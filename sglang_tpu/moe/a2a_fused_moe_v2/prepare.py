@@ -136,7 +136,7 @@ def prepare_model(model):
     if "GlmMoeDsaForCausalLM" not in architectures:
         logger.info("GLM A2A fused MoE v2: skipping %s", type(model).__name__)
         return
-    from sglang_tpu.moe.glm_a2a_fused_moe_v2_runtime import GlmA2AFusedMoEV2
+    from sglang_tpu.moe.a2a_fused_moe_v2.runtime import GlmA2AFusedMoEV2
 
     parallel = get_parallel()
     modules = [

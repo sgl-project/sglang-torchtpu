@@ -15,7 +15,7 @@ from sglang_tpu.fp8_linear import (
     _set_channelwise_fp8_weight,
     prepare_tpu_online_fp8_linear_weights,
 )
-from sglang_tpu.moe.glm_a2a_fused_moe_v2 import _prepare_shared
+from sglang_tpu.moe.a2a_fused_moe_v2.prepare import _prepare_shared
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

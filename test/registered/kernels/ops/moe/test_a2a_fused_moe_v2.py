@@ -309,7 +309,10 @@ def binder_loading_cases(ep, rank):
     from torch.nn import Parameter
 
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang_tpu.moe.glm_a2a_fused_moe_v2 import _prepare_shared, _replace_data
+    from sglang_tpu.moe.a2a_fused_moe_v2.prepare import (
+        _prepare_shared,
+        _replace_data,
+    )
     from sglang_tpu.moe.pallas.a2a_fused_moe_v2.op import (
         pack_gate_up,
         pack_gate_up_scale,
@@ -436,7 +439,7 @@ def worker():
     import torch.distributed as dist
     import torch_tpu
 
-    from sglang_tpu.moe.glm_a2a_fused_moe_v2 import _replace_data
+    from sglang_tpu.moe.a2a_fused_moe_v2.prepare import _replace_data
     from sglang_tpu.moe.pallas.a2a_fused_moe_v2.op import (
         get_op,
         pack_gate_up,

@@ -529,7 +529,7 @@ def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
     from sglang_tpu.envs import envs
 
     if envs.SGLANG_TPU_USE_A2A_FUSED_MOE_V2.get():
-        from sglang_tpu.moe.glm_a2a_fused_moe_v2 import (
+        from sglang_tpu.moe.a2a_fused_moe_v2.prepare import (
             prepare_model as prepare_glm_a2a_fused_moe_v2,
         )
 
