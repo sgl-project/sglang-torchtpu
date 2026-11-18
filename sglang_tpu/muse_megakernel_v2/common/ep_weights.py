@@ -115,11 +115,15 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
             _rows(u13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
             for e0 in range(0, u13.shape[0], _EXPERT_CHUNK)
         ]
-    ).view(torch.float8_e4m3fn)
+    )
+    # Rebound to its own fp8 storage, neither an fp8 view of the uint8 result nor copy_'d
+    # into the same-shape param: TorchTPU 0.2 re-materializes either with an eager
+    # as_strided before every compiled call (1 GiB per fp8 layer, #357).
+    new13 = new13.view(torch.float8_e4m3fn).clone()
     s13 = _channel_scales(experts.w13_weight_scale.data).index_select(2, cols)
     s2 = _channel_scales(experts.w2_weight_scale.data)
     _wait_for(new13, s13, s2)
-    copy_or_rebind_param(experts, "w13_weight", new13.contiguous())
+    experts.w13_weight.data = new13
     copy_or_rebind_param(experts, "w13_weight_scale", s13.contiguous())
     copy_or_rebind_param(experts, "w2_weight_scale", s2)
 
