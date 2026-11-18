@@ -391,18 +391,19 @@ def _fake_transport(*, tile=128, corrupt_d2h=False, defer_h2d=False):
             dst[0] ^= 1
 
     def batch_transfer_h2d(src_arrs, dst_arrs):
-        assert len(src_arrs) == len(dst_arrs) == 1
-        src, dst = src_arrs[0], dst_arrs[0]
-        assert src.device.type == "cpu" and src.is_contiguous()
-        assert src.nbytes >= _phys_bytes(dst)
+        assert len(src_arrs) == len(dst_arrs) >= 1
+        snapshots = []
+        for src, dst in zip(src_arrs, dst_arrs):
+            assert src.device.type == "cpu" and src.is_contiguous()
+            assert src.nbytes >= _phys_bytes(dst)
+            snapshots.append((dst, src[: dst.numel()].clone()))
         events.append("h2d_async")
-        n = dst.numel()
-        snapshot = src[:n].clone()
         done = [False]
 
         def apply():
             if not done[0]:
-                dst.copy_(snapshot)
+                for dst, snapshot in snapshots:
+                    dst.copy_(snapshot)
                 done[0] = True
 
         if not defer_h2d:
@@ -1332,10 +1333,9 @@ def test_tpu_consumer_event_releases_output_tensors_across_slots_and_warmup():
         )
         assert ev0.synced == 2
         assert ev1.synced == 0
-        # Both slot waits happen before their replacement h2d_async transfers.
-        assert events[:4] == [
+        # Both slot waits happen before the one h2d_async that replaces both slots.
+        assert events[:3] == [
             ("event_sync", 0),
-            "h2d_async",
             ("event_sync", 0),
             "h2d_async",
         ]
