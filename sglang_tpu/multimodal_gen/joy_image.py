@@ -57,8 +57,8 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 from sglang.multimodal_gen.runtime.models.dits import joy_image as dit
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 from sglang.multimodal_gen.runtime.pipelines import joy_image as pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
