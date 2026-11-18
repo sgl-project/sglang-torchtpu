@@ -27,6 +27,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
+from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import decoder_compile_policy, direct_compile
@@ -948,6 +949,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertIs(runtime_inputs[1], original_value)
         self.assertIs(runtime_inputs[2], value)
+        self.assertIn("Online weight updates", model._derived_weight_cache_error)
 
     def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
         with self.assertRaisesRegex(ValueError, "requires model"):
@@ -1615,6 +1617,50 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(kv_pool.value, pool_input)
         self.assertTrue(torch.equal(kv_pool.value, pool_output))
         self.assertEqual(len(traverse.call_args.args[0]), 1)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_policy_kv_pool_keeps_topk_capture_buffer_readable(self):
+        """Bug regression: a capture buffer written inside the forward must stay
+        readable after a direct-traced forward, on the trace call and on replay."""
+        cache = BaseDeviceCache(
+            max_batch_size=4, num_layers=2, topk_size=3, device="tpu", name="test"
+        )
+        buffer = cache.buffer
+        model = torch.nn.Identity()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(
+                model=model, token_to_kv_pool=_KVPool(torch.zeros(2, device="tpu"))
+            ),
+            owner=model,
+        )
+        # The TPU configuration: routed-experts capture on, no indexer capturer.
+        with (
+            patch.object(
+                decoder_compile_policy,
+                "get_global_experts_capturer",
+                return_value=SimpleNamespace(device_cache=cache),
+            ),
+            patch.object(
+                decoder_compile_policy, "get_global_indexer_capturer", return_value=None
+            ),
+        ):
+            kv_pool = policy.get_direct_compile_kv_pool()
+
+        def fn(topk):
+            cache.capture(layer_id=1, topk_indices=topk)
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda topk: tuple(topk.shape),
+            kv_pool=kv_pool,
+        )
+        for rows in ([[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]):
+            expected = torch.zeros((4, 2, 3), dtype=torch.int32)
+            expected[:2, 1] = torch.tensor(rows, dtype=torch.int32)
+            with torch.no_grad():
+                compiled(torch.tensor(rows, dtype=torch.int32, device="tpu"))
+            self.assertIs(cache.buffer, buffer)
+            self.assertTrue(torch.equal(cache.buffer.cpu(), expected))
 
     def test_rejects_function_with_neither_outputs_nor_mutations(self):
         """Negative branch: without a KV pool, a fn returning None traces an

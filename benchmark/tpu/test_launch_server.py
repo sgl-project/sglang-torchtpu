@@ -210,6 +210,22 @@ class TestRuntimeEnvironment(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_config(24, mode="router")
 
+    def test_agentx_mk_prefill(self):
+        """--mk-prefill adds its envs on the fp8 SAL pool and refuses what it cannot run."""
+        from benchmark.tpu.recipe.configs.muse_spark.agentic import (
+            MK_PREFILL_ENV,
+            get_config,
+        )
+
+        env = get_config(24, mk_prefill=True)["runtime_env"]
+        for name, value in MK_PREFILL_ENV.items():
+            self.assertEqual(env[name], value)
+        self.assertNotIn("SGLANG_TPU_MUSE_MK_PREFILL", get_config(24)["runtime_env"])
+        for concurrency, mode in ((8, "mixed"), (24, "decode"), (24, "prefill")):
+            with self.subTest(concurrency=concurrency, mode=mode):
+                with self.assertRaises(ValueError):
+                    get_config(concurrency, mode=mode, mk_prefill=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,11 +106,12 @@ class TpuBlockDraftWorker(TpuDraftWorker):
     @property
     def full_to_swa(self) -> torch.Tensor | None:
         """Host full-to-SWA slot map when the draft KV lives in the SWA sub-pool, else None."""
-        if not isinstance(self.model_runner.token_to_kv_pool, SWAKVPool):
+        kv_pool = self.model_runner.token_to_kv_pool
+        if not isinstance(kv_pool, SWAKVPool):
             return None
         allocator = self.model_runner.token_to_kv_pool_allocator
         assert isinstance(allocator, SWATokenToKVPoolAllocator), type(allocator)
-        return allocator.full_to_swa_index_mapping
+        return kv_pool.full_to_swa_index_mapping
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(

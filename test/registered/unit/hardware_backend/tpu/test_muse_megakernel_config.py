@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel import ops
-from sglang_tpu.muse_megakernel.ep_mk.config import ep_mk_config
+from sglang_tpu.muse_megakernel.common.plan import fold_fits
+from sglang_tpu.muse_megakernel.common.scratch import scratch_vmem_bytes
+from sglang_tpu.muse_megakernel.decode.spep.config import ep_mk_config
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -88,7 +89,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         if (cfg.alias_oy or cfg.alias_p or cfg.xfull_packed)
                         else ops._SCRATCH_VMEM_BUDGET
                     )
-                    self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
+                    self.assertLessEqual(scratch_vmem_bytes(cfg), budget)
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
                     self.assertEqual(cfg.row_tile, 0)
                     # pipelined attention: two iterations of chunks in use, refills in flight
@@ -120,17 +121,15 @@ class TestMuseMegakernelConfig(CustomTestCase):
         self.assertFalse(
             cfg_24_q4.alias_oy or cfg_24_q4.alias_p or cfg_24_q4.xfull_packed
         )
-        self.assertLessEqual(K.scratch_vmem_bytes(cfg_24_q4), ops._SCRATCH_VMEM_BUDGET)
+        self.assertLessEqual(scratch_vmem_bytes(cfg_24_q4), ops._SCRATCH_VMEM_BUDGET)
         for q, n_req in ((8, 3), (6, 4), (8, 4), (4, 8)):
             with self.subTest(q=q, n_req=n_req):
                 cfg = _config(_megakernel(), q, n_req, **_FP8_SAL)
                 self.assertTrue(cfg.fold_f and cfg.fold_o)
-                self.assertTrue(K.fold_fits(cfg))
+                self.assertTrue(fold_fits(cfg))
                 self.assertEqual(cfg.ring_slots, 10)
                 self.assertTrue(cfg.alias_oy and cfg.alias_p and cfg.xfull_packed)
-                self.assertLessEqual(
-                    K.scratch_vmem_bytes(cfg), ops._OPT_BASE_VMEM_BUDGET
-                )
+                self.assertLessEqual(scratch_vmem_bytes(cfg), ops._OPT_BASE_VMEM_BUDGET)
 
     def test_wave5_expert_split_swa_and_bd_all(self):
         groups = ops.expert_groups_of(_KINDS, 15)
@@ -164,7 +163,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         self.assertEqual((cfg.expert_depth, cfg.ring_slots), (3, 3))
                         self.assertFalse(cfg.fold_f or cfg.fold_o)
                     if cfg.fold_f or cfg.fold_o:
-                        self.assertTrue(K.fold_fits(cfg))
+                        self.assertTrue(fold_fits(cfg))
                     self.assertEqual(cfg.sal_fp8_dot, 0)  # env default; recipes set 2
                     budget = (
                         ops._TILED_VY2_VMEM_BUDGET
@@ -179,7 +178,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                             else ops._SCRATCH_VMEM_BUDGET
                         )
                     )
-                    self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
+                    self.assertLessEqual(scratch_vmem_bytes(cfg), budget)
 
     def test_ep_steps_validate(self):
         # the EP kernel validates ep_mk_config's config (no VMEM Y, no single-row collectives)
