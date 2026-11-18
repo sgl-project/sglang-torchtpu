@@ -347,12 +347,6 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             with self.assertRaisesRegex(NotImplementedError, "Multi-runner MTP"):
                 w._build_hicache_draft_plan()
 
-        empty_tc = NS(cache_controller=NS(mem_pool_host=NS(entry_map={})))
-        with self.assertRaises(KeyError):
-            hpa.build_swa_draft_pools(
-                draft_kv_pool=attach_draft(make_target()[1], (), (0, 1)),
-                tree_cache=empty_tc,
-            )
         _, swa_h_chk = _pair(make_target()[0])
         with self.assertRaisesRegex(TypeError, "TpuDMAHostKVPool"):
             swa_h_chk.bind_draft_swa_sidecar(NS())
@@ -666,6 +660,88 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         flat = dp.swa_kv_pool.get_fused_kv_buffer(0).flatten(0, 1)
         self.assertTrue(torch.equal(flat[new_locs, :4, 0, :64], k_tok))
         self.assertTrue(torch.equal(flat[new_locs, :4, 1, :64], v_tok))
+
+    def test_full_only_host_pool_group_skips_swa_draft_sidecar(self):
+        # P/D decode with pd_decode_swa_hicache builds a HostPoolGroup with
+        # only PoolName.KV (no PoolName.SWA) for both separate SWAKVPool and
+        # unified TpuUnifiedSWAKVPool targets; SWA drafts (e.g. Muse DFlash)
+        # keep SWA KV on device and must return no DRAFT_SWA sidecar.
+        sep_target = SWAKVPool(
+            size=64,
+            size_swa=32,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=[1, 2],
+            full_attention_layer_ids=[0, 3],
+            device="cpu",
+            enable_memory_saver=False,
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+        )
+        sep_kv_host = hpa.build_kv_host_pool(
+            kv_pool=sep_target.full_kv_pool,
+            page_size=4,
+            use_mla=False,
+            pool_label="full",
+        )
+        sep_grp = HostPoolGroup(
+            [
+                _entry(
+                    PN.KV,
+                    sep_kv_host,
+                    sep_target.full_kv_pool,
+                    {0: 0, 3: 1},
+                    4,
+                    is_anchor=True,
+                )
+            ]
+        )
+        sep_draft = SWAKVPool(
+            size=64,
+            size_swa=32,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=4,
+            head_dim=64,
+            swa_attention_layer_ids=[0, 1],
+            full_attention_layer_ids=[],
+            device="cpu",
+            enable_memory_saver=False,
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+        )
+        sep_tc = NS(cache_controller=NS(mem_pool_host=sep_grp, page_size=4))
+        self.assertEqual(
+            hpa.build_hicache_draft_sidecars(
+                draft_device_pools=(sep_draft,), tree_cache=sep_tc
+            ),
+            ([], []),
+        )
+        self.assertEqual(list(sep_grp.entry_map), [PN.KV])
+
+        tp, ta = make_target(size=64)
+        kv_h, _ = _pair(tp)
+        fm, sm = kph._unified_swa_layer_mappings(tp)
+        mx = max(fm.keys() | sm.keys()) + 1
+        uni_grp = HostPoolGroup([_entry(PN.KV, kv_h, tp, fm, mx, is_anchor=True)])
+        uni_tc = NS(cache_controller=NS(mem_pool_host=uni_grp, page_size=4))
+        uni_swa_draft = attach_draft(ta, (), (0, 1))
+        self.assertEqual(
+            hpa.build_hicache_draft_sidecars(
+                draft_device_pools=(uni_swa_draft,), tree_cache=uni_tc
+            ),
+            ([], []),
+        )
+        self.assertEqual(list(uni_grp.entry_map), [PN.KV])
+
+        # Full-attention drafts (e.g. EAGLE3) still attach PoolName.DRAFT to KV.
+        _, ta_full = make_target(size=64)
+        uni_full_draft = attach_draft(ta_full, (0, 1), ())
+        specs, entries = hpa.build_hicache_draft_sidecars(
+            draft_device_pools=(uni_full_draft,), tree_cache=uni_tc
+        )
+        self.assertEqual([s.pool_name for s in specs], [PN.DRAFT])
+        self.assertEqual([e.name for e in entries], [PN.DRAFT])
 
 
 if __name__ == "__main__":
