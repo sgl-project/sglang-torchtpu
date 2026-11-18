@@ -3834,10 +3834,12 @@ class _TokenParallelUp:
     # offset, from its chip's core-1 rank on that host.
     # (a) Slot reuse: R reads slot h in layer L's t4 and only then starts its
     #     output round to the seven other owners of pair p, S among them (R ^ S
-    #     is 8x or 8x + 1, both in _TOKEN_PARALLEL_PEERS). S's output round
-    #     waits for all seven before S leaves layer L, so S's layer L + 1 copy
-    #     lands after R's read and cannot signal R's semaphore 6 + x before
-    #     R's layer-L wait.
+    #     is 8x or 8x + 1, both in _TOKEN_PARALLEL_PEERS). S waits for all
+    #     seven before its next host round (send_outputs; after start_outputs
+    #     the caller's finish_token_parallel_outputs, which
+    #     moe_output_round_next_layer runs in the next layer's first code), so
+    #     S's layer L + 1 copy lands after R's read and cannot signal R's
+    #     semaphore 6 + x before R's layer-L wait.
     # (b) Layer 0's dense all-reduce also counts on semaphores 7..9 (other
     #     byte counts). S's layer-1 t4 follows its layer-1 attention host round
     #     (p2b), which waits for the p2b send of (h', 2p + 1). That send follows
