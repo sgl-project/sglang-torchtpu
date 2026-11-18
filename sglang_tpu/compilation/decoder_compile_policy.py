@@ -49,6 +49,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.state_capturer.base import BaseDeviceCache
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -134,6 +137,34 @@ _COMPILE_BAR_FORMAT = (
 # XLA TopK has a static output width. Warm the physically qualified serving
 # width so the common candidate path does not compile on its first request.
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
+
+
+class _TopkCaptureKVPool:
+    """KVPool over the KV state followed by the top-k capturers' device buffers.
+
+    The capturers write these process-global buffers inside the forward; a write that
+    direct_compile does not carry as state is left unscheduled in the live buffer.
+    """
+
+    def __init__(
+        self, *, kv_pool: Any, device_caches: tuple[BaseDeviceCache, ...]
+    ) -> None:
+        self._kv_pool = kv_pool
+        self._device_caches = device_caches
+
+    def get_state(self) -> list[torch.Tensor]:
+        return [*self._kv_pool.get_state(), *(c.buffer for c in self._device_caches)]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        kv_count = len(state) - len(self._device_caches)
+        self._kv_pool.set_state(state[:kv_count])
+        for cache, buffer in zip(self._device_caches, state[kv_count:], strict=True):
+            cache.buffer = buffer
+
+
+def _topk_capture_device_caches() -> tuple[BaseDeviceCache, ...]:
+    capturers = (get_global_experts_capturer(), get_global_indexer_capturer())
+    return tuple(c.device_cache for c in capturers if c is not None)
 
 
 def max_extend_tokens(*, context_len: int) -> int:
@@ -881,6 +912,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
+        kv_pool = self._get_direct_compile_kv_pool_state()
+        device_caches = _topk_capture_device_caches()
+        if not device_caches:
+            return kv_pool
+        return _TopkCaptureKVPool(kv_pool=kv_pool, device_caches=device_caches)
+
+    def _get_direct_compile_kv_pool_state(self):
         kv_pool = self.model_runner.token_to_kv_pool
         if not isinstance(kv_pool, HybridLinearKVPool):
             return kv_pool
