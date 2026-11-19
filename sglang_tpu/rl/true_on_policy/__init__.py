@@ -23,10 +23,11 @@ from sglang_tpu.rl.true_on_policy.attention_kernel import (
 )
 from sglang_tpu.rl.true_on_policy.logprob_kernel import logprob
 from sglang_tpu.rl.true_on_policy.matmul_kernel import matmul
-from sglang_tpu.rl.true_on_policy.norm_kernel import rms_norm
+from sglang_tpu.rl.true_on_policy.norm_kernel import gated_rms_norm, rms_norm
 
 __all__ = [
     "PAGE_SIZE",
+    "gated_rms_norm",
     "logprob",
     "matmul",
     "packed_causal_attention",
