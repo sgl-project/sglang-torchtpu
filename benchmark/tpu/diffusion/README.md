@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `joy_echo.sh` | `jdopensource/JoyAI-Echo` | 8 | Ulysses 8 (unguided, 32 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -22,7 +23,7 @@ e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 ## Performance
 
-tpu7x 2x2x1, torch_tpu 0.2.0, libtpu 0.0.50, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
+tpu7x 2x2x1, torch_tpu 0.2.0 (rows marked † use 0.2.1.dev20261028201649, main's pin), libtpu 0.0.50, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
 stage boundaries (otherwise queued denoising work is counted in the decode stage).
 
@@ -38,6 +39,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| JoyAI-Echo † | T2V+audio 832x480, 89 frames, 8 steps | 8 | 4.7 s | 0.172 s | 1.3 s | 59.1 GB |
+| JoyAI-Echo † | T2V+audio 1280x704, 121 frames, 8 steps | 8 | 10.3 s | 0.301 s | 4.8 s | 65.4 GB |
 
 
 ## Example requests
