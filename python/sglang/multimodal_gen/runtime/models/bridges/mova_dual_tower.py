@@ -233,7 +233,10 @@ class ConditionalCrossAttention(nn.Module):
         y: torch.Tensor,
         x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        y_replicated: bool = False,
     ):
+        """``y_replicated``: ``y`` holds every SP rank's rows (the same on each
+        rank), so each rank attends its own rows of ``x`` to it without SP."""
         ctx = y
         q, _ = self.q(x)
         k, _ = self.k(ctx)
@@ -295,7 +298,7 @@ class ConditionalCrossAttention(nn.Module):
         k = rearrange(k, "b l (h d) -> b l h d", h=self.num_heads_per_rank)
         v = rearrange(v, "b l (h d) -> b l h d", h=self.num_heads_per_rank)
 
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, skip_sequence_parallel_override=y_replicated)
         x = rearrange(x, "b l h d -> b l (h d)")
         x, _ = self.o(x)
         return x
@@ -383,6 +386,7 @@ class ConditionalCrossAttentionBlock(nn.Module):
         x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         video_grid_size: Optional[Tuple[int, int, int]] = None,
+        y_replicated: bool = False,
     ) -> torch.Tensor:
         if self.pooled_adaln:
             assert video_grid_size is not None, "video_grid_size cannot be None"
@@ -396,7 +400,9 @@ class ConditionalCrossAttentionBlock(nn.Module):
                 ).permute(0, 2, 1)
             x = self.adaln(x, temb=pooled_y)
         y = self.y_norm(y)
-        return self.inner(x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs)
+        return self.inner(
+            x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs, y_replicated=y_replicated
+        )
 
 
 def _is_conditioner_block(_name: str, module: nn.Module) -> bool:
@@ -594,6 +600,7 @@ class DualTowerConditionalBridge(
         y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         condition_scale: Optional[float] = None,
         video_grid_size: Optional[Tuple[int, int, int]] = None,
+        condition_replicated: bool = False,
     ) -> torch.Tensor:
         """Applies conditional control at the DiT hidden states level."""
         if not self.controller.should_interact(
@@ -614,6 +621,7 @@ class DualTowerConditionalBridge(
             x_freqs=x_freqs,
             y_freqs=y_freqs,
             video_grid_size=video_grid_size,
+            y_replicated=condition_replicated,
         )
 
         if self.trainable_condition_scale and condition_scale is not None:
@@ -642,21 +650,31 @@ class DualTowerConditionalBridge(
         v2a_condition_scale: Optional[float] = None,
         condition_scale: Optional[float] = None,
         video_grid_size: Optional[Tuple[int, int, int]] = None,
+        replicated_audio: Optional[torch.Tensor] = None,
+        replicated_audio_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs bidirectional conditional control for both visual and audio towers."""
+        """Performs bidirectional conditional control for both visual and audio towers.
+
+        ``replicated_audio`` (with its RoPE ``replicated_audio_freqs``): the
+        real audio rows of every SP rank, the audio-to-video keys and values.
+        """
+        a2v_replicated = replicated_audio is not None
         visual_conditioned = self.apply_conditional_control(
             layer_idx=layer_idx,
             direction="a2v",
             primary_hidden_states=visual_hidden_states,
-            condition_hidden_states=audio_hidden_states,
+            condition_hidden_states=(
+                replicated_audio if a2v_replicated else audio_hidden_states
+            ),
             x_freqs=x_freqs,
-            y_freqs=y_freqs,
+            y_freqs=replicated_audio_freqs if a2v_replicated else y_freqs,
             condition_scale=(
                 a2v_condition_scale
                 if a2v_condition_scale is not None
                 else condition_scale
             ),
             video_grid_size=video_grid_size,
+            condition_replicated=a2v_replicated,
         )
 
         audio_conditioned = self.apply_conditional_control(
