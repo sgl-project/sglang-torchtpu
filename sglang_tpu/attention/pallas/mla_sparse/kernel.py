@@ -332,9 +332,10 @@ def _attention_kernel(
     # part; the RoPE part arrives as a separate [T, H, 64] input and both are
     # joined (and zero-padded to 640) in registers, so XLA does no concat/pad.
     # narrow_output: 0 = the output aliases q (head_dim wide, sliced by the
-    # caller); 1 = a fresh NARROW_OUT_DIM-wide output (first chunk);
-    # 2 = that output passed back in, aliased, so later chunks keep the rows
-    # earlier chunks wrote. Skips the head_dim -> NoPE slice after the call.
+    # caller); 1 = a fresh NARROW_OUT_DIM-wide output whose unwritten rows are
+    # undefined; 2 = an output passed in and aliased, so rows earlier chunks
+    # (or the caller's zero fill) wrote are kept. sparse_ragged_paged_attention
+    # always passes a zeroed one. Skips the head_dim -> NoPE slice after the call.
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
     # (`[W * chunk, bkv_sz, ...]`), and the pipelined body attends window 0
@@ -1187,7 +1188,15 @@ def sparse_ragged_paged_attention(
 
     if narrow_output and (return_lse or topk_cap is not None):
         raise ValueError("narrow_output supports neither return_lse nor topk_cap")
-    o = None
+    # Narrow output: one zeroed buffer every chunk writes into (aliased), so
+    # rows no chunk's grid reaches (padding past token_end) read 0, not stale
+    # HBM. The memset has no input dependency, so it can run under the first
+    # chunk's SparseCore gather.
+    o = (
+        jnp.zeros((q.shape[0], num_q_heads, NARROW_OUT_DIM), q.dtype)
+        if narrow_output
+        else None
+    )
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
