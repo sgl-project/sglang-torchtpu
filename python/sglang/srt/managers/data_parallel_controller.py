@@ -254,6 +254,11 @@ class DataParallelController:
             # first leader, which then broadcasts over the full tp_group.
             local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
             self.control_message_step = 1 if local_ctrl else get_parallel().tp_size
+        elif get_parallel().nnodes_per_dp_replica:
+            # A replica's leader may be on another node: reach it over TCP, like DP
+            # attention's leaders.
+            self.launch_dp_attention_schedulers(server_args, port_args)
+            self.control_message_step = 1
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -700,6 +705,9 @@ class DataParallelController:
         )
 
         nnodes_per_tp_group = nnodes_per_pp_rank
+        if get_parallel().nnodes_per_dp_replica:
+            nnodes_per_tp_group = get_parallel().nnodes_per_dp_replica
+            dp_rank = get_parallel().node_rank // nnodes_per_tp_group
         tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
         if get_exec().moe.is_ep_scale_joiner:
             # Scale joiners enumerate their full local TP span.
@@ -741,6 +749,12 @@ class DataParallelController:
                         ).to_tcp()
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
+                    rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
+                elif get_parallel().nnodes_per_dp_replica:
+                    rank_port_args = PortArgs.init_new(
+                        server_args, dp_rank, worker_ports
+                    )
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
 

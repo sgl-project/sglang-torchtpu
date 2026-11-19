@@ -536,6 +536,51 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ratio, _ = self._low_ratio_item(layer_id)
         return self.kv_pools[ratio].page_size
 
+    # ------------------------------------------------------------------ #
+    # direct_compile KVPool protocol (sglang_tpu/compilation/direct_compile.py)
+    # ------------------------------------------------------------------ #
+
+    def _state_slots(self) -> list[tuple[object, str, Optional[int]]]:
+        """(owner, attribute, list index or None) of every tensor the forward reads
+        or writes, in a fixed order: SWA pages, then per ratio main KV words, main
+        KV scales and indexer K, then each compress-state ring."""
+        slots: list[tuple[object, str, Optional[int]]] = []
+
+        def add_list(owner, attr):
+            slots.extend((owner, attr, i) for i in range(len(getattr(owner, attr))))
+
+        add_list(self.swa_kv_pool, "kv_buffer")
+        for ratio in sorted(self.kv_pools):
+            pool = self.kv_pools[ratio]
+            if pool is not None:
+                add_list(pool, "kv_buffer")
+                add_list(pool, "scale_buffer")
+        for ratio in sorted(self.index_pools):
+            add_list(self.index_pools[ratio], "index_k_with_scale_buffer")
+        for pool in (*self.compress_state_pools, *self.indexer_compress_state_pools):
+            if pool is not None:
+                slots.append((pool.kv_score_buffer, "kv_score", None))
+        return slots
+
+    def get_state(self) -> list[torch.Tensor]:
+        return [
+            getattr(owner, attr) if index is None else getattr(owner, attr)[index]
+            for owner, attr, index in self._state_slots()
+        ]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        slots = self._state_slots()
+        if len(state) != len(slots):
+            raise ValueError(
+                f"DSV41TPUTokenToKVPool.set_state expects {len(slots)} tensors, "
+                f"got {len(state)}"
+            )
+        for (owner, attr, index), tensor in zip(slots, state):
+            if index is None:
+                setattr(owner, attr, tensor)
+            else:
+                getattr(owner, attr)[index] = tensor
+
 
 # ---------------------------------------------------------------------- #
 # Configurator hook bodies (registered in sglang_tpu/models/deepseek_v41/hooks.py)

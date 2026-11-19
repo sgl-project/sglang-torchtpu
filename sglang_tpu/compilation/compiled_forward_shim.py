@@ -950,18 +950,22 @@ class CompiledForwardShim:
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
-        # Read once: the flag decides which extend variant warmup compiled, so
-        # it is frozen for this shim's lifetime. Caching it also keeps the
-        # disabled path at a single attribute read per forward.
-        self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
-        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
-        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
-        self._logit_rows_enabled = logit_rows_enabled()
         runner = policy.model_runner
         # Draft models read the multimodal embeds inside their forward.
         self._draft_worker = bool(
             runner is not None and getattr(runner, "is_draft_worker", False)
         )
+        # Read once: the flag decides which extend variant warmup compiled, so
+        # it is frozen for this shim's lifetime. Caching it also keeps the
+        # disabled path at a single attribute read per forward. A draft never
+        # serves input logprobs, and its prompt extend is warmed and consumed
+        # as LAST capture (one row per request), so it keeps the flag off.
+        self._prompt_logprob_enabled = (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get() and not self._draft_worker
+        )
+        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
+        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
+        self._logit_rows_enabled = logit_rows_enabled()
         # Prefill context parallelism: above 1, extend batches present their
         # local zigzag rows to the graph and a batch-independent
         # extend_seq_lens_cpu (see __call__).

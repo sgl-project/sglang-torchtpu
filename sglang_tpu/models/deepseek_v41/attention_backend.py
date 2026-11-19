@@ -143,6 +143,10 @@ class DSV41TPUForwardMetadata:
     # [B] int32 earliest visible SWA position (no replay: 0).
     swa_minimum: torch.Tensor
     low_ratio: Dict[int, LowRatioMetadata]
+    # Direct tracer only: (local row ids, staged rows) of the host-staged Engram
+    # lookup (engram_host), carried here as graph inputs because the tracer
+    # rebuilds ForwardBatch from its dataclass fields only. None otherwise.
+    engram: Optional[tuple] = None
 
     # Filled lazily during the forward.
     swa_meta: Optional[torch.Tensor] = None
@@ -156,6 +160,48 @@ class DSV41TPUForwardMetadata:
     # (ratio, index source layer) -> indexer_ops.prepare_candidates result,
     # gathered once and read by every candidate consumer of that source.
     prepared_candidates: Dict[tuple, tuple] = field(default_factory=dict)
+
+
+# Host-built fields: the direct tracer's graph inputs. The rest is per-forward
+# scratch the layers fill, so it is left out of the pytree and every unflatten
+# starts it empty: warmup and serving then flatten to the same structure.
+_METADATA_INPUT_FIELDS = (
+    "positions",
+    "query_start_loc",
+    "token_rows",
+    "token_req_pool",
+    "valid",
+    "out_cache_loc",
+    "full_pages",
+    "swa_pages",
+    "swa_minimum",
+    "low_ratio",
+    "engram",
+)
+
+
+def _register_metadata_pytree() -> None:
+    try:
+        from jax import tree_util
+    except ModuleNotFoundError:  # CPU unit tests without JAX
+        return
+    # Keyed by attribute: direct_compile resolves every leaf of a deferred call
+    # through its key path and accepts only GetAttr / Dict / Sequence keys.
+    tree_util.register_pytree_with_keys(
+        DSV41TPUForwardMetadata,
+        lambda m: (
+            tuple(
+                (tree_util.GetAttrKey(f), getattr(m, f)) for f in _METADATA_INPUT_FIELDS
+            ),
+            None,
+        ),
+        lambda _, children: DSV41TPUForwardMetadata(
+            **dict(zip(_METADATA_INPUT_FIELDS, children))
+        ),
+    )
+
+
+_register_metadata_pytree()
 
 
 def _as_cpu_int64(values, length: int) -> torch.Tensor:
@@ -359,17 +405,6 @@ class DSV41TPUAttnBackend(AttentionBackend):
         model_config = model_runner.model_config
         config = model_config.hf_text_config
         _check_supported(config)
-        if (
-            getattr(model_runner.server_args, "enable_torch_compile", False)
-            and getattr(model_runner.server_args, "tpu_compile_tracer", None)
-            == "direct"
-        ):
-            # The direct tracer reads the KV pool through get_state(), which
-            # DSV41TPUTokenToKVPool does not implement.
-            raise NotImplementedError(
-                "DeepSeek-V4.1 TPU attention does not support "
-                "--tpu-compile-tracer direct yet; use the default dynamo tracer"
-            )
         self.model_runner = model_runner
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -381,7 +416,10 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.last_candidate_consumer = self._last_candidate_consumers(config)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
-        self.rope_tables: Dict[int, torch.Tensor] = {}
+        # Attention layer id -> the module owning that layer's freqs_cis buffer.
+        # The table is read through the owner at call time, so the direct tracer
+        # sees the buffer it lifted, not a tensor captured at init.
+        self.rope_owners: Dict[int, torch.nn.Module] = {}
         self.csa2_ops, self.indexer_ops = self._register_ops()
         # CSA2's fast main-record path reads exactly this many selected ids.
         self.selection_width = self.csa2_ops.MAX_SELECTED
@@ -435,7 +473,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 module.register_buffer("freqs_cis", table, persistent=False)
             attn = module._modules.get("attn_mqa")
             if attn is not None:
-                self.rope_tables[attn.layer_id] = table
+                self.rope_owners[attn.layer_id] = module
 
     # ------------------------------------------------------------------ #
     # Runtime hooks (mirror DSV4TPUAttnBackend)
@@ -500,8 +538,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
     ):
         """Returns (normalized q_lora, RoPE'd q [T, H, 512], normed RoPE'd kv [T, 512])."""
         assert not layer.q_head_norm, "DeepSeek-V4.1 has no per-head q norm"
-        if layer.layer_id not in self.rope_tables:
-            self.rope_tables[layer.layer_id] = rope_table(layer.freqs_cis)
+        # A module reference, never a tensor: safe to keep across traces.
+        self.rope_owners.setdefault(layer.layer_id, layer)
         q_lora = layer.q_norm(q_lora)
         q, _ = layer.wq_b(q_lora)
         q = apply_rope(
@@ -851,7 +889,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             metadata.query_start_loc,
             metadata.positions,
             sink,
-            self.rope_tables[layer_id],
+            rope_table(self.rope_owners[layer_id].freqs_cis),
             compress_ratio,
             float(layer.scaling),
             main=main,

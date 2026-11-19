@@ -322,7 +322,10 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        target_kv_pool = getattr(target_model_runner, "token_to_kv_pool", None)
+        if getattr(
+            target_kv_pool, "supports_packed_hicache_draft", True
+        ) and _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (
                 target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)

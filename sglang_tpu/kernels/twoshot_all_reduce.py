@@ -7,6 +7,13 @@ VMEM buffers; faster than XLA's all-reduce for decode-sized payloads.
 
 import functools
 
+# Largest per-rank payload worth sending to this kernel instead of XLA's
+# all-reduce. Measured on tpu7x 2x2x1 TP8, bf16, with the serving LIBTPU flags
+# (SparseCore all-reduce offload off): two-shot 17-25 us vs XLA 19-28 us from
+# 64 to 512 KiB, break-even near 768 KiB, XLA faster from 1 MiB. The cost tracks
+# bytes, not columns ([64, 4096] and [32, 8192] time the same).
+TWOSHOT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+
 
 def _twoshot_all_reduce_kernel(
     x_ref,

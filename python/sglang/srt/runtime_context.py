@@ -207,6 +207,14 @@ def num_dp_ranks_of(cfg: Any) -> int:
     return cfg.dp_size * cfg.attn_dp_size
 
 
+def nnodes_per_dp_replica_of(cfg: Any) -> int:
+    """`nnodes_per_dp_replica` (n), computed at publish: replica k takes node ranks
+    ``[k * n, (k + 1) * n)``."""
+    if cfg.dp_size == 1 or cfg.nnodes == 1 or attn_dp_enabled_of(cfg):
+        return 0
+    return cfg.nnodes // cfg.dp_size
+
+
 def attn_dcp_size_of(cfg: Any):
     """`attn_dcp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_dcp_size"]

@@ -676,6 +676,7 @@ def _bare_prefill_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._completed_send = set()
@@ -724,6 +725,7 @@ def _bare_decode_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._aborted = {}
     mgr._failed = set()

@@ -7,7 +7,7 @@ last partial page. Fix replaces with get_num_new_pages-based gating.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -68,33 +68,37 @@ def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
 
 
 class TestSWAAllocExtendPageEstimation(CustomTestCase):
-    def test_tpu_host_output_buffer_is_forwarded_to_full_allocator_only(self):
+    def test_tpu_host_output_buffer_maps_from_host_copies(self):
+        """With a caller host buffer, the mapping must be written from host
+        indices: the buffer for full, a host return for SWA."""
         stub = _make_self(page_size=8, full_available=16, swa_available=16)
         prefix = torch.tensor([7, 7], dtype=torch.int64)
         seq = torch.tensor([8, 8], dtype=torch.int64)
-        out_indices_cpu = torch.empty(2, dtype=torch.int32)
+        # The real full allocator fills this buffer; distinct values show which
+        # tensor the mapping reads.
+        out_indices_cpu = torch.tensor([12, 13], dtype=torch.int32)
 
-        with patch("sglang.srt.mem_cache.allocator.swa._is_tpu", True):
-            result = SWATokenToKVPoolAllocator.alloc_extend(
-                stub,
-                prefix_lens=prefix,
-                prefix_lens_cpu=prefix,
-                seq_lens=seq,
-                seq_lens_cpu=seq,
-                last_loc=prefix - 1,
-                extend_num_tokens=2,
-                out_indices_cpu=out_indices_cpu,
-            )
+        result = SWATokenToKVPoolAllocator.alloc_extend(
+            stub,
+            prefix_lens=prefix,
+            prefix_lens_cpu=prefix,
+            seq_lens=seq,
+            seq_lens_cpu=seq,
+            last_loc=prefix - 1,
+            extend_num_tokens=2,
+            out_indices_cpu=out_indices_cpu,
+        )
 
         self.assertIsNotNone(result)
         self.assertIs(
             stub.full_attn_allocator.alloc_extend.call_args.kwargs["out_indices_cpu"],
             out_indices_cpu,
         )
-        self.assertNotIn(
-            "out_indices_cpu",
-            stub.swa_attn_allocator.alloc_extend.call_args.kwargs,
-        )
+        swa_kwargs = stub.swa_attn_allocator.alloc_extend.call_args.kwargs
+        self.assertNotIn("out_indices_cpu", swa_kwargs)
+        self.assertTrue(swa_kwargs["return_host"])
+        self.assertEqual(stub.full_to_swa_index_mapping[[12, 13]].tolist(), [20, 21])
+        self.assertEqual(stub.full_to_swa_index_mapping[[10, 11]].tolist(), [0, 0])
 
     def test_zero_new_pages_must_succeed(self):
         # Old: 2 + 2*8 = 18 > 16 -> would refuse.

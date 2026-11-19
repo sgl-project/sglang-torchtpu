@@ -108,6 +108,7 @@ def _run_rank(rank: int, init_file: str) -> None:
         receiver = _receiver()
         parallel = SimpleNamespace(
             attn_dp_enabled=False,
+            num_dp_ranks=1,
             tp_size=WORLD,
             pp_size=1,
             nnodes=NNODES,
@@ -378,6 +379,7 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
             ({"pp_size": 2}, False, "1", False, "pp_size == 1"),
             ({"tp_size": 3}, False, "1", False, "divisible by nnodes"),
             ({"attn_dp_enabled": True}, False, "1", False, "DP attention"),
+            ({"num_dp_ranks": 4}, False, "1", False, "DP replicas"),
             ({}, True, "1", False, "tokenizer initialization"),
             # A prior rejected configuration must not cache the decision.
             ({}, False, "1", True, None),
@@ -386,7 +388,13 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
             with self.subTest(
                 overrides=overrides, skip_tokenizer=skip_tokenizer, flag=flag
             ):
-                config = dict(nnodes=2, tp_size=4, pp_size=1, attn_dp_enabled=False)
+                config = dict(
+                    nnodes=2,
+                    tp_size=4,
+                    pp_size=1,
+                    attn_dp_enabled=False,
+                    num_dp_ranks=1,
+                )
                 config.update(overrides)
                 with (
                     patch.dict(os.environ),

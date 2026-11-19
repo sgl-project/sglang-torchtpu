@@ -30,6 +30,7 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 
 
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
+    draft_model_config: ModelConfig | None = None
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
     # Draft layers whose KV cache uses the target SWA pool capacity.
@@ -177,6 +178,13 @@ def _resolve_eagle_aux_hidden_state(
     else:
         return
 
+    # Path-less: the draft is the target checkpoint in draft mode; its pool
+    # geometry and SWA layout come from that view (the TPU unified pool sizes
+    # its draft pools from it).
+    if not draft_path:
+        draft_model_config = draft_mode_config
+    config.draft_model_config = draft_model_config
+
     if (
         draft_model_config.is_hybrid_swa
         and not draft_model_config.is_compressed_kv_arch
@@ -279,6 +287,7 @@ def _resolve_dflash_aux_hidden_state(
                 if uses_compressed_kv_attention(draft_model_config.hf_config):
                     config.dspark_num_stages = len(target_layer_ids)
 
+        config.draft_model_config = draft_model_config
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.draft_model_config = draft_model_config

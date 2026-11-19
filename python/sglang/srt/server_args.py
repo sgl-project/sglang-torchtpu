@@ -59,6 +59,7 @@ from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     get_platform,
+    nnodes_per_dp_replica_of,
     num_dp_ranks_of,
     publish,
 )
@@ -972,7 +973,7 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not attn_dp_enabled_of(cfg):
+        if not (attn_dp_enabled_of(cfg) or nnodes_per_dp_replica_of(cfg)):
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -986,7 +987,8 @@ class PortArgs:
                 instance_id=instance_id,
             )
         else:
-            # DP attention. Use TCP + port to handle both single-node and multi-node.
+            # DP attention, or DP replicas on their own nodes. Use TCP + port to
+            # handle both single-node and multi-node.
             if cfg.nnodes == 1 and cfg.dist_init_addr is None:
                 derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
                 if derived_port > 65535:

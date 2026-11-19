@@ -367,6 +367,11 @@ class Parallel(msgspec.Struct):
         "an attention-DP deployment with a group of its own that may be one "
         "rank wide.",
     )
+    nnodes_per_dp_replica = Derived(
+        fn="sglang.srt.runtime_context.nnodes_per_dp_replica_of",
+        doc="How many nodes each `--dp-size` replica runs on when the replicas "
+        "span nodes; 0 when they don't (one node, one replica, or attention DP).",
+    )
     num_dp_ranks = Derived(
         fn="sglang.srt.runtime_context.num_dp_ranks_of",
         doc="How many data-parallel ranks the deployment serves with, one "

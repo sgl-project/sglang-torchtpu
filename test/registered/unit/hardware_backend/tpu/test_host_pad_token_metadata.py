@@ -439,6 +439,33 @@ class TestHostPadFieldSelection(CustomTestCase):
         for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
             self.assertEqual(getattr(batch, name).device.type, "meta", name)
 
+    def test_host_tokens_pad_before_upload_when_lengths_are_on_device(self):
+        """A pipeline stage keeps prefill tokens on host while seq_lens and request
+        rows stay on the device; the tokens still pad on host before upload."""
+        batch = self._extend_batch()
+        batch.seq_lens = batch.seq_lens.to("meta")
+        batch.req_pool_indices = torch.tensor([2, 7]).to("meta")
+        batch.mrope_positions = None
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        uploads = []
+
+        class ObserveCopies(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._to_copy.default:
+                    uploads.append(args[0].tolist())
+                return func(*args, **(kwargs or {}))
+
+        with ObserveCopies():
+            policy.prepare_forward_batch(batch)
+        for name in ("input_ids", "positions", "out_cache_loc", "extend_seq_lens"):
+            self.assertEqual(getattr(batch, name).device.type, "meta", name)
+        self.assertEqual(batch.input_ids.shape, (8,))
+        self.assertEqual(batch.seq_lens.shape, (4,))
+        self.assertEqual(batch.req_pool_indices.shape, (4,))
+        self.assertIn([0, 1, 2, 3, 4, 0, 0, 0], uploads)
+        self.assertIn([11, 12, 13, 50, 51, 0, 0, 0], uploads)
+
     def test_experimental_spec_keeps_non_overlap_metadata_on_host(self):
         """An experimental-worker PD-prefill batch filters and pads its lengths on
         host; an overlap batch, or one off the worker, keeps them on the device."""

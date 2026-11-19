@@ -44,6 +44,7 @@ from typing import (
 )
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -57,6 +58,7 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
+    DRAFT_PORT_OFFSET,
     PORTS_PER_RANK,
     STATE_PORT_OFFSET,
     SWA_PORT_OFFSET,
@@ -110,7 +112,6 @@ from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
-
 
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
@@ -183,11 +184,23 @@ class RaidenKVManager(
     # Whether an engine stages through fewer host buffers than device layers.
     _bounded_staging = False
     _listener_start_read = False
+    # Seconds between decode listener sweeps, from
+    # SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.
+    _listener_sweep_interval_s = 1.0
+    _stop_listener: Optional[threading.Event] = None
+    _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
     # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
     _unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     _seq_along_lane: bool = False
+    # Speculative draft engine when target uses TpuUnifiedSWAKVPool.
+    _draft_engine: Optional[Any] = None
+    _draft_kv_caches: Tuple[Any, ...] = ()
+    _draft_is_swa: bool = False
+    _draft_swa_sidecar: Optional[Any] = None
+    _draft_engine_max_blocks = 0
+    draft_raiden_endpoint: Optional[str] = None
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
@@ -352,6 +365,8 @@ class RaidenKVManager(
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._stop_listener = threading.Event()
 
         self._prefill: Optional[PrefillState] = None
         self._decode: Optional[DecodeState] = None
@@ -366,6 +381,7 @@ class RaidenKVManager(
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
             self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_sweep_interval_s = self._read_listener_sweep_interval()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -447,6 +463,9 @@ class RaidenKVManager(
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
         self._unified_swa_pool = kv_caches.unified_swa_pool
+        self._draft_kv_caches = list(kv_caches.draft)
+        self._draft_is_swa = kv_caches.draft_is_swa
+        self._draft_swa_sidecar = kv_caches.draft_swa_sidecar
         self._seq_along_lane = kv_caches.seq_along_lane
         self.kv_layout = (
             UNIFIED_SWA_KV_LAYOUT
@@ -454,11 +473,16 @@ class RaidenKVManager(
             else kv_layout_of(self._kv_caches)
         )
         if self._unified_swa_pool is not None:
-            page_bytes = getattr(self, "kv_item_lens_sum", 0) or sum(
-                int(buf[0].nbytes) for buf in self._kv_caches
+            page_bytes = sum(int(buf[0].nbytes) for buf in self._kv_caches) or getattr(
+                self, "kv_item_lens_sum", 0
+            )
+            draft_bytes = sum(int(buf[0].nbytes) for buf in self._draft_kv_caches)
+            self.kv_item_lens_sum = page_bytes + (
+                0 if self._draft_is_swa else draft_bytes
             )
             self.state_item_lens_sum = (
                 page_bytes * self._unified_swa_pool.layout.num_swa_groups
+                + (draft_bytes if self._draft_is_swa else 0)
             )
         self._state_kv_caches = tuple(kv_caches.state)
         self._state_type = kv_caches.state_type
@@ -540,6 +564,13 @@ class RaidenKVManager(
         if self._swa_kv_caches:
             swa_max_blocks = self._swa_max_request_blocks()
             engines.append((self._swa_kv_caches, swa_max_blocks))
+        if self._draft_kv_caches:
+            draft_max_blocks = (
+                self._swa_max_request_blocks()
+                if self._draft_is_swa
+                else self._max_request_blocks()
+            )
+            engines.append((self._draft_kv_caches, draft_max_blocks))
         layers = split_staging_layers(
             [len(t) for t, _ in engines], self._staging_layers_total
         )
@@ -552,7 +583,9 @@ class RaidenKVManager(
             n < len(tensors) for (tensors, _), n in zip(engines, layers)
         )
         sizes = self._size_host_staging(engines, layers)
-        num_slots, staging_layers = sizes[0]
+        size_idx = 0
+        num_slots, staging_layers = sizes[size_idx]
+        size_idx += 1
         self.raiden_endpoint, self._engine = self._start_engine(
             kv_caches=self._kv_caches,
             port=self._control_port,
@@ -564,6 +597,7 @@ class RaidenKVManager(
         pool_pages = num_slots * max_blocks
         swa_pool_pages = None
         state_pool_pages = None
+        draft_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s kv_tensors=%d "
             "max_blocks=%d num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
@@ -577,7 +611,8 @@ class RaidenKVManager(
             self._transfer_parallelism,
         )
         if self._swa_kv_caches:
-            swa_num_slots, swa_staging_layers = sizes[1]
+            swa_num_slots, swa_staging_layers = sizes[size_idx]
+            size_idx += 1
             self.swa_raiden_endpoint, self._swa_engine = self._start_engine(
                 kv_caches=self._swa_kv_caches,
                 port=self._control_port + SWA_PORT_OFFSET,
@@ -597,8 +632,20 @@ class RaidenKVManager(
                 swa_num_slots,
                 swa_pool_pages,
             )
+        if self._draft_kv_caches:
+            draft_num_slots, draft_staging_layers = sizes[size_idx]
+            size_idx += 1
+            self.draft_raiden_endpoint, self._draft_engine = self._start_engine(
+                kv_caches=list(self._draft_kv_caches),
+                port=self._control_port + DRAFT_PORT_OFFSET,
+                max_blocks=draft_max_blocks,
+                num_slots=draft_num_slots,
+                staging_layers=draft_staging_layers,
+            )
+            self._draft_engine_max_blocks = draft_max_blocks
+            draft_pool_pages = draft_num_slots * draft_max_blocks
         if self._state_kv_caches:
-            state_num_slots, _ = sizes[-1]
+            state_num_slots, _ = sizes[size_idx]
             self.state_raiden_endpoint, self._state_engine = self._start_engine(
                 kv_caches=list(self._state_kv_caches),
                 port=self._control_port + STATE_PORT_OFFSET,
@@ -619,7 +666,12 @@ class RaidenKVManager(
             )
         # Each engine's pool is handed out read by read, so the pages the
         # decode may hold in flight are the pages raiden reserved.
-        self._pulling = StagingAdmission(pool_pages, swa_pool_pages, state_pool_pages)
+        self._pulling = StagingAdmission(
+            pool_pages,
+            swa_pool_pages,
+            state_pool_pages,
+            draft_pool_pages,
+        )
 
     def _start_engine(
         self,
@@ -692,8 +744,16 @@ class RaidenKVManager(
         if self._dynamic_host_staging:
             other_slots_per_full_slot = WINDOW_SLOTS_PER_FULL_SLOT
 
-        full_slot_bytes = slot_bytes[0]
-        other_slot_bytes = other_slots_per_full_slot * sum(slot_bytes[1:])
+        is_full_engine = [
+            i == 0 or (tensors is self._draft_kv_caches and not self._draft_is_swa)
+            for i, (tensors, _) in enumerate(engines)
+        ]
+        full_slot_bytes = sum(
+            sb for sb, is_full in zip(slot_bytes, is_full_engine) if is_full
+        )
+        other_slot_bytes = other_slots_per_full_slot * sum(
+            sb for sb, is_full in zip(slot_bytes, is_full_engine) if not is_full
+        )
         budget = self._rank_budget_bytes()
         ceiling = self._slot_ceiling()
         full_slots = slots_within_budget(
@@ -701,7 +761,7 @@ class RaidenKVManager(
         )
 
         other_slots = min(full_slots * other_slots_per_full_slot, ceiling)
-        counts = [full_slots] + [other_slots] * (len(engines) - 1)
+        counts = [full_slots if is_full else other_slots for is_full in is_full_engine]
         logger.info(
             "RaidenKVManager rank%d host staging | rank_budget=%.2fGB slots=%s "
             "layers=%s of %s",
@@ -830,28 +890,40 @@ class RaidenKVManager(
     def _state_req_id(room: int) -> str:
         return f"state:{room}"
 
+    @staticmethod
+    def _draft_req_id(room: int) -> str:
+        return f"draft:{room}"
+
     @classmethod
     def _room_of(cls, rid: str) -> Optional[int]:
         """The room of a whole ("<room>"), sliding-window ("swa:<room>"), GDN
-        state ("state:<room>") or chunk ("<room>#<k>") transfer id, resharded
-        or not; None for any other id."""
-        room = cls._norm_req_id(rid).removeprefix("swa:").removeprefix("state:")
+        state ("state:<room>"), draft ("draft:<room>") or chunk ("<room>#<k>")
+        transfer id, resharded or not; None for any other id."""
+        room = (
+            cls._norm_req_id(rid)
+            .removeprefix("swa:")
+            .removeprefix("state:")
+            .removeprefix("draft:")
+        )
         room = room.partition("#")[0]
         return int(room) if room.isdecimal() else None
 
     def _is_room_transfer(self, key: str, room: int) -> bool:
-        """Whether key is a whole, sliding-window, state or chunk id of room."""
+        """Whether key is a whole, sliding-window, state, draft or chunk id of room."""
         return key in (
             str(room),
             self._swa_req_id(room),
             self._state_req_id(room),
+            self._draft_req_id(room),
         ) or key.startswith(f"{room}#")
 
     def _side_reads_done(self, room: int, done: Set[str]) -> bool:
-        """Whether the room's sliding-window and state reads, where their
+        """Whether the room's sliding-window, state and draft reads, where their
         engines exist, are in done."""
-        return (self._swa_engine is None or self._swa_req_id(room) in done) and (
-            self._state_engine is None or self._state_req_id(room) in done
+        return (
+            (self._swa_engine is None or self._swa_req_id(room) in done)
+            and (self._state_engine is None or self._state_req_id(room) in done)
+            and (self._draft_engine is None or self._draft_req_id(room) in done)
         )
 
     @staticmethod
@@ -870,8 +942,35 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        """Take the engines' settled transfers into the room tables.
+
+        The scheduler's poll and the listener's stall sweep both drain here;
+        the lock keeps two callers from interleaving one engine's poll with
+        the bookkeeping of another. Host reads of the DRAM offload channel
+        drain only here, on the scheduler: HiCache's wrapper owns their
+        native reports, and the listener sweep must not poll it.
+        """
         if self.dram_offload_channel is not None:
             self.dram_offload_channel.drain_host_reads()
+        self._last_scheduler_drain = time.monotonic()
+        with self._drain_lock:
+            self._drain_engine_serialized()
+
+    def _try_drain_engine(self) -> bool:
+        """Drain settled transfers unless another caller is already draining.
+
+        Used by the decode listener sweep so a scheduler blocked inside a
+        native poll or unregister cannot stall listener message dispatch.
+        """
+        if not self._drain_lock.acquire(blocking=False):
+            return False
+        try:
+            self._drain_engine_serialized()
+        finally:
+            self._drain_lock.release()
+        return True
+
+    def _drain_engine_serialized(self) -> None:
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -885,6 +984,7 @@ class RaidenKVManager(
             ("full", self._engine),
             ("swa", self._swa_engine),
             ("state", self._state_engine),
+            ("draft", self._draft_engine),
         )
         if all(engine is None for _, engine in engines):
             return
@@ -991,13 +1091,15 @@ class RaidenKVManager(
         """One engine's sent, received and failed transfers, or None if the
         poll raised.
 
-        Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this worker. Raiden raises from
-        ``poll_stats_with_details`` only before it takes any completion, so a
-        failed poll loses nothing and the next one reports it. Raiden's
-        transfer deadlines are reported through it too: once polls have failed
-        for longer than one deadline no transfer can settle, and that is raised
-        rather than left to hang every request with its pages held.
+        Runs inside ``_drain_engine_serialized`` on both the scheduler's poll
+        and the decode listener's stall sweep. In the scheduler's poll, an
+        escaping exception takes down every request on this worker. Raiden
+        raises from ``poll_stats_with_details`` only before it takes any
+        completion, so a failed poll loses nothing and the next one reports
+        it. Raiden's transfer deadlines are reported through it too: once
+        polls have failed for longer than one deadline no transfer can settle,
+        and that raises ``RuntimeError`` (fatal on the scheduler's poll;
+        logged and retried on the listener sweep until the scheduler polls).
         """
         try:
             stats = engine.poll_stats_with_details()
@@ -1034,6 +1136,8 @@ class RaidenKVManager(
             rids.append(self._swa_req_id(room))
         if self._state_engine is not None:
             rids.append(self._state_req_id(room))
+        if self._draft_engine is not None:
+            rids.append(self._draft_req_id(room))
         times = [self._send_done_at.get(rid) for rid in rids]
         return None if None in times else max(times)
 
@@ -1216,17 +1320,51 @@ class RaidenKVManager(
 
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
+    def _read_listener_sweep_interval(self) -> float:
+        """SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S, checked against the chunk
+        transfer deadline: a sweep that comes later than the deadline cannot
+        save a read the stalled scheduler is holding."""
+        interval = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.get()
+        if not (math.isfinite(interval) and 0 < interval < self._timeout_s):
+            raise ValueError(
+                f"{tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name} must be "
+                f"> 0 and below {tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.name}"
+                f" ({self._timeout_s:g} s), got {interval!r}"
+            )
+        return interval
+
     def _listen(self) -> None:
-        while True:
+        # chunked_transfer and _pipeline are only known after set_kv_caches,
+        # which runs after this thread starts; _sweep_pulls checks them per sweep.
+        sweeps = self._decode is not None and self._listener_start_read
+        stop = self._stop_listener
+        next_sweep = time.monotonic() + self._listener_sweep_interval_s
+        while stop is None or not stop.is_set():
             try:
-                msg = self.server_socket.recv_multipart()
+                ready = not sweeps or self.server_socket.poll(
+                    max(0, int((next_sweep - time.monotonic()) * 1000))
+                )
+                if stop is not None and stop.is_set():
+                    break
+                msg = self.server_socket.recv_multipart() if ready else None
             except Exception as e:
                 logger.error("RaidenKVManager listener error: %s", e)
                 continue
-            try:
-                self._dispatch(msg)
-            except Exception as e:
-                logger.error("RaidenKVManager message handling error: %s", e)
+            if msg is not None:
+                try:
+                    self._dispatch(msg)
+                except Exception as e:
+                    logger.error("RaidenKVManager message handling error: %s", e)
+            if sweeps and time.monotonic() >= next_sweep:
+                now = time.monotonic()
+                interval = self._listener_sweep_interval_s
+                next_sweep = now + interval
+                if now - self._last_scheduler_drain < interval:
+                    continue
+                try:
+                    self._sweep_pulls()
+                except Exception as e:
+                    logger.error("RaidenKVManager pull sweep error: %s", e)
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
@@ -1312,6 +1450,30 @@ class RaidenKVManager(
         pages = [int(x) for x in state_indices[index]]
         if self._unified_swa_pool is not None:
             return self._unified_swa_pool.expand_swa_pages(pages)
+        return pages
+
+    def _draft_swa_blocks_from_state_indices(
+        self, state_indices: Optional[List]
+    ) -> List[int]:
+        if not self._draft_is_swa or not self._draft_kv_caches:
+            return []
+        try:
+            index = self.kv_args.state_types.index(StateType.SWA)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Raiden has draft SWA KV tensors but StateType.SWA is not registered"
+            ) from exc
+        if (
+            state_indices is None
+            or index >= len(state_indices)
+            or state_indices[index] is None
+        ):
+            raise RuntimeError("Raiden draft SWA transfer is missing its page indices")
+        pages = [int(x) for x in state_indices[index]]
+        if self._draft_swa_sidecar is not None:
+            return self._draft_swa_sidecar.translate_pages(
+                torch.as_tensor(pages, dtype=torch.int64)
+            ).tolist()
         return pages
 
     def _state_rows_from_state_indices(
@@ -1488,6 +1650,7 @@ class RaidenKVManager(
                     self._prefill.send_blocks,
                     self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
+                    self._prefill.send_draft_swa_blocks,
                     self._prefill.send_state_rows,
                     self._prefill.send_state_meta,
                     self._prefill.send_aux,
@@ -1516,13 +1679,16 @@ class RaidenKVManager(
                     self._decode.reshard_chunk_sources,
                     self._decode.local_blocks,
                     self._decode.local_swa_blocks,
+                    self._decode.local_draft_swa_blocks,
                     self._decode.local_state_rows,
                     self._decode.decode_aux_index,
                     self._decode.remote_blocks,
                     self._decode.remote_swa_blocks,
+                    self._decode.remote_draft_swa_blocks,
                     self._decode.remote_state_rows,
                     self._decode.remote_endpoint,
                     self._decode.remote_swa_endpoint,
+                    self._decode.remote_draft_endpoint,
                     self._decode.remote_state_endpoint,
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,

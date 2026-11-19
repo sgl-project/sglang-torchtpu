@@ -222,6 +222,32 @@ enum TokenCell {
     Many(Vec<u32>),
 }
 
+/// One token id inside a bigram pair. Multimodal pad ids exceed `u32`, so it
+/// narrows like the scalar `TokenCell` path instead of rejecting the batch.
+struct TokenId(u32);
+
+impl<'de> Deserialize<'de> for TokenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TokenId;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a token id")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<TokenId, E> {
+                Ok(TokenId(v as u32))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<TokenId, E> {
+                Ok(TokenId(v as u32))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 impl<'de> Deserialize<'de> for TokenCell {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -250,7 +276,7 @@ impl<'de> Deserialize<'de> for TokenCell {
                     Some(h) => Vec::with_capacity(h.min(8)),
                     None => Vec::new(),
                 };
-                while let Some(t) = seq.next_element::<u32>()? {
+                while let Some(TokenId(t)) = seq.next_element::<TokenId>()? {
                     if ts.len() >= MAX_TOKENS_PER_EVENT {
                         return Err(de::Error::custom(format!(
                             "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
@@ -545,12 +571,12 @@ mod tests {
     /// Encode `token_ids` the way SGLang's *bigram* pages do: a sequence of
     /// 2-element `[t_i, t_{i+1}]` arrays instead of flat ints. See
     /// `mem_cache/events.py` (`is_bigram` branch).
-    fn write_bigram_token_array(buf: &mut Vec<u8>, pairs: &[(u32, u32)]) {
+    fn write_bigram_token_array(buf: &mut Vec<u8>, pairs: &[(u64, u64)]) {
         mp::write_array_len(buf, pairs.len() as u32).unwrap();
         for (a, b) in pairs {
             mp::write_array_len(buf, 2).unwrap();
-            mp::write_uint(buf, *a as u64).unwrap();
-            mp::write_uint(buf, *b as u64).unwrap();
+            mp::write_uint(buf, *a).unwrap();
+            mp::write_uint(buf, *b).unwrap();
         }
     }
 
@@ -654,7 +680,7 @@ mod tests {
     fn build_block_stored_bigram_bytes(
         block_hashes: &[i64],
         parent: Option<i64>,
-        token_pairs: &[(u32, u32)],
+        token_pairs: &[(u64, u64)],
         block_size: u32,
         lora_id: Option<i64>,
         medium: Option<&str>,
@@ -748,6 +774,31 @@ mod tests {
                 assert_eq!(b.parent_block_hash, None);
                 assert_eq!(b.block_size, 2);
                 assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
+    /// Multimodal pad ids in bigram pairs exceed `u32`; the batch must still
+    /// decode rather than be dropped whole.
+    #[test]
+    fn decodes_bigram_token_ids_above_u32() {
+        let pad = 1_000_000_u64 + (1 << 61);
+        let event = build_block_stored_bigram_bytes(
+            &[111_i64],
+            None,
+            &[(10, pad), (pad, 30)],
+            2,
+            None,
+            Some("GPU"),
+        );
+        let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
+
+        let batch = decode_event_batch(&bytes).expect("decode wide bigram token_ids");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![111]);
+                assert_eq!(b.token_ids, vec![10, pad as u32, pad as u32, 30]);
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }
