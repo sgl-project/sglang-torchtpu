@@ -40,6 +40,28 @@ def sample_tokens(
     return torch.where(top_ks <= 1, greedy, _exponential_race(probs, u))
 
 
+@compiled_op()
+def apply_verify_penalties(
+    logits: torch.Tensor,
+    additive: torch.Tensor | None,
+    scaling: torch.Tensor | None,
+    num_verify_rows: int,
+) -> torch.Tensor:
+    """[pbs * R, V] verify logits with each request's [pbs, V] penalty row on its R rows.
+
+    EAGLE's relaxed speculative penalty: the snapshot taken before the step
+    applies to every verify row. Pad rows carry neutral penalties (additive 0,
+    scaling 1). Same order and rule as SamplingBatchInfo's pre-grammar transforms.
+    """
+    rows = logits.reshape(-1, num_verify_rows, logits.shape[-1])
+    if additive is not None:
+        rows = rows + additive[:, None, :].to(rows.dtype)
+    if scaling is not None:
+        scale = scaling[:, None, :].to(rows.dtype)
+        rows = torch.where(rows < 0, rows * scale, rows / scale)
+    return rows.reshape(logits.shape)
+
+
 # Target candidates acceptance keeps per verify row; covers top_k up to this.
 TARGET_CANDIDATES = 64
 
