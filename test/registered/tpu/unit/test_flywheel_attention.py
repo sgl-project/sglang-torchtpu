@@ -1,7 +1,7 @@
 """Correctness of --attention-backend flywheel's kernel call on the fused KV pool.
 
 Runs ``fused_cache_flywheel_attention`` on the buffer layout
-``TpuFusedMHATokenToKVPool`` allocates, with steps planned by
+``TpuFlywheelKVPool`` allocates, with steps planned by
 ``plan_flywheel_step`` the way the backend plans them (padded batch rows,
 page 0 reserved), and checks every live output row and the whole cache
 against numpy. The cache starts filled with random values, which serve as the
@@ -83,12 +83,12 @@ class TestFlywheelFusedCacheAttention(unittest.TestCase):
         v = rng.standard_normal((num_tokens, num_kv_heads, head_dim), np.float32)
         q = q.astype(jnp.bfloat16)
         if fp8:
-            # The pool's fp8 buffer, [blocks, page, ceil(2H / 4), 4, head_dim],
+            # The pool's fp8 buffer, [blocks, page, align(2H, 4), head_dim],
             # rows past 2H padding; the backend's caller quantizes K/V before
             # the kernel call.
             cache = (
                 rng.standard_normal(
-                    (NUM_BLOCKS, PAGE_SIZE, -(-num_kv_heads * 2 // 4), 4, head_dim),
+                    (NUM_BLOCKS, PAGE_SIZE, -(-num_kv_heads * 2 // 4) * 4, head_dim),
                     np.float32,
                 )
                 / K_SCALE
@@ -98,7 +98,7 @@ class TestFlywheelFusedCacheAttention(unittest.TestCase):
             scales = {"k_scale": K_SCALE, "v_scale": V_SCALE}
         else:
             cache = rng.standard_normal(
-                (NUM_BLOCKS, PAGE_SIZE, num_kv_heads, 2, head_dim), np.float32
+                (NUM_BLOCKS, PAGE_SIZE, num_kv_heads * 2, head_dim), np.float32
             ).astype(jnp.bfloat16)
             k, v = (x.astype(jnp.bfloat16) for x in (k, v))
             scales = {}

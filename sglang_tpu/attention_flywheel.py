@@ -15,10 +15,10 @@ The host builds the writer's page pieces and the kernel index per step
 (``_plan_step``), so the compiled graph holds every kernel and never
 recompiles for a new batch.
 
-The fused pool, ``[num_blocks, page_size, align(2 * num_kv_heads, packing) /
-packing, packing, head_dim]``, is flywheel's cache layout ``[num_blocks,
-page_size, 2 * num_kv_heads, head_dim]`` with K and V interleaved per head, in
-bf16 and fp8 alike, so the op reshapes it in place.
+The KV pool (``TpuFlywheelKVPool``) is RPA's fused pool with the packing axis
+merged: ``[num_blocks, page_size, align(2 * num_kv_heads, packing), head_dim]``,
+K and V interleaved per head, in bf16 and fp8 alike. That is flywheel's cache
+layout, so the op takes the buffer as is.
 
 Neither registering the backend nor validating its server args imports
 flywheel_tpu; constructing the backend does.
@@ -27,6 +27,7 @@ flywheel_tpu; constructing the backend does.
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -36,6 +37,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
+    PallasForwardMetadata,
     RpaKernelSpec,
     _get_pages_per_seq,
     _pool_kv_pack_heads,
@@ -102,11 +104,22 @@ class FlywheelStepOperands(NamedTuple):
     kernel_index: torch.Tensor
 
 
+@dataclass
+class FlywheelForwardMetadata(PallasForwardMetadata):
+    """RPA's metadata plus the step's flywheel operands.
+
+    The operands ride in ``forward_metadata`` so that every compile tracer
+    lifts them as graph inputs (direct_compile registers this as a pytree).
+    """
+
+    step: FlywheelStepOperands | None = None
+
+
 def fused_cache_flywheel_attention(
     queries,  # [T, num_q_heads, head_dim]
     keys,  # [T, num_kv_heads, head_dim]
     values,
-    kv_cache_fused,  # [num_blocks, page_size, num_kv_heads, 2, head_dim]
+    kv_cache_fused,  # [num_blocks, page_size, align(2 * num_kv_heads), head_dim]
     kv_lens,  # i32[max_num_seqs]
     page_indices,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens,  # i32[max_num_seqs + 1]
@@ -119,20 +132,18 @@ def fused_cache_flywheel_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
 ):
-    """flywheel_tpu_attention on the fused pool's buffer, in JAX.
+    """flywheel_tpu_attention on the pool's buffer, in JAX.
 
-    Returns the output rows and the updated buffer in the pool's shape. An
+    Returns the output rows and the updated buffer. An
     fp8 pool takes K/V already quantized by the caller, and k_scale/v_scale
     dequantize them.
     """
     flywheel_tpu_attention = _import_flywheel_attention()
-    num_blocks, page_size = kv_cache_fused.shape[:2]
-    head_dim = kv_cache_fused.shape[-1]
     output, kv_cache = flywheel_tpu_attention(
         queries,
         keys,
         values,
-        kv_cache_fused.reshape(num_blocks, page_size, -1, head_dim),
+        kv_cache_fused,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -144,7 +155,7 @@ def fused_cache_flywheel_attention(
         k_descale=k_scale,
         v_descale=v_scale,
     )
-    return output, kv_cache.reshape(kv_cache_fused.shape)
+    return output, kv_cache
 
 
 def plan_flywheel_step(
@@ -345,7 +356,6 @@ class TpuFlywheelAttnBackend(BaseTpuPallasRpaAttnBackend):
         from sglang_tpu.attention import flywheel_attention
 
         self._fw = flywheel_attention
-        self._step_operands: FlywheelStepOperands | None = None
 
     def _build_kernel_op(self):
         op = _get_flywheel_op()
@@ -388,7 +398,7 @@ class TpuFlywheelAttnBackend(BaseTpuPallasRpaAttnBackend):
                 raise NotImplementedError(
                     "The flywheel attention backend does not support block-major KV."
                 )
-            step = self._step_operands
+            step = self.forward_metadata.step
             return op(
                 queries,
                 keys,
@@ -415,7 +425,11 @@ class TpuFlywheelAttnBackend(BaseTpuPallasRpaAttnBackend):
                 "their decode rows come last, and its decode kernel takes them first."
             )
         super().init_forward_metadata(forward_batch)
-        self._step_operands = self._plan_step(forward_batch)
+        base = self.forward_metadata
+        self.forward_metadata = FlywheelForwardMetadata(
+            **{f.name: getattr(base, f.name) for f in fields(base)},
+            step=self._plan_step(forward_batch),
+        )
 
     def _plan_step(self, forward_batch: ForwardBatch) -> FlywheelStepOperands:
         """This step's flywheel operands, planned on the host and uploaded."""

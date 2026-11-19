@@ -66,13 +66,13 @@ class TestFlywheelServerArgs(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_flywheel_server_args(_server_args(**overrides))
 
-    def test_shares_the_rpa_fused_pool(self):
-        # The flywheel op reads TpuFusedMHATokenToKVPool's buffer as its own
-        # cache layout; the generic MHA pool would not match.
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+    def test_allocates_the_flywheel_pool(self):
+        # flywheel's 4D pool; the 5D fused buffer costs a whole-layer relayout
+        # per call at head_dim 256, and the generic MHA pool does not match.
+        from sglang_tpu.kv_pool import TpuFlywheelKVPool
         from sglang_tpu.tpu_platform import _mha_kv_pool_cls
 
-        self.assertIs(_mha_kv_pool_cls("flywheel"), TpuFusedMHATokenToKVPool)
+        self.assertIs(_mha_kv_pool_cls("flywheel"), TpuFlywheelKVPool)
 
     def test_startup_imports_no_flywheel_tpu(self):
         # The launcher validates server args, and CPU hosts import the plugin,

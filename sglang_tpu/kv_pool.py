@@ -327,15 +327,17 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # Buffer creation / accessors
     # ------------------------------------------------------------------ #
 
-    def _create_buffers(self):
-        kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
-        shape = (
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
             self.num_blocks,
             self.page_size,
-            kv_heads_packed,
+            self.num_kv_heads_x2 // self.kv_packing,
             self.kv_packing,
             self.padded_head_dim,
         )
+
+    def _create_buffers(self):
+        shape = self._buffer_shape()
         logger.info(
             "Allocating fused TPU KV buffers: layers=%d, shape per layer=%s, dtype=%s",
             self.layer_num,
@@ -611,6 +613,31 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # them twice and inflated every KV-transfer byte count by that factor.
         kv_item_lens = [buf[0].nbytes for buf in self.kv_buffer]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+
+class TpuFlywheelKVPool(TpuFusedMHATokenToKVPool):
+    """The fused pool with its packing axis merged, for --attention-backend flywheel:
+    [num_blocks, page_size, num_kv_heads_x2, head_dim], flywheel's cache layout.
+
+    Same bytes and K/V interleave as the 5D buffer. At head_dim 256 the 5D
+    buffer's TPU tiling differs from the 4D view the kernels take, so every call
+    would relayout the whole layer buffer; this shape needs none.
+    """
+
+    KV_LAYOUT_NAME = "token-major-flywheel"
+
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
+            self.num_blocks,
+            self.page_size,
+            self.num_kv_heads_x2,
+            self.padded_head_dim,
+        )
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_blocks, page_size, kv_heads_x2, hd = buf.shape
+        return buf.view(n_blocks * page_size, kv_heads_x2, hd)
 
 
 class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):

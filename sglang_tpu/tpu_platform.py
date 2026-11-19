@@ -384,13 +384,14 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
 
         return TpuSeqAlongLaneKVPool
 
-    # RPA v3, batched and flywheel use the fused 5D KV layout; pallas_tpu_flash
-    # and torch_native read the generic MHA pool.
-    if backend in (
-        "pallas_tpu_rpa_v3",
-        "pallas_tpu_rpa_batched",
-        "flywheel",
-    ):
+    if backend == "flywheel":
+        from sglang_tpu.kv_pool import TpuFlywheelKVPool
+
+        return TpuFlywheelKVPool
+
+    # RPA v3 and batched use the fused 5D KV layout; pallas_tpu_flash and
+    # torch_native read the generic MHA pool.
+    if backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool
