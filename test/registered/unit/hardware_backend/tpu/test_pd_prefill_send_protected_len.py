@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -89,7 +90,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             kv_manager=SimpleNamespace(
-                kv_args=SimpleNamespace(state_types=[StateType.SWA])
+                kv_args=SimpleNamespace(
+                    state_types=[StateType.SWA], state_sub_pools=[None]
+                )
             )
         )
 
@@ -136,6 +139,8 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.pool = ReqToTokenPool(
             size=4, max_context_len=64, device="cpu", enable_memory_saver=False
         )
+        # The window keeps the cache's window, as the cache builder binds it.
+        kv_storage_of(self.pool, self.allocator).bind_window_retention(WINDOW, None)
         self.cache = UnifiedRadixCache(
             CacheInitParams(
                 disable=False,
@@ -175,6 +180,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
             prefix_len=0,
             extend_end=None,
             start_send_idx=0,
+            disagg_decode_prefix_len=0,
             kv=kv,
             owned_kv_len=lambda: kv.kv_committed_len,
             finished=lambda: False,
@@ -309,7 +315,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         (window_pages,) = sender.state_indices
         # The window is the request's last len(window_pages) pages.
         window_start = ((len(tokens) - 1) // PAGE - (len(window_pages) - 1)) * PAGE
-        freed_below = x.kv.get_evicted_seqlen(ComponentType.SWA)
+        freed_below = x.kv.get_evicted_seqlen(BaseSWAKVPool.WINDOW_SUB_POOL)
         # Not vacuous: the checkpoints did free out-of-window SWA.
         self.assertGreater(freed_below, 0)
         self.assertLessEqual(

@@ -692,7 +692,7 @@ class TestPPLoopWiring(CustomTestCase):
                 )
             return SimpleNamespace(running_batch=None, batch_to_run=batch)
 
-        def intake():
+        def intake(**_):
             issued_at_intake.append(list(issued))
             if len(issued_at_intake) > 3:
                 raise _StopLoop
@@ -708,6 +708,9 @@ class TestPPLoopWiring(CustomTestCase):
             scheduler.launch_event = None
 
         scheduler = Scheduler.__new__(Scheduler)
+        Scheduler.init_pause_state(scheduler)
+        scheduler._war_barrier_enabled = False
+        scheduler.invariant_checker = Mock()
         scheduler.pp_kv_free_fence = fence
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.init_pp_loop_state = init_loop_state
@@ -724,6 +727,7 @@ class TestPPLoopWiring(CustomTestCase):
             "_pp_process_batch_result",
             "_pp_send_proxy",
             "on_idle",
+            "increment_scheduler_iterations",
         ):
             setattr(scheduler, name, Mock())
 
@@ -774,6 +778,9 @@ class TestPPLoopWiring(CustomTestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.pp_kv_free_fence = fence
+        Scheduler.init_pause_state(scheduler)
+        scheduler._war_barrier_enabled = False
+        scheduler.invariant_checker = Mock()
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.enable_staging = False
         scheduler.disagg_prefill_inflight_queue = []
@@ -804,7 +811,9 @@ class TestPPLoopWiring(CustomTestCase):
             "_pp_process_batch_result",
             "_pp_send_proxy",
             "_pp_process_freeze_gc",
+            "process_bootstrapped_queue",
             "on_idle",
+            "increment_scheduler_iterations",
         ):
             setattr(scheduler, name, Mock())
 
@@ -823,7 +832,7 @@ class TestPPFenceGate(CustomTestCase):
     it, with a TPU DMA HiCache backend; every other server keeps none."""
 
     def _scheduler(self, *, device="tpu", mode="prefill", dma=True):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.device = device
