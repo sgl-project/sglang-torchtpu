@@ -32,6 +32,7 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
@@ -1557,14 +1558,14 @@ class ModelConfig:
         than groups, each GPU keeps one.
         """
         total_num_kv_heads = self.get_total_num_kv_heads()
-        if self.is_draft_model:
+        if self.is_draft_model or current_platform.pcp_ring_enabled():
             dcp_size = 1
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
     def get_swa_num_kv_heads(self, tensor_parallel_size, dcp_size: int = 1) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
-        if self.is_draft_model:
+        if self.is_draft_model or current_platform.pcp_ring_enabled():
             dcp_size = 1
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):

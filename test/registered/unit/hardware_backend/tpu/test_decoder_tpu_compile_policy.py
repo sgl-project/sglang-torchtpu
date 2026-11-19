@@ -1843,6 +1843,131 @@ class TestContextParallelWarmupFamily(_PolicyTestCase):
             policy.precompile()
 
 
+_PCP_RING_PATH = (
+    "sglang_tpu.compilation.decoder_compile_policy.current_platform.pcp_ring_enabled"
+)
+
+
+class TestContextParallelRingWarmup(_PolicyTestCase):
+    """SGLANG_TPU_PCP_MODE=ring: the context-parallel family uses the buckets
+    the page-aligned layout can fill and warms the ring with a cached prefix."""
+
+    PAGE = 16
+
+    def _ring_policy(self, token_buckets, bs_buckets=(1, 4)):
+        model_runner = _model_runner()
+        model_runner.page_size = self.PAGE
+        policy = _make_policy(
+            model_runner, token_buckets=token_buckets, bs_buckets=bs_buckets
+        )
+        strategy = SimpleNamespace(cp_size=2, cp_rank=0, ring_capacity=None)
+        strategy.set_ring_capacity = lambda rows: setattr(
+            strategy, "ring_capacity", rows
+        )
+        return policy, strategy
+
+    def test_cp_buckets_round_up_to_whole_block_pairs(self):
+        """A request reserves two page-aligned blocks on every rank, so local
+        buckets round up to multiples of 2 x page size (32), never past the
+        largest token bucket."""
+        policy, strategy = self._ring_policy(token_buckets=(8, 40, 80, 100))
+        cap = policy._extend_compile_cap()
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=strategy),
+            patch(_PCP_RING_PATH, return_value=True),
+        ):
+            policy._configure_cp_ring()
+            self.assertEqual(policy.cp_t_bucketer.buckets, [32, 64, 96])
+            self.assertEqual(
+                policy._extend_cp_compile_cases(), [(32, cap), (64, cap), (96, cap)]
+            )
+        self.assertEqual(strategy.ring_capacity, 96)
+
+    def test_gather_mode_keeps_every_bucket_and_configures_nothing(self):
+        policy, strategy = self._ring_policy(token_buckets=(8, 32, 48, 64))
+        cap = policy._extend_compile_cap()
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=strategy),
+            patch(_PCP_RING_PATH, return_value=False),
+        ):
+            self.assertIsNone(policy.cp_t_bucketer)
+            self.assertEqual(
+                policy._extend_cp_compile_cases(),
+                [(tokens, cap) for tokens in (8, 32, 48, 64) if tokens >= cap],
+            )
+        self.assertIsNone(strategy.ring_capacity)
+
+    def test_no_usable_bucket_fails_at_startup(self):
+        """Every token bucket is below one block pair (32 tokens)."""
+        policy, strategy = self._ring_policy(token_buckets=(8, 24))
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=strategy),
+            patch(_PCP_RING_PATH, return_value=True),
+            self.assertRaisesRegex(ValueError, "row unit"),
+        ):
+            policy._configure_cp_ring()
+
+    def test_warmup_batch_fills_the_bucket_behind_a_cached_logical_page(self):
+        """One program serves first chunks and cached prefixes; the warmup has
+        a cached prefix so the ring rotates before the first request does."""
+        policy, strategy = self._ring_policy(token_buckets=(8, 64))
+        captured = {}
+
+        def from_layout(layout, **kwargs):
+            captured["layout"], captured["kwargs"] = layout, kwargs
+            return SimpleNamespace()
+
+        policy._forward_batch_from_layout = from_layout
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=strategy),
+            patch(_PCP_RING_PATH, return_value=True),
+            patch(
+                "sglang_tpu.compilation.decoder_compile_policy.is_cp_active",
+                return_value=True,
+            ),
+            patch("sglang_tpu.compilation.decoder_compile_policy.prepare_cp_forward"),
+        ):
+            policy._configure_cp_ring()
+            policy._make_cp_dummy_forward_batch(
+                local_tokens=64, bs=4, capture_hidden_mode=CaptureHiddenMode.NULL
+            )
+        layout = captured["layout"]
+        # 64 local rows = two requests' worth of 2 x page blocks at cp 2.
+        lens = layout.extend_seq_lens_cpu
+        self.assertEqual(
+            sum(2 * -(-length // (4 * self.PAGE)) * self.PAGE for length in lens), 64
+        )
+        prefix = self.PAGE * 2
+        self.assertEqual(layout.extend_prefix_lens_cpu, [prefix] * len(lens))
+        self.assertEqual(layout.seq_lens_cpu.tolist(), [prefix + n for n in lens])
+        self.assertEqual(layout.positions[0].item(), prefix)
+        self.assertEqual(strategy.ring_capacity, 64)
+
+    def test_gather_warmup_batch_is_prefix_free(self):
+        policy, strategy = self._ring_policy(token_buckets=(8, 64))
+        captured = {}
+        policy._forward_batch_from_layout = lambda layout, **kwargs: captured.update(
+            layout=layout
+        )
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=strategy),
+            patch(_PCP_RING_PATH, return_value=False),
+            patch(
+                "sglang_tpu.compilation.decoder_compile_policy.is_cp_active",
+                return_value=True,
+            ),
+            patch("sglang_tpu.compilation.decoder_compile_policy.prepare_cp_forward"),
+        ):
+            policy._make_cp_dummy_forward_batch(
+                local_tokens=64, bs=4, capture_hidden_mode=CaptureHiddenMode.NULL
+            )
+        layout = captured["layout"]
+        self.assertEqual(layout.extend_prefix_lens_cpu, [0] * 4)
+        self.assertEqual(layout.seq_lens_cpu.tolist(), list(layout.extend_seq_lens_cpu))
+        self.assertEqual(layout.positions[0].item(), 0)
+        self.assertEqual(layout.seq_lens_sum, sum(layout.extend_seq_lens_cpu))
+
+
 class TestPrecompileLoops(_PolicyTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs

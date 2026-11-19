@@ -52,6 +52,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.common import round_up
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -473,16 +474,22 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         device: str | torch.device,
         slot: int,
         out_cache_loc_dtype: torch.dtype,
+        prefix_len: int = 0,
     ) -> _DummyForwardBatchFields:
-        """Reserved-slot EXTEND with one prefix-free request per entry of
-        ``request_lens`` (a context-parallel warmup batch)."""
+        """Reserved-slot EXTEND with one request per entry of ``request_lens``
+        (a context-parallel warmup batch), each after ``prefix_len`` cached
+        tokens (0: prefix-free)."""
         bs = len(request_lens)
         num_tokens = sum(request_lens)
         lens = torch.tensor(request_lens, dtype=torch.int64)
+        seq_lens = lens + prefix_len
         input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         input_ids[:bs] = 1
         positions = torch.cat(
-            [torch.arange(length, dtype=torch.int64) for length in request_lens]
+            [
+                torch.arange(prefix_len, prefix_len + length, dtype=torch.int64)
+                for length in request_lens
+            ]
         ).to(device)
         extend_start_loc = torch.zeros(bs, dtype=torch.int32)
         extend_start_loc[1:] = torch.cumsum(lens, dim=0)[:-1].to(torch.int32)
@@ -492,18 +499,20 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             out_cache_loc=torch.full(
                 (num_tokens,), slot, dtype=out_cache_loc_dtype, device=device
             ),
-            seq_lens=lens.to(device),
-            orig_seq_lens=lens.to(device),
-            seq_lens_cpu=lens.clone(),
+            seq_lens=seq_lens.to(device),
+            orig_seq_lens=seq_lens.to(device),
+            seq_lens_cpu=seq_lens.clone(),
             req_pool_indices=torch.full((bs,), slot, dtype=torch.int64, device=device),
             req_pool_indices_cpu=torch.full((bs,), slot, dtype=torch.int64),
-            seq_lens_sum=num_tokens,
+            seq_lens_sum=int(seq_lens.sum()),
             extend_num_tokens=num_tokens,
             extend_seq_lens=lens.to(torch.int32).to(device),
-            extend_prefix_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+            extend_prefix_lens=torch.full(
+                (bs,), prefix_len, dtype=torch.int32, device=device
+            ),
             extend_start_loc=extend_start_loc.to(device),
             extend_seq_lens_cpu=list(request_lens),
-            extend_prefix_lens_cpu=[0] * bs,
+            extend_prefix_lens_cpu=[prefix_len] * bs,
             extend_logprob_start_lens_cpu=[0] * bs,
         )
 
@@ -591,6 +600,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self.cp_t_bucketer: Bucketer | None = None
         self.tracer = tracer
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
@@ -604,6 +614,48 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Prefill context-parallel strategy, or None when not configured; not
         cached, since the strategy may initialize after this policy is built."""
         return get_cp_strategy()
+
+    def _configure_cp_ring(self) -> None:
+        """Tell the zigzag strategy the largest local bucket, which caps the
+        batches ring mode admits. Idempotent: runs at setup and again at
+        warmup, as the strategy may initialize later."""
+        if self._cp_strategy is not None:
+            self._cp_strategy.set_ring_capacity(self._cp_local_bucketer().max_val)
+
+    def _cp_local_bucketer(self) -> Bucketer:
+        """Local token buckets of the context-parallel extend program.
+
+        The token buckets of at least the extend batch cap, each rounded up to
+        a multiple of the layout's row unit and capped at the largest bucket
+        (rounded down), so the program never exceeds the planned token budget.
+        The row unit is 1 in gather mode; in ring mode it is 2 x page size,
+        because every request reserves two whole-page blocks on every rank
+        (``cp_layout.ring_max_local_rows``), so any other bucket would end in
+        rows that are always padding.
+        """
+        if self.cp_t_bucketer is not None:
+            return self.cp_t_bucketer
+        assert self.t_bucketer is not None
+        ring = current_platform.pcp_ring_enabled()
+        row_unit = 2 * self.model_runner.page_size if ring else 1
+        cap = self._extend_compile_cap()
+        # The largest multiple of row_unit that still fits the token budget
+        # (e.g. 8000 tokens, row_unit 512 -> 7680).
+        max_bucket = (self.t_bucketer.max_val // row_unit) * row_unit
+        buckets = set()
+        for bucket in self.t_bucketer.buckets:
+            if bucket < cap:
+                continue
+            # Round up to whole row units, but not past max_bucket.
+            buckets.add(min(round_up(bucket, row_unit), max_bucket))
+        if max_bucket < cap or not buckets:
+            raise ValueError(
+                "Prefill context parallelism needs a prefill token bucket of at "
+                f"least the extend batch cap {cap} and of {row_unit} tokens (the "
+                f"layout's row unit); got buckets {list(self.t_bucketer.buckets)}."
+            )
+        self.cp_t_bucketer = Bucketer(name="CpLocalTokenBucketer", buckets=buckets)
+        return self.cp_t_bucketer
 
     def _record_compile_step(
         self,
@@ -714,11 +766,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return []
         assert self.t_bucketer is not None
         cap = self._extend_compile_cap()
-        return [
-            (num_tokens, cap)
-            for num_tokens in self.t_bucketer.buckets
-            if num_tokens >= cap
-        ]
+        return [(num_tokens, cap) for num_tokens in self._cp_local_bucketer().buckets]
 
     def _extend_compile_shapes(self) -> list[tuple[int, int]]:
         return list(
@@ -815,6 +863,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 get_schedule().prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
+        # Needs the buckets above; before any batch is admitted. Ring mode
+        # refuses speculative decoding, so this is never a draft worker.
+        if current_platform.pcp_ring_enabled():
+            self._configure_cp_ring()
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -1181,7 +1233,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if self._cp_batch_active(forward_batch):
             real_q, real_b = prepare_tpu_cp_forward_batch(
                 forward_batch,
-                t_bucketer=self.t_bucketer,
+                t_bucketer=self._cp_local_bucketer(),
                 b_bucketer=self.b_bucketer,
                 extend_bs=self.extend_bs,
                 cp_size=self._cp_strategy.cp_size,
@@ -1742,14 +1794,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         rows on every context-parallel rank, with the CP-v2 metadata built
         the way serving builds it."""
         assert self._cp_strategy is not None
+        page_size, prefix_len = 1, 0
+        if current_platform.pcp_ring_enabled():
+            self._configure_cp_ring()
+            page_size = self.model_runner.page_size
+            # One program serves first chunks and cached prefixes alike; warming
+            # it with a cached logical page (the reserved page 0 on every rank)
+            # makes the warmup run the ring's remote DMAs, not just its barrier,
+            # so a ring that cannot rotate fails at startup.
+            prefix_len = page_size * self._cp_strategy.cp_size
         request_lens = warmup_request_lengths(
-            local_rows=local_tokens, cp_size=self._cp_strategy.cp_size, max_reqs=bs
+            local_rows=local_tokens,
+            cp_size=self._cp_strategy.cp_size,
+            max_reqs=bs,
+            page_size=page_size,
         )
         layout = _DummyForwardBatchFields.cp_extend(
             request_lens,
             device=self.model_runner.device,
             slot=self._dummy_kv_slot(),
             out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND),
+            prefix_len=prefix_len,
         )
         forward_batch = self._forward_batch_from_layout(
             layout,
