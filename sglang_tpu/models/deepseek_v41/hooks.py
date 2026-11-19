@@ -109,6 +109,23 @@ allow_tpu_dsv41_encoder_replay
   Remove when: the validator asks current_platform whether it folds encoder
        SWA replay.
 
+fold_tpu_dsv41_encoder_replay
+  Why: encoder_swa_replay._fold_batch concatenates each hit's replay rows with
+       the scheduled rows assuming one device and int64 slots: replay token ids
+       go to runner.device and replay slots are read from req_to_token. On TPU
+       req_to_token is host-resident (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST), the
+       DSpark spec worker stages input_ids and out_cache_loc on the host, and the
+       compiled extend graph rejects an int64 out_cache_loc (it is int32).
+  How: AROUND _fold_batch for the V4.1 TPU pool: runs the original against a
+       runner view whose device is input_ids' device and whose req_to_token
+       returns int64 slots on out_cache_loc's device, with out_cache_loc cast to
+       int64 once up front; then casts the folded out_cache_loc back to the
+       scheduled dtype and moves the row maps and Engram history to the runner's
+       device, where the original places them.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: _fold_batch builds the replay rows on the scheduled tensors'
+       devices and keeps out_cache_loc's dtype.
+
 derive_tpu_dsv41_pool_sizes, build_tpu_dsv41_allocator, get_tpu_dsv41_swa_fixed_bytes
   Why: under --enable-encoder-swa-bounded-replay the core sizes the paged SWA pool
        at 0 tokens (SWA lives in the request window), which the TPU 8-page SWA
@@ -218,6 +235,64 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     cuda = SimpleNamespace(is_cuda=True, is_hip=False)
     with patch.object(validator, "get_platform", lambda: cuda):
         return original(server_args)
+
+
+class _SlotsOnDevice:
+    """req_to_token view: each indexed slice as int64 on ``device``."""
+
+    def __init__(self, table: torch.Tensor, device: torch.device):
+        self._table = table
+        self._device = device
+
+    def __getitem__(self, key) -> torch.Tensor:
+        return self._table[key].to(device=self._device, dtype=torch.int64)
+
+
+def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
+    """AROUND encoder_swa_replay._fold_batch: fold on the scheduled tensors'
+    devices and keep out_cache_loc's dtype."""
+    from copy import copy
+    from types import SimpleNamespace
+
+    import msgspec
+
+    from sglang.srt.runtime_context import get_platform
+    from sglang_tpu.models.deepseek_v41.memory_pool import DSV41TPUTokenToKVPool
+
+    if not get_platform().is_tpu or not isinstance(
+        runner.token_to_kv_pool, DSV41TPUTokenToKVPool
+    ):
+        return original(batch=batch, runner=runner, rows=rows)
+    loc = batch.out_cache_loc
+    scheduled = copy(batch)
+    # One cast here makes the original's per-request .long() calls no-ops.
+    scheduled.out_cache_loc = loc.to(torch.int64)
+    # The original reads only these three runner fields.
+    view = SimpleNamespace(
+        device=batch.input_ids.device,
+        model=runner.model,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=_SlotsOnDevice(
+                runner.req_to_token_pool.req_to_token, loc.device
+            )
+        ),
+    )
+    folded = original(batch=scheduled, runner=view, rows=rows)
+    folded.batch.out_cache_loc = folded.batch.out_cache_loc.to(loc.dtype)
+    if folded.batch.engram_history is not None:
+        folded.batch.engram_history = folded.batch.engram_history.to(
+            runner.device, non_blocking=True
+        )
+
+    def put(t: torch.Tensor) -> torch.Tensor:
+        return t.to(runner.device, non_blocking=True)
+
+    return msgspec.structs.replace(
+        folded,
+        keep_rows=put(folded.keep_rows),
+        scheduled_row=put(folded.scheduled_row),
+        row_floor=put(folded.row_floor),
+    )
 
 
 def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
@@ -558,6 +633,11 @@ def hook_specs():
         (
             "sglang.srt.arg_groups.deepseek_v4_hook.validate_deepseek_v41_features",
             allow_tpu_dsv41_encoder_replay,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.encoder_swa_replay._fold_batch",
+            fold_tpu_dsv41_encoder_replay,
             HookType.AROUND,
         ),
         (
