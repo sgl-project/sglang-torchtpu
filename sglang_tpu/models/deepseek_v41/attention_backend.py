@@ -636,7 +636,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             req_to_token=self.req_to_token,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
             request_window=self.request_window,
-            swa_ring_valid_from=self.token_to_kv_pool.swa_req_ring_valid_from,
+            swa_ring_valid_from=self.token_to_kv_pool.swa_valid_from,
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,

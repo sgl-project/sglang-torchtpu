@@ -412,9 +412,7 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         assert not self._swa_pool_pending, "the core pool built no SWA pool"
         if self.swa_req_ring_size is not None:
             # The attention backend builds the draft's SWA table on the host.
-            self.swa_req_ring_valid_from = torch.zeros(
-                self.num_req_slots, dtype=torch.int64
-            )
+            self.swa_valid_from = torch.zeros(self.num_req_slots, dtype=torch.int64)
         if self.request_window is not None:
             swa_storage = "request window"
         elif self.swa_req_ring_size is not None:
@@ -566,8 +564,8 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # Kernel buffer accessors (absolute layer ids)
     # ------------------------------------------------------------------ #
 
-    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
-        self.swa_req_ring_valid_from[slots.cpu()] = valid_from.cpu()
+    def set_swa_valid_from(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+        self.swa_valid_from[slots.cpu()] = valid_from.cpu()
 
     def swa_ring_rows(
         self,
