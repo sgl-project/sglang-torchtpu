@@ -19,14 +19,11 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
-from sglang_tpu import shared_slice
+
+# By module: importing dp_replicas first runs platform discovery from its own
+# sglang import, which loads this module before dp_replicas defines its names.
+from sglang_tpu import dp_replicas, shared_slice
 from sglang_tpu._logging import get_logger
-from sglang_tpu.dp_replicas import (
-    ReplicaSession,
-    get_replica_session,
-    prepare_host_session,
-    validate_dp_replicas,
-)
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -736,15 +733,31 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
-    # The direct tracer gets the KV cache buffers from the pool's get_state and
-    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
-    # buffers, so the first compile would fail.
-    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
-    # tracer.
-    if not k3_program and cfg.tpu_compile_tracer != "dynamo":
+    _validate_kpool_raw_ring(cfg)
+
+
+def _validate_kpool_raw_ring(cfg) -> None:
+    """The pooled indexer's raw ring (SGLANG_TPU_DSA_KPOOL_RAW_RING) keeps raw
+    rows by request slot, not by page, so nothing that moves pages can carry an
+    open pool's raw rows, and an unchunked prefill would overrun the ring."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
+        return
+    if cfg.disaggregation_mode != "null":
         raise ValueError(
-            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
-            f"{cfg.tpu_compile_tracer!r}."
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --disaggregation-mode "
+            f"{cfg.disaggregation_mode!r}: a P/D transfer moves pages, and the "
+            "ring's raw rows are not paged."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --enable-prefill-cp."
+        )
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING needs chunked prefill: the ring is sized "
+            "for one chunk per request per step."
         )
 
 
@@ -774,11 +787,6 @@ def _validate_mtp_index_share(cfg, hf_config) -> None:
         raise ValueError(
             "DSA index sharing on TPU runs on the experimental spec worker; set "
             f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1 {opt_out}."
-        )
-    if cfg.disaggregation_mode != "null":
-        # A P/D decode would draft on seeds its prefill never sent.
-        raise NotImplementedError(
-            f"DSA index sharing on TPU does not support P/D disaggregation; {opt_out}."
         )
 
 
@@ -840,6 +848,14 @@ def _register_attention_backends() -> None:
 
     @register_attention_backend("dsv4")
     def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.models.deepseek_v41.memory_pool import uses_dsv41_pool
+
+        if uses_dsv41_pool(runner.model_config.compress_ratios):
+            from sglang_tpu.models.deepseek_v41.attention_backend import (
+                DSV41TPUAttnBackend,
+            )
+
+            return DSV41TPUAttnBackend(runner)
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
         return DSV4TPUAttnBackend(runner)
@@ -1099,8 +1115,12 @@ class TpuSRTPlatform(SRTPlatform):
         # torch_tpu.
         # One device per scheduler process across all pipeline stages.
         if cfg.dp_size > 1:
-            validate_dp_replicas(cfg)
-            prepare_host_session(cfg.dp_size, cfg.tp_size)
+            dp_replicas.validate_dp_replicas(cfg)
+            dp_replicas.prepare_host_session(
+                cfg.dp_size,
+                cfg.tp_size,
+                cfg.dist_init_addr if cfg.nnodes > 1 else None,
+            )
         _prepare_tpu_env(
             cfg.dp_size * cfg.tp_size * cfg.pp_size,
             setup_slicebuilder=not cfg.use_ray,
@@ -1536,14 +1556,21 @@ class TpuSRTPlatform(SRTPlatform):
     def get_batch_input_device(self, batch) -> str | None:
         """Keep eligible prefill inputs on CPU until backend padding."""
         from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.utils.common import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
+        # Pipeline stages pad prefill to the same buckets, so host-pad it too. A
+        # PD decode server's prebuilt first token keeps the device placement.
+        staged = _can_stage_forward_metadata(batch) or (
+            _can_stage_forward_metadata(batch, allow_pipeline_parallel=True)
+            and batch.forward_mode == ForwardMode.EXTEND
+        )
         checks = (
-            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("forward metadata is not staged", staged),
             ("context parallelism is on", get_cp_strategy() is None),
             ("the allocator returns device indices", host_return_allocators(allocator)),
             # Page size 1 uses alloc(), which has no host-return contract.
@@ -1647,7 +1674,7 @@ class TpuSRTPlatform(SRTPlatform):
     # Initialization
     # ------------------------------------------------------------------
 
-    _dp_replica_session: Optional[ReplicaSession] = None
+    _dp_replica_session: Optional[dp_replicas.ReplicaSession] = None
 
     def prepare_worker(
         self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -1655,16 +1682,17 @@ class TpuSRTPlatform(SRTPlatform):
         cfg = _resolving_view(server_args)
         if cfg.dp_size <= 1:
             return
-        validate_dp_replicas(cfg)
+        dp_replicas.validate_dp_replicas(cfg)
         if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
             raise ValueError(f"Invalid TPU engine DP rank: {dp_rank}")
-        self._dp_replica_session = ReplicaSession(
+        self._dp_replica_session = dp_replicas.ReplicaSession(
             dp_rank,
             cfg.dp_size,
             cfg.tp_size,
             cfg.ep_size,
             dp_rank * cfg.tp_size + tp_rank,
             cfg.dist_timeout or 7200,
+            cfg.dcp_size,
         )
         # The session rank chooses the physical device. Engine-local co-location
         # binding would put every replica on the first engine's devices.
@@ -1672,7 +1700,7 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.pop("TPU_VISIBLE_DEVICES", None)
 
     def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
-        if get_replica_session() is not None:
+        if dp_replicas.get_replica_session() is not None:
             return _ReplicaGroupCoordinator._load()
         return super().get_group_coordinator_cls()
 

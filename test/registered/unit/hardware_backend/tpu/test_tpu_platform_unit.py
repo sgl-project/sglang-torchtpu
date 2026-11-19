@@ -890,21 +890,19 @@ class TestDsaValidation(CustomTestCase):
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
 
-    def test_dsa_needs_the_dynamo_tracer(self):
-        """The direct tracer reads the KV cache through the pool's get_state,
-        which the split MLA pool does not implement. The launch must say so
-        instead of failing at the first compile."""
-        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
-            self._apply_dsa(
-                attention_backend="pallas_tpu_mla_sparse",
-                tpu_compile_tracer="direct",
-            )
+    def test_dsa_accepts_the_direct_tracer(self):
+        """TpuSplitMLATokenToKVPool implements get_state/set_state, so DSA runs
+        under both the dynamo and direct compile tracers."""
+        self._apply_dsa(
+            attention_backend="pallas_tpu_mla_sparse",
+            tpu_compile_tracer="direct",
+        )
 
     def test_mtp_index_share_runs_only_on_the_chain_worker(self):
         """Only the experimental chain worker reuses the MTP draft's DSA top-k
-        across its steps. Core's workers would take their GPU paths, a non-DSA
-        indexer has no TPU seed, and a P/D decode would draft on seeds its
-        prefill never sent: each must stop the launch."""
+        across its steps. Core's workers would take their GPU paths and a non-DSA
+        indexer has no TPU seed: each must stop the launch. A P/D prefill ships
+        the seed, so P/D may share."""
 
         sparse = dict(attention_backend="pallas_tpu_mla_sparse")
         share = dict(speculative_algorithm="NEXTN", index_share_for_mtp_iteration=True)
@@ -922,8 +920,7 @@ class TestDsaValidation(CustomTestCase):
                 ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"
             ):
                 self._apply_dsa(**sparse, **share)
-        with self.assertRaisesRegex(NotImplementedError, "P/D"):
-            self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
+        self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
         with self.assertRaisesRegex(ValueError, "DSA models only"):
             self._apply_dsa(**sparse, index_topk=None, **share)
 

@@ -1,0 +1,420 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Torch ops over the DeepSeek-V4.1 packed FP8 indexer (ratio 1 and 2 layers).
+
+Single bank, one device per process (no mesh). Each op is a
+``cpu_export_jax_op`` over the shared kernels in
+``sglang_tpu.kernels.deepseek_v41.index_selection``. ``write_index_k`` donates
+the cache and returns its new value; the caller does ``index_k.copy_(result)``.
+
+Layout (``memory_pool.DSV41TPUTokenToKVPool.get_index_k``): INT32
+``[P * 33, 128]``, ``PackedFP8Layout(P, 33, 0, 128)``. Record ``full_loc // r``
+lives on indexer page ``record // 128``; the per-request indexer page table is
+``expand_index_page_table`` of the full page table for ratio 1 (full page p ->
+indexer pages 2p, 2p + 1) and the full page table itself for ratio 2.
+
+Numerics follow the vllm-torchtpu epic (``indexer_fp8._quantize_query``,
+``_produce_index_k``): Q and K are RoPE'd and rounded to BF16, then quantized
+per 128-vector to E4M3 with a power-of-two scale. K scales live in the cache;
+the Q scale is folded into the FP32 head weights once, inside ``select``.
+"""
+
+# PEP 563 must stay off so cpu_export_jax_op sees real jax.Array annotations.
+
+from threading import Lock
+
+import jax
+import jax.numpy as jnp
+import torch
+
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+    PAGE_RECORDS,
+    PAGE_ROWS,
+    PackedFP8Layout,
+    quantize_index_rows,
+    write_fp8_records,
+)
+from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+    prepare_fp8_candidates,
+    select_fp8_indexer_jax,
+    select_fp8_prepared,
+)
+
+INDEX_TOPK = 512
+CANDIDATE_BLOCK_SIZE = 8
+
+_OP_PREFIX = "sglang_tpu_pallas::dsv41_indexer_"
+_OPS: dict = {}
+_OPS_LOCK = Lock()
+
+
+# =============================================================================
+# JAX bridges (traced by cpu_export_jax_op; non-array arguments are static)
+# =============================================================================
+
+
+def _write_index_k(
+    index_k: jax.Array,
+    records: jax.Array,
+    keys: jax.Array,
+    pages: int,
+    page_stride: int,
+    page_offset: int,
+    page_size: int,
+) -> jax.Array:
+    layout = PackedFP8Layout(pages, page_stride, page_offset, page_size)
+    return write_fp8_records((index_k,), records, keys.astype(jnp.bfloat16), layout)[0]
+
+
+def _compact(ids: jax.Array) -> jax.Array:
+    """Valid (>= 0) ids ascending, then -1."""
+    limit = jnp.iinfo(jnp.int32).max
+    ids = jnp.sort(jnp.where(ids >= 0, ids, limit), axis=-1)
+    return jnp.where(ids == limit, -1, ids)
+
+
+def _visible_ids(lengths: jax.Array, count: int) -> jax.Array:
+    ids = jnp.arange(count, dtype=jnp.int32)[None, :]
+    return jnp.where(ids < lengths[:, None], ids, -1)
+
+
+def _mask_pages_past_rows(
+    index_pages: jax.Array,
+    requests: jax.Array,
+    lengths: jax.Array,
+    page_size: int,
+) -> jax.Array:
+    """Invalidate storage pages at or past each page-table row's longest query.
+
+    Columns past a request's context hold leftover req_to_token entries: 0 in a
+    never-used row, so every one names page 0 (or pages 0 and 1 for ratio 1).
+    Those keys already score -inf by length; -1 lets the dense scorer spread
+    masked reads instead of queueing hundreds of DMAs of page 0 per K tile.
+    """
+    count = index_pages.shape[0]
+    live = (requests >= 0) & (requests < count)
+    # A [tokens, rows] TensorCore comparison; a segment max would lower to a
+    # SparseCore scatter.
+    owner = live[:, None] & (requests[:, None] == jnp.arange(count, dtype=jnp.int32))
+    row_keys = jnp.max(jnp.where(owner, lengths[:, None], 0), axis=0, initial=0)
+    starts = jnp.arange(index_pages.shape[1], dtype=jnp.int32) * page_size
+    return jnp.where(starts[None, :] < row_keys[:, None], index_pages, -1)
+
+
+def _select(
+    q: jax.Array,
+    weights: jax.Array,
+    index_k: jax.Array,
+    index_pages: jax.Array,
+    requests: jax.Array,
+    lengths: jax.Array,
+    candidates: jax.Array,
+    pages: int,
+    page_stride: int,
+    page_offset: int,
+    page_size: int,
+    topk: int,
+    block_size: int,
+    publish: bool,
+    consume: bool,
+) -> tuple[jax.Array, jax.Array]:
+    layout_args = (pages, page_stride, page_offset, page_size)
+    tokens, count = candidates.shape
+    width = index_pages.shape[1] * page_size
+    k = min(topk, width)
+    if tokens == 0:
+        return jnp.empty((0, k), jnp.int32), candidates
+    live = (requests >= 0) & (requests < index_pages.shape[0])
+    lengths = jnp.where(live, jnp.clip(lengths, 0, width), 0)
+    batch_max = lengths.max().reshape(1)
+    # The candidate buffer covers every block: publication and filtering are
+    # identities and the buffer passes through, as in the epic.
+    filters = (publish or consume) and count * block_size < width
+
+    def every_visible_id():
+        published = candidates
+        if publish and filters:
+            published = _visible_ids(-(-lengths // block_size), count)
+        return _visible_ids(lengths, k), published
+
+    def scored():
+        q8, q_scales, _ = quantize_index_rows(q)
+        masked_pages = _mask_pages_past_rows(index_pages, requests, lengths, page_size)
+        selected, published = select_fp8_indexer_jax(
+            q8,
+            (index_k,),
+            masked_pages,
+            weights.astype(jnp.float32) * q_scales,
+            lengths,
+            candidates,
+            requests,
+            batch_max,
+            layout_args,
+            topk,
+            block_size,
+            publish,
+            consume,
+            True,
+            width,
+        )
+        return _compact(selected[:, :k]), published
+
+    # A source whose buffer cannot hold every block of a top-k-long context
+    # must rank its blocks even when the selection itself is short.
+    if publish and filters and count * block_size < topk:
+        return scored()
+    # Batch-wide short-context rule of the epic (`_all_indices_fit` statically,
+    # `batch_max <= topk` at run time): every visible id, no scoring.
+    return jax.lax.cond(batch_max[0] <= topk, every_visible_id, scored)
+
+
+def _prepare_candidates(
+    index_k: jax.Array,
+    index_pages: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    pages: int,
+    page_stride: int,
+    page_offset: int,
+    page_size: int,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    layout_args = (pages, page_stride, page_offset, page_size)
+    width = index_pages.shape[1] * page_size
+    return prepare_fp8_candidates(
+        (index_k,), index_pages, candidates, requests, layout_args, block_size, width
+    )
+
+
+def _select_prepared(
+    q: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    keys: jax.Array,
+    block_ids: jax.Array,
+    offsets: jax.Array,
+    valid: jax.Array,
+    spans: jax.Array,
+    width: int,
+    topk: int,
+    block_size: int,
+) -> jax.Array:
+    q8, q_scales, _ = quantize_index_rows(q)
+    selected = select_fp8_prepared(
+        q8,
+        weights.astype(jnp.float32) * q_scales,
+        jnp.clip(lengths, 0, width),
+        (keys, block_ids, offsets, valid, spans),
+        topk,
+        block_size,
+        True,
+        width,
+    )
+    return _compact(selected[:, : min(topk, width)])
+
+
+# =============================================================================
+# Fakes and registration
+# =============================================================================
+
+
+def _fake_write_index_k(index_k, records, keys, *_):
+    return torch.empty_like(index_k)
+
+
+def _fake_select(
+    q, weights, index_k, index_pages, requests, lengths, candidates, *static_args
+):
+    page_size, topk = static_args[3], static_args[4]
+    width = index_pages.shape[1] * page_size
+    return (
+        q.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32),
+        torch.empty_like(candidates),
+    )
+
+
+def _fake_select_prepared(q, *args):
+    width, topk = args[-3], args[-2]
+    return q.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32)
+
+
+# name -> (JAX function, fake, donated argument positions); a None fake keeps
+# cpu_export_jax_op's exported shapes (the candidate gather pads its rows).
+_DEFINITIONS = {
+    "write_index_k": (_write_index_k, _fake_write_index_k, (0,)),
+    "select": (_select, _fake_select, ()),
+    "prepare_candidates": (_prepare_candidates, None, ()),
+    "select_prepared": (_select_prepared, _fake_select_prepared, ()),
+}
+
+
+def _op(name: str):
+    op = _OPS.get(name)
+    if op is not None:
+        return op
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    with _OPS_LOCK:
+        op = _OPS.get(name)
+        if op is None:
+            function, fake, donated = _DEFINITIONS[name]
+            op = cpu_export_jax_op(_OP_PREFIX + name, function, donate_argnums=donated)
+            if fake is not None:
+                op.register_fake(fake)
+            _OPS[name] = op
+    return op
+
+
+def register_indexer_ops() -> None:
+    """Register every op; call before torch.compile traces the model."""
+    for name in _DEFINITIONS:
+        _op(name)
+
+
+# =============================================================================
+# Public interface
+# =============================================================================
+
+
+def _i32(x: torch.Tensor) -> torch.Tensor:
+    return x if x.dtype == torch.int32 else x.to(torch.int32)
+
+
+def head_weights(
+    weights_proj_out: torch.Tensor, *, n_heads: int, head_dim: int
+) -> torch.Tensor:
+    """FP32 ``weights_proj(x) * head_dim**-0.5 * n_heads**-0.5`` [T, H].
+
+    FP32 and two roundings as in the epic (``attention._prepare_tpu``); core
+    ``DeepseekV41Indexer.head_weights`` scales once, in BF16.
+    """
+    return weights_proj_out.float() * head_dim**-0.5 * n_heads**-0.5
+
+
+def write_index_k(
+    index_k: torch.Tensor,
+    records: torch.Tensor,
+    keys: torch.Tensor,
+    layout: tuple[int, int, int, int],
+) -> torch.Tensor:
+    """Quantize normed, RoPE'd BF16 ``keys`` [N, 128] and write them at ``records``.
+
+    ``records`` [N] i32 is ``full_loc // r`` per compressed key; -1 skips, and
+    valid records must be unique. ``layout`` is ``pool.index_k_layout(layer)``.
+    Returns the new ``index_k``; the caller does ``index_k.copy_(...)``.
+    """
+    return _op("write_index_k")(
+        index_k, _i32(records), keys.reshape(-1, PAGE_RECORDS), *layout
+    )
+
+
+def select(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k: torch.Tensor,
+    index_pages: torch.Tensor,
+    requests: torch.Tensor,
+    lengths: torch.Tensor,
+    candidates: torch.Tensor,
+    layout: tuple[int, int, int, int],
+    *,
+    topk: int = INDEX_TOPK,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+    publish: bool = False,
+    consume: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-``topk`` logical compressed ids per query from the packed FP8 cache.
+
+    ``q`` [T, 32, 128] BF16, RoPE'd, not quantized (the op quantizes it).
+    ``weights`` [T, 32] FP32 from `head_weights`, without any Q scale.
+    ``index_pages`` [B, C'] i32 indexer page table; the score width is
+    ``C' * 128`` compressed positions. ``requests`` [T] i32 row into
+    ``index_pages``, -1 on padding rows, each request's rows contiguous.
+    ``lengths`` [T] i32 visible compressed keys, ``(pos + 1) // r``.
+    ``candidates`` [T, K] i32 candidate block ids (``K`` may be 0 off the
+    candidate scheme); ``publish`` for the candidate-source layer,
+    ``consume`` for later index layers.
+
+    Returns ``selected`` [T, min(topk, C' * 128)] i32 ids in ``[0, length)``,
+    ascending, -1 padded; and ``blocks`` [T, K] i32, the published block ids
+    (unordered, -1 padded) under ``publish``, else ``candidates`` unchanged.
+    When every live length is at most ``topk`` the selection is every visible
+    id and ``blocks`` every visible block, with no scoring.
+    """
+    assert not (publish and consume), "a candidate source does not filter"
+    return _op("select")(
+        q,
+        weights,
+        index_k,
+        _i32(index_pages),
+        _i32(requests),
+        _i32(lengths).reshape(-1),
+        _i32(candidates),
+        *layout,
+        topk,
+        block_size,
+        publish,
+        consume,
+    )
+
+
+def uses_prepared_candidates(*, count: int, block_size: int, width: int) -> bool:
+    """Whether a candidate consumer scores only its candidate blocks (the epic's
+    sparse-logits path); otherwise ``select`` scores the whole context."""
+    return block_size in (8, 16, 32, 64, 128) and 0 < count * block_size < width
+
+
+def prepare_candidates(
+    index_k: torch.Tensor,
+    index_pages: torch.Tensor,
+    candidates: torch.Tensor,
+    requests: torch.Tensor,
+    layout: tuple[int, int, int, int],
+    *,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> tuple[torch.Tensor, ...]:
+    """Gather the packed FP8 K of every query's candidate blocks, once per batch.
+
+    Every consumer layer of one source reads the same candidates and index K, so
+    the caller shares the result (the epic's ``packed_fp8_candidate_keys``
+    stage cache): the gathered K is ``[tokens * 2 * K * block / 128 * 33, 128]``
+    int32, 8.25 GiB at 2048 tokens and K = 2048.
+    """
+    return _op("prepare_candidates")(
+        index_k,
+        _i32(index_pages),
+        _i32(candidates),
+        _i32(requests),
+        *layout,
+        block_size,
+    )
+
+
+def select_prepared(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    lengths: torch.Tensor,
+    prepared: tuple[torch.Tensor, ...],
+    *,
+    width: int,
+    topk: int = INDEX_TOPK,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """``select``'s consumer result from ``prepare_candidates``'s gathered K.
+
+    ``width`` is ``index_pages.shape[1] * 128``; the other arguments are as in
+    ``select``. Returns ``selected`` only; the candidates pass through.
+    """
+    return _op("select_prepared")(
+        q,
+        weights,
+        _i32(lengths).reshape(-1),
+        *prepared,
+        width,
+        topk,
+        block_size,
+    )
+
+
+def index_k_rows(pages: int) -> int:
+    """INT32 rows of a ``pages``-page cache."""
+    return pages * PAGE_ROWS

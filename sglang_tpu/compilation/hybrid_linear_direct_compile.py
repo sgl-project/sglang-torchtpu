@@ -22,7 +22,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
-    MHATokenToKVPool,
+    KVCache,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -33,9 +33,7 @@ from sglang_tpu.mamba_pool import TpuMambaPool
 class HybridLinearKVPoolState:
     """KVPool over the full-attention KV buffers followed by the linear-attention state."""
 
-    def __init__(
-        self, *, full_kv_pool: MHATokenToKVPool, mamba_pool: TpuMambaPool
-    ) -> None:
+    def __init__(self, *, full_kv_pool: KVCache, mamba_pool: TpuMambaPool) -> None:
         self._full_kv_pool = full_kv_pool
         self._mamba_pool = mamba_pool
 
@@ -56,12 +54,31 @@ def hybrid_linear_kv_pool_state(
     mamba_pool = req_to_token_pool.mamba_pool
     assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
     full_kv_pool = kv_pool.full_kv_pool
-    assert isinstance(full_kv_pool, MHATokenToKVPool), type(full_kv_pool)
+    # MHA, or the split MLA pool of a hybrid DSA model (GLM-5.3-Flash).
+    assert isinstance(full_kv_pool, KVCache), type(full_kv_pool)
     return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
+
+
+def linear_attention_extra_tensor_attrs(model: nn.Module) -> tuple[str, ...]:
+    """Paths of the non-parameter tensors linear-attention layers read.
+
+    The TPU KDA binding (hooks/kda_weights.py, kimi_k3) attaches a packed
+    kernel operand to each layer as a plain attribute, so direct_compile must
+    be told to lift it.
+    """
+    return tuple(
+        f"{name}.packed_kernel_weights"
+        for name, module in model.named_modules()
+        if isinstance(module, RadixLinearAttention)
+        and isinstance(getattr(module, "packed_kernel_weights", None), torch.Tensor)
+    )
 
 
 def has_linear_attention(model: nn.Module) -> bool:
     return any(isinstance(module, RadixLinearAttention) for module in model.modules())
+
+
+_CONV_SUBMODULE_NAMES = ("conv1d", "qkv_conv1d")
 
 
 def _conv_weight_owners(
@@ -73,7 +90,19 @@ def _conv_weight_owners(
     for name, module in modules.items():
         if not isinstance(module, RadixLinearAttention):
             continue
-        conv1d = modules[name.rpartition(".")[0]].get_submodule("conv1d")
+        if "conv_weights" in module._parameters:
+            # The TPU KDA binding (hooks/kda_weights.py) assigns the conv
+            # parameter itself, which registers it as an alias that
+            # direct_compile already reparametrizes; nothing to re-derive.
+            continue
+        parent = modules[name.rpartition(".")[0]]
+        # GDN layers call it conv1d; KDA layers fuse q/k/v into qkv_conv1d.
+        conv_name = next((n for n in _CONV_SUBMODULE_NAMES if hasattr(parent, n)), None)
+        if conv_name is None:
+            raise NotImplementedError(
+                f"direct_compile found none of {_CONV_SUBMODULE_NAMES} next to {name}."
+            )
+        conv1d = parent.get_submodule(conv_name)
         # conv1d.weight is already the trace placeholder here, so match by size.
         if (
             not isinstance(module.conv_weights, torch.Tensor)

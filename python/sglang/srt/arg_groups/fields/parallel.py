@@ -108,6 +108,7 @@ class Parallel(msgspec.Struct):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_aware",
             ],
         ),
     ] = "auto"
@@ -304,6 +305,11 @@ class Parallel(msgspec.Struct):
         "than one, or this process is an elastic EP scale joiner, which joins "
         "an attention-DP deployment with a group of its own that may be one "
         "rank wide.",
+    )
+    nnodes_per_dp_replica = Derived(
+        fn="sglang.srt.runtime_context.nnodes_per_dp_replica_of",
+        doc="How many nodes each `--dp-size` replica runs on when the replicas "
+        "span nodes; 0 when they don't (one node, one replica, or attention DP).",
     )
     num_dp_ranks = Derived(
         fn="sglang.srt.runtime_context.num_dp_ranks_of",

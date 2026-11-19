@@ -2179,6 +2179,8 @@ class KVCache(abc.ABC):
     host_capacity_tokens: Optional[int] = None
     # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
     host_capacity_bytes: Optional[int] = None
+    # Whether MTP draft KV pools can pack into this target pool's HiCache pages.
+    supports_packed_hicache_draft: bool = True
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter

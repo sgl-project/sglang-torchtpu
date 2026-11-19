@@ -23,11 +23,13 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
-from sglang_tpu.fp8_moe import (
+from sglang_tpu.dsv4_mxfp4_moe import (
     _FP4_E2M1_LUT,
     _FP4_E2M1_THRESHOLDS,
     _TPU_FP4_BLOCK_SIZE,
     _dequantize_dsv4_mxfp4_block32,
+)
+from sglang_tpu.fp8_moe import (
     prepare_tpu_fp8_moe_weights,
 )
 from sglang_tpu.fp8_moe_fused_rs import _prepare_fp8_fused_rs

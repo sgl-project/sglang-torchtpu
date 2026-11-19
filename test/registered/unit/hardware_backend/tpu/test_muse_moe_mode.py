@@ -6,7 +6,7 @@ from unittest import mock
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.muse_megakernel.moe_mode import parse_moe_mode, resolve_moe_mode
+from sglang_tpu.muse_megakernel.common.moe_mode import parse_moe_mode, resolve_moe_mode
 
 register_tpu_ci(est_time=1, suite="stage-a-test-tpu-unit", chips=1)
 

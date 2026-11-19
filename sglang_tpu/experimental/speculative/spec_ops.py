@@ -617,6 +617,42 @@ def accept_drafts_target_only(
     )
 
 
+def simulated_real_draft_accept_inputs(
+    target_argmax: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token: forced accept length, real tokens.
+
+    Follows the upstream spec_utils rule: the accepted rows commit the draft's own tokens
+    and the bonus is the target's token at the first unaccepted row. Eager on purpose: the
+    outputs feed finalize_accept, whose programs warmup already builds per bucket.
+
+    Args:
+        target_argmax: [bs, N + 1] the target's greedy token id at each verify row.
+        draft_tokens: [bs, N] the draft tokens verified this step; sets the bonus dtype.
+        num_correct_drafts: [bs] forced number of accepted drafts, from the simulated
+            accept-length sampler.
+        num_verify_drafts: [bs] drafts each request can verify this step; caps
+            num_correct_drafts.
+
+    Returns:
+        num_correct_drafts clamped to num_verify_drafts, and the [bs] bonus tokens
+        (target_argmax at that row, in draft_tokens' dtype).
+    """
+    bs = draft_tokens.shape[0]
+    num_correct = torch.minimum(
+        num_correct_drafts, num_verify_drafts.to(num_correct_drafts.dtype)
+    )
+    bonus = torch.gather(
+        target_argmax.to(draft_tokens.dtype),
+        1,
+        num_correct.reshape(bs, 1).to(torch.int64),
+    ).reshape(bs)
+    return num_correct, bonus
+
+
 @compiled_op(warmup=lambda ctx: _finalize_warmup_args(ctx))
 def finalize_accept(
     draft_tokens: torch.Tensor,

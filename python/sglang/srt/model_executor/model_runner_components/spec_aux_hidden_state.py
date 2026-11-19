@@ -34,6 +34,7 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 
 
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
+    draft_model_config: ModelConfig | None = None
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
     # Draft layers whose KV cache uses the target SWA pool capacity.
@@ -87,18 +88,19 @@ def _resolve_eagle_aux_hidden_state(
     ):
         return
 
+    draft_path = get_spec().speculative_draft_model_path
     draft_model_config = model_config
-    if get_spec().speculative_draft_model_path:
+    if draft_path:
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=get_spec().speculative_draft_model_path,
+            model_path=draft_path,
             model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif get_spec().speculative_draft_model_path:
+    elif draft_path:
         config.eagle_draft_num_layers = int(
             max(
                 draft_model_config.num_hidden_layers,
@@ -107,6 +109,15 @@ def _resolve_eagle_aux_hidden_state(
         )
     else:
         return
+
+    if not draft_path and getattr(server_args, "model_path", None):
+        draft_model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=server_args.model_path,
+            model_revision=getattr(server_args, "revision", None),
+            is_draft_model=True,
+        )
+    config.draft_model_config = draft_model_config
 
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
         config.eagle_draft_swa_num_layers = len(
@@ -204,6 +215,7 @@ def _resolve_dflash_aux_hidden_state(
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
 
+        config.draft_model_config = draft_model_config
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
