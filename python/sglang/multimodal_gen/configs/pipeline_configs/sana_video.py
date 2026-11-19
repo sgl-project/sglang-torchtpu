@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -118,8 +119,29 @@ class SanaVideoPipelineConfig(PipelineConfig):
         return latents
 
 
+@dataclass
+class SanaVideo720pPipelineConfig(SanaVideoPipelineConfig):
+    """SANA-Video 720p: 128 latent channels from the LTX-2 VAE (8x time, 32x space)."""
+
+    vae_config: VAEConfig = field(default_factory=LTXVideoVAEConfig)
+    # bf16, as the model card runs the VAE; --vae-precision fp32 selects fp32
+    # for both loading and decoding.
+    vae_precision: str = "bf16"
+    vae_decode_precision: str | None = None
+
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        # Diffusers' SanaVideoPipeline: latents / (1 / std) + mean, from the
+        # VAE's latent statistics.
+        mean = vae.latents_mean.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        std = vae.latents_std.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
+        return 1.0 / std, mean
+
+
 def register():
-    from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
+    from sglang.multimodal_gen.configs.sample.sana_video import (
+        SanaVideo720pSamplingParams,
+        SanaVideoSamplingParams,
+    )
     from sglang.multimodal_gen.registry import register_configs
 
     register_configs(
@@ -131,4 +153,9 @@ def register():
         model_detectors=[
             lambda hf_id: "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
         ],
+    )
+    register_configs(
+        sampling_param_cls=SanaVideo720pSamplingParams,
+        pipeline_config_cls=SanaVideo720pPipelineConfig,
+        hf_model_paths=["Efficient-Large-Model/SANA-Video_2B_720p_diffusers"],
     )

@@ -135,6 +135,10 @@ jobs:
               # LTX-2 two-stage placement on platforms whose subgroup collectives need every rank.
               - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising_av.py'
               - 'python/sglang/multimodal_gen/test/unit/test_ltx2_two_stage_cfg_parallel.py'
+              # The SANA-Video DiT the TPU RoPE patch rebinds, and the configs its test checks.
+              - 'python/sglang/multimodal_gen/runtime/models/dits/sana_video.py'
+              - 'python/sglang/multimodal_gen/configs/pipeline_configs/sana_video.py'
+              - 'python/sglang/multimodal_gen/configs/sample/sana_video.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
