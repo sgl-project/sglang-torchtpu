@@ -476,35 +476,6 @@ class TestDecodeLandsAndMerges(unittest.TestCase):
             )
         self.assertEqual(seen, [[1, 2, 2, 2, 2, 2, 2, 2]] * 2)
 
-    def test_bf16_draft_tensor_skipped_during_land_merge(self):
-        """Merging a landing room leaves a trailing bf16 draft KV tensor untouched,
-        while fp8 target layers merge byte for byte."""
-        mgr = _decode()
-        bf16 = (
-            torch.arange(
-                (1 + ALLOC_BLOCKS + 8) * PAGE * 2 * 2 * HEAD_DIM, dtype=torch.int32
-            )
-            .to(torch.bfloat16)
-            .view(1 + ALLOC_BLOCKS + 8, PAGE, 2, 2, HEAD_DIM)
-        )
-        before = bf16.clone()
-        mgr._kv_caches.append(bf16)
-        _closing(mgr)
-        plans = _registered(mgr)
-        for req in plans.values():
-            _replay(req, mgr.test_sources, mgr._kv_caches[:2])
-        _settle(mgr, received=list(plans))
-        mgr.land_prepass()
-        self.assertFalse(mgr.is_failed(ROOM), mgr.failure_records.get(ROOM))
-        self.assertTrue(mgr.land_merged(ROOM))
-        self.assertEqual(mgr._land.arena.held, 0)
-        for layer in range(2):
-            want = _expected_page(mgr.test_heads, layer)
-            for b in FINAL:
-                got = mgr._kv_caches[layer].view(torch.uint8)[b].reshape(want.shape)
-                self.assertTrue(torch.equal(got, want), f"layer {layer} block {b}")
-        self.assertTrue(torch.equal(bf16, before))
-
 
 class TestScratchFreePaths(unittest.TestCase):
     """Every scratch id goes back exactly once, on every terminal path."""
@@ -1174,6 +1145,97 @@ class TestRefusal(unittest.TestCase):
         self.assertNotIn("probe", got)
         self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", got)
         self.assertTrue(plain.startswith(got), (plain, got))
+
+    def _run_receiver_init(self, mgr, *, remote_layout=None, src_tp=8):
+        mgr.kv_args.kv_layout = remote_layout
+        mgr._pipeline = None
+        mgr._dynamic_host_staging = True
+        mgr._bounded_staging = False
+        recv = RaidenKVReceiver.__new__(RaidenKVReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = ROOM
+        recv.conclude_state = None
+        recv.abort_notified = False
+        recv._started = False
+        recv.init_time = None
+        recv._handshake_start = time.time()
+        recv._handshake_timeout = 300
+        infos = [
+            {"rank_ip": "10.0.0.1", "rank_port": 4444 + i}
+            for i in range(src_tp // mgr.attn_tp_size)
+        ]
+
+        def common_init(self_, prefill_dp_rank):
+            self_.prefill_info = SimpleNamespace(
+                kv_layout=remote_layout, attn_tp_size=src_tp
+            )
+            self_.target_pp_ranks = [0]
+            self_.target_cp_ranks = [0]
+            self_.bootstrap_infos = infos
+            mgr.update_status(ROOM, KVPoll.WaitingForInput)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                common_init,
+            ),
+            patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+        ):
+            recv.init(0)
+        return recv, abort
+
+    def test_fp8_target_with_bf16_draft_refuses_at_init_and_merge_fails_fast(self):
+        from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        with (
+            envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True),
+            patch.object(land_mod, "land_arena_blocks", return_value=128),
+        ):
+            target = TpuFusedMHATokenToKVPool(
+                size=4 * PAGE,
+                page_size=PAGE,
+                dtype=FP8,
+                head_num=2,
+                head_dim=HEAD_DIM,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            draft = TpuFusedMHATokenToKVPool(
+                size=4 * PAGE,
+                page_size=PAGE,
+                dtype=torch.bfloat16,
+                head_num=2,
+                head_dim=HEAD_DIM,
+                layer_num=1,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            groups = get_raiden_kv_caches(target, draft)
+            mgr = _decode(cap=128, alloc=4)
+            mgr.attach_kv_pool(target)
+            mgr._kv_caches = list(groups.full)
+            mgr._kv_head_nums = tuple(groups.full_head_nums)
+            mgr._check_land_arena()
+
+            recv, abort = self._run_receiver_init(mgr)
+            self.assertEqual(recv.conclude_state, KVPoll.Failed)
+            abort.assert_called_once()
+            self.assertIn("differ in head_dim or dtype", mgr.failure_records[ROOM])
+            mgr.register_decode_request = Mock()
+            recv.send_metadata(np.asarray([1, 2], dtype=np.int32))
+            mgr.register_decode_request.assert_not_called()
+
+            with self.assertRaisesRegex(
+                ValueError, "no landing merge for kv_packing 2"
+            ):
+                land_mod.merge_pages(
+                    kv_caches=mgr._kv_caches,
+                    pairs=[(1, 6)],
+                    capacity=128,
+                    layout_of=mgr._land_layout,
+                )
 
     def test_prefill_needs_only_the_env(self):
         with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(False):

@@ -314,18 +314,10 @@ def merge_pages(
     not."""
     import torch
 
-    from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-        land_merge,
-        needs_land_merge,
-    )
+    from sglang_tpu.disaggregation.raiden.reshard_schedule import land_merge
     from sglang_tpu.kv_page_write import write_pages_torch
 
-    targets = [
-        (kv, layout)
-        for kv in kv_caches
-        if needs_land_merge(layout=(layout := layout_of(kv)))
-    ]
-    if not pairs or not targets:
+    if not pairs:
         return
     pairs = list(pairs)
     pairs += [pairs[-1]] * (merge_bucket(len(pairs), capacity) - len(pairs))
@@ -333,13 +325,13 @@ def merge_pages(
     scratch = torch.tensor([s for _, s in pairs], dtype=torch.long)
     # One H2D of the ids per device, not per layer.
     ids_on: dict = {}
-    for kv, layout in targets:
+    for kv in kv_caches:
         ptr = kv.data_ptr()
         if kv.device not in ids_on:
             ids_on[kv.device] = (final.to(kv.device), scratch.to(kv.device))
         f, s = ids_on[kv.device]
         pages = kv[f]
-        land_merge(pages.view(torch.uint8), kv[s].view(torch.uint8), layout)
+        land_merge(pages.view(torch.uint8), kv[s].view(torch.uint8), layout_of(kv))
         write_pages_torch(f, pages, kv)
         # raiden pushes into this buffer by address: the merge must write in
         # place, never rebind the tensor.
