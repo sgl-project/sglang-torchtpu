@@ -6,7 +6,7 @@ def install_runtime_patches() -> None:
     """Patch a worker; call after ``torch_tpu`` is imported."""
     import torch
 
-    from sglang_tpu.multimodal_gen import minimax_h3, rope
+    from sglang_tpu.multimodal_gen import glm_image_ar, glm_image_dit, minimax_h3, rope
     from sglang_tpu.patches import _register_aten_fallbacks
 
     # sglang_tpu's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
@@ -17,6 +17,8 @@ def install_runtime_patches() -> None:
     torch.set_float32_matmul_precision("highest")
     rope.install()
     minimax_h3.install()
+    glm_image_ar.install()
+    glm_image_dit.install()
 
 
 def configure_compile_cache() -> None:

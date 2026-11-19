@@ -64,9 +64,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    is_in_breakable_cuda_graph,
-)
 
 logger = init_logger(__name__)
 
@@ -1090,12 +1087,9 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
 
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        if is_in_breakable_cuda_graph():
-            prior_embedding = prior_embedding.masked_fill(
-                prior_token_drop.unsqueeze(-1), 0
-            )
-        else:
-            prior_embedding[prior_token_drop] *= 0.0
+        # The same zeros as an in-place boolean-indexed write, without its
+        # data-dependent indexing (a host sync, and a graph break when compiled).
+        prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
 
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
