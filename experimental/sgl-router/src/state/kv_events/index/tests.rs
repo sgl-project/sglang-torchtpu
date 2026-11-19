@@ -317,6 +317,7 @@ async fn pump_applies_block_stored_to_tree() {
             parent_block_hash: None,
             block_hashes: vec![10, 20, 30],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: None,
@@ -335,6 +336,49 @@ async fn pump_applies_block_stored_to_tree() {
     assert!(m.holds(&id), "tree must hold the worker");
 }
 
+/// Regression: hybrid-SSM (Mamba/KDA) workers under EAGLE/MTP report an
+/// EAGLE-family `speculative_algorithm` but publish unigram blocks. Queries
+/// must hash in the published mode, or no request ever matches the rank that
+/// holds its prefix and cache-aware routing degrades to least-load.
+#[tokio::test]
+async fn pump_learns_unigram_hashing_from_events_despite_eagle_guess() {
+    use crate::state::kv_events::{
+        compute_block_hashes, compute_block_hashes_bigram, RadixTreePrefixProvider, TokenIdShape,
+    };
+
+    let id = worker_id("http://w1", 3);
+    let h = spawn_pump(std::slice::from_ref(&id));
+    let (tree, tx, pump, oracle) = (h.tree, h.tx, h.pump, h.block_size_oracle);
+    // What discovery sets for a worker whose /server_info says EAGLE.
+    oracle.try_set(4).unwrap();
+    oracle.set_bigram(true);
+
+    let tokens: Vec<u32> = (100..112).collect();
+    let stored = compute_block_hashes(&tokens, 4);
+    assert_ne!(compute_block_hashes_bigram(&tokens, 4), stored);
+    tx.send(WorkerEvent::Batch {
+        worker: id.clone(),
+        seq: 1,
+        batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            parent_block_hash: None,
+            block_hashes: stored,
+            token_ids: tokens.clone(),
+            token_shape: Some(TokenIdShape::Unigram),
+            block_size: 4,
+            lora_id: None,
+            medium: None,
+        })]),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    pump.await.unwrap();
+
+    assert!(!oracle.is_bigram(), "the published unigram mode must win");
+    let provider = RadixTreePrefixProvider::new(tree, oracle);
+    assert_eq!(provider.rank_depths(&tokens, "http://w1"), vec![(3, 3)]);
+}
+
 /// The pump must carry each event's `medium` into the tree. The engine's
 /// write-back sequence for a backed-up block is a host-tagged store
 /// followed by a device-tagged removal; applied tier-blind, the removal
@@ -351,6 +395,7 @@ async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
             parent_block_hash: None,
             block_hashes: vec![10, 20],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: medium.map(str::to_owned),
@@ -416,6 +461,7 @@ async fn pump_tallies_applied_events_by_medium() {
             parent_block_hash: None,
             block_hashes: hashes,
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: medium.map(str::to_owned),
@@ -525,6 +571,7 @@ async fn pump_filters_out_of_order_seq() {
             parent_block_hash: None,
             block_hashes: vec![10],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: None,
@@ -572,6 +619,7 @@ async fn pump_handles_all_blocks_cleared() {
             parent_block_hash: None,
             block_hashes: vec![1, 2],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: None,
@@ -619,6 +667,7 @@ async fn pump_drops_events_from_detached_workers() {
             parent_block_hash: None,
             block_hashes: vec![42],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: None,
@@ -634,6 +683,7 @@ async fn pump_drops_events_from_detached_workers() {
             parent_block_hash: None,
             block_hashes: vec![99],
             token_ids: vec![],
+            token_shape: None,
             block_size: 64,
             lora_id: None,
             medium: None,
