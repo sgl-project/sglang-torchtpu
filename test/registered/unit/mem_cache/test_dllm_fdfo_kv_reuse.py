@@ -212,17 +212,15 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
 
     def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
         manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        waiting = _make_req("abort-waiting", [1], self.block_size)
-        staging = _make_req("abort-staging", [2], self.block_size)
-        keep = _make_req("keep", [3], self.block_size)
+        waiting = _make_req("abort_0", [1], self.block_size)
+        staging = _make_req("abort_1", [2], self.block_size)
+        keep = _make_req("abort_10x", [3], self.block_size)
         manager.waiting_queue = [waiting, keep]
         manager.staging_queue = [staging, waiting]
 
         aborted = manager.pop_aborted_reqs(False, "abort")
 
-        self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
-        )
+        self.assertEqual([req.rid for req in aborted], ["abort_0", "abort_1"])
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
 

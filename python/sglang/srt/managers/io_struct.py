@@ -2249,6 +2249,18 @@ class AbortReq(BaseReq, kw_only=True):
         if self.rid is None:
             self.rid = ""
 
+    def matches(self, rid: str) -> bool:
+        return self.abort_all or abort_targets_rid(target=self.rid, rid=rid)
+
+
+# An abort covers the rid it names and the `<rid>_<i>` items that _normalize_rid
+# derives from it, not every rid it prefixes; an empty target covers nothing.
+def abort_targets_rid(*, target: str, rid: str) -> bool:
+    if not target or not rid.startswith(target):
+        return False
+    suffix = rid[len(target) :]
+    return suffix == "" or (suffix[:1] == "_" and suffix[1:].isdecimal())
+
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
