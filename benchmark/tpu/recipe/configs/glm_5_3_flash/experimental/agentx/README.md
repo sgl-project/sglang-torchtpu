@@ -62,6 +62,8 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
   800 KDA slots, host 2.5x) at 4 / 8 running.
 - `runs/E*.json`: the launch JSONs of the c1 / c4 / c8 / c16 runs on these settings
   (cc1, cc4_host, cc8_host, cc16_host with `SGLANG_TPU_GLM_FLASH_MEGAKERNEL=0`).
+  `runs/R*.json`: the same with MTP K=3 at golden AL 3.00 (R2 c4, R3 c8, R5 = cc32_host at
+  c32) and K=7 at 3.93 (R1b c1).
 - Prefill: chunks of 4096 tokens (`chunked_prefill_size`, `max_prefill_tokens` 4096) and
   buckets `tpu_compile_tokens` 1024, 2048, 3072, 4096 at every cc. The measured rows below
   ran 8192-token chunks with buckets 1024, 2048, 4096, 8192.
