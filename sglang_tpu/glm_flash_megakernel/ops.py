@@ -210,9 +210,10 @@ class GlmFlashMegakernel:
             # Measured at tp8 / 1M (tpu7x, 64 MiB): 16 rows overflow by 1.2 MiB with a
             # 4-slot expert ring and fit with 3; 8 rows fit with 4; 32 rows need the lean form.
             # Context parallel adds ~5 MiB: 16 rows then also need the 3-slot dense ring and
-            # one slab (67.75 MiB with both at 4 / 2).
+            # one slab (67.75 MiB with both at 4 / 2). 9 rows (MTP K=8) overflow by 3.4 MiB
+            # with the deep rings (its DSA buffers scale with the queries): lean above 8 rows.
             big = b * n_query > 16
-            mid = b * n_query == 16
+            mid = 8 < b * n_query <= 16
             return D.KernelConfig(
                 max_len=max_len,
                 n_query=n_query,
