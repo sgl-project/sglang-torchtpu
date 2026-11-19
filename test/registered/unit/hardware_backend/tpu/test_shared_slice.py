@@ -150,6 +150,81 @@ class TestSliceEnvironment(CustomTestCase):
                 ("6", "6", "8", "8"),
             )
 
+    def test_enter_slice_env_clamps_local_world_size_on_multihost_slice(self):
+        env = {
+            "RANK": "3",
+            "WORLD_SIZE": "4",
+            "LOCAL_RANK": "3",
+            "LOCAL_WORLD_SIZE": "4",
+        }
+        # Engine 5 (offset 32 + 5 * 4 = 52) on a 64-TensorCore 2x4x4 slice:
+        # slice_rank = 55, host-local rank = 55 % 8 = 7, LOCAL_WORLD_SIZE = 8.
+        with patch.dict(os.environ, env):
+            job = shared_slice.enter_slice_env(
+                shared_slice.SharedSlice(52, 64, "10.0.0.1", 29600)
+            )
+            self.assertEqual(job, shared_slice.JobRank(rank=3, size=4))
+            self.assertEqual(
+                (
+                    os.environ["RANK"],
+                    os.environ["LOCAL_RANK"],
+                    os.environ["WORLD_SIZE"],
+                    os.environ["LOCAL_WORLD_SIZE"],
+                ),
+                ("55", "7", "64", "8"),
+            )
+
+    def test_join_records_slice_geometry_and_restores_multihost_job_env(self):
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        store = _FakeStore()
+        for r in range(16):
+            store.set(f"device:{32 + r}", str(100 + r))
+        fake_pg = object()
+        fake_tpu_dist = SimpleNamespace(
+            global_device_id=lambda: 110,
+            create_process_group=lambda *args, **kwargs: fake_pg,
+        )
+        mod_tpu = ModuleType("torch_tpu")
+        mod_internal = ModuleType("torch_tpu._internal")
+        mod_dist = ModuleType("torch_tpu._internal.distributed")
+        mod_dist.tpu_distributed = fake_tpu_dist
+
+        state = shared_slice._State()
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "torch_tpu": mod_tpu,
+                    "torch_tpu._internal": mod_internal,
+                    "torch_tpu._internal.distributed": mod_dist,
+                },
+            ),
+            patch.object(shared_slice.dist, "TCPStore", return_value=store),
+            patch.object(shared_slice, "PrefixStore", side_effect=lambda p, s: s),
+            patch.object(shared_slice, "_state", state),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            shared_slice.join(
+                shared_slice.SharedSlice(32, 64, "10.0.0.1", 29600),
+                shared_slice.JobRank(rank=10, size=16),
+            )
+            self.assertIs(state.backend, fake_pg)
+            self.assertEqual(
+                (state.slice_rank, state.shared_size, state.job_size),
+                (42, 64, 16),
+            )
+            self.assertEqual(
+                (
+                    os.environ["RANK"],
+                    os.environ["LOCAL_RANK"],
+                    os.environ["WORLD_SIZE"],
+                    os.environ["LOCAL_WORLD_SIZE"],
+                ),
+                ("10", "2", "16", "8"),
+            )
+
 
 class TestReceiverFactory(CustomTestCase):
     def test_other_backends_keep_torch_distributed_groups(self):
@@ -171,6 +246,39 @@ class TestReceiverFactory(CustomTestCase):
             )
         self.assertIsInstance(receiver, WeightUpdateReceiver)
         self.assertEqual((receiver._src_slice_rank, receiver._slice_rank), (2, 6))
+
+    def test_bijective_multi_engine_receiver_pairing(self):
+        # K=1 (2x2x1: shared_size=8, job_size=4),
+        # K=8 (2x4x4: shared_size=64, job_size=4),
+        # K=16 (2x4x4: shared_size=64, job_size=2).
+        for shared_size, job_size, expected_k in ((8, 4, 1), (64, 4, 8), (64, 2, 16)):
+            with self.subTest(shared_size=shared_size, job_size=job_size):
+                trainer_size = shared_size // 2
+                num_engines = trainer_size // job_size
+                self.assertEqual(num_engines, expected_k)
+                sources = []
+                for engine_idx in range(num_engines):
+                    for tp_rank in range(job_size):
+                        slice_rank = trainer_size + engine_idx * job_size + tp_rank
+                        with patch.object(
+                            shared_slice,
+                            "_state",
+                            shared_slice._State(
+                                backend=object(),
+                                store=_FakeStore(),
+                                slice_rank=slice_rank,
+                                shared_size=shared_size,
+                                job_size=job_size,
+                            ),
+                        ):
+                            rec = shared_slice.receiver(tp_rank)
+                        self.assertEqual(rec._slice_rank, slice_rank)
+                        self.assertEqual(
+                            rec._src_slice_rank,
+                            num_engines * tp_rank + engine_idx,
+                        )
+                        sources.append(rec._src_slice_rank)
+                self.assertEqual(sorted(sources), list(range(trainer_size)))
 
 
 if __name__ == "__main__":
