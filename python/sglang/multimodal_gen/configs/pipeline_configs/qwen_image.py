@@ -44,12 +44,13 @@ def _calculate_dimensions(target_area, ratio):
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
-    bool_mask = mask.bool()
-    valid_lengths = bool_mask.sum(dim=1)
-    selected = hidden_states[bool_mask]
-    split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
-
-    return split_result
+    # Host row indices, not a device boolean mask.
+    bool_mask = mask.bool().cpu()
+    rows = bool_mask.flatten().nonzero(as_tuple=True)[0]
+    selected = hidden_states.flatten(0, 1).index_select(
+        0, rows.to(hidden_states.device)
+    )
+    return torch.split(selected, bool_mask.sum(dim=1).tolist(), dim=0)
 
 
 def qwen_image_preprocess_text(prompt):
@@ -225,6 +226,14 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             tok_kwargs.setdefault("max_length", 1024)
             tok_kwargs["padding"] = True
         return tokenizer(prompts, **tok_kwargs)
+
+    def get_text_encoder_position_ids(self, text_inputs, encoder_index, text_encoder):
+        # get_rope_index's text-only positions, from the host mask: the encoder
+        # would otherwise take an int64 cumsum on the device.
+        mask = self.get_text_encoder_attention_mask(text_inputs, encoder_index)
+        if mask is None:
+            return None
+        return (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -502,6 +511,18 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
+
+    def get_text_encoder_position_ids(self, text_inputs, encoder_index, text_encoder):
+        # Positions of the prompt and its image tokens from the processor's
+        # host tensors; the encoder would derive them on the device (an int64
+        # cumsum and boolean indexing).
+        position_ids, _ = text_encoder.model.get_rope_index(
+            text_inputs["input_ids"],
+            text_inputs.get("image_grid_thw"),
+            text_inputs.get("video_grid_thw"),
+            attention_mask=text_inputs["attention_mask"],
+        )
+        return position_ids
 
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
