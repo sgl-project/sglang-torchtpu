@@ -7,7 +7,7 @@ One TPU plays every rank of a group: each attends the group's heads over its
 own candidates from its own cache, as serving does after the query all-gather.
 A prefill step is followed by a decode step on the caches it wrote.
 
-The token split's owned-row prefill (owned_width; groups of 2 and 8) runs a 1024-token chunk at a
+The token split's owned-row prefill (owned_width; groups of 2, 4 and 8) runs a 1024-token chunk at a
 20k context and a 256-token chunk whose picks all sit in one rank's offsets
 (that rank runs every further slice), with partial pages and padding tokens,
 against the unsharded step and the whole-row split step.
@@ -132,7 +132,7 @@ class TestMlaKvShardKernel(CustomTestCase):
             self.assertLess(float(diff.mean()), MEAN_ABS, f"q_lens {q_lens}")
 
     def test_merged_shards_match_unsharded(self):
-        for shards in (2, 8):
+        for shards in (2, 4, 8):
             with self.subTest(shards=shards):
                 self._check(shards)
 
@@ -213,7 +213,7 @@ class TestMlaKvShardKernel(CustomTestCase):
                 self.assertLess(float(diff.mean()), MEAN_ABS, msg)
 
     def test_owned_rows_match_whole_rows(self):
-        for shards in (2, 8):
+        for shards in (2, 4, 8):
             for zero_rope in (False, True):
                 with self.subTest(shards=shards, zero_rope=zero_rope):
                     self._check_owned(zero_rope, shards)
