@@ -16,21 +16,26 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import pools as PL
+from .decode import META_MLA_ROLE
 
 
 def row_write_call(spec, cfg):
     """`f(meta, pos, tab, ckrow, nkv, conv, *nope, *conv_pools) -> (*nope, *conv_pools)`.
     Row r = b*Q + qi is token pos[b]+qi of request b; its conv checkpoint goes to
-    pool row ckrow[r]."""
+    pool row ckrow[r]. A split latent cache takes a row only on the rank holding its
+    offset (meta[META_MLA_ROLE]), at its row in that rank's share of the page."""
     B, Q, R = cfg.n_req, cfg.n_query, cfg.rows
     ps, pps = cfg.page_size, cfg.pages_per_seq
     n_dsa, n_kda = len(spec.dsa_layers), len(spec.kda_layers)
+    MS = cfg.mla_shards
+    sub = ps // MS  # tokens of every page this rank's nope pool holds
 
     def kernel(meta_ref, pos_ref, tab_ref, ckrow_ref, nkv, conv, *rest):
         nope = rest[n_dsa + n_kda : 2 * n_dsa + n_kda]
         cpool = rest[2 * n_dsa + n_kda : 2 * (n_dsa + n_kda)]
         sems, csems = rest[2 * (n_dsa + n_kda)], rest[2 * (n_dsa + n_kda) + 1]
         n_live = meta_ref[0]
+        role = meta_ref[META_MLA_ROLE]
         issued = []
         for b in range(B):
             live = b < n_live
@@ -40,12 +45,16 @@ def row_write_call(spec, cfg):
                 tok = p + qi
                 page = PL.page_of(tab_ref, b, tok // ps, pps)
                 off = tok % ps
+                mine = live
+                if MS > 1:
+                    mine = live & (off // sub == role)
+                    off = off % sub
                 for d in range(n_dsa):
                     cp = pltpu.make_async_copy(
                         nkv.at[d, r], nope[d].at[page, off], sems.at[d]
                     )
-                    pl.when(live)(cp.start)
-                    issued.append((live, cp))
+                    pl.when(mine)(cp.start)
+                    issued.append((mine, cp))
                 row = ckrow_ref[r]
                 for k in range(n_kda):
                     cp = pltpu.make_async_copy(
