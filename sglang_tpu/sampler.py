@@ -4,12 +4,14 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import replace
 from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.sampler import (
     SYNC_TOKEN_IDS_ACROSS_TP,
@@ -327,16 +329,37 @@ def sample_from_global_top_k_logits(
     )
 
 
-def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
+def _sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
     """Exact categorical draw per row as argmax(p_i / E_i), E_i ~ Exp(1).
 
     Elementwise ops plus one reduce, so it stays inside the compiled graph;
     ``torch.multinomial`` runs eagerly on TPU. All-zero rows return 0.
+    The compiled boundary keeps pending probability views out of the draw,
+    so warmup and serving reuse the same program.
     """
     u = torch.rand_like(probs)
     # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
     e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
     return torch.argmax(probs / e, dim=-1).to(torch.int32)
+
+
+_compiled_sample_exponential_race = compiled_op(uses_rng=True)(_sample_exponential_race)
+_warmed_sampling_draws: set[tuple[torch.Size, torch.dtype, torch.device]] = set()
+
+
+@functools.wraps(_sample_exponential_race)
+def sample_exponential_race(probs: torch.Tensor, *, _warmup_async=False):
+    if torch.compiler.is_compiling():
+        return _sample_exponential_race(probs)
+    key = (probs.shape, probs.dtype, probs.device)
+    if _warmup_async:
+        pending = _compiled_sample_exponential_race(probs, _warmup_async=True)
+        _warmed_sampling_draws.add(key)
+        return pending
+    # Live-row decode modes and policies without warmup keep their eager draw.
+    if key not in _warmed_sampling_draws:
+        return _sample_exponential_race(probs)
+    return _compiled_sample_exponential_race(probs)
 
 
 def _capture_sampling_mask(
