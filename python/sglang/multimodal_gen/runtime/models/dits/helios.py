@@ -307,7 +307,13 @@ class HeliosSelfAttention(nn.Module):
             apply_rotary_emb_transposed(k, rotary_emb),
         )
 
-    def forward(self, hidden_states, rotary_emb=None, original_context_length=None):
+    def forward(
+        self,
+        hidden_states,
+        rotary_emb=None,
+        original_context_length=None,
+        skip_sequence_parallel=False,
+    ):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
         v, _ = self.to_v(hidden_states)
@@ -344,7 +350,13 @@ class HeliosSelfAttention(nn.Module):
                     dim=1,
                 )
 
-        x = self.attn(q, k, v, num_replicated_prefix=history_seq_len)
+        x = self.attn(
+            q,
+            k,
+            v,
+            num_replicated_prefix=history_seq_len,
+            skip_sequence_parallel_override=skip_sequence_parallel,
+        )
         x = x.flatten(2)
         x, _ = self.to_out(x)
         return x
@@ -507,6 +519,7 @@ class HeliosTransformerBlock(nn.Module):
         rotary_emb,
         original_context_length=None,
         cross_attn_key_value=None,
+        skip_sequence_parallel=False,
     ):
         if temb.ndim == 4:
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -526,7 +539,10 @@ class HeliosTransformerBlock(nn.Module):
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         attn_output = self.attn1(
-            norm_hidden_states, rotary_emb, original_context_length
+            norm_hidden_states,
+            rotary_emb,
+            original_context_length,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
         fused = try_helios_gated_residual(self, hidden_states, attn_output, gate_msa)
         hidden_states = (
@@ -802,30 +818,17 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         rotary_emb = rotary_emb.flatten(2).transpose(1, 2)
         original_context_length = hidden_states.shape[1]
 
-        # Sequence parallelism: shard current tokens and RoPE across SP ranks
-        seq_shard_pad = 0
+        # Sequence parallelism: shard current tokens and RoPE across SP ranks.
+        # The history tokens stay replicated on every rank. A token count the
+        # SP degree does not divide (pyramid level 0 at 384x640 has 540) runs
+        # unsharded on every rank: self-attention takes no key mask, so
+        # tail-pad rows would enter it as keys.
+        seq_len = hidden_states.shape[1]
+        skip_sp = sequence_shard_enabled and seq_len % self.sp_size != 0
+        sequence_shard_enabled = sequence_shard_enabled and not skip_sp
         if sequence_shard_enabled:
             sp_rank = get_sp_group().rank_in_group
-            seq_len = hidden_states.shape[1]
-            if seq_len % self.sp_size != 0:
-                seq_shard_pad = self.sp_size - (seq_len % self.sp_size)
-                hs_pad = torch.zeros(
-                    batch_size,
-                    seq_shard_pad,
-                    hidden_states.shape[2],
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-                re_pad = torch.zeros(
-                    batch_size,
-                    seq_shard_pad,
-                    rotary_emb.shape[2],
-                    dtype=rotary_emb.dtype,
-                    device=rotary_emb.device,
-                )
-                hidden_states = torch.cat([hidden_states, hs_pad], dim=1)
-                rotary_emb = torch.cat([rotary_emb, re_pad], dim=1)
-            local_seq_len = hidden_states.shape[1] // self.sp_size
+            local_seq_len = seq_len // self.sp_size
             hidden_states = hidden_states.view(
                 batch_size, self.sp_size, local_seq_len, -1
             )[:, sp_rank, :, :].contiguous()
@@ -968,17 +971,15 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 rotary_emb,
                 effective_context_length,
                 cross_attn_key_value=key_value,
+                skip_sequence_parallel=skip_sp,
             )
 
         # SP: all-gather current tokens before output
         if sequence_shard_enabled:
             current_tokens = hidden_states[:, -local_seq_len:, :].contiguous()
-            current_tokens = sequence_model_parallel_all_gather(current_tokens, dim=1)
-            if seq_shard_pad > 0:
-                current_tokens = current_tokens[:, :original_context_length, :]
-            hidden_states = current_tokens
+            hidden_states = sequence_model_parallel_all_gather(current_tokens, dim=1)
             # Re-create temb for norm_out (all current tokens share same timestep)
-            temb = temb[:, :1, :].expand(batch_size, original_context_length, -1)
+            temb = temb[:, -1:, :].expand(batch_size, original_context_length, -1)
 
         # 8. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb, original_context_length)

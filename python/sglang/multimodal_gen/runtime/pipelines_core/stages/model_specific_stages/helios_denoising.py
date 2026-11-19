@@ -38,6 +38,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    CompiledModuleRegistry,
+    resolve_torch_compile_kwargs,
+)
 
 logger = init_logger(__name__)
 
@@ -64,10 +68,24 @@ def calculate_shift(
     return mu
 
 
+# Added to the request seed for the pyramid re-noise generator.
+_BLOCK_NOISE_SEED_OFFSET = 1 << 32
+
+
 def sample_block_noise(
-    batch_size, channel, num_frames, height, width, gamma, patch_size=(1, 2, 2)
+    batch_size,
+    channel,
+    num_frames,
+    height,
+    width,
+    gamma,
+    patch_size=(1, 2, 2),
+    generator=None,
 ):
-    """Generate spatially-correlated block noise for pyramid SR."""
+    """Generate spatially-correlated block noise for pyramid SR.
+
+    ``generator`` is a CPU generator; None draws from the global CPU RNG.
+    """
     _, ph, pw = patch_size
     block_size = ph * pw
 
@@ -88,7 +106,7 @@ def sample_block_noise(
     eigvals = eigvals.clamp_min(0.0)
     transform = eigvecs @ torch.diag(torch.sqrt(eigvals))
     base_noise = torch.randn(
-        block_number, block_size, device="cpu", dtype=torch.float64
+        block_number, block_size, device="cpu", dtype=torch.float64, generator=generator
     )
     noise = (base_noise @ transform.T).to(dtype=torch.float32)
     noise = noise.view(
@@ -98,6 +116,17 @@ def sample_block_noise(
         batch_size, channel, num_frames, height, width
     )
     return noise
+
+
+def _step_timestep(t: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """The DiT's timestep for schedule entry ``t``, in its own storage.
+
+    ``t`` is a view into ``scheduler.timesteps`` at the step's offset. Under
+    whole-module compile the timestep is a graph input, and a backend that
+    guards input storage offsets (torch_tpu) would compile the DiT once per
+    step. Under regional compile it feeds only the eager time embedding.
+    """
+    return t.expand(batch_size).clone(memory_format=torch.contiguous_format)
 
 
 class HeliosChunkedDenoisingStage(PipelineStage):
@@ -114,6 +143,34 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = scheduler
         self._quality_fusions_mounted = False
+        self._torch_compile_registry = CompiledModuleRegistry()
+
+    def _maybe_compile_transformer(self, server_args: ServerArgs) -> None:
+        """Compile the DiT once, as ``DenoisingStage._maybe_torch_compile`` does:
+        the whole module, or under --regional-compile its blocks."""
+        if (
+            not getattr(server_args, "enable_torch_compile", False)
+            or not isinstance(self.transformer, torch.nn.Module)
+            or self._torch_compile_registry.is_compiled(self.transformer)
+        ):
+            return
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_TORCH_COMPILE_MODE",
+            config=server_args.pipeline_config.dit_config,
+            default="max-autotune-no-cudagraphs",
+            module=self.transformer,
+            enable_inductor_compute_comm_overlap=True,
+        )
+        if getattr(server_args, "regional_compile", False):
+            count = self._torch_compile_registry.compile_regions_once(
+                self.transformer, compile_kwargs=compile_kwargs
+            )
+            logger.info("Compiling %d Helios blocks with mode: %s", count, mode)
+        else:
+            self._torch_compile_registry.compile_once(
+                self.transformer, compile_kwargs=compile_kwargs
+            )
+            logger.info("Compiling the Helios transformer with mode: %s", mode)
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
         # Mount the request-scoped Helios gated-residual fast path for
@@ -194,7 +251,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     batch.perf_dump_path is not None if batch is not None else False
                 ),
             ):
-                timestep = t.expand(batch_size)
+                timestep = _step_timestep(t, batch_size)
                 latent_model_input = latents.to(target_dtype)
 
                 with set_forward_context(
@@ -313,6 +370,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         server_args=None,
         global_step_offset=0,
         scheduler=None,
+        block_noise_generator=None,
     ):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
@@ -378,7 +436,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
                 bs, ch, nf, h, w = latents.shape
-                noise = sample_block_noise(bs, ch, nf, h, w, gamma, patch_size)
+                noise = sample_block_noise(
+                    bs, ch, nf, h, w, gamma, patch_size, block_noise_generator
+                )
                 noise = noise.to(device=device, dtype=target_dtype)
                 latents = alpha * latents + beta * noise
 
@@ -395,7 +455,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         batch.perf_dump_path is not None if batch is not None else False
                     ),
                 ):
-                    timestep = t.expand(batch_size)
+                    timestep = _step_timestep(t, batch_size)
                     latent_model_input = latents.to(target_dtype)
 
                     with set_forward_context(
@@ -509,6 +569,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
         self._maybe_toggle_quality_fusions(batch)
+        self._maybe_compile_transformer(server_args)
         pipeline_config = server_args.pipeline_config
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (
@@ -639,6 +700,16 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             f"{num_inference_steps} steps each"
         )
 
+        # The pyramid re-noise draws from the request's seed, not the global
+        # CPU RNG: a seed reproduces the video, and every SP rank draws the
+        # same noise. The offset keeps it apart from a CPU latent generator
+        # seeded with the same seed.
+        block_noise_generator = None
+        seeds = getattr(batch, "seeds", None)
+        if seeds:
+            block_noise_generator = torch.Generator(device="cpu").manual_seed(
+                seeds[0] + _BLOCK_NOISE_SEED_OFFSET
+            )
         for k in range(num_latent_chunk):
             is_first_chunk = k == 0
 
@@ -727,6 +798,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     server_args=server_args,
                     global_step_offset=global_step_offset,
                     scheduler=scheduler,
+                    block_noise_generator=block_noise_generator,
                 )
             else:
                 # Stage 1: Standard flat denoising
