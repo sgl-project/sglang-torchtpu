@@ -48,6 +48,7 @@ def agentx_config(
             + [max_running],
             # Short turns run a small program instead of a padded 8192-token chunk.
             "tpu_compile_tokens": [1024, 2048, 4096, 8192],
+            "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
             "max_total_tokens": pool_tokens,
             "max_mamba_cache_size": mamba_slots,
             "enable_metrics": True,
@@ -76,6 +77,11 @@ def agentx_config(
             "SGLANG_TPU_DSA_KPOOL_RAW_RING": "1",
         }
     )
+    if kv_shards == 1:
+        # Compile each graph on one rank, broadcast it to the rest.
+        args["use_spmd_compile"] = True
+        # Off for SPMD: scattered prefill slices rows at a per-rank offset.
+        args["enable_attn_tp_input_scattered"] = False
     if kv_shards > 1:
         # The split latent cache refuses the decode megakernel.
         env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "0"

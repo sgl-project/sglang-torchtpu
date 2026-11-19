@@ -52,6 +52,10 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
 - Megakernel at c8: the recipe asks for 64 rows (16 running x 4 MTP rows); the kernel caps a
   step at 16 rows (VMEM), so steps with more than 4 running requests run on the model path.
 - Prefill buckets: `tpu_compile_tokens` 1024, 2048, 4096, 8192 at every cc; chunked prefill 8192.
+- Compile: direct tracer (`tpu_compile_tracer direct`) at every cc. Without the latent split
+  (c1/c4/c8) also SPMD compile (`use_spmd_compile`) with scattered prefill input off; the
+  split cache refuses SPMD (a rank's share is a compile-time constant of its program). The
+  measured rows below ran the Dynamo tracer.
 - DSA attention token split (`SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT`): off in every
   recipe. It is refused with the split cache (c16/c32). At c8 it was measured as an extra
   env (see the c8 rows).
