@@ -141,17 +141,23 @@ def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
 
 
 def _gather_page_chunks_per_iteration(
-    num_chunks: int, block_tokens: int, topk: int, *, table_in_vmem: bool = False
+    num_chunks: int,
+    block_tokens: int,
+    topk: int,
+    nblocks: int,
+    *,
+    table_in_vmem: bool = False,
 ) -> int | None:
     """Chunks per loop iteration for the bounded kernel, or None to use the unrolled kernel.
 
     Picks the option with the lowest expected cycles per token block, assuming the number of
     chunks ``c`` a block needs is uniform over ``1..num_chunks``. Both kernels wait at least
     for the step's DMAs (``floor``); on top of a fixed part, the unrolled kernel runs every
-    chunk step and the bounded kernel runs ``ceil(c / g)`` iterations of ``g`` steps:
+    chunk step and the bounded kernel pays a per-call ``setup`` across ``nblocks`` and runs
+    ``ceil(c / g)`` iterations of ``g`` steps:
 
       unrolled: max(floor, fixed + num_chunks * u)
-      bounded:  max(floor, fixed + ceil(c / g) * (o + g * u))
+      bounded:  setup / nblocks + max(floor, fixed + ceil(c / g) * (o + g * u))
 
     With the page table resident in VMEM (``table_in_vmem``), a grid step no longer DMAs a
     page-table row, so ``floor`` loses its per-chunk term, and chunks are read as aligned
@@ -164,6 +170,7 @@ def _gather_page_chunks_per_iteration(
         ``context_length``).
       block_tokens: Query tokens per grid step.
       topk: Top-k page ids per query token.
+      nblocks: Token blocks per kernel call (``padded_tokens // block_tokens``).
       table_in_vmem: Whether the kernel reads the page table from VMEM
         (``_gather_page_ids_vmem_table_kernel``).
 
@@ -188,14 +195,19 @@ def _gather_page_chunks_per_iteration(
         tile = _PAGE_TABLE_TILE_CHUNKS
         best_cycles, best_g = float("inf"), None
         candidates = [*range(tile, num_chunks, tile), num_chunks]
+        setup_per_block = 0.0
     else:
         # If not table_in_vmem, each chunk needs ~10 cycles for the page-table row (4 KB per
-        # 128-page chunk per block; ~1700 cycles at 64 chunks).
+        # 128-page chunk per block; ~1700 cycles at 64 chunks), and the bounded kernel adds a
+        # per-call setup that the unrolled kernel avoids: a separate XLA max-reduction over
+        # ``logical`` (``chunks_needed``, ~2600 cycles) plus the HBM-to-SMEM scalar-prefetch
+        # DMA wait before step 0 (~1000 cycles).
         floor += 10 * num_chunks
         best_cycles, best_g = max(floor, fixed + num_chunks * u), None
         candidates = range(1, num_chunks)
+        setup_per_block = 3600 / nblocks
     for g in candidates:
-        cycles = (
+        cycles = setup_per_block + (
             sum(
                 max(floor, fixed + -(-c // g) * (o + g * u))
                 for c in range(1, num_chunks + 1)
@@ -385,7 +397,7 @@ def gather_page_ids(
             ((0, 0), (0, padded_chunks * _GATHER_PAGE_CHUNK - pages_per_seq)),
         ).reshape(max_num_seqs, padded_chunks, _GATHER_PAGE_CHUNK)
         chunks_per_iteration = _gather_page_chunks_per_iteration(
-            num_chunks, block_tokens, topk, table_in_vmem=True
+            num_chunks, block_tokens, topk, nblocks, table_in_vmem=True
         )
         out = pl.pallas_call(
             functools.partial(
@@ -429,7 +441,7 @@ def gather_page_ids(
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
 
     chunks_per_iteration = _gather_page_chunks_per_iteration(
-        num_chunks, block_tokens, topk
+        num_chunks, block_tokens, topk, nblocks
     )
     if chunks_per_iteration is not None:
         out = pl.pallas_call(

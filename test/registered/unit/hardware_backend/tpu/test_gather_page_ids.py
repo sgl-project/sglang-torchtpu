@@ -85,11 +85,13 @@ def test_matches_reference(pages_per_seq, seq_pages, num_tokens, table_in_vmem):
 
 
 @pytest.mark.parametrize("pages_per_seq", [1000, 8192])
-def test_tokens_of_many_sequences_per_block(pages_per_seq, table_in_vmem):
-    # Every 8-token block mixes sequences (decode-like batches), so each chunk's window is built
-    # from several sequences' page-table rows.
-    rng = np.random.default_rng(pages_per_seq)
-    max_num_seqs, topk, num_tokens = 16, 2048, 251
+@pytest.mark.parametrize("num_tokens", [8, 251])
+def test_tokens_of_many_sequences_per_block(pages_per_seq, num_tokens, table_in_vmem):
+    # Every 8-token block mixes sequences (decode-like batches, including the 1-block batch=8
+    # decode case where per-call setup keeps the unrolled kernel), so each chunk's window is
+    # built from several sequences' rows.
+    rng = np.random.default_rng(pages_per_seq + num_tokens)
+    max_num_seqs, topk = 16, 2048
     page_indices = rng.integers(
         0, 1 << 20, size=(max_num_seqs * pages_per_seq,), dtype=np.int32
     )
