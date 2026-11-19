@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `wan_animate_2.sh` | `Wan-AI/Wan2.2-Animate-2-14B-Diffusers`, `Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers` | 8 | Ulysses 8 (base: CFG branches serial) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,17 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| Wan2.2-Animate-2-14B | 576x1024 budget, 24 driving frames (one clip), 40 steps | 8 | 23.6 s | 0.524 s | in loop | 43.0 GB |
+| Wan2.2-Animate-2-14B | 640x800 budget, 64 driving frames (two clips), 40 steps | 8 | 55.9 s | | in loop | 42.9 GB |
+| Wan2.2-Animate-2-14B | 720x1280 budget, 24 driving frames (one clip), 40 steps | 8 | 49.3 s | | in loop | 46.0 GB |
+| Wan2.2-Animate-2-14B-Distilled | 576x1024 budget, 24 driving frames (one clip), 10 steps | 8 | 5.4 s | 0.27 s | in loop | 43.0 GB |
+| Wan2.2-Animate-2-14B-Distilled | 640x800 budget, 64 driving frames (two clips), 10 steps | 8 | 11.1 s | | in loop | 42.9 GB |
+| Wan2.2-Animate-2-14B-Distilled | 720x1280 budget, 64 driving frames at 24 fps (96 frames, two clips of 81), 10 steps | 8 | 37.6 s | | in loop | 56.8 GB |
+
+Wan-Animate-2 rows use the CI inputs of `wan2_2_animate_2_14b_ref2v` (a 9:16 reference image and a 480x832 driving
+video at 16 fps, clip_len 37); the 64-frame video is that video looped. Each clip is VAE-decoded inside the denoising
+stage. The base checkpoint's denoise step (both CFG branches) is the difference of a synced 8-step and 40-step
+request; the distilled one is its 10-step request less the same per-request work (VAE, CLIP, reference pass).
 
 
 ## Example requests
@@ -70,5 +82,15 @@ Wan2.2-TI2V-5B (`wan22_ti2v_5b.sh`):
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x704", "num_frames": 121, "num_inference_steps": 20, "seed": 42
+}'
+```
+
+Wan2.2-Animate-2-14B (`wan_animate_2.sh`; `input_reference` is the image to animate, `video_path` the motion video
+the server reads, and `size` a pixel-area budget the output fits at the image's aspect ratio):
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "a person dancing", "input_reference": "/path/to/reference.png", "video_path": "/path/to/motion.mp4",
+  "size": "640x800", "clip_len": 37, "fps": 16, "seed": 42
 }'
 ```
