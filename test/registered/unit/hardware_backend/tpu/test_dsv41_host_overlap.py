@@ -1792,6 +1792,27 @@ def test_target_verify_single_threaded_numpy_staging_matches_engram_hasher():
             assert torch.equal(got_packed, expected_packed)
     assert saw_skip_pos_d2h and saw_short_prompt_fallback
 
+    # Ragged verify (explicit layout or non-uniform token count) must assert.
+    ragged_layout_fb = SimpleNamespace(
+        forward_mode=verify_mode,
+        spec_info=SimpleNamespace(draft_token_num=4, ragged_verify_layout=object()),
+        positions=torch.arange(8, dtype=torch.int64),
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int64),
+    )
+    with pytest.raises(AssertionError, match="ragged verify"):
+        coordinator.stage_verify(torch.zeros(8, dtype=torch.int64), ragged_layout_fb)
+
+    unequal_tokens_fb = SimpleNamespace(
+        forward_mode=verify_mode,
+        spec_info=SimpleNamespace(draft_token_num=4, ragged_verify_layout=None),
+        positions=torch.arange(6, dtype=torch.int64),
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int64),
+    )
+    with pytest.raises(AssertionError, match="ragged verify"):
+        coordinator.stage_verify(torch.zeros(6, dtype=torch.int64), unequal_tokens_fb)
+
 
 def test_deferred_verify_history_commits_order_across_verify_extend_and_prebuilt():
     """Deferred verify commits preserve slot 0, flush before reused-slot EXTEND,

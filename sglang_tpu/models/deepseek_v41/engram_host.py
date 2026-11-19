@@ -1164,6 +1164,10 @@ class HostEngramCoordinator:
             return None
         history = self._hasher.history
         spec_info = getattr(forward_batch, "spec_info", None)
+        assert getattr(spec_info, "ragged_verify_layout", None) is None, (
+            "Host Engram stage_verify assumes uniform draft_token_num per request "
+            "and does not yet support ragged verify"
+        )
         block = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if history is None or block <= 0 or history.shape[1] != self.ngram - 1:
             return None
@@ -1177,10 +1181,12 @@ class HostEngramCoordinator:
             req_slots = _cpu(forward_batch.req_pool_indices)
         padded_tokens = int(input_ids.shape[0])
         bs = int(req_slots.shape[0])
-        if (
-            padded_tokens != bs * block
-            or int(forward_batch.positions.shape[0]) != padded_tokens
-        ):
+        assert padded_tokens == bs * block, (
+            "Host Engram stage_verify expects one equal block per request "
+            f"(ragged verify not yet supported), got {padded_tokens} tokens for "
+            f"{bs} requests of {block}"
+        )
+        if int(forward_batch.positions.shape[0]) != padded_tokens:
             return None
         try:
             inputs = verify_inputs_from_host(
