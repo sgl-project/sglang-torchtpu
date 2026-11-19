@@ -639,7 +639,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
-    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
+    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded) |
+    # mixed (gather up to 128 rows, a2a above).
     SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
     # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
     # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.

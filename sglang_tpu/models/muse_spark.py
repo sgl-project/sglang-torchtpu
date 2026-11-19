@@ -962,6 +962,13 @@ class MuseSparkForConditionalGeneration(nn.Module):
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+        if megakernel is not None and megakernel.moe_mode == "ep":
+            # the experts hold the EP megakernel layout, which no native MoE reads
+            raise RuntimeError(
+                f"Muse EP serving: a {forward_batch.forward_mode.name} step of "
+                f"{input_ids.shape[0]} tokens fell outside the EP programs (decode/verify up "
+                "to SGLANG_TPU_MUSE_MK_MAX_ROWS rows, extend through prefill/spep)"
+            )
         hidden_states = self.model(
             input_ids,
             positions,
