@@ -170,13 +170,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
+        call_kwargs = (
+            {"pp_proxy_tensors": pp_proxy_tensors}
+            if pp_proxy_tensors is not None
+            else {}
         )
+        if input_embeds is None:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, **call_kwargs
+            )
+        else:
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                **call_kwargs,
+            )
 
         if not self.pp_group.is_last_rank:
             return hidden_states

@@ -1730,8 +1730,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 capture_hidden_mode=capture_hidden_mode,
                 spec_info=spec_info,
             )
+        positions = (
+            forward_batch.mrope_positions
+            if self._model_is_mrope
+            else forward_batch.positions
+        )
         return (
-            (forward_batch.input_ids, forward_batch.positions, forward_batch),
+            (forward_batch.input_ids, positions, forward_batch),
             self._pp_warmup_kwargs(num_tokens),
         )
 
@@ -2326,7 +2331,6 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
-        *,
         input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
