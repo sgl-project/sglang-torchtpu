@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `lingbot_world.sh` | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers`, `robbyant/lingbot-world-fast-diffusers` | 8 | Ulysses 8 |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| LingBot-World v2 14B | realtime I2V session 832x480, 12-frame chunks, 4 DMD steps | 8 | 0.85 s / chunk | — | — | 51.0 GB |
+| LingBot-World v2 14B | realtime I2V session 832x480, 12-frame chunks, 4 DMD steps | 1 | 4.09 s / chunk | — | — | 96.8 GB |
 
 
 ## Example requests
@@ -71,4 +74,34 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x704", "num_frames": 121, "num_inference_steps": 20, "seed": 42
 }'
+```
+
+LingBot-World (`lingbot_world.sh`) serves realtime sessions on the `/v1/realtime_video/generate` WebSocket in
+msgpack messages: an `init` request with the first frame, then each chunk's frames (a `frame_batch` message, or a
+`frame_batch_header` followed by the payload in its own binary message) and a `chunk_stats` message, until the server
+closes the session after `max_chunks`. `camera_actions` holds one list of keys per latent frame, three a chunk:
+
+```python
+import asyncio, msgspec.msgpack, websockets
+
+init = {"type": "init", "prompt": "A slow aerial orbit around a pastel floating island hotel in the open ocean",
+        "first_frame": open("first_frame.png", "rb").read(), "size": "832x480", "fps": 16, "max_chunks": 8,
+        "seed": 42, "generator_device": "cpu", "condition_inputs": {"camera_actions": [["w"]] * 6 + [[]] * 6}}
+
+async def session(url="ws://127.0.0.1:30000/v1/realtime_video/generate"):
+    async with websockets.connect(url, max_size=None) as ws:
+        await ws.send(msgspec.msgpack.encode(init))
+        skip = False  # the binary payload after a frame_batch_header
+        async for raw in ws:
+            if skip:
+                skip = False
+                continue
+            message = msgspec.msgpack.decode(raw)
+            skip = message["type"] == "frame_batch_header"
+            if message["type"] == "chunk_stats":
+                print(message["chunk_index"], message["scheduler_forward_ms"])
+            elif message["type"] == "error":
+                raise RuntimeError(message["content"])
+
+asyncio.run(session())
 ```

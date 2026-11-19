@@ -738,7 +738,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         x0_btchw = pred_noise_to_pred_video(
             pred_noise=pred_noise_btchw.flatten(0, 1),
             noise_input_latent=noise_latents_btchw.flatten(0, 1),
-            timestep=timestep_2d,
+            # where the schedule is (TPU workers keep it on the host)
+            timestep=timestep.reshape(1).expand(batch_size),
             scheduler=scheduler,
         ).unflatten(0, pred_noise_btchw.shape[:2])
         return x0_btchw, attn_metadata

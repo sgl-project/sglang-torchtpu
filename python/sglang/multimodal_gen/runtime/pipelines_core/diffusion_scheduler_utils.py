@@ -72,14 +72,16 @@ def pred_noise_to_pred_video(
     device = pred_noise.device
     pred_noise = pred_noise.double().to(device)
     noise_input_latent = noise_input_latent.double().to(device)
-    sigmas = scheduler.sigmas.double().to(device)
+    # The schedule lookup runs where the timestep is: a host schedule keeps
+    # the argmin off the device.
+    sigmas = scheduler.sigmas.double().to(timestep.device)
     high_dtype = (
         torch.float64 if current_platform.is_float64_supported() else torch.float32
     )
-    timesteps = scheduler.timesteps.to(high_dtype).to(device)
+    timesteps = scheduler.timesteps.to(high_dtype).to(timestep.device)
     timestep_id = torch.argmin(
         (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
     )
-    sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+    sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1).to(device)
     pred_video = noise_input_latent - sigma_t * pred_noise
     return pred_video.to(dtype)

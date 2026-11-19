@@ -121,12 +121,14 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         """
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
-        self.sigmas = self.sigmas.to(noise.device)
-        self.timesteps = self.timesteps.to(noise.device)
+        # The schedule lookup runs where the timestep is: a host schedule
+        # keeps the argmin off the device.
+        self.sigmas = self.sigmas.to(timestep.device)
+        self.timesteps = self.timesteps.to(timestep.device)
         timestep_id = torch.argmin(
             (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
         )
-        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1).to(noise.device)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
 
