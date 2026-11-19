@@ -385,6 +385,14 @@ def register_tpu_top_k_ops() -> None:
     _get_tpu_top_k_op()
 
 
+def output_logprob_topk(
+    values: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use native TopK while preserving the output-logprob index dtype."""
+    top_values, top_ids = tpu_top_k(values, k)
+    return top_values, top_ids.to(torch.int64)
+
+
 def distributed_tpu_top_k(
     local_logits: torch.Tensor,
     shard: TpuVocabShard,
