@@ -161,6 +161,18 @@ class GlmFlashMegakernel:
         self._full, self._lin = full, backend.linear_attn_backend
         self._pool = full.token_to_kv_pool
         self.raw_ring_pages_cnt = full.raw_ring_pages_cnt
+        # A split latent cache: the kernel reads share `me` on chip `me` (mesh = tp rank).
+        self.mla_shards = getattr(full, "mla_shards", 1)
+        if self.mla_shards not in (1, tp):
+            raise ValueError(
+                f"the megakernel needs the latent cache whole or split across all {tp} "
+                f"ranks, not {self.mla_shards}"
+            )
+        if self.mla_shards > 1 and full.mla_role != rank:
+            raise ValueError(
+                f"tp rank {rank} holds latent share {full.mla_role}; the kernel "
+                "reads share = mesh position = tp rank"
+            )
         self._meta_head = D.META_RAW_BASE
         self._req_pool = self._lin.req_to_token_pool
         self._mamba = self._req_pool.mamba_pool
@@ -217,6 +229,7 @@ class GlmFlashMegakernel:
                 single_slab=big or mid,
                 context_parallel=True,  # DSA phase split by score rows across the tp chips
                 raw_ring_pages_cnt=self.raw_ring_pages_cnt,
+                mla_shards=self.mla_shards,
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req, batch_sizes)}
@@ -245,6 +258,11 @@ class GlmFlashMegakernel:
             "conv": [self._lin._layer_state(L).conv[0] for L in spec.kda_layers],
         }
         self.pool_list = [p for n in R.POOL_ORDER for p in self.pools[n]]
+        if self.pools["nope"][0].shape[1] != page_size // self.mla_shards:
+            raise ValueError(
+                f"nope pool {tuple(self.pools['nope'][0].shape)}: expected "
+                f"{page_size // self.mla_shards} tokens of every page per rank"
+            )
         k_scales = []
         for L in spec.dsa_layers:
             attn = getattr(model.model.layers[L].self_attn, "attn_mqa", None)

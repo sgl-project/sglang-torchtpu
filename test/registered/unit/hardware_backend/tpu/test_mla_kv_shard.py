@@ -251,12 +251,12 @@ class TestSplitValidator(CustomTestCase):
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
 
-    def _validate(self, cfg, kpool=4):
+    def _validate(self, cfg, kpool=4, shards=8, megakernel=False):
         from sglang_tpu.tpu_platform import _validate_mla_kv_shards
 
         env = {
-            "SGLANG_TPU_DSA_MLA_KV_SHARDS": "8",
-            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "0",
+            "SGLANG_TPU_DSA_MLA_KV_SHARDS": str(shards),
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "1" if megakernel else "0",
             "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": "0",
         }
         with patch.dict(os.environ, env):
@@ -264,6 +264,13 @@ class TestSplitValidator(CustomTestCase):
 
     def test_admits_the_host_tier(self):
         self._validate(self._cfg())
+
+    def test_megakernel_needs_every_rank_and_16_token_shares(self):
+        self._validate(self._cfg(), megakernel=True)  # host tier on
+        with self.assertRaisesRegex(ValueError, "SGLANG_TPU_GLM_FLASH_MEGAKERNEL"):
+            self._validate(self._cfg(), shards=4, megakernel=True)
+        with self.assertRaisesRegex(ValueError, "SGLANG_TPU_GLM_FLASH_MEGAKERNEL"):
+            self._validate(self._cfg(page_size=64), megakernel=True)  # 8-token shares
 
     def test_refuses_a_shared_spmd_program(self):
         with self.assertRaisesRegex(ValueError, "--use-spmd-compile"):

@@ -737,7 +737,8 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
     """A sparse-MLA latent cache split inside every page (SGLANG_TPU_DSA_MLA_KV_SHARDS):
     groups of consecutive attention-TP ranks, attention TP only, a page that
     splits into whole RoPE rows and indexer pools, one compiled program per
-    rank, and nothing that reads the latent cache outside the sparse backend."""
+    rank, and nothing that reads the latent cache outside the sparse backend
+    and the GLM-Flash megakernel."""
     from sglang.srt.configs.model_config import get_dsa_index_kpool
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -768,8 +769,11 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
         # Both sides would have to split pages the same way; not validated.
         "--disaggregation-mode": cfg.disaggregation_mode != "null",
         "--enable-prefill-cp": cfg.enable_prefill_cp,
-        # Its decode reads every page whole.
-        "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get(),
+        # Its context-parallel DSA spans every rank, and it gathers 16-token blocks.
+        "SGLANG_TPU_GLM_FLASH_MEGAKERNEL (needs shards == --tp-size, 16-token shares)": (
+            tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
+            and (shards != tp or (cfg.page_size or 0) // shards % 16 != 0)
+        ),
         # Its window op stores every token on every rank's whole cache.
         "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": (
             tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get()
