@@ -746,7 +746,9 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                 page_size=8,
                 disable=False,
                 sliding_window_size=8,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=8
+                ),
                 eviction_policy="lru",
                 tree_core_backend="python",
             )
@@ -793,8 +795,8 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         hit_b = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", toks_b + [999]), None))
         )
-        self.assertEqual(len(hit_a.device_indices), 16)
-        self.assertEqual(len(hit_b.device_indices), 32)
+        self.assertEqual(hit_a.device_prefix_len, 16)
+        self.assertEqual(hit_b.device_prefix_len, 32)
         cache.sanity_check()
 
         # 2. TPU unified shared-host reclaim policy (_UnifiedHostSide + TpuDMAHybridCacheController).
@@ -816,7 +818,11 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                         destroy=lambda: None
                     ),
                 ),
-                patch.object(kph, "host_memory_budget_bytes", return_value=1 << 40),
+                patch.object(
+                    kph,
+                    "host_memory_preflight",
+                    side_effect=lambda lengths, **_: (sum(lengths), 1 << 40),
+                ),
             ):
                 kv_h, swa_h = kph.TpuDMAUnifiedHostKVPool.build_pair(
                     tp_h,
