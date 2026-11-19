@@ -90,30 +90,9 @@ class PrefillWorld:
         a.set_full_to_swa_mapping(full, swa)
         return full[:n]
 
-    def prefill(
-        self,
-        tokens: list[int],
-        chunk: int,
-        media: tuple[int, int] | None = None,
-        *,
-        decode: int = 0,
-        output: int = 7,
-    ) -> int:
-        """Returns the cached prefix length. ``decode`` output tokens (the first is
-        ``output``) get KV before the request finishes, so they enter the tree.
-        ``media`` is the [start, end) token span of one multimodal item."""
-        req = Req(
-            rid=f"r{self.rid}",
-            origin_input_text="",
-            origin_input_ids=array("q", tokens),
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-        )
-        if media is not None:
-            # Only the item token offsets (inclusive) matter to the cache.
-            req.multimodal_inputs = SimpleNamespace(
-                mm_items=[SimpleNamespace(offsets=[(media[0], media[1] - 1)])]
-            )
-        self.rid += 1
+    def _admit_and_extend(self, req: Req, fill: list[int], chunk: int) -> int:
+        """Admission match + lock, then chunked extends of ``fill``; returns the
+        cached prefix length."""
         self.req_to_token_pool.alloc([req])
         req.init_next_round_input(tree_cache=self.cache)
         req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
@@ -123,17 +102,56 @@ class PrefillWorld:
             self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
         req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
         pos = cached
-        while pos < len(tokens):
-            end = min(pos + chunk, len(tokens))
+        while pos < len(fill):
+            end = min(pos + chunk, len(fill))
             req.set_extend_range(pos, end)
             self.req_to_token_pool.write((row, slice(pos, end)), self._alloc(end - pos))
             req.kv.kv_committed_len = req.kv.kv_allocated_len = end
             pos = end
-            if pos < len(tokens):
+            if pos < len(fill):
                 checkpoint_kv_cache(req, self.cache)
                 req.init_next_round_input()
+        return cached
+
+    def prefill(
+        self,
+        tokens: list[int],
+        chunk: int,
+        media: tuple[int, int] | None = None,
+        *,
+        decode: int = 0,
+        output: int = 7,
+        retract: bool = False,
+    ) -> int:
+        """Returns the cached prefix length. ``decode`` output tokens (the first is
+        ``output``) get KV before the request finishes, so they enter the tree.
+        ``media`` is the [start, end) token span of one multimodal item. With
+        ``retract``, the request is retracted after its first output token and
+        re-prefills prompt + output, as on SWA memory pressure."""
+        assert not (retract and decode), "retract re-prefills only the first output"
+        req = Req(
+            rid=f"r{self.rid}",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        if media is not None:
+            # The cache reads only the item token offsets (inclusive); a retracted
+            # request's re-admission reads mrope_positions.
+            req.multimodal_inputs = SimpleNamespace(
+                mm_items=[SimpleNamespace(offsets=[(media[0], media[1] - 1)])],
+                mrope_positions=None,
+            )
+        self.rid += 1
+        cached = self._admit_and_extend(req, tokens, chunk)
         req.output_ids.append(output)
         checkpoint_kv_cache(req, self.cache)
+        if retract:
+            release_kv_cache(req, self.cache, is_insert=False)
+            req.reset_for_retract()
+            self._admit_and_extend(req, tokens + list(req.output_ids), chunk)
+            checkpoint_kv_cache(req, self.cache)
+        row = req.kv.req_pool_idx
         if decode:
             n = len(tokens)
             # The first slots continue the prompt's last page.
@@ -491,11 +509,17 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
     def _media_hit_after_dead_tails(self, *, stage1: bool, stage2: bool) -> int:
         return self._media_hit(self._world(stage1=stage1, stage2=stage2))
 
-    def _media_hit(self, w: PrefillWorld) -> int:
-        """First visit of a media prefix, then newer unrelated requests; keep only
-        a few windows of SWA; a sibling (same media, new text) matches."""
+    def _media_hit(self, w: PrefillWorld, *, retract: bool = False) -> int:
+        """First visit of a media prefix (retracted once if ``retract``), then newer
+        unrelated requests; keep only a few windows of SWA; a sibling (same media,
+        new text) matches."""
         media = _tokens(1, self.MEDIA)
-        w.prefill(media + _tokens(2, self.TAIL), self.CHUNK, media=(64, self.MEDIA))
+        w.prefill(
+            media + _tokens(2, self.TAIL),
+            self.CHUNK,
+            media=(64, self.MEDIA),
+            retract=retract,
+        )
         for k in range(6):
             w.prefill(_tokens(50 + k, self.MEDIA + self.TAIL), self.CHUNK)
         keep = 4 * (WINDOW + 1)
@@ -524,6 +548,12 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
         self.assertLess(
             self._media_hit_after_dead_tails(stage1=True, stage2=False), self.MEDIA
         )
+
+    def test_media_window_survives_retraction(self):
+        """A retracted first visit re-prefills on top of its own cached prompt; its
+        media window stays exempt from stage 2 there too."""
+        w = self._world(stage1=False, stage2=True)
+        self.assertEqual(self._media_hit(w, retract=True), self.MEDIA)
 
     def test_revisit_is_not_first_visit(self):
         """A request whose floor already covers the media has no media window to keep."""
