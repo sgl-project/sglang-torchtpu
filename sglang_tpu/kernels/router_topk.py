@@ -18,6 +18,9 @@ _RANK_MAX_EXPERTS = 1024
 # Tokens per grid step, measured on tpu7x over 128-1024 for 256, 288 and 896
 # experts.
 _BLOCK_TOKENS = 512
+# Tile elements (tokens x experts) that fit the 32 MiB VMEM limit; 512x896
+# compiles. Larger expert counts shrink the tile, down to 128 tokens.
+_BLOCK_ELEMS = 512 * 1024
 
 
 def _topk_kernel(
@@ -54,13 +57,13 @@ def _topk_kernel(
         jnp.broadcast_to(bias_ref[...].reshape(1, experts), (8, experts))
     )[:, 0:1]
     choice = scores + bias
+    # NaN never equals the max, so it would yield the out-of-range id `experts`.
+    # It ranks last instead, still above the -inf that marks a picked expert.
+    choice = jnp.where(choice == choice, choice, jnp.finfo(jnp.float32).min)
     expert = jax.lax.broadcasted_iota(jnp.int32, (experts, tokens), 0).astype(
         jnp.float32
     )
     total = jnp.zeros((1, tokens), jnp.float32)
-    # Router logits are finite here (rows past the last token in the final tile
-    # are never written back). A NaN logit would make `choice == m` false down
-    # its column, so every id there would come out as `experts`.
     for r in range(k):
         m = jnp.max(choice, axis=0, keepdims=True)
         idx = jnp.min(
@@ -88,7 +91,7 @@ def _topk_kernel_1tok(
     order the round loop picks experts in (ties -> lowest expert id). The k
     rounds are a serial chain of two cross-lane reductions each; the rank is
     one batch of independent compares, then slot r takes the expert of rank r.
-    Bit-identical to the round loop for finite logits."""
+    Bit-identical to the round loop."""
     import jax
     import jax.numpy as jnp
 
@@ -101,6 +104,8 @@ def _topk_kernel_1tok(
         .astype(jnp.float32)
     )
     choice = scores + bias_ref[...].reshape(1, -1).astype(jnp.float32)
+    # NaN compares false both ways, so ranks would collide and ids leave [0, E).
+    choice = jnp.where(choice == choice, choice, jnp.finfo(jnp.float32).min)
     # choice[j] down the sublanes, broadcast across the lanes: [E, 128].
     col = jnp.transpose(jnp.broadcast_to(choice, (8, experts)))[:, 0:1]
     col = jnp.broadcast_to(col, (experts, 128))
@@ -179,7 +184,10 @@ def router_topk_jax(
             interpret=interpret,
             name=f"router_topk_{k}_of_{experts}",
         )(logits, bias)
-    block = min(_BLOCK_TOKENS, tokens)
+    # A partial tile's token dim is the output's lane dim: a multiple of 128.
+    block = min(
+        tokens, max(128, min(_BLOCK_TOKENS, _BLOCK_ELEMS // experts) // 128 * 128)
+    )
     out_spec = pl.BlockSpec((k, block), lambda i: (0, i))
     weights, ids = pl.pallas_call(
         functools.partial(_topk_kernel, **params),
