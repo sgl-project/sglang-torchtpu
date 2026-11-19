@@ -483,6 +483,151 @@ class TestQwen35GdnQkReplication(CustomTestCase):
             self.assertIn("input_embeds", call_kwargs)
             self.assertIsNone(call_kwargs["input_embeds"])
 
+    def test_pd_gdn_conv_state_slice_with_qk_replication(self):
+        """Regression test for P/D GDN conv_state resharding when one or both
+        sides replicate Q/K heads (attn_tp_size > linear_num_key_heads).
+        """
+        from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
+        from sglang.srt.disaggregation.utils import (
+            compute_mamba_state_slice_blocks,
+            compute_mamba_state_slice_byte_blocks,
+        )
+
+        # Verify Qwen3_5MoeTextConfig publishes head-granularity conv_shard_groups.
+        text_cfg = Qwen3_5MoeTextConfig(
+            num_hidden_layers=4,
+            full_attention_interval=4,
+            linear_num_key_heads=16,
+            linear_num_value_heads=128,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )
+        with get_context().override_server_args(tp_size=32):
+            cache_params = text_cfg.mamba2_cache_params
+        self.assertEqual(
+            cache_params.shape.conv_shard_groups,
+            [(2048, 128), (2048, 128), (16384, 128)],
+        )
+        self.assertEqual(cache_params.shape.conv, [(768, 3)])
+
+        # Build canonical global [Q, K, V] conv state (scaled down to dk=dv=8
+        # with nk=16, nv=128 -> Qwen3.8 head counts) and verify exact byte-level
+        # reconstruction across scatter and aggregation for both GPU
+        # [conv_dim, K-1] (outer_count=1) and TPU [K-1, 1, conv_dim] (outer_count=3).
+        nk, nv, dk, dv, km1 = 16, 128, 8, 8, 3
+        groups = [(nk * dk, dk), (nk * dk, dk), (nv * dv, dv)]
+        g = torch.Generator().manual_seed(123)
+        q_global = torch.randint(
+            0, 100000, (km1, nk * dk), generator=g, dtype=torch.int32
+        )
+        k_global = torch.randint(
+            0, 100000, (km1, nk * dk), generator=g, dtype=torch.int32
+        )
+        v_global = torch.randint(
+            0, 100000, (km1, nv * dv), generator=g, dtype=torch.int32
+        )
+
+        def rank_conv_bytes(
+            tp: int, rank: int, tpu_layout: bool
+        ) -> tuple[int, bytearray]:
+            def slice_part(arr: torch.Tensor, nh: int, hd: int) -> torch.Tensor:
+                if nh >= tp:
+                    sub = (nh * hd) // tp
+                    return arr[:, rank * sub : (rank + 1) * sub]
+                rep = tp // nh
+                grp = rank // rep
+                return arr[:, grp * hd : (grp + 1) * hd]
+
+            cat_km1_dim = torch.cat(
+                [
+                    slice_part(q_global, nk, dk),
+                    slice_part(k_global, nk, dk),
+                    slice_part(v_global, nv, dv),
+                ],
+                dim=1,
+            ).contiguous()
+            conv_dim_local = cat_km1_dim.shape[1]
+            buf = (
+                cat_km1_dim if tpu_layout else cat_km1_dim.transpose(0, 1).contiguous()
+            )
+            return conv_dim_local, bytearray(buf.numpy().tobytes())
+
+        for tpu_layout, outer_count in ((False, 1), (True, km1)):
+            for src_tp, dst_tp in (
+                (16, 32),
+                (32, 16),
+                (8, 32),
+                (32, 8),
+                (32, 64),
+                (64, 32),
+            ):
+                with self.subTest(tpu_layout=tpu_layout, src_tp=src_tp, dst_tp=dst_tp):
+                    src_ranks = [
+                        rank_conv_bytes(src_tp, r, tpu_layout) for r in range(src_tp)
+                    ]
+                    dst_ranks = [
+                        rank_conv_bytes(dst_tp, r, tpu_layout) for r in range(dst_tp)
+                    ]
+                    src_dim, src_item_len = src_ranks[0][0], len(src_ranks[0][1])
+                    dst_dim, dst_item_len = dst_ranks[0][0], len(dst_ranks[0][1])
+
+                    for d in range(dst_tp):
+                        actual = bytearray(dst_item_len)
+                        write_counts = [0] * dst_item_len
+                        if src_tp > dst_tp:
+                            wpd = src_tp // dst_tp
+                            writers = [d * wpd + w for w in range(wpd)]
+                        else:
+                            fanout = dst_tp // src_tp
+                            writers = [d // fanout]
+                        for s in writers:
+                            byte_blocks = compute_mamba_state_slice_byte_blocks(
+                                src_item_len=src_item_len,
+                                dst_item_len=dst_item_len,
+                                src_dim=src_dim,
+                                dst_dim=dst_dim,
+                                outer_count=outer_count,
+                                src_attn_tp_size=src_tp,
+                                dst_attn_tp_size=dst_tp,
+                                dst_tp_rank_in_group=d,
+                                local_tp_rank_in_group=s,
+                                conv_shard_groups=groups,
+                            )
+                            for s_off, d_off, nbytes in byte_blocks:
+                                self.assertGreaterEqual(d_off, 0)
+                                self.assertLessEqual(d_off + nbytes, dst_item_len)
+                                actual[d_off : d_off + nbytes] = src_ranks[s][1][
+                                    s_off : s_off + nbytes
+                                ]
+                                for b_idx in range(d_off, d_off + nbytes):
+                                    write_counts[b_idx] += 1
+                        self.assertTrue(all(c == 1 for c in write_counts))
+                        self.assertEqual(actual, dst_ranks[d][1])
+
+        # Missing or stale plain-int metadata on replicated conv state must raise
+        # ValueError rather than silently falling back and overrunning dst_dim.
+        with self.assertRaises(ValueError):
+            compute_mamba_state_slice_blocks(
+                src_dim=768,
+                dst_dim=1280,
+                src_attn_tp_size=32,
+                dst_attn_tp_size=16,
+                dst_tp_rank_in_group=0,
+                local_tp_rank_in_group=1,
+                conv_shard_groups=None,
+            )
+        with self.assertRaises(ValueError):
+            compute_mamba_state_slice_blocks(
+                src_dim=768,
+                dst_dim=1280,
+                src_attn_tp_size=32,
+                dst_attn_tp_size=16,
+                dst_tp_rank_in_group=0,
+                local_tp_rank_in_group=1,
+                conv_shard_groups=[2048, 2048, 16384],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

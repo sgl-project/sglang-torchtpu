@@ -15,7 +15,9 @@
 import logging
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
+
+ConvShardGroup = Union[int, Tuple[int, int]]
 
 import numpy as np
 import torch
@@ -186,12 +188,14 @@ class Mamba2StateShape:
     # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
     # buffer (k_cache) to size/stride exactly like the kernel expects.
     num_k_heads_per_tp: int = 1
-    # Full (unsharded) conv sub-block dims, e.g. GDN's [key_dim, key_dim,
-    # value_dim] for conv_state == cat([query, key, value]). Each sub-block is
-    # head-sharded INDEPENDENTLY across attn-TP, so PD transfer across different
-    # attn_tp_size must slice per sub-block. None when the single contiguous
-    # slice already matches the layout (e.g. standard Mamba2 conv order differs).
-    conv_shard_groups: Optional[List[int]] = None
+    # Per-sub-block conv descriptors, e.g. GDN's
+    # [(key_dim, head_k_dim), (key_dim, head_k_dim), (value_dim, head_v_dim)]
+    # (or plain full_dim ints when unreplicated) for conv_state ==
+    # cat([query, key, value]). Each sub-block is head-sharded (or head-replicated
+    # when attn_tp_size > num_k_heads) independently across attn-TP, so PD
+    # transfer across different attn_tp_size slices per sub-block. None when the
+    # single contiguous slice already matches the layout.
+    conv_shard_groups: Optional[List[ConvShardGroup]] = None
 
     @staticmethod
     def create(
@@ -203,8 +207,9 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-        conv_shard_groups: Optional[List[int]] = None,
+        conv_shard_groups: Optional[List[ConvShardGroup]] = None,
     ) -> "Mamba2StateShape":
+        orig_n_groups = n_groups
         # The q/k projections are sharded by `num_k_heads // tp` heads (the
         # ORIGINAL n_groups, before the conv head-shard extension below), so the
         # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
@@ -220,6 +225,24 @@ class Mamba2StateShape:
         if n_groups % tp_world_size != 0:
             extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
             n_groups += extra_groups
+        if (
+            conv_shard_groups is not None
+            and len(conv_shard_groups) == 3
+            and all(isinstance(x, int) for x in conv_shard_groups)
+            and state_size > 0
+            and head_dim > 0
+            and list(conv_shard_groups)
+            == [
+                orig_n_groups * state_size,
+                orig_n_groups * state_size,
+                intermediate_size,
+            ]
+        ):
+            conv_shard_groups = [
+                (orig_n_groups * state_size, state_size),
+                (orig_n_groups * state_size, state_size),
+                (intermediate_size, head_dim),
+            ]
         # heads and n_groups are TP-ed
         conv_dim = intermediate_size + 2 * n_groups * state_size
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -96,10 +96,12 @@ class KVArgs:
     # Number of rows before the slice axis in each per-slot state tensor.
     state_slice_outer_counts: List[List[int]]
     is_hybrid_mla_backend: bool
-    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
-    # scatter transfer can slice each independently head-sharded sub-block; None
-    # per tensor when the single contiguous slice already matches the layout.
-    state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Per-tensor conv sub-block descriptors (GDN:
+    # [(key_dim, head_k_dim), (key_dim, head_k_dim), (value_dim, head_v_dim)] or
+    # plain full_dim ints) so heterogeneous-TP transfer can slice each
+    # independently head-sharded / head-replicated sub-block; None per tensor
+    # when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[Union[int, Tuple[int, int]]]]]]
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
