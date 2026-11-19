@@ -59,8 +59,9 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
   runs on the split cache too, so it is on in every recipe: 9-row steps fit its 16-row cap
   with one running request, 4-row steps with up to four.
 - `agentx_cc4_host.py` / `agentx_cc8_host.py`: the c16 host-tier config (split, 9.4M pool,
-  800 KDA slots, host 2.5x) at 4 / 8 running. Launch plans of this job's runs:
-  `launch_2460/E*.json`.
+  800 KDA slots, host 2.5x) at 4 / 8 running.
+- `runs/E*.json`: the launch JSONs of the c1 / c4 / c8 / c16 runs on these settings
+  (cc1, cc4_host, cc8_host, cc16_host with `SGLANG_TPU_GLM_FLASH_MEGAKERNEL=0`).
 - Prefill: chunks of 4096 tokens (`chunked_prefill_size`, `max_prefill_tokens` 4096) and
   buckets `tpu_compile_tokens` 1024, 2048, 3072, 4096 at every cc. The measured rows below
   ran 8192-token chunks with buckets 1024, 2048, 4096, 8192.
