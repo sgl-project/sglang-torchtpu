@@ -9,6 +9,7 @@ from unittest.mock import ANY, MagicMock, patch
 import numpy as np
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
@@ -129,6 +130,23 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
+
+    def test_decode_probe_records_completion_at_admission_and_preserves_it_on_requeue(
+        self,
+    ):
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        scheduler.health_monitor = SimpleNamespace(completion_seq=7)
+        req = self._new_req(priority=0)
+        req.rid = f"{HEALTH_CHECK_RID_PREFIX}_probe"
+        req.health_check_admission_seq = None
+
+        scheduler._add_request_to_queue(req)
+
+        self.assertEqual(req.health_check_admission_seq, 7)
+        scheduler.health_monitor.completion_seq = 8
+        scheduler._add_request_to_queue(req, is_retracted=True)
+        self.assertEqual(req.health_check_admission_seq, 7)
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.add.call_count, 2)
 
     def test_decode_retraction_queue_time_excludes_decoding_before_it(self):
         """After a PD-decode retraction, queue_time counts waits, not earlier decoding."""

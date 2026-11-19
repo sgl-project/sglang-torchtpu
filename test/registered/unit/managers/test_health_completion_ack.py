@@ -37,12 +37,14 @@ def _recv(rid, http_worker_ipc=None):
     return SimpleNamespace(rid=rid, http_worker_ipc=http_worker_ipc)
 
 
-def _req(rid, http_worker_ipc=None, aborted=False):
+def _req(rid, http_worker_ipc=None, aborted=False, finished=False):
     return SimpleNamespace(
         rid=rid,
         http_worker_ipc=http_worker_ipc,
         to_finish=FINISH_ABORT() if aborted else None,
-        finished_reason=None,
+        finished_reason=Mock() if finished else None,
+        finished=lambda: finished,
+        health_check_admission_seq=0,
         cache_request_handle=Mock(),
     )
 
@@ -506,6 +508,7 @@ class TestSchedulerHealthWiring(CustomTestCase):
         scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
         scheduler.enable_hisparse = True
         scheduler.hisparse_coordinator = Mock()
+        scheduler.health_monitor.completion_seq = 1
         probe = _req(PROBE_RID, PROBE_IPC)
         scheduler.waiting_queue = [probe]
         with (
@@ -528,6 +531,66 @@ class TestSchedulerHealthWiring(CustomTestCase):
             release.assert_called_once_with(
                 probe, scheduler.tree_cache, is_insert=False
             )
+
+    def test_decode_probe_expiry_does_not_change_rank_admission(self):
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                ranks = []
+                for elapsed in (41, 39):
+                    scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+                    clock = _Clock()
+                    send = Mock()
+                    scheduler.health_monitor = SchedulerHealthMonitor(
+                        send, dp_rank=0, ttl_s=40, now=clock
+                    )
+                    scheduler.health_monitor.register(
+                        _recv(PROBE_RID, PROBE_IPC), admitted=True
+                    )
+                    probe = _req(PROBE_RID, PROBE_IPC)
+                    scheduler.waiting_queue = [probe]
+                    clock.now += elapsed
+                    scheduler.health_monitor.pop_deferred()
+                    ranks.append((scheduler, probe, send))
+                self.assertEqual(ranks[0][0].health_monitor.pending_rids, [])
+                self.assertEqual(ranks[1][0].health_monitor.pending_rids, [PROBE_RID])
+
+                user = _req("user")
+                for scheduler, probe, send in ranks:
+                    if completed:
+                        scheduler.process_batch_result(
+                            _batch(user, forward_mode=ForwardMode.DECODE), Mock()
+                        )
+                    with patch(
+                        "sglang.srt.disaggregation.decode.release_kv_cache"
+                    ) as release:
+                        result, selected = self._prebuilt(scheduler)
+                        if completed:
+                            self.assertIsNone(result)
+                            self.assertEqual(selected, [])
+                            release.assert_called_once_with(
+                                probe, scheduler.tree_cache, is_insert=False
+                            )
+                        else:
+                            self.assertIsNotNone(result)
+                            self.assertEqual(selected, [probe])
+                            release.assert_not_called()
+                if completed:
+                    ranks[0][2].assert_not_called()
+                    ranks[1][2].assert_called_once()
+
+    def test_decode_finished_probe_does_not_delay_waiting_user(self):
+        for running_user in ((), (_req("running"),)):
+            with self.subTest(running_user=bool(running_user)):
+                scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+                probe = _req(PROBE_RID, PROBE_IPC, finished=True)
+                user = _req("user")
+                scheduler.waiting_queue = [user]
+                result, selected = self._prebuilt(
+                    scheduler, running=(probe, *running_user)
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(selected, [user])
+                self.assertEqual(scheduler.waiting_queue, [])
 
     def test_decode_idle_probe_still_reaches_prebuilt(self):
         scheduler = self._scheduler(mode=DisaggregationMode.DECODE)

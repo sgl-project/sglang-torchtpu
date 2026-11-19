@@ -4527,8 +4527,12 @@ class SchedulerDisaggregationDecodeMixin:
         # An idle probe can still be decoding when a user's KV transfer
         # finishes. Let its tiny forward finish alone: merging the user into
         # it would change the user's decode batch shape solely for liveness.
-        if any(is_health_check_req(req) for req in running_batch.reqs):
-            return None
+        finished_probes = 0
+        for req in running_batch.reqs:
+            if is_health_check_req(req):
+                if not req.finished():
+                    return None
+                finished_probes += 1
 
         if self.enable_priority_scheduling:
             self.waiting_queue.reorder(
@@ -4541,7 +4545,9 @@ class SchedulerDisaggregationDecodeMixin:
             self._start_host_restores()
             restores_ready = self._host_restores_ready()
 
-        curr_batch_size = running_batch.batch_size()
+        # Finished probes are filtered after prebuilt admission; they must not
+        # keep waiting users out for another scheduler iteration.
+        curr_batch_size = running_batch.batch_size() - finished_probes
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
@@ -4550,16 +4556,16 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
-        has_traffic = not running_batch.is_empty() or any(
+        has_traffic = curr_batch_size > 0 or any(
             not is_health_check_req(req) for req in self.waiting_queue
         )
 
         for req in self.waiting_queue:
             if is_health_check_req(req):
-                # A completion can acknowledge a probe before its KV transfer
-                # reaches this queue. HTTP cleanup need not send an abort, so
-                # retire its preallocated resources here after transfer ends.
-                if req.rid not in self.health_monitor.pending_rids:
+                # Completion counts agree across TP ranks; probe expiry uses
+                # rank-local clocks and must not decide admission or cleanup.
+                assert req.health_check_admission_seq is not None
+                if self.health_monitor.completion_seq > req.health_check_admission_seq:
                     self._release_aborted_request(req)
                     if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                         discard_kv_cache_backup(req, self.tree_cache, "host_pool")

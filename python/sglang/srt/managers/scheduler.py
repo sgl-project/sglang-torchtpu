@@ -4179,6 +4179,11 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if (
+                is_health_check_generate_req(req)
+                and req.health_check_admission_seq is None
+            ):
+                req.health_check_admission_seq = self.health_monitor.completion_seq
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
