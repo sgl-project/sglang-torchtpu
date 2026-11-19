@@ -34,7 +34,9 @@ def _layer_experts(c: PFConfig) -> list:
 def build_forward(c: PFConfig, axis: str = "model"):
     """(meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights in kernel.WEIGHT_NAMES order,
     *experts, *kv) -> (hidden, aux, *kv). meta is [live rows, TP rank]; smalls rows hold the
-    norms' gains (zero-centered weights + 1), as for the decode megakernel."""
+    norms' gains (zero-centered weights + 1), as for the decode megakernel. kv holds one pool per
+    layer, or TpuUnifiedSWAKVPool's c.n_kv_buffers shared buffers; then psw is the SWA groups'
+    page tables back to back."""
     from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
@@ -52,7 +54,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         for r in (True, False, None)
     }
 
-    def attention(l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
+    def attention(l, q, kvs, kv_pool, kv_lens, table, cu_q, dist):
         is_global = l in c.global_layers
         return ragged_paged_attention(
             q.reshape(T, c.q_heads, hd),
@@ -60,7 +62,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
             kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
             kv_pool,
             kv_lens,
-            pf if is_global else psw,
+            table,
             cu_q,
             dist,
             sm_scale=c.attn_scale,
@@ -133,8 +135,13 @@ def build_forward(c: PFConfig, axis: str = "model"):
             c, x, smalls[0], wqkvg[0], rope_rows if c.use_rope(0) else None
         )
         aux = []
+        swa_tables = psw.reshape(c.n_swa_groups, -1)
         for l in range(L):
-            o, kv[l] = attention(l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
+            b = c.layer_kv_buf(l)
+            table = (
+                pf if l in c.global_layers else swa_tables[c.layer_swa_group(l)]
+            )
+            o, kv[b] = attention(l, q, kvs, kv[b], kv_lens, table, cu_q, dist)
             lyr = jnp.full((1,), l, jnp.int32)
             x, xe, ids, tw = attn_out(
                 lyr, o.reshape(T, qd), gate, x, wo, wrouter, wpool, smalls
