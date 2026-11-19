@@ -41,5 +41,9 @@ _INNER = frozenset(
 
 
 def _scope(name):
-    on = _TRACE and (_TRACE_INNER or name not in _INNER)
+    # read at trace time too: a long-lived compile worker imports ops before a sweep's env is set
+    from sglang_tpu.envs import envs as tpu_envs
+
+    level = max(int(_TRACE) + int(_TRACE_INNER), tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get())
+    on = level >= 1 and (level >= 2 or name not in _INNER)
     return jax.named_scope(name) if on else contextlib.nullcontext()
