@@ -26,7 +26,7 @@
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Tri-state for the bigram flag: distinguishes "not yet reported" from an
@@ -61,6 +61,9 @@ pub struct BlockSizeOracle {
     value: AtomicU32,
     bigram: AtomicU8,
     observed_bigram: AtomicU8,
+    /// `observe_bigram` runs once per event batch, so a conflicting worker would
+    /// otherwise repeat its warning on every batch.
+    observed_conflict_warned: AtomicBool,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -149,14 +152,16 @@ impl BlockSizeOracle {
             }
             Err(existing) if existing == candidate => {}
             Err(existing) => {
-                tracing::warn!(
-                    established_bigram = existing == BIGRAM_BIGRAM,
-                    worker_bigram = is_bigram,
-                    "kv-events: a worker publishes BlockStored events in a different \
-                     hashing mode (bigram/unigram) than the established cluster value; \
-                     keeping the first. Cache-aware routing will never match for the \
-                     minority workers.",
-                );
+                if !self.observed_conflict_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        established_bigram = existing == BIGRAM_BIGRAM,
+                        worker_bigram = is_bigram,
+                        "kv-events: a worker publishes BlockStored events in a different \
+                         hashing mode (bigram/unigram) than the established cluster value; \
+                         keeping the first. Cache-aware routing will never match for the \
+                         minority workers. (Logged once.)",
+                    );
+                }
             }
         }
     }
@@ -312,8 +317,11 @@ mod tests {
         assert_eq!(oracle.hash_config(), None);
         oracle.observe_bigram(true);
         assert_eq!(oracle.hash_config(), Some((64, true)));
+        assert!(!oracle.observed_conflict_warned.load(Ordering::Relaxed));
         oracle.observe_bigram(false); // conflicting worker; first wins
+        oracle.observe_bigram(false); // repeats each batch; warned only once
         assert!(oracle.is_bigram());
+        assert!(oracle.observed_conflict_warned.load(Ordering::Relaxed));
     }
 
     #[test]
