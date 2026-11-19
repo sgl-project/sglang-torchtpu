@@ -425,7 +425,8 @@ class TestBlockMajorStartupCheck(CustomTestCase):
     def test_non_raiden_pd_is_refused(self):
         with self.assertRaisesRegex(ValueError, "raiden"):
             self._check(
-                disaggregation_mode="prefill", disaggregation_transfer_backend="tpu"
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="mooncake",
             )
 
     def test_non_pipeline_consumer_of_a_pipeline_is_refused(self):

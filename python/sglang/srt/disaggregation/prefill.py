@@ -355,10 +355,6 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
-        # TPU backend gathers KV pages off-device directly from the pool
-        # tensors (no cross-process device pointers), so hand it the pool.
-        if hasattr(kv_manager, "attach_kv_pool"):
-            kv_manager.attach_kv_pool(self.token_to_kv_pool)
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

@@ -98,7 +98,6 @@ tpu:
       - 'python/sglang/srt/hardware_backend/tpu/**'
       - 'python/sglang/srt/layers/attention/pallas/**'
       - 'python/sglang/srt/layers/moe/pallas/**'
-      - 'python/sglang/srt/disaggregation/tpu/**'
       - 'python/sglang/test/tpu/**'
       - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
       - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'
