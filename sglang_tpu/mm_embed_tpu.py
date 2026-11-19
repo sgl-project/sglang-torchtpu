@@ -127,7 +127,8 @@ class _HostRowBuffer:
 
     A fresh zeros() of the padded batch faults in every page on each prefill:
     ~100 ms at 8192 x 12288 bf16, against ~10 ms for the scatter itself. Reuse
-    relies on torch_tpu copying pageable host memory before .to() returns.
+    relies on uploading it with a blocking .to(), which returns only after the
+    copy has run.
     """
 
     def __init__(self, rows: int, hidden: int, dtype: torch.dtype):
@@ -221,9 +222,11 @@ def apply_host_mm_embeds(
 ) -> torch.Tensor:
     """Overwrite the masked rows of input_embeds with the host-placed rows."""
     device = input_embeds.device
+    # host_src is the reused _HostRowBuffer matrix, which the next prefill
+    # rewrites, so this copy stays blocking: it is done before .to() returns.
     return torch.where(
-        upload(host_mask, device),
-        upload(host_src.to(input_embeds.dtype), device),
+        host_mask.to(device),
+        host_src.to(device, input_embeds.dtype),
         input_embeds,
     )
 
@@ -280,7 +283,8 @@ def embed_mm_on_host(
         return input_embeds, torch.zeros(
             deepstack_shape, device=input_embeds.device, dtype=dtype
         )
-    return input_embeds, upload(placed_deepstack[0].to(dtype), input_embeds.device)
+    # A reused _HostRowBuffer matrix too: blocking, as in apply_host_mm_embeds.
+    return input_embeds, placed_deepstack[0].to(input_embeds.device, dtype)
 
 
 def _embed_mm_inputs(

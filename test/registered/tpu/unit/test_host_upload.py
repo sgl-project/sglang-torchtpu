@@ -138,26 +138,6 @@ class TestHostUploadDoesNotWait(CustomTestCase):
         expected[rows] = src.cpu()
         self.assertTrue(torch.equal(dest.cpu(), expected))
 
-    def test_apply_host_mm_embeds(self):
-        from sglang_tpu.mm_embed_tpu import apply_host_mm_embeds
-
-        host_mask = torch.zeros(8, 1, dtype=torch.bool)
-        host_mask[[0, 5]] = True
-        host_src = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-        input_embeds = torch.full((8, 4), -1.0, dtype=torch.bfloat16, device=DEV)
-
-        out = self._assert_no_wait(
-            "apply_host_mm_embeds",
-            lambda: apply_host_mm_embeds(
-                input_embeds=input_embeds, host_src=host_src, host_mask=host_mask
-            ),
-        )
-        expected = torch.where(
-            host_mask, host_src.to(torch.bfloat16), input_embeds.cpu()
-        )
-        self.assertEqual(out.dtype, torch.bfloat16)
-        self.assertTrue(torch.equal(out.cpu(), expected))
-
     def test_upload_copies_host_bytes_at_call_time(self):
         from sglang_tpu.host_upload import upload
 
