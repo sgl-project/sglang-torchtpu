@@ -350,6 +350,8 @@ class TestQwen35GdnQkReplication(CustomTestCase):
         self.assertEqual([c[2].shape[0] for c in calls], [16, 16, 128, 128])
 
     def test_qwen38_full_attention_dcp8_tp32_geometry(self):
+        from unittest.mock import patch
+
         from sglang.srt.distributed.utils import get_group_rank_size
         from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
 
@@ -396,6 +398,10 @@ class TestQwen35GdnQkReplication(CustomTestCase):
                 dcp_rank=13 % 8,
                 attn_dcp_rank=13 % 8,
                 pp_rank=0,
+            ),
+            patch(
+                "sglang.srt.models.qwen3_5.get_rope",
+                return_value=torch.nn.Identity(),
             ),
             torch.device("meta"),
         ):

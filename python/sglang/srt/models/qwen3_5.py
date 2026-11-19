@@ -545,22 +545,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if self.output_gate_type is not None
             else {}
         )
-        if _is_tpu:
-            # The pure-torch norm is always norm-before-gate and ungrouped, and
-            # takes no device arg (torch.get_device_module() has no TPU
-            # current_device), so those FLA-only kwargs are dropped here.
-            self.norm = RMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                dtype=config.torch_dtype,
-                **_gate_act,
-            )
-        else:
+        if _is_cuda or _is_hip:
             self.norm = RMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
                 group_size=None,
                 norm_before_gate=True,
+                dtype=config.torch_dtype,
+                **_gate_act,
+            )
+        else:
+            # Non-CUDA/HIP backends import the pure-torch RMSNormGated above,
+            # which is always norm-before-gate and ungrouped and takes no
+            # device/group_size/norm_before_gate kwargs.
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
                 dtype=config.torch_dtype,
                 **_gate_act,
             )

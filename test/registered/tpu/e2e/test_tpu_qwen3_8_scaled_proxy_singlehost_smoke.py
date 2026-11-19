@@ -50,6 +50,7 @@ register_tpu_ci(
     est_time=480,
     suite="tpu-integration",
     nightly=True,
+    disabled="manual: on-demand scaled Qwen3.8 FP8 proxy harness (https://github.com/sgl-project/sglang-torchtpu/pull/2288); run directly on 1x v7x-8",
     labels=["singlehost", "qwen3.8-max", "smoke", "dcp", "compile"],
 )
 
