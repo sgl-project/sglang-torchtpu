@@ -2,22 +2,28 @@
 GLM-5.3-Flash, tp8 on one tpu7x host (4 chips), 1M context, MTP verify.
 
 AGENTX_DUMMY=1 serves random weights (load_format dummy), as the measured runs did.
+
+MTP acceptance is forced to InferenceX's golden AL for the recipe's draft length
+(golden_al_distribution/glm-5.3-flash__mtp__native__default-default.yaml, thinking_on).
 """
 
 import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.mtp import CONFIG as MTP_CONFIG
-from benchmark.tpu.recipe.configs.glm_5_3_flash.mtp import NUM_STEPS
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import HICACHE_ARGS
 
 CONTEXT_LENGTH = 1048576
 # Decode steps whose longest request exceeds this run on the model path (1M: none do).
 MEGAKERNEL_MAX_LEN = 1048576
+# InferenceX golden acceptance length (bonus token included) per MTP draft length
+# (speculative_num_steps; draft tokens = steps + 1), SPEED-Bench coding, thinking_on.
+GOLDEN_AL = {1: 1.86, 2: 2.52, 3: 3.00, 4: 3.35, 5: 3.60, 6: 3.79, 7: 3.93, 8: 3.99}
 
 
 def agentx_config(
     *,
+    num_steps: int,
     max_running: int,
     pool_tokens: int,
     mamba_slots: int,
@@ -25,11 +31,12 @@ def agentx_config(
     hicache_ratio: float | None = None,
     state_host_ratio: float | None = None,
 ) -> dict:
-    """max_running: running-request cap (the rest queue); pool_tokens: KV pool size;
-    mamba_slots: device KDA checkpoint slots, sized for the conversations AgentX keeps
-    cached (concurrency and memory budget), independent of max_running; kv_shards:
-    attention-TP ranks that split every page of the MLA latent cache (>1: decode on
-    the model path); hicache_ratio: host tier (latent share, index keys and KDA
+    """num_steps: MTP draft steps (topk 1, num_steps + 1 draft tokens, accept length
+    forced to GOLDEN_AL[num_steps]); max_running: running-request cap (the rest
+    queue); pool_tokens: KV pool size; mamba_slots: device KDA checkpoint slots,
+    sized for the conversations AgentX keeps cached (concurrency and memory budget),
+    independent of max_running; kv_shards: attention-TP ranks that split every page
+    of the MLA latent cache; hicache_ratio: host tier (latent share, index keys and KDA
     states) as a multiple of the device pools; None: HICACHE_ARGS' ratio unsplit, no
     host tier split; state_host_ratio: host KDA states as a multiple of the device
     slots instead (SGLANG_TPU_HICACHE_STATE_RATIO)."""
@@ -53,6 +60,9 @@ def agentx_config(
             "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
             "max_total_tokens": pool_tokens,
             "max_mamba_cache_size": mamba_slots,
+            "speculative_eagle_topk": 1,
+            "speculative_num_steps": num_steps,
+            "speculative_num_draft_tokens": num_steps + 1,
             "enable_metrics": True,
             "enable_cache_report": True,
             "scheduler_recv_interval": 8,
@@ -65,12 +75,16 @@ def agentx_config(
     env.update(
         {
             "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-            # GPU parity: forced accept length 3.5 (match-expected, fixed tokens).
-            "SGLANG_SIMULATE_ACC_LEN": "3.5",
+            # Forced accept length: the golden AL, floor/ceil drawn per step with the
+            # AL as mean (match-expected); committed tokens are a fixed id.
+            "SGLANG_SIMULATE_ACC_LEN": str(GOLDEN_AL[num_steps]),
+            "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
+            "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
             "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "1",
             "SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN": str(MEGAKERNEL_MAX_LEN),
+            # The kernel caps a step at 16 rows (VMEM); larger steps run on the model.
             "SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS": str(
-                max_running * (NUM_STEPS + 1)
+                max_running * (num_steps + 1)
             ),
             # 1M context: the StreamIndex page table stays in HBM.
             "SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM": "1",
@@ -85,8 +99,6 @@ def agentx_config(
         # Off for SPMD: scattered prefill slices rows at a per-rank offset.
         args["enable_attn_tp_input_scattered"] = False
     if kv_shards > 1:
-        # The split latent cache refuses the decode megakernel.
-        env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "0"
         env["SGLANG_TPU_DSA_MLA_KV_SHARDS"] = str(kv_shards)
         if hicache_ratio is None:
             for key in HICACHE_ARGS:

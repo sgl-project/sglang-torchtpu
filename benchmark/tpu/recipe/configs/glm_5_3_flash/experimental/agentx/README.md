@@ -51,6 +51,16 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
   - Common: `hicache_io_backend raiden`, `page_first_fused`, `write_through`.
 - Megakernel at c8: the recipe asks for 64 rows (16 running x 4 MTP rows); the kernel caps a
   step at 16 rows (VMEM), so steps with more than 4 running requests run on the model path.
+- Since the golden-MTP recipes: MTP (NEXTN, topk 1) 8 steps / 9 draft tokens at c1, c4, c8
+  and the `_host` c4 / c8 variants, 3 steps / 4 draft tokens at c16 and c32; acceptance
+  forced to InferenceX's golden AL for that length (3.99 / 3.00,
+  `glm-5.3-flash__mtp__native__default-default.yaml`, thinking_on) with
+  `SGLANG_SIMULATE_ACC_METHOD=match-expected` and fixed committed tokens. The megakernel
+  runs on the split cache too, so it is on in every recipe: 9-row steps fit its 16-row cap
+  with one running request, 4-row steps with up to four.
+- `agentx_cc4_host.py` / `agentx_cc8_host.py`: the c16 host-tier config (split, 9.4M pool,
+  800 KDA slots, host 2.5x) at 4 / 8 running. Launch plans of this job's runs:
+  `launch_2460/E*.json`.
 - Prefill: chunks of 4096 tokens (`chunked_prefill_size`, `max_prefill_tokens` 4096) and
   buckets `tpu_compile_tokens` 1024, 2048, 3072, 4096 at every cc. The measured rows below
   ran 8192-token chunks with buckets 1024, 2048, 4096, 8192.
@@ -64,8 +74,7 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
 - DSA attention token split (`SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT`): off in every
   recipe. It is refused with the split cache (c16/c32). At c8 it was measured as an extra
   env (see the c8 rows).
-- Same at every cc: context 1,048,576, page 128, fp8 KV, MTP (NEXTN, 3 steps, 4 draft
-  tokens), ep 1, `SGLANG_SIMULATE_ACC_LEN=3.5`, `SGLANG_TPU_DSA_KPOOL_RAW_RING=1`,
+- Same at every cc: context 1,048,576, page 128, fp8 KV, ep 1, `SGLANG_TPU_DSA_KPOOL_RAW_RING=1`,
   `SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM=1`, megakernel max len 1,048,576,
   scheduler thread pinning, `scheduler_recv_interval 8`.
 
