@@ -16,7 +16,7 @@ from sglang_tpu.hooks.all_gather_via_all_reduce import (
     gather_attn_tp_logits,
     wrap_logits_gatherer,
 )
-from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
+from sglang_tpu.hooks.attn_residual import block_major_bank, register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.dflash_mla import (
@@ -195,6 +195,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
         register_attn_residual_ops,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.attn_residual.AttnResidual.__init__",
+        block_major_bank,
         HookType.AFTER,
     ),
     (
