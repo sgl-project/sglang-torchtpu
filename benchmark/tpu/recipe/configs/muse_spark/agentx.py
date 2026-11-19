@@ -118,7 +118,7 @@ MK_PREFILL_ENV = {
 }
 
 
-# MOE_MODE=ep: the env PR #2231's _check_ep_serving requires; KPERM and the e4m3 prefill
+# MOE_MODE=ep: the env PR #2231's _validate_ep_serving requires; KPERM and the e4m3 prefill
 # gathers are TP-layout knobs the EP programs refuse.
 EP_ENV = {
     "SGLANG_TPU_MUSE_MOE_MODE": "ep",
