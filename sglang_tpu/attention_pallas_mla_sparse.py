@@ -407,9 +407,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
         from sglang_tpu.attention_pallas_mla_kv_shard import build_kv_shard_attention_op
 
-        # Twice a rank's mean share of a row; tokens holding more run more slices.
+        # A rank's mean share of a row plus headroom (twice the share at 8 shards,
+        # share + 384 at 2); tokens holding more run more slices.
         share = -(-self._topk // self.mla_shards)
-        width = -(-2 * share // 128) * 128
+        width = -(-min(2 * share, share + 384) // 128) * 128
         self._kv_shard_owned_op = build_kv_shard_attention_op(
             zero_rope=self._zero_rope,
             gather_chunk_tokens=QBLOCK_GATHER_CHUNK_TOKENS,

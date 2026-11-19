@@ -430,10 +430,9 @@ class TestSplitValidator(CustomTestCase):
     def test_admits_the_host_tier(self):
         self._validate(self._cfg())
 
-    def test_token_split_needs_one_group(self):
-        self._validate(self._cfg(), token_split=True)
-        with self.assertRaisesRegex(ValueError, "TOKEN_SPLIT"):
-            self._validate(self._cfg(), shards=4, token_split=True)
+    def test_token_split_admits_every_group_size(self):
+        for shards in (2, 4, 8):
+            self._validate(self._cfg(), shards=shards, token_split=True)
 
     def test_megakernel_needs_every_rank_and_16_token_shares(self):
         self._validate(self._cfg(), megakernel=True)  # host tier on
