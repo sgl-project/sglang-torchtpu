@@ -2243,6 +2243,15 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
     """A HiCache load-back writes pool rows on its own stream; the gather
     reads them directly, not through the waiting getters, so it waits first."""
 
+    def setUp(self):
+        # The pool waits on torch.accelerator.current_stream() (#2094).
+        self.current_stream = None
+        patcher = unittest.mock.patch.object(
+            torch.accelerator, "current_stream", lambda *_: self.current_stream
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _pool(self, events, counter, multicast_gather=None):
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
@@ -2327,6 +2336,7 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _multicast_gather=SimpleNamespace(chain=chain),
             _prefetch_layer=lambda layer_id: events.append(("prefetch", layer_id)),
         )
+        self.current_stream = current
         self.assertIs(PageInterleaveKVPoolMixin._acquire_slot_for_read(pool, 3), slot)
         self.assertEqual(events, [("wait", 7, current), ("prefetch", 4)])
 

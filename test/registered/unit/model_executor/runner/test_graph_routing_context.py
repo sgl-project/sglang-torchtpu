@@ -197,6 +197,10 @@ class TestGraphRoutingContext(CustomTestCase):
             synchronize=lambda: None,
             is_current_stream_capturing=lambda: False,
         )
+        # The breakable graph reads torch.accelerator.current_stream() (#2094).
+        accel = patch.object(torch.accelerator, "current_stream", lambda *_: stream)
+        accel.start()
+        self.addCleanup(accel.stop)
         runner.backend = BreakableCudaGraphBackend(runner, debug_eager=True)
         runner.can_run_graph = lambda batch: True
 

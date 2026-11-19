@@ -61,6 +61,8 @@ def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypa
     monkeypatch.setattr(
         bcg, "get_device_module", lambda: SimpleNamespace(current_stream=lambda: None)
     )
+    # replay() reads torch.accelerator.current_stream() (#2094).
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda *_: None)
     x.fill_(4)
     with set_forward_batch(SimpleNamespace(scale=5)):
         graph.replay()

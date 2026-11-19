@@ -185,6 +185,8 @@ class TestPPCommOverlap(CustomTestCase):
         with (
             published_topology(role="scheduler", pp_size=2, tp_size=tp_size),
             patch.object(pp_mod, "_is_npu", True),
+            # The PP mixin fences on torch.accelerator.current_stream() (#2094).
+            patch.object(torch.accelerator, "current_stream", lambda *_: stream),
             pp_mod.envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(False),
             patch.multiple(
                 torch.distributed,

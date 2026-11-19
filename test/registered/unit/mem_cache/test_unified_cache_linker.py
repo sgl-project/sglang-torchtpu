@@ -2479,9 +2479,13 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.broadcast_loads = {3: (0, "prepared", ready)}
         device = MagicMock(name="device_module")
         device.current_stream.return_value = order.stream
-        with patch(
-            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
-            device,
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+                device,
+            ),
+            # The broadcast waits on torch.accelerator.current_stream() (#2094).
+            patch.object(torch.accelerator, "current_stream", lambda *_: order.stream),
         ):
             linker._broadcast_loaded_layers(3, 0)
             linker._broadcast_loaded_layers(3, 1)
