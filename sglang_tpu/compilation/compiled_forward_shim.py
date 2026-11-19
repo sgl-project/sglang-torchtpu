@@ -893,6 +893,17 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
     snapshot_recompilation_baseline()
 
 
+# Eager callbacks run before every compiled forward call, outside Dynamo. Each
+# empties per-forward Python state that the traced code reads, so every trace
+# and every call start from the same state instead of recompiling on it.
+_EAGER_RESETS: list[Callable[[], None]] = []
+
+
+def register_eager_reset(fn: Callable[[], None]) -> None:
+    if fn not in _EAGER_RESETS:
+        _EAGER_RESETS.append(fn)
+
+
 class _SkipGuardStance:
     """Run a serving-time decode with Dynamo's skip_guard_eval_unsafe stance.
 
@@ -1069,6 +1080,8 @@ class CompiledForwardShim:
         # its lifecycle state and recompile on the first real reload.
         if not torch.compiler.is_compiling():
             self.wait_for_hicache_reload()
+            for reset in _EAGER_RESETS:
+                reset()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as different

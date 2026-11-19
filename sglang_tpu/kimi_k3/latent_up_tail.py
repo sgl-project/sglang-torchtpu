@@ -51,6 +51,19 @@ def active() -> bool:
     return _ACTIVE
 
 
+def reset() -> None:
+    """Empty the per-forward state; runs eagerly before each compiled forward.
+
+    A forward leaves its last aggregation in ``_STATE.agg``. Dynamo traces
+    record_aggregation's ``agg.clear()`` against the state the list had at
+    trace time, so a forward that starts from another state fails that guard
+    and recompiles (the first prefill after the decode warmups did, ~2 min).
+    """
+    _STATE.agg.clear()
+    _STATE.pending.clear()
+    _STATE.normed.clear()
+
+
 def record_aggregation(bank: torch.Tensor, nvb: int) -> None:
     _STATE.agg.clear()
     _STATE.agg.append((bank, nvb))
@@ -219,4 +232,8 @@ def bind(layers, layout) -> int:
         )
         count += 1
     _ACTIVE = count > 0
+    if _ACTIVE:
+        from sglang_tpu.compilation.compiled_forward_shim import register_eager_reset
+
+        register_eager_reset(reset)
     return count
