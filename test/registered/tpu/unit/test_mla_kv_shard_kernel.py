@@ -6,6 +6,11 @@ its offsets of every page.
 One TPU plays every rank of a group: each attends the group's heads over its
 own candidates from its own cache, as serving does after the query all-gather.
 A prefill step is followed by a decode step on the caches it wrote.
+
+The token split's owned-row prefill (owned_width) runs a 1024-token chunk at a
+20k context and a 256-token chunk whose picks all sit in one rank's offsets
+(that rank runs every further slice), with partial pages and padding tokens,
+against the unsharded step and the whole-row split step.
 """
 
 import os
@@ -13,7 +18,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"
@@ -28,6 +33,8 @@ import numpy as np
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.pallas.mla_sparse import kv_shard
 from sglang_tpu.attention.pallas.mla_sparse_fused import (
+    QBLOCK_GATHER_CHUNK_TOKENS,
+    _store_step,
     sparse_mla_attention_fused,
     sparse_mla_attention_kv_shard,
 )
@@ -56,19 +63,22 @@ def _rows(rng, starts, lens, width):
     return rows
 
 
-def _step_inputs(rng, tokens):
+def _step_inputs(rng, tokens, zero_rope=False):
+    rope = 0.0 if zero_rope else 1.0
     return (
         jnp.asarray(rng.normal(size=(tokens, HEADS, 512)), jnp.bfloat16),
-        jnp.asarray(rng.normal(size=(tokens, HEADS, 64)), jnp.bfloat16),
+        jnp.asarray(rope * rng.normal(size=(tokens, HEADS, 64)), jnp.bfloat16),
         jnp.asarray(rng.normal(size=(tokens, 512)).astype(ml_dtypes.float8_e4m3fn)),
-        jnp.asarray(rng.normal(size=(tokens, 64)).astype(ml_dtypes.float8_e4m3fn)),
+        jnp.asarray(
+            (rope * rng.normal(size=(tokens, 64))).astype(ml_dtypes.float8_e4m3fn)
+        ),
     )
 
 
-def _caches(page):
+def _caches(page, num_pages=NUM_PAGES):
     return (
-        jnp.zeros((NUM_PAGES, page, 4, 128), jnp.uint8),
-        jnp.zeros((NUM_PAGES, page // 4, 4, 128), jnp.uint8),
+        jnp.zeros((num_pages, page, 4, 128), jnp.uint8),
+        jnp.zeros((num_pages, page // 4, 4, 128), jnp.uint8),
     )
 
 
@@ -125,6 +135,87 @@ class TestMlaKvShardKernel(CustomTestCase):
         for shards in (2, 8):
             with self.subTest(shards=shards):
                 self._check(shards)
+
+    def _check_owned(self, zero_rope):
+        shards, topk, width, pps = 8, 512, 640, 168
+        sub = PAGE // shards
+        rng = np.random.default_rng(11 + zero_rope)
+        num_pages = 2 * pps + 1
+        page_indices = jnp.asarray(rng.permutation(np.arange(1, num_pages)), jnp.int32)
+        prefix, new = [20000, 4096], [1024, 256]
+        kv_lens = jnp.asarray([p + n for p, n in zip(prefix, new)], jnp.int32)
+        cu = jnp.asarray([0, new[0], sum(new)], jnp.int32)
+        dist = jnp.asarray([0, 2, 2], jnp.int32)
+        tokens = sum(new) + 256  # 256 padding tokens
+        caches = [_caches(PAGE, num_pages)] + [
+            _caches(sub, num_pages) for _ in range(shards)
+        ]
+        # The prefixes, stored by every cache's writer.
+        pre_cu = jnp.asarray([0, prefix[0], sum(prefix)], jnp.int32)
+        kv_c = jnp.asarray(
+            rng.normal(size=(sum(prefix), 512)).astype(ml_dtypes.float8_e4m3fn)
+        )
+        k_pe = jnp.zeros((sum(prefix), 64), jnp.float8_e4m3fn)
+        if not zero_rope:
+            k_pe = jnp.asarray(
+                rng.normal(size=(sum(prefix), 64)).astype(ml_dtypes.float8_e4m3fn)
+            )
+        for i, cache in enumerate(caches):
+            shard = None if i == 0 else (shards, i - 1)
+            caches[i] = _store_step(
+                *cache, kv_c, k_pe, jnp.asarray(prefix, jnp.int32), page_indices,
+                pre_cu, dist, write_rope=not zero_rope, kv_shards=shard,
+            )  # fmt: skip
+        # Seq 0 picks pools anywhere; seq 1 only pools at rank 0's offsets.
+        rows = np.full((tokens, width), -1, np.int32)
+        for t in range(sum(new)):
+            seq = int(t >= new[0])
+            pos = prefix[seq] + t - seq * new[0]
+            closed = (pos + 1) // KPOOL
+            pools = np.arange(closed)
+            if seq:
+                pools = pools[(pools * KPOOL % PAGE) // sub == 0]
+            pick = rng.choice(pools, size=min(len(pools), topk // KPOOL), replace=False)
+            toks = [p * KPOOL + j for p in pick for j in range(KPOOL)]
+            toks += list(range(closed * KPOOL, pos + 1))
+            rows[t, : len(toks)] = toks
+        rows = jnp.asarray(rows)
+        args = _step_inputs(rng, tokens, zero_rope)
+        meta = (kv_lens, page_indices, cu, dist, rows)
+        want, *_ = jax.jit(
+            lambda *a: sparse_mla_attention_fused(
+                *a, sm_scale=SM_SCALE, k_scale=1.0, zero_rope=zero_rope,
+                gather_chunk_tokens=QBLOCK_GATHER_CHUNK_TOKENS,
+            )
+        )(*args, *caches[0], *meta)  # fmt: skip
+        want = np.asarray(want, np.float32)[: sum(new)]
+        merged = {}
+        for owned_width in (0, 64, 128):
+            outs, lses = [], []
+            for role in range(shards):
+                out, lse, *_ = jax.jit(
+                    lambda *a, role=role: sparse_mla_attention_kv_shard(
+                        *a, sm_scale=SM_SCALE, k_scale=1.0, shards=shards,
+                        role=role, kpool=KPOOL, zero_rope=zero_rope,
+                        gather_chunk_tokens=QBLOCK_GATHER_CHUNK_TOKENS,
+                        owned_width=owned_width,
+                    )
+                )(*args, *caches[role + 1], *meta)  # fmt: skip
+                outs.append(out.astype(jnp.float32))
+                lses.append(lse)
+            got = kv_shard.merge_partials(jnp.stack(outs), jnp.stack(lses))
+            merged[owned_width] = np.asarray(got)[: sum(new)]
+        for owned_width, got in merged.items():
+            for name, ref in (("unsharded", want), ("whole-row split", merged[0])):
+                diff = np.abs(got - ref)
+                msg = f"owned_width {owned_width} vs {name}"
+                self.assertLess(float(diff.max()), MAX_ABS, msg)
+                self.assertLess(float(diff.mean()), MEAN_ABS, msg)
+
+    def test_owned_rows_match_whole_rows(self):
+        for zero_rope in (False, True):
+            with self.subTest(zero_rope=zero_rope):
+                self._check_owned(zero_rope)
 
 
 if __name__ == "__main__":

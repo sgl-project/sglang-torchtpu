@@ -25,10 +25,11 @@ which is meant to gather keys faster.
 import jax
 import jax.numpy as jnp
 
-from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
+from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils, kv_shard
 from sglang_tpu.attention.pallas.mla_sparse.kernel import (
     DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
     TENSORCORE_CACHE_LAYOUT,
+    sparse_attention_owned_rows,
     sparse_ragged_paged_attention,
 )
 from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
@@ -299,11 +300,16 @@ def sparse_mla_attention_kv_shard(
     kpool: int = 1,
     zero_rope: bool = False,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    owned_width: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``sparse_mla_attention_fused`` on a latent cache split inside every page
     (mla_sparse/kv_shard.py): store the step's tokens at this rank's offsets,
     then attend this rank's candidates (``kpool`` consecutive entries of a row
     share a pool, which lies inside one rank's offsets).
+
+    ``owned_width`` > 0 (SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT prefill)
+    packs each row's own entries first and gathers ``owned_width`` slots per
+    token instead of the whole row (``sparse_attention_owned_rows``), exactly.
 
     Returns ``(output, lse, cache_nope, cache_rope)``: the partial output
     ``[max_num_tokens, group_heads, 512]`` normalized over this rank's
@@ -321,6 +327,36 @@ def sparse_mla_attention_kv_shard(
         write_rope=not zero_rope,
         kv_shards=(shards, role),
     )
+    num_tokens, width = topk_indices.shape
+    chunk = min(gather_chunk_tokens, max(64, num_tokens))
+    group = max(kpool, 1)
+    padded = -(-width // group) * group
+    if 0 < owned_width < padded and num_tokens % chunk == 0:
+        rows = kv_shard.owned_rows(
+            topk_indices,
+            page_size=cache_nope.shape[1] * shards,
+            shards=shards,
+            role=role,
+            group=group,
+            out_width=-(-padded // owned_width) * owned_width,
+        )
+        out, lse = sparse_attention_owned_rows(
+            ql_nope,
+            q_pe,
+            cache_nope,
+            cache_rope,
+            rows,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            shards=shards,
+            width=owned_width,
+            chunk=chunk,
+            gather_rope=not zero_rope,
+        )
+        return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
     out, lse = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),
         cache_nope,
@@ -332,9 +368,7 @@ def sparse_mla_attention_kv_shard(
         sm_scale=sm_scale,
         k_scale=k_scale,
         cache_layout=TENSORCORE_CACHE_LAYOUT,
-        gather_and_attention_chunk_size=min(
-            gather_chunk_tokens, max(64, ql_nope.shape[0])
-        ),
+        gather_and_attention_chunk_size=chunk,
         gather_rope=not zero_rope,
         return_lse=True,
         kv_shards=(shards, role, kpool),

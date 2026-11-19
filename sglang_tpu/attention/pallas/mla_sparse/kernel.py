@@ -29,6 +29,9 @@ from sglang_tpu.attention.pallas.mla_sparse import (
     kv_cache_utils,
     native_sc_gather,
 )
+from sglang_tpu.attention.pallas.mla_sparse.kv_shard import (
+    merge_two as kv_shard_merge_two,
+)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -1150,6 +1153,152 @@ def sparse_ragged_paged_attention(
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
     return out
+
+
+def _owned_physical_indices(
+    rows: jax.Array,  # i32[tokens, width]; this rank's positions, then -1
+    seq_ids: jax.Array,  # i32[tokens]
+    page_indices: jax.Array,
+    *,
+    sub_page: int,
+    shards: int,
+    total_num_pages: int,
+    max_num_seqs: int,
+    flat_base: jax.Array | int = 0,
+) -> tuple[jax.Array, jax.Array]:
+    """(kv_lens, flat rows of this rank's cache share) for rows of owned entries."""
+    is_padding = rows < 0
+    page_ids = gather_page_ids(
+        page_indices, rows // (sub_page * shards), seq_ids, max_num_seqs
+    )
+    flat = flat_base + jnp.arange(rows.size, dtype=jnp.int32).reshape(rows.shape)
+    page_ids = jnp.where(is_padding, _spread(flat * 104729, total_num_pages), page_ids)
+    offset = jnp.where(is_padding, _spread(flat * 15485863, sub_page), rows % sub_page)
+    kv_lens = jnp.sum(~is_padding, axis=-1)
+    return kv_lens, (page_ids * sub_page + offset).astype(jnp.int32)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("sm_scale", "k_scale", "shards", "width", "chunk", "gather_rope"),
+)
+def sparse_attention_owned_rows(
+    ql_nope: jax.Array,  # [max_num_tokens, heads, 512]
+    q_pe: jax.Array,  # [max_num_tokens, heads, 64]
+    cache_kv_nope: jax.Array,  # u8[pages, page_size // shards, 4, 128]
+    cache_kv_rope: jax.Array,
+    rows: jax.Array,  # i32[max_num_tokens, passes * width]; kv_shard.owned_rows
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float,
+    k_scale: float,
+    shards: int,
+    width: int,
+    chunk: int,
+    gather_rope: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Tensorcore-layout attention over this rank's entries of a split cache
+    (``kv_shards``), gathering ``width`` slots per token instead of the whole row.
+
+    Every chunk of ``chunk`` tokens attends its first ``width`` entries; a chunk
+    whose tokens hold more runs further ``width``-slices and merges them by
+    log-sum-exp. Returns ``(output [T, heads, 576], lse f32[T, heads])``.
+    """
+    num_tokens, heads, _ = ql_nope.shape
+    head_dim = ql_nope.shape[-1] + q_pe.shape[-1]
+    if num_tokens % chunk:
+        raise ValueError(f"{num_tokens} tokens are not whole {chunk}-token chunks")
+    if rows.shape[1] % width:
+        raise ValueError(f"row width {rows.shape[1]} is not whole {width}-slices")
+    sub_page = cache_kv_nope.shape[1]
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    ).astype(jnp.int32)
+    token_end = cu_q_lens[distribution[2]]
+    lookup = functools.partial(
+        _owned_physical_indices,
+        page_indices=page_indices,
+        sub_page=sub_page,
+        shards=shards,
+        total_num_pages=cache_kv_nope.shape[0],
+        max_num_seqs=max_num_seqs,
+    )
+    attend = functools.partial(
+        sparse_attention_chunk,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        small_chunk_tokens=16,
+        small_chunk_batch_size=1,
+        small_chunk_live_gather=True,
+        live_gather_all_chunks=True,
+        topk_override=width,
+        gather_rope=gather_rope,
+    )
+
+    def q_of(start, size):
+        part = lambda x: lax.dynamic_slice_in_dim(x, start, size)  # noqa: E731
+        return prepare_q_inputs(jnp.concatenate([part(ql_nope), part(q_pe)], axis=-1))
+
+    q = q_of(0, num_tokens)
+    q_heads = q.shape[1]
+    floor = jnp.finfo(jnp.float32).min
+    lse = jnp.full((num_tokens, q_heads, 1), floor, jnp.float32)
+    kv_lens, physical = lookup(rows[:, :width], seq_ids)
+    for start in range(0, num_tokens, chunk):
+        q, lse = attend(
+            q, cache_kv_nope, cache_kv_rope, kv_lens, physical, lse,
+            start_pos=start, end_pos=start + chunk, token_end=token_end,
+        )  # fmt: skip
+
+    passes = rows.shape[1] // width
+    if passes > 1:
+        counts = jnp.sum(rows >= 0, axis=-1)
+
+        def chunk_body(c, carry):
+            start = c * chunk
+            most = jnp.max(lax.dynamic_slice_in_dim(counts, start, chunk))
+            need = (most + width - 1) // width  # slices this chunk's tokens reach
+            seq = lax.dynamic_slice_in_dim(seq_ids, start, chunk)
+            end = jnp.clip(token_end - start, 0, chunk)
+
+            def pass_body(state):
+                p, out, lse = state
+                part_rows = lax.dynamic_slice(rows, (start, p * width), (chunk, width))
+                part_lens, part_physical = lookup(
+                    part_rows, seq, flat_base=(p * num_tokens + start) * width
+                )
+                part_out, part_lse = attend(
+                    q_of(start, chunk), cache_kv_nope, cache_kv_rope, part_lens,
+                    part_physical,
+                    jnp.full((chunk, q_heads, 1), floor, jnp.float32),
+                    start_pos=0, end_pos=chunk, token_end=end,
+                )  # fmt: skip
+                merged_out, merged_lse = kv_shard_merge_two(
+                    lax.dynamic_slice_in_dim(out, start, chunk),
+                    lax.dynamic_slice_in_dim(lse, start, chunk),
+                    part_out,
+                    part_lse,
+                )
+                out = lax.dynamic_update_slice_in_dim(out, merged_out, start, 0)
+                lse = lax.dynamic_update_slice_in_dim(lse, merged_lse, start, 0)
+                return p + 1, out, lse
+
+            _, out, lse = lax.while_loop(
+                lambda state: state[0] < need, pass_body, (jnp.int32(1), *carry)
+            )
+            return out, lse
+
+        q, lse = lax.cond(
+            jnp.max(counts) > width,
+            lambda carry: lax.fori_loop(0, num_tokens // chunk, chunk_body, carry),
+            lambda carry: carry,
+            (q, lse),
+        )
+    return prepare_outputs(q, heads, head_dim), lse[:, :heads, 0]
 
 
 def _spread(hashed: jax.Array, bound: int) -> jax.Array:

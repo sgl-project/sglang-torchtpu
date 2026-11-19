@@ -121,7 +121,9 @@ class TpuEnvs:
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
     # moves queries and outputs, and the rows' all-reduce is skipped. Prefill
-    # batches of the per-query kernel; attention TP must span the world.
+    # batches of the per-query kernel; attention TP must span the world. With
+    # SGLANG_TPU_DSA_MLA_KV_SHARDS each row is already attended by its owner, so
+    # prefill gathers only each rank's own entries of a row instead of all of it.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
