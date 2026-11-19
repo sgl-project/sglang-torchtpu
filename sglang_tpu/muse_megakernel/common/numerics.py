@@ -83,7 +83,7 @@ def _topk_iter(scores, k):
     R, E = scores.shape
     idx = jax.lax.broadcasted_iota(jnp.int32, (R, E), 1)
     route = tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROUTE.get()
-    if route:
+    if route and route != "relabel":
         scores = _dev_route_scores(scores, idx, fixed=route == "fixed")
     ids, picks = [], []
     for _ in range(k):
@@ -96,11 +96,35 @@ def _topk_iter(scores, k):
             # one pick per EP rank group: drop the picked expert's whole group
             pick = idx // (E // _DEV_ROUTE_GROUPS) == sel // (E // _DEV_ROUTE_GROUPS)
         scores = jnp.where(pick, -jnp.inf, scores)
+    if route == "relabel":
+        ids = _dev_relabel(ids, picks, E)
     return ids, picks
 
 
-# SGLANG_TPU_MUSE_MK_DEV_ROUTE=balanced assumes 8 EP ranks (one host)
+# SGLANG_TPU_MUSE_MK_DEV_ROUTE=balanced / relabel assume 8 EP ranks (one host)
 _DEV_ROUTE_GROUPS = 8
+
+
+def _dev_relabel(ids, picks, E: int):
+    """The step's top-k with experts moved, not re-picked: the j-th expert any row hit goes to
+    rank j % groups, slot j // groups, so each rank holds ceil(hit / groups) of them; rows that
+    share an expert still share one, and the weights (picks) are the model's."""
+    f32 = jnp.float32
+    hit = jnp.max(sum(p.astype(f32) for p in picks), axis=0, keepdims=True)  # [1, E]
+    hit = jnp.minimum(hit, 1.0)
+    r = jax.lax.broadcasted_iota(jnp.int32, (E, E), 0)
+    c = jax.lax.broadcasted_iota(jnp.int32, (E, E), 1)
+    before = jnp.dot(
+        hit, (r < c).astype(f32), precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=f32,
+    )  # [1, E]: hit experts below each lane
+    j = before.astype(jnp.int32)
+    g = E // _DEV_ROUTE_GROUPS
+    new_id = ((j % _DEV_ROUTE_GROUPS) * g + j // _DEV_ROUTE_GROUPS).astype(f32)  # [1, E]
+    return [
+        jnp.sum(jnp.where(p, new_id, 0.0), axis=1, keepdims=True).astype(jnp.int32)
+        for p in picks
+    ]
 
 
 def _dev_route_scores(scores, idx, *, fixed: bool = False):
