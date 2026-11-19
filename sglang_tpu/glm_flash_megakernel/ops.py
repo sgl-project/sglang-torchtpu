@@ -105,8 +105,11 @@ def require_expert_tp(ep_size: int) -> None:
 _MAX_ROWS = 16
 
 
-def _buckets(max_req: int) -> list[int]:
-    """Request-count buckets 1, 2, 4, ... up to max_req."""
+def _buckets(max_req: int, batch_sizes=None) -> list[int]:
+    """Request-count buckets: the server's decode batch sizes up to max_req (a step
+    pads to the next one, as the model path does), else 1, 2, 4, ... max_req."""
+    if batch_sizes:
+        return sorted({min(b, max_req) for b in batch_sizes if b >= 1} | {max_req})
     out, b = [], 1
     while b < max_req:
         out.append(b)
@@ -125,6 +128,7 @@ class GlmFlashMegakernel:
         backend,
         call_rows: int | None = None,
         max_requests: int | None = None,
+        batch_sizes: list[int] | None = None,
     ):
         import jax
         from jax.sharding import NamedSharding
@@ -215,7 +219,7 @@ class GlmFlashMegakernel:
                 raw_ring_pages_cnt=self.raw_ring_pages_cnt,
             )
 
-        self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
+        self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req, batch_sizes)}
         cfg0 = next(iter(self.cfgs.values()))
         weights = build_weights(model, spec, layout, cfg0, tp, rank)
         # Packing leaves dtype and shape views, which every call would re-materialise.
