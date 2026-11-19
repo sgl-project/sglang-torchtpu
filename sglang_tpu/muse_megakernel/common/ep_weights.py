@@ -112,7 +112,7 @@ def _fp4_to_ep(experts: torch.nn.Module, chunk: int) -> None:
     new13 = _materialize_packed_fp4(torch.cat(slabs))
     s13 = experts.w13_weight_scale.data.to(torch.bfloat16).index_select(2, cols)
     _wait_for(new13, s13)
-    copy_or_rebind_param(experts, "w13_weight", new13)
+    experts.w13_weight.data = new13
     copy_or_rebind_param(experts, "w13_weight_scale", s13.contiguous())
     del slabs, new13, s13, u13, w13
     w2 = _materialize_packed_fp4(_rows(experts.w2_weight.data.view(torch.uint8), kp_i))
@@ -137,22 +137,18 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
     dev = w13.device
     kp_he = _index(kperm(he), dev)
     cols = _index(chunk_cols(two_i, chunk), dev)
-    u13 = w13.view(torch.uint8)
-    permuted = torch.cat(
+    # Gathered in fp8, not through a uint8 view: TorchTPU 0.2 keeps any tensor derived from
+    # a dtype view (even cloned or copy_'d into an fp8 buffer) bound to the uint8 buffer and
+    # runs an eager as_strided bitcast of the 1 GiB slab before every compiled call.
+    new13 = torch.cat(
         [
-            _rows(u13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
-            for e0 in range(0, u13.shape[0], _EXPERT_CHUNK)
+            _rows(w13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
+            for e0 in range(0, w13.shape[0], _EXPERT_CHUNK)
         ]
     )
-    # Viewed as fp8 on CPU, then uploaded: a device-side dtype view (or a copy from one) stays
-    # an alias of the u8 slab, and every forward re-runs the bitcast (as_strided, 1 GiB).
-    new13 = permuted.to("cpu").view(torch.float8_e4m3fn).to(device=dev)
-    del permuted
-    torch.accelerator.synchronize()
     s13 = _channel_scales(experts.w13_weight_scale.data).index_select(2, cols)
     s2 = _channel_scales(experts.w2_weight_scale.data)
     _wait_for(new13, s13, s2)
-    # The uploaded leaf itself, not a copy into the old buffer.
     experts.w13_weight.data = new13
     copy_or_rebind_param(experts, "w13_weight_scale", s13.contiguous())
     copy_or_rebind_param(experts, "w2_weight_scale", s2)
