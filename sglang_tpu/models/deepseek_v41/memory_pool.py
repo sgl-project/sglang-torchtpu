@@ -41,7 +41,11 @@ from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import ceil_div
 from sglang_tpu.dsv4.dsv4_memory_pool import _zeros_kv_buffer
 from sglang_tpu.models.deepseek_v41.request_window import (
+    RESERVED_PAGES,
+    RING_PAGES,
+    RING_TOKENS,
     DSV41TPURequestWindow,
+    ring_rows,
     window_buffer_pages,
 )
 
@@ -406,11 +410,22 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 **kwargs,
             )
         assert not self._swa_pool_pending, "the core pool built no SWA pool"
+        if self.swa_req_ring_size is not None:
+            # The attention backend builds the draft's SWA table on the host.
+            self.swa_req_ring_valid_from = torch.zeros(
+                self.num_req_slots, dtype=torch.int64
+            )
+        if self.request_window is not None:
+            swa_storage = "request window"
+        elif self.swa_req_ring_size is not None:
+            swa_storage = "draft ring"
+        else:
+            swa_storage = "paged"
         logger.info(
             "DSV41 TPU pool: swa_pages64=%d (%s), sources=%s, main_records=%s, "
             "index_pages=%s",
             self._swa_storage().num_pages,
-            "request window" if self.request_window is not None else "paged",
+            swa_storage,
             self.sources_by_ratio,
             {r: p.num_records for r, p in self.kv_pools.items() if p is not None},
             {r: p.layout.pages for r, p in self.index_pools.items()},
@@ -479,6 +494,11 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         assert global_page_size == FULL_PAGE_TOKENS
         if self._swa_pool_pending:
             self._swa_pool_pending = False
+            if self.swa_req_ring_size is not None:
+                # The draft ring takes the request window's layout: RING_PAGES
+                # pages per slot after the reserved ones (num_swa_pages64 adds them).
+                assert self.swa_req_ring_size <= RING_TOKENS, self.swa_req_ring_size
+                size = self.num_req_slots * RING_TOKENS
             return DSV41TPUSWAKVPool(
                 size=size,
                 layer_num=layer_num,
@@ -545,6 +565,24 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # ------------------------------------------------------------------ #
     # Kernel buffer accessors (absolute layer ids)
     # ------------------------------------------------------------------ #
+
+    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+        self.swa_req_ring_valid_from[slots.cpu()] = valid_from.cpu()
+
+    def swa_ring_rows(
+        self,
+        *,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+        ends: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """int64 draft ring rows of (slot, position), broadcast. With ``ends`` (each
+        token's request end), -1 where a later token of one write takes the row."""
+        positions = positions.to(torch.int64)
+        rows = ring_rows(slots.to(torch.int64), positions)
+        if ends is None:
+            return rows
+        return torch.where(positions >= ends - RING_TOKENS, rows, -1)
 
     def get_swa_pages(self, layer_id: int) -> torch.Tensor:
         """bf16 [num_swa_pages64, 64, 512]."""
@@ -702,6 +740,22 @@ def window_bytes(*, num_slots: int, chunk_tokens: int, num_layers: int) -> int:
     return pages * SWA_PAGE_TOKENS * SWA_BYTES_PER_TOKEN * num_layers
 
 
+def init_tpu_dsv41_pool_configurator(original, configurator, kvc) -> None:
+    """AROUND DSV4PoolConfigurator.__init__: keep the DSpark draft's ring layer
+    count, which core computes as a local, for get_tpu_dsv41_swa_fixed_bytes."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import uses_draft_swa_ring
+
+    original(configurator, kvc)
+    draft_layers = 0
+    if configurator.encoder_replay and kvc.spec_algorithm.is_dspark():
+        draft_layers = int(kvc.spec_aux_config.dflash_draft_num_layers or 0)
+    # Same rule as core: a ring-kept draft is all the draft layers not paged.
+    configurator.draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
+    assert (
+        configurator.paged_draft_layers == draft_layers - configurator.draft_ring_layers
+    )
+
+
 def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
     """AROUND DSV4PoolConfigurator._get_swa_fixed_bytes: price the request window
     as the TPU window's bf16 pages instead of core's FlashMLA-packed rows."""
@@ -716,7 +770,14 @@ def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
         chunk_tokens=get_schedule().chunked_prefill_size,
         num_layers=configurator.num_layers_total,
     )
-    return fixed - configurator.request_window_bytes + tpu_window
+    slots = configurator.requested_max_running_requests_per_worker + 1
+    draft_ring = (
+        (RESERVED_PAGES + RING_PAGES * slots)
+        * SWA_PAGE_TOKENS
+        * SWA_BYTES_PER_TOKEN
+        * configurator.draft_ring_layers
+    )
+    return fixed - configurator.request_window_bytes + tpu_window + draft_ring
 
 
 def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
@@ -731,8 +792,7 @@ def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
 
     # Wraps every model's sizing; ModelConfig sets compress_ratios only for V4.
     if (
-        kvc.is_draft_worker
-        or kvc.device != "tpu"
+        kvc.device != "tpu"
         or not is_deepseek_v4(kvc.model_config.hf_config)
         or not uses_dsv41_pool(kvc.model_config.compress_ratios)
         or not get_exec().features.enable_encoder_swa_bounded_replay

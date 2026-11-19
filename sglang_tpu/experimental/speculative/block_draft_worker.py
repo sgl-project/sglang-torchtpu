@@ -109,6 +109,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         """Host full-to-SWA slot map when the draft KV lives in the SWA sub-pool, else None."""
         pool = self.model_runner.token_to_kv_pool
         allocator = self.model_runner.token_to_kv_pool_allocator
+        if self.swa_ring_pool is not None:
+            return None
         if isinstance(pool, DeepSeekV4TokenToKVPool):
             # Every DeepSeek-V4 draft stage is an SWA layer.
             return allocator.full_to_swa_index_mapping
@@ -116,6 +118,19 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             return None
         assert isinstance(allocator, SWATokenToKVPoolAllocator), type(allocator)
         return pool.full_to_swa_index_mapping
+
+    @property
+    def swa_ring_pool(self):
+        """The DeepSeek-V4.1 draft pool when its SWA KV is a per-request ring, else None."""
+        from sglang_tpu.models.deepseek_v41.memory_pool import DSV41TPUTokenToKVPool
+
+        pool = self.model_runner.token_to_kv_pool
+        if (
+            isinstance(pool, DSV41TPUTokenToKVPool)
+            and pool.swa_req_ring_size is not None
+        ):
+            return pool
+        return None
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(

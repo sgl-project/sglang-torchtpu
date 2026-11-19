@@ -66,7 +66,7 @@ def window_buffer_pages(*, num_slots: int, chunk_tokens: int) -> int:
     )
 
 
-def _ring_rows(slots: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+def ring_rows(slots: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     page = (
         RESERVED_PAGES + slots * RING_PAGES + positions // SWA_PAGE_TOKENS % RING_PAGES
     )
@@ -144,13 +144,13 @@ def extend_window_pages(
     history_dst = torch.where(
         history_ok, page * SWA_PAGE_TOKENS + safe % SWA_PAGE_TOKENS, -1
     )
-    history_src = torch.where(history_ok, _ring_rows(slot, safe), 0)
+    history_src = torch.where(history_ok, ring_rows(slot, safe), 0)
 
     kept = (first + counts)[:, None] - WINDOW_TOKENS + lane
     kept_ok = live & (kept >= first[:, None])
     row_start = (torch.cumsum(counts, 0) - counts)[:, None]
     commit_token = torch.where(kept_ok, row_start + kept - first[:, None], 0)
-    commit_dst = torch.where(kept_ok, _ring_rows(slot, kept.clamp(min=0)), -1)
+    commit_dst = torch.where(kept_ok, ring_rows(slot, kept.clamp(min=0)), -1)
 
     plan = WindowPlan(
         history_src=history_src.reshape(-1),
