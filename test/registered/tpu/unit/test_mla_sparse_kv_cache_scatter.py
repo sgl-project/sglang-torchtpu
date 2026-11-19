@@ -33,7 +33,12 @@ register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
 # (dcp_size, interleave_size) pairs are most of this file's 408s. The gate runs
 # the two small ones -- which still check the ownership partition exactly, over
 # every layout -- and the nightly adds dcp 8 and 16.
-register_tpu_ci(est_time=420, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=420,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra"],
+)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.

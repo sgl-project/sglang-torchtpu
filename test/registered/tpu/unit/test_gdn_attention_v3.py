@@ -48,7 +48,12 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
 # The reachable-tile sweep is ~45% of this file. The gate walks one head split;
 # the nightly walks every served one.
-register_tpu_ci(est_time=450, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=450,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra"],
+)
 
 
 def _has_jax() -> bool:

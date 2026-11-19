@@ -32,7 +32,12 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 # The gate walks the reachable tiles of one served head split; the nightly
 # walks all four.
-register_tpu_ci(est_time=220, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=220,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra"],
+)
 
 
 def _has_jax_tpu() -> bool:

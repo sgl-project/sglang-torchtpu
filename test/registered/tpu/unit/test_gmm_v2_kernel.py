@@ -31,7 +31,12 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 # 192-case grid below costs ~400s. The gate pins the shapes and keeps the code
 # paths (num_groups, has_bias, weight_dtype, zero vs non-zero group_offset);
 # the nightly walks the whole grid.
-register_tpu_ci(est_time=400, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=400,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra"],
+)
 
 import unittest
 
