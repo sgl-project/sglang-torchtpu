@@ -51,6 +51,32 @@ class MuseGeometry(msgspec.Struct, frozen=True, kw_only=True):
     # [lo, hi) fp4 layer ranges whose expert slabs arrive stacked ([hi - lo, E, ...] per slab),
     # so the rolled loop picks a range by a small compare tree and indexes the layer in it
     expert_groups: tuple = ()
+    # TpuUnifiedSWAKVPool: layer -> shared physical KV buffer (0..B-1) and SWA page group
+    # (0..M-1); empty for one KV buffer per layer and a single SWA page table
+    kv_buf_map: tuple = ()
+    swa_group_map: tuple = ()
+
+    @property
+    def n_kv_buffers(self) -> int:
+        return max(self.kv_buf_map) + 1 if self.kv_buf_map else self.n_layers
+
+    @property
+    def n_swa_groups(self) -> int:
+        return max(self.swa_group_map) + 1 if self.swa_group_map else 1
+
+    def layer_kv_buf(self, layer: int) -> int:
+        return self.kv_buf_map[layer] if self.kv_buf_map else layer
+
+    def layer_swa_group(self, layer: int) -> int:
+        return self.swa_group_map[layer] if self.swa_group_map else 0
+
+    def validate_kv_maps(self) -> None:
+        if self.kv_buf_map:
+            assert len(self.kv_buf_map) == self.n_layers
+            assert set(self.kv_buf_map) == set(range(self.n_kv_buffers))
+        if self.swa_group_map:
+            assert len(self.swa_group_map) == self.n_layers
+            assert all(self.swa_group_map[l] == 0 for l in self.global_layers)
 
     @property
     def q_dim(self) -> int:
@@ -318,6 +344,7 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
 
     def validate(self):
         assert self.rows % self.tp == 0 and self.rows >= self.tp
+        self.validate_kv_maps()
         if self.qblock:
             self._validate_qblock()
         # windows are DMA'd in TABLE_ALIGN-entry units; only the SAL kv write reads them
@@ -464,6 +491,7 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     sp_ep_layout: bool = False
 
     def validate(self) -> "PFConfig":
+        self.validate_kv_maps()
         if self.tp != PREFILL_TP:
             raise ValueError(
                 f"the Muse prefill program runs at TP {PREFILL_TP}, got {self.tp}"
