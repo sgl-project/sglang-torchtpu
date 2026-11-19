@@ -96,10 +96,10 @@ def _decode_main(words, scales):
 # a replay minimum hiding part of the window, an empty request, a long prefix.
 _PREFILL = ((0, 70, 0), (301, 45, 200), (50, 0, 0), (900, 20, 0))
 _DECODE = ((5, 1, 0), (130, 1, 0), (700, 1, 0), (1500, 1, 0))
-# Over 512 tokens the main records are gathered in chunks; 1152 rows end in a
-# partial chunk.
+# Over 512 tokens the main records are gathered in 128-row chunks; 1168 rows
+# (9 x 128 + 16) end in a partial chunk.
 _LONG_PREFILL = ((0, 700, 0), (500, 420, 300), (1200, 30, 0), (60, 0, 0))
-_PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8, _LONG_PREFILL: 1152}
+_PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8, _LONG_PREFILL: 1168}
 _PHASES = {"prefill": _PREFILL, "decode": _DECODE, "long_prefill": _LONG_PREFILL}
 
 
