@@ -843,10 +843,6 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Unified hybrid-SWA host reclaim: SWA demand takes pass-through windows (one child
-    # holding its own window) before LRU SWA; Full demand takes LRU host leaves; an
-    # evicted leaf also takes ancestors left with Full KV but no usable window.
-    SGLANG_HICACHE_HOST_RECLAIM_STRUCTURAL = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

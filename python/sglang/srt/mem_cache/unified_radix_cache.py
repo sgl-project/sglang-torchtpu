@@ -503,6 +503,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        if self.cache_controller is not None:
+            anchor_pool = self.cache_controller.mem_pool_host.anchor_entry.host_pool
+            self.tree_core.shared_host_arena = (
+                self.host_memory_mode == "cache"
+                and self.tree_core.has_swa_host_pool
+                and anchor_pool.shared_allocation_domain is not None
+            )
         # Preserve the SWA host window before device eviction makes it unrecoverable.
         if (
             get_memory().enable_unified_memory
@@ -1456,7 +1463,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
-        if envs.SGLANG_HICACHE_HOST_RECLAIM_STRUCTURAL.get():
+        if self.tree_core.shared_host_arena:
             # One shared host arena: tokens freed by either component make progress.
             return sum(result.tracker.values())
         return result.tracker.get(component_type, 0)

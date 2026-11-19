@@ -482,6 +482,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
+        # Set when Full and SWA host copies share one arena (the TPU unified pool): host
+        # reclaim then picks entries by structure (_drive_structural_host_eviction).
+        self.shared_host_arena = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
@@ -1995,10 +1998,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def _structural_host_reclaim(self) -> bool:
-        return (
-            ComponentType.SWA in self.components_by_type
-            and envs.SGLANG_HICACHE_HOST_RECLAIM_STRUCTURAL.get()
-        )
+        return self.shared_host_arena and ComponentType.SWA in self.components_by_type
 
     def _drive_structural_host_eviction(
         self,

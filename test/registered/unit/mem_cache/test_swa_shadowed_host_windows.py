@@ -1,4 +1,4 @@
-"""SWA host reclaim under SGLANG_HICACHE_HOST_RECLAIM_STRUCTURAL: a host window is
+"""SWA host reclaim on a shared Full/SWA host arena: a host window is
 reclaimed early only on a pass-through node, whose one child holds Full KV and a window
 of its own. Reclaiming every window with any deeper boundary below it emptied whole
 chunked-prefill paths of windows, so losing the last one recomputed the entire prefix.
