@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang_tpu.host_upload import upload
 from sglang_tpu.mm_embedding import (
     MultimodalEmbedding,
     PaddedEmbedding,
@@ -73,12 +74,15 @@ def _scatter_mm_rows(
     *,
     merge_rows: Callable = merge_mm_rows,
 ) -> None:
+    # The indices and mask are host-built and this runs right after the
+    # encoder launch: a blocking upload would hold the host until the encoder
+    # finished, and the TPU would then idle while the host caught up.
     dest.copy_(
         merge_rows(
             dest,
             src.to(device=dest.device, dtype=dest.dtype),
-            indices.to(dest.device),
-            mask.to(dest.device),
+            upload(indices, dest.device),
+            upload(mask, dest.device),
         )
     )
 
@@ -218,8 +222,8 @@ def apply_host_mm_embeds(
     """Overwrite the masked rows of input_embeds with the host-placed rows."""
     device = input_embeds.device
     return torch.where(
-        host_mask.to(device),
-        host_src.to(device, input_embeds.dtype),
+        upload(host_mask, device),
+        upload(host_src.to(input_embeds.dtype), device),
         input_embeds,
     )
 
@@ -276,7 +280,7 @@ def embed_mm_on_host(
         return input_embeds, torch.zeros(
             deepstack_shape, device=input_embeds.device, dtype=dtype
         )
-    return input_embeds, placed_deepstack[0].to(input_embeds.device, dtype)
+    return input_embeds, upload(placed_deepstack[0].to(dtype), input_embeds.device)
 
 
 def _embed_mm_inputs(
