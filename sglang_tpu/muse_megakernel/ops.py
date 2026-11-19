@@ -66,8 +66,8 @@ from sglang_tpu.muse_megakernel.decode.spep.kernel import (
 )
 from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 from sglang_tpu.muse_megakernel.common.expert_counts import (
+    count_buffer,
     expert_counts_enabled,
-    record_expert_counts,
 )
 from sglang_tpu.muse_megakernel.prefill import spep as PF_SP
 from sglang_tpu.muse_megakernel.prefill import tp as PF
@@ -420,6 +420,19 @@ class MuseMegakernel(torch.nn.Module):
             self.register_buffer(f"expert_{i}", t, persistent=False)
         self.n_expert_refs = len(experts)
         self.tp_rank = tp_rank
+        # SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR: the SP prefill program's running routed-expert counts
+        self.register_buffer(
+            "expert_count_buf",
+            count_buffer(
+                n_layers=geo.n_layers,
+                n_experts=geo.n_experts,
+                device=weights["smalls"].device,
+                rank=tp_rank,
+            )
+            if expert_counts_enabled()
+            else None,
+            persistent=False,
+        )
         self.register_buffer(
             "rank_t",
             torch.tensor([tp_rank], dtype=torch.int32, device=weights["smalls"].device),
@@ -1164,6 +1177,8 @@ class MuseMegakernel(torch.nn.Module):
         )
         meta = torch.cat([md.active_num_tokens.reshape(1).to(torch.int32), self.rank_t])
         kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
+        if self.expert_count_buf is not None and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP.get():
+            kv.append(self.expert_count_buf)  # mutated in place by the SP program
         weights = [
             self.w_wo_full
             if n == "wo" and self.prefill_whole_wo
@@ -1281,8 +1296,6 @@ def _register_prefill_op() -> None:
             outs = callable_(
                 meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv
             )
-        if cfg.expert_counts:
-            record_expert_counts(counts=outs[2], rank=mk.tp_rank)
         return outs[0], outs[1]
 
     @op.register_fake
@@ -1529,13 +1542,15 @@ def _build_prefill_callable(cfg: PFConfig):
     pools in place."""
     L = cfg.n_layers
     n_experts = PF_SP.n_expert_refs(cfg) if cfg.sp else n_expert_refs(cfg)
-    n_args = PF.N_STEP_ARGS + len(WEIGHT_NAMES) + n_experts + L
+    # the SP program's running expert counts ride after the pools as one more aliased state
+    n_state = L + (1 if cfg.expert_counts else 0)
+    n_args = PF.N_STEP_ARGS + len(WEIGHT_NAMES) + n_experts + n_state
     callable_ = _export_program(
         (PF_SP.build_forward if cfg.sp else PF.build_forward)(cfg),
         tp=cfg.tp,
         n_args=n_args,
-        kv0=n_args - L,
-        n_out=(3 if cfg.expert_counts else 2) + L,
+        kv0=n_args - n_state,
+        n_out=2 + n_state,
         tag=(
             f"muse_prefill{'_sp' if cfg.sp else ''}_r{cfg.rows}_c{len(cfg.capture_layers)}"
             f"{'_cnt' if cfg.expert_counts else ''}"

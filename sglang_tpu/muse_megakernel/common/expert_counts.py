@@ -1,53 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 """Running per-layer routed-expert counts of the SP prefill program, for offline EPLB placement
-(SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR). Each rank sums its program outputs on device and dumps
-``counts_rank<r>.npy`` ([n_layers, n_experts] int64, valid rows only) every DUMP_EVERY steps."""
+(SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR).
+
+The compiled graph replays the prefill program's executable without re-entering the op's Python
+body, so the sum lives on device: an int32 [n_layers, n_experts] buffer rides along with the KV
+pools (donated and aliased), and the program adds each chunk's counts of its valid rows. A daemon
+thread copies it to counts_rank<r>.npy every DUMP_SECONDS."""
 
 import os
+import threading
+import time
 
 import numpy as np
 import torch
 
 from sglang_tpu.envs import envs as tpu_envs
 
-# Each dump syncs the device; arbitrary, small next to a 4096-row prefill chunk every ~300 ms.
-DUMP_EVERY = 32
-
-
-class ExpertCountRecorder:
-    def __init__(self, out_dir: str, rank: int):
-        self._path = os.path.join(out_dir, f"counts_rank{rank}.npy")
-        self._sum: torch.Tensor | None = None
-        self._steps = 0
-        os.makedirs(out_dir, exist_ok=True)
-
-    def add(self, counts: torch.Tensor) -> None:
-        """counts: the program's [n_layers, n_experts] int32 output (or [tp * n_layers, ...]
-        when the runtime hands back the global array, which the dump folds)."""
-        c = counts.to(torch.int64)
-        self._sum = c if self._sum is None else self._sum + c
-        self._steps += 1
-        if self._steps % DUMP_EVERY == 0:
-            self.dump()
-
-    def dump(self) -> None:
-        if self._sum is None:
-            return
-        tmp = self._path + ".tmp.npy"
-        np.save(tmp, self._sum.cpu().numpy())
-        os.replace(tmp, self._path)
-
-
-_RECORDER: list[ExpertCountRecorder] = []
+# Each dump syncs the buffer to the host; arbitrary, long next to a prefill chunk.
+DUMP_SECONDS = 120
 
 
 def expert_counts_enabled() -> bool:
     return bool(tpu_envs.SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR.get())
 
 
-def record_expert_counts(*, counts: torch.Tensor, rank: int) -> None:
-    if not _RECORDER:
-        _RECORDER.append(
-            ExpertCountRecorder(tpu_envs.SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR.get(), rank)
-        )
-    _RECORDER[0].add(counts)
+def _dump_forever(buf: torch.Tensor, path: str) -> None:
+    while True:
+        time.sleep(DUMP_SECONDS)
+        tmp = path + ".tmp.npy"
+        np.save(tmp, buf.cpu().numpy().astype(np.int64))
+        os.replace(tmp, path)
+
+
+def count_buffer(*, n_layers: int, n_experts: int, device, rank: int) -> torch.Tensor:
+    """The on-device running counts of this rank, with its dump thread started."""
+    out_dir = tpu_envs.SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR.get()
+    os.makedirs(out_dir, exist_ok=True)
+    buf = torch.zeros((n_layers, n_experts), dtype=torch.int32, device=device)
+    path = os.path.join(out_dir, f"counts_rank{rank}.npy")
+    threading.Thread(target=_dump_forever, args=(buf, path), daemon=True).start()
+    return buf

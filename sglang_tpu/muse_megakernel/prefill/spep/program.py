@@ -312,6 +312,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
         *rest,
     ):
         experts, kv = rest[: n_expert_refs(c)], list(rest[n_expert_refs(c) :])
+        # c.expert_counts: the running counts ride after the pools (aliased state)
+        count_state = kv.pop() if c.expert_counts else None
         # the TP rank from meta: axis_index lowers to partition-id, which this export rejects
         me = meta[1]
         rope_rows = jnp.take(rope, pos, axis=0)
@@ -363,7 +365,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
         aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
         if c.expert_counts:
-            return (ag(hidden), ag(aux_out), jnp.stack(counts), *kv)
+            return (ag(hidden), ag(aux_out), *kv, count_state + jnp.stack(counts))
         return (ag(hidden), ag(aux_out), *kv)
 
     return forward
