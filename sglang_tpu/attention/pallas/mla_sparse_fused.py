@@ -114,8 +114,9 @@ def qblock_query_block(
 # overlap_rope; 3577 vs 4329 us at extend 2048 on a 49K prefix).
 SPARSECORE_GATHER_CHUNK_TOKENS = 128
 # 32 atoms with 32-row DMAs, phase stride 5 and the compact RoPE output
-# (_sparsecore_gather_kwargs): 3.300 / 3.259 / 3.209 ms vs 3.526 / 3.460 /
-# 3.478 ms at extend 2048 on the GLM-5.2 layer 0 / 10 / 40 top-k (exp-vomtfje770).
+# (_sparsecore_gather_kwargs), with narrow output and split q: 3146 / 3150 /
+# 3102 us vs 3741 / 3691 / 3657 us before, through the torch op at extend 2048
+# on a 49K prefix with the GLM-5.2 layer 0 / 10 / 40 top-k (exp-qd01jl2rm5).
 SPARSECORE_ATOMS_PER_BATCH = 32
 SPARSECORE_ROWS_PER_DMA = 32
 SPARSECORE_PHASE_STRIDE = 5
@@ -346,7 +347,9 @@ def sparse_mla_attention_fused(
             distribution,
             sm_scale=sm_scale,
             k_scale=k_scale,
-            gather_rope=not zero_rope,
+            # No gather_rope: the native SparseCore gather always reads RoPE
+            # (gather_rope is TensorCore only); with zero_rope those rows are
+            # zero, so the result is unchanged.
             cache_layout=SPARSECORE_CACHE_LAYOUT,
             gather_and_attention_chunk_size=chunk_tokens,
             sparsecore_atoms_per_batch=atoms,

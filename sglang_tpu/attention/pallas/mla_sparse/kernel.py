@@ -925,7 +925,6 @@ def prepare_outputs(
         "sparsecore_phase_stride",
         "compact_rope_output",
         "sparsecore_rows_per_dma",
-        "sparsecore_batch_fold",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
         "small_chunk_tokens",
@@ -963,7 +962,6 @@ def sparse_ragged_paged_attention(
     sparsecore_phase_stride: int = 0,
     compact_rope_output: bool = False,
     sparsecore_rows_per_dma: int = 16,
-    sparsecore_batch_fold: int = 1,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 16,
@@ -1009,7 +1007,6 @@ def sparse_ragged_paged_attention(
         intermediate HBM row; requires uncapped native SC and 64-byte RoPE.
       sparsecore_rows_per_dma: Number of indirect rows per native SparseCore
         read. Windows partition a 64-row atom without changing output order.
-      sparsecore_batch_fold: Group owner rounds in the compact32 prefill experiment.
       sparsecore_gather_wait_mode: Whether native SparseCore NOPE output DMA
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
@@ -1052,10 +1049,6 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
-    if sparsecore_batch_fold != 1 and (
-        not compact_rope_output or topk_cap is not None or not sparsecore_layout
-    ):
-        raise ValueError("folded gather requires uncapped compact SparseCore output")
     if compact_rope_output and (not sparsecore_layout or topk_cap is not None):
         raise ValueError(
             "compact_rope_output is supported only for uncapped native SC gather"
@@ -1217,7 +1210,6 @@ def sparse_ragged_paged_attention(
             sparsecore_phase_stride=sparsecore_phase_stride,
             compact_rope_output=compact_rope_output,
             sparsecore_rows_per_dma=sparsecore_rows_per_dma,
-            sparsecore_batch_fold=sparsecore_batch_fold,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
             small_chunk_tokens=small_chunk_tokens,
@@ -1335,7 +1327,6 @@ def sparse_attention_chunk(
     sparsecore_phase_stride: int = 0,
     compact_rope_output: bool = False,
     sparsecore_rows_per_dma: int = 16,
-    sparsecore_batch_fold: int = 1,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 0,
@@ -1650,7 +1641,6 @@ def sparse_attention_chunk(
                 phase_stride=sparsecore_phase_stride,
                 compact_rope_output=compact_rope_output,
                 rows_per_dma=sparsecore_rows_per_dma,
-                batch_fold=sparsecore_batch_fold,
                 **live_kwargs,
             )
         )

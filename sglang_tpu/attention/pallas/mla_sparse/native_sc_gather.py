@@ -96,7 +96,6 @@ def _kernel(
     query_batch_shift: int = 0,
     compact_rope_output: bool = False,
     rows_per_dma: int = NUM_LANES,
-    batch_fold: int = 1,
 ):
     streams = OCCURRENCES_PER_ATOM // rows_per_dma
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
@@ -116,28 +115,14 @@ def _kernel(
 
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
-        logical_batch = (
-            owner
-            + (owner_batch if batch_fold == 1 else owner_batch * batch_fold)
-            * num_owners
-        )
-
-        def subround(step):
-            return step >> (atoms_per_batch.bit_length() - 1)
-
-        def original_batch(step):
-            return (
-                logical_batch
-                if batch_fold == 1
-                else logical_batch + subround(step) * num_owners
-            )
+        logical_batch = owner + owner_batch * num_owners
 
         def scheduled_atom(atom):
             # Stagger owners serving different queries without rearranging indices
             # in HBM. Apply the same permutation to input and output addresses.
             if not phase_stride:
                 return atom
-            query = original_batch(atom) >> query_batch_shift
+            query = logical_batch >> query_batch_shift
             return (atom + query * phase_stride) & (atoms_per_batch - 1)
 
         def values(atom, stream):
@@ -146,17 +131,12 @@ def _kernel(
             # Give the indirect DMA a rank-1 VMEM ref, so its offsets can
             # span more than one SparseCore SIMD register. The outer pipeline
             # owns this buffer until all DMAs for this batch have drained.
-            local_atom = scheduled_atom(atom)
-            if batch_fold > 1:
-                local_atom = subround(atom) * atoms_per_batch + local_atom
             return indices_ref.at[
-                0, local_atom, pl.ds(stream * rows_per_dma, rows_per_dma)
+                0, scheduled_atom(atom), pl.ds(stream * rows_per_dma, rows_per_dma)
             ]
 
         def destinations(step, atom, stream):
-            occurrence_base = (
-                original_batch(step) * atoms_per_batch * OCCURRENCES_PER_ATOM
-            )
+            occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
             return pl.ds(
                 occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * rows_per_dma,
                 rows_per_dma,
@@ -238,23 +218,15 @@ def _kernel(
         rope_out_spec = pl.BlockSpec(
             (QUADS_PER_ATOM // (2 if compact_rope_output else 1), 128),
             lambda atom: (
-                original_batch(atom) * atoms_per_batch + scheduled_atom(atom),
+                logical_batch * atoms_per_batch + scheduled_atom(atom),
                 0,
             ),
         )
 
         def run_inner():
-            steps = atoms_per_batch * batch_fold
-            if batch_fold > 1 and live_batches is not None:
-                # Only complete owner rounds are admitted. The last group may
-                # contain fewer than batch_fold rounds, without dropping any.
-                steps = (
-                    jnp.minimum(owner_batches - owner_batch * batch_fold, batch_fold)
-                    * atoms_per_batch
-                )
             pltpu.emit_pipeline(
                 body,
-                grid=(steps,),
+                grid=(atoms_per_batch,),
                 in_specs=nope_specs + rope_specs,
                 out_specs=(rope_out_spec,),
                 no_pipelining=not serve_pipelined,
@@ -271,12 +243,7 @@ def _kernel(
         else:
             run_inner()
 
-    if batch_fold > 1:
-        indices_spec = pl.BlockSpec(
-            (1, batch_fold * atoms_per_batch, OCCURRENCES_PER_ATOM),
-            lambda group: (owner, group, 0),
-        )
-    elif rows_per_dma == NUM_LANES:
+    if rows_per_dma == NUM_LANES:
         indices_spec = pl.BlockSpec(
             (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
             lambda batch: (owner + batch * num_owners, 0, 0, 0),
@@ -289,7 +256,7 @@ def _kernel(
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
-            grid=(batches_per_owner // batch_fold,),
+            grid=(batches_per_owner,),
             in_specs=(indices_spec,),
         )(indices_hbm_ref)
     else:
@@ -302,17 +269,12 @@ def _kernel(
         # Uniform per-owner trip count; no scalar division on SC: the wrapper
         # sends live_batches as a multiple-of-num_owners-rounded pair.
         owner_batches = live_vmem_ref[pl.ds(NUM_LANES, NUM_LANES)][0]
-        groups = (
-            owner_batches
-            if batch_fold == 1
-            else (owner_batches + batch_fold - 1) >> (batch_fold.bit_length() - 1)
-        )
 
         @pl.when(owner_batches > 0)
         def _serve_live():
             pltpu.emit_pipeline(
                 serve_batch,
-                grid=(groups,),
+                grid=(owner_batches,),
                 in_specs=(indices_spec,),
             )(indices_hbm_ref)
 
@@ -328,7 +290,6 @@ def _kernel(
         "phase_stride",
         "compact_rope_output",
         "rows_per_dma",
-        "batch_fold",
     ),
 )
 def dsa_gather_native_sc(
@@ -345,7 +306,6 @@ def dsa_gather_native_sc(
     phase_stride: int = 0,
     compact_rope_output: bool = False,
     rows_per_dma: int = NUM_LANES,
-    batch_fold: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -445,20 +405,6 @@ def dsa_gather_native_sc(
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
     live = num_live_indices is not None
-    if batch_fold != 1 and (
-        batch_fold not in (2, 4, 8)
-        or batches_per_owner % batch_fold
-        or indices.shape != (128, 2048)
-        or atoms_per_batch != 16
-        or phase_stride != 5
-        or rows_per_dma != 32
-        or not compact_rope_output
-        or (live and live_multiple % owner_batch_size)
-    ):
-        raise ValueError(
-            "folded gather requires compact32 phase5 128x2048 with 16 atoms, "
-            "whole owner rounds, and a fold of 2/4/8 dividing rounds per owner"
-        )
     streams = OCCURRENCES_PER_ATOM // rows_per_dma
     index_shape = (
         (ROPE_PACKING, NUM_LANES)
@@ -466,20 +412,7 @@ def dsa_gather_native_sc(
         else (OCCURRENCES_PER_ATOM,)
     )
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((streams,))}
-    if batch_fold == 1:
-        index_input = indices.reshape(num_batches, atoms_per_batch, *index_shape)
-    else:
-        # Input rows are round-major. Make one owner's consecutive rounds
-        # contiguous for a single outer index DMA without changing KV order.
-        index_input = (
-            indices.reshape(
-                batches_per_owner, num_owners, atoms_per_batch, OCCURRENCES_PER_ATOM
-            )
-            .transpose(1, 0, 2, 3)
-            .reshape(
-                num_owners, batches_per_owner * atoms_per_batch, OCCURRENCES_PER_ATOM
-            )
-        )
+    index_input = indices.reshape(num_batches, atoms_per_batch, *index_shape)
     operands = [nope_rows_view, rope_rows_view, index_input]
     guard_tail = False
     if live:
@@ -528,7 +461,6 @@ def dsa_gather_native_sc(
         query_batch_shift=query_batch_shift,
         compact_rope_output=compact_rope_output,
         rows_per_dma=rows_per_dma,
-        batch_fold=batch_fold,
     )
     if live:
         inner = body
@@ -558,6 +490,5 @@ def dsa_gather_native_sc(
             + (f"_phase{phase_stride}" if phase_stride else "")
             + ("_compactrope" if compact_rope_output else "")
             + (f"_rows{rows_per_dma}" if rows_per_dma != NUM_LANES else "")
-            + (f"_fold{batch_fold}" if batch_fold != 1 else "")
         ),
     )(*operands)
