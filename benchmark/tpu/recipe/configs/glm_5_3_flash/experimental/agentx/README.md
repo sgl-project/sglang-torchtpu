@@ -51,7 +51,9 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
   - Common: `hicache_io_backend raiden`, `page_first_fused`, `write_through`.
 - Megakernel at c8: the recipe asks for 64 rows (16 running x 4 MTP rows); the kernel caps a
   step at 16 rows (VMEM), so steps with more than 4 running requests run on the model path.
-- Prefill buckets: `tpu_compile_tokens` 1024, 2048, 4096, 8192 at every cc; chunked prefill 8192.
+- Prefill: chunks of 4096 tokens (`chunked_prefill_size`, `max_prefill_tokens` 4096) and
+  buckets `tpu_compile_tokens` 1024, 2048, 3072, 4096 at every cc. The measured rows below
+  ran 8192-token chunks with buckets 1024, 2048, 4096, 8192.
 - Compile: direct tracer (`tpu_compile_tracer direct`) at every cc. Without the latent split
   (c1/c4/c8) also SPMD compile (`use_spmd_compile`) with scattered prefill input off; the
   split cache refuses SPMD (a rank's share is a compile-time constant of its program). The
