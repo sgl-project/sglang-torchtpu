@@ -290,6 +290,11 @@ def score_rows(n_rows, tp, cfg):
 BLOCK_ROWS = 16
 
 
+def q_rows(cfg: KernelConfig) -> int:
+    """Rows per request of the per-request buffers: n_query padded to a sublane tile."""
+    return -(-cfg.n_query // 8) * 8
+
+
 def cp_pads(cfg: KernelConfig) -> int:
     """CP exchange pads: queries, selected scores, attention partials, and with a split
     latent cache the selected-pool lists."""
@@ -323,6 +328,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     TR = cfg.tile_rows
     L = cfg.max_len
     R, Q, B = cfg.rows, cfg.n_query, cfg.n_req
+    QR = q_rows(cfg)
     split = cfg.mla_shards > 1
     TK = cfg.attn_tile
     PT = TK // kp
@@ -397,14 +403,14 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         # tile, cols], so the only dynamic index is the tile-aligned leading one.
         pltpu.VMEM((B, 16, kvl), BF16),
         pltpu.VMEM((B, 16, 2 * idh), BF16),
-        pltpu.VMEM((B, 8, nh * qk), F32),
+        pltpu.VMEM((B, QR, nh * qk), F32),
         pltpu.VMEM((R * hi, idh), F32),
-        pltpu.VMEM((B, 8, hi), F32),
+        pltpu.VMEM((B, QR, hi), F32),
         pltpu.VMEM((B, 16, nh * vd), BF16),
-        pltpu.VMEM((B, 8, qsh), F32),
-        pltpu.VMEM((B, 8, 3 * qsh), F32),
-        pltpu.VMEM((B, 8, 2 * qsh), F32),
-        pltpu.VMEM((B, 8, hkda), F32),
+        pltpu.VMEM((B, QR, qsh), F32),
+        pltpu.VMEM((B, QR, 3 * qsh), F32),
+        pltpu.VMEM((B, QR, 2 * qsh), F32),
+        pltpu.VMEM((B, QR, hkda), F32),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -418,7 +424,8 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.SemaphoreType.DMA((2, 2)),
         pltpu.SemaphoreType.DMA((2, S)),
         pltpu.SemaphoreType.DMA((2, 2)),
-        # Selected pools per group as (pool << 4 | query bits); the SMEM copy addresses the DMAs.
+        # Selected pools per group as (pool << n_query | query bits); the SMEM copy addresses
+        # the DMAs.
         pltpu.VMEM((gather_dims(spec, cfg)[2], 128), jnp.int32),
         pltpu.SMEM((gather_dims(spec, cfg)[2], 128), jnp.int32),
         pltpu.SemaphoreType.DMA((1,)),
@@ -428,7 +435,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM(
             (1, tp, B * nh * Q, kvl) if cfg.context_parallel else (1, 1, 16, 128), BF16
         ),
-        pltpu.VMEM((2, tp, 8, hsh) if cfg.context_parallel else (1, 1, 8, 128), F32),
+        pltpu.VMEM((2, tp, QR, hsh) if cfg.context_parallel else (1, 1, 8, 128), F32),
         pltpu.VMEM(
             (2, tp, cp_att_rows(nh, Q), kvl)
             if cfg.context_parallel
@@ -441,7 +448,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
             (cp_att_rows(nh, Q), tp * kvl) if cfg.context_parallel else (8, 128), F32
         ),
         pltpu.VMEM((B * nh * Q, kvl) if cfg.context_parallel else (16, 128), BF16),
-        pltpu.VMEM((8, hsh) if cfg.context_parallel else (8, 128), F32),
+        pltpu.VMEM((QR, hsh) if cfg.context_parallel else (8, 128), F32),
         pltpu.SemaphoreType.DMA((cp_pads(cfg), 2, 3)),
         # One round counter per pad: parity must alternate between consecutive rounds on
         # a pad, and a loop body traced once cannot alternate a static parity.
@@ -1120,8 +1127,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         TPG = TK // ps  # pages per attention tile
         if Q + kp + 15 > 32:
             raise ValueError(f"n_query={Q}: the pools closed this step span > 32 rows")
-        if Q > 8:
+        if Q > 16:
+            raise ValueError(f"n_query={Q}: a request's new rows are one 16-row block")
+        NFP = -(-Q // kp)  # most pools a request closes in one step
+        if NFP > 8:
             raise ValueError(f"n_query={Q}: a step closes at most 8 pools per request")
+        # A selected-pool entry is (pool << QS | one bit per query).
+        QS, QM = Q, (1 << Q) - 1
+        if (Lcap // kp) >= 1 << (31 - QS):
+            raise ValueError(f"max_len={Lcap}: pool ids overflow {31 - QS} entry bits")
         per = qk + vd
         hmat = PL.hadamard(idh)
 
@@ -1272,9 +1286,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     jnp.sum(
                         jnp.where(prow == fp0 + i, pk_blk, 0.0), axis=0, keepdims=True
                     )
-                    for i in range(Q)
+                    for i in range(NFP)
                 ]
-                for i in range(Q):
+                for i in range(NFP):
                     o_npk[d_i, b, pl.ds(i, 1), :] = keys[i]
                 return fp0, fresh, keys
 
@@ -1313,7 +1327,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
             def compact(p, nts):
                 """Selected pools of every query, in pool order, into gidx (and gsm unless
-                split: route() moves them first) as (pool << 4 | query bits); returns
+                split: route() moves them first) as (pool << QS | query bits); returns
                 their count."""
                 c_tail = p // kp
 
@@ -1345,7 +1359,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         pre - s32 + rp - rs
                     )  # block-local order of each selected pool
                     n_blk = jnp.sum(s32)
-                    val = (pid << 4) | qb
+                    val = (pid << QS) | qb
 
                     def more(st):
                         return st[2] < n_blk
@@ -1406,7 +1420,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 def take(d, row_g, n_d, carry):
                     cur, nxt, base_, g = carry
                     row = cpgl[par, d, pl.ds(row_g, 1), :]
-                    own = pool_owner(row >> 4, PPP, SUB // kp)
+                    own = pool_owner(row >> QS, PPP, SUB // kp)
                     mine = ((row_g * GS + lane) < n_d) & (own == me)
                     s32 = mine.astype(i32)
                     pre = s32
@@ -1591,11 +1605,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 """DMA the group's selected pools (8-row blocks) into kvw[slot]; slots past
                 the count refetch the group's first pool so the byte-counted wait matches.
                 A split cache holds the pool's block at its row in this chip's share."""
-                fill = gsm[g, 0] >> 4
+                fill = gsm[g, 0] >> QS
 
                 def issue(d):
                     def one(s, c):
-                        v = gsm[g, s] >> 4
+                        v = gsm[g, s] >> QS
                         pid = jnp.where(g * GS + s < n_sel, v, fill)
                         pg = page(b, pid // PPP)
                         off = pl.multiple_of(pool_block_row(pid, kp, ps, SUB, BR), BR)
@@ -1642,7 +1656,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         rec_fetch(b, t_of(j + RS - 1), jax.lax.rem(j + RS - 1, RS))
 
                     pk = PL.unpack_records(rkw[slot], idh)
-                    for i in range(Q):
+                    for i in range(NFP):
                         pk = jnp.where(
                             (pcol + t * PT == fp0 + i) & (i < fresh), keys[i], pk
                         )
@@ -1718,8 +1732,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 """[Q, GR] f32 0/1 mask over group g's gathered rows: a row counts for query
                 q when its pool was selected by q (or is q's open tail) and it is before p."""
                 v = gidx[pl.ds(g, 1), :]
-                pid = jnp.repeat(v >> 4, BR, axis=1)
-                qb = jnp.repeat(v & 15, BR, axis=1)
+                pid = jnp.repeat(v >> QS, BR, axis=1)
+                qb = jnp.repeat(v & QM, BR, axis=1)
                 i_r = glane % BR
                 tok = (pid // PPB) * BR + i_r
                 in_pool = (i_r // kp) == (pid % PPB)

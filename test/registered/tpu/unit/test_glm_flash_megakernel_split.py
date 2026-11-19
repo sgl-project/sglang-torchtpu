@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.3-Flash decode megakernel on a split latent cache.
+"""GLM-5.3-Flash decode megakernel on a split latent cache and with 9 query rows.
 
 Random weights and pools at the checkpoint's dimensions (one DSA layer), tp8 on 4 chips:
 
@@ -7,6 +7,7 @@ Random weights and pools at the checkpoint's dimensions (one DSA layer), tp8 on 
   [r * P/8, (r + 1) * P/8)). Each rank writes the step's latent rows at its own offsets
   only, at its share row, byte-identical to its own whole-page copy; the logits agree to
   the merge order of the attention partials.
+* rows: a 9-row step (MTP 8 steps) keeps the first 4 rows of a 4-row step.
 
 Usage:
     python test/registered/tpu/unit/test_glm_flash_megakernel_split.py
@@ -283,6 +284,14 @@ class TestGlmFlashMegakernelSplit(CustomTestCase):
 
     def test_split_matches_whole_pages(self):
         self._split_case(4, 2)
+
+    def test_split_with_nine_query_rows(self):
+        self._split_case(9, 1)
+
+    def test_nine_rows_keep_the_first_four(self):
+        four, _, _ = self.h.run(4, 1, TP, self.positions, self.tokens)
+        nine, _, _ = self.h.run(9, 1, TP, self.positions, self.tokens)
+        self._close(nine[:4], four)
 
 
 if __name__ == "__main__":
