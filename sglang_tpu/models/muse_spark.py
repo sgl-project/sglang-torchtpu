@@ -61,10 +61,8 @@ from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
 from sglang_tpu.moe.router_topk_tpu import (
-    argmax_router_topk,
     fits_sigmoid_router_topk,
     register_router_topk_op,
-    router_topk_enabled,
     sigmoid_router_topk,
 )
 
@@ -90,9 +88,6 @@ _QKV_SHARDS = ((".q_proj.", "q"), (".k_proj.", "k"), (".v_proj.", "v"))
 _FUSED_RS_POST_EXPERT_NORM_EPS = 1e-8
 # Sigmoid router scores are renormalized over the top-k with this epsilon.
 _ROUTE_EPS = 1e-15
-# Measured on tpu7x for top-8 of 256: the argmax rounds beat XLA's sort from
-# 1024 tokens (28 vs 38 us per layer) and lose below 512.
-_ARGMAX_TOPK_MIN_TOKENS = 1024
 
 
 def _sort_router_topk(
@@ -620,13 +615,11 @@ class MuseSparkMoE(nn.Module):
 
     def _route(self, router_input: torch.Tensor) -> StandardTopKOutput:
         router_logits, _ = self.gate(router_input)
-        tokens = router_logits.shape[0]
-        if fits_sigmoid_router_topk(tokens):
-            select = sigmoid_router_topk
-        elif router_topk_enabled() and tokens >= _ARGMAX_TOPK_MIN_TOKENS:
-            select = argmax_router_topk
-        else:
-            select = _sort_router_topk
+        select = (
+            sigmoid_router_topk
+            if fits_sigmoid_router_topk(router_logits.shape[0])
+            else _sort_router_topk
+        )
         topk_weights, topk_ids = select(
             router_logits.float() * self.router_multiplier,
             self.e_score_correction_bias,

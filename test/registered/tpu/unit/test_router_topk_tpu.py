@@ -49,6 +49,11 @@ class TestRouterTopk(CustomTestCase):
             (1, 896, 16, True, 2.5, jnp.float32),
             (2, 896, 16, True, 1.0, jnp.float32),
             (64, 896, 16, True, 2.5, jnp.float32),
+            # Gridded over 512-token tiles: one partial tile, several tiles with a
+            # partial last one, and an exact multiple.
+            (65, 256, 8, True, 1.0, jnp.float32),
+            (1100, 288, 8, True, 2.5, jnp.bfloat16),
+            (1024, 896, 16, False, 1.0, jnp.float32),
         ):
             logits = jnp.asarray(rng.standard_normal((tokens, experts)), dtype)
             bias = rng.standard_normal(experts).astype(np.float32) * 0.1
@@ -75,7 +80,7 @@ class TestRouterTopk(CustomTestCase):
         from sglang_tpu.kernels.router_topk import router_topk_jax
 
         rng = np.random.default_rng(1)
-        for tokens in (1, 8):
+        for tokens in (1, 8, 600):
             logits = np.round(rng.standard_normal((tokens, 896)) * 2) / 2
             logits = jnp.asarray(logits, jnp.float32)
             bias = np.zeros(896, np.float32)  # keep the ties in the biased choice

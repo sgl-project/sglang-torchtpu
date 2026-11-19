@@ -1,6 +1,6 @@
 """Registered router top-k op (through the biased_topk hook) vs biased_topk_impl
 on torch_tpu, for bf16 and f32 router logits, with random and tied scores; and
-Muse Spark's batch-size routing branches vs its sort path."""
+Muse Spark's route through the op vs its sort path."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -52,7 +52,7 @@ class TestRouterTopkTorchParity(CustomTestCase):
         g = torch.Generator().manual_seed(0)
         for dtype in (torch.bfloat16, torch.float32):
             for case in ("random", "ties"):
-                for tokens in (1, 8, 64):
+                for tokens in (1, 8, 64, 65, 513):
                     for apply_on_output in (False, True):
                         logits = torch.randn(tokens, E, generator=g) * 2.0
                         if case == "ties":
@@ -63,14 +63,15 @@ class TestRouterTopkTorchParity(CustomTestCase):
                             self._compare(logits.to(dtype), bias, apply_on_output, msg)
 
     def test_muse_spark_route_matches_sort(self):
-        """Muse's _route at each batch-size branch (Pallas op, sort, argmax rounds)
-        vs the sort path: f32 logits scaled before the sigmoid, top-8 of 256."""
+        """Muse's _route through the Pallas op vs the sort path, f32 logits scaled
+        before the sigmoid, top-8 of 256: the 1-token rank kernel, single tiles,
+        a partial last tile (513) and a 4096-token prefill chunk."""
         from sglang_tpu.models import muse_spark as ms
 
         mult = 0.17677669529663687
         g = torch.Generator().manual_seed(0)
         for case in ("random", "ties"):
-            for tokens in (1, 2, 8, 64, 65, 1024):
+            for tokens in (1, 2, 8, 64, 65, 513, 4096):
                 logits = torch.randn(tokens, 256, generator=g) * 8.0
                 bias = torch.randn(256, generator=g) * 0.05
                 if case == "ties":
