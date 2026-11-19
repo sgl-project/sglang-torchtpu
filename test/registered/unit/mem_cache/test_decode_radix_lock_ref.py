@@ -758,6 +758,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             [0, 7], req_pool_idx=None, cache_protected_len=1, last_node=shared
         )
         req.rid = f"{HEALTH_CHECK_RID_PREFIX}_acknowledged"
+        req.health_check_admission_seq = 0
         pool.alloc([req])
         self.assertEqual(pool.available_size(), pool.size - 1)
         pool.req_to_token[req.kv.req_pool_idx, :2] = torch.tensor([10, 50])
@@ -768,7 +769,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,
             tree_cache=cache,
-            health_monitor=SimpleNamespace(pending_rids=[]),
+            health_monitor=SimpleNamespace(completion_seq=1),
             _release_aborted_request=MagicMock(),
             enable_hisparse=False,
         )
