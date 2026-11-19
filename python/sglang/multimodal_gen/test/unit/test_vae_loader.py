@@ -408,6 +408,66 @@ class TestDirectGPUVAEState(unittest.TestCase):
         native_load.assert_not_called()
 
 
+class TestSanaVAELoad(CustomTestCase):
+    """SANA's AutoencoderDC wrapper served through VAELoader.load_customized."""
+
+    @staticmethod
+    def _save_tiny_dc_ae(path):
+        from diffusers import AutoencoderDC as DiffusersAutoencoderDC
+
+        model = DiffusersAutoencoderDC(
+            latent_channels=4,
+            attention_head_dim=8,
+            encoder_block_types=("ResBlock", "EfficientViTBlock"),
+            decoder_block_types=("ResBlock", "EfficientViTBlock"),
+            encoder_block_out_channels=(8, 16),
+            decoder_block_out_channels=(8, 16),
+            encoder_layers_per_block=(1, 1),
+            decoder_layers_per_block=(1, 1),
+            encoder_qkv_multiscales=((), (5,)),
+            decoder_qkv_multiscales=((), (5,)),
+            upsample_block_type="interpolate",
+            decoder_norm_types="rms_norm",
+            decoder_act_fns="silu",
+        )
+        # Off the default init, so a model built without weights cannot match.
+        generator = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.copy_(torch.randn(param.shape, generator=generator))
+        model.save_pretrained(path)
+        return DiffusersAutoencoderDC.from_pretrained(
+            path, torch_dtype=torch.float32
+        ).state_dict()
+
+    def test_served_weights_match_from_pretrained(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.sana import (
+            SanaPipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import (
+            AutoencoderDC,
+        )
+
+        for mapped in (False, True):
+            with (
+                self.subTest(keep_checkpoint_mapped=mapped),
+                TemporaryDirectory() as root,
+                patch.object(vae_loader, "keep_checkpoint_mapped", return_value=mapped),
+            ):
+                path = str(pathlib.Path(root) / "vae")
+                expected = self._save_tiny_dc_ae(path)
+                server_args = _FakeServerArgs(SanaPipelineConfig())
+                server_args.should_start_component_on_cpu = lambda _name: True
+
+                vae = vae_loader.VAELoader().load_customized(path, server_args, "vae")
+
+                self.assertIsInstance(vae, AutoencoderDC)
+                served = vae.state_dict()
+                self.assertEqual(set(served), set(expected))
+                for name, tensor in expected.items():
+                    self.assertTrue(torch.equal(served[name], tensor), name)
+
+
 class TestVAELoader(unittest.TestCase):
     def test_exact_precision_is_admitted_for_every_vae_component(self):
         loader = vae_loader.VAELoader()
