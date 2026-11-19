@@ -349,6 +349,9 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
 
                 stage_parallel = threading.local()
                 with (
+                    # The PP loop fences on torch.accelerator.current_stream();
+                    # CPU CI has no accelerator, so stub it like device_module.
+                    patch.object(torch.accelerator, "current_stream"),
                     patch.object(scheduler_pp_mixin, "_is_tpu", True),
                     patch.object(
                         scheduler_pp_mixin,

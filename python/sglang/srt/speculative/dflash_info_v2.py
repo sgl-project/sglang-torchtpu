@@ -213,7 +213,7 @@ class DFlashDraftInputV2(SpecInput):
         else:
             caller_stream = None
             if plan_stream is not None:
-                caller_stream = torch.get_device_module(batch.device).current_stream()
+                caller_stream = torch.accelerator.current_stream(batch.device)
 
             with plan_stream_ctx:
                 if plan_stream is not None and caller_stream is not None:
