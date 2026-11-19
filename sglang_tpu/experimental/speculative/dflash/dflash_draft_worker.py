@@ -30,7 +30,6 @@ from sglang.srt.speculative.dflash_utils import (
     DFlashDraftConfig,
     parse_dflash_draft_config,
 )
-from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.models.dflash2 import (
     build_lattice,
 )
@@ -67,7 +66,7 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         # The grouped convs and the in-graph argmax index the block at this size.
         draft_model.set_block_size(block_size)
         self.num_drafts = block_size - 1
-        self.block_width = block_draft_width(draft_model, block_size)
+        self.block_width = block_size
         self.mask_token_id = _resolve_mask_token_id(
             draft_config=draft_config,
             target_vocab_size=target_runner.model_config.vocab_size,
