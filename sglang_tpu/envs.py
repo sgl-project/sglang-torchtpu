@@ -533,6 +533,38 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Fused-RS MoE (moe/pallas/fused_rs) tuning knobs; defaults are the refkernel prefill tuning.
+    # Output staging buffers a tile's deferred row writes stay in flight across.
+    SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(10)
+    # Rows issued per iteration of the per-row gather and write DMA loops.
+    SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(8)
+    # Expert TP: skip zeroing out_buf, which the per-row writes cover exactly once.
+    SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(True)
+    # Expert TP: sum the ep partials in the kernel's (rows, hidden // 128, 128) layout.
+    SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(True)
+    # Expert TP with a post-expert norm: ep sum, norm and top-k combine in one Pallas pass
+    # (equal up to f32 summation order).
+    SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(True)
+    # Expert TP: size the tile loop and SMEM metadata by this rank's routed rows, and take
+    # the tile_m 256 entries tuned for prefill calls above 131072 routed rows.
+    SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(True)
+    # Expert TP (>= 4096 tokens): the two cores of a chip add their partials on-chip and
+    # send one pair sum per row off-chip (half the ICI bytes, one extra bf16 rounding).
+    SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE = EnvBool(True)
+    # Pair exchange: pair-sum only the rows forwarded off-chip (same numerics).
+    SGLANG_TPU_FUSED_RS_PAIR_FWD_PSUM = EnvBool(True)
+    # Pair exchange: issue only the 5 owner runs a core sends, each from a static
+    # source and receive block (same numerics; needs PAIR_FWD_PSUM).
+    SGLANG_TPU_FUSED_RS_PAIR_FAST_ISSUE = EnvBool(True)
+    # Pair exchange combine: Pallas block sum + norm + top-k scatter-add in VMEM instead
+    # of an argsort over every row and a 0/1 matmul (chunks of 8..1024 tokens).
+    SGLANG_TPU_FUSED_RS_PAIR_SCATTER_COMBINE = EnvBool(True)
+    # GMM2 writes the row-DMA staging layout directly, skipping the f32 spill and the
+    # relayout pass (bit-identical). 1: per column block, 2: LHS loads shared by a group.
+    SGLANG_TPU_FUSED_RS_DIRECT_STAGE = EnvInt(2)
+    # When W1 and W2 each fit one DMA, experts alternate weight buffers by parity and the
+    # next expert's weights stream behind the whole tile (exact).
+    SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG = EnvBool(True)
     # Share one page pool between full-attention and sliding-window KV on TPU
     # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
     SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
@@ -630,6 +662,21 @@ class TpuEnvs:
     # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
     # head_dim <= 64, no sink / LSE / soft cap / q scale / DCP attention scopes.
     SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    # Softmax without the running row max (no sink / LSE); transposed tiles stream key
+    # chunks with no alpha rescale. Only for bounded scores: Muse's weightless per-head
+    # RMS-normed q and k keep |s| small enough that exp(s) cannot overflow.
+    SGLANG_TPU_RPA_NO_MAX = EnvBool(True)
+    # Transposed tiles skip a partial q block's padded queries by a loop over groups of
+    # SKIP_PAD_Q_GROUP tokens, taken only when a whole group is padding. Exact.
+    SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(True)
+    SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP = EnvInt(256)
+    # "bq:bkv" batched-RPA prefill q / k blocks for full-attention and sliding-window
+    # layers, overriding the search (a q block dividing the chunk leaves no padding).
+    SGLANG_TPU_RPA_PREFILL_BLOCKS = EnvStr(None)
+    SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS = EnvStr("512:512")
+    # Batched RPA backend returns each head's output RMS-normalized (weightless, this
+    # eps); Muse Spark's attention then skips its own output head norm.
+    SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
     # Kernel-sweep knobs (anvil --env), read here so the compile cache keys them; unset = the
     # tuned default (dev_int). Muse megakernel tile / plan knobs (ops.py).
     SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)

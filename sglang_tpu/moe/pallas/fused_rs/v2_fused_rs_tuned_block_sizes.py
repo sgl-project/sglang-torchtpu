@@ -207,6 +207,17 @@ def _all_m(tile):
 # top-8 x 8 routed rows) beats the default 64, and 256 and 512.
 _H4096_I4096_EXPERT_TP8 = (128, 4096, 1024, 512, 4096, 2, 2)
 
+# Expert-TP prefill chunks of 4096 and 8192 tokens (above 131072 routed rows), read only
+# under SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS. Muse Spark microbench: tile_m 256 beats 128
+# and the default, and ties 512, at TP8 and at TP16's 256-wide slice.
+_EXPERT_TP_LOCAL_ROWS_M_KEYS = ["262144_silu", "524288_silu", "1048576_silu"]
+_H4096_I4096_EXPERT_TP8_LOCAL_ROWS = (256, 4096, 1024, 512, 4096, 2, 2)
+_H4096_I4096_EXPERT_TP16_LOCAL_ROWS = (256, 4096, 512, 256, 4096, 2, 2)
+
+
+def _local_rows_m(tile):
+    return {m_key: tile for m_key in _EXPERT_TP_LOCAL_ROWS_M_KEYS}
+
 
 def _h4096_i4096_fp4_size_dependent():
     """H4096-I4096 fp4: full tiles for small M, smaller tiles for large M.
@@ -616,6 +627,22 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
 # selector returns them directly (no tile_m clamp). Shapes WITHOUT an entry here
 # fall back to the bf16 table with tile_m clamped to <=64 for VMEM safety.
 # =============================================================================
+FUSED_RS_TUNED_BLOCK_SIZES_ETP_LOCAL_ROWS = {
+    "TPU7x": {
+        "lhs_bfloat16_rhs_float4_e2m1fn": {
+            f"k-4096_n-{n1}_g-256_lhs_quant_rhs_bs-{bs}+k-{k2}_n-4096_g-256_lhs_quant_rhs_bs-{bs}": _local_rows_m(
+                tile
+            )
+            for n1, k2, tile in (
+                (1024, 512, _H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
+                (512, 256, _H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
+            )
+            # bs-256: block-256 requantized experts (SGLANG_TPU_MUSE_MK_QBLOCK=256)
+            for bs in (16, 256)
+        },
+    },
+}
+
 FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
     "TPU7x": {
         "lhs_bfloat16_rhs_float8_e4m3fn": {

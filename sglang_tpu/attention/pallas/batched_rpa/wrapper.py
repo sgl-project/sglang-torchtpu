@@ -299,8 +299,10 @@ def _transposed_prefill_block_sizes(
     # IMEM: at most 64 unrolled compute blocks in the hot full tile.
     imem_row_cap = max(bq_sz, (64 * lanes_c) // aligned_num_q_heads)
     max_bq_sz = min(total_q_pow2, 1 << (imem_row_cap.bit_length() - 1))
-    # VREGs: V^T [acc rows, bkv] bf16 and the f32 scores [bkv, lanes_c].
-    max_bkv_sz = utils.align_to(4 * mxu_column_size, page)
+    # VREGs: V^T [acc rows, bkv] bf16 and the f32 scores [bkv, lanes_c]; the
+    # no_max streaming tile holds no running max, so V^T may grow to 6 columns.
+    vreg_k_cols = 6 if serve_cfgs.no_max else 4
+    max_bkv_sz = utils.align_to(vreg_k_cols * mxu_column_size, page)
     if model_cfgs.sliding_window is not None:
         # ~window / 4 tiles waste less masked work outside the band.
         win_q = max(2, model_cfgs.sliding_window // 4)
@@ -729,6 +731,11 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "rpa_cases",
+        "out_head_norm_eps",
+        "no_max",
+        "skip_pad_q",
+        "skip_pad_q_group",
+        "prefill_bq_bkv",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -768,6 +775,11 @@ def ragged_paged_attention(
     kv_lens_global: jax.Array | None = None,
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
     rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
+    out_head_norm_eps: float | None = None,
+    no_max: bool | None = None,
+    skip_pad_q: bool | None = None,
+    skip_pad_q_group: int | None = None,
+    prefill_bq_bkv: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -838,6 +850,17 @@ def ragged_paged_attention(
             global lengths and this rank's stripe table).
         rpa_cases: Which of the DECODE / MIXED launches to run (both when
             None); a case whose ``distribution`` range is empty can be skipped.
+        out_head_norm_eps: When set, each head's output is stored RMS-normalized
+            (weightless, this eps) after rounding to out_dtype.
+        no_max: Softmax without the running max (bounded scores only); None reads
+            SGLANG_TPU_RPA_NO_MAX.
+        skip_pad_q: Skip a partial q block's padded query groups; None reads
+            SGLANG_TPU_RPA_SKIP_PAD_Q.
+        skip_pad_q_group: Tokens per skipped group; None reads
+            SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.
+        prefill_bq_bkv: (bq, bkv) prefill blocks overriding the search, unless
+            prefill_block_sizes is given; None reads SGLANG_TPU_RPA_PREFILL_BLOCKS
+            (SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS with a sliding window).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -918,6 +941,21 @@ def ragged_paged_attention(
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
         skip_full_tile_mask=envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # The sink term and the LSE read the running max.
+        no_max=(
+            (envs.SGLANG_TPU_RPA_NO_MAX.get() if no_max is None else no_max)
+            and attention_sink is None
+            and not return_lse
+        ),
+        skip_pad_q=(
+            envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get() if skip_pad_q is None else skip_pad_q
+        ),
+        skip_pad_q_group=(
+            envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get()
+            if skip_pad_q_group is None
+            else skip_pad_q_group
+        ),
+        out_head_norm_eps=out_head_norm_eps,
         # Base-2 m and l would reach the soft cap, the sink term and the LSE.
         exp2_softmax=(
             envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()
@@ -967,6 +1005,23 @@ def ragged_paged_attention(
     if decode_block_sizes is None or prefill_block_sizes is None:
         default_decode, default_prefill = calculate_block_sizes(
             model_cfgs, serve_cfgs, vmem_limit_bytes
+        )
+    if prefill_bq_bkv is None:
+        blocks_env = (
+            envs.SGLANG_TPU_RPA_PREFILL_BLOCKS
+            if sliding_window is None
+            else envs.SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS
+        ).get()
+        if blocks_env:
+            bq_env, bkv_env = (int(x) for x in blocks_env.split(":"))
+            prefill_bq_bkv = (bq_env, bkv_env)
+    if prefill_block_sizes is None and prefill_bq_bkv is not None:
+        bq_sz, bkv_sz = prefill_bq_bkv
+        prefill_block_sizes = dataclasses.replace(
+            default_prefill,
+            bq_sz=bq_sz,
+            bq_c_sz=math.gcd(bq_sz, default_prefill.bq_c_sz),
+            bkv_sz=bkv_sz,
         )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads

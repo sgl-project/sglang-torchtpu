@@ -114,6 +114,7 @@ def _invoke_batched_kernel(
         # The kernel owns the KV write; the backend never writes out of band.
         skip_kv_update=False,
         kv_layout=kv_layout(),
+        out_head_norm_eps=envs.SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS.get(),
     )
 
 

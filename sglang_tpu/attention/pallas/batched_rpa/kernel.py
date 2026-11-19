@@ -191,6 +191,10 @@ def calculate_and_store_out(
         else:
             result = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
+        if cfgs.serve.out_head_norm_eps is not None:
+            out = utils.head_norm(
+                out, -1, cfgs.model.head_dim, cfgs.serve.out_head_norm_eps
+            )
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
         out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
@@ -371,9 +375,29 @@ def rpa_body(
     k_b = []
     v_b = []
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
+    # Multi-row q blocks stitch only where the k block holds new tokens; a block
+    # read wholly from the cache stitches to itself.
+    guard_stitch = (
+        cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE and cfgs.bq_sz > 1
+    )
+    if guard_stitch:
         for b_idx in range(cfgs.batch_size):
+
+            @pl.when(bkv_sz_frm_cache_list[b_idx] < cfgs.bkv_sz)
+            def _(b_idx=b_idx):
+                res = stitch_utils.stitch_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    bkv_sz_frm_cache_list[b_idx],
+                    new_kv_len_start_list[b_idx],
+                    cfgs=cfgs,
+                )
+                stitch_utils.store_new_kv_lane(kv_in_vref, b_idx, res, cfgs=cfgs)
+
+    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        n_unguarded = 0 if guard_stitch else cfgs.batch_size
+        stitch_results = []
+        for b_idx in range(n_unguarded):
             res = stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -382,7 +406,7 @@ def rpa_body(
                 cfgs=cfgs,
             )
             stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
+        for b_idx in range(n_unguarded):
             stitch_utils.store_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -473,6 +497,22 @@ def rpa_body(
             processed_kv_len=processed_kv_len[0],
             cfgs=cfgs,
         )
+        if cfgs.serve.skip_pad_q:
+            s_idx = jnp.maximum(0, schedule_ref.s_idx[step, 0])
+            q_len = cu_q_lens_ref[s_idx + 1] - cu_q_lens_ref[s_idx]
+            q_rows = q_len - schedule_ref.q_idx[step, 0] * cfgs.bq_sz
+            # The group loop costs more per row: take it only when a whole group is padding.
+            partial_q = q_rows <= cfgs.bq_sz - transposed.skip_group_tokens(cfgs)
+            run_full_q = run_tile
+
+            def run_tile(apply_mask):
+                pl.when(partial_q)(
+                    lambda: run_full_q(apply_mask=apply_mask, q_rows=q_rows)
+                )
+                pl.when(jnp.logical_not(partial_q))(
+                    lambda: run_full_q(apply_mask=apply_mask)
+                )
+
         if not cfgs.serve.skip_full_tile_mask:
             run_tile(apply_mask=True)
         else:
@@ -732,6 +772,10 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-cp{cfgs.serve.cp_group_size}"
     if cfgs.use_transposed:
         name += "-tr"
+        if cfgs.serve.skip_pad_q:
+            name += "-spq"
+        if cfgs.serve.no_max:
+            name += "-nm"
     return name
 
 
