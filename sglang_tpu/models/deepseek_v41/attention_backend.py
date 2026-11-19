@@ -37,6 +37,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
 
 # The pool owns the page layout the kernels read; the backend only indexes it.
@@ -225,7 +226,13 @@ def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
     if mode.is_decode():
         counts[:real_bs] = 1
         return counts
-    if mode.is_extend() and not mode.is_target_verify():
+    if mode.is_target_verify():
+        # extend_seq_lens is not set on verify batches; every request has the same width.
+        spec_info = forward_batch.spec_info
+        assert spec_info is not None, "a verify batch carries spec_info"
+        counts[:real_bs] = int(spec_info.draft_token_num)
+        return counts
+    if mode.is_extend():
         lens = forward_batch.extend_seq_lens_cpu
         if lens is None:
             lens = forward_batch.extend_seq_lens
@@ -233,7 +240,7 @@ def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
         counts[:real_bs] = _as_cpu_int64(lens, bs)[:real_bs]
         return counts
     raise NotImplementedError(
-        f"DeepSeek-V4.1 TPU attention serves extend and decode, not {mode.name}"
+        f"DeepSeek-V4.1 TPU attention serves extend, decode and target verify, not {mode.name}"
     )
 
 
@@ -358,6 +365,9 @@ def build_forward_metadata(
 # =============================================================================
 
 
+_MAX_BLOCK_ROWS = 64
+
+
 def _check_supported(config) -> None:
     from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
@@ -368,8 +378,20 @@ def _check_supported(config) -> None:
                 f"DeepSeek-V4.1 TPU attention needs {name} == 1 "
                 "(attention TP1 per DP rank)"
             )
-    if get_spec().speculative_algorithm is not None:
-        raise NotImplementedError("DeepSeek-V4.1 TPU attention does not run MTP yet")
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not (algorithm.is_none() or algorithm.is_dspark()):
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 TPU attention serves DSPARK speculation only, not {algorithm}"
+        )
+    # CSA2 serves non-causal requests of at most 64 queries; the draft block and
+    # the verify window are gamma + 1 rows.
+    rows = spec.speculative_num_draft_tokens
+    if algorithm.is_dspark() and rows is not None and rows > _MAX_BLOCK_ROWS:
+        raise ValueError(
+            f"DSpark verify of {rows} rows exceeds "
+            f"the {_MAX_BLOCK_ROWS} non-causal CSA2 queries"
+        )
     features = get_exec().features
     if (
         features.enable_encoder_swa_bounded_replay
@@ -412,9 +434,21 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.max_context_len = int(model_config.context_len)
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
-        self.low_ratios = tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
-        self.last_candidate_consumer = self._last_candidate_consumers(config)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
+        # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
+        self.is_dspark_draft = (
+            model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
+        )
+        # The draft carries the target config, but its stages are all ratio 0.
+        self.low_ratios = (
+            ()
+            if self.is_dspark_draft
+            else tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
+        )
+        # The draft has no index layers, hence no candidate consumers.
+        self.last_candidate_consumer = (
+            {} if self.is_dspark_draft else self._last_candidate_consumers(config)
+        )
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         # Attention layer id -> the module owning that layer's freqs_cis buffer.
         # The table is read through the owner at call time, so the direct tracer
@@ -429,7 +463,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 f"got index_topk={self.index_topk}"
             )
         self._prewarm_model_caches()
-        self._drop_text_only_image_mask(model_runner)
+        # The DSpark draft has no inner .model, Engram layers or image-token mask.
+        if not self.is_dspark_draft:
+            self._drop_text_only_image_mask(model_runner)
 
     @staticmethod
     def _drop_text_only_image_mask(model_runner) -> None:
@@ -830,8 +866,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
             metadata.query_start_loc,
             metadata.positions,
             metadata.swa_minimum,
+            non_causal=self.is_dspark_draft,
         )
-        metadata.swa_meta, metadata.swa_bounds = meta, bounds
+        # Bounds are passed to attention only for the non-causal draft block.
+        metadata.swa_meta = meta
+        metadata.swa_bounds = bounds if self.is_dspark_draft else None
         metadata.swa_write_records = records.masked_fill(~metadata.valid, -1)
 
     def _attention(

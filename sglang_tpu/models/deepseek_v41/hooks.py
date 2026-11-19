@@ -105,6 +105,42 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
+
+tpu_dsv41_dspark_attention, tpu_dsv41_dspark_forward,
+tpu_dsv41_dspark_write_target_hidden_kv
+  Why: DSparkAttention.forward and write_target_hidden_kv write the draft KV
+       with the CUDA FlashMLA writer, and the attention inverse-rotates its
+       output, which CSA2 already does; the draft forward returns no
+       next_draft_tokens, which TpuBlockSpecWorker reads for greedy drafts.
+  How: AROUND each when the draft runs on the CSA2 backend (dspark.py):
+       attention goes through the backend's prepare_mqa_qkv and non-causal
+       forward, then wo_a / wo_b; the KV write publishes into the CSA2 SWA
+       pages; the forward appends the greedy Markov chain in-graph, as
+       vllm-torchtpu models/vllm/deepseek_v41/v2/dspark.py does.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: the V4 draft reads its KV write and inverse RoPE from the
+       attention backend and returns draft tokens.
+
+tpu_dsv41_dspark_compute_base_logits
+  Why: under attention DP each rank's lm_head holds the full vocab
+       (tp_size 1), but gather_and_crop_vocab gathers over the full TP group
+       and keeps TP rank 0's rows, so every rank drafted rank 0's tokens.
+  How: AROUND compute_base_logits projects this rank's rows without a gather
+       when the head is unsharded.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: compute_base_logits gathers over the lm_head's own group.
+
+tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
+  Why: the target's Engram history lives on the host (engram_host), so
+       committing a verify reads its outputs back and blocks the host for the
+       whole verify; core commit_after_verify also writes padded rows into
+       req slot 0.
+  How: AROUND NgramEmbeddingManager.update_after_verify queues the commit;
+       the next host Engram staging (compile_policy) applies the queue, and a
+       PD prebuilt batch, which writes history rows in _prepare_engram_history
+       without staging, applies it first.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: the Engram history lives on the device and commits in-graph.
 """
 
 from __future__ import annotations
@@ -144,13 +180,18 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     if (
         type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
         or model_config is None
-        # Without Engram tables the generic EP-local loader does everything.
-        or not model_config.use_engram
-        or model_config.is_draft_model
         or load_config.draft_model_idx is not None
     ):
         return result
-    from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
+    from sglang_tpu.models.deepseek_v41.loader import (
+        DSV41RunaiModelStreamerLoader,
+        is_bundled_dspark_draft,
+    )
+
+    # Without Engram tables the generic EP-local loader does everything; a
+    # bundled DSpark draft comes here to stream only its mtp.* tensors.
+    if not (model_config.use_engram or is_bundled_dspark_draft(model_config)):
+        return result
 
     return DSV41RunaiModelStreamerLoader(load_config)
 
@@ -328,6 +369,84 @@ def tpu_dsv41_engram_embed_forward(
     return staged_lookup(embedding, indices, staged)
 
 
+def tpu_dsv41_dspark_attention(original, attn, positions, hidden_states, forward_batch):
+    """AROUND DSparkAttention.forward: the draft on the CSA2 backend."""
+    from sglang_tpu.models.deepseek_v41.dspark import (
+        dspark_attention_forward,
+        serves_dspark_draft,
+    )
+
+    if hidden_states.is_cuda or not serves_dspark_draft():
+        return original(attn, positions, hidden_states, forward_batch)
+    return dspark_attention_forward(attn, positions, hidden_states, forward_batch)
+
+
+def tpu_dsv41_dspark_forward(original, model, input_ids, positions, *args, **kwargs):
+    """AROUND DeepseekV4ForCausalLMDSpark.forward: add the greedy drafts."""
+    from sglang_tpu.models.deepseek_v41.dspark import (
+        dspark_forward,
+        serves_dspark_draft,
+    )
+
+    if input_ids.is_cuda or not serves_dspark_draft():
+        return original(model, input_ids, positions, *args, **kwargs)
+    return dspark_forward(original, model, input_ids, positions, *args, **kwargs)
+
+
+def tpu_dsv41_dspark_write_target_hidden_kv(original, model, **kwargs):
+    """AROUND DeepseekV4ForCausalLMDSpark.write_target_hidden_kv: CSA2 SWA pages."""
+    from sglang_tpu.models.deepseek_v41.dspark import write_target_hidden_kv
+
+    if kwargs["main_hidden"].is_cuda:
+        return original(model, **kwargs)
+    return write_target_hidden_kv(model, **kwargs)
+
+
+def tpu_dsv41_dspark_compute_base_logits(original, model, x):
+    """AROUND DeepseekV4ForCausalLMDSpark.compute_base_logits: no gather of an
+    unsharded head."""
+    from sglang_tpu.models.deepseek_v41.dspark import tpu_compute_base_logits
+
+    if x.is_cuda or model.lm_head is None or model.lm_head.tp_size != 1:
+        return original(model, x)
+    return tpu_compute_base_logits(model, x)
+
+
+def tpu_dsv41_defer_engram_commit(
+    original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
+):
+    """AROUND NgramEmbeddingManager.update_after_verify: queue the host commit."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    hasher = manager.engram_hasher
+    if hasher is None or verify_ids_2d.is_cuda:
+        return original(
+            manager,
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )
+    engram_host.defer_engram_commit(
+        hasher,
+        verify_ids_2d=verify_ids_2d,
+        req_pool_indices=req_pool_indices,
+        commit_lens=commit_lens,
+    )
+
+
+def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
+    """AROUND NgramEmbeddingManager._prepare_engram_history: a PD prebuilt batch
+    writes history rows directly, so queued verify commits land first."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    hasher = manager.engram_hasher
+    if batch.forward_mode.is_prebuilt() and engram_host.has_pending_engram_commits(
+        hasher
+    ):
+        engram_host.flush_engram_commits(hasher)
+    return original(manager, batch)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -336,6 +455,11 @@ def hook_specs():
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
+    dspark = "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark"
+    ngram = (
+        "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
+        ".NgramEmbeddingManager"
+    )
     return [
         (f"{kvc}._build_dsv4_kv_pool", build_tpu_dsv41_kv_pool, HookType.AROUND),
         (
@@ -396,6 +520,36 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding.forward",
             tpu_dsv41_engram_embed_forward,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_dspark.DSparkAttention.forward",
+            tpu_dsv41_dspark_attention,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.forward",
+            tpu_dsv41_dspark_forward,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.write_target_hidden_kv",
+            tpu_dsv41_dspark_write_target_hidden_kv,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.compute_base_logits",
+            tpu_dsv41_dspark_compute_base_logits,
+            HookType.AROUND,
+        ),
+        (
+            f"{ngram}.update_after_verify",
+            tpu_dsv41_defer_engram_commit,
+            HookType.AROUND,
+        ),
+        (
+            f"{ngram}._prepare_engram_history",
+            tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
         ),
     ]

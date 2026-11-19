@@ -33,11 +33,9 @@ class TpuDraftWorker(ABC):
 
     def __init__(self, target_runner: ModelRunner) -> None:
         self._target_runner = target_runner
-        # Under DP attention the draft runs inside its rank's attention-TP group, as
-        # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
         # Resolved here, in the target scope, as EAGLEWorkerV2 resolves its own.
         self.parallel_layout = resolve_draft_parallel_layout(
-            DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+            DraftParallelSpec(tp_execution=self._draft_tp_execution())
         )
         model_config = ModelConfig.from_server_args(
             target_runner.server_args,
@@ -58,6 +56,12 @@ class TpuDraftWorker(ABC):
                 server_args=target_runner.server_args,
                 is_draft_worker=True,
             )
+
+    def _draft_tp_execution(self) -> DraftTPExecution:
+        """Runs before the draft ModelRunner exists, so it reads only config."""
+        # Under DP attention the draft runs inside its rank's attention-TP group, as
+        # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
+        return DraftTPExecution.SINGLE_GROUP
 
     @contextlib.contextmanager
     def draft_context(self) -> Iterator[None]:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import weakref
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -1239,3 +1240,74 @@ def without_cuda_host_register():
         yield
     finally:
         torch.cuda.cudart = original
+
+
+# hasher -> verify commits not yet applied to its host history, oldest first.
+_PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def commit_engram_history(
+    hasher,
+    *,
+    verify_ids_2d: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Core EngramHasher.commit_after_verify on the host history.
+
+    Each request's history becomes the last n - 1 of history + its first
+    commit_lens verify tokens, oldest first. Padded rows (commit_lens 0) write
+    the hasher's pad row: core writes them into req slot 0, a live slot.
+    """
+    history = hasher.history
+    # The history lives on the host; the verify tensors come from the device.
+    device = history.device
+    verify_ids_2d, req_pool_indices, commit_lens = (
+        t.to(device) for t in (verify_ids_2d, req_pool_indices, commit_lens)
+    )
+    n1 = hasher.max_ngram_size - 1
+    req = req_pool_indices.to(torch.int64)
+    window = torch.cat([history[req], verify_ids_2d.to(history.dtype)], dim=1)
+    cols = commit_lens.to(torch.int64).unsqueeze(-1) + torch.arange(
+        n1, device=window.device
+    )
+    values = window.gather(1, cols)
+    rows = torch.where(commit_lens > 0, req, torch.full_like(req, hasher.pad_row))
+    history.copy_(history.index_put((rows,), values))
+
+
+def defer_engram_commit(
+    hasher,
+    *,
+    verify_ids_2d: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Queue a verify's Engram commit for flush_engram_commits.
+
+    Committing in the verify step copies the verify outputs to the host and
+    blocks it until the verify finishes; the next reader of the history runs
+    after the next draft is dispatched.
+    """
+    commit = (verify_ids_2d, req_pool_indices, commit_lens)
+    _PENDING_COMMITS.setdefault(hasher, []).append(commit)
+
+
+def has_pending_engram_commits(hasher) -> bool:
+    # Only DSpark verify queues; without a queue the hasher is never weak-referenced.
+    return bool(_PENDING_COMMITS) and bool(_PENDING_COMMITS.get(hasher))
+
+
+def flush_engram_commits(hasher) -> None:
+    """Apply the queued verify commits in order; call before reading or writing history."""
+    if not _PENDING_COMMITS:
+        return
+    for verify_ids_2d, req_pool_indices, commit_lens in _PENDING_COMMITS.pop(
+        hasher, ()
+    ):
+        commit_engram_history(
+            hasher,
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )

@@ -97,6 +97,13 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         class_name="DeepseekV4ForCausalLM",
         policy=_deepseek_v4_decoder_policy,
     ),
+    # The DSpark draft bundled with V4/V4.1 embeds with the target's table, so it
+    # needs the same DP embedding staging.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.deepseek_v4_dspark",
+        class_name="DeepseekV4ForCausalLMDSpark",
+        policy=_deepseek_v4_decoder_policy,
+    ),
     # Kimi-K3's vision encoder. Its layer loop runs on the TPU runner the
     # plugin attaches as graph_runners (sglang_tpu.hooks.kimi_k3_vision); this
     # compiles that runner per padded patch bucket. The language model carries
