@@ -571,7 +571,11 @@ def _refusal_manager(
 ):
     mgr = object.__new__(RaidenKVManager)
     mgr.attn_tp_size = own_tp
-    mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads, page_size=page_size)
+    mgr.kv_args = SimpleNamespace(
+        total_kv_head_num=total_heads,
+        page_size=page_size,
+        sliding_window_size=None,
+    )
     mgr.disaggregation_mode = (
         DisaggregationMode.DECODE if side == "decode" else DisaggregationMode.PREFILL
     )

@@ -577,16 +577,27 @@ class RaidenKVManager(
         of a landing room at one announcement (C)."""
         return -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
 
+    def _land_swa_window_blocks(self) -> int:
+        if tpu_envs.SGLANG_RAIDEN_SWA_MAX_BLOCKS.get() > 0 or (
+            self.kv_args.sliding_window_size is not None
+            and self.kv_args.sliding_window_size > 0
+        ):
+            return self._swa_max_request_blocks()
+        return self._land_chunk_pages()
+
     def _land_min_arena_blocks(self, *, swa: bool = False) -> int:
         chunk = self._land_chunk_pages()
-        if not swa and self._unified_swa_pool is not None:
-            return (1 + self._unified_swa_pool.layout.num_swa_groups) * chunk
+        if swa:
+            return max(chunk, self._land_swa_window_blocks())
+        if self._unified_swa_pool is not None:
+            return (
+                chunk
+                + self._unified_swa_pool.layout.num_swa_groups
+                * self._land_swa_window_blocks()
+            )
         return chunk
 
     def _land_ok(self, *, swa: bool = False) -> bool:
-        """Whether this side can serve a push reshard that needs landing
-        (#829): a decode whose arena holds a whole chunk, or a prefill with
-        SGLANG_RAIDEN_RESHARD_LAND_ARENA set."""
         if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
             return False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -597,7 +608,6 @@ class RaidenKVManager(
         )
 
     def _land_hint(self, *, swa: bool = False) -> str:
-        """What would let a refused landing cell through on this side."""
         if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
             return (
                 f" (or set {tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name}=1 on the "
@@ -616,6 +626,11 @@ class RaidenKVManager(
             return (
                 f" (the unified landing arena holds {land.arena.capacity} blocks, "
                 f"under the {needed} blocks one chunk and its SWA groups need)"
+            )
+        if swa and needed > self._land_chunk_pages():
+            return (
+                f" (the SWA landing arena holds {land.arena.capacity} blocks, "
+                f"under the {needed}-page SWA window)"
             )
         label = "SWA landing arena" if swa else "landing arena"
         return (
@@ -869,10 +884,15 @@ class RaidenKVManager(
                     continue
                 if land.arena.available < head.pages:
                     break
+                peer = head.peer_land
+                if peer is not None and (
+                    (peer.holds and peer.holds[0].room != head.room)
+                    or peer.arena.available < head.peer_pages
+                ):
+                    break
             head.retry()
             with self._state_lock:
-                # A retry that took nothing (its room failed meanwhile) must
-                # not block the queue.
+                # A retry whose room failed meanwhile took nothing; pop it.
                 if land.holds and land.holds[0] is head:
                     land.holds.popleft()
 
@@ -1475,14 +1495,17 @@ class RaidenKVManager(
         an engine that never held it the drop is the same no-op as for a plan
         raiden already reaped.
         """
+        first_error: Optional[RuntimeError] = None
         for engine in (self._engine, self._swa_engine):
             if engine is None:
                 continue
             try:
                 engine.unregister_active_plan(uuid)
             except RuntimeError as e:
-                if "not registered" not in str(e):
-                    raise
+                if "not registered" not in str(e) and first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
 
     def _reap_stale_plan(self, uuid: int, room: int, fut) -> None:
         """Waits out a parked plan's copy, then drops the plan.

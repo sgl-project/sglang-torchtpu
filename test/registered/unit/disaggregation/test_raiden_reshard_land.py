@@ -228,7 +228,10 @@ def _decode(
     mgr._swa_engine = None
     mgr._ensure_engine = lambda: mgr._engine
     mgr.kv_args = SimpleNamespace(
-        page_size=PAGE, total_kv_head_num=total_heads, total_swa_kv_head_num=0
+        page_size=PAGE,
+        total_kv_head_num=total_heads,
+        total_swa_kv_head_num=0,
+        sliding_window_size=None,
     )
     mgr._kv_caches = [_pool(1 + alloc + cap, heads) for _ in range(2)]
     mgr._kv_head_nums = (heads,)
@@ -353,7 +356,10 @@ def _prefill(rank=1, total_heads=8, src_tp=8, dst_tp=4, announce_pages=16):
     mgr._ensure_engine = lambda: mgr._engine
     mgr._swa_engine = None
     mgr.kv_args = SimpleNamespace(
-        page_size=PAGE, total_kv_head_num=total_heads, total_swa_kv_head_num=0
+        page_size=PAGE,
+        total_kv_head_num=total_heads,
+        total_swa_kv_head_num=0,
+        sliding_window_size=None,
     )
     mgr._kv_caches = [_pool(8, max(1, total_heads // src_tp)) for _ in range(2)]
     mgr._kv_head_nums = (max(1, total_heads // src_tp),)
@@ -1237,6 +1243,37 @@ class TestRefusal(unittest.TestCase):
                     layout_of=mgr._land_layout,
                 )
 
+    def test_swa_window_exceeding_arena_refused_at_init(self):
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            # PAGE = 128 -> C = 64, A = 128; sliding_window_size = 16384 -> W = 129 > A.
+            mgr = _attach_swa_decode(
+                _decode(cap=128, alloc=200), swa_cap=128, swa_alloc=200
+            )
+            mgr.kv_args.sliding_window_size = 16384
+            recv, abort = self._run_receiver_init(mgr)
+            self.assertEqual(recv.conclude_state, KVPoll.Failed)
+            abort.assert_called_once()
+            self.assertIn("128 blocks", mgr.failure_records[ROOM])
+            self.assertIn("129-page SWA window", mgr.failure_records[ROOM])
+            mgr.register_decode_request = Mock()
+            recv.send_metadata(np.asarray([1, 2], dtype=np.int32))
+            mgr.register_decode_request.assert_not_called()
+
+            # Unified SWA: C = 64, M_swa = 2, cap = 300; window 16384 -> W = 129,
+            # needed = 64 + 2 * 129 = 322 > 300.
+            uni = self._mgr(300)
+            uni._unified_swa_pool = SimpleNamespace(
+                layout=SimpleNamespace(num_swa_groups=2)
+            )
+            uni.kv_args.sliding_window_size = 16384
+            uni_recv, uni_abort = self._run_receiver_init(
+                uni, remote_layout="unified-swa"
+            )
+            self.assertEqual(uni_recv.conclude_state, KVPoll.Failed)
+            uni_abort.assert_called_once()
+            self.assertIn("300 blocks", uni.failure_records[ROOM])
+            self.assertIn("322 blocks", uni.failure_records[ROOM])
+
     def test_prefill_needs_only_the_env(self):
         with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(False):
             reason = _prefill().reshard_refusal(8, 4)
@@ -1796,14 +1833,14 @@ class TestHybridSwaLanding(unittest.TestCase):
         self._check_all_pages(dec, fab.final)
 
     def test_swa_hold_releases_full_scratch_and_retries(self):
-        """A closing plan whose SWA arena is full frees its full-arena take
-        before parking the SWA hold, then registers both on retry."""
+        """A closing plan whose SWA arena is full holds neither arena's blocks
+        while parking FIFO holds on both, then registers both on retry."""
         mgr = _attach_swa_decode(_decode(cap=4), swa_cap=2)
         mgr._swa_land.take("blocker", 99, 2)
         _closing_swa(mgr)
         self.assertEqual(_sent(mgr, ReshardLandReady), [])
         self.assertEqual(mgr._land.arena.held, 0)
-        self.assertEqual(len(mgr._land.holds), 0)
+        self.assertEqual(len(mgr._land.holds), 1)
         self.assertEqual(len(mgr._swa_land.holds), 1)
         mgr._swa_land.free("blocker")
         with patch.dict(sys.modules, _pb2_modules()):
@@ -1811,6 +1848,7 @@ class TestHybridSwaLanding(unittest.TestCase):
         (ready,) = _sent(mgr, ReshardLandReady)
         self.assertEqual((len(ready.scratch), len(ready.swa_scratch)), (4, 2))
         self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (4, 2))
+        self.assertEqual((len(mgr._land.holds), len(mgr._swa_land.holds)), (0, 0))
 
     def test_swa_register_failure_and_abort_free_both_arenas(self):
         """Staging failure on _engine unregisters _swa_engine and returns both
@@ -1829,6 +1867,86 @@ class TestHybridSwaLanding(unittest.TestCase):
         _closing_swa(mgr)
         self.assertEqual(_sent(mgr, ReshardLandReady), [])
         self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (0, 0))
+
+    def test_two_arena_closing_hold_preserves_deadline_and_fifo(self):
+        now = [1000.0]
+        with (
+            envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True),
+            envs.SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S.override(2.0),
+            patch.dict(sys.modules, _pb2_modules()),
+            patch(
+                "sglang_tpu.disaggregation.raiden.receiver.time.time",
+                side_effect=lambda: now[0],
+            ),
+            patch(
+                "sglang_tpu.disaggregation.raiden.conn.time.time",
+                side_effect=lambda: now[0],
+            ),
+        ):
+            mgr = _attach_swa_decode(_decode(cap=4), swa_cap=2)
+            mgr.waiting_timeout = 300.0
+            mgr._land.started[ROOM] = now[0]
+            mgr._swa_land.started[ROOM] = now[0]
+            mgr._land.take("r90", 90, 4)
+            mgr._swa_land.take("r91", 91, 2)
+            _closing_swa(mgr)
+            self.assertEqual(mgr._land.holds[0].deadline, 1002.0)
+
+            now[0] = 1001.5
+            mgr._land.free("r90")
+            mgr.land_prepass()
+            self.assertFalse(mgr.is_failed(ROOM))
+            # Younger room cannot overtake _land while ROOM still waits on _swa_land.
+            self.assertIsNone(mgr._land.take("r92", 92, 4))
+            self.assertEqual(mgr._land.holds[0].deadline, 1002.0)
+
+            now[0] = 1002.0
+            mgr.land_prepass()
+            self.assertTrue(mgr.is_failed(ROOM))
+            self.assertIn(
+                "SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S", mgr.failure_records[ROOM]
+            )
+            self.assertEqual(len(mgr._land.holds), 0)
+            self.assertEqual(len(mgr._swa_land.holds), 0)
+
+    def test_closing_rollback_frees_arenas_when_unregister_raises(self):
+        mgr = _attach_swa_decode(_decode())
+        mgr._engine.register_active_plan.side_effect = lambda *args, **kwargs: (
+            mgr.clear_room(ROOM)
+        )
+        mgr._engine.unregister_active_plan.side_effect = RuntimeError(
+            "transport closed"
+        )
+        _closing_swa(mgr)
+        mgr.clear_room(ROOM)
+        mgr._engine.unregister_active_plan.assert_called_with(ROOM)
+        mgr._swa_engine.unregister_active_plan.assert_called_with(ROOM)
+        self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (0, 0))
+        self.assertTrue(mgr.land_merged(ROOM))
+
+        fab = _UnifiedFabric(pages=4, chunk_arena=8, announce=4, m_swa=2)
+        dec = fab.dec
+        dec._engine.register_active_plan.side_effect = lambda *args, **kwargs: (
+            dec.clear_room(ROOM)
+        )
+        dec._engine.unregister_active_plan.side_effect = RuntimeError(
+            "transport closed"
+        )
+        with patch.dict(sys.modules, _pb2_modules()):
+            for p in fab.srcs:
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        ROOM,
+                        list(fab.src_blocks),
+                        p,
+                        b"",
+                        list(fab.swa_expanded),
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+        dec.clear_room(ROOM)
+        self.assertEqual(dec._land.arena.held, 0)
+        self.assertTrue(dec.land_merged(ROOM))
 
     def test_swa_refusal_hint_names_missing_swa_arena(self):
         """When full has an arena but SWA reserved none, reshard_refusal refuses
@@ -2208,6 +2326,51 @@ class TestUnifiedPoolLanding(unittest.TestCase):
                 self.assertTrue(pre.is_failed(ROOM))
                 self.assertTrue(pre.is_aborted(ROOM))
                 pre._engine.push_registered_plan.assert_not_called()
+
+    def test_unified_closing_validates_swa_before_marking_final_seen(self):
+        fab = _UnifiedFabric(pages=2, chunk_arena=2, announce=2, m_swa=2)
+        dec = fab.dec
+        dec._decode.reshard_meta[ROOM]["local_swa_blocks"] = []
+        observed_premature_done = []
+        orig_pair = dec._pair_unified_reshard_swa_receiver
+
+        def spy_pair(*args, **kwargs):
+            observed_premature_done.append(
+                dec.is_recv_done(ROOM)
+                and dec.land_merged(ROOM)
+                and not dec.is_failed(ROOM)
+            )
+            return orig_pair(*args, **kwargs)
+
+        dec._pair_unified_reshard_swa_receiver = spy_pair
+        with patch.dict(sys.modules, _pb2_modules()):
+            for p in fab.srcs:
+                dec._on_reshard_chunk(
+                    ReshardChunk(
+                        ROOM,
+                        0,
+                        0,
+                        2,
+                        list(fab.src_blocks),
+                        p,
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+            _settle(dec, received=list(_registered(dec)))
+            dec.land_prepass()
+            for p in fab.srcs:
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        ROOM,
+                        list(fab.src_blocks),
+                        p,
+                        b"",
+                        [],
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+        self.assertEqual(observed_premature_done, [False])
+        self.assertTrue(dec.is_failed(ROOM))
 
 
 if __name__ == "__main__":

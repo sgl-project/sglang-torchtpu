@@ -201,6 +201,8 @@ class LandHold:
     retry: Callable[[], None]
     # Fails the room once the hold expires; called without the lock.
     expire: Callable[[], None]
+    peer_land: Any = None
+    peer_pages: int = 0
 
 
 class LandState:
