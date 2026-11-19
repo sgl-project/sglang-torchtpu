@@ -43,7 +43,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not get_device_module().is_available():
+        if not torch.accelerator.is_available():
             raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -207,7 +207,7 @@ class TestCopyOutput(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not get_device_module().is_available():
+        if not torch.accelerator.is_available():
             raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -265,7 +265,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not get_device_module().is_available():
+        if not torch.accelerator.is_available():
             raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (

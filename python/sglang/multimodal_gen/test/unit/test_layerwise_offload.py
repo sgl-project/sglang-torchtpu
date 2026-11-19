@@ -244,7 +244,7 @@ def _server_args(**kwargs):
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -282,7 +282,7 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
 
 def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -306,7 +306,7 @@ def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch)
 
 def test_layerwise_offload_does_not_capture_nested_same_named_layers(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -331,7 +331,7 @@ def test_layerwise_offload_does_not_capture_nested_same_named_layers(monkeypatch
 
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -361,7 +361,7 @@ def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
 
 def test_layerwise_offload_loads_current_layer_for_reverse_execution(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -425,7 +425,7 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
 
 def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     layerwise_module = _NestedDummyModel()
@@ -445,7 +445,7 @@ def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
 
 def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -826,7 +826,7 @@ def test_pinned_copy_failure_retains_lease_for_live_alias(
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     text_encoder = _NestedEncoderDummyModel()
@@ -850,7 +850,7 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
 
 def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     text_encoder = _NestedEncoderDummyModel()
@@ -916,7 +916,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
 
 def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     text_encoder = _NestedEncoderDummyModel()
@@ -1089,7 +1089,7 @@ def test_resident_strategy_keeps_fsdp_managed_module_owned_by_fsdp(monkeypatch):
 
 def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -1183,7 +1183,7 @@ class _MultiGroupComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
 
@@ -1884,7 +1884,7 @@ def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
         _FakeDeviceModule, "current_stream", staticmethod(lambda: compute_stream)
     )
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
 
     manager = object.__new__(LayerwiseOffloadManager)
@@ -1982,7 +1982,7 @@ def _mapped_manager(
     block_cls=_FileBackedBlock,
 ):
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     if available_bytes is None:
@@ -2126,7 +2126,7 @@ def test_replacing_an_anonymous_original_is_not_charged_as_new(tmp_path, monkeyp
     block = _MIXED_BLOCK_BYTES
     available = 4 * 1024**3 + int(2.5 * block)
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     monkeypatch.setattr(
@@ -2402,7 +2402,7 @@ def test_releasing_host_copies_restores_placeholders(monkeypatch):
     # The parking path is for the non-MPS accelerator path, so bypass the
     # MPS-specific early return while still using the real local device.
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: False)
     comp = _ParkableResidentComponent(4)
@@ -2728,7 +2728,7 @@ def test_a_fully_resident_small_component_may_still_read_directly(
     # far below the size floor, but every layer is resident: it is armed once
     # per request, so there is no re-streamed pass for the floor to protect
     monkeypatch.setattr(
-        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+        layerwise_offload_mod.torch, "get_device_module", lambda *_: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     monkeypatch.setattr(

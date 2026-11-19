@@ -321,7 +321,7 @@ class LoRAPipeline(ComposedPipelineBase):
             return
 
         # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
+        if torch.accelerator.is_available():
             torch.get_device_module().synchronize()
             torch.get_device_module().empty_cache()
 

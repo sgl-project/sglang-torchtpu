@@ -212,7 +212,7 @@ def test_stage_metrics_do_not_synchronize_and_bound_step_labels(metrics, monkeyp
     monkeypatch.setattr(metrics_module, "_metrics", collector)
     monkeypatch.delenv("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", raising=False)
     device = Mock()
-    monkeypatch.setattr(perf_logger.torch, "get_device_module", lambda: device)
+    monkeypatch.setattr(perf_logger.torch, "get_device_module", lambda *_: device)
     for step in range(3):
         with perf_logger.StageProfiler(f"denoising_step_{step}", Mock(), None):
             pass
