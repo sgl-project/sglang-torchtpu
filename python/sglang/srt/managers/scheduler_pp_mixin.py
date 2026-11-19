@@ -1546,7 +1546,7 @@ class SchedulerPPMixin:
         """An event recorded after this rank's forward of the micro-batch, which
         processing the result retires. ``side_stream`` keeps the current stream
         from waiting on it."""
-        stream = self.device_module.current_stream()
+        stream = torch.accelerator.current_stream()
         forward_done = mb_metadata.forward_done if mb_metadata else None
         if forward_done is not None:
             if side_stream:
@@ -2121,9 +2121,7 @@ class SchedulerPPMixin:
                     and self.launch_event is not None
                 ):
                     with self.pp_comm_stream_ctx:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        torch.accelerator.current_stream().wait_event(self.launch_event)
                 tensor_dict, output_recv_event = self._pp_recv_dict_from_prev_stage()
                 next_pp_outputs = PPProxyTensors(tensor_dict)
             with self.copy_stream_ctx:
@@ -2305,7 +2303,7 @@ class SchedulerPPMixin:
                     attrs={"pp_mb_id": mb_id},
                 )
                 event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
+                event.record(torch.accelerator.current_stream())
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
