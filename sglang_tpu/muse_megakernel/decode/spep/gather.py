@@ -33,6 +33,7 @@ from sglang_tpu.muse_megakernel.common.numerics import _rms
 from sglang_tpu.muse_megakernel.common.packing import _pack_bf16x2, _unpack_bf16x2
 from sglang_tpu.muse_megakernel.decode.spep import route
 from sglang_tpu.muse_megakernel.decode.spep.config import (
+    DN_TK,
     TP_SCRATCH_UNUSED,
     EPPlan,
     ep_buffers,
@@ -83,26 +84,32 @@ class EPGatherExperts:
 
         pool_tail = _pool(step, routing)
 
+        early = _early_unpool()
+
         def dispatched() -> None:  # the experts' first weight chunks are in flight
             with _phase("items"):
                 _slot_rows(c, S, step.n_live)
             pool_tail()
             S["eg_u"][...] = jnp.zeros(S["eg_u"].shape, f32)
+            if early:  # the unpool's weights load under the expert loop
+                for cp in _unpool_copies(step):
+                    cp.start()
 
         with _phase("experts"):
             expert_loop(
                 step, p, n_items[0], dispatched, x_src="ep_xo", emit=_emit(step, p)
             )
-        # the unpool's first weight tiles stream in under the u reduce-scatter / all-gather
-        stream_prefetch(
-            S,
-            step.W["wunpool"],
-            step.layer,
-            c.expert_hidden,
-            c.hidden_local,
-            step.me * c.hidden_local,
-            c.hidden_local,
-        )
+        if not early:
+            # the unpool's first weight tiles stream in under the u reduce-scatter / all-gather
+            stream_prefetch(
+                S,
+                step.W["wunpool"],
+                step.layer,
+                c.expert_hidden,
+                c.hidden_local,
+                step.me * c.hidden_local,
+                c.hidden_local,
+            )
         with _phase("u_rs"):
             _u_reduce(step)
         with _phase("unpool"):
@@ -152,6 +159,16 @@ def gather_scratch(c: MKConfig, p: EPPlan) -> list:
         ("eg_uag", vmem((tp, R, He // tp // 2), u32)),
         ("eg_fag", vmem((tp, R, Hl // 2), u32)),
         ("eg_sc", vmem((8, Hl), f32)),  # own columns' pool / unpool scales
+        *(
+            # this rank's wunpool column block [He, Hl] as K tiles (fp8 in u32), loaded under
+            # the expert loop instead of through the expert ring after it
+            [
+                ("eg_unw", vmem((He // DN_TK, DN_TK // 4, Hl), u32)),
+                ("eg_unw_sems", dma((He // DN_TK,))),
+            ]
+            if _early_unpool()
+            else []
+        ),
         ("ep_w_sems", dma((p.nslot, 4))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
@@ -174,6 +191,28 @@ def _pair_ag(c: MKConfig) -> bool:
     """Collectives pair the two cores of each chip (4 chips x 2 cores: half the ICI bytes)."""
     min_rows = dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_PAIR_AG_MIN_ROWS, PAIR_AG_MIN_ROWS)
     return c.tp == 8 and c.rows >= min_rows
+
+
+def _early_unpool() -> bool:
+    """SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL: the unpool's weights load into their own VMEM
+    buffer while the experts run (experiment)."""
+    return tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL.get()
+
+
+def _unpool_copies(step: EPLayerStep) -> list:
+    """This rank's wunpool column block, K tile k -> eg_unw[k] (one DMA each)."""
+    c, S = step.c, step.S
+    He, Hl = c.expert_hidden, c.hidden_local
+    w32 = step.W["wunpool"].bitcast(jnp.uint32)  # [L, He / 4, H]
+    col = pl.multiple_of(step.me * Hl, Hl)
+    return [
+        pltpu.make_async_copy(
+            w32.at[step.layer, pl.ds(k * DN_TK // 4, DN_TK // 4), pl.ds(col, Hl)],
+            S["eg_unw"].at[k],
+            S["eg_unw_sems"].at[k],
+        )
+        for k in range(He // DN_TK)
+    ]
 
 
 def _dev_skipped(name: str) -> bool:
@@ -687,6 +726,16 @@ def _unpool(step: EPLayerStep) -> None:
     def put(n0, y):
         fag.at[me][...] = _pack_bf16x2(y)
 
+    if _early_unpool():
+        acc = None
+        for k, cp in enumerate(_unpool_copies(step)):
+            cp.wait()
+            w = S["eg_unw"].at[k].bitcast(jnp.float8_e4m3fn)[...]  # [DN_TK, Hl]
+            part = jnp.dot(x_cols(k * DN_TK, DN_TK), w, preferred_element_type=f32)
+            acc = part if acc is None else acc + part
+        put(0, acc * S["eg_sc"][pl.ds(1, 1), :])
+        _all_gather(c, S, me, fag, PH_FAG)
+        return
     stream_matmul(
         c,
         S,
