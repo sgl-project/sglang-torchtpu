@@ -16,6 +16,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -29,6 +30,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    resolve_generator_device,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -161,11 +165,20 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         if batch.num_outputs_per_prompt != 1:
             raise ValueError("Hunyuan3D only supports num_outputs_per_prompt=1.")
 
-    def _prepare_latents(self, batch_size, dtype, device, generator, scheduler):
+    def _prepare_latents(self, batch, server_args, batch_size, dtype, scheduler):
         from diffusers.utils.torch_utils import randn_tensor
 
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(
+                resolve_generator_device(batch, server_args)
+            ).manual_seed(batch.seed)
         shape = (batch_size, *self.latent_shape)
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        # A float16 draw quantizes the normal (on TPU and on the CPU): draw in
+        # float32 and round.
+        latents = randn_tensor(
+            shape, generator=generator, device=self.device, dtype=torch.float32
+        ).to(dtype)
         return latents * getattr(scheduler, "init_noise_sigma", 1.0)
 
     def component_uses(
@@ -253,11 +266,9 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
             sigmas=sigmas,
         )
 
-        generator = batch.generator
-        if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(batch.seed)
-
-        latents = self._prepare_latents(batch_size, dtype, device, generator, scheduler)
+        latents = self._prepare_latents(
+            batch, server_args, batch_size, dtype, scheduler
+        )
 
         guidance = None
         if self.guidance_embed:
@@ -557,8 +568,10 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         if isinstance(mesh, list):
             mesh = mesh[0]
 
+        # Warmup requests and the server's compile prewarm save no output.
+        saves_output = batch.save_output and not batch.is_warmup
         if mesh is None:
-            if batch.is_warmup:
+            if not saves_output:
                 logger.info(
                     "Skipping mesh export during warmup "
                     "(surface extraction returned None)"
@@ -572,7 +585,7 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
                 "The surface level may be outside the volume data range."
             )
 
-        if batch.is_warmup:
+        if not saves_output:
             if self.config.paint_enable:
                 return batch
             return OutputBatch(output_file_paths=[], metrics=batch.metrics)
@@ -581,7 +594,13 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         output_dir = os.path.dirname(obj_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        mesh.export(obj_path)
+        # Every rank holds the same mesh; the rank that answers the request (the
+        # first of its DP replica) writes it, so no rank rewrites a served file.
+        if (
+            not parallel_state.world_group_is_initialized()
+            or parallel_state.get_replica_group().rank_in_group == 0
+        ):
+            mesh.export(obj_path)
 
         batch.extra["shape_obj_path"] = obj_path
         batch.extra["shape_return_path"] = return_path

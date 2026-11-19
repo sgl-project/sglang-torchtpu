@@ -39,6 +39,15 @@ V = StageValidators
 # TODO: since this might change sampling params after logging, should be do this beforehand?
 
 
+def resolve_generator_device(batch: Req, server_args: ServerArgs) -> str:
+    """Where a request's generators draw: "cpu" when the request (else the
+    pipeline config) asks for it, otherwise the platform's device."""
+    generator_device = (
+        batch.generator_device or server_args.pipeline_config.generator_device
+    )
+    return "cpu" if generator_device == "cpu" else current_platform.device_type
+
+
 def _best_output_size(w, h, dw, dh, expected_area):
     # float output size
     ratio = w / h
@@ -165,18 +174,7 @@ class InputValidationStage(PipelineStage):
 
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
-        generator_device = batch.generator_device
-        if generator_device is None:
-            generator_device = (
-                getattr(server_args.pipeline_config, "generator_device", None)
-                or current_platform.device_type
-            )
-
-        if generator_device == "cpu":
-            device_str = "cpu"
-        else:
-            device_str = current_platform.device_type
-
+        device_str = resolve_generator_device(batch, server_args)
         batch.generator = [
             torch.Generator(device_str).manual_seed(seed) for seed in seeds
         ]
