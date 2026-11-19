@@ -6,6 +6,7 @@ from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import torch
+from pytest import MonkeyPatch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -23,19 +24,12 @@ def import_model(name):
     vllm.__path__ = []
     custom_ops = ModuleType("vllm._custom_ops")
     custom_ops.awq_dequantize = MagicMock()
-    stubs = {"vllm": vllm, "vllm._custom_ops": custom_ops}
-    # Swap only the stub keys: patch.dict(sys.modules) would also drop every module
-    # first imported here (ml_dtypes), and re-importing ml_dtypes fails on its dtypes.
-    saved = {key: sys.modules.get(key) for key in stubs}
-    sys.modules.update(stubs)
-    try:
+    # Restore only the stubs; evicting dependencies imported here can register
+    # native dtypes twice when the next model imports them again.
+    with MonkeyPatch.context() as modules:
+        modules.setitem(sys.modules, "vllm", vllm)
+        modules.setitem(sys.modules, "vllm._custom_ops", custom_ops)
         return importlib.import_module(f"sglang.srt.models.{name}")
-    finally:
-        for key, module in saved.items():
-            if module is None:
-                sys.modules.pop(key, None)
-            else:
-                sys.modules[key] = module
 
 
 class StubModule(torch.nn.Module):
