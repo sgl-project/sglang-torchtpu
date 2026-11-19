@@ -700,6 +700,7 @@ class TestDSV4TPUPatches(CustomTestCase):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
             envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.override(False),
+            envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.override(True),
         ):
             _tpu_deepseek_v4_env_adjustments(
                 server_args, lambda sa: prev_called.append(sa)
@@ -713,6 +714,7 @@ class TestDSV4TPUPatches(CustomTestCase):
             self.assertFalse(envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             self.assertFalse(envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get())
             self.assertTrue(envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get())
+            self.assertFalse(envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get())
 
     def test_dsv4_tpu_moe_mhc_and_model_hooks(self):
         from unittest.mock import patch

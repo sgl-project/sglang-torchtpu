@@ -34,6 +34,28 @@ def get_pallas_tpu_device_kind() -> str:
     return _PALLAS_DEVICE_KIND_BY_TORCHTPU.get(device_kind, device_kind)
 
 
+def get_tpu_info_or_none():
+    """Target metadata on TPU or during CPU export; None on an untargeted CPU.
+
+    JAX's default backend describes the tracing host, not the lowering target.
+    Use the same Pallas metadata as tiling and lowering, including an abstract
+    TPU mesh or ``tpu_info_for_cpu_export``. Do not cache across those contexts.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        # Pallas rejects a CPU/GPU device without a TPU target context.
+        return None
+
+
+def get_tpu_generation() -> int:
+    """The lowering target's generation, or -1 without a TPU target."""
+    info = get_tpu_info_or_none()
+    return -1 if info is None else info.generation
+
+
 @contextmanager
 def tpu_info_for_cpu_export():
     """Ensure Pallas kernels receive physical TPU7x hardware metadata during export."""

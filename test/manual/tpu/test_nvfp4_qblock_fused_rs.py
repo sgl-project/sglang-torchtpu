@@ -144,7 +144,9 @@ def main() -> None:
     from sglang_tpu.fp4_moe import prepare_tpu_nvfp4_moe_weights, qblock_layout
     from sglang_tpu.moe.pallas import fused_moe_rs_op
     from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
-    from sglang_tpu.muse_megakernel.expert_requant import requant_tpu_nvfp4_experts
+    from sglang_tpu.muse_megakernel.common.expert_requant import (
+        requant_tpu_nvfp4_experts,
+    )
 
     device = torch.device("tpu")
     layer = _checkpoint_layer(rank)

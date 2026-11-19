@@ -1586,6 +1586,10 @@ def build_swa_draft_pools(
         return [], []
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
+    # P/D decode with pd_decode_swa_hicache keeps SWA KV on device (no SWA host
+    # pool), so the draft's SWA KV stays on device as well.
+    if PoolName.SWA not in host_pool_group.entry_map:
+        return [], []
     target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):

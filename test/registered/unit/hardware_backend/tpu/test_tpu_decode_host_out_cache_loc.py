@@ -1,4 +1,4 @@
-"""Paged decode allocation against a host-resident req_to_token pool."""
+"""Paged decode and extend allocation against a host-resident req_to_token pool."""
 
 import importlib.util
 import unittest
@@ -119,12 +119,64 @@ def _batch(allocator, pool, seq_lens, rows, device):
     )
 
 
-class TestAllocForDecodeHostResidentPool(CustomTestCase):
+# Second extend: request D continues A's row (6 cached, 3 new), request C is new
+# (5 tokens). D fills A's page 2 and takes page 4; C takes pages 5-6.
+EXTEND_PREFIX_LENS = [6, 0]
+EXTEND_LENS = [3, 5]
+EXTEND_LOCS = [10, 11, 16, 20, 21, 22, 23, 24]
+# ReqToTokenPool.alloc pops free rows from the tail.
+EXTEND_ROWS = {8: [4, 5, 6, 7, 8, 9, 10, 11, 16], 9: [20, 21, 22, 23, 24]}
+
+
+def _extend_batch(allocator, pool, device):
+    prefix_rows = [
+        pool.req_to_token[ROWS[0], :6].clone(),
+        torch.empty(0, dtype=torch.int32),
+    ]
+    seq_lens = torch.tensor(
+        [p + e for p, e in zip(EXTEND_PREFIX_LENS, EXTEND_LENS)], dtype=torch.int64
+    )
+    return SimpleNamespace(
+        maybe_evict_swa=lambda: None,
+        reqs=[
+            SimpleNamespace(
+                prefix_indices=prefix,
+                kv=SimpleNamespace(
+                    holds_kv=False,
+                    req_pool_idx=None,
+                    kv_allocated_len=0,
+                    kv_committed_len=0,
+                ),
+            )
+            for prefix in prefix_rows
+        ],
+        is_dllm=lambda: False,
+        device=device,
+        metadata_device=lambda: device,
+        input_tensor_device=device,
+        prefix_lens=EXTEND_PREFIX_LENS,
+        extend_lens=EXTEND_LENS,
+        extend_num_tokens=sum(EXTEND_LENS),
+        seq_lens_cpu=seq_lens,
+        seq_lens=seq_lens.to(device),
+        tree_cache=SimpleNamespace(
+            page_size=PAGE,
+            token_to_kv_pool_allocator=allocator,
+            supports_prefix_sharing=lambda: False,
+        ),
+        req_to_token_pool=pool,
+    )
+
+
+class TestAllocHostResidentPool(CustomTestCase):
     def setUp(self):
         for target, name, value in (
             (allocation, "_is_tpu", True),
             (swa, "_is_tpu", True),
             (swa, "TpuPagedTokenToKVPoolAllocator", TpuPagedTokenToKVPoolAllocator),
+            # write_cache_indices skips Triton for torch_native, as it does for
+            # the Pallas backends once sglang_tpu.patches has run.
+            (allocation, "attention_backends", lambda: ("torch_native",) * 2),
         ):
             patcher = patch.object(target, name, value, create=True)
             patcher.start()
@@ -241,6 +293,94 @@ class TestAllocForDecodeHostResidentPool(CustomTestCase):
         self.assertEqual(args[2].tolist(), [9, 14])
         self.assertEqual(pool.req_to_token[3, 6].item(), 10)
         self.assertEqual(pool.req_to_token[1, 3].item(), 15)
+
+    def _extend(self, allocator, device):
+        """Prefill A and B, then one extend batch through alloc_for_extend. On
+        ``meta``, device-side tensors hold no data, so any host readback raises."""
+        self._prefill(allocator)
+        if device == "meta":
+            for page_allocator in _page_allocators(allocator):
+                page_allocator.device = "meta"
+        batch = _extend_batch(allocator, self.pool, device)
+
+        out, _, rows_cpu = allocation.alloc_for_extend(batch)
+
+        self.assertEqual(out.device.type, device)
+        self.assertEqual(out.dtype, torch.int32)
+        if device != "meta":
+            self.assertEqual(out.cpu().tolist(), EXTEND_LOCS)
+        self.assertEqual(rows_cpu.tolist(), list(EXTEND_ROWS))
+        for row, locs in EXTEND_ROWS.items():
+            self.assertEqual(self.pool.req_to_token[row, : len(locs)].tolist(), locs)
+
+    def _check_extend_full_to_swa(self, allocator):
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertEqual(mapping.device.type, "cpu")
+        prefill = [
+            loc for row, n in zip(ROWS, PREFILL_LENS) for loc in EXPECTED_ROWS[row][:n]
+        ]
+        for full_loc in prefill + EXTEND_LOCS:
+            self.assertEqual(mapping[full_loc].item(), full_loc + 2 * PAGE)
+
+    def test_swa_extend_writes_host_copies(self):
+        allocator = _swa_allocator("cpu")
+        self._extend(allocator, "meta")
+        self._check_extend_full_to_swa(allocator)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires torch_tpu and a TPU device")
+    def test_swa_extend_on_tpu(self):
+        allocator = _swa_allocator("tpu")
+        self._extend(allocator, "tpu")
+        self._check_extend_full_to_swa(allocator)
+
+    def test_device_pool_passes_no_host_buffer(self):
+        pool = ReqToTokenPool(
+            size=9, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        self.assertFalse(pool.host_resident)
+        pool.req_to_token[ROWS[0], :6] = torch.arange(4, 10)
+        result = torch.tensor(EXTEND_LOCS, dtype=torch.int32)
+        allocator = Mock(
+            spec=["page_size", "alloc_extend", "free", "forward_write_target"],
+            page_size=PAGE,
+            forward_write_target=nullcontext,
+        )
+        allocator.alloc_extend.return_value = result
+        batch = _extend_batch(allocator, pool, "cpu")
+
+        out, _, _ = allocation.alloc_for_extend(batch)
+
+        self.assertIs(out, result)
+        self.assertNotIn("out_indices_cpu", allocator.alloc_extend.call_args.kwargs)
+        for row, locs in EXTEND_ROWS.items():
+            self.assertEqual(pool.req_to_token[row, : len(locs)].tolist(), locs)
+
+
+class TestSwaAllocExtendHostOutput(CustomTestCase):
+    def setUp(self):
+        for name, value in (
+            ("_is_tpu", True),
+            ("TpuPagedTokenToKVPoolAllocator", TpuPagedTokenToKVPoolAllocator),
+        ):
+            patcher = patch.object(swa, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_ring_mode_fills_host_buffer(self):
+        """Ring mode skips the SWA allocator; the caller's host buffer must
+        still hold the full-attention locations."""
+        allocator = _swa_allocator("cpu")
+        allocator._swa_req_ring = True
+        lens = torch.tensor(PREFILL_LENS, dtype=torch.int64)
+        zeros = torch.zeros_like(lens)
+        host = torch.full((int(lens.sum()),), -7, dtype=torch.int32)
+
+        out = allocator.alloc_extend(
+            zeros, zeros, lens, lens, zeros - 1, int(lens.sum()), out_indices_cpu=host
+        )
+
+        self.assertEqual(host.tolist(), [4, 5, 6, 7, 8, 9, 12, 13, 14])
+        self.assertEqual(out.tolist(), host.tolist())
 
 
 class TestTpuAllocDecodeHostOutput(CustomTestCase):

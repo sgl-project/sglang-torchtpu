@@ -29,7 +29,19 @@
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
     },
+    "alisachen-google": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
     "angelayi": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
+    "aolemila": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
@@ -72,6 +84,12 @@
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
     },
     "jcc-google": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
+    "jimoosciuc": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
@@ -132,6 +150,12 @@
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
     },
     "wenxindongwork": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
+    "wjessG": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,

@@ -25,6 +25,7 @@ with a closed-pools-only causal mask.
 """
 
 import logging
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -116,6 +117,26 @@ def _page_slot(req, pos, page_indices, num_seqs, page_size, num_pages, valid):
     return page, pos % page_size
 
 
+def _raw_page_slot(
+    req: jax.Array,
+    pos: jax.Array,
+    *,
+    raw_page_base: jax.Array | None,
+    raw_ring_pages_cnt: int,
+    valid: jax.Array,
+    loc: dict[str, Any],
+    num_raw: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Physical (page, slot) of a raw key|gate row. With a raw ring, request
+    ``req`` keeps its rows at ``raw_page_base[req] + page % raw_ring_pages_cnt``;
+    otherwise they share the request's page ids."""
+    if not raw_ring_pages_cnt:
+        return _page_slot(req, pos, valid=valid, **loc)
+    page = raw_page_base[req] + (pos // loc["page_size"]) % raw_ring_pages_cnt
+    page = jnp.where(valid, page, num_raw)
+    return page, pos % loc["page_size"]
+
+
 def _align(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
@@ -173,6 +194,8 @@ def kpool_indexer_step(
     max_query_length: int | None = None,
     row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
     row_count: int = 0,
+    raw_page_base: jax.Array | None = None,  # i32[max_num_seqs]; raw ring only
+    raw_ring_pages_cnt: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
@@ -188,7 +211,8 @@ def kpool_indexer_step(
     ``kpool_expand_rows``; each row then equals the same row of an unsplit call.
     """
     num_tokens, n_heads, d = query.shape
-    num_pages, page_size, _ = raw_cache.shape
+    num_raw, page_size, _ = raw_cache.shape
+    num_pages = pooled_cache.shape[0]
     _, tokens_per_row, record_bytes = pooled_cache.shape[1:]
     num_seqs = kv_lens.shape[0]
     expected = (
@@ -215,8 +239,14 @@ def kpool_indexer_step(
         num_pages=num_pages,
     )
 
+    raw_loc = dict(
+        raw_page_base=raw_page_base,
+        raw_ring_pages_cnt=raw_ring_pages_cnt,
+        loc=loc,
+        num_raw=num_raw,
+    )
     # 1. Raw key | gate records of this step's tokens.
-    page, slot = _page_slot(req, pos, valid=valid, **loc)
+    page, slot = _raw_page_slot(req, pos, valid=valid, **raw_loc)
     raw = jnp.concatenate([key, gate], axis=-1).astype(raw_cache.dtype)
     raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
@@ -240,6 +270,8 @@ def kpool_indexer_step(
             distribution,
             num_tokens,
             max_query_length=max_query_length,
+            raw_page_base=raw_page_base,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
     else:
         # Logged at trace time, once per compiled shape.
@@ -255,13 +287,13 @@ def kpool_indexer_step(
         closing = valid & (pos % kpool == kpool - 1)
         first = pos - (kpool - 1)
         member = first[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None, :]
-        m_page, m_slot = _page_slot(
+        m_page, m_slot = _raw_page_slot(
             jnp.broadcast_to(req[:, None], member.shape),
             jnp.maximum(member, 0),
             valid=jnp.broadcast_to(closing[:, None], member.shape),
-            **loc,
+            **raw_loc,
         )
-        rows = raw_cache[jnp.minimum(m_page, num_pages - 1), m_slot]  # [T, kpool, 2d]
+        rows = raw_cache[jnp.minimum(m_page, num_raw - 1), m_slot]  # [T, kpool, 2d]
         pooled = compress_pools(rows[..., :d], rows[..., d:], ape)
         records = _pool_records(pooled, record_bytes)
         p_page, p_slot = _page_slot(req, jnp.maximum(first, 0), valid=closing, **loc)

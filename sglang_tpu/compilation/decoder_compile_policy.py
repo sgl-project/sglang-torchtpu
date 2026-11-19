@@ -49,6 +49,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.state_capturer.base import BaseDeviceCache
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -136,6 +139,74 @@ _COMPILE_BAR_FORMAT = (
 # XLA TopK has a static output width. Warm the physically qualified serving
 # width so the common candidate path does not compile on its first request.
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
+
+
+def _moe_topk_extra_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
+    """Paths of MoE router correction biases held by TopK's plain config.
+
+    TopK keeps ``correction_bias`` (DeepSeek-style ``e_score_correction_bias``)
+    on its ``topk_config`` dataclass, which direct_compile does not traverse,
+    so it must be lifted explicitly.
+    """
+    return tuple(
+        f"{name}.topk_config.correction_bias"
+        for name, module in model.named_modules()
+        if isinstance(
+            getattr(getattr(module, "topk_config", None), "correction_bias", None),
+            torch.Tensor,
+        )
+    )
+
+
+class _TopkCaptureKVPool:
+    """KVPool over the KV state followed by the top-k capturers' device buffers.
+
+    The capturers write these process-global buffers inside the forward; a write that
+    direct_compile does not carry as state is left unscheduled in the live buffer.
+    """
+
+    def __init__(
+        self, *, kv_pool: Any, device_caches: tuple[BaseDeviceCache, ...]
+    ) -> None:
+        self._kv_pool = kv_pool
+        self._device_caches = device_caches
+
+    def get_state(self) -> list[torch.Tensor]:
+        return [*self._kv_pool.get_state(), *(c.buffer for c in self._device_caches)]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        kv_count = len(state) - len(self._device_caches)
+        self._kv_pool.set_state(state[:kv_count])
+        for cache, buffer in zip(self._device_caches, state[kv_count:], strict=True):
+            cache.buffer = buffer
+
+
+def _topk_capture_device_caches() -> tuple[BaseDeviceCache, ...]:
+    capturers = (get_global_experts_capturer(), get_global_indexer_capturer())
+    return tuple(c.device_cache for c in capturers if c is not None)
+
+
+def _module_plain_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
+    """Paths of Tensors stored as plain attributes directly on submodules.
+
+    Some layers keep derived weights outside ``_parameters``/``_buffers``
+    (e.g. MLA ``w_kc``/``w_vc`` assigned in ``post_load_weights``), which
+    direct_compile cannot see unless they are lifted explicitly.
+    """
+    paths = []
+    for name, module in model.named_modules():
+        for attr, value in vars(module).items():
+            # Views (e.g. GDN conv_weights) share storage with a parameter and
+            # are re-derived by bind_traced_conv_weights; lifting them breaks
+            # the _base check and direct_compile requires base buffers.
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, torch.nn.Parameter)
+                and not value.is_meta
+                and value._base is None
+            ):
+                paths.append(f"{name}.{attr}" if name else attr)
+    return tuple(paths)
 
 
 def forward_bucketers(server_args: Any, *, context_len: int) -> tuple[Any, Any]:
@@ -453,6 +524,10 @@ class EagerLogitsCase(msgspec.Struct, frozen=True):
 
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
+
+    # Drop model tensors a specialization never reads from its direct_compile
+    # inputs (e.g. host-resident tables read only outside the graph).
+    direct_compile_prune_unused_inputs = False
 
     model_runner: ModelRunner
     platform = "tpu"
@@ -884,6 +959,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
+            prune_unused_inputs=self.direct_compile_prune_unused_inputs,
         )
 
         @functools.wraps(fn)
@@ -912,6 +988,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
+        kv_pool = self._get_direct_compile_kv_pool_state()
+        device_caches = _topk_capture_device_caches()
+        if not device_caches:
+            return kv_pool
+        return _TopkCaptureKVPool(kv_pool=kv_pool, device_caches=device_caches)
+
+    def _get_direct_compile_kv_pool_state(self):
         kv_pool = self.model_runner.token_to_kv_pool
         if not isinstance(kv_pool, HybridLinearKVPool):
             return kv_pool
@@ -956,7 +1039,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         Example: ("foo.bar.baz",).
         """
-        return self.model_extra_tensor_attrs
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            linear_attention_extra_tensor_attrs,
+        )
+
+        model = self.model_runner.model
+        extras = (
+            *linear_attention_extra_tensor_attrs(model),
+            *_moe_topk_extra_tensor_attrs(model),
+            *_module_plain_tensor_attrs(model),
+        )
+        return tuple(dict.fromkeys((*self.model_extra_tensor_attrs, *extras)))
 
     def _direct_compile_specialization_key(
         self,

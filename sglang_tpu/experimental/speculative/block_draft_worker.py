@@ -13,6 +13,7 @@ from torch import nn
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_disagg
@@ -106,15 +107,21 @@ class TpuBlockDraftWorker(TpuDraftWorker):
     @property
     def full_to_swa(self) -> torch.Tensor | None:
         """Host full-to-SWA slot map when the draft KV lives in the SWA sub-pool, else None."""
-        if not isinstance(self.model_runner.token_to_kv_pool, SWAKVPool):
-            return None
+        pool = self.model_runner.token_to_kv_pool
         allocator = self.model_runner.token_to_kv_pool_allocator
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            # Every DeepSeek-V4 draft stage is an SWA layer.
+            return allocator.full_to_swa_index_mapping
+        if not isinstance(pool, SWAKVPool):
+            return None
         assert isinstance(allocator, SWATokenToKVPoolAllocator), type(allocator)
-        return allocator.full_to_swa_index_mapping
+        return pool.full_to_swa_index_mapping
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(
-            self.model_runner.attn_backend, kv_writer=self._write_draft_kv_eager
+            self.model_runner.attn_backend,
+            kv_writer=self._write_draft_kv_eager,
+            block_width=self.block_width,
         )
 
     def write_draft_kv(
@@ -150,9 +157,17 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        kv_pool = self.model_runner.token_to_kv_pool
+        if isinstance(kv_pool, DeepSeekV4TokenToKVPool):
+            return _write_deepseek_v4_draft_kv(
+                draft_model=self.model_runner.model,
+                pool=kv_pool,
+                target_hidden=target_hidden,
+                positions=positions,
+                swa_loc=swa_commit_records(cache_loc, cache_loc_2d, commit_lens),
+            )
         # The fused rpa_v3 pool forbids set_kv_buffer (write_target_hidden_kv);
         # dense DFlash and DSpark drafts share one K/V layout and Pallas writer.
-        kv_pool = self.model_runner.token_to_kv_pool
         if isinstance(kv_pool, SWAKVPool):
             # Every layer of a hybrid-SWA draft is SWA; callers pass SWA slots.
             kv_pool = kv_pool.swa_kv_pool
@@ -192,6 +207,43 @@ class TpuBlockDraftWorker(TpuDraftWorker):
                 f"{type(compile_policy).__name__}."
             )
         return compile_policy
+
+
+def swa_commit_records(
+    cache_loc: torch.Tensor,
+    cache_loc_2d: torch.Tensor | None,
+    commit_lens: torch.Tensor | None,
+) -> torch.Tensor:
+    """[T] int32 SWA slots of the rows to write; -1 skips a row.
+
+    Extend writes every row; verify commit writes the first commit_lens columns,
+    as core TargetHiddenKvInjector masks them.
+    """
+    if cache_loc_2d is None:
+        return cache_loc.to(torch.int32)
+    assert commit_lens is not None
+    cols = torch.arange(cache_loc_2d.shape[1], device=cache_loc_2d.device)
+    committed = cols.unsqueeze(0) < commit_lens.to(cols.dtype).unsqueeze(-1)
+    records = torch.where(committed, cache_loc_2d, torch.full_like(cache_loc_2d, -1))
+    return records.reshape(-1).to(torch.int32)
+
+
+def _write_deepseek_v4_draft_kv(
+    *,
+    draft_model: nn.Module,
+    pool: DeepSeekV4TokenToKVPool,
+    target_hidden: torch.Tensor,
+    positions: torch.Tensor,
+    swa_loc: torch.Tensor,
+) -> torch.Tensor:
+    """Every stage's context KV through the draft's own writer, as core
+    TargetHiddenKvInjector; returns the last stage's KV free fence tail."""
+    draft_model.write_target_hidden_kv(
+        main_hidden=target_hidden, swa_loc=swa_loc, positions=positions, pool=pool
+    )
+    pages = pool.get_swa_raw_buffer(draft_model.stages[-1].self_attn.layer_id)
+    # A reduction, not a view: the copy thread reads it after later donations.
+    return pages[:1, :1].to(torch.float32).sum(dim=(1, 2))
 
 
 def target_input_embedding(target_model: nn.Module) -> nn.Module | None:

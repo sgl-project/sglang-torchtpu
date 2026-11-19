@@ -8,7 +8,8 @@ all_reduce
   How: AROUND GroupCoordinator.all_reduce; the TP group's eligible tensors go
        to sglang_tpu.twolevel_allreduce when SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE
        registered the op (every rank on, a measured topology), everything else
-       calls the original.
+       calls the original. With TP on one host, decode-sized bf16 TP
+       all-reduces (up to 512 KB per rank) go to the two-shot kernel instead.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1444 (platform all-reduce
        provider).
   Remove when: GroupCoordinator takes a platform all-reduce provider, per #1444.

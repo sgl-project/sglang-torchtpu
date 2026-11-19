@@ -302,7 +302,10 @@ class BaseSpecWorker(ABC):
                 "HiCache does not support Inkling MTP draft state yet."
             )
 
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        target_kv_pool = getattr(target_model_runner, "token_to_kv_pool", None)
+        if getattr(
+            target_kv_pool, "supports_packed_hicache_draft", True
+        ) and _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,

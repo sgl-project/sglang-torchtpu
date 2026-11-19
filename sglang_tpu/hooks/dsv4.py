@@ -85,6 +85,15 @@ skip_tpu_dsv4_prewarm_mhc_kernels
   Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
   Remove when: wo_a_fp8_gemm_enabled, _kernel_num_heads, and _prewarm_mhc_kernels
        query platform capabilities or attention backend properties.
+
+tpu_dsv4_get_last_loc
+  Why: get_last_loc picks the Triton kernel unless the attention backend name
+       is in its non-Triton list; "dsv4" is not, so the spec decode allocation
+       (allocate_and_assign_decode_cache) launches Triton on TPU and fails with
+       "0 active drivers".
+  How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
+  Upstream PR or issue: not filed.
+  Remove when: get_last_loc dispatches on the tensor device, not backend names.
 """
 
 from __future__ import annotations
@@ -323,6 +332,21 @@ def _tpu_deepseek_v4_env_adjustments(server_args: Any, previous) -> None:
     envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
     envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
     envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
+    # The TPU DSpark drafter samples from full-vocab draft logits
+    # (deepseek_v41/dspark.py tpu_compute_base_logits); the TP-sharded Markov path
+    # expects vocab-local logits and gathers them over NCCL/NVLink.
+    envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.set(False)
+
+
+def tpu_dsv4_get_last_loc(
+    original, req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+):
+    """AROUND get_last_loc: the torch lookup off CUDA, where Triton has no driver."""
+    if req_to_token.is_cuda:
+        return original(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+    from sglang.srt.mem_cache.allocation import get_last_loc_torch
+
+    return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
 
 def register_tpu_dsv4_resolution_hooks() -> None:
@@ -341,6 +365,15 @@ def register_tpu_dsv4_resolution_hooks() -> None:
         hooks.append(_tpu_deepseek_v4_env_adjustments)
 
 
+def disable_tpu_draft_swa_ring() -> bool:
+    """TPU keeps the DSpark draft SWA in the target's paged full-to-SWA mapping.
+
+    The TPU draft neither writes ring rows in extend/commit nor masks reads with
+    ``swa_valid_from``; drop this hook once it does (upstream sglang#44673).
+    """
+    return False
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -350,6 +383,11 @@ def hook_specs():
     htk = "sglang.srt.layers.moe.hash_topk.HashTopK"
     dsv4 = "sglang.srt.models.deepseek_v4"
     return [
+        (
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.uses_draft_swa_ring",
+            disable_tpu_draft_swa_ring,
+            HookType.REPLACE,
+        ),
         (
             f"{kvc}._build_dsv4_kv_pool",
             build_tpu_dsv4_kv_pool,
@@ -428,6 +466,11 @@ def hook_specs():
         (
             f"{dsv4}.DeepseekV4ForCausalLM._prewarm_mhc_kernels",
             skip_tpu_dsv4_prewarm_mhc_kernels,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.allocation.get_last_loc",
+            tpu_dsv4_get_last_loc,
             HookType.AROUND,
         ),
     ]

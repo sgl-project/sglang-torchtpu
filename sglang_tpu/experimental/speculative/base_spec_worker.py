@@ -123,6 +123,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     live_result_rows,
     pad_state_rows,
     select_verify_rows,
+    simulated_real_draft_accept_inputs,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -264,11 +265,17 @@ class TpuSpecWorker(BaseSpecWorker):
         self._all_drafts: dict[int, torch.Tensor] = {}
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
-        if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE != "fixed":
+        if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE not in (
+            "fixed",
+            "real-draft-token",
+        ):
             raise NotImplementedError(
-                "TpuSpecWorker only supports SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed, "
-                f"got {SIMULATE_ACC_TOKEN_MODE!r}."
+                "TpuSpecWorker supports SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed or "
+                f"real-draft-token, got {SIMULATE_ACC_TOKEN_MODE!r}."
             )
+        # real-draft-token commits the draft's real tokens and the target's greedy bonus,
+        # so the output is model text (reasoning/tool parsers see real output).
+        self._simulate_real_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
         # Filled per batch bucket in init_cuda_graphs when simulating.
         self._simulated_drafts: dict[int, torch.Tensor] = {}
         self._simulated_bonus: dict[int, torch.Tensor] = {}
@@ -756,6 +763,26 @@ class TpuSpecWorker(BaseSpecWorker):
         """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
         draft_tokens = draft_result.draft_tokens
         state = bucket.state
+        if self._simulate_acc_len > 0 and self._simulate_real_tokens:
+            forced_correct, _, _ = self._simulated_accept(draft_tokens.shape[0])
+            if logits_output.has_next_token_global_top_k:
+                target_argmax = logits_output.next_token_global_top_k_token_ids[:, 0]
+            else:
+                target_argmax = torch.argmax(logits_output.next_token_logits, dim=-1)
+            bs, n = draft_tokens.shape
+            num_correct_drafts, bonus_tokens = simulated_real_draft_accept_inputs(
+                target_argmax.reshape(bs, n + 1),
+                draft_tokens,
+                forced_correct,
+                draft_result.num_verify_drafts,
+            )
+            return finalize_accept(
+                draft_tokens,
+                num_correct_drafts,
+                bonus_tokens,
+                state.seq_lens,
+                bucket.live_mask,
+            )
         if self._simulate_acc_len > 0:
             num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
                 draft_tokens.shape[0]

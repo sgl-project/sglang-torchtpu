@@ -84,6 +84,17 @@ _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
 }
 
 
+def committed_verify_ids(
+    bonus_tokens: torch.Tensor, accept_tokens: torch.Tensor
+) -> torch.Tensor:
+    """[pbs, N + 2] tokens whose first accept_lens columns are the committed verify rows.
+
+    The verify window is [r, d_1..d_N]; the committed prefix is r and the correct
+    drafts, which accept_tokens holds first (then the new bonus, -1 padded).
+    """
+    return torch.cat([bonus_tokens.view(-1, 1), accept_tokens.clamp_min(0)], dim=1)
+
+
 class TpuBlockSpecWorker(TpuSpecWorker):
     def __init__(
         self,
@@ -244,6 +255,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 positions=rows.flat_positions,
                 cache_loc=rows.flat_cache_locs,
                 cache_loc_2d=rows.cache_locs,
+                commit_lens=accept.accept_lens,
+            )
+        # As core DSparkWorkerV2: a verify forward commits nothing to the target's
+        # per-request Engram history.
+        ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if ngram.engram_hasher is not None:
+            ngram.update_after_verify(
+                verify_ids_2d=committed_verify_ids(
+                    state.bonus_tokens, accept.accept_tokens
+                ),
+                req_pool_indices=state.req_pool_indices,
                 commit_lens=accept.accept_lens,
             )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
