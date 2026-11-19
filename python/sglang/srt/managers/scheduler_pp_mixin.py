@@ -954,7 +954,7 @@ class SchedulerPPMixin:
         outputs = queued_outputs.tensors
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
-                self.device_module.current_stream().wait_event(ready_event)
+                torch.accelerator.current_stream().wait_event(ready_event)
             next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
         self._pp_send_deferred_output(mb_id)
         self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(
@@ -1408,7 +1408,7 @@ class SchedulerPPMixin:
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
-                self.device_module.current_stream().wait_event(ready_event)
+                torch.accelerator.current_stream().wait_event(ready_event)
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
@@ -2203,7 +2203,7 @@ class SchedulerPPMixin:
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
-                        self.device_module.current_stream().wait_event(q_event)
+                        torch.accelerator.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:

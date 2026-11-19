@@ -536,6 +536,11 @@ class TpuEnvs:
     # Share one page pool between full-attention and sliding-window KV on TPU
     # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
     SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
+    # Cap SWA resident host usage at this share of the TPU unified HiCache host
+    # arena and reclaim Full KV before SWA below the cap (<= 0 disables the
+    # policy and restores request-order reclaim; >= 1 disables the cap while
+    # keeping Full-first reclaim).
+    SGLANG_TPU_UNIFIED_HICACHE_SWA_SHARE = EnvFloat(0.3)
 
     # Sampling
     # Keep the repetition-penalty state padded to the power-of-two logits row

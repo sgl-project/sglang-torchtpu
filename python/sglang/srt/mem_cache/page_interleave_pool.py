@@ -549,7 +549,7 @@ class PageInterleaveKVPoolMixin:
         # Order the gather after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
         # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
+        self.kv_gather_stream.wait_stream(torch.accelerator.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
             if self.layer_transfer_counter is not None:
                 # HiCache loads this layer's rows on its own stream, and the gather
@@ -590,7 +590,7 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            current = self.device_module.current_stream()
+            current = torch.accelerator.current_stream()
             if self._multicast_gather is not None:
                 # The slot's last run lands after every earlier one, once
                 # every rank's copies have arrived (its exit barrier).

@@ -63,18 +63,22 @@ class TestDSALayerShardUtils(CustomTestCase):
     def test_finalize_pending_broadcast_promotes_layer_id(self):
         # After an async prefetch, finalizing must promote pending -> remote so a
         # subsequent read of the same layer reuses the broadcast result.
+        from unittest.mock import patch
+
         pool = SimpleNamespace(
             pending_remote_kv_broadcast=True,
             pending_remote_kv_layer_id=7,
             remote_kv_layer_id=None,
-            device_module=SimpleNamespace(
-                current_stream=lambda: SimpleNamespace(wait_stream=lambda _stream: None)
-            ),
             kv_broadcast_stream=object(),
         )
-        LayerSplitDSATokenToKVPool._finalize_pending_kv_broadcast(
-            pool, set_remote_layer_id=True
-        )
+        with patch.object(
+            torch.accelerator,
+            "current_stream",
+            return_value=SimpleNamespace(wait_stream=lambda _stream: None),
+        ):
+            LayerSplitDSATokenToKVPool._finalize_pending_kv_broadcast(
+                pool, set_remote_layer_id=True
+            )
         self.assertFalse(pool.pending_remote_kv_broadcast)
         self.assertEqual(pool.remote_kv_layer_id, 7)
         self.assertIsNone(pool.pending_remote_kv_layer_id)

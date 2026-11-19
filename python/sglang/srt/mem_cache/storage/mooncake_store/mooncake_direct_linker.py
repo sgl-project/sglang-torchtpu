@@ -392,7 +392,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     indices.setdefault(transfer.name, []).append(transfer.host_indices)
             prepared = broadcaster.prepare_broadcast(
                 {name: torch.cat(parts) for name, parts in indices.items()},
-                device_module.current_stream(),
+                torch.accelerator.current_stream(),
             )
             if not broadcaster.is_src:
                 for layer in range(self.num_layers):
@@ -411,7 +411,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return
         first, prepared, ready = batch
         if first == 0:
-            ready.wait(device_module.current_stream())
+            ready.wait(torch.accelerator.current_stream())
         # KV access may wait several times per layer, or skip sparse layers.
         # Launch each broadcast exactly once, in order, on the forward stream.
         for layer in range(first, threshold + 1):

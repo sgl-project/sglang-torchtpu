@@ -638,8 +638,10 @@ class FutureMap:
         self.flush_deferred_relay()
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
+        # record_stream only guards the device caching allocator across streams;
+        # CPU has no streams, and torch.accelerator rejects a CPU device.
         if not _is_tpu and indices.device.type != "cpu":
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            indices.record_stream(torch.accelerator.current_stream(self.device))
         if self.need_topk:
             # Function-local: spec_utils imports schedule_batch, which imports
             # this module.

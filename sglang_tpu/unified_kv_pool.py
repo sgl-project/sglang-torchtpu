@@ -1714,8 +1714,19 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         needed_pages = self._page_ids_needed(need_f, need_s)
         short = needed_pages - self._free_page_count()
         if short > 0:
+            internal_swa = _internal_swa_tail_tokens(
+                tree_cache, _cdiv(short, self._swa_groups) * ps
+            )
+            if internal_swa > 0:
+                tree_cache.evict(
+                    EvictParams(
+                        window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: internal_swa}
+                    )
+                )
+                short = needed_pages - self._free_page_count()
+        if short > 0:
             tree_cache.evict(EvictParams(num_tokens=short * ps))
-        short = needed_pages - self._free_page_count()
+            short = needed_pages - self._free_page_count()
         if short > 0:
             tree_cache.evict(
                 EvictParams(
@@ -2070,6 +2081,51 @@ def maybe_build_unified_kv_pool(
         start_layer=kvc.layer_info.start_layer,
         enable_memory_saver=get_exec().features.enable_memory_saver,
     )
+
+
+def _internal_swa_tail_tokens(tree_cache, max_tokens: int) -> int:
+    """Count unlocked non-leaf SWA tokens ahead of D-leaves at the SWA LRU tail."""
+    if max_tokens <= 0:
+        return 0
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if not isinstance(tree_cache, UnifiedRadixCache):
+        return 0
+    tree_core = tree_cache.tree_core
+    if not isinstance(tree_core, UnifiedTreeCore):
+        return 0
+    lru = tree_core.lru_lists.get(ComponentType.SWA)
+    if lru is None:
+        return 0
+    leaves = tree_core.evictable_device_leaves
+    node = lru.get_lru_no_lock()
+    if node is None or node in leaves:
+        return 0
+    swa_free_leaf_cutoff: Optional[float] = None
+    tokens = 0
+    while node is not None and node not in leaves and tokens < max_tokens:
+        prev = lru.get_prev_no_lock(node)
+        demoted = lru.skips_host_backup(node) or (
+            prev is not None and prev.last_access_time < node.last_access_time
+        )
+        if not demoted:
+            if swa_free_leaf_cutoff is None:
+                swa_free_leaf_cutoff = min(
+                    (
+                        n.last_access_time
+                        for n in leaves
+                        if n.component_data[ComponentType.SWA].value is None
+                    ),
+                    default=float("inf"),
+                )
+            if node.last_access_time > swa_free_leaf_cutoff:
+                break
+        val = node.component_data[ComponentType.SWA].value
+        if val is not None:
+            tokens += len(val)
+        node = prev
+    return min(tokens, max_tokens)
 
 
 def maybe_build_unified_kv_pool_allocator(

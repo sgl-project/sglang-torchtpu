@@ -74,6 +74,7 @@ def get_vmem_declared_bytes(
     carry_scratch_bytes: int = 4,
     window_size: int = 1,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    state_out_buffers: int = 2,
 ) -> int:
     """Declared on-chip VMEM footprint in bytes (create_allocs + scratch shapes)."""
     aligned_num_v_heads = align_to(n_v, num_lanes)
@@ -87,19 +88,19 @@ def get_vmem_declared_bytes(
     b_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
     a_bytes = 2 * (tile_b * chunk_sz * aligned_gate_dim * carry_scratch_bytes)
 
-    # 2. Double-buffered state cache buffers (convolution and recurrent states).
-    # Input state windows hold 1 state per sequence; output state windows hold
-    # `window_size` checkpoints per sequence, giving `1 + window_size` state
-    # slots per sequence per buffer.
-    state_slots_per_seq = 1 + window_size
-    conv_state_buffer_bytes = 2 * (
+    # 2. State cache buffers (convolution and recurrent states). The input
+    # window holds 1 state per sequence and is double-buffered; the output
+    # window holds `window_size` checkpoints per sequence in
+    # `state_out_buffers` buffers.
+    state_slots_per_seq = 2 + state_out_buffers * window_size
+    conv_state_buffer_bytes = (
         tile_b
         * state_slots_per_seq
         * max(0, kernel_size - 1)
         * conv_state_dim_size
         * carry_scratch_bytes
     )
-    recurrent_state_buffer_bytes = 2 * (
+    recurrent_state_buffer_bytes = (
         tile_b * state_slots_per_seq * n_v * d_v * d_k * rec_state_bytes
     )
 
@@ -152,6 +153,7 @@ def get_vmem_estimate_bytes(
     carry_scratch_bytes: int = 4,
     window_size: int = 1,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    state_out_buffers: int = 2,
 ) -> int:
     """Estimates total on-chip VMEM footprint in bytes for a GDN tile."""
     aligned_d_k = align_to(d_k, num_lanes)
@@ -172,13 +174,17 @@ def get_vmem_estimate_bytes(
         carry_scratch_bytes=carry_scratch_bytes,
         window_size=window_size,
         attention_mode=attention_mode,
+        state_out_buffers=state_out_buffers,
     )
 
-    # Working state during decode: one f32 copy of the recurrent state
-    # alongside the double-buffered state windows.
-    decode_working_recurrent_bytes = (
-        tile_b * n_v * d_v * d_k * carry_scratch_bytes if is_decode else 0
-    )
+    # Working state during decode: one f32 copy of the recurrent state per
+    # sequence, plus window_size - 1 more for a KDA verify window. Measured on
+    # tpu7x (KDA, 64 heads, tile 1, window 4): 60.98M scoped vs 43.94M
+    # declared; GDN is unmeasured. Re-measure if the recurrence changes.
+    state_bytes = n_v * d_v * d_k * carry_scratch_bytes
+    is_kda = attention_mode == config.AttentionMode.KDA
+    working_states = tile_b + (window_size - 1 if is_kda else 0)
+    decode_working_recurrent_bytes = working_states * state_bytes if is_decode else 0
 
     # 6. Working memory for intra-chunk recurrence and per-head projections
     # (chunk_sz is the verify window in decode) plus per-slot vector
@@ -275,6 +281,50 @@ def calculate_decode_tile_size(
             return cand
 
     return decode_tile_size
+
+
+def calculate_decode_state_out_buffers(
+    tile_b: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    conv_state_dim_size: int,
+    act_out_dtype: jnp.dtype,
+    recurrent_state_dtype: jnp.dtype,
+    num_lanes: int,
+    vmem_capacity_limit_bytes: int,
+    kernel_size: int = 4,
+    window_size: int = 1,
+    attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+) -> int:
+    """2, or 1 when double-buffered state output windows do not fit the limit.
+
+    Single buffering only triggers once the tile cannot shrink further, e.g. an
+    attention-DP rank verifying a window with every KDA head. It gives up the
+    overlap of one tile's state write-back with the next tile's compute.
+    """
+    for buffers in (2, 1):
+        vmem_est = get_vmem_estimate_bytes(
+            tile_b=tile_b,
+            chunk_sz=window_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
+            rec_state_bytes=jnp.dtype(recurrent_state_dtype).itemsize,
+            num_lanes=num_lanes,
+            conv_state_dim_size=conv_state_dim_size,
+            is_decode=True,
+            window_size=window_size,
+            attention_mode=attention_mode,
+            state_out_buffers=buffers,
+        )
+        if vmem_est <= vmem_capacity_limit_bytes:
+            return buffers
+    return 1
 
 
 def calculate_mixed_tile_size(
