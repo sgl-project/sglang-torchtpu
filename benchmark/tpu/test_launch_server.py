@@ -194,7 +194,7 @@ class TestRuntimeEnvironment(unittest.TestCase):
 
     def test_glm_flash_agentx_per_concurrency_recipes(self):
         """Each agentx_cc<N>.py pins its measured cap and pool; the split cache
-        drops the host tier and the megakernel."""
+        drops the host tier and keeps the megakernel; MTP 8 steps up to c8, else 3."""
         root = "recipe/configs/glm_5_3_flash/experimental/agentx/agentx_cc"
         expected = {1: (2, 3407872), 4: (2, 3407872), 8: (16, 3407872)}
         expected.update({16: (16, 9437184), 32: (16, 9437184)})
@@ -210,9 +210,8 @@ class TestRuntimeEnvironment(unittest.TestCase):
                     args["max_mamba_cache_size"], 800 if split else 5 * max_running + 64
                 )
                 self.assertEqual("enable_hierarchical_cache" in args, not split)
-                self.assertEqual(
-                    env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"], "0" if split else "1"
-                )
+                self.assertEqual(env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"], "1")
+                self.assertEqual(args["speculative_num_steps"], 3 if split else 8)
                 self.assertEqual(
                     env.get("SGLANG_TPU_DSA_MLA_KV_SHARDS"), "8" if split else None
                 )

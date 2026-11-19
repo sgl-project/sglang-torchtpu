@@ -1,5 +1,6 @@
 """AgentX c4 on GLM-5.3-Flash: decode megakernel, host tier, raw ring,
-3.4M-token pool, 2 running (measured 8,163 tok/s/chip).
+3.4M-token pool, 2 running, MTP 8 steps / 9 draft tokens at golden AL 3.99
+(measured 8,163 tok/s/chip with 4 draft tokens at AL 3.5).
 
 Server, from the repo root (AGENTX_DUMMY=1: random weights, as measured):
 
@@ -23,4 +24,4 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.experimental.agentx._base import
     agentx_config,
 )
 
-CONFIG = agentx_config(max_running=2, pool_tokens=3407872, mamba_slots=74)
+CONFIG = agentx_config(num_steps=8, max_running=2, pool_tokens=3407872, mamba_slots=74)

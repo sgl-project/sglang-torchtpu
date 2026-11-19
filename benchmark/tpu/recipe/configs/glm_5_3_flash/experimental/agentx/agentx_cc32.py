@@ -1,6 +1,7 @@
 """AgentX c32 on GLM-5.3-Flash: MLA latent cache split inside every page over the 8 ranks,
-raw ring, no host tier, model-path decode, 9.4M-token pool, 800 KDA checkpoint slots,
-16 running (measured 22,813 tok/s/chip).
+raw ring, no host tier, 9.4M-token pool, 800 KDA checkpoint slots, 16 running, MTP 3
+steps / 4 draft tokens at golden AL 3.00, decode megakernel on steps of <= 4 running
+(measured 22,813 tok/s/chip on the model path at AL 3.5).
 
 Server, from the repo root (AGENTX_DUMMY=1: random weights, as measured):
 
@@ -26,5 +27,5 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.experimental.agentx._base import
 
 # Without a host tier the device KDA checkpoint slots bound prefix reuse: 800, not 144.
 CONFIG = agentx_config(
-    max_running=16, pool_tokens=9437184, kv_shards=8, mamba_slots=800
+    num_steps=3, max_running=16, pool_tokens=9437184, kv_shards=8, mamba_slots=800
 )
