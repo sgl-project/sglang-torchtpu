@@ -37,7 +37,9 @@ class TestAbortRidTargeting(unittest.TestCase):
         trees = [root / "python" / "sglang", root / "sglang_tpu"]
         for tree in trees:
             self.assertTrue(tree.is_dir(), tree)
-        pattern = re.compile(r"\.startswith\([^)]*rid[^)]*\)")
+        # Checks the argument only, for a `rid` not preceded by a letter (`abort_rid`,
+        # `rid_prefix`, `recv_req.rid`), so words like `hybrid` or `Grid` do not match.
+        pattern = re.compile(r"\.startswith\([^)]*(?<![A-Za-z])rid[^)]*\)")
         offenders = [
             f"{path.relative_to(root)}:{lineno}"
             for tree in trees
