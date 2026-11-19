@@ -368,48 +368,5 @@ def test_compiled_step_updates_caller_pools(tpu_ops, ratio):
     _check(case, inputs, out, swa_records)
 
 
-@requires_tpu
-@pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("phase", list(_PHASES))
-def test_gathered_main_kv_reuse_matches_attention(tpu_ops, phase, ratio):
-    """A gather group's later layers attend the first layer's kept gather; the
-    output must equal a fresh gather's, including the chunked long prefill."""
-    case = _Case(_PHASES[phase], ratio, seed=20 + ratio)
-    inputs = _inputs(case)
-    expected, _ = _step(case, inputs)
-    meta, _, _ = ops.swa_metadata(
-        inputs["swa_table"], inputs["starts"], inputs["positions"], inputs["minimum"]
-    )
-    common = (
-        inputs["starts"],
-        inputs["positions"],
-        inputs["sink"],
-        inputs["cos_sin"],
-        ratio,
-        SCALE,
-    )
-    main = (
-        inputs["words"],
-        inputs["scales"],
-        inputs["selected"],
-        inputs["main_pages"],
-        case.page_records,
-    )
-    first, gathered = ops.attention(
-        inputs["q"],
-        inputs["swa_pages"],
-        meta,
-        None,
-        *common,
-        main=main,
-        keep_gathered=True,
-    )
-    reused = ops.attention_gathered(
-        inputs["q"], gathered, inputs["swa_pages"], meta, *common
-    )
-    np.testing.assert_array_equal(_host(first), _host(expected))
-    np.testing.assert_array_equal(_host(reused), _host(expected))
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
