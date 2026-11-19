@@ -61,6 +61,47 @@ def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
     return values
 
 
+def owned_rows(
+    rows: jax.Array,  # i32[tokens, width]; sequence positions, -1 padded
+    *,
+    page_size: int,
+    shards: int,
+    role: int | jax.Array,
+    group: int,
+    out_width: int,
+) -> jax.Array:
+    """This rank's entries of each top-k row, in order, then -1:
+    ``i32[tokens, out_width]``, ``out_width`` >= the row width rounded up to
+    ``group``. ``group`` consecutive entries share a pool, so an owner."""
+    num_tokens, width = rows.shape
+    sub = page_size // shards
+    padded = -(-width // group) * group
+    assert out_width >= padded, (out_width, padded)
+    rows = jnp.pad(rows, ((0, 0), (0, padded - width)), constant_values=-1)
+    rows = rows.reshape(num_tokens, padded // group, group)
+    first = rows[..., 0]
+    keep = (first >= 0) & ((first % page_size) // sub == role)
+    rows = jnp.where(keep[..., None], rows, -1)
+    rows = compact_left(rows, keep).reshape(num_tokens, padded)
+    return jnp.pad(rows, ((0, 0), (0, out_width - padded)), constant_values=-1)
+
+
+def merge_two(
+    out_a: jax.Array, lse_a: jax.Array, out_b: jax.Array, lse_b: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Merge two partial attentions over disjoint candidates of the same rows:
+    ``out`` [..., d] normalized per part, ``lse`` [..., 1] f32 natural-log sums
+    (a part with no candidate has a very negative lse). Returns (out, lse), out
+    in ``out_a``'s dtype."""
+    m = jnp.maximum(lse_a, lse_b)
+    w_a, w_b = jnp.exp(lse_a - m), jnp.exp(lse_b - m)
+    total = w_a + w_b
+    out = jnp.where(w_a > 0, w_a * out_a.astype(jnp.float32), 0.0) + jnp.where(
+        w_b > 0, w_b * out_b.astype(jnp.float32), 0.0
+    )
+    return (out / total).astype(out_a.dtype), m + jnp.log(total)
+
+
 def merge_partials(out: jax.Array, lse: jax.Array) -> jax.Array:
     """Merge ``shards`` partial attentions: ``out`` f32[shards, ..., d] normalized
     per shard, ``lse`` f32[shards, ...] natural-log sums (-inf for an empty shard)."""

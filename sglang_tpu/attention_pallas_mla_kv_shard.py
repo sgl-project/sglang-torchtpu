@@ -18,11 +18,14 @@ from sglang_tpu.pallas_export import argnums, tpu_info_for_cpu_export
 _OPS: dict = {}
 
 
-def build_kv_shard_attention_op(*, zero_rope: bool, gather_chunk_tokens: int):
+def build_kv_shard_attention_op(
+    *, zero_rope: bool, gather_chunk_tokens: int, owned_width: int = 0
+):
     """Torch op: store this step's tokens at this rank's offsets, then attend
     this rank's candidates of the indexer's rows; returns (output
-    bf16[T, Hg, 512], lse f32[T, Hg])."""
-    key = ("attention", zero_rope, gather_chunk_tokens)
+    bf16[T, Hg, 512], lse f32[T, Hg]). ``owned_width``: see
+    sparse_mla_attention_kv_shard."""
+    key = ("attention", zero_rope, gather_chunk_tokens, owned_width)
     if key in _OPS:
         return _OPS[key]
 
@@ -36,6 +39,8 @@ def build_kv_shard_attention_op(*, zero_rope: bool, gather_chunk_tokens: int):
     op_name = f"sglang_tpu_pallas::sparse_mla_kv_shard_g{gather_chunk_tokens}"
     if zero_rope:
         op_name += "_zero_rope"
+    if owned_width:
+        op_name += f"_owned{owned_width}"
 
     def _wrapped(
         ql_nope: jax.Array,
@@ -74,6 +79,7 @@ def build_kv_shard_attention_op(*, zero_rope: bool, gather_chunk_tokens: int):
             kpool=kpool,
             zero_rope=zero_rope,
             gather_chunk_tokens=gather_chunk_tokens,
+            owned_width=owned_width,
         )
 
     nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
