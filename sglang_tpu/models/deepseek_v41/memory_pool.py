@@ -705,6 +705,22 @@ def window_bytes(*, num_slots: int, chunk_tokens: int, num_layers: int) -> int:
     return pages * SWA_PAGE_TOKENS * SWA_BYTES_PER_TOKEN * num_layers
 
 
+def init_tpu_dsv41_pool_configurator(original, configurator, kvc) -> None:
+    """AROUND DSV4PoolConfigurator.__init__: keep the DSpark draft's ring layer
+    count, which core computes as a local, for get_tpu_dsv41_swa_fixed_bytes."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import uses_draft_swa_ring
+
+    original(configurator, kvc)
+    draft_layers = 0
+    if configurator.encoder_replay and kvc.spec_algorithm.is_dspark():
+        draft_layers = int(kvc.spec_aux_config.dflash_draft_num_layers or 0)
+    # Same rule as core: a ring-kept draft is all the draft layers not paged.
+    configurator.draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
+    assert (
+        configurator.paged_draft_layers == draft_layers - configurator.draft_ring_layers
+    )
+
+
 def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
     """AROUND DSV4PoolConfigurator._get_swa_fixed_bytes: price the request window
     as the TPU window's bf16 pages instead of core's FlashMLA-packed rows."""
