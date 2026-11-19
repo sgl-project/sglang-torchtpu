@@ -1638,11 +1638,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         # Build the indices on the host, upload them non_blocking and write with
-        # index_copy_. A blocking H2D copy, or a setitem indexed by a Python list
-        # (which transfers synchronously), makes the host wait for the forward
-        # still running on an async device (TPU). A continuing chunked request
-        # comes through here on every chunk, so that wait serialized the next
-        # chunk's launch behind the previous chunk's forward.
+        # index_copy_. On an async device (TPU), a blocking H2D copy or a setitem
+        # indexed by a Python list (which transfers synchronously) makes the host
+        # wait for the forward still running. A chunked-prefill request calls
+        # alloc() again for every chunk (alloc_for_extend -> alloc_req_slots), so
+        # that wait held each chunk's launch until the previous chunk's forward
+        # had finished.
         select_index_cpu = torch.tensor(select_index, dtype=torch.int64)
         mapping = self.req_index_to_mamba_index_mapping
         mamba_index_tensor = torch.stack(mamba_indices).to(
