@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Mapping, Optional, Sequence, Tuple
 from unittest.mock import patch
 
@@ -29,12 +30,12 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
-from sglang.srt.mem_cache import dsv41_request_window as core_request_window
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.mem_cache.kv.memory import request_window as core_request_window
 from sglang.srt.mem_cache.memory_pool import get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import ceil_div
@@ -315,6 +316,35 @@ def _check_dsv41_pool_supported(
             raise ValueError(f"DSV41TPUTokenToKVPool does not support {feature}")
 
 
+class _DSV41TPURequestWindowMemory:
+    """Built by the core pool constructor in place of ``RequestWindowMemory``:
+    the window is a ``DSV41TPURequestWindow`` over the pool's own SWA buffers."""
+
+    def __init__(self, pool, spec, *, dtype, device, enable_memory_saver=False):
+        def make_window_pool(size, layers):
+            return pool._make_kv_pool(
+                size=size,
+                page_size=spec.page_size,
+                dtype=dtype,
+                layer_num=layers,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=spec.page_size,
+            )
+
+        self.view = DSV41TPURequestWindow(
+            make_window_pool,
+            num_slots=spec.num_slots,
+            layers=spec.layers,
+            page_size=spec.page_size,
+            capacity=spec.capacity,
+            workspace_rows=spec.workspace_rows,
+        )
+
+    def reset_rows(self, rows) -> None:
+        self.view.reset(rows)
+
+
 class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """DeepSeek-V4.1 TPU pool: core control plane, Pallas-shaped buffers."""
 
@@ -355,7 +385,11 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         self.full_to_swa_index_mapping = None
         # Under encoder replay the core constructor builds its request window,
         # looked up at call time, instead of a paged SWA pool.
-        with patch.object(core_request_window, "RequestWindow", DSV41TPURequestWindow):
+        with patch.object(
+            core_request_window,
+            "RequestWindowMemory",
+            partial(_DSV41TPURequestWindowMemory, self),
+        ):
             super().__init__(
                 compression_ratios=list(compression_ratios),
                 layer_num=layer_num,
