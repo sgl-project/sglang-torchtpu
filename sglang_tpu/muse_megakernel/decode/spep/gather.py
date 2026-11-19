@@ -77,7 +77,7 @@ class EPGatherExperts:
         def routing() -> None:  # under the pooled columns' all-gather
             with _phase("router"):
                 step.router()
-                route.own_topk(c, S, step.smr, (0, c.rows, 0))
+                route.own_topk(c, S, step.smr, (0, c.rows, 0), n_live=step.n_live)
                 _places(c, p, S, step.n_live, step.me)
             with _phase("items"):
                 n_items.append(_item_list(p, S))
@@ -169,6 +169,8 @@ def gather_scratch(c: MKConfig, p: EPPlan) -> list:
             if _early_unpool()
             else []
         ),
+        # rank-based top-k at <= 8 rows (route.own_topk), as the untiled TP program
+        *([("eg_rank", vmem((R, c.n_experts), i32))] if _rank_topk(c) else []),
         ("ep_w_sems", dma((p.nslot, 4))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
@@ -197,6 +199,11 @@ def _early_unpool() -> bool:
     """SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL: the unpool's weights load into their own VMEM
     buffer while the experts run (experiment)."""
     return tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL.get()
+
+
+def _rank_topk(c: MKConfig) -> bool:
+    """SGLANG_TPU_MUSE_MK_DEV_EP_RANK_TOPK: rank-based top-k at <= 8 rows (experiment)."""
+    return tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_RANK_TOPK.get() and c.rows <= 8
 
 
 def _unpool_copies(step: EPLayerStep) -> list:

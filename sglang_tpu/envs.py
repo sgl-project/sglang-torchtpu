@@ -647,6 +647,8 @@ class TpuEnvs:
     # EP gather arm: the unpool's wunpool block loads into its own VMEM buffer (4 MiB) under
     # the expert loop instead of through the expert ring after it.
     SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL = EnvBool(False)
+    # EP gather arm at <= 8 rows: top-k by rank (one comparison per live row), as untiled TP.
+    SGLANG_TPU_MUSE_MK_DEV_EP_RANK_TOPK = EnvBool(False)
     # EP gather arm: rows from which its collectives pair the two cores of a chip (default 48).
     SGLANG_TPU_MUSE_MK_DEV_EP_PAIR_AG_MIN_ROWS = EnvInt(None)
     # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded) |

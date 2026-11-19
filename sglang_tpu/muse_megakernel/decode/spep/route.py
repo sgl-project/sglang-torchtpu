@@ -11,7 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.muse_megakernel.common.a2a import SEG
 from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
-from sglang_tpu.muse_megakernel.common.numerics import _topk_iter
+from sglang_tpu.muse_megakernel.common.numerics import _topk_by_rank, _topk_iter
 from sglang_tpu.muse_megakernel.decode.spep.config import TAB_ROWS, EPPlan
 
 
@@ -19,15 +19,19 @@ def _ceil_seg(x):
     return (x + SEG - 1) // SEG * SEG
 
 
-def own_topk(c: MKConfig, S: dict, smr, win) -> None:
+def own_topk(c: MKConfig, S: dict, smr, win, n_live=None) -> None:
     """ep_ids / ep_wsel lanes [0, K): the top-k of the window rows (own rows among them) from
-    every row's router logits in S["acc"] (TP's top-k math)."""
+    every row's router logits in S["acc"] (TP's top-k math); with S["eg_rank"] (the gather arm
+    at <= 8 rows) and n_live, by rank as the untiled TP program does there."""
     K, E = c.top_k, c.n_experts
     w0, wn, _ = win
     rows = pl.ds(w0, wn)
     bias = smr[SMALL["expert_bias"] : SMALL["expert_bias"] + 1, :E]
     sc = jax.nn.sigmoid(S["acc"][rows, pl.ds(0, E)] * c.router_mult)
-    ids_list, picks = _topk_iter(sc + bias, K)
+    if n_live is not None and "eg_rank" in S:
+        ids_list, picks = _topk_by_rank(sc + bias, K, n_live, S["eg_rank"])
+    else:
+        ids_list, picks = _topk_iter(sc + bias, K)
     wsel = jnp.concatenate(
         [jnp.sum(jnp.where(q, sc, 0.0), axis=1, keepdims=True) for q in picks], axis=1
     )
