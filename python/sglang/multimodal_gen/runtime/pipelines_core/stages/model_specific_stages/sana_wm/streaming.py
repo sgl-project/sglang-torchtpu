@@ -98,7 +98,11 @@ def self_forcing_denoise_chunk(
     ctx = forward_ctx if forward_ctx is not None else (lambda _ts: nullcontext())
 
     scheduler.set_timesteps(sigmas=sigmas, device=device)
-    for t in scheduler.timesteps:
+    # Step from the first timestep without the device lookup step() runs by
+    # default, and read the schedule once for its host uses.
+    scheduler.set_begin_index(0)
+    timestep_values = scheduler.timesteps.tolist()
+    for t, t_value in zip(scheduler.timesteps, timestep_values):
         chunk_lat = get_chunk()
         B, C = chunk_lat.shape[0], chunk_lat.shape[1]
         lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if do_cfg else chunk_lat
@@ -108,7 +112,7 @@ def self_forcing_denoise_chunk(
         ts_in = torch.cat([ts_tensor, ts_tensor], dim=0) if do_cfg else ts_tensor
         model_ts = ts_in[:, :1, :, 0, 0]  # (B|2B, chunk_frames)
 
-        with ctx(int(t.item()) if t.ndim == 0 else 0):
+        with ctx(int(t_value)):
             noise_pred, _ = transformer.forward_long(
                 hidden_states=lat_in.to(target_dtype),
                 encoder_hidden_states=embeds,
@@ -127,7 +131,7 @@ def self_forcing_denoise_chunk(
             noise_pred = noise_uncond + cfg_scale * (noise_text - noise_uncond)
 
         if on_noise_pred is not None:
-            on_noise_pred(int(t.item()), noise_pred)
+            on_noise_pred(int(t_value), noise_pred)
 
         denoised = scheduler.step(
             -noise_pred.reshape(B, C, -1).transpose(1, 2),

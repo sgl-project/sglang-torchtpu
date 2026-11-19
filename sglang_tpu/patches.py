@@ -356,6 +356,18 @@ def _register_aten_fallbacks() -> None:
         gap = torch.where(self == other, torch.zeros_like(peak), -(self - other).abs())
         return peak + torch.log1p(torch.exp(gap))
 
+    # aten::linalg_cross -- no TPU kernel (torch_tpu 0.2.1.dev20261028201649:
+    # aten::linalg_cross.out is not implemented); SANA-WM's camera conditioning
+    # takes cross products of 3-vectors for its Plucker rays.
+    @torch.library.register_kernel("aten::linalg_cross", "PrivateUse1")
+    def _linalg_cross(self, other, dim=-1):
+        a, b = torch.broadcast_tensors(self, other)
+        a0, a1, a2 = a.unbind(dim)
+        b0, b1, b2 = b.unbind(dim)
+        return torch.stack(
+            (a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0), dim=dim
+        )
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
