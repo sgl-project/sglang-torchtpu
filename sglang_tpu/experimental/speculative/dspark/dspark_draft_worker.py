@@ -5,7 +5,7 @@ draft: z_j = l_j + bias(d_{j-1}, h_j), d_0 = r, d_j ~ softmax(z_j / T), so
 
 As core DSparkWorkerV2, one drafter serves the dense DSparkDraftModel and the
 DeepSeek-V4 MoE DeepseekV4ForCausalLMDSpark; the MoE draft keeps the target's
-placement (draft_is_deepseek_v4).
+placement (draft_uses_compressed_kv_attention).
 
 Not ported yet: the confidence verify budget (num_verify_drafts is always
 gamma).
@@ -26,7 +26,7 @@ from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_config import (
-    draft_is_deepseek_v4,
+    draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import (
@@ -72,7 +72,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
     def _draft_tp_execution(self) -> DraftTPExecution:
         # As core DSparkWorkerV2: the MoE draft's stages gather over DP and run
         # the target's EP MoE, so it keeps the target placement.
-        if draft_is_deepseek_v4():
+        if draft_uses_compressed_kv_attention():
             return DraftTPExecution.TARGET_LAYOUT
         return super()._draft_tp_execution()
 
