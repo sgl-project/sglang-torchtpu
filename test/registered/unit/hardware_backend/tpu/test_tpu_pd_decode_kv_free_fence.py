@@ -12,11 +12,11 @@ from sglang.srt.disaggregation.decode import alloc_for_decode_prealloc
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
@@ -113,6 +113,7 @@ def _scheduler(**overrides):
     scheduler = SimpleNamespace(**attrs)
     for name in (
         "_uses_tpu_dma_hicache",
+        "_forward_may_outlive_scheduling",
         "_needs_kv_free_fence",
         "maybe_init_kv_free_fence",
     ):
@@ -142,6 +143,11 @@ def _unfenceable_overrides():
 
 
 class TestPdDecodeFenceInstall(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Single-stage servers; the PP gate is tested with the PP fence.
+        enter_scope(self, get_parallel().override(pp_size=1))
+
     def test_pd_decode_installs_the_fence_without_hicache(self):
         scheduler = _scheduler()
         scheduler.maybe_init_kv_free_fence()
@@ -223,6 +229,11 @@ class TestPdDecodeFenceInstall(CustomTestCase):
 
 
 class TestHicacheBackupFence(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Single-stage servers; the PP gate is tested with the PP fence.
+        enter_scope(self, get_parallel().override(pp_size=1))
+
     def test_backups_are_fenced_on_every_raiden_hicache_server(self):
         controller = object()
         for mode in (
