@@ -151,8 +151,11 @@ class _Glm5NextLanguageModel(torch.nn.Module):
         if owner.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if owner.pp_group.is_last_rank:
+            logits_input_ids = (
+                input_ids if input_ids is not None else forward_batch.input_ids
+            )
             return owner.logits_processor(
-                input_ids,
+                logits_input_ids,
                 hidden_states,
                 owner.lm_head,
                 forward_batch,
@@ -255,8 +258,9 @@ def forward_glm5_next_multimodal(
             or forward_mode.is_target_verify()
             or tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get()
         ):
+            lm_input_ids = None if input_embeds is not None else input_ids
             return language_model(
-                input_ids,
+                lm_input_ids,
                 positions,
                 forward_batch,
                 input_embeds=input_embeds,
@@ -283,12 +287,15 @@ def _forward_glm5_next_nextn(
     input_embeds: torch.Tensor | None = None,
     pp_proxy_tensors: Any = None,
 ) -> Any:
-    hidden_states = model.model(
-        input_ids,
-        positions,
-        forward_batch,
-        input_embeds=input_embeds,
-    )
+    if input_embeds is not None:
+        hidden_states = model.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+        )
+    else:
+        hidden_states = model.model(input_ids, positions, forward_batch)
     return model.logits_processor(
         input_ids, hidden_states, model.lm_head, forward_batch
     )

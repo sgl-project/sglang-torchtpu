@@ -2723,8 +2723,8 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
 
     Compiles ``_Glm5NextLanguageModel`` (embedding + 45 hybrid KDA/DSA/MoE/mHC
     layers + final norm + ``logits_processor``) in one XLA graph without dead
-    ``text_ids`` variants, while warming eager multimodal prompt embedding and
-    row placement and preserving padded ``mm_input_embeds`` for ``NEXTN`` MTP.
+    ``text_ids`` variants, while warming eager text-only and multimodal prompt
+    embedding and row placement.
     """
 
     spmd_safe = False
@@ -2740,7 +2740,8 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
                 "pipeline parallelism with --enable-torch-compile on TPU yet."
             )
         if (
-            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            self.tracer == "direct"
+            or getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
             == "direct"
         ):
             raise ValueError(
@@ -2936,21 +2937,32 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
         start = time.perf_counter()
         with torch.no_grad():
             for num_tokens in buckets:
-                ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
-                ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
-                ids.cpu()
-                text_embeds = embed_tokens(ids)
-                text_embeds.cpu()
+                # 1. Text-only EXTEND (general_mm_embed_routine else-branch):
+                #    materialized device input_ids -> embed_tokens(ids).
+                text_ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
+                text_ids.cpu()
+                embed_tokens(text_ids).cpu()
+
+                # 2. Multimodal EXTEND (_embed_mm_inputs): keep clamp_,
+                #    embed_tokens, and row placement in one uninterrupted eager
+                #    chain so torch_tpu fuses them identically to live serving.
+                mm_ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
+                mm_ids.cpu()
+                mm_ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
+                mm_embeds = embed_tokens(mm_ids)
                 if on_device:
-                    merge_mm_rows(
-                        text_embeds,
-                        torch.zeros((num_tokens, hidden), dtype=dtype).to(device),
-                        torch.arange(num_tokens, dtype=torch.int32).to(device),
-                        torch.zeros((num_tokens, 1), dtype=torch.bool).to(device),
-                    ).cpu()
+                    mm_embeds.copy_(
+                        merge_mm_rows(
+                            mm_embeds,
+                            torch.zeros((num_tokens, hidden), dtype=dtype).to(device),
+                            torch.arange(num_tokens, dtype=torch.int32).to(device),
+                            torch.zeros((num_tokens, 1), dtype=torch.bool).to(device),
+                        )
+                    )
+                    mm_embeds.cpu()
                 else:
                     apply_host_mm_embeds(
-                        input_embeds=text_embeds,
+                        input_embeds=mm_embeds,
                         host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
                         host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                     ).cpu()
@@ -2966,12 +2978,4 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
             phase="mm_embed_placement",
             duration_seconds=elapsed,
             input_variant="device_scatter" if on_device else "host_placement",
-        )
-
-    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
-        """Keep multimodal embeds at the token bucket for HOST_PADDED draft extend."""
-        return (
-            batch.sampling_info is not None
-            and is_host_padded(batch.sampling_info)
-            and not batch.forward_mode.is_target_verify()
         )

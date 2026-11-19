@@ -477,6 +477,26 @@ class TestGlm5NextVisionHooks(CustomTestCase):
         self.assertEqual(len(lm_calls), 1)
         self.assertIs(lm_calls[0][0][1], mrope_positions)
 
+        # Passing precomputed input_embeds alongside non-None input_ids must
+        # normalize lm_input_ids to None so it hits the warmed text_only graph.
+        lm_calls.clear()
+        explicit_embeds = torch.ones((4, 8), dtype=torch.float32)
+        extend_fb.logits_output_mode = LogitsOutputMode.DISTRIBUTED_TOP_K
+        got = hooks.forward_glm5_next_multimodal(
+            lambda *a, **kw: self.fail("original_fn should not be called"),
+            model,
+            input_ids,
+            torch.arange(4),
+            extend_fb,
+            input_embeds=explicit_embeds,
+        )
+        self.assertEqual(got, "lm_result")
+        self.assertEqual(extend_fb.logits_output_mode, LogitsOutputMode.FULL_VOCAB)
+        self.assertEqual(len(lm_calls), 1)
+        self.assertIsNone(lm_calls[0][0][0])
+        self.assertIs(lm_calls[0][0][1], mrope_positions)
+        self.assertIs(lm_calls[0][1]["input_embeds"], explicit_embeds)
+
         mm_calls = []
 
         def fake_mm_routine(**kwargs):
@@ -584,7 +604,21 @@ class TestGlm5NextVisionHooks(CustomTestCase):
             tp_sum = sum(seen_by_decoder)
             torch.testing.assert_close(tp_sum, base_embeds)
             self.assertEqual(len(logits_calls), 8)
+            self.assertIs(logits_calls[0][0], forward_batch.input_ids)
             self.assertEqual(logits_calls[0][4], [aux_tensor])
+
+            explicit_ids = torch.full((6,), 7, dtype=torch.int64)
+            logits_calls.clear()
+            attn_tp_ctx.allow_input_scattered = False
+            explicit_owner = _Owner(is_last_rank=True, capture_aux=False)
+            explicit_lm = hooks._Glm5NextLanguageModel(explicit_owner)
+            explicit_lm(
+                explicit_ids,
+                torch.zeros((3, 6), dtype=torch.int64),
+                forward_batch,
+                input_embeds=base_embeds.clone(),
+            )
+            self.assertIs(logits_calls[0][0], explicit_ids)
 
             non_last_owner = _Owner(is_last_rank=False, capture_aux=False)
             non_last_lm = hooks._Glm5NextLanguageModel(non_last_owner)
@@ -611,15 +645,14 @@ class TestGlm5NextVisionHooks(CustomTestCase):
                 self.model = self._run_model
                 self.logits_processor = self._run_logits
 
-            def _run_model(
-                self, input_ids, positions, forward_batch, input_embeds=None
-            ):
+            def _run_model(self, input_ids, positions, forward_batch, **kwargs):
+                input_embeds = kwargs.get("input_embeds")
                 inner_calls.append(
                     (
                         input_ids,
                         positions,
                         forward_batch,
-                        input_embeds,
+                        dict(kwargs),
                         torch.is_grad_enabled(),
                     )
                 )
@@ -655,12 +688,13 @@ class TestGlm5NextVisionHooks(CustomTestCase):
 
         out_plain = draft.forward(ids, pos, fb)
         self.assertEqual(out_plain, "draft_logits")
-        self.assertIsNone(inner_calls[-1][3])
+        self.assertEqual(inner_calls[-1][3], {})
         self.assertFalse(inner_calls[-1][4])
 
         out_mm = draft.forward(ids, pos, fb, input_embeds=embeds)
         self.assertEqual(out_mm, "draft_logits")
-        self.assertIs(inner_calls[-1][3], embeds)
+        self.assertEqual(list(inner_calls[-1][3].keys()), ["input_embeds"])
+        self.assertIs(inner_calls[-1][3]["input_embeds"], embeds)
         self.assertIs(logits_calls[-1][1], embeds)
 
 

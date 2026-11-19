@@ -419,7 +419,8 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             ) as device_spy,
         ):
             policy._precompile_mm_embed_placement()
-            self.assertEqual(embed_spy.call_count, 2)
+            # 2 calls per bucket: standalone text-only + uninterrupted multimodal.
+            self.assertEqual(embed_spy.call_count, 4)
             self.assertEqual(host_spy.call_count, 2)
             self.assertEqual(device_spy.call_count, 0)
 
@@ -439,7 +440,7 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             ) as device_spy,
         ):
             policy._precompile_mm_embed_placement()
-            self.assertEqual(embed_spy.call_count, 2)
+            self.assertEqual(embed_spy.call_count, 4)
             self.assertEqual(host_spy.call_count, 0)
             self.assertEqual(device_spy.call_count, 2)
 
@@ -508,10 +509,13 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             sampling_info=plain_info,
             forward_mode=ForwardMode.EXTEND,
         )
-        for p in (policy, _make_glm_policy(runner)):
-            self.assertTrue(p.keeps_padded_mm_embeds(extend_batch))
-            self.assertFalse(p.keeps_padded_mm_embeds(verify_batch))
-            self.assertFalse(p.keeps_padded_mm_embeds(plain_batch))
+        self.assertTrue(policy.keeps_padded_mm_embeds(extend_batch))
+        self.assertFalse(policy.keeps_padded_mm_embeds(verify_batch))
+        self.assertFalse(policy.keeps_padded_mm_embeds(plain_batch))
+        self.assertFalse(_make_glm_policy(runner).keeps_padded_mm_embeds(extend_batch))
+        self.assertNotIn(
+            "keeps_padded_mm_embeds", Glm5NextVLDecoderTpuCompilePolicy.__dict__
+        )
         self.assertTrue(
             TpuSpecDecodeCompilePolicyMixin.keeps_padded_mm_embeds(policy, extend_batch)
         )
@@ -530,6 +534,11 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
         policy_direct = _make_glm_policy(runner_direct)
         with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
             policy_direct.install()
+
+        policy_direct_arg = _make_glm_policy()
+        policy_direct_arg.tracer = "direct"
+        with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
+            policy_direct_arg.install()
 
         policy_cp = _make_glm_policy()
         with (
