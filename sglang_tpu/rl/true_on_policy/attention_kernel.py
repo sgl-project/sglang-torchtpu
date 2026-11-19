@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from sglang_tpu.rl.true_on_policy.common import register
+from sglang_tpu.rl.true_on_policy.common import refuse_flags, register
 
 PAGE_SIZE = 256
 
@@ -33,17 +33,12 @@ def pin_kv_block(decode, prefill, page_size):
 
 def refuse_rpa_rounding_flags():
     """The RPA tile flags that change rounding must be unset in every process that traces this attention."""
-    from sglang_tpu.envs import envs
-
     flags = (
         "SGLANG_TPU_RPA_EXP2_SOFTMAX",
         "SGLANG_TPU_RPA_ONES_V",
         "SGLANG_TPU_RPA_TRANSPOSED",
     )
-    if on := [name for name in flags if getattr(envs, name).get()]:
-        raise ValueError(
-            f"True on-policy attention needs {', '.join(on)} unset: they change the rounding"
-        )
+    refuse_flags(flags, "attention")
 
 
 @contextlib.contextmanager

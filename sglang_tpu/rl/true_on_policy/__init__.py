@@ -27,6 +27,10 @@ from sglang_tpu.rl.true_on_policy.gated_delta_net_kernel import (
 )
 from sglang_tpu.rl.true_on_policy.logprob_kernel import logprob
 from sglang_tpu.rl.true_on_policy.matmul_kernel import matmul
+from sglang_tpu.rl.true_on_policy.moe_kernel import (
+    moe_experts,
+    refuse_moe_rounding_flags,
+)
 from sglang_tpu.rl.true_on_policy.norm_kernel import gated_rms_norm, rms_norm
 
 __all__ = [
@@ -35,9 +39,11 @@ __all__ = [
     "gated_rms_norm",
     "logprob",
     "matmul",
+    "moe_experts",
     "packed_causal_attention",
     "packed_gated_delta_net",
     "pin_kv_block",
+    "refuse_moe_rounding_flags",
     "refuse_rpa_rounding_flags",
     "rms_norm",
 ]

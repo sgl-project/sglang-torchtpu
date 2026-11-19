@@ -285,6 +285,42 @@ class TestTrueOnPolicyKernels(CustomTestCase):
         decoded = torch.cat(outs).reshape(packed.shape)
         self.assertTrue(torch.equal(decoded, packed))
 
+    def test_moe_experts_rows_do_not_depend_on_row_count(self):
+        hidden, inter, experts, topk = 512, 256, 16, 4
+        x = _rnd(1024, hidden)
+        w1 = _rnd(experts, hidden, 2 * inter, scale=hidden**-0.5, seed=1)
+        w2 = _rnd(experts, inter, hidden, scale=inter**-0.5, seed=2)
+        g = torch.Generator().manual_seed(3)
+        ids = torch.stack(
+            [torch.randperm(experts, generator=g)[:topk] for _ in range(1024)]
+        )
+        weights = torch.softmax(torch.randn(1024, topk, generator=g), dim=-1)
+        weights = weights.to(torch.bfloat16)
+
+        def moe(rows, row_weights, row_ids):
+            return self.k.moe_experts(rows, w1, w2, row_weights, row_ids)
+
+        args = (x, weights.to("tpu"), ids.to(torch.int32).to("tpu"))
+        self._assert_rows_invariant(moe, args)
+        # the first rows against the dense math: a slot is (silu(gate) * up) @ w2, summed with its weight
+        n = 32
+        xf, w1f, w2f = x[:n].cpu().float(), w1.cpu().float(), w2.cpu().float()
+        hidden_out = torch.einsum("rh,rkhn->rkn", xf, w1f[ids[:n]])
+        gate, up = hidden_out[..., :inter], hidden_out[..., inter:]
+        slots = torch.einsum(
+            "rki,rkih->rkh", torch.nn.functional.silu(gate) * up, w2f[ids[:n]]
+        )
+        ref = (weights[:n].float()[..., None] * slots).sum(dim=1)
+        out = moe(*(a[:n].clone() for a in args)).cpu().float()
+        self.assertLess((out - ref).abs().max().item(), 0.05)
+
+    def test_moe_refuses_flags_that_change_rounding(self):
+        from sglang_tpu.envs import envs
+
+        with envs.SGLANG_TPU_PALLAS_VMEM_RIGHTSIZE.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_TPU_PALLAS_VMEM_RIGHTSIZE"):
+                self.k.refuse_moe_rounding_flags()
+
     def test_backward_is_the_gradient_of_the_same_math(self):
         x = _rnd(64, 512).requires_grad_()
         w = _rnd(256, 512, scale=512**-0.5, seed=1).requires_grad_()

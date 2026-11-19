@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What the true on-policy kernels share: op registration, row block sizing and the plain backward set-up."""
+"""What the true on-policy kernels share: op registration, row block sizing, backward set-up, flag refusal."""
 
 from torch_tpu._internal import pallas as _torch_pallas
 
@@ -18,3 +18,12 @@ def row_block(m, cap, floor):
 
 def save_inputs(ctx, inputs, output):
     ctx.save_for_backward(*inputs)
+
+
+def refuse_flags(flags, what):
+    from sglang_tpu.envs import envs
+
+    if on := [name for name in flags if getattr(envs, name).get()]:
+        raise ValueError(
+            f"True on-policy {what} needs {', '.join(on)} unset: they change the rounding"
+        )
