@@ -216,6 +216,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
+            elif _is_tpu:
+                # Own a [K, N] buffer, as fp8.py's channelwise TPU path does,
+                # rather than a transposed view of the loaded [N, K] weight.
+                layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
