@@ -138,15 +138,21 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
     kp_he = _index(kperm(he), dev)
     cols = _index(chunk_cols(two_i, chunk), dev)
     u13 = w13.view(torch.uint8)
-    new13 = torch.cat(
+    permuted = torch.cat(
         [
             _rows(u13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
             for e0 in range(0, u13.shape[0], _EXPERT_CHUNK)
         ]
-    ).view(torch.float8_e4m3fn)
+    )
+    # Viewed as fp8 on CPU, then uploaded: a device-side dtype view (or a copy from one) stays
+    # an alias of the u8 slab, and every forward re-runs the bitcast (as_strided, 1 GiB).
+    new13 = permuted.to("cpu").view(torch.float8_e4m3fn).to(device=dev)
+    del permuted
+    torch.accelerator.synchronize()
     s13 = _channel_scales(experts.w13_weight_scale.data).index_select(2, cols)
     s2 = _channel_scales(experts.w2_weight_scale.data)
     _wait_for(new13, s13, s2)
-    copy_or_rebind_param(experts, "w13_weight", new13.contiguous())
+    # The uploaded leaf itself, not a copy into the old buffer.
+    experts.w13_weight.data = new13
     copy_or_rebind_param(experts, "w13_weight_scale", s13.contiguous())
     copy_or_rebind_param(experts, "w2_weight_scale", s2)
