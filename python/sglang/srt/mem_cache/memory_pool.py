@@ -1743,35 +1743,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def _write_mamba_index_mapping(
         self, rows: List[int], mamba_indices: Optional[torch.Tensor]
     ) -> None:
-        """Set ``req_index_to_mamba_index_mapping[rows] = mamba_indices``.
+        """See ``state_storage.write_mamba_index_mapping``."""
+        from sglang.srt.mem_cache.kv.state_storage import write_mamba_index_mapping
 
-        A chunked-prefill request calls alloc() again for every chunk
-        (alloc_for_extend -> alloc_req_slots). On an async device (TPU), a
-        blocking H2D copy or a setitem indexed by a Python list (which transfers
-        synchronously) makes the host wait for the forward still in flight, which
-        held each chunk's launch until the previous chunk's forward had finished.
-        So host-resident slot ids (TPU keeps them on the host) are padded on the
-        host and uploaded non_blocking.
-
-        The write is padded to one row per pool row so the device sees a single
-        ``index_copy_`` shape, compiled once at construction, instead of one per
-        batch size at serving time. Padding writes 0 into the reserved row 0.
-        """
-        mapping = self.req_index_to_mamba_index_mapping
-        if mamba_indices is not None and mamba_indices.device.type != "cpu":
-            # Slot ids already on the device: nothing to upload.
-            mapping[rows] = mamba_indices.to(dtype=mapping.dtype)
-            return
-        num_rows = mapping.shape[0]
-        index = torch.zeros(num_rows, dtype=torch.int64)
-        values = torch.zeros(num_rows, dtype=mapping.dtype)
-        if rows:
-            index[: len(rows)] = torch.tensor(rows, dtype=torch.int64)
-            values[: len(rows)] = mamba_indices.to(dtype=mapping.dtype)
-        mapping.index_copy_(
-            0,
-            index.to(mapping.device, non_blocking=True),
-            values.to(mapping.device, non_blocking=True),
+        write_mamba_index_mapping(
+            self.req_index_to_mamba_index_mapping, rows, mamba_indices
         )
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:

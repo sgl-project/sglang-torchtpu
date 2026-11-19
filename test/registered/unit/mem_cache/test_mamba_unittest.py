@@ -218,6 +218,8 @@ class TestMamba(unittest.TestCase):
     def test_alloc_writes_mamba_index_mappings(self):
         """alloc() fills req_index_to_mamba_index_mapping (and the ping-pong
         mapping) for fresh and continuing requests across separate calls."""
+        from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+
         num_layers = 8
         mamba_layers = [i for i in range(num_layers) if i % 4 != 3]
         shape = Mamba2StateShape.create(
@@ -270,15 +272,17 @@ class TestMamba(unittest.TestCase):
                                 req.kv.mamba_ping_pong_track_buffer.cpu().tolist(),
                             )
 
+                # Rows and their state slots are bound together, as the
+                # scheduler binds them (the sync's alloc() binds rows only).
                 first = [make_req(i) for i in range(3)]
-                first_rows = pool.alloc(first)
+                first_rows = acquire_rows(pool, pool.state, first)
                 check(first)
 
                 # A continuing chunked request keeps its row and mamba slot and
                 # goes through alloc() again next to a fresh request.
                 first[1].kv.kv_allocated_len = 16
                 fresh = make_req(3)
-                second_rows = pool.alloc([first[1], fresh])
+                second_rows = acquire_rows(pool, pool.state, [first[1], fresh])
                 self.assertEqual(second_rows[0], first_rows[1])
                 check(first + [fresh])
 

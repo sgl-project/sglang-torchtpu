@@ -21,6 +21,41 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
 
 
+def write_mamba_index_mapping(
+    mapping: torch.Tensor, rows: List[int], mamba_indices: Optional[torch.Tensor]
+) -> None:
+    """``mapping[rows] = mamba_indices`` without making the host wait.
+
+    A chunked-prefill request binds its rows again for every chunk. On an
+    async device (TPU), a blocking H2D copy or a setitem indexed by a Python
+    list makes the host wait for the forward still in flight, which held each
+    chunk's launch until the previous chunk's forward had finished. So
+    host-resident slot ids (TPU keeps them on the host) are padded on the host
+    and uploaded non_blocking, one row per table row, so the device sees a
+    single ``index_copy_`` shape (compiled once, at construction) instead of
+    one per batch size. Padding writes 0 into the reserved row 0.
+
+    The table can live off the slot allocator's device (a host-resident
+    request table on TPU); the slot ids are copied to it.
+    """
+    if mamba_indices is not None and mamba_indices.device.type != "cpu":
+        # Device rows: indexing a device tensor with a Python list syncs the host.
+        row_ids = async_h2d(rows, dtype=torch.int64, device=mapping.device)
+        mapping[row_ids] = mamba_indices.to(device=mapping.device, dtype=mapping.dtype)
+        return
+    num_rows = mapping.shape[0]
+    index = torch.zeros(num_rows, dtype=torch.int64)
+    values = torch.zeros(num_rows, dtype=mapping.dtype)
+    if rows:
+        index[: len(rows)] = torch.tensor(rows, dtype=torch.int64)
+        values[: len(rows)] = mamba_indices.to(dtype=mapping.dtype)
+    mapping.index_copy_(
+        0,
+        index.to(mapping.device, non_blocking=True),
+        values.to(mapping.device, non_blocking=True),
+    )
+
+
 class StateSlotsExhausted(RuntimeError):
     """No state slot was left for a request that was admitted for one."""
 
@@ -179,16 +214,14 @@ class StateStorage:
                 buffers = self._hand_out_tracking(
                     table, untracked, slots[len(needing) :]
                 )
-        # Device rows: indexing a device tensor with a Python list syncs the host.
-        row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
-        mamba_index_tensor = (
+        mamba_indices = (
             mids
             if mids is not None and len(needing) == len(reqs)
             else torch.stack([req.kv.mamba_pool_idx for req in reqs])
-        ).to(device=table.device, dtype=torch.int32)
-        # The table can live off the slot allocator's device (a host-resident
-        # request table on TPU); the requests' tensors are copied to it.
-        table.req_index_to_mamba_index_mapping[row_ids] = mamba_index_tensor
+        )
+        write_mamba_index_mapping(
+            table.req_index_to_mamba_index_mapping, rows, mamba_indices
+        )
         if tracking:
             ping_pong_tensor = (
                 buffers
@@ -198,11 +231,7 @@ class StateStorage:
             # The mapping sits with the slot ids (`slot_allocator_device`),
             # which can differ from the table's device (host slot ids on TPU).
             mapping = table.req_index_to_mamba_ping_pong_track_buffer_mapping
-            mapping_rows = (
-                row_ids
-                if mapping.device == row_ids.device
-                else async_h2d(rows, dtype=torch.int64, device=mapping.device)
-            )
+            mapping_rows = async_h2d(rows, dtype=torch.int64, device=mapping.device)
             mapping[mapping_rows] = ping_pong_tensor.to(mapping.device)
 
     @property
