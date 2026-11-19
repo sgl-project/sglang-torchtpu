@@ -95,6 +95,7 @@ class SWAComponent(TreeComponent):
         )
         self.cap_text = _cap_text_mode()
         self.sliding_window_size = params.sliding_window_size
+        self._host_tail_only = envs.SGLANG_HICACHE_SWA_HOST_TAIL_ONLY.get()
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -137,6 +138,8 @@ class SWAComponent(TreeComponent):
         ):
             if cur.write_through_pending_id is not None:
                 break
+            if self._host_tail_only and self._window_shadowed_by_children(cur):
+                break
 
             cd = cur.component_data[ct]
             value = cd.value if cd.value is not None else cd.host_value
@@ -147,6 +150,20 @@ class SWAComponent(TreeComponent):
                 unbacked.append(cur)
             cur = cur.parent
         return unbacked
+
+    def _window_shadowed_by_children(self, node: UnifiedTreeNode) -> bool:
+        """``node`` is a pass-through: its one child holds a full window of its own.
+
+        A branch point keeps its window even when every child holds one, since a
+        prompt sharing only the common prefix ends its match there.
+        """
+        if len(node.children) != 1:
+            return False
+        (child,) = node.children.values()
+        cd = child.component_data[self.component_type]
+        return len(child.key) >= self.sliding_window_size and (
+            cd.value is not None or cd.host_value is not None
+        )
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         return bool(self._collect_unbacked_swa_nodes(node))
