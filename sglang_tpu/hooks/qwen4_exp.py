@@ -348,7 +348,7 @@ def ple_rows128_supported(table: Any) -> bool:
     return table.dim() == 2 and table.shape[1] == 160 and table.shape[0] % 4 == 0
 
 
-def gather_ple_rows128(rows128: Any, ids: Any) -> Any:
+def gather_ple_rows128(rows128: Any, ids: Any, dtype: Any = None) -> Any:
     """Rows ``ids`` of a [N, 160] table stored as [N * 160 / 128, 128].
 
     A [N, 160] fp8 tensor on TPU gets the transposed layout {0,1} (160 is not a
@@ -362,11 +362,19 @@ def gather_ple_rows128(rows128: Any, ids: Any) -> Any:
 
     ids = ids.to(torch.int32)
     q = ids + (ids >> 2)
-    offset = (ids & 3) * 32
+    phase = (ids & 3).unsqueeze(-1)
     pair = torch.stack([q, q + 1], dim=-1).reshape(-1)
     window = torch.index_select(rows128, 0, pair).reshape(*ids.shape, 256)
-    cols = offset.unsqueeze(-1) + torch.arange(160, dtype=torch.int32, device=ids.device)
-    return torch.gather(window, -1, cols.to(torch.int64))
+    if dtype is not None:
+        # Convert the small gathered windows, not the table; select in dtype.
+        window = window.to(dtype)
+    # The offset is one of four: select among static slices rather than gather
+    # with per-element indices, whose int64 lowering aborted the TPU compiler
+    # ("Unsupported conversion from vmreg/vreg to U64").
+    out = window[..., 0:160]
+    for k in (1, 2, 3):
+        out = torch.where(phase == k, window[..., 32 * k : 32 * k + 160], out)
+    return out
 
 
 def embed_ple_rows128(
@@ -389,8 +397,10 @@ def embed_ple_rows128(
     lookup_ids, semantic_tokens = ngram._prepare_embedding_lookup(
         ngram_ids, forward_batch, physical_tokens
     )
-    rows = gather_ple_rows128(rows128, lookup_ids)
-    embeddings = rows.to(emb.output_dtype or torch.bfloat16) * emb.weight_scale
+    rows = gather_ple_rows128(
+        rows128, lookup_ids, dtype=emb.output_dtype or torch.bfloat16
+    )
+    embeddings = rows * emb.weight_scale
     return ngram._finish_embedding_lookup(
         embeddings, semantic_tokens, forward_batch, physical_tokens
     )
