@@ -4555,9 +4555,21 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         for req in self.waiting_queue:
-            if has_traffic and is_health_check_req(req):
-                waiting_queue.append(req)
-                continue
+            if is_health_check_req(req):
+                # A completion can acknowledge a probe before its KV transfer
+                # reaches this queue. HTTP cleanup need not send an abort, so
+                # retire its preallocated resources here after transfer ends.
+                if req.rid not in self.health_monitor.pending_rids:
+                    self._release_aborted_request(req)
+                    if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                        discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    continue
+                if has_traffic:
+                    waiting_queue.append(req)
+                    continue
             # A host-restored request joins only after the copy is ready.
             if len(can_run_list) < num_not_used_batch and (
                 not host_restore
