@@ -55,9 +55,7 @@ def moe_ord(L):
     return L - 3
 
 
-# meta is [live requests, the write-back's split-cache rank, 6 reserved words, then one
-# raw-ring base page per request].
-META_MLA_ROLE = 1
+# meta is [live requests, 7 reserved words, then one raw-ring base page per request].
 META_RAW_BASE = 8
 
 

@@ -206,8 +206,6 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         raw_out, rec_out = _scatter_index_rows(
             spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
         )
-        if cfg.mla_shards > 1:  # the write-back's rank: chip me holds share me
-            meta = meta.at[D.META_MLA_ROLE].set(jax.lax.axis_index(D.AXIS))
         written = write_rows(
             meta, pos, tab, ckrow, nkv8, conv, *pools["nope"], *pools["conv"]
         )

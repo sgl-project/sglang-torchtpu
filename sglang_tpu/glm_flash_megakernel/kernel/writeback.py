@@ -16,14 +16,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import pools as PL
-from .decode import META_MLA_ROLE
+from .decode import AXIS
 
 
 def row_write_call(spec, cfg):
     """`f(meta, pos, tab, ckrow, nkv, conv, *nope, *conv_pools) -> (*nope, *conv_pools)`.
     Row r = b*Q + qi is token pos[b]+qi of request b; its conv checkpoint goes to
     pool row ckrow[r]. A split latent cache takes a row only on the rank holding its
-    offset (meta[META_MLA_ROLE]), at its row in that rank's share of the page."""
+    offset (this chip's mesh position), at its row in that rank's share of the page."""
     B, Q, R = cfg.n_req, cfg.n_query, cfg.rows
     ps, pps = cfg.page_size, cfg.pages_per_seq
     n_dsa, n_kda = len(spec.dsa_layers), len(spec.kda_layers)
@@ -35,7 +35,8 @@ def row_write_call(spec, cfg):
         cpool = rest[2 * n_dsa + n_kda : 2 * (n_dsa + n_kda)]
         sems, csems = rest[2 * (n_dsa + n_kda)], rest[2 * (n_dsa + n_kda) + 1]
         n_live = meta_ref[0]
-        role = meta_ref[META_MLA_ROLE]
+        # In the kernel, as decode's `me`: an XLA partition-id is refused by SPMD export.
+        role = jax.lax.axis_index(AXIS) if MS > 1 else 0
         issued = []
         for b in range(B):
             live = b < n_live
