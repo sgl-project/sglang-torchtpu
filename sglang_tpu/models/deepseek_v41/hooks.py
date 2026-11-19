@@ -126,6 +126,15 @@ fold_tpu_dsv41_encoder_replay
   Remove when: _fold_batch builds the replay rows on the scheduled tensors'
        devices and keeps out_cache_loc's dtype.
 
+init_tpu_dsv41_pool_configurator
+  Why: DSV4PoolConfigurator.__init__ counts the DSpark draft layers kept in a
+       per-request SWA ring as a local; get_tpu_dsv41_swa_fixed_bytes prices those
+       ring pages in the TPU layout and needs the count.
+  How: AROUND __init__: after the original, set draft_ring_layers by core's rule
+       and assert it agrees with the paged_draft_layers core kept.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR4).
+  Remove when: the configurator exposes the draft ring layer count.
+
 derive_tpu_dsv41_pool_sizes, build_tpu_dsv41_allocator, get_tpu_dsv41_swa_fixed_bytes
   Why: under --enable-encoder-swa-bounded-replay the core sizes the paged SWA pool
        at 0 tokens (SWA lives in the request window), which the TPU 8-page SWA
@@ -309,6 +318,14 @@ def build_tpu_dsv41_allocator(original, kvc, **kwargs):
     )
 
     return _impl(original, kvc, **kwargs)
+
+
+def init_tpu_dsv41_pool_configurator(original, configurator, kvc) -> None:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        init_tpu_dsv41_pool_configurator as _impl,
+    )
+
+    _impl(original, configurator, kvc)
 
 
 def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
@@ -624,6 +641,7 @@ def hook_specs():
             get_tpu_dsv41_swa_fixed_bytes,
             HookType.AROUND,
         ),
+        (f"{cfg}.__init__", init_tpu_dsv41_pool_configurator, HookType.AROUND),
         (f"{kvc}._derive_pool_sizes", derive_tpu_dsv41_pool_sizes, HookType.AROUND),
         (
             f"{kvc}._build_token_to_kv_pool_allocator",

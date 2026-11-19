@@ -376,6 +376,7 @@ def build_forward_metadata(
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     request_window: Optional[DSV41TPURequestWindow],
+    swa_ring_valid_from: Optional[torch.Tensor],
     max_context_len: int,
     low_ratios: Sequence[int],
     device: torch.device,
@@ -407,7 +408,14 @@ def build_forward_metadata(
     columns = max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
     full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
     window_plan = None
-    if request_window is None:
+    if swa_ring_valid_from is not None:
+        # DSpark draft ring: every logical page is the slot's ring; rows before
+        # valid_from belong to the slot's previous owner.
+        swa_pages = decode_window_pages(
+            req_pool_indices, columns * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+        )
+        swa_minimum = torch.maximum(swa_minimum, swa_ring_valid_from[req_pool_indices])
+    elif request_window is None:
         swa_pages = _swa_page_table(full_pages, full_to_swa_index_mapping)
     else:
         swa_pages, window_plan = _window_swa_table(
@@ -628,6 +636,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             req_to_token=self.req_to_token,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
             request_window=self.request_window,
+            swa_ring_valid_from=self.token_to_kv_pool.swa_req_ring_valid_from,
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,
