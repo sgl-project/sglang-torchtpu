@@ -774,10 +774,6 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
             tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
             and (shards != tp or (cfg.page_size or 0) // shards % 16 != 0)
         ),
-        # Prefill gathers each rank's own entries only; validated with one group.
-        "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (needs shards == --tp-size)": (
-            tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get() and shards != tp
-        ),
         # A rank's share is a compile-time constant of its program; one shared
         # program would make every rank attend rank 0's share.
         "--use-spmd-compile": cfg.use_spmd_compile,
