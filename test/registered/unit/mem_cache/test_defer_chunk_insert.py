@@ -19,8 +19,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _Tree:
-    def __init__(self, defers=True):
+    def __init__(self, defers=True, inserts_branch=False):
         self.defers = defers
+        # Like the SWA component: an insert with a pending branch stops there.
+        self.inserts_branch = inserts_branch
         self.calls = []
 
     def defer_chunk_checkpoint(self, req):
@@ -28,15 +30,20 @@ class _Tree:
         return self.defers
 
     def checkpoint(self, req, *, up_to):
+        if self.inserts_branch and req.swa_branching_seqlen is not None:
+            self.calls.append(("checkpoint", req.swa_branching_seqlen))
+            req.swa_branching_seqlen = None
+            return
         self.calls.append(("checkpoint", up_to))
 
 
-def _run(stride, mid_prefill, start=4096, end=8192, tree=None):
+def _run(stride, mid_prefill, start=4096, end=8192, tree=None, branch=None):
     req = SimpleNamespace(
         rid="r",
         finished=lambda: False,
         skip_radix_cache_insert=False,
         extend_range=SimpleNamespace(start=start, end=end),
+        swa_branching_seqlen=branch,
     )
     tree = tree or _Tree()
     with envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride):
@@ -64,6 +71,34 @@ class TestDeferChunkInsert(unittest.TestCase):
     def test_cache_that_declines_still_inserts(self):
         calls = _run(16384, mid_prefill=True, tree=_Tree(defers=False))
         self.assertEqual(calls, [("defer", 8192), ("checkpoint", 8192)])
+
+
+class TestSwaBranchCheckpoint(unittest.TestCase):
+    """A request whose match stopped at an SWA branch must publish the branch while
+    its window is live, and still publish its own prompt end: otherwise the
+    session's next turn matches only the branch, and so does every turn after it."""
+
+    def test_chunk_reaching_the_branch_is_not_deferred(self):
+        calls = _run(16384, mid_prefill=True, branch=6144)
+        self.assertEqual(calls, [("checkpoint", 8192)])
+
+    def test_branch_beyond_the_chunk_still_defers(self):
+        self.assertEqual(_run(16384, True, branch=12288), [("defer", 8192)])
+
+    def test_insert_stopped_at_the_branch_publishes_the_rest(self):
+        tree = _Tree(inserts_branch=True)
+        for mid in (True, False):
+            tree.calls = []
+            _run(16384, mid_prefill=mid, branch=6144, tree=tree)
+            self.assertEqual(tree.calls, [("checkpoint", 6144), ("checkpoint", 8192)])
+
+    def test_branch_at_the_chunk_end_inserts_once(self):
+        calls = _run(16384, False, branch=8192, tree=_Tree(inserts_branch=True))
+        self.assertEqual(calls, [("checkpoint", 8192)])
+
+    def test_zero_stride_keeps_the_upstream_path(self):
+        calls = _run(0, True, branch=6144, tree=_Tree(inserts_branch=True))
+        self.assertEqual(calls, [("checkpoint", 6144)])
 
 
 def _swa_cache(**overrides):

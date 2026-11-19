@@ -15,7 +15,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_memory, get_observability
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -260,6 +260,16 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def extract_session_id(self, request, raw_request) -> Optional[str]:
+        """The body's session_id; else, with --session-id-header, that header's value
+        (only when the body has no session_params, which excludes session_id)."""
+        if request.session_id is not None or raw_request is None:
+            return request.session_id
+        header = get_memory().session_id_header
+        if not header or request.session_params is not None:
+            return None
+        return raw_request.headers.get(header) or None
 
     def extract_routing_key(self, raw_request):
         if raw_request is None:

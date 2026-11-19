@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.hicache_quiet_sync import QuietSyncGate
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -181,6 +182,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.session_leaf_at_prompt_end = params.session_leaf_at_prompt_end
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -260,6 +262,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # Set by init_hicache when SGLANG_HICACHE_QUIET_SYNC_EVERY applies.
+        self._quiet_sync: Optional[QuietSyncGate] = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -523,6 +527,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        quiet_every = envs.SGLANG_HICACHE_QUIET_SYNC_EVERY.get()
+        if (
+            quiet_every > 1
+            and self.cache_controller is not None
+            and self.pp_size <= 1
+            and self.linker is None
+            and self.host_memory_mode != "buffer_only"
+        ):
+            self._quiet_sync = QuietSyncGate(quiet_every)
+            logger.info(
+                "HiCache ack poll: every %d steps while no rank has a ready ack",
+                quiet_every,
+            )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -1269,6 +1286,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
+        if (
+            is_finished
+            and len(prompt_key) < len(radix_key)
+            and getattr(self.tree_core, "swa_host_evict_passed_first", False)
+        ):
+            # The next turn re-renders the assistant message and diverges at the
+            # prompt end, so the output's window is never a resume point.
+            self.tree_core.mark_match_passed(result.last_device_node)
+
         # Protect the whole inserted path. With disaggregated decode caching,
         # SWA slots may exist only for the prompt's tail; EAGLE page alignment
         # can leave less than a live window inside the inserted range. A fresh
@@ -1339,8 +1365,33 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
                 self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
+                    req,
+                    leaf=self.finished_session_leaf(
+                        result.last_device_node, len(prompt_key)
+                    ),
                 )
+
+    def finished_session_leaf(self, last_node: NodeId, prompt_len: int) -> NodeId:
+        """The node a finished request registers as its session's leaf: the end of its
+        inserted path, or with session_leaf_at_prompt_end the deepest node on that path
+        ending at or below `prompt_len` (key tokens, page-aligned). The prompt end is
+        where the session's next turn continues: the client resends the assistant turn
+        as re-rendered text, which diverges from the cached output tokens."""
+        if not self.session_leaf_at_prompt_end:
+            return last_node
+        core = self.tree_core
+        path = []
+        node = core.node_by_id(last_node)
+        while node is not None and node is not core.root_node:
+            path.append(node)
+            node = node.parent
+        best, end = core.root_node, 0
+        for node in reversed(path):
+            end += len(node.key)
+            if end > prompt_len:
+                break
+            best = node
+        return best.id
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -3555,12 +3606,30 @@ class UnifiedRadixCache(BasePrefixCache):
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
+        # Every rank skips the poll on the same steps (QuietSyncGate). A storage backend
+        # can be attached at runtime, so its queues are polled every step; so are
+        # in-flight load-backs, whose queue length agrees on every rank (see
+        # has_free_load_back_slot) and whose slots admission waits on.
+        gate = self._quiet_sync
+        if (
+            gate is not None
+            and not self.enable_storage
+            and not self.cache_controller.ack_load_queue
+            and gate.should_skip()
+        ):
+            return
         (
             write_finish_count,
             load_finish_count,
             storage_queue_sizes,
             extra_pool_names,
         ) = self._sync_hicache_ready_counts()
+        if gate is not None:
+            gate.record(
+                write_finish_count > 0
+                or load_finish_count > 0
+                or any(storage_queue_sizes)
+            )
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
