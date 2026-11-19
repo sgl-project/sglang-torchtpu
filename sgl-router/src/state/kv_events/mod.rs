@@ -47,4 +47,5 @@ pub use tree::{
 };
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
+    TokenIdShape,
 };

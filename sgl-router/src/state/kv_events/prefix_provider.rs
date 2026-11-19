@@ -204,6 +204,7 @@ mod tests {
             block_hashes: hashes[..blocks].to_vec(),
             parent_block_hash: None,
             token_ids: tokens[..blocks * BLOCK as usize].to_vec(),
+            token_shape: None,
             block_size: BLOCK,
             lora_id: None,
             lora_name: None,

@@ -215,6 +215,73 @@ class TestMamba(unittest.TestCase):
                 assert (cache.intermediate_ssm is not None) == allocate
                 assert cache.intermediate_conv_window[0].shape[2] == 3
 
+    def test_alloc_writes_mamba_index_mappings(self):
+        """alloc() fills req_index_to_mamba_index_mapping (and the ping-pong
+        mapping) for fresh and continuing requests across separate calls."""
+        num_layers = 8
+        mamba_layers = [i for i in range(num_layers) if i % 4 != 3]
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=256,
+            n_groups=2,
+            num_heads=4,
+            head_dim=64,
+            state_size=16,
+            conv_kernel=4,
+        )
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+
+        def make_req(rid):
+            return Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=sampling_params,
+            )
+
+        for extra_buffer in (False, True):
+            with self.subTest(enable_mamba_extra_buffer=extra_buffer):
+                pool = HybridReqToTokenPool(
+                    size=8,
+                    mamba_size=32,
+                    mamba_spec_state_size=8,
+                    max_context_len=64,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    cache_params=cache_params,
+                    mamba_layer_ids=mamba_layers,
+                    enable_mamba_extra_buffer=extra_buffer,
+                    speculative_num_draft_tokens=3,
+                )
+
+                def check(reqs):
+                    mapping = pool.req_index_to_mamba_index_mapping.cpu()
+                    for req in reqs:
+                        self.assertEqual(
+                            int(mapping[req.kv.req_pool_idx]),
+                            int(req.kv.mamba_pool_idx),
+                        )
+                        if extra_buffer:
+                            pp = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                            self.assertEqual(
+                                pp[req.kv.req_pool_idx].cpu().tolist(),
+                                req.kv.mamba_ping_pong_track_buffer.cpu().tolist(),
+                            )
+
+                first = [make_req(i) for i in range(3)]
+                first_rows = pool.alloc(first)
+                check(first)
+
+                # A continuing chunked request keeps its row and mamba slot and
+                # goes through alloc() again next to a fresh request.
+                first[1].kv.kv_allocated_len = 16
+                fresh = make_req(3)
+                second_rows = pool.alloc([first[1], fresh])
+                self.assertEqual(second_rows[0], first_rows[1])
+                check(first + [fresh])
+
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
             conv_window_axis = 0

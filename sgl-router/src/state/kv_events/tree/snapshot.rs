@@ -470,6 +470,7 @@ mod tests {
             block_hashes: vec![100, 101],
             parent_block_hash: None,
             token_ids: vec![1, 2, 3, 4],
+            token_shape: None,
             block_size: 2,
             lora_id: None,
             lora_name: Some("adapter-a".into()),

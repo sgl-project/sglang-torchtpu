@@ -671,6 +671,7 @@ mod tests {
                 block_hashes: vec![100],
                 parent_block_hash: None,
                 token_ids: vec![1, 2],
+                token_shape: None,
                 block_size: 64,
                 lora_id: None,
                 lora_name: Some("adapter-a".into()),
