@@ -56,6 +56,9 @@ the recipe source and the launcher's `--dry-run` at `e5305a50a9`.
   (c1/c4/c8) also SPMD compile (`use_spmd_compile`) with scattered prefill input off; the
   split cache refuses SPMD (a rank's share is a compile-time constant of its program). The
   measured rows below ran the Dynamo tracer.
+- Decode buckets: one program per running count (`tpu_compile_bs` 1..max running, as Muse's
+  AgentX recipe), so no decode step is padded; the megakernel builds the same buckets within
+  its 16-row cap. The table's "compile bs" column is what the measured rows ran.
 - DSA attention token split (`SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT`): off in every
   recipe. It is refused with the split cache (c16/c32). At c8 it was measured as an extra
   env (see the c8 rows).

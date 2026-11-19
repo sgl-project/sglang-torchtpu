@@ -44,8 +44,8 @@ def agentx_config(
             "page_size": 128,
             "max_running_requests": max_running,
             "torch_compile_max_bs": max_running,
-            "tpu_compile_bs": [b for b in (1, 4, 8, 16, 32) if b < max_running]
-            + [max_running],
+            # One decode program per running count: no step is padded (Muse's recipe).
+            "tpu_compile_bs": list(range(1, max_running + 1)),
             # Short turns run a small program instead of a padded 8192-token chunk.
             "tpu_compile_tokens": [1024, 2048, 4096, 8192],
             "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
