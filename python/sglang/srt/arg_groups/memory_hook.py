@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
     post_capture_kv_sizing_planned,
+    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -215,7 +216,9 @@ def handle_gpu_memory_settings(server_args: Any):
             declare_resolution(
                 server_args,
                 "_handle_gpu_memory_settings",
-                torch_compile_max_bs=cfg.torch_compile_max_bs
+                torch_compile_max_bs=resolution_result(
+                    server_args, "torch_compile_max_bs"
+                )
                 or decode_cuda_graph_config.max_bs,
             )
             decode_cuda_graph_config.bs = generate_cpu_graph_batch_sizes(server_args)

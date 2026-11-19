@@ -40,6 +40,7 @@ from sglang_tpu.compilation.core_compile_annotations import (
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+    rpa_leaves,
 )
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
@@ -72,6 +73,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def _warn_eager_attention_smem(attn_backend: object) -> None:
+    # The decoder runs eager here, so no compile policy checks its attention SMEM.
+    for backend in rpa_leaves(attn_backend):
+        backend.warn_eager_smem_overflow()
 
 
 def _spec_enabled(model_runner: ModelRunner) -> bool:
@@ -190,6 +197,7 @@ class TpuGraphRunner:
             from sglang.srt.runtime_context import get_flags
 
             get_flags().capture.enable_torch_compile = False
+            _warn_eager_attention_smem(model_runner.attn_backend)
             return
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
@@ -247,7 +255,6 @@ class TpuGraphRunner:
             # draft, then compile its backbone and logits regions itself.
             modules = (("", self.model),)
         warmup_start = time.perf_counter()
-        installed_any = False
         installed_policies: list[CompilePolicy] = []
         compile_timing_recorder = getattr(model_runner, "compile_timing", None)
         pending_warmups = []
@@ -297,11 +304,13 @@ class TpuGraphRunner:
             if issubclass(policy_cls, DecoderTpuCompilePolicy):
                 policy_kwargs["tracer"] = model_runner.server_args.tpu_compile_tracer
             policy = policy_cls(**policy_kwargs)
-            installed = policy.install()
-            if installed:
-                installed_any = True
+            if policy.install():
                 installed_policies.append(policy)
-                pending_warmups.extend(policy.precompile() or ())
+        # Warm up only after every install: decoder installs refuse grids that
+        # overflow attention SMEM, and vision warmups can compile synchronously.
+        for policy in installed_policies:
+            pending_warmups.extend(policy.precompile() or ())
+        installed_any = bool(installed_policies)
 
         if installed_any and not any(
             isinstance(policy, DecoderCompilePolicy) for policy in installed_policies
@@ -315,6 +324,7 @@ class TpuGraphRunner:
                 type(self.model).__name__,
                 ", ".join(type(p).__name__ for p in installed_policies),
             )
+            _warn_eager_attention_smem(model_runner.attn_backend)
 
         if not installed_any:
             server_args = model_runner.server_args

@@ -201,38 +201,6 @@ def ref_ragged_paged_attention(
     return jnp.concatenate(outputs, axis=0)
 
 
-def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
-    total_bits = (
-        # kv_lens_ref: i32[max_num_seqs]
-        align_to(max_num_seqs, 128) * 32
-        +
-        # page_indices_ref: i32[max_num_seqs * pages_per_seq]
-        align_to(max_num_seqs * pages_per_seq, 128) * 32
-        +
-        # cu_q_lens_ref: i32[max_num_seqs + 1]
-        align_to(max_num_seqs + 1, 128) * 32
-        +
-        # cu_kv_lens_ref: i32[max_num_seqs + 1]
-        align_to(max_num_seqs + 1, 128) * 32
-        +
-        # cu_seq_mask_lens: i32[max_num_seqs + 1]
-        align_to(max_num_seqs + 1, 128) * 32
-        +
-        # distribution_ref: i32[3]
-        128 * 32
-        +
-        # sem_ids_ref: i32[3]
-        128 * 32
-        +
-        # bo_ids_ref: i32[4]
-        128 * 32
-        +
-        # bkv_update_ids_ref: i32[6]
-        128 * 32
-    )
-    return cdiv(total_bits, 8)
-
-
 def get_vmem_estimate_bytes(
     actual_num_kv_heads,
     actual_num_q_heads_per_kv_head,
