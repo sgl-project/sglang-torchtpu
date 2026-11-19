@@ -36,31 +36,28 @@ from sglang_tpu.envs import envs
 _FP8_KV_CACHE_DTYPES = frozenset({"fp8_e4m3", "fp8_e5m2"})
 
 
-def land_arena_blocks(*, swa: bool = False) -> int:
+def land_arena_blocks() -> int:
     """Arena blocks every KV pool of a raiden group reserves past its pages.
 
     One decision per group, taken from the target's deployment (published
     config), never from the pool asking: raiden requires equal block counts
     within a group (``get_raiden_kv_caches``), and a draft pool may differ
     from the target in store dtype (--speculative-draft-kv-cache-dtype) or
-    page size (DCP widens draft pages). The SWA group never lands: 0.
+    page size (DCP widens draft pages). Both full-attention and sliding-window
+    groups reserve the same count.
 
     Non-zero only when SGLANG_RAIDEN_RESHARD_LAND_ARENA is set on a raiden
     decode whose target pool is token-major fused with an fp8 store dtype, the
     only layout whose push reshard needs landing. A target resolved to fp8 from
     ``--kv-cache-dtype auto`` (a checkpoint's kv quant) is not seen here and
-    gets no arena, so its LAND schedules stay refused. Neither does the
-    unified Full+SWA pool (--enable-unified-memory): its configurator charges
-    no arena, so the pool reserves none and its LAND schedules stay refused.
+    gets no arena, so its LAND schedules stay refused. ``TpuUnifiedSWAKVPool``
+    scales this count by ``1 + num_swa_groups`` so one plan's full and expanded
+    SWA companion pages fit in its shared arena.
 
     The size is two announcement chunks of schedule pages,
     ``2 * ceil(8192 / page_size)``.
     """
-    if not envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get() or swa:
-        return 0
-    from sglang_tpu.unified_kv_pool import unified_kv_pool_requested
-
-    if unified_kv_pool_requested():
+    if not envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
         return 0
     from sglang.srt.runtime_context import (
         get_disagg,
@@ -112,11 +109,25 @@ class ScratchArena:
         self._held: set[int] = set()
 
     @classmethod
-    def from_pool(cls, pool: Any) -> Optional[ScratchArena]:
-        """The arena of a KV pool (the full sub-pool of an SWA pool), or None
-        when it reserved none."""
-        pool = getattr(pool, "full_kv_pool", pool)
-        count = int(getattr(pool, "land_arena_blocks", 0) or 0)
+    def from_pool(cls, pool: Any, *, swa: bool = False) -> Optional[ScratchArena]:
+        """The arena of a KV pool (or the SWA sub-pool when ``swa`` is set), or
+        None when it reserved none."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        if swa:
+            if not isinstance(pool, SWAKVPool):
+                return None
+            pool = pool.swa_kv_pool
+        elif isinstance(pool, TpuUnifiedSWAKVPool):
+            pool = pool.kv_pool
+        elif isinstance(pool, (SWAKVPool, HybridLinearKVPool)):
+            pool = pool.full_kv_pool
+        if not isinstance(pool, TpuFusedMHATokenToKVPool):
+            return None
+        count = int(pool.land_arena_blocks)
         if count == 0:
             return None
         return cls(int(pool.num_blocks) - count, count)
@@ -157,7 +168,7 @@ class ScratchArena:
 # Carried by RESHARD_LAND_READY / RESHARD_LAND_CHUNK_READY. A prefill that
 # meets another version fails the room instead of pushing a schedule its
 # decode may place differently.
-LAND_VERSION = 1
+LAND_VERSION = 2
 
 # Merge batch sizes (pairs), so a round compiles one of a few shapes; the
 # arena capacity tops the list.
@@ -190,6 +201,8 @@ class LandHold:
     retry: Callable[[], None]
     # Fails the room once the hold expires; called without the lock.
     expire: Callable[[], None]
+    peer_land: Any = None
+    peer_pages: int = 0
 
 
 class LandState:

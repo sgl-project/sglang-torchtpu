@@ -241,6 +241,7 @@ def get_raiden_kv_caches(
                 full_layer_ids=full_ids,
                 swa_layer_ids=[],
                 unified_swa_pool=current_pool,
+                full_head_nums=[current_pool.head_num] * len(shared_buffers),
             )
         if isinstance(current_pool, DSV4TPUTokenToKVPool):
             dsv4_full: List[torch.Tensor] = []

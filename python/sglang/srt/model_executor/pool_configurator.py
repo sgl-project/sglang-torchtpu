@@ -153,9 +153,6 @@ def _mha_bytes_per_token_per_layer(
 
 
 def _reserved_blocks_sizer(kvc: KVCacheConfigurator) -> Callable[[], int]:
-    """Blocks each full-attention KV pool reserves past the allocator: one
-    count for the whole group, target and draft alike, read when sizing
-    (``SRTPlatform.get_kv_pool_reserved_blocks``)."""
     use_mla_backend = kvc.use_mla_backend
     return lambda: current_platform.get_kv_pool_reserved_blocks(
         use_mla_backend=use_mla_backend
@@ -975,15 +972,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _reserved_bytes(self, page_size: int) -> int:
-        # SWA pools reserve none. Draft layers of full capacity are charged
-        # whichever pool holds them, which at worst over-counts.
         return (
             self._reserved_blocks()
             * page_size
             * (
                 self._full_per_token * self._full_layers_num
+                + self._swa_per_token * self._swa_layers_num
                 + self._draft_full_per_token * self._draft_full_layers_num
-                + self._draft_swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_swa_per_token
+                * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
                 + self._draft_cell_size
             )
         )

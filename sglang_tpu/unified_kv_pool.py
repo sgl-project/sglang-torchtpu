@@ -395,8 +395,10 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             allocation_label="Unified",
+            land_arena_scale=1 + self.layout.num_swa_groups,
             **extra_kwargs,
         )
+        self.land_arena_blocks = self.kv_pool.land_arena_blocks
         if "kv_layout" in extra_kwargs:
             self.kv_layout = extra_kwargs["kv_layout"]
         self._swa_copy_kwargs = (
@@ -1045,8 +1047,15 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> int:
         """Compute aligned physical page count directly from free HBM quota and Full layers."""
-        usable = max(0, available_bytes - self._reserved_bytes)
+        arena_pages = 0
+        if tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
+            from sglang_tpu.disaggregation.raiden.land import land_arena_blocks
+
+            arena_pages = (1 + self._num_swa_groups) * land_arena_blocks()
         page_bytes = page_size * self._full_per_token * self._full_layers_num
+        usable = max(
+            0, available_bytes - self._reserved_bytes - arena_pages * page_bytes
+        )
         raw_pages = usable // page_bytes if page_bytes > 0 else 0
         return (raw_pages // self._align_pages) * self._align_pages
 

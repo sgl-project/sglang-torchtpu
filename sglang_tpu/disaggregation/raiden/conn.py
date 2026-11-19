@@ -203,6 +203,7 @@ class RaidenKVManager(
     # Decode: the reshard landing arena's LandState (land.py), when the KV
     # pool reserved one.
     _land = None
+    _swa_land = None
 
     def __init__(
         self,
@@ -535,8 +536,7 @@ class RaidenKVManager(
                 geom = self._make_geometry(src_attn_tp, dst_attn_tp, swa=swa)
             except (ValueError, RuntimeError) as e:
                 return f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
-            # The sliding-window group has no landing arena.
-            land_ok = not swa and self._land_ok()
+            land_ok = self._land_ok(swa=swa)
             for shape, element_size, heads in layers:
                 reasons = []
                 hinted = None
@@ -555,11 +555,11 @@ class RaidenKVManager(
                         reason = check(land_ok=land_ok)
                     except ValueError as e:
                         reason = f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
-                    if reason is not None and not swa and not land_ok:
+                    if reason is not None and not land_ok:
                         # The hint probe never replaces the refusal itself.
                         try:
                             if check(land_ok=True) is None:
-                                reason += self._land_hint()
+                                reason += self._land_hint(swa=swa)
                                 hinted = hinted or reason
                         except ValueError:
                             pass
@@ -577,40 +577,65 @@ class RaidenKVManager(
         of a landing room at one announcement (C)."""
         return -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
 
-    def _land_ok(self) -> bool:
-        """Whether this side can serve a push reshard that needs landing
-        (#829): a decode whose arena holds a whole chunk, or a prefill with
-        SGLANG_RAIDEN_RESHARD_LAND_ARENA set."""
+    def _land_swa_window_blocks(self) -> int:
+        if tpu_envs.SGLANG_RAIDEN_SWA_MAX_BLOCKS.get() > 0 or (
+            self.kv_args.sliding_window_size is not None
+            and self.kv_args.sliding_window_size > 0
+        ):
+            return self._swa_max_request_blocks()
+        return self._land_chunk_pages()
+
+    def _land_min_arena_blocks(self, *, swa: bool = False) -> int:
+        chunk = self._land_chunk_pages()
+        if swa:
+            return max(chunk, self._land_swa_window_blocks())
+        if self._unified_swa_pool is not None:
+            return (
+                chunk
+                + self._unified_swa_pool.layout.num_swa_groups
+                * self._land_swa_window_blocks()
+            )
+        return chunk
+
+    def _land_ok(self, *, swa: bool = False) -> bool:
         if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
             return False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             return True
-        land = self._land
-        return land is not None and land.arena.capacity >= self._land_chunk_pages()
+        land = self._swa_land if swa else self._land
+        return land is not None and land.arena.capacity >= self._land_min_arena_blocks(
+            swa=swa
+        )
 
-    def _land_hint(self) -> str:
-        """What would let a refused landing cell through on this side."""
+    def _land_hint(self, *, swa: bool = False) -> str:
         if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
             return (
                 f" (or set {tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name}=1 on the "
                 "prefill and the decode to land it in scratch blocks)"
             )
-        land = self._land
-        if land is None and self._unified_swa_pool is not None:
-            return (
-                f" ({tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name} is set, but "
-                "--enable-unified-memory reserves no landing arena: run the decode "
-                "without it to land)"
-            )
+        land = self._swa_land if swa else self._land
+        group = "SWA KV pool" if swa else "KV pool"
         if land is None:
             return (
                 f" ({tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name} is set, but this "
-                "decode's KV pool reserved no landing arena: it needs a token-major "
+                f"decode's {group} reserved no landing arena: it needs a token-major "
                 "fp8 --kv-cache-dtype)"
             )
+        needed = self._land_min_arena_blocks(swa=swa)
+        if not swa and self._unified_swa_pool is not None:
+            return (
+                f" (the unified landing arena holds {land.arena.capacity} blocks, "
+                f"under the {needed} blocks one chunk and its SWA groups need)"
+            )
+        if swa and needed > self._land_chunk_pages():
+            return (
+                f" (the SWA landing arena holds {land.arena.capacity} blocks, "
+                f"under the {needed}-page SWA window)"
+            )
+        label = "SWA landing arena" if swa else "landing arena"
         return (
-            f" (the landing arena holds {land.arena.capacity} blocks, under one "
-            f"{self._land_chunk_pages()}-page chunk)"
+            f" (the {label} holds {land.arena.capacity} blocks, under one "
+            f"{needed}-page chunk)"
         )
 
     def _check_reshard_bounds(
@@ -713,6 +738,7 @@ class RaidenKVManager(
             pipeline = PipelineTransfer(self, kv_caches)
             # The pipeline transfer never pushes a landing schedule.
             self._land = None
+            self._swa_land = None
             self._engine = pipeline.engine
             self.raiden_endpoint = pipeline.controller
             self.chunked_transfer = False
@@ -737,33 +763,41 @@ class RaidenKVManager(
     # ----- reshard landing arena (#829, decode) -----------------------------
 
     def attach_kv_pool(self, kv_pool: Any) -> None:
-        """Take the decode KV pool's landing arena, if it reserved one.
+        """Take the decode KV pool's landing arenas, if it reserved any.
         Called by decode.py/prefill.py before ``set_kv_caches``."""
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             return
         from sglang_tpu.disaggregation.raiden.land import LandState, ScratchArena
 
-        arena = ScratchArena.from_pool(kv_pool)
+        arena = ScratchArena.from_pool(pool=kv_pool)
         self._land = LandState(arena) if arena is not None else None
+        swa_arena = ScratchArena.from_pool(pool=kv_pool, swa=True)
+        self._swa_land = LandState(swa_arena) if swa_arena is not None else None
 
     def _check_land_arena(self) -> None:
-        """Drop the arena unless every full-attention tensor raiden indexes
-        (draft layers included) ends with it: the merge and the pushes
-        address scratch blocks by id in each of them."""
-        land = self._land
-        if land is None:
-            return
-        end = land.arena.first_block + land.arena.capacity
-        sizes = sorted({int(t.shape[0]) for t in self._kv_caches})
-        if sizes != [end]:
-            logger.warning(
-                "RaidenKVManager rank%d: KV tensors have %s blocks, the landing "
-                "arena ends at block %d; landing reshards stay refused",
-                self.attn_tp_rank,
-                sizes,
-                end,
-            )
-            self._land = None
+        # Every tensor of a group must end with its arena; pushes and merges index it.
+        for attr, tensors, label in (
+            ("_land", self._kv_caches, "KV"),
+            ("_swa_land", self._swa_kv_caches, "SWA KV"),
+        ):
+            land = self._swa_land if attr == "_swa_land" else self._land
+            if land is None:
+                continue
+            end = land.arena.first_block + land.arena.capacity
+            sizes = sorted({int(t.shape[0]) for t in (tensors or ())})
+            if sizes != [end]:
+                logger.warning(
+                    "RaidenKVManager rank%d: %s tensors have %s blocks, the landing "
+                    "arena ends at block %d; landing reshards stay refused",
+                    self.attn_tp_rank,
+                    label,
+                    sizes,
+                    end,
+                )
+                if attr == "_swa_land":
+                    self._swa_land = None
+                else:
+                    self._land = None
 
     def _land_live_locked(self, room: int) -> bool:
         """Whether a room may still have landed pages merged: it owns its
@@ -795,73 +829,50 @@ class RaidenKVManager(
 
     def land_merged(self, room: int) -> bool:
         """Every landed page of the room is merged into its final page."""
-        if self._land is None:
+        if self._land is None and self._swa_land is None:
             return True
         with self._state_lock:
-            return self._land.merged(room)
+            full_ok = self._land is None or self._land.merged(room)
+            swa_ok = self._swa_land is None or self._swa_land.merged(room)
+            return full_ok and swa_ok
 
-    def land_prepass(self) -> None:
-        """Merge settled landing plans, free their scratch, and serve or
-        expire held takes. Runs on the scheduler thread once per decode round,
-        before the transfer queue polls, at the same program point on every
-        rank; it issues no collective."""
-        land = self._land
-        if land is None or self._pipeline is not None:
-            return
-        from sglang_tpu.disaggregation.raiden.land import device_sync, merge_pages
-
-        # Same-round settles; every other drain records them too.
-        self._drain_engine()
-        now = time.time()
-        with self._state_lock:
-            jobs = []
-            for key, plan in list(land.plans.items()):
-                if not plan.settled:
-                    continue
-                # A room that failed or was cleared since its settle gets no
-                # merge: its pages may already belong to another request.
-                if self._land_live_locked(plan.room):
-                    jobs.append((key, plan))
-                else:
-                    land.free(key)
-            expired = [h for h in land.holds if now >= h.deadline]
-            for hold in expired:
-                land.holds.remove(hold)
-        if jobs:
-            kv = self._kv_caches
-
-            def merge(js):
-                merge_pages(
-                    kv,
-                    [pair for _, p in js for pair in zip(p.final, p.scratch)],
-                    land.arena.capacity,
-                    self._land_layout,
-                )
-
-            failed: Dict[int, BaseException] = {}
-            # Orders the settled H2D before the gathers (H6).
-            device_sync(kv)
-            try:
-                merge(jobs)
-            except Exception:
-                # Attribute the error: re-merge room by room. The merge only
-                # rewrites final slots 2-3 from scratch, so redoing a room the
-                # batch already merged is harmless; only rooms that raise fail.
-                for room in sorted({p.room for _, p in jobs}):
-                    try:
-                        merge([(k, p) for k, p in jobs if p.room == room])
-                    except Exception as e:
-                        failed[room] = e
-            # Orders the merge before any later H2D into the freed scratch.
-            device_sync(kv)
-            for room, error in failed.items():
-                self._fail_reshard_room(room, error)
-            with self._state_lock:
-                for key, _ in jobs:
-                    land.free(key)
+    def _collect_land_round_locked(
+        self, *, land: Any, now: float
+    ) -> Tuple[List[Tuple[str, Any]], List[Any]]:
+        if land is None:
+            return [], []
+        jobs = []
+        for key, plan in list(land.plans.items()):
+            if not plan.settled:
+                continue
+            # A room that failed or was cleared since its settle gets no merge:
+            # its pages may already belong to another request.
+            if self._land_live_locked(plan.room):
+                jobs.append((key, plan))
+            else:
+                land.free(key)
+        expired = [h for h in land.holds if now >= h.deadline]
         for hold in expired:
-            hold.expire()
-        # Serve holds in FIFO order while the arena covers the head.
+            land.holds.remove(hold)
+        return jobs, expired
+
+    def _merge_land_group(
+        self, *, kv_caches: Sequence[Any], land: Any, jobs: Sequence[Tuple[str, Any]]
+    ) -> None:
+        from sglang_tpu.disaggregation.raiden.land import merge_pages
+
+        if not jobs or land is None:
+            return
+        merge_pages(
+            kv_caches,
+            [pair for _, p in jobs for pair in zip(p.final, p.scratch)],
+            land.arena.capacity,
+            self._land_layout,
+        )
+
+    def _serve_land_holds(self, land: Any) -> None:
+        if land is None:
+            return
         while True:
             with self._state_lock:
                 if not land.holds:
@@ -872,12 +883,80 @@ class RaidenKVManager(
                     continue
                 if land.arena.available < head.pages:
                     break
+                peer = head.peer_land
+                if peer is not None and (
+                    (peer.holds and peer.holds[0].room != head.room)
+                    or peer.arena.available < head.peer_pages
+                ):
+                    break
             head.retry()
             with self._state_lock:
-                # A retry that took nothing (its room failed meanwhile) must
-                # not block the queue.
+                # A retry whose room failed meanwhile took nothing; pop it.
                 if land.holds and land.holds[0] is head:
                     land.holds.popleft()
+
+    def land_prepass(self) -> None:
+        """Merge settled landing plans, free their scratch, and serve or
+        expire held takes. Runs on the scheduler thread once per decode round,
+        before the transfer queue polls, at the same program point on every
+        rank; it issues no collective."""
+        land, swa_land = self._land, self._swa_land
+        if (land is None and swa_land is None) or self._pipeline is not None:
+            return
+        from sglang_tpu.disaggregation.raiden.land import device_sync
+
+        # Same-round settles; every other drain records them too.
+        self._drain_engine()
+        now = time.time()
+        with self._state_lock:
+            full_jobs, full_expired = self._collect_land_round_locked(
+                land=land, now=now
+            )
+            swa_jobs, swa_expired = self._collect_land_round_locked(
+                land=swa_land, now=now
+            )
+        if full_jobs or swa_jobs:
+            sync_kv = self._kv_caches or self._swa_kv_caches
+
+            def merge(*, f_js, s_js):
+                self._merge_land_group(kv_caches=self._kv_caches, land=land, jobs=f_js)
+                self._merge_land_group(
+                    kv_caches=self._swa_kv_caches, land=swa_land, jobs=s_js
+                )
+
+            failed: Dict[int, BaseException] = {}
+            # Orders the settled H2D before the gathers (H6).
+            device_sync(sync_kv)
+            try:
+                merge(f_js=full_jobs, s_js=swa_jobs)
+            except Exception:
+                # Attribute the error: re-merge room by room. The merge only
+                # rewrites final slots 2-3 from scratch, so redoing a room the
+                # batch already merged is harmless; only rooms that raise fail.
+                rooms = sorted({p.room for _, p in [*full_jobs, *swa_jobs]})
+                for room in rooms:
+                    try:
+                        merge(
+                            f_js=[(k, p) for k, p in full_jobs if p.room == room],
+                            s_js=[(k, p) for k, p in swa_jobs if p.room == room],
+                        )
+                    except Exception as e:
+                        failed[room] = e
+            # Orders the merge before any later H2D into the freed scratch.
+            device_sync(sync_kv)
+            for room, error in failed.items():
+                self._fail_reshard_room(room=room, error=error)
+            with self._state_lock:
+                if land is not None:
+                    for key, _ in full_jobs:
+                        land.free(key)
+                if swa_land is not None:
+                    for key, _ in swa_jobs:
+                        swa_land.free(key)
+        for hold in (*full_expired, *swa_expired):
+            hold.expire()
+        self._serve_land_holds(land)
+        self._serve_land_holds(swa_land)
 
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
@@ -1271,10 +1350,17 @@ class RaidenKVManager(
                     superseded -= norm_failed
                     self._native_failed.update(real_failed)
                     self._failed.update(real_failed)
-                    if self._land is not None:
+                    land_state = (
+                        self._land
+                        if name == "full"
+                        else self._swa_land
+                        if name == "swa"
+                        else None
+                    )
+                    if land_state is not None:
                         # Recorded here, at every drain: a settle consumed by
                         # another caller must still reach the merge or free.
-                        self._land.settle(
+                        land_state.settle(
                             [self._norm_req_id(t.req_id) for t in done_recv],
                             norm_failed,
                             self._land_live_locked,
@@ -1414,14 +1500,17 @@ class RaidenKVManager(
         an engine that never held it the drop is the same no-op as for a plan
         raiden already reaped.
         """
+        first_error: Optional[RuntimeError] = None
         for engine in (self._engine, self._swa_engine):
             if engine is None:
                 continue
             try:
                 engine.unregister_active_plan(uuid)
             except RuntimeError as e:
-                if "not registered" not in str(e):
-                    raise
+                if "not registered" not in str(e) and first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
 
     def _reap_stale_plan(self, uuid: int, room: int, fut) -> None:
         """Waits out a parked plan's copy, then drops the plan.
@@ -1843,6 +1932,7 @@ class RaidenKVManager(
                     self._prefill.offered_end,
                     self._prefill.reshard_ready_pages,
                     self._prefill.reshard_ready_scratch,
+                    self._prefill.reshard_ready_swa_scratch,
                     self._prefill.reshard_chunk_acked,
                     self._prefill.send_blocks,
                     self._prefill.send_block_set,
@@ -1895,6 +1985,8 @@ class RaidenKVManager(
                     table.discard(room)
             if self._land is not None:
                 self._land.drop_room(room)
+            if self._swa_land is not None:
+                self._swa_land.drop_room(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.

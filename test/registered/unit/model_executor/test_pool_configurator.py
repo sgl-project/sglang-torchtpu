@@ -2235,7 +2235,7 @@ class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
 
 class TestRaidenLandArenaBudget(CustomTestCase):
     """SGLANG_RAIDEN_RESHARD_LAND_ARENA charges the arena blocks every
-    full-attention KV pool reserves past the allocator (#829)."""
+    KV pool reserves past the allocator (#829)."""
 
     PAGE = 64
     # 2 * ceil(8192 / 64)
@@ -2250,6 +2250,7 @@ class TestRaidenLandArenaBudget(CustomTestCase):
         dtype=torch.float8_e4m3fn,
         mode="decode",
         eagle_draft_layers=None,
+        eagle_draft_swa_layers=None,
         platform_cls=None,
         **kwargs,
     ):
@@ -2265,6 +2266,7 @@ class TestRaidenLandArenaBudget(CustomTestCase):
             mr.spec_algorithm.is_eagle.return_value = True
             mr.spec_algorithm.is_none.return_value = False
             mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_layers
+            mr.spec_aux_config.eagle_draft_swa_num_layers = eagle_draft_swa_layers
         platform = SimpleNamespace(
             get_mha_kv_bytes_per_token=lambda **_: None,
             get_mha_kv_pool_cls=lambda: TpuFusedMHATokenToKVPool,
@@ -2343,20 +2345,25 @@ class TestRaidenLandArenaBudget(CustomTestCase):
                 _, on = self._run(True, **kwargs)
                 self.assertEqual(on, off)
 
-    def test_hybrid_swa_charges_full_layers_only(self):
+    def test_hybrid_swa_charges_full_and_swa_layers(self):
+        """Hybrid SWA sizing deducts the arena from both full and SWA pools,
+        including EAGLE draft full and SWA layers."""
         swa = dict(
             is_hybrid_swa=True,
             full_attention_layer_ids=list(range(8)),
             swa_attention_layer_ids=list(range(8, 32)),
-            swa_num_kv_heads=4,
+            swa_num_kv_heads=2,
+            eagle_draft_layers=4,
+            eagle_draft_swa_layers=2,
         )
-        cfg, _ = self._run(False, **swa)
         _, on = self._run(True, **swa)
-        arena = self.ARENA * self.PAGE * cfg._full_per_token * cfg._full_layers_num
+        arena = (
+            self.ARENA * self.PAGE * ((8 + 2) * 4 * 128 * 2 + (24 + 2) * 2 * 128 * 2)
+        )
         _, shrunk = self._run(False, available=self.AVAILABLE - arena, **swa)
         self.assertEqual(on, shrunk)
 
-    def test_swa_chunk_cap_charges_full_layers_only(self):
+    def test_swa_chunk_cap_charges_full_and_swa_layers(self):
         from sglang.srt.model_executor.pool_configurator import (
             SWAChunkCapPoolConfigurator,
         )
@@ -2367,7 +2374,7 @@ class TestRaidenLandArenaBudget(CustomTestCase):
             is_hybrid_swa=True,
             full_attention_layer_ids=list(range(8)),
             swa_attention_layer_ids=list(range(8, 32)),
-            swa_num_kv_heads=4,
+            swa_num_kv_heads=2,
             disable_radix_cache=True,
             chunked_prefill_size=self.PAGE,
             sliding_window_size=128,
@@ -2376,8 +2383,7 @@ class TestRaidenLandArenaBudget(CustomTestCase):
         cfg, off = self._run(False, **cap)
         self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
         _, on = self._run(True, **cap)
-        # 4 heads * (64 + 64) dims * 2 B, on the 8 full layers; SWA is a fixed cap.
-        arena = self.ARENA * self.PAGE * 4 * 128 * 2 * 8
+        arena = self.ARENA * self.PAGE * (8 * 4 * 128 * 2 + 24 * 2 * 128 * 2)
         _, shrunk = self._run(False, available=self.AVAILABLE - arena, **cap)
         self.assertEqual(on, shrunk)
         self.assertLess(on.full_max_total_num_tokens, off.full_max_total_num_tokens)

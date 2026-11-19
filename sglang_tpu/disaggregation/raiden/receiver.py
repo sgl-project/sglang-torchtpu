@@ -920,8 +920,11 @@ class RaidenReceiverMixin:
             )
             self._decode.reshard_sources[room] = {}
             self._decode.reshard_swa_sources[room] = {}
+            now = time.time()
             if self._land is not None:
-                self._land.started[room] = time.time()
+                self._land.started[room] = now
+            if self._swa_land is not None:
+                self._swa_land.started[room] = now
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
         payload = ReshardReq(
@@ -1029,11 +1032,20 @@ class RaidenReceiverMixin:
 
     # ----- reshard landing (#829) -------------------------------------------
 
-    def _land_geometry(self, src_attn_tp: int) -> Tuple[Any, bool]:
+    def _land_geometry(
+        self, src_attn_tp: int, *, swa: bool = False
+    ) -> Tuple[Any, bool]:
         """The receive geometry of this decode rank, and whether any of its
         sources lands in scratch. Without an arena, today's geometry."""
-        geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
-        if self._land is None:
+        geom = (
+            self._make_geometry(
+                src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size, swa=True
+            )
+            if swa
+            else self._make_geometry(src_attn_tp, self.attn_tp_size)
+        )
+        land = self._swa_land if swa else self._land
+        if land is None:
             return geom, False
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             LandEntry,
@@ -1061,6 +1073,14 @@ class RaidenReceiverMixin:
             "(SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S)"
         )
 
+    def _land_hold_deadline_locked(self, *, room: int, lands: Sequence[Any]) -> float:
+        deadline = time.time() + self._land_hold_timeout()
+        for land in lands:
+            started = land.started.get(room)
+            if started is not None and self.waiting_timeout:
+                deadline = min(deadline, started + float(self.waiting_timeout) - 10.0)
+        return deadline
+
     def _land_take(
         self,
         room: int,
@@ -1068,36 +1088,104 @@ class RaidenReceiverMixin:
         n: int,
         retry: Any,
         expire: Any,
+        *,
+        swa: bool = False,
+        deadline: Optional[float] = None,
     ) -> Optional[List[int]]:
         """``n`` scratch blocks for plan ``key``, or None after parking the
         take as a hold. The hold ends before the room's waiting timeout, so
         the expiry, not the timeout, names the arena."""
         from sglang_tpu.disaggregation.raiden.land import LandHold
 
+        land = self._swa_land if swa else self._land
         with self._state_lock:
-            ids = self._land.take(key, room, n)
+            ids = land.take(key, room, n)
             if ids is None:
-                now = time.time()
-                deadline = now + self._land_hold_timeout()
-                started = self._land.started.get(room)
-                waiting = getattr(self, "waiting_timeout", None)
-                if started is not None and waiting:
-                    deadline = min(deadline, started + float(waiting) - 10.0)
-                self._land.hold(
+                due = (
+                    deadline
+                    if deadline is not None
+                    else self._land_hold_deadline_locked(room=room, lands=(land,))
+                )
+                land.hold(
                     LandHold(
                         key=key,
                         room=room,
                         pages=n,
-                        deadline=deadline,
+                        deadline=due,
                         retry=retry,
                         expire=expire,
                     )
                 )
             return ids
 
-    def _land_free(self, key: str) -> None:
+    def _land_take_closing(
+        self,
+        *,
+        room: int,
+        req_id: str,
+        full_n: int,
+        swa_req_id: str,
+        swa_n: int,
+        retry_factory: Callable[[float], Callable[[], None]],
+        expire: Callable[[], None],
+        deadline: Optional[float] = None,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]], bool]:
+        from sglang_tpu.disaggregation.raiden.land import LandHold
+
+        legs: List[Tuple[Any, str, int]] = []
+        if full_n > 0:
+            legs.append((self._land, req_id, full_n))
+        if swa_n > 0:
+            legs.append((self._swa_land, swa_req_id, swa_n))
+        if not legs:
+            return None, None, True
         with self._state_lock:
-            self._land.free(key)
+            for land, key, n in legs:
+                if n > land.arena.capacity:
+                    raise ValueError(
+                        f"a landing plan of {n} pages exceeds the {land.arena.capacity}"
+                        "-block reshard landing arena"
+                    )
+                if key in land.plans:
+                    raise ValueError(f"landing plan {key} already holds scratch")
+            ready = all(
+                (not land.holds or land.holds[0].key == key)
+                and land.arena.available >= n
+                for land, key, n in legs
+            )
+            if ready:
+                taken = {key: land.take(key, room, n) for land, key, n in legs}
+                return taken.get(req_id), taken.get(swa_req_id), True
+            due = (
+                deadline
+                if deadline is not None
+                else self._land_hold_deadline_locked(
+                    room=room, lands=[land for land, _, _ in legs]
+                )
+            )
+            retry_cb = retry_factory(due)
+            for idx, (land, key, n) in enumerate(legs):
+                peer_land, _, peer_pages = (
+                    legs[1 - idx] if len(legs) == 2 else (None, "", 0)
+                )
+                land.hold(
+                    LandHold(
+                        key=key,
+                        room=room,
+                        pages=n,
+                        deadline=due,
+                        retry=retry_cb,
+                        expire=expire,
+                        peer_land=peer_land,
+                        peer_pages=peer_pages,
+                    )
+                )
+            return None, None, False
+
+    def _land_free(self, key: str, *, swa: bool = False) -> None:
+        land = self._swa_land if swa else self._land
+        with self._state_lock:
+            land.free(key)
 
     def _register_reshard_chunk(
         self,
@@ -1401,27 +1489,15 @@ class RaidenReceiverMixin:
         self._unregister_plan(uuid)
         return False
 
-    def _register_reshard_swa_receiver(
+    def _pair_reshard_swa_sources(
         self,
+        *,
         room: int,
-        src_attn_tp: int,
         local_swa_blocks: List[int],
         swa_sources_map: Dict[int, List[int]],
-    ) -> bool:
-        """Arm the sliding-window receive of a resharded room. True to continue.
-
-        Non-hybrid models have no second engine and skip this. The window is
-        whole -- it is settled only when the prefill ends, so it never chunks
-        and always travels with the closing push -- which is why this plan is
-        built once from the full SWA page list rather than a complement.
-
-        Pages pair by token order: both sides derive them from ``StateType.SWA``
-        over the same window, so the lists must be the same length. They can be
-        shorter on the decode after a prefix hit, in which case the tail pairs,
-        matching what the non-chunked full path does.
-        """
+    ) -> Optional[List[Tuple[int, List[int]]]]:
         if self._swa_engine is None:
-            return True
+            return []
         if not local_swa_blocks:
             # Let is_recv_done settle -- but this side has a window engine, so a
             # room with no window pages to place means the two sides disagree
@@ -1434,14 +1510,7 @@ class RaidenReceiverMixin:
             )
             with self._state_lock:
                 self._completed_recv.add(self._swa_req_id(room))
-            return True
-
-        from tpu_sync.rpc import raiden_service_pb2 as pb2
-
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            build_receiver_request,
-        )
-
+            return []
         n = len(local_swa_blocks)
         sources: List[Tuple[int, List[int]]] = []
         for p_rank in sorted(swa_sources_map):
@@ -1455,21 +1524,39 @@ class RaidenReceiverMixin:
                 with self._state_lock:
                     self._failed.add(str(room))
                     self.record_failure(room, reason)
-                return False
+                return None
             sources.append((p_rank, pages[-n:]))
+        return sources
 
+    def _stage_reshard_swa_plan(
+        self,
+        *,
+        room: int,
+        src_attn_tp: int,
+        swa_geom: Any,
+        local_swa_blocks: List[int],
+        sources: List[Tuple[int, List[int]]],
+        swa_scratch: Optional[List[int]] = None,
+    ) -> bool:
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+        )
+
+        n = len(local_swa_blocks)
         try:
-            geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
             req = build_receiver_request(
                 pb2,
                 uuid=room,
                 req_id=self._swa_req_id(room),
                 peer=self._swa_engine.transfer_address,
                 decode_rank=self.attn_tp_rank,
-                geom=geom,
+                geom=swa_geom,
                 sources=sources,
                 dst_block_ids=local_swa_blocks,
                 live_tokens=[self.kv_args.page_size] * n,
+                scratch_block_ids=swa_scratch,
             )
             self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size, swa=True)
             self._swa_engine.register_active_plan(room, req, is_sender=False)
@@ -1478,15 +1565,6 @@ class RaidenReceiverMixin:
             error.__cause__ = e
             self._fail_reshard_room(room, error)
             return False
-        with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
-                # Cleared while registering; drop the plan again so the pages
-                # cannot be written under their next owner.
-                self._unregister_plan(room)
-                return False
-            self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
-        # INFO for the same reason as the push: without it a skipped window and
-        # a transferred one produce identical logs.
         logger.info(
             "raiden reshard SWA receive room=%s decode_rank=%d sources=%d "
             "pages=%d layers=%d",
@@ -1496,6 +1574,46 @@ class RaidenReceiverMixin:
             n,
             len(self._swa_kv_caches),
         )
+        return True
+
+    def _register_reshard_swa_receiver(
+        self,
+        room: int,
+        src_attn_tp: int,
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> bool:
+        sources = self._pair_reshard_swa_sources(
+            room=room,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
+        )
+        if sources is None:
+            return False
+        if not sources:
+            return True
+        try:
+            geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
+        except Exception as e:
+            error = RuntimeError(f"SWA: cannot stage plan {room}: {e}")
+            error.__cause__ = e
+            self._fail_reshard_room(room=room, error=error)
+            return False
+        if not self._stage_reshard_swa_plan(
+            room=room,
+            src_attn_tp=src_attn_tp,
+            swa_geom=geom,
+            local_swa_blocks=local_swa_blocks,
+            sources=sources,
+        ):
+            return False
+        with self._state_lock:
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                # Cleared while registering; drop the plan again,
+                # so the pages cannot be written under their next owner.
+                self._unregister_plan(room)
+                return False
+            self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
         return True
 
     def _pair_unified_reshard_swa_receiver(
@@ -1551,22 +1669,33 @@ class RaidenReceiverMixin:
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
 
-        if self._land is not None and self.chunked_transfer:
+        if (
+            self._land is not None or self._swa_land is not None
+        ) and self.chunked_transfer:
             try:
-                geom, lands = self._land_geometry(src_attn_tp)
+                geom, full_lands = self._land_geometry(src_attn_tp)
+                if self._swa_engine is not None and local_swa_blocks:
+                    swa_geom, swa_lands = self._land_geometry(
+                        src_attn_tp=src_attn_tp, swa=True
+                    )
+                else:
+                    swa_geom, swa_lands = None, False
             except Exception as e:
-                self._fail_reshard_plan_build(room, str(room), e)
+                self._fail_reshard_plan_build(room=room, req_id=str(room), exc=e)
                 return
-            if lands:
+            if full_lands or swa_lands:
                 self._register_landing_closing(
-                    room,
-                    geom,
-                    local_blocks,
-                    local_swa_blocks,
-                    src_attn_tp,
-                    ready_endpoints,
-                    sources_map,
-                    swa_sources_map,
+                    room=room,
+                    geom=geom,
+                    full_lands=full_lands,
+                    swa_geom=swa_geom,
+                    swa_lands=swa_lands,
+                    local_blocks=local_blocks,
+                    local_swa_blocks=local_swa_blocks,
+                    src_attn_tp=src_attn_tp,
+                    ready_endpoints=ready_endpoints,
+                    sources_map=sources_map,
+                    swa_sources_map=swa_sources_map,
                 )
                 return
 
@@ -1696,10 +1825,48 @@ class RaidenReceiverMixin:
             record_read=not self.chunked_transfer,
         )
 
+    def _resolve_landing_closing_swa(
+        self,
+        *,
+        room: int,
+        src_attn_tp: int,
+        swa_lands: bool,
+        missing: List[int],
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> Tuple[
+        Optional[Dict[int, List[int]]], Optional[List[Tuple[int, List[int]]]], bool
+    ]:
+        if self._unified_swa_pool is not None:
+            paired = self._pair_unified_reshard_swa_receiver(
+                room=room,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources_map=swa_sources_map,
+            )
+            return paired, None, paired is not None
+        if not missing and not swa_lands:
+            ok = self._register_reshard_swa_receiver(
+                room=room,
+                src_attn_tp=src_attn_tp,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources_map=swa_sources_map,
+            )
+            return None, None, ok
+        swa_sources = self._pair_reshard_swa_sources(
+            room=room,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
+        )
+        return None, swa_sources, swa_sources is not None
+
     def _register_landing_closing(
         self,
+        *,
         room: int,
         geom: Any,
+        full_lands: bool,
+        swa_geom: Any,
+        swa_lands: bool,
         local_blocks: List[int],
         local_swa_blocks: List[int],
         src_attn_tp: int,
@@ -1707,98 +1874,101 @@ class RaidenReceiverMixin:
         sources_map: Dict[int, List[int]],
         swa_sources_map: Dict[int, List[int]],
     ) -> None:
-        """The closing plan of a room whose sources land (#829): the
-        complement first, since its length is the take; then the take (or a
-        hold), the SWA arm, the registration and RESHARD_LAND_READY. The SWA
-        arm follows the take so a hold never leaves it armed."""
         n = len(local_blocks)
         total = len(next(iter(sources_map.values())))
         base = total - n
         with self._state_lock:
             covered = list(self._decode.reshard_covered.get(room, []))
         missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
+        unified_swa_sources, swa_sources, ok = self._resolve_landing_closing_swa(
+            room=room,
+            src_attn_tp=src_attn_tp,
+            swa_lands=swa_lands,
+            missing=missing,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
+        )
+        if not ok:
+            return
+        has_closing_full = bool(missing) or (
+            unified_swa_sources is not None and bool(local_swa_blocks)
+        )
         with self._state_lock:
-            if room not in self._decode.reshard_meta:
-                return  # cleared while the complement was computed
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                return  # cleared while SWA or complement was resolved
             # Owed from the moment the room can look complete, as below.
-            if missing:
+            if has_closing_full:
                 self._decode.chunk_reads.setdefault(room, []).append(str(room))
             self._decode.final_seen.add(room)
-        if not missing:
-            if not self._register_reshard_swa_receiver(
-                room, src_attn_tp, local_swa_blocks, swa_sources_map
-            ):
-                return
-            # Nothing lands: today's empty READY.
+        dst = [local_blocks[pg - base] for pg in missing]
+        if unified_swa_sources is not None:
+            unified_sources = [
+                (
+                    p_rank,
+                    [sources_map[p_rank][pg] for pg in missing]
+                    + unified_swa_sources[p_rank],
+                )
+                for p_rank in sorted(sources_map)
+            ]
+            self._land_unified_closing(
+                room=room,
+                geom=geom,
+                src_attn_tp=src_attn_tp,
+                unified_sources=unified_sources,
+                dst=dst,
+                local_swa_blocks=list(local_swa_blocks),
+                missing=missing,
+                ready_endpoints=ready_endpoints,
+            )
+            return
+        if not missing and not swa_lands:
             for endpoint in ready_endpoints:
                 self._send_multipart_locked(
                     endpoint, ReshardReady(room=room).to_frames()
                 )
             return
-        sources = [
-            (p_rank, [sources_map[p_rank][pg] for pg in missing])
-            for p_rank in sorted(sources_map)
-        ]
-        dst = [local_blocks[pg - base] for pg in missing]
+        assert swa_sources is not None
+        sources = (
+            [
+                (p_rank, [sources_map[p_rank][pg] for pg in missing])
+                for p_rank in sorted(sources_map)
+            ]
+            if missing
+            else []
+        )
         self._land_closing(
-            room,
-            geom,
-            src_attn_tp,
-            local_swa_blocks,
-            swa_sources_map,
-            sources,
-            dst,
-            missing,
-            ready_endpoints,
+            room=room,
+            geom=geom,
+            full_lands=full_lands,
+            swa_geom=swa_geom,
+            swa_lands=swa_lands,
+            src_attn_tp=src_attn_tp,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources=swa_sources,
+            sources=sources,
+            dst=dst,
+            missing=missing,
+            ready_endpoints=ready_endpoints,
         )
 
-    def _land_closing(
+    def _stage_closing_full_plan(
         self,
+        *,
         room: int,
-        geom: Any,
+        req_id: str,
         src_attn_tp: int,
-        local_swa_blocks: List[int],
-        swa_sources_map: Dict[int, List[int]],
+        geom: Any,
         sources: List[Tuple[int, List[int]]],
         dst: List[int],
-        missing: List[int],
-        ready_endpoints: List[str],
-    ) -> None:
+        scratch: Optional[List[int]],
+    ) -> bool:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
         )
 
-        args = (
-            room,
-            geom,
-            src_attn_tp,
-            local_swa_blocks,
-            swa_sources_map,
-            sources,
-            dst,
-            missing,
-            ready_endpoints,
-        )
-        req_id = str(room)
-        scratch = self._land_take(
-            room,
-            req_id,
-            len(dst),
-            retry=functools.partial(self._retry_land_closing, *args),
-            expire=functools.partial(
-                self._fail_reshard_room, room, self._land_hold_error()
-            ),
-        )
-        if scratch is None:
-            return
-        published = False
         try:
-            if not self._register_reshard_swa_receiver(
-                room, src_attn_tp, local_swa_blocks, swa_sources_map
-            ):
-                return
             req = build_receiver_request(
                 pb2,
                 uuid=room,
@@ -1811,26 +1981,311 @@ class RaidenReceiverMixin:
                 live_tokens=[self.kv_args.page_size] * len(dst),
                 scratch_block_ids=scratch,
             )
+        except Exception as e:
+            self._fail_reshard_plan_build(room=room, req_id=req_id, exc=e)
+            return False
+        try:
+            self._check_reshard_bounds(
+                req=req, src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size
+            )
+            self._ensure_engine().register_active_plan(room, req, is_sender=False)
+        except Exception as e:
+            reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                if room in self._decode.reshard_meta:
+                    self._failed.add(str(room))
+                    self.record_failure(room, reason)
+            return False
+        return True
+
+    def _publish_closing_land_ready(
+        self,
+        *,
+        room: int,
+        ready_endpoints: List[str],
+        payload: List[bytes],
+        req_id: str,
+        dst: List[int],
+        full_registered: bool,
+        scratch: Optional[List[int]],
+        swa_req_id: Optional[str] = None,
+        local_swa_blocks: Optional[List[int]] = None,
+        swa_registered: bool = False,
+        swa_scratch: Optional[List[int]] = None,
+    ) -> bool:
+        with self._state_lock:
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                return False
+            plans = self._reshard_plans.setdefault(room, {})
+            if swa_registered and swa_req_id is not None:
+                plans[swa_req_id] = room
+            if full_registered:
+                plans[req_id] = room
+            if scratch is not None:
+                self._land.publish(key=req_id, final=dst)
+            if (
+                swa_scratch is not None
+                and swa_req_id is not None
+                and local_swa_blocks is not None
+            ):
+                self._swa_land.publish(key=swa_req_id, final=local_swa_blocks)
+            for endpoint in ready_endpoints:
+                self._send_multipart_locked(endpoint, payload)
+            return True
+
+    def _rollback_closing_land(
+        self,
+        *,
+        room: int,
+        registered: bool,
+        req_id: Optional[str] = None,
+        swa_req_id: Optional[str] = None,
+    ) -> None:
+        try:
+            if registered:
+                self._unregister_plan(room)
+        finally:
+            try:
+                if req_id is not None:
+                    self._land_free(req_id)
+            finally:
+                if swa_req_id is not None:
+                    self._land_free(swa_req_id, swa=True)
+
+    def _stage_land_closing_plans(
+        self,
+        *,
+        room: int,
+        req_id: str,
+        src_attn_tp: int,
+        geom: Any,
+        swa_geom: Any,
+        sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        scratch: Optional[List[int]],
+        swa_sources: List[Tuple[int, List[int]]],
+        local_swa_blocks: List[int],
+        swa_scratch: Optional[List[int]],
+    ) -> Tuple[bool, bool, bool]:
+        swa_registered = False
+        if swa_sources:
+            if swa_geom is None:
+                swa_geom = self._make_geometry(
+                    src_attn_tp=src_attn_tp,
+                    dst_attn_tp=self.attn_tp_size,
+                    swa=True,
+                )
+            if not self._stage_reshard_swa_plan(
+                room=room,
+                src_attn_tp=src_attn_tp,
+                swa_geom=swa_geom,
+                local_swa_blocks=local_swa_blocks,
+                sources=swa_sources,
+                swa_scratch=swa_scratch,
+            ):
+                return False, False, False
+            swa_registered = True
+        full_registered = False
+        if dst:
+            if not self._stage_closing_full_plan(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                sources=sources,
+                dst=dst,
+                scratch=scratch,
+            ):
+                return False, swa_registered, False
+            full_registered = True
+        return True, swa_registered, full_registered
+
+    def _land_closing(
+        self,
+        *,
+        room: int,
+        geom: Any,
+        full_lands: bool,
+        swa_geom: Any,
+        swa_lands: bool,
+        src_attn_tp: int,
+        local_swa_blocks: List[int],
+        swa_sources: List[Tuple[int, List[int]]],
+        sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        missing: List[int],
+        ready_endpoints: List[str],
+        deadline: Optional[float] = None,
+    ) -> None:
+        req_id, swa_req_id = str(room), self._swa_req_id(room)
+        scratch, swa_scratch, acquired = self._land_take_closing(
+            room=room,
+            req_id=req_id,
+            full_n=len(dst) if (full_lands and dst) else 0,
+            swa_req_id=swa_req_id,
+            swa_n=len(local_swa_blocks) if (swa_lands and swa_sources) else 0,
+            retry_factory=lambda due: functools.partial(
+                self._retry_land_closing,
+                room=room,
+                geom=geom,
+                full_lands=full_lands,
+                swa_geom=swa_geom,
+                swa_lands=swa_lands,
+                src_attn_tp=src_attn_tp,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources=swa_sources,
+                sources=sources,
+                dst=dst,
+                missing=missing,
+                ready_endpoints=ready_endpoints,
+                deadline=due,
+            ),
+            expire=functools.partial(
+                self._fail_reshard_room, room=room, error=self._land_hold_error()
+            ),
+            deadline=deadline,
+        )
+        if not acquired:
+            return
+        published = False
+        swa_registered = False
+        full_registered = False
+        try:
+            ok, swa_registered, full_registered = self._stage_land_closing_plans(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                swa_geom=swa_geom,
+                sources=sources,
+                dst=dst,
+                scratch=scratch,
+                swa_sources=swa_sources,
+                local_swa_blocks=local_swa_blocks,
+                swa_scratch=swa_scratch,
+            )
+            if not ok:
+                return
             payload = ReshardLandReady(
-                room=room, pages=missing, scratch=scratch, land_version=LAND_VERSION
+                room=room,
+                pages=missing,
+                scratch=scratch or [],
+                land_version=LAND_VERSION,
+                swa_scratch=swa_scratch or [],
             ).to_frames()
-            published = self._publish_reshard_plan(
-                room,
-                req_id,
-                room,
-                req,
-                payload,
-                ready_endpoints,
-                record_read=False,
-                land_final=dst,
+            published = self._publish_closing_land_ready(
+                room=room,
+                ready_endpoints=ready_endpoints,
+                payload=payload,
+                req_id=req_id,
+                dst=dst,
+                full_registered=full_registered,
+                scratch=scratch,
+                swa_req_id=swa_req_id,
+                local_swa_blocks=local_swa_blocks,
+                swa_registered=swa_registered,
+                swa_scratch=swa_scratch,
             )
         finally:
             if not published:
-                self._land_free(req_id)
+                self._rollback_closing_land(
+                    room=room,
+                    registered=swa_registered or full_registered,
+                    req_id=req_id if scratch is not None else None,
+                    swa_req_id=swa_req_id if swa_scratch is not None else None,
+                )
 
-    def _retry_land_closing(self, room: int, *args: Any) -> None:
+    def _land_unified_closing(
+        self,
+        *,
+        room: int,
+        geom: Any,
+        src_attn_tp: int,
+        unified_sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        local_swa_blocks: List[int],
+        missing: List[int],
+        ready_endpoints: List[str],
+        deadline: Optional[float] = None,
+    ) -> None:
+        req_id = str(room)
+        combined_dst = dst + local_swa_blocks
+        due = (
+            deadline
+            if deadline is not None
+            else self._land_hold_deadline_locked(room=room, lands=(self._land,))
+        )
+        all_scratch = self._land_take(
+            room=room,
+            key=req_id,
+            n=len(combined_dst),
+            retry=functools.partial(
+                self._retry_land_unified_closing,
+                room=room,
+                geom=geom,
+                src_attn_tp=src_attn_tp,
+                unified_sources=unified_sources,
+                dst=dst,
+                local_swa_blocks=local_swa_blocks,
+                missing=missing,
+                ready_endpoints=ready_endpoints,
+                deadline=due,
+            ),
+            expire=functools.partial(
+                self._fail_reshard_room, room=room, error=self._land_hold_error()
+            ),
+            deadline=due,
+        )
+        if all_scratch is None:
+            return
+        published = False
+        registered = False
         try:
-            self._land_closing(room, *args)
+            if not self._stage_closing_full_plan(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                sources=unified_sources,
+                dst=combined_dst,
+                scratch=all_scratch,
+            ):
+                return
+            registered = True
+            payload = ReshardLandReady(
+                room=room,
+                pages=missing,
+                scratch=all_scratch[: len(dst)],
+                land_version=LAND_VERSION,
+                swa_scratch=all_scratch[len(dst) :],
+            ).to_frames()
+            published = self._publish_closing_land_ready(
+                room=room,
+                ready_endpoints=ready_endpoints,
+                payload=payload,
+                req_id=req_id,
+                dst=combined_dst,
+                full_registered=True,
+                scratch=all_scratch,
+            )
+        finally:
+            if not published:
+                self._rollback_closing_land(
+                    room=room,
+                    registered=registered,
+                    req_id=req_id,
+                )
+
+    def _retry_land_unified_closing(self, *, room: int, **kwargs: Any) -> None:
+        try:
+            self._land_unified_closing(room=room, **kwargs)
+        except Exception as error:
+            self._fail_reshard_room(room, error)
+
+    def _retry_land_closing(self, *, room: int, **kwargs: Any) -> None:
+        try:
+            self._land_closing(room=room, **kwargs)
         except Exception as error:
             self._fail_reshard_room(room, error)
 

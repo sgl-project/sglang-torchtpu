@@ -18,9 +18,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import land as land_mod
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.land import (
@@ -39,8 +40,11 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardLandChunkReady,
     ReshardLandReady,
     ReshardReady,
+    ReshardReq,
+    RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.disaggregation.tpu.wire import WireMessage
 from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -225,7 +229,10 @@ def _decode(
     mgr._swa_engine = None
     mgr._ensure_engine = lambda: mgr._engine
     mgr.kv_args = SimpleNamespace(
-        page_size=PAGE, total_kv_head_num=total_heads, total_swa_kv_head_num=0
+        page_size=PAGE,
+        total_kv_head_num=total_heads,
+        total_swa_kv_head_num=0,
+        sliding_window_size=None,
     )
     mgr._kv_caches = [_pool(1 + alloc + cap, heads) for _ in range(2)]
     mgr._kv_head_nums = (heads,)
@@ -350,7 +357,10 @@ def _prefill(rank=1, total_heads=8, src_tp=8, dst_tp=4, announce_pages=16):
     mgr._ensure_engine = lambda: mgr._engine
     mgr._swa_engine = None
     mgr.kv_args = SimpleNamespace(
-        page_size=PAGE, total_kv_head_num=total_heads, total_swa_kv_head_num=0
+        page_size=PAGE,
+        total_kv_head_num=total_heads,
+        total_swa_kv_head_num=0,
+        sliding_window_size=None,
     )
     mgr._kv_caches = [_pool(8, max(1, total_heads // src_tp)) for _ in range(2)]
     mgr._kv_head_nums = (max(1, total_heads // src_tp),)
@@ -1096,16 +1106,28 @@ class TestRefusal(unittest.TestCase):
             self.assertIn("63 blocks", self._mgr(63).reshard_refusal(8, 4))
             self.assertIn("no landing arena", self._mgr(0).reshard_refusal(8, 4))
 
-    def test_unified_pool_names_its_missing_arena(self):
-        # The unified pool reserves no arena (land_arena_blocks); the refusal
-        # says why. The manager without it is the negative control.
+    def test_unified_pool_requires_scaled_arena_capacity(self):
+        """With TpuUnifiedSWAKVPool, reshard_refusal requires (1 + M_swa) * C
+        arena blocks so a full chunk plus SWA companion groups fit."""
+        unified = SimpleNamespace(layout=SimpleNamespace(num_swa_groups=5))
         with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
-            mgr = self._mgr(0)
-            mgr._unified_swa_pool = SimpleNamespace()
-            self.assertIn("--enable-unified-memory", mgr.reshard_refusal(8, 4))
-            reason = self._mgr(0).reshard_refusal(8, 4)
-            self.assertIn("no landing arena", reason)
-            self.assertNotIn("--enable-unified-memory", reason)
+            # C = 64, M_swa = 5 -> (1 + 5) * 64 = 384 blocks required.
+            mgr_ok = self._mgr(384)
+            mgr_ok._unified_swa_pool = unified
+            self.assertIsNone(mgr_ok.reshard_refusal(src_attn_tp=8, dst_attn_tp=4))
+
+            mgr_small = self._mgr(383)
+            mgr_small._unified_swa_pool = unified
+            reason = mgr_small.reshard_refusal(src_attn_tp=8, dst_attn_tp=4)
+            self.assertIn("383 blocks", reason)
+            self.assertIn("384 blocks", reason)
+
+            mgr_none = self._mgr(0)
+            mgr_none._unified_swa_pool = unified
+            self.assertIn(
+                "no landing arena",
+                mgr_none.reshard_refusal(src_attn_tp=8, dst_attn_tp=4),
+            )
 
     def test_aligned_cell_stays_allowed(self):
         # 16 kv heads TP8 -> TP4: two whole-granule sources per decode rank.
@@ -1133,6 +1155,128 @@ class TestRefusal(unittest.TestCase):
         self.assertNotIn("probe", got)
         self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", got)
         self.assertTrue(plain.startswith(got), (plain, got))
+
+    def _run_receiver_init(self, *, mgr, remote_layout=None, src_tp=8):
+        mgr.kv_args.kv_layout = remote_layout
+        mgr._pipeline = None
+        mgr._dynamic_host_staging = True
+        mgr._bounded_staging = False
+        recv = RaidenKVReceiver.__new__(RaidenKVReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = ROOM
+        recv.conclude_state = None
+        recv.abort_notified = False
+        recv._started = False
+        recv.init_time = None
+        recv._handshake_start = time.time()
+        recv._handshake_timeout = 300
+        infos = [
+            {"rank_ip": "10.0.0.1", "rank_port": 4444 + i}
+            for i in range(src_tp // mgr.attn_tp_size)
+        ]
+
+        def common_init(self_, prefill_dp_rank):
+            self_.prefill_info = SimpleNamespace(
+                kv_layout=remote_layout, attn_tp_size=src_tp
+            )
+            self_.target_pp_ranks = [0]
+            self_.target_cp_ranks = [0]
+            self_.bootstrap_infos = infos
+            mgr.update_status(ROOM, KVPoll.WaitingForInput)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                common_init,
+            ),
+            patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+        ):
+            recv.init(0)
+        return recv, abort
+
+    def test_fp8_target_with_bf16_draft_refuses_at_init_and_merge_fails_fast(self):
+        from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        with (
+            envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True),
+            patch.object(land_mod, "land_arena_blocks", return_value=128),
+        ):
+            target = TpuFusedMHATokenToKVPool(
+                size=4 * PAGE,
+                page_size=PAGE,
+                dtype=FP8,
+                head_num=2,
+                head_dim=HEAD_DIM,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            draft = TpuFusedMHATokenToKVPool(
+                size=4 * PAGE,
+                page_size=PAGE,
+                dtype=torch.bfloat16,
+                head_num=2,
+                head_dim=HEAD_DIM,
+                layer_num=1,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            groups = get_raiden_kv_caches(target, draft)
+            mgr = _decode(cap=128, alloc=4)
+            mgr.attach_kv_pool(target)
+            mgr._kv_caches = list(groups.full)
+            mgr._kv_head_nums = tuple(groups.full_head_nums)
+            mgr._check_land_arena()
+
+            recv, abort = self._run_receiver_init(mgr=mgr)
+            self.assertEqual(recv.conclude_state, KVPoll.Failed)
+            abort.assert_called_once()
+            self.assertIn("differ in head_dim or dtype", mgr.failure_records[ROOM])
+            mgr.register_decode_request = Mock()
+            recv.send_metadata(kv_indices=np.asarray([1, 2], dtype=np.int32))
+            mgr.register_decode_request.assert_not_called()
+
+            with self.assertRaisesRegex(
+                ValueError, "no landing merge for kv_packing 2"
+            ):
+                land_mod.merge_pages(
+                    kv_caches=mgr._kv_caches,
+                    pairs=[(1, 6)],
+                    capacity=128,
+                    layout_of=mgr._land_layout,
+                )
+
+    def test_swa_window_exceeding_arena_refused_at_init(self):
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            # PAGE = 128 -> C = 64, A = 128; sliding_window_size = 16384 -> W = 129 > A.
+            mgr = _attach_swa_decode(
+                mgr=_decode(cap=128, alloc=200), swa_cap=128, swa_alloc=200
+            )
+            mgr.kv_args.sliding_window_size = 16384
+            recv, abort = self._run_receiver_init(mgr=mgr)
+            self.assertEqual(recv.conclude_state, KVPoll.Failed)
+            abort.assert_called_once()
+            self.assertIn("128 blocks", mgr.failure_records[ROOM])
+            self.assertIn("129-page SWA window", mgr.failure_records[ROOM])
+            mgr.register_decode_request = Mock()
+            recv.send_metadata(kv_indices=np.asarray([1, 2], dtype=np.int32))
+            mgr.register_decode_request.assert_not_called()
+
+            # Unified SWA: C = 64, M_swa = 2, cap = 300; window 16384 -> W = 129,
+            # needed = 64 + 2 * 129 = 322 > 300.
+            uni = self._mgr(300)
+            uni._unified_swa_pool = SimpleNamespace(
+                layout=SimpleNamespace(num_swa_groups=2)
+            )
+            uni.kv_args.sliding_window_size = 16384
+            uni_recv, uni_abort = self._run_receiver_init(
+                mgr=uni, remote_layout="unified-swa"
+            )
+            self.assertEqual(uni_recv.conclude_state, KVPoll.Failed)
+            uni_abort.assert_called_once()
+            self.assertIn("300 blocks", uni.failure_records[ROOM])
+            self.assertIn("322 blocks", uni.failure_records[ROOM])
 
     def test_prefill_needs_only_the_env(self):
         with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(False):
@@ -1321,13 +1465,965 @@ class TestPrefillPushTargets(unittest.TestCase):
 class TestSerde(unittest.TestCase):
     def test_round_trip(self):
         for msg in (
-            ReshardLandReady(ROOM, [0, 3], [17, 18], LAND_VERSION),
-            ReshardLandChunkReady(ROOM, 2, (1 << 63) - 1, [17], LAND_VERSION),
+            ReshardLandReady(
+                room=ROOM, pages=[0, 3], scratch=[17, 18], land_version=LAND_VERSION
+            ),
+            ReshardLandReady(
+                room=ROOM,
+                pages=[0, 3],
+                scratch=[17, 18],
+                land_version=LAND_VERSION,
+                swa_scratch=[25, 26],
+            ),
+            ReshardLandReady(
+                room=ROOM,
+                pages=[],
+                scratch=[],
+                land_version=LAND_VERSION,
+                swa_scratch=[25, 26],
+            ),
+            ReshardLandChunkReady(
+                room=ROOM,
+                index=2,
+                uuid=(1 << 63) - 1,
+                scratch=[17],
+                land_version=LAND_VERSION,
+            ),
         ):
-            with self.subTest(msg=type(msg).__name__):
+            with self.subTest(msg=msg):
                 self.assertEqual(type(msg).from_frames(msg.to_frames()), msg)
+        self.assertNotIn(
+            b"swa_scratch",
+            ReshardLandReady(
+                room=ROOM, pages=[0, 3], scratch=[17, 18], land_version=LAND_VERSION
+            ).to_frames()[1],
+        )
         self.assertNotEqual(ReshardLandReady.TAG, ReshardReady.TAG)
         self.assertNotEqual(ReshardLandChunkReady.TAG, ReshardChunkReady.TAG)
+
+
+SWA_FINAL = [2, 3]
+SWA_PREFILL_BLOCKS = [5, 6]
+SWA_LAYER_BASE = 10
+
+
+class _V1ReshardLandReady(WireMessage):
+    TAG = MessageTag.RESHARD_LAND_READY
+    room: int
+    pages: list[int]
+    scratch: list[int]
+    land_version: int
+
+
+def _attach_swa_decode(
+    *,
+    mgr,
+    swa_total_heads=8,
+    swa_cap=8,
+    swa_alloc=ALLOC_BLOCKS,
+    swa_final=SWA_FINAL,
+    swa_src_blocks=SWA_PREFILL_BLOCKS,
+):
+    src_tp = mgr._decode.reshard_meta[ROOM]["src_attn_tp"]
+    dst_tp = mgr.attn_tp_size
+    swa_heads = max(1, swa_total_heads // dst_tp)
+    mgr.kv_args.total_swa_kv_head_num = swa_total_heads
+    mgr.kv_args.state_types = [StateType.SWA]
+    mgr.kv_args.engine_rank = mgr.attn_tp_rank
+    mgr.local_ip = "10.0.0.2"
+    mgr.rank_port = 5555
+    mgr._swa_engine = Mock(transfer_address="10.0.0.2:31002")
+    mgr._swa_engine.poll_stats_with_details = Mock(return_value=_polled())
+    mgr._swa_kv_caches = [
+        _pool(blocks=1 + swa_alloc + swa_cap, heads=swa_heads) for _ in range(2)
+    ]
+    mgr._swa_kv_head_nums = (swa_heads,)
+    mgr._swa_land = (
+        LandState(ScratchArena(first_block=1 + swa_alloc, num_blocks=swa_cap))
+        if swa_cap
+        else None
+    )
+    if mgr._swa_land is not None:
+        mgr._swa_land.started[ROOM] = time.time()
+    mgr._decode.reshard_meta[ROOM]["local_swa_blocks"] = list(swa_final)
+    srcs = mgr._decode.reshard_meta[ROOM]["source_ranks"]
+    mgr.test_swa_sources = {}
+    for p in srcs:
+        layers = []
+        for layer in range(2):
+            t = _pool(
+                blocks=max(swa_src_blocks) + 1,
+                heads=max(1, swa_total_heads // src_tp),
+            )
+            for b in swa_src_blocks:
+                _fill_page(
+                    kv=t,
+                    block=b,
+                    heads=_heads_of(rank=p, tp=src_tp, total=swa_total_heads),
+                    layer=SWA_LAYER_BASE + layer,
+                )
+            layers.append(t)
+        mgr.test_swa_sources[p] = layers
+    mgr.test_swa_heads = _heads_of(
+        rank=mgr.attn_tp_rank, tp=dst_tp, total=swa_total_heads
+    )
+    return mgr
+
+
+def _attach_swa_prefill(
+    *,
+    mgr,
+    swa_total_heads=8,
+    swa_final=SWA_FINAL,
+    swa_caches=None,
+):
+    src_tp = mgr.attn_tp_size
+    swa_heads = max(1, swa_total_heads // src_tp)
+    mgr.kv_args.total_swa_kv_head_num = swa_total_heads
+    mgr.kv_args.state_types = [StateType.SWA]
+    mgr._swa_engine = Mock()
+    mgr._swa_engine.d2h = Mock(return_value=_ReadyFuture())
+    mgr._swa_engine.plan_host_blocks = Mock(side_effect=lambda uuid, blocks: blocks)
+    mgr._swa_kv_caches = (
+        swa_caches
+        if swa_caches is not None
+        else [_pool(blocks=8, heads=swa_heads) for _ in range(2)]
+    )
+    mgr._swa_kv_head_nums = (swa_heads,)
+    if ROOM in mgr._prefill.reshard_req:
+        mgr._prefill.reshard_req[ROOM]["decode_swa_blocks"] = list(swa_final)
+        mgr._prefill.reshard_req[ROOM]["swa_push_endpoint"] = "10.0.0.2:31002"
+    return mgr
+
+
+def _closing_swa(mgr, *, swa_src_blocks=SWA_PREFILL_BLOCKS):
+    with patch.dict(sys.modules, _pb2_modules()):
+        for p in mgr._decode.reshard_meta[ROOM]["source_ranks"]:
+            mgr._on_reshard_blocks(
+                ReshardBlocks(
+                    room=ROOM,
+                    prefill_blocks=list(PREFILL_BLOCKS),
+                    src_rank=p,
+                    aux_blob=b"",
+                    prefill_swa_blocks=list(swa_src_blocks),
+                ).to_frames()
+            )
+
+
+def _registered_swa(mgr):
+    return {
+        c.args[1].req_id: c.args[1]
+        for c in mgr._swa_engine.register_active_plan.call_args_list
+    }
+
+
+def _settle_swa(mgr, *, received=(), failed=()):
+    mgr._swa_engine.poll_stats_with_details = Mock(
+        return_value=_polled(received=received, failed=failed)
+    )
+
+
+class _SwaFabric(_Fabric):
+    def __init__(self, *, pages, cap, announce, full_heads=8, swa_heads=8):
+        self.final = list(range(1, pages + 1))
+        self.src_blocks = list(range(1, pages + 1))
+        self.swa_final = list(SWA_FINAL)
+        self.swa_src_blocks = list(SWA_PREFILL_BLOCKS)
+        self.dec = _decode(
+            total_heads=full_heads,
+            cap=cap,
+            pages=pages,
+            final=self.final,
+            alloc=pages,
+            src_blocks=self.src_blocks,
+        )
+        _attach_swa_decode(
+            mgr=self.dec,
+            swa_total_heads=swa_heads,
+            swa_cap=cap,
+            swa_final=self.swa_final,
+            swa_src_blocks=self.swa_src_blocks,
+        )
+        self.srcs = self.dec._decode.reshard_meta[ROOM]["source_ranks"]
+        self.pre = {}
+        self.sender = {}
+        self.pushed = {}
+        self.swa_pushed = {}
+        self.settled = set()
+        self.swa_settled = set()
+        for p in self.srcs:
+            pre = _prefill(rank=p, total_heads=full_heads, announce_pages=announce)
+            pre._prefill.reshard_req[ROOM]["decode_blocks"] = list(self.final)
+            pre._kv_caches = self.dec.test_sources[p]
+            _attach_swa_prefill(
+                mgr=pre,
+                swa_total_heads=swa_heads,
+                swa_final=self.swa_final,
+                swa_caches=self.dec.test_swa_sources[p],
+            )
+            pre._pipeline = None
+            pre.is_dummy_cp_rank = False
+            pre.request_status[ROOM] = KVPoll.WaitingForInput
+            plans = {}
+            pre._engine.register_active_plan = Mock(
+                side_effect=lambda uuid, req, is_sender, plans=plans: plans.update(
+                    {uuid: req}
+                )
+            )
+            pre._engine.push_registered_plan = Mock(
+                side_effect=functools.partial(self._push, p, plans)
+            )
+            swa_plans = {}
+            pre._swa_engine.register_active_plan = Mock(
+                side_effect=lambda uuid, req, is_sender, plans=swa_plans: plans.update(
+                    {uuid: req}
+                )
+            )
+            pre._swa_engine.push_registered_plan = Mock(
+                side_effect=functools.partial(self._push_swa, p, swa_plans)
+            )
+            self.pre[p] = pre
+            snd = object.__new__(RaidenKVSender)
+            vars(snd).update(
+                kv_mgr=pre,
+                bootstrap_room=ROOM,
+                num_kv_indices=pages,
+                aux_index=None,
+                _transfer_start_time=None,
+                _record_transfer_indices=lambda *args: None,
+                _started=False,
+                _last_chunk=False,
+            )
+            self.sender[p] = snd
+        self.cursor = {id(m): 0 for m in self._mgrs()}
+
+    def _push_swa(self, p, plans, uuid, endpoint, src_ids, dst_ids, layer, **kwargs):
+        sreq = plans[uuid]
+        (rreq,) = [
+            c.args[1]
+            for c in self.dec._swa_engine.register_active_plan.call_args_list
+            if c.args[0] == uuid
+        ]
+        sent = sreq.shard_push_schedules[0].entries
+        recv = rreq.shard_push_schedules[p].entries
+        pairs = [(e.dst_block_id, e.src_block_id) for e in sent]
+        assert pairs == [(e.dst_block_id, e.src_block_id) for e in recv]
+        assert list(dst_ids) == [e.dst_block_id for e in sent], (dst_ids, pairs)
+        src = self.pre[p]._swa_kv_caches[layer].view(torch.uint8)
+        dst = self.dec._swa_kv_caches[layer].view(torch.uint8)
+        for se, re in zip(sent, recv):
+            idx_s = (
+                se.src_offset_bytes
+                + se.src_stride_bytes * torch.arange(se.count).view(-1, 1)
+                + torch.arange(se.size_bytes)
+            ).reshape(-1)
+            idx_d = (
+                re.dst_offset_bytes
+                + re.dst_stride_bytes * torch.arange(re.count).view(-1, 1)
+                + torch.arange(re.size_bytes)
+            ).reshape(-1)
+            dst[re.dst_block_id].reshape(-1)[idx_d] = src[se.src_block_id].reshape(-1)[
+                idx_s
+            ]
+        self.swa_pushed.setdefault(uuid, set()).add((p, layer))
+
+    def step_swa(self, *, p, blocks, last):
+        snd = self.sender[p]
+        snd.should_send_kv_chunk(num_pages=len(blocks), last_chunk=last)
+        state = [np.array(self.swa_src_blocks, dtype=np.int32)] if last else None
+        snd.send(kv_indices=np.array(blocks, dtype=np.int32), state_indices=state)
+
+    def run_swa(self):
+        want_full = {
+            (p, layer) for p in self.srcs for layer in range(len(self.dec._kv_caches))
+        }
+        want_swa = {
+            (p, layer)
+            for p in self.srcs
+            for layer in range(len(self.dec._swa_kv_caches))
+        }
+        with patch.dict(sys.modules, _pb2_modules()):
+            for _ in range(200):
+                moved = self._pump()
+                uuids = {
+                    c.args[0]: c.args[1].req_id
+                    for c in self.dec._engine.register_active_plan.call_args_list
+                }
+                done = [
+                    rid
+                    for u, rid in uuids.items()
+                    if self.pushed.get(u) == want_full and rid not in self.settled
+                ]
+                self.settled.update(done)
+                swa_uuids = {
+                    c.args[0]: c.args[1].req_id
+                    for c in self.dec._swa_engine.register_active_plan.call_args_list
+                }
+                swa_done = [
+                    rid
+                    for u, rid in swa_uuids.items()
+                    if self.swa_pushed.get(u) == want_swa
+                    and rid not in self.swa_settled
+                ]
+                self.swa_settled.update(swa_done)
+                _settle(self.dec, received=done)
+                _settle_swa(self.dec, received=swa_done)
+                self.dec.land_prepass()
+                if not moved and not done and not swa_done:
+                    break
+
+
+class TestHybridSwaLanding(CustomTestCase):
+    """Separate-pool hybrid SWA (GPT-OSS-120B shape and asymmetric full/SWA)
+    lands SWA sources in _swa_land, merges byte for byte, and rejects mixed
+    versions in both directions."""
+
+    def _check_all_pages(self, *, dec, full_pages):
+        for layer, kv in enumerate(dec._kv_caches):
+            want = _expected_page(heads=dec.test_heads, layer=layer)
+            for b in full_pages:
+                got = kv.view(torch.uint8)[b].reshape(want.shape)
+                self.assertTrue(torch.equal(got, want), f"full layer {layer} block {b}")
+        for layer, kv in enumerate(dec._swa_kv_caches):
+            want = _expected_page(
+                heads=dec.test_swa_heads, layer=SWA_LAYER_BASE + layer
+            )
+            for b in SWA_FINAL:
+                got = kv.view(torch.uint8)[b].reshape(want.shape)
+                self.assertTrue(torch.equal(got, want), f"swa layer {layer} block {b}")
+
+    def test_gpt_oss_120b_end_to_end_chunk_flushed_and_closing(self):
+        """GPT-OSS-120B (8 full / 8 SWA kv heads, fp8 TP8->TP4) lands SWA even
+        when prefill flushes all full pages as chunks (empty closing pages)."""
+        for steps in ([4, 4], [6]):
+            with self.subTest(steps=steps):
+                fab = _SwaFabric(pages=sum(steps), cap=8, announce=4)
+                with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+                    for p in fab.srcs:
+                        lo = 0
+                        for i, k in enumerate(steps):
+                            fab.step_swa(
+                                p=p,
+                                blocks=fab.src_blocks[lo : lo + k],
+                                last=(i == len(steps) - 1),
+                            )
+                            lo += k
+                    fab.run_swa()
+                dec = fab.dec
+                self.assertFalse(dec.is_failed(ROOM), dec.failure_records.get(ROOM))
+                (ready,) = _sent(mgr=dec, cls=ReshardLandReady)
+                self.assertEqual(ready.pages, [])
+                self.assertEqual(ready.scratch, [])
+                self.assertEqual(len(ready.swa_scratch), len(SWA_FINAL))
+                self.assertEqual(_sent(mgr=dec, cls=ReshardReady), [])
+                self.assertTrue(dec.land_merged(ROOM))
+                self.assertTrue(dec.is_recv_done(ROOM))
+                self.assertEqual(dec._land.arena.held, 0)
+                self.assertEqual(dec._swa_land.arena.held, 0)
+                for pre in fab.pre.values():
+                    self.assertFalse(pre.is_failed(ROOM), pre.failure_records.get(ROOM))
+                    self.assertTrue(pre.is_send_done(ROOM))
+                self._check_all_pages(dec=dec, full_pages=fab.final)
+
+    def test_closing_with_both_full_and_swa_landing(self):
+        """When closing carries uncovered full pages alongside SWA pages, both
+        arenas merge in one prepass and Success waits for both."""
+        mgr = _attach_swa_decode(mgr=_decode())
+        _closing_swa(mgr)
+        (ready,) = _sent(mgr=mgr, cls=ReshardLandReady)
+        self.assertEqual(ready.pages, [0, 1, 2, 3])
+        self.assertEqual(len(ready.scratch), 4)
+        self.assertEqual(len(ready.swa_scratch), len(SWA_FINAL))
+        for req in _registered(mgr).values():
+            _replay(rreq=req, sources=mgr.test_sources, decode_kv=mgr._kv_caches)
+        for req in _registered_swa(mgr).values():
+            _replay(
+                rreq=req, sources=mgr.test_swa_sources, decode_kv=mgr._swa_kv_caches
+            )
+        _settle(mgr, received=list(_registered(mgr)))
+        mgr.land_prepass()
+        self.assertFalse(mgr.land_merged(ROOM))
+        self.assertEqual(mgr._land.arena.held, 0)
+        self.assertEqual(mgr._swa_land.arena.held, len(SWA_FINAL))
+        _settle(mgr)
+        _settle_swa(mgr, received=list(_registered_swa(mgr)))
+        mgr.land_prepass()
+        self.assertTrue(mgr.land_merged(ROOM))
+        self.assertEqual(mgr._swa_land.arena.held, 0)
+        self._check_all_pages(dec=mgr, full_pages=FINAL)
+
+    def test_direct_full_with_landing_swa(self):
+        """16 full kv heads + 8 SWA kv heads at fp8 TP8->TP4 pushes full
+        directly (scratch=[]) while SWA lands through swa_scratch."""
+        fab = _SwaFabric(pages=4, cap=8, announce=4, full_heads=16, swa_heads=8)
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            for p in fab.srcs:
+                fab.step_swa(p=p, blocks=fab.src_blocks, last=True)
+            fab.run_swa()
+        dec = fab.dec
+        self.assertFalse(dec.is_failed(ROOM), dec.failure_records.get(ROOM))
+        self.assertEqual(_sent(mgr=dec, cls=ReshardLandChunkReady), [])
+        (ready,) = _sent(mgr=dec, cls=ReshardLandReady)
+        self.assertEqual(ready.scratch, [])
+        self.assertEqual(len(ready.swa_scratch), len(SWA_FINAL))
+        self.assertTrue(dec.land_merged(ROOM))
+        self.assertEqual(dec._land.arena.held, 0)
+        self.assertEqual(dec._swa_land.arena.held, 0)
+        self._check_all_pages(dec=dec, full_pages=fab.final)
+
+    def test_swa_hold_releases_full_scratch_and_retries(self):
+        """A closing plan whose SWA arena is full holds neither arena's blocks
+        while parking FIFO holds on both, then registers both on retry."""
+        mgr = _attach_swa_decode(mgr=_decode(cap=4), swa_cap=2)
+        mgr._swa_land.take(key="blocker", room=99, n=2)
+        _closing_swa(mgr)
+        self.assertEqual(_sent(mgr=mgr, cls=ReshardLandReady), [])
+        self.assertEqual(mgr._land.arena.held, 0)
+        self.assertEqual(len(mgr._land.holds), 1)
+        self.assertEqual(len(mgr._swa_land.holds), 1)
+        mgr._swa_land.free("blocker")
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr.land_prepass()
+        (ready,) = _sent(mgr=mgr, cls=ReshardLandReady)
+        self.assertEqual((len(ready.scratch), len(ready.swa_scratch)), (4, 2))
+        self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (4, 2))
+        self.assertEqual((len(mgr._land.holds), len(mgr._swa_land.holds)), (0, 0))
+
+    def test_swa_register_failure_and_abort_free_both_arenas(self):
+        """Staging failure on _engine unregisters _swa_engine and returns both
+        arenas' scratch; a clear during registration does the same."""
+        mgr = _attach_swa_decode(mgr=_decode())
+        mgr._engine.register_active_plan = Mock(side_effect=RuntimeError("boom"))
+        _closing_swa(mgr)
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (0, 0))
+        mgr._swa_engine.unregister_active_plan.assert_called_with(ROOM)
+
+        mgr = _attach_swa_decode(mgr=_decode())
+        mgr._engine.register_active_plan = Mock(
+            side_effect=lambda *args, **kwargs: mgr.clear_room(ROOM)
+        )
+        _closing_swa(mgr)
+        self.assertEqual(_sent(mgr=mgr, cls=ReshardLandReady), [])
+        self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (0, 0))
+
+    def test_two_arena_closing_hold_preserves_deadline_and_fifo(self):
+        now = [1000.0]
+        with (
+            envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True),
+            envs.SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S.override(2.0),
+            patch.dict(sys.modules, _pb2_modules()),
+            patch(
+                "sglang_tpu.disaggregation.raiden.receiver.time.time",
+                side_effect=lambda: now[0],
+            ),
+            patch(
+                "sglang_tpu.disaggregation.raiden.conn.time.time",
+                side_effect=lambda: now[0],
+            ),
+        ):
+            mgr = _attach_swa_decode(mgr=_decode(cap=4), swa_cap=2)
+            mgr.waiting_timeout = 300.0
+            mgr._land.started[ROOM] = now[0]
+            mgr._swa_land.started[ROOM] = now[0]
+            mgr._land.take(key="r90", room=90, n=4)
+            mgr._swa_land.take(key="r91", room=91, n=2)
+            _closing_swa(mgr)
+            self.assertEqual(mgr._land.holds[0].deadline, 1002.0)
+
+            now[0] = 1001.5
+            mgr._land.free("r90")
+            mgr.land_prepass()
+            self.assertFalse(mgr.is_failed(ROOM))
+            # Younger room cannot overtake _land while ROOM still waits on _swa_land.
+            self.assertIsNone(mgr._land.take(key="r92", room=92, n=4))
+            self.assertEqual(mgr._land.holds[0].deadline, 1002.0)
+
+            now[0] = 1002.0
+            mgr.land_prepass()
+            self.assertTrue(mgr.is_failed(ROOM))
+            self.assertIn(
+                "SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S", mgr.failure_records[ROOM]
+            )
+            self.assertEqual(len(mgr._land.holds), 0)
+            self.assertEqual(len(mgr._swa_land.holds), 0)
+
+    def test_closing_rollback_frees_arenas_when_unregister_raises(self):
+        mgr = _attach_swa_decode(mgr=_decode())
+        mgr._engine.register_active_plan.side_effect = lambda *args, **kwargs: (
+            mgr.clear_room(ROOM)
+        )
+        mgr._engine.unregister_active_plan.side_effect = RuntimeError(
+            "transport closed"
+        )
+        _closing_swa(mgr)
+        mgr.clear_room(ROOM)
+        mgr._engine.unregister_active_plan.assert_called_with(ROOM)
+        mgr._swa_engine.unregister_active_plan.assert_called_with(ROOM)
+        self.assertEqual((mgr._land.arena.held, mgr._swa_land.arena.held), (0, 0))
+        self.assertTrue(mgr.land_merged(ROOM))
+
+        fab = _UnifiedFabric(pages=4, chunk_arena=8, announce=4, m_swa=2)
+        dec = fab.dec
+        dec._engine.register_active_plan.side_effect = lambda *args, **kwargs: (
+            dec.clear_room(ROOM)
+        )
+        dec._engine.unregister_active_plan.side_effect = RuntimeError(
+            "transport closed"
+        )
+        with patch.dict(sys.modules, _pb2_modules()):
+            for p in fab.srcs:
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        room=ROOM,
+                        prefill_blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        aux_blob=b"",
+                        prefill_swa_blocks=list(fab.swa_expanded),
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+        dec.clear_room(ROOM)
+        self.assertEqual(dec._land.arena.held, 0)
+        self.assertTrue(dec.land_merged(ROOM))
+
+    def test_swa_refusal_hint_names_missing_swa_arena(self):
+        """When full has an arena but SWA reserved none, reshard_refusal refuses
+        and names the SWA KV pool."""
+        mgr = _attach_swa_decode(mgr=_decode(total_heads=16, cap=64), swa_cap=0)
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            reason = mgr.reshard_refusal(src_attn_tp=8, dst_attn_tp=4)
+        self.assertIsNotNone(reason)
+        self.assertIn("SWA KV pool", reason)
+
+    def test_mixed_version_v1_prefill_with_v2_decode_refuses_without_push(self):
+        """LAND_VERSION=1 prefill (no SWA landing) paired with LAND_VERSION=2
+        decode refuses cleanly and never pushes KV."""
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            dec = _attach_swa_decode(mgr=_decode(cap=64), swa_cap=64)
+            pre = _attach_swa_prefill(mgr=_prefill(rank=1))
+            pre.request_status[ROOM] = KVPoll.Bootstrapping
+            pre._land_ok = lambda *, swa=False: not swa
+            req = ReshardReq(
+                room=ROOM,
+                decode_ip="10.0.0.2",
+                decode_port=5555,
+                push_endpoint="10.0.0.2:31000",
+                decode_blocks=list(FINAL),
+                dst_attn_tp=4,
+                decode_swa_blocks=list(SWA_FINAL),
+                swa_push_endpoint="10.0.0.2:31002",
+            )
+            pre._on_reshard_req(req.to_frames())
+            self.assertTrue(pre.is_failed(ROOM))
+            self.assertTrue(pre.is_aborted(ROOM))
+            (failed_note,) = _sent(mgr=pre, cls=RoomFailed)
+            dec._on_room_failed(failed_note.to_frames())
+            self.assertTrue(dec.is_failed(ROOM))
+            pre._engine.push_registered_plan.assert_not_called()
+            pre._swa_engine.push_registered_plan.assert_not_called()
+
+            pre_v1 = _prefill(rank=1)
+            pre_v1._prefill.reshard_chunks[ROOM] = {0: (0, PREFILL_BLOCKS[:2])}
+            pre_v1._push_executor = Mock()
+            pre_v1.request_status[ROOM] = KVPoll.Transferring
+            with (
+                patch.object(land_mod, "LAND_VERSION", 1),
+                patch("sglang_tpu.disaggregation.raiden.sender.LAND_VERSION", 1),
+            ):
+                pre_v1._on_reshard_land_chunk_ready(
+                    ReshardLandChunkReady(
+                        room=ROOM, index=0, uuid=7, scratch=[17, 18], land_version=2
+                    ).to_frames()
+                )
+            self.assertTrue(pre_v1.is_failed(ROOM))
+            self.assertTrue(pre_v1.is_aborted(ROOM))
+            pre_v1._push_executor.submit.assert_not_called()
+
+            v2_closing = ReshardLandReady(
+                room=ROOM, pages=[], scratch=[], land_version=2, swa_scratch=[25, 26]
+            ).to_frames()
+            with self.assertRaisesRegex(ValueError, "swa_scratch"):
+                _V1ReshardLandReady.from_frames(v2_closing)
+
+    def test_mixed_version_v2_prefill_with_v1_decode_refuses_without_push(self):
+        """LAND_VERSION=2 prefill paired with LAND_VERSION=1 decode (no SWA arena)
+        refuses every v1 READY variant and never pushes KV."""
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            v1_dec = _attach_swa_decode(mgr=_decode(cap=64), swa_cap=0)
+            self.assertIsNotNone(v1_dec.reshard_refusal(src_attn_tp=8, dst_attn_tp=4))
+
+            v1_chunk = ReshardLandChunkReady(
+                room=ROOM, index=0, uuid=7, scratch=[17, 18], land_version=1
+            ).to_frames()
+            v1_land_closing = _V1ReshardLandReady(
+                room=ROOM, pages=[0, 1], scratch=[17, 18], land_version=1
+            ).to_frames()
+            v1_plain_empty = ReshardReady(room=ROOM, pages=[]).to_frames()
+            v1_plain_pages = ReshardReady(room=ROOM, pages=[0, 1]).to_frames()
+            for name, full_heads, handler, frames in (
+                ("v1 chunk ready", 8, "_on_reshard_land_chunk_ready", v1_chunk),
+                ("v1 land closing", 8, "_on_reshard_land_ready", v1_land_closing),
+                ("v1 plain empty closing", 8, "_on_reshard_ready", v1_plain_empty),
+                ("v1 plain 16/8 closing", 16, "_on_reshard_ready", v1_plain_pages),
+            ):
+                with self.subTest(case=name):
+                    pre = _attach_swa_prefill(
+                        mgr=_prefill(rank=1, total_heads=full_heads)
+                    )
+                    pre._prefill.send_blocks[ROOM] = list(PREFILL_BLOCKS)
+                    pre._prefill.send_swa_blocks[ROOM] = list(SWA_PREFILL_BLOCKS)
+                    pre._prefill.reshard_chunks[ROOM] = {0: (0, PREFILL_BLOCKS[:2])}
+                    pre.request_status[ROOM] = KVPoll.Transferring
+                    dispatch = {
+                        "_on_reshard_land_chunk_ready": pre._on_reshard_land_chunk_ready,
+                        "_on_reshard_land_ready": pre._on_reshard_land_ready,
+                        "_on_reshard_ready": pre._on_reshard_ready,
+                    }
+                    dispatch[handler](frames)
+                    self.assertTrue(pre.is_failed(ROOM))
+                    self.assertTrue(pre.is_aborted(ROOM))
+                    self.assertEqual(pre.request_status[ROOM], KVPoll.Failed)
+                    pre._engine.push_registered_plan.assert_not_called()
+                    pre._swa_engine.push_registered_plan.assert_not_called()
+
+
+def _make_unified_pool(*, size_pages, head_num, arena_blocks, m_swa=3):
+    from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
+
+    full = AttnLayerSpec(head_num=head_num, head_dim=HEAD_DIM, layer_ids=[0, 1])
+    swa = AttnLayerSpec(
+        head_num=head_num, head_dim=HEAD_DIM, layer_ids=list(range(2, 2 + 2 * m_swa))
+    )
+    with (
+        envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(bool(arena_blocks)),
+        patch.object(land_mod, "land_arena_blocks", return_value=arena_blocks),
+    ):
+        return TpuUnifiedSWAKVPool(
+            size=size_pages * PAGE,
+            page_size=PAGE,
+            dtype=FP8,
+            full=full,
+            swa=swa,
+            device="cpu",
+        )
+
+
+class _UnifiedFabric(_Fabric):
+    def __init__(self, *, pages, chunk_arena, announce, m_swa=3):
+        from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+
+        self.m_swa = m_swa
+        self.final = list(range(1, pages + 1))
+        self.src_blocks = list(range(1, pages + 1))
+        self.swa_logical = [pages + 1, pages + 2]
+        alloc_pages = pages + 2 * m_swa + 2
+        dec_pool = _make_unified_pool(
+            size_pages=alloc_pages, head_num=2, arena_blocks=chunk_arena, m_swa=m_swa
+        )
+        next_comp = pages + 3
+        for g in range(m_swa - 1):
+            for s in self.swa_logical:
+                dec_pool.swa_group_pages[g, s] = next_comp
+                next_comp += 1
+        self.swa_expanded = dec_pool.expand_swa_pages(self.swa_logical)
+
+        self.dec = _decode(
+            total_heads=8,
+            cap=chunk_arena,
+            pages=pages,
+            final=self.final,
+            alloc=alloc_pages,
+            src_blocks=self.src_blocks,
+        )
+        self.dec.kv_args.total_swa_kv_head_num = 8
+        self.dec.kv_args.state_types = [StateType.SWA]
+        dec_groups = get_raiden_kv_caches(dec_pool)
+        self.dec.attach_kv_pool(dec_pool)
+        self.dec._kv_caches = list(dec_groups.full)
+        self.dec._swa_kv_caches = []
+        self.dec._unified_swa_pool = dec_groups.unified_swa_pool
+        self.dec._kv_head_nums = tuple(dec_groups.full_head_nums)
+        self.dec.kv_layout = "unified-swa"
+        self.dec._check_land_arena()
+        self.dec._decode.reshard_meta[ROOM]["local_swa_blocks"] = list(
+            self.swa_expanded
+        )
+        if self.dec._land is not None:
+            self.dec._land.started[ROOM] = time.time()
+
+        self.srcs = self.dec._decode.reshard_meta[ROOM]["source_ranks"]
+        self.pre = {}
+        self.sender = {}
+        self.pushed = {}
+        self.settled = set()
+        for p in self.srcs:
+            self._init_prefill_rank(
+                p=p,
+                pages=pages,
+                alloc_pages=alloc_pages,
+                announce=announce,
+                m_swa=m_swa,
+            )
+        self.cursor = {id(m): 0 for m in self._mgrs()}
+
+    def _init_prefill_rank(self, *, p, pages, alloc_pages, announce, m_swa):
+        from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+
+        pre_pool = _make_unified_pool(
+            size_pages=alloc_pages, head_num=1, arena_blocks=0, m_swa=m_swa
+        )
+        next_comp = pages + 3
+        for g in range(m_swa - 1):
+            for s in self.swa_logical:
+                pre_pool.swa_group_pages[g, s] = next_comp
+                next_comp += 1
+        pre_expanded = pre_pool.expand_swa_pages(self.swa_logical)
+        assert pre_expanded == self.swa_expanded
+        heads = _heads_of(rank=p, tp=8, total=8)
+        for layer, kv in enumerate(pre_pool.kv_pool.page_buffers()):
+            for b in self.src_blocks:
+                _fill_page(kv=kv, block=b, heads=heads, layer=layer)
+            for idx, phys in enumerate(pre_expanded):
+                _fill_page(kv=kv, block=phys, heads=heads, layer=100 + idx * 10 + layer)
+
+        pre = _prefill(rank=p, total_heads=8, announce_pages=announce)
+        pre.kv_args.total_swa_kv_head_num = 8
+        pre.kv_args.state_types = [StateType.SWA]
+        pre_groups = get_raiden_kv_caches(pre_pool)
+        pre._kv_caches = list(pre_groups.full)
+        pre._swa_kv_caches = []
+        pre._unified_swa_pool = pre_groups.unified_swa_pool
+        pre._kv_head_nums = tuple(pre_groups.full_head_nums)
+        pre.kv_layout = "unified-swa"
+        pre._prefill.reshard_req[ROOM]["decode_blocks"] = list(self.final)
+        pre._prefill.reshard_req[ROOM]["decode_swa_blocks"] = list(self.swa_expanded)
+        pre._prefill.reshard_req[ROOM]["swa_push_endpoint"] = ""
+        pre._pipeline = None
+        pre.is_dummy_cp_rank = False
+        pre.request_status[ROOM] = KVPoll.WaitingForInput
+        plans = {}
+        pre._engine.register_active_plan = Mock(
+            side_effect=lambda uuid, req, is_sender, plans=plans: plans.update(
+                {uuid: req}
+            )
+        )
+        pre._engine.push_registered_plan = Mock(
+            side_effect=functools.partial(self._push, p, plans)
+        )
+        self.pre[p] = pre
+        snd = object.__new__(RaidenKVSender)
+        vars(snd).update(
+            kv_mgr=pre,
+            bootstrap_room=ROOM,
+            num_kv_indices=pages,
+            aux_index=None,
+            _transfer_start_time=None,
+            _record_transfer_indices=lambda *args: None,
+            _started=False,
+            _last_chunk=False,
+        )
+        self.sender[p] = snd
+
+    def step_unified(self, *, p, blocks, last):
+        snd = self.sender[p]
+        snd.should_send_kv_chunk(num_pages=len(blocks), last_chunk=last)
+        state = [np.array(self.swa_logical, dtype=np.int32)] if last else None
+        snd.send(kv_indices=np.array(blocks, dtype=np.int32), state_indices=state)
+
+
+class TestUnifiedPoolLanding(CustomTestCase):
+    """TpuUnifiedSWAKVPool (--enable-unified-memory) lands both full pages and
+    all M_swa expanded SWA companion pages in the single shared arena."""
+
+    def _check_unified(self, fab):
+        dec = fab.dec
+        for layer, kv in enumerate(dec._kv_caches):
+            want = _expected_page(heads=dec.test_heads, layer=layer)
+            for b in fab.final:
+                got = kv.view(torch.uint8)[b].reshape(want.shape)
+                self.assertTrue(torch.equal(got, want), f"full layer {layer} block {b}")
+            for idx, phys in enumerate(fab.swa_expanded):
+                want_swa = _expected_page(
+                    heads=dec.test_heads, layer=100 + idx * 10 + layer
+                )
+                got_swa = kv.view(torch.uint8)[phys].reshape(want_swa.shape)
+                self.assertTrue(
+                    torch.equal(got_swa, want_swa),
+                    f"swa companion {idx} (block {phys}) layer {layer}",
+                )
+
+    def test_unified_swa_end_to_end_chunk_flushed_and_closing(self):
+        """Unified SWA lands all M_swa=3 companion groups byte for byte both
+        when chunks flush every full page and when closing carries full+SWA."""
+        for steps in ([4, 4], [5]):
+            with self.subTest(steps=steps):
+                fab = _UnifiedFabric(
+                    pages=sum(steps), chunk_arena=8, announce=4, m_swa=3
+                )
+                with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+                    for p in fab.srcs:
+                        lo = 0
+                        for i, k in enumerate(steps):
+                            fab.step_unified(
+                                p=p,
+                                blocks=fab.src_blocks[lo : lo + k],
+                                last=(i == len(steps) - 1),
+                            )
+                            lo += k
+                    fab.run()
+                dec = fab.dec
+                self.assertFalse(dec.is_failed(ROOM), dec.failure_records.get(ROOM))
+                (ready,) = _sent(mgr=dec, cls=ReshardLandReady)
+                self.assertEqual(ready.pages, [])
+                self.assertEqual(ready.scratch, [])
+                self.assertEqual(len(ready.swa_scratch), len(fab.swa_expanded))
+                self.assertTrue(dec.is_recv_done(ROOM))
+                self.assertTrue(dec.land_merged(ROOM))
+                self.assertEqual(dec._land.arena.held, 0)
+                self._check_unified(fab)
+
+        # Uncovered closing: no chunks arrived before ReshardBlocks,
+        # so the single closing plan carries missing full pages and expanded SWA.
+        fab = _UnifiedFabric(pages=4, chunk_arena=8, announce=4, m_swa=3)
+        dec = fab.dec
+        with (
+            envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True),
+            patch.dict(sys.modules, _pb2_modules()),
+        ):
+            for p in fab.srcs:
+                fab.pre[p]._prefill.send_blocks[ROOM] = list(fab.src_blocks)
+                fab.pre[p]._prefill.send_swa_blocks[ROOM] = list(fab.swa_expanded)
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        room=ROOM,
+                        prefill_blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        aux_blob=b"",
+                        prefill_swa_blocks=list(fab.swa_expanded),
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+            fab.run()
+        self.assertFalse(dec.is_failed(ROOM), dec.failure_records.get(ROOM))
+        (ready,) = _sent(mgr=dec, cls=ReshardLandReady)
+        self.assertEqual(ready.pages, [0, 1, 2, 3])
+        self.assertEqual(len(ready.scratch), 4)
+        self.assertEqual(len(ready.swa_scratch), len(fab.swa_expanded))
+        self.assertTrue(dec.is_recv_done(ROOM))
+        self.assertTrue(dec.land_merged(ROOM))
+        self.assertEqual(dec._land.arena.held, 0)
+        self._check_unified(fab)
+
+    def test_unified_held_closing_keeps_recv_incomplete_until_merged(self):
+        """When chunks covered all full pages and unified SWA closing waits on
+        a full arena, is_recv_done stays False until the SWA plan settles."""
+        fab = _UnifiedFabric(pages=2, chunk_arena=2, announce=2, m_swa=2)
+        dec = fab.dec
+        with patch.dict(sys.modules, _pb2_modules()):
+            for p in fab.srcs:
+                dec._on_reshard_chunk(
+                    ReshardChunk(
+                        room=ROOM,
+                        index=0,
+                        start=0,
+                        total_pages=2,
+                        blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+            chunk_plans = list(_registered(dec))
+            _settle(dec, received=chunk_plans)
+            dec.land_prepass()
+            dec._land.take(key="blocker", room=99, n=dec._land.arena.capacity)
+            for p in fab.srcs:
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        room=ROOM,
+                        prefill_blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        aux_blob=b"",
+                        prefill_swa_blocks=list(fab.swa_expanded),
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+            self.assertFalse(dec.is_recv_done(ROOM))
+            self.assertEqual(_sent(mgr=dec, cls=ReshardLandReady), [])
+            dec._land.free("blocker")
+            dec.land_prepass()
+            self.assertEqual(len(_sent(mgr=dec, cls=ReshardLandReady)), 1)
+
+    def test_unified_mixed_version_refuses_without_push(self):
+        """Unified prefill rejects v1 READY frames (missing swa_scratch or
+        land_version=1) without pushing."""
+        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            for frames, handler in (
+                (ReshardReady(room=ROOM, pages=[]).to_frames(), "_on_reshard_ready"),
+                (
+                    _V1ReshardLandReady(
+                        room=ROOM, pages=[], scratch=[], land_version=1
+                    ).to_frames(),
+                    "_on_reshard_land_ready",
+                ),
+            ):
+                fab = _UnifiedFabric(pages=4, chunk_arena=8, announce=4, m_swa=2)
+                pre = fab.pre[fab.srcs[1]]
+                pre._prefill.send_blocks[ROOM] = list(fab.src_blocks)
+                pre._prefill.send_swa_blocks[ROOM] = list(fab.swa_expanded)
+                pre.request_status[ROOM] = KVPoll.Transferring
+                if handler == "_on_reshard_ready":
+                    pre._on_reshard_ready(frames)
+                else:
+                    pre._on_reshard_land_ready(frames)
+                self.assertTrue(pre.is_failed(ROOM))
+                self.assertTrue(pre.is_aborted(ROOM))
+                pre._engine.push_registered_plan.assert_not_called()
+
+    def test_unified_closing_validates_swa_before_marking_final_seen(self):
+        fab = _UnifiedFabric(pages=2, chunk_arena=2, announce=2, m_swa=2)
+        dec = fab.dec
+        dec._decode.reshard_meta[ROOM]["local_swa_blocks"] = []
+        observed_premature_done = []
+        orig_pair = dec._pair_unified_reshard_swa_receiver
+
+        def spy_pair(*args, **kwargs):
+            observed_premature_done.append(
+                dec.is_recv_done(ROOM)
+                and dec.land_merged(ROOM)
+                and not dec.is_failed(ROOM)
+            )
+            return orig_pair(*args, **kwargs)
+
+        dec._pair_unified_reshard_swa_receiver = spy_pair
+        with patch.dict(sys.modules, _pb2_modules()):
+            for p in fab.srcs:
+                dec._on_reshard_chunk(
+                    ReshardChunk(
+                        room=ROOM,
+                        index=0,
+                        start=0,
+                        total_pages=2,
+                        blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+            _settle(dec, received=list(_registered(dec)))
+            dec.land_prepass()
+            for p in fab.srcs:
+                dec._on_reshard_blocks(
+                    ReshardBlocks(
+                        room=ROOM,
+                        prefill_blocks=list(fab.src_blocks),
+                        src_rank=p,
+                        aux_blob=b"",
+                        prefill_swa_blocks=[],
+                        kv_layout="unified-swa",
+                    ).to_frames()
+                )
+        self.assertEqual(observed_premature_done, [False])
+        self.assertTrue(dec.is_failed(ROOM))
 
 
 if __name__ == "__main__":
