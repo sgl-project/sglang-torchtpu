@@ -51,6 +51,7 @@ from sglang_tpu.hooks.glm5_next_vision import (
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.hyperconnection import eager_gated_residual
 from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
     k3_megakernel_forward,
@@ -118,6 +119,11 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.layers.hyperconnection.GatedResidual.__init__",
+        eager_gated_residual,
+        HookType.AFTER,
+    ),
     (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
         bind_rank_cpu_set,
