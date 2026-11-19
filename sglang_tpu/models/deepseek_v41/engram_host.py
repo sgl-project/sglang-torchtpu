@@ -42,6 +42,7 @@ encoder SWA replay hits, beam search, PP/CP/DCP > 1) fall back cleanly to
 from __future__ import annotations
 
 import contextlib
+import logging
 import sys
 import weakref
 from dataclasses import dataclass, is_dataclass
@@ -53,6 +54,8 @@ import numpy as np
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+
+logger = logging.getLogger(__name__)
 
 # Per-call inputs the host stage sets; None outside a staged V4.1 forward.
 ForwardBatch.tpu_engram_local_ids = None
@@ -750,6 +753,7 @@ class HostEngramCoordinator:
         self._next_prompt_spec: tuple[tuple[Any, ...], list[int], list[int]] | None = (
             None
         )
+        self._prepared_extend_ranges: tuple[list[int], list[int]] | None = None
         self._prefetch: _EngramPrefetch | None = None
 
     def _next_prompt_prediction(
@@ -831,6 +835,7 @@ class HostEngramCoordinator:
         self._step_inputs = None
         self._history_commit = []
         self._next_prompt_spec = None
+        self._prepared_extend_ranges = None
         self.started = False
 
     @staticmethod
@@ -936,6 +941,9 @@ class HostEngramCoordinator:
             self._next_prompt_prediction(requests, starts, lengths)
             if is_plain_extend and not any_folded
             else None
+        )
+        self._prepared_extend_ranges = (
+            (list(starts), list(lengths)) if is_plain_extend else None
         )
         row_end = 0
         commit: list[tuple[int, int]] = []
@@ -1060,11 +1068,43 @@ class HostEngramCoordinator:
             self.deferred = None
         return self.hashes
 
+    def _matches_forward_extend_ranges(self, forward_batch: Any) -> bool:
+        """Verify predicted extend ranges match the actually-folded ForwardBatch."""
+        if forward_batch is None or self._prepared_extend_ranges is None:
+            return True
+        if getattr(forward_batch, "encoder_swa_replay", False):
+            return False
+        expected_starts, expected_lengths = self._prepared_extend_ranges
+        n_reqs = len(expected_lengths)
+        for attr, expected in (
+            ("extend_seq_lens_cpu", expected_lengths),
+            ("extend_prefix_lens_cpu", expected_starts),
+        ):
+            actual = getattr(forward_batch, attr, None)
+            if actual is None:
+                continue
+            if isinstance(actual, torch.Tensor):
+                if actual.device.type != "cpu":
+                    continue
+                actual = actual.tolist()
+            if len(actual) < n_reqs:
+                return False
+            if [int(x) for x in actual[:n_reqs]] != expected:
+                return False
+            if any(int(x) != 0 for x in actual[n_reqs:]):
+                return False
+        return True
+
     def _stage_layers(
         self, hashes: torch.Tensor, padded_tokens: int, *, use_prestaged: bool
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
         if hashes.shape[0] > padded_tokens:
             raise ValueError("Host Engram rows exceed the padded local token count")
+        if not use_prestaged:
+            # Verify and fallback staging bypass prepare(), so any pending
+            # next-chunk prefetch must be dropped before _reserve_upload can
+            # reuse its slot on the same padded token bucket.
+            self._discard_prefetch()
         if not use_prestaged or (
             self._staged_uploads
             and self._staged_padded_tokens is not None
@@ -1093,9 +1133,17 @@ class HostEngramCoordinator:
         return tuple(upload.device for upload in ordered), ordered, num_cols
 
     def stage_all(
-        self, padded_tokens: int
-    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
+        self, padded_tokens: int, *, forward_batch: Any = None
+    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Resolve deferred overlap tokens (if any) and stage every Engram layer."""
+        if not self._matches_forward_extend_ranges(forward_batch):
+            logger.warning(
+                "Host Engram predicted extend ranges %s did not match ForwardBatch; "
+                "falling back to host_hash_ids.",
+                self._prepared_extend_ranges,
+            )
+            self._reset_step_inputs()
+            return None
         hashes = self.resolve()
         if hashes is None:
             if self.started:
@@ -1110,6 +1158,7 @@ class HostEngramCoordinator:
         self, input_ids: torch.Tensor, forward_batch
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
+        self._discard_prefetch()
         flush_engram_commits(self._hasher)
         if not forward_batch.forward_mode.is_target_verify():
             return None
@@ -1305,6 +1354,7 @@ class HostEngramCoordinator:
         self._step_inputs = None
         self._history_commit = []
         self._next_prompt_spec = None
+        self._prepared_extend_ranges = None
         self.started = False
 
 

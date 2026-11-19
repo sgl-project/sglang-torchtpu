@@ -61,7 +61,9 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     engram_host.flush_engram_commits(hasher)
     staged_result = None
     if coordinator.started:
-        staged_result = coordinator.stage_all(padded_tokens)
+        staged_result = coordinator.stage_all(
+            padded_tokens, forward_batch=forward_batch
+        )
     elif forward_batch.forward_mode.is_target_verify():
         staged_result = coordinator.stage_verify(input_ids, forward_batch)
     if staged_result is None:

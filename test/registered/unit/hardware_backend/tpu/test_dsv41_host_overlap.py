@@ -1935,5 +1935,337 @@ def test_deferred_verify_history_commits_order_across_verify_extend_and_prebuilt
     assert torch.equal(hasher.history[5], torch.tensor([1, 4], dtype=torch.int32))
 
 
+def test_speculative_verify_discards_same_bucket_next_chunk_prefetch():
+    """Intervening verify/fallback staging on the same bucket must discard prefetch.
+
+    Regression for DSpark + chunked prefill: speculative extend leaves a
+    next-chunk prefetch in the inactive bucket slot; verify skips
+    prepare_if_supported and stages via use_prestaged=False on the same padded
+    token bucket, which would otherwise overwrite the prefetch slot while
+    _prefetch.matches still passes on host metadata alone.
+    """
+    from sglang.srt.layers.engram import EngramHasher
+    from sglang_tpu.models.deepseek_v41.compile_policy import _stage_host_engram
+
+    tables = _tables()
+    hasher = EngramHasher.__new__(EngramHasher)
+    torch.nn.Module.__init__(hasher)
+    hasher.max_ngram_size = NGRAM
+    hasher.pad_id = tables["pad_id"]
+    hasher.image_token_id = 7
+    for k in ("token_map", "multipliers", "primes", "offsets"):
+        hasher.register_buffer(k, torch.as_tensor(tables[k], dtype=torch.int64))
+    hasher.init_history(num_req_slots=8, device="cpu")
+    hasher.history[2] = torch.tensor([0, 0], dtype=torch.int32)
+
+    embeddings = []
+    for layer in (0, 1):
+        weight, scale = _table(rows=130, seed=layer + 23)
+        embeddings.append(
+            (
+                layer,
+                SimpleNamespace(
+                    weight=weight,
+                    scale=scale,
+                    dim=weight.shape[1],
+                    row_start=0,
+                    _shared=True,
+                    host_table=SimpleNamespace(layout="shared"),
+                    tpu_hash_index=layer,
+                ),
+            )
+        )
+    coordinator = HostEngramCoordinator(hasher, embeddings, "cpu")
+    model = SimpleNamespace(
+        model=SimpleNamespace(engram_hasher=hasher, layers=[]),
+        _tpu_host_engram_coordinator=coordinator,
+    )
+    runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(use_engram=True),
+        is_draft_worker=False,
+        device=torch.device("cpu"),
+        attn_backend=SimpleNamespace(folds_encoder_swa_replay=False),
+        token_to_kv_pool=SimpleNamespace(request_window=None),
+    )
+    worker = SimpleNamespace(model_runner=runner, is_dllm=lambda: False)
+    fake_parallel = SimpleNamespace(pp_size=1, attn_cp_size=1, attn_dcp_size=1)
+    fake_exec = SimpleNamespace(
+        features=SimpleNamespace(enable_encoder_swa_bounded_replay=False)
+    )
+
+    req_chunked = _request([1, 2, 3, 4, 5, 6, 7, 0], req_pool_idx=1)
+    b_c1 = _batch(
+        [req_chunked],
+        starts=[0],
+        lengths=[4],
+        spec_none=False,
+        req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+    )
+    b_c2 = _batch(
+        [req_chunked],
+        starts=[4],
+        lengths=[4],
+        spec_none=False,
+        req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+    )
+    verify_mode = SimpleNamespace(
+        is_decode=lambda: False,
+        is_target_verify=lambda: True,
+        is_extend=lambda: False,
+        is_idle=lambda: False,
+    )
+    b_ver = SimpleNamespace(
+        forward_mode=verify_mode,
+        spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        reqs=[],
+    )
+    verify_fb = SimpleNamespace(
+        forward_mode=verify_mode,
+        spec_info=SimpleNamespace(
+            draft_token_num=4,
+            live_seq_lens_cpu=torch.tensor([10], dtype=torch.int64),
+        ),
+        positions=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        req_pool_indices=torch.tensor([2], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([2], dtype=torch.int64),
+        tpu_engram_local_ids=None,
+        tpu_engram_staged=None,
+    )
+    verify_ids = torch.zeros(4, dtype=torch.int64)
+
+    with (
+        patch("sglang.srt.runtime_context.get_parallel", return_value=fake_parallel),
+        patch("sglang.srt.runtime_context.get_exec", return_value=fake_exec),
+    ):
+        # Step 1: speculative chunk 1 at padded bucket 4 prefetches chunk 2.
+        def run_c1(w, b):
+            fb = SimpleNamespace(
+                forward_mode=b.forward_mode,
+                extend_seq_lens_cpu=[4, 0],
+                extend_prefix_lens_cpu=[0, 0],
+                tpu_engram_local_ids=None,
+                tpu_engram_staged=None,
+            )
+            uploads = _stage_host_engram(
+                coordinator, hasher, torch.tensor([1, 2, 3, 4], dtype=torch.int64), fb
+            )
+            coordinator.record_consumers(uploads, [torch.tensor([1])])
+            coordinator.finish_forward(4)
+            return SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([0]))
+
+        hooks.tpu_dsv41_engram_worker_forward(run_c1, worker, b_c1)
+        assert coordinator._prefetch is not None
+        assert coordinator._prefetch.padded_tokens == 4
+
+        # Step 2: intervening TARGET_VERIFY on the exact same padded bucket 4.
+        verify_copies = []
+
+        def run_ver(w, b, is_verify=False):
+            uploads = _stage_host_engram(coordinator, hasher, verify_ids, verify_fb)
+            verify_copies.extend(t.clone() for t in verify_fb.tpu_engram_staged)
+            coordinator.record_consumers(uploads, [torch.tensor([2])])
+            return SimpleNamespace(copy_done=None, next_token_ids=None)
+
+        hooks.tpu_dsv41_engram_worker_forward(run_ver, worker, b_ver, is_verify=True)
+        assert coordinator._prefetch is None
+
+        # Step 3: speculative chunk 2 must NOT reuse the verify-overwritten slot.
+        c2_copies = []
+        saw_prestaged = []
+
+        def run_c2(w, b):
+            saw_prestaged.append(bool(coordinator._staged_uploads))
+            fb = SimpleNamespace(
+                forward_mode=b.forward_mode,
+                extend_seq_lens_cpu=[4, 0],
+                extend_prefix_lens_cpu=[4, 0],
+                tpu_engram_local_ids=None,
+                tpu_engram_staged=None,
+            )
+            uploads = _stage_host_engram(
+                coordinator, hasher, torch.tensor([5, 6, 7, 0], dtype=torch.int64), fb
+            )
+            c2_copies.extend(t.clone() for t in fb.tpu_engram_staged)
+            coordinator.record_consumers(uploads, [torch.tensor([3])])
+            return SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([0]))
+
+        hooks.tpu_dsv41_engram_worker_forward(run_c2, worker, b_c2)
+        assert saw_prestaged == [False]
+
+    expected_c2_hashes = hash_on_host(
+        _reference_capture([req_chunked], [4], [4], NGRAM),
+        **tables,
+        image_token_id=hasher.image_token_id,
+    )
+    for (layer, embedding), got_rows, ver_rows in zip(
+        embeddings, c2_copies, verify_copies, strict=True
+    ):
+        expected_rows = pack_rows(
+            embedding.weight,
+            embedding.scale,
+            expected_c2_hashes[:, layer],
+            row_start=0,
+            padded_tokens=4,
+        )
+        assert torch.equal(got_rows, expected_rows)
+        assert not torch.equal(got_rows, ver_rows)
+
+    # Fallback stage_from_hashes on the same bucket also discards pending prefetch.
+    coordinator.prepare(b_c1)
+    _, up1, _ = coordinator.stage_all(4)
+    coordinator.record_consumers(up1, [torch.tensor([4])])
+    coordinator.finish_forward(4)
+    coordinator.clear_step()
+    assert coordinator._prefetch is not None
+    _, up_fb, _ = coordinator.stage_from_hashes(
+        torch.zeros((4, 2, 4), dtype=torch.int64), 4
+    )
+    coordinator.record_consumers(up_fb, [torch.tensor([5])])
+    assert coordinator._prefetch is None
+
+
+def test_stage_all_falls_back_when_folded_extend_lens_drift():
+    """stage_all validates predicted extend ranges against ForwardBatch and falls back."""
+    from sglang.srt.layers.engram import EngramHasher
+    from sglang_tpu.models.deepseek_v41.compile_policy import _stage_host_engram
+    from sglang_tpu.models.deepseek_v41.engram_host import host_hash_ids
+
+    tables = _tables()
+
+    def make_real_hasher():
+        h = EngramHasher.__new__(EngramHasher)
+        torch.nn.Module.__init__(h)
+        h.max_ngram_size = NGRAM
+        h.pad_id = tables["pad_id"]
+        h.image_token_id = 7
+        for k in ("token_map", "multipliers", "primes", "offsets"):
+            h.register_buffer(k, torch.as_tensor(tables[k], dtype=torch.int64))
+        h.history = None
+        h.pad_row = 0
+        h.init_history(num_req_slots=8, device="cpu")
+        return h
+
+    fast_hasher = make_real_hasher()
+    ref_hasher = make_real_hasher()
+    fast_hasher.history[2] = torch.tensor([7, 7], dtype=torch.int32)
+    ref_hasher.history[2] = torch.tensor([7, 7], dtype=torch.int32)
+
+    embeddings = []
+    for layer in (0, 1):
+        weight, scale = _table(rows=130, seed=layer + 31)
+        embeddings.append(
+            (
+                layer,
+                SimpleNamespace(
+                    weight=weight,
+                    scale=scale,
+                    dim=weight.shape[1],
+                    row_start=0,
+                    _shared=True,
+                    host_table=SimpleNamespace(layout="shared"),
+                    tpu_hash_index=layer,
+                ),
+            )
+        )
+    coordinator = HostEngramCoordinator(fast_hasher, embeddings, "cpu")
+    fake_parallel = SimpleNamespace(pp_size=1, attn_cp_size=1, attn_dcp_size=1)
+
+    rng = np.random.default_rng(456)
+    prompt = rng.integers(0, 8, 260).tolist()
+    # Ensure drifted slice ending at 215 has a distinct 2-token tail from 220.
+    prompt[213:215] = [1, 2]
+    prompt[218:220] = [6, 5]
+    hit_req = _request(prompt, req_pool_idx=2)
+
+    b_fold = _batch(
+        [hit_req],
+        starts=[200],
+        lengths=[20],
+        req_pool_indices_cpu=torch.tensor([2], dtype=torch.int64),
+    )
+    b_fold.encoder_swa_reset = [True]
+    prep = coordinator.prepare_if_supported(
+        b_fold,
+        parallel=fake_parallel,
+        enable_encoder_swa_bounded_replay=True,
+        folds_encoder_swa_replay=True,
+        has_request_window=True,
+    )
+    assert prep == ([hit_req], [220])
+    assert coordinator._prepared_extend_ranges == ([72], [148])
+
+    # 1. Matching TPU/DP zero-padded batch buckets stay on the fast path.
+    matching_fb = SimpleNamespace(
+        forward_mode=b_fold.forward_mode,
+        extend_seq_lens_cpu=[148, 0, 0, 0],
+        extend_prefix_lens_cpu=[72, 0, 0, 0],
+        encoder_swa_replay=False,
+    )
+    assert coordinator._matches_forward_extend_ranges(matching_fb)
+
+    # 2. Core fold drift (actual batch has [200:215] instead of predicted [72:220]):
+    #    _stage_host_engram falls back cleanly to host_hash_ids without corrupting history.
+    actual_tokens = torch.tensor(prompt[200:215] + [0] * 17, dtype=torch.int64)
+    actual_positions = torch.tensor(list(range(200, 215)) + [0] * 17, dtype=torch.int64)
+    actual_hist = torch.tensor([prompt[198:200]], dtype=torch.int32)
+    extend_mode = SimpleNamespace(
+        is_decode=lambda: False,
+        is_target_verify=lambda: False,
+        is_extend=lambda: True,
+        is_idle=lambda: False,
+    )
+    drifted_fb = SimpleNamespace(
+        forward_mode=extend_mode,
+        spec_info=None,
+        positions=actual_positions,
+        req_pool_indices=torch.tensor([2, 0, 0, 0], dtype=torch.int64),
+        out_cache_loc=torch.arange(32, dtype=torch.int64),
+        extend_seq_lens=torch.tensor([15, 0, 0, 0], dtype=torch.int32),
+        extend_start_loc=torch.tensor([0, 15, 15, 15], dtype=torch.int32),
+        extend_seq_lens_cpu=[15, 0, 0, 0],
+        extend_prefix_lens_cpu=[200, 0, 0, 0],
+        engram_history=actual_hist,
+        encoder_swa_replay=False,
+        tpu_engram_local_ids=None,
+        tpu_engram_staged=None,
+    )
+    uploads = _stage_host_engram(coordinator, fast_hasher, actual_tokens, drifted_fb)
+    got_copies = [t.clone() for t in drifted_fb.tpu_engram_staged]
+    coordinator.record_consumers(uploads, [torch.tensor([1])])
+    assert not coordinator.started
+
+    ref_hashes = host_hash_ids(ref_hasher, actual_tokens, drifted_fb)
+    for (layer, embedding), got_rows in zip(embeddings, got_copies, strict=True):
+        expected_rows = pack_rows(
+            embedding.weight,
+            embedding.scale,
+            ref_hashes[:, layer],
+            row_start=0,
+            padded_tokens=32,
+        )
+        assert torch.equal(got_rows, expected_rows)
+    # History matches the actual [200:215] batch ([1, 2]), NOT predicted [6, 5].
+    assert torch.equal(fast_hasher.history[2], torch.tensor([1, 2], dtype=torch.int32))
+    assert torch.equal(fast_hasher.history[2], ref_hasher.history[2])
+
+    # 3. Unexpected encoder_swa_replay=True forward also falls back cleanly.
+    coordinator.prepare_if_supported(
+        b_fold,
+        parallel=fake_parallel,
+        enable_encoder_swa_bounded_replay=True,
+        folds_encoder_swa_replay=True,
+        has_request_window=True,
+    )
+    replay_fb = SimpleNamespace(
+        forward_mode=extend_mode,
+        extend_seq_lens_cpu=[148, 0, 0, 0],
+        extend_prefix_lens_cpu=[72, 0, 0, 0],
+        encoder_swa_replay=True,
+    )
+    assert coordinator.stage_all(256, forward_batch=replay_fb) is None
+    assert not coordinator.started
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
