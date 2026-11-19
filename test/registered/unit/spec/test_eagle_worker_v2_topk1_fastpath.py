@@ -198,6 +198,8 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             input_ids=None,
             out_cache_loc=torch.arange(3, device=DEVICE),
             positions=torch.zeros(1, dtype=torch.long, device=DEVICE),
+            draft_step_fold=None,
+            moe_num_token_non_padded=None,
             spec_info=SimpleNamespace(
                 topk_p=torch.ones((1, 1), device=DEVICE),
                 topk_index=torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
@@ -411,7 +413,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         worker.cuda_graph_runner = None
         worker.seed_dsa_topk_from_draft_extend = False
         worker.tree_mask_mode = None
-        worker.target_worker = SimpleNamespace()
+        worker.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(runner_ids=None)
+        )
         worker._prepare_draft_forward_batch = MagicMock()
 
         physical_bs = 16
@@ -457,7 +461,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             ),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                return_value=(forward_batch, False),
+                return_value=(forward_batch, False, None),
             ),
         ):
             verify_input = worker.draft(batch)

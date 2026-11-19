@@ -434,7 +434,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         prefix_lens=torch.tensor([3]),
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _ = result
+    accept_len, commit_lens, bonus, out_tokens, _, _ = result
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]

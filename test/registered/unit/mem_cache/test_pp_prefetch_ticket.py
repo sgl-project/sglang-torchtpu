@@ -1089,5 +1089,19 @@ class TestPPPrefetchTicket(unittest.TestCase):
         task_done.assert_not_called()
 
 
+class TestPerRequestControllerTickets(unittest.TestCase):
+    def test_arrival_binding_skips_a_controller_without_tickets(self):
+        # The scheduler reads the ticket group on any tree cache's controller,
+        # including the HiCacheController behind TPU's HiRadixCache.
+        from sglang.srt.managers.scheduler import Scheduler
+
+        controller = HiCacheController.__new__(HiCacheController)
+        self.assertIsNone(controller.pp_prefetch_command_group)
+        scheduler = Mock()
+        scheduler.tree_cache.cache_controller = controller
+        Scheduler._bind_pp_arrival_prefetch(scheduler, Mock(), Mock())
+        scheduler._prefetch_kvcache.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

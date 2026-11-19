@@ -103,7 +103,10 @@ def _run_until_self_attention(model, latent_shape, self_attention, batch_size=1)
     block.norm_q = block.norm_k = None
     block.attn1 = self_attention
     batch = SimpleNamespace(
-        enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
+        enable_sequence_shard=True,
+        enable_teacache=False,
+        enable_spectrum=False,
+        extra={},
     )
     context = SimpleNamespace(forward_batch=batch, attn_metadata=None)
     with patch.object(wanvideo, "get_forward_context", return_value=context):

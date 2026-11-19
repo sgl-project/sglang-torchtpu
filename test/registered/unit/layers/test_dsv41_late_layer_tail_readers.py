@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -239,7 +240,11 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         backend.enable_decoder_swa_bounded_replay = True
         backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
         backend.get_cpu_graph_seq_len_fill_value = lambda: 1
-        runner = MagicMock(attn_backend=backend, is_draft_worker=False)
+        runner = MagicMock(
+            attn_backend=backend,
+            is_draft_worker=False,
+            compile_policy=NoopCompilePolicy(),
+        )
         runner.attn_tp_sequence_sharded.return_value = False
 
         def idle_peer(out, local, group):

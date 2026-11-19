@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
@@ -151,7 +152,9 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
         post = (tokens, tokens, tokens, tokens, tokens, None)
         target_worker = SimpleNamespace(
             forward_batch_generation=lambda **_: output,
-            model_runner=SimpleNamespace(canary_manager=None),
+            model_runner=SimpleNamespace(
+                canary_manager=None, compile_policy=NoopCompilePolicy()
+            ),
         )
 
         with (
@@ -160,7 +163,7 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             patch.object(
                 eagle_worker_common,
                 "eagle_prepare_for_verify",
-                return_value=(SimpleNamespace(), True),
+                return_value=(SimpleNamespace(spec_info=SimpleNamespace()), True),
             ),
         ):
             result = eagle_worker_common.run_eagle_verify(

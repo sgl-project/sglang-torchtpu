@@ -1183,6 +1183,49 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
+    def test_hybrid_linear_dsa_leaf_is_the_split_pool(self):
+        # get_kv_pool_cls(kind="dsa") is None on TPU; the hybrid-linear leaf
+        # must still build the split pool with its index_key_layers.
+        from sglang.srt.mem_cache import memory_pool
+
+        class _Stop(Exception):
+            pass
+
+        built = {}
+
+        class _SplitPool:
+            def __init__(self, **kwargs):
+                built.update(kwargs)
+                raise _Stop
+
+        platform = SimpleNamespace(
+            is_out_of_tree=lambda: False,
+            is_tpu=lambda: True,
+            get_kv_pool_cls=lambda *, kind: None,
+            get_dsa_kv_pool_cls=lambda: _SplitPool,
+        )
+        with patch.object(memory_pool, "current_platform", platform):
+            with self.assertRaises(_Stop):
+                memory_pool.HybridLinearKVPool(
+                    size=64,
+                    dtype=torch.bfloat16,
+                    page_size=16,
+                    head_num=1,
+                    head_dim=576,
+                    full_attention_layer_ids=[1, 3],
+                    device="cpu",
+                    mamba_pool=None,
+                    use_mla=True,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    use_dsa=True,
+                    index_head_dim=128,
+                    kv_cache_dim=576,
+                    skip_topk_layers=[False, True],
+                )
+        self.assertEqual(built["index_key_layers"], [True, False])
+        self.assertEqual(built["layer_num"], 2)
+
     def test_draft_backends_run_their_target_backend_per_step(self):
         from sglang.srt.layers.attention import attention_registry as registry
         from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend

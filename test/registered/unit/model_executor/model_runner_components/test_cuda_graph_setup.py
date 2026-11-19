@@ -267,6 +267,8 @@ def test_pd_prefill_target_skip_is_cuda_only(monkeypatch, device, expect_runner)
     """
 
     class StubGraphRunner:
+        capture_bs = (1,)
+
         def __init__(self, model_runner):
             self.model_runner = model_runner
 

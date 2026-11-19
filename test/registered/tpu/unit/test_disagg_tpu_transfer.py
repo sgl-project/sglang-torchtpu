@@ -1572,6 +1572,7 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 req.sampling_params = SamplingParams()
                 # Read by SamplingBatchInfo.from_schedule_batch (Req default).
                 req.return_sampling_mask = False
+                req.custom_logit_processor = None
 
                 self.reqs = [req]
                 self.req_to_token_pool = SimpleNamespace(

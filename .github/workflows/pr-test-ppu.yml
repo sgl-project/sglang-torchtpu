@@ -1,11 +1,13 @@
 name: PR Test (PPU)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-    types: [opened, synchronize, reopened]
+  # Disabled in sglang-torchtpu: TPU PRs and pushes should not spawn PPU checks.
+  # PPU CI remains available via workflow_dispatch.
+  # push:
+  #   branches: [ main ]
+  # pull_request:
+  #   branches: [ main ]
+  #   types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       run_all_tests:

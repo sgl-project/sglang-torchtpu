@@ -206,9 +206,7 @@ class DFlashDraftInputV2(SpecInput):
                     host_req_pool_indices=batch.req_pool_indices_cpu,
                 )
                 for i, req in enumerate(batch.reqs):
-                    req.kv.kv_allocated_len = max(
-                        req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
-                    )
+                    req.kv.allocate_spec_decode(int(nxt_kv_lens_cpu_t[i]))
         else:
             caller_stream = None
             if plan_stream is not None:

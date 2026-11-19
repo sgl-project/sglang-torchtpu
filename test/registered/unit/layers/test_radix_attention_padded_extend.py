@@ -101,6 +101,20 @@ class TestPaddedExtendAttention(CustomTestCase):
                     expected,
                 )
 
+    def test_platform_can_opt_out_of_narrowing(self):
+        # TPU compiles the padded batch whole; narrowing inside the compiled
+        # region would trace data_ptr() and a per-count shape.
+        from sglang.srt.platforms import current_platform
+
+        with patch.object(
+            current_platform, "narrows_padded_extend_attention", lambda: False
+        ):
+            self.assertIsNone(
+                radix_attention.padded_extend_real_tokens(
+                    8, _batch(ForwardMode.EXTEND, 5)
+                )
+            )
+
     def test_the_backend_sees_the_real_rows_and_the_tail_is_zero(self):
         backend = _RecordingBackend()
         batch = _batch(ForwardMode.EXTEND, 5)

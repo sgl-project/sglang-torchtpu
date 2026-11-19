@@ -436,6 +436,11 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    # PP arrival-prefetch tickets are a HybridCacheController feature. The
+    # scheduler checks this on any tree cache's controller, so the controller
+    # behind TPU's HiRadixCache reports them as disabled.
+    pp_prefetch_command_group = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,

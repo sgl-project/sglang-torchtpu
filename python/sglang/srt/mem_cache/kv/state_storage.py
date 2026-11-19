@@ -195,8 +195,15 @@ class StateStorage:
                 if buffers is not None and len(untracked) == len(reqs)
                 else torch.stack([req.kv.mamba_ping_pong_track_buffer for req in reqs])
             )
+            # The mapping sits with the slot ids (`slot_allocator_device`),
+            # which can differ from the table's device (host slot ids on TPU).
             mapping = table.req_index_to_mamba_ping_pong_track_buffer_mapping
-            mapping[row_ids] = ping_pong_tensor.to(mapping.device)
+            mapping_rows = (
+                row_ids
+                if mapping.device == row_ids.device
+                else async_h2d(rows, dtype=torch.int64, device=mapping.device)
+            )
+            mapping[mapping_rows] = ping_pong_tensor.to(mapping.device)
 
     @property
     def tracks_decode_state(self) -> bool:

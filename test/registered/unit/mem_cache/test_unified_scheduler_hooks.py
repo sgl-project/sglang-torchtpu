@@ -133,6 +133,7 @@ class TestEmbeddingForwardRecords(_Bands):
         scheduler.record_batch_in_overlap = mock.Mock()
         scheduler.forward_stream_ctx = contextlib.nullcontext()
         scheduler.forward_stream = mock.Mock()
+        scheduler.use_overlap_streams = True
         scheduler.future_map = None
         scheduler.resolve_forward_inputs = mock.Mock()
         scheduler.tp_worker = SimpleNamespace(
@@ -237,9 +238,11 @@ class TestOpportunisticCompactionErrors(CustomTestCase):
         scheduler = self._scheduler()
         scheduler.dp_attn_adapter = mock.Mock()
         scheduler.deferred_responses = mock.Mock()
-        scheduler.maybe_send_health_check_signal = mock.Mock()
+        scheduler.health_monitor = mock.MagicMock()
         scheduler.is_fully_idle = mock.Mock(return_value=True)
         scheduler.metrics_reporter = mock.Mock()
+        scheduler.forward_ct = 0
+        scheduler.recompile_stance_set = False
         # The rest of the idle path has no state here: a swallowed error
         # fails on the first thing it reads.
         with self.assertRaisesRegex(RuntimeError, "a move failed"):

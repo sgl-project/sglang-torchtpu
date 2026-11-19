@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
 from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.device import is_hip, is_tpu
+from sglang.srt.utils.device import get_device, is_hip, is_tpu
 
 _is_hip = is_hip()
 _is_tpu = is_tpu()
@@ -238,7 +238,7 @@ class StandardDispatcher(BaseDispatcher):
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
-                device = hidden_states.device
+                device = get_device()
                 self.local_expert_mapping = torch.full(
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )

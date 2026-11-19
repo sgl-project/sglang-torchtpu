@@ -211,6 +211,10 @@ class TestFreezeGcAfterWarmup(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFreezeCompletion(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # freeze_gc reads the published gc_threshold.
+        enter_scope(self, get_context().override_server_args())
+
     async def test_waits_for_every_scheduler_reply_before_local_freeze(self):
         events = []
         communicator = FanOutCommunicator(lambda _: events.append("sent"), 2)
@@ -219,7 +223,8 @@ class TestFreezeCompletion(unittest.IsolatedAsyncioTestCase):
             freeze_gc_communicator=communicator,
         )
         with patch(
-            "sglang.srt.managers.tokenizer_manager.freeze_gc", side_effect=events.append
+            "sglang.srt.managers.tokenizer_manager.freeze_gc",
+            side_effect=lambda name, *_: events.append(name),
         ):
             task = asyncio.create_task(http_server.TokenizerManager.freeze_gc(manager))
             await asyncio.sleep(0)

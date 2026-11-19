@@ -22,7 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa:
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (  # noqa: E402
     SpecAuxHiddenStateConfig,
 )
-from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 from sglang_tpu import pp_scheduler  # noqa: E402
@@ -46,7 +46,12 @@ def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
     scheduler.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=is_last_rank)
     scheduler.run_batch = MagicMock(
         return_value=SimpleNamespace(
-            can_run_cuda_graph=False, spec_verify_out_cache_loc=None
+            can_run_cuda_graph=False,
+            spec_verify_out_cache_loc=None,
+            fpm_timing=None,
+            routed_experts_output=None,
+            forward_launch=None,
+            unified_forward_done=None,
         )
     )
     return scheduler
@@ -150,14 +155,16 @@ class TestStreamFences(CustomTestCase):
         self.batch_result = SimpleNamespace(logits_output=None)
         scheduler._pp_prep_batch_result = MagicMock(return_value=self.batch_result)
         scheduler._pp_send_output_to_next_stage = MagicMock(return_value=[])
-        return scheduler._pp_send_recv_and_preprocess_output_tensors(
-            next_first_rank_mb_id=0,
-            next_mb_id=0,
-            mbs=[target],
-            mb_metadata=[None],
-            last_rank_comm_queue=[],
-            pp_outputs=None,
-        )
+        # Send/recv order follows pp_rank parity; an even stage sends first.
+        with get_parallel().override(pp_rank=0, pp_size=2):
+            return scheduler._pp_send_recv_and_preprocess_output_tensors(
+                next_first_rank_mb_id=0,
+                next_mb_id=0,
+                mbs=[target],
+                mb_metadata=[None],
+                last_rank_comm_queue=[],
+                pp_outputs=None,
+            )
 
     def test_output_receive_runs_without_copy_stream(self):
         scheduler = _single_queue_scheduler()

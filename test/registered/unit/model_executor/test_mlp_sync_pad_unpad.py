@@ -348,7 +348,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
         hidden = torch.randn(bucket, 8)
         mm_input_embeds = torch.randn(bucket, 8)
-        logits_output = SimpleNamespace(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=torch.randn(1, 16),
             hidden_states=hidden,
             last_hidden_states=None,

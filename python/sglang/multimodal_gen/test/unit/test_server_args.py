@@ -4136,7 +4136,7 @@ class TestRingCapableAttentionBackends(unittest.TestCase):
         ):
             args._adjust_attention_backend()
             self.assertEqual(args.attention_backend, "fa")
-            with self.assertRaisesRegex(ValueError, r"\(fa, sage_attn\)"):
+            with self.assertRaisesRegex(ValueError, r"\(fa, sage_attn, aiter\)"):
                 self._args("torch_sdpa")._adjust_attention_backend()
 
     def test_a_platform_names_its_own_ring_backend(self):

@@ -474,6 +474,8 @@ def _fill_mm_placeholder_token_ids(
         )
         token_id = next((t for t in token_ids if t is not None), None)
         if token_id is not None:
+            # TPU builds the mask on the host (see _get_multimodal_mask).
+            mask = mask.to(input_ids.device, non_blocking=True)
             input_ids.masked_fill_(mask.view(input_ids.shape), token_id)
 
 

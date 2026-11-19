@@ -39,6 +39,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
@@ -134,6 +135,8 @@ class TestKVFreeFence(CustomTestCase):
 
         tree_cache = SimpleNamespace(
             token_to_kv_pool_allocator=self.allocator,
+            # No request rows: these allocations take token slots only.
+            req_to_token_pool=None,
             supports_prefix_sharing=lambda: False,
         )
         alloc_token_slots(tree_cache, num_tokens=PAGE)
@@ -372,7 +375,7 @@ class TestOverlapLoopWiring(CustomTestCase):
         ]
         scheduler = Mock(
             gracefully_exit=False,
-            _engine_paused=False,
+            pause_state=SimpleNamespace(paused=False, may_launch=lambda: True),
             enable_unified_memory=False,
             is_generation=True,
             running_batch=None,
@@ -392,7 +395,8 @@ class TestOverlapLoopWiring(CustomTestCase):
             "get_next_disagg_decode_batch_to_run",
         ):
             getattr(scheduler, name).side_effect = list(plans)
-        scheduler.is_disable_overlap_for_batch.side_effect = [
+        # disable_overlap: batch A's result is processed before B launches.
+        scheduler.should_process_last_batch_early.side_effect = [
             False,
             disable_overlap,
             False,
@@ -409,7 +413,9 @@ class TestOverlapLoopWiring(CustomTestCase):
         scheduler.launch_batch_sample_if_needed.side_effect = [None, None, _StopLoop]
         with self.assertRaises(_StopLoop):
             loop(scheduler)
-        self.assertEqual(held_at_processing, [0, 2])
+        # Processed early, A's result frees its pages before B forms, so B
+        # cannot write them and nothing is held; otherwise they wait for B.
+        self.assertEqual(held_at_processing, [0, 0] if disable_overlap else [0, 2])
         self.assertEqual(allocator.held_pages.num_pages, 0)
         self.assertEqual(log, ["copy_done", "copy_done"])
 
@@ -463,7 +469,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=PAGE,
                 eviction_policy="lru",
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 # The fence's release stamps live in the Python core, which a TPU
                 # allocator always resolves to; this CPU one would pick Rust.
                 tree_core_backend="python",

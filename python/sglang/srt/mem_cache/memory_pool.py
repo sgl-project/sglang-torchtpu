@@ -4470,11 +4470,10 @@ class HybridLinearKVPool(KVCache):
             if current_platform.is_tpu():
                 # TPU's split MLA pool, built as in
                 # kv_cache_configurator._build_tpu_dsa_kv_pool.
+                # get_kv_pool_cls(kind="dsa") is None on TPU: the split pool
+                # takes index_key_layers, not DSATokenToKVPool's arguments.
                 skips = skip_topk_layers or [False] * self.full_layer_nums
-                tpu_dsa_pool_class = (
-                    current_platform.get_kv_pool_cls(kind="dsa") or DSATokenToKVPool
-                )
-                self.full_kv_pool = tpu_dsa_pool_class(
+                self.full_kv_pool = current_platform.get_dsa_kv_pool_cls()(
                     size=size,
                     page_size=self.page_size,
                     dtype=dtype,

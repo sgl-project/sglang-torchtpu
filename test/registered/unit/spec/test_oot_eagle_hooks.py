@@ -203,7 +203,10 @@ class TestOOTSpecGraphRunnerSelection(CustomTestCase):
         )
         decode_cfg = SimpleNamespace(backend="custom")
         exec_cfg = SimpleNamespace(
-            graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=decode_cfg))
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(decode=decode_cfg),
+                disable_cuda_graph=False,
+            )
         )
         with contextlib.ExitStack() as stack:
             for flag in DEVICE_FLAGS:

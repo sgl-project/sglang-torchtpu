@@ -30,6 +30,8 @@ class TestMambaExtraBufferPlatform(CustomTestCase):
     @patch("sglang.srt.arg_groups.mamba_hook.current_platform")
     def test_in_tree_validation_uses_platform_context(self, platform, _supports_model):
         platform.is_out_of_tree.return_value = False
+        # The fork's in-tree capability flag, which the in-tree TPU platform sets.
+        platform.supports_mamba_extra_buffer = False
         platform_facts = dict(
             is_cuda=False,
             is_musa=False,

@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -609,7 +610,7 @@ class TestFoldMlpSync(CustomTestCase):
         return fb
 
     def _mlp_sync(self, fb):
-        runner = MagicMock()
+        runner = MagicMock(compile_policy=NoopCompilePolicy())
         runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = 1
         runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
         runner.is_draft_worker = False

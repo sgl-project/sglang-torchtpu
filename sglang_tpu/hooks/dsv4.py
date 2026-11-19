@@ -173,7 +173,7 @@ def forward_tpu_dsv4_compressor(
 def forward_tpu_dsv4_hash_topk_torch(
     original, topk_layer, router_logits: torch.Tensor, input_ids: torch.Tensor
 ):
-    if topk_layer.num_fused_shared_experts == 1:
+    if topk_layer.num_shared_topk_slots == 1:
         topk_weights, topk_ids = original(topk_layer, router_logits, input_ids)
         return topk_weights.to(torch.float32), topk_ids
     from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON

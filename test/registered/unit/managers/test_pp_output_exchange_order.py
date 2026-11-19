@@ -42,6 +42,8 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
     ops = []
     scheduler = SchedulerPPMixin()
     scheduler._pp_spec_relay = spec_relay
+    # The CUDA path: forward/copy/schedule streams buy overlap.
+    scheduler.use_overlap_streams = True
     scheduler.pp_group = SimpleNamespace(is_first_rank=pp_rank == 0)
     scheduler.launch_event = "own-forward"
     scheduler.pp_comm_stream_ctx = nullcontext()

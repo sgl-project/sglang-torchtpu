@@ -79,6 +79,8 @@ def test_pynccl_default(out_of_tree, platform_pynccl, explicit, expected):
         patch.object(parallel_state, "_is_xpu", False),
         patch.object(parallel_state, "GroupCoordinator") as coordinator,
     ):
+        # The fork builds the coordinator through the platform hook.
+        platform.get_group_coordinator_cls.return_value = coordinator
         parallel_state.init_model_parallel_group(
             group_ranks=[[0, 1]],
             local_rank=0,

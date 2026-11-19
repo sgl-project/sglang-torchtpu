@@ -495,6 +495,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(host_padding.metadata_device(original, off_worker), "tpu")
 
     def test_decode_mrope_builds_on_host_and_uploads_only_bucket_shape(self):
+        from sglang.srt.managers.req_types import MultimodalInputs
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.hooks import host_padding
 
@@ -516,8 +517,8 @@ class TestHostPadFieldSelection(CustomTestCase):
                     deltas = [(-3 if i % 2 == 0 else 0) for i in range(size)]
                     mm_inputs = [
                         (
-                            SimpleNamespace(
-                                mrope_positions=None,
+                            MultimodalInputs(
+                                mm_items=[],
                                 mrope_position_delta=torch.tensor(delta),
                             )
                             if multimodal and delta
@@ -670,6 +671,7 @@ class TestHostPadFieldSelection(CustomTestCase):
                         return_logprob=False,
                         grammar=None,
                         return_hidden_states_mode=CaptureHiddenMode.NULL,
+                        sampling_params=SimpleNamespace(top_k=1),
                     )
                     for _ in lengths
                 ],
@@ -721,6 +723,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         relay = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
         relay.spec_algo = SpeculativeAlgorithm.NONE
         relay._use_dynamic_index = True
+        relay._deferred_relay = None
         relay.output_tokens_buf = torch.empty(16, dtype=torch.int64, device="meta")
         operations = []
 
@@ -848,6 +851,7 @@ class TestHostPadFieldSelection(CustomTestCase):
             need_sort=False,
         )
         tree = SimpleNamespace(
+            req_to_token_pool=batch.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             supports_prefix_sharing=lambda: False,
         )
@@ -916,6 +920,8 @@ class TestHostPadFieldSelection(CustomTestCase):
                     grammar=None,
                     finished=lambda: False,
                     skip_radix_cache_insert=True,
+                    prefix_len=0,
+                    extend_end=1,
                 )
                 for token in (11, 22, 33)
             ],

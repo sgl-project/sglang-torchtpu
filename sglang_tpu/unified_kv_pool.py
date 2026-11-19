@@ -265,7 +265,7 @@ def _resolve_draft_attention_info(kvc, draft_mc):
     draft_dtype_str, draft_dtype = configure_kv_cache_dtype(
         server_args_kv_cache_dtype=get_model().kv_cache_dtype,
         speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
-        model=None,
+        quant_config=None,
         model_dtype=model_dtype,
         is_draft_worker=True,
         is_dflash=spec_algo.is_dflash_family(),
@@ -1653,7 +1653,12 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         lru = getattr(tree_core, "lru_lists", {}).get(ComponentType.SWA)
         if swa_comp is None or lru is None:
             evict_fn = getattr(tree_cache, "evict", None) or tree_cache.evict_for_alloc
-            evict_fn(EvictParams(num_tokens=0, swa_num_tokens=sc_short * ps))
+            evict_fn(
+                EvictParams(
+                    num_tokens=0,
+                    window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: sc_short * ps},
+                )
+            )
             return
 
         enabled = tree_core.enable_session_radix_cache
@@ -1666,7 +1671,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             target_pages = sample.to(device="cpu", dtype=torch.int64).clamp(min=0) // ps
             return bool(torch.any(sidecar.target_to_draft_page[target_pages] > 0))
 
-        def _filtered_next(tracker, device_frees, host_frees):
+        def _filtered_next(tracker, device_frees, host_frees, cache_actions):
             if sidecar.allocator.available_size() // ps >= need_s:
                 return None
             cur = swa_comp._evict_device_cursor
@@ -1680,11 +1685,16 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_comp._evict_device_cursor = cur
             if cur is None:
                 return None
-            return orig_next(tracker, device_frees, host_frees)
+            return orig_next(tracker, device_frees, host_frees, cache_actions)
 
         swa_comp._evict_device_next_node = _filtered_next
         try:
-            tree_cache.evict(EvictParams(num_tokens=0, swa_num_tokens=sys.maxsize))
+            tree_cache.evict(
+                EvictParams(
+                    num_tokens=0,
+                    window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: sys.maxsize},
+                )
+            )
         finally:
             swa_comp._evict_device_next_node = orig_next
 

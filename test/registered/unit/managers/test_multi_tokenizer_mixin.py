@@ -200,6 +200,8 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 debug_tensor_dump_input_file=None,
             ),
             mock.patch.object(http_server, "get_exec", return_value=execution),
+            # The warmup marks the worker's tokenizer manager as up.
+            mock.patch.object(http_server, "_global_state", mock.Mock()),
             mock.patch.object(http_server, "freeze_gc", side_effect=timeline.worker),
             mock.patch.object(
                 http_server,
@@ -212,16 +214,19 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 kwargs = http_server._multi_tokenizer_warmup_kwargs(
                     server_args, worker_id
                 )
+                # The lifespan adds the serving loop that owns the IPC handlers.
+                event_loop = mock.sentinel.event_loop
                 http_server._wait_and_warmup(
                     **kwargs,
                     execute_warmup_func=lambda _: timeline.warmup() or True,
+                    event_loop=event_loop,
                 )
                 self.assertEqual(
                     timeline.mock_calls,
                     [
                         mock.call.warmup(),
                         mock.call.worker(f"Tokenizer worker {worker_id}", threshold),
-                        mock.call.routed(server_args),
+                        mock.call.routed(event_loop),
                     ],
                 )
 

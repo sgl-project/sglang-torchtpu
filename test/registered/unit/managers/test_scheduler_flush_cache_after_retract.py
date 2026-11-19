@@ -53,6 +53,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True

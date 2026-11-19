@@ -37,6 +37,15 @@ class DeclaredSum:
         self.group = group
         self.complete_sum = complete_sum
 
+    # Value semantics, as the frozen Struct upstream had.
+    def __eq__(self, other):
+        if not isinstance(other, DeclaredSum):
+            return NotImplemented
+        return self.group == other.group and self.complete_sum == other.complete_sum
+
+    def __hash__(self):
+        return hash((self.group, self.complete_sum))
+
     def complete(self, value):
         if self.complete_sum is not None:
             return self.complete_sum(value)

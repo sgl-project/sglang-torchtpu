@@ -77,9 +77,12 @@ def bind_select_experts(
 
 
 def take_padded_rows_masked() -> bool:
-    masked = _handoff.padded_rows_masked
+    # Write only on a hit: select_experts calls this on every grouped-topk route,
+    # and torch.compile (TPU) cannot trace a store to the msgspec Struct.
+    if not _handoff.padded_rows_masked:
+        return False
     _handoff.padded_rows_masked = False
-    return masked
+    return True
 
 
 def try_route_quant_fused(

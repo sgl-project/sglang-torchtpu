@@ -272,6 +272,18 @@ class SRTPlatform(DeviceMixin):
         buffer_info = device_pool.get_device_pool_infos()[0].buffer_info
         return get_mha_host_pool_cls(buffer_info)
 
+    def get_device_pool_kv_host_cls(self, device_pool) -> Optional[type]:
+        """Return a host (L2) KV pool class built from ``device_pool`` itself,
+        for a device layout no buffer info describes; None builds the host
+        pool from the device pool's buffer info."""
+        return None
+
+    def get_hybrid_cache_controller_cls(self, io_backend: str) -> Optional[type]:
+        """Return the hybrid HiCache controller class for ``io_backend`` when
+        it needs its own (e.g. a backend with no device streams); None uses the
+        in-tree ``HybridCacheController``."""
+        return None
+
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         """Scope host-pool construction for an explicit HiCache ratio or size.
 
@@ -362,6 +374,12 @@ class SRTPlatform(DeviceMixin):
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
+
+    def narrows_padded_extend_attention(self) -> bool:
+        """Whether attention runs on only the real rows of an extend batch MLP
+        sync padded. False for a platform that compiles the padded batch whole
+        with attention metadata covering the padded rows."""
+        return True
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None

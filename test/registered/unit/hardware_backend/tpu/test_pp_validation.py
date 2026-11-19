@@ -264,6 +264,7 @@ def _compat_cfg(**overrides):
         speculative_algorithm="EAGLE3",
         disable_overlap_schedule=True,
         enable_multi_layer_eagle=False,
+        scheduler_recv_interval=1,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

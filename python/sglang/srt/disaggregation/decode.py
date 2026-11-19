@@ -134,7 +134,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
-    release_kv_cache,
     restore_kv_cache,
     retraction_needs_rebootstrap,
     start_restore_kv_cache,
@@ -2045,11 +2044,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self.tree_cache.unlock(decode_req.req.lock)
                         decode_req.req.lock = None
-                    # Prefix matching can reserve a Mamba COW slot before KV allocation.
-                    if decode_req.req.kv.holds_mamba:
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, checkpoint=False
-                        )
+                    # request_retirer.release frees a Mamba COW slot that prefix
+                    # matching reserved, with the other failed requests below.
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,

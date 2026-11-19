@@ -378,7 +378,7 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
 def _admission_manager(joint_head_config):
     manager = TokenizerManager.__new__(TokenizerManager)
     manager.model_config = SimpleNamespace(
-        joint_head_config=joint_head_config, pointer_head=None
+        joint_head_config=joint_head_config, pointer_head=None, vocab_size=32000
     )
     manager.is_generation = joint_head_config is None
     manager.context_len = 4096

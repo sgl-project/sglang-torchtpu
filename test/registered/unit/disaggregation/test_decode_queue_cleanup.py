@@ -73,9 +73,9 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
     def test_decode_poll_keeps_hicache_gate_and_reduces_tp_then_cp(self):
         tp_group, cp_group = object(), object()
         inner = SimpleNamespace(group_failure_requires_drain=True)
-        decode_req = SimpleNamespace(kv_receiver=inner)
+        decode_req = SimpleNamespace(kv_receiver=inner, req=FakeReq())
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         queue.gloo_group = tp_group
         queue.attn_cp_cpu_group = cp_group
         queue.metadata_buffers = object()
@@ -253,6 +253,8 @@ class TestHeldDestinationPublication(CustomTestCase):
     def test_publishes_while_retracted_requests_wait(self):
         queue, _, _, receiver = self.make_queue()
         queue.resolve_deferred_releases = MagicMock()
+        # Retracted requests block only new admissions; transfers still drain.
+        queue.move_transferred = MagicMock(return_value=[])
         prealloc = SimpleNamespace(
             publish_pending_destinations=MagicMock(),
             move_resumed=lambda dst: [],
@@ -261,6 +263,7 @@ class TestHeldDestinationPublication(CustomTestCase):
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
             enable_decode_hicache=False,
+            enable_hisparse=False,
             tree_cache=SimpleNamespace(linker=None),
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
@@ -347,7 +350,11 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.scheduler = scheduler
 
             def reduce_with_peer(
-                pollers, group, decode_reqs=None, metadata_buffers=None
+                pollers,
+                group,
+                decode_reqs=None,
+                metadata_buffers=None,
+                additional_groups=None,
             ):
                 return [min(int(p.poll()), int(peer_poll)) for p in pollers]
 
@@ -985,6 +992,7 @@ class TestAdmissionOverlap(CustomTestCase):
                 chunked_req=None,
                 future_map=object(),
                 enable_overlap=True,
+                use_overlap_streams=True,
                 schedule_stream=MagicMock(),
                 forward_stream=MagicMock(),
                 forward_stream_ctx=forward_context(),

@@ -4,6 +4,7 @@ import argparse
 import ast
 import importlib.util
 import io
+import math
 import shlex
 import subprocess
 import sys
@@ -86,11 +87,13 @@ class TestExecutionBudget(unittest.TestCase):
         # Import only main(): the TPU executor needs torch, but its actual CLI
         # and budget wiring can run on CPU with a controlled suite workload.
         tree = ast.parse((ROOT / "test/run_suite.py").read_text())
-        main = next(
+        # main() plus the argparse type helpers it references.
+        entrypoint = [
             node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "main"
-        )
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("main", "_parse_timeout_override")
+        ]
         for minutes, expected in ((40, 1), (45, 0), (0, 0)):
             with self.subTest(minutes=minutes):
                 result = subprocess.run(
@@ -134,12 +137,13 @@ class TestExecutionBudget(unittest.TestCase):
 
                 namespace = {
                     "argparse": argparse,
+                    "math": math,
                     "sys": sys,
                     "HW_MAPPING": {"tpu": object()},
                     "run_a_suite": suite,
                     "run_with_execution_budget": self.budget.run_with_execution_budget,
                 }
-                module = ast.Module(body=[main], type_ignores=[])
+                module = ast.Module(body=entrypoint, type_ignores=[])
                 exec(compile(module, "test/run_suite.py", "exec"), namespace)
                 with (
                     patch.object(sys, "argv", command[2:]),

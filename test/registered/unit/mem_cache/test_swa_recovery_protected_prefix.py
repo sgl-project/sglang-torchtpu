@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -67,7 +68,7 @@ def _build_swa_cache() -> tuple[UnifiedRadixCache, SWATokenToKVPoolAllocator]:
         token_to_kv_pool_allocator=allocator,
         page_size=1,
         sliding_window_size=WINDOW,
-        tree_components=(FULL, SWA),
+        tree_slots=tree_slots_of((FULL, SWA), window=WINDOW),
         tree_core_backend="python",
     )
     return UnifiedRadixCache(params), allocator

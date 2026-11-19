@@ -1583,8 +1583,14 @@ class MiniMaxH3Attention(nn.Module):
             )
         # The fused qk-norm/RoPE, pipelined Ulysses exchange and attention kernels
         # are untraceable, and the traceable fallback is slower than eager, so a
-        # compiled DiT runs this section eager and compiles around it.
-        attend = self._attend_eager if torch.compiler.is_compiling() else self._attend
+        # compiled DiT runs this section eager and compiles around it, unless
+        # the platform traces attention into the block's compiled program.
+        attend = (
+            self._attend_eager
+            if torch.compiler.is_compiling()
+            and current_platform.runs_dit_attention_eager_under_compile()
+            else self._attend
+        )
         out = attend(
             x,
             q,

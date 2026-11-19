@@ -162,7 +162,12 @@ def padded_extend_real_tokens(
     """The number of real rows of an extend batch of num_tokens rows that MLP sync
     padded to a multiple of attention TP, whose attention metadata covers only
     those rows; None for a batch without such padding. Target verify plans its
-    padded rows itself."""
+    padded rows itself. A platform that compiles the whole padded batch, with
+    attention metadata covering the padded rows, opts out of narrowing."""
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.narrows_padded_extend_attention():
+        return None
     mode = forward_batch.forward_mode
     if not mode.is_extend() or mode.is_target_verify():
         return None

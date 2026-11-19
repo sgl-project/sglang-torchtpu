@@ -950,6 +950,8 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         ray.get = lambda refs: refs
         placement = ModuleType("ray.util.placement_group")
         placement.PlacementGroup = object
+        # The fork engine also imports placement_group() for its own PG path.
+        placement.placement_group = lambda *args, **kwargs: None
         strategies = ModuleType("ray.util.scheduling_strategies")
         strategies.PlacementGroupSchedulingStrategy = object
         stubs = {
@@ -978,7 +980,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                     run_event_loop=SimpleNamespace(remote=lambda: None),
                 )
 
-            def create_controller(*args):
+            def create_controller(*args, **kwargs):
                 controller = self._controller(controller_type)
                 controller.scheduler_actors = []
                 controller.event_loop_refs = []
@@ -986,6 +988,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 controller.bundle_for_node = [0]
                 controller.rank0_node_ip = "127.0.0.1"
                 controller.pg = object()
+                controller.nnodes = kwargs["nnodes"]
                 for rank in range(2):
                     controller._launch_ray_tp_group(
                         SimpleNamespace(), SimpleNamespace(nccl_port=1234), rank
@@ -1008,6 +1011,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                     object(),
                     [0],
                     "127.0.0.1",
+                    nnodes=1,
                 )
             self.assertEqual(
                 result.scheduler_infos[0]["hicache_object_layout"],

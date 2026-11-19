@@ -1035,13 +1035,11 @@ def run_eagle_verify(
                     sparse_bonus_argmax=sparse_bonus_argmax,
                 )
             )
-            verify_result = (
-                post_verify_output.token_ids,
-                post_verify_output.accepted_lengths,
-                post_verify_output.accepted_indices,
-            )
+            predict = post_verify_output.token_ids
+            accept_lens = post_verify_output.accepted_lengths
+            accept_index = post_verify_output.accepted_indices
         else:
-            verify_result = eagle_sample(
+            predict, accept_lens, accept_index = eagle_sample(
                 verify_input,
                 batch,
                 logits_output,
@@ -1056,15 +1054,15 @@ def run_eagle_verify(
                 simulated_acc_len_rng=simulated_acc_len_rng,
                 sparse_bonus_argmax=sparse_bonus_argmax,
             )
-        post_predict, post_accept_lens, post_accept_index = verify_result
+        verify_result = (predict, accept_lens, accept_index)
         # Sampling and bookkeeping must use the same physical rows, including
         # padded idle DP peers. finalize_spec_verify restores the logical batch.
         if not fused_commit_outputs:
             verify_bookkeeping_result = verify_bookkeeping_func(
                 batch.seq_lens,
-                post_accept_lens,
-                post_predict,
-                post_accept_index,
+                accept_lens,
+                predict,
+                accept_index,
             )
     finally:
         # Restore logical tensors and finalize target outputs.

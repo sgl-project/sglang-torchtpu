@@ -274,7 +274,8 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
             ],
             req_pool_indices=torch.arange(2),
             req_to_token_pool=SimpleNamespace(
-                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+                mamba_pool=SimpleNamespace(slot_allocator_device="cuda"),
+                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping,
             ),
         )
         set_mamba_track_indices_from_reqs(batch, [1, -1])
@@ -296,7 +297,10 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         req.kv.kv_committed_len = 2 * TRACK_INTERVAL - 1
         batch.seq_lens = torch.tensor([2 * TRACK_INTERVAL - 1], dtype=torch.int64)
         batch.seq_lens_cpu = batch.seq_lens.clone()
-        batch.req_to_token_pool = None
+        # Decode reads only the track device off the pool.
+        batch.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(slot_allocator_device="cpu")
+        )
         storage = SimpleNamespace(take_tracking_slot=lambda req, position: took)
         storage.advance = lambda req, tracking: advance_tracking(storage, req, tracking)
         batch.token_to_kv_pool_allocator = SimpleNamespace(

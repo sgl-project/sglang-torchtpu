@@ -21,6 +21,7 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
     return SimpleNamespace(
         pp_group=SimpleNamespace(is_first_rank=first_rank),
         disagg_prefill_transfer_queue=[],
+        _deferred_chunked_sender_aborts=[],
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
     )

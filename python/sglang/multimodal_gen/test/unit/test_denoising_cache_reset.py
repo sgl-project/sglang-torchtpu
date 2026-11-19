@@ -54,6 +54,7 @@ class TestDenoisingCacheReset(CustomTestCase):
             is_cfg_negative=False,
             num_inference_steps=STEPS,
             debug=False,
+            extra={},
         )
 
     def _stage(self, expert, batch):

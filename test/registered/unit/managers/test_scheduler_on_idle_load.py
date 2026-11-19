@@ -121,13 +121,14 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
             send_abort=None,
         )
         scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
-        scheduler.maybe_send_health_check_signal = MagicMock()
+        scheduler.admit_deferred_health_probes = MagicMock()
         scheduler.is_fully_idle = Scheduler.is_fully_idle.__get__(scheduler)
         scheduler.on_idle = Scheduler.on_idle.__wrapped__.__get__(scheduler)
         scheduler.metrics_reporter = MagicMock()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler.dllm_manager = MagicMock()
         scheduler.last_batch = None
         scheduler.enable_overlap = False
@@ -166,6 +167,8 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.kv_events_publisher = MagicMock()
         scheduler.new_token_ratio_tracker = MagicMock()
         scheduler.idle_sleeper = MagicMock()
+        scheduler.forward_ct = 0
+        scheduler.recompile_stance_set = False
         return scheduler
 
     def test_async_shm_entries_block_idle_until_drained(self):

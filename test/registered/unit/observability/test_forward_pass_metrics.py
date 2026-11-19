@@ -745,6 +745,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 # No unified pool: nothing keeps freed pages on the forward.
                 receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
+                # The CUDA path: forward/copy/schedule streams buy overlap.
+                receiver.use_overlap_streams = True
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
                 receiver.schedule_stream = object()
@@ -1059,6 +1061,7 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
         )
+        self.scheduler.disagg_prefill_transfer_queue = []
         published = []
         self.scheduler.kv_events_publisher.emit_kv_metrics.side_effect = lambda: (
             published.append(

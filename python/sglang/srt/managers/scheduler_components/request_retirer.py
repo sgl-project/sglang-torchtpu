@@ -106,13 +106,12 @@ class RequestRetirer:
             # No-op once the group retired; member rows are not freed here.
             self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
-        if defer_kv_release:
-            return
-        # HiSparse clears its mapping of the row before the row is freed.
-        if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.release_request(req)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        if not defer_kv_release:
+            self._release_kv(req, checkpoint=checkpoint)
+
+    def release_deferred_kv(self, req: Req) -> None:
+        """Free the KV pages a `release` with ``defer_kv_release`` kept."""
+        self._release_kv(req, checkpoint=False)
 
     def retract(
         self,
@@ -178,6 +177,13 @@ class RequestRetirer:
         """Take a released request out of the list holding its final output;
         its release already recorded the exit."""
         _leave_owner_list(req)
+
+    def _release_kv(self, req: Req, *, checkpoint: bool) -> None:
+        # HiSparse clears its mapping of the row before the row is freed.
+        if req.kv.holds_kv and self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.release_request(req)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its

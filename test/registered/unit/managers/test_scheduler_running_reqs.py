@@ -117,7 +117,7 @@ def _scheduler():
     s._record_step_counters = Mock()
     s.enable_fpm = False
     s._maybe_clear_mm_inputs = Mock()
-    s.maybe_send_health_check_signal = Mock()
+    s.health_monitor = MagicMock()
     return s
 
 
@@ -409,6 +409,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s._tpu_pp_chunk_cost = None
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)

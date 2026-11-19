@@ -170,25 +170,24 @@ class TestHiCacheAutoSize(CustomTestCase):
                 sizing.auto_size_hicache(None, None, enabled=True),
             ):
                 memory = get_memory()
-                host = MHATokenToKVPoolHost(
-                    pool,
-                    memory.hicache_ratio,
-                    memory.hicache_size,
-                    2,
-                    "layer_first",
-                    pin_memory=False,
-                    device="cpu",
-                )
+
+                def build_host():
+                    return MHATokenToKVPoolHost(
+                        pool.get_device_pool_infos()[0].buffer_info,
+                        memory.hicache_ratio,
+                        memory.hicache_size,
+                        2,
+                        "layer_first",
+                        pin_memory=False,
+                        device="cpu",
+                        device_capacity_tokens=pool.size,
+                        start_layer=pool.start_layer,
+                        end_layer=pool.end_layer,
+                    )
+
+                host = build_host()
                 self.assertEqual(host.size, 258)
-                second = MHATokenToKVPoolHost(
-                    pool,
-                    memory.hicache_ratio,
-                    memory.hicache_size,
-                    2,
-                    "layer_first",
-                    pin_memory=False,
-                    device="cpu",
-                )
+                second = build_host()
                 self.assertEqual(second.size, 258)
                 self.assertIsNone(base._host_memory_budget.get())
             self.assertIsNone(base._host_memory_budget.get())
@@ -268,6 +267,12 @@ class TestHiCacheAutoSize(CustomTestCase):
     def test_register_sizeable_pool_enables_custom_pool_and_is_idempotent(self):
         class _CustomDevicePool:
             host_capacity_bytes = None
+            start_layer, layer_num = 0, 1
+
+            @property
+            def layer_router(self):
+                # One sub-pool that is its own view: sized as a leaf pool.
+                return PlainPoolRouter(self, IdSpaceKind.FULL)
 
             def get_kv_size_bytes(self) -> int:
                 return 8192
@@ -275,7 +280,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         pool = _CustomDevicePool()
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=pool)),
             page_size=2,
         )

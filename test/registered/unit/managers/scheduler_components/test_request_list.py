@@ -73,10 +73,19 @@ def _fields_holding_requests(owner) -> set:
     return fields
 
 
+# Fields that hold requests outside a request list. It only shrinks.
+_NOT_LISTS = {
+    # TPU fork: PD prefill aborts the request retirer already released with
+    # defer_kv_release, held (no longer live) only until their KV sender
+    # drains and their pages are freed.
+    "Scheduler._deferred_chunked_sender_aborts",
+}
+
+
 class TestRequestHoldersAreLists(CustomTestCase):
     def test_every_field_holding_requests_is_a_request_list(self):
         fields = set().union(*map(_fields_holding_requests, _OWNERS))
-        self.assertEqual(fields, set())
+        self.assertEqual(fields, _NOT_LISTS)
 
 
 _REPO = pathlib.Path(sglang.srt.__path__[0]).parents[2]

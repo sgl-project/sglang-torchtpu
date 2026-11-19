@@ -52,6 +52,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._use_triton_prepare_block = False
         worker._mask_token_id = 2
         worker._full_embed_gpu = None
+        worker._embed_module = None
         worker._noise_embed_scale = 1.0
         worker.use_compact_draft_cache = False
         worker.draft_kv_ring = None
@@ -68,6 +69,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             seq_lens=torch.tensor([3]),
             seq_lens_cpu=torch.tensor([3]),
             req_pool_indices=torch.tensor([0]),
+            req_pool_indices_cpu=None,
         )
         for allowed in (False, True):
             batch.can_run_decode_cuda_graph = allowed

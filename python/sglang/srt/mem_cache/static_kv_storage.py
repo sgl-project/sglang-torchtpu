@@ -1031,8 +1031,9 @@ def _static_state_entries(
         router = token_to_kv_pool.layer_router
         has_window_sub_pool = router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
         # A pool with a sliding-window sub-pool describes its window state here,
-        # and so does DeepSeek-V4's, its heterogeneous state list per entry.
-        if has_window_sub_pool or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        # and so does every other SWA pool (DeepSeek-V4's heterogeneous state
+        # list per entry, or a pool whose window shares the full pool's buffers).
+        if has_window_sub_pool or isinstance(token_to_kv_pool, BaseSWAKVPool):
             swa_kv_layout = None
             if has_window_sub_pool and isinstance(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool

@@ -1628,6 +1628,11 @@ class RaidenKVReceiver(CommonKVReceiver):
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
 
+    def _register_kv_args(self) -> bool:
+        # Raiden peers exchange KV layouts through their raiden handshake, not
+        # through a per-receiver registration message on the bootstrap socket.
+        return True
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],

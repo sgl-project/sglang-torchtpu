@@ -25,6 +25,7 @@ class TestTeaCache(CustomTestCase):
             num_inference_steps=5,
             do_classifier_free_guidance=True,
             is_cfg_negative=False,
+            extra={},
         )
         self.server_args = SimpleNamespace(enable_cfg_parallel=False)
         server_args_patch = patch(

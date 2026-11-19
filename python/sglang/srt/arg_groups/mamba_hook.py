@@ -105,10 +105,10 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 
 def _platform_supports_mamba_cache_extra_buffer() -> bool:
-    if current_platform.supports_mamba_extra_buffer:  # TPU
-        return True
     if current_platform.is_out_of_tree():
         return current_platform.support_mamba_cache_extra_buffer()
+    if current_platform.supports_mamba_extra_buffer:  # in-tree TPU
+        return True
     platform = get_platform()
     return (
         platform.is_cuda

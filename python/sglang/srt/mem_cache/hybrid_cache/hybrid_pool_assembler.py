@@ -37,7 +37,10 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    get_mha_host_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
     reserve_dsv4_paged_host_memory,
@@ -126,13 +129,8 @@ def _device_capacity_tokens(pool) -> int:
 
 
 def _mha_host_inputs(pool, info, drafts=()):
-    # The MHA host-pool class is a platform decision (TPU substitutes its
-    # fused/raiden host pools); the platform default delegates to
-    # get_mha_host_pool_cls.
-    from sglang.srt.platforms import current_platform
-
     return (
-        current_platform.get_mha_kv_pool_host_cls(pool),
+        get_mha_host_pool_cls(info),
         dict(
             device_capacity_tokens=_device_capacity_tokens(pool),
             start_layer=pool.start_layer,
@@ -145,6 +143,39 @@ def _mha_host_inputs(pool, info, drafts=()):
     )
 
 
+def _device_pool_host_cls(pool) -> Optional[type]:
+    # A platform host pool built from the device pool itself (TPU's fused
+    # pages), for a layout no buffer info describes.
+    from sglang.srt.platforms import current_platform
+
+    return current_platform.get_device_pool_kv_host_cls(pool)
+
+
+def _build_device_pool_host(
+    host_cls: type,
+    pool: Any,
+    *,
+    host_to_device_ratio: float,
+    host_size: float,
+    page_size: int,
+    layout: str,
+    allocator_type: str,
+    pool_label: str,
+    drafts: tuple[Any, ...] = (),
+):
+    kwargs = {"mtp_draft_device_pools": tuple(drafts)} if drafts else {}
+    return host_cls(
+        pool,
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=host_size,
+        page_size=page_size,
+        layout=layout,
+        allocator_type=allocator_type,
+        pool_label=pool_label,
+        **kwargs,
+    )
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -153,6 +184,19 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    device_pool_host_cls = _device_pool_host_cls(kv_pool)
+    if device_pool_host_cls is not None:
+        return _build_device_pool_host(
+            device_pool_host_cls,
+            kv_pool,
+            host_to_device_ratio=get_memory().hicache_ratio,
+            host_size=get_memory().hicache_size if host_size is None else host_size,
+            page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label=pool_label,
+            drafts=mtp_draft_device_pools,
+        )
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
@@ -282,11 +326,21 @@ def _build_cache_controller(
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
     kv_storage=None,
-    cache_controller_cls: type = HybridCacheController,
+    cache_controller_cls: Optional[type] = None,
 ) -> HybridCacheController:
     memory = get_memory()
-    # The io backend may need its own controller class (a TPU DMA backend).
-    return cache_controller_cls.create_for_backend(
+    from sglang.srt.platforms import current_platform
+
+    # A strategy's own controller class, else the io backend's (a platform may
+    # need its own), else the in-tree controller.
+    if cache_controller_cls is not None:
+        make_controller = cache_controller_cls.create_for_backend
+    else:
+        make_controller = (
+            current_platform.get_hybrid_cache_controller_cls(memory.hicache_io_backend)
+            or HybridCacheController
+        )
+    return make_controller(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,
@@ -430,18 +484,32 @@ def _draft_swa_entry(
     # from full attention. Use a separate host pool with KV indices instead of
     # packing their bytes into either target pool.
     first, *rest = drafts
-    host_input = first.get_device_pool_infos()[0].buffer_info
-    host_cls, host_kwargs = _mha_host_inputs(first, host_input, tuple(rest))
-    draft_host_pool = host_cls(
-        host_input,
-        host_to_device_ratio=kv_host_pool.size / first.size,
-        host_size=0,
-        page_size=page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        **host_kwargs,
-        pool_label="draft_swa",
-    )
+    device_pool_host_cls = _device_pool_host_cls(first)
+    if device_pool_host_cls is not None:
+        draft_host_pool = _build_device_pool_host(
+            device_pool_host_cls,
+            first,
+            host_to_device_ratio=kv_host_pool.size / first.size,
+            host_size=0,
+            page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft_swa",
+            drafts=tuple(rest),
+        )
+    else:
+        host_input = first.get_device_pool_infos()[0].buffer_info
+        host_cls, host_kwargs = _mha_host_inputs(first, host_input, tuple(rest))
+        draft_host_pool = host_cls(
+            host_input,
+            host_to_device_ratio=kv_host_pool.size / first.size,
+            host_size=0,
+            page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            **host_kwargs,
+            pool_label="draft_swa",
+        )
     return build_pool_entry(
         name=PoolName.DRAFT_SWA,
         host_pool=draft_host_pool,
@@ -1211,7 +1279,7 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
     kv_host_pool_fn: Optional[Callable[..., Any]] = None,
     mamba_host_pool_fn: Optional[Callable[..., Any]] = None,
-    cache_controller_cls: type = HybridCacheController,
+    cache_controller_cls: Optional[type] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
     """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
     then the Mamba state pool, which keeps its own host path.
@@ -1727,12 +1795,26 @@ def _build_mha_mla_host_pool(
     dcp_size: int = 1,
     dcp_rank: int = 0,
 ):
-    is_mha = isinstance(buffer_info, MHABufferInfo)
+    # A platform host pool built from the device pool (TPU's fused MHA pages)
+    # has no buffer info, so ask before reading buffer_info's kind.
+    device_pool_host_cls = _device_pool_host_cls(pool)
+    is_mha = isinstance(buffer_info, MHABufferInfo) or device_pool_host_cls is not None
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
     if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
         layout = "page_first_direct"
+    if device_pool_host_cls is not None:
+        return _build_device_pool_host(
+            device_pool_host_cls,
+            pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0,
+            page_size=page_size,
+            layout=layout,
+            allocator_type=allocator_type,
+            pool_label=pool_label,
+        )
 
     kwargs = dict(
         host_to_device_ratio=host_to_device_ratio,
@@ -2185,7 +2267,7 @@ class MambaStrategy(StackStrategy):
     # subclasses this and overrides the three host-stack factories.
     kv_host_pool_fn: Optional[Callable[..., Any]] = None
     mamba_host_pool_fn: Optional[Callable[..., Any]] = None
-    cache_controller_cls: type = HybridCacheController
+    cache_controller_cls: Optional[type] = None
 
     def matches(self, kvcache, components):
         return kvcache.layer_router.wrapped_view() is not None and components == {

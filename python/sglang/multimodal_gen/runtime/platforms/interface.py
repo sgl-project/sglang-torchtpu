@@ -589,6 +589,17 @@ class Platform:
         return True
 
     @classmethod
+    def runs_dit_attention_eager_under_compile(cls) -> bool:
+        """Whether a compiled DiT block runs its attention section eager.
+
+        True where the fused attention kernels are untraceable and the
+        traceable fallback is slower than eager. A platform whose attention
+        traces into the compiled program returns False to keep one program
+        per block.
+        """
+        return True
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True

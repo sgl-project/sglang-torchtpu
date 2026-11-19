@@ -25,7 +25,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.logprob_processor import input_logprob_chunk_bounds
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.plugins.hook_registry import HookType, _wrap_fn
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import (

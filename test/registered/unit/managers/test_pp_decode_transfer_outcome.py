@@ -35,6 +35,7 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
         ),
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
+        _pp_wave=None,
     )
 
 
@@ -198,6 +199,7 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
             ),
             enable_hisparse=False,
             waiting_queue=IndexedReqList(ListKind.WAITING),
+            _pp_wave=None,
         )
         forwarded = SchedulerPPMixin.process_decode_transfer_queue(
             scheduler, {"s": False, "f": True, "h": False}

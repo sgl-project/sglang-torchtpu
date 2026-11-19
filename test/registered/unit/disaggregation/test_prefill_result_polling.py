@@ -1506,6 +1506,7 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                 reqs=[req],
                 add_inflight_step=Mock(),
                 hicache_consumer_index=consumer_index,
+                hicache_load_page_ids=None,
                 extend_num_tokens=32,
                 forward_mode=SimpleNamespace(
                     is_prebuilt=lambda: False, is_extend=lambda: True

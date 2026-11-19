@@ -236,12 +236,9 @@ class GlmFlashMegakernel:
             "nope": [self._pool.get_nope_cache(L) for L in spec.dsa_layers],
             "raw": [self._pool.get_kpool_raw_cache(L) for L in spec.dsa_layers],
             "records": [self._pool.get_index_key_cache(L) for L in spec.dsa_layers],
-            "temporal": [
-                self._req_pool.mamba2_layer_cache(L).temporal for L in spec.kda_layers
-            ],
-            "conv": [
-                self._req_pool.mamba2_layer_cache(L).conv[0] for L in spec.kda_layers
-            ],
+            # The tensors the TPU KDA backend itself reads for each layer.
+            "temporal": [self._lin._layer_state(L).temporal for L in spec.kda_layers],
+            "conv": [self._lin._layer_state(L).conv[0] for L in spec.kda_layers],
         }
         self.pool_list = [p for n in R.POOL_ORDER for p in self.pools[n]]
         k_scales = []
@@ -356,7 +353,7 @@ class GlmFlashMegakernel:
         mamba = self._mamba
         return dict(
             slot_map=self._req_pool.req_index_to_mamba_index_mapping,
-            v2p=self._req_pool.mamba_v2p_table,
+            v2p=self._lin._state_ids.read_v2p,
             read_offsets=mamba.checkpoint_read_offsets,
             window_start=mamba.window_start or 0,
             checkpoint_width=mamba.checkpoint_width,

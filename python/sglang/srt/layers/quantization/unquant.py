@@ -1538,7 +1538,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         """Restore canonical destinations for loader-free P2P/RDMA refits."""
         # TPU: the FusedMoE weight loader writes SGLang's (num_experts, n, k) layout, so a
         # reload first undoes process_weights_after_loading's gmm_v2 layout and padding
-        pad = layer.tpu_gmm_pad
+        pad = getattr(layer, "tpu_gmm_pad", None)
         if pad is not None:
             _swap_expert_weight_layout(layer)
             if pad:

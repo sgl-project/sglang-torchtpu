@@ -213,7 +213,9 @@ def test_shared_tp_spans_pcp_without_crossing_dp_or_pp(tp, cp, dp, pp, shared):
         )
         stack.enter_context(
             patch.object(
-                parallel_state, "get_world_group", return_value=Mock(local_rank=0)
+                parallel_state,
+                "get_world_group",
+                return_value=Mock(local_rank=0, world_size=tp * pp),
             )
         )
         publish_build_topology(
@@ -504,6 +506,7 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world = Mock()
             mock_world.device_group = Mock()
             mock_world.local_rank = 0
+            mock_world.world_size = world_size
             mock_world_group.return_value = mock_world
 
             publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)

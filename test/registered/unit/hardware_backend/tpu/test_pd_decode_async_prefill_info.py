@@ -33,7 +33,11 @@ def _queue(executor, max_retries=15, prefill_info_table=None):
 
 
 def _req():
-    return SimpleNamespace(req=SimpleNamespace(rid="r"), kv_receiver=MagicMock())
+    return SimpleNamespace(
+        req=SimpleNamespace(rid="r"),
+        kv_receiver=MagicMock(),
+        awaiting_prefill_dp_rank=True,
+    )
 
 
 class TestAsyncPrefillInfo(CustomTestCase):
@@ -45,26 +49,20 @@ class TestAsyncPrefillInfo(CustomTestCase):
         req = _req()
 
         for _ in range(3):
-            self.assertEqual(
-                tpu._ensure_prefill_info(queue, {ADDR: [req]}), ({}, [req])
-            )
+            self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), {})
         executor.submit.assert_called_once_with(
             queue.kv_manager.try_ensure_parallel_info, ADDR
         )
 
         fetch.set_result(True)
-        self.assertEqual(
-            tpu._ensure_prefill_info(queue, {ADDR: [req]}), ({ADDR: [req]}, [])
-        )
+        self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), {ADDR: [req]})
 
     def test_cached_info_resolves_without_a_fetch(self):
         executor = MagicMock()
         queue = _queue(executor, prefill_info_table={ADDR: object()})
         req = _req()
 
-        self.assertEqual(
-            tpu._ensure_prefill_info(queue, {ADDR: [req]}), ({ADDR: [req]}, [])
-        )
+        self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), {ADDR: [req]})
         executor.submit.assert_not_called()
 
     def test_aborts_after_failed_fetches(self):
@@ -81,13 +79,14 @@ class TestAsyncPrefillInfo(CustomTestCase):
 
         # Each attempt takes two passes: submit, then collect the failed result.
         for _ in range(3):
-            self.assertEqual(
-                tpu._ensure_prefill_info(queue, {ADDR: [req]}), ({}, [req])
-            )
+            self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), {})
         req.kv_receiver.abort.assert_not_called()
+        self.assertTrue(req.awaiting_prefill_dp_rank)
 
-        self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), ({}, []))
+        self.assertEqual(tpu._ensure_prefill_info(queue, {ADDR: [req]}), {})
         req.kv_receiver.abort.assert_called_once_with()
+        # Upstream drops an aborted request from the DP-rank wait the same way.
+        self.assertFalse(req.awaiting_prefill_dp_rank)
 
     def test_reraises_config_mismatch(self):
         fetch = Future()
@@ -124,6 +123,13 @@ class TestInstall(CustomTestCase):
         self.assertIn("def _ensure_prefill_info", source)
         self.assertIn(
             "self.kv_manager.try_ensure_parallel_info(bootstrap_addr)", source
+        )
+        # The replacement returns the ready-addr dict the caller iterates.
+        self.assertIn(
+            "ready_addrs = self._ensure_prefill_info(addr_to_reqs)\n\n"
+            "        resolved: List[Tuple[DecodeRequest, int]] = []\n"
+            "        for bootstrap_addr, decode_reqs in ready_addrs.items():",
+            source,
         )
 
 

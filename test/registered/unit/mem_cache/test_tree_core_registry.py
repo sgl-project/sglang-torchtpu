@@ -519,7 +519,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.override(enabled),
             ):
                 params = _cache_init_params()
-                params.tree_components = components
+                params.tree_slots = tree_slots_of(components)
                 self.assertEqual(select_tree_core_backend(params), expected)
 
     def test_final_window_demotion_and_cap_use_python_for_swa_caches(self):
@@ -533,7 +533,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             flag.clear()
         swa = (ComponentType.FULL, ComponentType.SWA)
         params = _cache_init_params()
-        params.tree_components = swa
+        params.tree_slots = tree_slots_of(swa)
         self.assertIsNone(tree_core_registry._rust_fallback_reason(params))
         self.assertEqual(select_tree_core_backend(params), "rust")
         for flag in flags:
@@ -549,7 +549,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                     flag.override(enabled),
                 ):
                     params = _cache_init_params()
-                    params.tree_components = components
+                    params.tree_slots = tree_slots_of(components)
                     self.assertEqual(
                         tree_core_registry._rust_fallback_reason(params),
                         (

@@ -41,15 +41,33 @@ def _dflash_draw(monkeypatch):
     )
 
     def draw():
-        return dflash_mod.DFlashWorkerV2._accept_block(
-            worker,
-            candidates=torch.tensor([[9, 1, 2, 3]]),
-            next_token_logits=torch.zeros(1, 4, 8),
-            sampling_info=SimpleNamespace(is_all_greedy=True),
-            draft_input=object(),
-            prefix_lens=torch.tensor([3]),
-            bs=1,
-        )[1].item()
+        candidates = torch.tensor([[9, 1, 2, 3]])
+        next_token_logits = torch.zeros(1, 4, 8)
+        accept_len, commit_lens, bonus, out_tokens, _, target_predict = (
+            dflash_mod.DFlashWorkerV2._accept_block(
+                worker,
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                draft_input=object(),
+                prefix_lens=torch.tensor([3]),
+            )
+        )
+        # The fork's verify forces the lengths after the (bucketed) accept, as here.
+        dflash_mod.apply_dflash_simulated_acceptance(
+            candidates=candidates,
+            target_predict=target_predict,
+            accept_len=accept_len,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            out_tokens=out_tokens,
+            simulate_acc_len=dflash_mod.SIMULATE_ACC_LEN,
+            simulate_acc_method=dflash_mod.SIMULATE_ACC_METHOD,
+            simulate_acc_token_mode=dflash_mod.SIMULATE_ACC_TOKEN_MODE,
+            next_token_logits=next_token_logits,
+            generator=worker._simulated_acc_len_rng,
+        )
+        return commit_lens.item()
 
     return draw
 

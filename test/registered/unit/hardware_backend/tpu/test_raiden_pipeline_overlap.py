@@ -968,6 +968,8 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     in-flight queue's release consensus, which needs every stage drained."""
     from sglang.srt.disaggregation import prefill
     from sglang.srt.managers import scheduler
+    from sglang.srt.managers.scheduler_components import request_retirer
+    from sglang.test.scheduler_test_utils import release_only_retirer
 
     w = staged
     claim_without_landing(w)
@@ -986,7 +988,7 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     sender.abort = lambda: s.manager._aborted.update({ROOM: time.time()})
     sender.clear = lambda: None
     released = []
-    for module in (prefill, scheduler):
+    for module in (prefill, request_retirer):
         monkeypatch.setattr(
             module, "release_kv_cache", lambda req, *a, **k: released.append(req)
         )
@@ -1000,7 +1002,10 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     sched.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
     sched.hisparse_coordinator = None
     # Releases with defer_kv_release keep the pages for the drain to free.
-    sched.request_retirer = SimpleNamespace(release=lambda req, **kwargs: None)
+    sched.request_retirer = SimpleNamespace(
+        release=lambda req, **kwargs: None,
+        release_deferred_kv=release_only_retirer(sched.tree_cache).release_deferred_kv,
+    )
     sched.scheduler_stage_metrics = None
     req = SimpleNamespace(
         rid="r",

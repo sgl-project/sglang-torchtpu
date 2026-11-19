@@ -1789,11 +1789,12 @@ class TestHiCacheReloadGate(CustomTestCase):
                 expert_distribution_metrics=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
+                kv_weight_version_record=None,
             )
 
         worker = SimpleNamespace(
             hicache_layer_transfer_counter=counter,
-            model_runner=SimpleNamespace(forward=model_forward),
+            model_runner=SimpleNamespace(forward=model_forward, forward_observer=None),
             pp_group=SimpleNamespace(is_last_rank=True),
             is_dllm=lambda: False,
         )

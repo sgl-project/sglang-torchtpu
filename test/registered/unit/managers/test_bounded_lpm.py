@@ -127,7 +127,7 @@ class TestBoundedLPM(CustomTestCase):
         s.tree_cache = s.policy.tree_cache
         with patch(
             "sglang.srt.managers.scheduler.get_parallel",
-            return_value=SimpleNamespace(tp_size=1),
+            return_value=SimpleNamespace(tp_size=1, dp_rank=None),
         ):
             s.init_running_status()
         s.enable_hierarchical_cache = False

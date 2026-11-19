@@ -187,7 +187,7 @@ class TestPlatformKVCacheDtype(CustomTestCase):
             swa_qk_rope_head_dim=8,
         )
         configurator.layer_info = SimpleNamespace(
-            full_attention_layer_ids=[0], swa_attention_layer_ids=[1]
+            start_layer=0, full_attention_layer_ids=[0], swa_attention_layer_ids=[1]
         )
         with (
             patch.object(kcc, "current_platform", platform),
@@ -250,6 +250,8 @@ def _configurator(*, kv_cache_dtype_str):
 def _platform(**pool_classes):
     platform = MagicMock()
     platform.get_kv_pool_cls.side_effect = lambda *, kind: pool_classes.get(kind)
+    # A generic platform; the fork's in-tree TPU pool branch keys on is_tpu().
+    platform.is_tpu.return_value = False
     return platform
 
 

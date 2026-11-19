@@ -1965,11 +1965,16 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.has_window_pool = True
         self.mock_token_allocator.swa_req_ring = ring
         self.mock_token_allocator.swa_ring_cost_tokens = 4096
-        self.mock_token_allocator.create_prefill_budget.side_effect = (
-            lambda tree_cache, **kwargs: SWAPrefillBudget(
-                self.mock_token_allocator, tree_cache, **kwargs
-            )
-        )
+
+        def create_budget(tree_cache, **kwargs):
+            budget = SWAPrefillBudget(self.mock_token_allocator, tree_cache, **kwargs)
+            # These cases size the pool by upstream's offsetting chunk charge;
+            # the fork's additive charge (see the TODO in
+            # test_swa_budget_for_req) is covered there.
+            budget.additive_chunk = False
+            return budget
+
+        self.mock_token_allocator.create_prefill_budget.side_effect = create_budget
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_tree_cache.sliding_window_size = 1024
         self.mock_tree_cache.supports_mamba.return_value = False

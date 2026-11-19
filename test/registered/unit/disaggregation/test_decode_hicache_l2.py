@@ -259,6 +259,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                 batch = SimpleNamespace(
                     reqs=[req],
                     device="cpu",
+                    metadata_device=lambda: "cpu",
                     req_to_token_pool=self.pool,
                     return_logprob=False,
                     model_config=SimpleNamespace(vocab_size=512),

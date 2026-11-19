@@ -575,7 +575,9 @@ def test_launch_checks_warmups_before_spawning_schedulers():
         patch.object(engine.Engine, "_launch_scheduler_processes") as spawn,
         pytest.raises(ValueError, match="refused --warmups"),
     ):
-        engine.Engine._launch_subprocesses(Mock(), Mock(), Mock(), Mock())
+        # A non-TPU device: the fork prepares the TPU environment before publish.
+        server_args = Mock(device="cpu", _resolved_overrides=())
+        engine.Engine._launch_subprocesses(server_args, Mock(), Mock(), Mock())
     spawn.assert_not_called()
 
 

@@ -240,10 +240,15 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
             get_kv_transfer_buf_infos,
             setup_state_kv_args,
         )
+        from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
         pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        # PD peers register a static pool through the storage the scheduler
+        # builds over its allocator (`kv_storage_of`).
+        allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+        storage = StaticKVStorage(None, allocator, num_hidden_layers=6)
 
-        kv_ptrs, kv_lens, kv_items = get_kv_transfer_buf_infos(pool)
+        kv_ptrs, kv_lens, kv_items = get_kv_transfer_buf_infos(storage)
         # 2 C4 NoPE + 2 C4 RoPE + 2 C4 Indexer + 2 C128 HCA = 8 full-page tensors
         self.assertEqual(len(kv_ptrs), 8)
         self.assertEqual(
@@ -255,7 +260,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         )
 
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, pool, total_kv_layers=6)
+        setup_state_kv_args(kv_args, storage, total_kv_layers=6)
         self.assertEqual(
             kv_args.state_types,
             [StateType.SWA, StateType.DSV4_REQUEST_STATE],
@@ -687,8 +692,8 @@ class TestDSV4TPUPatches(CustomTestCase):
         server_args = SimpleNamespace(
             device="tpu",
             model_path="/tmp/fake-dsv4",
+            # A fixture-supplied config carries no cache key and is used as is.
             _model_config=SimpleNamespace(hf_config=hf),
-            _model_config_built_from="/tmp/fake-dsv4",
         )
         prev_called = []
         with (
@@ -719,6 +724,7 @@ class TestDSV4TPUPatches(CustomTestCase):
 
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.hash_topk import HashTopK
+        from sglang.srt.runtime_context import get_context
         from sglang_tpu.hooks.dsv4 import (
             disable_tpu_dsv4_wo_a_fp8_gemm,
             forward_tpu_dsv4_hash_topk,
@@ -727,6 +733,11 @@ class TestDSV4TPUPatches(CustomTestCase):
             skip_tpu_dsv4_prewarm_mhc_kernels,
             tpu_dsv4_silu_and_mul_clamp,
         )
+
+        # HashTopK reads the published model config bag at construction.
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
 
         # 1. HashTopK hooks: int64 gather, float32 weights, out-of-place padded row mask
         topk = HashTopK(

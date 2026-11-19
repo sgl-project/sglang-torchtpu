@@ -1037,6 +1037,8 @@ def test_fast_path_commits_hasher_history_for_fallback_decode():
         is_decode=lambda: True,
         is_target_verify=lambda: False,
         is_extend=lambda: False,
+        # The merged EngramHasher checks is_idle() first.
+        is_idle=lambda: False,
     )
     fallback_fb = SimpleNamespace(
         forward_mode=decode_mode,

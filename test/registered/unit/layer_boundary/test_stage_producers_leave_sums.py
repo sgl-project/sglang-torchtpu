@@ -44,10 +44,17 @@ _BUILDS_STAGES = (
 
 # Producers whose stage declares output_complete: their computation completes
 # the stage output's sum. Kimi K3's latent MoE reduces the latent before its
-# norm and completes the shared experts' sum beside it.
+# norm and completes the shared experts' sum beside it. merged_moe_all_reduce
+# (SGLANG_K3_MERGE_MOE_ALLREDUCE) completes the same latent + shared pair in one
+# collective; it stays module-level so a platform can replace it.
 _COMPLETES_OWN_SUM = {
     "kimi_k3.py": frozenset(
-        {"_reduce_latent", "_reduce_shared", "_reduce_latent_and_shared"}
+        {
+            "_reduce_latent",
+            "_reduce_shared",
+            "_reduce_latent_and_shared",
+            "merged_moe_all_reduce",
+        }
     ),
 }
 

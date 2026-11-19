@@ -982,6 +982,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node is self.root_node or window is None:
             return result, ()
         window_priority = window.eviction_priority(is_leaf=False)
+        self._stamp_write_horizon(node)
         released = []
         for comp in reversed(self.components):
             ct = comp.component_type

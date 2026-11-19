@@ -73,6 +73,8 @@ class _Stage(SchedulerPPMixin):
     def __init__(self):
         self.device = "cpu"
         self.device_module = _Device()
+        # The CUDA path: forward/copy/schedule streams buy overlap.
+        self.use_overlap_streams = True
 
 
 def _batch():

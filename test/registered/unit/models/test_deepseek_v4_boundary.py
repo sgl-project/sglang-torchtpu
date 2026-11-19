@@ -268,7 +268,7 @@ class TestMoeSourceRows(unittest.TestCase):
         shared = torch.full((2, 3), 0.5)
         # A rank other than TP rank 0 adds the replicated shared output only
         # when no later sum would count it again.
-        parallel = SimpleNamespace(dwdp_size=1, tp_size=2, tp_rank=1)
+        parallel = SimpleNamespace(dwdp_size=1, tp_size=2, tp_rank=1, moe_dp_size=1)
         batch = SimpleNamespace(dp_padding_mode=None)
         for backend in (MoeA2ABackend.FLASHINFER_MEGAMOE, MoeA2ABackend.MEGAMOE):
             # The local finalize adds the shared output into routed in place.

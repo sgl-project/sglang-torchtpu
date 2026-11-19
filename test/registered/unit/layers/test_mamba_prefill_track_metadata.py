@@ -468,7 +468,10 @@ def make_verify_batch():
         ],
         req_pool_indices=torch.tensor([2, 0, 1]),
         req_to_token_pool=SimpleNamespace(
-            req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+            req_index_to_mamba_ping_pong_track_buffer_mapping=mapping,
+            # A device slot allocator takes the gather path these tests cover;
+            # the tensors stay on CPU.
+            mamba_pool=SimpleNamespace(slot_allocator_device="cuda"),
         ),
         mamba_lazy_spec_track_positions_cpu=[1, 0, 0],
         token_to_kv_pool_allocator=SimpleNamespace(

@@ -14,6 +14,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import os
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.test.test_utils import CustomTestCase
@@ -22,7 +23,6 @@ _ENV = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
 
 
 def _make_config(extra_config):
-    # tp_rank=1 so HiCacheFile does not create the storage dir as a side effect.
     return HiCacheStorageConfig(
         tp_rank=1,
         tp_size=1,
@@ -50,6 +50,11 @@ def _inject(file_storage_path, extra_config=None):
 class TestFileStoragePathRouting(CustomTestCase):
     def setUp(self):
         self._saved = os.environ.pop(_ENV, None)
+        # Every rank creates its storage dir (a multi-host node has no rank 0);
+        # keep these routing checks free of that side effect.
+        makedirs = patch("sglang.srt.mem_cache.hicache_storage.os.makedirs")
+        makedirs.start()
+        self.addCleanup(makedirs.stop)
 
     def tearDown(self):
         if self._saved is not None:

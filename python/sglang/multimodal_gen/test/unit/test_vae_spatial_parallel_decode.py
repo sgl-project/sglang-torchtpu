@@ -244,7 +244,14 @@ def _fill_halo_rows_on_two_ranks(rank: int, rendezvous: str) -> None:
         x = torch.randn(
             1, 5, 2, height, 4, generator=torch.Generator().manual_seed(rank)
         )
-        reference, _, _ = halo_exchange(x, 1, parallel_group=group)
+        # Both are the p2p exchanges, which gloo provides; a platform without
+        # p2p (TPU) would route the reference through the all-gather path.
+        with patch.object(
+            parallel_conv.current_platform,
+            "supports_distributed_p2p",
+            return_value=True,
+        ):
+            reference, _, _ = halo_exchange(x, 1, parallel_group=group)
         padded = torch.zeros(1, 5, 2, height + 2, 4)
         padded[..., 1:-1, :] = x
         fill_halo_rows_(padded, 1, parallel_group=group)

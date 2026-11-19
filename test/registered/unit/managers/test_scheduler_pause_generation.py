@@ -112,6 +112,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_batch = MagicMock()
@@ -826,7 +827,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         ) as retract_decode:
             self._retract_by_kv_full(scheduler, self._make_req("run"))
 
-        retract_decode.assert_called_once_with(draft_kv_pools=draft_pools)
+        retract_decode.assert_called_once_with(
+            scheduler.request_retirer, draft_kv_pools=draft_pools
+        )
 
     def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
         """Retraction must be refused on every rank, before any KV is freed, while any

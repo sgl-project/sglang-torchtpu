@@ -15,6 +15,7 @@ import torch.nn as nn
 
 import sglang.srt.speculative.dflash_worker_v2 as dflash_worker_mod
 import sglang.srt.speculative.spec_utils as spec_utils
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -207,8 +208,15 @@ def _create_dflash_worker_for_tpu(
     worker._selector_sample = None
     worker._draft_probs_buf = None
     # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
-    # draft_tp_context is a module function now; draft_owns_attention=False
-    # above makes it a null context.
+    # A layout with no draft TP group makes draft_tp_context a null context.
+    worker.draft_parallel_layout = DraftParallelLayout(tp_group=None, attn_tp_size=1)
+    # Defaults __init__ sets for features this fixture leaves off.
+    worker.draft_kv_ring = None
+    worker._simulated_acc_len_rng = None
+    worker._sharded_greedy_logits = False
+    worker._target_logits_processor = None
+    worker._block_verification = False
+    worker._draft_compact_page_size = 1
     worker._full_embed_gpu = None
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
@@ -467,6 +475,11 @@ def _make_schedule_batch(
         orig_seq_lens=None,
         out_cache_loc_dsv4=None,
         engram_history=None,
+        # Read after verify (HiSparse off here).
+        hisparse_coordinator=None,
+        # ForwardBatch.init_new reads these (ScheduleBatch defaults).
+        decoding_reqs=None,
+        engram_staged_rows=None,
         mamba_track_indices=None,
         mamba_track_mask=None,
         mamba_track_seqlens=None,
@@ -575,6 +588,9 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
             next_draft_input=None,
             speculative_num_draft_tokens=block_size,
             new_seq_lens=seq_lens_prefill,
+            # The target returns its prefill's write plan (return_iteration_ids);
+            # the draft writes its KV to the same slots.
+            iteration_ids=worker.model_runner.runner_ids.own_plan(prefill_batch),
         )
         worker._target_worker.forward_batch_generation.return_value = prefill_target_res
 
@@ -649,6 +665,7 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
             can_run_cuda_graph=False,
             routed_experts_output=None,
             indexer_topk_output=None,
+            kv_weight_version_record=None,
         )
 
         with _ForceTpuContext():
@@ -704,6 +721,7 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
             can_run_cuda_graph=False,
             routed_experts_output=None,
             indexer_topk_output=None,
+            kv_weight_version_record=None,
         )
 
         with _ForceTpuContext():
@@ -761,6 +779,7 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
             can_run_cuda_graph=False,
             routed_experts_output=None,
             indexer_topk_output=None,
+            kv_weight_version_record=None,
         )
 
         with _ForceTpuContext():

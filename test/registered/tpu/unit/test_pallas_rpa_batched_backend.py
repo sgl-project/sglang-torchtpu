@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_batched import (
     PallasForwardMetadata,

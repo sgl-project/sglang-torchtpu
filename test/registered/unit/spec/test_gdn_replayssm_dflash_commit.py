@@ -8,6 +8,7 @@ goes through the same ring commit as the generic spec commit.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
+    MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import (
     _validate_gdn_target_verify_layout,
@@ -96,6 +98,10 @@ def _hybrid_backend(mamba_pool, spec_state, cache_indices, track_slots=None):
         # The ring rows the verify resolved; on static pools, the request rows.
         ring_rows=None,
         accept_lens_pool=None,
+        # The stock snapshot scatter; it reads nothing off the backend.
+        commit_verified_states=partial(
+            MambaAttnBackendBase.commit_verified_states, None
+        ),
         token_to_kv_pool=SimpleNamespace(
             layer_router=SimpleNamespace(part_view=lambda part: None)
         ),

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import base as pool_host_base
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1915,13 +1916,16 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
         queue.token_to_kv_pool_allocator = alloc
         self.assertTrue(queue._uses_swa_tail_prealloc())
 
+        # PD peers register through the storage the scheduler builds over the
+        # allocator.
+        storage = kv_storage_of(req_pool, alloc)
         kv_args = KVArgs()
         (
             kv_args.kv_data_ptrs,
             kv_args.kv_data_lens,
             kv_args.kv_item_lens,
-        ) = get_kv_transfer_buf_infos(pool)
-        setup_state_kv_args(kv_args, pool)
+        ) = get_kv_transfer_buf_infos(storage)
+        setup_state_kv_args(kv_args, storage)
         self.assertEqual(
             (kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens),
             pool.kv_pool.get_contiguous_buf_infos(),

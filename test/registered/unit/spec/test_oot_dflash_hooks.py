@@ -110,7 +110,7 @@ class TestOOTDFlashHooks(CustomTestCase):
 
     def test_dp_attention_needs_npu_or_a_platform_opt_in(self):
         for device, opts_in, error in (
-            ("custom", False, "does not support dp attention"),
+            ("custom", False, "dp attention requires CUDA or NPU"),
             ("custom", True, "requires setting --speculative-draft-model-path"),
             ("npu", False, "requires setting --speculative-draft-model-path"),
         ):

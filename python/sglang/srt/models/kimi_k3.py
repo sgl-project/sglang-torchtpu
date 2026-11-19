@@ -156,7 +156,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, is_tpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
@@ -168,6 +168,7 @@ logger = logging.getLogger(__name__)
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_tpu = is_tpu()
@@ -3635,9 +3636,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if not (_is_hip or _is_npu):
+        if _is_cuda:
             # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
-            # module level; neither ships on ROCm or Ascend NPU.
+            # module level; only CUDA ships them.
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 register_tgv_m_ranges,
             )

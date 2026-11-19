@@ -2398,7 +2398,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         self.assertIs(spec_input.future_indices, future_indices)
         self.assertFalse(spec_input.future_dsa_topk_indices_available)
 
-    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
+    @patch("sglang.srt.speculative.spec_utils.gather_spec_extras_func")
     def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
         future_map = object.__new__(FutureMap)
         future_map._deferred_relay = None

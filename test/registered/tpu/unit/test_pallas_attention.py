@@ -108,10 +108,24 @@ class TestSupportTritonPatch(CustomTestCase):
     like non-Triton backends (no Triton driver exists on TPU)."""
 
     def test_pallas_tpu_is_non_triton_after_patch(self):
-        import sglang.srt.utils.common as uc
+        from unittest.mock import patch
+
+        import sglang.srt.utils.triton_utils as uc
+        from sglang.srt.platforms.interface import PlatformCapabilities
         from sglang_tpu.patches import (
             _patch_support_triton_for_tpu,
         )
+
+        # support_triton also requires a Triton-capable platform (TPU is not
+        # one, so it is False there regardless); simulate one so the patch's
+        # own allowlist effect is what is checked.
+        triton_platform = patch.object(
+            uc.current_platform,
+            "capabilities",
+            PlatformCapabilities(supports_triton=True),
+        )
+        triton_platform.start()
+        self.addCleanup(triton_platform.stop)
 
         # Before: stock allowlist treats an unknown name as Triton-capable.
         self.assertTrue(uc.support_triton("pallas_tpu_flash"))

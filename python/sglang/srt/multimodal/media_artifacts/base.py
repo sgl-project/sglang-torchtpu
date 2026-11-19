@@ -206,8 +206,12 @@ class MediaArtifactCacheMixin:
             )
         try:
             return snapshot_media(source)
-        except requests.exceptions.RequestException as error:
-            raise _media_fetch_error(source, error) from error
+        except ValueError as error:
+            # snapshot_media wraps a failed download with the requests text.
+            cause = error.__cause__
+            if isinstance(cause, requests.exceptions.RequestException):
+                raise _media_fetch_error(source, cause) from cause
+            raise
 
     def prepare_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]

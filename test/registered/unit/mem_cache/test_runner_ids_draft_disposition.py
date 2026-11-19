@@ -364,6 +364,11 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
         )
+        worker._append_target_hidden_to_draft_kv_by_loc_prepare_inputs = lambda *a: (
+            DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
+                worker, *a
+            )
+        )
 
         self.assertIsNone(
             DFlashWorkerV2._draft_write_ids(worker, plan, IdSpaceKind.SLIDING_WINDOW)

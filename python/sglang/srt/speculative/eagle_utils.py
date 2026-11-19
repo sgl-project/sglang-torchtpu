@@ -1661,9 +1661,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             )
             # Bookkeeping that alloc_for_spec_decode does for the device path.
             for i, req in enumerate(batch.reqs):
-                req.kv.kv_allocated_len = max(
-                    req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i])
-                )
+                req.kv.allocate_spec_decode(int(nxt_kv_lens_cpu[i]))
         else:
             # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
             # barrier has chained to the prev forward -> host stalls a full forward.

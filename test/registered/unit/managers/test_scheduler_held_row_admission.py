@@ -55,7 +55,9 @@ class _Adder(PrefillAdder):
     def budget_state(self):
         return AddReqResult.CONTINUE
 
-    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+    def add_one_req(
+        self, req, has_chunked_req, truncation_align_size, chunk_tokens_cap=None
+    ):
         self.can_run_list.append(req)
         return AddReqResult.CONTINUE
 
@@ -98,6 +100,7 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: adder_class
+        s._tpu_pp_chunk_cost = None
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(

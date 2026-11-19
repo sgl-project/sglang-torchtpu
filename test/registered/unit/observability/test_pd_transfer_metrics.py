@@ -12,10 +12,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
-from sglang.srt.managers.scheduler_components.request_list import (
-    IndexedReqList,
-    ListKind,
-)
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.observability.metrics_collector import (
     QueueCount,
     SchedulerMetricsCollector,
@@ -23,6 +20,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import decode_queue
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -50,9 +48,7 @@ class TestPDTransferMetrics(CustomTestCase):
 
     @staticmethod
     def _decode_transfer_list(decode_reqs):
-        queue = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda d: d.req)
-        queue._join(decode_reqs)
-        return queue
+        return decode_queue(ListKind.PD_RECEIVING, decode_reqs)
 
     def set_queue(self, mode, times):
         self.reporter.scheduler.disaggregation_mode = mode

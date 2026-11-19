@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -228,6 +229,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         model_runner=SimpleNamespace(
             watermark_state=None,
             attn_backend=SimpleNamespace(verify_mask=None),
+            compile_policy=NoopCompilePolicy(),
         ),
     )
     with (
@@ -236,7 +238,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         patch.object(
             eagle_worker_common,
             "eagle_prepare_for_verify",
-            return_value=(SimpleNamespace(), True),
+            return_value=(SimpleNamespace(spec_info=SimpleNamespace()), True),
         ),
     ):
         eagle_worker_common.run_eagle_verify(

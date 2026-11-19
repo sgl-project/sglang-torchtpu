@@ -153,6 +153,7 @@ class TestAllPPLoras(CustomTestCase):
             enable_priority_preemption=False,
             is_hybrid_swa=False,
             chunked_reqs=IndexedReqList(ListKind.CHUNKED),
+            _tpu_pp_chunk_cost=None,
             min_free_slots_delayer=None,
             is_mixed_chunk=False,
             dllm_config=None,

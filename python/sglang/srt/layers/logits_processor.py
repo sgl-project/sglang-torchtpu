@@ -463,7 +463,6 @@ class LogitsMetadata:
             in (
                 ForwardMode.EXTEND,
                 ForwardMode.MIXED,
-                ForwardMode.SPLIT_PREFILL,
                 ForwardMode.DLLM_EXTEND,
             )
             and forward_batch.return_logprob
@@ -1043,7 +1042,6 @@ class LogitsProcessor(nn.Module):
                 ForwardMode.EXTEND,
                 ForwardMode.MIXED,
                 ForwardMode.TARGET_VERIFY,
-                ForwardMode.SPLIT_PREFILL,
                 ForwardMode.DLLM_EXTEND,
             )
             and not logits_metadata.extend_return_logprob

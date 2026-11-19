@@ -222,6 +222,7 @@ def test_held_responses_do_not_change_idle_state():
     scheduler.enable_lmcache = False
     scheduler.enable_unified_cache_external_linker = False
     scheduler.enable_hisparse = False
+    scheduler._deferred_chunked_sender_aborts = []
     scheduler.defer_response(_req("held"), Future())
 
     assert scheduler.deferred_responses.has_pending()
@@ -246,6 +247,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler.enable_lmcache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
+    scheduler.forward_ct = 0
 
     def poll():
         if state == "batch":

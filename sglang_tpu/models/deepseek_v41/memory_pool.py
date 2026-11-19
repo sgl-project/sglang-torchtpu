@@ -466,11 +466,14 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         enable_memory_saver: bool,
         force_fp4: bool = False,
         global_page_size: Optional[int] = None,
+        index_k_page8: bool = False,
     ) -> DSV41TPUIndexerPool:
         # The core page size (DSV41_INDEX_PAGE_SIZE) and fp4 choice are CUDA
         # DeepGEMM limits; the TPU kernels read packed FP8 pages of 128 records.
         del page_size, dtype, global_page_size
         assert force_fp4, "only the ratio-1/2 indexer pool exists on TPU V4.1"
+        # The page-8 index-K layout is a HIP (AITER) kernel option.
+        assert not index_k_page8, "the page-8 index-K pool is HIP-only"
         # The core sizes it (full_size + page_size) // ratio slots.
         ratio = (self.full_size + self.page_size) // size
         assert ratio in LOW_RATIOS and size * ratio == self.full_size + self.page_size

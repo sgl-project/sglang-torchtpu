@@ -1348,7 +1348,11 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
+    # In-tree (SGLANG_PLATFORM=tpu) answer; the method is the tpu_oot answer.
     supports_mamba_extra_buffer = True
+
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        return True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
@@ -1437,6 +1441,34 @@ class TpuSRTPlatform(SRTPlatform):
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
         return MHATokenToKVPoolHost
+
+    def get_device_pool_kv_host_cls(self, device_pool) -> Optional[type]:
+        # The TPU host pools mirror the device pool's fused pages, which no
+        # buffer info describes, so they build from the device pool. MLA pools
+        # keep the upstream MLA host pool.
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang_tpu.kv_pool_host import (
+            TpuDMAHostKVPool,
+            TpuFusedMHATokenToKVPoolHost,
+        )
+
+        if isinstance(device_pool, MLATokenToKVPool):
+            return None
+        host_cls = self.get_mha_kv_pool_host_cls(device_pool)
+        if issubclass(host_cls, (TpuDMAHostKVPool, TpuFusedMHATokenToKVPoolHost)):
+            return host_cls
+        return None
+
+    def get_hybrid_cache_controller_cls(self, io_backend: str) -> Optional[type]:
+        # A TPU DMA backend has no device streams and drives per-pool
+        # all-layer DMAs, so it needs its own hybrid controller.
+        if not is_tpu_dma_hicache_backend(io_backend):
+            return None
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+            TpuDMAHybridCacheController,
+        )
+
+        return TpuDMAHybridCacheController
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
@@ -1572,6 +1604,11 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_torch_compile(self) -> bool:
         return True
 
+    def narrows_padded_extend_attention(self) -> bool:
+        # The compiled forward runs the bucket-padded batch whole; narrowing
+        # would trace data_ptr() and bake each real-row count into a shape.
+        return False
+
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")
 
@@ -1676,6 +1713,16 @@ class TpuSRTPlatform(SRTPlatform):
         if dp_replicas.get_replica_session() is not None:
             return _ReplicaGroupCoordinator._load()
         return super().get_group_coordinator_cls()
+
+    def get_group_coordinator_device(self, local_rank: int) -> torch.device:
+        # Collectives run over the tpu_dist backend, not a device module the
+        # coordinator binds; keep the CPU binding the TPU path has always had.
+        return torch.device("cpu")
+
+    def get_moe_expert_executor_cls(self, context) -> Optional[type]:
+        # TPU serves MoE through the built-in FusedMoE with TPU quant methods,
+        # so no executor replaces it.
+        return None
 
     def init_backend(self) -> None:
         if getattr(self, "_backend_initialized", False):
