@@ -34,7 +34,9 @@ def collapse_image_slots(hidden, input_ids, image_token_id):
     keep = ~image_mask
     keep[0] = True
     keep[1:] |= image_mask[1:] & ~image_mask[:-1]
-    return hidden[keep], image_mask[keep]
+    # Row indices, not a boolean mask: the ids live on the host, the rows may not.
+    rows = keep.nonzero(as_tuple=True)[0]
+    return hidden.index_select(0, rows.to(hidden.device)), image_mask[keep]
 
 
 class QwenImage21InputValidationStage(InputValidationStage):
@@ -127,18 +129,32 @@ class QwenImage21EncodingStage(PipelineStage):
                     image = white
                 vision_images.append(image)
             kwargs["images"] = vision_images
-        inputs = self.processor(**kwargs).to(device)
+        inputs = self.processor(**kwargs)
+        # Positions and the kept rows depend only on the processor's host
+        # tensors; resolving them here keeps the encoder from deriving them on
+        # the device (an int64 cumsum and boolean indexing).
+        position_ids, _ = self.text_encoder.model.get_rope_index(
+            inputs.input_ids,
+            inputs.get("image_grid_thw"),
+            inputs.get("video_grid_thw"),
+            attention_mask=inputs.attention_mask,
+        )
+        rows = inputs.attention_mask[0].nonzero(as_tuple=True)[0][self.drop_idx :]
+        ids = inputs.input_ids[0, rows]
+        inputs = inputs.to(device)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
             outputs = encoder(
-                **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
+                **inputs,
+                position_ids=position_ids.to(device),
+                output_hidden_states=True,
+                use_cache=False,
+                logits_to_keep=1,
             )
             # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
             final_hidden = outputs.hidden_states[-1]
-        valid = inputs.attention_mask[0].bool()
-        hidden = final_hidden[0, valid][self.drop_idx :]
-        ids = inputs.input_ids[0, valid][self.drop_idx :]
+        hidden = final_hidden[0].index_select(0, rows.to(final_hidden.device))
         return collapse_image_slots(hidden, ids, self.image_token_id)
 
     def forward(self, batch, server_args):
