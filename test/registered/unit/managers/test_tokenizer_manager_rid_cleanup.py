@@ -29,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -1221,6 +1222,59 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     request reaches the scheduler (e.g. input-length validation rejecting an
     over-context request) used to leak those entries permanently.
     """
+
+    def test_client_health_probe_rids_rejected_before_dispatch(self):
+        reserved = f"{HEALTH_CHECK_RID_PREFIX}_client"
+        requests = (
+            GenerateReqInput(text="prompt", rid=HEALTH_CHECK_RID_PREFIX),
+            GenerateReqInput(
+                text="prompt", rid=reserved, sampling_params={"max_new_tokens": 1000}
+            ),
+            GenerateReqInput(text=["a", "b"], rid=["user", reserved]),
+            GenerateReqInput(text="prompt", rid=reserved, sampling_params={"n": 2}),
+            EmbeddingReqInput(text="prompt", rid=reserved),
+        )
+        for obj in requests:
+            with self.subTest(request_type=type(obj).__name__, rid=obj.rid):
+                tm = _make_tm_for_generate(self)
+                tm._tokenize_one_request = AsyncMock(
+                    side_effect=AssertionError("Client health RID reached tokenization")
+                )
+                tm._send_one_request = Mock()
+                tm._init_req_state = Mock(wraps=tm._init_req_state)
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "reserved for internal"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                tm._init_req_state.assert_not_called()
+                tm._tokenize_one_request.assert_not_awaited()
+                tm._send_one_request.assert_not_called()
+                self.assertEqual(tm.rid_to_state, {})
+
+    def test_internal_probe_can_dispatch_with_server_argument(self):
+        tm = _make_tm_for_generate(self)
+        obj = GenerateReqInput(input_ids=[0], rid=f"{HEALTH_CHECK_RID_PREFIX}_internal")
+        tokenized = SimpleNamespace(rid=obj.rid)
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = AsyncMock()
+
+        async def response(*args):
+            yield {"output_ids": [1]}
+
+        tm._wait_one_response = response
+
+        async def drive():
+            generator = tm.generate_request(obj, is_health_check=True)
+            try:
+                self.assertEqual(await generator.__anext__(), {"output_ids": [1]})
+            finally:
+                await generator.aclose()
+
+        asyncio.run(drive())
+        tm._tokenize_one_request.assert_awaited_once_with(obj)
+        tm._send_one_request.assert_awaited_once_with(tokenized)
 
     def test_single_failure_before_dispatch_cleans_up(self):
         """Validation failure must return the adapter reference acquired earlier."""

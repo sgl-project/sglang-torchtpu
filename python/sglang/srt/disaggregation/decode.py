@@ -4342,28 +4342,41 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
-        if new_prebuilt_batch:
-            assert self.chunked_req is None
-            self.batch_result_processor.process_batch_result_prebuilt(
-                new_prebuilt_batch
-            )
-            new_prebuilt_batch.filter_batch()
-            if not new_prebuilt_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        running_batch.hisparse_coordinator = self.hisparse_coordinator
-                else:
-                    running_batch.merge_batch(new_prebuilt_batch)
+        for health_check_only in (False, True):
+            # One-token or aborted users can all finish at prebuilt, without
+            # proving inference progress. Give a queued probe its own forward
+            # before admitting more such users, even when the queue stays busy.
+            if health_check_only:
+                if not running_batch.is_empty() or not any(
+                    is_health_check_req(req) for req in self.waiting_queue
+                ):
+                    break
+                new_prebuilt_batch = self.get_new_prebuilt_batch(
+                    running_batch, health_check_only=True
+                )
+            else:
+                new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
 
-        # Schedule decode batch
-        if running_batch.is_empty():
-            ret = None
-        else:
-            running_batch = self.update_running_batch(running_batch)
-            ret = running_batch if not running_batch.is_empty() else None
+            if new_prebuilt_batch:
+                assert self.chunked_req is None
+                self.batch_result_processor.process_batch_result_prebuilt(
+                    new_prebuilt_batch
+                )
+                new_prebuilt_batch.filter_batch()
+                if not new_prebuilt_batch.is_empty():
+                    if running_batch.is_empty():
+                        running_batch = new_prebuilt_batch
+                        if self.enable_hisparse:
+                            running_batch.hisparse_coordinator = (
+                                self.hisparse_coordinator
+                            )
+                    else:
+                        running_batch.merge_batch(new_prebuilt_batch)
+
+            if not running_batch.is_empty():
+                running_batch = self.update_running_batch(running_batch)
+
+        ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
@@ -4371,9 +4384,11 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, *, health_check_only: bool = False
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        batch = self._get_new_prebuilt_batch(
+            running_batch, health_check_only=health_check_only
+        )
         if batch is None:
             return None
         nonblocking = self._nonblocking_admit_in_scope(batch)
@@ -4513,7 +4528,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        *,
+        health_check_only: bool = False,
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -4556,8 +4574,9 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
-        has_traffic = curr_batch_size > 0 or any(
-            not is_health_check_req(req) for req in self.waiting_queue
+        has_traffic = not health_check_only and (
+            curr_batch_size > 0
+            or any(not is_health_check_req(req) for req in self.waiting_queue)
         )
 
         for req in self.waiting_queue:
@@ -4576,6 +4595,9 @@ class SchedulerDisaggregationDecodeMixin:
                 if has_traffic:
                     waiting_queue.append(req)
                     continue
+            elif health_check_only:
+                waiting_queue.append(req)
+                continue
             # A host-restored request joins only after the copy is ready.
             if len(can_run_list) < num_not_used_batch and (
                 not host_restore
