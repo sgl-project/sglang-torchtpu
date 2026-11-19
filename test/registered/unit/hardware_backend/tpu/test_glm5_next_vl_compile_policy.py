@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import mm_embed_tpu
 from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import _static_default_kwargs
 from sglang_tpu.compilation.decoder_compile_policy import (
     Glm5NextVLDecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
@@ -243,7 +245,149 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
                 Glm5NextVLDecoderTpuCompilePolicy, Qwen3VLDecoderTpuCompilePolicy
             )
         )
-        self.assertFalse(Glm5NextVLDecoderTpuCompilePolicy.spmd_safe)
+        self.assertTrue(Glm5NextVLDecoderTpuCompilePolicy.spmd_safe)
+
+    def test_direct_compile_passes_spmd_safe_and_keys_all_call_shapes(self):
+        from sglang_tpu.compilation.graph_identity import _key_value, canonical
+
+        runner = _make_runner(distributed_top_k=True)
+        self.addCleanup(
+            tpu_sampler_module._DISTRIBUTED_TOP_K_STATES.pop,
+            id(runner.model.logits_processor),
+            None,
+        )
+        runner.server_args.tpu_compile_tracer = "direct"
+        policy = _make_glm_policy(runner)
+        policy.tracer = "direct"
+
+        captured = {}
+
+        def fake_direct_compile(fn, **kwargs):
+            captured["fn"] = fn
+            captured["kwargs"] = kwargs
+            compiled = MagicMock(name="compiled_fn")
+            compiled.warmup_async = MagicMock(name="warmup_async")
+            return compiled
+
+        with patch(
+            "sglang_tpu.compilation.direct_compile.direct_compile",
+            side_effect=fake_direct_compile,
+        ):
+            compiled_call, _ = policy._direct_compile(
+                runner.model.language_model.forward
+            )
+
+        self.assertTrue(captured["kwargs"]["spmd_safe"])
+        self.assertEqual(captured["kwargs"]["name"], "target/language_model.forward")
+        self.assertIs(captured["kwargs"]["model"], runner.model)
+
+        key_fn = captured["kwargs"]["specialization_key"]
+        positions_1k = torch.zeros((3, 1024), dtype=torch.int64)
+        positions_64 = torch.zeros((3, 64), dtype=torch.int64)
+        positions_256 = torch.zeros((3, 256), dtype=torch.int64)
+
+        extend_embeds_key = key_fn(
+            None,
+            None,
+            positions_1k,
+            SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                batch_size=64,
+                logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            ),
+            input_embeds=torch.zeros((1024, 8), dtype=torch.bfloat16),
+        )
+        extend_ids_key = key_fn(
+            None,
+            torch.zeros(1024, dtype=torch.int64),
+            positions_1k,
+            SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                batch_size=64,
+                logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            ),
+        )
+        decode_full_key = key_fn(
+            None,
+            torch.zeros(64, dtype=torch.int64),
+            positions_64,
+            SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                batch_size=64,
+                logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            ),
+        )
+        decode_topk_key = key_fn(
+            None,
+            torch.zeros(64, dtype=torch.int64),
+            positions_64,
+            SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                batch_size=64,
+                logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
+            ),
+        )
+        verify_key = key_fn(
+            None,
+            torch.zeros(256, dtype=torch.int64),
+            positions_256,
+            SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                batch_size=64,
+                logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            ),
+        )
+
+        keys = [
+            extend_embeds_key,
+            extend_ids_key,
+            decode_full_key,
+            decode_topk_key,
+            verify_key,
+        ]
+        # Every key must be distinct and JSON-serializable for SPMDCompiler graph naming.
+        serialized = [canonical(_key_value(k)) for k in keys]
+        self.assertEqual(len(set(serialized)), len(keys))
+        self.assertEqual(
+            extend_embeds_key,
+            (
+                ForwardMode.EXTEND,
+                CaptureHiddenMode.NULL,
+                64,
+                1024,
+                True,
+                False,
+                LogitsOutputMode.FULL_VOCAB,
+            ),
+        )
+        self.assertEqual(
+            decode_topk_key,
+            (
+                ForwardMode.DECODE,
+                CaptureHiddenMode.NULL,
+                64,
+                64,
+                False,
+                False,
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+            ),
+        )
+
+        # Verify CompiledForwardShim strips default kwargs (input_embeds=None,
+        # pp_proxy_tensors=None) under direct tracer so serving calls match
+        # warmup's exact (args, kwargs) structure.
+        compiled_call.__signature__ = inspect.signature(
+            runner.model.language_model.forward
+        )
+        self.assertEqual(
+            _static_default_kwargs(compiled_call),
+            {"input_embeds": None, "pp_proxy_tensors": None},
+        )
 
     def test_language_model_owns_logits_processor_and_warms_distributed_top_k(self):
         runner = _make_runner(distributed_top_k=True)
@@ -459,6 +603,7 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             (TpuChainSpecDecodeCompilePolicyMixin, Glm5NextVLDecoderTpuCompilePolicy),
             {},
         )
+        self.assertTrue(SpecGlm5Policy.spmd_safe)
         with patch(
             "sglang_tpu.experimental.compilation.chain_compile_policy.process_model_config",
             return_value=runner.model_config,
@@ -529,17 +674,6 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
                 policy.install()
 
-        runner_direct = _make_runner()
-        runner_direct.server_args.tpu_compile_tracer = "direct"
-        policy_direct = _make_glm_policy(runner_direct)
-        with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
-            policy_direct.install()
-
-        policy_direct_arg = _make_glm_policy()
-        policy_direct_arg.tracer = "direct"
-        with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
-            policy_direct_arg.install()
-
         policy_cp = _make_glm_policy()
         with (
             patch(
@@ -549,6 +683,55 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             self.assertRaisesRegex(NotImplementedError, "context parallelism"),
         ):
             policy_cp.install()
+
+        runner_scattered_spmd = _make_runner()
+        runner_scattered_spmd.server_args.enable_attn_tp_input_scattered = True
+        runner_scattered_spmd.server_args.tpu_compile_tracer = "direct"
+        with (
+            get_context().override_server_args(**_BASE_CONFIG, use_spmd_compile=True),
+            self.assertRaisesRegex(
+                ValueError,
+                "--enable-attn-tp-input-scattered.*--use-spmd-compile",
+            ),
+        ):
+            _make_glm_policy(runner_scattered_spmd).install()
+
+        runner_scattered_spmd_arg = _make_runner()
+        runner_scattered_spmd_arg.server_args.enable_attn_tp_input_scattered = True
+        runner_scattered_spmd_arg.server_args.use_spmd_compile = True
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-attn-tp-input-scattered.*--use-spmd-compile",
+        ):
+            _make_glm_policy(runner_scattered_spmd_arg).install()
+
+        runner_scattered_ctx = _make_runner()
+        with (
+            get_context().override_server_args(
+                **_BASE_CONFIG,
+                enable_attn_tp_input_scattered=True,
+                use_spmd_compile=True,
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "--enable-attn-tp-input-scattered.*--use-spmd-compile",
+            ),
+        ):
+            _make_glm_policy(runner_scattered_ctx).install()
+
+        runner_direct_spmd = _make_runner()
+        runner_direct_spmd.server_args.tpu_compile_tracer = "direct"
+        runner_direct_spmd.server_args.enable_attn_tp_input_scattered = False
+        policy_direct_spmd = _make_glm_policy(runner_direct_spmd)
+        policy_direct_spmd.tracer = "direct"
+        with (
+            get_context().override_server_args(**_BASE_CONFIG, use_spmd_compile=True),
+            patch.object(
+                Qwen3VLDecoderTpuCompilePolicy, "install", return_value=True
+            ) as super_install,
+        ):
+            self.assertTrue(policy_direct_spmd.install())
+            super_install.assert_called_once_with()
 
         runner_scattered = _make_runner()
         runner_scattered.server_args.enable_attn_tp_input_scattered = True
@@ -572,40 +755,44 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
 
         saved_rank_tensors = dp_attention._RANK_TENSORS.copy()
         try:
-            dp_attention._RANK_TENSORS = {}
-            runner_ok = _make_runner()
-            runner_ok.server_args.enable_attn_tp_input_scattered = True
-            policy_ok = _make_glm_policy(runner_ok)
-            with (
-                get_flags().dp.override(enabled=False),
-                get_parallel().override(
-                    tp_size=8,
-                    tp_rank=3,
-                    attn_tp_size=8,
-                    attn_tp_rank=3,
-                    attn_dp_size=1,
-                    attn_dp_rank=0,
-                    attn_cp_size=1,
-                    attn_cp_rank=0,
-                    moe_ep_size=8,
-                    moe_ep_rank=3,
-                    moe_dp_size=1,
-                    moe_dp_rank=0,
-                    moe_tp_size=1,
-                    moe_tp_rank=0,
-                ),
-                patch.object(
-                    Qwen3VLDecoderTpuCompilePolicy, "install", return_value=True
-                ),
-            ):
-                self.assertTrue(policy_ok.install())
-            rank_tensor = dp_attention._RANK_TENSORS[
-                (
-                    "attn_tp",
-                    torch.device("cpu"),
-                )
-            ]
-            self.assertEqual(int(rank_tensor.item()), 3)
+            for tracer in ("dynamo", "direct"):
+                with self.subTest(tracer=tracer):
+                    dp_attention._RANK_TENSORS = {}
+                    runner_ok = _make_runner()
+                    runner_ok.server_args.tpu_compile_tracer = tracer
+                    runner_ok.server_args.enable_attn_tp_input_scattered = True
+                    policy_ok = _make_glm_policy(runner_ok)
+                    policy_ok.tracer = tracer
+                    with (
+                        get_flags().dp.override(enabled=False),
+                        get_parallel().override(
+                            tp_size=8,
+                            tp_rank=3,
+                            attn_tp_size=8,
+                            attn_tp_rank=3,
+                            attn_dp_size=1,
+                            attn_dp_rank=0,
+                            attn_cp_size=1,
+                            attn_cp_rank=0,
+                            moe_ep_size=8,
+                            moe_ep_rank=3,
+                            moe_dp_size=1,
+                            moe_dp_rank=0,
+                            moe_tp_size=1,
+                            moe_tp_rank=0,
+                        ),
+                        patch.object(
+                            Qwen3VLDecoderTpuCompilePolicy, "install", return_value=True
+                        ),
+                    ):
+                        self.assertTrue(policy_ok.install())
+                    rank_tensor = dp_attention._RANK_TENSORS[
+                        (
+                            "attn_tp",
+                            torch.device("cpu"),
+                        )
+                    ]
+                    self.assertEqual(int(rank_tensor.item()), 3)
         finally:
             dp_attention._RANK_TENSORS = saved_rank_tensors
 

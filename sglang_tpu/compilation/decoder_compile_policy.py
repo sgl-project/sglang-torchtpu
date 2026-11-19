@@ -2725,9 +2725,17 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
     layers + final norm + ``logits_processor``) in one XLA graph without dead
     ``text_ids`` variants, while warming eager text-only and multimodal prompt
     embedding and row placement.
+
+    ``spmd_safe``: rank-dependent values reach the graph as inputs (the lifted
+    rank for the DSA indexer split, MoE EP offsets, and vocab shards; attention
+    rank tensors; per-rank weights and hybrid KV/KDA pools), matching
+    ``Glm5NextDecoderTpuCompilePolicy``. ``--enable-attn-tp-input-scattered`` is
+    not rank-uniform because scattered prefill slices rows at a per-rank
+    constant offset, so ``install()`` rejects combining it with
+    ``--use-spmd-compile``.
     """
 
-    spmd_safe = False
+    spmd_safe = True
 
     def install(self) -> bool:
         if self.model_runner is None:
@@ -2739,28 +2747,30 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
                 "GLM-5.3-Flash's multimodal model does not support "
                 "pipeline parallelism with --enable-torch-compile on TPU yet."
             )
-        if (
-            self.tracer == "direct"
-            or getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
-            == "direct"
-        ):
-            raise ValueError(
-                "GLM-5.3-Flash's multimodal model does not support "
-                "--tpu-compile-tracer direct with --enable-torch-compile "
-                "on TPU yet."
-            )
         if self._cp_strategy is not None:
             raise NotImplementedError(
                 "GLM-5.3-Flash's multimodal model does not support prefill "
                 "context parallelism with --enable-torch-compile on TPU yet."
             )
         input_scattered_enabled = bool(
-            getattr(
+            parallel.enable_attn_tp_input_scattered
+            or getattr(
                 self.model_runner.server_args,
                 "enable_attn_tp_input_scattered",
                 False,
             )
         )
+        use_spmd_compile = bool(
+            get_exec().graph.use_spmd_compile
+            or getattr(self.model_runner.server_args, "use_spmd_compile", False)
+        )
+        if input_scattered_enabled and use_spmd_compile:
+            raise ValueError(
+                "GLM-5.3-Flash's multimodal model cannot combine "
+                "--enable-attn-tp-input-scattered with --use-spmd-compile on "
+                "TPU: scattered prefill slices rows at a per-rank constant "
+                "offset. Disable one of the two flags."
+            )
         if input_scattered_enabled and parallel.attn_tp_size != parallel.tp_size:
             raise NotImplementedError(
                 "GLM-5.3-Flash's multimodal model requires "
