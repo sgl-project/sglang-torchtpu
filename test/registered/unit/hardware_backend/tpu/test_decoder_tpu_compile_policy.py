@@ -1484,6 +1484,135 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         )
         self.assertNotEqual(ids_key, embeds_key)
 
+    def test_text_only_mrope_model_warms_mrope_positions(self):
+        """Text-only mRoPE wrappers (e.g. Qwen3_5MoeForCausalLM) share
+        Qwen3_5ForCausalLM and its Qwen3VLDecoderTpuCompilePolicy, have no
+        ``get_image_feature``, and pass 2-D ``mrope_positions`` at serve time."""
+        for model_is_mrope in (True, False):
+            with self.subTest(model_is_mrope=model_is_mrope):
+                model_runner = _model_runner()
+                model_runner.model_config.model_is_mrope = model_is_mrope
+                forward_batch = SimpleNamespace(
+                    input_ids=torch.ones(8, dtype=torch.int64),
+                    positions=torch.arange(8, dtype=torch.int64),
+                    mrope_positions=torch.arange(24, dtype=torch.int64).reshape(3, 8),
+                    forward_mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    batch_size=2,
+                    logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+                )
+                policy = Qwen3VLDecoderTpuCompilePolicy(
+                    model_runner=model_runner, owner=model_runner.model
+                )
+                self.assertFalse(policy._uses_input_embeds(policy.owner))
+                policy._make_dummy_forward_batch = MagicMock(return_value=forward_batch)
+
+                args, kwargs = policy._make_warmup_inputs(
+                    num_tokens=8,
+                    bs=2,
+                    mode=ForwardMode.EXTEND,
+                )
+
+                expected_pos = (
+                    forward_batch.mrope_positions
+                    if model_is_mrope
+                    else forward_batch.positions
+                )
+                self.assertEqual(kwargs, {})
+                self.assertEqual(len(args), 3)
+                self.assertIs(args[0], forward_batch.input_ids)
+                self.assertIs(args[1], expected_pos)
+                self.assertIs(args[2], forward_batch)
+
+    def test_direct_specialization_key_accepts_positional_input_embeds(self):
+        """Text-only Qwen3.5 wrappers pass ``input_embeds`` as the 4th positional
+        argument to ``Qwen3_5ForCausalLM.forward``."""
+        policy = Qwen3VLDecoderTpuCompilePolicy(model_runner=_model_runner())
+        input_ids = torch.ones(8, dtype=torch.int64)
+        positions = torch.zeros(3, 8, dtype=torch.int64)
+        embeds = torch.zeros(8, 4)
+        deepstack = torch.zeros(8, 8)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=2,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+        )
+
+        key_3arg = policy._direct_compile_specialization_key(
+            None, input_ids, positions, forward_batch
+        )
+        key_pos_none = policy._direct_compile_specialization_key(
+            None, input_ids, positions, forward_batch, None, pp_proxy_tensors=None
+        )
+        self.assertEqual(key_3arg, key_pos_none)
+
+        key_pos_embeds = policy._direct_compile_specialization_key(
+            None, None, positions, forward_batch, embeds
+        )
+        key_kw_embeds = policy._direct_compile_specialization_key(
+            None, None, positions, forward_batch, input_embeds=embeds
+        )
+        self.assertEqual(key_pos_embeds, key_kw_embeds)
+        self.assertNotEqual(key_3arg, key_pos_embeds)
+
+        key_pos_deepstack = policy._direct_compile_specialization_key(
+            None, None, positions, forward_batch, embeds, deepstack
+        )
+        key_kw_deepstack = policy._direct_compile_specialization_key(
+            None,
+            None,
+            positions,
+            forward_batch,
+            input_embeds=embeds,
+            input_deepstack_embeds=deepstack,
+        )
+        self.assertEqual(key_pos_deepstack, key_kw_deepstack)
+        self.assertNotEqual(key_pos_embeds, key_pos_deepstack)
+
+    def test_qwen3_5_text_forward_matches_warmed_call_shape(self):
+        from sglang.srt.models.qwen3_5_text import (
+            Qwen3_5ForCausalLM as Qwen3_5TextEntry,
+        )
+
+        calls = []
+
+        def fake_decoder(*args, **kwargs):
+            calls.append((args, kwargs))
+            return torch.zeros(8, 4)
+
+        wrapper = SimpleNamespace(
+            is_mrope_enabled=True,
+            model=fake_decoder,
+            pp_group=SimpleNamespace(is_last_rank=True),
+            lm_head="LM_HEAD",
+            logits_processor=lambda *args: ("logits", args),
+        )
+        input_ids = torch.ones(8, dtype=torch.int64)
+        positions_1d = torch.arange(8, dtype=torch.int64)
+        mrope_positions = torch.arange(24, dtype=torch.int64).reshape(3, 8)
+        forward_batch = SimpleNamespace(mrope_positions=mrope_positions)
+
+        Qwen3_5TextEntry.forward(wrapper, input_ids, positions_1d, forward_batch)
+        self.assertEqual(len(calls[-1][0]), 3)
+        self.assertIs(calls[-1][0][1], mrope_positions)
+        self.assertEqual(calls[-1][1], {})
+
+        proxy = PPProxyTensors({"hidden_states": torch.zeros(8, 4)})
+        Qwen3_5TextEntry.forward(
+            wrapper, input_ids, positions_1d, forward_batch, pp_proxy_tensors=proxy
+        )
+        self.assertEqual(len(calls[-1][0]), 3)
+        self.assertEqual(calls[-1][1], {"pp_proxy_tensors": proxy})
+
+        embeds = torch.zeros(8, 4)
+        Qwen3_5TextEntry.forward(
+            wrapper, input_ids, positions_1d, forward_batch, input_embeds=embeds
+        )
+        self.assertEqual(len(calls[-1][0]), 4)
+        self.assertIs(calls[-1][0][3], embeds)
+        self.assertEqual(calls[-1][1], {})
+
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
         hidden = torch.zeros(5, 4)
