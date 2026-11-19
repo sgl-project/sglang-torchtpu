@@ -125,7 +125,10 @@ def _apply_cfg_postprocess(
 ) -> torch.Tensor:
     if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
         noise_pred = _apply_cfg_normalization(
-            noise_pred, noise_pred_cond, float(batch.cfg_normalization)
+            noise_pred,
+            noise_pred_cond,
+            float(batch.cfg_normalization),
+            shard_group=pipeline_config.latent_shard_group(batch),
         )
     if batch.guidance_rescale > 0.0:
         noise_pred = _rescale_noise_cfg(
@@ -138,15 +141,23 @@ def _apply_cfg_normalization(
     noise_pred: torch.Tensor,
     noise_pred_cond: torch.Tensor,
     cfg_normalization: float,
+    shard_group: Any = None,
 ) -> torch.Tensor:
     cond_f = noise_pred_cond.float()
     pred_f = noise_pred.float()
-    ori_norm = torch.linalg.vector_norm(cond_f)
-    new_norm = torch.linalg.vector_norm(pred_f)
+    if shard_group is None:
+        ori_norm = torch.linalg.vector_norm(cond_f)
+        new_norm = torch.linalg.vector_norm(pred_f)
+    else:
+        # The predictions are this rank's piece of the latents: the norms are
+        # over the whole latents, so sum the squares over the group.
+        squares = torch.stack([cond_f.square().sum(), pred_f.square().sum()])
+        ori_norm, new_norm = shard_group.all_reduce(squares).sqrt()
     max_norm = ori_norm * cfg_normalization
-    if new_norm > max_norm:
-        noise_pred = noise_pred * (max_norm / new_norm)
-    return noise_pred
+    # Selected on device: a Python branch on the norms syncs the host each step.
+    return torch.where(
+        new_norm > max_norm, noise_pred * (max_norm / new_norm), noise_pred
+    )
 
 
 def _rescale_noise_cfg(

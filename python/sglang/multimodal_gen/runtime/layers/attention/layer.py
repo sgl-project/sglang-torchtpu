@@ -2213,8 +2213,6 @@ class USPAttention(nn.Module):
         """
         if num_rep <= 0:
             raise ValueError("num_rep must be positive for replicated suffix.")
-        u_rank = get_ulysses_parallel_rank()
-
         q_shard, q_rep = q[:, :-num_rep], q[:, -num_rep:]
         k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
         v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
@@ -2223,13 +2221,14 @@ class USPAttention(nn.Module):
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
         v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
-        h_local = q_shard.shape[2]
-        kv_h_local = k_shard.shape[2]
-        h_start = u_rank * h_local
-        kv_h_start = u_rank * kv_h_local
-        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
-        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
-        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        # This rank's heads of the replicated tokens, taken from the head
+        # all-to-all (every rank sends the same rows) rather than sliced at
+        # rank * heads: a rank-dependent slice compiles into a different
+        # program on each rank, and spmd-safe regions need one program.
+        q_rep, k_rep, v_rep = (
+            _usp_input_all_to_all(t, head_dim=2)[:, :num_rep]
+            for t in (q_rep, k_rep, v_rep)
+        )
 
         q = torch.cat([q_shard, q_rep], dim=1)
         out = self._replicated_kv_attention(
