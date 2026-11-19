@@ -46,8 +46,10 @@ def agentx_config(
             "torch_compile_max_bs": max_running,
             # One decode program per running count: no step is padded (Muse's recipe).
             "tpu_compile_bs": list(range(1, max_running + 1)),
-            # Short turns run a small program instead of a padded 8192-token chunk.
-            "tpu_compile_tokens": [1024, 2048, 4096, 8192],
+            # Prefill chunks of at most 4096 tokens; short turns run a smaller program.
+            "tpu_compile_tokens": [1024, 2048, 3072, 4096],
+            "chunked_prefill_size": 4096,  # one 4096-token chunk per prefill step
+            "max_prefill_tokens": 4096,  # a prefill batch fits one chunk
             "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
             "max_total_tokens": pool_tokens,
             "max_mamba_cache_size": mamba_slots,
