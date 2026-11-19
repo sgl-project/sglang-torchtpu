@@ -649,6 +649,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_EP_EARLY_UNPOOL = EnvBool(False)
     # EP gather arm at <= 8 rows: top-k by rank (one comparison per live row), as untiled TP.
     SGLANG_TPU_MUSE_MK_DEV_EP_RANK_TOPK = EnvBool(False)
+    # EP gather arm at <= 16 rows: u as one round of whole partials to every peer (summed
+    # locally) instead of a reduce-scatter and an all-gather.
+    SGLANG_TPU_MUSE_MK_DEV_EP_U_ALLREDUCE = EnvBool(False)
     # EP gather arm: rows from which its collectives pair the two cores of a chip (default 48).
     SGLANG_TPU_MUSE_MK_DEV_EP_PAIR_AG_MIN_ROWS = EnvInt(None)
     # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded) |

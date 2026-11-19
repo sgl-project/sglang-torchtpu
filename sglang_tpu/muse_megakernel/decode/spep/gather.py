@@ -171,6 +171,8 @@ def gather_scratch(c: MKConfig, p: EPPlan) -> list:
         ),
         # rank-based top-k at <= 8 rows (route.own_topk), as the untiled TP program
         *([("eg_rank", vmem((R, c.n_experts), i32))] if _rank_topk(c) else []),
+        # one-round u all-reduce: every rank's whole partial u
+        *([("eg_ufull", vmem((tp, R, He), f32))] if _u_allreduce(c) else []),
         ("ep_w_sems", dma((p.nslot, 4))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
@@ -680,6 +682,9 @@ def _u_reduce(step: EPLayerStep) -> None:
     W = He // tp
     u, urs = S["eg_u"], S["eg_urs"]
     rsem, ssem = S["eg_rsems"].at[PH_URS], S["eg_ssems"].at[PH_URS]
+    if _u_allreduce(c):
+        _u_allreduce_one_round(step)
+        return
 
     def block(d):
         return u.at[:, pl.ds(pl.multiple_of(d * W, W), W)]
@@ -711,6 +716,43 @@ def _u_reduce(step: EPLayerStep) -> None:
 
     _for_tiles(c, u_sum)
     _all_gather(c, S, me, uag, PH_UAG)
+
+
+def _u_allreduce(c: MKConfig) -> bool:
+    """SGLANG_TPU_MUSE_MK_DEV_EP_U_ALLREDUCE: u as one all-to-all round of whole partials at
+    <= 16 rows instead of a reduce-scatter then an all-gather (experiment)."""
+    return tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_U_ALLREDUCE.get() and c.rows <= 16
+
+
+def _u_allreduce_one_round(step: EPLayerStep) -> None:
+    """eg_uag of every owner from one round: each rank sends its whole partial u [R, He] f32
+    to every peer and sums all tp partials itself (7x the bytes of the reduce-scatter, one
+    latency instead of two at decode-sized steps)."""
+    c, S, me = step.c, step.S, step.me
+    tp, He = c.tp, c.expert_hidden
+    W = He // tp
+    u, ufull, uag = S["eg_u"], S["eg_ufull"], S["eg_uag"]
+    rsem, ssem = S["eg_rsems"].at[PH_URS], S["eg_ssems"].at[PH_URS]
+    for d in range(1, tp):
+        peer = (me + d) % tp
+        pltpu.make_async_remote_copy(
+            src_ref=u,
+            dst_ref=ufull.at[me],
+            send_sem=ssem,
+            recv_sem=rsem,
+            device_id=(peer,),
+        ).start()
+    _local_copy(S, u, ufull.at[me])
+    with _phase("u_rs_wait"):
+        _count_wait(pltpu.make_async_copy(ufull.at[0], ufull.at[0], rsem), tp - 1)
+        _count_wait(pltpu.make_async_copy(ufull.at[0], ufull.at[0], ssem), tp - 1)
+
+    def u_sum(rows):
+        total = sum(ufull[src, rows] for src in range(tp))  # [rows, He] f32
+        for d in range(tp):
+            uag.at[d][rows, :] = _pack_bf16x2(total[:, d * W : (d + 1) * W])
+
+    _for_tiles(c, u_sum)
 
 
 def _unpool(step: EPLayerStep) -> None:
