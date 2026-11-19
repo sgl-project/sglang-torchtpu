@@ -652,6 +652,9 @@ class TpuEnvs:
     # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
     # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.
     SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
+    # With SGLANG_TPU_MUSE_MK_PREFILL_SP: run its MoE on expert-TP weights (prefill/tp's fused-RS
+    # kernel, partials direct-written to the row owners) instead of EP; needs MOE_MODE=tp.
+    SGLANG_TPU_MUSE_MK_PREFILL_SP_TP_MOE = EnvBool(False)
     # Directory: the SP prefill program also returns per-layer routed-expert counts of the
     # valid rows, and each rank dumps their running sum there (expert_counts.py). Empty: off.
     SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR = EnvStr("")

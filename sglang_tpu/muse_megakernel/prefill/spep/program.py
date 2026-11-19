@@ -52,7 +52,12 @@ def _bf(x):
 
 
 def n_expert_refs(c: PFConfig) -> int:
-    """Expert operands of the SP program: (w13, s13, w2, s2) per layer."""
+    """Expert operands of the SP program: (w13, s13, w2, s2) per layer (EP), or per expert unit
+    of the expert-TP layout (c.sp_tp_moe, stacked groups as prefill/tp)."""
+    if c.sp_tp_moe:
+        from sglang_tpu.muse_megakernel.common.plan import n_expert_refs as tp_refs
+
+        return tp_refs(c)
     return 4 * c.n_layers
 
 
@@ -78,13 +83,18 @@ def build_forward(c: PFConfig, axis: str = "model"):
     from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
     c.validate()
-    if c.fp8_gather or c.expert_groups:
+    if c.fp8_gather or (c.expert_groups and not c.sp_tp_moe):
         raise NotImplementedError(
             "the sequence-parallel prefill program has no e4m3 gathers "
-            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER) or stacked expert groups"
+            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER) or stacked expert groups (EP MoE)"
         )
-    if len(c.expert_kinds) != c.n_layers:
+    if not c.sp_tp_moe and len(c.expert_kinds) != c.n_layers:
         raise ValueError(f"expert_kinds {c.expert_kinds}: one per layer needed")
+    if c.sp_tp_moe:
+        from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
+        from sglang_tpu.muse_megakernel.prefill.tp.program import _layer_experts
+
+        tp_layer_experts = _layer_experts(c)
     L, T, tp, hd, K = c.n_layers, c.rows, c.tp, c.head_dim, c.top_k
     Ts, El = T // tp, c.n_experts // tp
     H, He, qd, kvd = c.hidden, c.expert_hidden, c.q_dim, c.kv_dim
@@ -233,6 +243,44 @@ def build_forward(c: PFConfig, axis: str = "model"):
         y_own = back[rows[jnp.argsort(order)]]
         return y_own.reshape(Ts, K, He)
 
+    def moe_tp(l, me, xe8, xs, ids, tw, sm, experts):
+        """u [Ts, He] f32 of own rows with expert-TP weights (prefill/tp's fused-RS MoE): every
+        row's e4m3 input and routing gathered, each rank runs its 1 / tp slice of every expert
+        and direct-writes the partials to the row owners, which apply the post-expert norm and
+        the router weights (combine's math)."""
+        u_idx, in_group = tp_layer_experts[l]
+        w13, s13, w2, s2 = experts[4 * u_idx : 4 * u_idx + 4]
+        # expert TP: this rank's slices are virtual experts [rank * E, (rank + 1) * E)
+        go = (me * c.n_experts).reshape(1).astype(jnp.int32)
+        if in_group is not None:
+            go = jnp.stack([go[0], jnp.int32(in_group)])
+        xe = (ag(xe8).astype(_F32) * ag(xs)).astype(_BF16)
+        return moe_gmm_local_rs_nodedup(
+            xe,
+            w13,
+            s13,
+            None,
+            w2,
+            s2,
+            None,
+            None,
+            None,
+            go,
+            ag(tw).astype(_BF16),
+            ag(ids),
+            # fused-RS applies (w + 1): hand it the zero-centered weight
+            (small_row(sm, "post_expert_w")[0, :He] - 1.0).astype(_BF16),
+            activation="silu",
+            topk=K,
+            ep_size=tp,
+            ep_axis_name=axis,
+            has_post_norm=True,
+            # the output stays row-sharded: exactly the SP layout
+            sp_enabled=False,
+            expert_tp=True,
+            fp4_w4a16=l in c.w4a16_layers,
+        ).astype(_F32)
+
     def combine(y, tw, sm):
         """u [Ts, He] f32: sum over slots of weight * norm(post_expert_w * y)."""
         post = small_row(sm, "post_expert_w")[0, :He]
@@ -300,7 +348,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
             xe8, xs = _fp8_rows(
                 _rms(pooled, c.rms_eps) * small_row(sm, "pre_expert_w")[:, :He]
             )
-            u8, u_s = _fp8_rows(combine(moe(l, me, xe8, xs, ids, experts), tw, sm))
+            if c.sp_tp_moe:
+                u = moe_tp(l, me, xe8, xs, ids, tw, sm, experts)
+            else:
+                u = combine(moe(l, me, xe8, xs, ids, experts), tw, sm)
+            u8, u_s = _fp8_rows(u)
             # bf16: the unpool output feeds the post-FFN norm
             f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
             stream = residual(

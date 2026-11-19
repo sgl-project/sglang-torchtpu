@@ -1018,10 +1018,12 @@ class MuseMegakernel(torch.nn.Module):
     def prefill_config(self, *, rows: int, capture: tuple) -> PFConfig:
         g = self.geo
         sp = tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP.get()
-        if sp and self.moe_mode != "ep":
+        sp_tp = sp and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP_TP_MOE.get()
+        if sp and self.moe_mode != ("tp" if sp_tp else "ep"):
             raise NotImplementedError(
-                "SGLANG_TPU_MUSE_MK_PREFILL_SP runs the MoE on whole experts (EP): it needs "
-                f"moe_mode ep, got {self.moe_mode}"
+                "SGLANG_TPU_MUSE_MK_PREFILL_SP runs the MoE on whole experts (EP, moe_mode ep) "
+                "or, with SGLANG_TPU_MUSE_MK_PREFILL_SP_TP_MOE, on expert-TP slices (moe_mode "
+                f"tp); got moe_mode {self.moe_mode}"
             )
         return PFConfig(
             hidden=g.hidden,
@@ -1050,7 +1052,8 @@ class MuseMegakernel(torch.nn.Module):
             sp=sp,
             expert_kinds=tuple(self.kinds) if sp else (),
             sp_ep_layout=sp and tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT.get(),
-            expert_counts=sp and expert_counts_enabled(),
+            expert_counts=sp and not sp_tp and expert_counts_enabled(),
+            sp_tp_moe=sp_tp,
         ).validate()
 
     def prefill_callable_for(self, cfg: PFConfig):

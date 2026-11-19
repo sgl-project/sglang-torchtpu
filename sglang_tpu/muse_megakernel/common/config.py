@@ -465,6 +465,9 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     # SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR: the SP program also returns [n_layers, n_experts] int32
     # routed-slot counts of this rank's valid rows
     expert_counts: bool = False
+    # SGLANG_TPU_MUSE_MK_PREFILL_SP_TP_MOE: the SP program's MoE on expert-TP weights (prefill/tp's
+    # fused-RS layout and kernel) instead of EP all-to-alls; decode keeps the TP layout
+    sp_tp_moe: bool = False
 
     def validate(self) -> "PFConfig":
         if self.tp != PREFILL_TP:
