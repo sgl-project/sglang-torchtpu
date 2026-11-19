@@ -772,73 +772,72 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ),
             )
 
-    def test_unified_configurator_charges_raiden_land_arena(self):
-        """On fp8 Raiden decode with SGLANG_RAIDEN_RESHARD_LAND_ARENA=1, unified
-        sizing deducts (1 + M_swa) * A physical pages so pool bytes fit budget."""
+    def _run_land_arena_sizing(
+        self,
+        *,
+        arena,
+        avail,
+        mode="decode",
+        kv_dtype="fp8_e4m3",
+        dtype=torch.float8_e4m3fn,
+        page_size=128,
+        full_ids=None,
+        swa_ids=None,
+        head_num=2,
+        head_dim=256,
+    ):
         platform = types.SimpleNamespace(
             get_mha_kv_pool_cls=lambda: TpuFusedMHATokenToKVPool
         )
+        kvc = self._make_mock_kvc(
+            full_ids=full_ids,
+            swa_ids=swa_ids,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_head_num=head_num,
+            swa_head_dim=head_dim,
+            dtype=dtype,
+        )
+        kvc.pool_page_size = page_size
+        kvc.page_size = page_size
+        with (
+            self._cfg_patches(
+                disaggregation_mode=mode,
+                disaggregation_transfer_backend="raiden",
+                kv_cache_dtype=kv_dtype,
+                page_size=page_size,
+            ),
+            tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(arena),
+            patch("sglang.srt.runtime_context.uses_mla_backend", return_value=False),
+            patch("sglang.srt.platforms.current_platform", platform),
+        ):
+            conf = TpuUnifiedSWAPoolConfigurator(kvc)
+            cfg = conf.calculate_pool_sizes(avail, page_size=page_size)
+            pool = TpuUnifiedSWAKVPool(
+                size=cfg.full_max_total_num_tokens,
+                page_size=page_size,
+                dtype=dtype,
+                full=AttnLayerSpec(
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    layer_ids=kvc.layer_info.full_attention_layer_ids,
+                ),
+                swa=AttnLayerSpec(
+                    head_num=head_num,
+                    head_dim=head_dim,
+                    layer_ids=kvc.layer_info.swa_attention_layer_ids,
+                ),
+                device="cpu",
+            )
+        return conf, cfg, pool
+
+    def test_unified_configurator_charges_raiden_land_arena(self):
+        """On fp8 Raiden decode with SGLANG_RAIDEN_RESHARD_LAND_ARENA=1, unified
+        sizing deducts (1 + M_swa) * A physical pages so pool bytes fit budget."""
         budget = 2 * 1024**3
 
-        def run(
-            arena,
-            *,
-            avail=budget,
-            mode="decode",
-            kv_dtype="fp8_e4m3",
-            dtype=torch.float8_e4m3fn,
-            page_size=128,
-            full_ids=None,
-            swa_ids=None,
-            head_num=2,
-            head_dim=256,
-        ):
-            kvc = self._make_mock_kvc(
-                full_ids=full_ids,
-                swa_ids=swa_ids,
-                head_num=head_num,
-                head_dim=head_dim,
-                swa_head_num=head_num,
-                swa_head_dim=head_dim,
-                dtype=dtype,
-            )
-            kvc.pool_page_size = page_size
-            kvc.page_size = page_size
-            with (
-                self._cfg_patches(
-                    disaggregation_mode=mode,
-                    disaggregation_transfer_backend="raiden",
-                    kv_cache_dtype=kv_dtype,
-                    page_size=page_size,
-                ),
-                tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(arena),
-                patch(
-                    "sglang.srt.runtime_context.uses_mla_backend", return_value=False
-                ),
-                patch("sglang.srt.platforms.current_platform", platform),
-            ):
-                conf = TpuUnifiedSWAPoolConfigurator(kvc)
-                cfg = conf.calculate_pool_sizes(avail, page_size=page_size)
-                pool = TpuUnifiedSWAKVPool(
-                    size=cfg.full_max_total_num_tokens,
-                    page_size=page_size,
-                    dtype=dtype,
-                    full=AttnLayerSpec(
-                        head_num=head_num,
-                        head_dim=head_dim,
-                        layer_ids=kvc.layer_info.full_attention_layer_ids,
-                    ),
-                    swa=AttnLayerSpec(
-                        head_num=head_num,
-                        head_dim=head_dim,
-                        layer_ids=kvc.layer_info.swa_attention_layer_ids,
-                    ),
-                    device="cpu",
-                )
-            return conf, cfg, pool
-
         # 10 full + 50 SWA -> M_swa = 5, (1 + 5) * 128 = 768 arena blocks.
-        conf, on, pool = run(True)
+        conf, on, pool = self._run_land_arena_sizing(arena=True, avail=budget)
         arena_blocks = (1 + 5) * 128
         self.assertEqual(pool.land_arena_blocks, arena_blocks)
         self.assertEqual(
@@ -846,13 +845,16 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             on.full_max_total_num_tokens // 128 + 1 + arena_blocks,
         )
         self.assertLessEqual(sum(pool.get_kv_size_bytes()), budget)
-        _, shrunk, _ = run(False, avail=budget - arena_blocks * conf._page_bytes)
+        _, shrunk, _ = self._run_land_arena_sizing(
+            arena=False, avail=budget - arena_blocks * conf._page_bytes
+        )
         self.assertEqual(on, shrunk)
 
         # GPT-OSS-120B decode TP4 shape: 18 full + 18 SWA (M_swa=1), 2 kv heads/rank,
         # head_dim=64 (padded 128 -> 512 B/tok/layer), page_size=64 -> 512 blocks = 288 MiB.
-        gpt_conf, gpt_cfg, gpt_pool = run(
-            True,
+        gpt_conf, _, gpt_pool = self._run_land_arena_sizing(
+            arena=True,
+            avail=budget,
             page_size=64,
             full_ids=range(18),
             swa_ids=range(18, 36),
@@ -865,13 +867,16 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual(arena_bytes, 288 * 1024 * 1024)
         self.assertLessEqual(sum(gpt_pool.get_kv_size_bytes()), budget)
 
-        # Uncharged when env off, prefill, or bf16.
         for kwargs in (
             dict(mode="prefill"),
             dict(kv_dtype="bfloat16", dtype=torch.bfloat16),
         ):
-            _, off_cfg, _ = run(False, **kwargs)
-            _, on_cfg, p = run(True, **kwargs)
+            _, off_cfg, _ = self._run_land_arena_sizing(
+                arena=False, avail=budget, **kwargs
+            )
+            _, on_cfg, p = self._run_land_arena_sizing(
+                arena=True, avail=budget, **kwargs
+            )
             self.assertEqual(on_cfg, off_cfg)
             self.assertEqual(p.land_arena_blocks, 0)
 

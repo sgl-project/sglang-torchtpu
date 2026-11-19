@@ -1038,7 +1038,9 @@ class RaidenReceiverMixin:
         """The receive geometry of this decode rank, and whether any of its
         sources lands in scratch. Without an arena, today's geometry."""
         geom = (
-            self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
+            self._make_geometry(
+                src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size, swa=True
+            )
             if swa
             else self._make_geometry(src_attn_tp, self.attn_tp_size)
         )
@@ -1489,6 +1491,7 @@ class RaidenReceiverMixin:
 
     def _pair_reshard_swa_sources(
         self,
+        *,
         room: int,
         local_swa_blocks: List[int],
         swa_sources_map: Dict[int, List[int]],
@@ -1580,9 +1583,10 @@ class RaidenReceiverMixin:
         local_swa_blocks: List[int],
         swa_sources_map: Dict[int, List[int]],
     ) -> bool:
-        """Arm the sliding-window receive of a resharded room. True to continue."""
         sources = self._pair_reshard_swa_sources(
-            room, local_swa_blocks, swa_sources_map
+            room=room,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
         )
         if sources is None:
             return False
@@ -1593,7 +1597,7 @@ class RaidenReceiverMixin:
         except Exception as e:
             error = RuntimeError(f"SWA: cannot stage plan {room}: {e}")
             error.__cause__ = e
-            self._fail_reshard_room(room, error)
+            self._fail_reshard_room(room=room, error=error)
             return False
         if not self._stage_reshard_swa_plan(
             room=room,
@@ -1605,8 +1609,8 @@ class RaidenReceiverMixin:
             return False
         with self._state_lock:
             if room not in self._decode.reshard_meta or room in self._aborted:
-                # Cleared while registering; drop the plan again so the pages
-                # cannot be written under their next owner.
+                # Cleared while registering; drop the plan again,
+                # so the pages cannot be written under their next owner.
                 self._unregister_plan(room)
                 return False
             self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
@@ -1671,11 +1675,13 @@ class RaidenReceiverMixin:
             try:
                 geom, full_lands = self._land_geometry(src_attn_tp)
                 if self._swa_engine is not None and local_swa_blocks:
-                    swa_geom, swa_lands = self._land_geometry(src_attn_tp, swa=True)
+                    swa_geom, swa_lands = self._land_geometry(
+                        src_attn_tp=src_attn_tp, swa=True
+                    )
                 else:
                     swa_geom, swa_lands = None, False
             except Exception as e:
-                self._fail_reshard_plan_build(room, str(room), e)
+                self._fail_reshard_plan_build(room=room, req_id=str(room), exc=e)
                 return
             if full_lands or swa_lands:
                 self._register_landing_closing(
@@ -1819,6 +1825,40 @@ class RaidenReceiverMixin:
             record_read=not self.chunked_transfer,
         )
 
+    def _resolve_landing_closing_swa(
+        self,
+        *,
+        room: int,
+        src_attn_tp: int,
+        swa_lands: bool,
+        missing: List[int],
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> Tuple[
+        Optional[Dict[int, List[int]]], Optional[List[Tuple[int, List[int]]]], bool
+    ]:
+        if self._unified_swa_pool is not None:
+            paired = self._pair_unified_reshard_swa_receiver(
+                room=room,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources_map=swa_sources_map,
+            )
+            return paired, None, paired is not None
+        if not missing and not swa_lands:
+            ok = self._register_reshard_swa_receiver(
+                room=room,
+                src_attn_tp=src_attn_tp,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources_map=swa_sources_map,
+            )
+            return None, None, ok
+        swa_sources = self._pair_reshard_swa_sources(
+            room=room,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
+        )
+        return None, swa_sources, swa_sources is not None
+
     def _register_landing_closing(
         self,
         *,
@@ -1840,25 +1880,16 @@ class RaidenReceiverMixin:
         with self._state_lock:
             covered = list(self._decode.reshard_covered.get(room, []))
         missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
-        unified_swa_sources: Optional[Dict[int, List[int]]] = None
-        swa_sources: Optional[List[Tuple[int, List[int]]]] = None
-        if self._unified_swa_pool is not None:
-            unified_swa_sources = self._pair_unified_reshard_swa_receiver(
-                room, local_swa_blocks, swa_sources_map
-            )
-            if unified_swa_sources is None:
-                return
-        elif not missing and not swa_lands:
-            if not self._register_reshard_swa_receiver(
-                room, src_attn_tp, local_swa_blocks, swa_sources_map
-            ):
-                return
-        else:
-            swa_sources = self._pair_reshard_swa_sources(
-                room, local_swa_blocks, swa_sources_map
-            )
-            if swa_sources is None:
-                return
+        unified_swa_sources, swa_sources, ok = self._resolve_landing_closing_swa(
+            room=room,
+            src_attn_tp=src_attn_tp,
+            swa_lands=swa_lands,
+            missing=missing,
+            local_swa_blocks=local_swa_blocks,
+            swa_sources_map=swa_sources_map,
+        )
+        if not ok:
+            return
         has_closing_full = bool(missing) or (
             unified_swa_sources is not None and bool(local_swa_blocks)
         )
@@ -1869,6 +1900,7 @@ class RaidenReceiverMixin:
             if has_closing_full:
                 self._decode.chunk_reads.setdefault(room, []).append(str(room))
             self._decode.final_seen.add(room)
+        dst = [local_blocks[pg - base] for pg in missing]
         if unified_swa_sources is not None:
             unified_sources = [
                 (
@@ -1878,7 +1910,6 @@ class RaidenReceiverMixin:
                 )
                 for p_rank in sorted(sources_map)
             ]
-            dst = [local_blocks[pg - base] for pg in missing]
             self._land_unified_closing(
                 room=room,
                 geom=geom,
@@ -1905,7 +1936,6 @@ class RaidenReceiverMixin:
             if missing
             else []
         )
-        dst = [local_blocks[pg - base] for pg in missing]
         self._land_closing(
             room=room,
             geom=geom,
@@ -1952,10 +1982,12 @@ class RaidenReceiverMixin:
                 scratch_block_ids=scratch,
             )
         except Exception as e:
-            self._fail_reshard_plan_build(room, req_id, e)
+            self._fail_reshard_plan_build(room=room, req_id=req_id, exc=e)
             return False
         try:
-            self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size)
+            self._check_reshard_bounds(
+                req=req, src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size
+            )
             self._ensure_engine().register_active_plan(room, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
@@ -1991,13 +2023,13 @@ class RaidenReceiverMixin:
             if full_registered:
                 plans[req_id] = room
             if scratch is not None:
-                self._land.publish(req_id, dst)
+                self._land.publish(key=req_id, final=dst)
             if (
                 swa_scratch is not None
                 and swa_req_id is not None
                 and local_swa_blocks is not None
             ):
-                self._swa_land.publish(swa_req_id, local_swa_blocks)
+                self._swa_land.publish(key=swa_req_id, final=local_swa_blocks)
             for endpoint in ready_endpoints:
                 self._send_multipart_locked(endpoint, payload)
             return True
@@ -2021,6 +2053,54 @@ class RaidenReceiverMixin:
                 if swa_req_id is not None:
                     self._land_free(swa_req_id, swa=True)
 
+    def _stage_land_closing_plans(
+        self,
+        *,
+        room: int,
+        req_id: str,
+        src_attn_tp: int,
+        geom: Any,
+        swa_geom: Any,
+        sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        scratch: Optional[List[int]],
+        swa_sources: List[Tuple[int, List[int]]],
+        local_swa_blocks: List[int],
+        swa_scratch: Optional[List[int]],
+    ) -> Tuple[bool, bool, bool]:
+        swa_registered = False
+        if swa_sources:
+            if swa_geom is None:
+                swa_geom = self._make_geometry(
+                    src_attn_tp=src_attn_tp,
+                    dst_attn_tp=self.attn_tp_size,
+                    swa=True,
+                )
+            if not self._stage_reshard_swa_plan(
+                room=room,
+                src_attn_tp=src_attn_tp,
+                swa_geom=swa_geom,
+                local_swa_blocks=local_swa_blocks,
+                sources=swa_sources,
+                swa_scratch=swa_scratch,
+            ):
+                return False, False, False
+            swa_registered = True
+        full_registered = False
+        if dst:
+            if not self._stage_closing_full_plan(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                sources=sources,
+                dst=dst,
+                scratch=scratch,
+            ):
+                return False, swa_registered, False
+            full_registered = True
+        return True, swa_registered, full_registered
+
     def _land_closing(
         self,
         *,
@@ -2038,25 +2118,7 @@ class RaidenReceiverMixin:
         ready_endpoints: List[str],
         deadline: Optional[float] = None,
     ) -> None:
-        req_id = str(room)
-        swa_req_id = self._swa_req_id(room)
-        retry_kwargs = dict(
-            room=room,
-            geom=geom,
-            full_lands=full_lands,
-            swa_geom=swa_geom,
-            swa_lands=swa_lands,
-            src_attn_tp=src_attn_tp,
-            local_swa_blocks=local_swa_blocks,
-            swa_sources=swa_sources,
-            sources=sources,
-            dst=dst,
-            missing=missing,
-            ready_endpoints=ready_endpoints,
-        )
-        expire_cb = functools.partial(
-            self._fail_reshard_room, room, self._land_hold_error()
-        )
+        req_id, swa_req_id = str(room), self._swa_req_id(room)
         scratch, swa_scratch, acquired = self._land_take_closing(
             room=room,
             req_id=req_id,
@@ -2064,9 +2126,24 @@ class RaidenReceiverMixin:
             swa_req_id=swa_req_id,
             swa_n=len(local_swa_blocks) if (swa_lands and swa_sources) else 0,
             retry_factory=lambda due: functools.partial(
-                self._retry_land_closing, deadline=due, **retry_kwargs
+                self._retry_land_closing,
+                room=room,
+                geom=geom,
+                full_lands=full_lands,
+                swa_geom=swa_geom,
+                swa_lands=swa_lands,
+                src_attn_tp=src_attn_tp,
+                local_swa_blocks=local_swa_blocks,
+                swa_sources=swa_sources,
+                sources=sources,
+                dst=dst,
+                missing=missing,
+                ready_endpoints=ready_endpoints,
+                deadline=due,
             ),
-            expire=expire_cb,
+            expire=functools.partial(
+                self._fail_reshard_room, room=room, error=self._land_hold_error()
+            ),
             deadline=deadline,
         )
         if not acquired:
@@ -2075,33 +2152,21 @@ class RaidenReceiverMixin:
         swa_registered = False
         full_registered = False
         try:
-            if swa_sources:
-                if swa_geom is None:
-                    swa_geom = self._make_geometry(
-                        src_attn_tp, self.attn_tp_size, swa=True
-                    )
-                if not self._stage_reshard_swa_plan(
-                    room=room,
-                    src_attn_tp=src_attn_tp,
-                    swa_geom=swa_geom,
-                    local_swa_blocks=local_swa_blocks,
-                    sources=swa_sources,
-                    swa_scratch=swa_scratch,
-                ):
-                    return
-                swa_registered = True
-            if dst:
-                if not self._stage_closing_full_plan(
-                    room=room,
-                    req_id=req_id,
-                    src_attn_tp=src_attn_tp,
-                    geom=geom,
-                    sources=sources,
-                    dst=dst,
-                    scratch=scratch,
-                ):
-                    return
-                full_registered = True
+            ok, swa_registered, full_registered = self._stage_land_closing_plans(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                swa_geom=swa_geom,
+                sources=sources,
+                dst=dst,
+                scratch=scratch,
+                swa_sources=swa_sources,
+                local_swa_blocks=local_swa_blocks,
+                swa_scratch=swa_scratch,
+            )
+            if not ok:
+                return
             payload = ReshardLandReady(
                 room=room,
                 pages=missing,
@@ -2146,30 +2211,29 @@ class RaidenReceiverMixin:
     ) -> None:
         req_id = str(room)
         combined_dst = dst + local_swa_blocks
-        retry_kwargs = dict(
-            room=room,
-            geom=geom,
-            src_attn_tp=src_attn_tp,
-            unified_sources=unified_sources,
-            dst=dst,
-            local_swa_blocks=local_swa_blocks,
-            missing=missing,
-            ready_endpoints=ready_endpoints,
-        )
         due = (
             deadline
             if deadline is not None
             else self._land_hold_deadline_locked(room=room, lands=(self._land,))
         )
         all_scratch = self._land_take(
-            room,
-            req_id,
-            len(combined_dst),
+            room=room,
+            key=req_id,
+            n=len(combined_dst),
             retry=functools.partial(
-                self._retry_land_unified_closing, deadline=due, **retry_kwargs
+                self._retry_land_unified_closing,
+                room=room,
+                geom=geom,
+                src_attn_tp=src_attn_tp,
+                unified_sources=unified_sources,
+                dst=dst,
+                local_swa_blocks=local_swa_blocks,
+                missing=missing,
+                ready_endpoints=ready_endpoints,
+                deadline=due,
             ),
             expire=functools.partial(
-                self._fail_reshard_room, room, self._land_hold_error()
+                self._fail_reshard_room, room=room, error=self._land_hold_error()
             ),
             deadline=due,
         )

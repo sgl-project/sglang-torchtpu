@@ -769,14 +769,13 @@ class RaidenKVManager(
             return
         from sglang_tpu.disaggregation.raiden.land import LandState, ScratchArena
 
-        arena = ScratchArena.from_pool(kv_pool)
+        arena = ScratchArena.from_pool(pool=kv_pool)
         self._land = LandState(arena) if arena is not None else None
-        swa_arena = ScratchArena.from_pool(kv_pool, swa=True)
+        swa_arena = ScratchArena.from_pool(pool=kv_pool, swa=True)
         self._swa_land = LandState(swa_arena) if swa_arena is not None else None
 
     def _check_land_arena(self) -> None:
-        """Drop an arena unless every tensor of its group ends with it: the
-        merge and the pushes address scratch blocks by id in each of them."""
+        # Every tensor of a group must end with its arena; pushes and merges index it.
         for attr, tensors, label in (
             ("_land", self._kv_caches, "KV"),
             ("_swa_land", self._swa_kv_caches, "SWA KV"),
@@ -838,7 +837,7 @@ class RaidenKVManager(
             return full_ok and swa_ok
 
     def _collect_land_round_locked(
-        self, land: Any, now: float
+        self, *, land: Any, now: float
     ) -> Tuple[List[Tuple[str, Any]], List[Any]]:
         if land is None:
             return [], []
@@ -846,8 +845,8 @@ class RaidenKVManager(
         for key, plan in list(land.plans.items()):
             if not plan.settled:
                 continue
-            # A room that failed or was cleared since its settle gets no
-            # merge: its pages may already belong to another request.
+            # A room that failed or was cleared since its settle gets no merge:
+            # its pages may already belong to another request.
             if self._land_live_locked(plan.room):
                 jobs.append((key, plan))
             else:
@@ -858,7 +857,7 @@ class RaidenKVManager(
         return jobs, expired
 
     def _merge_land_group(
-        self, kv_caches: Sequence[Any], land: Any, jobs: Sequence[Tuple[str, Any]]
+        self, *, kv_caches: Sequence[Any], land: Any, jobs: Sequence[Tuple[str, Any]]
     ) -> None:
         from sglang_tpu.disaggregation.raiden.land import merge_pages
 
@@ -910,20 +909,26 @@ class RaidenKVManager(
         self._drain_engine()
         now = time.time()
         with self._state_lock:
-            full_jobs, full_expired = self._collect_land_round_locked(land, now)
-            swa_jobs, swa_expired = self._collect_land_round_locked(swa_land, now)
+            full_jobs, full_expired = self._collect_land_round_locked(
+                land=land, now=now
+            )
+            swa_jobs, swa_expired = self._collect_land_round_locked(
+                land=swa_land, now=now
+            )
         if full_jobs or swa_jobs:
             sync_kv = self._kv_caches or self._swa_kv_caches
 
-            def merge(f_js, s_js):
-                self._merge_land_group(self._kv_caches, land, f_js)
-                self._merge_land_group(self._swa_kv_caches, swa_land, s_js)
+            def merge(*, f_js, s_js):
+                self._merge_land_group(kv_caches=self._kv_caches, land=land, jobs=f_js)
+                self._merge_land_group(
+                    kv_caches=self._swa_kv_caches, land=swa_land, jobs=s_js
+                )
 
             failed: Dict[int, BaseException] = {}
             # Orders the settled H2D before the gathers (H6).
             device_sync(sync_kv)
             try:
-                merge(full_jobs, swa_jobs)
+                merge(f_js=full_jobs, s_js=swa_jobs)
             except Exception:
                 # Attribute the error: re-merge room by room. The merge only
                 # rewrites final slots 2-3 from scratch, so redoing a room the
@@ -932,15 +937,15 @@ class RaidenKVManager(
                 for room in rooms:
                     try:
                         merge(
-                            [(k, p) for k, p in full_jobs if p.room == room],
-                            [(k, p) for k, p in swa_jobs if p.room == room],
+                            f_js=[(k, p) for k, p in full_jobs if p.room == room],
+                            s_js=[(k, p) for k, p in swa_jobs if p.room == room],
                         )
                     except Exception as e:
                         failed[room] = e
             # Orders the merge before any later H2D into the freed scratch.
             device_sync(sync_kv)
             for room, error in failed.items():
-                self._fail_reshard_room(room, error)
+                self._fail_reshard_room(room=room, error=error)
             with self._state_lock:
                 if land is not None:
                     for key, _ in full_jobs:

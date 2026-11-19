@@ -86,6 +86,7 @@ def _manager(dtype, full_heads, swa_heads, tp, sal=False):
         total_kv_head_num=full_heads,
         total_swa_kv_head_num=swa_heads,
         page_size=SAL_PAGE if sal else PAGE,
+        sliding_window_size=None,
     )
     return mgr
 

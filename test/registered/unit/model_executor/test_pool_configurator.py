@@ -2356,17 +2356,9 @@ class TestRaidenLandArenaBudget(CustomTestCase):
             eagle_draft_layers=4,
             eagle_draft_swa_layers=2,
         )
-        cfg, _ = self._run(False, **swa)
         _, on = self._run(True, **swa)
         arena = (
-            self.ARENA
-            * self.PAGE
-            * (
-                cfg._full_per_token * cfg._full_layers_num
-                + cfg._swa_per_token * cfg._swa_layers_num
-                + cfg._draft_full_per_token * cfg._draft_full_layers_num
-                + cfg._draft_swa_per_token * cfg._draft_swa_layers_num
-            )
+            self.ARENA * self.PAGE * ((8 + 2) * 4 * 128 * 2 + (24 + 2) * 2 * 128 * 2)
         )
         _, shrunk = self._run(False, available=self.AVAILABLE - arena, **swa)
         self.assertEqual(on, shrunk)
@@ -2391,14 +2383,7 @@ class TestRaidenLandArenaBudget(CustomTestCase):
         cfg, off = self._run(False, **cap)
         self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
         _, on = self._run(True, **cap)
-        arena = (
-            self.ARENA
-            * self.PAGE
-            * (
-                cfg._full_per_token * cfg._full_layers_num
-                + cfg._swa_per_token * cfg._swa_layers_num
-            )
-        )
+        arena = self.ARENA * self.PAGE * (8 * 4 * 128 * 2 + 24 * 2 * 128 * 2)
         _, shrunk = self._run(False, available=self.AVAILABLE - arena, **cap)
         self.assertEqual(on, shrunk)
         self.assertLess(on.full_max_total_num_tokens, off.full_max_total_num_tokens)

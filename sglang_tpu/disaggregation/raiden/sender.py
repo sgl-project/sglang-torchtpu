@@ -879,15 +879,25 @@ class RaidenSenderMixin:
 
                 try:
                     base_geom = (
-                        self._make_geometry(self.attn_tp_size, dst_attn_tp, swa=True)
+                        self._make_geometry(
+                            src_attn_tp=self.attn_tp_size,
+                            dst_attn_tp=dst_attn_tp,
+                            swa=True,
+                        )
                         if swa
-                        else self._make_geometry(self.attn_tp_size, dst_attn_tp)
+                        else self._make_geometry(
+                            src_attn_tp=self.attn_tp_size,
+                            dst_attn_tp=dst_attn_tp,
+                        )
                     )
                     geom = base_geom.with_land()
                     kinds = tuple(
                         any(
-                            isinstance(geom.entry_bytes(p, d), LandEntry)
-                            for p in source_ranks_for(d, geom.ratio)
+                            isinstance(
+                                geom.entry_bytes(prefill_rank=p, decode_rank=d),
+                                LandEntry,
+                            )
+                            for p in source_ranks_for(decode_rank=d, ratio=geom.ratio)
                         )
                         for d in range(dst_attn_tp)
                     )
@@ -901,12 +911,11 @@ class RaidenSenderMixin:
         return (
             self._land_ok()
             and dst_attn_tp is not None
-            and self._land_kinds(dst_attn_tp)[0]
+            and self._land_kinds(dst_attn_tp=dst_attn_tp)[0]
         )
 
     def _plan_lands(self, dst_attn_tp: int, *, swa: bool = False) -> bool:
-        """Whether the plan of the decode rank this rank pushes to lands."""
-        kinds = self._land_kinds(dst_attn_tp, swa=swa)[1]
+        kinds = self._land_kinds(dst_attn_tp=dst_attn_tp, swa=swa)[1]
         d = self.attn_tp_rank * dst_attn_tp // self.attn_tp_size
         return bool(kinds) and kinds[d]
 
@@ -920,16 +929,13 @@ class RaidenSenderMixin:
         swa_scratch: Optional[List[int]] = None,
         is_closing: bool = False,
     ) -> Optional[str]:
-        """Why a READY does not fit the room's plan kind, or None. A plain
-        READY with pages for a landing plan, or a landing READY for a direct
-        one, means the two sides classified differently."""
         if land_version is None and not self._land_ok() and not self._land_ok(swa=True):
             return None
         req = self._prefill.reshard_req.get(room)
         if req is None or req.get("dst_attn_tp") is None:
             return None
         dst_attn_tp = req["dst_attn_tp"]
-        full_lands = self._land_ok() and self._plan_lands(dst_attn_tp)
+        full_lands = self._land_ok() and self._plan_lands(dst_attn_tp=dst_attn_tp)
         decode_swa_blocks = list(req.get("decode_swa_blocks") or [])
         swa_lands = (
             is_closing
@@ -940,7 +946,7 @@ class RaidenSenderMixin:
                 else (
                     bool(self._swa_kv_caches)
                     and self._land_ok(swa=True)
-                    and self._plan_lands(dst_attn_tp, swa=True)
+                    and self._plan_lands(dst_attn_tp=dst_attn_tp, swa=True)
                 )
             )
         )
@@ -1111,13 +1117,13 @@ class RaidenSenderMixin:
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
         req = ReshardReady.from_frames(msg)
-        self._accept_reshard_ready(req.room, req.pages)
+        self._accept_reshard_ready(room=req.room, pages=req.pages)
 
     def _on_reshard_land_ready(self, msg: List[bytes]) -> None:
         req = ReshardLandReady.from_frames(msg)
         self._accept_reshard_ready(
-            req.room,
-            req.pages,
+            room=req.room,
+            pages=req.pages,
             scratch=req.scratch,
             swa_scratch=req.swa_scratch,
             land_version=req.land_version,
@@ -1334,12 +1340,12 @@ class RaidenSenderMixin:
             if scratch is not None:
                 decode_swa_blocks = list(
                     _target_blocks(
-                        geom.entry_bytes(
-                            self.attn_tp_rank % geom.src_tp,
-                            self.attn_tp_rank // geom.ratio,
+                        entry=geom.entry_bytes(
+                            prefill_rank=self.attn_tp_rank % geom.src_tp,
+                            decode_rank=self.attn_tp_rank // geom.ratio,
                         ),
-                        decode_swa_blocks,
-                        scratch,
+                        dst_block_ids=decode_swa_blocks,
+                        scratch_block_ids=scratch,
                     )
                 )
             self._check_reshard_bounds(
@@ -1448,7 +1454,12 @@ class RaidenSenderMixin:
         # returning early below would strand it and is_send_done would never
         # settle.
         if chunk is None:
-            self._run_reshard_swa_push(room, req_meta, swa_blocks, scratch=swa_scratch)
+            self._run_reshard_swa_push(
+                room=room,
+                req_meta=req_meta,
+                swa_blocks=swa_blocks,
+                scratch=swa_scratch,
+            )
             if self._unified_swa_pool is not None:
                 unified_swa_pair = self._pair_unified_reshard_swa_push(
                     room, req_meta, swa_blocks

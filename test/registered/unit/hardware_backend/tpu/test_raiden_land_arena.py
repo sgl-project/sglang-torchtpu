@@ -169,12 +169,12 @@ class TestArenaSizing(CustomTestCase):
         arena = ScratchArena.from_pool(pool)
         self.assertEqual(arena.first_block, 17)
         self.assertEqual(arena.capacity, want)
-        self.assertIsNone(ScratchArena.from_pool(pool, swa=True))
+        self.assertIsNone(ScratchArena.from_pool(pool=pool, swa=True))
         req_pool = ReqToTokenPool(
             size=4, max_context_len=size, device="cpu", enable_memory_saver=False
         )
         allocator = TpuUnifiedSWATokenToKVPoolAllocator(
-            size,
+            size=size,
             page_size=PAGE,
             dtype=_FP8,
             device="cpu",
@@ -235,10 +235,10 @@ class TestArenaUniformAcrossGroups(CustomTestCase):
         self.assertEqual(pool.swa_kv_pool.land_arena_blocks, ARENA)
         self.assertEqual(pool.swa_kv_pool.num_blocks, SIZE // PAGE + 1 + ARENA)
         self.assertEqual(ScratchArena.from_pool(pool).capacity, ARENA)
-        swa_arena = ScratchArena.from_pool(pool, swa=True)
+        swa_arena = ScratchArena.from_pool(pool=pool, swa=True)
         self.assertEqual(swa_arena.first_block, SIZE // PAGE + 1)
         self.assertEqual(swa_arena.capacity, ARENA)
-        self.assertIsNone(ScratchArena.from_pool(plain, swa=True))
+        self.assertIsNone(ScratchArena.from_pool(pool=plain, swa=True))
         groups = get_raiden_kv_caches(pool, draft)
         self.assertEqual(
             {int(t.shape[0]) for t in groups.full}, {SIZE // PAGE + 1 + ARENA}

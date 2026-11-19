@@ -153,9 +153,6 @@ def _mha_bytes_per_token_per_layer(
 
 
 def _reserved_blocks_sizer(kvc: KVCacheConfigurator) -> Callable[[], int]:
-    """Blocks each KV pool reserves past the allocator: one count per group,
-    target and draft alike, read when sizing
-    (``SRTPlatform.get_kv_pool_reserved_blocks``)."""
     use_mla_backend = kvc.use_mla_backend
     return lambda: current_platform.get_kv_pool_reserved_blocks(
         use_mla_backend=use_mla_backend
