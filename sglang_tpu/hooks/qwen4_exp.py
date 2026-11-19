@@ -47,6 +47,17 @@ embed_ple_rows128
   Upstream PR or issue: not filed.
   Remove when: TPU gathers rows of a narrow table without re-laying it out.
 
+short_conv_slot_major
+  Why: TpuShortConvPool stores PLE short-conv state slot-major ([slots,
+       state_len, 1, channels], what Raiden can register); core's _short_conv
+       indexes and assigns a transposed view of it, which aborted the TPU
+       compiler ("Unsupported conversion from vmreg/vreg to U64").
+  How: AROUND Qwen4ExpPLELayer._short_conv: core's general-path math, with the
+       state rows read via index_select and written back via index_copy_ on the
+       stored tensor. The fused decode and verify paths fall back to core.
+  Upstream PR or issue: not filed.
+  Remove when: core's PLE state access goes through pool methods.
+
 hash_ngrams_int32
   Why: the PLE n-gram hash multiplies and XORs int64 values; it compiled for
        prefill, but decode-sized graphs aborted the TPU compiler
@@ -404,3 +415,74 @@ def embed_ple_rows128(
     return ngram._finish_embedding_lookup(
         embeddings, semantic_tokens, forward_batch, physical_tokens
     )
+
+
+def short_conv_slot_major(
+    original: Any,
+    ple: Any,
+    x: Any,
+    forward_batch: Any,
+    batch: Any,
+    *args,
+    **kwargs,
+):
+    """AROUND Qwen4ExpPLELayer._short_conv on a TpuShortConvPool.
+
+    The pool stores each layer's state slot-major as [slots, state_len, 1,
+    channels] (what Raiden registers); core's _short_conv indexes and assigns
+    a [slots, channels, state_len] view of it, which aborted the TPU compiler
+    ("Unsupported conversion from vmreg/vreg to U64"). Same math as core's
+    general path, but the state rows are read out of and written back into
+    the stored tensor with index_select / index_copy_.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from sglang.srt.models import qwen4_exp
+
+    if x.shape[0] == 0:
+        return x
+    pool = qwen4_exp.get_req_to_token_pool().short_conv_pool
+    stored = getattr(pool, "layer_states", None)
+    if (
+        not stored
+        or batch.use_decode_fast_path
+        or batch.mode.is_target_verify()
+        or ple.layer_id not in pool.layer_map
+    ):
+        return original(ple, x, forward_batch, batch, *args, **kwargs)
+    root = stored[pool.layer_map[ple.layer_id]]  # [slots, state_len, 1, C]
+
+    def read(indices):
+        return root.index_select(0, indices)[:, :, 0, :].transpose(1, 2).to(x.dtype)
+
+    def write(indices, value):  # value: [N, C, state_len]
+        root.index_copy_(0, indices, value.transpose(1, 2).unsqueeze(2).to(root.dtype))
+
+    state = read(batch.state_indices)
+    padded_seq = x.new_zeros((batch.lengths.shape[0], batch.row_width, ple.conv_channels))
+    padded_seq[batch.req_indices, batch.token_offsets] = x
+    conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+    conv_output = F.conv1d(
+        conv_input,
+        ple.conv1d.weight.to(dtype=x.dtype),
+        bias=None,
+        dilation=ple.short_conv_dilation,
+        groups=ple.conv_channels,
+    ).transpose(1, 2)
+    state_cols = torch.arange(ple.short_conv_state_len, device=x.device, dtype=torch.long)
+
+    def gather_at(offsets):
+        return conv_input.gather(
+            2,
+            (offsets.unsqueeze(1) + state_cols.unsqueeze(0))
+            .unsqueeze(1)
+            .expand(-1, ple.conv_channels, -1),
+        )
+
+    write(batch.state_indices, gather_at(batch.lengths))
+    track = qwen4_exp._ple_track_targets(forward_batch, batch)
+    if track is not None:
+        track_indices, track_offsets = track
+        write(track_indices, gather_at(track_offsets))
+    return F.silu(conv_output[batch.req_indices, batch.token_offsets])

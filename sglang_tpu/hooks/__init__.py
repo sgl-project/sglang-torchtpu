@@ -88,6 +88,7 @@ from sglang_tpu.hooks.qwen4_exp import (
     embed_ple_rows128,
     hash_ngrams_int32,
     load_ple_table_on_host,
+    short_conv_slot_major,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.ple_state_pool import TpuShortConvPool
@@ -145,6 +146,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._embed_ngram_ids",
         embed_ple_rows128,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.qwen4_exp.Qwen4ExpPLELayer._short_conv",
+        short_conv_slot_major,
         HookType.AROUND,
     ),
     (
