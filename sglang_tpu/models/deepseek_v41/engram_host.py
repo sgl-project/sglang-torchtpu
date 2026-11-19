@@ -1294,11 +1294,14 @@ def defer_engram_commit(
 
 
 def has_pending_engram_commits(hasher) -> bool:
-    return bool(_PENDING_COMMITS.get(hasher))
+    # Only DSpark verify queues; without a queue the hasher is never weak-referenced.
+    return bool(_PENDING_COMMITS) and bool(_PENDING_COMMITS.get(hasher))
 
 
 def flush_engram_commits(hasher) -> None:
     """Apply the queued verify commits in order; call before reading or writing history."""
+    if not _PENDING_COMMITS:
+        return
     for verify_ids_2d, req_pool_indices, commit_lens in _PENDING_COMMITS.pop(
         hasher, ()
     ):
