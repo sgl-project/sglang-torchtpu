@@ -710,8 +710,9 @@ class Envs:
     # chunk longer than window + page (4096-token chunks) then keeps the match
     # points of window-sized chunks instead of only its last window.
     SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS = EnvBool(False)
-    # Move the stale SWA windows behind a request's sliding window (chunk boundaries,
-    # earlier turns) to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    # After an insert, move the SWA windows behind the request's sliding window that
+    # it passed (nodes that existed before it, such as earlier turns, outside the
+    # window ending at a fork) to the SWA LRU eviction end.
     SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
     # When a request finishes, move its unshared final SWA windows (its private
     # tail, after it drops its tree lock) to the SWA LRU eviction end. On a first

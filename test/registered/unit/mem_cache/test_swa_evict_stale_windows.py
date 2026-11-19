@@ -90,6 +90,29 @@ class PrefillWorld:
         a.set_full_to_swa_mapping(full, swa)
         return full[:n]
 
+    def _admit_and_extend(self, req: Req, fill: list[int], chunk: int) -> int:
+        """Admission match + lock, then chunked extends of ``fill``; returns the
+        cached prefix length."""
+        self.req_to_token_pool.alloc([req])
+        req.init_next_round_input(tree_cache=self.cache)
+        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        cached = len(req.prefix_indices)
+        row = req.kv.req_pool_idx
+        if cached:
+            self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
+        pos = cached
+        while pos < len(fill):
+            end = min(pos + chunk, len(fill))
+            req.set_extend_range(pos, end)
+            self.req_to_token_pool.write((row, slice(pos, end)), self._alloc(end - pos))
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = end
+            pos = end
+            if pos < len(fill):
+                checkpoint_kv_cache(req, self.cache)
+                req.init_next_round_input()
+        return cached
+
     def prefill(
         self,
         tokens: list[int],
@@ -98,10 +121,14 @@ class PrefillWorld:
         *,
         decode: int = 0,
         output: int = 7,
+        retract: bool = False,
     ) -> int:
         """Returns the cached prefix length. ``decode`` output tokens (the first is
         ``output``) get KV before the request finishes, so they enter the tree.
-        ``media`` is the [start, end) token span of one multimodal item."""
+        ``media`` is the [start, end) token span of one multimodal item. With
+        ``retract``, the request is retracted after its first output token and
+        re-prefills prompt + output, as on SWA memory pressure."""
+        assert not (retract and decode), "retract re-prefills only the first output"
         req = Req(
             rid=f"r{self.rid}",
             origin_input_text="",
@@ -114,26 +141,15 @@ class PrefillWorld:
                 mm_items=[SimpleNamespace(offsets=[(media[0], media[1] - 1)])]
             )
         self.rid += 1
-        self.req_to_token_pool.alloc([req])
-        req.init_next_round_input(tree_cache=self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        cached = len(req.prefix_indices)
-        row = req.kv.req_pool_idx
-        if cached:
-            self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
-        req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
-        pos = cached
-        while pos < len(tokens):
-            end = min(pos + chunk, len(tokens))
-            req.set_extend_range(pos, end)
-            self.req_to_token_pool.write((row, slice(pos, end)), self._alloc(end - pos))
-            req.kv.kv_committed_len = req.kv.kv_allocated_len = end
-            pos = end
-            if pos < len(tokens):
-                checkpoint_kv_cache(req, self.cache)
-                req.init_next_round_input()
+        cached = self._admit_and_extend(req, tokens, chunk)
         req.output_ids.append(output)
         checkpoint_kv_cache(req, self.cache)
+        if retract:
+            release_kv_cache(req, self.cache, is_insert=False)
+            req.reset_for_retract()
+            self._admit_and_extend(req, tokens + list(req.output_ids), chunk)
+            checkpoint_kv_cache(req, self.cache)
+        row = req.kv.req_pool_idx
         if decode:
             n = len(tokens)
             # The first slots continue the prompt's last page.
@@ -178,21 +194,50 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
             return PrefillWorld(full_tokens=32768, swa_tokens=swa_tokens)
 
     def _full_hits(self, *, enabled: bool, sessions: int) -> int:
-        """Sessions whose revisit hits the full prefix."""
+        """Sessions whose second revisit hits the full prefix."""
         w = self._world(enabled=enabled, swa_tokens=4096)
         prefixes = [_tokens(100 + s, self.PREFIX) for s in range(sessions)]
-        for p in prefixes:
-            w.prefill(p, self.CHUNK)
+        for _ in range(2):
+            for p in prefixes:
+                w.prefill(p, self.CHUNK)
         hits = [w.prefill(p, self.CHUNK) for p in prefixes]
         w.cache.sanity_check()
         return sum(1 for h in hits if h == 1024)
 
     def test_round_robin_sessions_survive_swa_pressure(self):
         """Multi-turn shape: S prefixes revisited in order; the SWA pool fits every tail but
-        not every prefix's stale windows."""
+        not every prefix's chunk windows. The first revisit passes the windows its prefix
+        left in the tree, even where its SWA match fell short, so they go first and the
+        second revisit hits."""
         sessions = 12
         self.assertLess(self._full_hits(enabled=False, sessions=sessions), sessions)
         self.assertEqual(self._full_hits(enabled=True, sessions=sessions), sessions)
+
+    def _second_question_hit(self, *, retract: bool) -> int:
+        """A document's first visit between older and newer requests; evict as much SWA
+        as the older requests hold; a second question about the document matches."""
+        w = self._world(enabled=True)
+        for f in range(6):
+            w.prefill(_tokens(900 + f, self.PREFIX), self.CHUNK)
+        older = w.cache.swa_evictable_size()
+        doc = _tokens(1, 4 * self.CHUNK)
+        w.prefill(doc + _tokens(2, 2 * self.CHUNK), self.CHUNK, retract=retract)
+        for f in range(2):
+            w.prefill(_tokens(950 + f, self.PREFIX), self.CHUNK)
+        self._evict_swa(w, older)
+        hit = w.prefill(doc + _tokens(3, 2 * self.CHUNK), self.CHUNK)
+        w.cache.sanity_check()
+        return hit
+
+    def test_first_visit_windows_keep_their_place(self):
+        """The first visit's chunk windows are its own: they keep their LRU place behind
+        the older requests' windows."""
+        self.assertEqual(self._second_question_hit(retract=False), 4 * self.CHUNK)
+
+    def test_first_visit_windows_keep_their_place_across_retraction(self):
+        """A retracted first visit re-prefills on top of the nodes it inserted before the
+        retraction; they stay its own."""
+        self.assertEqual(self._second_question_hit(retract=True), 4 * self.CHUNK)
 
     def _conversation_hits(
         self, *, enabled: bool, conversations: int, turns: int
@@ -447,23 +492,59 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         self.assertIsNone(node.output_offset)
         w.cache.sanity_check()
 
+    def _demoted_spans(self, w: PrefillWorld, tokens: list[int]) -> set[tuple]:
+        """Prefill ``tokens``; return the [start, end) token spans of the nodes with
+        live, unlocked SWA that its inserts demoted."""
+        spans = set()
+        demote = SWAComponent._demote_swa
+        lru = w.cache.tree_core.lru_lists[ComponentType.SWA]
+
+        def record(comp, node):
+            cd = node.component_data[ComponentType.SWA]
+            if cd.value is not None and cd.lock_ref == 0 and lru.in_list(node):
+                end, n = 0, node
+                while n is not w.cache.tree_core.root_node:
+                    end += len(n.key)
+                    n = n.parent
+                spans.add((end - len(node.key), end))
+            demote(comp, node)
+
+        with mock.patch.object(SWAComponent, "_demote_swa", record):
+            w.prefill(tokens, self.CHUNK)
+        return spans
+
     def test_branch_window_is_not_stale(self):
-        """A window another cached sequence branches from must survive stale-window
-        eviction, or every later session recomputes the shared prefix."""
+        """A conversation's next turn passes the fork it shares with another session, but
+        the window ending at the fork keeps its place, or every later session recomputes
+        the shared prefix."""
         w = self._world(enabled=True)
         shared = _tokens(7, 160)
         a = shared + _tokens(8, self.PREFIX - 160)
-        b = shared + _tokens(9, self.PREFIX - 160)
         w.prefill(a, self.CHUNK)
         # b matches 96 tokens and restores the shared window [96, 160).
-        w.prefill(b, self.CHUNK)
-        keep = 6 * (WINDOW + 1)  # two windows per tail plus the shared window
-        w.cache.evict(
-            EvictParams(
-                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
-            )
-        )
+        w.prefill(shared + _tokens(9, self.PREFIX - 160), self.CHUNK)
+        spans = self._demoted_spans(w, a + _tokens(11, 2 * self.CHUNK))
+        self.assertTrue(any(start >= 160 for start, _ in spans))
+        self.assertFalse([s for s in spans if s[1] > 160 - (WINDOW + 1) and s[0] < 160])
+        self._evict_swa(w, sum(end - start for start, end in spans))
         self.assertEqual(len(w.match(shared + _tokens(10, 200)).device_indices), 160)
+        w.cache.sanity_check()
+
+    def test_shared_prefix_interior_is_passed(self):
+        """Above the window that ends at a fork, a shared prefix's chunk windows are
+        passed by every session through it: a new session demotes them."""
+        w = self._world(enabled=True)
+        shared = _tokens(7, 5 * self.CHUNK)
+        for k in range(2):
+            w.prefill(shared + _tokens(8 + k, 3 * self.CHUNK), self.CHUNK)
+        spans = self._demoted_spans(w, shared + _tokens(10, 3 * self.CHUNK))
+        fork_window = len(shared) - (WINDOW + 1)
+        self.assertTrue(any(end <= fork_window for _, end in spans))
+        self.assertFalse(
+            [s for s in spans if s[1] > fork_window and s[0] < len(shared)]
+        )
+        self._evict_swa(w, sum(end - start for start, end in spans))
+        self.assertEqual(w.prefill(shared + _tokens(11, 200), self.CHUNK), len(shared))
         w.cache.sanity_check()
 
 
@@ -517,12 +598,6 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
         )
         self.assertEqual(
             self._media_hit_after_dead_tails(stage1=True, stage2=True), self.MEDIA
-        )
-
-    def test_stage1_alone_demotes_the_media_window(self):
-        """Stage 1 treats the first-visit media window as stale; stage 2 exempts it."""
-        self.assertLess(
-            self._media_hit_after_dead_tails(stage1=True, stage2=False), self.MEDIA
         )
 
     def test_revisit_is_not_first_visit(self):
