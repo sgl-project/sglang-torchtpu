@@ -102,9 +102,9 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
         from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
 
         spec = _spec()
-        # The served buckets: plain decode and the NEXTN-3 verify, up to 64 rows; each
-        # with the latent cache whole or split over tp8.
-        cases = ((1, 1), (1, 16), (4, 1), (4, 16))
+        # The served buckets: plain decode, the NEXTN-3 verify up to 64 rows, and the
+        # NEXTN-8 verify (9 rows); each with the latent cache whole or split over tp8.
+        cases = ((1, 1), (1, 16), (4, 1), (4, 16), (9, 1))
         for (n_query, n_req), shards in itertools.product(cases, (1, 8)):
             with self.subTest(n_query=n_query, n_req=n_req, shards=shards):
                 cfg = D.KernelConfig(
@@ -172,6 +172,17 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
                     self.assertEqual(roles, [int(owner[pool])])
                     # The kernel gathers the block at row0; the token is row t % block of it.
                     self.assertEqual(row0 + t % block, int(row))
+
+    def test_query_bits_and_row_bounds(self):
+        from sglang_tpu.glm_flash_megakernel.kernel import decode as D
+
+        self.assertEqual(D.q_rows(D.KernelConfig(max_len=4096, n_query=4)), 8)
+        self.assertEqual(D.q_rows(D.KernelConfig(max_len=4096, n_query=9)), 16)
+        spec = _spec()
+        # 9 queries: 4,609 selected-pool slots (+ the tail) in 38 groups of 128.
+        self.assertEqual(
+            D.gather_dims(spec, D.KernelConfig(max_len=4096, n_query=9))[2], 38
+        )
 
 
 if __name__ == "__main__":

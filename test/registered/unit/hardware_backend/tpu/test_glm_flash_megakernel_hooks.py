@@ -58,7 +58,7 @@ class TestPoolBookkeeping(CustomTestCase):
         from sglang_tpu.glm_flash_megakernel import layout as PL
 
         kp = 4
-        for Q in (1, 2, 4):
+        for Q in (1, 2, 4, 8, 9):
             for pos in range(0, 40):
                 first, count = PL.closing_pools(np.int32(pos), Q, kp)
                 want = [
@@ -66,6 +66,8 @@ class TestPoolBookkeeping(CustomTestCase):
                 ]
                 got = list(range(int(first), int(first) + int(count)))
                 self.assertEqual(got, want, (Q, pos))
+                # The kernel keys at most ceil(Q / kp) closing pools per request.
+                self.assertLessEqual(int(count), -(-Q // kp))
 
 
 class TestDecodeSnapshot(CustomTestCase):
