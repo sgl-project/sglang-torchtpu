@@ -1386,17 +1386,13 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
         A raw ring is sized by request slots, not tokens, so it is not counted.
-        ``page_size`` is needed under the SparseCore layout, whose RoPE bytes
-        per token depend on it."""
+        ``page_size`` picks the layout (``sparsecore_kv_layout``); the SparseCore
+        RoPE bytes per token depend on it."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
         rope_bytes = cls.rope_bytes_per_token(qk_rope_head_dim)
-        if rope_bytes and cls.sparsecore_kv_layout():
-            if page_size is None:
-                raise ValueError(
-                    "bytes_per_token needs page_size under the SparseCore layout"
-                )
+        if rope_bytes and cls.sparsecore_kv_layout(page_size, index_kpool):
             rope_bytes = cls._sparsecore_specs(1, page_size)[1].token_bytes
         layer_bytes = cls.NOPE_BYTES + rope_bytes
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
@@ -1419,12 +1415,28 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         key_bytes = _cdiv(index_head_dim, lane) * lane
         return _cdiv(key_bytes + key_bytes // lane, lane) * lane
 
-    @staticmethod
-    def sparsecore_kv_layout() -> bool:
-        """Whether NoPE / RoPE use the SparseCore layout (SGLANG_TPU_DSA_SPARSECORE_KV_CACHE)."""
+    # The SparseCore layout is measured only at GLM-5.2's page size.
+    SPARSECORE_PAGE_SIZE = 64
+
+    @classmethod
+    def sparsecore_kv_layout(cls, page_size: int | None, index_kpool: int) -> bool:
+        """Whether NoPE / RoPE use the SparseCore layout.
+
+        On by default (SGLANG_TPU_DSA_SPARSECORE_KV_CACHE) for the configuration
+        it was validated on: GLM-5.2's plain DSA indexer (``index_kpool == 1``)
+        at page size 64. Any other page size, a pooled indexer, or
+        SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (whose window kernel reads
+        TensorCore pages) keeps the TensorCore layout. The sparse kernels pick
+        their path from the buffer dtype, so this is the only switch.
+        """
         from sglang_tpu.envs import envs as tpu_envs
 
-        return tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.get()
+        return (
+            tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.get()
+            and page_size == cls.SPARSECORE_PAGE_SIZE
+            and index_kpool == 1
+            and not tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get()
+        )
 
     @staticmethod
     def _sparsecore_specs(num_pages: int, page_size: int):
@@ -1441,7 +1453,9 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         rows_per_page = self.page_size // self.TOKENS_PER_ROW
         # As bytes_per_token: a model without RoPE dims keeps the TensorCore
         # layout and its one-row RoPE stand-in.
-        if self.qk_rope_head_dim > 0 and self.sparsecore_kv_layout():
+        if self.qk_rope_head_dim > 0 and self.sparsecore_kv_layout(
+            self.page_size, self._index_kpool
+        ):
             nope_spec, rope_spec = self._sparsecore_specs(
                 self.num_pages, self.page_size
             )

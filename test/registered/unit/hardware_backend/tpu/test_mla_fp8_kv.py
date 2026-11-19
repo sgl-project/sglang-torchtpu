@@ -5,6 +5,7 @@ base tensors (no uint8 view), the per-tensor quantizer, and the backend's
 fp8 branch handing quantized latents plus one shared scale to the kernel op.
 """
 
+import contextlib
 import functools
 import unittest
 from types import SimpleNamespace
@@ -138,10 +139,10 @@ class TestZerosKvBuffer(CustomTestCase):
                         + placeholder_bytes,
                     )
 
-    def _split_pool(self):
+    def _split_pool(self, page_size=64, index_kpool=1):
         return TpuSplitMLATokenToKVPool(
-            size=64,
-            page_size=32,
+            size=128,
+            page_size=page_size,
             dtype=FP8,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
@@ -150,6 +151,7 @@ class TestZerosKvBuffer(CustomTestCase):
             enable_memory_saver=False,
             index_head_dim=128,
             index_key_layers=[True, True],
+            index_kpool=index_kpool,
         )
 
     def test_split_pool_sparsecore_layout_matches_the_kernel_specs(self):
@@ -170,10 +172,6 @@ class TestZerosKvBuffer(CustomTestCase):
                 index_kpool=1,
                 page_size=pool.page_size,
             )
-            with self.assertRaisesRegex(ValueError, "needs page_size"):
-                TpuSplitMLATokenToKVPool.bytes_per_token(
-                    index_head_dim=128, index_key_layers=[True, True], index_kpool=1
-                )
         specs = _split_specs(pool.num_pages, pool.page_size, KVCacheLayout.SPARSECORE)
         for layer_id in range(2):
             bufs = (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
@@ -184,6 +182,38 @@ class TestZerosKvBuffer(CustomTestCase):
         self.assertEqual(
             pool.get_kv_size_bytes(), per_token * pool.num_pages * pool.page_size
         )
+
+    def test_split_pool_keeps_the_tensorcore_layout_outside_page_64_plain_dsa(self):
+        # The SparseCore layout is on by default only where it was validated:
+        # plain DSA (index kpool 1) at page size 64, without the attention token
+        # split, whose window kernel reads TensorCore pages.
+        cases = (
+            ("page 32", {"page_size": 32}, {}),
+            ("pooled indexer", {"index_kpool": 4}, {}),
+            (
+                "attention token split",
+                {},
+                {"SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": True},
+            ),
+            ("env off", {}, {"SGLANG_TPU_DSA_SPARSECORE_KV_CACHE": False}),
+        )
+        for name, pool_kwargs, env in cases:
+            with self.subTest(name), contextlib.ExitStack() as stack:
+                for key, value in env.items():
+                    stack.enter_context(getattr(tpu_envs, key).override(value))
+                pool = self._split_pool(**pool_kwargs)
+                self.assertEqual(pool.get_nope_cache(0).dtype, torch.uint8)
+                self.assertEqual(
+                    pool.get_kv_size_bytes(),
+                    TpuSplitMLATokenToKVPool.bytes_per_token(
+                        index_head_dim=128,
+                        index_key_layers=[True, True],
+                        index_kpool=pool._index_kpool,
+                        page_size=pool.page_size,
+                    )
+                    * pool.num_pages
+                    * pool.page_size,
+                )
 
 
 class TestQuantizeKvToFp8(CustomTestCase):
