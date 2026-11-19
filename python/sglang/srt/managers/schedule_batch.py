@@ -1157,6 +1157,7 @@ class Req(ReqDllmMixin):
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+        self.health_check_admission_seq: Optional[int] = None
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning

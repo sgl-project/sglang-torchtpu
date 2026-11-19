@@ -34,6 +34,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -50,6 +51,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -734,12 +736,67 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
         with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
-                scheduler, SimpleNamespace(batch_size=lambda: 0)
+                scheduler,
+                SimpleNamespace(reqs=[], batch_size=lambda: 0, is_empty=lambda: True),
             )
         cache.checkpoint(req, up_to=req.extend_range.end)
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
+
+    def test_acknowledged_probe_releases_row_tail_and_its_prefix_lock(self):
+        cache, _ = _make_cache_with_pools()
+        pool = ReqToTokenPool(4, 64, "cpu", enable_memory_saver=False)
+        cache.req_to_token_pool = pool
+        self._populate_prefix(cache, [0], [10])
+        shared = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [0])))
+        ).last_device_node
+        cache.inc_lock_ref(shared)  # another request owns the same prefix
+        cache.inc_lock_ref(shared)  # the health probe's preallocation
+        req = _make_req(
+            [0, 7], req_pool_idx=None, cache_protected_len=1, last_node=shared
+        )
+        req.rid = f"{HEALTH_CHECK_RID_PREFIX}_acknowledged"
+        req.health_check_admission_seq = 0
+        pool.alloc([req])
+        self.assertEqual(pool.available_size(), pool.size - 1)
+        pool.req_to_token[req.kv.req_pool_idx, :2] = torch.tensor([10, 50])
+        scheduler = SimpleNamespace(
+            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+            waiting_queue=[req],
+            enable_priority_scheduling=False,
+            req_to_token_pool=SimpleNamespace(size=4),
+            max_running_requests=4,
+            tree_cache=cache,
+            health_monitor=SimpleNamespace(completion_seq=1),
+            _release_aborted_request=MagicMock(),
+            enable_hisparse=False,
+        )
+        running = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="user")],
+            batch_size=lambda: 1,
+            is_empty=lambda: False,
+        )
+        cache.token_to_kv_pool_allocator.reset_mock()
+        with patch.object(cache, "checkpoint") as checkpoint:
+            result = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                scheduler, running
+            )
+            checkpoint.assert_not_called()
+        self.assertIsNone(result)
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertTrue(req.kv.is_kv_released)
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertEqual(pool.available_size(), pool.size)
+        ((indices, start_pos),) = (
+            cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
+        )
+        self.assertTrue(torch.equal(indices, torch.tensor([50], dtype=torch.int32)))
+        self.assertEqual(start_pos, 1)
+        self.assertEqual(shared.lock_ref, 1)
+        SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(scheduler, running)
+        self.assertEqual(pool.available_size(), pool.size)
 
     def test_hicache_restore_stops_at_promised_prefix(self):
         """A host prefix that grew after admission must not be restored past
