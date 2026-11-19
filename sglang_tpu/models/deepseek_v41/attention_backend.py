@@ -178,6 +178,9 @@ class DSV41TPUForwardMetadata:
     # (ratio, index source layer) -> indexer_ops.prepare_candidates result,
     # gathered once and read by every candidate consumer of that source.
     prepared_candidates: Dict[tuple, tuple] = field(default_factory=dict)
+    # Gather group's first layer -> its gathered main KV (csa2_ops.attention with
+    # keep_gathered), read by the group's later layers and dropped at its last.
+    gathered_main: Dict[int, tuple] = field(default_factory=dict)
 
 
 # Host-built fields: the direct tracer's graph inputs. The rest is per-forward
@@ -520,6 +523,39 @@ def _check_index_sources(config) -> None:
             raise ValueError(f"layer {layer_id} has no ratio-{ratio} index source")
 
 
+def main_gather_groups(
+    *,
+    compress_ratios: Sequence[int],
+    index_source_layer_ids: Sequence[int],
+    source_layer_of,
+    layer_ids: Sequence[int],
+) -> Dict[int, Tuple[int, int]]:
+    """layer_id -> (first, last) layer of its main-KV gather group.
+
+    Ratio 1/2 layers that read one main KV source with one selection gather the
+    same records: only kv_source layers publish main KV and only index_source
+    layers select, both before their own attention, so a group's first layer
+    is the one that changes either.
+    """
+    members: Dict[Tuple[int, int], list] = {}
+    for layer_id in layer_ids:
+        ratio = compress_ratios[layer_id]
+        if ratio not in LOW_RATIOS:
+            continue
+        selector = max(
+            s
+            for s in index_source_layer_ids
+            if s <= layer_id and compress_ratios[s] == ratio
+        )
+        key = (source_layer_of(layer_id), selector)
+        members.setdefault(key, []).append(layer_id)
+    return {
+        layer_id: (layers[0], layers[-1])
+        for layers in members.values()
+        for layer_id in layers
+    }
+
+
 class DSV41TPUAttnBackend(AttentionBackend):
     """DeepSeek-V4.1 CSA2 attention on sglang request/page metadata."""
 
@@ -553,6 +589,21 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # The draft has no index layers, hence no candidate consumers.
         self.last_candidate_consumer = (
             {} if self.is_dspark_draft else self._last_candidate_consumers(config)
+        )
+        # layer_id -> (group's first layer, group's last layer) of main-KV gathers.
+        self.gather_groups = (
+            {}
+            if self.is_dspark_draft
+            else main_gather_groups(
+                compress_ratios=config.compress_ratios,
+                index_source_layer_ids=config.index_source_layer_ids,
+                source_layer_of=self.token_to_kv_pool.source_layer_of,
+                layer_ids=[
+                    i
+                    for i, item in enumerate(self.token_to_kv_pool.layer_mapping)
+                    if item is not None
+                ],
+            )
         )
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         # Attention layer id -> the module owning that layer's freqs_cis buffer.
@@ -1020,33 +1071,93 @@ class DSV41TPUAttnBackend(AttentionBackend):
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)
         else:
             sink = attn_sink[: q.shape[1]].float().contiguous()
-        main = None
+        cos_sin = rope_table(self.rope_owners[layer_id].freqs_cis)
         if compress_ratio:
-            selected = metadata.selected.get(compress_ratio)
-            if selected is None:
-                raise RuntimeError(
-                    f"layer {layer_id} (ratio {compress_ratio}) attends before its "
-                    "index source selected"
-                )
-            words, scales = pool.get_main_kv(layer_id)
-            main = (
-                words,
-                scales,
-                selected,
-                metadata.full_pages,
-                pool.main_page_records(layer_id),
+            out = self._attend_main(
+                q=q.contiguous(),
+                swa=swa,
+                sink=sink,
+                cos_sin=cos_sin,
+                layer=layer,
+                compress_ratio=compress_ratio,
+                metadata=metadata,
             )
-        out = self.csa2_ops.attention(
-            q.contiguous(),
-            swa,
-            metadata.swa_meta,
-            metadata.swa_bounds,
-            metadata.query_start_loc,
-            metadata.positions,
-            sink,
-            rope_table(self.rope_owners[layer_id].freqs_cis),
-            compress_ratio,
-            float(layer.scaling),
-            main=main,
-        )
+        else:
+            out = self.csa2_ops.attention(
+                q.contiguous(),
+                swa,
+                metadata.swa_meta,
+                metadata.swa_bounds,
+                metadata.query_start_loc,
+                metadata.positions,
+                sink,
+                cos_sin,
+                0,
+                float(layer.scaling),
+            )
         return out.masked_fill(~metadata.valid[:, None, None], 0)
+
+    def _attend_main(
+        self, *, q, swa, sink, cos_sin, layer, compress_ratio, metadata
+    ) -> torch.Tensor:
+        """Main-KV attention; a gather group's first layer gathers the selected
+        records and keeps them for the group's later layers."""
+        layer_id = layer.layer_id
+        first, last = self.gather_groups.get(layer_id, (layer_id, layer_id))
+        common = dict(
+            swa_pages=swa,
+            swa_meta=metadata.swa_meta,
+            query_start_loc=metadata.query_start_loc,
+            positions=metadata.positions,
+            sink=sink,
+            cos_sin=cos_sin,
+            compress_ratio=compress_ratio,
+            scale=float(layer.scaling),
+        )
+        if layer_id != first:
+            gathered = metadata.gathered_main.get(first)
+            if gathered is None:
+                raise RuntimeError(
+                    f"layer {layer_id} reuses the main KV of layer {first}, "
+                    "which did not gather it"
+                )
+            if layer_id >= last:
+                # Released after its last reader; kept, it outlives the forward.
+                metadata.gathered_main.pop(first)
+            return self.csa2_ops.attention_gathered(q, gathered, **common)
+
+        selected = metadata.selected.get(compress_ratio)
+        if selected is None:
+            raise RuntimeError(
+                f"layer {layer_id} (ratio {compress_ratio}) attends before its "
+                "index source selected"
+            )
+        pool = self.token_to_kv_pool
+        words, scales = pool.get_main_kv(layer_id)
+        main = (
+            words,
+            scales,
+            selected,
+            metadata.full_pages,
+            pool.main_page_records(layer_id),
+        )
+        keep = last > layer_id
+        result = self.csa2_ops.attention(
+            q,
+            common["swa_pages"],
+            common["swa_meta"],
+            None,
+            common["query_start_loc"],
+            common["positions"],
+            sink,
+            cos_sin,
+            compress_ratio,
+            common["scale"],
+            main=main,
+            keep_gathered=keep,
+        )
+        if not keep:
+            return result
+        out, gathered = result
+        metadata.gathered_main[first] = gathered
+        return out
