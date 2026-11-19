@@ -870,6 +870,14 @@ class SamplingParams:
             )
             self.enable_teacache = False
 
+    def apply_sequence_shard(self, pipeline_config) -> None:
+        """Resolve enable_sequence_shard; a sharded sequence keeps its frame count."""
+        self.enable_sequence_shard = resolve_sequence_shard(
+            pipeline_config, self.enable_sequence_shard
+        )
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+
     def _adjust_visual_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             self.guidance_scale = 1.0
@@ -908,16 +916,8 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
-        if resolve_sequence_shard(
-            server_args.pipeline_config, self.enable_sequence_shard
-        ):
-            self.enable_sequence_shard = True
-            logger.debug("Automatically enabled enable_sequence_shard")
-        else:
-            self.enable_sequence_shard = False
-
+        self.apply_sequence_shard(server_args.pipeline_config)
         if self.enable_sequence_shard:
-            self.adjust_frames = False
             logger.info(
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
