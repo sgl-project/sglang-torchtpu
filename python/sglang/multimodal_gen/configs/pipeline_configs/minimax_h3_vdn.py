@@ -64,7 +64,10 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "VDN-H3 does not support --ring-degree > 1; use Ulysses sequence "
                 "parallelism."
             )
-        if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
+        if server_args.enable_breakable_cuda_graph or (
+            # the TPU plugin's hybrid backend compiles its own core per block
+            server_args.enable_torch_compile and not current_platform.is_tpu()
+        ):
             # BCG keeps one pool per captured segment and exhausts 183 GB at 104k rows
             raise ValueError(
                 "VDN-H3 hybrid attention is not validated under torch.compile or "

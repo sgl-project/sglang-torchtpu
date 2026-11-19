@@ -116,6 +116,10 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
               - 'python/sglang/multimodal_gen/runtime/models/encoders/minimax_h3_qwen3vl.py'
               - 'python/sglang/multimodal_gen/test/unit/test_minimax_h3_encoder_device.py'
+              # VDN-H3 core files behind sglang_tpu/multimodal_gen/minimax_h3_vdn.py's seams.
+              - 'python/sglang/multimodal_gen/configs/pipeline_configs/minimax_h3_vdn.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/hybrid_window_attn_h3.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_vdn*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
               # Shared diffusion files behind the TPU-only platform hooks (SPMD-safe
