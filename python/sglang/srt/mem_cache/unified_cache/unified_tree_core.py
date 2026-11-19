@@ -482,9 +482,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
-        # Set when Full and SWA host copies share one arena (the TPU unified pool): host
-        # reclaim then picks entries by structure (_drive_structural_host_eviction).
-        self.shared_host_arena = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
@@ -1969,12 +1966,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         write_back, FULL pressure reclaims redundant Full host copies first
         (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
-        if self._structural_host_reclaim and component_type in (
-            BASE_COMPONENT_TYPE,
-            ComponentType.SWA,
-        ):
-            self._drive_structural_host_eviction(component_type, num_tokens, result)
-            return result
         comp = self.components_by_type.get(component_type)
         if comp is not None:
             if (
@@ -1995,47 +1986,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.host_frees,
             )
         return result
-
-    @property
-    def _structural_host_reclaim(self) -> bool:
-        return self.shared_host_arena and ComponentType.SWA in self.components_by_type
-
-    def _drive_structural_host_eviction(
-        self,
-        component_type: ComponentType,
-        num_tokens: int,
-        result: DriveHostEvictionResult,
-    ) -> None:
-        """SWA demand: pass-through windows, then LRU SWA (a host leaf goes whole).
-        Full demand: LRU host leaves. The controller asks for SWA while it is over its
-        share and Full first otherwise; either way an evicted leaf takes up ancestors
-        left with Full KV but no usable window. Tokens freed by either component count
-        toward ``num_tokens`` because both share one host arena."""
-        tracker, df, hf = result.tracker, result.device_frees, result.host_frees
-        swa = self.components_by_type[ComponentType.SWA]
-        full = self.components_by_type[BASE_COMPONENT_TYPE]
-        if (
-            not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
-            and self.is_write_back
-        ):
-            self._reclaim_full_host_duplicates(num_tokens, tracker, df, hf)
-
-        def short() -> int:
-            return num_tokens - tracker[BASE_COMPONENT_TYPE] - tracker[ComponentType.SWA]
-
-        if component_type == ComponentType.SWA:
-            if short() > 0:
-                swa.evict_shadowed_host_windows(
-                    tracker[ComponentType.SWA] + short(), tracker, df, hf
-                )
-            if short() > 0:
-                swa.drive_host_eviction(
-                    tracker[ComponentType.SWA] + short(), tracker, df, hf
-                )
-        elif short() > 0:
-            full.drive_host_eviction(
-                tracker[BASE_COMPONENT_TYPE] + short(), tracker, df, hf
-            )
 
     def evict_excess_path_states(
         self,
@@ -2373,12 +2323,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         host_frees=host_frees,
                     )
 
-            if has_host and not (
-                self._structural_host_reclaim
-                and not self.components_by_type[ComponentType.SWA].has_usable_window(
-                    cur
-                )
-            ):
+            if has_host:
                 self._update_evictable_leaf_sets(cur)
                 break
 
