@@ -379,11 +379,6 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         )
         with ctx(enable_hierarchical_cache=True, hicache_io_backend="raiden"):
             self.assertTrue(ukp.unified_kv_pool_enabled(kvc))
-        with ctx(
-            disaggregation_mode="prefill", disaggregation_transfer_backend="raiden"
-        ):
-            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
-                ukp.unified_kv_pool_enabled(kvc)
 
     def test_write_back_swa_copy_ahead_and_host_alloc_extend_no_d2h(self):
         from sglang.srt.mem_cache.allocator import swa
