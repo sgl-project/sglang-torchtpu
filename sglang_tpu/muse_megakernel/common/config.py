@@ -410,7 +410,8 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
         assert (self.window + swa_cpt - 2) // swa_cpt + 1 <= swa_kr
         assert not self.row_tile or (
             self.rows % self.row_tile == 0
-            and self.row_tile % 16 == 0
+            # 8: experimental (SGLANG_TPU_MUSE_MK_DEV_ROW_TILE=8), half a bf16 vreg tile
+            and self.row_tile % 8 == 0
             and self.rows % self.tp == 0
             and owner_window_rows(self) <= self.rows
             and not ((self.fold_f or self.fold_o) and not self.tiled_vmem_pads)
