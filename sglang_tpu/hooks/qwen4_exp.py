@@ -36,6 +36,17 @@ load_ple_table_on_host
   Upstream PR or issue: not filed.
   Remove when: TPU loads large row-sharded tables without whole-table copies.
 
+embed_ple_rows128
+  Why: a [N, 160] fp8 table gets TPU's transposed layout (160 is not a multiple
+       of 128 lanes), and a row gather from it re-lays out the whole table: on a
+       TP=1 stage holding the 51.2 GB Qwen3.8-Flash-Next table the forward needed
+       140.98G of HLO temporaries (CompileTimeHbmOom).
+  How: load_ple_table_on_host keeps a TP=1 stage's table as a lane-aligned
+       [N * 160 / 128, 128] buffer; AROUND Qwen4ExpNGramEmbedding._embed_ngram_ids
+       gathers each row's two 128-byte rows and slices its 160 bytes.
+  Upstream PR or issue: not filed.
+  Remove when: TPU gathers rows of a narrow table without re-laying it out.
+
 hash_ngrams_int32
   Why: the PLE n-gram hash multiplies and XORs int64 values; it compiled for
        prefill, but decode-sized graphs aborted the TPU compiler
@@ -182,7 +193,14 @@ def load_ple_table_on_host(original: Any, model: Any, weights: Any, *args, **kwa
         device = emb.weight.device
         # Release the init-time table before the upload: two would not fit.
         emb.weight.data = torch.empty(0, dtype=table.dtype, device=device)
-        emb.weight.data = table.to(device)
+        if getattr(emb, "tp_size", 1) == 1 and ple_rows128_supported(table):
+            # The whole table on one device: keep it lane-aligned (see
+            # gather_ple_rows128); the core weight stays empty.
+            modules[prefix].register_buffer(
+                PLE_ROWS128_ATTR, table.view(-1, 128).to(device), persistent=False
+            )
+        else:
+            emb.weight.data = table.to(device)
         if loaded_params is not None:
             loaded_params.add(f"{prefix}.ngram_embedding.weight")
         logger.info(
@@ -320,3 +338,59 @@ def hash_ngrams_int32(original: Any, ngram: Any, contexts: Any, *args, **kwargs)
     vmreg/vreg to U64'); int32 limbs avoid 64-bit vector values entirely.
     """
     return ngram_hash_int32(ngram, contexts)
+
+
+PLE_ROWS128_ATTR = "_tpu_ple_rows128"
+
+
+def ple_rows128_supported(table: Any) -> bool:
+    """A [rows, 160] table folds into whole 128-byte rows when rows % 4 == 0."""
+    return table.dim() == 2 and table.shape[1] == 160 and table.shape[0] % 4 == 0
+
+
+def gather_ple_rows128(rows128: Any, ids: Any) -> Any:
+    """Rows ``ids`` of a [N, 160] table stored as [N * 160 / 128, 128].
+
+    A [N, 160] fp8 tensor on TPU gets the transposed layout {0,1} (160 is not a
+    multiple of the 128-lane tile), and a row gather from it makes XLA re-lay
+    out the whole table: PP0 of Qwen3.8-Flash-Next (51.2 GB fp8 table) needed
+    140.98G of HLO temporaries. As [N * 160 / 128, 128] it stays row-major with
+    no padding. Logical row r starts at byte 160 * r: 128-wide row
+    q = r + r // 4, offset 32 * (r % 4), and lies within rows q and q + 1.
+    """
+    import torch
+
+    ids = ids.to(torch.int32)
+    q = ids + (ids >> 2)
+    offset = (ids & 3) * 32
+    pair = torch.stack([q, q + 1], dim=-1).reshape(-1)
+    window = torch.index_select(rows128, 0, pair).reshape(*ids.shape, 256)
+    cols = offset.unsqueeze(-1) + torch.arange(160, dtype=torch.int32, device=ids.device)
+    return torch.gather(window, -1, cols.to(torch.int64))
+
+
+def embed_ple_rows128(
+    original: Any,
+    ngram: Any,
+    ngram_ids: Any,
+    forward_batch: Any,
+    physical_tokens: int,
+    *args,
+    **kwargs,
+):
+    """AROUND Qwen4ExpNGramEmbedding._embed_ngram_ids: look rows up in the
+    lane-aligned table that load_ple_table_on_host keeps on a TP=1 stage."""
+    import torch
+
+    rows128 = getattr(ngram, PLE_ROWS128_ATTR, None)
+    if rows128 is None:
+        return original(ngram, ngram_ids, forward_batch, physical_tokens, *args, **kwargs)
+    emb = ngram.ngram_embedding
+    lookup_ids, semantic_tokens = ngram._prepare_embedding_lookup(
+        ngram_ids, forward_batch, physical_tokens
+    )
+    rows = gather_ple_rows128(rows128, lookup_ids)
+    embeddings = rows.to(emb.output_dtype or torch.bfloat16) * emb.weight_scale
+    return ngram._finish_embedding_lookup(
+        embeddings, semantic_tokens, forward_batch, physical_tokens
+    )
