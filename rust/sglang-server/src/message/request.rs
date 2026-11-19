@@ -16,7 +16,7 @@ use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
-use crate::message::ids::Rid;
+use crate::message::ids::{HEALTH_CHECK_RID_PREFIX, Rid};
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 
@@ -287,6 +287,18 @@ impl GenerateBody {
             mm_hashes,
             processor_extensions,
         } = self;
+
+        // Client IDs must not select the scheduler's internal probe behavior.
+        let reserved_rid = match &rid {
+            Some(OneOrMany::One(r)) => r.starts_with(HEALTH_CHECK_RID_PREFIX),
+            Some(OneOrMany::Many(v)) => v.iter().any(|r| r.starts_with(HEALTH_CHECK_RID_PREFIX)),
+            None => false,
+        };
+        if reserved_rid {
+            return Err(Error::Validation(format!(
+                "Request IDs starting with '{HEALTH_CHECK_RID_PREFIX}' are reserved for internal health probes"
+            )));
+        }
 
         // Cap the batch BEFORE the columns below allocate anything. Reading the
         // declared length off the input costs nothing; the previous placement (after
@@ -1107,6 +1119,26 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+        }
+    }
+
+    #[test]
+    fn client_health_probe_rids_are_rejected() {
+        for body in [
+            r#"{"text":"a","rid":"HEALTH_CHECK"}"#,
+            r#"{"text":"a","rid":"HEALTH_CHECK_client","sampling_params":{"max_new_tokens":1000}}"#,
+            r#"{"text":["a","b"],"rid":"HEALTH_CHECK_client"}"#,
+            r#"{"text":["a","b"],"rid":["user","HEALTH_CHECK_client"]}"#,
+            r#"{"text":"a","rid":"HEALTH_CHECK_client","is_health_check":true}"#,
+        ] {
+            let error = requests(body).expect_err("client probe ID must be rejected");
+            assert!(matches!(error, Error::Validation(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved for internal health probes"),
+                "{error}"
+            );
         }
     }
 

@@ -10,19 +10,24 @@ failed result processing acknowledge nothing.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import HealthCheckOutput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.health_monitor import (
     SchedulerHealthMonitor,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -63,6 +68,28 @@ class _Clock:
 
     def __call__(self):
         return self.now
+
+
+class _HostPrebuiltBatch:
+    """Host queue/finish behavior without allocating device batch tensors."""
+
+    def __init__(self, reqs):
+        self.reqs = list(reqs)
+        self.return_logprob = False
+        self.prepare_for_prebuilt = Mock()
+        self.process_prebuilt = Mock()
+
+    def is_empty(self):
+        return not self.reqs
+
+    def batch_size(self):
+        return len(self.reqs)
+
+    def filter_batch(self):
+        self.reqs = [req for req in self.reqs if not req.finished()]
+
+    def merge_batch(self, other):
+        self.reqs.extend(other.reqs)
 
 
 class TestSchedulerHealthMonitor(CustomTestCase):
@@ -598,6 +625,108 @@ class TestSchedulerHealthWiring(CustomTestCase):
         self.assertEqual(selected, [probe])
         self.assertEqual(scheduler.waiting_queue, [])
         result.prepare_for_prebuilt.assert_called_once_with()
+
+    def test_decode_probe_runs_when_prebuilt_users_do_no_inference(self):
+        for reason in ("one_token", "abort", "stop_token"):
+            for capacity in (1, 2):
+                with self.subTest(reason=reason, capacity=capacity):
+                    scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+                    self._prebuilt(scheduler)
+                    scheduler.max_running_requests = capacity
+                    scheduler.future_map = Mock()
+                    scheduler.kv_checksum_computer = None
+                    scheduler.ngram_embedding_manager = Mock()
+                    scheduler.output_streamer = Mock()
+                    scheduler.dp_attn_adapter = SimpleNamespace(
+                        maybe_prepare_mlp_sync_batch=lambda batch: batch
+                    )
+
+                    def req(rid, *, probe=False):
+                        params = SamplingParams(
+                            max_new_tokens=2
+                            if probe
+                            else (1 if reason == "one_token" else 8),
+                            stop_token_ids=[1]
+                            if not probe and reason == "stop_token"
+                            else None,
+                            ignore_eos=probe or reason != "stop_token",
+                        )
+                        params.normalize(None)
+                        request = Req(
+                            rid=rid,
+                            origin_input_text="",
+                            origin_input_ids=array("q", [0]),
+                            sampling_params=params,
+                        )
+                        request.output_ids.append(1)  # Arrived with prefill's token.
+                        if reason == "abort" and not probe:
+                            request.to_finish = FINISH_ABORT()
+                        request.health_check_admission_seq = 0
+                        request.last_node = Mock()
+                        request.time_stats = Mock()
+                        request.init_next_round_input = Mock()
+                        return request
+
+                    probe = req(PROBE_RID, probe=True)
+                    users = [req(f"user-{i}") for i in range(3)]
+                    scheduler.health_monitor.register(_recv(PROBE_RID), admitted=True)
+                    scheduler.waiting_queue = [probe, *users]
+                    scheduler.batch_result_processor.process_batch_result_prebuilt.side_effect = (
+                        lambda batch: (
+                            SchedulerBatchResultProcessor.process_batch_result_prebuilt(
+                                scheduler, batch
+                            )
+                        )
+                    )
+
+                    def update(batch):
+                        batch.filter_batch()
+                        return batch
+
+                    scheduler.update_running_batch = Mock(side_effect=update)
+                    admitted = []
+
+                    def build(reqs, *args):
+                        admitted.append(list(reqs))
+                        return _HostPrebuiltBatch(reqs)
+
+                    with (
+                        get_context().override_server_args(
+                            disaggregation_decode_enable_radix_cache=False,
+                            enable_hisparse=False,
+                        ),
+                        patch(
+                            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                            side_effect=build,
+                        ),
+                        patch("sglang.srt.disaggregation.decode.set_time_batch"),
+                        patch(
+                            "sglang.srt.disaggregation.decode.set_schedule_time_batch"
+                        ),
+                        patch(
+                            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+                        ) as release,
+                    ):
+                        plan = scheduler.get_next_disagg_decode_batch_to_run(
+                            _HostPrebuiltBatch([])
+                        )
+                    self.assertIsNotNone(plan.batch_to_run)
+                    self.assertEqual(plan.batch_to_run.reqs, [probe])
+                    self.assertEqual(admitted, [users[:capacity], [probe]])
+                    self.assertEqual(scheduler.waiting_queue, users[capacity:])
+                    self.assertTrue(all(user.finished() for user in users[:capacity]))
+                    self.assertEqual(release.call_count, capacity)
+                    self.assertEqual(
+                        self.sent, []
+                    )  # Prebuilt output proves no inference.
+
+                    scheduler.process_batch_result(
+                        _batch(probe, forward_mode=ForwardMode.DECODE), Mock()
+                    )
+                    self.assertEqual(
+                        [(ack.rid, ack.completion_seq) for ack in self.sent],
+                        [(PROBE_RID, 1)],
+                    )
 
 
 if __name__ == "__main__":

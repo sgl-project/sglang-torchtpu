@@ -753,7 +753,11 @@ async def health_generate(request: Request) -> Response:
     # A decode engine finishes a 1-token probe at the prebuilt fake-handoff
     # stage without a forward; the second token forces a real decode step.
     max_new_tokens = 2 if disaggregation_mode == DisaggregationMode.DECODE.value else 1
-    sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0.0}
+    sampling_params = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": 0.0,
+        "ignore_eos": True,
+    }
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -774,7 +778,9 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+        async for _ in _global_state.tokenizer_manager.generate_request(
+            gri, request, is_health_check=True
+        ):
             break
 
     # Registered before dispatch so the acknowledgement cannot arrive first.
