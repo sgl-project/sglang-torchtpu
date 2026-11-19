@@ -56,8 +56,12 @@ def spec() -> Optional[SharedSlice]:
 def enter_slice_env(shared: SharedSlice) -> JobRank:
     """Swap the worker's job RANK / WORLD_SIZE for the slice-wide ones libtpu reads at startup."""
     job = JobRank(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]))
-    os.environ["RANK"] = os.environ["LOCAL_RANK"] = str(shared.rank_offset + job.rank)
-    os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = str(shared.size)
+    slice_rank = shared.rank_offset + job.rank
+    local_world_size = min(shared.size, 8)
+    os.environ["RANK"] = str(slice_rank)
+    os.environ["LOCAL_RANK"] = str(slice_rank % local_world_size)
+    os.environ["WORLD_SIZE"] = str(shared.size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
     return job
 
 
@@ -140,6 +144,8 @@ class _State:
     backend: Optional[dist.ProcessGroup] = None
     store: Optional[dist.Store] = None
     slice_rank: int = -1
+    shared_size: int = 0
+    job_size: int = 0
 
 
 # a worker process joins the slice once, at backend init, before any weight-update group exists
@@ -168,8 +174,12 @@ def join(shared: SharedSlice, job: JobRank) -> None:
         PrefixStore(BACKEND_NAME, store), slice_rank, shared.size, _TIMEOUT
     )
     _state.store, _state.slice_rank = store, slice_rank
-    os.environ["RANK"] = os.environ["LOCAL_RANK"] = str(job.rank)
-    os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = str(job.size)
+    _state.shared_size, _state.job_size = shared.size, job.size
+    local_job_size = min(job.size, 8)
+    os.environ["RANK"] = str(job.rank)
+    os.environ["LOCAL_RANK"] = str(job.rank % local_job_size)
+    os.environ["WORLD_SIZE"] = str(job.size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(local_job_size)
     logger.info(
         "Joined the shared TPU slice as rank %d of %d (job devices %s)",
         slice_rank,
@@ -183,12 +193,19 @@ def joined() -> bool:
 
 
 def receiver(tp_rank: int) -> SharedSliceReceiver:
-    """The trainer's rank i (slice rank i) sends to TP rank i."""
+    """Pair engine k's TP rank r with trainer slice rank (K * r + k)."""
     assert _state.backend is not None, f"{ENV_VAR} is unset or the slice was not joined"
+    if _state.shared_size > 0 and _state.job_size > 0:
+        trainer_size = _state.shared_size // 2
+        num_engines = max(1, trainer_size // _state.job_size)
+        engine_idx = (_state.slice_rank - trainer_size) // _state.job_size
+        src_slice_rank = num_engines * tp_rank + engine_idx
+    else:
+        src_slice_rank = tp_rank
     return SharedSliceReceiver(
         _state.backend,
         _state.store,
-        src_slice_rank=tp_rank,
+        src_slice_rank=src_slice_rank,
         slice_rank=_state.slice_rank,
     )
 
