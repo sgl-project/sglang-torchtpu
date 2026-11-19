@@ -2936,6 +2936,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_pallas_tpu()
             or moe_runner_backend.is_pallas_tpu_fused_rs()
             or moe_runner_backend.is_pallas_tpu_fused_decode()
+            or moe_runner_backend.is_pallas_tpu_fused_ep_push()
         ) and not _is_tpu:
             raise ValueError(f"{moe_runner_backend.value} is only available on TPU")
 

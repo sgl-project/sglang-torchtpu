@@ -172,6 +172,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "pallas_tpu",
     "pallas_tpu_fused_rs",
     "pallas_tpu_fused_decode",
+    "pallas_tpu_fused_ep_push",
     "megamoe",
     "intel_xpu",
 ]

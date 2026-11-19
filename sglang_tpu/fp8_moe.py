@@ -280,6 +280,12 @@ def prepare_tpu_fp8_moe_weights(
         from sglang_tpu.dsv4_mxfp4_moe import prepare_tpu_dsv4_mxfp4_moe_weights
 
         prepare_tpu_dsv4_mxfp4_moe_weights(layer)
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        if get_moe_runner_backend().is_pallas_tpu_fused_ep_push():
+            from sglang_tpu.fused_ep_push_moe import prepare_fused_ep_push_moe
+
+            prepare_fused_ep_push_moe(layer)
         return
 
     layer.weight_block_size = weight_block_size if block_quant else None
@@ -364,6 +370,15 @@ def apply_tpu_fp8_moe(
             "apply_router_weight_on_input=True is unsupported in the TPU MoE "
             "path: the Pallas fused-MoE kernel takes the raw hidden states and "
             "applies the router weights itself, in the un-permute combine."
+        )
+    from sglang_tpu.fused_ep_push_moe import (
+        apply_fused_ep_push_moe,
+        uses_fused_ep_push_moe,
+    )
+
+    if uses_fused_ep_push_moe(layer):
+        return apply_fused_ep_push_moe(
+            layer=layer, dispatch_output=dispatch_output, swiglu_limit=swiglu_limit
         )
     block_quant = block_quant and getattr(layer, "weight_block_size", None) is not None
 
