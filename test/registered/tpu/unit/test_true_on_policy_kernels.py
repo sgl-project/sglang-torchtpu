@@ -37,6 +37,77 @@ def _rnd(*shape, scale=1.0, seed=0):
     return (torch.randn(*shape, generator=g) * scale).to(torch.bfloat16).to("tpu")
 
 
+# A small gated-delta-net layer: 4 key heads, 8 value heads, head size 128, conv kernel 4.
+_GDN_NKQ, _GDN_NV, _GDN_D, _GDN_KERNEL = 4, 8, 128, 4
+_GDN_DIM = 2 * _GDN_NKQ * _GDN_D + _GDN_NV * _GDN_D
+
+
+def _gdn_inputs(tokens):
+    shapes = ((tokens, _GDN_DIM), (tokens, _GDN_NV), (tokens, _GDN_NV))  # qkv, b, a
+    return tuple(_rnd(*shape, seed=seed) for seed, shape in enumerate(shapes))
+
+
+def _gdn_weights():
+    return (
+        _rnd(_GDN_DIM, 1, _GDN_KERNEL, scale=0.3, seed=3),  # conv weight
+        _rnd(_GDN_NV, scale=0.5, seed=4),  # A_log
+        _rnd(_GDN_NV, scale=0.5, seed=5),  # dt_bias
+    )
+
+
+def _packed_gdn(kernels, qkv, b, a, cu_seqlens):
+    return kernels.packed_gated_delta_net(
+        qkv, b, a, *_gdn_weights(), cu_seqlens, _GDN_NKQ, _GDN_NV, _GDN_D, _GDN_D
+    )
+
+
+def _gdn_decode_step_op():
+    """The engine kernel on its decode path: one token of one request, state slot 1."""
+    import jax
+    import jax.numpy as jnp
+    from torch_tpu._internal import pallas
+
+    from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    def decode_step(
+        qkv: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+        conv_state: jax.Array,
+        recurrent_state: jax.Array,
+        conv_weight: jax.Array,
+        a_log: jax.Array,
+        dt_bias: jax.Array,
+        seq_len: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        with tpu_info_for_cpu_export():
+            (conv_state, recurrent_state), out = fused_conv1d_gdn(
+                qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                None,
+                a_log,
+                dt_bias,
+                jnp.array([0, 1], jnp.int32),
+                jnp.array([1], jnp.int32),
+                jnp.array([1, 1, 1], jnp.int32),  # one decode sequence
+                seq_len,
+                n_kq=_GDN_NKQ,
+                n_v=_GDN_NV,
+                d_k=_GDN_D,
+                d_v=_GDN_D,
+                kernel_size=_GDN_KERNEL,
+                batched_only=True,
+            )
+        return conv_state, recurrent_state, out
+
+    return pallas.jax_op("sglang_tpu_true_on_policy_test::gdn_decode_step", decode_step)
+
+
 @unittest.skipIf(not _TPU, "needs a TPU")
 class TestTrueOnPolicyKernels(CustomTestCase):
     @classmethod
@@ -173,6 +244,46 @@ class TestTrueOnPolicyKernels(CustomTestCase):
         with envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.override(True):
             with self.assertRaisesRegex(ValueError, "SGLANG_TPU_RPA_EXP2_SOFTMAX"):
                 self.k.refuse_rpa_rounding_flags()
+
+    def test_packed_gated_delta_net_does_not_depend_on_packing(self):
+        lens = (150, 300, 41)
+        qkv, b, a = _gdn_inputs(491)
+
+        def gdn(qkv, b, a, starts):
+            cu = torch.tensor(starts, dtype=torch.int32, device="tpu")
+            return _packed_gdn(self.k, qkv, b, a, cu).cpu()
+
+        packed = gdn(qkv, b, a, [0, 150, 450, 491])
+        # each sequence alone, padded to another length, with empty sequences after it
+        start = 0
+        for n in lens:
+            sl = slice(start, start + n)
+            pad = (0, 0, 0, 512 - n)
+            rows = (torch.nn.functional.pad(t[sl], pad) for t in (qkv, b, a))
+            alone = gdn(*rows, [0, n, n, n])[:n]
+            self.assertTrue(torch.equal(alone, packed[sl]), f"sequence of {n} differs")
+            start += n
+
+    def test_packed_gated_delta_net_equals_the_engine_decode_steps(self):
+        tokens = 24
+        qkv, b, a = _gdn_inputs(tokens)
+        cu = torch.tensor([0, tokens], dtype=torch.int32, device="tpu")
+        packed = _packed_gdn(self.k, qkv, b, a, cu).cpu()
+        self.assertEqual(packed.shape, (tokens, _GDN_NV, _GDN_D))
+        # the engine decodes one token per call, carrying the conv and recurrent state in its pool
+        decode_step = _gdn_decode_step_op()
+        conv = torch.zeros(2, _GDN_KERNEL - 1, 1, _GDN_DIM, device="tpu")
+        recurrent = torch.zeros(2, _GDN_NV, _GDN_D, _GDN_D, device="tpu")
+        outs = []
+        for t in range(tokens):
+            seq_len = torch.tensor([t + 1], dtype=torch.int32, device="tpu")
+            row = (x[t : t + 1].clone() for x in (qkv, b, a))
+            conv, recurrent, out = decode_step(
+                *row, conv, recurrent, *_gdn_weights(), seq_len
+            )
+            outs.append(out.cpu())
+        decoded = torch.cat(outs).reshape(packed.shape)
+        self.assertTrue(torch.equal(decoded, packed))
 
     def test_backward_is_the_gradient_of_the_same_math(self):
         x = _rnd(64, 512).requires_grad_()

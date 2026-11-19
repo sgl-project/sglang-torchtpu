@@ -21,16 +21,22 @@ from sglang_tpu.rl.true_on_policy.attention_kernel import (
     pin_kv_block,
     refuse_rpa_rounding_flags,
 )
+from sglang_tpu.rl.true_on_policy.gated_delta_net_kernel import (
+    GDN_PREFILL_TILE,
+    packed_gated_delta_net,
+)
 from sglang_tpu.rl.true_on_policy.logprob_kernel import logprob
 from sglang_tpu.rl.true_on_policy.matmul_kernel import matmul
 from sglang_tpu.rl.true_on_policy.norm_kernel import gated_rms_norm, rms_norm
 
 __all__ = [
+    "GDN_PREFILL_TILE",
     "PAGE_SIZE",
     "gated_rms_norm",
     "logprob",
     "matmul",
     "packed_causal_attention",
+    "packed_gated_delta_net",
     "pin_kv_block",
     "refuse_rpa_rounding_flags",
     "rms_norm",
