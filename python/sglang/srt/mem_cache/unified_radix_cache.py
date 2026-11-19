@@ -1456,6 +1456,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
+        if envs.SGLANG_HICACHE_HOST_RECLAIM_STRUCTURAL.get():
+            # One shared host arena: tokens freed by either component make progress.
+            return sum(result.tracker.values())
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----

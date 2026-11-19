@@ -1855,6 +1855,68 @@ class SWAComponent(TreeComponent):
         if enabled:
             host_lru.cursor_end()
 
+    def evict_shadowed_host_windows(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Tombstone, oldest first, the host windows of pass-through nodes: one child,
+        which holds Full KV and a full window of its own. A match can end at such a
+        node only by diverging inside the child's first window, so its window is the
+        cheapest to lose. Branch points and chunk-end windows (whose child has no SWA
+        KV) are kept, so losing any later window costs at most one segment."""
+        ct = self.component_type
+        host_lru = self.tree_core.host_lru_lists[ct]
+        x = host_lru.get_lru_no_host_lock()
+        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+            x_next = host_lru.get_prev_no_host_lock(x)
+            if self._is_pass_through(x):
+                self.tree_core._evict_component_and_detach_lru(
+                    x,
+                    self,
+                    target=EvictLayer.HOST,
+                    tracker=tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
+                )
+                self.tree_core._cascade_evict(
+                    x,
+                    self,
+                    tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
+                    target=EvictLayer.HOST,
+                )
+            x = x_next
+
+    def _is_pass_through(self, node: UnifiedTreeNode) -> bool:
+        if len(node.children) != 1:
+            return False
+        (child,) = node.children.values()
+        swa = child.component_data[self.component_type]
+        full = child.component_data[ComponentType.FULL]
+        return (
+            len(child.key) >= self.sliding_window_size
+            and (swa.value is not None or swa.host_value is not None)
+            and (full.value is not None or full.host_value is not None)
+        )
+
+    def has_usable_window(self, node: UnifiedTreeNode) -> bool:
+        """Whether a match ending at ``node`` finds SWA KV (device or host) for the
+        sliding window before it."""
+        ct = self.component_type
+        covered = 0
+        cur = node
+        while cur is not self.tree_core.root_node and covered < self.sliding_window_size:
+            cd = cur.component_data[ct]
+            if cd.value is None and cd.host_value is None:
+                return False
+            covered += len(cur.key)
+            cur = cur.parent
+        return True
+
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._swa_kv_pool_host is None:
             return
