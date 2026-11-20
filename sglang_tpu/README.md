@@ -262,9 +262,9 @@ At startup, each pipeline column logs how many ICI hops each stage hand-off
 crosses, the last stage's relay to the first included (`pp_stage_chips.py`).
 
 - Single-chip stages (TP1 or TP2 on two-core chips) form a ring of one-hop
-  hand-offs on one host, and on two hosts of a 2x2x2 slice, where the second
-  host binds its chips in reverse order. On those layouts a longer hand-off
-  within the slice fails the launch;
+  hand-offs when they fill one host's four chips, and on two hosts of a 2x2x2
+  slice, where the second host binds its chips in reverse order. On those
+  layouts a longer hand-off within the slice fails the launch;
   `SGLANG_TPU_PP_ALLOW_DISTANT_STAGES=1` turns the failure into a warning.
 - Other layouts keep the native device order, and a longer hand-off is
   warned about.

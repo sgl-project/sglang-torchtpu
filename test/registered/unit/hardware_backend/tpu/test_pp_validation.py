@@ -657,11 +657,16 @@ class TestPipelinePlacement(CustomTestCase):
         for name, args in cases.items():
             with self.subTest(name):
                 self.assertEqual(self._placement(9, **args), native)
-        # One host's native order is already the ring.
-        self.assertEqual(
-            self._placement(5, pp_size=8, tp_size=1, nnodes=1),
-            pp_stage_chips.PipelinePlacement(local_device=None, ring_expected=True),
-        )
+        # One host's native order is already the ring, but only stages filling
+        # all four chips close it.
+        for pp_size, tp_size, ring in ((8, 1, True), (4, 2, True), (3, 2, False)):
+            with self.subTest(one_host=(pp_size, tp_size)):
+                self.assertEqual(
+                    self._placement(1, pp_size=pp_size, tp_size=tp_size, nnodes=1),
+                    pp_stage_chips.PipelinePlacement(
+                        local_device=None, ring_expected=ring
+                    ),
+                )
 
 
 if __name__ == "__main__":

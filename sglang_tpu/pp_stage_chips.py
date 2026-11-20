@@ -242,6 +242,8 @@ _NATIVE = PipelinePlacement(local_device=None, ring_expected=False)
 # the hosts stacked along z.
 _TWO_HOST_RING_SLICE = (2, 2, 2)
 _RING_DEVICES_PER_CHIP = 2
+# A host of four two-core chips.
+_HOST_RING_DEVICES = 4 * _RING_DEVICES_PER_CHIP
 
 
 def pipeline_placement(cfg, *, tp_rank: int, pp_rank: int) -> PipelinePlacement:
@@ -249,7 +251,7 @@ def pipeline_placement(cfg, *, tp_rank: int, pp_rank: int) -> PipelinePlacement:
     worker bootstrap gives torch_tpu: pp-major ranks filling hosts in order.
 
     Each host's native device order walks its chips as a ring, so single-chip
-    stages on one host already form a one-hop ring. On two hosts of a 2x2x2
+    stages filling one host already form a one-hop ring. On two hosts of a 2x2x2
     slice, the second host walks its chips backwards: its first stage then
     sits next to the first host's last, and its last stage next to the first
     host's first. Cores keep their place on the chip, so a stage's
@@ -265,7 +267,13 @@ def pipeline_placement(cfg, *, tp_rank: int, pp_rank: int) -> PipelinePlacement:
     ):
         return _NATIVE
     if cfg.nnodes == 1:
-        return PipelinePlacement(local_device=None, ring_expected=True)
+        # Only stages filling all four chips close the ring; three chips of it
+        # leave the relay two hops long.
+        fills_host = cfg.tp_size * cfg.pp_size == _HOST_RING_DEVICES
+        single_chip = _RING_DEVICES_PER_CHIP % cfg.tp_size == 0
+        return PipelinePlacement(
+            local_device=None, ring_expected=fills_host and single_chip
+        )
     topology = (
         cfg.torch_tpu_topology
         or os.environ.get("TORCH_TPU_TOPOLOGY")
