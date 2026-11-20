@@ -23,10 +23,14 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=4)
 # The latency benchmark below runs only on the nightly full-matrix run, which
 # is where the speed gate lives; see the guard in _run_distributed_worker.
-register_tpu_ci(est_time=900, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=900,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra", "tp"],
+)
 
 _BATCH_SIZES = (64, 128, 256)
 _SPEED_GATED_BATCH_SIZES = (64, 128, 256)

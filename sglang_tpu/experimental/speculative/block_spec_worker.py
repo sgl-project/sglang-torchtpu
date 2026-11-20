@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -60,6 +60,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -70,13 +71,28 @@ from sglang_tpu.experimental.speculative.spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows, prompt_positions
+from sglang_tpu.experimental.speculative.spec_utils import (
+    pad_rows,
+    padded_h2d,
+    prompt_positions,
+)
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DFLASH: TpuDflashDraftWorker,
     SpeculativeAlgorithm.DSPARK: TpuDsparkDraftWorker,
 }
+
+
+def committed_verify_ids(
+    bonus_tokens: torch.Tensor, accept_tokens: torch.Tensor
+) -> torch.Tensor:
+    """[pbs, N + 2] tokens whose first accept_lens columns are the committed verify rows.
+
+    The verify window is [r, d_1..d_N]; the committed prefix is r and the correct
+    drafts, which accept_tokens holds first (then the new bonus, -1 padded).
+    """
+    return torch.cat([bonus_tokens.view(-1, 1), accept_tokens.clamp_min(0)], dim=1)
 
 
 class TpuBlockSpecWorker(TpuSpecWorker):
@@ -113,9 +129,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        self._warmup_draft_block_inputs()
-        if self._sampled_drafts:
-            self._warmup_draft_sampling()
+        # Under PP (pp_size > 1), TpuBlockSpecWorker only runs on the last stage
+        # of a non-decode (PD prefill) server, which projects extend draft KV and
+        # never drafts or samples speculative blocks. Scope this skip strictly to
+        # pp_size > 1 and disaggregation_mode != "decode" so PP prefill avoids
+        # single-stage decode compilations and unsharded-lm_head draft-sampling
+        # HBM spikes on the last stage, while keeping all pp_size == 1 (TP /
+        # monolithic) and decode paths completely unchanged.
+        is_pp_non_decode = (
+            get_parallel().pp_size > 1 and get_disagg().disaggregation_mode != "decode"
+        )
+        if not is_pp_non_decode:
+            self._warmup_draft_block_inputs()
+            if self._sampled_drafts:
+                self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -202,12 +229,19 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> CommitResult:
-        del verify_input
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
+        swa_candidates = self._draft_swa_candidates(verify_input)
+        if swa_candidates is not None:
+            rows = select_verify_rows(
+                padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
+                verify_input.committed_lens,
+                state.seq_lens,
+                self.num_verify_rows,
+            )
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -217,6 +251,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
             )
+        # As core DSparkWorkerV2: a verify forward commits nothing to the target's
+        # per-request Engram history.
+        ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if ngram.engram_hasher is not None:
+            ngram.update_after_verify(
+                verify_ids_2d=committed_verify_ids(
+                    state.bonus_tokens, accept.accept_tokens
+                ),
+                req_pool_indices=state.req_pool_indices,
+                commit_lens=accept.accept_lens,
+            )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
@@ -224,6 +269,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             req_pool_indices=state.req_pool_indices,
         )
         return CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
+
+    def _draft_swa_candidates(
+        self, verify_input: TpuSpecVerifyInput
+    ) -> torch.Tensor | None:
+        """Host [bs, 2 * capacity] int64 draft SWA slots of the verify candidate
+        window, or None when the draft writes the target's slots."""
+        # The window starts at the host committed base; select_verify_rows picks the
+        # active rows on device, where seq_lens may lead the host by one commit.
+        ring_pool = self._block_draft_worker.swa_ring_pool
+        if ring_pool is not None:
+            bs = verify_input.seq_lens_cpu.shape[0]
+            offsets = torch.arange(2 * self.verify_window_rows, dtype=torch.int64)
+            return ring_pool.swa_ring_rows(
+                slots=verify_input.req_pool_indices_cpu[:bs, None],
+                positions=verify_input.seq_lens_cpu.to(torch.int64)[:, None] + offsets,
+            )
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is None:
+            return None
+        return full_to_swa[verify_input.verify_cache_candidates_cpu].to(torch.int64)
 
     def extend(
         self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
@@ -260,6 +325,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
             cache_loc_cpu = batch.out_cache_loc
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+            ring_pool = self._block_draft_worker.swa_ring_pool
+            full_to_swa = self._block_draft_worker.full_to_swa
+            if ring_pool is not None:
+                assert not self.ships_pd_hidden, "PD does not serve a draft SWA ring"
+                cache_loc_cpu = _extend_ring_rows(
+                    ring_pool=ring_pool, batch=batch, positions=positions_cpu
+                ).to(cache_loc_cpu.dtype)
+            elif full_to_swa is not None and not self.ships_pd_hidden:
+                cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
@@ -268,10 +342,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
-        with self._block_draft_worker.draft_context():
-            kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
-            )
+        if self.ships_pd_hidden:
+            # The decode projects these rows into its draft KV.
+            kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
+        else:
+            with self._block_draft_worker.draft_context():
+                kv_fence_tail = self._block_draft_worker.write_draft_kv(
+                    target_hidden=target_hidden,
+                    positions=positions,
+                    cache_loc=cache_loc,
+                )
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
@@ -296,6 +376,33 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 f"distributed top-k width {width} != TARGET_CANDIDATES {TARGET_CANDIDATES}"
             )
         return width
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        del bonus_tokens
+        if (
+            self._block_draft_worker.full_to_swa is not None
+            or self._block_draft_worker.swa_ring_pool is not None
+        ):
+            raise NotImplementedError(
+                "PD decode-side draft prefill does not support a hybrid-SWA draft."
+            )
+        positions = pad_rows(
+            prompt_positions(
+                prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
+            ),
+            target_hidden.shape[0],
+        ).to(self.device, non_blocking=True)
+        with self._block_draft_worker.draft_context():
+            self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+            )
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
@@ -476,3 +583,22 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     # return the info records once the confidence budget is ported.
     def dump_info_records(self) -> dict | None:
         return None
+
+
+def _extend_ring_rows(*, ring_pool, batch: ScheduleBatch, positions: torch.Tensor):
+    """[T] int64 draft ring rows of an extend's tokens. Restarts the ring of each
+    newly placed request at its cached prefix: the replayed rows' hidden states
+    never reach the draft, so the ring holds nothing below it."""
+    if batch.encoder_swa_reset is not None:
+        placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+        if placed:
+            ring_pool.set_swa_valid_from(
+                batch.req_pool_indices_cpu[placed],
+                torch.tensor([batch.prefix_lens[i] for i in placed], dtype=torch.int64),
+            )
+    lens = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    slots = torch.repeat_interleave(batch.req_pool_indices_cpu.to(torch.int64), lens)
+    ends = torch.repeat_interleave(
+        torch.tensor(batch.prefix_lens, dtype=torch.int64) + lens, lens
+    )
+    return ring_pool.swa_ring_rows(slots=slots, positions=positions, ends=ends)

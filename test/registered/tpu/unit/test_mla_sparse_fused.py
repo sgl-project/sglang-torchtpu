@@ -32,7 +32,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.
@@ -320,6 +320,68 @@ class TestSparseMlaFused(CustomTestCase):
         # First token, one past a page boundary, and kv_len == topk; then two
         # padded rows whose page table aliases the first sequence.
         self._run(
+            [(1, 1), (1, 129), (1, _TOPK)],
+            padded_rows=2,
+            token_bucket=5,
+            is_decode=True,
+            seed=1,
+        )
+
+    def _run_zero_rope_placeholder(self, lens, **step_kwargs):
+        """zero_rope=True gives the same output and NoPE cache whether the rope
+        cache is full size or the one-row placeholder that the pool allocates
+        for a model without rope (qk_rope_head_dim == 0)."""
+        step = _build_step(lens, **step_kwargs)
+        new_tokens = [
+            jnp.asarray(step.ql_nope),
+            jnp.zeros_like(jnp.asarray(step.q_pe)),
+            jnp.asarray(step.new_kv_c),
+            jnp.zeros_like(jnp.asarray(step.new_k_pe)),
+        ]
+        metadata = [
+            jnp.asarray(step.kv_lens),
+            jnp.asarray(step.page_indices),
+            jnp.asarray(step.cu_q_lens),
+        ]
+        distribution = jnp.asarray(step.distribution)
+        rows = jnp.asarray(_causal_rows(step))
+        results = []
+        for placeholder in (False, True):
+            cache_nope, cache_rope = _split(step.cache_before)
+            cache_rope = jnp.zeros_like(cache_rope)
+            if placeholder:
+                cache_rope = jnp.zeros((1, 1, 4, 128), jnp.uint8)
+            out, cache_nope, cache_rope = sparse_mla_attention_fused(
+                *new_tokens,
+                cache_nope,
+                cache_rope,
+                *metadata,
+                distribution,
+                rows,
+                sm_scale=_SM_SCALE,
+                k_scale=step.k_scale,
+                zero_rope=True,
+            )
+            out, cache_nope, cache_rope = jax.block_until_ready(
+                (out, cache_nope, cache_rope)
+            )
+            results.append((np.asarray(out), np.asarray(cache_nope), cache_rope.shape))
+        (full_out, full_nope, _), (ph_out, ph_nope, ph_rope_shape) = results
+        self.assertEqual(ph_rope_shape, (1, 1, 4, 128))
+        self.assertTrue(full_out[: step.num_active_tokens].any())
+        np.testing.assert_array_equal(ph_out, full_out)
+        np.testing.assert_array_equal(ph_nope, full_nope)
+
+    def test_zero_rope_placeholder_extend(self):
+        self._run_zero_rope_placeholder(
+            [(37, 37), (64, 200), (5, 133)],
+            padded_rows=0,
+            token_bucket=128,
+            is_decode=False,
+        )
+
+    def test_zero_rope_placeholder_decode(self):
+        self._run_zero_rope_placeholder(
             [(1, 1), (1, 129), (1, _TOPK)],
             padded_rows=2,
             token_bucket=5,

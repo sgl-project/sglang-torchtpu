@@ -3,15 +3,17 @@ gmm_v2.pad_size_n_to_fewest_tiles (load-time N padding).
 
 These exercise the pure tile-sizing math, so they need no TPU: ``get_tpu_info``
 (the only hardware dependency) is stubbed with the tpu7x lane/MXU geometry, and
-``vmem_limit_bytes`` is passed explicitly. Registered as a CPU CI test but
-skipped gracefully where JAX / the pallas import chain is unavailable.
+``vmem_limit_bytes`` is passed explicitly. Registered on both lanes and skipped
+gracefully where JAX is unavailable: the CPU agents have no JAX, so the TPU
+unit lane is the one that actually executes these assertions.
 """
 
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest import mock
@@ -22,13 +24,16 @@ try:
     import jax
     import jax.numpy as jnp
 
-    from sglang_tpu.moe.pallas import gmm_v2
-
     _HAS_GMM = True
-except Exception:  # pragma: no cover - depends on JAX/pallas availability
+except ImportError:  # pragma: no cover - JAX is absent on some CPU CI agents
     _HAS_GMM = False
 
-_SKIP_REASON = "Requires JAX + the gmm_v2 pallas import chain"
+# Deliberately outside the try: once JAX is present, a failure to import the
+# pallas chain is a real breakage and must surface, not silently skip the suite.
+if _HAS_GMM:
+    from sglang_tpu.moe.pallas import gmm_v2
+
+_SKIP_REASON = "Requires JAX"
 
 # tpu7x geometry; calculate_tiling only reads mxu_column_size and num_lanes.
 _TPU_INFO = SimpleNamespace(mxu_column_size=128, num_lanes=128)

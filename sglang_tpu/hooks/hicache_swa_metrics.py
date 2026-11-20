@@ -40,6 +40,8 @@ def used_tokens(pool: HostKVCache) -> int:
         with backing.lock:
             side = backing.sides[pool.pool_label]
             return side.live_page_count * side.page_size
+    if hasattr(pool, "live_tokens"):
+        return pool.live_tokens()
     return pool.logical_size - pool.available_size()
 
 

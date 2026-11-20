@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import contextlib
 import logging
 import math
 from typing import TYPE_CHECKING
@@ -16,9 +17,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
+SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -39,6 +42,30 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+# depth of open uncached_a2a_staging() blocks
+_UNCACHED_STAGING = 0
+
+
+@contextlib.contextmanager
+def uncached_a2a_staging():
+    """Run the Ulysses exchanges inside the block over NCCL on per-call buffers.
+
+    For a one-off exchange the steady state never repeats (the pipelined
+    attention's first-sight reference): the staging cache and the IPC
+    transports' staging pairs would otherwise stay allocated at its size. An
+    all-to-all is a permutation, so the transport never changes its bytes.
+    """
+    global _UNCACHED_STAGING
+    _UNCACHED_STAGING += 1
+    try:
+        yield
+    finally:
+        _UNCACHED_STAGING -= 1
+
+
+# Accelerators whose device module exposes is_current_stream_capturing() and can
+# run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
+_A2A_DEVICE_TYPES = ("cuda", "xpu")
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -50,8 +77,9 @@ def drop_a2a_staging_buffers() -> None:
     """
     if not _A2A_STAGING_BUFFERS:
         return
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_module.synchronize()
     _A2A_STAGING_BUFFERS.clear()
 
 
@@ -64,22 +92,23 @@ def _a2a_staging_buffer(
     next collective with the same role overwrites it. Keep one grow-only
     backing allocation per (role, dtype, device), then return an exact-shape
     view into that allocation. This removes per-block allocator churn without
-    retaining one CUDA tensor for every request shape seen by the worker.
-    Bypassed under autograd and CUDA graph capture: a buffer first allocated
-    while capturing would live in the graph's private memory pool and must
-    not be shared with eager replays.
+    retaining one device tensor for every request shape seen by the worker.
+    Bypassed under autograd and graph capture: a buffer first allocated while
+    capturing would live in the graph's private memory pool and must not be
+    shared with eager replays.
     """
     if (
-        torch.is_grad_enabled()
+        _UNCACHED_STAGING
+        or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or device.type != "cuda"
-        or torch.cuda.is_current_stream_capturing()
+        or device.type not in _A2A_DEVICE_TYPES
+        or torch.get_device_module(device).is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.get_device_module(device).current_device()
     key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
@@ -95,18 +124,61 @@ def _a2a_staging_buffer(
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
+    sp_group = get_sp_group()
+    ulysses_pg = sp_group.ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten().contiguous()
+    # Every caller's dim 0 splits evenly over the group, so exchanging the
+    # tensor in its own shape moves the same bytes as a flat exchange; a
+    # flattened buffer costs torch_tpu relayout copies around the collective.
+    x = x.contiguous()
+    assert x.shape[0] % get_ulysses_parallel_world_size() == 0, (
+        f"dim 0 ({x.shape[0]}) must split evenly over the Ulysses group"
+    )
+    if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+            IPC_A2A_MULTI,
+            ipc_a2a_multi_ready,
+        )
+
+        if ipc_a2a_multi_ready(ulysses_pg):
+            world_size = torch.distributed.get_world_size(group=ulysses_pg)
+            received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
+            if received is not None:
+                return received.view(x.shape)
     if role is None:
         output = torch.empty_like(x)
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
+
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
-    return output.reshape(x_shape)
+    handle = sp_group.ulysses_shm_handle
+    input_bytes = x.numel() * x.element_size()
+    if (
+        current_platform.is_cpu()
+        and handle is not None
+        and handle >= 0
+        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+    ):
+        torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
+    else:
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+
+    return output
+
+
+def _usp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``x`` from every Ulysses rank along dim 0, rank order."""
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x = x.contiguous()
+    output = torch.empty(
+        (get_ulysses_parallel_world_size() * x.shape[0], *x.shape[1:]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    dist.all_gather_into_tensor(output, x, group=ulysses_pg)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
@@ -134,6 +206,10 @@ def _ipc_ready_group():
         ipc_a2a_ready,
     )
 
+    # The transport's custom-class handles cannot be traced; a compiled graph
+    # keeps the NCCL all-to-all (traceable) instead of breaking here.
+    if _UNCACHED_STAGING or torch.compiler.is_compiling():
+        return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None
 
@@ -337,12 +413,16 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    # clone, not contiguous(): with one head and one batch row per rank the
+    # reorder is a free view of the staging buffer the next exchange reuses.
     if head_dim == 1:
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+        x = x.permute(2, 1, 0, 3, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, h_local, s_global, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
-        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+        x = x.permute(2, 0, 3, 1, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, s_global, h_local, d)
 
     return x
 
@@ -363,7 +443,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -401,18 +481,98 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def ulysses_head_group_pipelined_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attend,
+    groups: int,
+) -> torch.Tensor:
+    """Ulysses attention with the collective exchange pipelined over head groups.
+
+    q/k/v are matching ``[rows, heads, head_size]`` row shards and
+    ``attend(q, k, v)`` attends one head group over the gathered rows; it must
+    treat heads independently, so the result is the sequential exchange's
+    bytes. Every input exchange is queued up front on the collective stream
+    and group g's output exchange runs while group g + 1 attends.
+    """
+    group = get_sp_group().ulysses_group
+    world_size = get_ulysses_parallel_world_size()
+    rows, heads, head_size = q.shape
+    group_heads = heads // (world_size * groups)
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
+
+    # pack block w * groups + g holds rank w's heads of group g
+    packed = pack_qkv_destination_major(
+        q,
+        k,
+        v,
+        world_size * groups,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size * groups, rows, group_heads, 3 * head_size),
+            q.dtype,
+            q.device,
+        ),
+    ).view(world_size, groups, rows, group_heads, 3 * head_size)
+    received = _a2a_staging_buffer(
+        "usp_packed_qkv_recv",
+        (groups, world_size, rows, group_heads, 3 * head_size),
+        q.dtype,
+        q.device,
+    )
+    exchanges = [
+        dist.all_to_all(
+            list(received[g].unbind(0)),
+            list(packed[:, g].unbind(0)),
+            group=group,
+            async_op=True,
+        )
+        for g in range(groups)
+    ]
+    out = _a2a_staging_buffer(
+        "usp_output",
+        (groups, world_size, rows, group_heads, head_size),
+        q.dtype,
+        q.device,
+    )
+    for g in range(groups):
+        exchanges[g].wait()
+        group_qkv = received[g].view(world_size * rows, group_heads, 3 * head_size)
+        group_out = attend(*group_qkv.split(head_size, dim=-1))
+        exchanges.append(
+            dist.all_to_all_single(out[g], group_out, group=group, async_op=True)
+        )
+    for exchange in exchanges[groups:]:
+        exchange.wait()
+    # [group, rank, row, head, dim] -> [row, rank, group, head, dim]
+    return out.permute(2, 1, 0, 3, 4).reshape(rows, heads, head_size)
+
+
+def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
+    """True when ``x.view(b * s_local, h, d)`` costs no copy.
+
+    The pack kernel reads q/k/v through explicit row/head strides, so only the
+    head_size dim has to be unit-stride; full contiguity is not required. The
+    batch and sequence dims still have to merge into one, which is free when
+    batch is 1 or when the two dims are already adjacent in memory.
+    """
+    batch, seq_local = x.shape[0], x.shape[1]
+    return x.stride(-1) == 1 and (batch == 1 or x.stride(0) == seq_local * x.stride(1))
+
+
 def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
         and q.dtype in (torch.float16, torch.bfloat16)
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
+        and _packed_qkv_row_view_is_free(q)
+        and _packed_qkv_row_view_is_free(k)
+        and _packed_qkv_row_view_is_free(v)
         and q.shape[2] % world_size == 0
         and not torch.compiler.is_compiling()
     )
@@ -429,7 +589,8 @@ def _usp_input_all_to_all_qkv(
     destination-major by one relayout kernel and exchanged in a single
     collective instead of three; only data movement changes, so the result is
     bit-identical to the unpacked path, which stays as the fallback for
-    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
+    would copy).
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()
@@ -601,6 +762,36 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     )
 
     s_local, h_global = s_global // world_size, h_local * world_size
+
+    if (
+        head_dim == 2
+        and h_local > 1
+        and current_platform.prefers_head_slab_output_exchange()
+        and x.transpose(1, 2).is_contiguous()
+    ):
+        # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
+        # platforms that ask for it (TPU): exchange whole [s_local, d] head
+        # slabs instead of the sequence-major [s, b, h_local, d] buffer. The
+        # relayout copy before the exchange and the gather copy after it are the
+        # same two copies as the path below; what changes is the exchanged
+        # buffer, whose minor dims (s_local, d) stay dense where (h_local, d)
+        # would be padded to (8, 128) tiles on TPU. Values are bit-identical to
+        # the path below. Callers that slice a replicated prefix/suffix off the
+        # output (FLUX.2, Z-Image) are not heads-major contiguous and take the
+        # path below. h_local > 1: with one head,
+        # sequence-major inputs also pass the contiguity check.
+        x = (
+            x.transpose(1, 2)
+            .reshape(b, h_local, world_size, s_local, d)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        x = _usp_all_to_all_single(x, role="usp_output")
+        # [world_size, b, h_local, s_local, d] -> [b, s_local, h_global, d]. A
+        # fresh tensor: contiguous() is a no-op when b == s_local == 1 and would
+        # return a view of the reused staging buffer.
+        x = x.permute(1, 3, 0, 2, 4).clone(memory_format=torch.contiguous_format)
+        return x.view(b, s_local, h_global, d)
 
     x = x.permute(permute_order).contiguous()
     x = _usp_all_to_all_single(x, role="usp_output")
@@ -827,12 +1018,12 @@ def _ring_merge_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Online-softmax combine of one more ring step's partial attention.
 
-    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
-    layout `[H, T]`. Both are already self-normalized over their own KV
+    `step_out` is `[T, H, D]` or `[B, T, H, D]`; `step_lse` is
+    `[H, T]` or `[B, H, T]`. Both are already self-normalized over their own KV
     chunk, so combining chunks is the standard two-term logsumexp merge
     (exact up to float rounding); done in fp32 for stability.
     """
-    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_lse = step_lse.transpose(-2, -1).unsqueeze(-1).to(torch.float32)
     step_out = step_out.to(torch.float32)
     if out_acc is None:
         return step_out, step_lse
@@ -854,7 +1045,8 @@ def _ring_attention_varlen(
 ) -> torch.Tensor:
     """Ring-rotated varlen attention over one rank's local packed chunk.
 
-    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    `q, k, v` are `[T, H, D]` or `[B, T, H, D]`, with equal lengths per batch.
+    They contain this rank's full local ring chunk (`ring_chunk_len` rows,
     real rows followed by however many of this chunk's rows are padding).
     KV is P2P-rotated around the ring one hop per step (send this step's
     buffer to the next rank, receive the following step's buffer from the
@@ -868,7 +1060,7 @@ def _ring_attention_varlen(
     """
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
-    ring_chunk_len = q.shape[0]
+    ring_chunk_len = q.shape[-3]
     _, ring_rank = get_ring_ctx()
 
     # `isend`/`irecv` (unlike collectives) address peers by global rank even
@@ -882,9 +1074,15 @@ def _ring_attention_varlen(
 
     # K and V travel as one stacked buffer so each hop is a single P2P
     # send/recv pair instead of two; stacking also makes the buffer
-    # contiguous, so no separate .contiguous() call is needed.
-    kv0 = torch.stack((k, v))
-    kv_bufs = [kv0, torch.empty_like(kv0)]
+    # contiguous, so no separate .contiguous() call is needed. The pair is
+    # reused across calls: a fresh pair stays held for the P2P stream until the
+    # GPU reaches it, and with the host layers ahead that is one pair per
+    # queued layer (MiniMax-H3 on 2xMI350X runs out of device memory in 4 steps).
+    kv_bufs = [
+        _a2a_staging_buffer(f"ring_kv_{i}", (2, *k.shape), k.dtype, k.device)
+        for i in range(2)
+    ]
+    torch.stack((k, v), out=kv_bufs[0])
     cur = 0
 
     out_acc: torch.Tensor | None = None
@@ -917,11 +1115,14 @@ def _ring_attention_varlen(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
         if remote_used > 0:
-            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
-                q,
-                kv_bufs[cur][0, :remote_used],
-                kv_bufs[cur][1, :remote_used],
-            )
+            key = kv_bufs[cur][0, ..., :remote_used, :, :]
+            value = kv_bufs[cur][1, ..., :remote_used, :, :]
+            if q.ndim == 3:
+                step_out, step_lse = attn_impl.forward_ring_kv_chunk(q, key, value)
+            else:
+                step_out, step_lse, *_ = attn_impl.forward(
+                    q, key, value, attn_metadata=None, return_softmax_lse=True
+                )
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse
             )
@@ -932,3 +1133,72 @@ def _ring_attention_varlen(
             pending_ops = None
             cur = nxt
     return out_acc.to(q.dtype)
+
+
+def allgather_kv_ring_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_impl: "AttentionImpl",
+    kv_real_len: int | None = None,
+) -> torch.Tensor:
+    """Ring attention over all-gathered K/V; inputs and output are [B, S, H, D].
+
+    The local shard is attended first so the gather can overlap it; each later
+    shard resumes the softmax inside the attention kernel
+    (``AttentionImpl.forward_ring_resume``), so there is no merge pass.
+
+    Ring rank ``r`` holds keys ``[r * S, (r + 1) * S)``. With tail padding,
+    keys from ``kv_real_len`` on are skipped and the query rows past it are
+    zeroed. Which shard is local and how many real keys each shard holds
+    depend on the rank, so they reach the kernel as device data: ranks running
+    collectives inside one compiled program must compile the same program.
+
+    Nothing rotates: K/V of the whole ring group stay resident on every device
+    (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
+    compute (1/R of the layer) can hide the gathers. Bytes on the wire equal a
+    p2p ring's; this trades memory for not needing p2p, which TPU lacks.
+    Query and key shards may differ in length (cross-attention between two
+    sequence-sharded streams, e.g. LTX-2 video and audio); query rows past
+    ``kv_real_len`` are zeroed only for self-attention.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    world_size = dist.get_world_size(group=ring_pg)
+    batch, shard_len, kv_heads = key.shape[:3]
+    self_attention = query.shape[1] == shard_len
+    padded = kv_real_len is not None and kv_real_len < world_size * shard_len
+    if kv_real_len is None:
+        kv_real_len = world_size * shard_len
+    # This rank's ring position as data: an all-to-all of [0, .., R-1] hands
+    # rank r the value r. Issued before the K/V gathers it gates. A per-process
+    # constant tensor would skip the collective, but a compiler may fold it
+    # into a rank-specialised program, which breaks one-program-per-rank.
+    positions = torch.arange(world_size, dtype=torch.float32, device=key.device)
+    rank_t = ft_c.all_to_all_single(positions, None, None, group=ring_pg)
+    # Heads-major shards, the kernel's layout: the gathered K/V need no
+    # relayout.
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+    keys = ft_c.all_gather_tensor(key, 0, group=ring_pg)
+    values = ft_c.all_gather_tensor(value, 0, group=ring_pg)
+    rank_t = _maybe_wait(rank_t)[0].to(torch.int32)
+
+    def kv_info(shard_t: torch.Tensor, row_offset_t: torch.Tensor) -> torch.Tensor:
+        real = (kv_real_len - shard_t * shard_len).clamp(0, shard_len)
+        return torch.stack([row_offset_t, real]).to(torch.int32)
+
+    out, carry = attn_impl.forward_ring_resume(
+        query, key, value, kv_info(rank_t, torch.zeros_like(rank_t))
+    )
+    keys, values = _maybe_wait(keys), _maybe_wait(values)
+    for step in range(1, world_size):
+        peer_t = (rank_t + step) % world_size
+        out, carry = attn_impl.forward_ring_resume(
+            query, keys, values, kv_info(peer_t, peer_t * batch * kv_heads), carry
+        )
+    if padded and self_attention:
+        rows = rank_t * shard_len + torch.arange(shard_len, device=out.device)
+        out = torch.where((rows < kv_real_len)[:, None], out, 0)
+    return out.transpose(1, 2)

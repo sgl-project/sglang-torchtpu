@@ -6,10 +6,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_parallel_rank,
@@ -155,8 +155,14 @@ def expand_wan_ti2v_timestep(
 
     local_seq_len = _get_wan_ti2v_local_seq_len(batch, seq_len, patch_size)
 
-    if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
-        temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
+    # Each SP rank builds the timesteps of the latents it holds (its time
+    # shard, or the whole video when unsharded), so ranks agree on every token.
+    if reserved_frames_mask is not None:
+        # One timestep per patch: sample the mask at the patch stride.
+        pt, ph, pw = patch_size
+        temp_ts = (
+            reserved_frames_mask[0][::pt, ::ph, ::pw] * t_device_rounded
+        ).flatten()
         temp_ts = torch.cat(
             [
                 temp_ts,

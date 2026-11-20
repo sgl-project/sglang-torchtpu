@@ -8,9 +8,10 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.model_executor import forward_batch_info
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
@@ -22,6 +23,8 @@ from sglang_tpu.compilation.compiled_forward_shim import (
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.hooks.host_padding import extend_metadata_device
+from sglang_tpu.host_padding import _can_stage_forward_metadata
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -47,6 +50,40 @@ class TestPaddedSamplingCompileGuards(CustomTestCase):
 
 
 class TestPositionOnHost(CustomTestCase):
+    def test_pp_extend_lengths_stay_on_host_without_staging_other_inputs(self):
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            mix_running_indices=None,
+            dllm_config=None,
+            input_tensor_device=None,
+            sampling_info=None,
+            model_config=SimpleNamespace(
+                is_generation=True,
+                use_ngram_embedding=False,
+                use_engram=False,
+                is_encoder_decoder=False,
+            ),
+        )
+
+        def original(batch, device):
+            return device
+
+        with get_context().override_server_args(
+            pp_size=16, enable_torch_compile=True, enable_mixed_chunk=False
+        ):
+            self.assertFalse(_can_stage_forward_metadata(batch))
+            self.assertEqual(extend_metadata_device(original, batch, "meta"), "cpu")
+            positions, starts = forward_batch_info.compute_position_torch(
+                torch.tensor([2, 9], dtype=torch.int32),
+                torch.tensor([3, 2], dtype=torch.int32),
+            )
+            self.assertTrue(torch.equal(positions, torch.tensor([2, 3, 4, 9, 10])))
+            self.assertTrue(
+                torch.equal(starts, torch.tensor([0, 3], dtype=torch.int32))
+            )
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            self.assertEqual(extend_metadata_device(original, batch, "meta"), "meta")
+
     def test_compute_position_torch_cpu_staged(self):
         cases = (
             ([7], [3], [7, 8, 9], [0]),
@@ -242,11 +279,11 @@ class TestHostPadFieldSelection(CustomTestCase):
         policy.model_runner.device = "meta"
         decode = self._decode_batch()
         decode.input_ids = decode.input_ids.to("meta")
-        with self.assertNoLogs("sglang.srt.utils.common", level="WARNING"):
+        with self.assertNoLogs("sglang.srt.utils.log_utils", level="WARNING"):
             policy.prepare_forward_batch(decode)
         prefill = self._extend_batch()
         prefill.input_ids = prefill.input_ids.to("meta")
-        with self.assertLogs("sglang.srt.utils.common", level="WARNING"):
+        with self.assertLogs("sglang.srt.utils.log_utils", level="WARNING"):
             policy.prepare_forward_batch(prefill)
 
     def test_extend_mrope_follows_the_extend_metadata_placement(self):
@@ -402,6 +439,33 @@ class TestHostPadFieldSelection(CustomTestCase):
         for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
             self.assertEqual(getattr(batch, name).device.type, "meta", name)
 
+    def test_host_tokens_pad_before_upload_when_lengths_are_on_device(self):
+        """A pipeline stage keeps prefill tokens on host while seq_lens and request
+        rows stay on the device; the tokens still pad on host before upload."""
+        batch = self._extend_batch()
+        batch.seq_lens = batch.seq_lens.to("meta")
+        batch.req_pool_indices = torch.tensor([2, 7]).to("meta")
+        batch.mrope_positions = None
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        uploads = []
+
+        class ObserveCopies(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._to_copy.default:
+                    uploads.append(args[0].tolist())
+                return func(*args, **(kwargs or {}))
+
+        with ObserveCopies():
+            policy.prepare_forward_batch(batch)
+        for name in ("input_ids", "positions", "out_cache_loc", "extend_seq_lens"):
+            self.assertEqual(getattr(batch, name).device.type, "meta", name)
+        self.assertEqual(batch.input_ids.shape, (8,))
+        self.assertEqual(batch.seq_lens.shape, (4,))
+        self.assertEqual(batch.req_pool_indices.shape, (4,))
+        self.assertIn([0, 1, 2, 3, 4, 0, 0, 0], uploads)
+        self.assertIn([11, 12, 13, 50, 51, 0, 0, 0], uploads)
+
     def test_experimental_spec_keeps_non_overlap_metadata_on_host(self):
         """An experimental-worker PD-prefill batch filters and pads its lengths on
         host; an overlap batch, or one off the worker, keeps them on the device."""
@@ -431,6 +495,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(host_padding.metadata_device(original, off_worker), "tpu")
 
     def test_decode_mrope_builds_on_host_and_uploads_only_bucket_shape(self):
+        from sglang.srt.managers.req_types import MultimodalInputs
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.hooks import host_padding
 
@@ -451,12 +516,14 @@ class TestHostPadFieldSelection(CustomTestCase):
                     lengths = torch.arange(10, 10 + size)
                     deltas = [(-3 if i % 2 == 0 else 0) for i in range(size)]
                     mm_inputs = [
-                        SimpleNamespace(
-                            mrope_positions=None,
-                            mrope_position_delta=torch.tensor(delta),
+                        (
+                            MultimodalInputs(
+                                mm_items=[],
+                                mrope_position_delta=torch.tensor(delta),
+                            )
+                            if multimodal and delta
+                            else None
                         )
-                        if multimodal and delta
-                        else None
                         for delta in deltas
                     ]
                     batch = SimpleNamespace(
@@ -592,7 +659,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         from unittest.mock import MagicMock
 
         from sglang.srt.managers.schedule_batch import ScheduleBatch
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         def make_batch(lengths, originals, indices):
@@ -604,6 +671,7 @@ class TestHostPadFieldSelection(CustomTestCase):
                         return_logprob=False,
                         grammar=None,
                         return_hidden_states_mode=CaptureHiddenMode.NULL,
+                        sampling_params=SimpleNamespace(top_k=1),
                     )
                     for _ in lengths
                 ],
@@ -655,6 +723,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         relay = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
         relay.spec_algo = SpeculativeAlgorithm.NONE
         relay._use_dynamic_index = True
+        relay._deferred_relay = None
         relay.output_tokens_buf = torch.empty(16, dtype=torch.int64, device="meta")
         operations = []
 
@@ -687,8 +756,8 @@ class TestHostPadFieldSelection(CustomTestCase):
 
         req = SimpleNamespace(
             kv=SimpleNamespace(req_pool_idx=1),
-            prefix_indices=[0, 1],
-            extend_range=SimpleNamespace(length=3),
+            prefix_len=2,
+            extend_len=3,
             origin_input_ids=[10, 11, 12, 13, 14],
             output_ids=[],
             retracted_stain=True,
@@ -782,6 +851,7 @@ class TestHostPadFieldSelection(CustomTestCase):
             need_sort=False,
         )
         tree = SimpleNamespace(
+            req_to_token_pool=batch.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             supports_prefix_sharing=lambda: False,
         )
@@ -850,6 +920,8 @@ class TestHostPadFieldSelection(CustomTestCase):
                     grammar=None,
                     finished=lambda: False,
                     skip_radix_cache_insert=True,
+                    prefix_len=0,
+                    extend_end=1,
                 )
                 for token in (11, 22, 33)
             ],

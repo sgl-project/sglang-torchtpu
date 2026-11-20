@@ -14,6 +14,11 @@ from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
+# The compressed-KV pool's page; its C128 sub-pool hardcodes 256-token pages.
+DSV4_PAGE_SIZE = 256
+# Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
+DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
+
 
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -45,10 +50,13 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         cfg.swa_full_tokens_ratio is None
         and getattr(hf_config, "model_type", None) != "deepseek_v41"
     ):
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+        overrides["swa_full_tokens_ratio"] = DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
+        logger.info(
+            f"Setting swa_full_tokens_ratio to "
+            f"{DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO} for {model_arch}."
+        )
 
-    page_size = 256
+    page_size = DSV4_PAGE_SIZE
     if cfg.device == "npu":
         # NPU keeps the device-aware "dsv4" backend (the registry routes it to
         # the Ascend V4 subclass); only the pool geometry / dtype differ.
@@ -58,12 +66,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         page_size = 128
         overrides["prefill_attention_backend"] = "dsv4"
         overrides["decode_attention_backend"] = "dsv4"
-    elif cfg.device == "tpu":
-        overrides["prefill_attention_backend"] = "dsv4"
-        overrides["decode_attention_backend"] = "dsv4"
-        if cfg.dsv4_attn_backend == "auto":
-            overrides["dsv4_attn_backend"] = "tpu_dsv4"
-        overrides["disable_shared_experts_fusion"] = True
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."

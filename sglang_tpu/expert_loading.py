@@ -265,6 +265,7 @@ def _replace_with_expert_chunks(
     _free_replaced_storage(old, param.data)
     param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
     chunks.clear()
+    _wait_for(param.data)
 
 
 def _wait_for(*tensors: torch.Tensor) -> None:

@@ -13,13 +13,14 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.kernels.ops.sampling import OutputTopK
 from sglang.srt.layers import logits_processor as logits_processor_module
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -27,6 +28,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu import top_k as tpu_top_k_module
+from sglang_tpu.envs import envs
 from sglang_tpu.row_pad import pad_rows, row_bucket
 from sglang_tpu.sampler import (
     MAX_DISTRIBUTED_TOP_K,
@@ -516,7 +518,12 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
     def test_model_requiring_full_logits_disables_global_top_k(self):
         execution = SimpleNamespace(
-            features=SimpleNamespace(enable_fp32_lm_head=False, enable_mis=False),
+            features=SimpleNamespace(
+                enable_fp32_lm_head=False,
+                enable_mis=False,
+                aux_hidden_state_capture=None,
+                return_aux_hidden_state_layer_ids=None,
+            ),
             deterministic=SimpleNamespace(rl_on_policy_target=None),
             kernel=SimpleNamespace(sampling_backend="tpu"),
         )
@@ -918,6 +925,70 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
 
 class TestTpuTopKLayout(CustomTestCase):
+    def test_output_topk_buckets_widths_and_preserves_indices(self):
+        op = OutputTopK()
+        values = torch.arange(17, dtype=torch.float32).reshape(1, -1)
+        expected = values.topk(3, dim=-1)
+        with patch.object(tpu_top_k_module, "tpu_top_k") as native:
+            actual = tpu_top_k_module.output_logprob_topk(op, values, 3)
+            torch.testing.assert_close(actual, expected)
+            native.assert_not_called()
+
+        tied = values.clone()
+        tied[:, :9] = 20
+        for scores in (values, tied):
+            # Native TPU TopK breaks ties by ascending index, matching stable sort.
+            reference = scores.sort(dim=-1, descending=True, stable=True)
+            device_values = SimpleNamespace(
+                device=SimpleNamespace(type="tpu"), ndim=2, shape=scores.shape
+            )
+
+            def select_width(values, k):
+                return reference.values[:, :k], reference.indices[:, :k].to(torch.int32)
+
+            with patch.object(
+                tpu_top_k_module, "tpu_top_k", side_effect=select_width
+            ) as native:
+                for k, bucket in ((5, 8), (7, 8), (8, 8), (9, 16), (17, 17)):
+                    with self.subTest(tied=scores is tied, k=k):
+                        actual = tpu_top_k_module.output_logprob_topk(
+                            op, device_values, k
+                        )
+                        self.assertEqual(native.call_args, call(device_values, bucket))
+                        torch.testing.assert_close(
+                            actual, (reference.values[:, :k], reference.indices[:, :k])
+                        )
+                        self.assertEqual(actual[1].dtype, torch.int64)
+
+    def test_output_topk_preserves_invalid_k_and_rank_errors(self):
+        op = OutputTopK()
+        host_values = torch.ones(1, 17)
+        device_values = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), ndim=2, shape=host_values.shape
+        )
+        with patch.object(tpu_top_k_module, "tpu_top_k") as native:
+            self.assertEqual(
+                tpu_top_k_module.output_logprob_topk(op, host_values, 0)[0].numel(), 0
+            )
+            with self.assertRaises(RuntimeError):
+                tpu_top_k_module.output_logprob_topk(op, host_values, 18)
+            for k in (-1, 0, 18):
+                with (
+                    self.subTest(k=k),
+                    self.assertRaisesRegex(ValueError, "k must be in"),
+                ):
+                    tpu_top_k_module.output_logprob_topk(op, device_values, k)
+            for shape in ((), (17,)):
+                invalid_values = SimpleNamespace(
+                    device=device_values.device, ndim=len(shape), shape=shape
+                )
+                with (
+                    self.subTest(shape=shape),
+                    self.assertRaisesRegex(ValueError, "expects a 2D tensor"),
+                ):
+                    tpu_top_k_module.output_logprob_topk(op, invalid_values, 3)
+            native.assert_not_called()
+
     @staticmethod
     def _canonical_shard(rank, *, world_size=8, org_vocab_size=1000):
         org_padded_count = 128
@@ -1203,9 +1274,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         with (
             patch.object(logits_processor_module, "_is_tpu", True),
@@ -1232,9 +1303,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         with (
             patch.object(logits_processor_module, "_is_tpu", True),
@@ -1264,9 +1335,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         scoped = MagicMock()
         scoped.scoped.return_value.__enter__ = lambda *a: None

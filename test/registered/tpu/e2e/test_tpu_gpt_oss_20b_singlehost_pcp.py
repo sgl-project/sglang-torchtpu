@@ -4,8 +4,8 @@ PCP8 with MoE DP8 on the batched RPA backend, radix cache on. A greedy needle
 probe checks that prompts landing in the smallest and in a larger local token
 bucket, alone and in shared context-parallel batches, keep every code word. The
 shared batches also carry prompts shorter than the zigzag split and the two
-prompts sent first, which come back with a cached prefix. Few-shot GSM8K, whose
-prompts share their examples, checks answers end to end.
+prompts sent first, which come back with a cached prefix. On the nightly,
+few-shot GSM8K, whose prompts share their examples, checks answers end to end.
 """
 
 import os
@@ -15,6 +15,7 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.needle_probe import needle_runner
 from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
@@ -24,8 +25,16 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 # probe's assertions. test_tpu_qwen3_30b_a3b_singlehost_pcp.py keeps the 30B
 # FP8 configuration on the nightly.
 register_tpu_ci(
-    est_time=600,
+    est_time=500,
     suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "gpt-oss-20b", "pcp"],
+)
+# The gate runs the needle probe; GSM8K, which needs 200 questions to hold its
+# floor, runs only on the nightly.
+register_tpu_ci(
+    est_time=600,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "gpt-oss-20b", "pcp"],
 )
 
@@ -44,6 +53,19 @@ NEEDLE_PROMPT_TEMPLATE = (
     "<|start|>assistant<|channel|>final<|message|>"
 )
 
+GSM8K_GATE = {
+    "dataset": "gsm8k",
+    "label": "gsm8k",
+    "baseline": GSM8K_ACCURACY,
+    "num_examples": 200,
+    "num_threads": 32,
+    "max_tokens": 512,
+    "temperature": 0.0,
+    # Few-shot completion prompts: the chat template would spend the
+    # token budget on reasoning.
+    "api": "completion",
+}
+
 MODEL_CONFIG = {
     "model": "gpt-oss-20b",
     "test_name": "gpt-oss-20b-pcp",
@@ -58,18 +80,7 @@ MODEL_CONFIG = {
                 prompt_template=NEEDLE_PROMPT_TEMPLATE,
             ),
         },
-        {
-            "dataset": "gsm8k",
-            "label": "gsm8k",
-            "baseline": GSM8K_ACCURACY,
-            "num_examples": 200,
-            "num_threads": 32,
-            "max_tokens": 512,
-            "temperature": 0.0,
-            # Few-shot completion prompts: the chat template would spend the
-            # token budget on reasoning.
-            "api": "completion",
-        },
+        *([GSM8K_GATE] if full_matrix() else []),
     ],
 }
 

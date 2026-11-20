@@ -1,7 +1,7 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -29,6 +29,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             .unsqueeze_(1)
         )
 
+        vocab_size = self.orchestrator.vocab_size
         padded_stop_token_ids_cpu = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
@@ -44,7 +45,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                                 else set()
                             )
                         )
-                        if token_id is not None
+                        # Out-of-vocab ids can never be sampled;
+                        # scattering them would index outside the penalty tensor.
+                        if token_id is not None and 0 <= token_id < vocab_size
                     ],
                     dtype=torch.int64,
                 )
@@ -81,6 +84,16 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
+
+    def _seed_history(self, rows: list, tokens: list):
+        # One count per cumulated token, in the vocabulary or not: each one is
+        # a decode step (see _vocab_tokens).
+        device = self.orchestrator.device
+        for row, toks in zip(rows, tokens):
+            index = torch.tensor([row], dtype=torch.int64, device=device)
+            self.len_output_tokens.index_add_(
+                0, index, torch.tensor([[len(toks)]], dtype=torch.int32, device=device)
+            )
 
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a

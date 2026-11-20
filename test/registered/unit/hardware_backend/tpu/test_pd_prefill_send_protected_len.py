@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import swa
@@ -26,10 +27,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -37,6 +40,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -58,6 +62,8 @@ ROOM = 7
 class _Sender:
     """Records the room's send list the way RaidenKVManager accumulates it."""
 
+    kv_mgr = None
+
     def __init__(self, blocks: List[int]):
         self.blocks = blocks
 
@@ -69,6 +75,7 @@ class _Sender:
 
     def send(self, page_indices, state_indices=None, num_kv_tokens=None):
         self.blocks.extend(int(p) for p in page_indices)
+        self.state_indices = state_indices
 
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
@@ -79,6 +86,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_overlap = True
         self.enable_staging = False
         self.kv_checksum_computer = None
+        self.sliding_window_size = WINDOW
+        self.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(
+                    state_types=[StateType.SWA], state_sub_pools=[None]
+                )
+            )
+        )
 
 
 class TestChunkSendsStayOwned(CustomTestCase):
@@ -123,6 +139,8 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.pool = ReqToTokenPool(
             size=4, max_context_len=64, device="cpu", enable_memory_saver=False
         )
+        # The window keeps the cache's window, as the cache builder binds it.
+        kv_storage_of(self.pool, self.allocator).bind_window_retention(WINDOW, None)
         self.cache = UnifiedRadixCache(
             CacheInitParams(
                 disable=False,
@@ -131,7 +149,9 @@ class TestChunkSendsStayOwned(CustomTestCase):
                 page_size=PAGE,
                 sliding_window_size=WINDOW,
                 eviction_policy="lru",
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=WINDOW
+                ),
                 tree_core_backend="python",
             )
         )
@@ -157,29 +177,30 @@ class TestChunkSendsStayOwned(CustomTestCase):
             pending_bootstrap=False,
             host_hit_length=0,
             early_send_prefix_end=None,
-            extend_range=None,
+            prefix_len=0,
+            extend_end=None,
             start_send_idx=0,
+            disagg_decode_prefix_len=0,
             kv=kv,
             owned_kv_len=lambda: kv.kv_committed_len,
             finished=lambda: False,
             refresh_fill_ids=lambda: None,
             disagg_kv_sender=_Sender(self.blocks),
         )
-        req.get_fill_ids = lambda: req.full_untruncated_fill_ids[: req.extend_range.end]
+        req.get_fill_ids = lambda: req.full_untruncated_fill_ids[: req.extend_end]
         return req
 
     def _match_and_lock(self, req):
         result = self.cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", req.origin_input_ids)))
         )
-        req.prefix_indices = result.device_indices
+        req.prefix_len = result.device_prefix_len
         req.last_node = result.last_device_node
         req.swa_branching_seqlen = result.swa_branching_seqlen
-        req.kv.cache_protected_len = len(result.device_indices)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        req.swa_prefix_lock_released = False
-        self.pool.req_to_token[req.kv.req_pool_idx, : len(req.prefix_indices)] = (
-            req.prefix_indices
+        req.kv.cache_protected_len = result.device_prefix_len
+        req.lock = self.cache.lock(req.last_node)
+        self.pool.req_to_token[req.kv.req_pool_idx, : req.prefix_len] = (
+            self.cache.prefix_device_indices(req)
         )
         return result
 
@@ -194,7 +215,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         )
         self.assertIsNotNone(slots)
         row[start:end] = slots
-        req.extend_range = SimpleNamespace(start=start, end=end)
+        req.prefix_len, req.extend_end = start, end
         req.kv.kv_committed_len = req.kv.kv_allocated_len = end
         return slots.long()
 
@@ -222,7 +243,11 @@ class TestChunkSendsStayOwned(CustomTestCase):
             self.cache.insert(
                 InsertParams(key=RadixKey(array("q", tokens + tail)), value=slots)
             )
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens) + 16))
+        self.cache.evict(
+            EvictParams(
+                window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: len(tokens) + 16}
+            )
+        )
 
     def test_a_page_freed_under_a_pending_send_is_never_listed_twice(self):
         self._seed_prefix_without_swa(TOKENS[:16])
@@ -231,7 +256,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         # Full hit reaches 16, so the branch cap sits inside chunk 2.
         x = self._req("x", 1, TOKENS)
         match = self._match_and_lock(x)
-        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(match.device_prefix_len, 0)
         self.assertEqual(x.swa_branching_seqlen, 16)
 
         # Overlap loop, chunks of 12: form batch k+1 (checkpoint chunk k, then
@@ -254,7 +279,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.assertEqual(y.kv.cache_protected_len, 16)
         self._alloc_chunk(y, 16, 24)
         y.finished = lambda: True
-        release_kv_cache(y, self.cache)
+        release_kv_cache(y, self.cache, checkpoint=True)
 
         # X's next checkpoint dedups [16, 24) against the sibling's leaf.
         self._checkpoint(x, 36)
@@ -271,6 +296,31 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.assertEqual(len(self.blocks), len(set(self.blocks)), self.blocks)
         # The send list covers the row the decode will be told about.
         self.assertEqual(self.blocks, self._pages(self.pool.req_to_token[1, :48]))
+
+    def test_checkpoint_swa_frees_stay_below_the_sent_window(self):
+        """SWA slots a mid-prefill checkpoint frees while the chunk may still be
+        computing (PP) are never part of the window the closing send lists, so
+        a fence on those frees need not wait for the transfer."""
+        tokens = TOKENS[:46]  # 46 - WINDOW is not page aligned: the tight case
+        x = self._req("x", 1, tokens)
+        self._match_and_lock(x)
+        sender = x.disagg_kv_sender
+        # PP loop order: checkpoint chunk k when forming k+1, then send it.
+        for start, end in ((0, 12), (12, 24), (24, 36), (36, 46)):
+            self._alloc_chunk(x, start, end)
+            self._checkpoint(x, end)
+            if end < len(tokens):
+                self._send(x, end)
+        self.scheduler.send_kv_chunk(x, last_chunk=True)
+        (window_pages,) = sender.state_indices
+        # The window is the request's last len(window_pages) pages.
+        window_start = ((len(tokens) - 1) // PAGE - (len(window_pages) - 1)) * PAGE
+        freed_below = x.kv.get_evicted_seqlen(BaseSWAKVPool.WINDOW_SUB_POOL)
+        # Not vacuous: the checkpoints did free out-of-window SWA.
+        self.assertGreater(freed_below, 0)
+        self.assertLessEqual(
+            freed_below, window_start, "a sent SWA window slot was freed"
+        )
 
 
 if __name__ == "__main__":

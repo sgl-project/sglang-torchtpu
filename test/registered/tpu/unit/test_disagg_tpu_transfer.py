@@ -44,9 +44,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Range
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -64,6 +62,7 @@ from sglang_tpu.disaggregation.tpu.serde import (
     KVDataChannelHeader,
     Transfer,
 )
+from sglang_tpu.envs import envs
 
 # Enable Perfetto tracing for tests to exercise tracing code paths
 envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.set(True)
@@ -1555,20 +1554,25 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 req = SimpleNamespace()
                 # prepare_for_prebuilt reads the pool row off the request's KV state.
                 req.kv = SimpleNamespace(req_pool_idx=1)
-                req.prefix_indices = list(range(10))
+                req.prefix_len = 10
                 req.get_fill_ids = lambda: array("q", range(110))
-                req.extend_range = Range(10, 110)  # length = 100
+                req.extend_len = 100
                 req.origin_input_ids = list(range(110))
                 req.output_ids = []
                 req.retracted_stain = False
                 req.cached_tokens = 0
                 req.cached_tokens_device = 0
+                req.cached_tokens_host = 0
+                req.cached_tokens_storage = 0
+                req.host_loaded_length = 0
+                req.fulfilled_storage_hit_len = lambda prefix_len: 0
                 req.already_computed = 0
                 req.is_retracted = False
                 req.multimodal_inputs = None
                 req.sampling_params = SamplingParams()
                 # Read by SamplingBatchInfo.from_schedule_batch (Req default).
                 req.return_sampling_mask = False
+                req.custom_logit_processor = None
 
                 self.reqs = [req]
                 self.req_to_token_pool = SimpleNamespace(

@@ -120,7 +120,7 @@ class TestScaleStorage(CustomTestCase):
         return layer, scales
 
     def test_default_stores_f32_scales(self):
-        from sglang.srt.environ import envs
+        from sglang_tpu.envs import envs
         from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
@@ -134,7 +134,7 @@ class TestScaleStorage(CustomTestCase):
         )
 
     def test_opt_out_keeps_bf16_scales(self):
-        from sglang.srt.environ import envs
+        from sglang_tpu.envs import envs
         from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
@@ -150,13 +150,14 @@ class TestScaleStorage(CustomTestCase):
 
     def test_vmem_fp8_ignores_the_opt_out(self):
         from sglang.srt.environ import envs
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
         layer, _ = self._layer()
         with (
-            envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False),
+            tpu_envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False),
             envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-fp8"),
         ):
             prepare_tpu_w4a16_moe_weights(layer, 32)

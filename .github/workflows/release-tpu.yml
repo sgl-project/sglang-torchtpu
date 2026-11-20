@@ -6,6 +6,11 @@
 # The image that passed smoke and scan is the one published: publish-image copies
 # that digest from the private CI registry to Docker Hub instead of rebuilding.
 #
+# `image_tag` (optional) publishes a pre-release image from any `ref` under
+# dev-<name>-tpu instead of v<version>-tpu, e.g. to build a feature branch while
+# its CI runs. A dev tag can be republished (it moves, like the CUDA dev tags);
+# v<version>-tpu never is. Such a run only ever makes a draft GitHub Release.
+#
 # `target` picks how far a run goes:
 #   none     build, smoke, scan, wheels; draft GitHub Release. Nothing leaves the
 #            private registry, so this needs no Docker Hub credential.
@@ -15,7 +20,7 @@
 # Wheels go to the GitHub Release, not PyPI: the fork's sglang cannot take the
 # `sglang` name there, and sglang-tpu alone would pull upstream sglang from PyPI.
 name: Release (TPU)
-run-name: "Release (TPU) v${{ inputs.version }}-tpu [${{ inputs.target }}]"
+run-name: "Release (TPU) ${{ inputs.image_tag || format('v{0}-tpu', inputs.version) }} [${{ inputs.target }}]"
 
 on:
   workflow_dispatch:
@@ -33,6 +38,10 @@ on:
         default: none
         type: choice
         options: [none, staging, prod]
+      image_tag:
+        description: "Optional pre-release image tag, dev-<name>-tpu (e.g. dev-myfeature-tpu). Empty = v<version>-tpu"
+        required: false
+        default: ""
       allow_vulnerabilities:
         description: "Publish even if the scan finds fixable CRITICAL vulnerabilities"
         required: false
@@ -43,7 +52,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-tpu-${{ inputs.version }}
+  group: release-tpu-${{ inputs.image_tag || inputs.version }}
   cancel-in-progress: false
 
 env:
@@ -67,6 +76,7 @@ jobs:
       version: ${{ steps.r.outputs.version }}
       sglang_version: ${{ steps.r.outputs.sglang_version }}
       image_tag: ${{ steps.r.outputs.image_tag }}
+      dev: ${{ steps.r.outputs.dev }}
       image_repo: ${{ steps.r.outputs.image_repo }}
       release_tag: ${{ steps.r.outputs.release_tag }}
     steps:
@@ -78,6 +88,8 @@ jobs:
         env:
           IN_VERSION: ${{ inputs.version }}
           IN_TARGET: ${{ inputs.target }}
+          # Via env so a crafted input cannot break out of the script.
+          IN_IMAGE_TAG: ${{ inputs.image_tag }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -95,8 +107,29 @@ jobs:
             staging) image_repo=lmsysorg/sglang-staging ;;
             *)       image_repo="" ;;
           esac
+          # Whole-string checks (a '^...$' regex anchors per line): dev-<name>-tpu,
+          # lowercase alphanumerics, '.' and '-' only.
+          dev=false
+          image_tag="v${version}-tpu"
+          if [ -n "$IN_IMAGE_TAG" ]; then
+            case "$IN_IMAGE_TAG" in
+              *[!a-z0-9.-]*|dev--tpu|dev-.*|*.-tpu|*--tpu)
+                echo "::error::image_tag must look like dev-<name>-tpu, got '$IN_IMAGE_TAG'"
+                exit 1
+                ;;
+              dev-?*-tpu) ;;
+              *)
+                echo "::error::image_tag must look like dev-<name>-tpu, got '$IN_IMAGE_TAG'"
+                exit 1
+                ;;
+            esac
+            dev=true
+            image_tag="$IN_IMAGE_TAG"
+          fi
           # `tpu-` keeps the git tag clear of the upstream v* tags synced into this repo.
-          if [ "$IN_TARGET" = prod ]; then
+          if [ "$dev" = true ]; then
+            release_tag="tpu-${image_tag}.${RUN_ID}"
+          elif [ "$IN_TARGET" = prod ]; then
             release_tag="tpu-v${version}"
           else
             release_tag="tpu-v${version}-${IN_TARGET}.${RUN_ID}"
@@ -105,11 +138,12 @@ jobs:
             echo "sha=$(git rev-parse HEAD)"
             echo "version=${version}"
             echo "sglang_version=${sglang_version}"
-            echo "image_tag=v${version}-tpu"
+            echo "image_tag=${image_tag}"
+            echo "dev=${dev}"
             echo "image_repo=${image_repo}"
             echo "release_tag=${release_tag}"
           } >> "$GITHUB_OUTPUT"
-          echo "Releasing $(git rev-parse HEAD) as v${version}-tpu, sglang ${sglang_version} (target: ${IN_TARGET})"
+          echo "Releasing $(git rev-parse HEAD) as ${image_tag}, sglang ${sglang_version} (target: ${IN_TARGET})"
 
   build:
     needs: resolve
@@ -267,7 +301,10 @@ jobs:
           if-no-files-found: error
 
   publish-image:
-    needs: [resolve, build, smoke, scan, wheels]
+    # The image is gated on its own build, smoke and scan; the wheels only gate
+    # the GitHub Release (their dependency check cannot reach every index the
+    # image installs from).
+    needs: [resolve, build, smoke, scan]
     if: inputs.target != 'none'
     runs-on: ubuntu-latest
     # Required reviewers on this environment are the approval step. It also holds
@@ -289,14 +326,17 @@ jobs:
           SRC: ${{ needs.build.outputs.digest }}
           REPO: ${{ needs.resolve.outputs.image_repo }}
           TAG: ${{ needs.resolve.outputs.image_tag }}
+          DEV: ${{ needs.resolve.outputs.dev }}
           GAR_TOKEN: ${{ steps.auth.outputs.access_token }}
           DOCKERHUB_USERNAME: ${{ secrets.LMSYS_DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.LMSYS_DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # lmsysorg/sglang also carries the CUDA tags (latest, vX.Y.Z); only ever
-          # write a -tpu tag there.
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?-tpu$ ]]; then
+          # lmsysorg/sglang also carries the CUDA tags (latest, vX.Y.Z, dev-*); only
+          # ever write a -tpu tag there: v<version>-tpu, or dev-<name>-tpu checked
+          # in resolve.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?-tpu$ ]] \
+            && ! { [ "$DEV" = true ] && [[ "$TAG" =~ ^dev-[a-z0-9.-]+-tpu$ ]]; }; then
             echo "::error::refusing to push non-TPU tag '$TAG'"
             exit 1
           fi
@@ -305,9 +345,14 @@ jobs:
           ./crane auth login "${SRC%%/*}" -u oauth2accesstoken --password-stdin <<< "$GAR_TOKEN"
           ./crane auth login index.docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
           dst="docker.io/${REPO}:${TAG}"
-          if ./crane digest "$dst" >/dev/null 2>&1; then
-            echo "::error::$dst already exists; bump the version (e.g. .post1) instead of overwriting"
-            exit 1
+          # v<version>-tpu is immutable once published. A dev-<name>-tpu tag moves
+          # like the CUDA dev tags: overwrite it, recording the digest it replaced.
+          if old="$(./crane digest "$dst" 2>/dev/null)"; then
+            if [ "$DEV" != true ]; then
+              echo "::error::$dst already exists; bump the version (e.g. .post1) instead of overwriting"
+              exit 1
+            fi
+            echo "overwriting $dst (was $old)" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           # A copy, not a rebuild: the bytes that passed smoke and scan.
           ./crane copy "$SRC" "$dst"
@@ -345,6 +390,7 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           IMAGE_REPO: ${{ needs.resolve.outputs.image_repo }}
           IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          DEV: ${{ needs.resolve.outputs.dev }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           set -euo pipefail
@@ -370,8 +416,13 @@ jobs:
             ${base}/sglang-${SGLANG_VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
           \`\`\`
           EOF
-          flags=(--target "$SHA" --title "TPU v${VERSION}" --notes-file notes.md)
-          # Drafts create no git tag and are visible to maintainers only.
-          [ "$TARGET" = prod ] || flags+=(--draft --prerelease)
+          title="TPU v${VERSION}"
+          [ "$DEV" = true ] && title="TPU ${IMAGE_TAG}"
+          flags=(--target "$SHA" --title "$title" --notes-file notes.md)
+          # Drafts create no git tag and are visible to maintainers only. A dev
+          # image_tag never publishes a Release, even with target=prod.
+          if [ "$TARGET" != prod ] || [ "$DEV" = true ]; then
+            flags+=(--draft --prerelease)
+          fi
           gh release create "$RELEASE_TAG" "${flags[@]}" dist/*.whl
           echo "release: $(gh release view "$RELEASE_TAG" --json url -q .url)" | tee -a "$GITHUB_STEP_SUMMARY"

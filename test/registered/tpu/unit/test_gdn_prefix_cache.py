@@ -9,7 +9,7 @@ import torch
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestGDNPrefixCache(CustomTestCase):
@@ -162,6 +162,7 @@ class TestGDNPrefixCache(CustomTestCase):
         )
         from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.static_kv_storage import acquire_rows
         from sglang.srt.platforms import current_platform
         from sglang_tpu.mamba_pool import TpuMambaPool
 
@@ -193,7 +194,7 @@ class TestGDNPrefixCache(CustomTestCase):
                 enable_mamba_extra_buffer=True,
             )
         req = SimpleNamespace(kv=ReqKvInfo(), rid="copy-test")
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         row = req.kv.req_pool_idx
         self.assertEqual(req.kv.mamba_pool_idx.device.type, "cpu")
         self.assertEqual(req.kv.mamba_ping_pong_track_buffer.device.type, "cpu")
@@ -209,8 +210,8 @@ class TestGDNPrefixCache(CustomTestCase):
         ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
         self.assertEqual(batch.mamba_cow_src_indices.device.type, "cpu")
         self.assertEqual(batch.mamba_cow_dst_indices.device.type, "cpu")
-        pool.copy_mamba_state(batch.mamba_cow_src_indices, batch.mamba_cow_dst_indices)
-        pool.free_mamba_cache(req)
+        pool.state.copy(batch.mamba_cow_src_indices, batch.mamba_cow_dst_indices)
+        pool.state.release(pool, req)
         pool.mamba_allocator.free(checkpoint)
         self.assertEqual(pool.mamba_allocator.available_size(), 16)
 
@@ -317,15 +318,16 @@ class TestGDNPrefixCache(CustomTestCase):
             self.assertEqual(torch.count_nonzero(actual[0].cpu()).item(), 0)
 
     def test_bucketed_metadata(self):
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_tpu.attention_gdn_pallas import (
             TpuGDNAttnBackend,
         )
 
         backend = TpuGDNAttnBackend.__new__(TpuGDNAttnBackend)
+        # Identity state ids, as a static pool has (no v2p table).
+        backend._state_ids = IdSpace(key=("mamba", None))
         backend._distribution_cache = {}
         backend._mamba_chunk_size = 64
         backend._extra_buffer_enabled = True
@@ -337,7 +339,6 @@ class TestGDNPrefixCache(CustomTestCase):
             req_index_to_mamba_index_mapping=torch.arange(
                 4, dtype=torch.int32, device="tpu"
             ),
-            mamba_v2p_table=None,
         )
 
         def t(x, dtype=torch.int64):

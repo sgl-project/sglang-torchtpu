@@ -109,6 +109,7 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=${PLATFORM} SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export CI_WEIGHT_LOADER_PREFETCH=1
                       export SGLANG_TPU_FULL_MATRIX=${FULL_MATRIX}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
@@ -167,7 +168,7 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} ${EXECUTION_BUDGET_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).

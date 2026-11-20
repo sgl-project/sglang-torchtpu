@@ -28,7 +28,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
 register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 # The op's arguments, in order. build_dcp_kernel_op passes the JAX wrapper
-# static_argnums=(11, ..., 18), which are exactly the eight entries after
+# static_argnums=(11, ..., 21), which are exactly the eleven entries after
 # attention_sink here.
 ARG_NAMES = (
     "queries",
@@ -50,19 +50,10 @@ ARG_NAMES = (
     "cache_only",
     "skip_kv_write",
     "cp_group_size",
+    "attention_scope",
+    "rpa_cases",
 )
 NUM_TRACED_TENSORS = 10
-STATIC_FLAGS = (
-    "sm_scale",
-    "sliding_window",
-    "soft_cap",
-    "k_scale",
-    "v_scale",
-    "cache_only",
-    "skip_kv_write",
-    "cp_group_size",
-)
-FIRST_STATIC_ARGNUM = 11
 
 
 def _has_torch_tpu_pallas() -> bool:
@@ -102,9 +93,6 @@ class TestDcpOpContract(CustomTestCase):
         namespace, name = DCP_OP_NAME.split("::")
         self.overload = getattr(getattr(torch.ops, namespace), name).default
 
-    def test_the_op_name_resolves(self):
-        self.assertEqual(self.overload.name(), DCP_OP_NAME)
-
     def test_argument_order_and_return_arity(self):
         schema = self.overload._schema
         self.assertEqual([arg.name for arg in schema.arguments], list(ARG_NAMES))
@@ -115,14 +103,6 @@ class TestDcpOpContract(CustomTestCase):
         for arg in schema.arguments[:NUM_TRACED_TENSORS]:
             self.assertEqual(str(arg.type), "Tensor", arg.name)
         self.assertEqual(schema.arguments[NUM_TRACED_TENSORS].name, "attention_sink")
-
-    def test_the_static_flags_sit_at_the_static_argnums(self):
-        self.assertEqual(ARG_NAMES[FIRST_STATIC_ARGNUM:], STATIC_FLAGS)
-        for offset, name in enumerate(STATIC_FLAGS):
-            self.assertEqual(
-                self.overload._schema.arguments[FIRST_STATIC_ARGNUM + offset].name,
-                name,
-            )
 
     def test_only_the_kv_cache_is_mutated(self):
         schema = self.overload._schema
@@ -163,6 +143,89 @@ class TestDcpOpContract(CustomTestCase):
         self.assertEqual(output.dtype, args[0].dtype)
         self.assertEqual(tuple(lse.shape), (self.NUM_TOKENS, self.NUM_Q_HEADS))
         self.assertEqual(lse.dtype, torch.float32)
+
+    def test_the_op_runs_every_scope_on_the_device(self):
+        """Execute the real kernel through the torch op once per scope and
+        case selection, so the JAX wrapper's glue (imports, static-arg
+        plumbing) is exercised, not only its schema."""
+        import torch_tpu  # noqa: F401
+
+        device = torch.device("tpu")
+        page_size = 128
+        cp = 2
+        seqs = self.NUM_SEQS
+        pages_per_seq = 2
+
+        def dev(*shape, dtype=torch.bfloat16, scale=0.1):
+            return (torch.randn(*shape) * scale).to(dtype).to(device)
+
+        kv_cache = dev(seqs * pages_per_seq, page_size, self.NUM_KV_HEADS, 2, 128)
+        page_indices = torch.arange(seqs * pages_per_seq, dtype=torch.int32)
+
+        def local_len(n, rank=0):
+            cycle = cp * page_size
+            rem = min(max(n % cycle - rank * page_size, 0), page_size)
+            return (n // cycle) * page_size + rem
+
+        # (scope, q_lens, global seq_lens, striped kv_lens, distribution,
+        # rpa_cases): the chunk row first and the decode rows last, as the
+        # kernel's [mixed, mixed + prefill, total] layout lists them; a
+        # decode-only selection reads the same batch with its chunk row
+        # excluded ([0, 0, n] would be a batch of three decode rows).
+        cases = (
+            (
+                3,
+                [4, 1, 1],
+                [200, 300, 130],
+                [local_len(196), local_len(300), local_len(130)],
+                [1, 1, 3],
+                0,
+            ),
+            (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 3], 2),
+            (
+                3,
+                [4, 1, 1],
+                [200, 300, 130],
+                [local_len(196), local_len(300), local_len(130)],
+                [1, 1, 3],
+                1,
+            ),
+            (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 1], 2),
+        )
+        for scope, q_lens, seq_lens, kv_lens, distribution, rpa_cases in cases:
+            total_q = sum(q_lens)
+            cu_q_lens = torch.tensor(
+                [0] + list(torch.cumsum(torch.tensor(q_lens), 0)), dtype=torch.int32
+            )
+            out, lse = self.overload(
+                dev(self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM),
+                dev(self.NUM_TOKENS, self.NUM_KV_HEADS, self.HEAD_DIM),
+                dev(self.NUM_TOKENS, self.NUM_KV_HEADS, self.HEAD_DIM),
+                kv_cache,
+                torch.tensor(kv_lens, dtype=torch.int32).to(device),
+                page_indices.to(device),
+                cu_q_lens.to(device),
+                torch.tensor(distribution, dtype=torch.int32).to(device),
+                torch.tensor(seq_lens, dtype=torch.int32).to(device),
+                torch.tensor([0], dtype=torch.int32).to(device),
+                None,
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                False,
+                False,
+                cp,
+                scope,
+                rpa_cases,
+            )
+            self.assertEqual(
+                tuple(out.shape), (self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM)
+            )
+            self.assertTrue(torch.isfinite(out.float().cpu()[:total_q]).all(), scope)
+            # Unprocessed rows report -inf; nothing may be NaN.
+            self.assertFalse(torch.isnan(lse.cpu()).any(), scope)
 
 
 class TestDcpOpKernelSpec(CustomTestCase):

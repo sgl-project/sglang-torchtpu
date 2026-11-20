@@ -66,21 +66,293 @@ def _largest_divisor(x: int, cap: int) -> int:
 
 
 _GATHER_PAGE_CHUNK = 128
+# Rows of an int32 (8, 128) VMEM tile: the page table is read 8 chunks of one sequence at a
+# time.
+_PAGE_TABLE_TILE_CHUNKS = 8
+
+
+def _lane_gather(window_chunk: jax.Array, lane: jax.Array) -> jax.Array:
+    """``out[t, j] = window_chunk[t, lane[t, j]]``: one XLU lane gather per (8, 128) vreg.
+
+    ``lane`` is promised to be in ``[0, 128)``, so no clamping or negative-index wrap is emitted.
+    """
+    dimension_numbers = lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(1,),
+        start_index_map=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(0,),
+    )
+    return lax.gather(
+        window_chunk,
+        lane[..., None],
+        dimension_numbers,
+        slice_sizes=(1, 1),
+        mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
+
+
+def _split_logical_pages(logical: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Splits logical page ids into (lane within a 128-page chunk, chunk index).
+
+    Done once per token block, so each chunk step is just a gather and a compare-select, and
+    nothing but the output has to stay live across the gather.
+    """
+    return (
+        logical & (_GATHER_PAGE_CHUNK - 1),
+        logical >> (_GATHER_PAGE_CHUNK.bit_length() - 1),
+    )
 
 
 def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
-    logical = logical_ref[...]  # i32[block_tokens, topk]
-    out = jnp.zeros_like(logical)
+    lane, chunk = _split_logical_pages(logical_ref[...])  # i32[block_tokens, topk]
+    out = jnp.zeros_like(lane)
     for c in range(num_chunks):
         window_chunk = windows_ref[
             :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
         ]  # i32[block_tokens, 128]
-        local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(
-            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-        )
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+        out = jnp.where(chunk == c, _lane_gather(window_chunk, lane), out)
     out_ref[...] = out
+
+
+def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
+    """Cycles of one chunk step for one token block, from the TensorCore LLO schedule on tpu7x.
+
+    A chunk step is bound by the cross-lane unit (XLU): one lane gather per (8, 128) vreg of the
+    block's top-k indices.
+
+    Args:
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+
+    Returns:
+      Cycles the busier XLU spends on one 128-page chunk step of one token block.
+    """
+    num_vregs = cdiv(block_tokens, 8) * cdiv(topk, _GATHER_PAGE_CHUNK)
+    # The permute reserves an XLU for 4 cycles and the all-sublanes set-pattern for 4 more, but
+    # every chunk gathers with the same lane indices, so the compiler reuses about a quarter of
+    # the patterns (187 set-patterns for 256 gathers in a 16-chunk body): ~7 cycles per gather.
+    gather_cycles = 7
+    # Share of the gathers that lands on the busier of the two XLUs: the compiler assigns these
+    # independent gathers about 1:2, which makes the busier XLU the critical path.
+    # NOTE(b/586649669): 1/2 once the assignment is balanced.
+    busier_xlu_share = 2 / 3
+    return num_vregs * busier_xlu_share * gather_cycles
+
+
+def _gather_page_chunks_per_iteration(
+    num_chunks: int,
+    block_tokens: int,
+    topk: int,
+    nblocks: int,
+    *,
+    table_in_vmem: bool = False,
+) -> int | None:
+    """Chunks per loop iteration for the bounded kernel, or None to use the unrolled kernel.
+
+    Picks the option with the lowest expected cycles per token block, assuming the number of
+    chunks ``c`` a block needs is uniform over ``1..num_chunks``. Both kernels wait at least
+    for the step's DMAs (``floor``); on top of a fixed part, the unrolled kernel runs every
+    chunk step and the bounded kernel pays a per-call ``setup`` across ``nblocks`` and runs
+    ``ceil(c / g)`` iterations of ``g`` steps:
+
+      unrolled: max(floor, fixed + num_chunks * u)
+      bounded:  setup / nblocks + max(floor, fixed + ceil(c / g) * (o + g * u))
+
+    With the page table resident in VMEM (``table_in_vmem``), a grid step no longer DMAs a
+    page-table row, so ``floor`` loses its per-chunk term, and chunks are read as aligned
+    (8, 128) tiles of 8 chunks, so a loop iteration covers a multiple of 8 chunks; the one
+    exception is a single iteration over the whole table (``g = num_chunks``, the unrolled
+    kernel's equivalent), which steps only through the table's chunks.
+
+    Args:
+      num_chunks: Width of a page-table row in 128-page chunks (static, from
+        ``context_length``).
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+      nblocks: Token blocks per kernel call (``padded_tokens // block_tokens``).
+      table_in_vmem: Whether the kernel reads the page table from VMEM
+        (``_gather_page_ids_vmem_table_kernel``).
+
+    Returns:
+      The number of chunk steps to unroll per ``fori_loop`` iteration of the bounded kernel,
+      or None if the unrolled kernel is expected to be cheaper (never None with
+      ``table_in_vmem``).
+    """
+    u = _gather_page_chunk_step_cycles(block_tokens, topk)
+    # Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the
+    # final select and copies (44-49 bundles after the last XLU issue in every loop body), plus
+    # about as much loop control that the static schedule does not show (per-iteration time
+    # over 8, 11, 16 and 22 chunks per iteration fits this + 73 cycles per chunk).
+    o = 100
+    # Per-step work outside the chunk steps: load and split the block's top-k tile, store its
+    # output tile, drain the last gathers (both kernels' time fits this + chunk steps).
+    fixed = 330
+    # A grid step also waits on its DMAs (top-k tile in, output tile out): a 1-chunk step takes
+    # ~1030 cycles although its body is ~120 bundles.
+    floor = 1030
+    if table_in_vmem:
+        tile = _PAGE_TABLE_TILE_CHUNKS
+        best_cycles, best_g = float("inf"), None
+        candidates = [*range(tile, num_chunks, tile), num_chunks]
+        setup_per_block = 0.0
+    else:
+        # If not table_in_vmem, each chunk needs ~10 cycles for the page-table row (4 KB per
+        # 128-page chunk per block; ~1700 cycles at 64 chunks), and the bounded kernel adds a
+        # per-call setup that the unrolled kernel avoids: a separate XLA max-reduction over
+        # ``logical`` (``chunks_needed``, ~2600 cycles) plus the HBM-to-SMEM scalar-prefetch
+        # DMA wait before step 0 (~1000 cycles).
+        floor += 10 * num_chunks
+        best_cycles, best_g = max(floor, fixed + num_chunks * u), None
+        candidates = range(1, num_chunks)
+        setup_per_block = 3600 / nblocks
+    for g in candidates:
+        cycles = setup_per_block + (
+            sum(
+                max(floor, fixed + -(-c // g) * (o + g * u))
+                for c in range(1, num_chunks + 1)
+            )
+            / num_chunks
+        )
+        if cycles < best_cycles:
+            best_cycles, best_g = cycles, g
+    return best_g
+
+
+def _gather_page_ids_bounded_kernel(
+    nchunks_ref, windows_ref, logical_ref, out_ref, *, chunks_per_iteration, num_chunks
+):
+    """Visits only the chunks up to each token block's largest logical page.
+
+    ``chunks_per_iteration`` chunks are unrolled per loop iteration so the loop overhead is
+    amortized; tail steps past the table repeat its last chunk, which selects the same values.
+    """
+    lane, chunk = _split_logical_pages(logical_ref[...])  # i32[block_tokens, topk]
+    g = chunks_per_iteration
+
+    def body(i, out):
+        for j in range(g):
+            c = jnp.minimum(i * g + j, num_chunks - 1)
+            start = pl.multiple_of(c * _GATHER_PAGE_CHUNK, _GATHER_PAGE_CHUNK)
+            window_chunk = windows_ref[:, pl.ds(start, _GATHER_PAGE_CHUNK)]
+            out = jnp.where(chunk == c, _lane_gather(window_chunk, lane), out)
+        return out
+
+    num_iterations = (nchunks_ref[pl.program_id(0)] + g - 1) // g
+    out_ref[...] = lax.fori_loop(0, num_iterations, body, jnp.zeros_like(lane))
+
+
+def _gather_page_ids_vmem_table_kernel(
+    nchunks_ref,  # SMEM i32[num_blocks]: chunks each token block needs
+    seq_ids_ref,  # SMEM i32[padded_tokens]: sequence id of each token
+    page_table_ref,  # VMEM i32[max_num_seqs, padded_chunks, 128]: whole page table
+    logical_ref,  # VMEM i32[num_tokens_per_block, topk]: this block's logical page ids
+    out_ref,  # VMEM i32[num_tokens_per_block, topk]: this block's physical page ids
+    *,
+    chunks_per_iteration,
+    num_chunks,
+):
+    """Bounded kernel that reads the page table from VMEM instead of a per-token row.
+
+    ``page_table_ref`` is the whole table as i32[max_num_seqs, padded_chunks, 128], so a
+    sequence's 8 consecutive chunks are one aligned (8, 128) tile and only the tiles a block
+    visits are read. A block of one sequence broadcasts each tile row to all its tokens; a block
+    spanning sequences builds each chunk's window from its tokens' tiles.
+
+    ``chunks_per_iteration`` is a multiple of 8, or ``num_chunks`` for a single iteration over
+    the whole table, which skips the padding chunks of its last tile.
+    """
+    # Grid step: one block of num_tokens_per_block query tokens.
+    block_idx = pl.program_id(0)
+    num_tokens_per_block = out_ref.shape[0]
+    tile_size = _PAGE_TABLE_TILE_CHUNKS
+    last_tile_start = page_table_ref.shape[1] - tile_size
+    g = chunks_per_iteration
+    # i32[num_tokens_per_block, topk] each.
+    lane, chunk = _split_logical_pages(logical_ref[...])
+    seq_ids = [
+        seq_ids_ref[block_idx * num_tokens_per_block + r]
+        for r in range(num_tokens_per_block)
+    ]
+    row = lax.broadcasted_iota(jnp.int32, (num_tokens_per_block, _GATHER_PAGE_CHUNK), 0)
+    one_seq = seq_ids[0] == seq_ids[1]
+    for r in range(2, num_tokens_per_block):
+        one_seq = jnp.logical_and(one_seq, seq_ids[0] == seq_ids[r])
+
+    def make_body(token_seq_ids):
+        def body(i, out):
+            for k in range(cdiv(g, tile_size)):
+                # Tail tiles past the table repeat its last tile, which selects the same values.
+                c0 = pl.multiple_of(
+                    jnp.minimum(i * g + k * tile_size, last_tile_start), tile_size
+                )
+                tiles = [
+                    page_table_ref[s, pl.ds(c0, tile_size), :] for s in token_seq_ids
+                ]
+                # Only a whole-table iteration (g == num_chunks) has a partial tile.
+                for j in range(min(tile_size, g - k * tile_size)):
+                    window_chunk = jnp.broadcast_to(tiles[0][j : j + 1], row.shape)
+                    for r in range(1, len(tiles)):
+                        window_chunk = jnp.where(
+                            row == r,
+                            jnp.broadcast_to(tiles[r][j : j + 1], row.shape),
+                            window_chunk,
+                        )
+                    out = jnp.where(
+                        chunk == c0 + j, _lane_gather(window_chunk, lane), out
+                    )
+            return out
+
+        return body
+
+    num_iterations = (nchunks_ref[block_idx] + g - 1) // g
+
+    @pl.when(one_seq)
+    def _():
+        out_ref[...] = lax.fori_loop(
+            0, num_iterations, make_body(seq_ids[:1]), jnp.zeros_like(lane)
+        )
+
+    @pl.when(jnp.logical_not(one_seq))
+    def _():
+        out_ref[...] = lax.fori_loop(
+            0, num_iterations, make_body(seq_ids), jnp.zeros_like(lane)
+        )
+
+
+def _page_table_fits_in_vmem(
+    max_num_seqs: int,
+    padded_chunks: int,
+    padded_tokens: int,
+    block_tokens: int,
+    topk: int,
+) -> bool:
+    """Whether ``_gather_page_ids_vmem_table_kernel`` fits this TPU's VMEM and SMEM.
+
+    Args:
+      max_num_seqs: Rows of the page table.
+      padded_chunks: Width of a page-table row in 128-page chunks, a multiple of 8.
+      padded_tokens: Query tokens, a multiple of ``block_tokens``.
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+
+    Returns:
+      True if the single-buffered page table plus the double-buffered top-k and output blocks
+      fit in the default scoped VMEM limit, and the per-token sequence ids plus per-block chunk
+      counts fit in SMEM.
+    """
+    info = pltpu.get_tpu_info()
+    vmem = 4 * (
+        max_num_seqs * padded_chunks * _GATHER_PAGE_CHUNK + 2 * 2 * block_tokens * topk
+    )
+    smem = 4 * (padded_tokens + padded_tokens // block_tokens)
+    # Stay within the default scoped VMEM limit (half of VMEM): raising the limit to all of VMEM
+    # made this kernel ~4x slower on short tables on tpu7x.
+    # Same SMEM reserve as the batched RPA schedule (batched_rpa/configs.py).
+    return (
+        vmem <= info.vmem_capacity_bytes // 2
+        and smem <= info.smem_capacity_bytes - 32 * 1024
+    )
 
 
 def gather_page_ids(
@@ -96,6 +368,65 @@ def gather_page_ids(
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
     padded_pps = num_chunks * _GATHER_PAGE_CHUNK
+    padded_tokens = align_to(num_tokens, block_tokens)
+    nblocks = padded_tokens // block_tokens
+
+    def chunks_needed(logical):
+        """i32[nblocks]: chunks up to each block's largest logical page."""
+        return (
+            logical.reshape(nblocks, block_tokens * topk).max(axis=1)
+            // _GATHER_PAGE_CHUNK
+            + 1
+        ).astype(jnp.int32)
+
+    padded_chunks = align_to(num_chunks, _PAGE_TABLE_TILE_CHUNKS)
+    # Load the whole page table into VMEM once per call when it is smaller than the per-token
+    # rows it replaces (fewer sequences than tokens, i.e. prefill) and fits. With a token per
+    # sequence (decode), the rows are no bigger and every token block mixes sequences, so the
+    # row-window kernels are cheaper.
+    if max_num_seqs < num_tokens and _page_table_fits_in_vmem(
+        max_num_seqs, padded_chunks, padded_tokens, block_tokens, topk
+    ):
+        pad = padded_tokens - num_tokens
+        logical = jnp.pad(
+            jnp.clip(seq_page_ids, 0, pages_per_seq - 1), ((0, pad), (0, 0))
+        )
+        seq_ids = jnp.pad(seq_ids_segment.astype(jnp.int32), (0, pad))
+        page_table = jnp.pad(
+            page_indices.reshape(max_num_seqs, pages_per_seq),
+            ((0, 0), (0, padded_chunks * _GATHER_PAGE_CHUNK - pages_per_seq)),
+        ).reshape(max_num_seqs, padded_chunks, _GATHER_PAGE_CHUNK)
+        chunks_per_iteration = _gather_page_chunks_per_iteration(
+            num_chunks, block_tokens, topk, nblocks, table_in_vmem=True
+        )
+        out = pl.pallas_call(
+            functools.partial(
+                _gather_page_ids_vmem_table_kernel,
+                chunks_per_iteration=chunks_per_iteration,
+                num_chunks=num_chunks,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[
+                    # Same block every step: fetched once, so one buffer is enough.
+                    pl.BlockSpec(
+                        page_table.shape,
+                        lambda t, n, s: (0, 0, 0),
+                        pipeline_mode=pl.Buffered(1),
+                    ),
+                    pl.BlockSpec((block_tokens, topk), lambda t, n, s: (t, 0)),
+                ],
+                out_specs=pl.BlockSpec((block_tokens, topk), lambda t, n, s: (t, 0)),
+                grid=(nblocks,),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+            ),
+            name="gather_page_ids_vmem_table",
+        )(chunks_needed(logical), seq_ids, page_table, logical)
+        return out[:num_tokens]
 
     page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
     if padded_pps != pages_per_seq:
@@ -104,11 +435,38 @@ def gather_page_ids(
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
 
-    padded_tokens = align_to(num_tokens, block_tokens)
     if padded_tokens != num_tokens:
         pad = padded_tokens - num_tokens
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
+
+    chunks_per_iteration = _gather_page_chunks_per_iteration(
+        num_chunks, block_tokens, topk, nblocks
+    )
+    if chunks_per_iteration is not None:
+        out = pl.pallas_call(
+            functools.partial(
+                _gather_page_ids_bounded_kernel,
+                chunks_per_iteration=chunks_per_iteration,
+                num_chunks=num_chunks,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[
+                    pl.BlockSpec((block_tokens, padded_pps), lambda t, n: (t, 0)),
+                    pl.BlockSpec((block_tokens, topk), lambda t, n: (t, 0)),
+                ],
+                out_specs=pl.BlockSpec((block_tokens, topk), lambda t, n: (t, 0)),
+                grid=(nblocks,),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+            ),
+            name="gather_page_ids_bounded",
+        )(chunks_needed(logical), windows, logical)
+        return out[:num_tokens]
 
     out = pl.pallas_call(
         functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
@@ -266,7 +624,7 @@ def _attention_kernel(
         out = (
             lax.div(pv, l_sum)
             if q_dtype == jnp.float32
-            else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+            else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
         )
         return out
 
@@ -524,7 +882,7 @@ def _attention_kernel(
                 out = (
                     lax.div(pv, l_sum)
                     if q_dtype == jnp.float32
-                    else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                    else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
                 bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:
@@ -717,6 +1075,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "gather_rope",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -725,7 +1084,7 @@ def sparse_ragged_paged_attention(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -749,6 +1108,7 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    gather_rope: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -803,6 +1163,9 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      gather_rope: TensorCore layout only (ignored otherwise). False skips the
+        rope cache in the gather and attends with zero rope keys; exact only
+        when the queries' rope lane is identically zero (a model without rope).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -829,9 +1192,28 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32[pages,rope_rows,128]"
+            )
+        rope_rows = cache_kv_rope.shape[1]
+        if rope_rows <= 0 or cache_kv_nope.shape[1] % rope_rows != 0:
+            raise ValueError(
+                "NOPE and ROPE caches must have matching page counts and page geometry"
+            )
+        rope_tokens_per_row = cache_kv_nope.shape[1] // rope_rows
+        rope_words = (
+            128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
+        )
+        if (
+            rope_words <= 0
+            or rope_words % native_sc_gather.NUM_LANES != 0
+            or native_sc_gather.ROPE_PACKING * rope_words > 128
+        ):
+            raise ValueError(
+                f"sparsecore ROPE cache packs {rope_tokens_per_row} tokens per "
+                "128-word row, which is incompatible with SparseCore gather"
             )
     else:
+        rope_tokens_per_row = 4
         if (
             cache_kv_nope.dtype != jnp.uint8
             or cache_kv_nope.ndim != 4
@@ -848,14 +1230,17 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    # A TensorCore call with gather_rope=False never reads the rope cache, so
+    # it may be a placeholder (a model without rope allocates one row).
+    rope_read = sparsecore_layout or gather_rope
+    if rope_read and cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
-    if (
+    if rope_read and (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -940,6 +1325,7 @@ def sparse_ragged_paged_attention(
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
             topk_override=topk,
+            gather_rope=gather_rope,
         )
         if return_lse:
             q, lse = result
@@ -951,6 +1337,16 @@ def sparse_ragged_paged_attention(
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
     return out
+
+
+def _spread(hashed: jax.Array, bound: int) -> jax.Array:
+    """Map arbitrary int32 values into [0, bound) to spread padding reads.
+
+    TPU has no integer divider, so ``%`` by a non-power-of-two constant lowers
+    to a multiply-shift sequence per element. Masking to the largest power of
+    two <= bound spreads the reads just as well.
+    """
+    return hashed & ((1 << (bound.bit_length() - 1)) - 1)
 
 
 def prepare_gather_indices(
@@ -991,14 +1387,14 @@ def prepare_gather_indices(
         )
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
+        scattered_page_ids = _spread(flat_element_index * 104729, total_num_pages)
+        scattered_token_offset = _spread(flat_element_index * 15485863, page_size)
         page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
         token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
         physical_indices = page_ids * page_size + token_offset
     else:
         total_tokens = total_num_pages * page_size
-        scattered_physical = (flat_element_index * 15485863) % total_tokens
+        scattered_physical = _spread(flat_element_index * 15485863, total_tokens)
         physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)
@@ -1011,7 +1407,7 @@ def sparse_attention_chunk(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_tokens]
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]
@@ -1036,6 +1432,7 @@ def sparse_attention_chunk(
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
     topk_override: int | None = None,
+    gather_rope: bool = True,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1319,6 +1716,7 @@ def sparse_attention_chunk(
             cache_kv_rope,
             indices.reshape(-1),
             num_valid_indices=num_valid_indices,
+            gather_rope=gather_rope,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,

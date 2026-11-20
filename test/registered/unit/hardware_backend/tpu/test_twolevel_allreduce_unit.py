@@ -52,6 +52,46 @@ class TestFallbacks(CustomTestCase):
                 tl.merged_moe_all_reduce_around(original, latent, shared), ("a", "b")
             )
 
+    def test_merged_passes_norm_to_original_when_not_registered(self):
+        original = mock.Mock(return_value=("a", "b"))
+        latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
+        shared = torch.zeros(1, 7168, dtype=torch.bfloat16)
+        norm = mock.Mock()
+        with mock.patch.object(tl, "_READY", False):
+            self.assertEqual(
+                tl.merged_moe_all_reduce_around(original, latent, shared, norm),
+                ("a", "b"),
+            )
+        original.assert_called_once_with(latent, shared, norm)
+
+    def test_merged_norm_unfused_without_2n_op(self):
+        """Registered pair op but no fused-norm op: reduce, then the norm."""
+        latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
+        shared = torch.zeros(1, 7168, dtype=torch.bfloat16)
+        norm = mock.Mock(return_value="normed")
+        pair = mock.Mock(return_value=("l", "s"))
+        with (
+            mock.patch.object(tl, "_READY", True),
+            mock.patch.dict(tl._OPS, {2: pair}, clear=True),
+        ):
+            got = tl.merged_moe_all_reduce_around(mock.Mock(), latent, shared, norm)
+        self.assertEqual(got, ("normed", "s"))
+        norm.assert_called_once_with("l")
+
+    def test_row_parallel_linear_calls_original_without_ar1r_op(self):
+        """No fused attention-residual op: o_proj keeps its own all-reduce."""
+        original = mock.Mock(return_value=("y", None))
+        layer = mock.Mock()
+        x = torch.zeros(1, 384, dtype=torch.bfloat16)
+        with mock.patch.dict(tl._OPS, {}, clear=True):
+            self.assertEqual(
+                tl.row_parallel_linear_forward_around(original, layer, x),
+                ("y", None),
+            )
+        original.assert_called_once_with(
+            layer, x, skip_all_reduce=False, forward_batch=None, output_tensor=None
+        )
+
     def test_merged_falls_back_on_mixed_dtypes(self):
         """A non-bf16 shared output is not cast into the packed exchange."""
         original = mock.Mock(return_value=("a", "b"))
@@ -72,6 +112,7 @@ class TestRegistration(CustomTestCase):
         with (
             tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.override(enabled),
             mock.patch.object(tl, "register") as reg,
+            mock.patch.object(tl, "_register_twoshot_from_parallel_state"),
             mock.patch(
                 "sglang.srt.distributed.parallel_state.get_world_group",
                 return_value=mock.Mock(world_size=world, cpu_group="cpu"),
@@ -132,6 +173,95 @@ class TestMergedMoeAllReduceDefault(CustomTestCase):
         ar.assert_called_once()  # one collective for both
         torch.testing.assert_close(got_latent, latent * 2)
         torch.testing.assert_close(got_shared, (shared * 2).to(torch.bfloat16))
+
+
+class TestTwoShotRoute(CustomTestCase):
+    """Single-host TP: decode-sized bf16 TP all-reduces go to the two-shot op."""
+
+    def test_eligibility_cap_and_layout(self):
+        cap_rows = tl.TWOSHOT_ALL_REDUCE_MAX_BYTES // (4096 * 2)
+        for shape, dtype, want in (
+            ((1, 4096), torch.bfloat16, True),
+            ((cap_rows, 4096), torch.bfloat16, True),
+            ((cap_rows + 1, 4096), torch.bfloat16, False),  # over the cap
+            ((32, 4096), torch.float32, False),
+            ((32, 4000), torch.bfloat16, False),  # columns not 128 per rank
+            ((0, 4096), torch.bfloat16, False),
+            ((4096,), torch.bfloat16, False),
+        ):
+            with self.subTest(shape=shape, dtype=dtype):
+                t = torch.zeros(shape, dtype=dtype)
+                self.assertEqual(tl.twoshot_eligible(t, 8), want)
+
+    def _dispatch(self, x, *, group_is_tp=True, ready=False):
+        tp_group, other = mock.Mock(), mock.Mock()
+        original = mock.Mock(return_value="xla")
+        twoshot, twolevel = (
+            mock.Mock(return_value="twoshot"),
+            mock.Mock(return_value="twolevel"),
+        )
+        with (
+            mock.patch.object(tl, "_TWOSHOT_WORLD", 8),
+            mock.patch.object(tl, "_READY", ready),
+            mock.patch.dict(tl._OPS, {1: twolevel}),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_tp_group",
+                return_value=tp_group,
+            ),
+            mock.patch(
+                "sglang_tpu.twoshot_all_reduce.get_twoshot_all_reduce_op",
+                return_value=twoshot,
+            ) as get_op,
+        ):
+            out = tl.all_reduce_around(original, tp_group if group_is_tp else other, x)
+        return out, get_op
+
+    def test_dispatch(self):
+        small = torch.zeros(32, 4096, dtype=torch.bfloat16)
+        out, get_op = self._dispatch(small)
+        self.assertEqual(out, "twoshot")
+        get_op.assert_called_once_with(8)
+        self.assertEqual(self._dispatch(small, group_is_tp=False)[0], "xla")
+        large = torch.zeros(4096, 4096, dtype=torch.bfloat16)
+        self.assertEqual(self._dispatch(large)[0], "xla")
+
+    def test_single_row_prefers_the_two_level_op(self):
+        row = torch.zeros(1, 4096, dtype=torch.bfloat16)
+        self.assertEqual(self._dispatch(row, ready=True)[0], "twolevel")
+
+    def _register(self, *, world=8, tp=None, nnodes=1):
+        with (
+            mock.patch.object(tl, "_TWOSHOT_WORLD", 0),
+            mock.patch("torch.distributed.get_world_size", return_value=world),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=world if tp is None else tp,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=mock.Mock(nnodes=nnodes),
+            ),
+            mock.patch(
+                "sglang_tpu.twoshot_all_reduce.get_twoshot_all_reduce_op"
+            ) as build,
+        ):
+            tl._register_twoshot_from_parallel_state()
+            return tl._TWOSHOT_WORLD, build
+
+    def test_registration_needs_tp_on_one_host(self):
+        world, build = self._register()
+        self.assertEqual(world, 8)
+        build.assert_called_once_with(8)
+        for kwargs in (
+            dict(world=32, nnodes=4),  # the exchange is host-local
+            dict(world=8, tp=4),  # the kernel's mesh is the whole world
+            dict(world=1),
+        ):
+            with self.subTest(**kwargs):
+                world, build = self._register(**kwargs)
+                self.assertEqual(world, 0)
+                build.assert_not_called()
 
 
 if __name__ == "__main__":

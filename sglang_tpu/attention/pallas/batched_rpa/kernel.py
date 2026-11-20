@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.experimental.pallas as pl
@@ -28,6 +29,7 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     flash_attention,
     schedule,
     stitch_utils,
+    transposed,
     utils,
 )
 
@@ -170,8 +172,14 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
-        if cfgs.serve.cache_only:
-            # A row that attended no key keeps l == 0 and outputs 0.
+        if cfgs.serve.ones_v:
+            # l rode along in the accumulator lanes above the head.
+            h = cfgs.aligned_kv_head_dim
+            batch_l = batch_acc[..., h : 2 * h]
+            batch_acc = batch_acc[..., :h]
+        if cfgs.serve.attention_scope.walks_cache_stripe:
+            # A row that attended no key (empty stripe) keeps l == 0 and
+            # outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
@@ -181,7 +189,7 @@ def calculate_and_store_out(
         ):
             result = lax.div(batch_acc, batch_l)
         else:
-            result = batch_acc * pl.reciprocal(batch_l, approx=True)
+            result = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
@@ -224,8 +232,7 @@ def rpa_body(
     m_scratch_ref: jax.Ref,
     l_scratch_ref: jax.Ref,
     acc_scratch_ref: jax.Ref,
-    lse_stage_ref: jax.Ref | None,
-    *,
+    *rest_scratch_refs: jax.Ref | None,
     # Passed refs
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
@@ -235,14 +242,28 @@ def rpa_body(
     # Configs.
     cfgs: configs.RpaConfigs,
 ):
+    if cfgs.use_transposed:
+        qt_scratch_ref, qkey_scratch_ref, lse_stage_ref = rest_scratch_refs
+    else:
+        (lse_stage_ref,) = rest_scratch_refs
     step = pl.program_id(0)
 
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if cfgs.serve.cache_only else None
+    kv_len_left = (
+        []
+        if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe)
+        else None
+    )
+    # NEW_TOKENS_ONLY: keys before this per-block bound are cached and masked.
+    kv_new_start_left = [] if cfgs.serve.attention_scope.skips_cached_keys else None
     global_q_k_gap = None
-    if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
+    if (
+        cfgs.serve.cp_group_size is not None
+        and cfgs.model.sliding_window is not None
+        and cfgs.serve.attention_scope.walks_cache_stripe
+    ):
         global_q_k_gap = []
     # Lists to hold the 2 variables needed for stitching
     bkv_sz_frm_cache_list = []
@@ -263,21 +284,53 @@ def rpa_body(
         q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
         q_len = q_end - q_start
         # cache_only queries follow every one of the kv_len keys.
-        offset = kv_len if cfgs.serve.cache_only else kv_len - q_len
+        offset = (
+            kv_len
+            if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe)
+            else kv_len - q_len
+        )
 
         processed_q_len.append((q_idx * cfgs.bq_sz + offset))
         processed_kv_len.append(k_id)
         if kv_len_left is not None:
             kv_len_left.append(kv_len - k_id)
+        if kv_new_start_left is not None:
+            kv_new_start_left.append(kv_len - q_len - k_id)
         if global_q_k_gap is not None:
             kv_len_global = jnp.where(is_valid, kv_lens_global_ref[safe_s_idx], 0)
             q_global = kv_len_global - q_len + q_idx * cfgs.bq_sz
-            k_global = k_id * cfgs.serve.cp_group_size + cp_rank_ref[0]
+            # Page-striped cache: local key j holds global position
+            # j + (j // page_size) * (cp - 1) * page_size + rank * page_size. The
+            # mask adds the j-dependent stripe term per key; the scalar part of
+            # the gap is q_global - (k_id + rank * page_size).
+            k_global = k_id + cp_rank_ref[0] * cfgs.serve.page_size
             global_q_k_gap.append(q_global - k_global)
 
-        # Stitching metadata
+        # Stitching metadata (mirrors the schedule's split of a block into its
+        # cached and new keys; SEQ_ALONG_LANE rolls the new keys into place
+        # from ``bkv_sz_frm_cache`` on, so an overshort cached count would
+        # overwrite cached keys).
         kv_left = jnp.maximum(kv_len - k_id, 0)
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if cfgs.serve.cache_only:
+            # Every key comes from the cache; nothing is stitched.
+            kv_left_frm_cache = kv_left
+        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+            k_len_global = (
+                kv_lens_global_ref[safe_s_idx] if kv_lens_global_ref is not None else 0
+            )
+            page_size = cfgs.serve.page_size
+            cp_size = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+            owns_token = (
+                (k_len_global > 0)
+                & (q_len == 1)
+                & (((k_len_global - 1) // page_size) % cp_size == rank)
+            )
+            kv_left_frm_cache = jnp.where(
+                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
+            )
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
@@ -289,21 +342,27 @@ def rpa_body(
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
-        q_ref,
-        0,
-        cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
-        1,
-        dtype=cfgs.serve.dtype_q,
-    )
-    q = q_loaded.reshape(
-        cfgs.batch_size,
-        cfgs.model.num_kv_heads,
-        cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
-        cfgs.aligned_q_head_dim,
-    )
-    if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
-        q = q[..., : cfgs.aligned_kv_head_dim]
+
+    def load_q() -> jax.Array:
+        q_loaded = utils.strided_load(
+            q_ref,
+            0,
+            cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
+            1,
+            dtype=cfgs.serve.dtype_q,
+        )
+        return q_loaded.reshape(
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
+            cfgs.aligned_q_head_dim,
+        )
+
+    # The transposed tile reads q only when it rebuilds Q^T (once per q block).
+    if not cfgs.use_transposed:
+        q = load_q()
+        if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
+            q = q[..., : cfgs.aligned_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -381,87 +440,196 @@ def rpa_body(
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
 
-    # Step 3: Perform compute.
-    m_val = m_scratch_ref[...]
-    l_val = l_scratch_ref[...]
-    acc_val = acc_scratch_ref[...]
-
-    l_new_list = []
-    m_new_list = []
-    acc_new_list = []
-
-    prev_p = prev_alpha_list = prev_q_slice = None
-    for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-        bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
-        q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
-        q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
-        q_slice = slice(q_start, q_end)
-
-        p, alpha_list, m_next, l_next, m_lanes = (
-            flash_attention.flash_attention_qk_softmax(
-                step,
-                q[:, :, q_slice],
-                k,
-                m_val[:, q_slice],
-                l_val[:, q_slice],
-                schedule_ref.is_last_k,
-                processed_q_len=processed_q_len,
-                processed_kv_len=processed_kv_len,
-                cfgs=cfgs,
-                bq_start=bq_start,
-                kv_len_left=kv_len_left,
-                global_q_k_gap=global_q_k_gap,
-            )
+    if cfgs.serve.ones_v and not cfgs.use_transposed:
+        # [B, KV, H, S] -> [B, KV, lanes, S]: the PV matmul then returns
+        # sum(p) in the lanes above the head, for free on an MXU that pads H.
+        assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        ones_rows = cfgs.acc_width - v.shape[-2]
+        assert ones_rows > 0, v.shape
+        v = jnp.concatenate(
+            [v, jnp.ones((*v.shape[:-2], ones_rows, v.shape[-1]), v.dtype)],
+            axis=-2,
         )
-        m_scratch_ref[:, q_slice] = m_next
-        l_scratch_ref[:, q_slice] = l_next[-1]
-        l_new_list.append(l_next)
-        m_new_list.append(m_lanes)
 
-        if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
-                prev_p,
-                v,
-                prev_alpha_list,
-                acc_val[:, prev_q_slice],
-                cfgs=cfgs,
+    if cfgs.use_transposed:
+        transposed.refresh_qt(
+            load_q,
+            qt_scratch_ref,
+            qkey_scratch_ref,
+            schedule_ref.s_idx[step, 0],
+            schedule_ref.q_idx[step, 0],
+            cfgs=cfgs,
+        )
+        run_tile = functools.partial(
+            transposed.tile,
+            step,
+            k,
+            v,
+            schedule_ref,
+            m_scratch_ref,
+            acc_scratch_ref,
+            qt_scratch_ref,
+            processed_q_len=processed_q_len[0],
+            processed_kv_len=processed_kv_len[0],
+            cfgs=cfgs,
+        )
+        if not cfgs.serve.skip_full_tile_mask:
+            run_tile(apply_mask=True)
+        else:
+            full_tile = _full_tile(
+                step, schedule_ref, processed_q_len, processed_kv_len, cfgs
             )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-            acc_new_list.append(o_next)
+            pl.when(full_tile)(lambda: run_tile(apply_mask=False))
+            pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
+        transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
+        return
 
-        prev_p = p
-        prev_alpha_list = alpha_list
-        prev_q_slice = q_slice
-
-    assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
-        prev_p,
-        v,
-        prev_alpha_list,
-        acc_val[:, prev_q_slice],
-        cfgs=cfgs,
+    # Step 3: Perform compute, then step 4: write back outputs.
+    fast_tiles = (
+        cfgs.serve.skip_full_tile_mask
+        and cfgs.batch_size == 1
+        and kv_len_left is None
+        and kv_new_start_left is None
+        and global_q_k_gap is None
     )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-    acc_new_list.append(o_next)
+    # exp2 folds sm_scale * log2e into q, which is not a power of two: bf16 q rounds.
+    fold_sm_scale = (
+        fast_tiles
+        and cfgs.serve.scale_q is None
+        and math.frexp(cfgs.model.sm_scale)[0] == 0.5
+    ) or (cfgs.serve.exp2_softmax and cfgs.serve.scale_q is None)
 
-    l_next = jnp.concatenate(l_new_list, axis=2)
-    acc_next = jnp.concatenate(acc_new_list, axis=2)
-    m_lanes = None
-    if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
-        m_lanes = jnp.concatenate(m_new_list, axis=2)
+    def compute_and_store(apply_mask: bool):
+        m_val = m_scratch_ref[...]
+        l_val = l_scratch_ref[...]
+        acc_val = acc_scratch_ref[...]
 
-    # Step 4: Write back outputs.
-    calculate_and_store_out(
-        step,
-        schedule_ref,
-        acc_next,
-        l_next,
-        o_vref,
-        m_list=m_lanes,
-        sink_ref=sink_ref,
-        lse_vref=lse_vref,
-        lse_stage_ref=lse_stage_ref,
-        cfgs=cfgs,
+        l_new_list = []
+        m_new_list = []
+        acc_new_list = []
+
+        prev_p = prev_alpha_list = prev_q_slice = None
+        for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+            bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
+            q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
+            q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
+            q_slice = slice(q_start, q_end)
+
+            p, alpha_list, m_next, l_next, m_lanes = (
+                flash_attention.flash_attention_qk_softmax(
+                    step,
+                    q[:, :, q_slice],
+                    k,
+                    m_val[:, q_slice],
+                    l_val[:, q_slice],
+                    schedule_ref.is_last_k,
+                    processed_q_len=processed_q_len,
+                    processed_kv_len=processed_kv_len,
+                    cfgs=cfgs,
+                    bq_start=bq_start,
+                    kv_len_left=kv_len_left,
+                    global_q_k_gap=global_q_k_gap,
+                    kv_new_start_left=kv_new_start_left,
+                    apply_mask=apply_mask,
+                    fold_sm_scale=fold_sm_scale,
+                )
+            )
+            m_scratch_ref[:, q_slice] = m_next
+            if not cfgs.serve.ones_v:
+                l_scratch_ref[:, q_slice] = l_next[-1]
+            l_new_list.append(l_next)
+            m_new_list.append(m_lanes)
+
+            if prev_p is not None:
+                o_next = flash_attention.flash_attention_pv(
+                    prev_p,
+                    v,
+                    prev_alpha_list,
+                    acc_val[:, prev_q_slice],
+                    cfgs=cfgs,
+                )
+                acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+                acc_new_list.append(o_next)
+
+            prev_p = p
+            prev_alpha_list = alpha_list
+            prev_q_slice = q_slice
+
+        assert prev_p is not None
+        o_next = flash_attention.flash_attention_pv(
+            prev_p,
+            v,
+            prev_alpha_list,
+            acc_val[:, prev_q_slice],
+            cfgs=cfgs,
+        )
+        acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+        acc_new_list.append(o_next)
+
+        l_next = jnp.concatenate(l_new_list, axis=2)
+        acc_next = jnp.concatenate(acc_new_list, axis=2)
+        m_lanes = None
+        if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
+            m_lanes = jnp.concatenate(m_new_list, axis=2)
+
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_next,
+            l_next,
+            o_vref,
+            m_list=m_lanes,
+            sink_ref=sink_ref,
+            lse_vref=lse_vref,
+            lse_stage_ref=lse_stage_ref,
+            cfgs=cfgs,
+        )
+
+    if not fast_tiles:
+        compute_and_store(apply_mask=True)
+        return
+    full_tile = _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs)
+
+    @pl.when(full_tile)
+    def _():
+        compute_and_store(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full_tile))
+    def _():
+        compute_and_store(apply_mask=True)
+
+
+def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):
+    # The tile needs no mask when its last key precedes its first query and, with
+    # a sliding window, its last query still sees its first key.
+    is_valid = schedule_ref.s_idx[step, 0] != -1
+    first_q, first_k = processed_q_len[0], processed_kv_len[0]
+    full_tile = jnp.logical_and(is_valid, first_q >= first_k + cfgs.bkv_sz - 1)
+    if cfgs.model.sliding_window is not None:
+        full_tile = jnp.logical_and(
+            full_tile,
+            first_q + cfgs.bq_sz - 1 - first_k < cfgs.model.sliding_window,
+        )
+    return full_tile
+
+
+def _carry_scratch_shapes(cfgs: configs.RpaConfigs):
+    if cfgs.use_transposed:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            pltpu.VMEM(cfgs.mt_scratch_shape, dtype=jnp.float32),  # m, base 2
+            pltpu.VMEM((1, 1, num_lanes), dtype=jnp.float32),  # l rides in acc
+            pltpu.VMEM(cfgs.acct_scratch_shape, dtype=jnp.float32),  # O^T and l
+            pltpu.VMEM(cfgs.qt_scratch_shape, dtype=cfgs.serve.dtype_kv),  # Q^T
+            pltpu.SMEM((2,), dtype=jnp.int32),  # (s_idx, q_idx) of the cached Q^T
+        )
+    # ones_v carries l in acc: a bf16 l stops growing once it exceeds ~256x a
+    # tile's row sum.
+    dtype = jnp.float32 if cfgs.serve.ones_v else cfgs.serve.dtype_out
+    return (
+        pltpu.VMEM(cfgs.lm_scratch_shape, dtype=dtype),  # m
+        pltpu.VMEM(cfgs.lm_scratch_shape, dtype=dtype),  # l
+        pltpu.VMEM(cfgs.acc_scratch_shape, dtype=dtype),  # acc
     )
 
 
@@ -550,14 +718,20 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-sw{cfgs.model.sliding_window}"
     if cfgs.model.has_attention_sink:
         name += "-sink"
-    if cfgs.serve.cache_only:
+    if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY:
         name += "-co"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+        name += "-striped"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+        name += "-new"
     if cfgs.serve.skip_kv_write:
         name += "-nowb"
     if cfgs.serve.return_lse:
         name += "-lse"
     if cfgs.serve.cp_group_size is not None:
         name += f"-cp{cfgs.serve.cp_group_size}"
+    if cfgs.use_transposed:
+        name += "-tr"
     return name
 
 
@@ -661,20 +835,7 @@ def rpa_kernel(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=schedule.RpaSchedule.create_shape_dtype(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
-            scratches=(
-                pltpu.VMEM(
-                    cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # m
-                pltpu.VMEM(
-                    cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # l
-                pltpu.VMEM(
-                    cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # acc
-            ),
+            scratches=_carry_scratch_shapes(cfgs),
             lse_stage=(
                 pltpu.VMEM(cfgs.lse_stage_shape, dtype=jnp.float32)
                 if cfgs.serve.return_lse and cfgs.bq_sz > 1
@@ -695,6 +856,10 @@ def rpa_kernel(
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
             scratches[1][...] = jnp.zeros_like(scratches[1])
             scratches[2][...] = jnp.zeros_like(scratches[2])
+            if cfgs.use_transposed:
+                # No (sequence, q block) owns the Q^T scratch yet.
+                scratches[4][0] = -1
+                scratches[4][1] = -1
 
             num_lanes = pltpu.get_tpu_info().num_lanes
             kv_alloc = final_allocs[1]
@@ -716,7 +881,7 @@ def rpa_kernel(
                 flat_smem = jax.tree_util.tree_leaves(schedule_ref)
                 dma_list = []
                 for h, s in zip(flat_hbm, flat_smem):
-                    if h.memory_space == pltpu.HBM:
+                    if jax.typeof(h).memory_space == pltpu.HBM:
                         element_size = s.shape[0] // cfgs.max_steps_ub
                         read_size = element_size * (num_steps + prefix_steps)
                         read_size = utils.align_to(read_size, 1024)

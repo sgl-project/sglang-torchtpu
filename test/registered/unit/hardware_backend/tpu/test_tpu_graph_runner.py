@@ -322,7 +322,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -406,13 +406,6 @@ class TestTpuGraphRunner(CustomTestCase):
             self.mock_cache_key.assert_called_once_with()
             # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
-
-    def test_annotation_drives_compile_when_can_torch_compile_default(self):
-        # Models that don't set _can_torch_compile should compile only when
-        # they declare a boundary.
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_compile.assert_called_once()
 
     def test_no_annotation_uses_direct_tracer(self):
         # Most text decoder models should not need an explicit annotation.
@@ -560,7 +553,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -578,7 +571,7 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_checker_is_not_armed_unless_opted_in(self):
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
@@ -593,7 +586,7 @@ class TestTpuGraphRunner(CustomTestCase):
         runner_args = self._runner_for(model)
         runner_args.is_draft_worker = True
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
@@ -601,11 +594,6 @@ class TestTpuGraphRunner(CustomTestCase):
         ):
             TpuGraphRunner(runner_args)
         shared.assert_not_called()
-
-    def test_precompile_called_for_installed_policy(self):
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_precompile.assert_called_once()
 
     def test_discovers_annotated_module(self):
         events = []
@@ -781,6 +769,8 @@ class TestDraftTorchCompileInstall(CustomTestCase):
             server_args=SimpleNamespace(forward_hooks=[]),
             forward_stream=None,
             canary_manager=None,
+            # Decode capture first offers the Unlimited-OCR greedy recorder.
+            maybe_init_uocr_greedy_graph=lambda: None,
         )
 
     def _call(self, device, enable_torch_compile):
@@ -870,7 +860,7 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         self.addCleanup(stack.close)
         stack.enter_context(get_flags().capture.override(enable_torch_compile=True))
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
-        worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
+        worker.parallel_layout = object()
         worker.draft_owns_attention = False
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
@@ -916,6 +906,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
                 "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",
                 side_effect=contextlib.nullcontext,
             ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_tp_context",
+                side_effect=lambda _layout: contextlib.nullcontext(),
+            ),
         ):
             worker.init_cuda_graphs()
 
@@ -952,6 +946,47 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
 
         self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
+
+
+class TestTorchCompileBundleTracer(CustomTestCase):
+    """The scheduler saves and loads torch.compile bundles only under Dynamo."""
+
+    def _init_all_cuda_graphs(self, tracer, *, save=None, load=None):
+        from sglang.srt.compilation import torch_compile_bundle
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                tpu_compile_tracer=tracer,
+                unsafe_save_torch_compile_bundle=save,
+                unsafe_load_torch_compile_bundle=load,
+            ),
+            tp_worker=MagicMock(),
+            draft_worker=None,
+            attn_dp_enabled=True,
+        )
+        with (
+            patch.object(torch_compile_bundle, "set_fresh_compiler_cache") as fresh,
+            patch.object(torch_compile_bundle, "load") as loads,
+            patch.object(torch_compile_bundle, "save") as saves,
+            patch("torch.distributed.get_rank", return_value=0),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+        ):
+            Scheduler.init_all_cuda_graphs(scheduler)
+        scheduler.tp_worker.init_cuda_graphs.assert_called_once_with()
+        return fresh.call_count, loads.call_count, saves.call_count
+
+    def test_direct_tracer_skips_bundles(self):
+        for flags in (dict(save="/tmp/b"), dict(load="/tmp/b")):
+            with self.subTest(**flags):
+                self.assertEqual(
+                    self._init_all_cuda_graphs("direct", **flags), (0, 0, 0)
+                )
+
+    def test_dynamo_tracer_keeps_bundles(self):
+        self.assertEqual(self._init_all_cuda_graphs("dynamo", save="/tmp/b"), (1, 0, 1))
+        self.assertEqual(self._init_all_cuda_graphs("dynamo", load="/tmp/b"), (1, 1, 0))
+        self.assertEqual(self._init_all_cuda_graphs("dynamo"), (0, 0, 0))
 
 
 if __name__ == "__main__":

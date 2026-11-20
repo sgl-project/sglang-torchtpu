@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs
 from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
@@ -277,8 +277,13 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    row_out_ref=None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
+
+    `row_out_ref` ([tile_m, tile_n // lanes, lanes], scatter mode, one k step, quantized RHS,
+    no activation or bias): store each MXU column block, scaled and masked, straight into
+    this row-major layout as soon as it is done, instead of `tiled_out_ref` after the tile.
 
     tiled_lhs_ref and tiled_out_ref points to rows [m_start:m_end] of lhs and out.
     Additionally, m_start and m_end does not have to align with tile boundaries
@@ -305,6 +310,13 @@ def inner_kernel(
     # Small FP4 RHS scale blocks are folded into RHS and requantized to the
     # LHS quant dtype before matmul so their per-block scales are not dropped.
     _resolved_gm_id = pl.program_id(0) if _gm_id is None else _gm_id
+
+    def _to_bf16(w):
+        # e2m1 values are exact in e4m3; fp4 -> fp8 -> bf16 takes fewer VPU ops than the
+        # direct widen (bit-identical).
+        if w.dtype == jnp.float4_e2m1fn:
+            w = w.astype(jnp.float8_e4m3fn)
+        return w.astype(jnp.bfloat16)
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
@@ -359,6 +371,28 @@ def inner_kernel(
                     amax == 0, jnp.zeros_like(block_scale), block_scale
                 )
             return block_q, block_scale
+
+        # Every k-step variant is traced; only the single-step one stores row blocks (the
+        # caller passes row_out_ref only when there is one k step).
+        row_blocks = row_out_ref is not None and is_first_k_step and is_last_k_step
+        if row_blocks:
+            # Only the quantized-RHS path below stores row blocks.
+            assert cfgs.rhs_cfgs.quant_dtype is not None
+            assert scatter_mode and cfgs.fuse_act is None and not cfgs.rhs_cfgs.has_bias
+
+        def _store_row_block(acc_n, start_n, end_n):
+            # Same ops per element as the whole-tile epilogue below (global scale, row
+            # mask, cast), so the stored values are bit-identical.
+            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                _gid = metadata_ref.gm_id_to_group_id[_resolved_gm_id]
+                acc_n = acc_n * gs_gate_ref[_gid].astype(acc_n.dtype)
+            acc_n = jnp.where(_valid_m_mask(acc_n.shape), acc_n, 0)
+            lanes = row_out_ref.shape[-1]
+            row_out_ref[:, pl.ds(start_n // lanes, (end_n - start_n) // lanes), :] = (
+                acc_n.astype(row_out_ref.dtype).reshape(
+                    acc_n.shape[0], (end_n - start_n) // lanes, lanes
+                )
+            )
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
@@ -417,6 +451,13 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_tile_n = tiled_rhs.shape[-1]
+            # Row-layout stores go out in groups of whole [sublanes, lanes] tiles per row.
+            row_group = row_group_start = 0
+            if row_blocks:
+                row_group = (
+                    pltpu.get_tpu_info().get_sublane_tiling(row_out_ref.dtype)
+                    * row_out_ref.shape[-1]
+                )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -439,14 +480,14 @@ def inner_kernel(
                             local_k_end = rhs_k_end - start_k
                             rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
                             block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = block_rhs_slice.astype(
-                                jnp.bfloat16
+                            scaled_rhs_slice = _to_bf16(
+                                block_rhs_slice
                             ) * rhs_scale_slice.astype(jnp.bfloat16)
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
                     else:
-                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
+                        block_rhs_for_quant = _to_bf16(block_rhs)
 
                     if fp8_activation_quant:
                         block_lhs_for_matmul, lhs_scale = _online_quantize(
@@ -487,6 +528,16 @@ def inner_kernel(
                     acc_n += block_acc
 
                 acc_list.append(acc_n)
+                if row_blocks and (
+                    end_n - row_group_start == row_group or end_n == rhs_tile_n
+                ):
+                    _store_row_block(
+                        jnp.concatenate(acc_list, axis=1), row_group_start, end_n
+                    )
+                    acc_list = []
+                    row_group_start = end_n
+            if row_blocks:
+                return
             acc = jnp.concatenate(acc_list, axis=1)
 
         if not is_first_k_step:
@@ -949,12 +1000,21 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
+    src_ref,
+    dst_ref,
+    indices_ref,
+    sem_ref,
+    gm_id,
+    metadata_ref,
+    divisor: int = 1,
+    unroll: int = 1,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
+
+    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -978,7 +1038,20 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
+    num_rows = m_end - m_start
+    if unroll == 1:
+        lax.fori_loop(0, num_rows, _gather_body, 0)
+        return
+
+    # `unroll` rows per iteration (fewer loop branches per row), then the tail.
+    def _block(b, _):
+        for u in range(unroll):
+            _gather_body(b * unroll + u, None)
+        return _
+
+    num_blocks = num_rows // unroll
+    lax.fori_loop(0, num_blocks, _block, 0)
+    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")

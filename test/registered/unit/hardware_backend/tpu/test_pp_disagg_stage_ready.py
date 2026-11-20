@@ -6,6 +6,7 @@ the pages it exposed out of the radix cache."""
 
 import sys
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -16,7 +17,8 @@ from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pipeline_final_chunks
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
@@ -35,7 +37,7 @@ def _req(sender, n_input, extend_end, pool_idx=0, **fields):
     return SimpleNamespace(
         disagg_kv_sender=sender,
         origin_input_ids=list(range(n_input)),
-        extend_range=SimpleNamespace(end=extend_end),
+        extend_end=extend_end,
         kv=SimpleNamespace(req_pool_idx=pool_idx),
         **fields,
     )
@@ -210,6 +212,7 @@ def test_prefill_loop_reports_launches_and_the_tokens_its_send_copied():
 
     kv_manager = Mock()
     scheduler = SchedulerPPMixin()
+    scheduler.pp_comm_stream_ctx = nullcontext()
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=kv_manager)
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, reqs=[])
     scheduler._pp_pd_stage_ready(1, batch, "result")

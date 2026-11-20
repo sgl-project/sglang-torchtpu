@@ -20,6 +20,7 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.patches import build_slicebuilder_addresses
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,13 @@ class TopologyConfig:
         }
 
 
+def rewrites_host_order(cfg) -> bool:
+    """Whether startup reorders hosts physically, on request or to place DP replicas."""
+    return cfg.tpu_node_normalization or bool(
+        tpu_envs.SGLANG_TPU_DP_REPLICA_SHAPE.get()
+    )
+
+
 def canonical_host_order(ranks: list[int]) -> list[int]:
     """Invert the complete host-to-rank assignment returned by TorchTPU."""
     if any(type(rank) is not int for rank in ranks) or sorted(ranks) != list(
@@ -127,6 +135,10 @@ def _query_local_device_coords(timeout: int = 300) -> list[int]:
     """Queries local TPU device coordinates in an isolated child process."""
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    # A launcher's distributed env (WORLD_SIZE > 1) would make TorchTPU demand a
+    # full rendezvous for what is a local query.
+    for name in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE"):
+        child_env.pop(name, None)
     try:
         result = subprocess.run(
             [sys.executable, "-m", _MODULE_NAME, _PRINT_LOCAL_DEVICE_COORDS_FLAG],
@@ -252,7 +264,7 @@ def prepare_tpu_environment(server_args) -> None:
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
     cfg = resolving_view(server_args)
-    if not cfg.tpu_node_normalization or cfg.device != "tpu" or cfg.nnodes == 1:
+    if not rewrites_host_order(cfg) or cfg.device != "tpu" or cfg.nnodes == 1:
         return
     if cfg.use_ray:
         raise ValueError(
@@ -271,20 +283,20 @@ def prepare_tpu_environment(server_args) -> None:
     if not master_host or not separator:
         raise ValueError("--dist-init-addr must contain a host and port")
     master_port = int(port)
+    bootstrap_port = tpu_envs.SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT.get()
     config = TopologyConfig(
         hosts=tuple(hosts.split(",")),
         topology=dimensions(topology),
         devices_per_host=int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", "8")),
         chips_per_host=dimensions(os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")),
-        bootstrap_port=int(
-            os.environ.get("SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT", master_port + 1)
-        ),
+        bootstrap_port=(master_port + 1 if bootstrap_port is None else bootstrap_port),
         master_port=master_port,
         slicebuilder_port=int(os.environ.get("TORCH_TPU_BASE_PORT", "8070")),
     )
     if (
         cfg.nnodes != len(config.hosts)
-        or cfg.tp_size * cfg.pp_size != len(config.hosts) * config.devices_per_host
+        or cfg.dp_size * cfg.tp_size * cfg.pp_size
+        != len(config.hosts) * config.devices_per_host
     ):
         raise ValueError("TPU topology normalization requires all devices in one slice")
     if not 0 <= cfg.node_rank < cfg.nnodes:
@@ -296,6 +308,12 @@ def prepare_tpu_environment(server_args) -> None:
         raise ValueError("SliceBuilder addresses conflict with the TPU host order")
 
     order = discover_host_order(config, cfg.node_rank, cfg.dist_timeout or 120)
+    if cfg.dp_size > 1:
+        from sglang_tpu.dp_replicas import order_hosts_by_replica
+
+        order = order_hosts_by_replica(
+            order, config.topology, config.chips_per_host, cfg.dp_size
+        )
     config = replace(config, hosts=tuple(config.hosts[index] for index in order))
     node_rank = order.index(cfg.node_rank)
     dist_init_addr = f"{config.hosts[0]}:{master_port}"

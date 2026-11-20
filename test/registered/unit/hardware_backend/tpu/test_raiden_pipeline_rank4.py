@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden import pipeline as pl
-from sglang_tpu.disaggregation.raiden import pp_common
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
+from sglang_tpu.disaggregation.raiden.pool_spans import head_slice_spans
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -25,6 +25,7 @@ def _groups(full, swa, full_ids, swa_ids):
         full_layer_ids=full_ids,
         swa_layer_ids=swa_ids,
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 
@@ -55,7 +56,7 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
     swa_src = torch.zeros((4, 2 * total_kv_heads, head_dim, page), dtype=dtype)
     pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
     full_ids, swa_ids = [4, 0, 2], [1, 3]
-    spans = pp_common.head_slice_spans(
+    spans = head_slice_spans(
         pools, [src, swa_src], full_ids, swa_ids, dst_tp, total_kv_heads
     )
     rng = np.random.default_rng(0)
@@ -90,9 +91,9 @@ def test_rank4_fingerprint_ignores_per_rank_heads():
     decode = torch.zeros((7, 2, 128, 512), dtype=torch.bfloat16)
     p_pools = pl.pool_manifest(_groups([prefill], [], [5], []))
     d_pools = pl.pool_manifest(_groups([decode], [], [5], []))
-    assert pl.layout_fingerprint(p_pools, [prefill], getter) == pl.layout_fingerprint(
-        d_pools, [decode], getter
-    )
+    assert pl.layout_fingerprint(
+        p_pools, [prefill], getter, ships_pd_hidden=False
+    ) == pl.layout_fingerprint(d_pools, [decode], getter, ships_pd_hidden=False)
 
 
 def test_unsupported_or_mixed_kv_layouts_are_rejected():

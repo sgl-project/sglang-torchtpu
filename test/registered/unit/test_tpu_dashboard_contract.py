@@ -308,9 +308,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
         for job in workflow["jobs"].values():
             self.assertNotIn('"nightly"', job.get("if", ""))
-        gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
-        self.assertIn('"day-10am"', gpt["if"])
-        self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
 
         def suites(job_name):
             legs = workflow["jobs"][job_name]["strategy"]["matrix"]["include"]

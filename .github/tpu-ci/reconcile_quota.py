@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Keep the CI's Kueue objects in step with topology.yaml and the live CI node pools.
+"""Keep the CI's Kueue objects in step with topology.yaml and the CI node pools.
 
 For each shape in topology.yaml this ensures:
   - one ResourceFlavor per CI pool of the shape (a flavor is one pool, so a multi-host gang
     lands on one slice);
   - one ClusterQueue + LocalQueue per lane, all in the shape's cohort, each listing every
     pool of the shape;
-  - quotas from live Ready nodes: each lane's min_hosts in whole slices, never lent, and
-    the priority lane holding the rest, lent while it is idle.
+  - quotas from each pool's capacity: each lane's min_hosts in whole slices, never lent,
+    and the priority lane holding the rest, lent while it is idle.
+
+A pool's capacity is its autoscaler maximum when autoscaling is on, else its live Ready
+nodes. Quota on an autoscaled pool admits a job before its node exists; the pending pod is
+what makes the cluster autoscaler add the node, so the pool's own labels (not its nodes)
+must identify it. The pool list therefore comes from GKE, not from the nodes: a pool scaled
+to zero has none.
 
 Run by _tpu-test.yml before every submission, so quota matches the cluster when admission
 is decided. Any error fails the job: a stale quota admits jobs onto chips that do not
@@ -16,9 +22,10 @@ exist, or leaves live chips idle, and nothing downstream reports either.
 cpu and memory are derived from the chip count (pods take 4 chips / 4 cpu / 32Gi, so 1 cpu
 and 8Gi per chip) to keep TPU the only binding resource.
 
-Usage: reconcile_quota.py [--dry-run]
+Usage: reconcile_quota.py [--dry-run] [--project P] [--zone Z] [--cluster C]
 """
 
+import argparse
 import json
 import re
 import subprocess
@@ -31,6 +38,14 @@ TOPOLOGY_LABEL = "cloud.google.com/gke-tpu-topology"
 TPU = "google.com/tpu"
 NAMESPACE = "tpu-ci"
 KUEUE_API = "kueue.x-k8s.io/v1beta2"
+# Same cluster _tpu-test.yml authenticates against.
+PROJECT = "sglang-torchtpu"
+ZONE = "us-central1-c"
+CLUSTER = "tpu-cluster"
+# A pool without a placement policy is one host per slice; GKE labels such tpu7x nodes 2x2x1.
+SINGLE_HOST_TOPOLOGY = "2x2x1"
+# tpu7x-standard-4t; GKE's per-node label carries the same value once a node exists.
+DEFAULT_CHIPS_PER_HOST = 4
 
 
 def kget(kind, namespace=None):
@@ -50,40 +65,87 @@ def ready(node):
     )
 
 
-def nodes_per_slice(node):
-    """2x2x1 = 4 chips = 1 node; 2x2x2 = 8 = 2; 2x2x4 = 16 = 4."""
-    labels = node["metadata"]["labels"]
-    dims = labels.get(TOPOLOGY_LABEL, "")
-    if not re.fullmatch(r"\d+(x\d+)*", dims):
+def gcloud_node_pools(project, zone, cluster):
+    cmd = [
+        "gcloud",
+        "container",
+        "node-pools",
+        "list",
+        f"--project={project}",
+        f"--zone={zone}",
+        f"--cluster={cluster}",
+        "--format=json",
+    ]
+    out = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=120, check=True
+    ).stdout
+    return json.loads(out)
+
+
+def hosts_per_slice(topology, chips_per_host):
+    """2x2x1 = 4 chips = 1 host; 2x2x2 = 8 = 2; 2x2x4 = 16 = 4."""
+    if not re.fullmatch(r"\d+(x\d+)*", topology):
         return 1
     chips = 1
-    for d in dims.split("x"):
+    for d in topology.split("x"):
         chips *= int(d)
-    return max(1, chips // chips_per_host(node))
+    return max(1, chips // chips_per_host)
 
 
 def chips_per_host(node):
     labels = node["metadata"]["labels"]
-    return int(labels.get("cloud.google.com/gke-accelerator-count", 4)) or 4
+    return (
+        int(
+            labels.get("cloud.google.com/gke-accelerator-count", DEFAULT_CHIPS_PER_HOST)
+        )
+        or DEFAULT_CHIPS_PER_HOST
+    )
 
 
-def ci_pools(nodes):
-    """{pool: {topology, hosts, nodes, ready, chips_per_host}} for every CI pool."""
-    pools = {}
+def pool_from_gke(node_pool):
+    """Pool entry for a GKE node pool carrying the ci-tpu-pool label, or None."""
+    name = (node_pool.get("config") or {}).get("labels", {}).get(POOL_LABEL)
+    if not name:
+        return None
+    topology = (node_pool.get("placementPolicy") or {}).get(
+        "tpuTopology", SINGLE_HOST_TOPOLOGY
+    )
+    autoscaling = node_pool.get("autoscaling") or {}
+    max_nodes = (
+        int(autoscaling.get("maxNodeCount", 0)) if autoscaling.get("enabled") else None
+    )
+    return name, {
+        "topology": topology,
+        "hosts": hosts_per_slice(
+            topology=topology, chips_per_host=DEFAULT_CHIPS_PER_HOST
+        ),
+        "nodes": 0,
+        "ready": 0,
+        "chips_per_host": DEFAULT_CHIPS_PER_HOST,
+        # None: fixed-size pool, capacity is its live Ready nodes.
+        "max_nodes": max_nodes,
+    }
+
+
+def ci_pools(nodes, node_pools):
+    """{pool: {topology, hosts, nodes, ready, chips_per_host, max_nodes}} per CI pool.
+
+    Pools come from GKE so one scaled to zero still exists; nodes add live counts and
+    refine the topology and chip count for a pool that has any.
+    """
+    pools = dict(filter(None, (pool_from_gke(np) for np in node_pools)))
     for n in nodes:
         labels = n["metadata"].get("labels", {})
         pool = labels.get(POOL_LABEL)
         if not pool:
             continue
-        p = pools.setdefault(
-            pool,
-            {
-                "topology": labels.get(TOPOLOGY_LABEL, ""),
-                "hosts": nodes_per_slice(n),
-                "nodes": 0,
-                "ready": 0,
-                "chips_per_host": chips_per_host(n),
-            },
+        per_host = chips_per_host(n)
+        topology = labels.get(TOPOLOGY_LABEL, SINGLE_HOST_TOPOLOGY)
+        p = pools.setdefault(pool, {"nodes": 0, "ready": 0, "max_nodes": None})
+        p.update(
+            topology=topology,
+            hosts=hosts_per_slice(topology=topology, chips_per_host=per_host),
+            chips_per_host=per_host,
         )
         p["nodes"] += 1
         p["ready"] += ready(n)
@@ -91,21 +153,25 @@ def ci_pools(nodes):
 
 
 def usable_slices(pool, info):
-    """Whole slices `pool` can host right now.
+    """Whole slices `pool` can host: its autoscaler maximum, or its Ready nodes if fixed.
 
     GKE tpu7x nodes carry no per-slice label, so a multi-host pool holding more than one
     slice would let a gang straddle two of them and hang at ICI rendezvous. Such a pool
     gets no quota; add capacity as a new pool, never by resizing a multi-host one.
     """
+    max_nodes = info["max_nodes"]
     if info["hosts"] == 1:
-        return info["ready"]
-    if info["nodes"] != info["hosts"]:
+        return info["ready"] if max_nodes is None else max(max_nodes, info["ready"])
+    nodes = info["nodes"] if max_nodes is None else max(max_nodes, info["nodes"])
+    if nodes != info["hosts"]:
         print(
-            f"::warning::pool {pool!r} has {info['nodes']} nodes but one "
+            f"::warning::pool {pool!r} has {nodes} nodes but one "
             f"{info['topology']} slice is {info['hosts']}; giving it no quota",
             file=sys.stderr,
         )
         return 0
+    if max_nodes is not None:
+        return 1
     return int(info["ready"] == info["hosts"])
 
 
@@ -315,13 +381,28 @@ def sync_shape(shape, cfg, pools, topo, live, dry_run):
         ensure_local_queue(name=name, existing=live["lqs"], dry_run=dry_run)
 
 
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--project", default=PROJECT)
+    ap.add_argument("--zone", default=ZONE)
+    ap.add_argument("--cluster", default=CLUSTER)
+    return ap.parse_args()
+
+
 def main():
-    dry_run = "--dry-run" in sys.argv
+    args = parse_args()
+    dry_run = args.dry_run
     topo = ci_topology.load()
     nodes = kget("nodes")
     if not nodes:
         sys.exit("no nodes returned -- refusing to zero every quota")
-    pools = ci_pools(nodes)
+    node_pools = gcloud_node_pools(
+        project=args.project, zone=args.zone, cluster=args.cluster
+    )
+    if not node_pools:
+        sys.exit("no node pools returned -- refusing to zero every quota")
+    pools = ci_pools(nodes=nodes, node_pools=node_pools)
     live = {
         "flavors": {
             f["spec"]["nodeLabels"][POOL_LABEL]: f["metadata"]["name"]

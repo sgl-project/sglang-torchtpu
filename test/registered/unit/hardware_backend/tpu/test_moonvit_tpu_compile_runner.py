@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.envs import envs
 from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
     MoonVitTpuCompilePolicy,
     MoonVitTpuCompileRunner,

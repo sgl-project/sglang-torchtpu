@@ -69,6 +69,38 @@ jobs:
               - 'python/sglang/test/tpu/**'
               - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
               - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'
+              # Shared diffusion files whose TPU paths (platform hooks, RoPE, compile
+              # guards) are tested only in the TPU unit lane, and the core tests the TPU
+              # wrappers import.
+              - 'python/sglang/multimodal_gen/configs/models/base.py'
+              - 'python/sglang/multimodal_gen/configs/models/vaes/base.py'
+              - 'python/sglang/multimodal_gen/configs/sample/sampling_params.py'
+              - 'python/sglang/multimodal_gen/runtime/distributed/utils.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/selector.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/parallel_conv.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/rotary_embedding/mrope.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/usp.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/lingbot_world.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/schedule_batch.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising_av.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/mova.py'
+              - 'python/sglang/multimodal_gen/configs/pipeline_configs/ltx_2.py'
+              - 'python/sglang/multimodal_gen/runtime/server_args/server_args.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_attention_backend_selector.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_compile_cache_key.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_compile_graph_breaks.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_decoding_stage_parallelism.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_ltx2_sp_padding_mask.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_server_args.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_vae_spatial_parallel_decode.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_wan_temb_table_slices.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_wan_ti2v_helpers.py'
               # Shared diffusion files carrying a TPU-only branch.
               - 'python/sglang/multimodal_gen/runtime/layers/custom_op.py'
               - 'python/sglang/multimodal_gen/runtime/layers/layernorm.py'
@@ -76,8 +108,33 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/distributed/parallel_state.py'
               - 'python/sglang/multimodal_gen/runtime/disaggregation/transport/manager.py'
               - 'python/sglang/multimodal_gen/runtime/managers/memory_managers/layerwise_offload.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/denoising.py'
+              # Shared files sglang_tpu/multimodal_gen/minimax_h3.py patches or imports.
+              - 'python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/packed_sequence.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/comfyui_step.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
+              - 'python/sglang/multimodal_gen/runtime/models/encoders/minimax_h3_qwen3vl.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_minimax_h3_encoder_device.py'
               - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
+              # Shared diffusion files behind the TPU-only platform hooks (SPMD-safe
+              # regions, fusion barrier, request drain), and their core test.
+              - 'python/sglang/multimodal_gen/runtime/managers/gpu_worker.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/base.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py'
+              - 'python/sglang/multimodal_gen/runtime/platforms/interface.py'
+              - 'python/sglang/multimodal_gen/runtime/utils/torch_compile.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_spmd_safe_regions.py'
+              # Shared diffusion files behind Ulysses head padding and the Wan SP
+              # tail-pad mask, and the core tests the TPU wrappers import.
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/layer.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
+              # LTX-2 two-stage placement on platforms whose subgroup collectives need every rank.
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising_av.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_ltx2_two_stage_cfg_parallel.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
@@ -168,6 +225,8 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      # Both PR suites use a 40-minute execution budget by default.
+      execution_budget_minutes: ${{ fromJSON(vars.TPU_PR_GATE_BUDGET_MINUTES || '40') }}
       # The PR gate runs the plugin platform (mode B); nightly lanes cover mode A.
       platform: tpu_oot
       # Most unit tests are registered chips=1 and run four at a time, each
@@ -185,6 +244,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      execution_budget_minutes: ${{ fromJSON(vars.TPU_PR_GATE_BUDGET_MINUTES || '40') }}
       platform: tpu_oot
       weights_pvc: model-weights
     permissions:

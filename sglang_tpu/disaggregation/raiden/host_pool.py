@@ -10,7 +10,10 @@ issuing pulls the pool cannot seat.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class StagingAdmission:
@@ -34,13 +37,17 @@ class StagingAdmission:
         capacity: int,
         swa_capacity: Optional[int] = None,
         state_capacity: Optional[int] = None,
+        draft_capacity: Optional[int] = None,
     ):
         self.capacity = max(1, int(capacity))
         self.swa_capacity = None if swa_capacity is None else max(1, int(swa_capacity))
         self.state_capacity = (
             None if state_capacity is None else max(1, int(state_capacity))
         )
-        self._in_flight: Dict[Any, Tuple[int, int, int]] = {}
+        self.draft_capacity = (
+            None if draft_capacity is None else max(1, int(draft_capacity))
+        )
+        self._in_flight: Dict[Any, Tuple[int, int, int, int]] = {}
         self._waiting: Optional[Any] = None
 
     def __len__(self) -> int:
@@ -55,32 +62,45 @@ class StagingAdmission:
         return self._waiting
 
     def pages(self) -> int:
-        return sum(pages for pages, _, _ in self._in_flight.values())
+        return sum(pages for pages, _, _, _ in self._in_flight.values())
 
     def swa_pages(self) -> int:
-        return sum(swa_pages for _, swa_pages, _ in self._in_flight.values())
+        return sum(swa_pages for _, swa_pages, _, _ in self._in_flight.values())
 
     def state_pages(self) -> int:
-        return sum(state_pages for _, _, state_pages in self._in_flight.values())
+        return sum(state_pages for _, _, state_pages, _ in self._in_flight.values())
+
+    def draft_pages(self) -> int:
+        return sum(draft_pages for _, _, _, draft_pages in self._in_flight.values())
 
     def admit(
-        self, key: Any, pages: int, swa_pages: int = 0, state_pages: int = 0
+        self,
+        key: Any,
+        pages: int,
+        swa_pages: int = 0,
+        state_pages: int = 0,
+        draft_pages: int = 0,
     ) -> bool:
         """Reserves ``pages`` of the pool (``swa_pages`` of the sliding-window
-        pool, ``state_pages`` of the GDN state pool) for ``key``. False means
-        try again later."""
+        pool, ``state_pages`` of the GDN state pool, plus any draft pool) for
+        ``key``. False means try again later."""
         if key in self._in_flight:
             return True
-        pages, swa_pages, state_pages = int(pages), int(swa_pages), int(state_pages)
+        pages = int(pages)
+        swa_pages = int(swa_pages)
+        state_pages = int(state_pages)
+        draft_pages = int(draft_pages)
         if (
             pages > self.capacity
             or _exceeds(swa_pages, self.swa_capacity)
             or _exceeds(state_pages, self.state_capacity)
+            or _exceeds(draft_pages, self.draft_capacity)
         ):
             raise ValueError(
                 f"read {key!r} needs {pages} pages, {swa_pages} sliding-window "
-                f"pages and {state_pages} state rows, more than the pool holds "
-                f"({self.capacity}, {self.swa_capacity} and {self.state_capacity})"
+                f"pages, {state_pages} state rows and {draft_pages} draft pages, "
+                f"more than the pool holds ({self.capacity}, {self.swa_capacity}, "
+                f"{self.state_capacity} and {self.draft_capacity})"
             )
         if self._waiting is not None and self._waiting != key:
             return False
@@ -91,11 +111,15 @@ class StagingAdmission:
                 state_pages > 0
                 and self.state_pages() + state_pages > self.state_capacity
             )
+            or (
+                draft_pages > 0
+                and self.draft_pages() + draft_pages > self.draft_capacity
+            )
         ):
             self._waiting = key
             return False
         self._waiting = None
-        self._in_flight[key] = (pages, swa_pages, state_pages)
+        self._in_flight[key] = (pages, swa_pages, state_pages, draft_pages)
         return True
 
     def release(self, key: Any) -> None:
@@ -114,12 +138,14 @@ def _exceeds(pages: int, capacity: Optional[int]) -> bool:
     return pages > 0 and (capacity is None or pages > capacity)
 
 
-def slot_host_bytes(kv_caches: List[Any], max_blocks: int) -> int:
+def slot_host_bytes(
+    kv_caches: List[Any], max_blocks: int, layers: Optional[int] = None
+) -> int:
     """Host staging bytes one transfer slot reserves.
 
-    Raiden allocates ``max_blocks`` pages of host memory for every layer, so a
-    slot costs the widest layer's page times the layer count times the per-slot
-    block budget.
+    Raiden allocates ``max_blocks`` pages of host memory for each of ``layers``
+    host buffers, every layer by default, so a slot costs the widest layer's
+    page times the buffer count times the per-slot block budget.
     """
     page_bytes = 0
     for buf in kv_caches:
@@ -127,7 +153,29 @@ def slot_host_bytes(kv_caches: List[Any], max_blocks: int) -> int:
         for dim in buf.shape[1:]:
             layer_bytes *= int(dim)
         page_bytes = max(page_bytes, layer_bytes)
-    return page_bytes * len(kv_caches) * max_blocks
+    return page_bytes * (len(kv_caches) if layers is None else layers) * max_blocks
+
+
+# SWA and state slots per full-attention slot, for dynamic staging only (fixed
+# slots use one). Shorter transfers share full-attention pages, but each fills
+# a whole window. Picked by hand, not measured. Ideally about the typical
+# prefill length over the sliding window, so SWA slots don't cap concurrent
+# transfers.
+WINDOW_SLOTS_PER_FULL_SLOT = 8
+
+
+def split_staging_layers(layers: Sequence[int], total: int) -> List[int]:
+    """Host layer buffers per engine, ``total`` split roughly by layer count. 0
+    keeps every layer.
+
+    For example, Muse Spark has 16 full-attention and 46 SWA layers, so
+    ``split_staging_layers([16, 46], 8)`` returns ``[2, 6]``, and a total of 0
+    returns ``[16, 46]``. One buffer runs each layer's copy and send back to
+    back, two overlap them.
+    """
+    if total <= 0:
+        return list(layers)
+    return [min(n, max(1, round(total * n / sum(layers)))) for n in layers]
 
 
 def ranks_per_node(
@@ -179,16 +227,17 @@ def node_worker_rank(
 
 
 def slots_within_budget(budget_bytes: float, slot_bytes: int, ceiling: int) -> int:
-    """Slots that fit ``budget_bytes``, at most ``ceiling``.
+    """Slots that fit ``budget_bytes``, at most ``ceiling`` and at least one.
 
-    Raises ``ValueError`` when not even one slot fits: the pool cannot be
-    allocated within the budget, so the configuration has to change.
+    One slot that does not fit is still allocated, over the budget, so a
+    max-length transfer can always run.
     """
     if slot_bytes > budget_bytes:
-        raise ValueError(
-            "raiden host staging: one transfer slot needs "
-            f"{slot_bytes / 1024**3:.2f} GiB but this engine's share of "
-            f"SGLANG_RAIDEN_HOST_POOL_GB is {budget_bytes / 1024**3:.2f} GiB; "
-            "raise SGLANG_RAIDEN_HOST_POOL_GB or lower the context length"
+        logger.warning(
+            "raiden host staging: one transfer slot needs %.2f GiB, over this "
+            "engine's %.2f GiB share of SGLANG_RAIDEN_HOST_POOL_GB; allocating "
+            "one slot anyway",
+            slot_bytes / 1024**3,
+            budget_bytes / 1024**3,
         )
     return max(1, min(ceiling, int(budget_bytes // max(1, slot_bytes))))

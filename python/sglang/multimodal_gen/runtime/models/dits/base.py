@@ -27,6 +27,12 @@ class BaseDiT(nn.Module, ABC):
     # validated against platform and layer capabilities instead of this set.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
+    # True only if every SP rank runs each _compile_conditions region with the
+    # same shapes, strides, storage offsets and non-tensor arguments: the
+    # platform may then keep a region's collectives in one compiled program
+    # (prepare_spmd_region_wrapper), which hangs or exchanges wrong data when
+    # the ranks' programs differ.
+    _compile_regions_spmd_safe: bool = False
     # Methods that drive a forward pass without going through __call__. FSDP2
     # only unshards around the wrapped module's own forward, so anything the
     # shard conditions left in the root group stays sharded unless the entry
@@ -34,6 +40,7 @@ class BaseDiT(nn.Module, ABC):
     _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
+    lora_param_names_mapping: dict = {}
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
@@ -44,7 +51,9 @@ class BaseDiT(nn.Module, ABC):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.AITER_QUANT,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.AMX_ATTN,
         AttentionBackendEnum.VIDEO_SPARSE_ATTN,
         AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
         AttentionBackendEnum.VMOBA_ATTN,

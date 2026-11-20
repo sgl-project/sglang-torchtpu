@@ -13,8 +13,9 @@ import importlib
 import os
 from collections.abc import Sequence
 
-from sglang.srt.environ import envs
+from sglang._lazy_import import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs
 
 logger = get_logger(__name__)
 
@@ -72,6 +73,9 @@ def _register_tpu_compile_backend() -> None:
 
 
 _tpu_sampler_backend_registered = False
+# This module is also imported before worker bootstrap prepares TorchTPU.
+_output_topk = LazyImport("sglang.kernels.ops.sampling", "output_topk")
+_output_logprob_topk = LazyImport("sglang_tpu.top_k", "output_logprob_topk")
 
 
 def _register_tpu_sampler_backend() -> None:
@@ -86,6 +90,10 @@ def _register_tpu_sampler_backend() -> None:
     from sglang_tpu.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
+    output_topk = _output_topk._load()
+    output_topk.register_oot_forward(
+        type(output_topk), _output_logprob_topk._load(), "tpu"
+    )
     _tpu_sampler_backend_registered = True
 
 
@@ -344,6 +352,18 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # aten::logaddexp -- no TPU kernel (torch_tpu 0.2.0rc4, libtpu 0.0.50:
+    # aten::logaddexp.out is not implemented); the ring-attention LSE merges
+    # use it.
+    @torch.library.register_kernel("aten::logaddexp", "PrivateUse1")
+    def _logaddexp(self, other):
+        # CPU's formulation: max + log1p(exp(-|a - b|)). Equal inputs (both
+        # -inf or both +inf included) would give inf - inf = NaN, so their gap
+        # is 0 and the result is max + log(2), still -inf or +inf.
+        peak = torch.maximum(self, other)
+        gap = torch.where(self == other, torch.zeros_like(peak), -(self - other).abs())
+        return peak + torch.log1p(torch.exp(gap))
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -360,7 +380,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, upsample_bicubic2d"
+        "masked_scatter_, logaddexp, upsample_bicubic2d"
     )
 
 
@@ -643,6 +663,7 @@ _PALLAS_TPU_BACKENDS = (
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
     "pallas_tpu_mla_sparse",
+    "flywheel",
 )
 
 
@@ -668,16 +689,16 @@ def _patch_support_triton_for_tpu() -> None:
         return
     _support_triton_patched = True
 
-    import sglang.srt.utils.common as _utils_common
+    import sglang.srt.utils.triton_utils as _triton_utils
 
-    orig = _utils_common.support_triton
+    orig = _triton_utils.support_triton
 
     def support_triton(backend: str) -> bool:
         if backend in _PALLAS_TPU_BACKENDS:
             return False
         return orig(backend)
 
-    _utils_common.support_triton = support_triton
+    _triton_utils.support_triton = support_triton
 
     # Rebind the by-value imports (and the package re-export).
     for modname in (
@@ -738,13 +759,15 @@ _future_map_direct_handoff_patched = False
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
     unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu.
+    stash also keeps the chain drafter's DSA top-k seeds out of FutureMap."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang_tpu.experimental import is_experimental_chain
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
@@ -759,6 +782,10 @@ def _patch_future_map_direct_handoff() -> None:
     FutureMap.tpu_published_seq_lens = None
 
     def stash(self, future_indices, payload):
+        if is_experimental_chain(self.spec_algo):
+            # The chain drafter keeps its DSA seeds in a req-pool-indexed table. A PD
+            # prefill's draft input holds them at the extend cap only for core to ship.
+            payload.dsa_topk_indices = None
         if not stash_tpu(self, future_indices, payload):
             orig_stash(self, future_indices, payload)
 
@@ -838,12 +865,12 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     # Each polled request's time stats -> its sender, during the poll only.
     polled_senders = {}
     orig_poll = (
-        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue
+        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue
     )
     orig_set_finish = SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
 
-    def process_disagg_prefill_inflight_queue(self, *args, **kwargs):
-        for req in self.disagg_prefill_inflight_queue:
+    def process_disagg_prefill_transfer_queue(self, *args, **kwargs):
+        for req in self.disagg_prefill_transfer_queue:
             polled_senders[id(req.time_stats)] = req.disagg_kv_sender
         try:
             return orig_poll(self, *args, **kwargs)
@@ -859,12 +886,22 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
                 ts = max(finish, self.prefill_transfer_queue_entry_time)
         orig_set_finish(self, ts)
 
-    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue = (
-        process_disagg_prefill_inflight_queue
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue = (
+        process_disagg_prefill_transfer_queue
     )
     SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = (
         set_prefill_kv_transfer_finish_time
     )
+
+
+def _install_hybrid_linear_hicache() -> None:
+    """Offload GDN/KDA models' KV and recurrent state through a TPU DMA engine.
+
+    Registers a host stack strategy; see ``hybrid_linear_hicache``.
+    """
+    from sglang_tpu import hybrid_linear_hicache
+
+    hybrid_linear_hicache.install()
 
 
 def _patch_pd_decode_swa_hicache() -> None:
@@ -888,6 +925,16 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_hicache_async_ready_counts() -> None:
+    """Defer the TP ready-count reduce by one step so the scheduler never waits on rank skew.
+
+    See ``hicache_async_ready_counts``.
+    """
+    from sglang_tpu import hicache_async_ready_counts
+
+    hicache_async_ready_counts.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -896,6 +943,24 @@ def _patch_pd_decode_async_prefill_info() -> None:
     from sglang_tpu import pd_decode_async_prefill_info
 
     pd_decode_async_prefill_info.install()
+
+
+def _patch_prefill_kv_offload_to_decode_dram() -> None:
+    """Offload cold prefill KV to the decode's host RAM, as a tier below the
+    prefill's own host RAM (the HiCache L2 extension of the P/D pair).
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in
+    disaggregation/decode_dram_offload/dram_offload_hooks.py (``_patch_targets``).
+    Upstream PR or issue: none yet; tracked with the hooks module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the modules' imports.
+    if not envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+        return
+    from sglang_tpu.disaggregation.decode_dram_offload import dram_offload_hooks
+
+    dram_offload_hooks.install()
 
 
 def _patch_host_heap_trim() -> None:
@@ -918,39 +983,71 @@ def _patch_profile_auto() -> None:
     profile_auto.install()
 
 
-def _patch_scheduler_reject_prompt_logprob() -> None:
-    """Finish prompt-logprob requests the compiled forward cannot serve with a
-    400 at scheduler intake, instead of raising inside the forward.
+def _scheduler_intake_rejection(scheduler, req) -> str | None:
+    """Why this server cannot serve ``req``, or None if it can.
 
-    Same shape as the scheduler's MLX check: a logprob_start_len inside the
-    prompt asks for input logprobs. The answer comes from the shim, so intake
-    and forward cannot disagree.
+    Each check is a request the compiled forward would otherwise fail inside
+    the scheduler loop (taking the server down) instead of answering with a
+    400.
     """
-    from sglang.srt.managers.scheduler import Scheduler
     from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
 
+    if (
+        req.return_logprob
+        # -1 means output logprobs only; any other start below the prompt
+        # length asks for prompt logprobs.
+        and req.logprob_start_len != -1
+        and req.logprob_start_len < len(req.origin_input_ids)
+    ):
+        # Same shape as the scheduler's MLX check. The answer comes from the
+        # shim, so intake and forward cannot disagree.
+        rejection = CompiledForwardShim._prompt_logprob_rejection(
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        )
+        if rejection is not None:
+            return rejection
+    if req.return_logprob:
+        # The experimental TPU spec worker raises on a logprob batch. Ask the
+        # worker class, not scheduler.draft_worker: every rank must reach the
+        # same answer, and PP stages other than the last have no draft worker.
+        spec_algorithm = getattr(scheduler, "spec_algorithm", None)
+        if spec_algorithm is not None and not spec_algorithm.is_none():
+            worker_cls = spec_algorithm.create_worker(scheduler.server_args)
+            if not getattr(worker_cls, "supports_logprobs", True):
+                return (
+                    f"Speculative decoding on this server ({worker_cls.__name__}) "
+                    "does not support logprobs; resend without return_logprob."
+                )
+    if req.multimodal_inputs is not None and envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+        # Only the token-id EXTEND graphs are warmed and compilation is frozen
+        # after warmup, so an input_embeds forward would hit fail_on_recompile.
+        return (
+            "This server serves text only (SGLANG_TPU_VL_TEXT_ONLY_EXTEND=1); "
+            "multimodal inputs are not supported."
+        )
+    return None
+
+
+def _patch_scheduler_reject_unservable_requests() -> None:
+    """Finish requests the compiled forward cannot serve with a 400 at
+    scheduler intake, instead of raising inside the forward.
+
+    See ``_scheduler_intake_rejection`` for the checks.
+    """
+    from sglang.srt.managers.scheduler import Scheduler
+
     original = Scheduler._add_request_to_queue
-    if getattr(original, "_tpu_prompt_logprob_gate", None) is True:
+    if getattr(original, "_tpu_intake_gate", None) is True:
         return
 
     def _add_request_to_queue(self, req, is_retracted: bool = False):
-        if (
-            not is_retracted
-            and req.to_finish is None
-            and req.return_logprob
-            # -1 means output logprobs only; any other start below the prompt
-            # length asks for prompt logprobs.
-            and req.logprob_start_len != -1
-            and req.logprob_start_len < len(req.origin_input_ids)
-        ):
-            rejection = CompiledForwardShim._prompt_logprob_rejection(
-                envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
-            )
+        if not is_retracted and req.to_finish is None:
+            rejection = _scheduler_intake_rejection(self, req)
             if rejection is not None:
                 req.set_finish_with_abort(rejection)
         return original(self, req, is_retracted)
 
-    _add_request_to_queue._tpu_prompt_logprob_gate = True
+    _add_request_to_queue._tpu_intake_gate = True
     Scheduler._add_request_to_queue = _add_request_to_queue
 
 
@@ -974,11 +1071,14 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
+    _patch_prefill_kv_offload_to_decode_dram()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
     install_benchmark_batch_gate()
     _patch_host_heap_trim()
     _patch_profile_auto()
-    _patch_scheduler_reject_prompt_logprob()
+    _patch_scheduler_reject_unservable_requests()

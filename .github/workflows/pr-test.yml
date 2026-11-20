@@ -157,7 +157,12 @@ jobs:
               {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
             ]
-          max-wait-minutes: '480'
+          # 10 min under the 6h GitHub-hosted job cap: setup needs under 2 min, the rest is margin;
+          # timeout-minutes cannot raise the cap, and a wait killed by it ends `cancelled`.
+          max-wait-minutes: '350'
+          # pr-test-finish fails the run on any base-b failure, so this gate only saves GPU time;
+          # a slow base-b lets base-c start rather than costing the base-c run.
+          fail-on-timeout: 'false'
 
   # =============================================== PR Gate ====================================================
   call-gate:
@@ -171,7 +176,7 @@ jobs:
         needs.check-changes.outputs.sgl_kernel == 'true' ||
         needs.check-changes.outputs.jit_kernel == 'true' ||
         needs.check-changes.outputs.multimodal_gen == 'true' ||
-        needs.check-changes.outputs.renderer == 'true'
+        needs.check-changes.outputs.processor == 'true'
       )
     uses: ./.github/workflows/pr-gate.yml
     with:
@@ -237,7 +242,10 @@ jobs:
     #
     # !cancelled() so a skipped call-gate does not take this job with it, since a
     # docs-only PR still installs sglang in every stage.
-    if: |
+    # [Do Not Upstream] The fork guard is part of the shared &build-gate anchor,
+    # so rust-ext-build-aarch64 and both sgl-router builds skip here too: their
+    # only consumers are GPU stages, which this fork skips.
+    if: &build-gate |
       github.repository != 'sgl-project/sglang-torchtpu' &&
       !cancelled() &&
       needs.check-changes.result == 'success' &&
@@ -251,34 +259,39 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   # gb300 is Grace, and PyO3 modules are portable across neither arch nor
   # interpreter, so it can use nothing the job above builds.
   rust-ext-build-aarch64:
     needs: [check-changes, call-gate]
-    # Same gate as rust-ext-build: every main-ref run has to seed the cache, and a
-    # docs-only PR still installs sglang on gb300.
-    # [Do Not Upstream] Its only consumer (gb300) is GPU CI, which this fork skips.
-    if: |
-      github.repository != 'sgl-project/sglang-torchtpu' &&
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.multimodal_gen != 'true' ||
-       needs.check-changes.outputs.main_package == 'true' ||
-       needs.check-changes.outputs.jit_kernel == 'true' ||
-       needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: *build-gate
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04-arm
       collect_runs_on: ubuntu-22.04-arm
       artifact_name: rust-ext-aarch64
-      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      cache_key_prefix: rust-ext-aarch64-cp312
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
+    secrets: inherit
+
+  sgl-router-build:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04
+      git_ref: ${{ inputs.git_ref || '' }}
+    secrets: inherit
+
+  sgl-router-build-aarch64:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   call-sgl-kernel-tests:
@@ -322,6 +335,7 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
     secrets: inherit
 
   # =============================================== primary ====================================================
@@ -369,8 +383,9 @@ jobs:
 
   base-b-test:
     name: base-b-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
+    # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -390,6 +405,7 @@ jobs:
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build.outputs.artifact_name }}
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -402,9 +418,10 @@ jobs:
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
-      runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
+      multimodal_gen_server: ${{ needs.check-changes.outputs.multimodal_gen_server }}
+      diffusion_sm103: ${{ needs.check-changes.outputs.diffusion_sm103 }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       git_ref: ${{ inputs.git_ref || '' }}
@@ -415,27 +432,15 @@ jobs:
 
   base-c-test:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
+    # wait-for-base-a is listed only to read its result: when it is cancelled,
+    # wait-for-base-b ends `skipped`, which alone would let this stage through.
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {
-              runner_config: 4-gpu-h100,
-              run_timeout: '30',
-              timeout_per_file: '',
-              warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4',
-              warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4',
-            }
-          - {
-              runner_config: 8-gpu-h200,
-              run_timeout: '30',
-              timeout_per_file: '1800',
-              warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8',
-              warmup_timeout: '60',
-            }
-          - { runner_config: 8-gpu-h20, run_timeout: '30', timeout_per_file: '' }
+          - { runner_config: 4-gpu-h100, run_timeout: '30', timeout_per_file: '' }
           - { runner_config: 4-gpu-b200, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 8-gpu-b300, run_timeout: '60', timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
@@ -447,23 +452,21 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
-      warmup_deep_gemm_models: ${{ matrix.warmup_deep_gemm_models }}
-      warmup_server_models: ${{ matrix.warmup_server_models }}
-      # Rows that do not set it keep _pr-test-stage.yml's own default.
-      warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build.outputs.artifact_name }}
     secrets: inherit
 
   # Separate only because `needs` cannot vary per matrix row: this stage takes
   # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64, sgl-router-build-aarch64]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - { runner_config: 2-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -475,6 +478,7 @@ jobs:
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   # List every build and test job: `skipped` passes here, so an omission turns that
@@ -491,6 +495,8 @@ jobs:
 
         rust-ext-build,
         rust-ext-build-aarch64,
+        sgl-router-build,
+        sgl-router-build-aarch64,
 
         wait-for-base-a,
         wait-for-base-b,

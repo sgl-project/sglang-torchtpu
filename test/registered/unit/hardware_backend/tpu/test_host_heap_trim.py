@@ -8,6 +8,7 @@ import sys
 import threading
 import unittest
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -24,8 +25,18 @@ register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class _Scheduler:
-    def __init__(self):
+    def __init__(self, enable_hierarchical_cache=False):
         self.calls = []
+        self.enable_hierarchical_cache = enable_hierarchical_cache
+
+    def init_model_worker(self):
+        self.init_all_cuda_graphs()
+        self.calls.append("sampling warmup")
+        return "initialized"
+
+    def init_all_cuda_graphs(self):
+        self.calls.append("graphs")
+        return "graphs initialized"
 
     def get_init_info(self):
         self.calls.append("ready")
@@ -90,11 +101,15 @@ class TestInstall(CustomTestCase):
         enter_scope(self, patch.dict(sys.modules, {"jax": self.jax}))
         enter_scope(self, patch.object(tpu, "_release_cpu_backend"))
         directory = enter_scope(self, TemporaryDirectory())
-        (Path(directory) / "weights.safetensors").write_bytes(b"payload")
+        self.directory = Path(directory)
+        (self.directory / "weights.safetensors").write_bytes(b"payload")
         enter_scope(self, get_context().override_server_args(model_path=directory))
         self.group = MagicMock(local_rank=0)
         enter_scope(self, get_parallel().override(world_group=self.group))
-        enter_scope(self, patch.object(page_cache, "resolve_compilations", MagicMock()))
+        self.join_writers = enter_scope(
+            self, patch.object(page_cache, "resolve_compilations", MagicMock())
+        )
+        enter_scope(self, patch.object(page_cache, "_checkpoint_release", None))
         self.advise = enter_scope(self, patch.object(page_cache.os, "posix_fadvise"))
         enter_scope(self, tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False))
         enter_scope(self, patch.dict(os.environ, {"LOCAL_RANK": "0"}))
@@ -170,7 +185,9 @@ class TestInstall(CustomTestCase):
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
-            self.cls().handle_freeze_gc("req")
+            scheduler = self.cls()
+            scheduler.get_init_info()
+            scheduler.handle_freeze_gc("req")
         trim.assert_not_called()
         self.clear.assert_not_called()
         clear_jax.assert_not_called()
@@ -193,15 +210,194 @@ class TestInstall(CustomTestCase):
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
         wrapped_init_info = self.cls.get_init_info
+        wrapped_graphs = self.cls.init_all_cuda_graphs
+        wrapped_worker = self.cls.init_model_worker
         tpu.install(scheduler_cls=self.cls)
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
         self.assertIs(self.cls.get_init_info, wrapped_init_info)
+        self.assertIs(self.cls.init_all_cuda_graphs, wrapped_graphs)
+        self.assertIs(self.cls.init_model_worker, wrapped_worker)
+
+    def test_hicache_waits_for_cleanup_without_freezing_gc(self):
+        scheduler = self.cls(enable_hierarchical_cache=True)
+        gc.disable()
+        self.addCleanup(gc.enable)
+        node = _Node()
+        node.ref = node
+        alive = weakref.ref(node)
+        del node
+        self.group.barrier.side_effect = lambda: scheduler.calls.append("barrier")
+        with (
+            patch.object(tpu, "start_checkpoint_page_cache_release"),
+            patch.object(
+                tpu,
+                "release_startup_page_cache",
+                side_effect=lambda **_: scheduler.calls.append("files"),
+            ) as release_files,
+            patch.object(self.jax, "clear_caches"),
+            patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
+            patch.object(tpu.gc, "freeze") as freeze,
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+        ):
+            self.assertEqual(scheduler.init_model_worker(), "initialized")
+            scheduler.calls.append("allocate HiCache")
+        self.assertIsNone(alive())
+        freeze.assert_not_called()
+        release_files.assert_called_once_with(
+            include_checkpoints=True, synchronize=True
+        )
+        self.clear.assert_called_once_with()
+        self.assertEqual(
+            scheduler.calls,
+            [
+                "graphs",
+                "sampling warmup",
+                "files",
+                "before HiCache",
+                "barrier",
+                "allocate HiCache",
+            ],
+        )
+
+    def test_early_cleanup_only_runs_for_hicache_and_propagates_failures(self):
+        with (
+            patch.object(tpu, "start_checkpoint_page_cache_release"),
+            patch.object(
+                tpu,
+                "release_before_hicache",
+                side_effect=RuntimeError("cache save failed"),
+            ) as cleanup,
+        ):
+            self.assertEqual(self.cls().init_model_worker(), "initialized")
+            cleanup.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "cache save failed"):
+                self.cls(enable_hierarchical_cache=True).init_model_worker()
+        self.clear.assert_not_called()
+
+    def test_pp_freeze_cleans_up_without_a_world_barrier(self):
+        # PP stages dispatch the freeze in different loop iterations.
+        with (
+            get_parallel().override(pp_size=2),
+            patch.object(page_cache, "release_compile_artifacts") as release,
+            patch.object(tpu, "trim_host_heap"),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
+        ):
+            self.cls().handle_freeze_gc("req")
+        self.group.barrier.assert_not_called()
+        self.advise.assert_not_called()
+        release.assert_called_once_with(native_only=True)
 
     def test_startup_releases_files_without_a_freeze_request(self):
         scheduler = self.cls()
         self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
         self.advise.assert_called_once()
         self.assertEqual(scheduler.calls, ["ready"])
+
+    def test_startup_phases_release_checkpoints_once(self):
+        cache_root = self.directory / "compiler"
+        active = cache_root / "active"
+        active.mkdir(parents=True)
+        artifact = active / "graph.bin"
+        artifact.write_bytes(b"initial warmup")
+        checkpoint_inode = (self.directory / "weights.safetensors").stat().st_ino
+        for mode, hicache, pp_size in (
+            ("serial", False, 1),
+            ("overlap", False, 1),
+            ("serial", True, 1),
+            ("overlap", True, 1),
+            ("serial", True, 2),
+            ("overlap", True, 2),
+        ):
+            with (
+                self.subTest(mode=mode, hicache=hicache, pp_size=pp_size),
+                get_context().override_server_args(
+                    model_path=str(self.directory), startup_weight_load_mode=mode
+                ),
+                get_parallel().override(pp_size=pp_size),
+                tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(True),
+                tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
+                tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
+                patch.object(page_cache, "_CACHE_ROOT", cache_root),
+                patch.object(page_cache, "_filesystem_type", return_value="ext4"),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TORCH_TPU_TIER2_COMPILATION_CACHE": "active",
+                        "TORCHINDUCTOR_CACHE_DIR": "",
+                        "JAX_COMPILATION_CACHE_DIR": "",
+                    },
+                ),
+            ):
+                advised = []
+                self.advise.side_effect = lambda fd, *_: advised.append(
+                    os.fstat(fd).st_ino
+                )
+                self.join_writers.reset_mock()
+                self.group.barrier.reset_mock()
+                scheduler = self.cls(enable_hierarchical_cache=hicache)
+                self.assertEqual(scheduler.init_model_worker(), "initialized")
+                # Preserve checkpoint-reader and compiler-writer barriers;
+                # only the final early-cleanup barrier is skipped under PP.
+                self.assertEqual(
+                    self.group.barrier.call_count,
+                    1 + int(hicache) + int(hicache and pp_size == 1),
+                )
+                initial_cleanups = 2 if hicache else 1
+                self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
+                self.assertEqual(advised.count(checkpoint_inode), 1)
+                self.assertEqual(
+                    advised.count(artifact.stat().st_ino), initial_cleanups
+                )
+                artifact.write_bytes(b"HTTP warmup")
+                self.group.barrier.reset_mock()
+                self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
+                self.assertEqual(
+                    self.group.barrier.call_count, 2 if pp_size == 1 else 0
+                )
+                self.assertEqual(advised.count(checkpoint_inode), 1)
+                self.assertEqual(
+                    advised.count(artifact.stat().st_ino), initial_cleanups + 1
+                )
+                self.assertEqual(self.join_writers.call_count, initial_cleanups + 1)
+                self.assertEqual(
+                    scheduler.calls, ["graphs", "sampling warmup", "ready", "req"]
+                )
+                self.assertIsNone(page_cache._checkpoint_release)
+                gc.unfreeze()
+
+    def test_ready_waits_for_background_checkpoint_advice_and_propagates_errors(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                entered, release, joining = (threading.Event() for _ in range(3))
+
+                def advise(*_):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                    if fail:
+                        raise OSError("checkpoint advice failed")
+
+                self.advise.side_effect = advise
+                self.join_writers.side_effect = lambda _: joining.set()
+                scheduler = self.cls()
+                scheduler.init_all_cuda_graphs()
+                self.assertTrue(entered.wait(5))
+                with ThreadPoolExecutor(1) as pool:
+                    ready = pool.submit(scheduler.get_init_info)
+                    try:
+                        self.assertTrue(joining.wait(5))
+                        self.assertFalse(ready.done())
+                        self.assertEqual(scheduler.calls, ["graphs"])
+                    finally:
+                        release.set()
+                    if fail:
+                        with self.assertRaisesRegex(
+                            OSError, "checkpoint advice failed"
+                        ):
+                            ready.result(timeout=5)
+                        self.assertEqual(scheduler.calls, ["graphs"])
+                    else:
+                        self.assertEqual(ready.result(timeout=5), {"status": "ready"})
 
     def test_startup_cleanup_failure_prevents_ready_handshake(self):
         scheduler = self.cls()

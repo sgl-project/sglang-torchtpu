@@ -48,11 +48,12 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     get_kv_transfer_buf_infos,
     setup_state_kv_args,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.common import (
@@ -123,8 +124,9 @@ class _InMemoryKVCacheManager:
         num_slots: int,
         timeout_s: float = 30.0,
         parallelism: int = 1,
+        num_staging_layers: int | None = None,
     ) -> None:
-        del node_id, timeout_s, parallelism
+        del node_id, timeout_s, parallelism, num_staging_layers
         self.registry = registry
         self.kv_caches = list(kv_caches)
         self.port = int(local_control_port)
@@ -264,7 +266,6 @@ def _make_dsv4_pool(
     override = get_context().override_server_args(
         host="127.0.0.1",
         disaggregation_bootstrap_port=bootstrap_port,
-        dsv4_attn_backend="tpu_dsv4",
         page_size=256,
         tp_size=1,
         dp_size=1,
@@ -334,7 +335,11 @@ class TestDSV4RaidenDisaggregation(CustomTestCase):
     def _build_kv_args_and_aux(
         self, pool: DSV4TPUTokenToKVPool, *, port: int
     ) -> tuple[KVArgs, ctypes.Array]:
-        ptrs, lens, item_lens = get_kv_transfer_buf_infos(pool)
+        # PD peers register a static pool through the storage the scheduler
+        # builds over its allocator (`kv_storage_of`).
+        allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+        storage = StaticKVStorage(None, allocator)
+        ptrs, lens, item_lens = get_kv_transfer_buf_infos(storage)
 
         aux_buf = (ctypes.c_int32 * 8)()
         kv_args = KVArgs()
@@ -343,7 +348,7 @@ class TestDSV4RaidenDisaggregation(CustomTestCase):
         kv_args.kv_data_lens = lens
         kv_args.kv_item_lens = item_lens
         kv_args.kv_cache_dtype_str = "bf16"
-        setup_state_kv_args(kv_args, pool)
+        setup_state_kv_args(kv_args, storage)
         kv_args.aux_data_ptrs = [ctypes.addressof(aux_buf)]
         kv_args.aux_data_lens = [ctypes.sizeof(aux_buf)]
         kv_args.aux_item_lens = [ctypes.sizeof(ctypes.c_int32)]
@@ -701,7 +706,11 @@ class TestDSV4RaidenDisaggregation(CustomTestCase):
         with (
             patch.dict(sys.modules, _fake_tpu_sync_modules(registry)),
             patch.dict("os.environ", {"SGLANG_RAIDEN_KV_PORT": str(port_base)}),
-            patch.object(RaidenKVManager, "_num_slots", return_value=3),
+            patch.object(
+                RaidenKVManager,
+                "_size_host_staging",
+                lambda self, engines, layers: [(3, n) for n in layers],
+            ),
         ):
             mgr = RaidenKVManager(kv_args, DisaggregationMode.DECODE, server_args)
             mgr.set_kv_caches(get_raiden_kv_caches(pool))

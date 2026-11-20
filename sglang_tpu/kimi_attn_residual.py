@@ -36,37 +36,75 @@ _DECODE_MAX_TOKENS = 16
 _DECODE_MAX_BANK_ELEMS = 16 * 9 * 7168
 
 
-def _decode_kernel(
-    *refs, nvb: int, has_addend: bool, eps: float, out_eps: float
-) -> None:
-    if has_addend:
-        a_ref, b_ref, bank_ref, cw_ref, w_ref, out_ref, prefix_ref = refs
-        # bf16 add, rounded like the torch `prefix_a + prefix_b` it replaces.
-        prefix = (
-            a_ref[...].astype(jnp.float32) + b_ref[...].astype(jnp.float32)
-        ).astype(a_ref.dtype)
-        prefix_ref[...] = prefix
-    else:
-        a_ref, bank_ref, cw_ref, w_ref, out_ref = refs
-        prefix = a_ref[...]
-    cw = cw_ref[...]
-    values = [bank_ref[:, j, :].astype(jnp.float32) for j in range(nvb)]
-    values.append(prefix.astype(jnp.float32))
+def decode_math(
+    prefix, bank_ref, cw, w, *, nvb: int, eps: float, out_eps: float, out_dtype
+):
+    """The kernel body on loaded values: ``prefix`` bf16 [T, H] (pending add
+    already applied), ``bank_ref`` the [T, NB, H] bank ref, ``cw`` / ``w`` f32
+    [1, H]. Returns the normed mixture in ``out_dtype``. Shared with the
+    two-level all-reduce kernel that fuses this aggregation (same ops, same
+    order)."""
+    values, scores = bank_scores(bank_ref, cw, nvb=nvb, eps=eps)
+    return decode_finish(
+        prefix, values, scores, cw, w, eps=eps, out_eps=out_eps, out_dtype=out_dtype
+    )
+
+
+def _score(v, cw, eps):
     # score_j = <v_j, norm_w * proj_w> / rms(v_j): the score RMSNorm and the
     # [H] -> 1 projection folded into one f32 dot.
-    scores = [
-        jnp.sum(v * cw, axis=-1, keepdims=True)
-        * jax.lax.rsqrt(jnp.mean(v * v, axis=-1, keepdims=True) + eps)
-        for v in values
-    ]
+    return jnp.sum(v * cw, axis=-1, keepdims=True) * jax.lax.rsqrt(
+        jnp.mean(v * v, axis=-1, keepdims=True) + eps
+    )
+
+
+def bank_scores(bank_ref, cw, *, nvb: int, eps: float):
+    """The part of decode_math that does not depend on the prefix: the f32
+    bank rows and their scores (a kernel may run it before the prefix is
+    ready)."""
+    values = [bank_ref[:, j, :].astype(jnp.float32) for j in range(nvb)]
+    return values, [_score(v, cw, eps) for v in values]
+
+
+def decode_finish(prefix, values, scores, cw, w, *, eps, out_eps, out_dtype):
+    """The rest of decode_math once ``prefix`` is known."""
+    values = values + [prefix.astype(jnp.float32)]
+    scores = scores + [_score(values[-1], cw, eps)]
     m = functools.reduce(jnp.maximum, scores)
     exps = [jnp.exp(s - m) for s in scores]
     total = functools.reduce(jnp.add, exps)
     mixed = functools.reduce(jnp.add, [e * v for e, v in zip(exps, values)]) / total
     # Output RMSNorm on the bf16 mixture (RMSNorm.forward_native semantics).
-    x = mixed.astype(out_ref.dtype).astype(jnp.float32)
+    x = mixed.astype(out_dtype).astype(jnp.float32)
     x = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + out_eps)
-    out_ref[...] = (x * w_ref[...].astype(jnp.float32)).astype(out_ref.dtype)
+    return (x * w.astype(jnp.float32)).astype(out_dtype)
+
+
+def add_prefix(a, b):
+    """bf16 add, rounded like the torch ``prefix_a + prefix_b`` it replaces."""
+    return (a.astype(jnp.float32) + b.astype(jnp.float32)).astype(a.dtype)
+
+
+def _decode_kernel(
+    *refs, nvb: int, has_addend: bool, eps: float, out_eps: float
+) -> None:
+    if has_addend:
+        a_ref, b_ref, bank_ref, cw_ref, w_ref, out_ref, prefix_ref = refs
+        prefix = add_prefix(a_ref[...], b_ref[...])
+        prefix_ref[...] = prefix
+    else:
+        a_ref, bank_ref, cw_ref, w_ref, out_ref = refs
+        prefix = a_ref[...]
+    out_ref[...] = decode_math(
+        prefix,
+        bank_ref,
+        cw_ref[...],
+        w_ref[...],
+        nvb=nvb,
+        eps=eps,
+        out_eps=out_eps,
+        out_dtype=out_ref.dtype,
+    )
 
 
 def attention_residual_decode_jax(

@@ -1,0 +1,140 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: tests/kernels/test_fused_shared_expert.py
+"""Fused FP8 shared expert: dispatch envelope and bitwise parity with the
+unfused ops (two quantized matmuls around the clamped SiLU-and-mul).
+
+vLLM-TorchTPU checks parity against its torch path; SGLang has no torch op for
+it, so the TPU cases compare against this module's own unfused JAX ops,
+compiled without excess precision as torch_tpu compiles the served program.
+"""
+
+import sys
+
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "infra"],
+)
+
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from sglang_tpu import fp8_swiglu_mlp as se
+
+HIDDEN, INTER, LIMIT = 5120, 2304, 10.0
+
+
+def _abstract(tokens=288, hidden=HIDDEN, inter=INTER):
+    return (
+        jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16),
+        jax.ShapeDtypeStruct((hidden, 2 * inter), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((2 * inter,), jnp.float32),
+        jax.ShapeDtypeStruct((inter, hidden), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((hidden,), jnp.float32),
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tokens,expected,generation",
+    [(288, True, 7), (240, False, 7), (288, False, 6), (288, False, -1)],
+)
+def test_envelope(monkeypatch, tokens, expected, generation):
+    monkeypatch.setattr(se, "get_tpu_generation", lambda: generation)
+    assert se.is_supported(*_abstract(tokens)) is (expected and generation == 7)
+
+
+@pytest.mark.cpu_test
+def test_envelope_rejects_other_dims(monkeypatch):
+    monkeypatch.setattr(se, "get_tpu_generation", lambda: 7)
+    assert not se.is_supported(*_abstract(inter=2560))
+    x, w13, s13, w2, s2 = _abstract()
+    blockwise = jax.ShapeDtypeStruct((1, 40, 1, 2 * INTER), jnp.float32)
+    assert not se.is_supported(x, w13, blockwise, w2, s2)
+
+
+@pytest.mark.cpu_test
+def test_shared_expert_fuses_during_cpu_export(monkeypatch):
+    from sglang_tpu import pallas_export
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x")
+    with pallas_export.tpu_info_for_cpu_export():
+        assert se.is_supported(*_abstract())
+        graph = str(
+            jax.make_jaxpr(lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT))(*_abstract())
+        )
+        assert "fused_shared_expert_fp8" in graph
+
+
+def _weights(seed):
+    rng = np.random.default_rng(seed)
+    w13 = np.clip(rng.standard_normal((HIDDEN, 2 * INTER)) * 64, -448, 448)
+    w2 = np.clip(rng.standard_normal((INTER, HIDDEN)) * 64, -448, 448)
+    s13 = (rng.random(2 * INTER) + 0.5) * 1e-3
+    s2 = (rng.random(HIDDEN) + 0.5) * 1e-3
+    fp8 = jnp.float8_e4m3fn
+    return (
+        jnp.asarray(w13, jnp.float32).astype(fp8),
+        jnp.asarray(s13, jnp.float32),
+        jnp.asarray(w2, jnp.float32).astype(fp8),
+        jnp.asarray(s2, jnp.float32),
+    )
+
+
+def _unfused(x, w13, s13, w2, s2):
+    gate, up = jnp.split(se.xla_quantized_matmul(x, w13, s13), 2, axis=-1)
+    return se.xla_quantized_matmul(se.silu_and_mul_with_clamp(gate, up, LIMIT), w2, s2)
+
+
+_AS_SERVED = {"xla_allow_excess_precision": False}
+
+
+@pytest.mark.parametrize("tokens,seed", [(288, 0), (256, 4)])
+def test_fused_shared_expert_is_bitwise_equal(tokens, seed):
+    if jax.default_backend() != "tpu" or se.get_tpu_generation() != 7:
+        pytest.skip("the fused shared expert is measured on TPU v7 only")
+    graph = str(
+        jax.make_jaxpr(lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT))(
+            *_abstract(tokens)
+        )
+    )
+    assert ("fused_shared_expert_fp8" in graph) is (tokens == 288)
+    rng = np.random.default_rng(100 + seed)
+    x = rng.standard_normal((tokens, HIDDEN)).astype(np.float32)
+    x = jnp.asarray(x).astype(jnp.bfloat16)
+    weights = _weights(seed)
+    want = jax.jit(_unfused, compiler_options=_AS_SERVED)(x, *weights)
+    got = jax.jit(
+        lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT), compiler_options=_AS_SERVED
+    )(x, *weights)
+    got = np.asarray(got)
+    assert np.isfinite(got.astype(np.float32)).all()
+    np.testing.assert_array_equal(got.view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

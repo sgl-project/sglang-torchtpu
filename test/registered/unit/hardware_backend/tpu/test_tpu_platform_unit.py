@@ -8,15 +8,16 @@ import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.compiler.config as compiler_config
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -24,11 +25,15 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.dp_replicas import ReplicaSession
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.replica_group import ReplicaGroupCoordinator
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -139,8 +144,8 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.is_pin_memory_available())
 
     def test_cuda_graph_disabled(self):
-        self.assertFalse(self.platform.support_cuda_graph())
-        self.assertFalse(self.platform.support_piecewise_cuda_graph())
+        self.assertFalse(self.platform.capabilities.graph_capture)
+        self.assertFalse(self.platform.capabilities.piecewise_graph)
 
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())
@@ -216,6 +221,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 "sglang_tpu.tpu_platform.traced_rank._load",
                 side_effect=lambda: calls.append(("traced_rank", None)),
             ),
+            patch("sglang_tpu.tpu_platform._register_models"),
         ):
             self.platform.init_backend()
 
@@ -238,12 +244,11 @@ class TestTpuPlatformInitialization(CustomTestCase):
     def test_reentry_during_model_registration_registers_once(self):
         """init_backend re-entered while registering models (model_runner's OOT import
         hook does this) must not register the TPU models a second time."""
-        registered = []
+        session = MagicMock()
+        self.platform._dp_replica_session = session
 
-        def register(package_name):
-            registered.append(package_name)
-            if len(registered) == 1:
-                self.platform.init_backend()
+        def register():
+            self.platform.init_backend()
 
         with (
             patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
@@ -256,13 +261,51 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch("sglang_tpu.tpu_platform.rank_slice._load"),
             patch("sglang_tpu.tpu_platform.traced_rank._load"),
             patch(
-                "sglang.srt.models.registry.ModelRegistry.register_lazy",
+                "sglang_tpu.tpu_platform._register_models",
                 side_effect=register,
-            ),
+            ) as register_models,
         ):
             self.platform.init_backend()
 
-        self.assertEqual(registered, ["sglang_tpu.models"])
+        register_models.assert_called_once_with()
+        session.initialize.assert_called_once_with()
+        session.initialize.return_value.__enter__.assert_called_once_with()
+        session.initialize.return_value.__exit__.assert_called_once_with(
+            None, None, None
+        )
+        self.assertIsNone(self.platform._dp_replica_session)
+
+    def test_replicas_reject_a_shared_trainer_slice_before_native_setup(self):
+        self.platform._dp_replica_session = ReplicaSession(1, 2, 4, 2, device=4)
+        with (
+            patch.dict(
+                os.environ,
+                {"RANK": "0", "WORLD_SIZE": "4", "SGLANG_TPU_SHARED_SLICE": "4,16,h:1"},
+            ),
+            patch("sglang_tpu.shared_slice.enter_slice_env") as enter_slice,
+            patch("sglang_tpu.patches._prepare_tpu_env") as prepare,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "cannot share a slice with a trainer"
+            ):
+                self.platform.init_backend()
+            self.assertEqual(os.environ["RANK"], "0")
+            self.assertEqual(os.environ["WORLD_SIZE"], "4")
+        enter_slice.assert_not_called()
+        prepare.assert_not_called()
+
+
+class TestTpuReplicaGroupSelection(CustomTestCase):
+    def test_replica_coordinator_requires_active_session(self):
+        platform = TpuSRTPlatform()
+        session = ReplicaSession(1, 2, 4, 2, device=6)
+        with patch("sglang_tpu.dp_replicas._active_session", None):
+            self.assertIs(platform.get_group_coordinator_cls(), GroupCoordinator)
+        with patch("sglang_tpu.dp_replicas._active_session", session):
+            self.assertIs(platform.get_group_coordinator_cls(), ReplicaGroupCoordinator)
+
+    def test_default_platform_leaves_group_creation_to_sglang(self):
+        self.assertIs(SRTPlatform().get_group_coordinator_cls(), GroupCoordinator)
 
 
 class TestTpuCompileCache(CustomTestCase):
@@ -309,13 +352,18 @@ class TestTpuPlatformMemory(CustomTestCase):
 
     def test_total_memory_returns_reported_limit(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
-        with dev, mem:
-            self.assertEqual(self.platform.get_device_total_memory(), 96 << 30)
+        with dev as get_device, mem:
+            self.assertEqual(self.platform.get_device_total_memory(2), 96 << 30)
+            get_device.assert_called_once_with(0)
 
     def test_current_memory_usage_is_total_minus_free(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
-        with dev, mem:
-            self.assertEqual(self.platform.get_current_memory_usage(), float(86 << 30))
+        with dev as get_device, mem:
+            self.assertEqual(
+                self.platform.get_current_memory_usage(torch.device("cpu", 2)),
+                float(86 << 30),
+            )
+            get_device.assert_called_once_with(0)
 
     def test_available_memory_returns_free_and_total(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
@@ -382,6 +430,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attn_cp_size=1,
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
             tpu_compile_tracer="dynamo",
             json_model_override_args=None,
         )
@@ -602,7 +652,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
         """At attention TP 1 the target head shards over the full TP group, but these
         drafts share it inside the attention-TP group: they would draft from one shard."""
-        from sglang_tpu.envs import envs as tpu_envs
 
         for algorithm, enabled, error in (
             ("DFLASH", True, True),
@@ -700,7 +749,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         args = self._args(**fields)
         hf_config = SimpleNamespace(architectures=list(architectures))
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)
@@ -722,7 +771,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             )
             self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
             self.assertTrue(envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get())
-            self.assertFalse(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+            self.assertFalse(tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
             libtpu_args = os.environ["LIBTPU_INIT_ARGS"].split()
         self.assertIn(user_flag, libtpu_args)
         self.assertNotIn("--xla_tpu_offload_gather_to_sparsecore=false", libtpu_args)
@@ -737,7 +786,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             os.environ.pop("SGLANG_TPU_FUSED_MOE_SC_GATHER", None)
             self._apply(self._args(tp_size=8))
             self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "")
-            self.assertTrue(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+            self.assertTrue(tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
 
     def test_rejections_name_the_missing_piece(self):
         cases = [
@@ -822,7 +871,7 @@ class TestDsaValidation(CustomTestCase):
             **config_fields,
         )
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)
@@ -841,22 +890,19 @@ class TestDsaValidation(CustomTestCase):
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
 
-    def test_dsa_needs_the_dynamo_tracer(self):
-        """The direct tracer reads the KV cache through the pool's get_state,
-        which the split MLA pool does not implement. The launch must say so
-        instead of failing at the first compile."""
-        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
-            self._apply_dsa(
-                attention_backend="pallas_tpu_mla_sparse",
-                tpu_compile_tracer="direct",
-            )
+    def test_dsa_accepts_the_direct_tracer(self):
+        """TpuSplitMLATokenToKVPool implements get_state/set_state, so DSA runs
+        under both the dynamo and direct compile tracers."""
+        self._apply_dsa(
+            attention_backend="pallas_tpu_mla_sparse",
+            tpu_compile_tracer="direct",
+        )
 
     def test_mtp_index_share_runs_only_on_the_chain_worker(self):
         """Only the experimental chain worker reuses the MTP draft's DSA top-k
-        across its steps. Core's workers would take their GPU paths, a non-DSA
-        indexer has no TPU seed, and a P/D decode would draft on seeds its
-        prefill never sent: each must stop the launch."""
-        from sglang_tpu.envs import envs as tpu_envs
+        across its steps. Core's workers would take their GPU paths and a non-DSA
+        indexer has no TPU seed: each must stop the launch. A P/D prefill ships
+        the seed, so P/D may share."""
 
         sparse = dict(attention_backend="pallas_tpu_mla_sparse")
         share = dict(speculative_algorithm="NEXTN", index_share_for_mtp_iteration=True)
@@ -874,8 +920,7 @@ class TestDsaValidation(CustomTestCase):
                 ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"
             ):
                 self._apply_dsa(**sparse, **share)
-        with self.assertRaisesRegex(NotImplementedError, "P/D"):
-            self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
+        self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
         with self.assertRaisesRegex(ValueError, "DSA models only"):
             self._apply_dsa(**sparse, index_topk=None, **share)
 
@@ -924,6 +969,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             use_ray=False,
             hicache_io_backend=None,
             max_total_tokens=None,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -976,14 +1023,13 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_refuses_speculative_decoding(self):
         self._assert_refused("(?i)specul", speculative_algorithm="EAGLE3")
 
-    def test_refuses_mixed_chunk(self):
-        self._assert_refused("(?i)mixed[-_ ]chunk", enable_mixed_chunk=True)
-
-    def test_refuses_a_quantized_kv_cache(self):
-        # Only the bf16 cache has been validated under DCP.
-        for dtype in ("fp8_e4m3", "fp8_e5m2", "mxint8"):
+    def test_accepts_a_bf16_or_fp8_kv_cache_and_refuses_the_rest(self):
+        # The batched kernel dequantizes an fp8 cache on read under DCP as it
+        # does without it; mxint8 has no DCP path.
+        for dtype in ("auto", "bfloat16", "bf16", "fp8", "fp8_e4m3", "fp8_e5m2"):
             with self.subTest(kv_cache_dtype=dtype):
-                self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype=dtype)
+                self._validate(self._args(kv_cache_dtype=dtype))
+        self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype="mxint8")
 
     def test_refuses_dp_attention(self):
         self._assert_refused("(?i)dp[-_ ]attention", attn_dp_size=2)
@@ -1007,8 +1053,10 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             with self.subTest(backend=backend):
                 self._assert_refused("(?i)dcp[-_ ]comm", dcp_comm_backend=backend)
 
-    def test_refuses_a_replicated_q_projection(self):
-        self._assert_refused("(?i)replicate[-_ ]q", dcp_replicate_q_proj=True)
+    def test_accepts_a_replicated_q_projection(self):
+        # GQA layers project the group's query heads directly and skip the
+        # per-layer head gather.
+        self._validate(self._args(dcp_replicate_q_proj=True))
 
     def test_refuses_eager_mode(self):
         self._assert_refused("(?i)torch[-_ ]compile", enable_torch_compile=False)
@@ -1020,10 +1068,11 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"):
             self._validate(self._args(), env={"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "0"})
 
-    def test_refuses_the_seq_along_lane_kv_layout(self):
-        # The owner-masked KV write addresses the token-major fused cache.
-        with self.assertRaisesRegex(ValueError, "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"):
-            self._validate(self._args(), env={"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"})
+    def test_accepts_the_seq_along_lane_kv_layout(self):
+        # Every DCP KV write happens inside the kernel, which handles both
+        # cache layouts (SEQ_ALONG_LANE fetches the page a chunk shares with
+        # its cached prefix so its whole-page write carries the head back).
+        self._validate(self._args(), env={"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"})
 
     def test_refuses_a_chunk_below_one_dcp_page(self):
         # A DCP page holds page_size * dcp_size tokens and prefill chunks end on
@@ -1047,12 +1096,13 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             chunked_prefill_size=None,
         )
 
-    def test_refuses_more_than_two_dcp_ranks(self):
-        # DCP4 and DCP8 stall in warmup or return wrong first tokens on the
-        # pinned stack; only DCP2 passes the e2e gate.
-        for dcp_size in (4, 8):
+    def test_accepts_up_to_eight_dcp_ranks(self):
+        for dcp_size in (2, 4, 8):
             with self.subTest(dcp_size=dcp_size):
-                self._assert_refused("(?i)must be 1 or 2", dcp_size=dcp_size)
+                self._validate(self._args(dcp_size=dcp_size, chunked_prefill_size=4096))
+        self._assert_refused(
+            "(?i)decode-context-parallel-size", dcp_size=16, tp_size=16
+        )
 
     def test_chunk_check_uses_the_resolved_page_size(self):
         # An unset page resolves to the batched kernel's 256-token floor first.
@@ -1132,6 +1182,49 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
+
+    def test_hybrid_linear_dsa_leaf_is_the_split_pool(self):
+        # get_kv_pool_cls(kind="dsa") is None on TPU; the hybrid-linear leaf
+        # must still build the split pool with its index_key_layers.
+        from sglang.srt.mem_cache import memory_pool
+
+        class _Stop(Exception):
+            pass
+
+        built = {}
+
+        class _SplitPool:
+            def __init__(self, **kwargs):
+                built.update(kwargs)
+                raise _Stop
+
+        platform = SimpleNamespace(
+            is_out_of_tree=lambda: False,
+            is_tpu=lambda: True,
+            get_kv_pool_cls=lambda *, kind: None,
+            get_dsa_kv_pool_cls=lambda: _SplitPool,
+        )
+        with patch.object(memory_pool, "current_platform", platform):
+            with self.assertRaises(_Stop):
+                memory_pool.HybridLinearKVPool(
+                    size=64,
+                    dtype=torch.bfloat16,
+                    page_size=16,
+                    head_num=1,
+                    head_dim=576,
+                    full_attention_layer_ids=[1, 3],
+                    device="cpu",
+                    mamba_pool=None,
+                    use_mla=True,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    use_dsa=True,
+                    index_head_dim=128,
+                    kv_cache_dim=576,
+                    skip_topk_layers=[False, True],
+                )
+        self.assertEqual(built["index_key_layers"], [True, False])
+        self.assertEqual(built["layer_num"], 2)
 
     def test_draft_backends_run_their_target_backend_per_step(self):
         from sglang.srt.layers.attention import attention_registry as registry

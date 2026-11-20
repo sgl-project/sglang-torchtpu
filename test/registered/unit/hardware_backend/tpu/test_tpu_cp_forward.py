@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_batched import (
@@ -267,7 +267,7 @@ class TestCpMetadata(CustomTestCase):
         host, metadata = self._metadata(req_to_token)
         self.assertEqual(metadata.kv_lens.tolist(), [7, 110, 135, 0, 0, 0, 0, 0])
         self.assertEqual(metadata.cu_q_lens.tolist(), [0, 1, 6] + [11] * 6)
-        self.assertEqual(metadata.distribution.tolist(), [0, 0, 3])
+        self.assertEqual(metadata.distribution.tolist(), [3, 3, 3])
         pages = metadata.page_indices.reshape(8, 256 // self.PAGE)
         for row, req in enumerate([0, 1, 1]):
             page_row = req_to_token[self.POOL_ROWS[req], :: self.PAGE] // self.PAGE

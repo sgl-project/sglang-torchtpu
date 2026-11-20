@@ -7,8 +7,9 @@ import torch
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
 
-# (host req_pool_indices [bs], host draft hidden [bs, H]) -> None.
-PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor], None]
+# (host req_pool_indices [bs], host draft hidden [bs, H],
+#  host DSA top-k seeds [bs, W] or None) -> None.
+PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None]
 
 _host_batch_padder: Callable[[int], int] | None = None
 _pd_carry_seeder: PdCarrySeeder | None = None
@@ -31,6 +32,20 @@ def get_pd_carry_seeder() -> PdCarrySeeder:
     if _pd_carry_seeder is None:
         raise RuntimeError("No TpuChainSpecWorker registered a PD carry seeder.")
     return _pd_carry_seeder
+
+
+def pd_decode_draft_prefill() -> bool:
+    """Whether a PD decode, not its prefill, runs the draft over each prompt."""
+    return tpu_envs.SGLANG_TPU_PD_DECODE_DRAFT_PREFILL.get()
+
+
+def runs_draft_prompt_pass(disagg_mode: str) -> bool:
+    """Whether this server runs the draft over prompts: a PD decode only under the flag."""
+    if disagg_mode == "decode":
+        return pd_decode_draft_prefill()
+    if disagg_mode == "prefill":
+        return not pd_decode_draft_prefill()
+    return True
 
 
 def uses_host_batch(batch) -> bool:

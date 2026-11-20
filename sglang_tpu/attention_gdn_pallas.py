@@ -41,7 +41,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    mamba_cache_chunk_size,
+)
 from sglang_tpu.mamba_pool import AT_SLOT
 
 if TYPE_CHECKING:
@@ -54,6 +59,16 @@ logger = logging.getLogger(__name__)
 # One custom op per process. The kernel specialises on shapes internally, so no
 # shape-dependent op specialisation is needed at the torch.library boundary.
 _PALLAS_GDN_OP = None
+
+
+def _mamba_chunk_cap() -> Optional[int]:
+    """Return the radix-cache mamba chunk cap when active, or None otherwise."""
+    try:
+        if get_memory().disable_radix_cache:
+            return None
+        return mamba_cache_chunk_size()
+    except ValueError:  # Standalone op use: no config published.
+        return None
 
 
 def build_gdn_pallas_op():
@@ -132,6 +147,7 @@ def build_gdn_pallas_op():
         track_end: Optional[jax.Array] = None,
         read_offsets: Optional[jax.Array] = None,
         num_spec_tokens: int = 0,
+        max_mixed_tile_size: Optional[int] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -183,6 +199,7 @@ def build_gdn_pallas_op():
                 track_indices=track_indices,
                 track_end=track_end,
                 num_spec_tokens=num_spec_tokens,
+                max_mixed_tile_size=max_mixed_tile_size,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
@@ -200,8 +217,9 @@ def build_gdn_pallas_op():
         _wrapped,
         name=f"jax_{op_name}",
         # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
-        # prefill_only, fused_qkvg and num_spec_tokens are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27),
+        # prefill_only, fused_qkvg, num_spec_tokens and max_mixed_tile_size are
+        # static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -273,6 +291,7 @@ def build_gdn_pallas_op():
             track_end,
             read_offsets,
         )
+        chunk_cap = _mamba_chunk_cap()
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
             n_kq,
@@ -286,6 +305,7 @@ def build_gdn_pallas_op():
             prefill_only,
             fused_qkvg,
             num_spec_tokens,
+            chunk_cap,
         )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
@@ -317,6 +337,7 @@ def build_gdn_pallas_op():
                 track_end,
                 read_offsets,
                 num_spec_tokens,
+                chunk_cap,
             )
         else:
             with (
@@ -352,6 +373,7 @@ def build_gdn_pallas_op():
                     track_end,
                     read_offsets,
                     num_spec_tokens,
+                    chunk_cap,
                 )
             _exported_shapes.add(key)
         return output
@@ -497,7 +519,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # int64 for the verify commit's index_copy_ (the table itself is int32).
         if slots.dtype != torch.int64:
             slots = slots.long()
-        if pool.mamba_v2p_table is None:
+        if self._state_ids.read_v2p is None:
             self._slot_memo = (
                 weakref.ref(req_pool_indices),
                 req_pool_indices._version,
@@ -619,10 +641,26 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             # tensor signature as live requests to precompile the cache path.
             self._track_indices = torch.zeros_like(self._state_indices)
             self._track_end = torch.full_like(self._state_indices, -1)
+        metadata_track = self._track_indices
+        if is_verify and metadata_track is None:
+            # The kernel takes no snapshot during verify, but the commit after
+            # acceptance reads its checkpoint slots from this metadata
+            # (forward_state_slots), as upstream's metadata always carries them.
+            # Keep the scheduler's live-length host ids: commit_verified_states
+            # pads them on the host and uploads at the bucket, as warmup does. A
+            # TPU-side op on the uploaded copy would be an eager program per
+            # bucket that no warmup compiles.
+            host_tracking = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+            verify_track = (host_tracking or {}).get(
+                "mamba_track_indices",
+                getattr(forward_batch, "mamba_track_indices", None),
+            )
+            if verify_track is not None:
+                metadata_track = self._translate_mamba_indices(verify_track)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self._query_start_loc,
             mamba_cache_indices=self._state_indices,
-            mamba_track_indices=self._track_indices,
+            mamba_track_indices=metadata_track,
         )
         self._init_spec_metadata(forward_batch)
 
@@ -645,6 +683,15 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             self._read_offsets_pool.index_fill_(
                 0, self._state_indices.clamp(min=0).long(), AT_SLOT
             )
+
+    def _layer_state(self, layer_id: int):
+        """``layer_id``'s state tensors, read inside the compiled forward.
+
+        Skips the pool's per-layer HiCache wait: the forward already waited for
+        the whole batch, and branching on the counter would guard the graph on it.
+        """
+        req_pool = self.req_to_token_pool
+        return req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer_id])
 
     def _state_rows(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """(base state rows, per-sequence read offsets) the kernel addresses.
@@ -730,7 +777,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self._layer_state(layer.layer_id)
         conv_state = layer_cache.conv[0]  # [size+1, K-1, 1, dim]
         recurrent_state = layer_cache.temporal  # [size+1, n_v, d_k, d_v]
 

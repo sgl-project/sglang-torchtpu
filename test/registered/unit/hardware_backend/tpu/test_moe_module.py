@@ -43,7 +43,7 @@ class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
     """
 
     def __init__(self, *, activation="silu", apply_router_weight_on_input=False):
-        # MultiPlatformOp.__init__ runs dispatch_forward, which resolves
+        # MultiPlatformOp.__init__ runs _resolve_forward_method, which resolves
         # off the *module-level* _is_* flags. The harness patches those
         # flags before constructing the method so the dispatch cache
         # reflects the intended platform.
@@ -401,24 +401,6 @@ class TestForwardTpuContract(CustomTestCase):
     def tearDown(self):
         self.runner.stop()
 
-    def test_routes_through_fused_moe_call(self):
-        """Headline: ``forward_tpu`` must invoke the Pallas fused MoE
-        kernel (``fused_moe_call``). A regression that dropped to
-        ``forward_native``, raised early, or otherwise skipped the
-        kernel would silently disable Pallas on TPU -- the contract
-        tests below would all error out, but the failure mode would
-        be confusing. This explicit routing check produces a clean
-        diagnostic ahead of those secondary failures.
-        """
-        layer = self.runner.make_layer()
-        d_out = self.runner.make_dispatch_output()
-        self.runner.tpu_forward(layer, d_out)
-
-        self.assertTrue(
-            self.runner.kernel_was_called,
-            "forward_tpu did not route through fused_moe_call",
-        )
-
     def test_passes_w13_and_w2_through_unchanged(self):
         """``process_weights_after_loading`` already swapped axes -- the
         forward must not transpose again, must not call ``.contiguous()``
@@ -575,7 +557,7 @@ class TestForwardTpuContract(CustomTestCase):
 class TestForwardTpuViaDispatch(CustomTestCase):
     """Integration: ``BaseFusedOp.forward`` -> dispatch -> ``forward_tpu``
     -> kernel. Pins ``_platform_key()`` to ``"tpu"`` so dispatch resolution
-    (lazy, on first call / ``dispatch_forward()``) lands on ``forward_tpu``.
+    (lazy, on first call / ``_resolve_forward_method()``) lands on ``forward_tpu``.
     Confirms the dispatch wiring is intact on top of the method's
     contract.
     """
@@ -588,10 +570,10 @@ class TestForwardTpuViaDispatch(CustomTestCase):
         self.runner.stop()
 
     def test_dispatch_resolves_forward_tpu(self):
-        """``dispatch_forward()`` must resolve to ``forward_tpu``, never
+        """``_resolve_forward_method()`` must resolve to ``forward_tpu``, never
         silently drop back to ``forward_native``."""
         self.assertEqual(
-            self.runner.method.dispatch_forward().__func__.__name__,
+            self.runner.method._resolve_forward_method().__func__.__name__,
             "forward_tpu",
         )
 

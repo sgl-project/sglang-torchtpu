@@ -11,13 +11,12 @@ maybe_stub_sgl_kernel()
 
 import torch  # noqa: E402
 
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang_tpu.pp_buffered import PPBufferedHandoff, Transport  # noqa: E402
 from sglang_tpu.pp_wave import PPWave  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -31,7 +30,44 @@ def batch(mode):
     return SimpleNamespace(forward_mode=mode, reqs=[])
 
 
-def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
+class _Done:
+    def wait(self):
+        return True
+
+
+class _NullTransport(Transport):
+    """Device primitives of the buffered hand-off that do nothing, for a loop
+    that runs one stage on its own."""
+
+    def landing_buffer(self, shape, dtype, device):
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    def recv_list(self, tensors, src, tag):
+        return _Done()
+
+    def send_list(self, tensors, dst, tag):
+        return _Done()
+
+    def wait_landed(self, tensor):
+        pass
+
+    def flush(self, tensors):
+        list(tensors)
+
+    def materialize(self, tensors):
+        list(tensors)
+
+    def flush_all(self):
+        pass
+
+    def fence(self):
+        return SimpleNamespace(synchronize=lambda: None, query=lambda: True)
+
+
+def run_loop(
+    mode, schedule, rank, *, use_wave=True, depth=1, handoff="wave", trace=False
+):
+    """trace=True also records each hand-off and each processed result."""
     """Run every loop statement, stopping only at the next request-receive turn."""
     scheduler = SchedulerPPMixin()
     scheduler.pp_group = SimpleNamespace(
@@ -44,8 +80,9 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     scheduler.pp_group.recv_object = Mock(return_value=[])
     scheduler.disaggregation_mode = mode
     scheduler.device_module = Mock()
+    scheduler.token_to_kv_pool_allocator = Mock()
     scheduler.waiting_queue = []
-    scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_transfer_queue = []
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
@@ -59,21 +96,42 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     def record(name, value=None):
         events.append((step[0], name, value))
 
-    wave = PPWave(
-        rank=rank,
-        size=4,
-        rows=8,
-        hidden=4,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        launcher=lambda x: x,
-    )
+    if handoff == "buffered":
+        wave = PPBufferedHandoff(
+            rank=rank,
+            size=4,
+            pp_ranks=(0, 1, 2, 3),
+            hidden=4,
+            num_aux=0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            max_rows=8,
+            rows_of=lambda batch: 2,
+            transport=_NullTransport(),
+        )
+    else:
+        wave = PPWave(
+            rank=rank,
+            size=4,
+            rows=8,
+            hidden=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=lambda x: x,
+        )
     wave.begin_iteration = Mock(wraps=wave.begin_iteration)
     wave.receive = Mock(wraps=wave.receive)
-    wave.end_iteration = Mock(wraps=wave.end_iteration)
+    end_iteration = wave.end_iteration
+
+    def hand_off(tensors):
+        if trace:
+            record("hand-off", tensors is not None)
+        return end_iteration(tensors)
+
+    wave.end_iteration = Mock(side_effect=hand_off)
     scheduler._pp_init_wave = Mock(return_value=wave)
 
-    def recv_requests():
+    def recv_requests(**kwargs):
         step[0] += 1
         if step[0] == len(schedule):
             raise EndSchedule
@@ -85,6 +143,12 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     scheduler.process_prefill_chunk = Mock()
     scheduler.maybe_prefetch_staging_for_batch = Mock()
     scheduler.on_idle = Mock()
+    scheduler.increment_scheduler_iterations = Mock()
+    scheduler.pause_state = SimpleNamespace(may_launch=lambda: True)
+    scheduler.invariant_checker = Mock()
+    scheduler._apply_war_barrier = Mock()
+    scheduler._flush_staging_scatters = Mock()
+    scheduler._on_step_processed = Mock()
 
     def plan(running_batch):
         return SimpleNamespace(
@@ -107,7 +171,7 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         "process_retract_queue",
         "process_prealloc_queue",
         "process_decode_transfer_queue",
-        "process_disagg_prefill_inflight_queue",
+        "process_disagg_prefill_transfer_queue",
     ):
         setattr(scheduler, name, Mock(return_value=[]))
     scheduler._pp_recv_pyobj_from_prev_stage = Mock(return_value=[])
@@ -127,6 +191,9 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
 
     def launch(mb_id, cur_batch, proxy, metadata, queue):
         record("launch", cur_batch)
+        if callable(proxy):
+            # As _pp_launch_batch: wait for the buffered hand-off's receive.
+            proxy = PPProxyTensors(proxy())
         if cur_batch.forward_mode.is_prebuilt():
             assert proxy is None
         elif use_wave and rank != 0:
@@ -142,7 +209,9 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         return result, Mock()
 
     scheduler._pp_launch_batch = Mock(side_effect=launch)
-    scheduler._pp_process_batch_result = Mock()
+    scheduler._pp_process_batch_result = Mock(
+        side_effect=lambda *args: record("process") if trace else None
+    )
     parallel = SimpleNamespace(
         pp_size=4,
         pp_rank=rank,
@@ -150,6 +219,9 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         enable_dsa_prefill_context_parallel=False,
     )
     with (
+        # The PP loop fences on torch.accelerator.current_stream(); CPU CI has
+        # no accelerator, so stub it like the mocked device_module events.
+        patch.object(torch.accelerator, "current_stream"),
         patch.object(scheduler_pp_mixin, "_is_tpu", use_wave),
         patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
         patch.object(
@@ -175,6 +247,50 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         except EndSchedule:
             pass
     return scheduler, wave, copy_event, events
+
+
+class TestDisaggregatedBufferedHandoff(unittest.TestCase):
+    @staticmethod
+    def _hand_off_before_results(events):
+        """For each step that launches a forward and processes an older
+        micro-batch's results, whether its hand-off came first."""
+        steps = {}
+        for index, (step, name, value) in enumerate(events):
+            if name == "hand-off" and not value:
+                continue
+            steps.setdefault(step, {}).setdefault(name, index)
+        return [
+            names["hand-off"] < names["process"]
+            for names in steps.values()
+            if {"launch", "process", "hand-off"} <= set(names)
+        ]
+
+    def test_buffered_handoff_sends_before_older_results_are_processed(self):
+        """The buffered hand-off queues a forward's activations right after
+        the launch, before the output relay and an older micro-batch's
+        results; the wave keeps its place at the end of the iteration."""
+        for mode, forward in (
+            (DisaggregationMode.PREFILL, ForwardMode.EXTEND),
+            (DisaggregationMode.DECODE, ForwardMode.DECODE),
+        ):
+            # Seven forwards in a row: from the fifth on (5 slots, depth 1),
+            # a step also processes the results of the forward 4 steps back.
+            schedule = [batch(forward)] * 7 + [None] * 10
+            for rank in range(3):  # the last stage hands nothing on
+                with self.subTest(mode=mode, rank=rank):
+                    scheduler, handoff, _, events = run_loop(
+                        mode, schedule, rank, handoff="buffered", trace=True
+                    )
+                    order = self._hand_off_before_results(events)
+                    self.assertTrue(order)
+                    self.assertTrue(all(order), order)
+                    self.assertEqual(handoff.forwards, 7)
+                    self.assertEqual(handoff.end_iteration.call_count, len(schedule))
+                    handoff.close()
+                    _, _, _, wave_events = run_loop(mode, schedule, rank, trace=True)
+                    wave_order = self._hand_off_before_results(wave_events)
+                    self.assertTrue(wave_order)
+                    self.assertFalse(any(wave_order), wave_order)
 
 
 class TestDisaggregatedWave(unittest.TestCase):
@@ -206,7 +322,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                     scheduler._pp_pd_get_prefill_transferred_ids.call_count,
                     len(schedule),
                 )
-                scheduler.process_disagg_prefill_inflight_queue.assert_called()
+                scheduler.process_disagg_prefill_transfer_queue.assert_called()
                 scheduler.process_bootstrapped_queue.assert_called()
                 if rank != 3:
                     forwarded_requests = [

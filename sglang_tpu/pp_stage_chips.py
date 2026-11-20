@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import msgspec
+import torch
 
 from sglang_tpu._logging import get_logger
 
@@ -46,10 +47,7 @@ def _partial_chip_problems(
 
 
 def _devices_per_chip() -> int | None:
-    # Imported on call: the CPU unit lane imports this module without torch_tpu.
-    from torch_tpu._internal.utils.hardware import get_devices_per_chip
-
-    return get_devices_per_chip()
+    return torch.tpu.get_device_properties().devices_per_chip
 
 
 def _stage_core_locations(ranks: Sequence[int]) -> list[CoreLocation]:

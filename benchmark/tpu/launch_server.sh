@@ -551,6 +551,11 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 
 PYTHON=${PYTHON:-python3}
 
+if [[ "${CI_WEIGHT_LOADER_PREFETCH:-0}" == "1" ]]; then
+    checkpoint_setup=$("$PYTHON" "$SCRIPT_DIR/ci_checkpoint_prefetch.py" -- "${args[@]}")
+    eval "$checkpoint_setup"
+fi
+
 # ===== reproducibility metadata dump =====
 # Emit launch_meta.json BEFORE exec (exec replaces this process). Captures the
 # resolved server config, the exact server_argv, the reproducibility-critical

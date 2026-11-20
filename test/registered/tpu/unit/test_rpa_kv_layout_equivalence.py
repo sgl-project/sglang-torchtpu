@@ -98,13 +98,13 @@ class TestKvLayoutEquivalence(unittest.TestCase):
             cache,
             jnp.full((num_seqs,), chunk, jnp.int32),
             jnp.asarray(np.arange(num_seqs + 1, dtype=np.int32) * chunk),
-            jnp.asarray([0, 0, num_seqs], jnp.int32),
+            jnp.full((3,), num_seqs, jnp.int32),  # extend: MIXED range
         )
         outs.append(np.asarray(out.astype(jnp.float32)))
 
         # Decode steps: one new token per sequence, kv_len growing each step.
         cu_q_decode = jnp.asarray(np.arange(num_seqs + 1, dtype=np.int32))
-        distribution = jnp.full((3,), num_seqs, jnp.int32)
+        distribution = jnp.asarray([0, 0, num_seqs], jnp.int32)  # DECODE range
         for step in range(steps):
             out, cache = call(
                 randn((num_seqs, num_q_heads, self.HEAD_DIM)),

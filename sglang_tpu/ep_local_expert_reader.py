@@ -47,6 +47,16 @@ _SAFETENSORS_DTYPES = {
 }
 
 
+def local_expert_id(name: str, expert_range: tuple[int, int]) -> int | None:
+    """Routed-expert id of a checkpoint tensor in ``expert_range``; -1 for an
+    expert outside it, None for a tensor that is not a routed expert."""
+    m = _EXPERT_ID_KEY_RE.match(name)
+    if m is None:
+        return None
+    eid = int(m.group(2))
+    return eid if expert_range[0] <= eid < expert_range[1] else -1
+
+
 def _log_whole_shards(reason: str) -> None:
     # An opted-in model reading whole shards can need far more host memory.
     log_info_on_rank0(
@@ -54,10 +64,26 @@ def _log_whole_shards(reason: str) -> None:
     )
 
 
+# Core model classes opted in from the plugin, so core carries no TPU-only flag.
+# Every `.experts.<id>.` checkpoint key of these loads into FusedMoE expert <id>.
+_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = frozenset(
+    {"sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"}
+)
+
+
+def _supports_ep_local_expert_reads(model: torch.nn.Module) -> bool:
+    cls = type(model)
+    return (
+        getattr(model, "supports_tpu_ep_local_expert_reads", False)
+        or f"{cls.__module__}.{cls.__qualname__}" in _PLUGIN_EP_LOCAL_EXPERT_READ_MODELS
+    )
+
+
 def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | None:
     """Routed-expert ids [start, end) this EP rank stores, for EP-local reads.
 
-    For models that set ``supports_tpu_ep_local_expert_reads`` (every
+    For models that set ``supports_tpu_ep_local_expert_reads`` or are listed in
+    ``_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS`` (every
     ``.experts.<id>.`` checkpoint key loads into FusedMoE expert ``<id>``), the
     range is ``local_routed_expert_range`` of their FusedMoE layers. None (read
     everything) off TPU, without EP, with EPLB metadata or elastic EP join, when
@@ -65,13 +91,13 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | N
     (fused shared experts, parameters that need every expert), or when
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS is true.
     """
-    if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+    if not _is_tpu or not _supports_ep_local_expert_reads(model):
         return None
-    from sglang.srt.environ import envs
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.utils import local_routed_expert_range
     from sglang.srt.runtime_context import get_exec
+    from sglang_tpu.envs import envs
 
     moes = [m for m in model.modules() if isinstance(m, FusedMoE)]
     # Without MoE layers or EP there is nothing to skip, and nothing to report.
@@ -154,11 +180,7 @@ class EpLocalExpertReader:
         return cls(hf_weights_files, expert_range)
 
     def _local_expert_id(self, name: str) -> int | None:
-        m = _EXPERT_ID_KEY_RE.match(name)
-        if m is None:
-            return None
-        eid = int(m.group(2))
-        return eid if self.expert_range[0] <= eid < self.expert_range[1] else -1
+        return local_expert_id(name, self.expert_range)
 
     def handles(self, st_file: str) -> bool:
         return os.path.basename(st_file) in self.indexed_files

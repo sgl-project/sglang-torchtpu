@@ -15,7 +15,13 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden.pool_spans import _BLOCK_MAJOR_KV_RANK
+from sglang_tpu.disaggregation.raiden.serde import (
+    BLOCK_MAJOR_KV_LAYOUT,
+    PER_LAYER_KV_LAYOUT,
+)
 from sglang_tpu.dsv4.dsv4_memory_pool import (
     _TPU_STATE_SLOT_STRIDE_PAGES,
     DSV4TPUTokenToKVPool,
@@ -25,7 +31,13 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
+from sglang_tpu.kv_pool import (
+    TpuBlockMajorMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    TpuSplitMLATokenToKVPool,
+)
 from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool, _DraftSwaSidecar
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -38,12 +50,13 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
-PORTS_PER_RANK = 6
+# Ports each rank reserves: control+data for full, SWA, state, and unified draft.
+PORTS_PER_RANK = 8
 SWA_PORT_OFFSET = 2
 STATE_PORT_OFFSET = 4
+DRAFT_PORT_OFFSET = 6
 
-# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
+# Base of the per-rank control ports (`base + 8*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
@@ -68,11 +81,18 @@ class RaidenKVCacheGroups:
 
     full: List[Any]
     swa: List[Any]
+    # One global layer ID per tensor; a block-major bundle is named by its first.
     full_layer_ids: List[int] = field(default_factory=list)
     swa_layer_ids: List[int] = field(default_factory=list)
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
+    # Per-rank KV head counts of the separate draft pool (equal to the draft's
+    # total_kv_heads on a TP=1 pipeline producer).
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
+    # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
+    num_hidden_full: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
@@ -82,6 +102,30 @@ class RaidenKVCacheGroups:
     # Optional host-side metadata pack/unpack hooks accompanying state_blocks.
     read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
+    # Shared-buffer Full+SWA pool: SWA rides on the single full engine via companion pages.
+    unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    # Separate homogeneous draft KV tensor group when the target uses TpuUnifiedSWAKVPool.
+    draft: List[torch.Tensor] = field(default_factory=list)
+    draft_is_swa: bool = False
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
+    # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
+    seq_along_lane: bool = False
+
+
+def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
+    if pool is None:
+        return False
+    if isinstance(pool, TpuSeqAlongLaneKVPool):
+        return True
+    if isinstance(pool, TpuUnifiedSWAKVPool):
+        return isinstance(pool.kv_pool, TpuSeqAlongLaneKVPool)
+    if isinstance(pool, SWAKVPool):
+        return isinstance(pool.full_kv_pool, TpuSeqAlongLaneKVPool) or isinstance(
+            pool.swa_kv_pool, TpuSeqAlongLaneKVPool
+        )
+    if isinstance(pool, HybridLinearKVPool):
+        return isinstance(getattr(pool, "full_kv_pool", None), TpuSeqAlongLaneKVPool)
+    return False
 
 
 def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
@@ -91,6 +135,45 @@ def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
                 f"Raiden requires root tensors (not views) for {name}[{idx}] "
                 "so PJRT buffer registration remains valid."
             )
+
+
+def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
+    """The P/D layout tag of the registered full-attention KV tensors."""
+    if any(len(tensor.shape) == _BLOCK_MAJOR_KV_RANK for tensor in tensors):
+        return BLOCK_MAJOR_KV_LAYOUT
+    return PER_LAYER_KV_LAYOUT
+
+
+def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
+    """One bundle per page namespace for a block-major pool, else None.
+
+    The bundle row holds every layer of a page, so it is registered whole; its
+    strided per-layer ``kv_buffer`` views are never registered.
+    """
+    if isinstance(pool, TpuBlockMajorMHATokenToKVPool):
+        has_layers = pool.layer_num > 0
+        groups = RaidenKVCacheGroups(
+            full=pool.page_buffers() if has_layers else [],
+            swa=[],
+            full_layer_ids=[pool.start_layer] if has_layers else [],
+        )
+    elif isinstance(pool, SWAKVPool) and isinstance(
+        pool.full_kv_pool, TpuBlockMajorMHATokenToKVPool
+    ):
+        mapping = pool.layers_mapping
+        full_ids = sorted(layer for layer, (_, swa) in mapping.items() if not swa)
+        swa_ids = sorted(layer for layer, (_, swa) in mapping.items() if swa)
+        groups = RaidenKVCacheGroups(
+            full=pool.full_kv_pool.page_buffers() if full_ids else [],
+            swa=pool.swa_kv_pool.page_buffers() if swa_ids else [],
+            full_layer_ids=full_ids[:1],
+            swa_layer_ids=swa_ids[:1],
+        )
+    else:
+        return None
+    _assert_root_buffers("block-major full KV", groups.full)
+    _assert_root_buffers("block-major SWA KV", groups.swa)
+    return groups
 
 
 def get_raiden_kv_caches(
@@ -106,10 +189,27 @@ def get_raiden_kv_caches(
     the matching namespace and move them in the same Raiden transfer. Hybrid
     linear-attention pools contribute GDN state rows; ``DSV4TPUTokenToKVPool``
     contributes its compressed full-page sub-pools, SWA pages, and 32-page
-    request compressor state rings.
+    request compressor state rings. A block-major pool contributes one bundle
+    per namespace. The split sparse-MLA pool, alone or under a hybrid pool,
+    contributes several page buffers per layer (``transfer_page_buffers``).
     """
 
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
+        if isinstance(current_pool, TpuUnifiedSWAKVPool):
+            shared_buffers = current_pool.kv_pool.page_buffers()
+            _assert_root_buffers("unified shared KV", shared_buffers)
+            full_ids = sorted(
+                layer
+                for layer, (_, swa) in current_pool.layers_mapping.items()
+                if not swa
+            )
+            return RaidenKVCacheGroups(
+                full=shared_buffers,
+                swa=[],
+                full_layer_ids=full_ids,
+                swa_layer_ids=[],
+                unified_swa_pool=current_pool,
+            )
         if isinstance(current_pool, DSV4TPUTokenToKVPool):
             dsv4_full: List[torch.Tensor] = []
             if isinstance(current_pool.c4_kv_pool, TPUDeepSeekV4CSAKVPool):
@@ -129,6 +229,27 @@ def get_raiden_kv_caches(
             _assert_root_buffers("DSV4 full KV", dsv4_full)
             _assert_root_buffers("DSV4 SWA KV", dsv4_swa)
             return RaidenKVCacheGroups(full=dsv4_full, swa=dsv4_swa)
+        bundles = _block_major_groups(current_pool)
+        if bundles is not None:
+            return bundles
+        is_hybrid = isinstance(current_pool, HybridLinearKVPool)
+        split_pool = current_pool.full_kv_pool if is_hybrid else current_pool
+        if isinstance(split_pool, TpuSplitMLATokenToKVPool):
+            entries = split_pool.transfer_page_buffers()
+            split_buffers = [buf for _, buf in entries]
+            _assert_root_buffers("split MLA KV", split_buffers)
+            split_ids = [layer for layer, _ in entries]
+            if is_hybrid:
+                # The hybrid pool's split pool is dense over its full layers.
+                mapping = current_pool.full_attention_layer_id_mapping
+                global_ids = {dense: layer for layer, dense in mapping.items()}
+                split_ids = [global_ids[layer] for layer in split_ids]
+            return RaidenKVCacheGroups(
+                full=split_buffers,
+                swa=[],
+                full_layer_ids=split_ids,
+                swa_layer_ids=[],
+            )
 
         layers_mapping = getattr(current_pool, "layers_mapping", None)
         start = current_pool.start_layer
@@ -174,17 +295,55 @@ def get_raiden_kv_caches(
             full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
         )
 
+    # Lazy: the experimental spec package loads after the platform.
+    from sglang_tpu.experimental.speculative.pd_hidden_pool import get_pd_hidden_pool
+
+    hidden_pool = get_pd_hidden_pool() if draft_pool is not None else None
+    if hidden_pool is not None:
+        # The decode builds the draft KV from these rows, so it never travels.
+        draft_pool = None
+
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
-    num_draft_full = num_draft_swa = 0
+    seq_along_lane = _is_seq_along_lane_pool(pool)
+    num_draft_full = num_draft_swa = num_hidden_full = 0
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
+    draft: List[torch.Tensor] = []
+    draft_is_swa = False
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
-        num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
-        full.extend(draft_groups.full)
-        swa.extend(draft_groups.swa)
-        full_ids.extend(draft_groups.full_layer_ids)
-        swa_ids.extend(draft_groups.swa_layer_ids)
+        if groups.unified_swa_pool is not None:
+            if draft_groups.full and draft_groups.swa:
+                raise RuntimeError(
+                    "Raiden does not support mixed full/SWA draft KV pools on "
+                    "TpuUnifiedSWAKVPool."
+                )
+            draft_is_swa = bool(draft_groups.swa)
+            draft = list(draft_groups.swa if draft_is_swa else draft_groups.full)
+            draft_swa_sidecar = groups.unified_swa_pool.draft_swa_sidecar
+            _assert_root_buffers("unified draft KV", draft)
+        else:
+            num_draft_full, num_draft_swa = (
+                len(draft_groups.full),
+                len(draft_groups.swa),
+            )
+            full.extend(draft_groups.full)
+            swa.extend(draft_groups.swa)
+            full_ids.extend(draft_groups.full_layer_ids)
+            swa_ids.extend(draft_groups.swa_layer_ids)
+        full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
+        swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
+        draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
+        draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
+        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
+
+    if hidden_pool is not None:
+        full.append(hidden_pool.buffer)
+        full_ids.append(0)
+        num_hidden_full = 1
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -209,7 +368,12 @@ def get_raiden_kv_caches(
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
 
-    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
+    for name, group in (
+        ("full KV", full),
+        ("SWA KV", swa),
+        ("GDN state", state),
+        ("unified draft KV", draft),
+    ):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
             raise RuntimeError(
@@ -223,10 +387,18 @@ def get_raiden_kv_caches(
         swa_layer_ids=swa_ids,
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
+        draft_kv_head_num=draft_kv_head_num,
+        draft_swa_kv_head_num=draft_swa_kv_head_num,
+        num_hidden_full=num_hidden_full,
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,
         committed_state_row=committed_state_row,
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
+        unified_swa_pool=groups.unified_swa_pool,
+        draft=draft,
+        draft_is_swa=draft_is_swa,
+        draft_swa_sidecar=draft_swa_sidecar,
+        seq_along_lane=seq_along_lane,
     )

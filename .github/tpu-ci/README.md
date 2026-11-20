@@ -135,7 +135,7 @@ Runs at 10:00 and 17:00 PT. A `plan` job maps the cron that fired to a selection
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | GPT-OSS-120B AIME / GPQA / GSM8K / MMLU-Pro; GPT-OSS-20B; Gemma 4 AIME / GPQA; Qwen3.8 AIME / GPQA | Kimi-K2.6 MMMU shards |
+| `day-10am` | GPT-OSS-120B AIME / GPQA / GSM8K / MMLU-Pro; Gemma 4 AIME / GPQA; Qwen3.8 AIME / GPQA | Kimi-K2.6 MMMU shards |
 | `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 - **Single-host:** one job per benchmark (one suite, one file), each written out in the
@@ -190,6 +190,19 @@ long job gets less of it. `est_time` therefore matters: it sizes the deadline, t
 and the admission budget. `weekly-update-tpu-est-time.yml` keeps it (and a
 `timeout_per_file` that mirrors it) at p90 × 1.25 of the nightlies' passing runs; the
 upstream est_time bot has no TPU data.
+
+PR unit and E2E suites also check actual execution against a 40-minute budget
+after their tests finish. This fails the gate when a suite is too slow, without
+interrupting tests. One monotonic timer covers the suite's parallel and serial
+phases, including model loading and precompilation. Queueing and pod startup
+happen before this timer starts.
+
+Set the repository Actions variable `TPU_PR_GATE_BUDGET_MINUTES` to override
+the default 40-minute budget for both PR lanes. Other callers keep this check
+disabled unless they pass the reusable workflow's `execution_budget_minutes`
+input. Locally, use `test/run_suite.py --execution-budget-minutes 40`; `0` keeps
+the existing behavior without an execution-budget check. Per-file timeouts and
+the JobSet deadlines above remain separate safeguards.
 
 **Weights.** Jobs that need models mount a read-only PVC at `/weights`. The key
 `model-weights` maps to the claim named in `weights.yaml` (today the Filestore claim

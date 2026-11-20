@@ -169,6 +169,7 @@ def main():
         help="Key from weights.yaml or literal PVC name; empty disables the mount.",
     )
     ap.add_argument("--timeout-per-file", type=int, default=3600)
+    ap.add_argument("--execution-budget-minutes", type=float, default=0)
     ap.add_argument(
         "--service-account",
         default="",
@@ -406,6 +407,11 @@ def main():
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
         "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
         "TIMEOUT_PER_FILE": str(a.timeout_per_file),
+        "EXECUTION_BUDGET_FLAG": (
+            f"--execution-budget-minutes {a.execution_budget_minutes:g}"
+            if a.execution_budget_minutes
+            else ""
+        ),
         "SERVICE_ACCOUNT": (
             SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)
             if a.service_account

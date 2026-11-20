@@ -16,26 +16,25 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
+from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.compilation import direct_compile
+from sglang_tpu.compilation import decoder_compile_policy, direct_compile
 from sglang_tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 
@@ -197,7 +196,7 @@ class TestPPProxyPytree(CustomTestCase):
 
 class TestAuxHiddenStatePytree(CustomTestCase):
     def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
-        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+        """A target that returns (hidden, aux), for EAGLE3 or DFlash capture, must trace.
 
         Unregistered, the aux list is one opaque leaf and direct_compile rejects
         the output as a non-tensor.
@@ -232,22 +231,82 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     )
 
 
-class TestAuxHiddenStatePytree(CustomTestCase):
-    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
-        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
-        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
-        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
-        leaves, treespec = tree_util.tree_flatten(
-            (hidden, AuxHiddenStateList([first, second]))
-        )
-        self.assertEqual(len(leaves), 3)
-        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
-        _, aux = tree_util.tree_unflatten(treespec, leaves)
-        self.assertIsInstance(aux, AuxHiddenStateList)
-        self.assertIs(aux[1], second)
-
-
 class TestDirectCompile(CustomTestCase):
+    def test_helper_warmup_preserves_shared_queue_participation(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object(), calls=[])
+                compiled = MagicMock()
+                compiled.cache = {}
+                compiled.precompile.return_value = PendingCall(lambda: None)
+
+                def scale(value, factor):
+                    return value * factor
+
+                def build(fn, **options):
+                    compiled.cache[options["specialization_key"](torch.ones(2), 3)] = (
+                        object()
+                    )
+                    return compiled
+
+                op = compiled_op(spmd_safe=shared)(scale)
+                with (
+                    patch(
+                        "sglang.srt.compilation.compiled_op.is_tpu", return_value=True
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.current_warmup_queue",
+                        return_value=queue,
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.direct_compile",
+                        side_effect=build,
+                    ) as compile_fn,
+                    get_context().override_server_args(tpu_compile_tracer="direct"),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+                ):
+                    for _ in range(2):
+                        warmup_compiled_op(op, torch.ones(2), factor=3)
+                    self.assertEqual(
+                        compile_fn.call_count, 0 if verify and not shared else 1
+                    )
+                    self.assertEqual(compiled.precompile.call_count, 2 if shared else 0)
+                    if shared:
+                        self.assertTrue(
+                            compiled.precompile.call_args.kwargs["async_compile"]
+                        )
+                    # Verification must never suppress ordinary helper execution.
+                    op(torch.ones(2), 3)
+                    compiled.assert_called_once()
+
+    def test_verification_skips_only_unshared_warmups(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                compiled = direct_compile.direct_compile(
+                    lambda value: value + 1,
+                    specialization_key=lambda value: tuple(value.shape),
+                    name="test/model.forward",
+                    spmd_safe=shared,
+                )
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object())
+                with (
+                    patch.object(
+                        direct_compile, "current_warmup_queue", return_value=queue
+                    ),
+                    patch.object(compiled, "_get_artifact") as get_artifact,
+                ):
+                    value = torch.ones(2)
+                    compiled.warmup_async(value).wait()
+                    compiled.precompile(value).wait()
+                    compiled.precompile(value, async_compile=True).wait()
+                    self.assertEqual(
+                        get_artifact.call_count, 0 if verify and not shared else 3
+                    )
+                    get_artifact.reset_mock()
+                    compiled(value)
+                    get_artifact.assert_called_once()
+
     def test_random_compiled_op_warmup_preserves_rng(self):
         torch_compile = torch.compile
 
@@ -356,10 +415,11 @@ class TestDirectCompile(CustomTestCase):
                     artifact.pending_compile = future
 
                 def compile_helper(
-                    args, kwargs, *, async_compile, spmd_compiler, graph
+                    args, kwargs, *, async_compile, spmd_compiler, graph, store
                 ):
                     self.assertEqual(async_compile, asynchronous)
                     self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(store)
                     self.assertIsNone(graph)
                     return artifact
 
@@ -381,6 +441,34 @@ class TestDirectCompile(CustomTestCase):
                     self.assertIsNone(artifact.pending_compile)
                     self.assertEqual(future.get.call_count, int(asynchronous))
                     execute.assert_not_called()
+
+    def test_async_precompile_keeps_keyword_order(self):
+        """Serving calls must find the graph warmed with the same keywords."""
+        compiled = direct_compile.direct_compile(
+            lambda value, *, b, a: value,
+            specialization_key=lambda value, **kwargs: tuple(kwargs),
+        )
+        orders = []
+
+        def get_artifact(args, kwargs, *, async_compile=False):
+            orders.append(list(kwargs))
+            return MagicMock()
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
+            patch.object(direct_compile, "synchronize"),
+            patch.object(
+                direct_compile.tpu_torch_compile,
+                "placeholder_like",
+                side_effect=lambda value: value,
+            ),
+            patch.object(compiled, "_get_artifact", get_artifact),
+        ):
+            compiled.precompile(
+                torch.ones(2), async_compile=True, b=torch.ones(1), a=torch.ones(1)
+            )
+
+        self.assertEqual(orders, [["b", "a"]])
 
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
@@ -435,6 +523,45 @@ class TestDirectCompile(CustomTestCase):
                 op(b=b, a=a, scale=2)
 
         compile_fn.assert_called_once()
+
+    def test_spmd_safe_compiled_op_keys_graphs_by_rank_independent_values(self):
+        """spmd_safe names the direct graph after the helper and keys it by typed
+        values, without the argument structure."""
+        built = []
+
+        def capture(fn, **kwargs):
+            built.append(kwargs)
+            compiled = MagicMock(side_effect=fn)
+            compiled.cache = {}
+            return compiled
+
+        def scale(x, factor):
+            return x * factor
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch("sglang.srt.compilation.compiled_op.direct_compile", new=capture),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        ):
+            compiled_op(spmd_safe=True)(scale)(torch.ones(4), 2)
+
+        (kwargs,) = built
+        self.assertTrue(kwargs["spmd_safe"])
+        self.assertEqual(kwargs["name"], f"{__name__}.{scale.__qualname__}")
+        key = kwargs["specialization_key"]
+        x = torch.ones(4)
+        # --use-spmd-compile names each graph by the canonical key; 2, 2.0 and
+        # True compare equal but bake different constants into the graph.
+        names = {canonical(_key_value(key(x, factor))) for factor in (2, 2.0, True, 3)}
+        self.assertEqual(len(names), 4)
+        self.assertEqual(
+            canonical(_key_value(key(x, 2))), '[[[4],"torch.float32","cpu"],["int",2]]'
+        )
+        self.assertEqual(key(x, 2), key(x, factor=2))
+
+        with self.assertRaisesRegex(ValueError, "TPU generator"):
+            compiled_op(spmd_safe=True, uses_rng=True)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
@@ -820,6 +947,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertIs(runtime_inputs[1], original_value)
         self.assertIs(runtime_inputs[2], value)
+        self.assertIn("Online weight updates", model._derived_weight_cache_error)
 
     def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
         with self.assertRaisesRegex(ValueError, "requires model"):
@@ -889,6 +1017,76 @@ class TestDirectCompile(CustomTestCase):
 
         compile_fn.assert_called_once()
         self.assertEqual(execute.call_count, len(routing_inputs))
+
+    def test_published_moe_bound_traces_from_the_batch_input(self):
+        """The forward context's MoE bound getter is bound to the live batch;
+        tracing must read it from the traced batch, or the live int32 scalar
+        becomes an argument the executable is never given."""
+        from sglang.srt.model_executor.forward_context import get_forward_context
+
+        bound = torch.tensor(3, dtype=torch.int32)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.ones(2, dtype=torch.int64),
+            out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            seq_lens_sum=2,
+            num_token_non_padded=bound,
+        )
+        seen = []
+
+        def forward(forward_batch):
+            seen.append(get_forward_context().moe_num_token_non_padded())
+            return forward_batch.input_ids + 1
+
+        compiler = direct_compile.tpu_torch_compile
+        # precompile/warmup_async may compile a tree_map copy of the bound batch.
+        for name, called in (("same", batch), ("copy", replace(batch))):
+            seen.clear()
+            with (
+                self.subTest(batch=name),
+                patch.object(
+                    ForwardBatch,
+                    "moe_num_token_non_padded",
+                    lambda self: self.num_token_non_padded,
+                ),
+                patch.object(
+                    direct_compile,
+                    "_is_tpu_tensor",
+                    side_effect=lambda item: isinstance(item, torch.Tensor),
+                ),
+                patch.object(
+                    direct_compile.execution_mode,
+                    "set_eager_mode",
+                    return_value=nullcontext(),
+                ),
+                patch.object(
+                    compiler,
+                    "placeholder_like",
+                    side_effect=lambda tensor: tensor.clone(),
+                ),
+                patch.object(
+                    compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+                ) as compile_fn,
+                forward_context(
+                    ForwardContext(attn_backend=MagicMock(spec=AttentionBackend)),
+                    forward_batch=batch,
+                ),
+            ):
+                compiled = direct_compile.direct_compile(
+                    forward, specialization_key=lambda forward_batch: 0
+                )
+                compiled._compile((called,), {})
+                # Serving's binding is restored after the trace.
+                getter = get_forward_context().moe_num_token_non_padded
+                self.assertIs(getter.__self__, batch)
+
+                graph_inputs = compile_fn.call_args.args[1]
+                (traced_bound,) = seen
+                self.assertIsNot(traced_bound, bound)
+                self.assertTrue(any(t is traced_bound for t in graph_inputs))
 
     def test_registered_tensor_aliases_are_traced(self):
         model = _ModelWithRegisteredAlias()
@@ -1488,6 +1686,50 @@ class TestDirectCompile(CustomTestCase):
         self.assertTrue(torch.equal(kv_pool.value, pool_output))
         self.assertEqual(len(traverse.call_args.args[0]), 1)
 
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_policy_kv_pool_keeps_topk_capture_buffer_readable(self):
+        """Bug regression: a capture buffer written inside the forward must stay
+        readable after a direct-traced forward, on the trace call and on replay."""
+        cache = BaseDeviceCache(
+            max_batch_size=4, num_layers=2, topk_size=3, device="tpu", name="test"
+        )
+        buffer = cache.buffer
+        model = torch.nn.Identity()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(
+                model=model, token_to_kv_pool=_KVPool(torch.zeros(2, device="tpu"))
+            ),
+            owner=model,
+        )
+        # The TPU configuration: routed-experts capture on, no indexer capturer.
+        with (
+            patch.object(
+                decoder_compile_policy,
+                "get_global_experts_capturer",
+                return_value=SimpleNamespace(device_cache=cache),
+            ),
+            patch.object(
+                decoder_compile_policy, "get_global_indexer_capturer", return_value=None
+            ),
+        ):
+            kv_pool = policy.get_direct_compile_kv_pool()
+
+        def fn(topk):
+            cache.capture(layer_id=1, topk_indices=topk)
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda topk: tuple(topk.shape),
+            kv_pool=kv_pool,
+        )
+        for rows in ([[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]):
+            expected = torch.zeros((4, 2, 3), dtype=torch.int32)
+            expected[:2, 1] = torch.tensor(rows, dtype=torch.int32)
+            with torch.no_grad():
+                compiled(torch.tensor(rows, dtype=torch.int32, device="tpu"))
+            self.assertIs(cache.buffer, buffer)
+            self.assertTrue(torch.equal(cache.buffer.cpu(), expected))
+
     def test_rejects_function_with_neither_outputs_nor_mutations(self):
         """Negative branch: without a KV pool, a fn returning None traces an
         empty graph and must still be rejected."""
@@ -1576,6 +1818,46 @@ class _RankModel(torch.nn.Module):
 class _RankPolicy(DecoderTpuCompilePolicy):
     def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
         return tuple(input_ids.shape)
+
+
+class TestPolicyRankLifting(unittest.TestCase):
+    def test_subgroups_require_shared_compilation(self):
+        model = torch.nn.Identity()
+        policy = _RankPolicy(
+            model_runner=SimpleNamespace(model=model, token_to_kv_pool=None),
+            owner=model,
+            tracer="direct",
+        )
+        for initialized, tp_size, world_size, shared, expected in (
+            (False, 1, 1, False, False),
+            (True, 2, 16, False, False),  # PP8/TP2
+            (True, 1, 16, False, False),  # PP16/TP1
+            (True, 4, 8, False, False),
+            (True, 4, 8, True, True),  # DP2/TP4 shared compilation
+            (True, 16, 16, False, True),
+        ):
+            with (
+                self.subTest(tp_size=tp_size, world_size=world_size, shared=shared),
+                patch("torch.distributed.is_initialized", return_value=initialized),
+                patch("torch.distributed.get_world_size", return_value=world_size),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(world_size=tp_size)
+                    ),
+                ),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        graph=SimpleNamespace(use_spmd_compile=shared)
+                    ),
+                ),
+                patch.object(direct_compile, "direct_compile") as compile_mock,
+            ):
+                policy._direct_compile(model.forward)
+                self.assertIs(compile_mock.call_args.kwargs["lift_rank"], expected)
 
 
 class TestAttentionRankTensorScope(unittest.TestCase):

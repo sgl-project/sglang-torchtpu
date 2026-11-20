@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -123,7 +124,7 @@ class TestBatchedRpaKernel(unittest.TestCase):
         kv_lens = jnp.asarray([kv_len], dtype=jnp.int32)
         cu_q_lens = jnp.asarray([0, 1], dtype=jnp.int32)
         page_indices = jnp.asarray(page_indices_host.reshape(-1))
-        distribution = jnp.ones((3,), dtype=jnp.int32)
+        distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)  # one decode row
         sm_scale = 1.0 / math.sqrt(self.HEAD_DIM)
 
         expected = ref_ragged_paged_attention(
@@ -337,10 +338,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         kv_lens_padded[:num_seqs] = kv_lens
         cu_q_lens_padded = np.full(max_num_seqs + 1, total_tokens, dtype=np.int32)
         cu_q_lens_padded[: num_seqs + 1] = cu_q_lens
+        # [mixed, mixed + prefill, total]: decode rows are the tail range.
         if decode:
-            distribution = [num_seqs, num_seqs, num_seqs]
-        else:
             distribution = [0, 0, num_seqs]
+        else:
+            distribution = [num_seqs, num_seqs, num_seqs]
         sm_scale = 1.0 / math.sqrt(head_dim)
 
         def _reference(attention_sink):
@@ -544,6 +546,70 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
                 )
+
+    def _check_prefill_tiles(self, variants):
+        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows,
+        (k_scale, v_scale)) variant."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for env, windows, (k_scale, v_scale) in variants:
+            for sliding_window in windows:
+                with (
+                    self.subTest(
+                        env=env,
+                        sliding_window=sliding_window,
+                        kv_scales=(k_scale, v_scale),
+                    ),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    # The wrapper reads the flags while tracing; drop cached traces.
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+
+    def test_seq_along_lane_softmax_variants(self):
+        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone.
+
+        Ones-in-V also runs with a v scale other than 1, which must scale the output
+        but not the row sums riding in the accumulator."""
+        # Each variant recompiles; the combination is covered by the transposed test.
+        self._check_prefill_tiles(
+            (
+                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (0.5, 0.25)),
+                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,), (1.0, 1.0)),
+            )
+        )
+
+    def test_seq_along_lane_transposed(self):
+        """The transposed prefill tile (scores^T, split fp8 q), alone, with every other
+        tile, and with KV scales other than 1, which it must apply. The sequences end in
+        partial q blocks, whose padded compute blocks the tile skips."""
+        all_tiles = {
+            "SGLANG_TPU_RPA_TRANSPOSED": "1",
+            "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+            "SGLANG_TPU_RPA_ONES_V": "1",
+        }
+        self._check_prefill_tiles(
+            (
+                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,), (1.0, 1.0)),
+                (all_tiles, (None, 128), (1.0, 1.0)),
+                (all_tiles, (None,), (0.5, 0.25)),
+            )
+        )
 
 
 if __name__ == "__main__":

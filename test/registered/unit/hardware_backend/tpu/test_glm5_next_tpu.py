@@ -23,7 +23,7 @@ from sglang.kernels.ops.layernorm.mhc import (
 from sglang.srt.configs.glm5_next import Glm5NextConfig
 from sglang.srt.configs.hybrid_arch import glm5_next_config
 from sglang.srt.environ import envs
-from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
+from sglang.srt.hf_transformers.config import HfModelConfigParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

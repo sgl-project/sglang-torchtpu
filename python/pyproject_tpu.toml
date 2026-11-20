@@ -19,15 +19,23 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "anyio>=4.13.0",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "av",
+  # SGLang decodes video with torchcodec or, failing that, decord; this stack
+  # ships neither, so without it every video request fails to decode.
+  "decord2==3.4.0",
   "build",
   "compressed-tensors",
   "datasets",
+  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "einops",
   "fastapi",
   "easydict",
   "gguf",
+  "grpcio>=1.81.1",
+  "grpcio-health-checking>=1.81.1",
+  "grpcio-reflection>=1.81.1",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -42,8 +50,10 @@ dependencies = [
   "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
+  "protobuf>=6.33.5",
   "psutil",
   "py-spy",
   "pybase64",
@@ -56,17 +66,16 @@ dependencies = [
   "setproctitle",
   "soundfile==0.13.1",
   "tiktoken",
-  "timm==1.0.16",
+  "timm==1.0.25",
   "torchao==0.9.0",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.17.0",
+  "transformers==5.19.0",
   "uvicorn",
   "uvloop",
   "xxhash",
   "zstandard",
   "xgrammar==0.2.7",
-  "smg-grpc-servicer>=0.5.0",
 
   # The pins below form one TPU stack and must be upgraded and validated
   # together:
@@ -76,28 +85,35 @@ dependencies = [
   # - jax and jaxlib must be compatible with libtpu.
   # - tpu-sync-torch's native extension links torch_tpu's per-torch-version
   #   glue library, so it must be upgraded and validated with torch_tpu.
-  "torch_tpu==0.2.0",
+  "torch_tpu==0.2.1.dev20261028201649",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases.
-  "tpu-sync-torch==0.0.1.dev20261013083150",
+  # Minimum floor: >= 0.0.1.dev20261110081704 (contains google/tpu-sync
+  # 4e61045e5 + 47e9f2001 fixing PP->TP pool-reshard Chunk-out-of-bounds
+  # regression from #1391; dev20261031081414 breaks PP->TP P/D).
+  "tpu-sync-torch==0.0.1.dev20261112081648",
   "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",
-  "jax==0.10.2",
-  "jaxlib==0.10.2",
+  "jax==0.11.2",
+  "jaxlib==0.11.2",
 ]
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
-runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.17.0"]
 
 # Ray is required only for the --use-ray multihost launch path (RayEngine).
 # Mirrors the `ray` extra in the base pyproject so `sglang[ray]` resolves on TPU
 # builds too; pulled into dev_tpu so the TPU unit-test image gets it (otherwise
 # test_ray_bundle_order.py's importorskip("ray") silently skips forever).
 ray = ["ray[default]>=2.54.0"]
+
+# Kernels for --attention-backend flywheel; pulled into dev_tpu so the TPU
+# test image runs its unit and e2e tests.
+flywheel = ["flywheel-tpu==0.4.1"]
 
 tracing = [
   "opentelemetry-api",
@@ -147,6 +163,7 @@ dev_tpu = [
   "sglang[test]",
   "sglang[ray]",
   "sglang[runai]",
+  "sglang[flywheel]",
 ]
 
 [project.urls]
@@ -215,5 +232,11 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+torch-tpu = { index = "torch-tpu-registry" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true

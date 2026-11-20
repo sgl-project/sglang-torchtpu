@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import recompilation_checker
@@ -23,6 +22,7 @@ from sglang_tpu.compilation.recompilation_checker import (
     maybe_enable_site_tracing,
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.envs import envs
 
 # Pure logic over injected cache readers, no torch_tpu needed.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -830,6 +830,7 @@ class TestRecompilationGateHelpers(CustomTestCase):
             startup_time=1.0,
             max_total_num_tokens=100,
             swa_tokens_per_layer=None,
+            window_token_capacities=lambda: {},
             max_running_requests=8,
             spec_algorithm=SimpleNamespace(
                 is_none=lambda: True,

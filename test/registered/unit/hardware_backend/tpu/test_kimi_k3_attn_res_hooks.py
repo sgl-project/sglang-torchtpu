@@ -33,6 +33,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.hooks import HOOKS
 from sglang_tpu.hooks import attn_residual as hooks
+from sglang_tpu.platform import TpuOOTPlatform
 
 _KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 _FLAG = tpu_envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL
@@ -43,9 +44,10 @@ _KEY = current_platform.get_dispatch_key_name()
 @contextlib.contextmanager
 def _hooks_applied(kernel=None):
     """Apply the attention-residual HOOKS entries through HookRegistry, as the
-    plugin does on TPU, with `kernel` behind them and a scratch aggregation
-    registry; restore every target on exit. A given `kernel` is registered as
-    register_attn_residual_ops registers it."""
+    plugin does on TPU, with `kernel` behind them, a scratch aggregation
+    registry and the TPU platform's post-load call; restore every target on
+    exit. A given `kernel` is registered as register_attn_residual_ops
+    registers it."""
     with contextlib.ExitStack() as stack:
         for target, _, _ in _ATTN_RES_HOOKS:
             obj_path, attr = target.rsplit(".", 1)
@@ -56,6 +58,7 @@ def _hooks_applied(kernel=None):
         stack.enter_context(patch.object(HookRegistry, "_patched", set()))
         stack.enter_context(patch.object(hooks, "_kernel", kernel))
         stack.enter_context(patch.object(attn_residual, "_AGGREGATE_IMPLS", {}))
+        stack.enter_context(patch.object(kimi_k3, "current_platform", TpuOOTPlatform()))
         for target, hook, hook_type in _ATTN_RES_HOOKS:
             HookRegistry.register(target, hook, hook_type)
         HookRegistry.apply_hooks()
@@ -83,11 +86,12 @@ def _stand_in_kernel(supported: bool = True) -> types.ModuleType:
 
 
 class TestAttnResidualHookWiring(CustomTestCase):
-    def test_only_model_hooks_remain(self):
-        """Aggregation goes through attn_residual's registry, not AROUND hooks
-        on its private functions."""
+    def test_only_the_model_init_hook_remains(self):
+        """Aggregation goes through attn_residual's registry and preparation
+        through the platform's post-load call, not hooks on core functions."""
         self.assertEqual(
-            [h[2] for h in _ATTN_RES_HOOKS], [HookType.AFTER, HookType.AFTER]
+            [h[:1] + h[2:] for h in _ATTN_RES_HOOKS],
+            [("sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__", HookType.AFTER)],
         )
 
     def test_aggregate_mirrors_the_registry_protocol(self):
@@ -298,8 +302,9 @@ class TestKimiK3AttnResHookModelSetup(CustomTestCase):
         built = [c.args for c in kernel.get_norm_weight_f32.call_args_list]
         self.assertEqual(built, [(out_norm,) for _, out_norm in points])
 
-        # Checked on the module this hook marks: the TPU KDA layers publish a
-        # guard of their own, so the updater rejects updates either way.
+        # Checked on the module prepare_attn_residual_kernel marks: the TPU KDA
+        # layers publish a guard of their own, so the updater rejects updates
+        # either way.
         reason = model.model._derived_weight_cache_error
         self.assertIn("SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL", reason)
 

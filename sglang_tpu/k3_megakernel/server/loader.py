@@ -8,6 +8,7 @@ import inspect
 import time
 
 import jax
+import numpy as np
 
 ANCHOR = (1008, 18985, 387)  # anchor-protocol prompt
 
@@ -51,6 +52,14 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
         metavar="HOSTSxLANES",
         help="kernel topology, default <processes>x8; e.g. 2x4 on one host treats its 8 cores as two "
         "fake hosts (cross-host code paths on a single host)",
+    )
+    p.add_argument(
+        "--expert-blocks",
+        default="auto",
+        metavar="auto|none|B0,B1,..",
+        help="checkpoint expert block served by each kernel host (MoeLayout.ckpt_blocks): 'auto' detects "
+        "EP-local checkpoints (one expert block per host, possibly not in kernel host order) and "
+        "gathers every host's block; 'none' = identity; or an explicit list (tests: e.g. 1,0 with --topology 2x4)",
     )
     p.add_argument("--embed", choices=("full", "sharded"), default="full")
     p.add_argument(
@@ -100,21 +109,99 @@ def stack_spec(args, mesh):
     )
     if hosts * lanes != world:
         raise SystemExit(f"--topology {hosts}x{lanes} does not cover {world} devices")
+    relax = Relax.parse(args.relax.split(","))
+    topo = Topology(hosts=hosts, lanes=lanes)
     return StackSpec(
-        Topology(hosts=hosts, lanes=lanes),
+        topo,
         args.layers,
         model_io.mla_layers(args.layers, args.ckpt),
-        relax=Relax.parse(args.relax.split(",")),
+        relax=relax,
+        dsa_layers=model_io.dsa_layers(args.layers, args.ckpt),
+        expert_blocks=expert_blocks(args, mesh, topo, relax),
     )
+
+
+_BLOCKS_CACHE: dict = {}
+
+
+def expert_blocks(args, mesh, topo, relax) -> tuple[int, ...]:
+    """``MoeLayout.ckpt_blocks`` from ``--expert-blocks`` (see ``add_model_args``); () = identity."""
+    from sglang_tpu.k3_megakernel import model_io
+    from sglang_tpu.k3_megakernel.config import K3Dims
+
+    mode = args.expert_blocks or "none"
+    if mode == "none":
+        return ()
+    if mode != "auto":
+        blocks = tuple(int(x) for x in mode.split(","))
+        if len(blocks) != topo.hosts:
+            raise SystemExit(f"--expert-blocks {mode}: need {topo.hosts} entries")
+        return () if blocks == tuple(range(topo.hosts)) else blocks
+    key = (args.ckpt, topo.hosts, topo.lanes)
+    if key in _BLOCKS_CACHE:
+        return _BLOCKS_CACHE[key]
+    eh = K3Dims().num_experts // topo.hosts
+    mine = model_io.local_expert_block(args.ckpt, eh, K3Dims().num_experts)
+    from sglang_tpu.k3_megakernel.mesh import local_ranks
+
+    ranks = local_ranks(mesh)
+    host = ranks[0] // topo.lanes
+    if any(r // topo.lanes != host for r in ranks) and mine is not None:
+        raise SystemExit(
+            "EP-local checkpoint, but this process spans several kernel hosts"
+        )
+    pair = np.array([host, -1 if mine is None else mine], np.int32)
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        pairs = np.asarray(multihost_utils.process_allgather(pair)).reshape(-1, 2)
+    else:
+        pairs = pair[None]
+    if (pairs[:, 1] < 0).all():
+        out = ()
+    elif (pairs[:, 1] < 0).any():
+        raise SystemExit(
+            f"mixed EP-local / full checkpoints over the hosts: {pairs.tolist()}"
+        )
+    else:
+        got = {int(h): int(b) for h, b in pairs}
+        if sorted(got) != list(range(topo.hosts)) or sorted(got.values()) != list(
+            range(topo.hosts)
+        ):
+            raise SystemExit(f"EP-local expert blocks do not cover the hosts: {got}")
+        out = tuple(got[h] for h in range(topo.hosts))
+        if relax.expert_replicas and topo.hosts > 1:
+            raise SystemExit(
+                "expert_replicas needs host h-1's experts, which an EP-local checkpoint does not hold"
+            )
+        if out == tuple(range(topo.hosts)):
+            out = ()
+    log(f"expert blocks: {out or 'identity'} (process blocks {pairs.tolist()})")
+    _BLOCKS_CACHE[key] = out
+    return out
 
 
 def expert_load(args) -> str:
     return args.expert_load or ("cache" if args.layers <= 13 else "stream")
 
 
-def expert_cache_dir(args, world: int) -> str:
+def model_tag(ckpt: str) -> str:
+    """ "k31" for a K3.1 (DSA) checkpoint, "" for Kimi-K3: keeps the default expert caches apart."""
+    from sglang_tpu.k3_megakernel import model_io
+
+    return "k31" if model_io.text_config(ckpt).get("dsa_config") else ""
+
+
+def expert_cache_dir(args, world: int, blocks: tuple = ()) -> str:
+    """Default ``/dev/shm/k3mk_experts[_k31]_<L>l_tp<world>[_<topology>][_b<blocks>]`` (the K3 name is
+    unchanged; K3.1 and remapped expert layouts get their own)."""
+    if args.expert_cache:
+        return args.expert_cache
     topo = f"_{args.topology}" if args.topology else ""
-    return args.expert_cache or f"/dev/shm/k3mk_experts_{args.layers}l_tp{world}{topo}"
+    tag = model_tag(args.ckpt)
+    tag = f"_{tag}" if tag else ""
+    perm = "_b" + "".join(map(str, blocks)) if blocks else ""
+    return f"/dev/shm/k3mk_experts{tag}_{args.layers}l_tp{world}{topo}{perm}"
 
 
 def load_weights(args, mesh, experts=None, log_fn=log):
@@ -124,7 +211,7 @@ def load_weights(args, mesh, experts=None, log_fn=log):
 
     spec = stack_spec(args, mesh)
     cache = (
-        expert_cache_dir(args, mesh.devices.size)
+        expert_cache_dir(args, mesh.devices.size, spec.expert_blocks)
         if expert_load(args) == "cache"
         else ""
     )

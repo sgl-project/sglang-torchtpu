@@ -73,9 +73,7 @@ class TestDSV4TPUHelpers(CustomTestCase):
     def test_cos_sin_and_compressor_indexer_cache_preparation(self):
         from sglang.srt.runtime_context import get_context
 
-        override = get_context().override_server_args(
-            dsv4_attn_backend="tpu_dsv4", page_size=256
-        )
+        override = get_context().override_server_args(page_size=256)
         override.install()
         self.addCleanup(override.restore)
 
@@ -436,10 +434,8 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
         from sglang.srt.runtime_context import get_context, get_parallel
         from sglang.test.test_utils import enter_scope
-        from sglang_tpu.fp8_moe import (
-            _dequantize_dsv4_mxfp4_block32,
-            prepare_tpu_fp8_moe_weights,
-        )
+        from sglang_tpu.dsv4_mxfp4_moe import _dequantize_dsv4_mxfp4_block32
+        from sglang_tpu.fp8_moe import prepare_tpu_fp8_moe_weights
         from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         enter_scope(self, get_parallel().override(tp_size=1))

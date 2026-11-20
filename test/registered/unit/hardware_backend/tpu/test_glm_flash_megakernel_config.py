@@ -100,9 +100,12 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
         from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
 
         spec = _spec()
-        for n_query in (1, 4):
-            with self.subTest(n_query=n_query):
-                cfg = D.KernelConfig(max_len=16384, n_query=n_query, embed_2d=True)
+        # The served buckets: plain decode and the NEXTN-3 verify, up to 64 rows.
+        for n_query, n_req in ((1, 1), (1, 16), (4, 1), (4, 16)):
+            with self.subTest(n_query=n_query, n_req=n_req):
+                cfg = D.KernelConfig(
+                    max_len=16384, n_query=n_query, n_req=n_req, embed_2d=True
+                )
                 vmem = sum(
                     math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
                     for s in D.scratch_shapes(spec, KernelLayout(spec, 8), cfg)

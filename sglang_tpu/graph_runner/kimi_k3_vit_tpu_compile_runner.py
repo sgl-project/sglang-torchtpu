@@ -37,8 +37,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import multimodal_encoder_runs_here
+from sglang_tpu.envs import envs
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionTpuCompilePolicy,
     _compute_patch_counts,
@@ -53,12 +53,35 @@ _MERGE_SIZE = 2
 _MERGE_AREA = _MERGE_SIZE * _MERGE_SIZE
 
 
+# Default ladder when neither ViT precompile env is set. Kimi-K3's processor
+# admits up to in_patch_limit = 65536 patches per image (OCRBench images reach
+# 66096 after rounding, MMMU-Pro 33488), far past the generic 4900-patch cap,
+# and an image past the largest bucket runs the tower eagerly: full SDPA over
+# the image, which runs out of device memory at these sizes. Each rung at most
+# doubles the padded length; 258^2 = 66564 covers the processor's cap.
+# Only with splash: the flash op (VisionTpuAttention) runs out of scoped VMEM
+# compiling above ~16k patches (XLA e1001 at 33856). Without splash the generic
+# ladder (SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, default 4900) stays the default,
+# so text-only serving compiles exactly what it did before.
+_SPLASH_PATCH_BUCKETS = (1024, 2304, 4096, 9216, 16384, 33856, 66564)
+
+
 def patch_buckets() -> list[int]:
-    """The patch-count ladder: even-sided squares, bounded by the ViT envs."""
+    """The patch-count ladder: even-sided squares.
+
+    SGLANG_TPU_VIT_PRECOMPILE_SIZES, then SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES,
+    when set; otherwise the splash ladder with
+    SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION, else the generic ladder.
+    """
     if envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
         # Set but empty => () => warms nothing, i.e. precompile disabled.
         buckets = sorted({int(x) for x in envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()})
         return _validate_patch_buckets(buckets, _MERGE_SIZE)
+    if (
+        not envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.is_set()
+        and envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.get()
+    ):
+        return list(_SPLASH_PATCH_BUCKETS)
     return _compute_patch_counts(
         _MERGE_SIZE, max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
     )
@@ -165,9 +188,14 @@ class KimiK3VitTpuCompileRunner:
         self.tower = None
         self.projector = None
         if attention_cls is None:
-            from sglang.srt.layers.attention.vision import VisionTpuAttention
+            # The registered "tpu" vision backend, not the flash op directly:
+            # SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION=1 swaps in
+            # VisionTpuSplashAttention, whose fixed-size KV blocks still compile
+            # above ~16k patches, where the flash op's single KV step runs out
+            # of scoped VMEM (XLA e1001 at the 33856-patch bucket).
+            from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
 
-            attention_cls = VisionTpuAttention
+            attention_cls = QKV_BACKEND_IMPL["tpu"]
         # The layers hold no attention module of their own on TPU (their eager
         # path calls SDPA per segment), and the segment-id attention has no
         # weights, so one instance per layer lives here.

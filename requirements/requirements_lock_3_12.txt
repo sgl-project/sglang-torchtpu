@@ -233,9 +233,9 @@ ipython==9.17.1
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 ipython-pygments-lexers==1.1.1
     # via ipython
-jax==0.10.2
+jax==0.11.2
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-jaxlib==0.10.2
+jaxlib==0.11.2
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   jax

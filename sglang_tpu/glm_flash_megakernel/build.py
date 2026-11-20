@@ -191,7 +191,8 @@ def build_weights(
         kda["fgb"].append(fgb)
         kda["o"].append(a.o_proj.weight)
         kda["dt"].append(a.dt_bias.reshape(1, qsh).float())
-        kda["conv"].append(a.qkv_conv1d.weight[:, 0, :].t().to(bf16))
+        # [K, 1, C]: the kernel's conv window has the pool's channels-last unit dim.
+        kda["conv"].append(a.qkv_conv1d.weight[:, 0, :].t().to(bf16).unsqueeze(1))
         kda["a_log"].append(a.A_log.reshape(1, hk).float())
     q8, sq, o8, so = [], [], [], []
     for qkv, o in zip(kda["qkv"], kda["o"]):

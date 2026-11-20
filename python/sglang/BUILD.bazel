@@ -1,4 +1,4 @@
-# Handwritten. Two filegroups for the whole sglang package, consumed by
+# Handwritten. Filegroups for the whole sglang package, consumed by
 # //python:sglang. sglang's directories are too import-coupled (its own scan:
 # 254 of 415 dirs in cycles through top-level __init__ re-export chains) for
 # fine-grained per-directory targets to be acyclic, so the package ships as a
@@ -7,6 +7,15 @@
 # .py sources go in srcs; everything else (kernels/jit's include/ and csrc/
 # trees, resolved from the filesystem at import time) goes in data, because a
 # py_library only propagates non-source files to runfiles through data.
+
+# Source-tree launch planning loads this stdlib-only helper without importing
+# SGLang's runtime package.
+filegroup(
+    name = "checkpoint_prefetch",
+    srcs = ["test/ci/checkpoint_prefetch.py"],
+    visibility = ["//benchmark/tpu:__pkg__"],
+)
+
 filegroup(
     name = "py_files",
     srcs = glob(["**/*.py"]),

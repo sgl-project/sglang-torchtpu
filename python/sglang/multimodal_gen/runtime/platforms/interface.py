@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 
 class AttentionBackendEnum(enum.Enum):
     FA2 = enum.auto()
+    FLASHINFER_FA2 = enum.auto()
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
@@ -42,6 +43,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     AITER_SAGE = enum.auto()
+    AITER_QUANT = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
@@ -56,6 +58,7 @@ class AttentionBackendEnum(enum.Enum):
     # (Platform.get_oot_attn_backend_name) and resolves its class. Appended so
     # earlier members keep their auto() values.
     OOT = enum.auto()
+    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -134,8 +137,6 @@ class Platform:
     # compilation strategy.
     simple_compile_backend: str = "inductor"
 
-    supported_quantization: list[str] = []
-
     def init_backend(self) -> None:
         """One-time backend initialization, in each worker; raising aborts startup.
 
@@ -147,13 +148,39 @@ class Platform:
         """Apply defaults before argument normalization and validation."""
         pass
 
+    def supports_teacache_with_torch_compile(self) -> bool:
+        """Whether TeaCache may run under --enable-torch-compile.
+
+        TeaCache updates module state every denoising step; a backend that
+        recompiles on that (rather than graph-breaking cheaply) says False and
+        requests drop TeaCache with a warning.
+        """
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each. May configure process-wide compile
+        state the wrapper needs (e.g. a cache-key tag), so it must be
+        idempotent: compile_matching_submodules calls it once per compiled
+        model."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
+
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
+
+        Called once per worker after distributed initialization, before any
+        compilation.
+        """
+        pass
 
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
@@ -212,6 +239,12 @@ class Platform:
         if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 12
+
+    @classmethod
+    def is_gfx1151(cls) -> bool:
+        """True on the gfx1151 (Strix Halo) ROCm arch. Overridden on
+        RocmPlatform; every other platform is False."""
+        return False
 
     @classmethod
     def is_cuda_static(cls) -> bool:
@@ -273,7 +306,6 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
 
@@ -300,6 +332,19 @@ class Platform:
         return True
 
     @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        """Whether the Ulysses output all-to-all sends a heads-major attention
+        output as per-head slabs instead of relayouting it to sequence-major
+        first. Both give bit-identical values."""
+        return False
+
+    @classmethod
+    def supports_rank_subset_collectives(cls) -> bool:
+        """Whether a process subgroup's collectives can run while ranks outside
+        the subgroup do other work."""
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
@@ -320,6 +365,16 @@ class Platform:
         torch.get_device_module(device).set_device(device)
 
     @classmethod
+    def synchronize(cls) -> None:
+        """Synchronize pending device work for the current platform."""
+        torch.get_device_module().synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release cached device memory for the current platform."""
+        torch.get_device_module().empty_cache()
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
@@ -333,6 +388,21 @@ class Platform:
     def get_oot_attn_backend_name(cls) -> str | None:
         """The ``--attention-backend`` name of this platform's own backend
         (``AttentionBackendEnum.OOT``), or None when it has none."""
+        return None
+
+    @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        """Whether automatic selection may give the OOT backend to a layer that
+        lists only ``supported_attention_backends``."""
+        return False
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...] | None:
+        """``--attention-backend`` names that run ring attention on this
+        platform, the first being the ``--ring-degree`` default; None keeps the
+        core list."""
         return None
 
     @classmethod
@@ -432,13 +502,6 @@ class Platform:
         )
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        """
-        Check if the current platform supports async output.
-        """
-        raise NotImplementedError
-
-    @classmethod
     def inference_mode(cls):
         """A device-specific wrapper of `torch.inference_mode`.
 
@@ -473,16 +536,6 @@ class Platform:
         - By default all models are considered supported.
         """
         pass
-
-    @classmethod
-    def verify_quantization(cls, quant: str) -> None:
-        """
-        Verify whether the quantization is supported by the current platform.
-        """
-        if cls.supported_quantization and quant not in cls.supported_quantization:
-            raise ValueError(
-                f"{quant} quantization is currently not supported in {cls.device_name}."
-            )
 
     @classmethod
     def get_current_memory_usage(
@@ -531,6 +584,22 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        """Whether ``--enable-torch-compile`` also compiles the VAE decode."""
+        return True
+
+    @classmethod
+    def runs_dit_attention_eager_under_compile(cls) -> bool:
+        """Whether a compiled DiT block runs its attention section eager.
+
+        True where the fused attention kernels are untraceable and the
+        traceable fallback is slower than eager. A platform whose attention
+        traces into the compiled program returns False to keep one program
+        per block.
+        """
+        return True
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
@@ -550,6 +619,24 @@ class Platform:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
 
+    @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        """Whether every rank drains its device queue when a request finishes.
+
+        For platforms where queued collectives can otherwise reach into the
+        next request, so a host-to-device copy there waits on a peer.
+        """
+        return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
+
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_name(attention_cls_str)
@@ -557,8 +644,3 @@ class Platform:
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         """Check if a tensor is on the current platform's device."""
         return t.is_cuda
-
-
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""

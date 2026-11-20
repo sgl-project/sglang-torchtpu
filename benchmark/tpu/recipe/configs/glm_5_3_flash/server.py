@@ -2,13 +2,8 @@
 
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/glm_5_3_flash/server.py
-
-GLM_FLASH_DENSE_MAX_CONTEXT=<tokens> serves dense MLA instead (no indexer), at
-that context length; it matches the model only up to index_topk tokens.
 """
 
-import json
-import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
@@ -16,12 +11,20 @@ from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
 INPUT_TOKENS = 8192
 OUTPUT_TOKENS = 1024
 CONCURRENCY = 1
-DENSE_MAX_CONTEXT = os.environ.get("GLM_FLASH_DENSE_MAX_CONTEXT")
-CONTEXT_LENGTH = (
-    int(DENSE_MAX_CONTEXT) if DENSE_MAX_CONTEXT else INPUT_TOKENS + OUTPUT_TOKENS + 1024
-)
+CONTEXT_LENGTH = INPUT_TOKENS + OUTPUT_TOKENS + 1024
 MAX_RUNNING = CONCURRENCY if CONCURRENCY == 1 else CONCURRENCY + 2
 COMPILE_BS = [b for b in (1, 2, 4, 8, 16) if b <= CONCURRENCY] or [1]
+# Host tier for evicted prefixes (DSA pages and KDA state slots); a recipe
+# without the radix cache drops these keys.
+HICACHE_ARGS = {
+    "enable_hierarchical_cache": True,
+    "hicache_io_backend": "raiden",
+    "hicache_mem_layout": "page_first_fused",
+    "hicache_write_policy": "write_through",
+    "hicache_ratio": 2,
+}
+# Radix snapshot slots; too few stops cache hits silently. Arbitrary.
+MAMBA_SLOTS = 5 * MAX_RUNNING + 64
 
 CONFIG = deepcopy(_FP8_BASE_CONFIG)
 CONFIG["server_args"].update(
@@ -40,13 +43,12 @@ CONFIG["server_args"].update(
         "torch_compile_max_bs": MAX_RUNNING,
         "tpu_compile_bs": COMPILE_BS,
         "max_total_tokens": max(2, MAX_RUNNING) * CONTEXT_LENGTH,
-        "max_mamba_cache_size": MAX_RUNNING + 2,
-        "attention_backend": (
-            "pallas_tpu_mla" if DENSE_MAX_CONTEXT else "pallas_tpu_mla_sparse"
-        ),
+        "max_mamba_cache_size": MAMBA_SLOTS,
+        "attention_backend": "pallas_tpu_mla_sparse",
         "kv_cache_dtype": "fp8_e4m3",
         "page_size": 128,
-        "disable_radix_cache": True,
+        "disable_radix_cache": False,
+        "mamba_radix_cache_strategy": "extra_buffer",
         "mem_fraction_static": 0.9,
         "disable_shared_experts_fusion": True,
         "watchdog_timeout": 1800,
@@ -56,11 +58,7 @@ CONFIG["server_args"].update(
         "enable_attn_tp_input_scattered": True,
     }
 )
-if DENSE_MAX_CONTEXT:
-    # is_deepseek_dsa reads index_topk from both config levels.
-    CONFIG["server_args"]["json_model_override_args"] = json.dumps(
-        {"index_topk": None, "text_config": {"index_topk": None}}
-    )
+CONFIG["server_args"].update(HICACHE_ARGS)
 CONFIG["runtime_env"].update(
     {
         "SGLANG_MAMBA_SSM_DTYPE": "float32",

@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang_tpu.kv_free_fence import (
     KVFreeFence,
     assert_not_forward_write_target,
@@ -40,17 +41,33 @@ from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent, Transfer
 logger = logging.getLogger(__name__)
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
-# while a forward may still write them; any other pool's slots are unfenced.
+# while a forward may still write them.
 _KV_PAGE_POOLS = frozenset(
     (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA)
 )
+# Recurrent-state slots: the fence does not hold freed slots, so a load into one
+# waits for the in-flight forwards instead (see start_loading).
+_STATE_SLOT_POOLS = frozenset((PoolName.MAMBA,))
 
 
 def _check_kv_page_pool(name: PoolName) -> None:
-    if name not in _KV_PAGE_POOLS:
+    if name not in _KV_PAGE_POOLS | _STATE_SLOT_POOLS:
         raise NotImplementedError(
             f"The TPU hybrid HiCache path does not offload the {name.value} pool."
         )
+
+
+class BatchGateCounter(BatchDoneCounter):
+    """BatchDoneCounter plus the per-layer ``wait_until`` that recurrent-state
+    accessors call once the counter is registered on the req-to-token pool."""
+
+    def wait_until(self, threshold: int) -> None:
+        # The whole batch lands at once; the TPU backends read state without it.
+        del threshold
+        # CompiledForwardShim waited before the graph; branching here guards it.
+        if torch.compiler.is_compiling():
+            return
+        self.wait()
 
 
 class TpuDMAHybridCacheController(HybridCacheController):
@@ -59,6 +76,10 @@ class TpuDMAHybridCacheController(HybridCacheController):
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
+    # This engine's end of the prefill DRAM offload's extension to decode
+    # DRAM, set once the P/D manager exists; None without it. See
+    # disaggregation/decode_dram_offload/dram_offload_hooks.py.
+    decode_dram_extension: Optional[Any] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -69,8 +90,13 @@ class TpuDMAHybridCacheController(HybridCacheController):
         # re-register it on the device pool wrapper (SWAKVPool holds the
         # counter itself; its sub-pools carry None), so CompiledForwardShim's
         # whole-batch ``wait()`` resolves against the reload event.
-        self.layer_done_counter = BatchDoneCounter()
+        self.layer_done_counter = BatchGateCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        # A packed MTP draft pool's forward gates on its own counter; its pages
+        # land in the same engine call as the target's.
+        for entry in self.mem_pool_host.entries:
+            for draft_pool in entry.packed_draft_device_pools:
+                draft_pool.register_layer_transfer_counter(self.layer_done_counter)
 
     # ----- draft registration guards -----------------------------------------
 
@@ -150,6 +176,100 @@ class TpuDMAHybridCacheController(HybridCacheController):
                 transfer.device_indices = transfer.device_indices.cpu()
         return device_indices
 
+    # ----- unified shared-host reclaim ----------------------------------------
+
+    @staticmethod
+    def _bytes_to_aligned_tokens(pool: Any, byte_count: int) -> int:
+        raw_tokens = (byte_count + pool.size_per_token - 1) // pool.size_per_token
+        return (raw_tokens + pool.page_size - 1) // pool.page_size * pool.page_size
+
+    def _alloc_shared_host_requests_with_reclaim(
+        self, requests: list[tuple[PoolName, int]]
+    ) -> Optional[list[torch.Tensor]]:
+        from sglang_tpu.kv_pool_host import _SharedUnifiedDMAHostState
+
+        entries = [self.mem_pool_host.entry_map[name] for name, _ in requests]
+        domain = entries[0].host_pool.shared_allocation_domain
+        if not isinstance(domain, _SharedUnifiedDMAHostState):
+            return super()._alloc_shared_host_requests_with_reclaim(requests)
+        if any(
+            entry.host_pool.shared_allocation_domain is not domain for entry in entries
+        ):
+            raise ValueError("Host pools do not share one allocation domain.")
+        domain_requests = [
+            (entry.host_pool.pool_label, need_size)
+            for entry, (_, need_size) in zip(entries, requests, strict=True)
+        ]
+
+        allocated = domain.alloc_many(domain_requests)
+        if allocated is not None:
+            return allocated
+
+        pools = [entry.host_pool for entry in entries]
+        requested_bytes = sum(
+            need_size * pool.size_per_token
+            for pool, (_, need_size) in zip(pools, requests, strict=True)
+        )
+        requested_names = list(dict.fromkeys(name for name, _ in reversed(requests)))
+        candidates = [self.mem_pool_host.entry_map[name] for name in requested_names]
+        candidates.extend(
+            entry
+            for entry in self.mem_pool_host.entries
+            if entry.name not in requested_names
+            and uses_shared_host_layout(entry.host_pool)
+            and entry.host_pool.shared_allocation_domain is domain
+        )
+        candidates.sort(
+            key=lambda entry: domain.sides[entry.host_pool.pool_label].reclaim_priority
+        )
+
+        total_bytes = domain.total_bytes()
+        capped_entries = [
+            (entry, int(side.max_share * total_bytes))
+            for entry in candidates
+            if entry.host_evict_fn is not None
+            and (side := domain.sides[entry.host_pool.pool_label]).max_share is not None
+        ]
+
+        while True:
+            made_progress = False
+            for entry, cap_bytes in capped_entries:
+                pool = entry.host_pool
+                excess_bytes = domain.used_bytes(pool.pool_label) - cap_bytes
+                if excess_bytes <= 0:
+                    continue
+                shortfall_bytes = min(
+                    excess_bytes,
+                    max(
+                        pool.page_size * pool.size_per_token,
+                        requested_bytes - domain.free_bytes(),
+                    ),
+                )
+                tokens = self._bytes_to_aligned_tokens(pool, shortfall_bytes)
+                if entry.host_evict_fn(tokens) <= 0:
+                    continue
+                made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            for entry in candidates:
+                if entry.host_evict_fn is None:
+                    continue
+                pool = entry.host_pool
+                shortfall_bytes = max(
+                    pool.page_size * pool.size_per_token,
+                    requested_bytes - domain.free_bytes(),
+                )
+                tokens = self._bytes_to_aligned_tokens(pool, shortfall_bytes)
+                if entry.host_evict_fn(tokens) <= 0:
+                    continue
+                made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            if not made_progress:
+                return None
+
     # ----- transfers ----------------------------------------------------------
 
     def _issue_pool_dmas(self, op: CacheOperation, load: bool) -> List[TransferEvent]:
@@ -225,6 +345,12 @@ class TpuDMAHybridCacheController(HybridCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
+        # A request that finished one step ago may still be writing its freed
+        # state slot in the in-flight forward, and that slot can be this load's target.
+        if self.kv_free_fence is not None and any(
+            t.name in _STATE_SLOT_POOLS for t in op.pool_transfers or ()
+        ):
+            self.kv_free_fence.wait_for_in_flight()
 
         # All pools' H2d; each future-event comes back before its DMA lands.
         # The consuming forward's CompiledForwardShim wait() polls the combined

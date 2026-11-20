@@ -39,11 +39,12 @@ from sglang.benchmark.stream_metrics import (
 )
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
@@ -52,6 +53,14 @@ DEFAULT_TIMEOUT = 600
 # Replay recorded text prompts (encoded client-side); recorded completion
 # lens are ignored -- --output-len caps every request.
 REPLAY_TEXT_DATASETS = ("sharegpt", "custom")
+
+
+def get_last_gen_throughput(internal_states: List[dict]) -> float:
+    """Sum DP schedulers' recent decode rates; -1 means unavailable."""
+    throughputs = [state.get("last_gen_throughput") for state in internal_states]
+    if not throughputs or any(value is None for value in throughputs):
+        return -1
+    return sum(throughputs)
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
@@ -121,6 +130,7 @@ class BenchArgs:
     return_logprob: bool = False
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
+    input_len_list: str = ""
     base_url: str = ""
     local_tokenizer_path: str = ""
     skip_warmup: bool = False
@@ -196,6 +206,14 @@ class BenchArgs:
             "--input-len-step-percentage",
             type=float,
             default=BenchArgs.input_len_step_percentage,
+        )
+        parser.add_argument(
+            "--input-len-list",
+            type=str,
+            default=BenchArgs.input_len_list,
+            help="Comma-separated per-request input lengths for random/random-ids "
+            "batches: request i gets entry i modulo the list length, and the "
+            "reported input_len is the batch's mean.",
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument(
@@ -483,6 +501,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    num_dp_ranks: int = 1,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -495,6 +514,7 @@ def _warmup_cache(
         image_data: Optional image data for VLM models
         backend: Backend server type ("sglang" or "vllm")
         model_name: Model name (required for vllm backend)
+        num_dp_ranks: Number of SGLang DP ranks with separate prefix caches
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -531,20 +551,38 @@ def _warmup_cache(
             cache_warmup_payload["image_data"] = image_data
         gen_url = url + "/generate"
 
-    warmup_response = requests.post(
-        gen_url,
-        json=cache_warmup_payload,
-        timeout=DEFAULT_TIMEOUT,
+    # An undersized batch may be measured on a different replica than it warmed.
+    # Populate every replica so the measurement does not depend on the router cursor.
+    warmup_ranks = (
+        range(num_dp_ranks)
+        if backend == "sglang" and len(input_ids) < num_dp_ranks
+        else [None]
     )
-    warmup_response.raise_for_status()
+    for rank in warmup_ranks:
+        payload = (
+            cache_warmup_payload
+            if rank is None
+            else {**cache_warmup_payload, "routed_dp_rank": rank}
+        )
+        warmup_response = requests.post(
+            gen_url,
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        warmup_response.raise_for_status()
     print("Cache warmup completed")
 
 
-def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+def _flush_cache_with_retry(
+    url: str, endpoint: str, max_retries: int = 3, admin_api_key: Optional[str] = None
+):
     """Post to a cache flush endpoint with retries on failure."""
+    headers = admin_auth_headers(admin_api_key)
     for attempt in range(max_retries):
         try:
-            response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
+            response = requests.post(
+                url + endpoint, headers=headers, timeout=DEFAULT_TIMEOUT
+            )
             if response.status_code == 200:
                 return
             if attempt >= max_retries - 1:
@@ -562,6 +600,9 @@ def _load_hf_config(name_or_path: str):
 
     from transformers import AutoConfig
 
+    from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+    apply_all_hf_patches()
     try:
         return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:
@@ -616,6 +657,7 @@ def run_one_case(
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
+    admin_api_key: Optional[str] = None,
     dataset_name: str = BenchArgs.dataset_name,
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
@@ -633,16 +675,20 @@ def run_one_case(
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
+    input_len_list: str = "",
+    num_dp_ranks: int = 1,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
-        _flush_cache_with_retry(url, "/flush_cache")
+        _flush_cache_with_retry(url, "/flush_cache", admin_api_key=admin_api_key)
         # /flush_cache resets the radix tree and the host tier; a storage tier
         # persists across it and would serve the same prompts on the next case.
         if flush_hicache_storage:
-            _flush_cache_with_retry(url, "/hicache/storage-backend/clear")
+            _flush_cache_with_retry(
+                url, "/hicache/storage-backend/clear", admin_api_key=admin_api_key
+            )
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -733,6 +779,12 @@ def run_one_case(
         else:
             input_ids = [req.prompt for req in input_requests]
             image_data = None
+            if input_len_list:
+                lens = _batch_input_lens(input_len_list, batch_size)
+                input_ids = [
+                    (ids * (n // len(ids) + 1))[:n] for ids, n in zip(input_ids, lens)
+                ]
+                input_len = sum(lens) // batch_size
 
     # Build payload based on backend
     if backend == "vllm":
@@ -818,6 +870,7 @@ def run_one_case(
             image_data=image_data,
             backend=backend,
             model_name=model_name,
+            num_dp_ranks=num_dp_ranks,
         )
 
     # Turn on profiler
@@ -831,6 +884,7 @@ def run_one_case(
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
             start_step=profile_start_step,
+            admin_api_key=admin_api_key,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -951,14 +1005,11 @@ def run_one_case(
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
         acc_length = -1
-        last_gen_throughput = -1
+        last_gen_throughput = get_last_gen_throughput(internal_states)
         for internal_state in internal_states:
             val_acc = internal_state.get("avg_spec_accept_length")
             if val_acc is not None:
                 acc_length = val_acc
-            val_thr = internal_state.get("last_gen_throughput")
-            if val_thr is not None:
-                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -1027,13 +1078,50 @@ def run_one_case(
     return result
 
 
+def _parse_input_len_list(input_len_list: str) -> List[int]:
+    entries = [entry.strip() for entry in input_len_list.split(",")]
+    if not all(entry.isdecimal() and int(entry) > 0 for entry in entries):
+        raise ValueError(
+            "--input-len-list must be comma-separated positive integers, "
+            f"got {input_len_list!r}"
+        )
+    return [int(entry) for entry in entries]
+
+
+def _batch_input_lens(input_len_list: str, batch_size: int) -> List[int]:
+    """Per-request input lengths of a batch: --input-len-list cycled to its size."""
+    lens = _parse_input_len_list(input_len_list)
+    return [lens[i % len(lens)] for i in range(batch_size)]
+
+
 def should_skip_due_to_token_capacity(
-    batch_size, input_len, output_len, skip_token_capacity_threshold
+    batch_size,
+    input_len,
+    output_len,
+    skip_token_capacity_threshold,
+    input_len_list="",
+    num_dp_ranks=1,
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+    input_tokens = (
+        sum(_batch_input_lens(input_len_list, batch_size))
+        if input_len_list
+        else batch_size * input_len
+    )
+    resident_tokens = input_tokens + batch_size * output_len
+    if input_len_list and num_dp_ranks > 1:
+        # Requests land on DP rank i % num_dp_ranks (the DP controller's
+        # round-robin), so a ragged batch fills its heaviest rank first; the
+        # requests past that rank's share of the pool would queue.
+        lens = _batch_input_lens(input_len_list, batch_size)
+        heaviest = max(
+            sum(n + output_len for n in lens[rank::num_dp_ranks])
+            for rank in range(num_dp_ranks)
+        )
+        resident_tokens = max(resident_tokens, heaviest * num_dp_ranks)
+    if resident_tokens > skip_token_capacity_threshold:
         print(
             "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+            + f"Skip benchmark {batch_size=} {input_len=} {output_len=}: {resident_tokens=} > {skip_token_capacity_threshold=} due to kv cache limit."
             + "=" * 8
         )
         return True
@@ -1172,6 +1260,19 @@ def run_benchmark_internal(
                 "request."
             )
 
+    if bench_args.input_len_list:
+        _parse_input_len_list(bench_args.input_len_list)
+    if bench_args.input_len_list and (
+        bench_args.dataset_name not in ("random", "random-ids")
+        or bench_args.fixed_prompt_file
+        or len(bench_args.input_len) > 1
+    ):
+        raise ValueError(
+            "--input-len-list sizes random/random-ids prompts and replaces "
+            "--input-len: use one of those datasets, one --input-len value and "
+            "no --fixed-prompt-file."
+        )
+
     if bench_args.dataset_name in REPLAY_TEXT_DATASETS:
         if bench_args.backend == "vllm":
             raise ValueError(
@@ -1232,6 +1333,7 @@ def run_benchmark_internal(
         # vLLM does not expose token capacity or max running requests via API
         skip_token_capacity_threshold = float("inf")
         skip_max_running_requests_threshold = float("inf")
+        num_dp_ranks = 1
     else:
         model_name = None
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
@@ -1359,6 +1461,26 @@ def run_benchmark_internal(
         print("=" * 8 + " Warmup Begin " + "=" * 8)
         print(f"Warmup with batch_size={batch_size_unique}")
         for bs in batch_size_unique:
+            kv_footprint_bs = (
+                bs if effective_running_cap is None else min(bs, effective_running_cap)
+            )
+            # Do not warm batches that every measured shape will skip.
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ) or all(
+                should_skip_due_to_token_capacity(
+                    kv_footprint_bs,
+                    il,
+                    ol,
+                    skip_token_capacity_threshold,
+                    bench_args.input_len_list,
+                    num_dp_ranks,
+                )
+                for il, ol in itertools.product(
+                    bench_args.input_len, bench_args.output_len
+                )
+            ):
+                continue
             run_one_case(
                 base_url,
                 batch_size=bs,
@@ -1372,6 +1494,7 @@ def run_benchmark_internal(
                 run_name="",
                 result_filename="",
                 tokenizer=tokenizer,
+                admin_api_key=server_args.admin_api_key,
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
                 parallel_batch=bench_args.parallel_batch,
@@ -1379,6 +1502,7 @@ def run_benchmark_internal(
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
                 flush_hicache_storage=bench_args.flush_hicache_storage,
+                num_dp_ranks=num_dp_ranks,
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1401,7 +1525,12 @@ def run_benchmark_internal(
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                kv_footprint_bs,
+                il,
+                ol,
+                skip_token_capacity_threshold,
+                bench_args.input_len_list,
+                num_dp_ranks,
             ):
                 continue
             results.append(
@@ -1418,6 +1547,7 @@ def run_benchmark_internal(
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    admin_api_key=server_args.admin_api_key,
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
@@ -1426,11 +1556,13 @@ def run_benchmark_internal(
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
                     flush_hicache_storage=bench_args.flush_hicache_storage,
+                    num_dp_ranks=num_dp_ranks,
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     fixed_prompt_file=bench_args.fixed_prompt_file,
                     apply_chat_template=bench_args.apply_chat_template,
+                    input_len_list=bench_args.input_len_list,
                     **gsp_kwargs,
                 )
             )
@@ -1449,7 +1581,12 @@ def run_benchmark_internal(
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                        kv_footprint_bs,
+                        il,
+                        ol,
+                        skip_token_capacity_threshold,
+                        bench_args.input_len_list,
+                        num_dp_ranks,
                     ):
                         continue
                     profile_prefix = (
@@ -1480,15 +1617,18 @@ def run_benchmark_internal(
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
+                            admin_api_key=server_args.admin_api_key,
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
                             flush_hicache_storage=bench_args.flush_hicache_storage,
+                            num_dp_ranks=num_dp_ranks,
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             fixed_prompt_file=bench_args.fixed_prompt_file,
                             apply_chat_template=bench_args.apply_chat_template,
+                            input_len_list=bench_args.input_len_list,
                             **gsp_kwargs,
                         )
                     )

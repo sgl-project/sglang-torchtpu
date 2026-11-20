@@ -3,22 +3,23 @@
 import inspect
 import unittest
 from array import array
+from functools import partial
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers import tp_worker as tp_worker_module
+from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -60,6 +61,9 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.envs import envs
+from sglang_tpu.host_padding import ordinary_compiled_forward
+from sglang_tpu.raiden_transfer import RaidenFutureEvent
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
@@ -210,6 +214,25 @@ class TestHostStagedPrefillInputs(CustomTestCase):
             )
             platform = TpuSRTPlatform()
             self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+            # Pipeline stages pad prefill to the same buckets; a PD decode
+            # server's prebuilt first token and DP attention still do not.
+            with get_context().override_server_args(
+                enable_torch_compile=True, pp_size=2
+            ):
+                batch.forward_mode = ForwardMode.EXTEND
+                self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+                batch.forward_mode = ForwardMode.PREBUILT
+                self.assertIsNone(platform.get_batch_input_device(batch))
+                batch.forward_mode = ForwardMode.EXTEND
+            with get_context().override_server_args(
+                enable_torch_compile=True, pp_size=2, tp_size=2, attn_dp_size=2
+            ):
+                self.assertFalse(
+                    ordinary_compiled_forward(
+                        batch.model_config, allow_pipeline_parallel=True
+                    )
+                )
+                self.assertIsNone(platform.get_batch_input_device(batch))
             with get_schedule().override(enable_mixed_chunk=True):
                 self.assertIsNone(platform.get_batch_input_device(batch))
             batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
@@ -231,7 +254,9 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         runner = SimpleNamespace(
             device="meta",
             is_draft_worker=False,
-            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
+            runner_ids=SimpleNamespace(
+                own_plan=lambda _: SimpleNamespace(bind=lambda *_, **__: None)
+            ),
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             model_config=SimpleNamespace(
                 model_is_mrope=True, requires_mm_token_modalities=False
@@ -260,8 +285,8 @@ class TestHostStagedPrefillInputs(CustomTestCase):
                         "0", "", array("q", range(n + 3)), SamplingParams(), False
                     )
                     req.refresh_fill_ids()
-                    req.prefix_indices = torch.arange(3)
-                    req.set_extend_range(3, n + 3)
+                    req.prefix_len = 3
+                    req.extend_end = n + 3
                     expected_mrope = torch.arange(3, n + 3).repeat(3, 1)
                     if has_image:
                         spatial_offsets = torch.tensor([[0], [10], [20]])
@@ -904,6 +929,41 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertEqual(len(seen_by_graph), 1)
         torch.testing.assert_close(seen_by_graph[0][:3], embeds)
         torch.testing.assert_close(fb.mm_input_embeds[:3], embeds)
+
+    def test_prompt_logprobs_leave_the_draft_extend_capture_alone(self):
+        """With prompt logprobs on, a target extend runs with FULL capture, but an
+        MTP draft's prompt extend keeps LAST (one row per request): FULL returned
+        every bucket row and broke the draft's per-request seed copy."""
+        seen = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen.append(forward_batch.capture_hidden_mode)
+            return torch.zeros(8, 4)
+
+        for is_draft, want in (
+            (False, CaptureHiddenMode.FULL),
+            (True, CaptureHiddenMode.LAST),
+        ):
+            with self.subTest(draft=is_draft):
+                seen.clear()
+                policy = DecoderTpuCompilePolicy()
+                if is_draft:
+                    policy.model_runner = SimpleNamespace(
+                        model=SimpleNamespace(),
+                        token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+                        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+                        is_draft_worker=True,
+                    )
+                with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+                    shim = CompiledForwardShim(compiled, policy=policy)
+                fb = self._forward_batch(
+                    input_ids=torch.arange(8, dtype=torch.int32),
+                    forward_mode=_ForwardModeMock("extend"),
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+                shim(None, None, fb)
+                self.assertEqual(seen, [want])
+                self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.LAST)
 
     def test_recompilation_check_runs_when_forward_raises(self):
         """A compile that raises mid-forward must still be reported."""
@@ -1632,7 +1692,7 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
 
 
 class TestHiCacheReloadGate(CustomTestCase):
-    """The shim must wait on the device pool's transfer counter per forward.
+    """A forward must wait on its batch's slot in the pool's transfer counter.
 
     Regression: the gate looked the pool up on the ForwardBatch, which
     carries no pool references, so the defensive lookup returned None and a
@@ -1641,7 +1701,7 @@ class TestHiCacheReloadGate(CustomTestCase):
     32933877240).
     """
 
-    def _shim(self, counter):
+    def _shim(self, counter, fn=lambda *a, **k: "out"):
         policy = SimpleNamespace(
             model_runner=SimpleNamespace(
                 token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
@@ -1649,7 +1709,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             finalize_forward_batch=lambda out, fb: out,
             keep_outputs_padded=lambda fb: False,
         )
-        return CompiledForwardShim(lambda *a, **k: "out", policy=policy)
+        return CompiledForwardShim(fn, policy=policy)
 
     def test_forward_waits_on_reload_counter(self):
         counter = MagicMock()
@@ -1703,6 +1763,90 @@ class TestHiCacheReloadGate(CustomTestCase):
             self.assertEqual(shim(None, None, fb), "out")
 
         counter.wait.assert_not_called()
+
+    def test_worker_forward_starts_after_its_batch_reload_lands(self):
+        """A batch's forward starts only after its HiCache reload DMA lands;
+        PD sends read those pages after the forward. Drives the upstream worker method."""
+        dma = _PendingDma(polls_before_landing=1)
+        counter = BatchDoneCounter()
+        slot = counter.update_producer()
+        counter.set_event(slot, RaidenFutureEvent(dma))
+        # A later batch's reload owns the newest slot; this batch must wait on its own.
+        counter.set_event(
+            counter.update_producer(),
+            RaidenFutureEvent(_PendingDma(polls_before_landing=0)),
+        )
+        landed_at_forward = []
+        shim = self._shim(
+            counter, fn=lambda *a, **k: landed_at_forward.append(dma.landed)
+        )
+
+        def model_forward(forward_batch, pp_proxy_tensors=None):
+            shim(None, None, forward_batch)
+            return SimpleNamespace(
+                logits_output=None,
+                can_run_graph=False,
+                expert_distribution_metrics=None,
+                routed_experts_output=None,
+                indexer_topk_output=None,
+                kv_weight_version_record=None,
+            )
+
+        worker = SimpleNamespace(
+            hicache_layer_transfer_counter=counter,
+            model_runner=SimpleNamespace(forward=model_forward, forward_observer=None),
+            pp_group=SimpleNamespace(is_last_rank=True),
+            is_dllm=lambda: False,
+        )
+        worker.set_hicache_consumer = partial(
+            TpModelWorker.set_hicache_consumer, worker
+        )
+        fb = SimpleNamespace(
+            is_prefill_only=False,
+            mm_input_embeds=None,
+            input_embeds=None,
+            spec_info=None,
+            forward_mode=_ForwardModeMock("extend"),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+            apply_deprecated_skip_attn_backend_init=lambda value: None,
+        )
+        exec_ctx = SimpleNamespace(
+            features=SimpleNamespace(enable_encoder_swa_bounded_replay=False)
+        )
+        with (
+            patch.object(tp_worker_module, "get_exec", return_value=exec_ctx),
+            patch.object(tp_worker_module.ForwardBatch, "init_new", return_value=fb),
+            patch.object(tp_worker_module, "capture_pre_sample_logits"),
+        ):
+            TpModelWorker.forward_batch_generation(
+                worker, SimpleNamespace(hicache_consumer_index=slot), is_verify=True
+            )
+
+        self.assertEqual(landed_at_forward, [True])
+
+
+class _PendingDma:
+    """The raiden future surface RaidenFutureEvent polls; lands after N polls."""
+
+    def __init__(self, polls_before_landing: int):
+        self.polls_left = polls_before_landing
+        self.landed = False
+
+    def is_ready(self) -> bool:
+        if self.polls_left > 0:
+            self.polls_left -= 1
+            return False
+        self.landed = True
+        return True
+
+    def ok(self) -> bool:
+        return True
+
+    def error_message(self) -> str:
+        return ""
 
 
 def _policy(model):
@@ -1792,18 +1936,30 @@ class TestPromptLogprobIntakeGate(CustomTestCase):
     """The TPU patch finishes an unservable prompt-logprob request with 400 at
     scheduler intake; everything else reaches the queue untouched."""
 
-    def _enqueue(self, *, logprob_start_len, flag, return_logprob=True):
+    def _enqueue(
+        self,
+        *,
+        logprob_start_len,
+        flag,
+        return_logprob=True,
+        multimodal=False,
+        text_only=False,
+        scheduler=None,
+    ):
         req = Req("r", "", array("q", [1, 2, 3, 4]), SamplingParams(), return_logprob)
         req.logprob_start_len = logprob_start_len
+        if multimodal:
+            req.multimodal_inputs = MagicMock()
         queue = MagicMock()
         with (
             patch.object(Scheduler, "_add_request_to_queue", queue),
             envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(flag),
+            envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(text_only),
             get_context().override_server_args(),
             get_parallel().override(tp_rank=0),
         ):
-            patches._patch_scheduler_reject_prompt_logprob()
-            Scheduler._add_request_to_queue(SimpleNamespace(), req)
+            patches._patch_scheduler_reject_unservable_requests()
+            Scheduler._add_request_to_queue(scheduler or SimpleNamespace(), req)
         queue.assert_called_once()
         return req
 
@@ -1832,6 +1988,60 @@ class TestPromptLogprobIntakeGate(CustomTestCase):
 
     def test_prompt_logprobs_pass_with_the_flag_on(self):
         self.assertIsNone(self._enqueue(logprob_start_len=0, flag=True).to_finish)
+
+    def test_multimodal_refused_on_a_text_only_vl_server(self):
+        req = self._enqueue(
+            logprob_start_len=-1, flag=False, multimodal=True, text_only=True
+        )
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("SGLANG_TPU_VL_TEXT_ONLY_EXTEND", req.to_finish.message)
+
+    @staticmethod
+    def _spec_scheduler(supports_logprobs):
+        worker_cls = type("FakeSpecWorker", (), {})
+        if supports_logprobs is not None:
+            worker_cls.supports_logprobs = supports_logprobs
+        algorithm = SimpleNamespace(
+            is_none=lambda: False, create_worker=lambda server_args: worker_cls
+        )
+        return SimpleNamespace(spec_algorithm=algorithm, server_args=None)
+
+    def test_logprobs_refused_by_a_spec_worker_without_them(self):
+        req = self._enqueue(
+            logprob_start_len=-1,
+            flag=False,
+            scheduler=self._spec_scheduler(supports_logprobs=False),
+        )
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("FakeSpecWorker", req.to_finish.message)
+
+    def test_logprobs_pass_spec_workers_that_serve_them(self):
+        # Upstream workers have no supports_logprobs attribute.
+        for supports in (True, None):
+            with self.subTest(supports_logprobs=supports):
+                req = self._enqueue(
+                    logprob_start_len=-1,
+                    flag=False,
+                    scheduler=self._spec_scheduler(supports),
+                )
+                self.assertIsNone(req.to_finish)
+        req = self._enqueue(
+            logprob_start_len=-1,
+            flag=False,
+            return_logprob=False,
+            scheduler=self._spec_scheduler(supports_logprobs=False),
+        )
+        self.assertIsNone(req.to_finish)
+
+    def test_text_only_flag_leaves_text_and_default_servers_alone(self):
+        self.assertIsNone(
+            self._enqueue(logprob_start_len=-1, flag=False, text_only=True).to_finish
+        )
+        self.assertIsNone(
+            self._enqueue(logprob_start_len=-1, flag=False, multimodal=True).to_finish
+        )
 
 
 class TestPinFields(CustomTestCase):

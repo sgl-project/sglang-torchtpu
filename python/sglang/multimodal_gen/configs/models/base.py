@@ -27,8 +27,9 @@ class ArchConfig:
     extra_attrs: Dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str):
-        d = object.__getattribute__(self, "__dict__")
-        extras = d.get("extra_attrs")
+        # self.__dict__ rather than object.__getattribute__, which dynamo
+        # cannot trace in a compiled forward.
+        extras = self.__dict__.get("extra_attrs")
         if extras is not None and name in extras:
             return extras[name]
         raise AttributeError(

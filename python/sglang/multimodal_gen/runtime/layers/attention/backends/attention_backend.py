@@ -37,11 +37,6 @@ def trailing_padding_used_len(
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    # For some attention backends, we allocate an output tensor before
-    # calling the custom op. When piecewise cudagraph is enabled, this
-    # makes sure the output tensor is allocated inside the cudagraph.
-    accept_output_buffer: bool = False
-
     @staticmethod
     @abstractmethod
     def get_enum() -> AttentionBackendEnum:
@@ -96,16 +91,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     """Abstract class for attention metadata builders."""
 
     @abstractmethod
-    def __init__(self) -> None:
-        """Create the builder, remember some configuration and parameters."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def prepare(self) -> None:
-        """Prepare for one batch."""
-        raise NotImplementedError
-
-    @abstractmethod
     def build(
         self,
         **kwargs: dict[str, Any],
@@ -115,6 +100,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # forward_varlen reads a packed [0, used, total] layout's live length from
+    # cu_seqlens on device, so callers may pass no host bounds.
+    trailing_padding_on_device: bool = False
+
     @abstractmethod
     def __init__(
         self,
@@ -167,6 +156,19 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: T,
+    ) -> bool:
+        """Write what ``forward`` returns into ``out`` (any token stride), or with
+        ``out=None`` only answer; False, having written nothing, when this
+        backend cannot serve these inputs that way."""
+        return False
+
     def forward_varlen(
         self,
         query: torch.Tensor,
@@ -195,6 +197,32 @@ class AttentionImpl(ABC, Generic[T]):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement ring KV-chunk attention"
         )
+
+    def forward_ring_resume(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_info: torch.Tensor,
+        carry: Any = None,
+    ) -> tuple[torch.Tensor, Any]:
+        """Attend to one shard of all-gathered K/V, resuming the softmax.
+
+        ``query`` is heads-major ``[B, H, S, D]``; ``key``/``value`` stack the
+        gathered shards ``[N, H_kv, S_kv, D]``. ``kv_info`` is a device int32
+        ``[row offset, real keys]``: the shard's rows of the batch-flattened
+        stack, and how many of its leading keys are real. ``carry`` is the
+        previous step's second return value; the returned output is attention
+        over every shard visited so far. Rank-dependent choices travel in
+        ``kv_info``, so every rank runs the same program.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement all-gather ring attention"
+        )
+
+    @classmethod
+    def supports_ring_resume(cls) -> bool:
+        return cls.forward_ring_resume is not AttentionImpl.forward_ring_resume
 
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:

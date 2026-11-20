@@ -8,8 +8,7 @@ Four pieces, each checked against a reference built from a plain dense softmax:
   ``out * sigmoid(lse - sink)``.
 * ``merge_lse`` joins the cached-prefix pass with the chunk-local pass of an
   extend step.
-* ``get_dcp_lens`` and the global-window rule ``keep local j iff
-  j*dcp + rank > Q - sw`` select exactly the positions inside the window.
+* ``get_dcp_lens`` gives each rank the count of the positions it owns.
 
 The collectives are faked: every rank's call runs in-process and the fake group
 serves the other ranks' tensors, so the values crossing the "wire" are the ones
@@ -342,10 +341,9 @@ class TestMergeLse(CustomTestCase):
 
 @_requires_dcp_helpers
 class TestGlobalWindowRule(CustomTestCase):
-    """Local lengths and the global sliding-window rule against brute force."""
+    """Per-rank local lengths from ``get_dcp_lens`` against brute force."""
 
     DCP_SIZES = (2, 4, 8)
-    WINDOWS = (64, 128)
     LENGTHS = (1, 2, 7, 63, 64, 65, 127, 128, 129, 200, 513)
 
     @staticmethod
@@ -361,39 +359,6 @@ class TestGlobalWindowRule(CustomTestCase):
                     len(self._owned_positions(L, dcp, rank)) for L in self.LENGTHS
                 ]
                 self.assertEqual(got, expected, f"dcp={dcp} rank={rank}")
-
-    def test_kept_local_indices_match_brute_force(self):
-        for dcp in self.DCP_SIZES:
-            for sw in self.WINDOWS:
-                for length in self.LENGTHS:
-                    query = length - 1  # decode: the new token's global position
-                    for rank in range(dcp):
-                        owned = self._owned_positions(length, dcp, rank)
-                        kept_rule = [
-                            j for j in range(len(owned)) if j * dcp + rank > query - sw
-                        ]
-                        kept_brute = [j for j, p in enumerate(owned) if p > query - sw]
-                        self.assertEqual(
-                            kept_rule,
-                            kept_brute,
-                            f"dcp={dcp} sw={sw} len={length} rank={rank}",
-                        )
-
-    def test_the_group_keeps_exactly_the_windowed_positions(self):
-        for dcp in self.DCP_SIZES:
-            for sw in self.WINDOWS:
-                for length in self.LENGTHS:
-                    query = length - 1
-                    kept = set()
-                    for rank in range(dcp):
-                        owned = self._owned_positions(length, dcp, rank)
-                        kept.update(
-                            owned[j]
-                            for j in range(len(owned))
-                            if j * dcp + rank > query - sw
-                        )
-                    expected = {p for p in range(length) if p > query - sw}
-                    self.assertEqual(kept, expected, f"dcp={dcp} sw={sw} len={length}")
 
 
 if __name__ == "__main__":

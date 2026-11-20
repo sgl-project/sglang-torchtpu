@@ -56,6 +56,13 @@ def _gather(per_rank, local, used, cols):
     )
 
 
+def _assert_fp8_bytes_equal(got, want):
+    """fp8 arrays compared byte for byte (prefetch copies are raw copies)."""
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8)
+    )
+
+
 @unittest.skipUnless(len(_DEVICES) >= 4, "requires >= 4 TPU devices")
 class TestHostSplitGemv(CustomTestCase):
     def _inputs(self, k, n, seed):
@@ -125,6 +132,98 @@ class TestHostSplitGemv(CustomTestCase):
                 _gather(y, local, local, n),
                 f"local={local}",
             )
+
+    def test_prefetch_copies_weight(self):
+        """prefetch: the up-proj output is unchanged and the second output is
+        a bit-exact copy of the prefetched array (KDA qkvg shape, TP32)."""
+        from sglang_tpu.kernels.host_split_gemv import host_split_gemv_local
+
+        world = len(_DEVICES)
+        k, n = 3584, 896
+        x, w, s, inv, _ = self._inputs(k, n, seed=30)
+        pf = jnp.asarray(
+            np.random.default_rng(31).standard_normal((world * 7168, 1536)) * 30,
+            jnp.float8_e4m3fn,
+        )
+        kw = dict(local=world, cols=n, used=world, used_e=0)
+
+        def plain(x, w, s, inv):
+            return host_split_gemv_local(x, w, s, inv, None, **kw)[0]
+
+        def with_pf(x, w, s, inv, pf):
+            return host_split_gemv_local(x, w, s, inv, None, prefetch=pf, **kw)
+
+        want = _smap(plain, 4, 1)(x, w, s, inv)
+        got, copy = _smap(with_pf, 5, 2)(x, w, s, inv, pf)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        _assert_fp8_bytes_equal(copy, pf)
+
+    def test_tail_add_and_attn_res(self):
+        """tail: the gathered up-proj becomes (up + shared) [+ prefix] with
+        bf16 rounding after each add, and the second output equals the
+        attention-residual decode kernel on that sum, bit for bit (with and
+        without the prefix add and the qkvg prefetch)."""
+        from sglang_tpu.kernels.host_split_gemv import host_split_gemv_local
+        from sglang_tpu.kimi_attn_residual import attention_residual_decode_jax
+
+        world = len(_DEVICES)
+        k, n = 3584, 896
+        hidden = world * n
+        rng = np.random.default_rng(40)
+        x, w, s, inv, _ = self._inputs(k, n, seed=41)
+        shared = jnp.asarray(rng.standard_normal((world, hidden)), jnp.bfloat16)
+        prefix = jnp.asarray(rng.standard_normal((world, hidden)) * 4, jnp.bfloat16)
+        nb = 9
+        bank = jnp.asarray(rng.standard_normal((world, nb, hidden)) * 4, jnp.bfloat16)
+        cw = jnp.asarray(rng.standard_normal((world * hidden,)) * 0.05, jnp.float32)
+        nw = jnp.asarray(1 + 0.1 * rng.standard_normal((world * hidden,)), jnp.float32)
+        pf = jnp.asarray(
+            rng.standard_normal((world * 1024, 1536)) * 30, jnp.float8_e4m3fn
+        )
+        kw = dict(local=world, cols=n, used=world, used_e=0)
+
+        def plain(x, w, s, inv):
+            return host_split_gemv_local(x, w, s, inv, None, **kw)[0]
+
+        up = np.asarray(_smap(plain, 4, 1)(x, w, s, inv)).astype(np.float32)
+        bf = lambda a: np.asarray(jnp.asarray(a, jnp.bfloat16)).astype(np.float32)
+        # (nvb, prefix add, qkvg prefetch): no extras, everything, prefix only.
+        for nvb, has_prefix, use_pf in (
+            (1, False, False),
+            (8, True, True),
+            (4, True, False),
+        ):
+            o = bf(up + np.asarray(shared).astype(np.float32))
+            if has_prefix:
+                o = bf(o + np.asarray(prefix).astype(np.float32))
+            o16 = jnp.asarray(o, jnp.bfloat16)
+
+            def ref(o, bank, cw, nw, nvb=nvb):
+                return attention_residual_decode_jax(
+                    o, None, bank, cw, nw, nvb, 1e-6, 1e-5
+                )[0]
+
+            want = np.asarray(_smap(ref, 4, 1)(o16, bank, cw, nw))
+
+            # Traced right below, inside this iteration: the loop variables are
+            # read before they change.
+            def fused(x, w, s, inv, sh, pre, bank, cw, nw, pf):
+                tail = (sh, pre if has_prefix else None, bank, cw, nw, nvb, 1e-6, 1e-5)
+                prefetch = pf if use_pf else None
+                return host_split_gemv_local(
+                    x, w, s, inv, None, prefetch=prefetch, tail=tail, **kw
+                )
+
+            outs = _smap(fused, 10, 2 + use_pf)(
+                x, w, s, inv, shared, prefix, bank, cw, nw, pf
+            )
+            tag = f"{nvb=} {has_prefix=} {use_pf=}"
+            np.testing.assert_array_equal(
+                np.asarray(outs[0]).astype(np.float32), o, tag
+            )
+            np.testing.assert_array_equal(np.asarray(outs[1]), want, tag)
+            if use_pf:
+                _assert_fp8_bytes_equal(outs[2], pf)
 
 
 if __name__ == "__main__":

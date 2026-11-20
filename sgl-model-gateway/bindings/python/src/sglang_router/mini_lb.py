@@ -48,6 +48,38 @@ HEALTH_CHECK_TIMEOUT_SECS = 30
 # would mark a server unhealthy before its own 20 s check answers.
 HEALTH_PROBE_PATH = "/health_generate"
 
+# How long a completed stream waits, in the background, for the prefill to end
+# its own response before the connection to it is closed anyway.
+PREFILL_DRAIN_TIMEOUT_SECS = 60
+
+# Strong references to fire-and-forget tasks (asyncio keeps only weak ones).
+_background_tasks: set = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _read_to_eof(response) -> None:
+    async for _ in response.content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+        pass
+
+
+def _stream_error_event(message: str) -> bytes:
+    """An SSE error event in the shape sglang's /generate stream uses. A
+    broken upstream is transient (a retry is routed to a random, possibly
+    healthy, decode), so it is marked retryable."""
+    error = {
+        "message": message,
+        "type": "upstream_error",
+        "code": HTTPStatus.BAD_GATEWAY.value,
+        "retryable": True,
+    }
+    return b"data: " + orjson.dumps({"error": error}) + b"\n\n"
+
 
 def maybe_wrap_ipv6_address(address: str) -> str:
     try:
@@ -169,6 +201,9 @@ class MiniLoadBalancer:
         try:
             return await operation(*args, **kwargs)
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            # Covers a refused connect too, which the stream-break probe in
+            # stream_results never sees.
+            self.request_health_probe(engine)
             if self.affinity_policy is None:
                 raise
             self.affinity_policy.loads.mark_unreachable(engine)
@@ -255,10 +290,11 @@ class MiniLoadBalancer:
                         url: probe for url, probe in probes.items() if not probe.done()
                     }
                     for url in self._registered_urls():
-                        if url not in probes:
+                        if not self._probe_in_flight(url):
                             probes[url] = asyncio.create_task(
                                 self._probe_health(session, url)
                             )
+                            self._health_probes()[url] = (probes[url], False)
                     await asyncio.sleep(self.health_poll_interval_secs)
             finally:
                 for probe in probes.values():
@@ -276,6 +312,47 @@ class MiniLoadBalancer:
             await asyncio.gather(
                 *(self._probe_health(session, url) for url in self._registered_urls())
             )
+
+    def request_health_probe(self, url: str) -> None:
+        """Probe `url` now instead of at the next poll.
+
+        Called when a request to a backend fails or breaks mid-stream, so
+        routing stops sending it traffic within one probe rather than one
+        poll interval. The probe decides, not the failure: a transient error
+        on a healthy backend leaves it routable. A periodic probe still in
+        flight is cancelled, since it may have been answered before the
+        failure; a requested one still in flight already covers it. No-op
+        when health checks are off.
+        """
+        if getattr(self, "health_poll_interval_secs", None) is None:
+            return
+        probes = self._health_probes()
+        if url in probes:
+            probe, requested = probes[url]
+            if not probe.done():
+                if requested:
+                    return
+                probe.cancel()
+        probes[url] = (_spawn_background(self._probe_once(url)), True)
+
+    def _health_probes(self) -> Dict[str, Tuple[asyncio.Task, bool]]:
+        """Each backend's latest probe task, and whether it was requested.
+
+        Periodic and requested probes share it, so one backend has at most
+        one probe in flight and an older verdict cannot land after a newer
+        one.
+        """
+        # Kept in __dict__ so instances built without __init__ work too.
+        return self.__dict__.setdefault("_health_probe_by_url", {})
+
+    def _probe_in_flight(self, url: str) -> bool:
+        entry = self._health_probes().get(url)
+        return entry is not None and not entry[0].done()
+
+    async def _probe_once(self, url: str) -> None:
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await self._probe_health(session, url)
 
     async def _probe_health(self, session: aiohttp.ClientSession, url: str) -> None:
         """GET HEALTH_PROBE_PATH on `url` and route to it only if it answers 200."""
@@ -333,6 +410,11 @@ class MiniLoadBalancer:
     def _forget_health(self, worker_url) -> None:
         """Treat `worker_url` as not probed yet."""
         self._health.forget(worker_url)
+        # Its verdict would be dropped as stale anyway; cancelling it lets a
+        # re-registered backend be probed without waiting for the old probe.
+        entry = self._health_probes().pop(worker_url, None)
+        if entry is not None:
+            entry[0].cancel()
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
@@ -490,7 +572,10 @@ class MiniLoadBalancer:
                     decode_server, decode_response.json
                 )
 
-            if expected_decode_dp_rank is not None:
+            # Only a successful decode response carries meta_info.dp_rank; an
+            # upstream rejection must keep its own status rather than being
+            # reported as a DP rank mismatch.
+            if expected_decode_dp_rank is not None and decode_response.status == 200:
                 actual = ret_json.get("meta_info", {}).get("dp_rank")
                 if actual != expected_decode_dp_rank:
                     return ORJSONResponse(
@@ -522,7 +607,29 @@ class MiniLoadBalancer:
                 response.close()
             await session.close()
 
+        async def drain_prefill_then_close():
+            # The decode has answered in full, but the prefill may not have
+            # wrapped up its side yet (it ends its stream once its own request,
+            # KV transfer included, is done). Closing its connection now looks
+            # like a client disconnect to it: it aborts the request and counts
+            # it as aborted, or as a failed transfer. Read its stream to the end
+            # first, bounded so a stuck prefill cannot hold the session forever.
+            try:
+                await asyncio.wait_for(
+                    _read_to_eof(prefill_response),
+                    timeout=min(PREFILL_DRAIN_TIMEOUT_SECS, self.timeout),
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug(
+                    f"[MiniLB] prefill {prefill_server} did not finish after a "
+                    f"completed stream: {type(e).__name__}: {e}"
+                )
+            finally:
+                await close_upstreams()
+
         async def stream_results():
+            completed = False
+            upstream = prefill_server
             try:
                 if modified_request.get("return_logprob", False):
                     prefill_chunks = []
@@ -533,6 +640,7 @@ class MiniLoadBalancer:
                     )
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
+                    upstream = decode_server
                     async for chunk in decode_response.content:
                         # Note: This is inefficient
                         # merge prefill input_token_logprobs, output_token_logprobs to decode
@@ -553,12 +661,29 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
+                    upstream = decode_server
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+                completed = True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # The upstream broke after the 200 status went out (e.g. the
+                # decode died mid-stream). Without this the stream would just
+                # stop, and a cut-off answer would look complete. Tell the
+                # client explicitly, in the same shape sglang's own /generate
+                # stream reports errors.
+                message = f"upstream {upstream} stream broke: {type(e).__name__}: {e}"
+                logger.error(f"[MiniLB] {message}")
+                # Let health routing (#1801) re-check this backend now.
+                self.request_health_probe(upstream)
+                yield _stream_error_event(message)
+                yield b"data: [DONE]\n\n"
             finally:
-                await close_upstreams()
+                if completed and responses:
+                    _spawn_background(drain_prefill_then_close())
+                else:
+                    await close_upstreams()
 
         # The session and both upstream responses stay open only for an
         # accepted request, whose stream_results() closes them when the
@@ -918,10 +1043,23 @@ def _generate_bootstrap_room():
 
 # We may utilize `GenerateReqInput`'s logic later
 def _get_request_batch_size(request):
+    """Return the batch size of a batched /generate request, or None when it is
+    a single request that takes scalar bootstrap fields.
+
+    Only the batch shape is detected here. Validating the prompt is left to the
+    engines (`GenerateReqInput.normalize_batch_and_arguments`), whose 400 is
+    forwarded, so empty or malformed inputs must not raise. For example,
+    `input_ids: []` is a single request: the engines reject it as empty unless
+    `session_params` supplies the prompt.
+    """
     if (text := request.get("text")) is not None:
-        return None if isinstance(text, str) else len(text)
+        return len(text) if isinstance(text, list) else None
     if (input_ids := request.get("input_ids")) is not None:
-        return None if isinstance(input_ids[0], int) else len(input_ids)
+        # Only a non-empty list of lists is a batch, matching the engine's
+        # GenerateReqInput._determine_batch_size.
+        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+            return len(input_ids)
+        return None
     return None
 
 

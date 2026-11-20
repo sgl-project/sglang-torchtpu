@@ -18,7 +18,7 @@ from sglang.kernels.ops.diffusion.common.platform import platform_key, select_im
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=1, suite="base-b-test-cpu-arm64")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -52,6 +52,32 @@ class TestDiffusionPlatformDispatch(CustomTestCase):
             self.assertIs(
                 select_impl(triton_impl, cpu=cpu_impl, tpu=tpu_impl), tpu_impl
             )
+
+    def test_selected_lazy_fallback_resolves_to_its_function(self):
+        """Selection imports the fallback, so a compiled call never imports."""
+        from sglang.kernels.ops.diffusion.common import fallback_torch
+        from sglang.kernels.ops.diffusion.common.platform import lazy_fallback
+
+        def triton_impl():
+            pass
+
+        platforms_module = ModuleType("sglang.multimodal_gen.runtime.platforms")
+        platforms_module.current_platform = SimpleNamespace(
+            is_cuda=lambda: False,
+            is_hip=lambda: False,
+            is_tpu=lambda: True,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {platforms_module.__name__: platforms_module},
+        ):
+            selected = select_impl(
+                triton_impl,
+                tpu=lazy_fallback("torch", "norm_infer_native"),
+                npu=lazy_fallback("npu", "fuse_scale_shift_native"),
+            )
+        self.assertIs(selected, fallback_torch.norm_infer_native)
 
 
 class TestDiffusionTorchFallback(unittest.TestCase):

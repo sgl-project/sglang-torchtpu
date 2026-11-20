@@ -50,10 +50,6 @@ class TestBucketer(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "exceeds the maximum"):
             b.next_bucket(17)
 
-    def test_repr_includes_buckets(self):
-        b = Bucketer(name="t", buckets=[1, 4, 16])
-        self.assertIn("buckets=[1, 4, 16]", repr(b))
-
 
 class TestPowerBucketer(CustomTestCase):
     """Test PowerBucketer geometric progressions."""

@@ -41,19 +41,27 @@ def _long_tile_rows(max_q, page_size):
 
 
 def _descriptors(
-    kv_lens,
-    page_indices,
-    cu_q_lens,
-    distribution,
-    num_tokens,
-    tile_rows,
-    max_q,
-    page_size,
-):
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    num_tokens: int,
+    tile_rows: int,
+    max_q: int,
+    page_size: int,
+    raw_ring: tuple[jax.Array, int] | None,
+) -> tuple[jax.Array, jax.Array]:
     """Compact request tile slots in request order for the streaming schedule."""
     batch = kv_lens.shape[0]
     tiles = _request_descriptors(
-        kv_lens, page_indices, cu_q_lens, distribution, tile_rows, max_q, page_size
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        tile_rows,
+        max_q,
+        page_size,
+        raw_ring,
     )
     # Preserve request-major order. The short schedule instead groups the
     # first tiles of independent requests to expose concurrent transfers.
@@ -68,8 +76,15 @@ def _descriptors(
 
 
 def _request_descriptors(
-    kv_lens, page_indices, cu_q_lens, distribution, tile_rows, max_q, page_size
-):
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    tile_rows: int,
+    max_q: int,
+    page_size: int,
+    raw_ring: tuple[jax.Array, int] | None,
+) -> jax.Array:
     """Fixed tile slots cover every newly completed pool, including verify Q>1."""
     batch = kv_lens.shape[0]
     # Closed groups end at 3 mod 4. A request's first end can be at the last
@@ -86,18 +101,23 @@ def _request_descriptors(
     # Inactive slots still need safe metadata gathers, but issue no DMA.
     safe_start = jnp.where(live, tile_start, 0)
     pages_per_seq = page_indices.shape[0] // batch
-    # Pool p sits at slot p of the pooled cache, so one pooled page holds the
-    # pools of 4 * page_size raw tokens, four pools per destination quad row.
-    pooled_span = 4 * page_size
+    # A pool's record lives in its tokens' page, four pools (16 raw rows) per
+    # destination quad row.
+    page = page_indices[req * pages_per_seq + safe_start // page_size]
+    raw_page = page
+    if raw_ring is not None:
+        # (raw_page_base, raw_ring_pages_cnt): a request's raw rows live in its ring.
+        raw_page_base, raw_ring_pages_cnt = raw_ring
+        raw_page = raw_page_base[req] + (safe_start // page_size) % raw_ring_pages_cnt
     # Tile-major order keeps the first tiles of different requests adjacent.
     # Request-major order would insert unused slots between Q=1 requests.
     return (
         jnp.stack(
             (
-                page_indices[req * pages_per_seq + safe_start // page_size],
+                raw_page,
                 (safe_start % page_size) // tile_rows,
-                page_indices[req * pages_per_seq + safe_start // pooled_span],
-                (safe_start % pooled_span) // 16,
+                page,
+                (safe_start % page_size) // 16,
                 start[None, :] - tile_start,
                 kv_lens[None, :] - tile_start,
                 live.astype(jnp.int32),
@@ -180,6 +200,8 @@ def compress_and_store(
     kpool=4,
     *,
     max_query_length=None,
+    raw_page_base=None,
+    raw_ring_pages_cnt=0,
 ):
     """Compress newly closed K4 groups into the aliased native pooled cache.
 
@@ -196,7 +218,9 @@ def compress_and_store(
             "fused pooling requires K=4, D=128 and a page size that is a multiple "
             f"of {_SHORT_TILE_ROWS}"
         )
-    if pooled_cache.shape != (raw_cache.shape[0], page_size // 4, 4, 256):
+    raw_ring = (raw_page_base, raw_ring_pages_cnt) if raw_ring_pages_cnt else None
+    pooled_pages = pooled_cache.shape[0] if raw_ring else raw_cache.shape[0]
+    if pooled_cache.shape != (pooled_pages, page_size // 16, 4, 256):
         raise ValueError("unexpected pooled-cache layout")
     if raw_cache.dtype != jnp.bfloat16 or pooled_cache.dtype != jnp.uint8:
         raise ValueError("expected BF16 raw cache and uint8 pooled cache")
@@ -217,6 +241,7 @@ def compress_and_store(
             _SHORT_TILE_ROWS,
             max_q,
             page_size,
+            raw_ring,
         )
         group_size = min(16, desc.shape[1])
         padding = (-desc.shape[1]) % group_size
@@ -276,6 +301,7 @@ def compress_and_store(
         tile_rows,
         max_q,
         page_size,
+        raw_ring,
     )
     return pl.pallas_call(
         partial(_long_kernel, tile_rows=tile_rows),

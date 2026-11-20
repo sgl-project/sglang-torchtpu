@@ -53,6 +53,10 @@ on:
         required: false
         type: number
         default: 3600
+      execution_budget_minutes:
+        required: false
+        type: number
+        default: 0
       # Chip sharing: run this many `chips=1` tests at once on the slice the job
       # already holds, instead of giving every test all four chips. Whole-node
       # tests still run alone, after the shared ones have released their chips.
@@ -159,6 +163,7 @@ jobs:
           IN_PD_DECODE_HOSTS: ${{ inputs.pd_decode_hosts }}
           IN_WEIGHTS_PVC: ${{ inputs.weights_pvc }}
           IN_TIMEOUT_PER_FILE: ${{ inputs.timeout_per_file }}
+          IN_EXECUTION_BUDGET_MINUTES: ${{ inputs.execution_budget_minutes }}
           IN_TPU_CHIP_WORKERS: ${{ inputs.tpu_chip_workers }}
           IN_PARTITION_ID: ${{ inputs.partition_id }}
           IN_PARTITION_SIZE: ${{ inputs.partition_size }}
@@ -187,6 +192,7 @@ jobs:
             --pd-decode-hosts "$IN_PD_DECODE_HOSTS" \
             --weights-pvc "$IN_WEIGHTS_PVC" \
             --timeout-per-file "$IN_TIMEOUT_PER_FILE" \
+            --execution-budget-minutes "$IN_EXECUTION_BUDGET_MINUTES" \
             --tpu-chip-workers "$IN_TPU_CHIP_WORKERS" \
             --partition-id "$IN_PARTITION_ID" \
             --partition-size "$IN_PARTITION_SIZE" \

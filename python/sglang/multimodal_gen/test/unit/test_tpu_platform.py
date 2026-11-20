@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the TPU platform. Cases needing torch_tpu self-skip."""
 
+import json
 import os
 import subprocess
 import sys
+import textwrap
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -68,31 +71,37 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_p2p_is_unsupported(self):
         self.assertFalse(TpuPlatform.supports_distributed_p2p())
 
-    def test_spatial_shard_decode_is_refused_without_p2p(self):
+    def test_auto_spatial_decode_without_p2p_only_for_opted_in_vaes(self):
         from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+        from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+            LTXVideoVAEConfig,
+        )
         from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = False
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertFalse(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
+        explicit = LTXVideoVAEConfig()
+        explicit.parallel_decode_mode = "spatial_shard"
+        cases = (
+            # Halos travel by all-gather where the VAE opts in.
+            (False, WanVAEConfig(), True),
+            (False, LTXVideoVAEConfig(), False),
+            (False, explicit, True),
+            (True, LTXVideoVAEConfig(), True),
+        )
+        for p2p, config, expected in cases:
+            platform = MagicMock()
+            platform.supports_distributed_p2p.return_value = p2p
+            with (
+                self.subTest(
+                    p2p=p2p, vae=type(config).__name__, mode=config.parallel_decode_mode
+                ),
+                patch.object(vae_base, "current_platform", platform),
+            ):
+                self.assertEqual(
+                    vae_base.should_use_spatial_shard_parallel_decode(
+                        config, world_size=2
+                    ),
+                    expected,
                 )
-            )
-
-    def test_spatial_shard_decode_survives_where_p2p_works(self):
-        from sglang.multimodal_gen.configs.models.vaes import base as vae_base
-        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
-
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = True
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertTrue(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
-                )
-            )
 
     def test_platform_defaults_leave_other_backends_alone(self):
         from sglang.multimodal_gen.runtime.platforms.interface import Platform
@@ -130,6 +139,36 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
+    def test_memory_shims_report_allocated_bytes_as_reserved(self):
+        # PJRT has no caching allocator: reserved is the allocated bytes, and
+        # gpu_worker sizes residency off reserved and its peak.
+        from sglang.multimodal_gen.runtime.platforms.tpu import _DEVICE_MODULE_SHIMS
+
+        stats = {"allocated_bytes.all.current": 5, "allocated_bytes.all.peak": 9}
+        for initialized, current, peak in ((True, 5, 9), (False, 0, 0)):
+            fake_tpu = SimpleNamespace(is_initialized=lambda up=initialized: up)
+            with (
+                self.subTest(initialized=initialized),
+                patch.object(torch, "tpu", fake_tpu, create=True),
+                patch.object(
+                    torch.accelerator, "memory_stats", return_value=stats
+                ) as memory_stats,
+            ):
+                self.assertEqual(
+                    [
+                        _DEVICE_MODULE_SHIMS[name]()
+                        for name in (
+                            "memory_allocated",
+                            "memory_reserved",
+                            "max_memory_allocated",
+                            "max_memory_reserved",
+                        )
+                    ],
+                    [current, current, peak, peak],
+                )
+                # Before PJRT is up the launcher may call them: no device query.
+                self.assertEqual(memory_stats.called, initialized)
+
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):
@@ -161,13 +200,39 @@ class TestWorkerInitOnce(unittest.TestCase):
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch_tpu not installed")
 class TestTorchTpuIntegration(unittest.TestCase):
     def test_pre_init_memory_queries_do_not_initialize_pjrt(self):
-        if torch.tpu.is_initialized():
-            self.skipTest("PJRT already initialized in this process")
-        self.assertGreater(TpuPlatform.get_device_total_memory(), 0)
-        self.assertGreater(TpuPlatform.get_available_gpu_memory(), 0.0)
-        self.assertEqual(TpuPlatform.get_current_memory_usage(), 0.0)
-        self.assertTrue(TpuPlatform.get_device_name().startswith("TPU "))
-        self.assertFalse(torch.tpu.is_initialized())
+        # The launcher sizes offload with these before any worker exists, and
+        # the worker must be the one to own PJRT. A fresh interpreter: an
+        # earlier case may have initialized PJRT in this one.
+        code = textwrap.dedent(
+            """
+            import json, torch
+            from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+
+            queries = {
+                "total": TpuPlatform.get_device_total_memory(),
+                "available": TpuPlatform.get_available_gpu_memory(),
+                "used": TpuPlatform.get_current_memory_usage(),
+                "name": TpuPlatform.get_device_name(),
+            }
+            queries["pjrt_initialized"] = torch.tpu.is_initialized()
+            print("QUERIES", json.dumps(queries))
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        [line] = [
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("QUERIES ")
+        ]
+        queries = json.loads(line.removeprefix("QUERIES "))
+        self.assertFalse(queries["pjrt_initialized"], queries)
+        self.assertGreater(queries["total"], 0)
+        self.assertGreater(queries["available"], 0.0)
+        self.assertEqual(queries["used"], 0.0)
+        self.assertTrue(queries["name"].startswith("TPU "), queries["name"])
 
     def test_srt_symbols_the_platform_imports_exist(self):
         # tpu.py imports this lazily; a rename on the srt side must fail here,
@@ -223,8 +288,6 @@ class TestTorchTpuIntegration(unittest.TestCase):
         ):
             self.assertTrue(hasattr(torch.tpu, name))
         torch.tpu.empty_cache()
-        if not torch.tpu.is_initialized():
-            self.assertEqual(torch.tpu.memory_allocated(), 0)
 
 
 if __name__ == "__main__":

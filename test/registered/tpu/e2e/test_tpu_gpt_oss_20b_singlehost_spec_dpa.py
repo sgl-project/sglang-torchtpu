@@ -3,9 +3,9 @@
 This is the only per-commit test that runs a server with DP attention
 (`DP_SIZE` > 1 becomes `--dp-size N --enable-dp-attention`), so it stays on the
 gate. It deliberately does NOT set `--tpu-compile-tracer dynamo`: the tracers
-have their own gate in test_tpu_qwen3_0_6b_singlehost_compile_tracer.py at 150s
-against Qwen3-0.6B, and carrying the flag here made this launch the second most
-expensive in the e2e suite.
+have their own gate checks against Qwen3-0.6B (smoke for the dynamo default,
+test_tpu_qwen3_0_6b_singlehost_compile_tracer.py for direct), and carrying the
+flag here made this launch the second most expensive in the e2e suite.
 """
 
 import os
