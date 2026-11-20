@@ -15,6 +15,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarRow,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers import row_select
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.sampling.custom_logit_processor import (
@@ -409,7 +410,6 @@ class SamplingBatchInfo:
         return batch.device
 
     def _filter_params(self, keep_indices, keep_indices_device):
-        indices = keep_indices if self.sampling_params_on_cpu else keep_indices_device
         for item in [
             "temperatures",
             "top_ps",
@@ -418,8 +418,12 @@ class SamplingBatchInfo:
             "sampling_seed",
         ]:
             value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[indices])
+            if value is None:
+                continue
+            if self.sampling_params_on_cpu:
+                setattr(self, item, value[keep_indices])
+            else:
+                setattr(self, item, row_select.select_rows(value, keep_indices_device))
 
     def _merge_params(self, other):
         for item in [
@@ -432,7 +436,7 @@ class SamplingBatchInfo:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+                setattr(self, item, row_select.concat_rows(self_val, other_val))
 
     def __len__(self):
         return len(self.temperatures)
