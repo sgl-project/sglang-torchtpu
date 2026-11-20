@@ -311,6 +311,13 @@ def moe(k: KernelCtx, l, ffn_in32, sm, kind, nxt, pool_router=None):
         def do_prologue():
             issue_experts(0, jnp.minimum(pdepth, n_u))
 
+        def send_block(nb):
+            owner = blk_owner(nb)
+            pl.when(owner * Rc < n_live)(
+                coll.block_copy("y", S["ysend"], owner, Rc).start
+            )
+            return nb + 1
+
         def ebody(i, carry, part=None):
             slot = i % nslot
 
@@ -660,13 +667,6 @@ def moe(k: KernelCtx, l, ffn_in32, sm, kind, nxt, pool_router=None):
                     end = rget("blk_end", jnp.minimum(nb, c.tp - 2))
                     return (nb < c.tp - 1) & (end <= i + 1)
 
-                def send_block(nb):
-                    owner = blk_owner(nb)
-                    pl.when(owner * Rc < n_live)(
-                        coll.block_copy("y", S["ysend"], owner, Rc).start
-                    )
-                    return nb + 1
-
                 return jax.lax.while_loop(ready, send_block, carry)
             return carry
 
@@ -689,9 +689,15 @@ def moe(k: KernelCtx, l, ffn_in32, sm, kind, nxt, pool_router=None):
                             carry,
                         )
 
-                    jax.lax.fori_loop(0, c.tp if y_block else 1, group, jnp.int32(0))
+                    sent = jax.lax.fori_loop(
+                        0, c.tp if y_block else 1, group, jnp.int32(0)
+                    )
                 else:
-                    jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+                    sent = jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+                if y_block:
+                    # Blocks no expert closed (n_u = 0: every live row routed to no valid
+                    # expert, e.g. NaN scores) still go out, or y_rs waits forever.
+                    jax.lax.while_loop(lambda nb: nb < c.tp - 1, send_block, sent)
 
         return do_prologue, do_loop
 
