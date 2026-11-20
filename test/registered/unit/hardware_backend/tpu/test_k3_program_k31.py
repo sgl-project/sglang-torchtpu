@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=11350, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13000, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -177,7 +177,9 @@ class TestTokenParallelLatentUp(CustomTestCase):
     case gives the same bits; so do three tails back to back on fresh partials
     (eager DMAs, the ranks of one core lagging before the host round), each
     tail's core-1 copies landing in host slots the previous tail's readers
-    were done with."""
+    were done with, also with each tail's output round finished in the next
+    tail's first code (``KernelConfig.moe_output_round_next_layer``: the
+    round's buffer and semaphores alone, no barrier between tails)."""
 
     # The tail kernel and the lane-block model (after TestAttentionHostBf16's
     # PRELUDE).
@@ -189,12 +191,15 @@ bfv = lambda x: x.astype(jnp.bfloat16).astype(F32)
 LAG = int(os.environ.get("LAG", "100"))  # loop trips a pair index
 
 
-def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None):
+def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None, deferred=False):
     # E [32, n, B, 4096] and Sh [32, n, B, H]: n tails back to back, each on
     # fresh partials. Before the next tail each rank waits until its seven
     # local peers have read their local rounds' slots (the decoder's attention
     # rounds between two MoE tails order more). With ``lag_core`` the ranks of
     # that core spin (p + 1) * LAG loop trips (pair p) before the host round.
+    # With ``deferred`` a tail only starts its output round; the next tail's
+    # first code (after the last tail, the kernel's) finishes it, the tail's
+    # local buffers holding NaN.
     T, n = B // 4, E.shape[1]
 
     def kernel(e_ref, sh_ref, norm_ref, up_hbm, out_ref, tokens_out, sl, el, shh, eh,
@@ -217,7 +222,15 @@ def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None):
             spin[...] = spin[...] + 1.0
             return carry
 
+        def finish_round(i):  # the stack's finish_output_round
+            for ref in (routed, up_vmem, shared, owned):
+                ref[...] = jnp.full(ref.shape, jnp.nan, ref.dtype)
+            dmk.finish_token_parallel_outputs(outv, osend, orecv, owned)
+            out_ref[i] = owned[...]
+
         for i in range(n):
+            if i and deferred:
+                finish_round(i - 1)
             if i:
                 pl.semaphore_wait(consumed, 7)
             copy = pltpu.make_async_copy(up_hbm, up_vmem, up_sem)
@@ -248,8 +261,13 @@ def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None):
                             latent_feature_count=HALF)
             tp.finish_routed_host_sends()
             tp.finish_shared_host(routed)
+            if deferred:
+                tp.start_outputs(up, routed)
+                continue
             tp.send_outputs(up, routed, owned)
             out_ref[i] = owned[...]
+        if deferred:
+            finish_round(n - 1)
 
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
     scratch = [*dmk.communication_scratch(B)[:4], dma((10,)), dma((10,)), dma((16,)),
@@ -274,7 +292,7 @@ def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None):
     f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp"), P(), P("tp")),
                               out_specs=(P("tp"),) * 2, check_vma=False))
     result = [np.asarray(x) for x in f(E, Sh, norm, blocks)]
-    assert not ipc.races.races_found, (B, late, races, odd, lag_core)  # this call's
+    assert not ipc.races.races_found, (B, late, races, odd, lag_core, deferred)  # this call's
     return result
 
 
@@ -367,16 +385,18 @@ print("OK")
 """
     )
 
-    # Three tails back to back (core-0 ranks lagging, then core-1 ranks).
+    # Three tails back to back (core-0 ranks lagging, then core-1 ranks; then,
+    # core-0 ranks lagging, with the output rounds finished in the next tail).
     LOOP = (
         DEFS
         + r"""
-for odd, lag_core in ((True, 0), (True, 1), (False, 0)):
+for odd, lag_core, deferred in ((True, 0, False), (True, 1, False), (False, 0, False), (True, 0, True)):
     E, Sh = (np.stack(x, axis=1) for x in zip(*(partials(8) for _ in range(3))))
-    out, tokens = tail(8, E, Sh, norm, blocks, True, "eager", odd, lag_core)
+    out, tokens = tail(8, E, Sh, norm, blocks, True, "eager", odd, lag_core, deferred)
     for i in range(3):
-        check(8, out[:, i], tokens[:, i], E[:, i], Sh[:, i], (odd, lag_core, i))
-    print(f"odd_host_round={odd} lagging core {lag_core}: three tails bit-exact", flush=True)
+        check(8, out[:, i], tokens[:, i], E[:, i], Sh[:, i], (odd, lag_core, deferred, i))
+    print(f"odd_host_round={odd} lagging core {lag_core} deferred round {deferred}: three tails bit-exact",
+          flush=True)
 print("OK")
 """
     )
@@ -440,6 +460,7 @@ print("OK")
 
     def test_odd_host_round_tails_back_to_back(self):
         self._run(self.LOOP)
+
 
 class TestOutputRoundNextLayer(CustomTestCase):
     """``KernelConfig.moe_output_round_next_layer``: the token-parallel MoE
@@ -9161,11 +9182,13 @@ class TestDecodeKnobsTogether(CustomTestCase):
     captures after layers 1 and 3. With ``decode_latent_down_prefetch``,
     ``moe_routed_send_in_expert_region``, ``attention_input_gather_in_branches``,
     ``moe_output_round_next_layer`` (the round and the residual rows finished
-    in the next layer's first code) and ``aux_capture_in_flight`` on, eager
-    and with DMAs at their waits, every layer's finished and gathered rows,
-    the gathered latents, the aux slots and the last rows are those of the
-    run with them off, byte for byte. Each MoE's scoped buffers and region B
-    are poisoned after it (with the deferred round, the owned rows too)."""
+    in the next layer's first code), ``aux_capture_in_flight`` and
+    ``moe_host_round_odd_cores`` (the routed host round from the core-1
+    ranks) on, eager and with DMAs at their waits, every layer's finished and
+    gathered rows, the gathered latents, the aux slots and the last rows are
+    those of the run with them off, byte for byte. Each MoE's scoped buffers
+    and region B are poisoned after it (with the deferred round, the owned
+    rows too)."""
 
     MOE_SETUP = r"""
 import os
@@ -9309,6 +9332,7 @@ def run(knobs, mode, args):
     prefetch = region = ovb = aux_flight = input_wait = on
     dmk.ROUTED_SEND_IN_EXPERT_REGION = region  # read when moe() is traced
     dmk.OUTPUT_ROUND_NEXT_LAYER = ovb
+    dmk.TOKEN_PARALLEL_ODD_HOST_ROUND = on
 
     def kernel(x0_ref, bias_ref, norm_ref, noise_ref, router_hbm, ld_hbm, qup_hbm, lu_hbm, sgu_hbm,
                sd_hbm, egu_hbm, egus_hbm, ed_hbm, eds_hbm, state_hbm, aux_in, owned_out,
