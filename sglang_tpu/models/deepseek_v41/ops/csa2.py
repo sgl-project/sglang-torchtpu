@@ -215,6 +215,42 @@ def _attend_main(
     scale: float,
 ) -> jax.Array:
     """SWA window plus the selected compressed records of each token."""
+    output, _, _, _ = _gather_attend_main(
+        q,
+        words,
+        scales,
+        selected,
+        main_pages,
+        swa,
+        starts,
+        positions,
+        sink,
+        cos_sin,
+        metadata,
+        main_page_records,
+        compress_ratio,
+        scale,
+    )
+    return output
+
+
+def _gather_attend_main(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    selected: jax.Array,
+    main_pages: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    main_page_records: int,
+    compress_ratio: int,
+    scale: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``_attend_main`` that also returns the gathered (words, scales, counts)."""
     # As the epic caller: ids at or past the token's compressed length are
     # invalid. Selections must still form a valid prefix per row.
     lengths = (positions + 1) // compress_ratio
@@ -226,7 +262,7 @@ def _attend_main(
         page_size=main_page_records,
         onehot_requests=True,
     )
-    output, _, _ = csa2_pipeline(
+    output, gathered_words, gathered_scales = csa2_pipeline(
         q,
         words,
         scales,
@@ -245,7 +281,39 @@ def _attend_main(
         compress_ratio=compress_ratio,
         deep_gather=True,
     )
-    return output
+    return output, gathered_words, gathered_scales, counts
+
+
+def _attend_gathered(
+    q: jax.Array,
+    gathered_words: jax.Array,
+    gathered_scales: jax.Array,
+    counts: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    compress_ratio: int,
+    scale: float,
+) -> jax.Array:
+    """Main attention over KV a group's first layer already gathered."""
+    return csa2(
+        q,
+        gathered_words,
+        gathered_scales,
+        swa,
+        starts,
+        positions,
+        sink.astype(jnp.float32),
+        _inverse_rope(cos_sin, positions),
+        swa_metadata=metadata,
+        main_lengths=counts,
+        scale=scale,
+        compress_ratio=compress_ratio,
+        bq=_bq(q.shape[0]),
+    )
 
 
 # =============================================================================
@@ -283,6 +351,16 @@ def _fake_attend(q, *args):
     return torch.empty_like(q)
 
 
+def _fake_gather_attend(q, *args):
+    tokens = q.shape[0]
+    return (
+        torch.empty_like(q),
+        q.new_empty((tokens, MAX_SELECTED, 128), dtype=torch.int32),
+        q.new_empty((tokens, MAX_SELECTED), dtype=torch.float32),
+        q.new_empty((tokens,), dtype=torch.int32),
+    )
+
+
 # name -> (JAX function, fake, donated argument positions)
 _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
@@ -293,6 +371,8 @@ _DEFINITIONS = {
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_swa_non_causal": (_attend_swa_non_causal, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
+    "gather_attend_main": (_gather_attend_main, _fake_gather_attend, ()),
+    "attend_gathered": (_attend_gathered, _fake_attend, ()),
 }
 
 
@@ -403,7 +483,8 @@ def attention(
     main: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None
     ) = None,
-) -> torch.Tensor:
+    keep_gathered: bool = False,
+):
     """CSA2 attention; returns ``[T, H, 512]`` BF16 with inverse RoPE applied.
 
     ``q`` [T, H, 512] BF16 RoPE'd (H a multiple of 8 in [8, 128]); ``sink``
@@ -419,6 +500,9 @@ def attention(
     prefix, ids < (position + 1) // compress_ratio; ``main_pages`` [B, C'] i32
     full page ids; ``main_page_records`` = 256 // compress_ratio. ``None``
     (ratio 0) attends the SWA window alone.
+
+    ``keep_gathered`` (with ``main``) returns ``(out, (words, scales, counts))``,
+    the gathered main KV that ``attention_gathered`` reuses.
     """
     if not q.shape[0]:
         return torch.empty_like(q)
@@ -426,6 +510,8 @@ def attention(
         raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
     if swa_bounds is not None and main is not None:
         raise ValueError("non-causal SWA bounds serve ratio-0 layers without main KV")
+    if keep_gathered and main is None:
+        raise ValueError("keep_gathered needs main KV")
     cos_sin = cos_sin.float()
     common = (_i32(query_start_loc), _i32(positions), sink.float(), cos_sin)
     if swa_bounds is not None:
@@ -439,7 +525,7 @@ def attention(
     words, scales, selected, main_pages, main_page_records = main
     if selected.shape[1] > MAX_SELECTED:
         raise ValueError(f"CSA2 attends at most {MAX_SELECTED} compressed records")
-    return _op("attend_main")(
+    args = (
         q,
         words,
         scales,
@@ -449,6 +535,49 @@ def attention(
         *common,
         _i32(swa_meta),
         int(main_page_records),
+        int(compress_ratio),
+        float(scale),
+    )
+    if not keep_gathered:
+        return _op("attend_main")(*args)
+    out, gathered_words, gathered_scales, counts = _op("gather_attend_main")(*args)
+    return out, (gathered_words, gathered_scales, counts)
+
+
+def attention_gathered(
+    q: torch.Tensor,
+    gathered: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    swa_pages: torch.Tensor,
+    swa_meta: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    sink: torch.Tensor,
+    cos_sin: torch.Tensor,
+    compress_ratio: int,
+    scale: float,
+) -> torch.Tensor:
+    """``attention`` with ``main`` over ``gathered`` = (words [T, 512, 128] i32,
+    scales [T, 512] FP32, counts [T] i32) from ``attention(keep_gathered=True)``.
+
+    Valid only while the main KV source and the selection that produced
+    ``gathered`` are unchanged; the result then equals ``attention``'s.
+    """
+    if not q.shape[0]:
+        return torch.empty_like(q)
+    if not compress_ratio:
+        raise ValueError("gathered main KV requires a positive compress_ratio")
+    words, scales, counts = gathered
+    return _op("attend_gathered")(
+        q,
+        words,
+        scales,
+        _i32(counts),
+        swa_pages,
+        _i32(query_start_loc),
+        _i32(positions),
+        sink.float(),
+        cos_sin.float(),
+        _i32(swa_meta),
         int(compress_ratio),
         float(scale),
     )

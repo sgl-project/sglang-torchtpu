@@ -1,13 +1,12 @@
 name: PR Test (MLU)
 
-# Label-gated MLU CI workflow. The PR must carry BOTH `run-ci` (basic-CI
-# prerequisite) and `run-ci-mlu` (explicit opt-in) for the MLU test job to
-# run. The shared gate reads current labels, including on explicit reruns.
+# MLU CI is manual-only in sglang-torchtpu; TPU PRs must not require MLU labels.
 
 on:
-  # Run the reviewed base-branch workflow, never workflow code from the PR.
-  pull_request_target:
-    branches: [ main ]
+  # Disabled in sglang-torchtpu: TPU PRs should not spawn MLU checks.
+  # MLU CI remains available via workflow_dispatch.
+  # pull_request_target:
+  #   branches: [ main ]
   workflow_dispatch:
     inputs:
       ref:

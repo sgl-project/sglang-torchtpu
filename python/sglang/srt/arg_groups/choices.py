@@ -165,6 +165,8 @@ HICACHE_IO_BACKEND_CHOICES = [
     "raiden",
 ]
 
+DISAGG_DCP_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "mori", "ascend", "fake"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
@@ -315,6 +317,7 @@ add_cp_kv_layout_choices = CP_KV_LAYOUT_CHOICES.extend
 # --- Transport ---
 
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
+add_disagg_dcp_transfer_backend_choices = DISAGG_DCP_TRANSFER_BACKEND_CHOICES.extend
 
 # --- Sampling and grammar ---
 

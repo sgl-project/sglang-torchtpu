@@ -17,6 +17,8 @@ import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    choices,
+    hicache_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -1916,6 +1918,20 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
+    def test_pd_decode_dcp_accepts_a_registered_transfer_backend(self):
+        """A platform extending the DCP backend list must pass decode validation."""
+        saved = list(choices.DISAGG_DCP_TRANSFER_BACKEND_CHOICES)
+        self.addCleanup(
+            choices.DISAGG_DCP_TRANSFER_BACKEND_CHOICES.__setitem__, slice(None), saved
+        )
+        choices.add_disagg_dcp_transfer_backend_choices(["mooncake_tcp"])
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake_tcp",
+            dcp_size=4,
+        )
+        self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
+
     def test_pd_decode_dcp_allows_fake_transfer_backend(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
@@ -3086,6 +3102,31 @@ class TestHiCacheArgs(CustomTestCase):
                 )
                 with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
                     handle_pd_disaggregation(args)
+
+    def test_hicache_dcp_on_mha_requires_a_platform_that_shards_every_pool(self):
+        """Non-MLA HiCache + DCP is allowed only when the platform shards every KV pool."""
+        args = self._make_args(
+            enable_hierarchical_cache=True, dcp_size=2, speculative_algorithm=None
+        )
+        with patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=False
+        ):
+            for shards, ok in ((False, False), (True, True)):
+                with (
+                    self.subTest(shards_every_pool=shards),
+                    patch.object(
+                        hicache_hook.current_platform,
+                        "dcp_shards_every_kv_pool",
+                        return_value=shards,
+                    ),
+                ):
+                    if ok:
+                        hicache_hook.resolve_hicache_dcp_compatibility(args)
+                    else:
+                        with self.assertRaisesRegex(
+                            NotImplementedError, "only supported for MLA models"
+                        ):
+                            hicache_hook.resolve_hicache_dcp_compatibility(args)
 
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (

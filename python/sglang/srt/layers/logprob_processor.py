@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import output_topk
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
@@ -103,7 +104,10 @@ def get_top_logprobs_raw(
     no_copy_to_cpu: bool = False,
 ):
     max_k = max(top_logprobs_nums)
-    values, indices = logprobs.topk(max_k, dim=-1)
+    if stage == LogprobStage.DECODE and max_k > 0:
+        values, indices = output_topk(logprobs, max_k)
+    else:
+        values, indices = logprobs.topk(max_k, dim=-1)
     if not no_copy_to_cpu:
         values = values.tolist()
         indices = indices.tolist()

@@ -219,8 +219,8 @@ with interchangeable implementations along **two independent dimensions**:
   **not** kernel backends.
 
 Dispatch priority, highest first: explicit `forward(..., backend=...)` →
-global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → OOT platform
-override → declared optimized kernel backends by `priority` (filtered by
+global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → registered plugin
+platform override → declared optimized kernel backends by `priority` (filtered by
 `backend_eligible()`, a `CapabilityRequirement`-vs-`PlatformInfo` check
 extensible with per-call applicability gates) → platform-specific forward →
 `forward_native`. A gate only answers whether the kernel covers these operands,
@@ -228,6 +228,10 @@ so that falling through is a correct way to compute the same result; operands
 that violate the op's contract (mismatched shapes or devices) are a caller bug
 that the backend's launcher must raise, not a reason to fall back. The static part of the decision is resolved once and cached
 on the instance, so the hot path stays a single indirect call.
+
+`register_oot_forward()` accepts both in-tree and out-of-tree platform keys,
+so a plugin can serve either platform identity through the same registration.
+Register before an instance's first call, which caches its dispatch target.
 
 `BaseFusedOp` also owns the torch.compile mode protocol
 (`enter_torch_compile(num_tokens)` / `leave_torch_compile()`, both
