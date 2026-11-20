@@ -2,17 +2,34 @@
 weight families in the kernels' per-rank layout, and the pre-shard shapes."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=13000, suite="base-a-test-cpu")
+# Needs jax and torch_tpu, which the CPU runners do not install; the TPU unit
+# stage's time budget is spent, so test_k3_programs_nightly.py runs it in the
+# TPU nightly.
+register_tpu_ci(
+    est_time=120,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    disabled="runs in the TPU nightly through test_k3_programs_nightly.py",
+)
+
+# The classes marked kernel_test run whole kernels in Pallas interpret mode on
+# host devices, minutes to tens of minutes each and hours in all: they run with
+# K3_KERNEL_TESTS=1 (python3 test_k3_program_k31.py), not in CI.
+kernel_test = unittest.skipUnless(
+    os.environ.get("K3_KERNEL_TESTS") == "1",
+    "Pallas interpret mode, minutes: set K3_KERNEL_TESTS=1",
+)
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -161,6 +178,7 @@ class TestIndexerFamilies(CustomTestCase):
             self.assertEqual(tuple(value.shape), shapes[name][1:])
 
 
+@kernel_test
 class TestTokenParallelLatentUp(CustomTestCase):
     """``KernelConfig.moe_token_parallel_up``: the ``latent_up_tp`` family is
     latent_up's block 2 * host + core, and the token-parallel MoE tail
@@ -462,6 +480,7 @@ print("OK")
         self._run(self.LOOP)
 
 
+@kernel_test
 class TestOutputRoundNextLayer(CustomTestCase):
     """``KernelConfig.moe_output_round_next_layer``: the token-parallel MoE
     tail (decode_late_shared_down's order) over three layers of a loop, each
@@ -618,6 +637,7 @@ print("OK")
         self._run("eager", "8")
 
 
+@kernel_test
 class TestAuxCaptureInFlight(CustomTestCase):
     """``KernelConfig.aux_capture_in_flight``: the aux hidden capture of
     rank-row steps (both ranks of a pair hold its rows) over a loop of seven
@@ -908,6 +928,7 @@ class TestIndexCommit(CustomTestCase):
                         self.assertFalse(np.asarray(pools[m][block]).any())
 
 
+@kernel_test
 class TestFusedDsaCommit(CustomTestCase):
     """The fused K3.1 epilogue commit (``paged._commit_dsa_rows_fused``, Pallas
     interpret mode) writes the bytes of the latent commit kernel and the XLA
@@ -1102,6 +1123,7 @@ class TestFusedDsaCommit(CustomTestCase):
                 )
 
 
+@kernel_test
 class TestVerifyFusedTail(CustomTestCase):
     """``paged.commit_verify_tail`` (KernelConfig.verify_fused_tail, Pallas
     interpret mode): from the decoder's BF16 new-key handoff it writes the
@@ -1389,6 +1411,7 @@ class TestVerifyFusedTailOps(CustomTestCase):
         )
 
 
+@kernel_test
 class TestIndexSelect(CustomTestCase):
     """The decode selection kernel (``dsa_dcp.select_call``) in Pallas
     interpret mode on a 4-rank DCP group of host devices: every rank's keys
@@ -1494,6 +1517,7 @@ class TestIndexSelect(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestIndexSelectBins(CustomTestCase):
     """Bin selection (``KernelConfig.dsa_select_rounds`` < 8): the kernel's
     threshold is the lower bound of the ``4 * rounds``-bit key prefix bin that
@@ -1614,6 +1638,7 @@ class TestIndexSelectBins(CustomTestCase):
         self._run(4)
 
 
+@kernel_test
 class TestIndexSelectGatherFinish(CustomTestCase):
     """``KernelConfig.dsa_gather_finish``: once every row's threshold bin is
     small the ranks gather its keys and finish the rounds locally -- the same
@@ -1692,6 +1717,7 @@ class TestIndexSelectGatherFinish(CustomTestCase):
         )
 
 
+@kernel_test
 class TestIndexSelectScoringKnobs(CustomTestCase):
     """The scoring loop's KernelConfig knobs (``dsa_stage_slots``,
     ``dsa_page_slots``, ``dsa_resident_keys``, ``dsa_patch_loop``) leave the
@@ -1862,6 +1888,7 @@ class TestIndexSelectScoringKnobs(CustomTestCase):
         self._runs(8, (self.RESIDENT, f"{self.RESIDENT},{self.ODD}"))
 
 
+@kernel_test
 class TestSelectedAttention(CustomTestCase):
     """The DCP attention with a DSA selection (``mla_dcp.DcpSelection``) in
     Pallas interpret mode on a 4-rank group: each row attends exactly its
@@ -2267,6 +2294,7 @@ class TestSelectedAttention(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestPairCombine(CustomTestCase):
     """``KernelConfig.dcp_pair_combine`` (the two-stage DCP combine) in Pallas
     interpret mode on a 4-rank group whose chips are ranks 0/1 and 2/3, with
@@ -2478,6 +2506,7 @@ class TestPairCombine(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestPairLseRows(CustomTestCase):
     """``KernelConfig.dcp_pair_lse_rows`` (the pair combine's stage two as
     the latent lanes plus two lse rows) must not change a bit. The
@@ -2590,6 +2619,7 @@ class TestPairLseRows(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestDraftPairCombine(CustomTestCase):
     """``KernelConfig.draft_pair_combine``: the MLA draft's attention
     (explicit keys, its lse in the padding row, FP8 pages) through the host
@@ -2796,6 +2826,7 @@ class TestDraftPairCombine(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestK31DraftNativePages(CustomTestCase):
     """``KernelConfig.draft_native_pages`` and ``draft_step_trims``: the MLA
     draft's attention (explicit keys, its lse in the padding row, FP8 pages,
@@ -3084,6 +3115,7 @@ class TestPrefillIndexRows(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(pool)[1:], rows)
 
 
+@kernel_test
 class TestDecodeIndexer(CustomTestCase):
     """The decode megakernel's indexer (``dsa_decode.DecodeIndexer``) in
     Pallas interpret mode on a 4-rank DCP group (8 index heads a rank): the
@@ -3182,6 +3214,7 @@ class TestDecodeIndexer(CustomTestCase):
                     )
 
 
+@kernel_test
 class TestRouterBothHalves(CustomTestCase):
     """The decode MoE router with both router halves on every rank
     (``KernelConfig.decode_router_both_halves``) in Pallas interpret mode on a
@@ -3486,6 +3519,7 @@ class TestK31Draft(CustomTestCase):
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))
 
 
+@kernel_test
 class TestExpertSchedule(CustomTestCase):
     """The grouped routed-expert stream (``_run_routed_expert_stream``) at B8
     and B16 in Pallas interpret mode, on random MXFP4 experts and routings
@@ -3617,6 +3651,7 @@ class TestExpertSchedule(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestK31DraftWholeWeights(CustomTestCase):
     """``KernelConfig.draft_whole_weights``: Kimi-K3.1's draft (three heads a
     rank) holds o whole at up to 8 rows and down at up to 16 instead of
@@ -3700,6 +3735,7 @@ class TestK31DraftWholeWeights(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestK31DraftFusedEpilogue(CustomTestCase):
     """``KernelConfig.draft_fused_epilogue`` and ``draft_lm_prefetch`` in
     Pallas interpret mode, against the XLA code they replace, bitwise:
@@ -4166,6 +4202,7 @@ class TestK31DraftVerifyPacket(CustomTestCase):
         self._run(self.HOST)
 
 
+@kernel_test
 class TestOwnerEmbedding(CustomTestCase):
     """``KernelConfig.decode_embedding_broadcast`` in Pallas interpret mode on
     four host devices (race detection on): ``decode_megakernel.decode_local``
@@ -4262,6 +4299,7 @@ class TestOwnerEmbedding(CustomTestCase):
         _run_script(self, self.SCRIPT)
 
 
+@kernel_test
 class TestLocalEmbedding(CustomTestCase):
     """``KernelConfig.decode_embedding_replicated`` on four host devices.
     ``DecodeOps.load_weights`` (bridge stubbed: ops are jitted shard_maps) adds
@@ -4457,6 +4495,7 @@ class TestLocalEmbedding(CustomTestCase):
         _run_script(self, self.SCRIPT)
 
 
+@kernel_test
 class TestVerifyGreedyKernel(CustomTestCase):
     """``KernelConfig.verify_greedy_kernel`` in Pallas interpret mode on four
     host devices (race detection on): ``sampling.verify_acceptance`` with the
@@ -4632,6 +4671,7 @@ def _run_script(case, script):
     case.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
 
 
+@kernel_test
 class TestK31DraftWithVerify(CustomTestCase):
     """``KernelConfig.draft_with_verify`` through the real op bodies on a
     4-device CPU mesh, with stand-ins for the decoder and draft megakernels
@@ -5159,6 +5199,7 @@ class TestK31DraftWithVerify(CustomTestCase):
         self._run(PART="warm", WARM="one,one+first")
 
 
+@kernel_test
 class TestB16OneHotStaging(CustomTestCase):
     """KernelConfig.b16_one_hot_staging: the B16 routed-expert stream stages
     its compact rows with a one-hot product instead of a scalar row scan. In
@@ -5299,6 +5340,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestSharedExpertPasses(CustomTestCase):
     """KernelConfig.shared_expert_passes: the routed-expert stream with compact
     tiles (B16, B32) runs an iteration's noncompact pair or tail (experts with
@@ -5456,6 +5498,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestB8CompactExperts(CustomTestCase):
     """KernelConfig.b8_compact_experts: the B8 routed-expert stream runs an
     expert pair of at most 4 rows an expert (not two singletons) on compact
@@ -5723,6 +5766,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestSingletonRowStaging(CustomTestCase):
     """A singleton route's row staging (``_stage_singleton_row``) in Pallas
     interpret mode: at 8 rows, ``KernelConfig.b8_singleton_select`` (one select
@@ -5799,6 +5843,7 @@ class TestSingletonRowStaging(CustomTestCase):
         self.assertEqual(branches(staging(12, True), routes, source), 12 * 12)
 
 
+@kernel_test
 class TestAttentionHostBf16(CustomTestCase):
     """The token-scattered attention output projection (``_project_attention_2d``)
     at B8, B16 and B24 in Pallas interpret mode on 32 host devices (4 hosts x 4 rank
@@ -6031,6 +6076,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestAttentionHostRoundAfterJoin(CustomTestCase):
     """``KernelConfig.attention_host_round_after_join``: rank-row output
     projections (B8 and B16, FP32 and BF16 host sums) that return with their
@@ -6184,6 +6230,7 @@ print("OK")
         self._run("eager")
 
 
+@kernel_test
 class TestAttentionRankRows(CustomTestCase):
     """``KernelConfig.attention_rank_rows`` in the token-scattered attention
     output projection (``_project_attention_2d(rank_rows=True)``) at B8 and
@@ -6287,6 +6334,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestLatentDownPrefetch(CustomTestCase):
     """``KernelConfig.decode_latent_down_prefetch``: the decode MoE
     (``decode_megakernel.moe``) at 8 rows with the presorted router, the
@@ -6435,6 +6483,7 @@ print("OK")
         self.assertNotIn("non-zero count", result.stdout + result.stderr)
 
 
+@kernel_test
 class TestFirstPairGateUpCopies(CustomTestCase):
     """The initial routed-expert copies with ``gate_up_first_pair``
     (``KernelConfig.decode_late_shared_down``) in Pallas interpret mode: on
@@ -6654,6 +6703,7 @@ class TestKdaFp8Families(CustomTestCase):
             self.assertIn("k_gate", kda)
 
 
+@kernel_test
 class TestKdaFp8OutputProjection(CustomTestCase):
     """The token-scattered attention output projection
     (``_project_attention_2d``) with FP8 weights and FP32 column scales
@@ -6764,6 +6814,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestKdaFp8Layer(CustomTestCase):
     """A KDA decode layer (``kda``: gate, input projection, short conv,
     delta-rule recurrence, gated norm, token-scattered output projection) at
@@ -7249,6 +7300,7 @@ class TestSeededWindowMath(CustomTestCase):
         np.testing.assert_array_equal(out, expect)  # slot 0 unchanged
 
 
+@kernel_test
 class TestIndexSelectSeededWindow(CustomTestCase):
     """``KernelConfig.dsa_seeded_window``: ``select_call`` in interpret mode
     on a 4-rank group over multi-step streams, each step's centres the last
@@ -7499,6 +7551,7 @@ class TestIndexSelectSeededWindow(CustomTestCase):
                 np.testing.assert_array_equal(base[name], seeded[name], err_msg=name)
 
 
+@kernel_test
 class TestCrossedPairGathers(CustomTestCase):
     """``KernelConfig.crossed_pair_gathers``: the four-owner gathers of the
     pairs' rows (``_gather_local_pair_rows(cross_cores=True)``) in Pallas
@@ -7664,6 +7717,7 @@ print("OK")
         )
 
 
+@kernel_test
 class TestAttentionInputGatherInBranches(CustomTestCase):
     """``KernelConfig.attention_input_gather_in_branches``: the rank-row
     steps' gather of the attention input rows
@@ -7916,6 +7970,7 @@ print("OK")
         self._run("eager", "races")
 
 
+@kernel_test
 class TestSelectExchangeHook(CustomTestCase):
     """``IndexSelect.select(in_exchange, keys_ready)`` (the decode's
     ``dsa_prologue_in_select`` runs the attention's prologue in the first and
@@ -8024,6 +8079,7 @@ class TestSelectExchangeHook(CustomTestCase):
         self._run(8, cases=1)  # the 8-row sequence (the exact rounds compile slowly)
 
 
+@kernel_test
 class TestIndexSelectFillsAndPatch(TestIndexSelectScoringKnobs):
     """``KernelConfig.dsa_exchange_fill`` (own keys, p_tie and the resident
     keys' copy wait in the first count exchange's wait),
@@ -8153,6 +8209,7 @@ class TestIndexSelectFillsAndPatch(TestIndexSelectScoringKnobs):
         self._runs(8, (self.RESIDENT,))
 
 
+@kernel_test
 class TestAttentionExactKnobs(CustomTestCase):
     """Default-off rewrites of the DSA verify attention that must not change
     a bit (``TestSelectedAttention``'s harness, interpret mode, 4-rank group):
@@ -8212,6 +8269,7 @@ class TestAttentionExactKnobs(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestDsaNativePages(CustomTestCase):
     """``KernelConfig.dsa_native_pages``: the DSA verify attention with its
     pages staged native (``[span * 512, 640]`` FP8 buffers, each page DMA
@@ -8301,6 +8359,7 @@ class TestDsaNativePages(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+@kernel_test
 class TestDecodeIndexerExchangeFill(CustomTestCase):
     """``KernelConfig.dsa_exchange_fill`` inside the decode indexer: the
     dense regime's step activity marked in the first count exchange's wait
@@ -8370,6 +8429,7 @@ class TestDecodeIndexerExchangeFill(CustomTestCase):
                     )
 
 
+@kernel_test
 class TestSelectHooksSeededFills(CustomTestCase):
     """The selection's hooks under the seeded window and the first wait's
     fill together: ``select_call`` in interpret mode on a 4-rank group over
@@ -8595,6 +8655,7 @@ class TestSelectHooksSeededFills(CustomTestCase):
                     )
 
 
+@kernel_test
 class TestMlaQ6Knobs(CustomTestCase):
     """The decode MLA layer with the DSA indexer (``decode_megakernel.mla``)
     in Pallas interpret mode on a 4-rank DCP group, with the serving
@@ -8939,6 +9000,7 @@ print("OK" if ok else "FAIL")
                 )
 
 
+@kernel_test
 class TestK31DraftPrologueOverlap(CustomTestCase):
     """``KernelConfig.draft_prologue_overlap`` and ``draft_markov_rows``: the
     fused MLA draft kernel in Kimi-K3.1's shape (three heads a rank, causal
@@ -9170,6 +9232,7 @@ class TestK31DraftPrologueOverlap(CustomTestCase):
         self._run("two")
 
 
+@kernel_test
 class TestDecodeKnobsTogether(CustomTestCase):
     """Decode layer pieces that several knobs change at once, in Pallas
     interpret mode, bit for bit against the same pieces with those knobs off.

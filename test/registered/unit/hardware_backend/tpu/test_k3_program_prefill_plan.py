@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # The prefill module imports the bridge, which imports torch_tpu's Pallas op
@@ -25,7 +25,15 @@ if "torch_tpu" not in sys.modules:
 
 from sglang_tpu.k3_programs.kimi_k3.prefill import plan_pieces, skips_step  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# Needs jax and torch_tpu, which the CPU runners do not install; the TPU unit
+# stage's time budget is spent, so test_k3_programs_nightly.py runs it in the
+# TPU nightly.
+register_tpu_ci(
+    est_time=20,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    disabled="runs in the TPU nightly through test_k3_programs_nightly.py",
+)
 
 ALIGN = 512
 BLOCK = 32 * ALIGN  # a logical block (fp8)

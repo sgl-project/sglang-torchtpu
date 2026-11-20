@@ -23,10 +23,19 @@ import unittest
 
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=300, suite="base-a-test-cpu")
+# Whole kernels in Pallas interpret mode on host devices, minutes a case: the
+# TPU nightly runs it (the CPU runners do not install jax).
+register_tpu_ci(
+    est_time=240,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "kimi-k3", "k3-programs"],
+)
 
 
 class TestRouterFp8Families(CustomTestCase):
@@ -253,10 +262,14 @@ class TestRouterFp8Routing(CustomTestCase):
     """The FP8 router in ``_route_hidden_states`` (see the module docstring)."""
 
     def test_fp8_routes_match_the_dequantized_router(self):
-        from jax.experimental.pallas import tpu as pltpu
-
+        try:
+            from jax.experimental.pallas import tpu as pltpu
+        except ImportError:
+            pltpu = None
         if not hasattr(pltpu, "InterpretParams"):
-            self.skipTest("Pallas TPU interpret mode unavailable")
+            # The TPU nightly runs this file: there it fails instead of skipping.
+            self.assertFalse(full_matrix(), "no Pallas TPU interpret mode")
+            self.skipTest("no Pallas TPU interpret mode")
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(SCRIPT)],

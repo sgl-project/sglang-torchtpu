@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs import sglang_bridge as bridge
 from sglang_tpu.k3_programs import sglang_config
@@ -19,7 +19,15 @@ from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+# Needs jax and torch_tpu, which the CPU runners do not install; the TPU unit
+# stage's time budget is spent, so test_k3_programs_nightly.py runs it in the
+# TPU nightly.
+register_tpu_ci(
+    est_time=40,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    disabled="runs in the TPU nightly through test_k3_programs_nightly.py",
+)
 
 PACKAGE = pathlib.Path(bridge.__file__).parent
 

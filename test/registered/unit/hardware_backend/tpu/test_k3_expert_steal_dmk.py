@@ -51,10 +51,19 @@ import subprocess
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1300, suite="base-a-test-cpu")
+# Whole kernels in Pallas interpret mode on host devices, minutes a case: the
+# TPU nightly runs it (the CPU runners do not install jax).
+register_tpu_ci(
+    est_time=1300,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "kimi-k3", "k3-programs"],
+)
 
 GROUP_EXPERTS, TOP_K = 112, 16
 K, W, OUT = 512, 256, 128
@@ -847,8 +856,10 @@ class TestK3ExpertStealMegakernel(CustomTestCase):
         try:
             from jax.experimental.pallas import tpu as pltpu
         except ImportError:
-            self.skipTest("no Pallas TPU")
+            pltpu = None
         if not hasattr(pltpu, "InterpretParams"):
+            # The TPU nightly runs this file: there it fails instead of skipping.
+            self.assertFalse(full_matrix(), "no Pallas TPU interpret mode")
             self.skipTest("no Pallas TPU interpret mode")
         result = subprocess.run(
             [sys.executable, os.path.abspath(__file__), mode, str(batch)],

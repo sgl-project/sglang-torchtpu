@@ -26,10 +26,19 @@ import sys
 import time
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=900, suite="base-a-test-cpu")
+# Whole kernels in Pallas interpret mode on host devices, minutes a case: the
+# TPU nightly runs it (the CPU runners do not install jax).
+register_tpu_ci(
+    est_time=1400,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "kimi-k3", "k3-programs"],
+)
 
 H, E, K, LOCAL = 256, 896, 16, 112
 # Batches with one kind of planted tie a row: (experts, at the 16th/17th
@@ -467,9 +476,13 @@ class TestSortingNetwork(CustomTestCase):
 class TestPresortedRouting(CustomTestCase):
     def _run(self, kinds, batch, modes):
         try:
-            from jax.experimental.pallas import tpu as pltpu  # noqa: F401
+            from jax.experimental.pallas import tpu as pltpu
         except ImportError:
-            self.skipTest("no Pallas TPU")
+            pltpu = None
+        if not hasattr(pltpu, "InterpretParams"):
+            # The TPU nightly runs this file: there it fails instead of skipping.
+            self.assertFalse(full_matrix(), "no Pallas TPU interpret mode")
+            self.skipTest("no Pallas TPU interpret mode")
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, os.path.abspath(__file__), kinds, str(batch), modes],

@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host.base import HostMemoryPreflight
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import tpu_dma_hybrid_cache_controller as tpu_controller
 from sglang_tpu.envs import envs as tpu_envs
@@ -29,7 +29,15 @@ from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA
 from sglang_tpu.k3_programs.program import StepOutput
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, register_tpu_dma_hicache_backend
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+# Needs jax and torch_tpu, which the CPU runners do not install; the TPU unit
+# stage's time budget is spent, so test_k3_programs_nightly.py runs it in the
+# TPU nightly.
+register_tpu_ci(
+    est_time=150,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    disabled="runs in the TPU nightly through test_k3_programs_nightly.py",
+)
 
 ENGINE = "k3_row_engine"
 STEP = 8192  # bf16 logical block
