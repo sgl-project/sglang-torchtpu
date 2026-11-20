@@ -209,6 +209,31 @@ class TestSharedEmbedding(CustomTestCase):
         )
 
 
+class TestRopeTables(CustomTestCase):
+    """KernelConfig.draft_rope_bf16: BF16 tables hold exactly what the kernel
+    rounds the FP32 rows to, and each window covers a block's 8 positions."""
+
+    def test_bf16_tables(self):
+        import dataclasses
+
+        import ml_dtypes
+
+        c = dspark.DraftConfig()
+        f32 = dspark.rope_tables(c, 5000)
+        bf16 = dspark.rope_tables(dataclasses.replace(c, rope_bf16=True), 5000)
+        for a, b in zip(f32, bf16):
+            self.assertEqual(b.dtype, ml_dtypes.bfloat16)
+            np.testing.assert_array_equal(a.astype(ml_dtypes.bfloat16), b)
+        for rope_bf16 in (False, True):
+            align, rows, _ = dspark._rope_window(
+                dataclasses.replace(c, rope_bf16=rope_bf16)
+            )
+            self.assertEqual((align, rows), (16, 32) if rope_bf16 else (8, 16))
+            for position in range(100):
+                start = position // align * align
+                self.assertLess(position + dspark.ROWS - 1, start + rows)
+
+
 def _draft(markov_rank):
     d = object.__new__(draft_mod.DsparkDraft)
     d.config = SimpleNamespace(markov_rank=markov_rank)

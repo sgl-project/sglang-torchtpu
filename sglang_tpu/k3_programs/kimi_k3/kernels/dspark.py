@@ -63,6 +63,10 @@ class DraftConfig:
     # every shard (all-gathered once) instead of the full vocabulary. Zero
     # means exact full-vocabulary sampling with a collective per slot.
     markov_top_m: int = 16
+    # The RoPE tables in BF16 (KernelConfig.draft_rope_bf16): the kernel
+    # rounds the FP32 rows it reads to BF16, so the drafts are the same and
+    # the tables (to the context length, in HBM) take half the bytes.
+    rope_bf16: bool = False
 
     @property
     def q_width(self) -> int:
@@ -963,7 +967,8 @@ def _rotation(head_dim: int) -> np.ndarray:
 
 def rope_tables(c: DraftConfig, max_position: int):
     """``[P, 384]`` (cos x3 | sin x3) for the 3 local q heads and ``[P, 256]``
-    (cos | ones | sin | zeros) for the packed K/V row, FP32."""
+    (cos | ones | sin | zeros) for the packed K/V row, FP32 (BF16 with
+    ``c.rope_bf16``)."""
     positions = np.arange(max_position, dtype=np.float32)
     inv_freq = 1.0 / c.rope_theta ** (
         np.arange(0, c.head_dim, 2, dtype=np.float32) / c.head_dim
@@ -975,6 +980,10 @@ def rope_tables(c: DraftConfig, max_position: int):
     rope_q = np.concatenate([cos] * heads + [sin] * heads, axis=1).astype(np.float32)
     ones, zeros = np.ones_like(cos), np.zeros_like(sin)
     rope_kv = np.concatenate((cos, ones, sin, zeros), axis=1).astype(np.float32)
+    if c.rope_bf16:
+        import ml_dtypes
+
+        return rope_q.astype(ml_dtypes.bfloat16), rope_kv.astype(ml_dtypes.bfloat16)
     return rope_q, rope_kv
 
 
@@ -1253,6 +1262,16 @@ def _rope(x_bf16, rotation_bf16, cos32, sin32):
     return _bf16(_f32(first) + _f32(second))
 
 
+def _rope_window(c: DraftConfig):
+    """``(alignment, rows, dtype)`` of the RoPE table rows each request's block
+    reads: 16 FP32 rows from a multiple of 8, or (``c.rope_bf16``) 32 BF16 rows
+    from a multiple of 16 -- whole (16, 128) BF16 tiles. Either covers the 8
+    positions after any start."""
+    if c.rope_bf16:
+        return 16, 32, jnp.bfloat16
+    return 8, 16, jnp.float32
+
+
 def _select_rows(block32, offset, rows):
     """Rows ``offset .. offset + rows`` of a ``[16, W]`` value as ``[rows, W]`` (masked sums)."""
     row_index = jax.lax.broadcasted_iota(jnp.int32, block32.shape, 0)
@@ -1333,6 +1352,7 @@ def _make_body(
     rows = _fused_rows(requests, block)
     T = R * rows
     stream_aux = R >= 8
+    rope_align, rope_rows, _ = _rope_window(c)
     kv_width = 2 * c.head_dim  # 128
     q_width = 3 * c.head_dim  # 192
     vocab = c.vocab // RANKS  # 5120
@@ -1754,21 +1774,25 @@ def _make_body(
         start_w1(anchor_token, 0)
         rope_copies = []
         for j in range(R):
-            rope_q_start = pl.multiple_of((anchor_position[j] // 8) * 8, 8)
-            rope_kv_start = pl.multiple_of((new_position[j] // 8) * 8, 8)
+            rope_q_start = pl.multiple_of(
+                (anchor_position[j] // rope_align) * rope_align, rope_align
+            )
+            rope_kv_start = pl.multiple_of(
+                (new_position[j] // rope_align) * rope_align, rope_align
+            )
             rope_copies += (
                 copy(
-                    weights["rope_q"].at[pl.ds(rope_q_start, 16)],
+                    weights["rope_q"].at[pl.ds(rope_q_start, rope_rows)],
                     rope_q_blk.at[j],
                     10 + R + j,
                 ),
                 copy(
-                    weights["rope_kv"].at[pl.ds(rope_q_start, 16)],
+                    weights["rope_kv"].at[pl.ds(rope_q_start, rope_rows)],
                     rope_kv_blk.at[0, j],
                     10 + 2 * R + j,
                 ),
                 copy(
-                    weights["rope_kv"].at[pl.ds(rope_kv_start, 16)],
+                    weights["rope_kv"].at[pl.ds(rope_kv_start, rope_rows)],
                     rope_kv_blk.at[1, j],
                     10 + 3 * R + j,
                 ),
@@ -1955,7 +1979,7 @@ def _make_body(
             item.wait()
         rope_q_rows = jnp.stack(
             [
-                _select_rows(rope_q_blk[j], anchor_position[j] % 8, rows)
+                _select_rows(_f32(rope_q_blk[j]), anchor_position[j] % rope_align, rows)
                 for j in range(R)
             ]
         )  # [R, 8, 384]
@@ -1963,7 +1987,9 @@ def _make_body(
         sin_q = _f32(_bf16(rope_q_rows[:, :, q_width:])).reshape(T, q_width)
         rope_kv_rows = jnp.stack(
             [
-                _select_rows(rope_kv_blk[0, j], anchor_position[j] % 8, rows)
+                _select_rows(
+                    _f32(rope_kv_blk[0, j]), anchor_position[j] % rope_align, rows
+                )
                 for j in range(R)
             ]
         )  # [R, 8, 256]
@@ -1971,7 +1997,9 @@ def _make_body(
         sin_kv = _f32(_bf16(rope_kv_rows[:, :, kv_width:])).reshape(T, kv_width)
         rope_new_rows = jnp.stack(
             [
-                _select_rows(rope_kv_blk[1, j], new_position[j] % 8, rows)
+                _select_rows(
+                    _f32(rope_kv_blk[1, j]), new_position[j] % rope_align, rows
+                )
                 for j in range(R)
             ]
         )
@@ -2312,6 +2340,7 @@ def make_fused_draft(
     window, hidden = c.window, c.hidden
     R, T = requests, requests * rows
     packed = T * CHUNK // 256  # FP32 rows holding one BF16 [T, 896] chunk
+    _, rope_rows, rope_dtype = _rope_window(c)
     body = _make_body(c, block, eps, stop_after, host_bf16, requests)
 
     def local(
@@ -2386,8 +2415,9 @@ def make_fused_draft(
             tpu.VMEM((2, R, 16, c.markov_rank), jnp.bfloat16),  # w1_blk
             tpu.VMEM((16, hidden), jnp.bfloat16),  # embed_blk
             tpu.VMEM((R, ROW_PACKED, 128), jnp.float32),  # bcast_buf
-            tpu.VMEM((R, 16, 6 * c.head_dim), jnp.float32),  # rope_q_blk
-            tpu.VMEM((2, R, 16, 4 * c.head_dim), jnp.float32),  # rope_kv_blk
+            # rope_q_blk, rope_kv_blk: each row's RoPE window (_rope_window)
+            tpu.VMEM((R, rope_rows, 6 * c.head_dim), rope_dtype),
+            tpu.VMEM((2, R, rope_rows, 4 * c.head_dim), rope_dtype),
             tpu.VMEM(
                 (2, window, 2 * c.head_dim), jnp.bfloat16
             ),  # ring_vmem: the ring slice stream, double-buffered

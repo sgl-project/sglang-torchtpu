@@ -467,6 +467,9 @@ class KernelConfig:
     # four chunks start right then (under the last down_proj all-reduce).
     # The same products in the same order (bit-identical).
     draft_lm_prefetch: bool = False
+    # The Qwen3-style DSpark draft's RoPE tables in BF16 (kernels.dspark
+    # DraftConfig.rope_bf16): the same drafts, half the tables' HBM.
+    draft_rope_bf16: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's

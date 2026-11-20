@@ -43,6 +43,7 @@ from sglang_tpu.k3_programs.bridge import (
     register_global_op,
     upload,
 )
+from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
 from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, kernel_modules
 
 logger = init_logger(__name__)
@@ -220,7 +221,10 @@ class DsparkDraft:
         # synthetic_rates_by_width gives each draft width its own rates.
         self.synthetic_rates = synthetic_rates
         self.synthetic_rates_by_width = synthetic_rates_by_width
-        self.config = self.dspark.DraftConfig.from_checkpoint(checkpoint)
+        self.config = dataclasses.replace(
+            self.dspark.DraftConfig.from_checkpoint(checkpoint),
+            rope_bf16=kernel_config.active().draft_rope_bf16,
+        )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         if self.rank == 0:
             for width, rates in (synthetic_rates_by_width or {}).items():
