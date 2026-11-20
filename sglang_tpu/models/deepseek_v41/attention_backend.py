@@ -803,7 +803,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             keys = apply_rope(
                 indexer.k_norm(indexer.wk(latent)), group_pos, layer.freqs_cis
             )
-            index_k = pool.get_index_k(layer.layer_id)
+            index_k = pool.get_index_k_root(layer.layer_id)
             index_k.copy_(
                 self.indexer_ops.write_index_k(
                     index_k, records, keys, pool.index_k_layout(layer.layer_id)
@@ -813,7 +813,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             metadata.prepared_candidates.pop(pool.index_source(layer.layer_id), None)
 
         latent = apply_rope(latent, group_pos, layer.freqs_cis)
-        words, scales = pool.get_main_kv(layer.layer_id)
+        words, scales = pool.get_main_kv_roots(layer.layer_id)
         new_words, new_scales = self.csa2_ops.publish_main(
             words, scales, records, latent
         )
@@ -851,7 +851,10 @@ class DSV41TPUAttnBackend(AttentionBackend):
         if not num_tokens:
             return kv, score
 
-        read_pos = (pos - 1).masked_fill(pad, -1)
+        # Even and padded positions never publish a ratio-2 pair; route their
+        # carried lookup to the read-only -1 sentinel so reused slots never
+        # leak stale state even without eager HBM clears.
+        read_pos = (pos - 1).masked_fill(pad | ((pos % 2) == 0), -1)
         carried = state.get_state_by_state_loc(
             state.translate_from_req_position_to_state_loc(req, read_pos)
         )
@@ -871,7 +874,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             keep[:-ring] &= (req[:-ring] != req[ring:]) | pad[ring:]
         write_pos = pos.masked_fill(~keep, -1)
         slots = state.translate_from_req_position_to_state_loc(req, write_pos)
-        buffer = state.kv_score_buffer.kv_score
+        buffer = getattr(state, "state_buffer", state.kv_score_buffer.kv_score)
         values = torch.cat([kv, score], dim=-1)
         buffer.copy_(self.csa2_ops.write_rows(buffer, slots, values, carried.kv_score))
         return partner_kv, partner_score
@@ -1055,17 +1058,18 @@ class DSV41TPUAttnBackend(AttentionBackend):
         layer_id = layer.layer_id
         self._swa_metadata(metadata)
 
-        swa = pool.get_swa_pages(layer_id)
+        swa_root = pool.get_swa_root(layer_id)
         kv = k.reshape(k.shape[0], -1).contiguous()
         records = metadata.swa_write_records
         plan = metadata.swa_window_plan
         if plan is not None:
             # One publish also copies ring history into the workspace pages the
             # chunk attends and the chunk's last window back into the ring.
-            history = swa.reshape(-1, kv.shape[1])[plan.history_src]
+            history = swa_root.reshape(-1, kv.shape[1])[plan.history_src]
             kv = torch.cat((kv, history, kv[plan.commit_token]))
             records = torch.cat((records, plan.history_dst, plan.commit_dst))
-        swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+        swa_root.copy_(self.csa2_ops.publish_swa(swa_root, records, kv))
+        swa = swa_root.view(-1, SWA_PAGE_TOKENS, swa_root.shape[-1])
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)

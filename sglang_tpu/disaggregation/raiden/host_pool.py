@@ -138,22 +138,54 @@ def _exceeds(pages: int, capacity: Optional[int]) -> bool:
     return pages > 0 and (capacity is None or pages > capacity)
 
 
+def _buffer_page_bytes(buf: Any) -> int:
+    page_bytes = buf.element_size()
+    for dim in buf.shape[1:]:
+        page_bytes *= int(dim)
+    return page_bytes
+
+
+def has_heterogeneous_page_layouts(kv_caches: Sequence[Any]) -> bool:
+    """Whether ``kv_caches`` mix buffers with different per-page shapes or element sizes.
+
+    ``tpu_sync``'s bounded shared-layer staging (``num_staging_layers <
+    len(kv_caches)``) uses a per-session ``StagingLayerManager`` while striding
+    each shared host buffer by ``host_block_id * layer_block_byte_size(layer)``.
+    Two concurrent sessions sharing the same host buffer on layers with
+    different page byte sizes (or different XLA-tiled physical sizes) overwrite
+    each other even when their ``host_block_id`` ranges are disjoint. Engines
+    with heterogeneous per-page layouts must therefore keep full per-layer host
+    mirrors.
+    """
+    if len(kv_caches) <= 1:
+        return False
+    layouts = set()
+    for buf in kv_caches:
+        shape = getattr(buf, "shape", None)
+        element_size = getattr(buf, "element_size", None)
+        if shape is None or not callable(element_size):
+            return False
+        layouts.add((tuple(int(dim) for dim in shape[1:]), int(element_size())))
+    return len(layouts) > 1
+
+
 def slot_host_bytes(
     kv_caches: List[Any], max_blocks: int, layers: Optional[int] = None
 ) -> int:
     """Host staging bytes one transfer slot reserves.
 
-    Raiden allocates ``max_blocks`` pages of host memory for each of ``layers``
-    host buffers, every layer by default, so a slot costs the widest layer's
-    page times the buffer count times the per-slot block budget.
+    When Raiden allocates fewer host buffers than device layers
+    (``layers < len(kv_caches)``), each shared buffer is sized for the widest
+    layer's page. When every layer has its own host buffer (``layers is None``
+    or ``layers >= len(kv_caches)``), Raiden sizes each host buffer to that
+    layer's own page size.
     """
-    page_bytes = 0
-    for buf in kv_caches:
-        layer_bytes = buf.element_size()
-        for dim in buf.shape[1:]:
-            layer_bytes *= int(dim)
-        page_bytes = max(page_bytes, layer_bytes)
-    return page_bytes * (len(kv_caches) if layers is None else layers) * max_blocks
+    page_sizes = [_buffer_page_bytes(buf) for buf in kv_caches]
+    if not page_sizes:
+        return 0
+    if layers is None or layers >= len(kv_caches):
+        return sum(page_sizes) * max_blocks
+    return max(page_sizes) * layers * max_blocks
 
 
 # SWA and state slots per full-attention slot, for dynamic staging only (fixed

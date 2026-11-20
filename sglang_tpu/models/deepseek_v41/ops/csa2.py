@@ -105,7 +105,10 @@ def _publish_main(
     words: jax.Array, scales: jax.Array, records: jax.Array, latent: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
     encoded, encoded_scales = encode_csa2_kv(latent)
-    return publish_csa2_kv(words, scales, records, encoded, encoded_scales)
+    new_words, new_scales = publish_csa2_kv(
+        words.reshape(-1, 128), scales.reshape(-1), records, encoded, encoded_scales
+    )
+    return new_words.reshape(words.shape), new_scales.reshape(scales.shape)
 
 
 def _write_rows(
@@ -113,8 +116,13 @@ def _write_rows(
 ) -> jax.Array:
     # Finish reading the old rows first; otherwise XLA copies the whole buffer.
     rows, _ = jax.lax.optimization_barrier((rows, after))
-    slots = jnp.where(slots >= 0, slots, rows.shape[0])
-    return rows.at[slots].set(values.astype(rows.dtype), mode="drop")
+    flat = rows.reshape(-1, rows.shape[-1])
+    if flat.shape[1] > values.shape[1]:
+        values = jnp.pad(values, ((0, 0), (0, flat.shape[1] - values.shape[1])))
+    slots = jnp.where(slots >= 0, slots, flat.shape[0])
+    return (
+        flat.at[slots].set(values.astype(flat.dtype), mode="drop").reshape(rows.shape)
+    )
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:

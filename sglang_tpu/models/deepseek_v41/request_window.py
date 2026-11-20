@@ -52,7 +52,9 @@ class WindowPlan(NamedTuple):
 
 
 def _workspace_pages(*, num_slots: int, chunk_tokens: int) -> int:
-    return ceil_div(chunk_tokens, SWA_PAGE_TOKENS) + (
+    # Align chunk workspace pages up to 256-token (RING_PAGES * 64) root pages
+    # so DSV41TPUSWAKVPool's [num_pages256, 256, 512] root matches num_pages.
+    return ceil_div(chunk_tokens, RING_TOKENS) * RING_PAGES + (
         EXTRA_WORKSPACE_PAGES_PER_REQUEST * num_slots
     )
 

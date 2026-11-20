@@ -10,7 +10,10 @@ from unittest.mock import patch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-from sglang_tpu.disaggregation.raiden.host_pool import split_staging_layers
+from sglang_tpu.disaggregation.raiden.host_pool import (
+    has_heterogeneous_page_layouts,
+    split_staging_layers,
+)
 from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -18,10 +21,12 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class _Buffer:
     # One Muse Spark BF16 page per layer: 256 tokens x K/V x 1 head x 128.
-    shape = (32, 256, 2, 1, 128)
+    def __init__(self, shape=(32, 256, 2, 1, 128), itemsize=2):
+        self.shape = shape
+        self._itemsize = itemsize
 
     def element_size(self):
-        return 2
+        return self._itemsize
 
 
 class TestStagingLayers(CustomTestCase):
@@ -163,6 +168,111 @@ class TestBuildEngines(CustomTestCase):
         # Same full-mirror plan as SGLANG_TPU_RAIDEN_STAGING_LAYERS=0.
         self.assertEqual(sizes, [(3, None), (24, None)])
         self.assertEqual(manager._staging_layers_total, 0)
+        self.assertFalse(manager._bounded_staging)
+
+    def test_heterogeneous_full_keeps_full_mirror_while_homogeneous_swa_shares(self):
+        # DSV4.1-like full engine: 12 heterogeneous roots totaling 432 KiB/page
+        # (1x 128 KiB, 3x 64 KiB, 4x 4 KiB, 1x 36 KiB, 3x 20 KiB), paired with
+        # 40 homogeneous 256 KiB SWA layers and 3 uniform 36 KiB state layers.
+        full_bufs = [
+            _Buffer((64, 256, 128), itemsize=4),  # 128 KiB
+            _Buffer((64, 8, 128), itemsize=4),  # 4 KiB
+            _Buffer((64, 72, 128), itemsize=4),  # 36 KiB
+            *[_Buffer((64, 128, 128), itemsize=4) for _ in range(3)],  # 3x 64 KiB
+            *[_Buffer((64, 8, 128), itemsize=4) for _ in range(3)],  # 3x 4 KiB
+            *[_Buffer((64, 40, 128), itemsize=4) for _ in range(3)],  # 3x 20 KiB
+        ]
+        swa_bufs = [_Buffer((64, 256, 512), itemsize=2) for _ in range(40)]
+        state_bufs = [_Buffer((16, 16, 576), itemsize=4) for _ in range(3)]
+
+        manager = object.__new__(RaidenKVManager)
+        manager._engine = None
+        manager._kv_caches = full_bufs
+        manager._swa_kv_caches = swa_bufs
+        manager._state_kv_caches = tuple(state_bufs)
+        manager._state_max_blocks = 1
+        manager._dynamic_host_staging = True
+        manager._staging_layers_total = 8
+        manager._slot_ceiling = lambda: 160
+        manager._max_request_blocks = lambda: 37
+        manager._swa_max_request_blocks = lambda: 2
+        manager.attn_tp_rank = 0
+        manager.attn_tp_size = 1
+        manager.attn_dp_size = 8
+        manager.system_dp_size = manager.attn_cp_size = 1
+        manager.pp_size = 1
+        manager.server_args = SimpleNamespace(nnodes=1)
+        manager.local_ip = "127.0.0.1"
+        manager._local_rank = 0
+        manager._control_port = 31000
+        manager._timeout_s = 120
+        manager._transfer_parallelism = 4
+        manager.chunked_transfer = True
+        with self.assertLogs(
+            "sglang_tpu.disaggregation.raiden.conn", level="WARNING"
+        ) as logs:
+            manager._build_engine()
+
+        self.assertTrue(
+            any(
+                "heterogeneous engine(s) [full (12 tensors)]" in msg
+                for msg in logs.output
+            ),
+            logs.output,
+        )
+        sizes = [(e["num_slots"], e.get("num_staging_layers")) for e in self.engines]
+        # Full keeps all 12 dedicated layers (no shared buffers); homogeneous SWA
+        # receives the full 8-layer staging budget; state keeps full mirrors.
+        self.assertEqual(sizes, [(160, 12), (160, 8), (160, None)])
+        self.assertTrue(manager._bounded_staging)
+
+    def test_heterogeneous_page_layouts_handles_single_and_opaque_buffers(self):
+        self.assertFalse(has_heterogeneous_page_layouts([]))
+        self.assertFalse(has_heterogeneous_page_layouts([object()]))
+        self.assertFalse(has_heterogeneous_page_layouts([object(), object()]))
+        self.assertFalse(has_heterogeneous_page_layouts([_Buffer(), _Buffer()]))
+        self.assertTrue(
+            has_heterogeneous_page_layouts(
+                [_Buffer((64, 256, 128), itemsize=4), _Buffer((64, 8, 128), itemsize=4)]
+            )
+        )
+        self.assertTrue(
+            has_heterogeneous_page_layouts(
+                [
+                    _Buffer((64, 256, 128), itemsize=4),
+                    _Buffer((64, 256, 128), itemsize=2),
+                ]
+            )
+        )
+
+    def test_heterogeneous_full_only_disables_bounded_staging(self):
+        manager = object.__new__(RaidenKVManager)
+        manager._engine = None
+        manager._kv_caches = [
+            _Buffer((64, 256, 128), itemsize=4),
+            _Buffer((64, 8, 128), itemsize=4),
+        ]
+        manager._swa_kv_caches = []
+        manager._state_kv_caches = ()
+        manager._dynamic_host_staging = True
+        manager._staging_layers_total = 8
+        manager._slot_ceiling = lambda: 64
+        manager._max_request_blocks = lambda: 32
+        manager.attn_tp_rank = 0
+        manager.attn_tp_size = 8
+        manager.attn_dp_size = manager.system_dp_size = manager.attn_cp_size = 1
+        manager.pp_size = 1
+        manager.server_args = SimpleNamespace(nnodes=1)
+        manager.local_ip = "127.0.0.1"
+        manager._local_rank = 0
+        manager._control_port = 31000
+        manager._timeout_s = 120
+        manager._transfer_parallelism = 4
+        manager.chunked_transfer = True
+        manager._build_engine()
+
+        sizes = [(e["num_slots"], e.get("num_staging_layers")) for e in self.engines]
+        self.assertEqual(sizes, [(64, 2)])
         self.assertFalse(manager._bounded_staging)
 
 
