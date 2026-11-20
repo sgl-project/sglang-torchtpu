@@ -14,7 +14,7 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
-"""Exact unsorted top-k over fp32 score rows on SparseCore.
+"""Exact top-k over fp32 score rows on SparseCore.
 
 Single-stage multi-subcore selection with VMEM_SHARED global histogram:
 1. For any batch size B (including B = 1, 2, 4, 8, 16, 32) and N in 2048..256K,
@@ -26,7 +26,7 @@ Single-stage multi-subcore selection with VMEM_SHARED global histogram:
    global threshold and emit only the final k winners directly to HBM in a
    single stage.
 
-Output rows are the top-k column indices in unspecified order, ``-1``
+Output rows are the top-k column indices in ascending order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
 or beyond ``row_lengths`` are never selected. NaNs are unsupported.
@@ -779,6 +779,11 @@ def _sc_topk_direct(
     return slots_2d
 
 
+def supports_topk_width(k: int) -> bool:
+    """Whether the direct selector supports this output width."""
+    return 0 < k <= 4096 and k % LANES == 0
+
+
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..16) per row."""
     # A cooperative group must fit on one SparseCore's 16 subcores; past that,
@@ -823,7 +828,7 @@ def sparsecore_topk(
     return_scores: bool = False,
     branch_max_len: jax.Array | None = None,  # i32 scalar
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
-    """Exact top-k indices per row, unsorted, -1 suffix-padded.
+    """Exact top-k indices per row, ascending, -1 suffix-padded.
 
     When ``p > 1`` (for ``n > 32K``), subcores on the same SparseCore
     cooperatively compute a global histogram in ``VMEM_SHARED`` to find the
