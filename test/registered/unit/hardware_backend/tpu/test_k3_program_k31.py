@@ -964,9 +964,7 @@ class TestFusedDsaCommit(CustomTestCase):
         )
         row_bytes = raw(latents.astype(dtype))
         tables_, positions_ = jnp.asarray(tables, jnp.int32), jnp.asarray(positions)
-        interpret = functools.partial(
-            pl.pallas_call, interpret=pltpu.InterpretParams()
-        )
+        interpret = functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams())
         for member in members:
             want_lat = [x.copy() for x in lat]
             want_idx = [x.copy() for x in idx]
@@ -978,9 +976,9 @@ class TestFusedDsaCommit(CustomTestCase):
                     continue
                 (key_row, sub), (scale_row, lane) = dsa_dcp.record_place(t)
                 for m in range(layers):
-                    want_lat[pool_map[m]][block, t // packing, t % packing] = (
-                        row_bytes[b, m]
-                    )
+                    want_lat[pool_map[m]][block, t // packing, t % packing] = row_bytes[
+                        b, m
+                    ]
                     want_idx[m][block, key_row, sub] = records[b, m, 0]
                     want_idx[m][block, scale_row, 0, lane] = records[b, m, 1, 0]
             with (
@@ -1823,7 +1821,9 @@ class TestIndexSelectScoringKnobs(CustomTestCase):
                 env = dict(
                     os.environ,
                     PYTHONPATH=os.pathsep.join(sys.path),
-                    KNOBS=",".join(filter(None, (f"dsa_select_rounds={rounds}", knobs))),
+                    KNOBS=",".join(
+                        filter(None, (f"dsa_select_rounds={rounds}", knobs))
+                    ),
                     OUT=f"{tmp}/run{i}.npz",
                 )
                 result = subprocess.run(
@@ -3118,7 +3118,13 @@ class TestDecodeIndexer(CustomTestCase):
             {"S": "4", "TOPK": "200", "POS": "1500,3000", "ACTIVITY_MIN_STEPS": "16"},
             {"S": "4", "TOPK": "200", "POS": "1500,3000", "GATHER": "1"},
             {"S": "4", "TOPK": "200", "POS": "1500,3000", "ROUNDS": "5"},
-            {"S": "4", "TOPK": "200", "POS": "1500,3000", "ROUNDS": "5", "KNOBS": SCORING},
+            {
+                "S": "4",
+                "TOPK": "200",
+                "POS": "1500,3000",
+                "ROUNDS": "5",
+                "KNOBS": SCORING,
+            },
             {"S": "8", "TOPK": "400", "POS": "3069", "ROUNDS": "5", "KNOBS": SCORING},
             # KernelConfig.dsa_live_activity: the entries the attention reads,
             # scanned and dense, verify sequences and plain rows, on tables
@@ -5972,7 +5978,9 @@ def reference(partial, B, host_bf16):
     return out
 """
 
-    SCRIPT = PRELUDE + r"""
+    SCRIPT = (
+        PRELUDE
+        + r"""
 rng = np.random.default_rng(0)
 for B in (8, 16, 24):
     tpp = B // 4
@@ -5997,6 +6005,7 @@ for B in (8, 16, 24):
     assert 0.2 < changed < 0.6, changed  # the extra rounding moves a share of outputs by an ulp
 print("OK")
 """
+    )
 
     def test_host_sums_match_their_rounding_points(self):
         import os
@@ -6040,7 +6049,9 @@ class TestAttentionHostRoundAfterJoin(CustomTestCase):
     show the hosts' order); the phase advances once a projection and no DMA
     semaphore is left nonzero."""
 
-    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+    SCRIPT = (
+        TestAttentionHostBf16.PRELUDE
+        + r"""
 import sys
 
 from sglang_tpu.k3_programs.common import collectives32
@@ -6143,6 +6154,7 @@ for B in (8, 16):
         print(f"B{B} host_bf16={host_bf16} dma={DMA_MODE}: deferred rows bit-exact")
 print("OK")
 """
+    )
 
     def _run(self, dma_mode):
         import os
@@ -6184,7 +6196,9 @@ class TestAttentionRankRows(CustomTestCase):
     one semaphore, one-row wires in private storage) delivers every local
     rank's rows in owner order."""
 
-    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+    SCRIPT = (
+        TestAttentionHostBf16.PRELUDE
+        + r"""
 rng = np.random.default_rng(1)
 for B in (8, 16):
     tpp, rows = B // 4, B // 8
@@ -6249,6 +6263,7 @@ for rows in (1, 2):
     print(f"gather of {rows}-row owners bit-exact")
 print("OK")
 """
+    )
 
     def test_rank_rows_match_the_pair_rows(self):
         import os
@@ -6313,7 +6328,7 @@ sgu = bf(rng.standard_normal((32, H, 2 * SW)) * H**-0.5)
 sd = bf(rng.standard_normal((32, SW, H)) * SW**-0.5)
 egu = rng.integers(0, 2**32, (32, LOC, K // 8, 2 * WD), dtype=np.uint32)
 egus = rng.integers(118, 124, (32, LOC, K // 32, 2 * WD), dtype=np.uint8)
-edn = rng.integers(0, 2**32, (32, LOC, WD // 8, OUT), dtype=np.uint32)
+edown = rng.integers(0, 2**32, (32, LOC, WD // 8, OUT), dtype=np.uint32)
 eds = rng.integers(118, 124, (32, LOC, WD // 32, OUT), dtype=np.uint8)
 
 acc_rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
@@ -6375,7 +6390,7 @@ def run(prefetch, mode):
     f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P(), *(P("tp"),) * 9),
                               out_specs=(P("tp"),) * 2, check_vma=False))
     return [np.asarray(x) for x in f(hidden, bias, norm, router, ld, lu, sgu, sd, egu, egus,
-                                     edn, eds)]
+                                     edown, eds)]
 
 
 for mode in ("eager", "on_wait"):
@@ -6733,7 +6748,9 @@ print("OK")
 
         if not hasattr(pltpu, "InterpretParams"):
             self.skipTest("Pallas TPU interpret mode unavailable")
-        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[0]
+        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[
+            0
+        ]
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
         result = subprocess.run(
             [sys.executable, "-c", harness + self.MAIN],
@@ -6745,7 +6762,6 @@ print("OK")
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
         )
-
 
 
 class TestKdaFp8Layer(CustomTestCase):
@@ -6876,7 +6892,9 @@ print("OK")
 
         if not hasattr(pltpu, "InterpretParams"):
             self.skipTest("Pallas TPU interpret mode unavailable")
-        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[0]
+        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[
+            0
+        ]
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
         result = subprocess.run(
             [sys.executable, "-c", harness + self.MAIN],
@@ -7499,7 +7517,9 @@ class TestCrossedPairGathers(CustomTestCase):
     (crossing only one of the two fails here: one round's copy completes the
     other round's wait)."""
 
-    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+    SCRIPT = (
+        TestAttentionHostBf16.PRELUDE
+        + r"""
 rng = np.random.default_rng(2)
 vmem = pltpu.VMEM
 LAG = int(os.environ.get("LAG", "100"))  # core-0 lag: loop trips a pair index
@@ -7620,6 +7640,7 @@ for rows in (2, 4):
     print(f"{rows} rows a pair: back-to-back crossed gathers bit-exact", flush=True)
 print("OK")
 """
+    )
 
     def test_crossed_gathers_match_the_same_parity_gathers(self):
         import os

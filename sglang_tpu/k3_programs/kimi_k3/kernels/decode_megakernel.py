@@ -4925,6 +4925,7 @@ def moe(
                 (selected_probabilities, selected_probabilities), axis=2
             ).reshape(batch_size, route_columns)
             local_route_counts = 2 * local_route_counts
+
         def store_routes(selected_experts, selected_probabilities, local_route_counts):
             selected_experts_vmem[...] = jnp.pad(
                 selected_experts,
@@ -7175,7 +7176,7 @@ def mla(
     sequence_rows: int = 1,
     output_projection_after_query_down: bool = False,
     streams: dict | None = None,
-    dsa: "dsa_decode.DecodeIndexer | None" = None,
+    dsa: dsa_decode.DecodeIndexer | None = None,
     hand_out: Callable[[], None] | None = None,
     after_query_up: Callable[[], None] | None = None,
     wait_for_input: Callable[[], None] | None = None,
@@ -7337,7 +7338,9 @@ def mla(
     # the indexer's own query gather has landed, so it flies under the scoring.
     queries_sent = (
         dsa is not None
-        and not mla_dcp.chunked(batch_size)  # chunked calls send per chunk (not prototyped)
+        and not mla_dcp.chunked(
+            batch_size
+        )  # chunked calls send per chunk (not prototyped)
         and "gather_late" not in dcp_skip
     )
     # KernelConfig.dsa_prologue_in_select: the attention's gather wait, query
@@ -7569,6 +7572,7 @@ def mla(
         (``mla_dcp.DcpAttention``, the output gate projected while the query
         gather is in flight), then W_UV per head. The heads' outputs land in
         the accumulator with a unit denominator."""
+
         def output_gate():
             workspace.output_gate_values_vmem[...] = projection(
                 "output_gate", hidden_ref[...]
@@ -9909,8 +9913,7 @@ def stack(
         any(name not in weights for name in ROUTER_FP8_SCALES) or attention_dp != 1
     ):
         raise ValueError(
-            "An FP8 router takes its expert scales (router_scale), without "
-            "attention DP"
+            "An FP8 router takes its expert scales (router_scale), without attention DP"
         )
     # Copy-free KDA rows and FP32 norm stacks (KernelConfig.
     # decode_copy_free_weights): the final norm lands in the attention norm's
@@ -12910,17 +12913,13 @@ def stack(
                         *steal_semaphores,
                         steal_errors,
                     ) = steal_persistent
-                    steal_ready, steal_returns, *steal_return_semaphores = (
-                        steal_scoped
-                    )
+                    steal_ready, steal_returns, *steal_return_semaphores = steal_scoped
                     accumulators = moe_workspace.routed_outputs_vmem
                     moe_workspace = dataclasses.replace(
                         moe_workspace, routed_outputs_vmem=accumulators.at[0]
                     )
                     steal = SimpleNamespace(
-                        staging=tuple(
-                            ref for ref in steal_staging
-                        ),
+                        staging=tuple(ref for ref in steal_staging),
                         packets=steal_packets,
                         packet_tables=steal_tables,
                         semaphores=tuple(steal_semaphores),

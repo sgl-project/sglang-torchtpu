@@ -80,10 +80,26 @@ def _routing(batch, seed, two_expert_giver=False, zero_pair_layers=False):
     live = np.ones((layers, batch), np.int32)
     # (pool size, most routes a row) for groups 0 and 1, per layer.
     shapes = {
-        8: [((9, 4), (2, 1)), ((1, 1), (10, 5)), ((12, 6), (12, 6)), ((14, 3), (3, 3)),
-            ((2, 2), (13, 5)), ((6, 2), (5, 2)), ((11, 5), (0, 0)), ((3, 1), (12, 4))],
-        16: [((14, 5), (3, 2)), ((2, 1), (16, 6)), ((20, 4), (6, 6)), ((9, 9), (2, 2)),
-             ((5, 2), (22, 5)), ((12, 3), (11, 3)), ((24, 6), (1, 1)), ((4, 4), (18, 3))],
+        8: [
+            ((9, 4), (2, 1)),
+            ((1, 1), (10, 5)),
+            ((12, 6), (12, 6)),
+            ((14, 3), (3, 3)),
+            ((2, 2), (13, 5)),
+            ((6, 2), (5, 2)),
+            ((11, 5), (0, 0)),
+            ((3, 1), (12, 4)),
+        ],
+        16: [
+            ((14, 5), (3, 2)),
+            ((2, 1), (16, 6)),
+            ((20, 4), (6, 6)),
+            ((9, 9), (2, 2)),
+            ((5, 2), (22, 5)),
+            ((12, 3), (11, 3)),
+            ((24, 6), (1, 1)),
+            ((4, 4), (18, 3)),
+        ],
     }[batch]
     if two_expert_giver:
         shapes = [*shapes, ((2, 2), (0, 0))]
@@ -215,7 +231,8 @@ def _child(mode, batch):
     # (the first pair's gate/up copies first at B8).
     scheduled = mode.startswith("scheduled") or (region and not perturbed)
     winners, probabilities, totals, live, latents = _routing(
-        batch, 7 + batch, two_expert_giver=scheduled, zero_pair_layers=region)
+        batch, 7 + batch, two_expert_giver=scheduled, zero_pair_layers=region
+    )
     layers = winners.shape[0]
     rng = np.random.default_rng(11)
     exponent_range = (119, 123)
@@ -244,36 +261,75 @@ def _child(mode, batch):
     )
 
     def run(steal, in_region=False):
-        def kernel(winners_ref, probabilities_ref, totals_ref, live_ref, latents_ref, *refs):
+        def kernel(
+            winners_ref, probabilities_ref, totals_ref, live_ref, latents_ref, *refs
+        ):
             hbm, refs = refs[:4], refs[4:]
             out_ref, routes_ref, info_ref, *refs = refs
             staging, refs = refs[:4], refs[4:]
             if in_region:
                 received_out, *refs = refs
             slot_vmem, refs = refs[:4], refs[4:]
-            (expert_semaphores, gate_up_acc, down_acc, processed, first_compact,
-             second_compact, table, table_semaphore, experts_vmem, probabilities_vmem,
-             counts_vmem, source, accumulators, handshake, *refs) = refs
+            (
+                expert_semaphores,
+                gate_up_acc,
+                down_acc,
+                processed,
+                first_compact,
+                second_compact,
+                table,
+                table_semaphore,
+                experts_vmem,
+                probabilities_vmem,
+                counts_vmem,
+                source,
+                accumulators,
+                handshake,
+                *refs,
+            ) = refs
             protocol, region_scratch = refs[:12], refs[12:]
-            (packets, packet_tables, packet_send, packet_receive, slab_send, table_copies,
-             slab_receives, errors, ready, returns, return_send, return_receive) = protocol
+            (
+                packets,
+                packet_tables,
+                packet_send,
+                packet_receive,
+                slab_send,
+                table_copies,
+                slab_receives,
+                errors,
+                ready,
+                returns,
+                return_send,
+                return_receive,
+            ) = protocol
             rank = jax.lax.axis_index("x")
             sibling = rank ^ 1
             group = es.expert_group(rank)
             errors[0] = 0
             barrier = pltpu.get_barrier_semaphore()
             pl.semaphore_signal(
-                barrier, 1, device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH)
+                barrier, 1, device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH
+            )
             pl.semaphore_wait(barrier, 1)
             moe_weights = dmk.MixtureOfExpertsWeights(
-                *(None,) * 11, hbm[0], slot_vmem[0], hbm[1], slot_vmem[1], hbm[2],
-                slot_vmem[2], hbm[3], slot_vmem[3], expert_semaphores)
+                *(None,) * 11,
+                hbm[0],
+                slot_vmem[0],
+                hbm[1],
+                slot_vmem[1],
+                hbm[2],
+                slot_vmem[2],
+                hbm[3],
+                slot_vmem[3],
+                expert_semaphores,
+            )
             row_ids = jnp.arange(batch)
 
             def store_routes(selected, selected_probabilities, counts):
                 experts_vmem[...] = jnp.pad(selected, ((0, 0), (0, 128 - TOP_K)))
                 probabilities_vmem[...] = jnp.pad(
-                    selected_probabilities, ((0, 0), (0, 128 - TOP_K)))
+                    selected_probabilities, ((0, 0), (0, 128 - TOP_K))
+                )
                 counts_vmem[...] = jnp.broadcast_to(counts[:, None], counts_vmem.shape)
 
             @pl.loop(0, layers)
@@ -282,30 +338,52 @@ def _child(mode, batch):
                 layer_probabilities = probabilities_ref[layer]
                 rows_live = jnp.stack([live_ref[layer, b] for b in range(batch)]) != 0
                 source[...] = latents_ref[layer]
-                schedule = dmk._expert_schedule(processed.at[:8], table, table_semaphore)
+                schedule = dmk._expert_schedule(
+                    processed.at[:8], table, table_semaphore
+                )
                 if steal:
                     step = dmk._ExpertStealStep(
                         es.ExpertSteal(
-                            sibling, hbm, staging, packets, packet_tables,
-                            (packet_send, packet_receive, slab_send, table_copies,
-                             slab_receives),
-                            errors, ready=ready, returns=returns,
+                            sibling,
+                            hbm,
+                            staging,
+                            packets,
+                            packet_tables,
+                            (
+                                packet_send,
+                                packet_receive,
+                                slab_send,
+                                table_copies,
+                                slab_receives,
+                            ),
+                            errors,
+                            ready=ready,
+                            returns=returns,
                             return_semaphores=(return_send, return_receive),
                             # Interpret mode has no semaphore reads: the slab
                             # poll says "landed" in even layers (the next
                             # pair's stolen experts start an iteration early)
                             # and "in flight" in odd ones.
-                            landed=lambda slot: layer % 2 == 0),
-                        group=group, local_expert_count=GROUP_EXPERTS,
-                        live_rows=rows_live, accumulators=accumulators,
-                        weights=moe_weights)
+                            landed=lambda slot: layer % 2 == 0,
+                        ),
+                        group=group,
+                        local_expert_count=GROUP_EXPERTS,
+                        live_rows=rows_live,
+                        accumulators=accumulators,
+                        weights=moe_weights,
+                    )
                     plan = None
                     if perturbed:
                         # Each core plans every other layer without rows 0-3
                         # (core 0 the even ones, core 1 the odd ones).
                         dropped = (layer % 2 == rank) & (row_ids < 4)
                         plan = es.steal_plan(
-                            layer_winners, rows_live & ~dropped, group, GROUP_EXPERTS, slots)
+                            layer_winners,
+                            rows_live & ~dropped,
+                            group,
+                            GROUP_EXPERTS,
+                            slots,
+                        )
                     # The router feeds the planner one selection at a time.
                     planner = step.planner(batch, TOP_K)
                     copy_expert = dmk._steal_copy_expert(moe_weights, GROUP_EXPERTS)
@@ -315,38 +393,63 @@ def _child(mode, batch):
                         for selection in range(TOP_K):
                             planner.add(selection, layer_winners[:, selection])
                         selected, unused_probabilities, counts = step.begin_scheduled(
-                            planner, layer, schedule=schedule, copy_expert=copy_expert,
-                            slot_count=4, gate_up_first_pair=batch == 8)
+                            planner,
+                            layer,
+                            schedule=schedule,
+                            copy_expert=copy_expert,
+                            slot_count=4,
+                            gate_up_first_pair=batch == 8,
+                        )
                         for selection in range(TOP_K):
                             planner.add_probabilities(
-                                selection, layer_probabilities[:, selection])
+                                selection, layer_probabilities[:, selection]
+                            )
                         selected_probabilities = planner.probabilities
                     else:
                         for selection in range(TOP_K):
-                            planner.add(selection, layer_winners[:, selection],
-                                        layer_probabilities[:, selection])
+                            planner.add(
+                                selection,
+                                layer_winners[:, selection],
+                                layer_probabilities[:, selection],
+                            )
                         selected, selected_probabilities, counts = step.begin(
-                            planner, layer, plan=plan)
+                            planner, layer, plan=plan
+                        )
                 else:
                     nothing = jnp.zeros((1, 128), jnp.int32)
                     selected, selected_probabilities, counts = es.steal_routes(
-                        layer_winners, layer_probabilities, rows_live, group,
-                        GROUP_EXPERTS, nothing != 0, nothing, 0)
+                        layer_winners,
+                        layer_probabilities,
+                        rows_live,
+                        group,
+                        GROUP_EXPERTS,
+                        nothing != 0,
+                        nothing,
+                        0,
+                    )
                     copy_expert = moe_weights.make_expert_copies
                 store_routes(selected, selected_probabilities, counts)
                 if not (steal and scheduled):
                     dmk._start_initial_expert_weight_copies(
-                        selected, counts, copy_expert, slot_count=4,
-                        already_started=jnp.int32(0), group_pending_routes=True,
-                        first_staged_expert=GROUP_EXPERTS if steal else None)
+                        selected,
+                        counts,
+                        copy_expert,
+                        slot_count=4,
+                        already_started=jnp.int32(0),
+                        group_pending_routes=True,
+                        first_staged_expert=GROUP_EXPERTS if steal else None,
+                    )
                     dmk._start_expert_schedule(
-                        schedule, selected, counts, GROUP_EXPERTS if steal else None)
+                        schedule, selected, counts, GROUP_EXPERTS if steal else None
+                    )
                 if steal:
+
                     def replace_routes(routes):
                         store_routes(*routes)
                         schedule.copy.wait()
                         dmk._start_expert_schedule(
-                            schedule, routes[0], routes[2], GROUP_EXPERTS)
+                            schedule, routes[0], routes[2], GROUP_EXPERTS
+                        )
 
                     step.receive(replace_routes)
                 routes_ref[layer, :, :128] = experts_vmem[...]
@@ -354,13 +457,27 @@ def _child(mode, batch):
 
                 def stream(progress=None):
                     dmk._run_routed_expert_stream(
-                        source, experts_vmem[:, :TOP_K], probabilities_vmem[:, :TOP_K],
-                        counts_vmem[:, 0], totals_ref[layer][:, 0], *slot_vmem,
-                        accumulators.at[0], gate_up_acc, down_acc, processed, first_compact,
-                        second_compact, copy_expert, expert_input_size=K, expert_width=W,
-                        expert_output_size=OUT, group_pending_routes=True,
-                        progress=progress, expert_schedule=schedule,
-                        stolen=step.stream_hooks() if steal else None)
+                        source,
+                        experts_vmem[:, :TOP_K],
+                        probabilities_vmem[:, :TOP_K],
+                        counts_vmem[:, 0],
+                        totals_ref[layer][:, 0],
+                        *slot_vmem,
+                        accumulators.at[0],
+                        gate_up_acc,
+                        down_acc,
+                        processed,
+                        first_compact,
+                        second_compact,
+                        copy_expert,
+                        expert_input_size=K,
+                        expert_width=W,
+                        expert_output_size=OUT,
+                        group_pending_routes=True,
+                        progress=progress,
+                        expert_schedule=schedule,
+                        stolen=step.stream_hooks() if steal else None,
+                    )
 
                 if in_region:
                     # moe()'s token-parallel tail: the stream (the latent-up
@@ -368,16 +485,30 @@ def _child(mode, batch):
                     # no pair ran), the combine and the routed send (a copy of
                     # the combined outputs into the sibling's buffer) in one
                     # region. Counters: region trips, copy starts, sends.
-                    phase, started, counters, sent, received, latent_vmem, \
-                        latent_semaphore, routed_semaphores = region_scratch
+                    (
+                        phase,
+                        started,
+                        counters,
+                        sent,
+                        received,
+                        latent_vmem,
+                        latent_semaphore,
+                        routed_semaphores,
+                    ) = region_scratch
                     phase[0] = layer  # never negative, as the reduction phase
                     for counter in range(3):
                         counters[counter] = 0
                     latent_copy = pltpu.make_async_copy(
-                        latents_ref.at[layer], latent_vmem, latent_semaphore)
+                        latents_ref.at[layer], latent_vmem, latent_semaphore
+                    )
                     routed_copy = pltpu.make_async_remote_copy(
-                        sent, received, routed_semaphores.at[0], routed_semaphores.at[1],
-                        device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH)
+                        sent,
+                        received,
+                        routed_semaphores.at[0],
+                        routed_semaphores.at[1],
+                        device_id=(sibling,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
 
                     def start_latent_copy():
                         counters[1] += 1
@@ -387,7 +518,8 @@ def _child(mode, batch):
                     def start_with_last_pair(iteration):
                         count = schedule.table[dmk.SCHEDULE_EXPERT_COUNT, 0]
                         pl.when((2 * iteration + 2 >= count) & (started[0] == 0))(
-                            start_latent_copy)
+                            start_latent_copy
+                        )
 
                     def expert_region():
                         counters[0] += 1
@@ -419,7 +551,11 @@ def _child(mode, batch):
                 out_ref[layer] = accumulators[0]
                 # The routed reduction orders the cores before the next layer.
                 pl.semaphore_signal(
-                    handshake, 1, device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH)
+                    handshake,
+                    1,
+                    device_id=(sibling,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
                 pl.semaphore_wait(handshake, 1)
 
         vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -431,11 +567,24 @@ def _child(mode, batch):
                 jax.ShapeDtypeStruct((layers, batch, OUT), jnp.float32),
                 jax.ShapeDtypeStruct((layers, batch, 256), jnp.int32),
                 jax.ShapeDtypeStruct((layers, 8), jnp.int32),
-                *(jax.ShapeDtypeStruct((slots, *w.shape[2:]), w.dtype) for w in weights),
-                *([jax.ShapeDtypeStruct((layers, batch, OUT), jnp.float32)] if in_region else []),
+                *(
+                    jax.ShapeDtypeStruct((slots, *w.shape[2:]), w.dtype)
+                    for w in weights
+                ),
+                *(
+                    [jax.ShapeDtypeStruct((layers, batch, OUT), jnp.float32)]
+                    if in_region
+                    else []
+                ),
             ),
             in_specs=[vmem, vmem, vmem, smem, vmem] + [anywhere] * 4,
-            out_specs=(vmem, vmem, smem, *(anywhere,) * 4, *((vmem,) if in_region else ())),
+            out_specs=(
+                vmem,
+                vmem,
+                smem,
+                *(anywhere,) * 4,
+                *((vmem,) if in_region else ()),
+            ),
             scratch_shapes=[
                 *(pltpu.VMEM((4, *w.shape[2:]), w.dtype) for w in weights),
                 pltpu.SemaphoreType.DMA((4, 4)),
@@ -455,11 +604,20 @@ def _child(mode, batch):
                 *es.return_scratch_shapes(slots, batch, OUT),
                 # The region's phase, copy flag, counters, send and receive
                 # buffers, copy destination and semaphores.
-                *([pltpu.SMEM((1,), jnp.int32), pltpu.SMEM((1,), jnp.int32),
-                   pltpu.SMEM((3,), jnp.int32), pltpu.VMEM((batch, OUT), jnp.float32),
-                   pltpu.VMEM((batch, OUT), jnp.float32),
-                   pltpu.VMEM((batch, K), jnp.bfloat16), pltpu.SemaphoreType.DMA,
-                   pltpu.SemaphoreType.DMA((2,))] if in_region else []),
+                *(
+                    [
+                        pltpu.SMEM((1,), jnp.int32),
+                        pltpu.SMEM((1,), jnp.int32),
+                        pltpu.SMEM((3,), jnp.int32),
+                        pltpu.VMEM((batch, OUT), jnp.float32),
+                        pltpu.VMEM((batch, OUT), jnp.float32),
+                        pltpu.VMEM((batch, K), jnp.bfloat16),
+                        pltpu.SemaphoreType.DMA,
+                        pltpu.SemaphoreType.DMA((2,)),
+                    ]
+                    if in_region
+                    else []
+                ),
             ],
             compiler_params=pltpu.CompilerParams(collective_id=9),
             interpret=pltpu.InterpretParams(
@@ -470,17 +628,32 @@ def _child(mode, batch):
 
         def body(winners, probabilities, totals, live, latents, *weights):
             out, routes, info, *rest = call(
-                winners, probabilities, totals, live, latents, *(w[0] for w in weights))
+                winners, probabilities, totals, live, latents, *(w[0] for w in weights)
+            )
             return out[None], routes[None], info[None], *(x[None] for x in rest[4:])
 
         mesh = Mesh(np.asarray(jax.devices()), ("x",))
-        f = jax.jit(jax.shard_map(
-            body, mesh=mesh, in_specs=(P(),) * 5 + (P("x"),) * 4,
-            out_specs=(P("x"),) * (3 + in_region), check_vma=False))
+        f = jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P(),) * 5 + (P("x"),) * 4,
+                out_specs=(P("x"),) * (3 + in_region),
+                check_vma=False,
+            )
+        )
         wide_totals = np.broadcast_to(totals[..., None], (*totals.shape, 128)).copy()
-        return [np.asarray(x) for x in f(
-            winners, probabilities, wide_totals, live,
-            latents.astype(ml_dtypes.bfloat16), *weights)]
+        return [
+            np.asarray(x)
+            for x in f(
+                winners,
+                probabilities,
+                wide_totals,
+                live,
+                latents.astype(ml_dtypes.bfloat16),
+                *weights,
+            )
+        ]
 
     reference, reference_routes, _ = run(False)
     stolen, routes, info = run(True)
@@ -488,13 +661,17 @@ def _child(mode, batch):
     races = interpret_pallas_call.races
     raced = bool(races is not None and races.races_found)
     if region:
-        region_outputs, region_routes, region_info, sibling_outputs = run(True, in_region=True)
+        region_outputs, region_routes, region_info, sibling_outputs = run(
+            True, in_region=True
+        )
         races = interpret_pallas_call.races
         raced |= bool(races is not None and races.races_found)
     if mode == "compact":
         # The steal layout's eight-row pairs (no compact tiles).
         dmk.B8_COMPACT_EXPERTS = False
-        rows = dmk._expert_accumulator_rows(batch, jnp.uint32, group_pending_routes=True)
+        rows = dmk._expert_accumulator_rows(
+            batch, jnp.uint32, group_pending_routes=True
+        )
         sources = (pltpu.VMEM((1, K), jnp.bfloat16),) * 2
         eight_row_reference, _, _ = run(False)
         dmk.B8_COMPACT_EXPERTS = True
@@ -523,13 +700,19 @@ def _child(mode, batch):
         gives = [int(info[core, layer, 0]) for core in (0, 1)]
         received = [int(info[core, layer, 1]) for core in (0, 1)]
         exact = all(
-            np.array_equal(stolen[c, layer].view(np.uint32), reference[c, layer].view(np.uint32))
-            for c in (0, 1))
+            np.array_equal(
+                stolen[c, layer].view(np.uint32), reference[c, layer].view(np.uint32)
+            )
+            for c in (0, 1)
+        )
         close = np.allclose(stolen[:, layer], reference[:, layer], rtol=1e-5, atol=1e-6)
-        print(f"B{batch} layer {layer}: distinct experts {[p[0] for p in plans]} "
-              f"give {gives} received {received} "
-              f"mismatches {[int(info[c, layer, 2]) for c in (0, 1)]} "
-              f"exact {exact} close {close}", flush=True)
+        print(
+            f"B{batch} layer {layer}: distinct experts {[p[0] for p in plans]} "
+            f"give {gives} received {received} "
+            f"mismatches {[int(info[c, layer, 2]) for c in (0, 1)]} "
+            f"exact {exact} close {close}",
+            flush=True,
+        )
         if perturbed:
             ok &= close
             continue
@@ -538,13 +721,18 @@ def _child(mode, batch):
             if mode == "compact":
                 same = np.array_equal(
                     eight_row_reference[:, layer].view(np.uint32),
-                    reference[:, layer].view(np.uint32))
-                print(f"B{batch} layer {layer}: compact pairs match the eight-row pairs: "
-                      f"{same}", flush=True)
+                    reference[:, layer].view(np.uint32),
+                )
+                print(
+                    f"B{batch} layer {layer}: compact pairs match the eight-row pairs: "
+                    f"{same}",
+                    flush=True,
+                )
                 ok &= same
             for core in (0, 1):
                 coverage |= _receiver_pairs(
-                    routes[core, layer], dmk.STEAL_TIMING[batch], dmk.B8_COMPACT_ROWS)
+                    routes[core, layer], dmk.STEAL_TIMING[batch], dmk.B8_COMPACT_ROWS
+                )
         for core in (0, 1):
             d_mine, d_theirs, give, take, given = plans[core]
             ok &= gives[core] == give and received[core] == take
@@ -553,22 +741,31 @@ def _child(mode, batch):
                 continue
             light = core ^ 1
             coverage.add(f"give from core {core}")
-            coverage.add("capped" if d_mine - d_theirs >= 2 * slots + 2 else "under the cap")
+            coverage.add(
+                "capped" if d_mine - d_theirs >= 2 * slots + 2 else "under the cap"
+            )
             coverage.add(
                 "first stolen in the initial window"
                 if plans[light][0] < 4
-                else "first stolen in the prefetch window")
+                else "first stolen in the prefetch window"
+            )
             slab, lead, copy, _ = dmk.STEAL_TIMING[batch]
             own = plans[light][0]
             if own >= 6 and (slab + copy) * give - lead <= 10 * (own - 4):
                 coverage.add("stolen before the last own pair")
             for e in given:
                 n = sum(
-                    bool(live[layer, r]) and core * GROUP_EXPERTS + e in winners[layer, r]
-                    for r in range(batch))
+                    bool(live[layer, r])
+                    and core * GROUP_EXPERTS + e in winners[layer, r]
+                    for r in range(batch)
+                )
                 coverage.add(
-                    "stolen single-row" if n == 1
-                    else "stolen multi-row" if n <= 8 else "stolen past a compact tile")
+                    "stolen single-row"
+                    if n == 1
+                    else "stolen multi-row"
+                    if n <= 8
+                    else "stolen past a compact tile"
+                )
             # The receiver's routes name the stolen experts 112 + slot.
             light_routes = routes[light, layer, :, :128]
             stolen_ids = (light_routes >= GROUP_EXPERTS) & (light_routes != es.UNROUTED)
@@ -578,23 +775,35 @@ def _child(mode, batch):
         # The region: the same plans and outputs as the combine after the
         # loop, the sibling's combined outputs received, and one trip, one
         # copy start and one send a layer.
-        same = (np.array_equal(region_outputs.view(np.uint32), stolen.view(np.uint32))
-                and np.array_equal(region_routes, routes)
-                and np.array_equal(region_info[..., :3], info[..., :3]))
+        same = (
+            np.array_equal(region_outputs.view(np.uint32), stolen.view(np.uint32))
+            and np.array_equal(region_routes, routes)
+            and np.array_equal(region_info[..., :3], info[..., :3])
+        )
         delivered = all(
-            np.array_equal(sibling_outputs[c].view(np.uint32),
-                           region_outputs[c ^ 1].view(np.uint32))
-            for c in (0, 1))
+            np.array_equal(
+                sibling_outputs[c].view(np.uint32),
+                region_outputs[c ^ 1].view(np.uint32),
+            )
+            for c in (0, 1)
+        )
         once = bool((region_info[..., 3:6] == 1).all())
         for core in (0, 1):
             for layer in range(layers):
                 layer_routes = region_routes[core, layer]
-                used = {int(e) for r, n in zip(layer_routes[:, :128], layer_routes[:, 128])
-                        for e in r[:n] if e < 128}
+                used = {
+                    int(e)
+                    for r, n in zip(layer_routes[:, :128], layer_routes[:, 128])
+                    for e in r[:n]
+                    if e < 128
+                }
                 if not used:
                     coverage.add("a core without experts")
-        print(f"expert region: same as the combine after the loop {same}, "
-              f"sibling outputs received {delivered}, once a layer {once}", flush=True)
+        print(
+            f"expert region: same as the combine after the loop {same}, "
+            f"sibling outputs received {delivered}, once a layer {once}",
+            flush=True,
+        )
         ok &= same and delivered and once
         if not perturbed:
             ok &= "a core without experts" in coverage
@@ -605,16 +814,25 @@ def _child(mode, batch):
         ok &= errors[0] > 0 or errors[1] > 0
     else:
         ok &= errors == [0, 0]
-        wanted = {"give from core 0", "give from core 1", "capped", "under the cap",
-                  "first stolen in the initial window",
-                  "first stolen in the prefetch window",
-                  "stolen before the last own pair",
-                  "stolen single-row", "stolen multi-row"}
+        wanted = {
+            "give from core 0",
+            "give from core 1",
+            "capped",
+            "under the cap",
+            "first stolen in the initial window",
+            "first stolen in the prefetch window",
+            "stolen before the last own pair",
+            "stolen single-row",
+            "stolen multi-row",
+        }
         if batch == 16:
             wanted.add("stolen past a compact tile")
         if compact_pairs:
-            wanted |= {"compact pair", "compact pair with a stolen expert",
-                       "eight-row pair with a stolen expert"}
+            wanted |= {
+                "compact pair",
+                "compact pair with a stolen expert",
+                "eight-row pair with a stolen expert",
+            }
         ok &= wanted <= coverage
     # Interpret mode prints any DMA semaphore left nonzero at kernel exit; the
     # test fails on it.

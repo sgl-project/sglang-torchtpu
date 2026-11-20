@@ -619,7 +619,9 @@ class DecodeOps:
         ) and config.decode_no_hlo_calls:
             options["xla_tpu_enable_deduplicated_calls"] = "DISABLED"
         if rows in (8, 16) and config.decode_tc_all_reduce:
-            options["xla_tpu_enable_sparse_core_collective_offload_all_reduce"] = "false"
+            options["xla_tpu_enable_sparse_core_collective_offload_all_reduce"] = (
+                "false"
+            )
         if rows == 16 and config.decode_b16_overlay_table:
             options["xla_tpu_overlay_allocation_table_size"] = str(
                 config.decode_b16_overlay_table

@@ -1087,9 +1087,9 @@ class DcpAttention:
                         for i in range(1, 4):
                             chosen = jnp.where(
                                 query == i,
-                                self._selected(
-                                    slot, local_step, row, first + i
-                                ).astype(jnp.int32),
+                                self._selected(slot, local_step, row, first + i).astype(
+                                    jnp.int32
+                                ),
                                 chosen,
                             )
                         visible = visible & (chosen != 0)
@@ -1113,7 +1113,9 @@ class DcpAttention:
             window = getattr(self, "_window", None)
             if window is None:
                 pl.when(take)(
-                    lambda: self._compact_verify(load, masks, union, row - base, compact)
+                    lambda: self._compact_verify(
+                        load, masks, union, row - base, compact
+                    )
                 )
                 pl.when(count > compact)(dense)
                 return
@@ -1126,7 +1128,9 @@ class DcpAttention:
             low = 0
             for tier in [t for t in (32, 64) if t < compact] + [compact]:
                 pl.when((count > low) & (count <= tier))(
-                    lambda tier=tier: self._window_gather(load, masks, union, count, tier)
+                    lambda tier=tier: self._window_gather(
+                        load, masks, union, count, tier
+                    )
                 )
                 low = tier
             pl.when(count > compact)(dense)
@@ -1197,7 +1201,9 @@ class DcpAttention:
         token = self._step_token(local_step, offset)
         mask = dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
         mask = mask & (token < self.position_ref[row] + r)
-        if sel.active is not None:  # a skipped step's buffers hold an earlier step's bytes
+        if (
+            sel.active is not None
+        ):  # a skipped step's buffers hold an earlier step's bytes
             mask = mask & self._active(row, local_step)
         return mask
 
@@ -1269,8 +1275,7 @@ class DcpAttention:
             return
         for first in range(0, self.sequence_rows, 4):
             query = (
-                jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
-                // self.tile
+                jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0) // self.tile
             )
             visible = jnp.broadcast_to(slot_visible[first : first + 1], (1, slots))
             for i in range(1, 4):
@@ -2406,7 +2411,6 @@ class DcpAttention:
                     0,
                 )
             else:
-
                 self._step_loop(
                     self.starts[first],
                     self.starts[first] if "attend" in self.skip else self.starts[end],

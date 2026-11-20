@@ -496,9 +496,7 @@ class DecodeIndexer:
         # slabs' sum.
         early, select = dsa_dcp.early_plan(), None
         if early:
-            select = self._index_select(
-                cache, position_ref, batch, owner, member, base
-            )
+            select = self._index_select(cache, position_ref, batch, owner, member, base)
             select.plan()
             select.start_pages()
         if during_gather is not None:
@@ -553,9 +551,7 @@ class DecodeIndexer:
 
         # 4. The selection.
         if select is None:
-            select = self._index_select(
-                cache, position_ref, batch, owner, member, base
-            )
+            select = self._index_select(cache, position_ref, batch, owner, member, base)
 
         def query(row):  # [32, 128] FP8 query heads of a row (traced or not)
             return s["q8"][row]

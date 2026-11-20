@@ -591,9 +591,7 @@ def _dsa_commit_parts(
             @pl.when(idx >= 0)
             def _():
                 tpu.make_async_copy(key_buf.at[w], key_buf.at[w], sems.at[1]).wait()
-                tpu.make_async_copy(
-                    scale_buf.at[w], scale_buf.at[w], sems.at[2]
-                ).wait()
+                tpu.make_async_copy(scale_buf.at[w], scale_buf.at[w], sems.at[2]).wait()
 
         def merge(w):
             first, offset, sub, lat_row, key_row, _, _ = windows(w)
