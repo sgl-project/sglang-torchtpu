@@ -141,6 +141,8 @@ def cos_sin_rows(cos_sin_cache: jax.Array, positions: jax.Array) -> jax.Array:
     ``LANE`` wide is taken as lane-packed: DeepSeek-V4's rotary_dim is 64."""
     if cos_sin_cache.shape[-1] != LANE:
         return jnp.take(cos_sin_cache, positions, axis=0)
+    # Clamped like CSA2's inverse RoPE: an out-of-range take returns NaN rows.
+    positions = jnp.clip(positions, 0, cos_sin_positions(cos_sin_cache) - 1)
     rows = jnp.take(cos_sin_cache, positions // 2, axis=0)
     return jnp.where(
         (positions % 2 == 1)[:, None], rows[:, ROPE_DIM:], rows[:, :ROPE_DIM]

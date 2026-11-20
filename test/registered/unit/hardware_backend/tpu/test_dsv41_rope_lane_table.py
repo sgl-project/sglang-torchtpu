@@ -88,6 +88,14 @@ class TestRopeLaneTable(CustomTestCase):
             self.assertTrue(torch.equal(old, new))
             self.assertFalse(torch.equal(new, x))
 
+    def test_plain_table_rejects_the_lane_width(self):
+        """A plain 128-wide table would be read as lane-packed."""
+        from sglang_tpu.dsv4.dsv4_memory_pool import get_or_build_cos_sin_cache
+
+        freqs = torch.polar(torch.ones(8, 64), torch.zeros(8, 64))
+        with self.assertRaises(ValueError):
+            get_or_build_cos_sin_cache(freqs)
+
     def test_prewarm_gives_each_freqs_one_lane_table(self):
         """Layers sharing a freqs_cis share one table; another freqs_cis gets its own."""
         dsv4_memory_pool._COS_SIN_CACHE.clear()
@@ -189,6 +197,20 @@ class TestRopeLaneTableKernels(CustomTestCase):
                 self.assert_same(rope_quant, x, positions)
                 x, positions = self.inputs(tokens, (4, 512), tokens + 1)
                 self.assert_same(qnorm_rope, x, positions)
+
+    def test_rows_past_the_table_end_clamp_to_the_last_position(self):
+        """An out-of-range jnp.take fills NaN; lane rows clamp instead."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.dsv4.rope import cos_sin_rows
+
+        last = self.MAX_POS - 1
+        positions = jnp.asarray([-1, 0, last, self.MAX_POS, self.MAX_POS + 9])
+        rows = np.asarray(cos_sin_rows(self.lanes, positions))
+        self.assertTrue(np.isfinite(rows).all())
+        np.testing.assert_array_equal(bits(rows[0]), bits(self.plain[0]))
+        for row in rows[2:]:
+            np.testing.assert_array_equal(bits(row), bits(self.plain[last]))
 
     def test_csa2_inverse_rope_clips_like_the_plain_table(self):
         """Positions past either end clip to the first / last position."""

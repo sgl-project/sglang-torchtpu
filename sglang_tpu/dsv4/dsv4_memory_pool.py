@@ -67,6 +67,10 @@ def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     """Convert complex64 ``freqs_cis`` ``[max_pos, rope_head_dim // 2]`` into the
     contiguous ``float32`` ``[max_pos, rope_head_dim]`` ``[cos, sin]`` table
     consumed by the TPU Pallas compressor and RoPE kernels."""
+    # The RoPE kernels read a 128-wide table as lane-packed
+    # (get_or_build_rope_lane_table); a plain one that wide would misrotate.
+    if 2 * freqs_cis.shape[-1] == ROPE_LANES:
+        raise ValueError("rope_head_dim 128 has no plain cos/sin table layout")
     key = (id(freqs_cis), freqs_cis.device)
     cached = _COS_SIN_CACHE.get(key)
     if cached is not None:
