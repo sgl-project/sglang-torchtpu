@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -32,6 +33,7 @@ from sglang_tpu.disaggregation.raiden.serde import VictimAck, VictimPush
 from sglang_tpu.testing.decode_dram_offload import (
     FULL,
     DecodeReceiverFixture,
+    FakeHostPool,
     PrefillPusherFixture,
     device_hit,
     full_cache,
@@ -191,6 +193,57 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
 
 
 class TestDecodeReceiver(DecodeReceiverFixture, CustomTestCase):
+    def test_full_host_leaf_releases_the_window_without_extra_swa_eviction(self):
+        self.host.capacity = self.host.used = 8
+        swa_host = FakeHostPool(4)
+        swa_host.used = 4
+        self.receiver._swa_host_pool = swa_host
+
+        def evict(num_tokens, component):
+            self.assertEqual((num_tokens, component), (8, FULL))
+            self.host.used = 0
+            swa_host.used = 0
+
+        with (
+            patch.object(self.cache, "evict_host", side_effect=evict) as eviction,
+            patch.object(
+                self.receiver._lockstep, "reduce", side_effect=lambda rows, op: rows
+            ),
+        ):
+            self.receiver._make_host_room(8, 4)
+        eviction.assert_called_once_with(8, FULL)
+        self.assertIsNotNone(self.host.alloc(8))
+        self.assertIsNotNone(swa_host.alloc(4))
+        self.assertEqual(
+            (self.host.available_size(), swa_host.available_size()), (0, 0)
+        )
+
+    def test_remaining_swa_shortage_uses_the_maximum_after_full_eviction(self):
+        self.host.capacity = self.host.used = 8
+        swa_host = FakeHostPool(8)
+        swa_host.used = 8
+        self.receiver._swa_host_pool = swa_host
+        evictions = []
+
+        def evict(num_tokens, component):
+            evictions.append((num_tokens, component))
+            if component == FULL:
+                self.host.used = 0
+                swa_host.used -= 2
+            else:
+                swa_host.used -= num_tokens
+
+        # This rank still needs two window slots; a peer needs three.
+        with (
+            patch.object(self.cache, "evict_host", side_effect=evict),
+            patch.object(
+                self.receiver._lockstep, "reduce", side_effect=[[[8, 4]], [[3]]]
+            ),
+        ):
+            self.receiver._make_host_room(8, 4)
+        self.assertEqual(evictions, [(8, FULL), (3, ComponentType.SWA)])
+        self.assertEqual(swa_host.available_size(), 5)
+
     def test_push_is_inserted_and_answered_once_its_read_has_landed(self):
         self.granted()
         self.round()
