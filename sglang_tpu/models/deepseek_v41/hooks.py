@@ -197,6 +197,24 @@ tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
        without staging, applies it first.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: the Engram history lives on the device and commits in-graph.
+
+prepare_tpu_dsv41_fused_ep
+  (registered only with SGLANG_TPU_DSV41_FUSED_EP=1, see fused_ep_hook_specs)
+  Why: the fused EP kernel (fused_ep_moe_v2) needs its own expert layout,
+       converted from the gmm_v2 FP4 expert tensors, which exist only after the
+       quant methods' process_weights_after_loading. The platform's
+       process_model_after_loading is only called from a model's
+       post_load_weights (Kimi-K3 today), which runs inside load_weights,
+       before DefaultModelLoader.postprocess_weights: too early.
+  How: AFTER DefaultModelLoader.postprocess_weights (after
+       prepare_model_for_fused_moe_decode, before precompile) converts the
+       eligible layers' experts, builds the op and sets mlp.dp_local_forward,
+       which NonCudaDecoderMixin._run_moe_ffn_dp_sync (deepseek_v4_platform_stage)
+       calls with this rank's rows. Bodies in
+       sglang_tpu.models.deepseek_v41.fused_ep_op.
+  Upstream PR or issue: not filed.
+  Remove when: the loader offers a platform step after quant-method weight
+       processing.
 """
 
 from __future__ import annotations
@@ -626,6 +644,38 @@ def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
     return original(manager, batch)
 
 
+def prepare_tpu_dsv41_fused_ep(result, model, target_device):
+    """AFTER DefaultModelLoader.postprocess_weights: convert the eligible V4.1
+    MoE layers' experts to the fused EP operands and set their
+    ``dp_local_forward``."""
+    if target_device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.fused_ep_op import (
+            prepare_model_for_dsv41_fused_ep,
+        )
+
+        prepare_model_for_dsv41_fused_ep(model)
+    return result
+
+
+def fused_ep_hook_specs():
+    """The fused EP hook, only when SGLANG_TPU_DSV41_FUSED_EP=1. Otherwise nothing
+    is registered and the default path is untouched."""
+    from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_FUSED_EP.get():
+        return []
+    # Never raise here: load_plugins logs a plugin import error and drops all TPU
+    # hooks. check_dsv41_fused_ep_env rejects a missing SGLANG_SHARED_EXPERT_TP1.
+    return [
+        (
+            "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights",
+            prepare_tpu_dsv41_fused_ep,
+            HookType.AFTER,
+        ),
+    ]
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -753,4 +803,4 @@ def hook_specs():
             tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
         ),
-    ]
+    ] + fused_ep_hook_specs()
