@@ -84,6 +84,11 @@ class DraftConfig:
     # [layers, width] rather than [layers, 1, width], whose singleton tile
     # XLA re-tiles for the kernel on every call.
     flat_norms: bool = False
+    # KernelConfig.ring_draft_ring_fresh: the ring's output is a fresh buffer,
+    # not aliased to its input. Every slice is written back (ring_drain copies
+    # through any not visited), so nothing changes but XLA's copies of the
+    # ring into and out of the aliased call.
+    ring_fresh: bool = False
 
     @property
     def q_width(self) -> int:
@@ -2526,7 +2531,7 @@ def make_fused_draft(
                 out_specs=out_specs,
                 scratch_shapes=scratch,
             ),
-            input_output_aliases={cache_index: 2},
+            input_output_aliases={} if c.ring_fresh else {cache_index: 2},
             compiler_params=tpu.CompilerParams(
                 collective_id=25, vmem_limit_bytes=64 * 1024**2
             ),

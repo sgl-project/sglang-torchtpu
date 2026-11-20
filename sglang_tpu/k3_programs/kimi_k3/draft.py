@@ -279,6 +279,7 @@ class DsparkDraft:
             q_padded=kernel_config.active().ring_draft_q_padded,
             lean_epilogue=kernel_config.active().ring_draft_lean_epilogue,
             flat_norms=kernel_config.active().ring_draft_flat_norms,
+            ring_fresh=kernel_config.active().ring_draft_ring_fresh,
         )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         if self.rank == 0:
