@@ -58,9 +58,9 @@ class TestMHAKVPoolSelection(CustomTestCase):
         from sglang.srt.runtime_context import get_context
         from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-        # get_mha_kv_pool_cls reads the exec bag; publish the backend.
+        # get_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(attention_backend=attention_backend):
-            return TpuSRTPlatform().get_mha_kv_pool_cls()
+            return TpuSRTPlatform().get_kv_pool_cls(kind="mha")
 
     def test_fused_pool_for_rpa_backends(self):
         from sglang_tpu.kv_pool import (

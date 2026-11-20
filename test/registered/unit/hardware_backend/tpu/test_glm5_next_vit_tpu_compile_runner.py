@@ -92,15 +92,6 @@ def _cpu_vit_env(use_data_parallel: bool = False):
             )
         )
         stack.enter_context(
-            patch.dict(
-                vision.ROTARY_EMBED_CLASSES,
-                {
-                    k: vision.apply_rotary_pos_emb_native_eager
-                    for k in list(vision.ROTARY_EMBED_CLASSES)
-                },
-            )
-        )
-        stack.enter_context(
             patch.object(
                 glm5_next, "swiglu_clamped", _unwrapped(glm5_next.swiglu_clamped)
             )

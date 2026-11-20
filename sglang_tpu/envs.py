@@ -321,6 +321,10 @@ class TpuEnvs:
     # same set of indices, but their order (and so the sparse-MLA summation order
     # downstream) can differ from the partitioned path.
     SGLANG_TPU_SCTOPK_SHORT_ROWS = EnvBool(True)
+    # Expert-TP fused-RS as a two-level reduce-scatter: the two cores of a chip add their
+    # partials on-chip, then send one chip sum per row to another chip's owner, halving
+    # off-chip bytes (one extra bf16 rounding).
+    SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL = EnvBool(False)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data

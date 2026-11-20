@@ -51,7 +51,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -1690,6 +1690,7 @@ class RaidenKVManager(
                     self._decode.remote_swa_endpoint,
                     self._decode.remote_draft_endpoint,
                     self._decode.remote_state_endpoint,
+                    self._decode.page_tags,
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,

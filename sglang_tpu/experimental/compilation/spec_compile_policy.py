@@ -13,6 +13,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 
 
 class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
@@ -59,3 +60,11 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         if self.is_draft_worker:
             batch.input_embeds = None
         return batch
+
+    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
+        """Keep multimodal embeds at the token bucket for HOST_PADDED draft extend."""
+        return (
+            batch.sampling_info is not None
+            and is_host_padded(batch.sampling_info)
+            and not batch.forward_mode.is_target_verify()
+        )

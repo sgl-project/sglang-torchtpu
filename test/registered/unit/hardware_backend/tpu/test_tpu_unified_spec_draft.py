@@ -12,12 +12,14 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.mem_cache.allocator import swa
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm as SA
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu import unified_kv_pool as ukp
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.dflash_draft_kv_write import _scatter_layer_kv
@@ -53,6 +55,7 @@ def _mc(
         has_asymmetric_kv=asym,
         is_hybrid_swa=bool(swa_ids),
         is_deepseek_v4_arch=False,
+        is_compressed_kv_arch=False,
         linear_attn_registry_result=None,
         num_hidden_layers=n_layers,
         num_attention_layers=n_layers,
@@ -587,7 +590,12 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         fake_tree = types.SimpleNamespace(
             supports_prefix_sharing=lambda: True,
             evict_for_alloc=lambda p: (
-                evicted.append((p.num_tokens, p.swa_num_tokens)),
+                evicted.append(
+                    (
+                        p.num_tokens,
+                        p.window_num_tokens.get(BaseSWAKVPool.WINDOW_SUB_POOL, 0),
+                    )
+                ),
                 ta.free_swa(held[:8]),
             ),
         )
@@ -645,7 +653,9 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                 page_size=8,
                 disable=False,
                 sliding_window_size=8,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=8
+                ),
                 eviction_policy="lru",
                 tree_core_backend="python",
             )
@@ -693,11 +703,11 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                     )
                 )
             )
-            self.assertEqual(len(hit.device_indices), kept_len)
+            self.assertEqual(hit.device_prefix_len, kept_len)
         evicted_400 = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", list(range(400, 408))), None))
         )
-        self.assertEqual(len(evicted_400.device_indices), 0)
+        self.assertEqual(evicted_400.device_prefix_len, 0)
 
         prefill = ta.alloc_extend(z0, z0, s8, s8, neg1, 8)
         self.assertIsNotNone(prefill)
@@ -736,7 +746,9 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                 page_size=8,
                 disable=False,
                 sliding_window_size=8,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=8
+                ),
                 eviction_policy="lru",
                 tree_core_backend="python",
             )
@@ -783,8 +795,8 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         hit_b = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", toks_b + [999]), None))
         )
-        self.assertEqual(len(hit_a.device_indices), 16)
-        self.assertEqual(len(hit_b.device_indices), 32)
+        self.assertEqual(hit_a.device_prefix_len, 16)
+        self.assertEqual(hit_b.device_prefix_len, 32)
         cache.sanity_check()
 
         # 2. TPU unified shared-host reclaim policy (_UnifiedHostSide + TpuDMAHybridCacheController).
@@ -806,7 +818,11 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
                         destroy=lambda: None
                     ),
                 ),
-                patch.object(kph, "host_memory_budget_bytes", return_value=1 << 40),
+                patch.object(
+                    kph,
+                    "host_memory_preflight",
+                    side_effect=lambda lengths, **_: (sum(lengths), 1 << 40),
+                ),
             ):
                 kv_h, swa_h = kph.TpuDMAUnifiedHostKVPool.build_pair(
                     tp_h,

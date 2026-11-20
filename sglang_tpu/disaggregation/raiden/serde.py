@@ -174,7 +174,7 @@ class VictimAck(WireMessage):
     stored: bool
 
 
-class Blocks(WireMessage):
+class Blocks(WireMessage, omit_defaults=True):
     """Return symmetric-TP KV block locations and auxiliary data."""
 
     TAG: ClassVar[bytes] = MessageTag.BLOCKS
@@ -193,9 +193,18 @@ class Blocks(WireMessage):
     # Optional unified-target speculative draft endpoint and compact SWA page ids.
     draft_endpoint: str = ""
     draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    # Optional per-page tags from a registered page tag source (e.g. a KV checker):
+    # one fixed-size record per page of ``blocks``, then per page of
+    # ``swa_blocks``, which start at request page ``swa_page_tags_first``.
+    # omit_defaults leaves them off the wire when empty, so an older decode
+    # still reads a message without tags.
+    page_tags: bytes = b""
+    swa_page_tags: bytes = b""
+    swa_page_tags_first: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+        require_non_negative(self.swa_page_tags_first, "swa_page_tags_first")
 
 
 class Chunk(WireMessage):

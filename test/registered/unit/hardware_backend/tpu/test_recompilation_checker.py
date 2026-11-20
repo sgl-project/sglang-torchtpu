@@ -830,6 +830,7 @@ class TestRecompilationGateHelpers(CustomTestCase):
             startup_time=1.0,
             max_total_num_tokens=100,
             swa_tokens_per_layer=None,
+            window_token_capacities=lambda: {},
             max_running_requests=8,
             spec_algorithm=SimpleNamespace(
                 is_none=lambda: True,

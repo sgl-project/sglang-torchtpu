@@ -257,6 +257,25 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             compiled = policy._compile_method(lambda x: x, use_bundle=False)
         self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
 
+    def test_direct_install_with_a_bundle_flag_compiles_directly(self):
+        # Under the direct tracer the flags select the direct_compile
+        # executable store, not torch.compile bundles.
+        for flag in (
+            "unsafe_save_torch_compile_bundle",
+            "unsafe_load_torch_compile_bundle",
+        ):
+            with self.subTest(flag=flag):
+                owner = SimpleNamespace(forward=lambda x, extra=None: x * 2)
+                policy = _DirectVisionPolicy(nn.Identity(), owner=owner)
+                with (
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+                    _graph_config(tpu_compile_tracer="direct", **{flag: "/tmp/bundle"}),
+                ):
+                    self.assertTrue(policy.install())
+                self.assertIsInstance(
+                    policy.compiled_fn, direct_compile.CompiledFunction
+                )
+
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
 

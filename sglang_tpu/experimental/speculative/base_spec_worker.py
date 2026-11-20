@@ -80,7 +80,8 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -234,11 +235,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._block_verification = tpu_envs.SGLANG_TPU_SPEC_BLOCK_VERIFICATION.get()
         self._verify_ct = 0
         self._dp_attention = is_dp_attention_enabled()
-        if self._dp_attention and (
-            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-            or get_spec().speculative_skip_dp_mlp_sync
-        ):
-            # Both let DP ranks mix prefill and decode in one step; dispatch and
+        if self._dp_attention and envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            # It lets DP ranks mix prefill and decode in one step; dispatch and
             # the idle-rank mirror assume every rank runs the same phase.
             raise NotImplementedError(
                 "TpuSpecWorker does not support mixed prefill/decode DP steps."

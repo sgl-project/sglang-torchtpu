@@ -186,6 +186,49 @@ def _build_pallas_mla_kernel_op():
     return custom_op
 
 
+def mla_latents_for_store(
+    *,
+    k: torch.Tensor,
+    k_rope: Optional[torch.Tensor],
+    layer: "RadixAttention",
+    quant_dtype: Optional[torch.dtype],
+) -> tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[float]]:
+    """A step's latents as the MLA ops store them, with the scales they read.
+
+    ``k`` is ``[T, 1, kv_lora_rank]`` and ``k_rope`` ``[T, 1, rope_dim]``, as
+    ``forward_absorb_core`` hands them to the backend. Returns
+    ``(new_kv_c [T, kv_lora_rank], new_k_pe [T, rope_dim or the NoPE
+    placeholder width], k_scale, v_scale)``, in the cache dtype (fp8 only for an
+    fp8 cache). This is the ops' store form: any other writer of these caches
+    must build its latents here to store the same bytes.
+    """
+    kv_lora_rank = layer.v_head_dim
+    rope_dim = layer.qk_head_dim - layer.v_head_dim
+    num_tokens = k.shape[0]
+    # k / k_rope can be strided views (k_rope is a slice of the fused qkv_a
+    # output under skip_rope), and the pallas bridge reads raw buffers.
+    new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
+    if rope_dim == 0:
+        # NoPE model: the kernels need a rope segment, so store zeros.
+        new_k_pe = k.new_zeros(num_tokens, NOPE_MLA_ROPE_DIM)
+    else:
+        new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
+    if quant_dtype is None:
+        return new_kv_c, new_k_pe, None, None
+    # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
+    # itself and requires them in the cache dtype. Quantize per-tensor with
+    # the layer's k_scale (1.0 when the checkpoint has none) and pass the same
+    # scale for K and V: MLA's V is the same latent tensor, so it must be
+    # dequantized with the scale it was quantized with.
+    k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+    return (
+        _quantize_kv_to_fp8(new_kv_c, k_scale, quant_dtype),
+        _quantize_kv_to_fp8(new_k_pe, k_scale, quant_dtype),
+        k_scale,
+        k_scale,
+    )
+
+
 class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     """SGLang attention backend backed by the Pallas MLA v2 kernel.
 
@@ -319,38 +362,22 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         num_tokens = q.shape[0]
 
         # q arrives as [T, H, kv_lora_rank] from forward_absorb_core but is
-        # NON-contiguous (bmm(...).transpose(0, 1)); k / k_rope are slices of
-        # latent_cache ([T, 1, kv_lora_rank] / [T, 1, rope_dim], row stride
-        # 576). ``reshape`` to the same logical shape keeps those strides, and
-        # the torch->JAX pallas bridge hands the raw buffer to the kernel, so
-        # every input must be made dense explicitly or the kernel reads
-        # scrambled data.
+        # NON-contiguous (bmm(...).transpose(0, 1)). The torch->JAX pallas
+        # bridge hands the raw buffer to the kernel, so every input must be
+        # made dense explicitly or the kernel reads scrambled data.
         ql_nope = q.reshape(num_tokens, layer.tp_q_head_num, kv_lora_rank).contiguous()
-        new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
         if rope_dim == 0:
             # NoPE model: the kernels need a rope segment, so attend with zeros.
             q_pe = q.new_zeros(num_tokens, layer.tp_q_head_num, NOPE_MLA_ROPE_DIM)
-            new_k_pe = k.new_zeros(num_tokens, NOPE_MLA_ROPE_DIM)
         else:
             q_pe = q_rope.reshape(
                 num_tokens, layer.tp_q_head_num, rope_dim
             ).contiguous()
-            new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
-
-        # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
-        # itself and requires them in the cache dtype. Quantize per-tensor with
-        # the layer's k_scale (1.0 when the checkpoint has none) and pass the
-        # same scale for K and V: MLA's V is the same latent tensor, so it
-        # must be dequantized with the scale it was quantized with. Q stays
-        # bf16 (the combination upstream tests).
-        if self.kv_cache_quant_dtype is not None:
-            k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
-            v_scale = k_scale
-            new_kv_c = _quantize_kv_to_fp8(new_kv_c, k_scale, self.kv_cache_quant_dtype)
-            new_k_pe = _quantize_kv_to_fp8(new_k_pe, k_scale, self.kv_cache_quant_dtype)
-        else:
-            k_scale = None
-            v_scale = None
+        # Q stays bf16 (the combination upstream tests); only the stored
+        # latents take the cache dtype.
+        new_kv_c, new_k_pe, k_scale, v_scale = mla_latents_for_store(
+            k=k, k_rope=k_rope, layer=layer, quant_dtype=self.kv_cache_quant_dtype
+        )
 
         return (
             ql_nope,

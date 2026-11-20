@@ -47,13 +47,21 @@ def _attention(backend=AttentionBackendEnum.TORCH_SDPA):
 
 
 @contextlib.contextmanager
-def _ulysses(degree, exchanged_heads):
-    """Ulysses ``degree`` x ring 1 with identity exchanges; the input exchange
-    records the head count it receives."""
+def _ulysses(degree, exchanged_heads, gathered=None):
+    """Ulysses ``degree`` x ring 1; the input exchange records the head count it
+    receives. With ``gathered`` (the full-sequence q, k, v), it returns them as
+    the exchange of this rank's sequence shard would, at the head count sent;
+    otherwise it is the identity."""
 
     def input_all_to_all(q, k, v):
         exchanged_heads.append(q.shape[2])
-        return q, k, v
+        if gathered is None:
+            return q, k, v
+        heads = q.shape[2]
+        return tuple(
+            F.pad(t, (0, 0, 0, heads - t.shape[2])) if t.shape[2] < heads else t
+            for t in gathered
+        )
 
     with (
         patch(
@@ -103,8 +111,12 @@ class TestUlyssesPadding(unittest.TestCase):
             pad_start=self.real, pad_end=self.real + self.pad, local_pad=self.pad
         )
         attn, exchanged_heads = _attention(backend), []
-        with _ulysses(degree, exchanged_heads):
-            out = attn.forward(q, k, v, attn_mask_meta=meta)
+        # This rank holds 1/degree of the sequence; the exchange gathers it.
+        local = (self.real + self.pad) // degree
+        with _ulysses(degree, exchanged_heads, gathered=(q, k, v)):
+            out = attn.forward(
+                q[:, :local], k[:, :local], v[:, :local], attn_mask_meta=meta
+            )
 
         want = F.scaled_dot_product_attention(
             q[:, : self.real].transpose(1, 2),

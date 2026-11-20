@@ -222,8 +222,8 @@ def apply_host_mm_embeds(
     """Overwrite the masked rows of input_embeds with the host-placed rows."""
     device = input_embeds.device
     return torch.where(
-        upload(host_mask, device),
-        upload(host_src.to(input_embeds.dtype), device),
+        host_mask.to(device),
+        host_src.to(device, input_embeds.dtype),
         input_embeds,
     )
 
@@ -280,7 +280,7 @@ def embed_mm_on_host(
         return input_embeds, torch.zeros(
             deepstack_shape, device=input_embeds.device, dtype=dtype
         )
-    return input_embeds, upload(placed_deepstack[0].to(dtype), input_embeds.device)
+    return input_embeds, placed_deepstack[0].to(input_embeds.device, dtype)
 
 
 def _embed_mm_inputs(

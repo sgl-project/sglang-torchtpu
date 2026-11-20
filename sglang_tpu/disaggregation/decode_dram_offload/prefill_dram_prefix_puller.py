@@ -224,7 +224,7 @@ class PrefillDramPrefixPuller:
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
         # Reuse the part of the prefix this engine already holds in host RAM.
         node, have, have_indices = host_backed_prefix(self._cache, key, tokens, page)
-        covered = len(match.device_indices) + match.host_hit_length >= tokens
+        covered = match.device_prefix_len + match.host_hit_length >= tokens
         if covered or (have >= tokens and not swa_blocks):
             self.stats["skipped_local_host"] += 1
             return None

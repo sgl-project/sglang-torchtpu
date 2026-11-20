@@ -8,15 +8,15 @@ from torch import nn
 
 from sglang.kernels.ops.embeddings.engram_hash import MODE_EXTEND
 from sglang.srt.layers.engram import EngramHasher
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 IMAGE_TOKEN_ID = 9
 # Multimodal pad ids span 62 bits, past what the int32 history holds.
@@ -41,15 +41,15 @@ def _make_manager():
 
 class TestEngramHistoryMultimodalPads(CustomTestCase):
     def test_extend_history_clamps_pads_and_hashes_them_as_images(self):
-        """62-bit pad ids before an extend must fit the int32 history and hash as images."""
         manager = _make_manager()
         hasher = manager.engram_hasher
         # The prefix hit ends right after an image, so both predecessors are pads.
         req = SimpleNamespace(
-            full_untruncated_fill_ids=[1, 2, WIDE_PAD, WIDE_PAD, 3, 4],
-            extend_range=SimpleNamespace(start=4),
+            full_untruncated_fill_ids=[1, 2, WIDE_PAD, WIDE_PAD, 3, 4]
         )
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, reqs=[req])
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, reqs=[req], prefix_lens=[4]
+        )
         manager._prepare_engram_history(batch)
         self.assertEqual(batch.engram_history.tolist(), [[MM_PAD_SHIFT_VALUE] * 2])
 
@@ -71,7 +71,6 @@ class TestEngramHistoryMultimodalPads(CustomTestCase):
         )
 
     def test_pd_prebuilt_history_clamps_pads(self):
-        """A PD decode row ending in an image must fit the int32 history."""
         manager = _make_manager()
         # The prompt ends with an image and prefill sampled token 7.
         req = SimpleNamespace(
