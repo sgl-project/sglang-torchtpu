@@ -13,13 +13,23 @@ of the top-2048, ``_program.SELECT_ROUNDS``). Every setting is
 ``kimi_k3/pd_program.py``'s, with Kimi-K3.1-Pro's model, DSpark draft at a
 pinned revision and pre-shard (``_program.apply``). The decode verifies its
 drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS asks for simulated acceptance
-(``_program.py`` gives InferenceX's curves). Weights come pre-sharded per host
-(the draft at ``_program.DRAFT_REVISION``):
+(``_program.py`` gives InferenceX's curves). Weights come pre-sharded per host.
+A draft's pre-shard goes to dspark-<its revision's first 8 characters>, which
+the name of its Hugging Face snapshot directory gives; the released draft shares
+the target's embedding and LM head, which its pre-shard reads from the target
+checkpoint:
 
     python3 -m sglang_tpu.k3_programs.tools preshard k3 \\
         --checkpoint /weights/Kimi-K3.1-Pro --output $SGLANG_TPU_K3_PROGRAM_PRESHARDED
     python3 -m sglang_tpu.k3_programs.tools preshard dspark \\
-        --draft /weights/Kimi-K3.1-Pro-DSpark-preview --output $SGLANG_TPU_K3_PROGRAM_PRESHARDED
+        --draft $HF_HOME/hub/models--Inferact--Kimi-K3.1-Pro-DSpark/snapshots/e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f \\
+        --checkpoint /weights/Kimi-K3.1-Pro --output $SGLANG_TPU_K3_PROGRAM_PRESHARDED
+
+and for K3_PROGRAM_K31_DRAFT=preview
+
+    python3 -m sglang_tpu.k3_programs.tools preshard dspark \\
+        --draft $HF_HOME/hub/models--Inferact--Kimi-K3.1-Pro-DSpark-preview/snapshots/6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94 \\
+        --output $SGLANG_TPU_K3_PROGRAM_PRESHARDED
 
 Environment: as ``kimi_k3/pd_program.py``.
 """

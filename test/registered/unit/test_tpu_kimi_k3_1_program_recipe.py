@@ -27,7 +27,7 @@ FP8_WEIGHTS = ("decode_router_fp8", "kda_fp8_projections")
 PREVIEW_CURVE = "7:3.69,3:2.88,1:1.82"
 RELEASED_CURVE = "7:4.16,3:3.08,1:1.86"
 # K3_PROGRAM_K31_DRAFT unset.
-DEFAULT_DRAFT = "preview"
+DEFAULT_DRAFT = "released"
 
 
 def resolve(**env):

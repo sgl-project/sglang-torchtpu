@@ -2,8 +2,8 @@
 its model, its DSpark draft at a pinned revision and its pre-shard
 (:func:`apply`), and the colocated AgentX settings (:func:`colocated_defaults`).
 
-K3_PROGRAM_K31_DRAFT selects the draft (DRAFTS): "preview" (the default) or
-"released". The decode verifies its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS
+K3_PROGRAM_K31_DRAFT selects the draft (DRAFTS): "released" (the default) or
+"preview". The decode verifies its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS
 asks for simulated acceptance: "curve" simulates the selected draft's
 InferenceX AgentX curve (infx/golden_al_distribution; drafts sampled
 probabilistically, block verification), and "drafts:length,..." gives mean
@@ -36,7 +36,7 @@ DRAFTS = {
         "7:3.69,3:2.88,1:1.82",
     ),
 }
-DEFAULT_DRAFT = "preview"
+DEFAULT_DRAFT = "released"
 DRAFT, ACC_LENGTHS = DRAFTS[DEFAULT_DRAFT]
 # The decode indexer selects every key at or above the top-2048 threshold's
 # 20-bit bin (five 4-bit rounds over the DCP group): a superset of the top-2048
