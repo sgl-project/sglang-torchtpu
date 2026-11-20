@@ -527,6 +527,12 @@ class TpuEnvs:
     # MoE under EP, off the dense permute, with the SparseCore gather and combine:
     # route on local expert ids (counting sort) and gather only this rank's rows.
     SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE = EnvBool(True)
+    # MoE on the SparseCore gather with fp8 experts (per-channel or 512-multiple block
+    # scales): quantize the activations once per token (gmm_v2.prequantize_lhs_fp8, the
+    # GMM's own quantizer) and gather the fp8 rows by pure DMA (sparse_core.row_gather)
+    # instead of gathering bf16 rows and quantizing every routed row in GMM1. Same bits.
+    # Off by default: measured only at a few per-rank MoE shapes.
+    SGLANG_TPU_ENABLE_MOE_PREQUANT_DISPATCH = EnvBool(False)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, the permute is dense below this many tokens per

@@ -613,6 +613,44 @@ def _ep_counting_route(
     )
 
 
+def _prequant_dispatch_ok(
+    hidden_states,
+    w1,
+    w1_scale,
+    w1_bias,
+    w1_channel_scale,
+    *,
+    num_rows,
+    num_lhs_groups,
+    tile_info,
+    fuse_act,
+) -> bool:
+    """Whether GMM1 can take a ``prequantize_lhs_fp8`` lhs: fp8 experts with full (not
+    compact) scales and no bias, bf16 activations, and ``gmm_v2.prequant_supported``."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.moe.pallas.gmm_v2 import prequant_supported
+
+    if (
+        w1_scale is None
+        or w1_bias is not None
+        or w1_channel_scale is not None
+        or w1.dtype != jnp.float8_e4m3fn
+        or hidden_states.dtype != jnp.bfloat16
+        or w1.shape[1] != hidden_states.shape[1]
+        or w1_scale.shape[-1] != w1.shape[-1]
+    ):
+        return False
+    return prequant_supported(
+        num_rows,
+        w1,
+        w1_scale,
+        num_lhs_groups,
+        tile_info=tile_info,
+        fuse_act=fuse_act,
+    )
+
+
 def _fused_moe_jax(
     hidden_states,  # [m, k]
     w1,  # [g,k,2*n] bf16 | [g,k/2,2*n] uint8 (packed FP4) | [g,k/8,2*n] int32 (packed int4)
@@ -888,8 +926,51 @@ def _fused_moe_jax(
                 topk_ids_flat, expert_group_offset, num_experts
             )
 
+    # Same bits as gathering bf16 rows: gmm_v2._quantize_lhs_block is the one quantizer.
+    x_scale_sorted = None
+    prequant_dispatch = False
+    if (
+        use_sc_gather
+        and not use_dense_permute
+        and not single_token
+        and ep_route is None
+        and maybe_quantize_lhs
+        and not w_quant_bits
+        and not w1_packed
+        and tpu_envs.SGLANG_TPU_ENABLE_MOE_PREQUANT_DISPATCH.get()
+    ):
+        prequant_dispatch = _prequant_dispatch_ok(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_bias,
+            w1_channel_scale,
+            num_rows=m * topk,
+            num_lhs_groups=global_num_experts if use_group_offset else num_experts,
+            tile_info=_dividing_tile_k(
+                _vmem_safe_packed_tile_n(
+                    _tuned_or_calculated(
+                        jax.ShapeDtypeStruct(
+                            (m * topk, hidden_size), hidden_states.dtype
+                        ),
+                        w1,
+                        w1_scale,
+                        num_experts,
+                    )
+                )
+            ),
+            fuse_act=_fuse_act_name(activation_name),
+        )
+
     if single_token:
         x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
+    elif prequant_dispatch:
+        from sglang_tpu.moe.pallas.gmm_v2 import prequantize_lhs_fp8
+        from sglang_tpu.moe.pallas.sparse_core.row_gather import row_gather
+
+        x_q, x_q_scale = prequantize_lhs_fp8(hidden_states)
+        x_sorted = row_gather(x_q, sorted_token_ids)
+        x_scale_sorted = row_gather(x_q_scale, sorted_token_ids)
     elif use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
         x_sorted = jax.lax.dot_general(
@@ -984,17 +1065,23 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
+    # A pre-quantized x_sorted is a u32 container; tile as the bf16 rows it encodes.
+    gmm1_lhs_like = (
+        jax.ShapeDtypeStruct((x_sorted.shape[0], hidden_size), hidden_states.dtype)
+        if prequant_dispatch
+        else x_sorted
+    )
     gmm1_tiling = _dividing_tile_k(
         _vmem_safe_packed_tile_n(
             gmm1_tile_info
             or (
                 calculate_tiling
                 if w1_packed
-                else _tuned_or_calculated(x_sorted, w1, w1_scale, num_experts)
+                else _tuned_or_calculated(gmm1_lhs_like, w1, w1_scale, num_experts)
             )
         )
     )
-    if w1_scale is None:
+    if w1_scale is None and not prequant_dispatch:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
             "to a multiple of 128 at load time"
@@ -1064,6 +1151,7 @@ def _fused_moe_jax(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
+        lhs_scale=x_scale_sorted,
     )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(

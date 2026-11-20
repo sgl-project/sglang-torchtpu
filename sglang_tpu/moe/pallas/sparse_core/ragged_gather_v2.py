@@ -1,7 +1,9 @@
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tpu_inference/kernels/sparse_core/ragged_gather_v2.py @ 4367dcff1 (2026-07-19).
 # Local changes: input rows are padded to the 32-bit packing; an odd row count
-# failed at trace time (neither tpu-inference nor vllm-torchtpu pads).
+# failed at trace time (neither tpu-inference nor vllm-torchtpu pads). Keep pl.kernel:
+# core_map_helper.kernel aliases a `lax.empty` output operand, which XLA may copy
+# before each call in a large graph (0.87 ms per 65,536-row bf16 dispatch on tpu7x).
 
 import functools
 
@@ -11,8 +13,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
-
-from sglang_tpu.moe.pallas.sparse_core import core_map_helper
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
@@ -264,7 +264,7 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    return pl.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,

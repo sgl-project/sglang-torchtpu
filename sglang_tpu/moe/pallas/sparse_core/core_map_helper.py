@@ -3,11 +3,12 @@
 
 """Run single-mesh SparseCore kernels through ``core_map``.
 
-``pl.kernel`` lowers through ``mpmd_map``, which is slower than the ``core_map``
-path for these single-mesh kernels on TPU. ``kernel`` here is a drop-in
-replacement for ``pl.kernel`` that uses ``core_map`` directly, so the SparseCore
-kernels keep that lowering without depending on the jax-side ``pl.kernel``
-implementation.
+``kernel`` here is a drop-in replacement for ``pl.kernel`` (which lowers through
+``mpmd_map``) that uses ``core_map`` directly. It passes each output as an
+aliased ``lax.empty`` operand, which XLA may copy before the call in a large
+graph: 0.85 ms per 65,536-row bf16 MoE dispatch in a serving graph. Measured with jax 0.11.2 on tpu7x, ``ragged_gather_v2`` costs the same
+through either lowering at 512-65536 rows (bf16 and fp8) except 512 fp8 rows,
+where ``pl.kernel`` is 2.3 us (8%) slower; ragged_gather_v2 uses ``pl.kernel``.
 """
 
 from jax._src import api
