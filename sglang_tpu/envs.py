@@ -269,6 +269,13 @@ class TpuEnvs:
     # largest min_bs <= it. Width counts the root, in [2, gamma + 1]. Unset
     # verifies all gamma drafts at every bucket.
     SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS = EnvStr(None)
+    # Verify widths compiled for every bucket, e.g. "4,6,8"; each step takes the one
+    # with the best predicted goodput for its bucket (verify_width.AdaptiveVerifyWidth).
+    # Exclusive with SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS.
+    SGLANG_TPU_SPEC_VERIFY_WIDTH_CANDIDATES = EnvStr(None)
+    # Skip the startup profile of each (bucket, candidate) verify forward that seeds
+    # the adaptive width's step times; it then measures every candidate online.
+    SGLANG_TPU_SPEC_VERIFY_WIDTH_DISABLE_PROFILE = EnvBool(False)
     # PD on the experimental spec worker: the prefill ships the target's draft-input
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.

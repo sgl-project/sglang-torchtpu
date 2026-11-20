@@ -513,6 +513,13 @@ class TpuSpecWorker(BaseSpecWorker):
                 hidden_dtype=hidden_dtype,
             )
 
+    def begin_decode_step(self, padded_bs: int, bs: int) -> None:
+        """Fix this decode step's width choices before anything reads them.
+
+        Noop: workers whose width is a function of the bucket alone.
+        """
+        del padded_bs, bs
+
     def verify_width_for(self, padded_bs: int) -> int:
         """Verify rows per request at a decode batch bucket, one of verify_widths().
 
@@ -1072,6 +1079,7 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
+        self.begin_decode_step(padded_bs, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
             batch, self.verify_width_for(padded_bs), padded_bs
         )
