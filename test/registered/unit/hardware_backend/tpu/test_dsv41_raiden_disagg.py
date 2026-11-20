@@ -9,6 +9,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 import ctypes
+import importlib.util
 import re
 import socket
 import sys
@@ -51,6 +52,8 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
     index_page_stride,
     main_bytes_per_record,
 )
+
+_HAS_JAX = importlib.util.find_spec("jax") is not None
 
 
 def _free_port_block(count: int = 8) -> int:
@@ -956,7 +959,9 @@ class TestDSV41RaidenDisaggregation(CustomTestCase):
                 )
                 self.assertTrue(bool(torch.isneginf(sentinel[:, 512:1024]).all()))
 
-        # Also verify the JAX _write_rows op directly on CPU with 3D root layout.
+    @unittest.skipUnless(_HAS_JAX, "jax is required for JAX op verification")
+    def test_pair_compress_jax_write_rows_3d_layout(self):
+        """Verify the JAX _write_rows op directly on CPU with 3D root layout."""
         import jax.numpy as jnp
 
         from sglang_tpu.models.deepseek_v41.ops.csa2 import _write_rows
@@ -1176,6 +1181,7 @@ class TestDSV41RaidenDisaggregation(CustomTestCase):
             ptrs_before,
         )
 
+    @unittest.skipUnless(_HAS_JAX, "jax is required for TPU7x MLIR export tests")
     def test_tpu7x_mlir_export_aligned_kernels_and_no_sc_constant_operands(self):
         """TPU7x CPU export of aligned indexer, CSA2 main KV, SWA 256-page, and pair-state ops."""
         import jax

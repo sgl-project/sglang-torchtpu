@@ -157,15 +157,16 @@ def has_heterogeneous_page_layouts(kv_caches: Sequence[Any]) -> bool:
     with heterogeneous per-page layouts must therefore keep full per-layer host
     mirrors.
     """
-    return (
-        len(
-            {
-                (tuple(int(dim) for dim in buf.shape[1:]), int(buf.element_size()))
-                for buf in kv_caches
-            }
-        )
-        > 1
-    )
+    if len(kv_caches) <= 1:
+        return False
+    layouts = set()
+    for buf in kv_caches:
+        shape = getattr(buf, "shape", None)
+        element_size = getattr(buf, "element_size", None)
+        if shape is None or not callable(element_size):
+            return False
+        layouts.add((tuple(int(dim) for dim in shape[1:]), int(element_size())))
+    return len(layouts) > 1
 
 
 def slot_host_bytes(

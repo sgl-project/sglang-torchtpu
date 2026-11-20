@@ -10,7 +10,10 @@ from unittest.mock import patch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-from sglang_tpu.disaggregation.raiden.host_pool import split_staging_layers
+from sglang_tpu.disaggregation.raiden.host_pool import (
+    has_heterogeneous_page_layouts,
+    split_staging_layers,
+)
 from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -205,13 +208,42 @@ class TestBuildEngines(CustomTestCase):
         manager._timeout_s = 120
         manager._transfer_parallelism = 4
         manager.chunked_transfer = True
-        manager._build_engine()
+        with self.assertLogs(
+            "sglang_tpu.disaggregation.raiden.conn", level="WARNING"
+        ) as logs:
+            manager._build_engine()
 
+        self.assertTrue(
+            any(
+                "heterogeneous engine(s) [full (12 tensors)]" in msg
+                for msg in logs.output
+            ),
+            logs.output,
+        )
         sizes = [(e["num_slots"], e.get("num_staging_layers")) for e in self.engines]
         # Full keeps all 12 dedicated layers (no shared buffers); homogeneous SWA
         # receives the full 8-layer staging budget; state keeps full mirrors.
         self.assertEqual(sizes, [(160, 12), (160, 8), (160, None)])
         self.assertTrue(manager._bounded_staging)
+
+    def test_heterogeneous_page_layouts_handles_single_and_opaque_buffers(self):
+        self.assertFalse(has_heterogeneous_page_layouts([]))
+        self.assertFalse(has_heterogeneous_page_layouts([object()]))
+        self.assertFalse(has_heterogeneous_page_layouts([object(), object()]))
+        self.assertFalse(has_heterogeneous_page_layouts([_Buffer(), _Buffer()]))
+        self.assertTrue(
+            has_heterogeneous_page_layouts(
+                [_Buffer((64, 256, 128), itemsize=4), _Buffer((64, 8, 128), itemsize=4)]
+            )
+        )
+        self.assertTrue(
+            has_heterogeneous_page_layouts(
+                [
+                    _Buffer((64, 256, 128), itemsize=4),
+                    _Buffer((64, 256, 128), itemsize=2),
+                ]
+            )
+        )
 
     def test_heterogeneous_full_only_disables_bounded_staging(self):
         manager = object.__new__(RaidenKVManager)

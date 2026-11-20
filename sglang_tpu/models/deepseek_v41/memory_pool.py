@@ -958,10 +958,11 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return bufs
 
     def raiden_swa_buffers(self) -> List[torch.Tensor]:
-        """Per-layer 3D 256-token SWA page roots."""
-        if self.swa_kv_pool is None:
+        """Per-layer 3D 256-token SWA page roots (paged pool or encoder replay window)."""
+        swa_storage = self._swa_storage()
+        if swa_storage is None:
             return []
-        return list(self.swa_kv_pool.k_pages)
+        return list(swa_storage.k_pages)
 
     def raiden_state_buffers(self) -> List[torch.Tensor]:
         """Per ratio-2 kv_source 3D pair-state roots (one block per req slot)."""

@@ -173,6 +173,17 @@ class TestDSV41TPUPoolState(CustomTestCase):
             [v.shape for v in _accessor_views(rw_pool) if id(v._base) not in state_ids],
             [],
         )
+        # Encoder-replay SWA buffers must also be exposed to Raiden / P/D transfer.
+        raiden_swa = rw_pool.raiden_swa_buffers()
+        self.assertEqual(len(raiden_swa), len(RATIOS))
+        self.assertEqual(
+            [id(t) for t in raiden_swa],
+            [id(t) for t in rw_pool.request_window.state.k_pages],
+        )
+        ptrs, lens, item_lens = rw_pool.get_state_buf_infos()
+        self.assertEqual(ptrs, [t.data_ptr() for t in raiden_swa])
+        self.assertEqual(lens, [t.nbytes for t in raiden_swa])
+        self.assertEqual(item_lens, [t[0].nbytes for t in raiden_swa])
 
 
 if __name__ == "__main__":

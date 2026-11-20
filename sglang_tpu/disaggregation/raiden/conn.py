@@ -562,9 +562,11 @@ class RaidenKVManager(
                 * self._swa_max_request_blocks()
             )
         engines = [(self._kv_caches, max_blocks)]
+        engine_names = ["full"]
         if self._swa_kv_caches:
             swa_max_blocks = self._swa_max_request_blocks()
             engines.append((self._swa_kv_caches, swa_max_blocks))
+            engine_names.append("swa")
         if self._draft_kv_caches:
             draft_max_blocks = (
                 self._swa_max_request_blocks()
@@ -572,6 +574,7 @@ class RaidenKVManager(
                 else self._max_request_blocks()
             )
             engines.append((self._draft_kv_caches, draft_max_blocks))
+            engine_names.append("draft")
         # Bounded shared-layer staging (num_staging_layers < len(tensors)) is
         # unsafe when an engine mixes buffers with different per-page layouts
         # (e.g. DSV4.1 full KV/scale/indexer roots), because tpu_sync strides
@@ -579,11 +582,24 @@ class RaidenKVManager(
         # concurrent sessions. Keep full per-layer host mirrors for
         # heterogeneous engines and split SGLANG_TPU_RAIDEN_STAGING_LAYERS only
         # across homogeneous ones.
-        homog_indices = [
-            i
-            for i, (tensors, _) in enumerate(engines)
-            if not has_heterogeneous_page_layouts(tensors)
-        ]
+        homog_indices = []
+        hetero_engines = []
+        for i, (name, (tensors, _)) in enumerate(zip(engine_names, engines)):
+            if has_heterogeneous_page_layouts(tensors):
+                hetero_engines.append((name, len(tensors)))
+            else:
+                homog_indices.append(i)
+        if self._staging_layers_total > 0 and hetero_engines:
+            desc = ", ".join(f"{name} ({n} tensors)" for name, n in hetero_engines)
+            logger.warning(
+                "RaidenKVManager rank%d keeping full per-layer host staging "
+                "mirrors for heterogeneous engine(s) [%s] despite "
+                "SGLANG_TPU_RAIDEN_STAGING_LAYERS=%d; bounded shared-layer "
+                "staging requires uniform per-page layouts.",
+                self.attn_tp_rank,
+                desc,
+                self._staging_layers_total,
+            )
         layers = [len(tensors) for tensors, _ in engines]
         if homog_indices:
             homog_layers = split_staging_layers(
