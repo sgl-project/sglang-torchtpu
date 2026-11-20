@@ -1,5 +1,11 @@
 """DeepSeek-V4.1-Flash text serving on one tpu7x-8 host: attention DP8, EP8.
 
+The decoder graphs are traced once by the direct tracer, compiled once on an
+owner rank and broadcast to the others (--use-spmd-compile), and the warmup
+compiles run concurrently (SGLANG_DIRECT_COMPILE_ASYNC, on by default).
+Before relying on the shared compile, check that every rank traces the same
+graph: VERIFY_SPMD_SAFE=1 compares them without executing.
+
 Sample usage (from the repo root):
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/deepseek_v41_flash.py
@@ -27,14 +33,19 @@ CONFIG["server_args"].update(
         "attention_backend": "dsv4",
         "page_size": 256,
         "kv_cache_dtype": "bfloat16",
-        "context_length": 103424,
-        # Global values, divided by attn_dp_size (8): 64 requests and 2048
-        # prefill tokens per worker.
+        # Served AgentX traces at 1M (prompts up to 507k tokens) with a 21.1M-token
+        # KV pool per worker and ~13 GB HBM left after precompile.
+        "context_length": 1048576,
+        # Global values, divided by attn_dp_size (8): 64 requests and 1024
+        # prefill tokens per worker, as in the 1M AgentX runs.
         "max_running_requests": 512,
-        "chunked_prefill_size": 16384,
-        "max_prefill_tokens": 2048,
+        "chunked_prefill_size": 8192,
+        # Per scheduler step, not divided by attn_dp_size.
+        "max_prefill_tokens": 8192,
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
+        "tpu_compile_tracer": "direct",
+        "use_spmd_compile": True,
         "tpu_compile_tokens": [512, 1024, 2048],
         # bs 1 decode returns NaN logits after the first token.
         "tpu_compile_bs": [8, 16, 32, 64],
