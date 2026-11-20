@@ -11,13 +11,16 @@ subagents to one rank, so ranks are uneven. At c32 the busiest rank peaked at
 j-3e6d0e27-2566-49c7-aca4). At c64 (8 per rank on average) that is ~22, above
 the base cap of 16, so the base would queue sessions on the busy ranks.
 
-Unchanged, by computation:
-- KV pool: ~20.2M tokens per rank at mem_fraction_static 0.83 (same run). 32
-  requests x ~140k average context is 4.5M (22%).
-- Compile buckets: tpu_compile_bs [8, 16, 32, 64] already covers 32 per rank.
-- HBM: the bs 32/64 verify and extend programs are already compiled and
-  resident at the base cap (14.7 GB free after precompile). The request-scaled
-  SWA window and draft ring come out of the KV pool budget.
+Capacity, computed (the boot log and smoke run check it on hardware):
+- KV pool: ~20.2M tokens per rank at mem_fraction_static 0.83 and 16 requests
+  per rank (canonical c32 j-3e6d0e27-2566-49c7-aca4). The request-scaled SWA
+  windows, draft ring and state come out of the same budget, ~320 MiB more per
+  rank at 32 requests, so the pool shrinks by a few percent. 32 requests x
+  ~140k average context is 4.5M (22%).
+- Compile buckets: tpu_compile_bs [8, 16, 32, 64] covers 32 per rank; no new
+  compile shapes.
+- HBM: 14.7 GB was free after precompile at 16 per rank, with the bs 64
+  programs compiled. Headroom at 32 per rank is not measured yet.
 """
 
 from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark_agentx import (
