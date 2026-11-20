@@ -91,6 +91,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.managers import row_select
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.req_types import (
@@ -3678,7 +3679,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
         # tensor while a relay-staged side is None -- there the worker rebuilds.
         if self.input_ids is not None and other.input_ids is not None:
-            self.input_ids = torch.cat([self.input_ids, other.input_ids])
+            self.input_ids = row_select.concat_rows(self.input_ids, other.input_ids)
         else:
             self.input_ids = None
         # Optional under no-verify-sync; drop the mirror if either side absent.
@@ -3724,21 +3725,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Filter model-facing rows after the host pool-index mirror is updated."""
 
         def keep(t):
-            return t[keep_indices if t.device.type == "cpu" else keep_indices_device]
+            if t.device.type == "cpu":
+                return t[keep_indices]
+            return row_select.select_rows(t, keep_indices_device)
 
         self.req_pool_indices = keep(self.req_pool_indices)
         self.seq_lens = keep(self.seq_lens)
         self.orig_seq_lens = keep(self.orig_seq_lens)
         if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
+            self.input_ids = row_select.select_rows(self.input_ids, keep_indices_device)
 
     def _merge_model_inputs(self, other):
         """Merge model-facing rows after the host pool-index mirror is updated."""
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
+        self.req_pool_indices = row_select.concat_rows(
+            self.req_pool_indices, other.req_pool_indices
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.seq_lens = row_select.concat_rows(self.seq_lens, other.seq_lens)
+        self.orig_seq_lens = row_select.concat_rows(
+            self.orig_seq_lens, other.orig_seq_lens
+        )
 
     def _filter_spec_input(self, keep_indices, keep_indices_device):
         self.spec_info.filter_batch(

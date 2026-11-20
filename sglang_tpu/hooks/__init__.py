@@ -95,6 +95,8 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
+from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -442,6 +444,16 @@ HOOKS: list[tuple] = [
         "sglang.srt.model_loader.loader.get_model_loader",
         _select_tpu_ep_local_runai_loader,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.managers.row_select.select_rows",
+        select_kept_rows,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.row_select.concat_rows",
+        concat_merged_rows,
+        HookType.AROUND,
     ),
 ]
 
