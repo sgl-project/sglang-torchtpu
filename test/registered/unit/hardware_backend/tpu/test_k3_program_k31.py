@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=10850, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11350, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -4232,6 +4232,201 @@ class TestOwnerEmbedding(CustomTestCase):
     """
 
     def test_owner_rows_match_the_tp_sum(self):
+        _run_script(self, self.SCRIPT)
+
+
+class TestLocalEmbedding(CustomTestCase):
+    """``KernelConfig.decode_embedding_replicated`` on four host devices.
+    ``DecodeOps.load_weights`` (bridge stubbed: ops are jitted shard_maps) adds
+    ``embedding_full``, every rank's copy the shards in mesh order bit for bit
+    (NaN payloads included), only with the knob on. ``decode_local`` up to its
+    stubbed stack then runs ``token_kernels.local_embedding`` alone (Pallas
+    interpret mode: race detection, NaN-filled scratch, eager and on-wait
+    DMAs) and hands the stack the rows of the knob-off paths (the batched and
+    per-row gather + ``tp_sum``, ``owner_embedding``) on every rank, bit for
+    bit (a NaN as a NaN of the same sign: XLA:CPU's FP32 -> BF16 convert keeps
+    or drops payloads with the shape), with decode_embedding_broadcast off and
+    on: tables with -0.0 (+0.0 out), +-inf, the smallest normal, subnormals
+    and NaN payloads, ids at shard and 16-row block edges, duplicates, ids
+    outside the vocabulary (zero rows), 1 to 32 rows, 512 and 7168 wide."""
+
+    SCRIPT = """
+        import os
+        N = 4
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={N}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import dataclasses, sys, types
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
+        from jax.sharding import Mesh, PartitionSpec as P
+
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+        registered, materialized = [], []
+        bridge = types.ModuleType("sglang_tpu.k3_programs.bridge")
+
+        def register_op(name, mesh_, body, ins, outs, donate_argnums=(), export_key=None):
+            assert export_key is not None, name
+            registered.append(name)
+            return jax.jit(jax.shard_map(body, mesh=mesh, in_specs=ins, out_specs=outs, check_vma=False))
+
+        def stream_to_device(iterator, store):
+            for group, name, array in iterator:
+                store(group, name, array)
+            return {"wall": 0.0, "gib": 0.0}
+
+        bridge.register_op, bridge.stream_to_device, bridge.materialize = register_op, stream_to_device, materialized.append
+        for name in ("hbm", "kernel_mesh", "report_load_stats", "register_global_op", "upload"):
+            setattr(bridge, name, lambda *a, **k: None)
+        sys.modules["sglang_tpu.k3_programs.bridge"] = bridge
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig, decode_ops
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk, token_kernels
+
+        class Host:  # torch.zeros(...).to("tpu") of the KDA slots
+            def __init__(self, array):
+                self.array = array
+
+            def to(self, *args):
+                return self.array
+
+        decode_ops.torch = types.SimpleNamespace(bfloat16=jnp.bfloat16,
+                                                 zeros=lambda shape, dtype=None: Host(jnp.zeros(shape, dtype)))
+        base = kconfig.active()
+
+        def load(families, knob):
+            # DecodeOps.load_weights over a stand-in rank loader yielding families (global [N, ...] arrays).
+            config = dataclasses.replace(base, decode_embedding_replicated=knob)
+            kconfig.active = lambda: config
+            try:
+                ops = object.__new__(decode_ops.DecodeOps)
+                ops.presharded, ops.rank, ops.mesh, ops.attention_dp, ops.num_slots = None, 0, mesh, 1, 3
+                ops.recurrent_dtype, ops.weights, ops.names = jnp.float32, {}, ()
+                ops.rank_loader = types.SimpleNamespace(
+                    iter_decode_rank=lambda *a, **k: (("decode", n, v) for n, v in families.items()))
+                registered.clear(), materialized.clear()
+                ops.load_weights()
+                return ops
+            finally:
+                kconfig.active = lambda: base
+
+        called, captured, mode = [], [], ["eager"]
+        stock = pl.pallas_call
+
+        def interpret(*a, **k):
+            called.append(k.get("name"))
+            params = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan", dma_execution_mode=mode[0])
+            return stock(*a, **{"interpret": params, **k})
+
+        token_kernels.pl.pallas_call = interpret
+
+        def stack(prefix, embedding, weights, states, positions, **kwargs):
+            captured.append(embedding)
+            return (prefix, None, states[0], states[1], None, None, None)
+
+        dmk.stack = stack
+
+        def embed(tokens, weights, knobs, batched):
+            config = dataclasses.replace(base, **knobs)
+            dmk._config = lambda: config
+            try:
+                def body(tokens, shard, full):
+                    captured.clear()
+                    local = {"embedding": shard[0], "embedding_full": full[0],
+                             "lm_head": jnp.zeros((shard.shape[-1], 8), jnp.bfloat16)}
+                    dmk.decode_local(local, (jnp.zeros(1), jnp.zeros(1)), tokens, jnp.zeros_like(tokens),
+                                     batch_size=tokens.shape[0], sequence_parallel_pre_attention=True,
+                                     batched_decoder_boundaries=batched)
+                    return captured[0][None]
+                called.clear()
+                f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp"), P("tp")), out_specs=P("tp"),
+                                          check_vma=False))
+                out = f(jnp.asarray(tokens, jnp.int32), weights["embedding"], weights["embedding_full"])
+                return np.asarray(out).view(np.uint16), list(called)
+            finally:
+                dmk._config = lambda: base
+
+        def same(a, b):
+            # Bit for bit, but a NaN's payload: XLA:CPU's f32 -> BF16 convert keeps or drops it depending on the
+            # operand's shape (at 7168 lanes one path keeps it, another drops it), so NaNs compare by sign.
+            nan = lambda x: (x & 0x7F80 == 0x7F80) & (x & 0x7F != 0)
+            return np.array_equal(np.where(nan(a), a & 0x8000, a), np.where(nan(b), b & 0x8000, b)) and (
+                np.array_equal(nan(a), nan(b)))
+
+        rng = np.random.default_rng(0)
+        SPECIAL = [0x8000, 0x7F80, 0xFF80, 0x0080, 0x0001, 0x8001, 0x007F, 0x7FC1, 0xFFC1, 0x7F81]
+        for W, H in ((64, 512), (32, 7168)):
+            V = N * W
+            table = rng.standard_normal((N, W, H)).astype(ml_dtypes.bfloat16)
+            bits = table.view(np.uint16)
+            for value in SPECIAL:  # -0.0, +-inf, the smallest normal, subnormals, NaN payloads (quiet, signalling)
+                bits[rng.random(bits.shape) < 0.01] = value
+            bits[rng.random(bits.shape) < 0.04] = 0x0000
+            bits[:, :, : len(SPECIAL)] = SPECIAL
+            flat = table.reshape(V, H).view(np.uint16)
+            families = {"lm_head": jnp.zeros((N, 8, 8), jnp.bfloat16), "embedding": jnp.asarray(table)}
+
+            # The load op: only with the knob; every rank holds the shards in mesh order, bit for bit.
+            decode_ops.TP_SIZE, decode_ops.VOCAB = N, V
+            off = load(families, False)
+            assert off.names == ("embedding", "lm_head") and not registered, (off.names, registered)
+            ops = load(families, True)
+            assert ops.names == ("embedding", "embedding_full", "lm_head"), ops.names
+            assert registered == ["pallas::k3_decode_embedding_full"], registered
+            full = ops.weights["embedding_full"]
+            assert any(t is full for t in materialized)
+            assert full.shape == (N, V, H) and full.dtype == jnp.bfloat16, (full.shape, full.dtype)
+            gathered = np.asarray(full).view(np.uint16)
+            assert all(np.array_equal(gathered[r], flat) for r in range(N))
+            try:
+                load({"embedding": jnp.asarray(table[:, :16])}, True)
+                raise AssertionError("a table that is not V / n rows a rank was taken")
+            except RuntimeError:
+                pass
+
+            edges = [r * W + d for r in range(N) for d in (0, 15, 16, W - 1)]
+            cases = [
+                [5],
+                [V - 1, 0, -1, V, W, 2 * W - 1, -2**31, 2**31 - 1],  # shard edges, outside
+                edges,  # every shard's and 16-row block's edges
+                [3, 3, 4, 19, 3, 2, 1, 0],  # one owner, duplicates, one 16-row block
+                list(rng.integers(-W, V + W, 32)),
+                [-5] * 4,  # nothing owned: zero rows
+                [V, -1, 2**31 - 1, -2**31, V + 7],  # every row outside the vocabulary
+                [17, 17, V - 16],
+                list(rng.integers(0, V, 2)),
+                list(rng.integers(0, V, 7)),
+                list(rng.integers(0, V, 31)),
+            ][: 7 if H > 512 else None]  # (the 7168-wide table: the first seven)
+            for tokens in cases:
+                batched = len(tokens) % 2 == 0
+                want, _ = embed(tokens, ops.weights, {}, True)
+                assert same(want, embed(tokens, ops.weights, {}, False)[0])  # both XLA paths
+                assert all(np.array_equal(want[0], want[r]) for r in range(N))
+                for b, t in enumerate(tokens):
+                    # In range: the row with -0.0 as +0.0, NaNs as NaNs and subnormals as themselves or +0.0 (the
+                    # platform's f32 flush; XLA:CPU flushes); else zeros.
+                    row = flat[t] if 0 <= t < V else np.zeros(H, np.uint16)
+                    nan = (row & 0x7F80 == 0x7F80) & (row & 0x7F != 0)
+                    subnormal = (row & 0x7F80 == 0) & (row & 0x7F != 0)
+                    out = want[0, b]
+                    assert ((out == np.where(row == 0x8000, 0, row)) | (subnormal & (out == 0)) | nan).all(), (b, t)
+                    assert (out[nan] & 0x7F80 == 0x7F80).all() and (out[nan] & 0x7F != 0).all(), (b, t)
+                mode[0] = "eager"
+                owner, ran = embed(tokens, ops.weights, dict(decode_embedding_broadcast=True), batched)
+                assert ran == ["kimi_owner_embedding"] and same(owner, want), (W, H, tokens, ran)
+                for mode[0], broadcast in (("eager", False), ("on_wait", True)):  # the knob wins over the broadcast
+                    knobs = dict(decode_embedding_replicated=True, decode_embedding_broadcast=broadcast)
+                    got, ran = embed(tokens, ops.weights, knobs, batched)
+                    assert ran == ["kimi_local_embedding"], ran
+                    assert all(np.array_equal(got[0], got[r]) for r in range(N))
+                    assert same(got, want) and same(got, owner), (W, H, tokens, mode[0], broadcast)
+            print("width", H, "cases", len(cases), flush=True)
+        assert not interpreter.races.races_found
+        print("OK")
+    """
+
+    def test_local_rows_match_the_knob_off_rows(self):
         _run_script(self, self.SCRIPT)
 
 

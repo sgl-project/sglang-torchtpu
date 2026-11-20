@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Two small TP kernels at the decoder's token ends, for ops inside a ``tp``
+"""Small TP kernels at the decoder's token ends, for ops inside a ``tp``
 ``shard_map`` whose ranks hold the vocabulary in mesh order (rank ``r``: rows
 ``[r * V / n, (r + 1) * V / n)`` of the embedding, columns of the LM head).
 
 - :func:`owner_embedding` (``KernelConfig.decode_embedding_broadcast``): the
   rows' input embeddings. The rank holding a token's row reads it and sends
   it to the other ranks, replacing the local gather and the FP32 ``psum``.
+- :func:`local_embedding` (``KernelConfig.decode_embedding_replicated``): the
+  same rows from a whole table on every rank, without a collective.
 - :func:`greedy_decisions` (``KernelConfig.verify_greedy_kernel``): a greedy
   verify's accepted counts and bonus tokens from the vocabulary-sharded
   logits, with one exchange of per-shard maxima, replacing ``jnp.argmax``,
   an ``all_gather`` and the small XLA ops around them.
 
-Both return the XLA code's bits; each function says why.
+All three return the XLA code's bits; each function says why.
 """
 
 from __future__ import annotations
@@ -194,6 +196,69 @@ def owner_embedding(tokens: jax.Array, table: jax.Array) -> jax.Array:
             ],
         ),
         compiler_params=tpu.CompilerParams(collective_id=EMBEDDING_COLLECTIVE_ID),
+    )(tokens.astype(jnp.int32), table)
+
+
+# --------------------------------------------------------------------------
+# Embedding rows from a whole table
+
+
+def local_embedding(tokens: jax.Array, table: jax.Array) -> jax.Array:
+    """``[rows, hidden]`` BF16: row ``b`` the embedding of ``tokens[b]`` from
+    this rank's whole ``table`` ``[V, hidden]``, with no collective.
+
+    Every row's 16-row block is copied from HBM first; then each row is
+    selected with :func:`owner_embedding`'s one-hot FP32 sum, and a token
+    outside the vocabulary gives a zero row. That kernel returns the BF16
+    value of the same sum (its packed words hold that value exactly) and
+    zero packets outside the vocabulary, so the bits are the same: -0.0
+    becomes +0.0 in both.
+    """
+    (rows,) = tokens.shape
+    vocabulary, hidden = table.shape
+    if rows > EMBEDDING_MAX_ROWS or vocabulary % 16 or hidden % 256:
+        raise ValueError(f"local_embedding: {rows} rows of a {table.shape} table")
+
+    def body(tokens_ref, table_hbm, out_ref, blocks, copies):
+        inside, local = [], []
+        for b in range(rows):
+            token = tokens_ref[b]
+            inside.append((token >= 0) & (token < vocabulary))
+            local.append(jnp.clip(token, 0, vocabulary - 1))
+
+        def block_copy(b):
+            start = pl.multiple_of((local[b] // 16) * 16, 16)
+            return tpu.make_async_copy(
+                table_hbm.at[pl.ds(start, 16)], blocks.at[b], copies.at[b]
+            )
+
+        for b in range(rows):
+            block_copy(b).start()
+        selected = []
+        for b in range(rows):
+            block_copy(b).wait()
+            index = jax.lax.broadcasted_iota(jnp.int32, (16, hidden), 0)
+            row = jnp.sum(
+                jnp.where(index == local[b] % 16, blocks[b].astype(jnp.float32), 0.0),
+                axis=0,
+                keepdims=True,
+            )
+            selected.append(jnp.where(inside[b], row, 0.0))
+        out_ref[...] = jnp.concatenate(selected, axis=0).astype(out_ref.dtype)
+
+    return pl.pallas_call(
+        body,
+        name="kimi_local_embedding",
+        out_shape=jax.ShapeDtypeStruct((rows, hidden), table.dtype),
+        grid_spec=tpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=tpu.VMEM),
+            scratch_shapes=[
+                tpu.VMEM((rows, 16, hidden), table.dtype),
+                tpu.SemaphoreType.DMA((rows,)),
+            ],
+        ),
     )(tokens.astype(jnp.int32), table)
 
 

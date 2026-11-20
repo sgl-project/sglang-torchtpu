@@ -376,6 +376,15 @@ class KernelConfig:
     # owner's BF16 value to zeros, which only turns -0.0 into +0.0; the
     # kernel's one-hot row sum does the same (bit-identical).
     decode_embedding_broadcast: bool = False
+    # Decode steps of up to 32 rows (the DSpark verifies included): every rank
+    # holds the whole [V, hidden] BF16 embedding table (family
+    # "embedding_full", all-gathered from the vocabulary shards once at load:
+    # +2.19 GiB a rank) and reads its rows locally
+    # (kernels.token_kernels.local_embedding): no barrier and no sends. Its
+    # one-hot row sum turns -0.0 into +0.0, as the owner broadcast and the
+    # psum do (bit-identical). Takes precedence over
+    # decode_embedding_broadcast.
+    decode_embedding_replicated: bool = False
     # DSpark verify ops: the greedy decisions (each row's vocabulary argmax,
     # the accepted count and the bonus token) in one kernel with a single
     # exchange of per-shard maxima (kernels.token_kernels.greedy_decisions)

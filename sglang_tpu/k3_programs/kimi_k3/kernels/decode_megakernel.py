@@ -14161,6 +14161,14 @@ def decode_local(
     vocabulary = weights["embedding"].shape[0]
 
     if (
+        _config().decode_embedding_replicated
+        and "embedding_full" in weights
+        and batch_size <= token_kernels.EMBEDDING_MAX_ROWS
+    ):
+        # Each rank reads its rows from its whole table: the owners' bits
+        # (see local_embedding).
+        embedding = token_kernels.local_embedding(tokens, weights["embedding_full"])
+    elif (
         _config().decode_embedding_broadcast
         and batch_size <= token_kernels.EMBEDDING_MAX_ROWS
     ):
