@@ -109,6 +109,16 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
         )
         self.assertEqual(settings, expected)
         self.assertEqual(len(kernel_items(config)), len(settings))
+        # The released draft's ring-draft settings on by default.
+        self.assertEqual(
+            {name for name in settings if name.startswith("ring_draft_")},
+            {
+                "ring_draft_q_padded",
+                "ring_draft_with_verify",
+                "ring_draft_lm_prefetch",
+                "ring_draft_first_step",
+            },
+        )
         self.assertLessEqual(set(settings), set(KernelConfig.__dataclass_fields__))
         # The FP8 weights are opt-in, and K3_PROGRAM_KERNEL_EXTRA comes last.
         for name in FP8_WEIGHTS:

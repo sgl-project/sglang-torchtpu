@@ -117,6 +117,13 @@ DECODE_SETTINGS = (
     "aux_capture_in_flight=true",
     "moe_host_round_odd_cores=true",
     "decode_embedding_replicated=true",
+    # The released draft's ring draft (kernels.dspark): q staged padded, the
+    # single-request op inside the verify's, the LM head prefetched, and
+    # first-step drafts. The MLA draft does not read them.
+    "ring_draft_q_padded=true",
+    "ring_draft_with_verify=true",
+    "ring_draft_lm_prefetch=true",
+    "ring_draft_first_step=true",
 )
 # The TensorCore's highest DVFS clock (p-state 7): the MXU, vector and scalar
 # work runs faster; the interconnect is unchanged.
