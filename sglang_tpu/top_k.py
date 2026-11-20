@@ -361,16 +361,20 @@ def _get_tpu_top_k_op() -> Callable:
     return op
 
 
-def tpu_top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select exact descending TopK values from a two-dimensional TPU tensor.
-    Indices are int32 positions in the input's final dimension."""
-
+def _validate_tpu_top_k_inputs(values: torch.Tensor, k: int) -> None:
     if values.device.type != "tpu":
         raise ValueError(f"tpu_top_k requires a TPU tensor, got {values.device}")
     if values.ndim != 2:
         raise ValueError(f"tpu_top_k expects a 2D tensor, got shape {values.shape}")
     if not 0 < k <= values.shape[-1]:
         raise ValueError(f"k must be in [1, {values.shape[-1]}], got {k}")
+
+
+def tpu_top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select exact descending TopK values from a two-dimensional TPU tensor.
+    Indices are int32 positions in the input's final dimension."""
+
+    _validate_tpu_top_k_inputs(values, k)
     # The exported op compiles once per argument shape: bucket rows to a power of two.
     rows = values.shape[0]
     bucket = row_bucket(rows)
@@ -388,11 +392,15 @@ def register_tpu_top_k_ops() -> None:
 def output_logprob_topk(
     op, values: torch.Tensor, k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use native TopK while preserving the output-logprob index dtype."""
+    """Bucket native TopK widths and return the requested output-logprob width."""
     if values.device.type != "tpu":
         return op.forward_native(values, k)
-    top_values, top_ids = tpu_top_k(values, k)
-    return top_values, top_ids.to(torch.int64)
+    _validate_tpu_top_k_inputs(values, k)
+    bucket_k = min(1 << (k - 1).bit_length(), values.shape[-1])
+    top_values, top_ids = tpu_top_k(values, bucket_k)
+    # Share the native kernel and index conversion across nearby requested widths.
+    top_ids = top_ids.to(torch.int64)
+    return top_values[:, :k], top_ids[:, :k]
 
 
 def distributed_tpu_top_k(
