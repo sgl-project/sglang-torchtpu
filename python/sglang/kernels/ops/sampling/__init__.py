@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING, Optional
 
+from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
@@ -17,6 +18,24 @@ from sglang.kernels.spec import (
 
 if TYPE_CHECKING:
     import torch
+
+
+class OutputTopK(BaseFusedOp):
+    """Descending output-score TopK values and int64 vocabulary indices."""
+
+    op = "sampling.output_topk"
+
+    def forward_native(
+        self, values: torch.Tensor, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return values.topk(k, dim=-1)
+
+    def _torch_compile_forward(self, num_tokens: int):
+        # Backend implementations use traceable operations, so preserve dispatch.
+        return None
+
+
+output_topk = register_fused_op(OutputTopK(), __name__, "output_topk")
 
 register_kernel(
     KernelSpec(
@@ -136,7 +155,7 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits, dim=-1)
 
 
-__all__ = ["argmax", "cake_softmax", "softmax"]
+__all__ = ["OutputTopK", "output_topk", "argmax", "cake_softmax", "softmax"]
 
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
