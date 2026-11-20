@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: src/vllm_torchtpu/megakernel/kimi_k3/kernels/rank_loader.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Streaming per-rank readers for the TP32 pre-shards (decode and prefill).

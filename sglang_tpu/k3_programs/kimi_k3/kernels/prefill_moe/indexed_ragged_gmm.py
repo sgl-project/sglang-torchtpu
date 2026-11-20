@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_moe/indexed_ragged_gmm.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Indexed activation loads into the ragged GMM pipeline."""

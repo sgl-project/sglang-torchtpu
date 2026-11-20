@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/coverage.py
 # SPDX-License-Identifier: Apache-2.0
 """Which kernel lines a run executes (``--coverage FILE``).
 

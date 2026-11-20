@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: src/vllm_torchtpu/megakernel/export_cache.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A persistent export cache for the megakernel's torch ops.

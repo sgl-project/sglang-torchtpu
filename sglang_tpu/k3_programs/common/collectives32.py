@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: src/vllm_torchtpu/megakernel/common/collectives32.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TP32 collectives: a barrier across the 32 ranks of the ``tp`` mesh axis."""

@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/preshard.py
 # SPDX-License-Identifier: Apache-2.0
 """Write the checkpoints in the kernels' per-rank layout (``preshard``).
 

@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/bench.py
 # SPDX-License-Identifier: Apache-2.0
 """Kernel-only timing of the serving ops (``bench decode`` / ``bench prefill``).
 

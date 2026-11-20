@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c.
+# Source: src/vllm_torchtpu/megakernel/kimi_k3/kernels/helpers.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3 model math shared by the prefill and decode megakernels.

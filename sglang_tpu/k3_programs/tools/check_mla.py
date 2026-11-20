@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/check_mla.py
 # SPDX-License-Identifier: Apache-2.0
 """``check mladraft``: the fused MLA DSpark draft kernel against the JAX
 reference (``kernels.dspark_mla.reference_*``) on synthetic inputs.

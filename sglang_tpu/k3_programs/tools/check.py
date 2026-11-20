@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/check.py
 # SPDX-License-Identifier: Apache-2.0
 """Numerics checks of the K3 programs (``check spec`` / ``check handoff`` /
 ``check packing`` / ``check greedy``).

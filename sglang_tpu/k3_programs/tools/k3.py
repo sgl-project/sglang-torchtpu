@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: tools/megakernel/k3.py
 # SPDX-License-Identifier: Apache-2.0
 """Kimi-K3 fixtures for the standalone tools: stand-in unified pools laid out
 as vLLM's, their KV cache groups, the fixed prompt."""

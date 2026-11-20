@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c.
+# Source: src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_moe/layer.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EP16/TP2 BF16-reduction MoE and prepared-route overflow consumers.

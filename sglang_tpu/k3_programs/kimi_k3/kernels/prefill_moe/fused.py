@@ -1,3 +1,5 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0), commit c78529c; modified.
+# Source: src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_moe/fused.py
 # SPDX-License-Identifier: Apache-2.0
 """Fused EP16/TP2 prefill MoE for 512- through 8192-token windows.
 
