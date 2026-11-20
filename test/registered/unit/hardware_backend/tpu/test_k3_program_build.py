@@ -22,7 +22,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 RC = "sglang.srt.runtime_context"
 
 
-def _server(role="decode", max_running=8, context=1 << 20, kv="auto", draft=None):
+def _server(
+    role="decode", max_running=8, context=1 << 20, kv="auto", draft=None, revision=None
+):
     return [
         mock.patch(
             f"{RC}.get_disagg", return_value=SimpleNamespace(disaggregation_mode=role)
@@ -39,7 +41,10 @@ def _server(role="decode", max_running=8, context=1 << 20, kv="auto", draft=None
         ),
         mock.patch(
             f"{RC}.get_spec",
-            return_value=SimpleNamespace(speculative_draft_model_path=draft),
+            return_value=SimpleNamespace(
+                speculative_draft_model_path=draft,
+                speculative_draft_model_revision=revision,
+            ),
         ),
         mock.patch(f"{RC}.get_parallel", return_value=SimpleNamespace(tp_rank=3)),
     ]
@@ -143,6 +148,26 @@ class TestServerConfig(CustomTestCase):
                 self.assertRaisesRegex(ValueError, "not the MLA DSpark draft"),
             ):
                 sglang_program.build_from_server()
+
+    def test_the_draft_loads_at_the_pinned_revision(self):
+        with tempfile.TemporaryDirectory() as d:
+            snapshot = Path(d, "models--Inferact--Draft", "snapshots", "6a2ef20a")
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+            with (
+                _Patched(_server(draft="Inferact/Draft", revision="6a2ef20a")),
+                tpu_envs.SGLANG_TPU_K3_PROGRAM_PRESHARDED.override("/presharded"),
+                mock.patch(
+                    "huggingface_hub.snapshot_download", return_value=str(snapshot)
+                ) as download,
+                self.assertRaisesRegex(ValueError, "not the MLA DSpark draft"),
+            ):
+                sglang_program.build_from_server()
+            download.assert_called_once_with(
+                "Inferact/Draft", revision="6a2ef20a", local_files_only=True
+            )
+            self.assertEqual(sglang_program._snapshot_revision(snapshot), "6a2ef20a")
+            self.assertIsNone(sglang_program._snapshot_revision(Path(d)))
 
 
 class TestKernelConfig(CustomTestCase):

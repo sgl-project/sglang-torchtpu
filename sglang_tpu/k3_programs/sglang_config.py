@@ -45,6 +45,29 @@ def acceptance_length_to_rates(length: float, drafts: int) -> tuple[float, ...]:
     return tuple(rates[:drafts])
 
 
+def simulated_acceptance_warning(config: MegakernelEngineConfig) -> str | None:
+    """What a server whose program accepts drafts synthetically (``config``'s
+    synthetic acceptance rates) warns of, naming each draft width's rates;
+    None when it verifies its drafts."""
+    by_width = config.synthetic_acceptance_rates_by_width
+    if by_width is None and config.synthetic_acceptance_rates is not None:
+        by_width = ((config.num_speculative_tokens, config.synthetic_acceptance_rates),)
+    if not by_width:
+        return None
+    widths = "; ".join(
+        f"{width} drafts: mean length {1 + sum(rates):.2f}, rates "
+        f"{[round(rate, 4) for rate in rates]}"
+        for width, rates in by_width
+    )
+    return (
+        "K3_PROGRAM: simulated acceptance "
+        f"(SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS), {widths}. Each verify "
+        "accepts a drawn number of drafts without checking them and takes the "
+        "target's greedy token after them, whatever the request's sampling "
+        "parameters: the outputs are not the model's."
+    )
+
+
 def engine_config(
     *,
     role: str,

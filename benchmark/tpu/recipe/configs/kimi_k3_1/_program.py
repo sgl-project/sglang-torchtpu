@@ -1,27 +1,52 @@
 """What Kimi-K3.1-Pro changes in the Kimi-K3 program recipes (K3_PROGRAM):
-its DSpark draft, its golden acceptance and its pre-shard."""
+its model, its DSpark draft at a pinned revision and its pre-shard
+(:func:`apply`), and the colocated AgentX settings (:func:`colocated_defaults`).
+
+The decode verifies its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS gives
+simulated mean acceptance lengths per draft width ("drafts:length,...", bonus
+token included): each verify then accepts a drawn number of drafts without
+checking them and takes the target's greedy token after them, whatever the
+request's sampling parameters, and the worker logs a warning with the rates.
+InferenceX AgentX's Kimi-K3.1-Pro DSpark curves (infx/golden_al_distribution;
+drafts sampled probabilistically, block verification):
+
+* the preview draft served here (DRAFT at DRAFT_REVISION; InferenceX #4851):
+  7:3.69,3:2.88,1:1.82;
+* the released draft Inferact/Kimi-K3.1-Pro-DSpark, InferenceX's K3.1 curve
+  since 2026-11-17 (InferenceX #5102): 7:4.16,3:3.08,1:1.86. The released
+  draft (GQA layers with a sliding window) is not an MLA draft, which the
+  programs need.
+"""
 
 import os
 import re
 
-# Inferact/Kimi-K3.1-Pro-DSpark-preview is the draft of InferenceX's K3.1
-# DSpark golden curve (probabilistic draft sampling, block verification);
-# AgentX accepts at the curve's mean length per draft width
-# (infx/golden_al_distribution/kimi-k3.1-pro__dspark__...): 1.82 at one
-# draft, 2.88 at three, 3.69 at seven.
 MODEL = "moonshotai/Kimi-K3.1-Pro"
+# The MLA DSpark draft, at the revision InferenceX's preview-draft curve was
+# measured with (--speculative-draft-model-revision; the worker loads it from
+# the Hugging Face cache and logs the revision it loaded).
 DRAFT = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
-ACC_LENGTHS = "7:3.69,3:2.88,1:1.82"
+DRAFT_REVISION = "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
 # The decode indexer selects every key at or above the top-2048 threshold's
-# 20-bit bin (five 4-bit rounds over the DCP group): the top-2048 and the bin's
-# other keys, three exchange rounds fewer than the exact threshold.
+# 20-bit bin (five 4-bit rounds over the DCP group): a superset of the top-2048
+# (the bin's other keys too), three exchange rounds fewer than the exact
+# threshold (dsa_select_rounds=8). The prefill attends every earlier token
+# (dense MLA) unless the kernel config sets prefill_sparse=1.
 SELECT_ROUNDS = "dsa_select_rounds=5"
 
-# The colocated c1 AgentX settings (colocated_defaults): 497.3 tok/s/user at
-# 1289 tok/s/chip on one 2x2x4 slice (mean ITL 2.011 ms), needles at 6k-548k
-# and GSM8K 0.990 with real acceptance. Every kernel setting keeps the decode's
-# outputs bit for bit except kda_fp8_projections and decode_router_fp8 (FP8 KDA
-# projection and router weights). K3_PROGRAM_KERNEL_EXTRA overrides any of them.
+# The decode's kernel settings in the colocated AgentX configuration
+# (colocated_defaults; K3_PROGRAM_KERNEL_EXTRA overrides any of them). These
+# change the decode's numerics:
+#   attention_host_bf16, dcp_pair_combine: one more BF16 rounding;
+#   dsa_gather_overlap, expert_steal: FP32 sums in another order;
+#   dsa_compact_tokens, dsa_compact_window: the FP8 attention's tokens gathered
+#     and folded differently;
+# and so does SELECT_ROUNDS. KernelConfig documents every setting
+# (sglang_tpu/k3_programs/kimi_k3/config.py). The decode's KDA projections and
+# MoE router keep the checkpoint's BF16 weights, as InferenceX's Kimi-K3.1
+# rules require of linear ops; their FP8 weights (per-column scales, a weight
+# quantization that changes numerics) are opt-in:
+# K3_PROGRAM_KERNEL_EXTRA="kda_fp8_projections=true;decode_router_fp8=true".
 DECODE_SETTINGS = (
     "dsa_compact_tokens=128",
     "dsa_compact_window=512",
@@ -46,7 +71,6 @@ DECODE_SETTINGS = (
     "draft_lm_prefetch=true",
     "expert_steal=true",
     "attention_rank_rows=true",
-    "kda_fp8_projections=true",
     "dsa_live_activity=true",
     "dsa_odd_stride=true",
     "draft_epilogue_unroll=8",
@@ -73,21 +97,26 @@ DECODE_SETTINGS = (
     "draft_with_verify=true",
     "draft_prologue_overlap=true",
     "draft_markov_rows=true",
-    "decode_router_fp8=true",
     "decode_latent_down_prefetch=true",
     "dsa_native_pages=true",
     "dcp_pair_lse_rows=true",
     "moe_routed_send_in_expert_region=true",
     "attention_input_gather_in_branches=true",
+    "moe_output_round_next_layer=true",
+    "aux_capture_in_flight=true",
+    "moe_host_round_odd_cores=true",
+    "decode_embedding_replicated=true",
 )
-# The TensorCore's highest clock (11-15% on the MXU, VPU and scalar work; the
-# interconnect rounds are unchanged).
+# The TensorCore's highest DVFS clock (p-state 7): the MXU, vector and scalar
+# work runs faster; the interconnect is unchanged.
 LIBTPU_EXTRA = "--xla_tpu_dvfs_p_state=7"
 
 
 def apply(config: dict) -> dict:
     """``config`` (a Kimi-K3 program recipe's CONFIG) for Kimi-K3.1-Pro."""
-    config["server_args"]["model_path"] = MODEL
+    config["server_args"].update(
+        model_path=MODEL, speculative_draft_model_revision=DRAFT_REVISION
+    )
     env = config["runtime_env"]
     if env.get("SGLANG_TPU_K3_PROGRAM_ATTENTION_DP", "1") != "1":
         # The DSA indexer gathers its 32 query heads over a DCP32 group.
@@ -95,9 +124,6 @@ def apply(config: dict) -> dict:
             "Kimi-K3.1 on the K3 programs decodes with attention DP1 (DCP32)"
         )
     env["SGLANG_TPU_K3_PROGRAM_DRAFT"] = DRAFT
-    env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"] = os.environ.get(
-        "K3_PROGRAM_SIMULATE_ACC_LENGTHS", ACC_LENGTHS
-    )
     env["SGLANG_TPU_K3_PROGRAM_PRESHARDED"] = os.environ.get(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded-k31"
     )
@@ -130,11 +156,12 @@ def add_libtpu_flags(env: dict, flags: str) -> None:
 
 
 def colocated_defaults(config: dict) -> dict:
-    """The colocated c1 AgentX settings on top of :func:`apply`: both programs at
+    """The colocated AgentX settings on top of :func:`apply`: both programs at
     expert parallelism 8, DECODE_SETTINGS ahead of K3_PROGRAM_KERNEL_EXTRA, the
-    host-side bookkeeping and first-step drafts, a prefill wait of 150 rounds
-    and LIBTPU_EXTRA. Each follows its environment variable when set
-    (K3_PROGRAM_LIBTPU_EXTRA="" drops the clock flag)."""
+    host-side bookkeeping and first-step drafts, a prefill wait of 150 rounds,
+    LIBTPU_EXTRA, Prometheus metrics and no reasoning or tool-call parser. Each
+    environment setting follows its variable when set (K3_PROGRAM_LIBTPU_EXTRA=""
+    drops the clock flag)."""
     env = config["runtime_env"]
     parts = [
         p
@@ -168,6 +195,15 @@ def colocated_defaults(config: dict) -> dict:
     )
     if "K3_PROGRAM_LIBTPU_EXTRA" not in os.environ:
         add_libtpu_flags(env, LIBTPU_EXTRA)
+    args = config["server_args"]
+    # AgentX's client scrapes the server's Prometheus metrics.
+    args["enable_metrics"] = True
+    # Replies stream the model's text as content, without reasoning_content or
+    # tool_calls (reasoning_parser and tool_call_parser kimi_k3 split them out).
+    # InferenceX takes Kimi's parsers out of its synthetic-acceptance runs
+    # (they stop streaming on unverified draft tokens).
+    for key in ("reasoning_parser", "tool_call_parser"):
+        args.pop(key, None)
     return config
 
 

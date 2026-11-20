@@ -27,6 +27,12 @@ Environment:
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     K3_PROGRAM_ATTENTION_DP         1 (default) or 2: the decode's attention
                                     data parallelism (two DCP16 groups)
+    K3_PROGRAM_SIMULATE_ACC_LENGTHS simulated DSpark acceptance: the mean
+                                    accepted length per draft width, e.g.
+                                    7:3.78,3:2.87,1:1.84 (InferenceX's Kimi-K3
+                                    DSpark curve, default drafting and
+                                    verification); unset: the decode verifies
+                                    the drafts
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -47,10 +53,9 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 RUNNING = min(64, max(4, 2 * CONCURRENCY)) if ROLE == "decode" else max(4, CONCURRENCY)
 # A smaller decode batch keeps every step speculating: three drafts verify up
 # to 16 requests (64 rows), and past that the decode steps plain. At AgentX
-# concurrency 32 with 64 slots, ~18 requests decoded on average and 46% of
-# steps ran 17-32 requests plain (ITL 17.4 ms); 16 requests at three drafts
-# emit more tokens a second than 17-28 plain, and the others wait their turn
-# with their KV already transferred.
+# concurrency 32 with 64 slots, many steps ran 17-32 requests plain; 16
+# requests at three drafts emit more tokens a second than 17-28 plain, and the
+# others wait their turn with their KV already transferred.
 if ROLE == "decode":
     RUNNING = int(os.environ.get("K3_PROGRAM_DECODE_RUNNING", RUNNING))
 # Attention DP2 on the decode (k3_programs/sglang_dp.py): two DCP16 groups,
@@ -68,8 +73,7 @@ PREFILL_CHUNK = PAGE_SIZE
 # checkpoints, 96 tails (38 MB each) and ~8M tokens of KV at 580 bytes.
 # A prefix hit resumes only at a checkpoint, and running requests hold
 # several slots each: at concurrency 32, 128 checkpoints let bursts evict
-# cached prefixes (4.9M tokens in 9 minutes, effective hit ~81%) and the
-# prefill queue grew to 32 requests. Eight a session, 128 to 384.
+# cached prefixes, and the prefill queue grew. Eight a session, 128 to 384.
 PREFILL_CHECKPOINTS = int(
     os.environ.get(
         "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(384, max(128, 8 * CONCURRENCY)))
@@ -189,18 +193,18 @@ runtime_env.update(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED": os.environ.get(
             "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded"
         ),
-        # InferenceX AgentX's synthetic acceptance for Kimi-K3 DSpark (mean
-        # accepted length, bonus token included, per draft width).
+        # Simulated DSpark acceptance (mean accepted length, bonus token
+        # included, per draft width) only when K3_PROGRAM_SIMULATE_ACC_LENGTHS
+        # asks for it (the worker then logs a warning with the rates).
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": os.environ.get(
-            "K3_PROGRAM_SIMULATE_ACC_LENGTHS", "7:3.78,3:2.87,1:1.84"
+            "K3_PROGRAM_SIMULATE_ACC_LENGTHS", ""
         ),
         "SGLANG_RAIDEN_RESHARD": "0",
         # The MLA DSpark draft (both roles hold its KV).
         "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",
-        # At AgentX's pinned acceptance (3.78 at seven drafts, 2.87 at three),
-        # measured with fp8 KV: seven drafts win only for a lone request; three
-        # beat seven from two requests and beat plain steps through sixteen
-        # (e.g. B8 1034 vs 851 tok/s, B16 1274 vs 995 at 131k context). Past
+        # Under simulated acceptance at InferenceX's Kimi-K3 curve, measured
+        # with fp8 KV: seven drafts win only for a lone request; three beat
+        # seven from two requests and beat plain steps through sixteen. Past
         # sixteen, plain steps (vLLM's schedule carries the last range's count
         # into the tail); K3_PROGRAM_SPEC_SCHEDULE overrides it (three drafts
         # verify up to 24 requests).

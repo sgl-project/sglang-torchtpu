@@ -75,14 +75,20 @@ def parse_spec_schedule(text: str):
     return tuple(entries)
 
 
-def _local_checkpoint(path: str) -> Path:
-    """A checkpoint argument (directory or Hugging Face id) as its local
-    directory, from the cache only."""
+def _local_checkpoint(path: str, revision: str | None = None) -> Path:
+    """A checkpoint argument (directory, or Hugging Face id at ``revision``:
+    default its main branch) as its local directory, from the cache only."""
     if Path(path).is_dir():
         return Path(path)
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(path, local_files_only=True))
+    return Path(snapshot_download(path, revision=revision, local_files_only=True))
+
+
+def _snapshot_revision(checkpoint: Path) -> str | None:
+    """The commit a Hugging Face cache snapshot directory holds (None for any
+    other directory)."""
+    return checkpoint.name if checkpoint.parent.name == "snapshots" else None
 
 
 COLOCATED = "colocated"
@@ -159,7 +165,18 @@ def build_from_server():
             "K3_PROGRAM needs SGLANG_TPU_K3_PROGRAM_DRAFT (the MLA DSpark draft, "
             "Inferact/Kimi-K3-DSpark): both roles hold its KV"
         )
-    draft = _local_checkpoint(str(draft_path))
+    # --speculative-draft-model-revision pins a Hugging Face id's revision.
+    draft = _local_checkpoint(
+        str(draft_path), get_spec().speculative_draft_model_revision
+    )
+    tp_rank = int(get_parallel().tp_rank)
+    if tp_rank == 0:
+        logger.info(
+            "K3_PROGRAM: DSpark draft %s at revision %s (%s)",
+            draft_path,
+            _snapshot_revision(draft) or "unknown, a local directory",
+            draft,
+        )
     if not dspark_mla.is_mla_draft(draft):
         raise ValueError(f"K3_PROGRAM: {draft} is not the MLA DSpark draft")
     layers = dspark_mla.MlaDraftConfig.from_checkpoint(draft).layers
@@ -172,13 +189,17 @@ def build_from_server():
     role = server_role()
     roles = sglang_config.ROLES if role == COLOCATED else (role,)
     configs = {r: server_engine_config(r) for r in roles}
+    if tp_rank == 0:
+        for config in configs.values():
+            warning = sglang_config.simulated_acceptance_warning(config)
+            if warning:
+                logger.warning(warning)
     # The program is a handful of whole-model custom ops per step: fusing the
     # eager ops around them would compile a new device program for every
     # distinct surrounding op sequence (vLLM-TorchTPU's runner does the same).
     from torch_tpu._internal import execution_mode
 
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
-    tp_rank = int(get_parallel().tp_rank)
     programs = {
         r: k3.build(configs[r], Path(presharded), draft, tp_rank=tp_rank) for r in roles
     }

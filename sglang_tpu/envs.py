@@ -254,7 +254,7 @@ class TpuEnvs:
     SGLANG_TPU_K3_PROGRAM_PRESHARDED = EnvStr(None)
     # Synthetic DSpark acceptance per draft width, "drafts:mean length,..." (bonus
     # token included; InferenceX pins "7:3.78,3:2.87" for Kimi-K3). Empty
-    # verifies for real.
+    # verifies for real; set, rank 0 logs a warning with the rates.
     SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS = EnvStr("")
     # Kernel config overrides for the programs, "FIELD=VALUE;..." (fields of
     # sglang_tpu/k3_programs/kimi_k3/config.py KernelConfig, e.g.
@@ -305,7 +305,10 @@ class TpuEnvs:
     SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE = EnvFloat(0.0)
     # Colocated K3_PROGRAM engines: while requests decode, a waiting prefill
     # waits up to this many scheduler rounds in a row (each prefill batch
-    # stops every decoding request; rounds keep TP ranks in step). 0: off.
+    # stops every decoding request; rounds keep TP ranks in step), rounds that
+    # do not count down --prefill-decode-interval. It trades the waiting
+    # request's time to first token for the decoding requests' inter-token
+    # latency (hooks/k3_program.py, k3_program_prefill_wait). 0: off.
     SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS = EnvInt(0)
     # K3_PROGRAM decode program: attention data parallelism (1, or 2: two
     # DCP16 groups, k3_programs/sglang_dp.py). A P/D server sets it on the

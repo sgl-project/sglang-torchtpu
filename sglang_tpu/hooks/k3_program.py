@@ -89,16 +89,20 @@ reject_unsupported_k3_requests
   Remove when: that seam exists.
 
 k3_program_prefill_wait
-  Why: AgentX's interactivity averages each request's inter-token latency, and
-       a colocated engine's prefill batch (0.3-1 s a chunk) stops every
-       decoding request: a stall in a short answer multiplies its latency
-       (ITL mean 3.11 ms against a 2.79 ms median at concurrency 4 on
-       hardware), while the trace's sessions sit idle most of the time.
+  Why: a colocated engine's prefill batch stops every decoding request while
+       it runs, and that time lands in those requests' inter-token latency.
+       Holding a new prefill while requests decode trades the waiting
+       request's time to first token for the decoding requests' inter-token
+       latency.
   How: AROUND sglang.srt.managers.scheduler.Scheduler._should_defer_prefill
-       defers a new prefill while requests decode for up to
+       defers a new prefill while requests decode for up to W =
        SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS scheduler rounds in a row
-       (rounds, not seconds: every TP rank must take the same branch);
-       otherwise the scheduler's own interval decides.
+       (rounds, not seconds: every TP rank must take the same branch); the
+       round after, the scheduler's own check decides, and the count starts
+       again. The rounds the wait defers do not count down
+       --prefill-decode-interval: once a prefill batch has armed its N rounds,
+       a prefill that waits while requests keep decoding is held for up to
+       (W + 1) * (N + 1) - 1 rounds; it runs as soon as nothing decodes.
   Upstream PR or issue: <to be filed> (a scheduling policy seam for
        prefill/decode priority).
   Remove when: that seam exists.

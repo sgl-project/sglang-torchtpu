@@ -13,7 +13,9 @@ pd_program.py).
 
 Environment:
     K3_PROGRAM_CONCURRENCY          this engine's share of the client concurrency
-                                    (default 4)
+                                    (default 4): sizes the running requests, KDA
+                                    checkpoints and prefix tails
+                                    (size_for_concurrency)
     K3_PROGRAM_CONTEXT              context length (default 1048576)
     K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default) or bf16
     K3_PROGRAM_EXPERT_PARALLEL      16 (default) or 8: both programs' expert
@@ -23,13 +25,22 @@ Environment:
     K3_PROGRAM_PREFILL_SHARE        prefill's share of the engine while
                                     requests decode (0: the fixed interval)
     K3_PROGRAM_PREFILL_WAIT         scheduler rounds a prefill waits for
-                                    decoding requests (0: off)
+                                    decoding requests (0: off): the waiting
+                                    request's time to first token traded for
+                                    the decoding requests' inter-token latency
+                                    (sglang_tpu/hooks/k3_program.py)
     K3_PROGRAM_RUNNING              running requests (default twice the
                                     concurrency, up to 64)
     K3_PROGRAM_ATTENTION_DP         1 (default) or 2: the decode program's
                                     attention DP (two DCP16 groups)
     K3_PROGRAM_DP_ROW_SHARE         DP2 B rows per KV page (default 0.5)
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
+    K3_PROGRAM_SIMULATE_ACC_LENGTHS simulated DSpark acceptance: the mean
+                                    accepted length per draft width, e.g.
+                                    7:3.78,3:2.87,1:1.84 (InferenceX's Kimi-K3
+                                    DSpark curve, default drafting and
+                                    verification); unset: the decode verifies
+                                    the drafts
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -43,33 +54,49 @@ CONTEXT_LENGTH = int(os.environ.get("K3_PROGRAM_CONTEXT", str(1 << 20)))
 KV_DTYPE = os.environ.get("K3_PROGRAM_KV_DTYPE") or "fp8_e4m3"
 # One logical block: 256 tokens on each of the 32 ranks in bf16, 512 in fp8.
 PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
-# Decoding requests, up to the 64 rows the programs' plain decode is checked
-# to; the prefill takes its share of the same slots.
-RUNNING = min(64, max(4, 2 * CONCURRENCY))
-# A session has one request in flight: K3_PROGRAM_RUNNING (e.g. the
-# concurrency) frees the state slots planned for the second (three blocks
-# each, sglang plans up to five a running request).
-RUNNING = int(os.environ.get("K3_PROGRAM_RUNNING", RUNNING))
 # Attention DP2 on the decode program (sglang_tpu/k3_programs/sglang_dp.py,
 # ColoRows): the prefill keeps its DCP32 pages, decoding requests add B rows.
 ATTENTION_DP = int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1"))
-# Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts 45,
-# two sets of dense weights 12, the prefill's sequence-parallel projections
-# 22.5): the pools are small, and every KDA state (a checkpoint, a running
-# request's slot) takes three of their blocks, a tail four -- each block a
-# page of KV. A prefix hit resumes only at a checkpoint, and running requests
-# hold several slots each (sglang plans five), so a burst evicts checkpoints:
-# at concurrency 8, 24 checkpoints left long sessions matching a few pages of
-# their 100k-500k contexts (minute-long TTFTs) while 94% of 9.8M KV tokens sat
-# idle; 64 checkpoints and 48 tails left only 1.2M tokens of KV, and sessions
-# evicted each other's pages. Eight checkpoints and three tails a session, up to
-# 64 checkpoints.
-CHECKPOINTS = int(
-    os.environ.get(
-        "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(64, max(16, 8 * CONCURRENCY)))
+
+
+def size_for_concurrency(config: dict, concurrency: int) -> dict:
+    """``config``'s running requests, KDA state slots and prefix tails for
+    ``concurrency``, this engine's share of the client concurrency (each
+    follows its environment variable when set)."""
+    # Decoding requests, up to the 64 rows the programs' plain decode is
+    # checked to; the prefill takes its share of the same slots.
+    running = min(64, max(4, 2 * concurrency))
+    # A session has one request in flight: K3_PROGRAM_RUNNING (e.g. the
+    # concurrency) frees the state slots planned for the second (three blocks
+    # each, sglang plans up to five a running request).
+    running = int(os.environ.get("K3_PROGRAM_RUNNING", running))
+    # Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts
+    # 45, two sets of dense weights 12, the prefill's sequence-parallel
+    # projections 22.5): the pools are small, and every KDA state (a
+    # checkpoint, a running request's slot) takes three of their blocks, a tail
+    # four -- each block a page of KV. A prefix hit resumes only at a
+    # checkpoint, and running requests hold several slots each (sglang plans
+    # five), so a burst evicts checkpoints: at concurrency 8, 24 checkpoints
+    # left long sessions matching a few pages of their contexts while most of
+    # the KV pool sat idle, and 64 checkpoints with 48 tails left too little KV
+    # (sessions evicted each other's pages). Eight checkpoints and three tails
+    # a session, up to 64 checkpoints.
+    checkpoints = int(
+        os.environ.get(
+            "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(64, max(16, 8 * concurrency)))
+        )
     )
-)
-TAILS = os.environ.get("K3_PROGRAM_PREFIX_TAILS", str(max(8, 3 * CONCURRENCY)))
+    config["server_args"].update(
+        max_running_requests=running,
+        # sglang caps max_running_requests at a fifth of the slots under
+        # overlap scheduling.
+        max_mamba_cache_size=max(checkpoints + 2 * running, 5 * running),
+    )
+    config["runtime_env"]["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"] = os.environ.get(
+        "K3_PROGRAM_PREFIX_TAILS", str(max(8, 3 * concurrency))
+    )
+    return config
+
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
@@ -90,7 +117,6 @@ server_args.update(
         "context_length": CONTEXT_LENGTH,
         "chunked_prefill_size": PAGE_SIZE,
         "max_prefill_tokens": PAGE_SIZE,
-        "max_running_requests": RUNNING,
         "mem_fraction_static": 0.92,
         "skip_server_warmup": True,
         # AgentX traces reach 990k tokens: a long prompt's max_tokens is cut to
@@ -106,14 +132,11 @@ server_args.update(
         # Checkpoints at the prefill's page-sized chunks only (the decode
         # program keeps its requests' KDA state; K3ProgramAlgo sets the same).
         "mamba_track_interval": PAGE_SIZE * (1 << 16),
-        # sglang caps max_running_requests at a fifth of the slots under
-        # overlap scheduling.
-        "max_mamba_cache_size": max(CHECKPOINTS + 2 * RUNNING, 5 * RUNNING),
         "max_total_tokens": None,
         # Decode steps between prefill batches: a long prompt's chunks would
         # otherwise stop every decoding request on the engine until it ends.
         # 32 (with lpm) against 16 (fcfs) at AgentX concurrency 8 on hardware:
-        # the same throughput, ITL 6.3 against 9.8 ms, TTFT 2.3 against 1.6 s.
+        # the same throughput, lower ITL and higher TTFT.
         "prefill_decode_interval": int(
             os.environ.get("K3_PROGRAM_PREFILL_DECODE_INTERVAL", "32")
         ),
@@ -162,9 +185,10 @@ runtime_env.update(
                 ),
             )
         ),
-        "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": TAILS,
+        # Simulated acceptance only when K3_PROGRAM_SIMULATE_ACC_LENGTHS asks
+        # for it (the worker then logs a warning with the rates).
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": os.environ.get(
-            "K3_PROGRAM_SIMULATE_ACC_LENGTHS", "7:3.78,3:2.87,1:1.84"
+            "K3_PROGRAM_SIMULATE_ACC_LENGTHS", ""
         ),
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
             "K3_PROGRAM_SPEC_SCHEDULE",
@@ -184,9 +208,14 @@ runtime_env.update(
             "K3_PROGRAM_PREFILL_SHARE", "0"
         ),
         # While requests decode, a prefill waits up to this many scheduler
-        # rounds for them (0: the interval alone decides).
+        # rounds in a row for them, rounds that leave prefill_decode_interval's
+        # countdown where it is (hooks/k3_program.py, k3_program_prefill_wait;
+        # 0: the interval alone decides).
         "SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS": os.environ.get(
             "K3_PROGRAM_PREFILL_WAIT", "0"
         ),
     }
 )
+# Running requests, state slots and prefix tails for this engine's share of
+# the client concurrency.
+size_for_concurrency(CONFIG, CONCURRENCY)
