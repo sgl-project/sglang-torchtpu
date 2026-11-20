@@ -24,6 +24,8 @@ from sglang_tpu.hooks.dflash_mla import (
     select_dflash_mla_attention,
 )
 from sglang_tpu.hooks.draft_kv_pool import (
+    attach_unified_draft_kv_pool,
+    derive_unified_draft_pool_sizes,
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
@@ -38,7 +40,15 @@ from sglang_tpu.hooks.encoder import (
     install_encoder_vision_compile,
     reject_encoder_dp,
 )
+from sglang_tpu.hooks.evict_cause_metrics import hook_specs as evict_cause_metrics_hooks
 from sglang_tpu.hooks.experimental_spec import hook_specs
+from sglang_tpu.hooks.glm5_next_vision import (
+    attach_glm5_next_vision_runner,
+    compile_glm5_next_decoder_only,
+    defer_host_staged_mm_feature_move,
+    encode_glm5_next_vision_on_host,
+    encode_with_glm5_next_vision_runner,
+)
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -241,6 +251,36 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.models.glm5_next.Glm5NextVisionModel.__init__",
+        attach_glm5_next_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextVisionModel.forward",
+        encode_with_glm5_next_vision_runner,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.__init__",
+        compile_glm5_next_decoder_only,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_image_feature",
+        encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_video_feature",
+        encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.mm_schedule._can_skip_pre_embed_feature_move",
+        defer_host_staged_mm_feature_move,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
         HookType.AFTER,
@@ -331,6 +371,16 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._derive_pool_sizes",
+        derive_unified_draft_pool_sizes,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_token_to_kv_pool_allocator",
+        attach_unified_draft_kv_pool,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
         size_tpu_dsa_kv_pool,
         HookType.AFTER,
@@ -369,6 +419,8 @@ HOOKS.extend(host_padding_hooks())
 HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(swa_miss_metrics_hooks())
+
+HOOKS.extend(evict_cause_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 

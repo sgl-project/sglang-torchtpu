@@ -198,7 +198,10 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
             jnp.float8_e4m3fn
         )
         nkv8 = jax.lax.bitcast_convert_type(nkv8, jnp.uint8).reshape(n_dsa, R, 4, 128)
-        npk = npk[:, :, :Q].reshape(n_dsa, R, spec.index_head_dim)
+        # Rows past the pools a request closes are never scattered (qi >= fresh).
+        nfp = min(Q, npk.shape[2])
+        npk = jnp.pad(npk[:, :, :nfp], ((0, 0), (0, 0), (0, Q - nfp), (0, 0)))
+        npk = npk.reshape(n_dsa, R, spec.index_head_dim)
         nrec = jnp.stack([PL.pool_records(npk[d], rec_bytes) for d in range(n_dsa)])
         raw_out, rec_out = _scatter_index_rows(
             spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]

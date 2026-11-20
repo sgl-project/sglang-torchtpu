@@ -19,9 +19,14 @@ from sglang_tpu.compilation import core_compile_annotations
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 QWEN3_VL_MOE = "sglang.srt.models.qwen3_vl_moe"
+GLM5_NEXT = "sglang.srt.models.glm5_next"
 
 
 class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
+    pass
+
+
+class FakeGlm5NextVisionTpuCompilePolicy(CompilePolicy):
     pass
 
 
@@ -33,7 +38,14 @@ def _fake_policy_module():
     # The real policy module imports TorchTPU; the annotator only needs the name.
     module = types.ModuleType("sglang_tpu.compilation.decoder_compile_policy")
     module.Qwen3VLDecoderTpuCompilePolicy = FakeQwen3VLDecoderTpuCompilePolicy
-    return {module.__name__: module}
+    glm_vit_module = types.ModuleType(
+        "sglang_tpu.graph_runner.glm5_next_vit_tpu_compile_runner"
+    )
+    glm_vit_module.Glm5NextVisionTpuCompilePolicy = FakeGlm5NextVisionTpuCompilePolicy
+    return {
+        module.__name__: module,
+        glm_vit_module.__name__: glm_vit_module,
+    }
 
 
 def _drop_policy(cls):
@@ -46,6 +58,7 @@ class TestCoreCompileAnnotations(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.qwen3_vl_moe = importlib.import_module(QWEN3_VL_MOE)
+        cls.glm5_next = importlib.import_module(GLM5_NEXT)
 
     def setUp(self):
         # Annotations are class attributes: undo them so other tests in this
@@ -53,16 +66,19 @@ class TestCoreCompileAnnotations(CustomTestCase):
         for cls in (
             self.qwen3_vl_moe.Qwen3MoeLLMModel,
             self.qwen3_vl_moe.Qwen3MoeModel,
+            self.glm5_next.Glm5NextVisionModel,
+            self.glm5_next.Glm5NextModel,
         ):
             self.assertNotIn(_COMPILE_POLICY_ATTR, vars(cls))
             self.addCleanup(_drop_policy, cls)
         modules_patch = patch.dict(sys.modules, _fake_policy_module())
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
-        # Only the Qwen3-VL boundary is under test: hide the other listed model
-        # modules an earlier test may have loaded (restored with sys.modules).
+        # Only the Qwen3-VL and GLM-5.x-Next boundaries are under test: hide the
+        # other listed model modules an earlier test may have loaded (restored
+        # with sys.modules).
         for boundary in core_compile_annotations.CORE_COMPILE_BOUNDARIES:
-            if boundary.module != QWEN3_VL_MOE:
+            if boundary.module not in (QWEN3_VL_MOE, GLM5_NEXT):
                 sys.modules.pop(boundary.module, None)
 
     def test_qwen3_vl_moe_decoder_gets_the_vl_decoder_policy(self):
@@ -75,6 +91,17 @@ class TestCoreCompileAnnotations(CustomTestCase):
         # The text-only Qwen3-MoE decoder stays unannotated, so it keeps
         # TpuGraphRunner's whole-model fallback.
         self.assertIsNone(get_torch_compile_policy(self.qwen3_vl_moe.Qwen3MoeModel))
+
+    def test_glm5_next_vision_encoder_gets_the_vision_policy(self):
+        core_compile_annotations.annotate_core_compile_boundaries()
+
+        self.assertIs(
+            get_torch_compile_policy(self.glm5_next.Glm5NextVisionModel),
+            FakeGlm5NextVisionTpuCompilePolicy,
+        )
+        # Glm5NextModel stays unannotated at class level so --language-model-only
+        # keeps TpuGraphRunner's whole-model fallback.
+        self.assertIsNone(get_torch_compile_policy(self.glm5_next.Glm5NextModel))
 
     def test_unloaded_model_module_is_not_imported(self):
         with patch.dict(sys.modules):

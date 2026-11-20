@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""GLM-5.3-Flash megakernel: served configs fit VMEM at tp8 (host only)."""
+"""GLM-5.3-Flash megakernel: served configs fit VMEM at tp8, and the split latent cache's
+ownership math matches serving's layout (host only)."""
 
+import itertools
 import json
 import math
 import os
@@ -100,11 +102,18 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
         from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
 
         spec = _spec()
-        # The served buckets: plain decode and the NEXTN-3 verify, up to 64 rows.
-        for n_query, n_req in ((1, 1), (1, 16), (4, 1), (4, 16)):
-            with self.subTest(n_query=n_query, n_req=n_req):
+        # The served buckets: plain decode, the NEXTN-3 verify up to 64 rows, and the
+        # NEXTN-8 verify (9 rows); each with the latent cache whole or split over tp8.
+        cases = ((1, 1), (1, 16), (4, 1), (4, 16), (9, 1))
+        for (n_query, n_req), shards in itertools.product(cases, (1, 8)):
+            with self.subTest(n_query=n_query, n_req=n_req, shards=shards):
                 cfg = D.KernelConfig(
-                    max_len=16384, n_query=n_query, n_req=n_req, embed_2d=True
+                    max_len=16384,
+                    n_query=n_query,
+                    n_req=n_req,
+                    embed_2d=True,
+                    context_parallel=shards > 1,
+                    mla_shards=shards,
                 )
                 vmem = sum(
                     math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
@@ -116,6 +125,64 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
                 self.assertLessEqual(cfg.prefetch, cfg.slots - 2)
         with self.assertRaises(ValueError):
             D.KernelConfig(max_len=1000)  # not a multiple of attn_tile
+
+    def test_split_ownership_matches_serving(self):
+        """A pool's owner and gather-block row (layout.py, read by the kernel) agree with
+        where serving stores each of its tokens (kv_shard.own_page_slots)."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        from sglang_tpu.attention.pallas.mla_sparse.kv_shard import own_page_slots
+        from sglang_tpu.glm_flash_megakernel.layout import pool_block_row, pool_owner
+
+        ps, kp, block = 128, 4, 16
+        for shards in (1, 2, 4, 8):
+            sub = ps // shards
+            pools = np.arange(3 * ps // kp, dtype=np.int32)  # three pages of pools
+            owner = pool_owner(pools, ps // kp, sub // kp)
+            np.testing.assert_array_equal(
+                owner, pool_owner(jnp.asarray(pools), ps // kp, sub // kp)
+            )
+            for pool in pools.tolist():
+                row0 = pool_block_row(pool, kp, ps, sub, block)
+                for t in range(pool * kp, (pool + 1) * kp):
+                    page, slot = t // ps, t % ps
+                    # The rank whose store keeps this token, and the row it keeps it at.
+                    roles = [
+                        r
+                        for r in range(shards)
+                        if int(
+                            own_page_slots(
+                                jnp.int32(page),
+                                jnp.int32(slot),
+                                sub_page=sub,
+                                role=r,
+                                oob_page=-1,
+                            )[0]
+                        )
+                        == page
+                    ]
+                    _, row = own_page_slots(
+                        jnp.int32(page),
+                        jnp.int32(slot),
+                        sub_page=sub,
+                        role=0,
+                        oob_page=-1,
+                    )
+                    self.assertEqual(roles, [int(owner[pool])])
+                    # The kernel gathers the block at row0; the token is row t % block of it.
+                    self.assertEqual(row0 + t % block, int(row))
+
+    def test_query_bits_and_row_bounds(self):
+        from sglang_tpu.glm_flash_megakernel.kernel import decode as D
+
+        self.assertEqual(D.q_rows(D.KernelConfig(max_len=4096, n_query=4)), 8)
+        self.assertEqual(D.q_rows(D.KernelConfig(max_len=4096, n_query=9)), 16)
+        spec = _spec()
+        # 9 queries: 4,609 selected-pool slots (+ the tail) in 38 groups of 128.
+        self.assertEqual(
+            D.gather_dims(spec, D.KernelConfig(max_len=4096, n_query=9))[2], 38
+        )
 
 
 if __name__ == "__main__":

@@ -121,7 +121,9 @@ class TpuEnvs:
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
     # moves queries and outputs, and the rows' all-reduce is skipped. Prefill
-    # batches of the per-query kernel; attention TP must span the world.
+    # batches of the per-query kernel; attention TP must span the world. With
+    # SGLANG_TPU_DSA_MLA_KV_SHARDS each row is already attended by its owner, so
+    # prefill gathers only each rank's own entries of a row instead of all of it.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
@@ -210,9 +212,10 @@ class TpuEnvs:
     # Pooled DSA indexer: keep each request's raw key|gate rows in a ring of pages per
     # request slot instead of one row per pool token; only the open pool is read back.
     SGLANG_TPU_DSA_KPOOL_RAW_RING = EnvBool(False)
-    # Experimental: shard the sparse-MLA latent cache by page across groups of this
-    # many attention-TP ranks (page g on rank g % shards, at page g // shards); each
-    # rank attends its own pages and the group merges partials. 1 = replicated.
+    # Experimental: split the sparse-MLA latent cache inside every page across groups
+    # of this many attention-TP ranks (rank r holds the r-th of `shards` equal runs of
+    # each page's offsets); each rank attends its own offsets and the group merges
+    # partials. 1 = replicated.
     SGLANG_TPU_DSA_MLA_KV_SHARDS = EnvInt(1)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
@@ -398,6 +401,10 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+    # HiCache host slots for recurrent (GDN/KDA) states as a multiple of the device
+    # state slots, so host RAM can go to states or KV pages; unset: --hicache-ratio.
+    # Ignored under --hicache-size, which splits by device bytes.
+    SGLANG_TPU_HICACHE_STATE_RATIO = EnvFloat(None)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.
@@ -486,6 +493,9 @@ class TpuEnvs:
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE under EP, off the dense permute, with the SparseCore gather and combine:
+    # route on local expert ids (counting sort) and gather only this rank's rows.
+    SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, the permute is dense below this many tokens per

@@ -23,6 +23,7 @@ buffer.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -119,7 +120,8 @@ def mla_kv_shards() -> int:
 
 
 def mla_kv_shard_role(shards: int) -> int:
-    """This rank's role in its shard group: the page ids it stores are role mod shards."""
+    """This rank's role in its shard group: it stores offsets ``[role * sub,
+    (role + 1) * sub)`` of every page, ``sub = page_size // shards``."""
     if shards <= 1:
         return 0
     from sglang.srt.runtime_context import get_parallel
@@ -1280,7 +1282,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     * NoPE, ``[num_pages, page_size, 4, 128]``: 512 bytes per token.
     * RoPE, ``[num_pages, page_size // 4, 4, 128]``: 64 bytes per token, padded
-      to 128.
+      to 128. A model without RoPE dims (``qk_rope_head_dim == 0``,
+      GLM-5.3-Flash) never writes or reads it (the ops attend with a zero rope
+      lane), so it gets a one-row placeholder instead, and the pool's bytes per
+      token leave it out.
 
     The values are FP8, stored as raw bytes.
 
@@ -1376,6 +1381,13 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
                 f"page_size ({self.page_size}) must be divisible by "
                 f"{self.TOKENS_PER_ROW * index_kpool} for the TPU split MLA pool."
             )
+        # A rank's share holds whole RoPE rows and whole indexer pools.
+        share_unit = self.mla_shards * math.lcm(self.TOKENS_PER_ROW, index_kpool)
+        if self.page_size % share_unit != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by {share_unit} "
+                f"to split the latent cache {self.mla_shards} ways."
+            )
         # Allocate one extra page. Token index 0 is the slot used for padded
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
         # page 0 is never a real page.
@@ -1393,14 +1405,23 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_kpool: int,
         raw_ring: bool = False,
         mla_shards: int = 1,
+        qk_rope_head_dim: int = 64,
     ) -> int:
-        """Bytes one token takes across all layers' buffers, as allocated.
-        A raw ring is sized by request slots, not tokens, so it is not counted."""
+        """Bytes one token takes across all layers' buffers, as allocated (a
+        split latent cache holds 1/mla_shards of every page). A raw ring is
+        sized by request slots, not tokens, so it is not counted."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
-        layer_bytes = _cdiv(cls.NOPE_BYTES + cls.LANE_BYTES, mla_shards)
+        layer_bytes = _cdiv(
+            cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim), mla_shards
+        )
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
+
+    @classmethod
+    def rope_bytes_per_token(cls, qk_rope_head_dim: int) -> int:
+        """RoPE cache bytes per token: one lane, or none without RoPE dims."""
+        return cls.LANE_BYTES if qk_rope_head_dim > 0 else 0
 
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:
@@ -1417,20 +1438,26 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def _create_buffers(self):
         rows_per_page = self.page_size // self.TOKENS_PER_ROW
-        # A sharded latent cache holds this rank's page ids only (kv_shard.py).
-        mla_pages = _cdiv(self.num_pages, self.mla_shards)
+        # A split latent cache holds this rank's share of every page (kv_shard.py).
+        mla_page = self.page_size // self.mla_shards
         nope_shape = (
-            mla_pages,
-            self.page_size,
+            self.num_pages,
+            mla_page,
             self.NOPE_BYTES // self.LANE_BYTES,
             self.LANE_BYTES,
         )
-        rope_shape = (
-            mla_pages,
-            rows_per_page,
-            self.TOKENS_PER_ROW,
-            self.LANE_BYTES,
-        )
+        if self.qk_rope_head_dim > 0:
+            rope_shape = (
+                self.num_pages,
+                mla_page // self.TOKENS_PER_ROW,
+                self.TOKENS_PER_ROW,
+                self.LANE_BYTES,
+            )
+        else:
+            # No RoPE dims: the ops neither write nor read the rope cache
+            # (zero_rope), so one row stands in for it. It is not a page
+            # buffer: P/D transfer and HiCache leave it out.
+            rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
             self.num_pages,
             rows_per_page // self._index_kpool,
@@ -1534,6 +1561,12 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def set_state(self, state: list[torch.Tensor]) -> None:
         """Install a list laid out like ``get_state``; absent buffers stay None."""
+        expected = len(self.get_state())
+        if len(state) != expected:
+            raise ValueError(
+                f"TpuSplitMLATokenToKVPool.set_state expects {expected} tensors, "
+                f"got {len(state)}"
+            )
         it = iter(state)
 
         def take(kind: list) -> list:
@@ -1543,21 +1576,16 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self.rope_buffer = take(self.rope_buffer)
         self.index_key_buffer = take(self.index_key_buffer)
         self.kpool_raw_buffer = take(self.kpool_raw_buffer)
-        leftover = sum(1 for _ in it)
-        assert leftover == 0, f"set_state got {leftover} extra tensors"
 
     def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
         """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
         index keys and raw key|gate when it has them. Each leads with
-        ``num_pages``, so a request's page ids address it in all of them."""
-        if self.mla_shards > 1:
-            raise NotImplementedError(
-                "A sharded MLA latent cache is not addressed by page id; nothing "
-                "that copies pages (host tier, P/D) supports it."
-            )
+        ``num_pages``, so a request's page ids address it in all of them; a
+        split latent cache's page is this rank's share of it."""
         i = layer_id - self.start_layer
+        rope = (self.rope_buffer[i],) if self.qk_rope_head_dim > 0 else ()
         optional = (self.index_key_buffer[i], self._paged_raw_buffers()[i])
-        return [self.nope_buffer[i], self.rope_buffer[i]] + [
+        return [self.nope_buffer[i], *rope] + [
             buf for buf in optional if buf is not None
         ]
 
@@ -1572,15 +1600,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
 
         Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
-        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) only
-        writes zeros to its RoPE buffer, so the buffer stays behind: the
-        receiver's starts zeroed too.
+        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) has only
+        a placeholder RoPE buffer that no op reads, so it stays behind. A split
+        latent cache moves this rank's share of each page.
         """
-        if self.mla_shards > 1:
-            raise NotImplementedError(
-                "A sharded MLA latent cache is not addressed by page id; P/D "
-                "transfer does not support it."
-            )
         kinds = [self.nope_buffer]
         if self.qk_rope_head_dim > 0:
             kinds.append(self.rope_buffer)

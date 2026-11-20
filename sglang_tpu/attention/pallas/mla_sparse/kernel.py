@@ -29,6 +29,9 @@ from sglang_tpu.attention.pallas.mla_sparse import (
     kv_cache_utils,
     native_sc_gather,
 )
+from sglang_tpu.attention.pallas.mla_sparse.kv_shard import (
+    merge_two as kv_shard_merge_two,
+)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -889,7 +892,7 @@ def sparse_ragged_paged_attention(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -972,12 +975,12 @@ def sparse_ragged_paged_attention(
       gather_rope: TensorCore layout only (ignored otherwise). False skips the
         rope cache in the gather and attends with zero rope keys; exact only
         when the queries' rope lane is identically zero (a model without rope).
-      kv_shards: ``(shards, role, group)`` for a cache sharded by page
-        (mla_sparse/kv_shard.py): ``page_indices`` holds allocator page ids,
-        this rank attends only the candidates whose page id is ``role`` mod
-        ``shards`` (at page id // shards), and ``group`` consecutive top-k
-        entries share a page (the pooled indexer's pools). Use with
-        ``return_lse`` and merge the ranks' partials.
+      kv_shards: ``(shards, role, group)`` for a cache split inside every
+        allocator page (mla_sparse/kv_shard.py): the caches' page dim is this
+        rank's share, so an allocator page has ``shards`` times its offsets;
+        this rank attends only the candidates in its share, and ``group``
+        consecutive top-k entries share an owner (the pooled indexer's pools).
+        Use with ``return_lse`` and merge the ranks' partials.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1004,9 +1007,28 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32[pages,rope_rows,128]"
+            )
+        rope_rows = cache_kv_rope.shape[1]
+        if rope_rows <= 0 or cache_kv_nope.shape[1] % rope_rows != 0:
+            raise ValueError(
+                "NOPE and ROPE caches must have matching page counts and page geometry"
+            )
+        rope_tokens_per_row = cache_kv_nope.shape[1] // rope_rows
+        rope_words = (
+            128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
+        )
+        if (
+            rope_words <= 0
+            or rope_words % native_sc_gather.NUM_LANES != 0
+            or native_sc_gather.ROPE_PACKING * rope_words > 128
+        ):
+            raise ValueError(
+                f"sparsecore ROPE cache packs {rope_tokens_per_row} tokens per "
+                "128-word row, which is incompatible with SparseCore gather"
             )
     else:
+        rope_tokens_per_row = 4
         if (
             cache_kv_nope.dtype != jnp.uint8
             or cache_kv_nope.ndim != 4
@@ -1023,14 +1045,17 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    # A TensorCore call with gather_rope=False never reads the rope cache, so
+    # it may be a placeholder (a model without rope allocates one row).
+    rope_read = sparsecore_layout or gather_rope
+    if rope_read and cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
-    if (
+    if rope_read and (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1130,6 +1155,152 @@ def sparse_ragged_paged_attention(
     return out
 
 
+def _owned_physical_indices(
+    rows: jax.Array,  # i32[tokens, width]; this rank's positions, then -1
+    seq_ids: jax.Array,  # i32[tokens]
+    page_indices: jax.Array,
+    *,
+    sub_page: int,
+    shards: int,
+    total_num_pages: int,
+    max_num_seqs: int,
+    flat_base: jax.Array | int = 0,
+) -> tuple[jax.Array, jax.Array]:
+    """(kv_lens, flat rows of this rank's cache share) for rows of owned entries."""
+    is_padding = rows < 0
+    page_ids = gather_page_ids(
+        page_indices, rows // (sub_page * shards), seq_ids, max_num_seqs
+    )
+    flat = flat_base + jnp.arange(rows.size, dtype=jnp.int32).reshape(rows.shape)
+    page_ids = jnp.where(is_padding, _spread(flat * 104729, total_num_pages), page_ids)
+    offset = jnp.where(is_padding, _spread(flat * 15485863, sub_page), rows % sub_page)
+    kv_lens = jnp.sum(~is_padding, axis=-1)
+    return kv_lens, (page_ids * sub_page + offset).astype(jnp.int32)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("sm_scale", "k_scale", "shards", "width", "chunk", "gather_rope"),
+)
+def sparse_attention_owned_rows(
+    ql_nope: jax.Array,  # [max_num_tokens, heads, 512]
+    q_pe: jax.Array,  # [max_num_tokens, heads, 64]
+    cache_kv_nope: jax.Array,  # u8[pages, page_size // shards, 4, 128]
+    cache_kv_rope: jax.Array,
+    rows: jax.Array,  # i32[max_num_tokens, passes * width]; kv_shard.owned_rows
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float,
+    k_scale: float,
+    shards: int,
+    width: int,
+    chunk: int,
+    gather_rope: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Tensorcore-layout attention over this rank's entries of a split cache
+    (``kv_shards``), gathering ``width`` slots per token instead of the whole row.
+
+    Every chunk of ``chunk`` tokens attends its first ``width`` entries; a chunk
+    whose tokens hold more runs further ``width``-slices and merges them by
+    log-sum-exp. Returns ``(output [T, heads, 576], lse f32[T, heads])``.
+    """
+    num_tokens, heads, _ = ql_nope.shape
+    head_dim = ql_nope.shape[-1] + q_pe.shape[-1]
+    if num_tokens % chunk:
+        raise ValueError(f"{num_tokens} tokens are not whole {chunk}-token chunks")
+    if rows.shape[1] % width:
+        raise ValueError(f"row width {rows.shape[1]} is not whole {width}-slices")
+    sub_page = cache_kv_nope.shape[1]
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    ).astype(jnp.int32)
+    token_end = cu_q_lens[distribution[2]]
+    lookup = functools.partial(
+        _owned_physical_indices,
+        page_indices=page_indices,
+        sub_page=sub_page,
+        shards=shards,
+        total_num_pages=cache_kv_nope.shape[0],
+        max_num_seqs=max_num_seqs,
+    )
+    attend = functools.partial(
+        sparse_attention_chunk,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        small_chunk_tokens=16,
+        small_chunk_batch_size=1,
+        small_chunk_live_gather=True,
+        live_gather_all_chunks=True,
+        topk_override=width,
+        gather_rope=gather_rope,
+    )
+
+    def q_of(start, size):
+        part = lambda x: lax.dynamic_slice_in_dim(x, start, size)  # noqa: E731
+        return prepare_q_inputs(jnp.concatenate([part(ql_nope), part(q_pe)], axis=-1))
+
+    q = q_of(0, num_tokens)
+    q_heads = q.shape[1]
+    floor = jnp.finfo(jnp.float32).min
+    lse = jnp.full((num_tokens, q_heads, 1), floor, jnp.float32)
+    kv_lens, physical = lookup(rows[:, :width], seq_ids)
+    for start in range(0, num_tokens, chunk):
+        q, lse = attend(
+            q, cache_kv_nope, cache_kv_rope, kv_lens, physical, lse,
+            start_pos=start, end_pos=start + chunk, token_end=token_end,
+        )  # fmt: skip
+
+    passes = rows.shape[1] // width
+    if passes > 1:
+        counts = jnp.sum(rows >= 0, axis=-1)
+
+        def chunk_body(c, carry):
+            start = c * chunk
+            most = jnp.max(lax.dynamic_slice_in_dim(counts, start, chunk))
+            need = (most + width - 1) // width  # slices this chunk's tokens reach
+            seq = lax.dynamic_slice_in_dim(seq_ids, start, chunk)
+            end = jnp.clip(token_end - start, 0, chunk)
+
+            def pass_body(state):
+                p, out, lse = state
+                part_rows = lax.dynamic_slice(rows, (start, p * width), (chunk, width))
+                part_lens, part_physical = lookup(
+                    part_rows, seq, flat_base=(p * num_tokens + start) * width
+                )
+                part_out, part_lse = attend(
+                    q_of(start, chunk), cache_kv_nope, cache_kv_rope, part_lens,
+                    part_physical,
+                    jnp.full((chunk, q_heads, 1), floor, jnp.float32),
+                    start_pos=0, end_pos=chunk, token_end=end,
+                )  # fmt: skip
+                merged_out, merged_lse = kv_shard_merge_two(
+                    lax.dynamic_slice_in_dim(out, start, chunk),
+                    lax.dynamic_slice_in_dim(lse, start, chunk),
+                    part_out,
+                    part_lse,
+                )
+                out = lax.dynamic_update_slice_in_dim(out, merged_out, start, 0)
+                lse = lax.dynamic_update_slice_in_dim(lse, merged_lse, start, 0)
+                return p + 1, out, lse
+
+            _, out, lse = lax.while_loop(
+                lambda state: state[0] < need, pass_body, (jnp.int32(1), *carry)
+            )
+            return out, lse
+
+        q, lse = lax.cond(
+            jnp.max(counts) > width,
+            lambda carry: lax.fori_loop(0, num_tokens // chunk, chunk_body, carry),
+            lambda carry: carry,
+            (q, lse),
+        )
+    return prepare_outputs(q, heads, head_dim), lse[:, :heads, 0]
+
+
 def _spread(hashed: jax.Array, bound: int) -> jax.Array:
     """Map arbitrary int32 values into [0, bound) to spread padding reads.
 
@@ -1140,22 +1311,29 @@ def _spread(hashed: jax.Array, bound: int) -> jax.Array:
     return hashed & ((1 << (bound.bit_length() - 1)) - 1)
 
 
-def _own_shard_entries(page_ids, token_offset, is_padding, kv_shards):
-    """This rank's entries (page id = role mod shards) moved to the front of each
-    row in their order, at page id // shards; padding marks the rest."""
+def _own_shard_entries(page_ids, token_offset, is_padding, kv_shards, sub_page):
+    """This rank's entries (offset in its ``sub_page`` share of the page) moved to
+    the front of each row in their order, at their row in the share; padding
+    marks the rest."""
     from sglang_tpu.attention.pallas.mla_sparse.kv_shard import compact_left
 
     shards, role, group = kv_shards
     if shards & (shards - 1):
         raise ValueError(f"kv_shards: shards must be a power of two, got {shards}")
+    if sub_page % group:
+        raise ValueError(
+            f"kv_shards: a {group}-entry group straddles {sub_page}-token shares"
+        )
     num_tokens, topk = page_ids.shape
     width = -(-topk // group) * group
-    owned = ~is_padding & ((page_ids & (shards - 1)) == role)
-    local = jnp.where(owned, page_ids // shards, -1)
-    packed = jnp.stack([local, token_offset], axis=-1)
+    owned = ~is_padding & (token_offset // sub_page == role)
+    packed = jnp.stack(
+        [jnp.where(owned, page_ids, -1), jnp.where(owned, token_offset % sub_page, -1)],
+        axis=-1,
+    )
     packed = jnp.pad(packed, ((0, 0), (0, width - topk), (0, 0)), constant_values=-1)
     owned = jnp.pad(owned, ((0, 0), (0, width - topk)))
-    # A group's entries share a page, so the group's first entry decides.
+    # A group's entries share an owner, so the group's first entry decides.
     packed = compact_left(
         packed.reshape(num_tokens, width // group, group * 2),
         owned.reshape(num_tokens, width // group, group)[..., 0],
@@ -1199,14 +1377,16 @@ def prepare_gather_indices(
         seq_ids_segment = jnp.repeat(
             jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
         )
-        seq_page_ids = topk_indices // page_size
-        token_offset = topk_indices % page_size
+        # page_size is the cache's page dim: a rank's share of an allocator page.
+        seq_page_size = page_size * (kv_shards[0] if kv_shards is not None else 1)
+        seq_page_ids = topk_indices // seq_page_size
+        token_offset = topk_indices % seq_page_size
         page_ids = gather_page_ids(
             page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
         )
         if kv_shards is not None:
             page_ids, token_offset, is_padding = _own_shard_entries(
-                page_ids, token_offset, is_padding, kv_shards
+                page_ids, token_offset, is_padding, kv_shards, page_size
             )
             kv_lens = jnp.sum(~is_padding, axis=-1)
 
@@ -1231,7 +1411,7 @@ def sparse_attention_chunk(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/tokens_per_row, 128].
     cache_kv_rope: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_tokens]
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]

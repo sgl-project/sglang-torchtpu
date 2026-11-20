@@ -192,6 +192,18 @@ class TestRuntimeEnvironment(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_recipe(name, concurrency)
 
+    def test_glm_flash_agentx_per_concurrency_recipes(self):
+        """Each agentx_cc<N>.py renders the launch JSON of its chart point; only the
+        real-weight settings may differ."""
+        from benchmark.tpu.recipe.configs.glm_5_3_flash.experimental.agentx import (
+            check_recipes,
+        )
+
+        for recipe, run in check_recipes.POINTS.items():
+            with self.subTest(recipe=recipe):
+                lines, ok = check_recipes.check(recipe, run)
+                self.assertTrue(ok, "\n".join(lines))
+
     def test_agentx_pd_modes(self):
         """A PP prefill must run without the megakernel (the model rejects it under PP)."""
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config

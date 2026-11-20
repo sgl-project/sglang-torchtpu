@@ -11,6 +11,7 @@ with TPU DMA host pools and ``TpuDMAHybridCacheController``.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -18,6 +19,8 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory
 from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+
+logger = logging.getLogger(__name__)
 
 _is_installed = False
 
@@ -62,11 +65,23 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.MambaStrategy):
         )
 
     def mamba_host_pool_fn(self, *, mamba_pool: Any, host_size: float) -> Any:
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.kv_pool_host import tpu_dma_mamba_pool_host_cls
 
         memory = get_memory()
+        ratio = tpu_envs.SGLANG_TPU_HICACHE_STATE_RATIO.get()
+        if ratio is not None:
+            if not ratio > 0:  # also NaN
+                raise ValueError(
+                    f"SGLANG_TPU_HICACHE_STATE_RATIO must be > 0, got {ratio}"
+                )
+            if memory.hicache_size:
+                logger.warning(
+                    "SGLANG_TPU_HICACHE_STATE_RATIO is ignored under --hicache-size, "
+                    "which splits host memory by device bytes."
+                )
         return tpu_dma_mamba_pool_host_cls(memory.hicache_io_backend)(
-            mamba_pool, memory.hicache_ratio, host_size
+            mamba_pool, memory.hicache_ratio if ratio is None else ratio, host_size
         )
 
 

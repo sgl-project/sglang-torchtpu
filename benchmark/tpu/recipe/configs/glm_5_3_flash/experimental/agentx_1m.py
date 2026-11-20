@@ -7,7 +7,7 @@ MTP verify on the decode megakernel up to 128k of context, the model path beyond
 Then `agentx profile --concurrency $AGENTX_CONC --public-dataset
 semianalysis_cc_traces_weka_062126 --benchmark-duration 3600 ...` against port 30000.
 
-AGENTX_KV_SHARDS=8 splits the sparse-MLA latent cache across the 8 ranks
+MLA_KV_SHARDS=8 splits the sparse-MLA latent cache across the 8 ranks
 (SGLANG_TPU_DSA_MLA_KV_SHARDS): no host tier, and decode on the model path.
 """
 
@@ -30,11 +30,14 @@ BUCKETS = [b for b in (1, 4, 8, 16, 32) if b < MAX_RUNNING] + [MAX_RUNNING]
 # 4,804 / 6,707 / 7,964 / 7,040 with this cap; every step on the kernel at 1M was slower.
 MEGAKERNEL_MAX_LEN = int(os.environ.get("AGENTX_MK_MAX_LEN", 131072))
 # Attention-TP ranks that split the sparse-MLA latent cache by page; 1 keeps it replicated.
-KV_SHARDS = int(os.environ.get("AGENTX_KV_SHARDS", 1))
+KV_SHARDS = int(os.environ.get("MLA_KV_SHARDS", 1))
 # 1M tokens = 13 GB per chip of fp8 DSA KV; two requests' worth of pool. Split eight
 # ways, 9.4M tokens plus 800 KDA checkpoint slots take about the HBM of this pool
 # plus its 144 slots (only 8 was measured).
 POOL_TOKENS = 9437184 if KV_SHARDS == 8 else 2097152
+# KDA checkpoint slots, sized for the conversations AgentX keeps cached, not the running
+# cap. 144 = the MRR 16 points; the 11-17 MRR 2 / 4 / 8 points ran 74 / 84 / 104.
+MAMBA_SLOTS = int(os.environ.get("AGENTX_MAMBA_SLOTS", 144))
 
 CONFIG = deepcopy(MTP_CONFIG)
 CONFIG["server_args"].update(
@@ -49,8 +52,11 @@ CONFIG["server_args"].update(
         "tpu_compile_bs": sorted(set(BUCKETS)),
         # One prefill program: at 1M the chunk cost is the context scan, not the padding.
         "tpu_compile_tokens": [8192],
+        "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
+        "use_spmd_compile": True,  # compile each graph on one rank, broadcast it to the rest
+        "enable_attn_tp_input_scattered": False,  # off for SPMD: scattered prefill slices rows at a per-rank offset
         "max_total_tokens": int(os.environ.get("AGENTX_POOL_TOKENS", POOL_TOKENS)),
-        "max_mamba_cache_size": 5 * MAX_RUNNING + 64,
+        "max_mamba_cache_size": MAMBA_SLOTS,
         "enable_metrics": True,
         "enable_cache_report": True,
         "scheduler_recv_interval": 8,

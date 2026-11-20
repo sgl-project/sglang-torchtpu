@@ -22,6 +22,13 @@ class TestGlmFlashMegakernelBuckets(CustomTestCase):
             for n in range(1, max_req + 1):
                 self.assertTrue(any(b >= n for b in bs), (max_req, n))
 
+    def test_buckets_follow_the_servers_batch_sizes(self):
+        """One bucket per decode batch size the server compiles, capped at max_req."""
+        self.assertEqual(ops._buckets(4, [1, 2, 3, 4]), [1, 2, 3, 4])
+        self.assertEqual(ops._buckets(4, [1, 4, 8, 16]), [1, 4])
+        self.assertEqual(ops._buckets(1, [1, 2]), [1])  # 9-row requests: one per call
+        self.assertEqual(ops._buckets(2, [1]), [1, 2])
+
 
 class TestServingGuards(CustomTestCase):
     def test_expert_parallel_is_rejected_at_startup(self):
@@ -51,7 +58,7 @@ class TestPoolBookkeeping(CustomTestCase):
         from sglang_tpu.glm_flash_megakernel import layout as PL
 
         kp = 4
-        for Q in (1, 2, 4):
+        for Q in (1, 2, 4, 8, 9):
             for pos in range(0, 40):
                 first, count = PL.closing_pools(np.int32(pos), Q, kp)
                 want = [
@@ -59,6 +66,8 @@ class TestPoolBookkeeping(CustomTestCase):
                 ]
                 got = list(range(int(first), int(first) + int(count)))
                 self.assertEqual(got, want, (Q, pos))
+                # The kernel keys at most ceil(Q / kp) closing pools per request.
+                self.assertLessEqual(int(count), -(-Q // kp))
 
 
 class TestDecodeSnapshot(CustomTestCase):

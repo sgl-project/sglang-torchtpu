@@ -351,13 +351,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         else:
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
-        self._init_attention_token_split()
         self._init_mla_kv_shards()
+        self._init_attention_token_split()
 
     def _init_attention_token_split(self) -> None:
         """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
         self._attn_split_world = 0
         if not tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get():
+            return
+        if getattr(self, "mla_shards", 1) > 1:
+            self._init_kv_shard_owned_rows()
             return
         import torch.distributed as dist
 
@@ -395,10 +398,47 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._zero_rope,
         )
 
+    def _init_kv_shard_owned_rows(self) -> None:
+        """The token split on a split latent cache: each selected row is already
+        attended by its owner alone, so prefill gathers only the owner's share
+        of each row (sparse_mla_attention_kv_shard's owned_width)."""
+        from sglang_tpu.attention.pallas.mla_sparse_fused import (
+            QBLOCK_GATHER_CHUNK_TOKENS,
+        )
+        from sglang_tpu.attention_pallas_mla_kv_shard import build_kv_shard_attention_op
+
+        # A rank's mean share of a row plus headroom (twice the share at 8 shards,
+        # share + 384 at 2); tokens holding more run more slices.
+        share = -(-self._topk // self.mla_shards)
+        width = -(-min(2 * share, share + 384) // 128) * 128
+        self._kv_shard_owned_op = build_kv_shard_attention_op(
+            zero_rope=self._zero_rope,
+            gather_chunk_tokens=QBLOCK_GATHER_CHUNK_TOKENS,
+            owned_width=width,
+        )
+        logger.info(
+            "DSA attention token split on the split latent cache: %d shards, "
+            "prefill gathers %d slots of each row per rank.",
+            self.mla_shards,
+            width,
+        )
+
+    def _kv_shard_owned_rows(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        """Whether this batch attends through the owned-rows op: the prefill
+        batches the token split would split."""
+        return (
+            getattr(self, "_kv_shard_owned_op", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and bool(self._indexer_split_rows(forward_batch, num_tokens))
+        )
+
     def _init_mla_kv_shards(self) -> None:
         """The sharded latent cache's ops and group (attention_pallas_mla_kv_shard)."""
         split = _split_pool(self.token_to_kv_pool)
         self.mla_shards, self.mla_role = split.mla_shards, split.mla_role
+        self._kv_shard_owned_op = None
         if self.mla_shards <= 1:
             return
         from sglang_tpu.attention.pallas.mla_sparse.kernel import (
@@ -898,7 +938,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             k_rope=k_rope,
         )
         if self.mla_shards > 1:
-            out = self._forward_mla_kv_shard(args, topk_indices)
+            owned = self._kv_shard_owned_rows(forward_batch, q.shape[0])
+            out = self._forward_mla_kv_shard(args, topk_indices, owned=owned)
             return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
@@ -989,18 +1030,28 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         out = oneshot_all_to_all(out.reshape(world, -1), world_size=world)
         return out.view(world * rows, heads, nope)[:num_tokens]
 
-    def _forward_mla_kv_shard(self, args: tuple, topk_indices: torch.Tensor):
+    def _forward_mla_kv_shard(
+        self, args: tuple, topk_indices: torch.Tensor, owned: bool = False
+    ):
         """Attention over a latent cache sharded across the group: gather the
-        group's queries, attend this rank's candidates, merge into own heads."""
+        group's queries, attend this rank's candidates, merge into own heads.
+        ``owned``: through the owned-rows op (_kv_shard_owned_rows)."""
         from sglang_tpu.attention_pallas_mla_kv_shard import merge_kv_shards
 
         (ql_nope, q_pe, new_kv_c, new_k_pe, cache_nope, cache_rope, kv_lens,
          page_indices, cu_q_lens, _cu_kv_lens, distribution, sm_scale, k_scale,
          _v_scale) = args  # fmt: skip
         group = self._mla_group
-        out, lse = self._kv_shard_op(
+        op = self._kv_shard_owned_op if owned else self._kv_shard_op
+        if owned and self._zero_rope:
+            # A zero rope lane stays home.
+            tokens, heads, rope = q_pe.shape
+            q_pe = q_pe.new_zeros(tokens, heads * group.world_size, rope)
+        else:
+            q_pe = group.all_gather(q_pe, dim=1).contiguous()
+        out, lse = op(
             group.all_gather(ql_nope, dim=1).contiguous(),
-            group.all_gather(q_pe, dim=1).contiguous(),
+            q_pe,
             new_kv_c,
             new_k_pe,
             cache_nope,
