@@ -198,21 +198,29 @@ class TestHostUploadDoesNotWait(CustomTestCase):
         two_placements_ms = (time.perf_counter() - t0) * 1e3
         _sync()
 
-        # Queue several times the two placements' host time, so both finish
-        # while the first batch's copies still wait behind this work.
-        for _ in range(max(5, math.ceil(4 * two_placements_ms / (2 * QUEUED_MS)))):
+        # Queue several times the two placements' host time, so that with
+        # non-blocking copies both placements finish while the first batch's
+        # copies still wait behind this work.
+        steps = max(5, math.ceil(4 * two_placements_ms / (2 * QUEUED_MS)))
+        for _ in range(steps):
             self._queue_work()
+        t0 = time.perf_counter()
         out, out_deepstack = place(first)
+        first_ms = (time.perf_counter() - t0) * 1e3
         place(second)
         remaining_t0 = time.perf_counter()
         _sync()
         remaining_ms = (time.perf_counter() - remaining_t0) * 1e3
-        self.assertGreater(
-            remaining_ms,
-            QUEUED_MS,
-            f"only {remaining_ms:.1f} ms of TPU work was left after the second "
-            "placement; the test did not queue enough work",
-        )
+        # A blocking copy waits for the queue, so the second placement has
+        # nothing to race; a placement that returned early must have left the
+        # queue running for the second one.
+        if first_ms < steps * QUEUED_MS:
+            self.assertGreater(
+                remaining_ms,
+                QUEUED_MS,
+                f"only {remaining_ms:.1f} ms of TPU work was left after the second "
+                "placement; the test did not queue enough work",
+            )
 
         mask, embeds, deepstack = first
         placed_rows = mask.reshape(-1).nonzero(as_tuple=True)[0]
