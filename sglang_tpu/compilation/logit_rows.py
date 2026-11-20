@@ -88,9 +88,9 @@ def build_logit_rows(
             end += int(length)
             rows.append(end - 1)
         packed = rows + [0] * (MAX_LOGIT_ROWS - len(rows)) + [len(rows), 0]
-    # Pinned and non-blocking, like ForwardBatch's own fields: a blocking
-    # upload waits for the running forward, so the host could no longer
-    # prepare the next one under it.
+    # Non-blocking, like ForwardBatch's own fields: a blocking upload waits
+    # for the running forward, so the host could no longer prepare the next
+    # one under it.
     return torch.tensor(
         packed, dtype=torch.int32, pin_memory=is_pin_memory_available(device)
     ).to(device, non_blocking=True)
