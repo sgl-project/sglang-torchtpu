@@ -17,6 +17,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -76,8 +78,16 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
         contains_last_prefill_chunk=True,
         return_logprob=True,
     )
-    with published_topology(
-        role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+    with (
+        published_topology(
+            role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+        ),
+        # The PP mixin fences on torch.accelerator.current_stream() (#2094).
+        mock.patch.object(
+            torch.accelerator,
+            "current_stream",
+            lambda *_: scheduler.device_module.current_stream(),
+        ),
     ):
         scheduler._pp_send_recv_and_preprocess_output_tensors(
             0, 1, [None, target], [None, None], deque(), None

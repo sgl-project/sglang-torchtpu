@@ -795,6 +795,12 @@ class TestForwardPassMetrics(unittest.TestCase):
                         "sglang.srt.managers.scheduler_pp_mixin.get_spec",
                         return_value=SimpleNamespace(speculative_num_draft_tokens=3),
                     ),
+                    # The PP mixin fences on torch.accelerator.current_stream().
+                    patch.object(
+                        torch.accelerator,
+                        "current_stream",
+                        receiver.device_module.current_stream,
+                    ),
                 ):
                     receiver._pp_launch_batch(0, batch, None, metadata, wire_queue)
                     wire = wire_queue[0][1]
@@ -828,9 +834,10 @@ class TestForwardPassMetrics(unittest.TestCase):
         scheduler._pp_result_done_event = types.MethodType(
             SchedulerPPMixin._pp_result_done_event, scheduler
         )
-        wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
-            scheduler, types.SimpleNamespace(reqs=[object()]), metadata
-        )
+        with patch.object(torch.accelerator, "current_stream", lambda *_: object()):
+            wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
+                scheduler, types.SimpleNamespace(reqs=[object()]), metadata
+            )
         self.assertIsNone(wire)
         self.assertTrue(result.skipped_output_comm)
         self.assertIs(result.fpm_timing, timing)

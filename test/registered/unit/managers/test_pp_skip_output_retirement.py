@@ -11,6 +11,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
@@ -45,9 +47,13 @@ class _Event:
 
 
 class _Device:
+    # The latest fake device; torch.accelerator.current_stream() routes to it.
+    active = None
+
     def __init__(self):
         self.current = _Stream("current")
         self.made = []
+        _Device.active = self
 
     def Event(self):
         return _Event()
@@ -67,6 +73,18 @@ class _Device:
             yield
         finally:
             self.current = outer
+
+
+def _route_accelerator_stream(testcase):
+    """The PP mixin fences on torch.accelerator.current_stream() (#2094); route
+    it to the stage's fake device so its stream switches still apply."""
+    patcher = mock.patch.object(
+        torch.accelerator,
+        "current_stream",
+        lambda *_: _Device.active.current_stream(),
+    )
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
 
 
 class _Stage(SchedulerPPMixin):
@@ -105,6 +123,9 @@ def _forward_result(unified_forward_done=None):
 
 
 class TestSkippedOutputRetirement(CustomTestCase):
+    def setUp(self):
+        _route_accelerator_stream(self)
+
     def test_completion_follows_the_local_forward(self):
         stage = _Stage()
         unified_forward_done = object()
@@ -137,6 +158,9 @@ class TestSkippedOutputRetirement(CustomTestCase):
 
 
 class TestReceivedOutputRetirement(CustomTestCase):
+    def setUp(self):
+        _route_accelerator_stream(self)
+
     def test_completion_follows_the_local_forward(self):
         stage = _Stage()
         copy_stream = _Stream("copy")
@@ -172,6 +196,9 @@ class TestReceivedOutputRetirement(CustomTestCase):
 
 
 class TestPrebuiltInnerForward(CustomTestCase):
+    def setUp(self):
+        _route_accelerator_stream(self)
+
     def test_processed_only_after_the_inner_forward_completes(self):
         """A prebuilt step whose inner idle batch ran a forward carries that
         forward's launch: its `copy_done` is synchronized before the step is
