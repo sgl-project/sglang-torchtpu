@@ -89,6 +89,10 @@ class DraftConfig:
     # through any not visited), so nothing changes but XLA's copies of the
     # ring into and out of the aliased call.
     ring_fresh: bool = False
+    # KernelConfig.ring_draft_markov_trim: skip the Markov chain's last slot,
+    # whose draft (the token after the verify's last row) no verify takes;
+    # its output lane keeps the vector's -1.
+    markov_trim: bool = False
 
     @property
     def q_width(self) -> int:
@@ -2318,7 +2322,10 @@ def _make_body(
         token_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
         rank_iota = jax.lax.broadcasted_iota(jnp.int32, (RANKS, R, 128), 0)
         previous = anchor_token  # [R]
-        for slot in range(block):
+        # DraftConfig.markov_trim: the block's last slot drafts the token after
+        # the verify's last row, which no verify reads (it takes block - 1).
+        slots = block - 1 if c.markov_trim else block
+        for slot in range(slots):
             if slot == 0:
                 bias = slot0_bias[0]
             else:
@@ -2364,7 +2371,7 @@ def _make_body(
             token = token_row[:, 1:2]  # [R, 1]
             tokens = jnp.where(token_lane == OUT_DRAFTS + slot, token, tokens)
             previous = token[:, 0]  # [R]
-            if slot + 1 < block:
+            if slot + 1 < slots:
                 start_w1(previous, (slot + 1) % 2)
         _phase_end(scope)
         tokens_v[...] = tokens

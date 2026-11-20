@@ -492,6 +492,9 @@ class KernelConfig:
     # The ring draft kernel writes the ring to a fresh output buffer instead of
     # its aliased input (DraftConfig.ring_fresh): no copies around the call.
     ring_draft_ring_fresh: bool = False
+    # The ring draft kernel stops its Markov chain one slot early: that slot's
+    # draft is never verified (DraftConfig.markov_trim).
+    ring_draft_markov_trim: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's
