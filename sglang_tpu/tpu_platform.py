@@ -882,6 +882,10 @@ def _register_models() -> None:
     # Preserve the external-model fast path without importing unused catalogs.
     ModelRegistry.register_lazy("sglang_tpu.models")
 
+    from sglang_tpu.glm import register_loading_capabilities
+
+    register_loading_capabilities()
+
 
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
@@ -1948,11 +1952,15 @@ class TpuSRTPlatform(SRTPlatform):
     @contextmanager
     def weight_loading_context(self, weights):
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.expert_loading import (
             expert_loading_context,
         )
 
-        if get_parallel().pp_size > 1:
+        if (
+            get_parallel().pp_size > 1
+            or tpu_envs.SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING.get()
+        ):
             with expert_loading_context():
                 yield _sync_weight_stream(weights)
             return

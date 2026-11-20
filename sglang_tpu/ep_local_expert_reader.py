@@ -66,9 +66,18 @@ def _log_whole_shards(reason: str) -> None:
 
 # Core model classes opted in from the plugin, so core carries no TPU-only flag.
 # Every `.experts.<id>.` checkpoint key of these loads into FusedMoE expert <id>.
-_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = frozenset(
-    {"sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"}
-)
+_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = {
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"
+}
+
+
+def register_ep_local_expert_read_model(class_path: str) -> None:
+    """Opt in an exact model class during backend initialization.
+
+    The owning model adapter must establish that checkpoint expert IDs map
+    directly to FusedMoE IDs. Subclasses are not implicitly opted in.
+    """
+    _PLUGIN_EP_LOCAL_EXPERT_READ_MODELS.add(class_path)
 
 
 def _supports_ep_local_expert_reads(model: torch.nn.Module) -> bool:

@@ -438,6 +438,52 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
                 )
                 self.assertEqual(log.call_count, 0 if label in silent else 1)
 
+    def test_glm_target_and_nextn_cover_all_routed_experts(self):
+        from sglang.srt.models.glm4_moe import (
+            GlmMoeDsaForCausalLM,
+            GlmMoeDsaForCausalLMNextN,
+        )
+        from sglang_tpu.glm import register_loading_capabilities
+
+        with (
+            patch.object(
+                ep_local_expert_reader,
+                "_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS",
+                set(ep_local_expert_reader._PLUGIN_EP_LOCAL_EXPERT_READ_MODELS),
+            ),
+            self._env(),
+        ):
+            register_loading_capabilities()
+            for cls in (GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN):
+                covered = []
+                for rank in range(16):
+                    model = cls.__new__(cls)
+                    torch.nn.Module.__init__(model)
+                    layer = _fused_moe(16, rank, 16, 256)
+                    model.layers = torch.nn.ModuleList([layer])
+                    start, end = ep_local_expert_reader.tpu_local_routed_expert_range(
+                        model
+                    )
+                    covered.extend(range(start, end))
+                    for eid in range(256):
+                        stored = FusedMoE._map_global_expert_id_to_local_expert_id(
+                            layer, eid
+                        )
+                        for layer_id in (0, 77, 78):
+                            key = f"model.layers.{layer_id}.mlp.experts.{eid}.gate_proj.weight_scale_inv"
+                            kept = (
+                                ep_local_expert_reader.local_expert_id(
+                                    key, (start, end)
+                                )
+                                != -1
+                            )
+                            self.assertEqual(kept, stored != -1)
+                    layer._has_fused_shared = True
+                    self.assertIsNone(
+                        ep_local_expert_reader.tpu_local_routed_expert_range(model)
+                    )
+                self.assertEqual(covered, list(range(256)))
+
     def test_kill_switch(self):
         with (
             self._env(),
