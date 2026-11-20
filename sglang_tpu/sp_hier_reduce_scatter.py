@@ -17,8 +17,6 @@ reduce-scatter on the same input and falls back if they disagree (e.g. a device
 order whose chips are not paired as [2k, 2k + 1]).
 """
 
-from __future__ import annotations
-
 import logging
 
 import torch
@@ -80,7 +78,8 @@ def _build_op():
     mesh = get_pallas_mesh(("model",), (NUM_DEVICES,))
     spec = P("model", None)
 
-    # torch_tpu reads the operand types from these annotations.
+    # torch_tpu reads the operand types from these annotations, so this module
+    # must not use `from __future__ import annotations` (it would make them strings).
     def _wrapped(x: jax.Array) -> jax.Array:
         return jax.shard_map(
             lambda local_x: reduce_scatter_stream_local(local_x, axis_name="model"),
