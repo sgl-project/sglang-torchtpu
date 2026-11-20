@@ -339,7 +339,7 @@ def prefill_wait_defers(scheduler: Any, rounds: int) -> bool:
 
 def k3_program_prefill_wait(original, scheduler: Any, *args, **kwargs) -> bool:
     """AROUND Scheduler._should_defer_prefill."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang_tpu.envs import envs as tpu_envs
 
     rounds = tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS.get()

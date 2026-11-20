@@ -268,7 +268,7 @@ class K3Strategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ) -> StackBuildResult:
-        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+        from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
         from sglang.srt.runtime_context import get_memory
         from sglang_tpu.envs import envs as tpu_envs
 
@@ -288,7 +288,8 @@ class K3Strategy(StackStrategy):
         )
         blocks = pages + KDA_PER_POOL * slots
         requested = blocks * view.block_bytes
-        if requested > host_memory_budget_bytes(requested):
+        _, available = host_memory_preflight([requested])
+        if requested > available:
             raise ValueError(
                 f"K3 host tier: {requested / 1e9:.1f} GB of host blocks exceed this "
                 "rank's host memory budget"
@@ -360,10 +361,8 @@ class K3Strategy(StackStrategy):
                 ComponentType.FULL: kv_host,
                 ComponentType.MAMBA: state_host,
             },
-            register_req_to_token_counter=True,
+            loads_state_layer_wise=True,
             pools_desc="K3 KV + KDA checkpoints",
-            # Both pools above; HybridLinearKVPool's declarations name sglang's.
-            pool_declarations=(),
         )
 
 

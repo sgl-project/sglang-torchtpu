@@ -192,7 +192,7 @@ class TestPrefixCache(CustomTestCase):
         self.assertEqual(self._value(3), 0.0)
 
     def test_prefill_hit_and_track(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_tpu.k3_programs import sglang_worker as worker
         from sglang_tpu.k3_programs.program import StepOutput
 
@@ -395,7 +395,7 @@ class TestSpecCheckHook(CustomTestCase):
 
 class TestDecodeTreeHook(CustomTestCase):
     def test_stateless_component_on_the_decode_only(self):
-        from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+        from sglang.srt.mem_cache.kv.plan import TREE_STATE
         from sglang_tpu.k3_programs.sglang_decode_cache import K3DecodeStateComponent
 
         def build(mode, radix=True, active=True):
@@ -414,9 +414,7 @@ class TestDecodeTreeHook(CustomTestCase):
                 ),
             ):
                 hooks.k3_program_decode_tree(lambda c: c, ctx)
-            return (ctx.params.component_registry_override or {}).get(
-                ComponentType.MAMBA
-            )
+            return (ctx.params.component_registry_override or {}).get(TREE_STATE)
 
         self.assertIs(build("decode"), K3DecodeStateComponent)
         self.assertIsNone(build("prefill"))

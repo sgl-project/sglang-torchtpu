@@ -37,7 +37,6 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.utils.common import async_d2h
 
 
 def accept_counts(rows: np.ndarray) -> np.ndarray:
@@ -142,6 +141,7 @@ class HostRowsResult(GenerationBatchResult):
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         if return_logprob or self.logits_output is not None:
             raise NotImplementedError("K3_PROGRAM results carry tokens only")
-        # As sglang's copy, the result keeps the host copy only.
-        self._host_rows = async_d2h(self.__dict__.pop("_device_rows"))
+        # As sglang's copy, the result keeps the host copy only: enqueued on
+        # the copy stream, its readers wait on copy_done.
+        self._host_rows = self.__dict__.pop("_device_rows").to("cpu", non_blocking=True)
         self.copy_done.record()

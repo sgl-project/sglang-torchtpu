@@ -14,8 +14,9 @@ from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host.base import HostMemoryPreflight
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import tpu_dma_hybrid_cache_controller as tpu_controller
@@ -166,9 +167,7 @@ class TestStrategyAndController(CustomTestCase):
         )
         other = HybridLinearKVPool.__new__(HybridLinearKVPool)
         other.full_kv_pool = object()
-        self.assertNotIsInstance(
-            assembler._select_strategy(other, components), hicache.K3Strategy
-        )
+        self.assertFalse(hicache.K3Strategy().matches(other, components))
 
     def test_controller_offloads_checkpoints(self):
         tpu_controller._check_kv_page_pool(
@@ -206,8 +205,10 @@ class TestStrategyAndController(CustomTestCase):
         with (
             mock.patch("sglang.srt.runtime_context.get_memory", return_value=memory),
             mock.patch(
-                "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-                side_effect=lambda requested: requested,
+                "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+                side_effect=lambda lengths: HostMemoryPreflight(
+                    sum(lengths), sum(lengths)
+                ),
             ),
             tpu_envs.SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS.override(3),
         ):

@@ -109,8 +109,13 @@ class K3StatePool:
     dsa = False
 
     slot_allocator_device = "cpu"
-    # HybridReqToTokenPool resets GDN ReplaySSM rings on fresh slots; KDA has none.
+    # HybridReqToTokenPool resets GDN ReplaySSM rings on fresh slots, and
+    # StateStorage.reset_request_rows the speculative ReplaySSM cursors of new
+    # rows; KDA has neither.
     replayssm_write_pos = None
+    replayssm_spec_write_pos = None
+    replayssm_cache_base = None
+    replayssm_is_flush = None
 
     def __init__(
         self, *, size: int, mamba_layer_ids, device: str, **kwargs: Any

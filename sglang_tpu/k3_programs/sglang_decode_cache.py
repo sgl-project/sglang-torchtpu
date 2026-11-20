@@ -20,8 +20,10 @@ to the pool.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Optional
 
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
@@ -33,6 +35,7 @@ class K3DecodeStateComponent(TreeComponent):
     """The decode tree's Mamba component: no states (see the module docstring)."""
 
     component_type = ComponentType.MAMBA
+    family = TREE_STATE
 
     def create_match_validator(self, match_device_only: bool = False):
         return lambda node: True
@@ -47,18 +50,24 @@ class K3DecodeStateComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target=EvictLayer.DEVICE
+        self, node, device_frees, host_frees, cache_actions, target=EvictLayer.DEVICE
     ) -> tuple[int, int]:
         return 0, 0
 
     def _evict_device_start(self, request_cnt: int) -> None:
         return None
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:
         return None
+
+    def _mamba_host_only_checkpoint(self) -> bool:
+        return False
+
+    def lease_checkpoint_state_slots(self, reqs):
+        return nullcontext()  # a checkpoint takes no state slot
 
     def acquire_component_lock(self, node, result, lock_host: bool = False):
         return result
@@ -88,12 +97,16 @@ class K3DecodeStateComponent(TreeComponent):
         insert_params: Any = None,
     ) -> None:
         if is_finished and req.kv.mamba_pool_idx is not None:
-            self.cache.req_to_token_pool.free_mamba_cache(req)
+            storage = self.cache.kv_storage()
+            sub_pool = storage.tree_sub_pool(
+                self.component_type.name, family=self.family
+            )
+            storage.release_state(sub_pool, req)
 
 
 def install(params: Any) -> None:
     """Make a unified tree built from ``params`` use the stateless component."""
     params.component_registry_override = {
         **(getattr(params, "component_registry_override", None) or {}),
-        ComponentType.MAMBA: K3DecodeStateComponent,
+        TREE_STATE: K3DecodeStateComponent,
     }

@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -46,6 +46,11 @@ class StubProgram:
         return StepOutput(rows)
 
 
+class _Kv(SimpleNamespace):
+    def commit_decode(self, num_tokens: int) -> None:  # as a request's KV state
+        self.kv_committed_len += num_tokens
+
+
 def _req(rid, prompt, output, committed, pool_idx, slot):
     return SimpleNamespace(
         rid=rid,
@@ -60,7 +65,7 @@ def _req(rid, prompt, output, committed, pool_idx, slot):
         sampling_params=SimpleNamespace(
             temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
         ),
-        kv=SimpleNamespace(
+        kv=_Kv(
             kv_committed_len=committed,
             req_pool_idx=pool_idx,
             mamba_pool_idx=torch.tensor([slot]),
@@ -324,7 +329,7 @@ class TestPrefillWait(CustomTestCase):
     number of scheduler rounds (the same on every TP rank)."""
 
     def _scheduler(self, decoding, waiting, chunked=False, mode=None):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
 
         running = SimpleNamespace(is_empty=lambda: not decoding, is_prefill_only=False)
         return SimpleNamespace(
@@ -351,7 +356,7 @@ class TestPrefillWait(CustomTestCase):
         )
 
     def test_hook_falls_back_to_the_interval(self):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang_tpu.hooks import k3_program as hooks
 
         original = mock.Mock(return_value=False)
@@ -569,6 +574,8 @@ class TestRegisteredAlgorithm(CustomTestCase):
             speculative_adaptive=False,
             kv_cache_dtype="auto",
             disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=False,
+            speculative_use_block_verification=False,
         )
         handle_speculative_decoding(server_args)
         self.assertEqual(
@@ -616,10 +623,12 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsInstance(result.next_draft_input, worker.K3ProgramInput)
         # sglang's output processor reads it as each request's accepted run.
         processor = SimpleNamespace(
-            model_worker=w, advance_grammar_fsm=lambda result, batch: None
+            model_worker=w,
+            advance_grammar_fsm=lambda result, batch: None,
+            metrics_reporter=mock.Mock(),
         )
         runs = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-            processor, result, batch
+            processor, result, batch, [True] * len(batch.reqs)
         )
         self.assertEqual(runs, [[0, 1, 2], [100]])
         self.assertEqual([r.kv.kv_committed_len for r in batch.reqs], [13, 21])

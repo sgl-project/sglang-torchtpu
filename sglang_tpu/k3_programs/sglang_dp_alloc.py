@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
     alloc_extend_vectorized_cpu,
@@ -25,7 +25,7 @@ from sglang_tpu.k3_programs import sglang_dp as dp
 _ACTIVE: list = []
 
 
-def active() -> "K3DpPagedAllocator | None":
+def active() -> K3DpPagedAllocator | None:
     """The process's DP2 allocator (the decode's), once built."""
     return _ACTIVE[-1] if _ACTIVE else None
 

@@ -26,7 +26,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -219,6 +219,9 @@ class _Sampling:
     def filter_batch(self, *args):
         pass
 
+    def refresh_top_k_flags(self, top_ks):
+        pass
+
     def merge_batch(self, other):
         pass
 
@@ -247,14 +250,17 @@ def _processor(model_worker, recorder: Recorder) -> SchedulerBatchResultProcesso
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=True,
-        enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None, is_encoder_decoder=False),
+        model_config=SimpleNamespace(
+            think_end_ids=None,
+            self_opened_think_start_ids=None,
+            is_encoder_decoder=False,
+        ),
         token_to_kv_pool_allocator=mock.MagicMock(),
         tree_cache=None,
         hisparse_coordinator=None,
         beam_coordinator=mock.MagicMock(),
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=mock.MagicMock(),
@@ -262,7 +268,11 @@ def _processor(model_worker, recorder: Recorder) -> SchedulerBatchResultProcesso
         model_worker=model_worker,
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(stream_output=recorder.stream),
+        request_retirer=mock.MagicMock(),
         abort_request=lambda *args, **kwargs: None,
+        # Under overlap a finished row reappears for one more step.
+        still_in_batch=lambda req: not (req.finished() or req.is_retracted),
+        prefill_launched_reqs=[],
     )
 
 
@@ -357,8 +367,11 @@ class OverlapRun:
         s.tpu_async_copy_worker = None
         s.spec_algorithm = self.algo
         s.beam_coordinator = mock.Mock()
-        s.chunked_req = None
+        s.chunked_reqs = []
         s.attn_dp_enabled = False
+        s.invariant_checker = mock.Mock()
+        s.enable_async_d2h_copy = False
+        s.enable_unified_cache_external_linker = False
         return s
 
     def _batch(self, reqs, mode) -> ScheduleBatch:
