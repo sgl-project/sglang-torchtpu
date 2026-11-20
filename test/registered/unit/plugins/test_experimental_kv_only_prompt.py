@@ -16,7 +16,7 @@ from torch import nn
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_nextn import (
     DeepseekModelNextN,
     DeepseekV3ForCausalLMNextN,
