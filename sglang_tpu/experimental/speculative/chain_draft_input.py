@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -24,12 +24,15 @@ class ChainDraftForwardInput(DFlashVerifyInput):
         when the draft does not share its indexer top-k.
       dsa_seed_topk_select: [rows] int64 forward rows the capture keeps, or None
         to keep the first rows.
+      kv_only: the draft prompt's pass 1, which only stores the draft KV
+        (kv_only_prompt.py); static, so it compiles its own program.
     """
 
     hidden_states: torch.Tensor | None = None
     rpa_draft_kv_lens: torch.Tensor | None = None
     dsa_seed_topk_capture: torch.Tensor | None = None
     dsa_seed_topk_select: torch.Tensor | None = None
+    kv_only: bool = field(default=False, metadata={"static": True})
 
 
 @functools.cache
@@ -51,6 +54,7 @@ def chain_draft_forward_input(
     width: int,
     dsa_seed_topk_capture: torch.Tensor | None = None,
     dsa_seed_topk_select: torch.Tensor | None = None,
+    kv_only: bool = False,
 ) -> ChainDraftForwardInput:
     device = hidden_states.device
     return ChainDraftForwardInput(
@@ -61,6 +65,7 @@ def chain_draft_forward_input(
         hidden_states=hidden_states,
         dsa_seed_topk_capture=dsa_seed_topk_capture,
         dsa_seed_topk_select=dsa_seed_topk_select,
+        kv_only=kv_only,
     )
 
 

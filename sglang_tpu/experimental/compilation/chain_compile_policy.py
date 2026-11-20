@@ -46,6 +46,7 @@ from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.chain_draft_input import (
+    ChainDraftForwardInput,
     chain_draft_forward_input,
     dsa_seed_topk_buffer,
     register_chain_draft_pytree,
@@ -66,6 +67,12 @@ def _publishes_dsa_topk(forward_batch: ForwardBatch | None) -> bool:
     )
 
 
+def _runs_kv_only(forward_batch: ForwardBatch) -> bool:
+    """Whether this draft forward is the KV-only pass 1 of a two-pass prompt pass."""
+    spec_info = forward_batch.spec_info
+    return isinstance(spec_info, ChainDraftForwardInput) and spec_info.kv_only
+
+
 class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     """The draft warms its chain forwards per batch bucket.
 
@@ -82,10 +89,14 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         self._eager_backbone_forward: Callable[..., Any] | None = None
         self._eager_model_forward: Callable[..., Any] | None = None
         self._eager_logits_forward: Callable[..., Any] | None = None
+        # The drafter's KV-only pass 1 (set_kv_only_backbone), if it takes two passes.
+        self._kv_only_backbone: Callable[..., Any] | None = None
 
     def install(self) -> bool:
         """Keep the draft's eager forwards; the draft programs trace them inline."""
         if self.is_draft_worker and self.owner is not None:
+            # Before either tracer compiles it, so pass 1 gets its own program.
+            self.owner.model.forward = self._dispatch_kv_only(self.owner.model.forward)
             self._eager_backbone_forward = self.owner.model.forward
             self._eager_model_forward = self.owner.forward
             self._eager_logits_forward = self.owner.logits_processor.forward
@@ -96,6 +107,29 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             assert self.compiled_forward_shim is not None
             self.compiled_forward_shim.fn = self._direct_compile_draft_forward()
         return installed
+
+    def set_kv_only_backbone(self, backbone: Callable[..., Any]) -> None:
+        """Route a KV-only draft prompt forward (spec_info.kv_only) to backbone,
+        which takes and returns what the draft model's backbone does."""
+        self._kv_only_backbone = backbone
+
+    def _dispatch_kv_only(self, backbone: Callable[..., Any]) -> Callable[..., Any]:
+        """backbone, or the drafter's KV-only backbone for a pass-1 forward.
+
+        kv_only is static on the forward input: the direct tracer keys its
+        programs on it and Dynamo guards on it, so each pass compiles its own.
+        """
+
+        @functools.wraps(backbone)
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            if _runs_kv_only(forward_batch):
+                assert self._kv_only_backbone is not None, "no KV-only backbone set"
+                return self._kv_only_backbone(
+                    input_ids, positions, forward_batch, *args, **kwargs
+                )
+            return backbone(input_ids, positions, forward_batch, *args, **kwargs)
+
+        return forward
 
     @property
     def _model_is_mrope(self) -> bool:
@@ -248,6 +282,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             ),
             kwargs.get("input_embeds") is not None,
             _publishes_dsa_topk(forward_batch),
+            _runs_kv_only(forward_batch),
         )
 
     def compile_fused_draft(
@@ -330,12 +365,14 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         target_feature_size: int,
         dsa_seed_topk_width: int | None,
         fused_draft_warmup: Callable[[int, bool], None],
+        kv_only_prompt_tokens: frozenset[int] = frozenset(),
     ) -> None:
         """Compile the fused draft, commit's draft rows and the draft prompt extend.
 
         A draft sharing its DSA top-k (dsa_seed_topk_width set) warms the draft
         rows publishing their top-k and the prompt extend with its top-k capture,
-        as commit and extend run them.
+        as commit and extend run them. ``kv_only_prompt_tokens`` are the token
+        buckets whose KV-only pass 1 is warmed too.
         """
         if not self.is_draft_worker:
             raise ValueError("precompile_draft runs on the draft runner only.")
@@ -354,6 +391,10 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             self._precompile_draft_prompt_extend(
                 target_feature_size, dsa_seed_topk_width=dsa_seed_topk_width
             )
+            if kv_only_prompt_tokens:
+                self._precompile_kv_only_prompt(
+                    target_feature_size, kv_only_prompt_tokens
+                )
         logger.info(
             "[spec compile policy] %s DRAFT precompile done in %.1fs.",
             self.algo_label,
@@ -471,6 +512,54 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             return f"tokens={num_tokens}, bs={bs}, variant={variant}"
 
         self._precompile_shapes(f"{self.algo_label} DRAFT EXTEND(LAST)", shapes, run)
+
+    def kv_only_last_row_tokens(self) -> int:
+        """Token bucket of pass 2: one row per request, padded as any extend is."""
+        assert self.t_bucketer is not None
+        return self.t_bucketer.next_bucket(self._extend_compile_cap())
+
+    def _precompile_kv_only_prompt(
+        self, target_feature_size: int, tokens: frozenset[int]
+    ) -> None:
+        """Pass 1 of the two-pass draft prompt pass, per token bucket it takes.
+
+        Pass 2 is the draft prompt extend at the bucket of the extend cap, which
+        _precompile_draft_prompt_extend already warms.
+        """
+        bs = self._extend_compile_cap()
+        variants = (
+            ("plain", "input_embeds") if self._target_is_multimodal else ("plain",)
+        )
+        shapes = [
+            (num_tokens, variant)
+            for num_tokens in sorted(tokens)
+            for variant in variants
+        ]
+        logger.info(
+            "[spec compile policy] %s DRAFT KV-ONLY PROMPT: %d shapes (bs=%d, tokens=%s)",
+            self.algo_label,
+            len(shapes),
+            bs,
+            sorted({num_tokens for num_tokens, _ in shapes}),
+        )
+
+        def run(shape: tuple[int, str]) -> str:
+            num_tokens, variant = shape
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.EXTEND,
+                variant=variant,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=chain_draft_forward_input(
+                    hidden_states=self._dummy_hidden(num_tokens, target_feature_size),
+                    width=1,
+                    kv_only=True,
+                ),
+            )
+            return f"tokens={num_tokens}, bs={bs}, variant={variant}"
+
+        self._precompile_shapes(f"{self.algo_label} DRAFT KV-ONLY PROMPT", shapes, run)
 
     def _make_warmup_inputs(
         self,
