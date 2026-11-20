@@ -63,18 +63,27 @@ def profile_points(
     max_tokens: int,
     max_model_len: int,
     schedule: tuple[int, int, int] | None = None,
+    min_prefix: int = 0,
 ) -> list[tuple[int, int]]:
     """(tokens, prefix) pairs to time as one request: every bucket without a
     prefix, and the larger buckets behind one and two steps of prefix,
-    staying a step short of the model length. A prefixed point whose
-    attention pairs exceed the ``schedule`` capacity is left out, since the
-    kernel cannot run it."""
+    staying a step short of the model length. When ``min_prefix`` exceeds
+    ``max_tokens`` (e.g. a hybrid-SWA sliding window), the prefix pair starts
+    at ``ceil(min_prefix / max_tokens) * max_tokens`` so the fitted slope
+    measures only the unbounded full-attention growth past the window. A
+    prefixed point whose attention pairs exceed the ``schedule`` capacity is
+    left out, since the kernel cannot run it."""
+    base_prefix = max_tokens
+    if min_prefix > max_tokens:
+        shifted = -(-min_prefix // max_tokens) * max_tokens
+        if shifted + 2 * max_tokens <= max_model_len:
+            base_prefix = shifted
     points = []
     for bucket in buckets:
         points.append((bucket, 0))
         if bucket * _PREFIX_PROFILE_MIN_DIVISOR < max_tokens:
             continue
-        for prefix in (max_tokens, 2 * max_tokens):
+        for prefix in (base_prefix, base_prefix + max_tokens):
             prefix = min(prefix, max_model_len - max_tokens - bucket)
             if prefix <= 0 or (bucket, prefix) in points:
                 continue
