@@ -75,10 +75,11 @@ def _inputs(
     kv_heads=None,
     q_gain=1.0,
     negative_scores=False,
+    head_dim=128,
 ):
     gen = torch.Generator().manual_seed(q_seq * 7919 + kv_seq)
-    shape_q = (batch, heads, q_seq, 128)
-    shape_kv = (batch, kv_heads or heads, kv_seq, 128)
+    shape_q = (batch, heads, q_seq, head_dim)
+    shape_kv = (batch, kv_heads or heads, kv_seq, head_dim)
     q = torch.randn(shape_q, generator=gen) * q_gain
     k = torch.randn(shape_kv, generator=gen)
     v = torch.randn(shape_kv, generator=gen)
@@ -212,6 +213,10 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_custom_single_kv_block(self):
         # One KV block: the first, last and only grid step coincide.
         self._check(1, 2, 2048, 2048, expect="flash")
+
+    def test_custom_head_dim_256(self):
+        # Ideogram 4's heads: 4608 = 2 * 2048 + 512.
+        self._check(1, 3, 4608, 4608, expect="flash", head_dim=256, scale=256**-0.5)
 
     def test_custom_softmax_scale(self):
         # A scale other than head_dim ** -0.5, which equals the default.
@@ -390,12 +395,17 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
 
     def test_ring_step_skips_keys_past_the_real_count(self):
         # Keys past the real count are sequence-parallel padding; NaN there
-        # proves they never contribute.
+        # proves they never contribute. Head dim 256 is Ideogram 4's.
         tsa = self._kernels()
-        scale = 128**-0.5
-        for q_seq, kv_seq, real in ((4608, 4624, 4600), (2048, 8192, 6150)):
-            with self.subTest(kv_seq=kv_seq, real=real), _ring_spy(tsa) as ring:
-                q, k, v = _inputs(1, 2, q_seq, kv_seq)
+        for head_dim, q_seq, kv_seq, real in (
+            (128, 4608, 4624, 4600),
+            (128, 2048, 8192, 6150),
+            (256, 4608, 4608, 4130),
+        ):
+            scale = head_dim**-0.5
+            case = dict(head_dim=head_dim, kv_seq=kv_seq, real=real)
+            with self.subTest(**case), _ring_spy(tsa) as ring:
+                q, k, v = _inputs(1, 2, q_seq, kv_seq, head_dim=head_dim)
                 k[:, :, real:], v[:, :, real:] = float("nan"), float("nan")
                 want = _reference(q, k[:, :, :real], v[:, :, :real], scale, False)
                 out, carry = tsa.tpu_ring_attention_step(
@@ -416,23 +426,27 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         # Two key halves, the second step resuming the first, equal attention
         # over all keys.
         tsa = self._kernels()
-        scale = 128**-0.5
-        q, k, v = _inputs(1, 2, 4608, 2 * 4600)
-        want = _reference(q, k, v, scale, False)
-        qt = q.to("tpu")
-        halves = [(t[:, :, :4600].to("tpu"), t[:, :, 4600:].to("tpu")) for t in (k, v)]
-        with _ring_spy(tsa) as ring:
-            _, carry = tsa.tpu_ring_attention_step(
-                qt, halves[0][0], halves[1][0], _kv_info(0, 4600), None, scale
-            )
-            out, _ = tsa.tpu_ring_attention_step(
-                qt, halves[0][1], halves[1][1], _kv_info(0, 4600), carry, scale
-            )
-        self.assertEqual(ring.call_count, 2)
-        # The partial output is carried in float32; only the result is bf16.
-        self.assertEqual(carry[0].dtype, torch.float32)
-        self.assertEqual(out.dtype, torch.bfloat16)
-        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+        for head_dim in (128, 256):
+            scale = head_dim**-0.5
+            q, k, v = _inputs(1, 2, 4608, 2 * 4600, head_dim=head_dim)
+            want = _reference(q, k, v, scale, False)
+            qt = q.to("tpu")
+            halves = [
+                (t[:, :, :4600].to("tpu"), t[:, :, 4600:].to("tpu")) for t in (k, v)
+            ]
+            with self.subTest(head_dim=head_dim), _ring_spy(tsa) as ring:
+                _, carry = tsa.tpu_ring_attention_step(
+                    qt, halves[0][0], halves[1][0], _kv_info(0, 4600), None, scale
+                )
+                out, _ = tsa.tpu_ring_attention_step(
+                    qt, halves[0][1], halves[1][1], _kv_info(0, 4600), carry, scale
+                )
+                self.assertEqual(ring.call_count, 2)
+                # The partial output is carried in float32; only the result is bf16.
+                self.assertEqual(carry[0].dtype, torch.float32)
+                self.assertEqual(out.dtype, torch.bfloat16)
+                error = (out.to("cpu").float() - want).abs().max().item()
+                self.assertLess(error, 2e-2)
 
     def test_ring_step_picks_shard_and_key_count_at_run_time(self):
         # Stacked shards with batch 2 and GQA: the row offset and real-key
@@ -874,6 +888,15 @@ class TestTpuSplashDispatch(CustomTestCase):
             )
             self.assertEqual(
                 reason((1, 4, 4608, 64), (1, 4, 4608, 64)), "head_dim=64/64"
+            )
+            # head_dim 256: the flash kernel only.
+            self.assertIsNone(reason((1, 4, 4608, 256), (1, 4, 4608, 256)))
+            self.assertEqual(
+                reason((1, 4, 4608, 256), (1, 4, 4608, 256), is_causal=True),
+                "head_dim=256/256",
+            )
+            self.assertEqual(
+                reason((1, 4, 200, 256), (1, 4, 700, 256)), "head_dim=256/256"
             )
             self.assertEqual(reason((1, 3, 4608, 128), (1, 2, 4608, 128)), "heads=3/2")
             self.assertEqual(

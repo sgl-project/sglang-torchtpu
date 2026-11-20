@@ -19,6 +19,7 @@ scale applied to the float32 scores inside an exp2 softmax.
 import functools
 import math
 import threading
+from collections.abc import Collection
 
 import numpy as np
 import torch
@@ -796,14 +797,21 @@ def _sdpa_fallback_reason(
         return "short"
     if is_causal and q_seq != kv_seq:
         return "ragged causal"
-    return _kernel_input_fallback_reason(query, key, value)
+    # The flash kernel (non-causal, 512+ keys) is validated at head_dim 128
+    # and 256 (Ideogram 4); make_splash_mha at 128.
+    supported = {128, 256} if _use_custom_kernel(q_seq, kv_seq, is_causal) else {128}
+    return _kernel_input_fallback_reason(query, key, value, supported)
 
 
 def _kernel_input_fallback_reason(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    supported_head_dims: Collection[int] = (128,),
 ) -> str | None:
     """Why the kernels cannot take these ``[B, H, S, D]`` inputs, else None."""
-    if query.shape[-1] != 128 or key.shape[-1] != 128 or value.shape[-1] != 128:
+    head_dims = {query.shape[-1], key.shape[-1], value.shape[-1]}
+    if len(head_dims) != 1 or not head_dims <= set(supported_head_dims):
         return f"head_dim={query.shape[-1]}/{value.shape[-1]}"
     if query.shape[1] % key.shape[1] != 0:
         return f"heads={query.shape[1]}/{key.shape[1]}"
