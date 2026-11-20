@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -373,7 +372,6 @@ class TestSWAHostPartition(CustomTestCase):
             host_lru_lists={SWA: host_lru},
             lru_lists={SWA: UnifiedLRUList(SWA, (FULL, SWA), is_referenced=is_ref)},
             enable_session_radix_cache=True,
-            swa_host_evict_passed_first=False,
             evictable_host_leaves=set(),
             _evict_component_and_detach_lru=evict,
             _cascade_evict=lambda *args, **kwargs: None,
@@ -406,12 +404,6 @@ class TestSWAHostPartition(CustomTestCase):
         comp._refresh_session_partition(nodes[0])
         self.assertEqual(self.drive(comp, 2 * WINDOW), 2 * WINDOW)
         self.assertEqual(evicted, [nodes[1], nodes[2]])
-
-    def test_passed_first_is_off_with_session_radix_cache(self):
-        with envs.SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST.override(True):
-            cache = make_cache()
-        self.assertFalse(cache.tree_core.swa_host_evict_passed_first)
-
 
 if __name__ == "__main__":
     unittest.main()
