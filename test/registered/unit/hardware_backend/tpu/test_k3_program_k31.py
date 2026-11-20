@@ -171,61 +171,98 @@ class TestTokenParallelLatentUp(CustomTestCase):
     routed send: every rank's routed host sums (its rank pair's tokens) and
     owned output rows. A quarter of the partials spread over 2^+-12 and some
     carry cancelling large terms, so the lane and host sums round in FP32 and
-    a change of their order shows."""
+    a change of their order shows. With ``odd_host_round``
+    (``KernelConfig.moe_host_round_odd_cores``: only the core-1 ranks send the
+    routed host round, to both cores of their chip on each other host) every
+    case gives the same bits; so do three tails back to back on fresh partials
+    (eager DMAs, the ranks of one core lagging before the host round), each
+    tail's core-1 copies landing in host slots the previous tail's readers
+    were done with."""
 
-    MAIN = r"""
+    # The tail kernel and the lane-block model (after TestAttentionHostBf16's
+    # PRELUDE).
+    DEFS = r"""
 from sglang_tpu.k3_programs.kimi_k3.kernels import load
 
 F32, EPS = jnp.float32, 1e-5
 bfv = lambda x: x.astype(jnp.bfloat16).astype(F32)
+LAG = int(os.environ.get("LAG", "100"))  # loop trips a pair index
 
 
-def tail(B, E, Sh, norm, blocks, late, races):
-    T = B // 4
+def tail(B, E, Sh, norm, blocks, late, races, odd=False, lag_core=None):
+    # E [32, n, B, 4096] and Sh [32, n, B, H]: n tails back to back, each on
+    # fresh partials. Before the next tail each rank waits until its seven
+    # local peers have read their local rounds' slots (the decoder's attention
+    # rounds between two MoE tails order more). With ``lag_core`` the ranks of
+    # that core spin (p + 1) * LAG loop trips (pair p) before the host round.
+    T, n = B // 4, E.shape[1]
 
     def kernel(e_ref, sh_ref, norm_ref, up_hbm, out_ref, tokens_out, sl, el, shh, eh,
-               ssend, srecv, send, recv, outv, osend, orecv, routed, up_vmem, up_sem):
+               ssend, srecv, send, recv, outv, osend, orecv, routed, up_vmem, up_sem,
+               shared, owned, spin, consumed):
         rank = jax.lax.axis_index("tp")
         for ref in (sl, el, shh, eh):
             ref[...] = jnp.full(ref.shape, jnp.nan, ref.dtype)
         outv[...] = jnp.full(outv.shape, jnp.nan, outv.dtype)
+        spin[...] = jnp.zeros(spin.shape, F32)
         barrier = pltpu.get_barrier_semaphore()
         for peer in range(1, 32):
             pl.semaphore_signal(barrier, 1, device_id=(rank ^ peer,),
                                 device_id_type=pl.DeviceIdType.MESH)
         pl.semaphore_wait(barrier, 31)
         tp = dmk._TokenParallelUp(B, HALF, rank, sl, shh, el, eh, ssend, srecv, send,
-                                  recv, outv, osend, orecv)
-        copy = pltpu.make_async_copy(up_hbm, up_vmem, up_sem)
-        copy.start()
-        routed[...] = e_ref[...]
-        if not late:
-            tp.begin_shared(sh_ref)
-        tp.routed_send(routed[...])
-        if late:
-            tp.begin_shared(sh_ref)
-        else:
-            tp.finish_shared_local()
-        tp.routed_local_reduce()
-        tp.start_routed_host()
-        if late:
-            tp.finish_shared_local()
-        tp.routed_host_reduce(routed)
-        tokens_out[...] = routed[:T, :HALF]
-        up = tp.project(routed, norm_ref, up_vmem, copy, epsilon=EPS, latent_feature_count=HALF)
-        tp.finish_shared_host(routed)
-        tp.send_outputs(up, routed, out_ref)
+                                  recv, outv, osend, orecv, odd_host_round=odd)
+
+        def lag(i, carry):
+            spin[...] = spin[...] + 1.0
+            return carry
+
+        for i in range(n):
+            if i:
+                pl.semaphore_wait(consumed, 7)
+            copy = pltpu.make_async_copy(up_hbm, up_vmem, up_sem)
+            copy.start()
+            routed[...] = e_ref[i]
+            shared[...] = sh_ref[i]
+            if not late:
+                tp.begin_shared(shared)
+            tp.routed_send(routed[...])
+            if late:
+                tp.begin_shared(shared)
+            else:
+                tp.finish_shared_local()
+            tp.routed_local_reduce()
+            if lag_core is not None:
+                trips = jnp.where(rank % 2 == lag_core, (rank % 8) // 2 + 1, 0) * LAG
+                jax.lax.fori_loop(0, trips, lag, 0)
+            tp.start_routed_host()
+            if late:
+                tp.finish_shared_local()
+            tp.routed_host_reduce(routed)
+            if i + 1 < n:  # this rank is done with its local rounds' slots
+                for offset in range(1, 8):
+                    pl.semaphore_signal(consumed, 1, device_id=(rank ^ offset,),
+                                        device_id_type=pl.DeviceIdType.MESH)
+            tokens_out[i] = routed[:T, :HALF]
+            up = tp.project(routed, norm_ref, up_vmem, copy, epsilon=EPS,
+                            latent_feature_count=HALF)
+            tp.finish_routed_host_sends()
+            tp.finish_shared_host(routed)
+            tp.send_outputs(up, routed, owned)
+            out_ref[i] = owned[...]
 
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
     scratch = [*dmk.communication_scratch(B)[:4], dma((10,)), dma((10,)), dma((16,)),
                dma((16,)), vmem((12, T * 8, 128), jnp.bfloat16), dma((7,)), dma((7,)),
-               vmem((B, 4096), F32), vmem((HALF, 1024), jnp.bfloat16), dma(())]
+               vmem((B, 4096), F32), vmem((HALF, 1024), jnp.bfloat16), dma(()),
+               vmem((B, H), F32), vmem((T, H), jnp.bfloat16), vmem((8, 128), F32),
+               pltpu.SemaphoreType.REGULAR]
 
     def body(e, sh, nm, up):
         out = pl.pallas_call(
             kernel,
-            out_shape=(jax.ShapeDtypeStruct((T, H), jnp.bfloat16),
-                       jax.ShapeDtypeStruct((T, HALF), F32)),
+            out_shape=(jax.ShapeDtypeStruct((n, T, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((n, T, HALF), F32)),
             in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)],
             out_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
             scratch_shapes=scratch,
@@ -236,7 +273,9 @@ def tail(B, E, Sh, norm, blocks, late, races):
 
     f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp"), P(), P("tp")),
                               out_specs=(P("tp"),) * 2, check_vma=False))
-    return [np.asarray(x) for x in f(E, Sh, norm, blocks)]
+    result = [np.asarray(x) for x in f(E, Sh, norm, blocks)]
+    assert not ipc.races.races_found, (B, late, races, odd, lag_core)  # this call's
+    return result
 
 
 @jax.jit
@@ -281,7 +320,9 @@ norm[0, :HALF] = 1 + 0.1 * rng.standard_normal(HALF)
 blocks = np.stack([U_pad[:, 1024 * load.token_parallel_up_block(r):][:, :1024]
                    for r in range(32)])
 spread = lambda shape: np.where(rng.random(shape) < 0.25, 2.0 ** rng.integers(-12, 13, shape), 1.0)
-for B, late, races in ((8, True, "on_wait"), (16, True, "on_wait"), (8, False, "eager")):
+
+
+def partials(B):
     E = np.zeros((32, B, 4096), np.float32)
     E[:, :, :HALF] = (rng.standard_normal((32, B, HALF)) * 0.05 * spread((32, B, HALF))
                       * rng.choice([1.0, 30.0], (1, B, 1), p=[0.75, 0.25]))
@@ -297,17 +338,48 @@ for B, late, races in ((8, True, "on_wait"), (16, True, "on_wait"), (8, False, "
         hit = rng.random((B, width)) < 0.05
         X[2, :, :width] += np.where(hit, 2048.0, 0.0)
         X[26, :, :width] -= np.where(hit, 2048.0, 0.0)
-    out, tokens = tail(B, E, Sh, norm, blocks, late, races)
+    return E, Sh
+
+
+def check(B, out, tokens, E, Sh, what):
+    # Every rank's routed host sums and owned rows: its pair's tokens.
     want, want_tokens = lane_block_tail(B, jnp.asarray(E), jnp.asarray(Sh), norm, jnp.asarray(U))
     T = B // 4
     for r in range(32):
         pair = r % 8 // 2
-        assert tokens[r].tobytes() == want_tokens[pair * T:(pair + 1) * T].tobytes(), (B, late, r)
-        assert out[r].tobytes() == want[pair * T:(pair + 1) * T].tobytes(), (B, late, r)
-    print(f"B{B} late={late} {races}: bit-exact", flush=True)
-assert not ipc.races.races_found
+        assert tokens[r].tobytes() == want_tokens[pair * T:(pair + 1) * T].tobytes(), (what, r)
+        assert out[r].tobytes() == want[pair * T:(pair + 1) * T].tobytes(), (what, r)
+"""
+
+    MAIN = (
+        DEFS
+        + r"""
+for B, late, races in ((8, True, "on_wait"), (16, True, "on_wait"), (8, False, "eager")):
+    E, Sh = partials(B)
+    runs = []
+    for odd in (False, True):
+        out, tokens = tail(B, E[:, None], Sh[:, None], norm, blocks, late, races, odd)
+        check(B, out[:, 0], tokens[:, 0], E, Sh, (B, late, races, odd))
+        runs.append(out.tobytes() + tokens.tobytes())
+        print(f"B{B} late={late} {races} odd_host_round={odd}: bit-exact", flush=True)
+    assert runs[0] == runs[1], (B, late, races)
 print("OK")
 """
+    )
+
+    # Three tails back to back (core-0 ranks lagging, then core-1 ranks).
+    LOOP = (
+        DEFS
+        + r"""
+for odd, lag_core in ((True, 0), (True, 1), (False, 0)):
+    E, Sh = (np.stack(x, axis=1) for x in zip(*(partials(8) for _ in range(3))))
+    out, tokens = tail(8, E, Sh, norm, blocks, True, "eager", odd, lag_core)
+    for i in range(3):
+        check(8, out[:, i], tokens[:, i], E[:, i], Sh[:, i], (odd, lag_core, i))
+    print(f"odd_host_round={odd} lagging core {lag_core}: three tails bit-exact", flush=True)
+print("OK")
+"""
+    )
 
     def test_family_is_the_host_core_block(self):
         from unittest import mock
@@ -340,7 +412,7 @@ print("OK")
                 family = rank_loader.token_parallel_up_family("x", rank, 3)
                 self.assertTrue((family == load.token_parallel_up_block(rank)).all())
 
-    def test_tail_matches_the_lane_block_tail(self):
+    def _run(self, script):
         import os
         import subprocess
         import sys
@@ -351,17 +423,23 @@ print("OK")
             self.skipTest("Pallas TPU interpret mode unavailable")
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
         result = subprocess.run(
-            [sys.executable, "-c", TestAttentionHostBf16.PRELUDE + self.MAIN],
+            [sys.executable, "-c", TestAttentionHostBf16.PRELUDE + script],
             capture_output=True,
             text=True,
             env=env,
-            timeout=1800,
+            timeout=3600,
         )
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
         )
         self.assertNotIn("non-zero count", result.stdout + result.stderr)
+        self.assertNotIn("RACE DETECTED", result.stdout + result.stderr)
 
+    def test_tail_matches_the_lane_block_tail(self):
+        self._run(self.MAIN)
+
+    def test_odd_host_round_tails_back_to_back(self):
+        self._run(self.LOOP)
 
 class TestOutputRoundNextLayer(CustomTestCase):
     """``KernelConfig.moe_output_round_next_layer``: the token-parallel MoE
