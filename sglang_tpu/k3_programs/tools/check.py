@@ -1350,7 +1350,8 @@ def run_packing(args, records: harness.Records) -> None:
     from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
     from sglang_tpu.k3_programs.kimi_k3.pools import kda_blocks_at_length
 
-    window, slots = k3_program.MAX_STEP_TOKENS, k3_prefill.SLOTS
+    window = k3_program.MAX_STEP_TOKENS
+    slots = k3_prefill.SLOTS
     max_model_len = 2 * window
     cases = _packing_cases(k3.PAGE, window, slots)
     hits = [i for i, (_, prefix) in enumerate(cases) if prefix]
