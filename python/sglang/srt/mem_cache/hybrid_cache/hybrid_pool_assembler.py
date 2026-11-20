@@ -245,6 +245,8 @@ def build_kv_host_pool(
     else:
         kwargs.update(mha_kwargs)
     if parallel.dcp_enabled:
+        from sglang.srt.platforms import current_platform
+
         assert use_mla or current_platform.dcp_shards_every_kv_pool(), (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
             "pool has no DCP index translation."
