@@ -65,6 +65,16 @@ def _int_list(values: Any, count: int, name: str) -> list[int]:
     return values[:count]
 
 
+def cp_local_rows_padded(
+    extend_lens: list[int], *, pad_b: int, t_bucketer: Any, cp_size: int
+) -> int:
+    """The local rows every rank of a context-parallel extend pads to: the
+    token bucket of the largest per-rank row count, identical on every rank.
+    A pipeline stage that must size its receive before the forward derives it
+    from the batch with this too (pp_scheduler.pp_forward_rows)."""
+    return t_bucketer.next_bucket(max(max_local_rows(extend_lens, cp_size), pad_b))
+
+
 def prepare_tpu_cp_forward_batch(
     forward_batch: Any,
     *,
@@ -110,8 +120,8 @@ def prepare_tpu_cp_forward_batch(
             f"{real_q} rows; context parallelism needs a pure extend batch."
         )
 
-    local_rows_padded = t_bucketer.next_bucket(
-        max(max_local_rows(extend_lens, cp_size), pad_b)
+    local_rows_padded = cp_local_rows_padded(
+        extend_lens, pad_b=pad_b, t_bucketer=t_bucketer, cp_size=cp_size
     )
     host = build_tpu_cp_layout(
         extend_lens=extend_lens,
