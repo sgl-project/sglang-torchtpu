@@ -3878,7 +3878,7 @@ class _Copies:
 
 
 def kda_prefill_tiled_scratch_shapes(
-    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
+    hidden_size, tile, gate_w, fb_w, proj_w, conv_w, a_log, dt, norm
 ):
     """Scratch specs, in the order expected by ``kda_prefill_tiled_body``."""
     width = _HEADS * _CHANNELS
@@ -3889,7 +3889,7 @@ def kda_prefill_tiled_scratch_shapes(
         pltpu.VMEM(fb_w.shape, fb_w.dtype),
         pltpu.VMEM(proj_w.shape, proj_w.dtype),
         pltpu.VMEM(conv_w.shape, conv_w.dtype),
-        pltpu.VMEM(alog.shape, alog.dtype),
+        pltpu.VMEM(a_log.shape, a_log.dtype),
         pltpu.VMEM(dt.shape, dt.dtype),
         pltpu.VMEM(norm.shape, norm.dtype),
         pltpu.VMEM((_HEADS, _CHANNELS, _CHANNELS), jnp.float32),
@@ -3910,7 +3910,7 @@ def make_kda_tiled(
 ):
     """Build the sequence-tiled KDA prefill kernel.
 
-    Returns a callable ``(hidden, gate_w, fb_w, proj_w, conv_w, alog, dt,
+    Returns a callable ``(hidden, gate_w, fb_w, proj_w, conv_w, a_log, dt,
     norm, rec_state, conv_hist, length) -> (attended, rec_state, conv_hist)``.
     ``length`` is an int32 array of shape ``[1]`` with 0 <= length <= seq_len.
     Rows at or beyond length have zero output and do not change either state.
@@ -3933,7 +3933,7 @@ def make_kda_tiled(
         fb_w,
         proj_w,
         conv_w,
-        alog,
+        a_log,
         dt,
         norm,
         rec_state,
@@ -3966,7 +3966,7 @@ def make_kda_tiled(
                 in_specs=[pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(10)],
                 out_specs=[pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(3)],
                 scratch_shapes=kda_prefill_tiled_scratch_shapes(
-                    H, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
+                    H, tile, gate_w, fb_w, proj_w, conv_w, a_log, dt, norm
                 ),
             ),
             interpret=interpret,
@@ -3980,7 +3980,7 @@ def make_kda_tiled(
             fb_w,
             proj_w,
             conv_w,
-            alog,
+            a_log,
             dt,
             norm,
             rec_state,

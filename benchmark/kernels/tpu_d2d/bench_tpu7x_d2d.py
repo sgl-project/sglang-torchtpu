@@ -39,7 +39,7 @@ receiver's buffers hold its sibling's slabs.
     D2D_AOT=1 python3 bench_tpu7x_d2d.py        # compile-only for tpu7x:2x2x1
 
 ``D2D_ONLY=name,name`` runs a subset. Results go to stdout and, as JSON lines,
-to ``$D2D_OUT/d2d_bench.jsonl``.
+to ``$D2D_OUT/d2d_bench.jsonl`` (``D2D_OUT`` defaults to ``/tmp/d2d``).
 """
 
 from __future__ import annotations
@@ -796,9 +796,9 @@ def run_variant(variant, mesh, devices, tables, out_path):
         print(f"{name:18s} interpret OK, data check: {check}", flush=True)
         return check
     # The xprof profiler is not used: jax.profiler.start_trace segfaults on
-    # TPU in the sglang-torchtpu:20261017 image (PLUGIN_Profiler_Api size
-    # mismatch). The kernels loop on the device; differencing two counts
-    # cancels launch and sync costs.
+    # TPU with jax 0.10.2, libtpu 0.0.50 and torch_tpu 0.2.0rc4
+    # (PLUGIN_Profiler_Api size mismatch). The kernels loop on the device;
+    # differencing two counts cancels launch and sync costs.
     reps = 7
     wall_low, wall_high = [], []
     for _ in range(reps):
@@ -856,11 +856,7 @@ def main():
             flush=True,
         )
     mesh = Mesh(np.asarray(devices), (AXIS,))
-    out_dir = os.environ.get("D2D_OUT") or (
-        "/mnt/kimik3-ssd/k31scratch-steal/d2d"
-        if os.path.isdir("/mnt/kimik3-ssd")
-        else "/tmp/d2d"
-    )
+    out_dir = os.environ.get("D2D_OUT") or "/tmp/d2d"
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "d2d_bench.jsonl")
     only = [n for n in os.environ.get("D2D_ONLY", "").split(",") if n]
