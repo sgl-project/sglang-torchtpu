@@ -9,7 +9,7 @@ How: AROUND Scheduler._pp_launch_batch starts the copy of the queued outputs'
      device tensors on a TPUAsyncCopyWorker. AROUND
      Scheduler._pp_send_output_to_next_stage and
      Scheduler._pp_pd_send_deferred_output put the host copies in place of the
-     outputs the send pops; a skipped send drops them without waiting.
+     outputs the send pops; a skipped send waits for them and drops them.
 Upstream PR or issue: not filed; the wave and its deferred send are TPU only.
 Remove when: the deferred send moves into sglang_tpu with the wave.
 """
@@ -50,15 +50,17 @@ class PPOutputCopies:
         entries[key] = (ref, copies)
 
     def take(self, outputs: PPProxyTensors, *, sent: bool) -> None:
-        """Forget the copies of ``outputs``; if they are about to be sent, wait
-        for them and put the host tensors in place."""
+        """Wait for the copies of ``outputs`` and, if they are about to be sent,
+        put the host tensors in place. Waiting even for a skipped send keeps
+        every copy ahead of the next launch, which may donate their buffers."""
         entry = self._copies.get(id(outputs))
         if entry is None or entry[0]() is not outputs:
             return
         del self._copies[id(outputs)]
-        if sent:
-            for name, copy in entry[1].items():
-                outputs.tensors[name] = copy.result()
+        for name, copy in entry[1].items():
+            host = copy.result()
+            if sent:
+                outputs.tensors[name] = host
 
 
 _copies: PPOutputCopies | None = None

@@ -300,10 +300,14 @@ class TestLaunchTimeOutputCopy(_StreamPatchedTestCase):
         sent = scheduler._pp_send_dict_to_next_stage.call_args.args[0]
         self.assertIs(sent["next_token_ids"], host)
 
-    def test_skipped_send_does_not_wait_for_the_copy(self):
+    def test_skipped_send_keeps_the_device_outputs(self):
         scheduler, queue, landed = self._launched()
+        landed.set_result(torch.tensor([5]))
+        outputs = queue[0][1]
+        device_tokens = outputs.tensors["next_token_ids"]
         self.assertEqual(self._send(scheduler, queue, skip=True), [])
         scheduler._pp_send_dict_to_next_stage.assert_not_called()
+        self.assertIs(outputs.tensors["next_token_ids"], device_tokens)
 
     def test_prefill_send_hands_the_kv_manager_the_launch_copy(self):
         scheduler, queue, landed = self._launched()
