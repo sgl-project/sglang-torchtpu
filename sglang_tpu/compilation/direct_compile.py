@@ -33,6 +33,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
+from sglang_tpu.attention_flywheel import FlywheelForwardMetadata
 from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
@@ -163,6 +164,7 @@ class KVPool(Protocol):
 # flatten their tensor fields and reconstruct the same objects for tracing.
 tree_util.register_dataclass(ForwardBatch)
 tree_util.register_dataclass(PallasForwardMetadata)
+tree_util.register_dataclass(FlywheelForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
 register_pp_proxy_pytree(tree_util)

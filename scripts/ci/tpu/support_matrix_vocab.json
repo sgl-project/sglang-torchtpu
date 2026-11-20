@@ -130,6 +130,7 @@
     "tpu-oot": "Out-of-tree plugin (mode B)",
     "rpa-v3": "RPA v3 attention backend",
     "seq-along-lane": "Batched RPA seq-along-lane layout",
+    "flywheel": "FlyWheel attention backend",
     "normalization": "Multi-host node normalization"
   }
 }
