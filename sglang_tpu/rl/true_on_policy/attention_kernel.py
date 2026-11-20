@@ -71,6 +71,7 @@ def _jax_packed_causal_attention(
     over a bf16 cache only: no sliding window, logit cap or attention sink.
     """
     from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     refuse_rpa_rounding_flags()
     tokens, _, head_dim = q.shape
@@ -90,14 +91,15 @@ def _jax_packed_causal_attention(
     kv_lens = jnp.concatenate([lens, jnp.zeros((1,), lens.dtype)]).astype(jnp.int32)
     cu_q_lens = jnp.concatenate([cu_seqlens, cu_seqlens[-1:]]).astype(jnp.int32)
     layout = configs.KVLayout.SEQ_ALONG_LANE
-    kv_cache = jnp.zeros(
-        wrapper.get_kv_cache_shape(
-            num_pages, PAGE_SIZE, k.shape[1], head_dim, k.dtype, kv_layout=layout
-        ),
-        k.dtype,
-    )
     distribution = jnp.full((3,), n, jnp.int32)  # every sequence is an extend
-    with _pinned_kv_blocks():
+    # The kernel sizes its cache and tiles from the physical TPU's metadata while it is traced, as in the engine.
+    with tpu_info_for_cpu_export(), _pinned_kv_blocks():
+        kv_cache = jnp.zeros(
+            wrapper.get_kv_cache_shape(
+                num_pages, PAGE_SIZE, k.shape[1], head_dim, k.dtype, kv_layout=layout
+            ),
+            k.dtype,
+        )
         out, _ = wrapper.ragged_paged_attention(
             q,
             k,

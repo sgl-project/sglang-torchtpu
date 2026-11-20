@@ -198,6 +198,7 @@ def refuse_transformed_sampling(result, self, vocab_size) -> Any:
 
 def pin_kv_block(result, model_cfgs, serve_cfgs, vmem_limit_bytes) -> Any:
     """AFTER batched RPA calculate_block_sizes: one KV block (the page) for decode and prefill alike."""
+    attention_kernel.refuse_rpa_rounding_flags()
     return attention_kernel.pin_kv_block(*result, serve_cfgs.page_size)
 
 
