@@ -287,9 +287,12 @@ class TestKpoolIndexerStep(CustomTestCase):
 
     def test_prefill_raw_cache_matches_the_row_scatter(self):
         # Three requests (mid-page, whole-page, and empty prefix) plus bucket
-        # padding on a >= 1,024-page cache so the page-wise write runs.
+        # padding on a large cache so the page-wise write runs.
         tokens, pages_per_seq, num_pages = 4096, 16, 1280
         prefix, new = (77, 2 * PAGE, 0), (1500, 700, 1203)
+        self.assertTrue(
+            kp._should_use_page_write(tokens, len(new), num_pages, PAGE, 2 * D)
+        )
         rng = np.random.default_rng(3)
 
         def f(*shape, dtype=jnp.bfloat16):
@@ -335,6 +338,23 @@ class TestKpoolIndexerStep(CustomTestCase):
         np.testing.assert_array_equal(
             np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
         )
+
+    def test_page_write_cost_model_gate(self):
+        dim = 2 * D
+        self.assertTrue(kp._should_use_page_write(8192, 64, 5121, PAGE, dim))
+        self.assertTrue(kp._should_use_page_write(1024, 64, 1056, PAGE, dim))
+        self.assertTrue(kp._should_use_page_write(512, 64, 5121, PAGE, dim))
+        self.assertTrue(kp._should_use_page_write(256, 16, 5121, PAGE, dim))
+        self.assertTrue(kp._should_use_page_write(1024, 8, 528, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(0, 1, 5121, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(16, 1, 5121, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(64, 64, 5121, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(256, 64, 5121, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(4096, 64, 512, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(8192, 128, 1024, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(8192, 2, 240, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(1024, 256, 5121, PAGE, dim))
+        self.assertFalse(kp._should_use_page_write(16384, 2, 260, PAGE, dim))
 
 
 def _scatter_pools(raw, old, ape, lens, pages, cu, distribution, tokens):
