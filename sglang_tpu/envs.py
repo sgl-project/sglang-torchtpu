@@ -192,8 +192,8 @@ class TpuEnvs:
     # layer also runs the MLP-side aggregation (kimi_attn_res_decode with the
     # pending add) in the same kernel. Same ops in the same order (exact).
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_FUSE_ATTN_RES = EnvBool(True)
-    # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
-    # batches (kernels/router_topk.py); False keeps the generic top-k.
+    # MoE router: one Pallas kernel for the biased sigmoid top-k at every batch
+    # size (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
     # GLM-5.3-Flash: target steps (the MTP verify, or decode without speculation)
     # as one Pallas call per device (glm_flash_megakernel/); other steps run the

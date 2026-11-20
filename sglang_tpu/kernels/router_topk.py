@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Pallas router top-k for small batches.
+"""Fused Pallas router top-k.
 
 Sigmoid scores, the biased choice, k rounds of argmax-and-mask, the weight
-gather and the renormalization in one VMEM-resident kernel. Ties pick the
-lowest expert id. A single token (decode at batch 1) takes the same top-k by
-rank instead (_topk_kernel_1tok): the k rounds are a serial chain of
-reductions, ~0.2 us each on tpu7x, while the ranks are independent compares.
-The op registration and the ``biased_topk_impl`` dispatch live in
+gather and the renormalization in one kernel, gridded over tiles of tokens.
+Ties pick the lowest expert id. A single token (decode at batch 1) takes the
+same top-k by rank instead (_topk_kernel_1tok): the k rounds are a serial
+chain of reductions, ~0.2 us each on tpu7x, while the ranks are independent
+compares. The op registration and the ``biased_topk_impl`` dispatch live in
 sglang_tpu/moe/router_topk_tpu.py.
 """
 
@@ -15,6 +15,12 @@ import functools
 # One token with at most this many experts (a multiple of 128) takes the rank
 # formulation (_topk_kernel_1tok); its compares grow as experts^2.
 _RANK_MAX_EXPERTS = 1024
+# Tokens per grid step, measured on tpu7x over 128-1024 for 256, 288 and 896
+# experts.
+_BLOCK_TOKENS = 512
+# Tile elements (tokens x experts) that fit the 32 MiB VMEM limit; 512x896
+# compiles. Larger expert counts shrink the tile, down to 128 tokens.
+_BLOCK_ELEMS = 512 * 1024
 
 
 def _topk_kernel(
@@ -28,65 +34,51 @@ def _topk_kernel(
     eps: float,
     scale: float,
 ):
+    """One tile of tokens: logits [bt, E] in, weights and ids [k, bt] out.
+
+    Experts go down the sublanes and tokens across the lanes, so each round's
+    max and lowest-tied-id are elementwise reductions over the expert vregs
+    plus one sublane reduce, rather than a cross-lane reduce per token row.
+    The expert iota is f32 (exact below 2^24): its min is cheaper than int32's.
+    """
     import jax
     import jax.numpy as jnp
 
-    tokens, experts = logits_ref.shape
-    if tokens == 1 and experts % 128 == 0 and k <= experts <= _RANK_MAX_EXPERTS:
-        return _topk_kernel_1tok(
-            logits_ref,
-            bias_ref,
-            w_ref,
-            ids_ref,
-            k=k,
-            renormalize=renormalize,
-            eps=eps,
-            scale=scale,
-        )
     logits = logits_ref[...]
     # sigmoid in f32, rounded to the logits dtype like torch's bf16 sigmoid.
     scores = (
         (1.0 / (1.0 + jnp.exp(-logits.astype(jnp.float32))))
         .astype(logits.dtype)
         .astype(jnp.float32)
+    ).T
+    experts, tokens = scores.shape
+    # bias [E] (lanes) to a column [E, 1] (sublanes).
+    bias = jnp.transpose(
+        jnp.broadcast_to(bias_ref[...].reshape(1, experts), (8, experts))
+    )[:, 0:1]
+    choice = scores + bias
+    # NaN never equals the max, so it would yield the out-of-range id `experts`.
+    # It ranks last instead, still above the -inf that marks a picked expert.
+    choice = jnp.where(choice == choice, choice, jnp.finfo(jnp.float32).min)
+    expert = jax.lax.broadcasted_iota(jnp.int32, (experts, tokens), 0).astype(
+        jnp.float32
     )
-    choice = scores + bias_ref[...].reshape(1, -1).astype(jnp.float32)
-    tokens, experts = choice.shape
-    lane = jnp.broadcast_to(
-        jnp.arange(experts, dtype=jnp.int32)[None, :], (tokens, experts)
-    )
-    col = jnp.broadcast_to(jnp.arange(k, dtype=jnp.int32)[None, :], (tokens, k))
-    ids = jnp.zeros((tokens, k), jnp.int32)
-    weights = jnp.zeros((tokens, k), jnp.float32)
-    neg = jnp.float32(-jnp.inf)
-    packed = logits.dtype == jnp.bfloat16
-    if packed:
-        # bf16 scores fit in 16 bits: key = expert * 2^16 + score bits, so the
-        # min over the tied keys gives the lowest tied expert and its weight
-        # in one reduction.
-        bits = jax.lax.bitcast_convert_type(scores, jnp.int32) >> 16
-        key = lane * 65536 + (bits & 0xFFFF)
-        no_key = jnp.int32(experts * 65536)
-    # Router logits are finite here (padded rows hold finite values and are
-    # masked by the caller afterwards). A NaN logit would make `choice == m`
-    # false across its row, so every id there would come out as `experts`.
+    total = jnp.zeros((1, tokens), jnp.float32)
     for r in range(k):
-        m = jnp.max(choice, axis=-1, keepdims=True)
-        if packed:
-            best = jnp.min(jnp.where(choice == m, key, no_key), axis=-1, keepdims=True)
-            idx = best >> 16
-            w = jax.lax.bitcast_convert_type((best & 0xFFFF) << 16, jnp.float32)
-        else:
-            idx = jnp.min(jnp.where(choice == m, lane, experts), axis=-1, keepdims=True)
-            w = jnp.sum(jnp.where(lane == idx, scores, 0.0), axis=-1, keepdims=True)
-        ids = jnp.where(col == r, idx, ids)
-        weights = jnp.where(col == r, w, weights)
-        choice = jnp.where(lane == idx, neg, choice)
+        m = jnp.max(choice, axis=0, keepdims=True)
+        idx = jnp.min(
+            jnp.where(choice == m, expert, jnp.float32(experts)),
+            axis=0,
+            keepdims=True,
+        )
+        hit = expert == idx
+        w = jnp.sum(jnp.where(hit, scores, 0.0), axis=0, keepdims=True)
+        w_ref[r : r + 1, :] = w
+        ids_ref[r : r + 1, :] = idx.astype(jnp.int32)
+        total = total + w
+        choice = jnp.where(hit, -jnp.inf, choice)
     if renormalize:
-        weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + eps)
-        weights = weights * scale
-    w_ref[...] = weights
-    ids_ref[...] = ids
+        w_ref[...] = w_ref[...] * (scale / (total + eps))
 
 
 def _topk_kernel_1tok(
@@ -99,7 +91,7 @@ def _topk_kernel_1tok(
     order the round loop picks experts in (ties -> lowest expert id). The k
     rounds are a serial chain of two cross-lane reductions each; the rank is
     one batch of independent compares, then slot r takes the expert of rank r.
-    Bit-identical to the round loop for finite logits."""
+    Bit-identical to the round loop."""
     import jax
     import jax.numpy as jnp
 
@@ -112,6 +104,8 @@ def _topk_kernel_1tok(
         .astype(jnp.float32)
     )
     choice = scores + bias_ref[...].reshape(1, -1).astype(jnp.float32)
+    # NaN compares false both ways, so ranks would collide and ids leave [0, E).
+    choice = jnp.where(choice == choice, choice, jnp.finfo(jnp.float32).min)
     # choice[j] down the sublanes, broadcast across the lanes: [E, 128].
     col = jnp.transpose(jnp.broadcast_to(choice, (8, experts)))[:, 0:1]
     col = jnp.broadcast_to(col, (experts, 128))
@@ -151,6 +145,24 @@ def _topk_kernel_1tok(
     ids_ref[...] = ids
 
 
+def _vmem_limit(tokens: int, block: int, experts: int, k: int, itemsize: int) -> int:
+    """Scoped VMEM from the tile working set: input/output refs (double-buffered
+    across a multi-step grid), bias, the transposed [E, block] f32 arrays
+    (scores, choice, expert) plus temporary/spill headroom and a 2 MiB margin."""
+    from sglang_tpu.kernels.vmem_limit import padded_bytes
+
+    mib = 1 << 20
+    bufs = 2 if tokens > block else 1
+    need = (
+        bufs * padded_bytes((block, experts), itemsize)
+        + padded_bytes((experts,), 4)
+        + 2 * bufs * padded_bytes((k, block), 4)
+        + 5 * padded_bytes((experts, block), 4)
+        + 2 * mib
+    )
+    return min(32 * mib, -(-need // mib) * mib)
+
+
 def router_topk_jax(
     logits,
     bias,
@@ -167,24 +179,52 @@ def router_topk_jax(
     from jax.experimental.pallas import tpu as pltpu
 
     tokens, experts = logits.shape
-    full = lambda shape: pl.BlockSpec(shape, lambda i: (0,) * len(shape))
-    return pl.pallas_call(
-        functools.partial(
-            _topk_kernel, k=k, renormalize=renormalize, eps=eps, scale=scale
-        ),
+    params = dict(k=k, renormalize=renormalize, eps=eps, scale=scale)
+    # The bias stays 1-D: reshaping it to [1, E] outside the kernel is a
+    # relayout op per call (f32 [E] and [1, E] tile differently).
+    bias = bias.reshape(experts).astype(jnp.float32)
+    bias_spec = pl.BlockSpec((experts,), lambda i: (0,))
+    if tokens == 1 and experts % 128 == 0 and k <= experts <= _RANK_MAX_EXPERTS:
+        out_spec = pl.BlockSpec((1, k), lambda i: (0, 0))
+        return pl.pallas_call(
+            functools.partial(_topk_kernel_1tok, **params),
+            out_shape=(
+                jax.ShapeDtypeStruct((1, k), jnp.float32),
+                jax.ShapeDtypeStruct((1, k), jnp.int32),
+            ),
+            grid=(1,),
+            in_specs=[pl.BlockSpec((1, experts), lambda i: (0, 0)), bias_spec],
+            out_specs=(out_spec, out_spec),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=4 * 1024 * 1024,
+                allow_input_fusion=[True, False],
+            ),
+            interpret=interpret,
+            name=f"router_topk_{k}_of_{experts}",
+        )(logits, bias)
+    # A partial tile's token dim is the output's lane dim: a multiple of 128.
+    block = min(
+        tokens, max(128, min(_BLOCK_TOKENS, _BLOCK_ELEMS // experts) // 128 * 128)
+    )
+    vmem_limit = _vmem_limit(
+        tokens, block, experts, k, jnp.dtype(logits.dtype).itemsize
+    )
+    out_spec = pl.BlockSpec((k, block), lambda i: (0, i))
+    weights, ids = pl.pallas_call(
+        functools.partial(_topk_kernel, **params),
         out_shape=(
-            jax.ShapeDtypeStruct((tokens, k), jnp.float32),
-            jax.ShapeDtypeStruct((tokens, k), jnp.int32),
+            jax.ShapeDtypeStruct((k, tokens), jnp.float32),
+            jax.ShapeDtypeStruct((k, tokens), jnp.int32),
         ),
-        grid=(1,),
-        # The bias stays 1-D: reshaping it to [1, E] outside the kernel is a
-        # relayout op per call (f32 [E] and [1, E] tile differently).
-        in_specs=[full((tokens, experts)), full((experts,))],
-        out_specs=(full((tokens, k)), full((tokens, k))),
+        grid=(pl.cdiv(tokens, block),),
+        in_specs=[pl.BlockSpec((block, experts), lambda i: (i, 0)), bias_spec],
+        out_specs=(out_spec, out_spec),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=4 * 1024 * 1024,
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit,
             allow_input_fusion=[True, False],
         ),
         interpret=interpret,
         name=f"router_topk_{k}_of_{experts}",
-    )(logits, bias.reshape(experts).astype(jnp.float32))
+    )(logits, bias)
+    return weights.T, ids.T

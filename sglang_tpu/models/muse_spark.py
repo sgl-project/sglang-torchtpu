@@ -61,6 +61,11 @@ from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
+from sglang_tpu.moe.router_topk_tpu import (
+    fits_sigmoid_router_topk,
+    register_router_topk_op,
+    sigmoid_router_topk,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,20 @@ _QKV_SHARDS = ((".q_proj.", "q"), (".k_proj.", "k"), (".v_proj.", "v"))
 _FUSED_RS_POST_EXPERT_NORM_EPS = 1e-8
 # Sigmoid router scores are renormalized over the top-k with this epsilon.
 _ROUTE_EPS = 1e-15
+
+
+def _sort_router_topk(
+    logits: torch.Tensor, bias: torch.Tensor, k: int, eps: float, scale: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.sigmoid(logits)
+    _, topk_ids = torch.topk(scores + bias, k, dim=-1)
+    # One-hot select, not gather: TPU runs the row gather as a slow serial loop.
+    expert_ids = torch.arange(scores.shape[-1], device=scores.device)
+    topk_scores = torch.where(
+        topk_ids.unsqueeze(-1) == expert_ids, scores.unsqueeze(1), 0.0
+    ).sum(dim=-1)
+    topk_weights = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + eps) * scale
+    return topk_weights, topk_ids.to(torch.int32)
 
 
 def _param_name(checkpoint_name: str) -> Optional[str]:
@@ -523,6 +542,9 @@ class MuseSparkMoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False
         )
+        # Muse builds no TopK, whose __init__ hook registers the op elsewhere;
+        # it must exist before torch.compile traces the model.
+        register_router_topk_op()
         from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
 
         # With expert TP, the small decode-sized projection outputs are gathered
@@ -594,23 +616,21 @@ class MuseSparkMoE(nn.Module):
 
     def _route(self, router_input: torch.Tensor) -> StandardTopKOutput:
         router_logits, _ = self.gate(router_input)
-        scores = torch.sigmoid(router_logits.float() * self.router_multiplier)
-        _, topk_ids = torch.topk(
-            scores + self.e_score_correction_bias, self.top_k, dim=-1
+        select = (
+            sigmoid_router_topk
+            if fits_sigmoid_router_topk(router_logits.shape[0])
+            else _sort_router_topk
         )
-        # One-hot select, not gather: TPU runs the row gather as a slow serial loop.
-        expert_ids = torch.arange(scores.shape[-1], device=scores.device)
-        topk_scores = torch.where(
-            topk_ids.unsqueeze(-1) == expert_ids, scores.unsqueeze(1), 0.0
-        ).sum(dim=-1)
-        topk_weights = (
-            topk_scores
-            / (topk_scores.sum(dim=-1, keepdim=True) + self.route_eps)
-            * self.route_scale
+        topk_weights, topk_ids = select(
+            router_logits.float() * self.router_multiplier,
+            self.e_score_correction_bias,
+            self.top_k,
+            eps=self.route_eps,
+            scale=self.route_scale,
         )
         return StandardTopKOutput(
             topk_weights=topk_weights,
-            topk_ids=topk_ids.to(torch.int32),
+            topk_ids=topk_ids,
             router_logits=router_logits,
         )
 
