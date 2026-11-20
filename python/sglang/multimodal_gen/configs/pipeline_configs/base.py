@@ -142,6 +142,8 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
+    # Pipelines whose model code shards with tensor parallelism on TPU set this.
+    supports_tpu_tensor_parallel: ClassVar[bool] = False
     native_only_components: ClassVar[tuple[str, ...]] = ()
     # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I

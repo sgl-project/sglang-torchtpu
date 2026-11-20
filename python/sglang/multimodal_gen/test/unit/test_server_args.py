@@ -4222,12 +4222,13 @@ class TestTpuDistributedArgs(unittest.TestCase):
         self.assertEqual((args.nnodes, args.node_rank), (4, 3))
         self.assertEqual(args.dist_init_addr, "chosen:1234")
 
-    def test_tensor_parallel_is_rejected(self):
+    def test_tensor_parallel_needs_the_pipeline_opt_in(self):
         args = self._args(8)
         args.tp_size = 2
         with self._on_tpu(), self._slice_env():
+            args._adjust_platform_specific()
             with self.assertRaisesRegex(ValueError, "tensor-parallel"):
-                args._adjust_platform_specific()
+                args._validate_tpu_tensor_parallel()
 
     def test_other_platforms_are_unaffected(self):
         with patch(
