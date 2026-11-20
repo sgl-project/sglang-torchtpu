@@ -115,6 +115,10 @@ class GDNConfig:
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
     num_buffers: int = 2
+    # Buffers for the dense conv/recurrent state output windows. 1 when the
+    # double-buffered verify checkpoints do not fit VMEM (see
+    # tiling.calculate_decode_state_out_buffers); dense states only.
+    state_out_buffers: int = 2
     state_plan: StateSourcePlan | None = None
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The

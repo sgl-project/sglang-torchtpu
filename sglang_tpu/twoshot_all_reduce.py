@@ -15,12 +15,10 @@ import torch
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.runtime_context import get_forward
+from sglang_tpu.kernels.twoshot_all_reduce import TWOSHOT_ALL_REDUCE_MAX_BYTES
 
 _OPS: dict[int, Callable] = {}
 _OPS_LOCK = Lock()
-# Above this many bytes per rank XLA's all-reduce is as fast (measured on TP8 v7x,
-# where bf16 [32, 8192] already matches it).
-TWOSHOT_ALL_REDUCE_MAX_BYTES = 256 * 1024
 
 
 @functools.cache

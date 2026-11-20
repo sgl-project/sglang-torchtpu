@@ -78,7 +78,6 @@ class _Scheduler(Scheduler):
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
         self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
-        self.maybe_send_health_check_signal = Mock()
         self.req_to_metadata_buffer_idx_allocator = Mock()
         self.enable_hicache_storage = True
         self.chunked_req = None

@@ -107,7 +107,7 @@ print_highlight(response.text)
 
 ## Health Check
 - `/health`: Check the health of the server.
-- `/health_generate`: Check the health of the server by generating one token.
+- `/health_generate`: Check the health of the server by completing inference: 200 only after the scheduler finishes a real forward (running traffic when busy, the probe's own one-token generation when idle).
 
 ```python Example
 url = f"http://localhost:{port}/health_generate"

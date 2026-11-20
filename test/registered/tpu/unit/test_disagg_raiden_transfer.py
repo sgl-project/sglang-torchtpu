@@ -1055,15 +1055,15 @@ class TestRaidenStateEngine(RaidenRendezvousTestCase):
         self.assertEqual(m._pulling.state_capacity, 20)
 
     def test_each_rank_reserves_six_ports(self):
-        """Full, SWA and state engines at +0/+2/+4 of base + 6*local_rank."""
+        """Full, SWA, state, and draft engines reserve PORTS_PER_RANK (8) ports per rank."""
         m, built = self._build(attn_tp_rank=1, swa=True, state=True)
-        self.assertEqual(m._control_port, 32006)
+        self.assertEqual(m._control_port, 32008)
         self.assertEqual(
-            [kw["local_control_port"] for kw in built], [32006, 32008, 32010]
+            [kw["local_control_port"] for kw in built], [32008, 32010, 32012]
         )
-        self.assertEqual(m.raiden_endpoint, "127.0.0.1:32006")
-        self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32008")
-        self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32010")
+        self.assertEqual(m.raiden_endpoint, "127.0.0.1:32008")
+        self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32010")
+        self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32012")
 
 
 class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
@@ -1137,6 +1137,8 @@ class TestRaidenStateGroups(CustomTestCase):
         pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
         kv = {3: torch.zeros(9, 2), 7: torch.zeros(9, 2)}
         pool.get_fused_kv_buffer = lambda layer_id: kv[layer_id]
+        # A fused full-attention pool, which get_fused_kv_buffer above reads.
+        pool.full_kv_pool = SimpleNamespace()
         pool.mamba_pool = mamba_pool
         return pool, kv
 

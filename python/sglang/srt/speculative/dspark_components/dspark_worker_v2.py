@@ -3,9 +3,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -687,12 +684,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # A SWA ring is keyed by (draft req slot, position); thread the per-token
+        # state_slot + the req's final position so the injector keeps only the
+        # last SWA window (older prefill tokens share a ring slot and would race).
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if self._kv_injector.swa_ring_size is not None:
             repeats = ctx_lens.to(torch.int64)
             num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
@@ -705,6 +701,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
+            # A newly placed request's ring holds nothing below its cached prefix.
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                draft_pool.reset_swa_req_ring(
+                    batch.req_pool_indices[placed],
+                    torch.tensor(
+                        [batch.prefix_lens[i] for i in placed],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                )
         cache_loc = batch.out_cache_loc
         token_indices = logits_output.hidden_states_token_indices
         if token_indices is not None:
@@ -825,9 +834,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # `seq_lens` may come from another stream; record_stream keeps the device
+        # caching allocator from reusing it early. CPU has no streams (and
+        # torch.accelerator rejects a CPU device), so skip it there.
+        if torch.device(self.device).type != "cpu":
+            batch.seq_lens.record_stream(torch.accelerator.current_stream(self.device))
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens

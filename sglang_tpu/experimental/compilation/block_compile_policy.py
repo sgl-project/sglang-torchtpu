@@ -13,15 +13,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     LogitsOutputMode,
 )
-from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_disagg
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
+from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
@@ -31,29 +30,14 @@ from sglang_tpu.experimental.compilation.spec_compile_policy import (
 logger = get_logger(__name__)
 
 
-def block_draft_width(model: DFlashDraftModel, num_verify_rows: int) -> int:
-    """Rows per request in the draft block forward [r, m, ..., m]."""
-    # Anchor DSpark drafts read all gamma rows, so the block drops the last mask row.
-    if isinstance(model, DSparkDraftModel) and model.sample_from_anchor:
-        return num_verify_rows - 1
-    return num_verify_rows
-
-
 class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     """The draft warms its block forward and KV writer.
 
     DFlash and DSpark drafts share the spec inputs and K/V layout, so the target
     verify grid and the draft KV writer carry over. The target scores
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
-    [r, m, ..., m] (draft_block_width rows) and never runs EXTEND.
+    [r, m, ..., m] (the drafter's block_width rows) and never runs EXTEND.
     """
-
-    @property
-    def draft_block_width(self) -> int:
-        model = self.model_runner.model
-        if not isinstance(model, DFlashDraftModel):
-            raise TypeError(f"Expected a DFlashDraftModel draft, got {type(model)}.")
-        return block_draft_width(model, self.draft_token_num)
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.
@@ -61,18 +45,12 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             return (LogitsOutputMode.FULL_VOCAB,)
         return (LogitsOutputMode.FULL_VOCAB, LogitsOutputMode.DISTRIBUTED_TOP_K)
 
-    def make_null_spec_info(self) -> DFlashVerifyInput:
-        # Same structure as TpuBlockSpecWorker's draft block input, so the draft trace matches.
-        width = self.draft_block_width if self.is_draft_worker else self.draft_token_num
-        return make_draft_block_spec_info(
-            draft_token_num=width, device=self.model_runner.device
-        )
-
     def precompile_draft(
         self,
         draft_attn_backend: AttentionBackend,
         *,
         kv_writer: Callable[..., torch.Tensor],
+        block_width: int,
     ) -> None:
         """Compile the draft block forward and the draft KV writer."""
         if not self.is_draft_worker:
@@ -83,24 +61,47 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         if self._compiled_kv_appender is None:
             self._compiled_kv_appender = self._compile_kv_appender(kv_writer)
         disagg_mode = get_disagg().disaggregation_mode
+        pending: list[PendingCall] = []
         if disagg_mode != "prefill":
-            self._precompile_draft_block(draft_attn_backend)
+            pending = self._precompile_draft_block(
+                draft_attn_backend, block_width=block_width
+            )
             self._precompile_draft_append_kv_verify()
         if runs_draft_prompt_pass(disagg_mode):
             self._precompile_draft_append_kv_extend()
+        queue = current_warmup_queue()
+        if pending and queue is not None:
+            # Async block warmups compile with the target's (shared under SPMD);
+            # the checker baselines only once they have run.
+            queue.calls.extend(pending)
+            queue.completions.append(self._install_draft_recompilation_checker)
+            logger.info(
+                "[spec compile policy] %s DRAFT queued %d warmups in %.1fs.",
+                self.algo_label,
+                len(pending),
+                time.perf_counter() - start,
+            )
+            return
+        for warmup in pending:
+            warmup.wait()
         logger.info(
             "[spec compile policy] %s DRAFT precompile done in %.1fs.",
             self.algo_label,
             time.perf_counter() - start,
         )
+        self._install_draft_recompilation_checker()
+
+    def _install_draft_recompilation_checker(self) -> None:
         install_recompilation_checker(
             policies=(self,),
             model_label=f"draft {type(self.model_runner.model).__name__}",
         )
 
-    def _precompile_draft_block(self, draft_attn_backend: AttentionBackend) -> None:
+    def _precompile_draft_block(
+        self, draft_attn_backend: AttentionBackend, *, block_width: int
+    ) -> list[PendingCall]:
         assert self.b_bucketer is not None
-        width = self.draft_block_width
+        width = block_width
         lm_head = self.model_runner.model.lm_head
         if lm_head is not None:
             register_argmax_draft_top_k(lm_head)
@@ -113,16 +114,24 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             width,
         )
 
+        pending: list[PendingCall] = []
+
         def run(shape: tuple[int, int]) -> str:
             bs, num_tokens = shape
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                spec_info=self.make_null_spec_info(),
+                # Same structure as TpuBlockSpecWorker's draft block input, so the trace matches.
+                spec_info=make_draft_block_spec_info(
+                    draft_token_num=width, device=self.model_runner.device
+                ),
                 attn_backend=draft_attn_backend,
             )
+            if isinstance(warmup, PendingCall):
+                pending.append(warmup)
             return f"bs={bs}, tokens={num_tokens}"
 
         self._precompile_shapes(f"{self.algo_label} DRAFT BLOCK", shapes, run)
+        return pending

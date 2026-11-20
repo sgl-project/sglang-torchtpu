@@ -24,6 +24,7 @@ import logging
 import torch
 
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kernels.twoshot_all_reduce import TWOSHOT_ALL_REDUCE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ _COLLECTIVE_ID = 1
 _OPS: dict = {}
 # Plain bool, not dict truthiness: Dynamo traces the eligibility checks.
 _READY = False
+# TP world size the two-shot op was built for; 0 = off. Plain int for Dynamo.
+_TWOSHOT_WORLD = 0
 # Set (while Dynamo traces / Python runs the decode forward) when a tagged
 # attention o_proj skipped its all-reduce so that the following attention-residual
 # aggregation runs it fused (all_reduce_attn_res); consumed by that aggregation.
@@ -86,15 +89,15 @@ def _comm(world: int, local: int, split_barrier: bool, scratch):
         # Every peer must have entered the kernel (its VMEM buffers exist)
         # before anyone writes into them.
         for p in local_peers:
-            pltpu.semaphore_signal(barrier, m, device_id=(p,), device_id_type=mesh_id)
+            pl.semaphore_signal(barrier, m, device_id=(p,), device_id_type=mesh_id)
         for p in remote_peers:
-            pltpu.semaphore_signal(barrier, 1, device_id=(p,), device_id_type=mesh_id)
+            pl.semaphore_signal(barrier, 1, device_id=(p,), device_id_type=mesh_id)
 
     def wait():
         if split:
-            pltpu.semaphore_wait(barrier, local_wait)
+            pl.semaphore_wait(barrier, local_wait)
         else:
-            pltpu.semaphore_wait(barrier, local_wait + nr)
+            pl.semaphore_wait(barrier, local_wait + nr)
 
     def exchange(src, gather, slot, peers, send_sem, recv_sem):
         copies = []
@@ -126,11 +129,11 @@ def _comm(world: int, local: int, split_barrier: bool, scratch):
         if groups > 1:
             if split:
                 lax.while_loop(
-                    lambda c: lax.rem(pltpu.semaphore_read(barrier), m) != nr,
+                    lambda c: lax.rem(pl.semaphore_read(barrier), m) != nr,
                     lambda c: c + 1,
                     jnp.int32(0),
                 )
-                pltpu.semaphore_wait(barrier, nr)
+                pl.semaphore_wait(barrier, nr)
             exchange(part, gather2, grp, remote_peers, s2, r2)
             return jnp.sum(gather2[...].astype(jnp.float32), axis=0)
         return part[...].astype(jnp.float32)
@@ -498,6 +501,42 @@ def register(world: int, local: int) -> None:
 def register_from_parallel_state() -> None:
     """Called from TpuPlatform.prepare_model_parallel_groups (every rank, after
     the groups exist, before the first collective)."""
+    _register_twolevel_from_parallel_state()
+    _register_twoshot_from_parallel_state()
+
+
+def _register_twoshot_from_parallel_state() -> None:
+    """Build the two-shot op when TP spans one host (every rank decides the
+    same from the parallel state)."""
+    global _TWOSHOT_WORLD
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+    )
+    from sglang.srt.runtime_context import get_server_args
+    from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
+
+    world = get_tensor_model_parallel_world_size()
+    # The kernel's mesh is the whole world and its exchange is host-local.
+    if world <= 1 or world != dist.get_world_size() or get_server_args().nnodes != 1:
+        logger.info(
+            "Two-shot TP all-reduce off: TP %d over %d ranks, %d hosts; it needs "
+            "TP to span one host.",
+            world,
+            dist.get_world_size(),
+            get_server_args().nnodes,
+        )
+        return
+    get_twoshot_all_reduce_op(world)
+    _TWOSHOT_WORLD = world
+    logger.info(
+        "Two-shot TP all-reduce on: bf16 TP all-reduces up to %d KB per rank.",
+        TWOSHOT_ALL_REDUCE_MAX_BYTES // 1024,
+    )
+
+
+def _register_twolevel_from_parallel_state() -> None:
     enabled = tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.get()
     _check_ranks_agree(enabled)
     if not enabled:
@@ -561,13 +600,30 @@ def eligible(t: torch.Tensor) -> bool:
     )
 
 
+def twoshot_eligible(t: torch.Tensor, world: int) -> bool:
+    """A bf16 [rows, cols] payload within the size cap whose columns split into
+    128-lane chunks per rank (the kernel's reduce-scatter unit)."""
+    return (
+        t.dim() == 2
+        and t.dtype == torch.bfloat16
+        and t.shape[1] % (128 * world) == 0
+        and 0 < t.numel() * t.element_size() <= TWOSHOT_ALL_REDUCE_MAX_BYTES
+    )
+
+
 def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
     """AROUND hook for ``GroupCoordinator.all_reduce``."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if not (_READY and group is get_tp_group() and eligible(input_)):
+    if not (_READY or _TWOSHOT_WORLD) or group is not get_tp_group():
         return original(group, input_)
-    return _OPS[1](input_)
+    if _READY and eligible(input_):
+        return _OPS[1](input_)
+    if _TWOSHOT_WORLD and twoshot_eligible(input_, _TWOSHOT_WORLD):
+        from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
+
+        return get_twoshot_all_reduce_op(_TWOSHOT_WORLD)(input_)
+    return original(group, input_)
 
 
 def _fusable_norm(norm, latent: torch.Tensor) -> bool:

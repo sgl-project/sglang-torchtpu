@@ -123,6 +123,12 @@ class SWAComponent(TreeComponent):
         self, node: UnifiedTreeNode
     ) -> list[UnifiedTreeNode]:
         ct = self.component_type
+        # Under write_back a stale window is evicted without a host copy: nothing reads
+        # it, and a host copy taken before its device eviction can't be reclaimed.
+        if self.tree_core.is_write_back and self.tree_core.lru_lists[
+            ct
+        ].skips_host_backup(node):
+            return []
         covered = 0
         unbacked: list[UnifiedTreeNode] = []
         cur = node
@@ -466,9 +472,12 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
-        window_start = params.get_evicted_seqlen(self.component_type)
-        if self._independent:
-            window_start = max(window_start, params.prev_prefix_len)
+        # Never recover below the request's protected prefix: the incoming row
+        # there holds the node's own canonical ids, so a lower window cursor
+        # would free pages the node keeps (mirrors the Rust core).
+        window_start = max(
+            params.get_evicted_seqlen(self.component_type), params.prev_prefix_len
+        )
         consumed_from = prefix_len
         for fragment, start, end in self._segments(
             node=node, start=total_prefix_len, end=total_prefix_len + prefix_len
@@ -707,6 +716,10 @@ class SWAComponent(TreeComponent):
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
+                # A stale window's host copy goes next: at MRU it outlives windows
+                # that are read.
+                if self.tree_core.lru_lists[ct].skips_host_backup(node):
+                    host_lru.reset_node_lru(node)
 
         return freed, host_freed
 
@@ -1160,7 +1173,7 @@ class SWAComponent(TreeComponent):
         cd = node.component_data[self.component_type]
         lru = self.tree_core.lru_lists[self.component_type]
         if cd.value is not None and cd.lock_ref == 0 and lru.in_list(node):
-            lru.reset_node_lru(node)
+            lru.reset_node_lru(node, skip_host_backup=True)
 
     def _media_window(self, req: Req) -> Optional[tuple[int, int]]:
         """[start, end) of the SWA window that a later request reusing this

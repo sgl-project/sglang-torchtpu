@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
 from parameterized import parameterized
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
@@ -550,7 +551,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
-        scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
+        scheduler.device_module = SimpleNamespace(Event=Mock)
+        enter_scope(self, patch.object(torch.accelerator, "current_stream", Mock()))
         scheduler._pp_recv_proxy_tensors = Mock()
         scheduler._pp_commit_comm_work = Mock()
         scheduler._pp_prepare_tensor_dict = Mock(return_value={})

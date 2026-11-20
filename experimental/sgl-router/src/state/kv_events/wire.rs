@@ -57,6 +57,16 @@ pub enum KvCacheEvent {
     AllBlocksCleared,
 }
 
+/// How a `BlockStored`'s `token_ids` were laid out on the wire: one scalar per
+/// token (unigram), or one `[t_i, t_{i+1}]` pair per token (bigram). The engine
+/// emits pairs exactly when the page's radix key is bigram
+/// (`mem_cache/events.py`), so this is the worker's actual block-hash mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenIdShape {
+    Unigram,
+    Bigram,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockStored {
     /// 64-bit block hashes in declaration order. Hashes can exceed `i32`
@@ -66,6 +76,10 @@ pub struct BlockStored {
     pub parent_block_hash: Option<i64>,
     /// Tokens covered by this block. SGLang uses 32-bit token IDs.
     pub token_ids: Vec<u32>,
+    /// Wire layout of `token_ids` before flattening; `None` when it was empty.
+    /// Kept apart from `token_ids` because bootstrap hold-back drops the tokens
+    /// but the index still needs the shape to learn the worker's hash mode.
+    pub token_shape: Option<TokenIdShape>,
     /// Block size (tokens per block).
     pub block_size: u32,
     /// LoRA adapter ID this block is associated with, if any.
@@ -212,12 +226,38 @@ impl<'de> Deserialize<'de> for BoundedI64Vec {
 /// One element of a `token_ids` array. SGLang emits a flat `u32` per token for
 /// unigram pages, but a 2-element `[t_i, t_{i+1}]` array per token for *bigram*
 /// pages (`mem_cache/events.py`, `is_bigram` branch — DeepSeek-V4-class models).
-/// `token_ids` is purely informational for the gateway (routing keys off the
-/// engine-provided `block_hashes`), so we accept either shape and flatten the
-/// ints rather than model the bigram pairing.
+/// Routing keys off the engine-provided `block_hashes`, so we flatten the ints
+/// rather than model the pairing, but record which shape was used
+/// ([`TokenIdShape`]): it tells the index which hasher queries must use.
 enum TokenCell {
     One(u32),
     Many(Vec<u32>),
+}
+
+/// One token id inside a bigram pair. Multimodal pad ids exceed `u32`, so it
+/// narrows like the scalar `TokenCell` path instead of rejecting the batch.
+struct TokenId(u32);
+
+impl<'de> Deserialize<'de> for TokenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TokenId;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a token id")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<TokenId, E> {
+                Ok(TokenId(v as u32))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<TokenId, E> {
+                Ok(TokenId(v as u32))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 impl<'de> Deserialize<'de> for TokenCell {
@@ -248,7 +288,7 @@ impl<'de> Deserialize<'de> for TokenCell {
                     Some(h) => Vec::with_capacity(h.min(8)),
                     None => Vec::new(),
                 };
-                while let Some(t) = seq.next_element::<u32>()? {
+                while let Some(TokenId(t)) = seq.next_element::<TokenId>()? {
                     if ts.len() >= MAX_TOKENS_PER_EVENT {
                         return Err(de::Error::custom(format!(
                             "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
@@ -266,9 +306,12 @@ impl<'de> Deserialize<'de> for TokenCell {
 
 /// `BoundedI64Vec`'s `u32` twin. Same shape, different cap. Accepts both flat
 /// (unigram) token ids and bigram `[t_i, t_{i+1}]` pairs via [`TokenCell`],
-/// flattening the latter.
+/// flattening the latter and recording which layout the first cell used.
 #[derive(Debug, Clone, PartialEq)]
-struct BoundedU32Vec(Vec<u32>);
+struct BoundedU32Vec {
+    tokens: Vec<u32>,
+    shape: Option<TokenIdShape>,
+}
 
 impl<'de> Deserialize<'de> for BoundedU32Vec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -277,11 +320,11 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
     {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = Vec<u32>;
+            type Value = BoundedU32Vec;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a msgpack array of u32 values")
             }
-            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u32>, A::Error>
+            fn visit_seq<A>(self, mut seq: A) -> Result<BoundedU32Vec, A::Error>
             where
                 A: SeqAccess<'de>,
             {
@@ -296,9 +339,14 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                     Some(h) => Vec::with_capacity(h),
                     None => Vec::new(),
                 };
+                let mut shape: Option<TokenIdShape> = None;
                 // Each element is either a scalar token id (unigram) or a
                 // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`.
                 while let Some(cell) = seq.next_element::<TokenCell>()? {
+                    shape.get_or_insert(match cell {
+                        TokenCell::One(_) => TokenIdShape::Unigram,
+                        TokenCell::Many(_) => TokenIdShape::Bigram,
+                    });
                     let push = |t: u32, out: &mut Vec<u32>| -> Result<(), A::Error> {
                         if out.len() >= MAX_TOKENS_PER_EVENT {
                             return Err(de::Error::custom(format!(
@@ -318,11 +366,10 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                         }
                     }
                 }
-                Ok(out)
+                Ok(BoundedU32Vec { tokens: out, shape })
             }
         }
-        let v = deserializer.deserialize_seq(V)?;
-        Ok(BoundedU32Vec(v))
+        deserializer.deserialize_seq(V)
     }
 }
 
@@ -456,19 +503,22 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 }
                 let tag = tag.ok_or_else(|| de::Error::missing_field("type"))?;
                 match tag.as_str() {
-                    "BlockStored" => Ok(KvCacheEvent::BlockStored(BlockStored {
-                        block_hashes: block_hashes
-                            .ok_or_else(|| de::Error::missing_field("block_hashes"))?
-                            .0,
-                        parent_block_hash,
-                        token_ids: token_ids
-                            .ok_or_else(|| de::Error::missing_field("token_ids"))?
-                            .0,
-                        block_size: block_size
-                            .ok_or_else(|| de::Error::missing_field("block_size"))?,
-                        lora_id,
-                        medium,
-                    })),
+                    "BlockStored" => {
+                        let token_ids =
+                            token_ids.ok_or_else(|| de::Error::missing_field("token_ids"))?;
+                        Ok(KvCacheEvent::BlockStored(BlockStored {
+                            block_hashes: block_hashes
+                                .ok_or_else(|| de::Error::missing_field("block_hashes"))?
+                                .0,
+                            parent_block_hash,
+                            token_ids: token_ids.tokens,
+                            token_shape: token_ids.shape,
+                            block_size: block_size
+                                .ok_or_else(|| de::Error::missing_field("block_size"))?,
+                            lora_id,
+                            medium,
+                        }))
+                    }
                     "BlockRemoved" => Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
                         block_hashes: block_hashes
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?
@@ -530,12 +580,12 @@ mod tests {
     /// Encode `token_ids` the way SGLang's *bigram* pages do: a sequence of
     /// 2-element `[t_i, t_{i+1}]` arrays instead of flat ints. See
     /// `mem_cache/events.py` (`is_bigram` branch).
-    fn write_bigram_token_array(buf: &mut Vec<u8>, pairs: &[(u32, u32)]) {
+    fn write_bigram_token_array(buf: &mut Vec<u8>, pairs: &[(u64, u64)]) {
         mp::write_array_len(buf, pairs.len() as u32).unwrap();
         for (a, b) in pairs {
             mp::write_array_len(buf, 2).unwrap();
-            mp::write_uint(buf, *a as u64).unwrap();
-            mp::write_uint(buf, *b as u64).unwrap();
+            mp::write_uint(buf, *a).unwrap();
+            mp::write_uint(buf, *b).unwrap();
         }
     }
 
@@ -639,7 +689,7 @@ mod tests {
     fn build_block_stored_bigram_bytes(
         block_hashes: &[i64],
         parent: Option<i64>,
-        token_pairs: &[(u32, u32)],
+        token_pairs: &[(u64, u64)],
         block_size: u32,
         lora_id: Option<i64>,
         medium: Option<&str>,
@@ -733,6 +783,71 @@ mod tests {
                 assert_eq!(b.parent_block_hash, None);
                 assert_eq!(b.block_size, 2);
                 assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
+    /// The decoder must report which `token_ids` layout the worker used: it is
+    /// the only signal of the worker's real block-hash mode, since the engine
+    /// keeps unigram keys for hybrid-SSM models even under EAGLE/MTP.
+    #[test]
+    fn records_token_id_shape() {
+        let shape_of = |event: Vec<u8>| {
+            let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
+            match decode_event_batch(&bytes).expect("decode").events.remove(0) {
+                KvCacheEvent::BlockStored(b) => b.token_shape,
+                other => panic!("expected BlockStored, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            shape_of(build_block_stored_bytes(
+                &[1],
+                None,
+                &[10, 20],
+                2,
+                None,
+                None
+            )),
+            Some(TokenIdShape::Unigram),
+        );
+        assert_eq!(
+            shape_of(build_block_stored_bigram_bytes(
+                &[1],
+                None,
+                &[(10, 20), (20, 30)],
+                2,
+                None,
+                None,
+            )),
+            Some(TokenIdShape::Bigram),
+        );
+        assert_eq!(
+            shape_of(build_block_stored_bytes(&[1], None, &[], 2, None, None)),
+            None,
+        );
+    }
+
+    /// Multimodal pad ids in bigram pairs exceed `u32`; the batch must still
+    /// decode rather than be dropped whole.
+    #[test]
+    fn decodes_bigram_token_ids_above_u32() {
+        let pad = 1_000_000_u64 + (1 << 61);
+        let event = build_block_stored_bigram_bytes(
+            &[111_i64],
+            None,
+            &[(10, pad), (pad, 30)],
+            2,
+            None,
+            Some("GPU"),
+        );
+        let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
+
+        let batch = decode_event_batch(&bytes).expect("decode wide bigram token_ids");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![111]);
+                assert_eq!(b.token_ids, vec![10, pad as u32, pad as u32, 30]);
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }

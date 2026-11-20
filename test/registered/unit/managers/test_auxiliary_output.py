@@ -609,7 +609,6 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         transfer_backend=None,
-        maybe_send_health_check_signal=Mock(),
     )
 
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
@@ -627,7 +626,6 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
-    scheduler.maybe_send_health_check_signal.assert_called_once_with()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

@@ -14,6 +14,7 @@ from anyio.from_thread import start_blocking_portal
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.utils.network import try_bind_socket
+from sglang_tpu.node_normalization import rewrites_host_order
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def forward_normalized_leader(server_args):
     """Yield whether this worker owns the input leader's serving listeners."""
     cfg = resolving_view(server_args)
     if (
-        not cfg.tpu_node_normalization
+        not rewrites_host_order(cfg)
         or cfg.nnodes == 1
         or server_args.node_rank != 0
         or cfg.node_rank == 0

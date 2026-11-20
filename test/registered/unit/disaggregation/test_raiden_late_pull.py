@@ -28,6 +28,7 @@ def _decode_manager(engine, chunked=False):
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._aborted = {}
     mgr._failed = set()

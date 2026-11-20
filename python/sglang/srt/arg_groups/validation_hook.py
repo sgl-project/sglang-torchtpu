@@ -120,9 +120,8 @@ def check_server_args(server_args: Any):
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
 
-    assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
-        "multi-node data-parallel replicas are not supported; use attention DP "
-        "(--attn-dp-size) across nodes"
+    assert cfg.dp_size == 1 or cfg.nnodes == 1 or cfg.nnodes % cfg.dp_size == 0, (
+        "each multi-node data-parallel replica runs on nnodes / dp_size whole nodes"
     )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"

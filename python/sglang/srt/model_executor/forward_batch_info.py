@@ -799,6 +799,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
+    # Encoder replay folded into the extend: per-row window floor [num_tokens]
+    # int64 (the request's replay start, 0 for other requests).
+    encoder_swa_row_floor: Optional[torch.Tensor] = None
+    encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
@@ -1391,12 +1395,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         None means tracking is skipped for this forward:
         no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
         Masked-off rows hold garbage.
+
+        Decode rows that MAX_LEN DP padding runs as 1-token extends
+        (prepare_mlp_sync_batch) keep their decode track plan: the mask marks
+        rows whose post-token length lands on the track grid, and the decode
+        result path records that snapshot as taken. The whole row is covered;
+        its prefix (seq_len - 1) is off the chunk grid, so the floor below
+        would wrongly round it to 0.
         """
-        if (
-            self.mamba_track_mask is None
-            or self.mamba_track_seqlens is None
-            or self.extend_prefix_lens is None
-        ):
+        if self.mamba_track_mask is None:
+            return None
+        original_mode = getattr(self, "_original_forward_mode", None)
+        if original_mode is not None and original_mode.is_decode():
+            return self.extend_seq_lens
+        if self.mamba_track_seqlens is None or self.extend_prefix_lens is None:
             return None
 
         chunk_size = mamba_cache_chunk_size()

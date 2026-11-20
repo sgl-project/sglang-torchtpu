@@ -52,7 +52,17 @@ def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
     return scheduler
 
 
-class TestStreamFences(CustomTestCase):
+class _StreamPatchedTestCase(CustomTestCase):
+    """Stub torch.accelerator.current_stream so CPU CI needs no accelerator."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(torch.accelerator, "current_stream")
+        self.current_stream = patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestStreamFences(_StreamPatchedTestCase):
     def test_deferred_prefill_result_copy_waits_on_its_communication_stream(self):
         scheduler = _single_queue_scheduler(is_last_rank=True)
         order = []
@@ -73,7 +83,7 @@ class TestStreamFences(CustomTestCase):
         scheduler.last_rank_comm_queue = [
             (ready, PPProxyTensors({"next_token_ids": source}))
         ]
-        copy_stream = scheduler.device_module.current_stream.return_value
+        copy_stream = self.current_stream.return_value
         copy_stream.wait_event.side_effect = lambda event: order.append(
             "wait-producer-on-stream"
         )
@@ -185,7 +195,7 @@ class TestStreamFences(CustomTestCase):
         )
 
 
-class TestProxyReceive(CustomTestCase):
+class TestProxyReceive(_StreamPatchedTestCase):
     def _scheduler(self, received):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=False)
@@ -200,7 +210,7 @@ class TestProxyReceive(CustomTestCase):
         scheduler._pp_recv_typed_dict.assert_not_called()
 
 
-class TestWaveBuffers(CustomTestCase):
+class TestWaveBuffers(_StreamPatchedTestCase):
     def _wave_args(self, compile_policy, model=None):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=False)

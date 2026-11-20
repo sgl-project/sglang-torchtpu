@@ -22,6 +22,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang_tpu.disaggregation.raiden import dram_offload_channel as raiden_offload
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -86,12 +87,30 @@ class RaidenSenderMixin:
         decode_port = req.decode_port
         decode_pages = req.decode_pages
         decode_swa_pages = req.decode_swa_pages
+        # One role offloading to a peer that does not take part would run
+        # without the offload and never say so.
+        switch_mismatch = raiden_offload.peer_switch_mismatch(
+            decode_enabled=req.kv_offload
+        )
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None and switch_mismatch is not None:
+                logger.error(
+                    "RaidenKVManager rank%d room %s: %s",
+                    self.attn_tp_rank,
+                    room,
+                    switch_mismatch,
+                )
+                self._fail_room_locked(room, switch_mismatch)
+                failed_reason = switch_mismatch
             if failed_reason is None:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
+                if self.dram_offload_channel is not None:
+                    self.dram_offload_channel.accept_prefix_offer_locked(
+                        room, req.prefix_blocks, req.prefix_swa_blocks
+                    )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
         if failed_reason is not None:
@@ -215,6 +234,7 @@ class RaidenSenderMixin:
         block_ids: List[int],
         swa_block_ids: Optional[List[int]] = None,
         state_block_ids: Optional[List[int]] = None,
+        draft_swa_block_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         """Records a chunk's pages and returns its start index in the request.
 
@@ -234,6 +254,10 @@ class RaidenSenderMixin:
                 listed.update(block_ids)
                 if swa_block_ids is not None:
                     self._prefill.send_swa_blocks[room] = list(swa_block_ids)
+                if draft_swa_block_ids is not None:
+                    self._prefill.send_draft_swa_blocks[room] = list(
+                        draft_swa_block_ids
+                    )
                 if state_block_ids is not None:
                     self._prefill.send_state_rows[room] = list(state_block_ids)
                 return start
@@ -466,6 +490,11 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted or not self._decode_requested_locked(room):
                 return False
+            if (
+                self.dram_offload_channel is not None
+                and self.dram_offload_channel.prefix_pull_open_locked(room)
+            ):
+                return False
             if self.request_status.get(room) == KVPoll.Bootstrapping:
                 self.update_status(room, KVPoll.WaitingForInput)
             return True
@@ -630,10 +659,16 @@ class RaidenSenderMixin:
                     self._state_engine is not None
                     and room not in self._prefill.send_state_rows
                 )
+                or (
+                    self._draft_engine is not None
+                    and self._draft_is_swa
+                    and room not in self._prefill.send_draft_swa_blocks
+                )
                 or room not in self._prefill.decode_addr
             ):
                 return
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            draft_swa_blocks = list(self._prefill.send_draft_swa_blocks.get(room, []))
             state_rows = list(self._prefill.send_state_rows.get(room, []))
             blocks = list(self._prefill.send_blocks[room])
             addr = self._prefill.decode_addr[room]
@@ -646,6 +681,19 @@ class RaidenSenderMixin:
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)
         swa_read_blocks = whole_pull_registration(swa_blocks, decode_swa_pages)
+        draft_read_blocks: List[int] = []
+        if self._draft_engine is not None:
+            if self._draft_is_swa:
+                decode_draft_swa_pages = (
+                    decode_swa_pages // self._unified_swa_pool.layout.num_swa_groups
+                    if self._unified_swa_pool is not None
+                    else decode_swa_pages
+                )
+                draft_read_blocks = whole_pull_registration(
+                    draft_swa_blocks, decode_draft_swa_pages
+                )
+            else:
+                draft_read_blocks = whole_pull_registration(blocks, decode_pages)
         if self._unified_swa_pool is not None:
             read_blocks = read_blocks + swa_read_blocks
             swa_read_blocks = []
@@ -672,6 +720,14 @@ class RaidenSenderMixin:
                     room,
                     swa_read_blocks,
                 )
+            if self._draft_engine is not None and draft_read_blocks:
+                self._register_sender_read(
+                    room,
+                    self._draft_engine,
+                    self._draft_req_id(room),
+                    room,
+                    draft_read_blocks,
+                )
             if read_blocks:
                 self._register_sender_read(
                     room, self._ensure_engine(), str(room), room, read_blocks
@@ -693,6 +749,8 @@ class RaidenSenderMixin:
                 state_endpoint=self.state_raiden_endpoint or "",
                 state_meta=state_meta,
                 kv_layout=self.kv_layout,
+                draft_endpoint=self.draft_raiden_endpoint or "",
+                draft_swa_blocks=draft_swa_blocks,
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
@@ -716,8 +774,16 @@ class RaidenSenderMixin:
                 self._completed_send.add(str(room))
             if self._swa_engine is not None and not swa_read_blocks:
                 self._completed_send.add(self._swa_req_id(room))
+            if self._draft_engine is not None and not draft_read_blocks:
+                self._completed_send.add(self._draft_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
+        if self._draft_engine is not None:
+            raise NotImplementedError(
+                "Raiden push resharding does not support speculative draft KV "
+                "over TpuUnifiedSWAKVPool yet; use equal attention TP on "
+                "prefill and decode."
+            )
         req = ReshardReq.from_frames(msg)
         if self._bounded_staging:
             # The reshard push copies every layer with one engine.d2h call, which
@@ -730,6 +796,24 @@ class RaidenSenderMixin:
                 "Raiden asymmetric attention TP does not support staging layers to "
                 "reduce host staging RAM. Set SGLANG_TPU_RAIDEN_STAGING_LAYERS=0 on "
                 "prefill and decode to keep full mirrors."
+            )
+            with self._state_lock:
+                self._fail_room_locked(req.room, reason)
+            self._reply_room_failed(
+                room=req.room,
+                endpoint=_tcp_endpoint(ip=req.decode_ip, port=req.decode_port),
+                reason=reason,
+            )
+            return
+        reason = raiden_offload.resharding_refusal(decode_enabled=req.kv_offload)
+        if reason is not None:
+            # A decode at another attention TP cannot take host pages rank to
+            # rank; serving it without the offload would hide that.
+            logger.error(
+                "RaidenKVManager rank%d room %s: %s",
+                self.attn_tp_rank,
+                req.room,
+                reason,
             )
             with self._state_lock:
                 self._fail_room_locked(req.room, reason)
@@ -1698,6 +1782,11 @@ class RaidenKVSender(CommonKVSender):
             if state_indices is not None
             else None
         )
+        draft_swa_blocks = (
+            self.kv_mgr._draft_swa_blocks_from_state_indices(state_indices)
+            if state_indices is not None
+            else None
+        )
         state_rows = (
             self.kv_mgr._state_rows_from_state_indices(state_indices)
             if state_indices is not None
@@ -1709,6 +1798,7 @@ class RaidenKVSender(CommonKVSender):
             blocks,
             swa_block_ids=swa_blocks,
             state_block_ids=state_rows,
+            draft_swa_block_ids=draft_swa_blocks,
         )
         if start is None:
             return  # aborted while this chunk was being computed

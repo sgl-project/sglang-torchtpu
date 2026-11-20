@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden import pipeline as pl
-from sglang_tpu.disaggregation.raiden import pp_common
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
+from sglang_tpu.disaggregation.raiden.pool_spans import head_slice_spans
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -56,8 +56,14 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
     swa_src = torch.zeros((4, 2 * total_kv_heads, head_dim, page), dtype=dtype)
     pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
     full_ids, swa_ids = [4, 0, 2], [1, 3]
-    spans = pp_common.head_slice_spans(
-        pools, [src, swa_src], full_ids, swa_ids, dst_tp, total_kv_heads, total_kv_heads
+    spans = head_slice_spans(
+        pools=pools,
+        tensors=[src, swa_src],
+        full=full_ids,
+        swa=swa_ids,
+        dst_attn_tp=dst_tp,
+        total_kv_heads=total_kv_heads,
+        total_swa_kv_heads=total_kv_heads,
     )
     rng = np.random.default_rng(0)
     heads_per_rank = max(1, total_kv_heads // dst_tp)
@@ -91,8 +97,14 @@ def test_rank4_swa_pool_slices_over_swa_heads():
     src = torch.zeros((3, 2 * full_heads, head_dim, page), dtype=torch.bfloat16)
     swa_src = torch.zeros((3, 2 * swa_heads, head_dim, page), dtype=torch.bfloat16)
     pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
-    full_spans, swa_spans = pp_common.head_slice_spans(
-        pools, [src, swa_src], [0, 1], [2], dst_tp, full_heads, swa_heads
+    full_spans, swa_spans = head_slice_spans(
+        pools=pools,
+        tensors=[src, swa_src],
+        full=[0, 1],
+        swa=[2],
+        dst_attn_tp=dst_tp,
+        total_kv_heads=full_heads,
+        total_swa_kv_heads=swa_heads,
     )
     run = 2 * head_dim * page * src.element_size()
     assert {s.size_bytes for s in full_spans.spans} == {full_heads // dst_tp * run}

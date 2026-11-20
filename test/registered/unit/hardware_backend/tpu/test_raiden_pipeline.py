@@ -20,8 +20,13 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     node_worker_rank,
     ranks_per_node,
 )
-from sglang_tpu.disaggregation.raiden.pipeline import (
-    PipelineTransfer,
+from sglang_tpu.disaggregation.raiden.pool_spans import (
+    head_slice_spans,
+    is_swa_pool,
+    source_spans,
+)
+from sglang_tpu.disaggregation.raiden.pool_transfer import (
+    RaidenPoolTransfer,
     Receive,
     destination_blocks,
     layout_fingerprint,
@@ -30,11 +35,6 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     materialized_storage_layout,
     pool_manifest,
     warn_if_staging_exceeds_premapped,
-)
-from sglang_tpu.disaggregation.raiden.pp_common import (
-    head_slice_spans,
-    is_swa_pool,
-    source_spans,
 )
 from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
 
@@ -144,7 +144,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
 def sent(expires=None, registered=True):
     return dict(
         full=[20, 21],
-        swa=[30],
+        side=[30],
         aux=b"",
         expires=time.monotonic() + 120 if expires is None else expires,
         registered=registered,
@@ -155,9 +155,10 @@ def sent(expires=None, registered=True):
 
 
 def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=0):
-    pipe = PipelineTransfer.__new__(PipelineTransfer)
+    pipe = RaidenPoolTransfer.__new__(RaidenPoolTransfer)
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
+        _drain_lock=threading.Lock(),
         _aborted={},
         _norm_req_id=lambda value: value.removeprefix("resharded_transfer_"),
         _require_frames=Mock(),
@@ -201,6 +202,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
     pipe.client_type = Mock(return_value=Mock())
     pipe.controller = "decode:30001"
     pipe.rank = pp_rank * attn_tp_size + attn_tp_rank
+    pipe.workers = pp_size * attn_tp_size
     pipe.unit_fields = dict(
         job_name="sglang",
         job_replica_id="decode:30001",
@@ -243,7 +245,7 @@ def receive(rank=0, pp_size=8, full=(20, 21), swa=(30,)):
     )
     return Receive(
         full=list(full),
-        swa=list(swa),
+        side=list(swa),
         aux_index=None,
         ranks={rank},
         sources={rank: metadata},
@@ -654,7 +656,7 @@ class TestLegacyPoolBudget(unittest.TestCase):
 
     def test_staging_above_the_premapped_buffer_warns(self):
         with self.assertLogs(
-            "sglang_tpu.disaggregation.raiden.pipeline", level="WARNING"
+            "sglang_tpu.disaggregation.raiden.pool_transfer", level="WARNING"
         ) as logs:
             self.assertTrue(
                 warn_if_staging_exceeds_premapped(
@@ -882,6 +884,7 @@ class TestPipelineLifetimes(unittest.TestCase):
                 manager._pipeline_init_lock = threading.Lock()
                 manager._pipeline = pipe
                 manager._state_lock = threading.Lock()
+                manager._drain_lock = threading.Lock()
                 manager._status_lock = threading.Lock()
                 manager._aborted = {}
                 manager._failed = set()
@@ -910,7 +913,9 @@ class TestPipelineLifetimes(unittest.TestCase):
         request = receive()
         request.ranks, request.aux_index = set(range(8)), 5
         pipe.receives[7] = request
-        with patch("sglang_tpu.disaggregation.raiden.pipeline.write_aux_blob") as write:
+        with patch(
+            "sglang_tpu.disaggregation.raiden.pool_transfer.write_aux_blob"
+        ) as write:
             for rank in (7, 0):
                 meta = receive(rank=rank).sources[rank]
                 pipe.on_message(
@@ -1139,7 +1144,7 @@ class TestPipelineInitialization(unittest.TestCase):
     def test_legacy_host_budget_uses_resolved_node_count(self):
         get_context().override("test.multihost", nnodes=2)
         with patch(
-            "sglang_tpu.disaggregation.raiden.pipeline.ranks_per_node",
+            "sglang_tpu.disaggregation.raiden.pool_transfer.ranks_per_node",
             wraps=ranks_per_node,
         ) as local_ranks:
             self._initialize(legacy=True)
@@ -1235,7 +1240,7 @@ class TestPipelineInitialization(unittest.TestCase):
             ),
         }
         with patch.dict(sys.modules, native):
-            pipe = PipelineTransfer(manager, buffers)
+            pipe = RaidenPoolTransfer(manager, buffers)
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
             expected = ["materialize", "layout"] + expected
@@ -1366,7 +1371,7 @@ class TestDraftPoolGroups(unittest.TestCase):
                 )
 
     def test_pipeline_register_blocks_passes_draft_kv_heads_to_full_and_swa_pools(self):
-        from sglang_tpu.disaggregation.raiden import pp_swa
+        from sglang_tpu.disaggregation.raiden import pool_side_engine
 
         pipe = transfer(producer=True, pp_size=8, pp_rank=7)
         pipe.manager.kv_args.total_kv_head_num = 16
@@ -1382,10 +1387,11 @@ class TestDraftPoolGroups(unittest.TestCase):
             num_hidden_full=0,
             num_draft_swa=1,
         )
-        pipe.pools, swa_pools = pp_swa.split_manifest(pool_manifest(layers))
+        pipe.pools, swa_pools = pool_side_engine.split_manifest(pool_manifest(layers))
         pipe.tensors = list(layers.full)
         swa_client = Mock()
-        pipe.swa = pp_swa.SwaLink(
+        pipe.side = pool_side_engine.SideLink(
+            family=pool_side_engine.SWA,
             pools=swa_pools,
             tensors=list(layers.swa),
             controller="decode-swa:30001",
@@ -1395,11 +1401,11 @@ class TestDraftPoolGroups(unittest.TestCase):
             slots=4,
             hold_undeclared=False,
         )
-        pipe.swa.client = swa_client
+        pipe.side.client = swa_client
         pipe.replies[7] = {0: {"attn_tp_size": 8}}
         self.assertTrue(
             pipe._register_blocks(
-                7, req_id="7", uuid=7, full=[20], swa=[30], with_swa=True
+                7, req_id="7", uuid=7, full=[20], side=[30], with_side=True
             )
         )
         full_spans = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]

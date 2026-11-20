@@ -116,7 +116,11 @@ def _scatter_index_rows(spec, cfg, meta, pos, tab, nraw, nrec, raw, rec):
     b, qi = r // Q, r % Q
     live = b < meta[0]
     tok = pos[b] + qi
-    tpage = jnp.where(live, tab[b * pps + jnp.minimum(tok // ps, pps - 1)], -1)
+    if cfg.raw_ring_pages_cnt:
+        raw_base = meta[D.META_RAW_BASE + b]
+        tpage = jnp.where(live, raw_base + (tok // ps) % cfg.raw_ring_pages_cnt, -1)
+    else:
+        tpage = jnp.where(live, tab[b * pps + jnp.minimum(tok // ps, pps - 1)], -1)
     fp0, fresh = PL.closing_pools(pos[b], Q, kp)
     ptok = (fp0 + qi) * kp
     rpage = jnp.where(
@@ -134,7 +138,7 @@ def _scatter_index_rows(spec, cfg, meta, pos, tab, nraw, nrec, raw, rec):
 
 
 def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfig):
-    """`shard(step_inputs, init_streams, weights, pools) -> (logits, hidden, pools)`."""
+    """`shard(step_inputs, init_streams, weights, pools) -> (logits, hidden, pools)`; logits are gathered to the full vocab."""
     tp = layout.tp
     slab = D.SlabIndex(small_map, small_f32_map, spec)
     kernel = D.build(spec, layout, cfg, slab)
@@ -187,6 +191,8 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
             tok, pos, meta, tab, srow, k_scales, init_streams, *ws, *ps, *experts
         )
         logits, _, hidden, nkv, nraw, npk, recur, conv = out
+        # Vocab shards gathered here: one program instead of a separate collective launch.
+        logits = jax.lax.all_gather(logits, D.AXIS, axis=1, tiled=True)
         # fp8 bytes as the nope pool holds them: kv / k_scale per layer.
         nkv8 = (nkv.astype(jnp.float32) / k_scales[:, None, None]).astype(
             jnp.float8_e4m3fn
@@ -197,17 +203,26 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         raw_out, rec_out = _scatter_index_rows(
             spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
         )
-        dma_pools = [*pools["nope"], *pools["temporal"], *pools["conv"]]
-        new = write_rows(meta, pos, tab, ckrow, nkv8, recur, conv, *dma_pools)
+        written = write_rows(
+            meta, pos, tab, ckrow, nkv8, conv, *pools["nope"], *pools["conv"]
+        )
+        nope_out, conv_out = written[:n_dsa], written[n_dsa:]
+        # KDA temporal checkpoints (17 MB per row) go in as XLA scatters on the
+        # donated pools: an in-kernel HBM->HBM DMA runs at ~33 GB/s on v7x, 2 ms per 4 rows.
+        live = jnp.arange(R, dtype=jnp.int32) // Q < meta[0]
+        ck = jnp.where(live, ckrow, -1)
+        temporal_out = [
+            pools["temporal"][k].at[ck].set(recur[k], mode="drop") for k in range(n_kda)
+        ]
         return (
             logits,
             hidden,
             {
-                "nope": list(new[:n_dsa]),
+                "nope": list(nope_out),
                 "raw": raw_out,
                 "records": rec_out,
-                "temporal": list(new[n_dsa : n_dsa + n_kda]),
-                "conv": list(new[n_dsa + n_kda :]),
+                "temporal": temporal_out,
+                "conv": list(conv_out),
             },
         )
 
@@ -221,7 +236,7 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         body,
         mesh=mesh,
         in_specs=(P(), P(), P(), P(), P(), P(), P(), P(None, None), wspec, pspec),
-        out_specs=(P(None, D.AXIS), P(None, None), pspec),
+        out_specs=(P(None, None), P(None, None), pspec),
         check_vma=False,
     )
     return _Step(shard=shard, wspec=wspec, pspec=pspec)

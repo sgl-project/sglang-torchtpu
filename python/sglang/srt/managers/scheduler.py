@@ -153,7 +153,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
-    HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -235,6 +234,9 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.health_monitor import (
+    SchedulerHealthMonitor,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -1170,7 +1172,7 @@ class Scheduler(
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
-            if self.enable_overlap or get_parallel().pp_size > 1 or use_mlx()
+            if self._forward_may_outlive_scheduling() or use_mlx()
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
@@ -1346,7 +1348,10 @@ class Scheduler(
         self.enable_continuous_input_polling = False
         self.forward_ct = 0
         self.recompile_stance_set = False
-        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self.health_monitor = SchedulerHealthMonitor(
+            self.ipc_channels.send_to_tokenizer.send_output,
+            get_parallel().dp_rank if get_parallel().dp_rank is not None else 0,
+        )
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1777,23 +1782,33 @@ class Scheduler(
             get_memory().hicache_io_backend
         )
 
+    def _forward_may_outlive_scheduling(self) -> bool:
+        """Whether a launched forward can still run while the scheduler frees
+        pages and forms the next batch: under overlap, and in the PP stage loops."""
+        # TODO(norx1991): after a PP check, move the other enable_overlap timing
+        # reads here (chunk-cache SWA eviction, prebuilt-row drain, finished or
+        # retracted result skip, mamba ping-pong buffers, PD early-send clip and event).
+        return self.enable_overlap or get_parallel().pp_size > 1
+
     def _needs_kv_free_fence(self) -> bool:
-        """Whether unordered DMAs can write pages an in-flight forward writes:
-        TPU DMA HiCache loads, or KV arriving on a PD decode server."""
-        return (
-            self.device == "tpu"
-            and self.enable_overlap
-            and (
-                self._uses_tpu_dma_hicache()
-                or self.disaggregation_mode == DisaggregationMode.DECODE
-            )
-        )
+        """Whether unordered DMAs can touch pages an in-flight forward uses:
+        TPU DMA HiCache loads and backups, or KV arriving on a PD decode server."""
+        if self.device != "tpu" or not self._forward_may_outlive_scheduling():
+            return False
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # The PP decode loop drives no fence hooks.
+            # TODO(norx1991): add the fence hooks there,
+            # or reject PP PD decode at startup.
+            return get_parallel().pp_size == 1
+        return self._uses_tpu_dma_hicache()
 
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets.
-        Raises if the fence cannot cover every KV write of this server."""
+        """Hold KV pages freed under overlap or PP back from DMA write targets,
+        and defer HiCache backups behind in-flight forwards. Raises if the fence
+        cannot cover every KV write of this server."""
         if not self._needs_kv_free_fence():
             return
+        pp = get_parallel().pp_size > 1
         from sglang_tpu.kv_free_fence import (
             fence_hicache_backups,
             install_kv_free_fence,
@@ -1801,13 +1816,24 @@ class Scheduler(
         )
 
         fence_kwargs = dict(
-            spec_algorithm=self.spec_algorithm,
+            # A PP stage retires a forward on an event recorded after its whole
+            # run_batch, draft writes included, not on a copied result tensor.
+            spec_algorithm=SpeculativeAlgorithm.NONE if pp else self.spec_algorithm,
             copies_draft_tail=self.tpu_async_copy_worker is not None
             and self.tpu_async_copy_worker.copy_draft_tail,
         )
         reason = kv_free_fence_unsupported_reason(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
+        if (
+            pp
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and not self.spec_algorithm.is_none()
+        ):
+            reason = (
+                "the unified PP loop commits speculative KV while processing "
+                "results, after the launch event the fence retires on."
+            )
         if reason is not None:
             # Unfenced, a DMA into a freed page can land before an in-flight
             # forward's write to it and be overwritten without any error.
@@ -1816,17 +1842,25 @@ class Scheduler(
                 if self._uses_tpu_dma_hicache()
                 else "A PD decode server under overlap scheduling"
             )
-            raise ValueError(
-                f"{needed_by} needs the KV free fence: {reason} "
-                "Pass --disable-overlap-schedule to run without it."
+            fix = (
+                "Disable hierarchical cache to run pipeline parallelism without it."
+                if pp
+                else "Pass --disable-overlap-schedule to run without it."
             )
-        self.kv_free_fence = install_kv_free_fence(
+            raise ValueError(f"{needed_by} needs the KV free fence: {reason} {fix}")
+        fence = install_kv_free_fence(
             self.token_to_kv_pool_allocator,
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
+        # PP forces overlap off, so at most one of the two is set. The PP loops
+        # retire forwards by polling launch events, not through on_forward_done.
+        if pp:
+            self.pp_kv_free_fence = fence
+        else:
+            self.kv_free_fence = fence
         if self._uses_tpu_dma_hicache():
-            fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
+            fence_hicache_backups(self.tree_cache.cache_controller, fence)
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang_tpu.compilation.spec_decode_compile_policy import (
@@ -2033,6 +2067,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "page_size": self.page_size,
             "startup_time": self.startup_time,
         }
 
@@ -2083,9 +2118,7 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
-            self.enable_overlap or get_parallel().pp_size > 1
-        ):
+        elif (is_cuda() or _is_hip) and self._forward_may_outlive_scheduling():
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
@@ -2337,14 +2370,14 @@ class Scheduler(
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+            if is_health_check_generate_req(recv_req):
+                # A busy engine proves itself with the batch it is running, so
+                # the probe waits for that completion instead of a forward of
+                # its own; on_idle admits it if no completion follows.
+                admitted = self.is_fully_idle(for_health_check=True)
+                self.health_monitor.register(recv_req, admitted=admitted)
+                if not admitted:
+                    continue
 
             if vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
@@ -4118,9 +4151,12 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
+        # Requests the caller counts that already hold a row (a continuing
+        # chunk, a session borrow) need no free one; give their rows back.
+        available = self.req_to_token_pool.available_size() + num_held_rows
 
         active_batch = running_batch or self.running_batch
         available = max(
@@ -4204,8 +4240,8 @@ class Scheduler(
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
+        # In the non-PP case, a chunked request keeps its req_to_token row across chunks,
+        # so continuing it needs no free row.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
@@ -4334,16 +4370,21 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                num_held_rows=num_held_rows,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if (
+                    len(adder.can_run_list) - num_held_rows
+                    >= self.req_to_token_pool.available_size()
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
@@ -5214,11 +5255,16 @@ class Scheduler(
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
-        self.maybe_signal_queued_health_checks(batch)
         self.metrics_reporter.update_device_timer()
         if self.kv_free_fence is not None:
             self.kv_free_fence.on_forward_done(result)
+        # Last: everything above has synchronized and consumed the device
+        # results, so an acknowledgement here certifies completed inference.
+        if not self.health_monitor.on_batch_completed(batch):
+            # Idle, prebuilt or aborted-only passes prove nothing and, under
+            # DP attention, an otherwise idle rank runs them in lockstep
+            # without ever reaching on_idle.
+            self.admit_deferred_health_probes()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5273,56 +5319,16 @@ class Scheduler(
                 result.get_num_generated_tokens(batch_size),
             )
 
-    def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
-            )
+    def admit_deferred_health_probes(self) -> None:
+        """Run probes that were deferred as busy when no completion will follow.
 
-    def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
-        """Answer health probes that are queued behind a prefill doing real work.
-
-        A probe that arrives while the scheduler looks idle is admitted like a
-        normal request, yet it can still land behind a long prompt (e.g. on a
-        PD prefill both leave the bootstrap queue in the same poll, prompt
-        first). Each chunk of that prompt fills the prefill token budget, so
-        the probe is not scheduled until the chain ends, and a prefill server
-        sends the tokenizer nothing meanwhile. A completed prefill batch with
-        real work is the evidence the busy path in process_input_requests
-        relies on, so send the same HealthCheckOutput that
-        maybe_send_health_check_signal sends.
-
-        The queues are the only state: each queued probe is flagged when
-        signaled, so a long chain answers it once, not once per chunk. A
-        scheduler that completes no batch sends nothing, so a hung engine still
-        fails the probe. The probe stays queued and runs its 1-token forward
-        later; the tokenizer drops that late output.
+        A probe deferred in the iteration after the last real batch completed
+        has nothing left to wait for; its own tiny forward is the only
+        evidence an idle engine can produce, and it does not depend on router
+        traffic that an unhealthy engine is not receiving.
         """
-        if (
-            not batch.forward_mode.is_extend_without_speculative()
-            or not batch.reqs
-            or all(is_health_check_generate_req(req) for req in batch.reqs)
-        ):
-            return
-        queues = [self.waiting_queue]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            queues.append(self.disagg_prefill_bootstrap_queue.queue)
-        for queue in queues:
-            for req in queue:
-                if not is_health_check_generate_req(req) or getattr(
-                    req, "_health_check_signaled", False
-                ):
-                    continue
-                req._health_check_signaled = True
-                # One per probe rid, so an own-rid probe waiter can match it.
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
-                )
+        for recv_req in self.health_monitor.pop_deferred():
+            self._request_dispatcher(recv_req)
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
@@ -5369,8 +5375,7 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Nothing is waiting on the device: drop parked multimodal features.
         MM_FEATURE_RELEASER.drain_all()
-        # Flush any health-check signal deferred while the engine was busy.
-        self.maybe_send_health_check_signal()
+        self.admit_deferred_health_probes()
 
         # Publish before the fully-idle gate: a no-batch-but-not-idle stall
         # (queues parked under KV pressure / disagg transfer) has no

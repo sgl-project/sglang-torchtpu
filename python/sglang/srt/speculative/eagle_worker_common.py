@@ -607,7 +607,13 @@ def run_eagle_verify(
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
-    fwd_stream = torch.get_device_module(device).current_stream()
+    # torch.accelerator.current_stream raises for a device that is not the
+    # current accelerator (e.g. CPU), so CPU uses torch.cpu's stub stream.
+    fwd_stream = (
+        torch.cpu.current_stream()
+        if torch.device(device).type == "cpu"
+        else torch.accelerator.current_stream(device)
+    )
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -639,7 +645,7 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        fwd_stream.wait_stream(plan_stream)
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope

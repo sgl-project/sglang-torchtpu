@@ -194,6 +194,97 @@ class TestKpoolIndexerStep(CustomTestCase):
                 kp._MAX_UNCHUNKED_SCORE_BYTES = default
         np.testing.assert_array_equal(outs[1], outs[0])
 
+    def test_token_split_matches_unsplit(self):
+        # The DSA indexer token split on one device: every rank's window
+        # (R = ceil(T / tp) rounded up to 8 rows, as the backend splits) picks
+        # pools; put together in rank order and expanded, they must be the
+        # unsplit rows bit for bit. Two 4096-token prefill chunks (the second
+        # scores against the first's pools), one and two requests, with
+        # padding rows in the bucket.
+        tokens, topk, width = 4096, 2048, 2176
+        rng = np.random.default_rng(2)
+
+        def f(*shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+        def run(args, **kw):
+            return jax.jit(
+                lambda *a: kp.kpool_indexer_step(
+                    *a,
+                    weight_scale=1.0,
+                    topk=topk,
+                    kpool=KPOOL,
+                    out_width=width,
+                    **kw,
+                )
+            )(*args)
+
+        for new in ((tokens,), (2500, 1000)):
+            num_seqs = len(new)
+            pages_per_seq = 2 * tokens // PAGE
+            pages = jnp.asarray(1 + np.arange(num_seqs * pages_per_seq), jnp.int32)
+            raw = jnp.zeros((num_seqs * pages_per_seq + 1, PAGE, 2 * D), jnp.bfloat16)
+            pooled = jnp.zeros(
+                (
+                    num_seqs * pages_per_seq + 1,
+                    PAGE // 16,
+                    4,
+                    kp.pooled_record_bytes(D),
+                ),
+                jnp.uint8,
+            )
+            cu = jnp.asarray(np.concatenate([[0], np.cumsum(new)]), jnp.int32)
+            dist = jnp.asarray([0, 0, num_seqs], jnp.int32)
+            for chunk in range(2):
+                kv_lens = jnp.asarray([(chunk + 1) * n for n in new], jnp.int32)
+                args = [
+                    f(tokens, HEADS, D),
+                    f(tokens, D),
+                    f(tokens, D),
+                    f(tokens, HEADS, dtype=jnp.float32),
+                    f(KPOOL, D, dtype=jnp.float32),
+                    raw,
+                    pooled,
+                    kv_lens,
+                    pages,
+                    cu,
+                    dist,
+                ]
+                full, raw_next, pooled_next = run(args)
+                full = np.asarray(full)
+                for tp in (8, 4):
+                    rows = -(-tokens // tp)
+                    rows = -(-rows // 8) * 8
+                    with self.subTest(new=new, chunk=chunk, tp=tp):
+                        slices = []
+                        for rank in range(tp):
+                            picked, raw_r, pooled_r = run(
+                                args,
+                                row_start=jnp.asarray([rank * rows], jnp.int32),
+                                row_count=rows,
+                            )
+                            self.assertEqual(picked.shape, (rows, topk // KPOOL))
+                            # Every rank stores the same caches as unsplit.
+                            np.testing.assert_array_equal(
+                                np.asarray(pooled_r), np.asarray(pooled_next)
+                            )
+                            slices.append(np.asarray(picked))
+                        picked = np.concatenate(slices)
+                        np.testing.assert_array_equal(picked[tokens:], -1)
+                        split = kp.kpool_expand_rows(
+                            jnp.asarray(picked[:tokens]),
+                            kv_lens,
+                            cu,
+                            dist,
+                            topk=topk,
+                            kpool=KPOOL,
+                            out_width=width,
+                        )
+                        np.testing.assert_array_equal(np.asarray(split), full)
+                # Padding rows of the bucket select nothing.
+                self.assertTrue((full[sum(new) :] == -1).all())
+                raw, pooled = raw_next, pooled_next
+
 
 def _scatter_pools(raw, old, ape, lens, pages, cu, distribution, tokens):
     """The generic gather/compress/scatter pooling that the fused writer replaces."""
@@ -318,6 +409,74 @@ class TestFusedPooling(CustomTestCase):
                     prefix, own = pages[:shared], pages[shared]
                     np.testing.assert_array_equal(out[prefix], old[prefix])
                     self.assertFalse(np.array_equal(out[own], old[own]))
+
+    def test_raw_ring_matches_paged_raw(self):
+        """With raw rows in a per-request ring that wraps, every step must select
+        and pool exactly what the paged raw layout does: an open pool that spans
+        steps (and a rejected verify tail) is read back from the ring."""
+        ring, slots = 3, (2, 5)  # 3 pages >= ceil((130 + 3) / 128) + 1
+        rng = np.random.default_rng(7)
+        ape = jnp.asarray(rng.normal(size=(KPOOL, D)).astype(np.float32))
+        common = dict(weight_scale=0.01, topk=TOPK, kpool=KPOOL)
+        steps = {
+            "paged": jax.jit(lambda *a: kp.kpool_indexer_step(*a, **common)),
+            "ring": jax.jit(
+                lambda *a, base: kp.kpool_indexer_step(
+                    *a, **common, raw_page_base=base, raw_ring_pages_cnt=ring
+                )
+            ),
+        }
+        pages = 6  # a request reaches 5 pages, so a 3-page ring wraps
+        page_indices = jnp.asarray(
+            [1 + r * pages + i for r in range(2) for i in range(pages)], jnp.int32
+        )
+        num_pages = 2 * pages + 1
+        pooled0 = jnp.zeros(
+            (num_pages, PAGE // 16, 4, kp.pooled_record_bytes(D)), jnp.uint8
+        )
+        layouts = {
+            "paged": {},
+            "ring": {"base": jnp.asarray([s * ring for s in slots], jnp.int32)},
+        }
+        state = {
+            "paged": [jnp.zeros((num_pages, PAGE, 2 * D), jnp.bfloat16), pooled0],
+            "ring": [jnp.zeros((6 * ring, PAGE, 2 * D), jnp.bfloat16), pooled0],
+        }
+        lens = [0, 0]
+        # (tokens per request, committed per request): ragged prefill chunks that
+        # end mid-pool, decode, and verify steps whose rejected tail is rewritten.
+        plan = [((130, 101), (130, 101)), ((126, 130), (126, 130))]
+        plan += [((1, 1), (1, 1)), ((8, 8), (3, 8)), ((1, 1), (1, 1))]
+        plan += [((130, 127), (130, 127)), ((8, 8), (8, 2)), ((1, 1), (1, 1))]
+        plan += [((129, 130), (129, 130)), ((1, 1), (1, 1))]
+        for new, keep in plan:
+            n_tok = sum(new)
+            pad = 512 if n_tok > 32 else 32
+            args = (
+                jnp.asarray(rng.normal(size=(pad, HEADS, D)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(pad, D)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(pad, D)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(pad, HEADS)), jnp.float32),
+                ape,
+            )
+            meta = (
+                jnp.asarray([lens[0] + new[0], lens[1] + new[1]], jnp.int32),
+                page_indices,
+                jnp.asarray([0, new[0], n_tok], jnp.int32),
+                jnp.asarray([0, 0, 2], jnp.int32),
+            )
+            outs = {}
+            for name, layout in layouts.items():
+                raw, pooled = state[name]
+                out, raw, pooled = steps[name](*args, raw, pooled, *meta, **layout)
+                state[name] = [raw, pooled]
+                outs[name] = np.asarray(out)
+            with self.subTest(lens=tuple(lens), new=new):
+                np.testing.assert_array_equal(outs["ring"], outs["paged"])
+                np.testing.assert_array_equal(
+                    np.asarray(state["ring"][1]), np.asarray(state["paged"][1])
+                )
+            lens = [lens[r] + keep[r] for r in range(2)]
 
 
 if __name__ == "__main__":

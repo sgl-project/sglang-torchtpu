@@ -240,7 +240,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         ):
             raise NotImplementedError(
                 "TpuSpecWorker needs the verify window (overlap schedule, "
-                "host-resident req_to_token, no grammar/logprob/LoRA)."
+                "host-resident req_to_token, supported request features, no LoRA)."
             )
         verify_window_rows = draft_input.tpu_verify_window_rows
         if not 0 < num_verify_rows <= verify_window_rows:

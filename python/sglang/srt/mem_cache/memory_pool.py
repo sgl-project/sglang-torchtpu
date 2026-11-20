@@ -1537,6 +1537,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+        # Compile the fixed-shape mapping write now rather than at serving time.
+        self._write_mamba_index_mapping([], None)
         if enable_mamba_extra_buffer:
             # Kept with the slot IDs: set_mamba_track_indices_from_reqs reads it
             # only when they live on the device, so a host allocator needs no
@@ -1637,10 +1639,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(mamba_ping_pong_track_buffers), (
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
-        mamba_index_tensor = torch.stack(mamba_indices).to(
-            device=self.device, dtype=torch.int32
-        )
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        self._write_mamba_index_mapping(select_index, torch.stack(mamba_indices))
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping.device
@@ -1649,6 +1648,40 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ping_pong_tensor
             )
         return select_index
+
+    def _write_mamba_index_mapping(
+        self, rows: List[int], mamba_indices: Optional[torch.Tensor]
+    ) -> None:
+        """Set ``req_index_to_mamba_index_mapping[rows] = mamba_indices``.
+
+        A chunked-prefill request calls alloc() again for every chunk
+        (alloc_for_extend -> alloc_req_slots). On an async device (TPU), a
+        blocking H2D copy or a setitem indexed by a Python list (which transfers
+        synchronously) makes the host wait for the forward still in flight, which
+        held each chunk's launch until the previous chunk's forward had finished.
+        So host-resident slot ids (TPU keeps them on the host) are padded on the
+        host and uploaded non_blocking.
+
+        The write is padded to one row per pool row so the device sees a single
+        ``index_copy_`` shape, compiled once at construction, instead of one per
+        batch size at serving time. Padding writes 0 into the reserved row 0.
+        """
+        mapping = self.req_index_to_mamba_index_mapping
+        if mamba_indices is not None and mamba_indices.device.type != "cpu":
+            # Slot ids already on the device: nothing to upload.
+            mapping[rows] = mamba_indices.to(dtype=mapping.dtype)
+            return
+        num_rows = mapping.shape[0]
+        index = torch.zeros(num_rows, dtype=torch.int64)
+        values = torch.zeros(num_rows, dtype=mapping.dtype)
+        if rows:
+            index[: len(rows)] = torch.tensor(rows, dtype=torch.int64)
+            values[: len(rows)] = mamba_indices.to(dtype=mapping.dtype)
+        mapping.index_copy_(
+            0,
+            index.to(mapping.device, non_blocking=True),
+            values.to(mapping.device, non_blocking=True),
+        )
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
@@ -2179,6 +2212,8 @@ class KVCache(abc.ABC):
     host_capacity_tokens: Optional[int] = None
     # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
     host_capacity_bytes: Optional[int] = None
+    # Whether MTP draft KV pools can pack into this target pool's HiCache pages.
+    supports_packed_hicache_draft: bool = True
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter

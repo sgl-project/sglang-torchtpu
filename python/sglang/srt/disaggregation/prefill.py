@@ -1180,7 +1180,6 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
-        self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
@@ -1521,6 +1520,8 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap and _is_tpu:
             # TPU cannot send pages the in-flight forward might write, since
             # those pages might be partially updated.
+            # TODO(norx1991): PP turns overlap off and skips this clip; its stages need
+            # their own ordering of this send against in-flight forwards.
             cached_end = tpu_clip_cached_prefix_send_end(self, req, cached_end)
             if cached_end <= req.start_send_idx:
                 return
@@ -1596,6 +1597,7 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # The next checkpoint can dedup the request's own pages past
             # cache_protected_len and free them while a transfer still lists them.
+            # KV free fences rely on this: no page a checkpoint frees is ever sent.
             if (
                 self.tree_cache.supports_prefix_sharing()
                 and not req.skip_radix_cache_insert

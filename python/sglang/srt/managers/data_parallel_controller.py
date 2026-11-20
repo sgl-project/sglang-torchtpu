@@ -28,6 +28,7 @@ import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_prefix_router import PrefixAwareSelector
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -91,6 +92,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -168,11 +170,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AWARE: self.prefix_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AWARE,
         )
 
         self.launch_dp_size: int = get_parallel().num_dp_ranks
@@ -214,9 +218,18 @@ class DataParallelController:
             # first leader, which then broadcasts over the full tp_group.
             local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
             self.control_message_step = 1 if local_ctrl else get_parallel().tp_size
+        elif get_parallel().nnodes_per_dp_replica:
+            # A replica's leader may be on another node: reach it over TCP, like DP
+            # attention's leaders.
+            self.launch_dp_attention_schedulers(server_args, port_args)
+            self.control_message_step = 1
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        self.prefix_selector: PrefixAwareSelector | None = None
+        if self.load_balance_method == LoadBalanceMethod.PREFIX_AWARE:
+            self.prefix_selector = self._make_prefix_selector()
 
         self.init_dispatcher()
 
@@ -626,6 +639,9 @@ class DataParallelController:
         )
 
         nnodes_per_tp_group = nnodes_per_pp_rank
+        if get_parallel().nnodes_per_dp_replica:
+            nnodes_per_tp_group = get_parallel().nnodes_per_dp_replica
+            dp_rank = get_parallel().node_rank // nnodes_per_tp_group
         tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
         if get_exec().moe.is_ep_scale_joiner:
             # Scale joiners enumerate their full local TP span.
@@ -667,6 +683,12 @@ class DataParallelController:
                         ).to_tcp()
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
+                    rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
+                elif get_parallel().nnodes_per_dp_replica:
+                    rank_port_args = PortArgs.init_new(
+                        server_args, dp_rank, worker_ports
+                    )
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
 
@@ -725,6 +747,9 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # From the scheduler, not get_schedule(): the dp_controller role may
+        # not read the schedule namespace (ROLE_NAMESPACE_SETS).
+        self.page_size = scheduler_info[0]["page_size"]
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
@@ -790,6 +815,49 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def _make_prefix_selector(self) -> PrefixAwareSelector:
+        # One index block per radix page: a rank only reuses whole pages.
+        block_size = max(1, int(self.page_size or 1))
+        # A rank's radix cache holds at most its KV pool (plus the HiCache host
+        # tier). Tracking more than it holds only keeps stale affinities, which
+        # still route a session to one rank; tracking less drops live ones. Err
+        # on the large side.
+        capacity_tokens = 4 * self.max_total_num_tokens
+        selector = PrefixAwareSelector(
+            num_ranks=self.max_dp_size,
+            block_size=block_size,
+            capacity_blocks=max(1, capacity_tokens // block_size),
+            cache_threshold=envs.SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD.get(),
+            balance_abs_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD.get(),
+            balance_rel_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD.get(),
+            # Stats line every decode_log_interval routed requests.
+            log_interval=get_observability().decode_log_interval,
+        )
+        logger.info(
+            "Prefix-aware DP routing: block_size=%d, capacity=%d tokens/rank, "
+            "cache_threshold=%.2f, balance_abs_threshold=%d, "
+            "balance_rel_threshold=%.2f",
+            block_size,
+            capacity_tokens,
+            selector.cache_threshold,
+            selector.balance_abs_threshold,
+            selector.balance_rel_threshold,
+        )
+        return selector
+
+    def prefix_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        input_ids = req.input_ids or []
+        budget = self.dp_budget
+        active = [r for r in self._active_workers if r < budget.num_dp_ranks]
+        target = self.prefix_selector.select(input_ids, budget.total_requests, active)
+        # Same speculative increment as DPBudget.dispatch, until the next
+        # load snapshot replaces it.
+        budget.total_requests[target] += 1
+        budget.total_tokens[target] += len(input_ids)
+        sock_send(self.workers[target], req)
 
     def event_loop(self):
         while True:
