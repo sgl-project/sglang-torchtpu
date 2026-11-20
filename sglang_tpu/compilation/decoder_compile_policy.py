@@ -2938,8 +2938,6 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
 
         embed_tokens = self.owner.get_input_embeddings()
-        hidden = embed_tokens.embedding_dim
-        dtype = embed_tokens.weight.dtype
         device = self.model_runner.device
         buckets = list(self.t_bucketer.buckets)
         on_device = bool(envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get())
@@ -2956,24 +2954,43 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
                 # 2. Multimodal EXTEND (_embed_mm_inputs): keep clamp_,
                 #    embed_tokens, and row placement in one uninterrupted eager
                 #    chain so torch_tpu fuses them identically to live serving.
-                mm_ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
-                mm_ids.cpu()
-                mm_ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
-                mm_embeds = embed_tokens(mm_ids)
                 if on_device:
-                    mm_embeds.copy_(
-                        merge_mm_rows(
-                            mm_embeds,
-                            torch.zeros((num_tokens, hidden), dtype=dtype).to(device),
-                            torch.arange(num_tokens, dtype=torch.int32).to(device),
-                            torch.zeros((num_tokens, 1), dtype=torch.bool).to(device),
-                        )
+                    # Warm both exact-row (no F.pad) and fewer-row (F.pad)
+                    # branches of merge_mm_rows without allocating a 0-row
+                    # device tensor.
+                    src_row_counts = (
+                        (num_tokens, 1) if num_tokens > 1 else (num_tokens,)
                     )
-                    mm_embeds.cpu()
+                    for src_rows in src_row_counts:
+                        mm_ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
+                        mm_ids.cpu()
+                        mm_ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
+                        mm_embeds = embed_tokens(mm_ids)
+                        hidden = mm_embeds.shape[-1]
+                        embed_dtype = mm_embeds.dtype
+                        mm_embeds.copy_(
+                            merge_mm_rows(
+                                mm_embeds,
+                                torch.zeros((src_rows, hidden), dtype=embed_dtype).to(
+                                    device
+                                ),
+                                torch.arange(num_tokens, dtype=torch.int32).to(device),
+                                torch.zeros((num_tokens, 1), dtype=torch.bool).to(
+                                    device
+                                ),
+                            )
+                        )
+                        mm_embeds.cpu()
                 else:
+                    mm_ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
+                    mm_ids.cpu()
+                    mm_ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
+                    mm_embeds = embed_tokens(mm_ids)
+                    hidden = mm_embeds.shape[-1]
+                    embed_dtype = mm_embeds.dtype
                     apply_host_mm_embeds(
                         input_embeds=mm_embeds,
-                        host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
+                        host_src=torch.zeros((num_tokens, hidden), dtype=embed_dtype),
                         host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                     ).cpu()
         elapsed = time.perf_counter() - start

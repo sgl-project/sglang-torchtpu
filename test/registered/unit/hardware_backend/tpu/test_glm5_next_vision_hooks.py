@@ -682,19 +682,31 @@ class TestGlm5NextVisionHooks(CustomTestCase):
         )
 
         ids = torch.ones(4, dtype=torch.int64)
+        fallback_ids = torch.full((4,), 2, dtype=torch.int64)
         pos = torch.arange(4, dtype=torch.int64)
-        fb = SimpleNamespace()
+        fb_without_ids = SimpleNamespace()
+        fb_with_ids = SimpleNamespace(input_ids=fallback_ids)
         embeds = torch.full((4, 4), 3.0)
 
-        out_plain = draft.forward(ids, pos, fb)
+        out_plain = draft.forward(ids, pos, fb_without_ids)
         self.assertEqual(out_plain, "draft_logits")
         self.assertEqual(inner_calls[-1][3], {})
         self.assertFalse(inner_calls[-1][4])
+        self.assertIs(logits_calls[-1][0], ids)
 
-        out_mm = draft.forward(ids, pos, fb, input_embeds=embeds)
+        out_mm = draft.forward(ids, pos, fb_with_ids, input_embeds=embeds)
         self.assertEqual(out_mm, "draft_logits")
         self.assertEqual(list(inner_calls[-1][3].keys()), ["input_embeds"])
         self.assertIs(inner_calls[-1][3]["input_embeds"], embeds)
+        self.assertIs(logits_calls[-1][0], ids)
+        self.assertIs(logits_calls[-1][1], embeds)
+
+        out_mm_none_ids = draft.forward(None, pos, fb_with_ids, input_embeds=embeds)
+        self.assertEqual(out_mm_none_ids, "draft_logits")
+        self.assertIsNone(inner_calls[-1][0])
+        self.assertEqual(list(inner_calls[-1][3].keys()), ["input_embeds"])
+        self.assertIs(inner_calls[-1][3]["input_embeds"], embeds)
+        self.assertIs(logits_calls[-1][0], fallback_ids)
         self.assertIs(logits_calls[-1][1], embeds)
 
 

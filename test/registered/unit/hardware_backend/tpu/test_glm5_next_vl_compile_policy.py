@@ -6,8 +6,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 import inspect
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -70,9 +71,15 @@ class _FakeLmHead(torch.nn.Module):
 
 
 class _RecordingEmbedding(torch.nn.Module):
-    def __init__(self, inner: torch.nn.Embedding) -> None:
+    def __init__(
+        self,
+        inner: torch.nn.Embedding,
+        *,
+        output_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self._inner = inner
+        self._output_dtype = output_dtype
         self.num_embeddings = inner.num_embeddings
         self.embedding_dim = inner.embedding_dim
         self.call_count = 0
@@ -83,7 +90,10 @@ class _RecordingEmbedding(torch.nn.Module):
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         self.call_count += 1
-        return self._inner(ids)
+        out = self._inner(ids)
+        if self._output_dtype is not None:
+            out = out.to(self._output_dtype)
+        return out
 
 
 class _DummyDecoder(torch.nn.Module):
@@ -269,10 +279,10 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             compiled.warmup_async = MagicMock(name="warmup_async")
             return compiled
 
-        with patch(
-            "sglang_tpu.compilation.direct_compile.direct_compile",
-            side_effect=fake_direct_compile,
-        ):
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = fake_direct_compile
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
             compiled_call, _ = policy._direct_compile(
                 runner.model.language_model.forward
             )
@@ -542,7 +552,13 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
 
     def test_precompile_mm_embed_placement_warms_embed_tokens_and_merge_modes(self):
         runner = _make_runner()
-        embed_spy = _RecordingEmbedding(runner.model.model.embed_tokens)
+        # Use an embedding whose runtime output dtype differs from weight.dtype
+        # (e.g. quantized embeddings with output_dtype) to verify warmup tracks
+        # embed_tokens' actual output dtype rather than embed_tokens.weight.dtype.
+        self.assertEqual(runner.model.model.embed_tokens.weight.dtype, torch.float32)
+        embed_spy = _RecordingEmbedding(
+            runner.model.model.embed_tokens, output_dtype=torch.bfloat16
+        )
         runner.model.get_input_embeddings = lambda: embed_spy
         policy = _make_glm_policy(
             runner, token_buckets=(1024, 2048), bs_buckets=(1, 16)
@@ -567,6 +583,14 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
             self.assertEqual(embed_spy.call_count, 4)
             self.assertEqual(host_spy.call_count, 2)
             self.assertEqual(device_spy.call_count, 0)
+            self.assertEqual(
+                [c.kwargs["host_src"].dtype for c in host_spy.call_args_list],
+                [torch.bfloat16, torch.bfloat16],
+            )
+            self.assertEqual(
+                [c.kwargs["host_src"].shape for c in host_spy.call_args_list],
+                [(1024, 8), (2048, 8)],
+            )
 
         embed_spy.call_count = 0
         with (
@@ -582,11 +606,58 @@ class TestGlm5NextVLDecoderTpuCompilePolicy(CustomTestCase):
                 "merge_mm_rows",
                 wraps=mm_embed_tpu.merge_mm_rows,
             ) as device_spy,
+            patch.object(
+                mm_embed_tpu.F,
+                "pad",
+                wraps=mm_embed_tpu.F.pad,
+            ) as pad_spy,
         ):
             policy._precompile_mm_embed_placement()
-            self.assertEqual(embed_spy.call_count, 4)
+            # 3 calls per bucket: text-only + exact-row merge + F.pad merge.
+            self.assertEqual(embed_spy.call_count, 6)
             self.assertEqual(host_spy.call_count, 0)
-            self.assertEqual(device_spy.call_count, 2)
+            self.assertEqual(device_spy.call_count, 4)
+            self.assertEqual(
+                [(c.args[0].shape, c.args[1].shape) for c in device_spy.call_args_list],
+                [
+                    ((1024, 8), (1024, 8)),
+                    ((1024, 8), (1, 8)),
+                    ((2048, 8), (2048, 8)),
+                    ((2048, 8), (1, 8)),
+                ],
+            )
+            self.assertEqual(
+                [c.args[1].dtype for c in device_spy.call_args_list],
+                [torch.bfloat16] * 4,
+            )
+            self.assertEqual(pad_spy.call_count, 2)
+
+        # Boundary: num_tokens=1 under ON_DEVICE=1 must only warm src_rows=1
+        # (never allocate a 0-row device tensor or trigger F.pad).
+        embed_spy.call_count = 0
+        single_token_policy = _make_glm_policy(
+            runner, token_buckets=(1,), bs_buckets=(1,)
+        )
+        with (
+            tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(False),
+            envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(True),
+            patch.object(
+                mm_embed_tpu,
+                "merge_mm_rows",
+                wraps=mm_embed_tpu.merge_mm_rows,
+            ) as device_spy,
+            patch.object(
+                mm_embed_tpu.F,
+                "pad",
+                wraps=mm_embed_tpu.F.pad,
+            ) as pad_spy,
+        ):
+            single_token_policy._precompile_mm_embed_placement()
+            self.assertEqual(embed_spy.call_count, 2)
+            self.assertEqual(device_spy.call_count, 1)
+            self.assertEqual(device_spy.call_args.args[1].shape, (1, 8))
+            self.assertEqual(device_spy.call_args.args[1].dtype, torch.bfloat16)
+            self.assertEqual(pad_spy.call_count, 0)
 
         embed_spy.call_count = 0
         with tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(True):

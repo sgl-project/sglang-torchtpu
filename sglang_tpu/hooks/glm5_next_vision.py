@@ -281,7 +281,7 @@ def forward_glm5_next_multimodal(
 @torch.no_grad()
 def _forward_glm5_next_nextn(
     model: Any,
-    input_ids: torch.Tensor,
+    input_ids: torch.Tensor | None,
     positions: torch.Tensor,
     forward_batch: Any,
     input_embeds: torch.Tensor | None = None,
@@ -296,8 +296,9 @@ def _forward_glm5_next_nextn(
         )
     else:
         hidden_states = model.model(input_ids, positions, forward_batch)
+    logits_input_ids = input_ids if input_ids is not None else forward_batch.input_ids
     return model.logits_processor(
-        input_ids, hidden_states, model.lm_head, forward_batch
+        logits_input_ids, hidden_states, model.lm_head, forward_batch
     )
 
 
