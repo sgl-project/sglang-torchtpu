@@ -67,14 +67,17 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             prefix=prefix,
         )
 
-    def load_weights(self, weights):
-        if not hasattr(self, "fuse_qkv_a_proj"):
-            self.fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
+    def loadable_weight_prefixes(self) -> tuple[str, ...]:
         layer_id = self.config.num_hidden_layers
-        layer_prefixes = (
+        return (
             f"model.layers.{layer_id}.",
             f"model.language_model.layers.{layer_id}.",
         )
+
+    def load_weights(self, weights):
+        if not hasattr(self, "fuse_qkv_a_proj"):
+            self.fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
+        layer_prefixes = self.loadable_weight_prefixes()
         nextn_weights = (
             (name, weight)
             for name, weight in weights
