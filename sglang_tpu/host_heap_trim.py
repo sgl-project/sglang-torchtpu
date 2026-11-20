@@ -8,10 +8,12 @@ so each rank stays near its startup peak.
 ``install`` releases startup file-cache pages before the scheduler-ready
 handshake, including for offline Engine and Rust launches. It also wraps
 ``Scheduler.handle_freeze_gc`` to release pages created by subsequent warmup,
-clear export records and JAX caches, collect garbage before freezing GC,
-and return freed heap pages. With HiCache enabled, model-worker initialization
-releases compiler state before the host KV pools are allocated; final cleanup
-still releases anything allocated later in startup.
+and, when ``SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED`` is set, to clear
+export records and JAX caches, collect garbage before freezing GC, and return
+freed heap pages. The collection after the freeze always runs. With
+HiCache enabled, model-worker initialization releases compiler state before
+the host KV pools are allocated; final cleanup still releases anything
+allocated later in startup.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -223,6 +225,13 @@ def _before_freeze(*, synchronize: bool, include_checkpoints: bool = False) -> N
 
 
 def _after_freeze() -> None:
+    # Only a full collection frees garbage in the oldest generation, and CPython
+    # (through 3.13) runs one only once the objects moved in since the last one,
+    # the survivors of younger collections, reach a quarter of what it left there.
+    # gc.freeze() keeps that baseline at the whole startup heap, so finished
+    # requests caught in cycles stay allocated far too long; this collection
+    # skips frozen objects and resets the baseline.
+    gc.collect()
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
         trim_host_heap("after warmup")
     _start_periodic(tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.get())
