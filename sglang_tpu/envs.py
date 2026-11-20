@@ -449,6 +449,13 @@ class TpuEnvs:
     SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # Sequence parallelism (--enable-attn-tp-input-scattered) on one tpu7x 2x2x1
+    # host at TP=8: run each stage's reduce-scatter as the row-streaming
+    # hierarchical Pallas kernel (sum the chip's two TensorCores first, then
+    # across chips; kernels/hier_all_reduce.py) instead of XLA's reduce-scatter,
+    # for bf16 batches of a multiple of 1024 rows. Other shapes and topologies
+    # keep XLA's (sp_hier_reduce_scatter.py).
+    SGLANG_TPU_SP_HIER_REDUCE_SCATTER = EnvBool(False)
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
     # device on Kimi-K2.6). vmem-fp8 always uses f32.
     SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)

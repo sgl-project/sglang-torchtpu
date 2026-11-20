@@ -1868,6 +1868,9 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.twolevel_allreduce import register_from_parallel_state
 
         register_from_parallel_state()
+        from sglang_tpu import sp_hier_reduce_scatter
+
+        sp_hier_reduce_scatter.register_from_parallel_state()
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

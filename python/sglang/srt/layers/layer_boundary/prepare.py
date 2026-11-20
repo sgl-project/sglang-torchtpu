@@ -529,6 +529,16 @@ def _attn_tp_slice_update_read(
     return read.update_and_read(update, hidden_states, residual, norm)
 
 
+def sp_reduce_scatter(shard: torch.Tensor, hidden_states: torch.Tensor) -> None:
+    """Complete the TP sum of ``hidden_states`` onto this rank's row ``shard``
+    (rank r gets row block r): the reduce-scatter that ends every stage of an
+    input-scattered (sequence-parallel) batch.
+
+    The seam lets a platform plugin run a topology-aware reduce-scatter kernel
+    for the shapes it supports."""
+    get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
+
+
 def _tp_reduce_scatter_update_read_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -551,7 +561,7 @@ def _tp_reduce_scatter_update_read_gather(
         return hidden_states, hidden_states
     shard = hidden_states.tensor_split(parallel.tp_size)[parallel.tp_rank]
     if reduces:
-        parallel.tp_group.reduce_scatter_tensor(shard, hidden_states)
+        sp_reduce_scatter(shard, hidden_states)
     else:
         shard = shard.clone()
     shard, residual = read.update_and_read(update, shard, residual, norm)
