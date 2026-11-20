@@ -386,9 +386,11 @@ def register_tpu_top_k_ops() -> None:
 
 
 def output_logprob_topk(
-    values: torch.Tensor, k: int
+    op, values: torch.Tensor, k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use native TopK while preserving the output-logprob index dtype."""
+    if values.device.type != "tpu":
+        return op.forward_native(values, k)
     top_values, top_ids = tpu_top_k(values, k)
     return top_values, top_ids.to(torch.int64)
 

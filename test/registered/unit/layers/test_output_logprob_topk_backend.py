@@ -6,6 +6,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.kernels.fused_op as fused_op
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.sampling import OutputTopK, output_topk
 from sglang.srt.layers import logprob_processor
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,14 +19,26 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestOutputTopkBackend(CustomTestCase):
     def setUp(self):
-        registry = patch.dict(logprob_processor._OUTPUT_TOPK_BACKENDS, {}, clear=True)
-        registry.start()
-        self.addCleanup(registry.stop)
+        patches = [
+            patch.dict(BaseFusedOp._oot_forward_registry, {}, clear=True),
+            patch.object(output_topk, "_forward_method", None),
+            patch.object(fused_op, "_forced_backend", None),
+            patch.object(fused_op, "_platform_key", lambda: "cpu"),
+            patch.object(fused_op, "_oot_dispatch_key", lambda: None),
+        ]
+        for patched in patches:
+            patched.start()
+            self.addCleanup(patched.stop)
         self.logits = torch.arange(34, dtype=torch.float32).reshape(2, 17)
         self.topk = Mock(side_effect=lambda values, k: values.topk(k, dim=-1))
 
+    def register_topk(self, platform_key="cpu"):
+        BaseFusedOp.register_oot_forward(
+            OutputTopK, lambda op, values, k: self.topk(values, k), platform_key
+        )
+
     def test_unregistered_device_keeps_tensor_topk(self):
-        logprob_processor.register_output_topk_backend("other_device", self.topk)
+        self.register_topk("other_device")
         values, indices = logprob_processor.get_top_logprobs(
             self.logits, [3, 0], no_copy_to_cpu=True
         )
@@ -34,7 +49,7 @@ class TestOutputTopkBackend(CustomTestCase):
         self.topk.assert_not_called()
 
     def test_registered_output_processors(self):
-        logprob_processor.register_output_topk_backend("cpu", self.topk)
+        self.register_topk()
         processor = logprob_processor.OutputLogprobProcessor()
         scores = self.logits.log_softmax(-1)
         expected = scores.topk(5, dim=-1)
@@ -67,7 +82,7 @@ class TestOutputTopkBackend(CustomTestCase):
                 )
 
     def test_registered_spec_scoring(self):
-        logprob_processor.register_output_topk_backend("cpu", self.topk)
+        self.register_topk()
         logits = self.logits.repeat(2, 1)
         output = LogitsProcessorOutput(next_token_logits=logits)
         batch = SimpleNamespace(
@@ -106,7 +121,7 @@ class TestOutputTopkBackend(CustomTestCase):
         )
 
     def test_prompt_and_zero_k_bypass_registered_backend(self):
-        logprob_processor.register_output_topk_backend("cpu", self.topk)
+        self.register_topk()
         values, indices = logprob_processor.get_top_logprobs_raw(
             self.logits, [3, 0], logprob_processor.LogprobStage.PREFILL, [1, 1]
         )

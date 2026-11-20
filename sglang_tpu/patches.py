@@ -74,9 +74,7 @@ def _register_tpu_compile_backend() -> None:
 
 _tpu_sampler_backend_registered = False
 # This module is also imported before worker bootstrap prepares TorchTPU.
-_register_output_topk_backend = LazyImport(
-    "sglang.srt.layers.logprob_processor", "register_output_topk_backend"
-)
+_output_topk = LazyImport("sglang.kernels.ops.sampling", "output_topk")
 _output_logprob_topk = LazyImport("sglang_tpu.top_k", "output_logprob_topk")
 
 
@@ -92,7 +90,10 @@ def _register_tpu_sampler_backend() -> None:
     from sglang_tpu.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
-    _register_output_topk_backend("tpu", _output_logprob_topk._load())
+    output_topk = _output_topk._load()
+    output_topk.register_oot_forward(
+        type(output_topk), _output_logprob_topk._load(), "tpu"
+    )
     _tpu_sampler_backend_registered = True
 
 

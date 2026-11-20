@@ -24,6 +24,7 @@ from torch import nn
 
 import sglang.kernels.fused_op as fo
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.sampling import OutputTopK
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -268,22 +269,25 @@ def test_forced_global_falls_back_when_unimplemented(monkeypatch):
         op(torch.zeros(1), backend=KernelBackend.JIT)
 
 
-def test_forced_global_beats_platform_and_oot(monkeypatch):
-    _mock_platform(monkeypatch, key="", oot_key="myplat")
+@pytest.mark.parametrize("oot_key", [None, "cuda"])
+def test_forced_global_beats_platform_and_oot(monkeypatch, oot_key):
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA, oot_key=oot_key)
     BaseFusedOp.register_oot_forward(
-        _CudaOnlyPlatformOp, lambda self, x: "oot", "myplat"
+        _BackendAndPlatformOp, lambda self, x: "oot", "cuda"
     )
-    op = _CudaOnlyPlatformOp()
+    op = _BackendAndPlatformOp()
     fo.set_fused_op_backend(KernelBackend.TORCH)
     assert op(torch.zeros(1)) == "native"
     fo.set_fused_op_backend(None)
     assert op(torch.zeros(1)) == "oot"
+    assert op(torch.zeros(1), backend=KernelBackend.TORCH) == "native"
 
 
 # --- OOT platform overrides ----------------------------------------------------
 
 
-def test_oot_registered_forward_wins_over_method(monkeypatch):
+@pytest.mark.parametrize("oot_key", [None, "myplat"])
+def test_oot_registered_forward_wins_over_method(monkeypatch, oot_key):
     class _OotOp(BaseFusedOp):
         op = "test.oot"
 
@@ -293,18 +297,17 @@ def test_oot_registered_forward_wins_over_method(monkeypatch):
         def forward_myplat(self, x):
             return "method"
 
-    _mock_platform(monkeypatch, oot_key="myplat")
+    _mock_platform(monkeypatch, key="myplat", oot_key=oot_key)
     assert _OotOp()(torch.zeros(1)) == "method"  # forward_<key> lookup
 
     BaseFusedOp.register_oot_forward(_OotOp, lambda self, x: "registered", "myplat")
     assert _OotOp()(torch.zeros(1)) == "registered"  # registry beats method
 
 
-def test_oot_registration_is_exact_type(monkeypatch):
-    _mock_platform(monkeypatch, oot_key="myplat")
-    BaseFusedOp.register_oot_forward(
-        _CudaOnlyPlatformOp, lambda self, x: "oot", "myplat"
-    )
+@pytest.mark.parametrize("oot_key", [None, "cuda"])
+def test_oot_registration_is_exact_type(monkeypatch, oot_key):
+    _mock_platform(monkeypatch, key="cuda", oot_key=oot_key)
+    BaseFusedOp.register_oot_forward(_CudaOnlyPlatformOp, lambda self, x: "oot", "cuda")
 
     class _Sub(_CudaOnlyPlatformOp):
         pass
@@ -312,7 +315,32 @@ def test_oot_registration_is_exact_type(monkeypatch):
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == "oot"
     # Subclasses do not inherit the registered forward (pre-existing
     # MultiPlatformOp semantics: lookup is by exact type).
-    assert _Sub()(torch.zeros(1)) == "native"
+    assert _Sub()(torch.zeros(1)) == "cuda"
+
+
+@pytest.mark.parametrize("oot_key", [None, "myplat"])
+def test_output_topk_compiles_on_first_call_and_preserves_dispatch(
+    monkeypatch, oot_key
+):
+    _mock_platform(monkeypatch, key="myplat", oot_key=oot_key)
+    monkeypatch.setattr(fo, "_forced_backend", fo._UNRESOLVED)
+
+    def plugin_forward(op, values, k):
+        top_values, indices = values.topk(k, dim=-1)
+        return top_values + 1, indices
+
+    BaseFusedOp.register_oot_forward(OutputTopK, plugin_forward, "myplat")
+    op = OutputTopK()
+    values = torch.arange(17, dtype=torch.float32).reshape(1, -1)
+    expected = values.topk(3, dim=-1)
+    compiled = torch.compile(op, backend="eager", fullgraph=True)
+    actual = compiled(values, 3)
+    torch.testing.assert_close(actual[0], expected.values + 1)
+    torch.testing.assert_close(actual[1], expected.indices)
+    op.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(op(values, 3)[0], expected.values + 1)
+    op.leave_torch_compile()
+    torch.testing.assert_close(op(values, 3)[0], expected.values + 1)
 
 
 def test_oot_falls_back_to_native(monkeypatch):
@@ -325,7 +353,9 @@ def test_oot_registered_fn_is_bound(monkeypatch):
     BaseFusedOp.register_oot_forward(
         _CudaOnlyPlatformOp, lambda self, x: type(self).__name__, "myplat"
     )
+    fo.enable_fused_op_trace()
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == "_CudaOnlyPlatformOp"
+    assert fo.get_fused_op_trace()[0].backend == "<lambda>"
 
 
 # --- dispatch caching + per-call gates ------------------------------------------

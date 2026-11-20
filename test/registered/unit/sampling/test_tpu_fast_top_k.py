@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.kernels.ops.sampling import OutputTopK
 from sglang.srt.layers import logits_processor as logits_processor_module
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -918,6 +919,21 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
 
 class TestTpuTopKLayout(CustomTestCase):
+    def test_output_topk_preserves_host_fallback_and_int64_indices(self):
+        op = OutputTopK()
+        values = torch.arange(17, dtype=torch.float32).reshape(1, -1)
+        expected = values.topk(3, dim=-1)
+        with patch.object(tpu_top_k_module, "tpu_top_k") as native:
+            actual = tpu_top_k_module.output_logprob_topk(op, values, 3)
+            torch.testing.assert_close(actual, expected)
+            native.assert_not_called()
+            native.return_value = (expected.values, expected.indices.to(torch.int32))
+            device_values = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+            actual = tpu_top_k_module.output_logprob_topk(op, device_values, 3)
+            native.assert_called_once_with(device_values, 3)
+            torch.testing.assert_close(actual, tuple(expected))
+            self.assertEqual(actual[1].dtype, torch.int64)
+
     @staticmethod
     def _canonical_shard(rank, *, world_size=8, org_vocab_size=1000):
         org_padded_count = 128

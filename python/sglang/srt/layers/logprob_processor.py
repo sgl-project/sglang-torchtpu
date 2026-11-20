@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import output_topk
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
@@ -26,20 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
-
-_OUTPUT_TOPK_BACKENDS: dict[
-    str, Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]]
-] = {}
-
-
-def register_output_topk_backend(
-    device_type: str,
-    topk: Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]],
-) -> None:
-    """Register descending output TopK for a device, returning int64 indices."""
-    if not device_type:
-        raise ValueError("device_type must be a non-empty string")
-    _OUTPUT_TOPK_BACKENDS[device_type] = topk
 
 
 class LogprobStage(Enum):
@@ -117,8 +104,7 @@ def get_top_logprobs_raw(
     no_copy_to_cpu: bool = False,
 ):
     max_k = max(top_logprobs_nums)
-    output_topk = _OUTPUT_TOPK_BACKENDS.get(logprobs.device.type)
-    if stage == LogprobStage.DECODE and max_k > 0 and output_topk is not None:
+    if stage == LogprobStage.DECODE and max_k > 0:
         values, indices = output_topk(logprobs, max_k)
     else:
         values, indices = logprobs.topk(max_k, dim=-1)

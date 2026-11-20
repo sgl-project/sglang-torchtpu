@@ -28,9 +28,10 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
    Best-effort: an op that does not implement the forced backend falls back
    to normal dispatch with a one-time warning, so the debug switch works on
    whole models that contain device-only ops.
-3. **OOT platform override** — on an out-of-tree platform, a forward
-   registered via :meth:`BaseFusedOp.register_oot_forward`, then a
-   ``forward_<dispatch_key>`` method, then ``forward_native``.
+3. **Plugin platform override** — a forward registered via
+   :meth:`BaseFusedOp.register_oot_forward` for the active platform key.
+   Out-of-tree platforms then try ``forward_<dispatch_key>`` and
+   ``forward_native``.
 4. **Optimized kernel backends** — the first backend in :attr:`priority`
    whose method is overridden, that is *declared* in :attr:`capabilities`,
    and whose :class:`~sglang.kernels.spec.CapabilityRequirement` set matches
@@ -298,6 +299,8 @@ def _dispatch_label(method: Callable) -> str:
     ``forward_native`` traces as ``"torch"``, matching explicit-backend
     calls); platform forwards trace as their device key (``"cuda"``, ...).
     """
+    if isinstance(method, functools.partial):
+        method = method.func
     name = getattr(method, "__name__", "")
     label = _METHOD_BACKEND_LABELS.get(name)
     if label is not None:
@@ -390,8 +393,11 @@ class BaseFusedOp(nn.Module, ABC):
 
     @classmethod
     def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
-        """Register an OOT forward implementation for a specific op class and
-        platform. ``fn`` is bound to the instance at dispatch time (it receives
+        """Register a plugin forward for an exact op class and platform key.
+
+        The key may identify an in-tree or out-of-tree platform. Register before
+        the op's first call, since each instance caches its dispatch target.
+        ``fn`` is bound to the instance at dispatch time (it receives
         the op as ``self``) and takes precedence over ``forward_<platform_key>``
         methods on that exact class."""
         cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
@@ -541,12 +547,15 @@ class BaseFusedOp(nn.Module, ABC):
 
     def _resolve_forward_method(self) -> Callable:
         """Resolve dispatch steps 3-6 (see module docstring) to one callable."""
-        # 3) OOT platform override.
+        # 3) Plugin override, including plugins serving an in-tree identity.
         oot_key = _oot_dispatch_key()
+        platform_key = oot_key if oot_key is not None else _platform_key()
+        registered = self._oot_forward_registry.get(platform_key, {}).get(type(self))
+        if registered is not None:
+            # A bound free function makes Dynamo look for a nonexistent method
+            # on this module when caching dispatch during a compiled first call.
+            return functools.partial(registered, self)
         if oot_key is not None:
-            registered = self._oot_forward_registry.get(oot_key, {}).get(type(self))
-            if registered is not None:
-                return registered.__get__(self)
             method = self._platform_method(oot_key)
             if method is not None:
                 return method
@@ -567,7 +576,7 @@ class BaseFusedOp(nn.Module, ABC):
                     return getattr(self, BACKEND_METHODS[backend])
 
         # 5) Platform-specific forward; 6) native fallback.
-        method = self._platform_method(_platform_key())
+        method = self._platform_method(platform_key)
         return method if method is not None else self.forward_native
 
     def _forward_backend_dynamic(self, *args, **kwargs):
