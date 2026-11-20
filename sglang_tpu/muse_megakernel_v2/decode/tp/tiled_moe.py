@@ -1139,6 +1139,15 @@ def moe_tiled(k: KernelCtx, l, smr, kind, nxt):
                 for d in range(1, c.tp):
                     peer = coll._peer(d)
                     pl.when(peer * Rc < n_live)(y_block_cp(peer).start)
+            else:
+                # Blocks no expert closed (n_u = 0: every live row routed to no valid
+                # expert, e.g. NaN scores) still go out, or the waits below never end.
+                def send_rem(nb, carry_):
+                    owner = blk_owner(nb)
+                    pl.when(owner * Rc < n_live)(y_block_cp(owner).start)
+                    return carry_
+
+                jax.lax.fori_loop(nb_sent, c.tp - 1, send_rem, 0)
             for d in range(1, c.tp):
                 peer = coll._peer(d)
                 pl.when(peer * Rc < n_live)(y_block_cp(peer).wait_send)
