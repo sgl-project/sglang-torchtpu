@@ -15,6 +15,7 @@ from sglang.srt.managers import schedule_batch as schedule_batch_module  # noqa:
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.platforms.interface import SRTPlatform  # noqa: E402
 from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
+from sglang.srt.sampling import penaltylib  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -222,6 +223,36 @@ class TestSeedRetractedPenaltyHistory(CustomTestCase):
         reqs = [_req([], 0), _req([101, 102], 0)]
         batch._seed_retracted_penalty_history(reqs)
         self.assertEqual(seen, [("seed", [1], [[13, 101]])])
+
+    def test_pad_valued_last_input_token(self):
+        # A multimodal prompt can end with a pad value (MM_PAD_SHIFT_VALUE +
+        # hash, above vocab_size). The real penalizers skip it instead of
+        # raising IndexError and seed only output 101.
+        pad = schedule_batch_module._compute_pad_value(123456789)
+        req = _req([101, 102], 0)
+        req.origin_input_ids = PROMPT[:-1] + [pad]
+        req.sampling_params = SamplingParams(
+            repetition_penalty=1.2, frequency_penalty=0.4, presence_penalty=0.3
+        )
+        batch = _batch([req], [])
+        orch = penaltylib.BatchedPenalizerOrchestrator(
+            256,
+            batch,
+            {
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            },
+        )
+        batch.sampling_info.penalizer_orchestrator = orch
+        batch._seed_retracted_penalty_history([req])
+        for pen, name, untouched in (
+            (penaltylib.BatchedFrequencyPenalizer, "frequency", 0.0),
+            (penaltylib.BatchedPresencePenalizer, "presence", 0.0),
+            (penaltylib.BatchedRepetitionPenalizer, "repetition", 1.0),
+        ):
+            row = getattr(orch.penalizers[pen], f"cumulated_{name}_penalties")[0]
+            self.assertEqual(torch.nonzero(row != untouched).flatten().tolist(), [101])
 
     def test_no_seed_without_penalties(self):
         seen = []
