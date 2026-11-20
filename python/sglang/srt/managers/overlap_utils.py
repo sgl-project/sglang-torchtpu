@@ -81,6 +81,17 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
+def _consume_asserts() -> bool:
+    """Whether to run the gather-side consume check: in CI, unless async asserts
+    are explicitly turned off (SGLANG_ENABLE_ASYNC_ASSERT=0), as performance runs
+    do. Where the check is not compiled (TPU) it costs several eager programs
+    plus an async-assert wait every decode step."""
+    if not _DEBUG_ASSERT:
+        return False
+    flag = envs.SGLANG_ENABLE_ASYNC_ASSERT
+    return not flag.is_set() or flag.get()
+
+
 def spec_relay_bypass_enabled(
     spec_algo: SpeculativeAlgorithm | None = None,
 ) -> bool:
@@ -169,7 +180,7 @@ def resolve_forward_inputs(
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
-            if _DEBUG_ASSERT:
+            if _consume_asserts():
                 _assert_nonneg_and_invalidate(
                     decode_gpu,
                     future_map.output_tokens_buf,
@@ -186,7 +197,7 @@ def resolve_forward_inputs(
             future_map.output_tokens_buf.device, non_blocking=True
         )
         batch.input_ids = future_map.output_tokens_buf[relay_indices]
-        if _DEBUG_ASSERT:
+        if _consume_asserts():
             _assert_nonneg_and_invalidate(
                 batch.input_ids, future_map.output_tokens_buf, relay_indices
             )
@@ -679,7 +690,7 @@ class FutureMap:
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         else:
             draft_input.dsa_topk_indices = None
-        if _DEBUG_ASSERT:
+        if _consume_asserts():
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
@@ -805,7 +816,7 @@ class FutureMap:
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
-            if _DEBUG_ASSERT:
+            if _consume_asserts():
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
@@ -815,7 +826,7 @@ class FutureMap:
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
+            if _consume_asserts():
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
@@ -829,7 +840,7 @@ class FutureMap:
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        if _DEBUG_ASSERT:
+        if _consume_asserts():
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
