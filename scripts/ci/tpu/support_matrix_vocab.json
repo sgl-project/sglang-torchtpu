@@ -61,6 +61,9 @@
         "deepseek-r1"
       ]
     },
+    "deepseek-v4-flash": {
+      "name": "DeepSeek-V4 Flash"
+    },
     "deepseek-v4.1-flash": {
       "name": "DeepSeek-V4.1 Flash"
     },
@@ -93,6 +96,10 @@
     "infra": "infra"
   },
   "features": {
+    "block-major": "Block-major KV layout",
+    "mxint8": "MXINT8 KV cache",
+    "long-context": "Long-context workload",
+    "multi-turn": "Multi-turn workload",
     "spec": "Speculative decoding",
     "eagle3": "EAGLE3",
     "dflash": "DFlash",
@@ -130,6 +137,7 @@
     "tpu-oot": "Out-of-tree plugin (mode B)",
     "rpa-v3": "RPA v3 attention backend",
     "seq-along-lane": "Batched RPA seq-along-lane layout",
-    "normalization": "Multi-host node normalization"
+    "normalization": "Multi-host node normalization",
+    "unified-kv": "Unified Full/SWA KV pool"
   }
 }

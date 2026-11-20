@@ -15,7 +15,12 @@ from sglang.test.test_utils import CustomTestCase
 # Each case is its own TP8 torchrun at ~21s. The gate runs five of the eight;
 # the nightly adds the cases another gate case already passes through.
 register_tpu_ci(est_time=105, suite="stage-a-test-tpu-unit", chips=4)
-register_tpu_ci(est_time=170, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=170,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra"],
+)
 
 
 class TestFp8FusedRsKernel(CustomTestCase):
