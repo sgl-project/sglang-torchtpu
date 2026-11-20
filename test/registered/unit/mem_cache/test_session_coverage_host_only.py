@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
@@ -160,6 +161,41 @@ class TestDeviceOrder(CustomTestCase):
         self.assertIsNotNone(core.host_lru_lists[SWA].mid)
         default = make_cache(host_only=False).tree_core
         self.assertIsNotNone(default.lru_lists[SWA].mid)
+
+
+class TestMambaDeviceWalk(CustomTestCase):
+    """The Mamba device-eviction walk follows the device list: a session cursor only
+    when sessions order device eviction, plain LRU when coverage is host-only."""
+
+    def walk(self, host_only):
+        mamba = ComponentType.MAMBA
+        ordered = not host_only
+        lru = UnifiedLRUList(
+            mamba, (FULL, mamba), is_referenced=(lambda node: False) if ordered else None
+        )
+        comp = SimpleNamespace(
+            component_type=mamba,
+            state_cost=None,
+            tree_core=SimpleNamespace(
+                enable_session_radix_cache=True,
+                session_orders_device=ordered,
+                lru_lists={mamba: lru},
+            ),
+        )
+        MambaComponent._evict_device_start(comp, 1)
+        cursor = comp._evict_device_cursor
+        MambaComponent._evict_device_end(comp)
+        return lru, cursor
+
+    def test_host_only_walks_the_plain_lru_list(self):
+        lru, cursor = self.walk(host_only=True)
+        self.assertIsNone(lru.mid)
+        self.assertIsNone(cursor)
+
+    def test_default_walks_with_the_session_cursor(self):
+        lru, cursor = self.walk(host_only=False)
+        self.assertIsNotNone(lru.mid)
+        self.assertIsNone(cursor)
 
 
 class TestHostOrder(CustomTestCase):
