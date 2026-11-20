@@ -224,6 +224,7 @@ class DsparkDraft:
         self.config = dataclasses.replace(
             self.dspark.DraftConfig.from_checkpoint(checkpoint),
             rope_bf16=kernel_config.active().draft_rope_bf16,
+            lm_prefetch=kernel_config.active().ring_draft_lm_prefetch,
         )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         if self.rank == 0:

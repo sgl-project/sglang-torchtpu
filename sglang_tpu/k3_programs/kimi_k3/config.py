@@ -477,6 +477,9 @@ class KernelConfig:
     # KernelConfig.draft_with_verify for the ring draft too: its single-request
     # op runs inside the verify's (DecodeOps._build_verify_draft).
     ring_draft_with_verify: bool = False
+    # The ring draft kernel starts its LM head's first chunk loads in its last
+    # layer, under the down projection's reduction (DraftConfig.lm_prefetch).
+    ring_draft_lm_prefetch: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's

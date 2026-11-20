@@ -40,7 +40,7 @@ from jax.experimental.pallas import tpu
 
 from sglang_tpu.k3_programs.common import collectives32
 
-from .decode_megakernel import _attention_scores, _dot
+from .decode_megakernel import _attention_scores, _dot, _phase_end, _phase_start
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +67,10 @@ class DraftConfig:
     # rounds the FP32 rows it reads to BF16, so the drafts are the same and
     # the tables (to the context length, in HBM) take half the bytes.
     rope_bf16: bool = False
+    # KernelConfig.ring_draft_lm_prefetch: the last layer starts the LM head's
+    # first chunk loads once its gate/up buffers are read (under its down
+    # projection's reduction) instead of after the final norm.
+    lm_prefetch: bool = False
 
     @property
     def q_width(self) -> int:
@@ -1602,6 +1606,8 @@ def _make_body(
                 item.start()
                 item.wait()
 
+        # Phase scopes (KernelConfig.phase_scopes) name the profile's regions.
+        scope = _phase_start("r_prologue")
         # ---------------- prologue: barrier and DMA issue ----------------
         collectives32.barrier()
         small_sources = {
@@ -1880,6 +1886,7 @@ def _make_body(
                 item.wait()
             receive_anchor_rows()
 
+        _phase_end(scope)
         # ---------------- fc: context features for the new rows ----------------
         if stop_after == "barrier":
             early_exit([fc_copy] + w1_drain(0))
@@ -1888,6 +1895,7 @@ def _make_body(
         if stop_after == "fc_wait":
             early_exit(w1_drain(0))
             return
+        scope = _phase_start("r_fc")
         # Layer-0 weights and the Markov pieces stream in behind the fc phase.
         pending = {name: layer_copy(name, 0) for name in layer_buffers}
         for name in ("kv", "q", "o", "gate", "up", "down"):
@@ -1941,9 +1949,11 @@ def _make_body(
                         ] = total
 
         fc_round(0, CHUNK, a_buf.at[:, pl.ds(0, CHUNK)])
+        _phase_end(scope)
         if stop_after == "fc_matmul":
             early_exit(list(pending.values()) + w1_drain(0) + [w2t_copy])
             return
+        scope = _phase_start("r_prep")
         context = _rms_norm(
             _bf16(host_reduce_gather(fc_part[...], 0)), small["hidden_norm"][...], eps
         )  # [T, 7168]
@@ -2030,9 +2040,12 @@ def _make_body(
             tokens_copy.wait()
             positions_copy.wait()
 
+        _phase_end(scope)
         if stop_after == "fc":
             finish(list(pending.values()) + w1_drain(0) + [w2t_copy])
             return
+
+        scope = _phase_start("r_ctx")
 
         def kv_rows(features_bf16, layer, cos32, sin32):
             """Packed [T, 128] K (normed, RoPE) | V rows for all requests' feature rows."""
@@ -2096,8 +2109,28 @@ def _make_body(
         pending["kv"] = None
         newkv_buf[...] = kv_rows(context, 0, cos_new, sin_new)
 
+        _phase_end(scope)
+        # The LM head's rotating chunk buffers (free once their earlier users are
+        # done: the fc columns' scratch, then the gate / up buffers).
+        lm_chunk_buffers = (
+            a_buf.at[pl.ds(0, hidden), pl.ds(0, LM_CHUNK)],
+            gate_buf,
+            up_buf,
+        )
+        lm_chunk_sems = (0, 5, 6)
+
+        def lm_chunk_copy(chunk):
+            return copy(
+                weights["lm_head"].at[chunk],
+                lm_chunk_buffers[chunk % 3],
+                lm_chunk_sems[chunk % 3],
+            )
+
+        lm_prefetch = c.lm_prefetch and stop_after == "full"
+        lm_prefetched = {}
         # ---------------- layers ----------------
         for layer in range(layers):
+            scope = _phase_start("r_qkv")
             h = _rms_norm(x, small["ln1"][layer], eps)
             block_kv = kv_rows(
                 h, layer, cos_kv, sin_kv
@@ -2116,6 +2149,8 @@ def _make_body(
             q = _bf16(_f32(_bf16(normed)) * _f32(small["qnorm"][layer]))
             q = _rope(q, small["rot_q"][...], cos_q, sin_q)
 
+            _phase_end(scope)
+            scope = _phase_start("r_attend")
             block_tile = jnp.pad(
                 block_kv.reshape(R, rows, kv_width), ((0, 0), (0, 16 - rows), (0, 0))
             )  # [R, 16, 128]
@@ -2164,6 +2199,8 @@ def _make_body(
                     ring_start_in(v + 2)
             attended = _bf16(jnp.concatenate(attended_rows, axis=0))
 
+            _phase_end(scope)
+            scope = _phase_start("r_o")
             pending["o"].wait()
             handles = all_reduce_start(
                 attended,
@@ -2179,6 +2216,8 @@ def _make_body(
                 compute_slot0_bias()  # overlaps the reduction's local phase
             x = _bf16(_f32(x) + all_reduce_finish(handles, 1))
 
+            _phase_end(scope)
+            scope = _phase_start("r_mlp")
             h2 = _rms_norm(x, small["ln2"][layer], eps)
             pending["gate"].wait()
             gate = _bf16(_dot(h2, gate_buf[...]))  # [T, 512], zero beyond 448
@@ -2189,6 +2228,13 @@ def _make_body(
                 pending["gate"].start()
                 pending["up"] = layer_copy("up", layer + 1)
                 pending["up"].start()
+            elif lm_prefetch:
+                # The LM head's chunks into the buffers this layer has read, as
+                # the refills above do for a next layer (chunk 0's buffer is the
+                # streamed down projection's spare when R > 4: loaded later).
+                for chunk in range(0 if R <= 4 else 1, 3):
+                    lm_prefetched[chunk] = lm_chunk_copy(chunk)
+                    lm_prefetched[chunk].start()
             gate32 = _f32(gate)
             activation = _bf16(_f32(_bf16(gate32 * jax.nn.sigmoid(gate32))) * _f32(up))
             pending["down"].wait()
@@ -2205,30 +2251,22 @@ def _make_body(
                 )
                 newkv_buf[...] = kv_rows(context, layer + 1, cos_new, sin_new)
             x = _bf16(_f32(x) + all_reduce_finish(handles, 0))
+            _phase_end(scope)
             if stop_layers == layer + 1:
                 # w1/w2t were already waited on by compute_slot0_bias in layer 0.
                 finish(list(pending.values()) if layer + 1 < layers else [])
                 return
 
         # ---------------- LM head ----------------
+        scope = _phase_start("r_lm")
         hidden_rows = _rms_norm(x, small["final_norm"][...], eps)  # [T, 7168]
-        chunk_buffers = (
-            a_buf.at[pl.ds(0, hidden), pl.ds(0, LM_CHUNK)],
-            gate_buf,
-            up_buf,
-        )
-        chunk_sems = (0, 5, 6)
-
-        def chunk_copy(chunk):
-            return copy(
-                weights["lm_head"].at[chunk],
-                chunk_buffers[chunk % 3],
-                chunk_sems[chunk % 3],
-            )
-
-        chunk_copies = [chunk_copy(chunk) for chunk in range(3)]
-        for item in chunk_copies:
-            item.start()
+        chunk_buffers = lm_chunk_buffers
+        chunk_copy = lm_chunk_copy
+        chunk_copies = [lm_prefetched.get(chunk) for chunk in range(3)]
+        for chunk, item in enumerate(chunk_copies):
+            if item is None:
+                chunk_copies[chunk] = chunk_copy(chunk)
+                chunk_copies[chunk].start()
         vocab_lane = jax.lax.broadcasted_iota(jnp.int32, (1, vocab), 1)
         for chunk in range(LM_CHUNKS):
             chunk_copies[chunk % 3].wait()
@@ -2241,11 +2279,13 @@ def _make_body(
             logits_vmem[:, :, pl.ds(chunk * LM_CHUNK, LM_CHUNK)] = logits.reshape(
                 R, rows, LM_CHUNK
             )
+        _phase_end(scope)
         if stop_after == "lm_head":
             finish([])
             return
 
         # ---------------- exact Markov sampling ----------------
+        scope = _phase_start("r_markov")
         tokens = tokens_v[...]  # [R, 128]
         token_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
         rank_iota = jax.lax.broadcasted_iota(jnp.int32, (RANKS, R, 128), 0)
@@ -2298,6 +2338,7 @@ def _make_body(
             previous = token[:, 0]  # [R]
             if slot + 1 < block:
                 start_w1(previous, (slot + 1) % 2)
+        _phase_end(scope)
         tokens_v[...] = tokens
         finish([])
 
