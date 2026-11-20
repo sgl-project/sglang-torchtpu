@@ -19,7 +19,8 @@ import torch
 from torch.multiprocessing import reductions
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_musa, is_npu, torch_release
+from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.device import is_musa, is_npu
 
 logger = logging.getLogger(__name__)
 

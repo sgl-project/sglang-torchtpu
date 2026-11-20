@@ -18,7 +18,7 @@ from torch import nn
 from sglang.srt.configs.muse_spark import MuseSparkVisionConfig
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 
 def _rope_frequencies(

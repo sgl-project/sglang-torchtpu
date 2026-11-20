@@ -334,6 +334,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids.dim() != 1:
             raise ValueError(f"input_ids must be 1-D, got {list(input_ids.shape)}")
@@ -355,14 +356,18 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             if video_grid_thw is not None
             else None
         )
-        # Positions depend only on host token and grid metadata, so resolve
-        # them on the host before the transfer, for text-only requests too.
-        position_ids, _ = self.model.get_rope_index(
-            host_ids,
-            host_image_grid_thw,
-            host_video_grid_thw,
-            attention_mask=torch.ones_like(host_ids),
-        )
+        # Callers may pass mRoPE position_ids (the image release repeats the final
+        # multimodal position over padding); otherwise derive them here, where
+        # padding counts as trailing text. Positions depend only on host token
+        # and grid metadata, so resolve them on the host before the transfer,
+        # for text-only requests too.
+        if position_ids is None:
+            position_ids, _ = self.model.get_rope_index(
+                host_ids,
+                host_image_grid_thw,
+                host_video_grid_thw,
+                attention_mask=torch.ones_like(host_ids),
+            )
         ids = host_ids.to(self.device)
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
@@ -409,6 +414,14 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
+                if (
+                    name == "model.visual.patch_embed.proj.weight"
+                    and param.ndim == 5
+                    and tuple(loaded_weight.shape)
+                    == (param.shape[0] * param.shape[1], *param.shape[2:])
+                ):
+                    # H3 GGUF folds the Conv3D output and input channel axes.
+                    loaded_weight = loaded_weight.reshape(param.shape)
                 can_keep_checkpoint_tensor = bool(
                     getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader

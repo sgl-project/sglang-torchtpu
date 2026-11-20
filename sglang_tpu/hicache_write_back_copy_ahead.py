@@ -44,7 +44,7 @@ from __future__ import annotations
 import heapq
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
@@ -430,7 +431,11 @@ def attach_copy_ahead(
 
 
 def evict_with_copy_ahead(
-    cache: UnifiedRadixCache, params: EvictParams, available_size_targets=None
+    cache: UnifiedRadixCache,
+    params: EvictParams,
+    *,
+    demand: Optional[dict[ComponentType, int]] = None,
+    satisfied: Optional[Callable[[], bool]] = None,
 ) -> EvictResult:
     if cache.disable:
         return EvictResult()
@@ -438,23 +443,26 @@ def evict_with_copy_ahead(
     tracker = {ct: 0 for ct in cache.tree_components}
     request_by_type = cache._evict_request_by_type(params)
     cache._evict_components(
-        request_by_type, tracker, available_size_targets=available_size_targets
+        request_by_type, tracker, demand=demand, satisfied=satisfied
     )
     # Short behind window copies' locks would retract a request: wait for them
     # once and walk again with the same request (the tracker is cumulative).
     copy_ahead = cache._write_back_copy_ahead
     if copy_ahead.pending_node_ids and _is_short(
-        cache, request_by_type, tracker, available_size_targets
+        cache, request_by_type, tracker, demand, satisfied
     ):
         copy_ahead.wait_for_acks(window_acks=copy_ahead.pending_node_ids)
         cache._evict_components(
-            request_by_type, tracker, available_size_targets=available_size_targets
+            request_by_type, tracker, demand=demand, satisfied=satisfied
         )
     cache.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
     return EvictResult(
         num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
-        swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
-        mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
+        mamba_num_evicted=tracker.get(cache.slot_id(TREE_STATE), 0),
+        window_num_tokens_evicted={
+            name: tracker.get(ct, 0)
+            for ct, name in cache._window_sub_pools_by_slot().items()
+        },
     )
 
 
@@ -462,17 +470,21 @@ def _is_short(
     cache: UnifiedRadixCache,
     request_by_type: dict[ComponentType, int],
     tracker: dict[ComponentType, int],
-    available_size_targets,
+    demand: Optional[dict[ComponentType, int]],
+    satisfied: Optional[Callable[[], bool]],
 ) -> bool:
+    if satisfied is not None and satisfied():
+        return False
     for component_type in cache.tree_components:
         requested = request_by_type.get(component_type, 0)
         if requested <= 0 or tracker.get(component_type, 0) >= requested:
             continue
-        target = (available_size_targets or {}).get(component_type)
-        if target is not None:
-            target_component, target_size = target
-            if cache._component_available_size(target_component) >= target_size:
-                continue
+        if (
+            demand is not None
+            and component_type in demand
+            and cache._pool_available(component_type) >= demand[component_type]
+        ):
+            continue
         return True
     return False
 
@@ -499,10 +511,12 @@ def install(cache_cls: Optional[type] = None) -> None:
             cache=self, chunked_prefill_size=server_args.chunked_prefill_size
         )
 
-    def _evict(self, params: EvictParams, available_size_targets=None) -> EvictResult:
+    def _evict(
+        self, params: EvictParams, *, demand=None, satisfied=None
+    ) -> EvictResult:
         if self._write_back_copy_ahead is None:
-            return orig_evict(self, params, available_size_targets)
-        return evict_with_copy_ahead(self, params, available_size_targets)
+            return orig_evict(self, params, demand=demand, satisfied=satisfied)
+        return evict_with_copy_ahead(self, params, demand=demand, satisfied=satisfied)
 
     def check_hicache_events(self):
         orig_check_hicache_events(self)

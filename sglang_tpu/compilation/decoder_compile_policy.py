@@ -1506,11 +1506,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ):
             return
         buckets = sorted(set(self.b_bucketer.buckets) | {self._extend_compile_cap()})
-        backends = (
-            runner.attn_backend,
-            runner.decode_attn_backend,
-            *(runner.decode_attn_backend_group or ()),
-        )
+        backends = (runner.attn_backend,)
         max_live = min(runner.max_running_requests, max(buckets))
         runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
         from sglang_tpu.allocator_tpu import host_return_allocators
@@ -1836,10 +1832,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_attn_backend = attn_backend or self.model_runner.attn_backend
         forward_attn_backend.init_forward_metadata(forward_batch)
 
-        # The compiled forward resolves its attention backend from the forward
-        # context (upstream moved attn_backend off ForwardBatch into a
-        # ForwardContext). Serving establishes it in ModelRunner.forward, but the
-        # warmup path invokes the compiled forward directly, so set it here too.
+        # The compiled forward resolves its attention backend and the MoE
+        # padded-row bound from the forward context. Serving publishes both in
+        # ModelRunner._forward_raw, but the warmup path invokes the compiled
+        # forward directly, so publish them here the same way: TopK guards on
+        # whether the bound getter is set, and a mismatch recompiles every
+        # bucket on the first served request.
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
@@ -1852,7 +1850,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with (
-            forward_context(ForwardContext(attn_backend=forward_attn_backend)),
+            forward_context(
+                ForwardContext(attn_backend=forward_attn_backend),
+                forward_batch=forward_batch,
+            ),
             torch.no_grad(),
         ):
             started = time.perf_counter()

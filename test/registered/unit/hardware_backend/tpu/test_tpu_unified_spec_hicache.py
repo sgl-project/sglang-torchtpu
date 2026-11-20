@@ -12,12 +12,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.managers.cache_controller import BatchDoneCounter, CacheOperation
 from sglang.srt.mem_cache import hicache_auto_size
 from sglang.srt.mem_cache.hicache_storage import PoolName as PN
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer as PT
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -174,9 +173,17 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             patch.object(hpa, "build_swa_draft_pools", wrap_swa),
             patch.object(hicache_auto_size, "_draft_bytes", wrap_draft_bytes),
             patch.object(kph, "create_tpu_dma_kv_transfer", side_effect=_InMemoryDMA),
-            patch.object(kph, "host_memory_budget_bytes", return_value=1 << 40),
+            patch.object(
+                kph,
+                "host_memory_preflight",
+                side_effect=lambda lengths, **_: (sum(lengths), 1 << 40),
+            ),
             patch(
                 "sglang.srt.platforms.current_platform.get_mha_kv_pool_host_cls",
+                side_effect=host_cls,
+            ),
+            patch(
+                "sglang.srt.platforms.current_platform.get_device_pool_kv_host_cls",
                 side_effect=host_cls,
             ),
             patch.object(hpa, "get_memory", return_value=mem),
@@ -214,8 +221,14 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             [],
         )
         ctrl.layer_done_counter = BatchDoneCounter()
+        ctrl.transfer_layer_id_max = mx
         specs, entries = hpa.build_hicache_draft_sidecars(
-            draft_device_pools=(dp,), tree_cache=NS(cache_controller=ctrl)
+            draft_device_pools=(dp,),
+            tree_cache=NS(
+                cache_controller=ctrl,
+                token_to_kv_pool_allocator=ta,
+                req_to_token_pool=None,
+            ),
         )
         for e in entries:
             grp.add_entry(e)
@@ -323,6 +336,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         dp = attach_draft(ta, (0,))
         r1 = NS(
             token_to_kv_pool=dp,
+            runner_ids=NS(is_fused_draft=False),
             model_config=NS(
                 num_nextn_predict_layers=1,
                 hf_config=NS(architectures=["EagleLlamaForCausalLM"]),
@@ -386,6 +400,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.mem_cache.unified_cache.components import ComponentType as CT
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.test.tree_slots import tree_slots_of
         from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.hicache_write_back_copy_ahead import attach_copy_ahead
@@ -402,7 +417,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
                 token_to_kv_pool_allocator=ta,
                 page_size=4,
                 sliding_window_size=8,
-                tree_components=(CT.FULL, CT.SWA),
+                tree_slots=tree_slots_of((CT.FULL, CT.SWA), window=8),
                 tree_core_backend="python",
             )
         )
@@ -562,6 +577,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             dp = attach_draft(ta, (), (0, 1))
             r_df = NS(
                 token_to_kv_pool=dp,
+                runner_ids=NS(is_fused_draft=False),
                 model_config=NS(
                     num_nextn_predict_layers=None,
                     hf_config=NS(architectures=["DFlash2DraftModel"]),
@@ -611,8 +627,14 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             [],
         )
         ctrl.layer_done_counter = BatchDoneCounter()
+        ctrl.transfer_layer_id_max = mx
         specs, entries = hpa.build_hicache_draft_sidecars(
-            draft_device_pools=(dp,), tree_cache=NS(cache_controller=ctrl)
+            draft_device_pools=(dp,),
+            tree_cache=NS(
+                cache_controller=ctrl,
+                token_to_kv_pool_allocator=ta,
+                req_to_token_pool=None,
+            ),
         )
         for e in entries:
             grp.add_entry(e)
@@ -677,7 +699,6 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         sep_kv_host = hpa.build_kv_host_pool(
             kv_pool=sep_target.full_kv_pool,
             page_size=4,
-            use_mla=False,
             pool_label="full",
         )
         sep_grp = HostPoolGroup(
@@ -706,12 +727,14 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
         )
         sep_tc = NS(cache_controller=NS(mem_pool_host=sep_grp, page_size=4))
-        self.assertEqual(
-            hpa.build_hicache_draft_sidecars(
-                draft_device_pools=(sep_draft,), tree_cache=sep_tc
-            ),
-            ([], []),
-        )
+        # The static SWA pools back their window up to host pool ``swa``.
+        with patch.object(hpa, "target_window_host_pool", return_value=PN.SWA):
+            self.assertEqual(
+                hpa.build_hicache_draft_sidecars(
+                    draft_device_pools=(sep_draft,), tree_cache=sep_tc
+                ),
+                ([], []),
+            )
         self.assertEqual(list(sep_grp.entry_map), [PN.KV])
 
         tp, ta = make_target(size=64)
@@ -719,7 +742,13 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         fm, sm = kph._unified_swa_layer_mappings(tp)
         mx = max(fm.keys() | sm.keys()) + 1
         uni_grp = HostPoolGroup([_entry(PN.KV, kv_h, tp, fm, mx, is_anchor=True)])
-        uni_tc = NS(cache_controller=NS(mem_pool_host=uni_grp, page_size=4))
+        uni_tc = NS(
+            cache_controller=NS(
+                mem_pool_host=uni_grp, page_size=4, transfer_layer_id_max=mx
+            ),
+            token_to_kv_pool_allocator=ta,
+            req_to_token_pool=None,
+        )
         uni_swa_draft = attach_draft(ta, (), (0, 1))
         self.assertEqual(
             hpa.build_hicache_draft_sidecars(

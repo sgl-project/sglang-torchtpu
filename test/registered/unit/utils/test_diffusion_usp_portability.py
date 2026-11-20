@@ -31,6 +31,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 
+def _cpu_platform(slabs_preferred=False):
+    return SimpleNamespace(
+        is_cpu=lambda: True,
+        prefers_head_slab_output_exchange=lambda: slabs_preferred,
+    )
+
+
+def _sp_group(ulysses_group):
+    # No CPU shared-memory all-to-all handle: exchanges take torch.distributed.
+    return SimpleNamespace(ulysses_group=ulysses_group, ulysses_shm_handle=None)
+
+
 def _load_usp():
     parallel_name = "sglang.multimodal_gen.runtime.distributed.parallel_state"
     parallel = ModuleType(parallel_name)
@@ -44,11 +56,25 @@ def _load_usp():
     common_name = "sglang.srt.utils.common"
     common = ModuleType(common_name)
     common.torch_release = tuple(int(part) for part in torch.__version__.split(".")[:2])
+    platforms_name = "sglang.multimodal_gen.runtime.platforms"
+    platforms = ModuleType(platforms_name)
+    platforms.current_platform = _cpu_platform()
     path = Path(sglang.__file__).parent / "multimodal_gen/runtime/layers/usp.py"
     spec = importlib.util.spec_from_file_location("_usp_portability", path)
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {parallel_name: parallel, common_name: common}):
+    stubs = {parallel_name: parallel, common_name: common, platforms_name: platforms}
+    saved = {name: sys.modules.get(name) for name in stubs}
+    # Swap only the stubbed names: restoring all of sys.modules would drop the
+    # torch modules usp imports first, and re-importing them re-registers ops.
+    sys.modules.update(stubs)
+    try:
         spec.loader.exec_module(module)
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     # CUDA IPC is a separate transport, not exercised by the Gloo tests.
     module._ipc_ready_group = lambda: None
     return module
@@ -65,7 +91,7 @@ def _gloo_worker(rank, world, init_method):
     )
     try:
         usp = _load_usp()
-        usp.get_sp_group = lambda: SimpleNamespace(ulysses_group=dist.group.WORLD)
+        usp.get_sp_group = lambda: _sp_group(dist.group.WORLD)
         usp.get_ulysses_parallel_world_size = lambda: world
         usp.get_ulysses_parallel_rank = lambda: rank
         local_seq, local_heads, dim = 3, 2, 5
@@ -130,9 +156,7 @@ def _check_head_dim2_output_exchange(usp, rank, world):
     for slabs_preferred, batch, local_heads, local_seq in itertools.product(
         (False, True), (1, 2), (1, 2), (1, 3)
     ):
-        usp.current_platform = SimpleNamespace(
-            prefers_head_slab_output_exchange=lambda value=slabs_preferred: value
-        )
+        usp.current_platform = _cpu_platform(slabs_preferred)
         shape = (batch, prefix + local_seq * world, local_heads * world, dim)
         full = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
         start = prefix + rank * local_seq
@@ -209,7 +233,7 @@ class TestUspPortableLayouts(unittest.TestCase):
         # Equal dim-0 splits equal the flat exchange; a flattened buffer costs
         # torch_tpu relayout copies around the collective.
         usp = _load_usp()
-        usp.get_sp_group = lambda: SimpleNamespace(ulysses_group=object())
+        usp.get_sp_group = lambda: _sp_group(object())
         usp.get_ulysses_parallel_world_size = lambda: 2
         seen = []
 

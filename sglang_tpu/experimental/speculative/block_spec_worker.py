@@ -592,7 +592,7 @@ def _extend_ring_rows(*, ring_pool, batch: ScheduleBatch, positions: torch.Tenso
     if batch.encoder_swa_reset is not None:
         placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
         if placed:
-            ring_pool.reset_swa_req_ring(
+            ring_pool.set_swa_valid_from(
                 batch.req_pool_indices_cpu[placed],
                 torch.tensor([batch.prefix_lens[i] for i in placed], dtype=torch.int64),
             )

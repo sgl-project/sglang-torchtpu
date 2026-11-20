@@ -688,16 +688,16 @@ def _patch_support_triton_for_tpu() -> None:
         return
     _support_triton_patched = True
 
-    import sglang.srt.utils.common as _utils_common
+    import sglang.srt.utils.triton_utils as _triton_utils
 
-    orig = _utils_common.support_triton
+    orig = _triton_utils.support_triton
 
     def support_triton(backend: str) -> bool:
         if backend in _PALLAS_TPU_BACKENDS:
             return False
         return orig(backend)
 
-    _utils_common.support_triton = support_triton
+    _triton_utils.support_triton = support_triton
 
     # Rebind the by-value imports (and the package re-export).
     for modname in (
@@ -864,12 +864,12 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     # Each polled request's time stats -> its sender, during the poll only.
     polled_senders = {}
     orig_poll = (
-        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue
+        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue
     )
     orig_set_finish = SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
 
-    def process_disagg_prefill_inflight_queue(self, *args, **kwargs):
-        for req in self.disagg_prefill_inflight_queue:
+    def process_disagg_prefill_transfer_queue(self, *args, **kwargs):
+        for req in self.disagg_prefill_transfer_queue:
             polled_senders[id(req.time_stats)] = req.disagg_kv_sender
         try:
             return orig_poll(self, *args, **kwargs)
@@ -885,8 +885,8 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
                 ts = max(finish, self.prefill_transfer_queue_entry_time)
         orig_set_finish(self, ts)
 
-    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue = (
-        process_disagg_prefill_inflight_queue
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue = (
+        process_disagg_prefill_transfer_queue
     )
     SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = (
         set_prefill_kv_transfer_finish_time

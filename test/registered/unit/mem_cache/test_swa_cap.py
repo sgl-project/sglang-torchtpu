@@ -15,6 +15,7 @@ from swa_cache_world import (
     PAGE,
     POISON,
     SWA,
+    SWA_POOL,
     WINDOW,
     KVWorld,
     cpu_ci_tree_core_selection,
@@ -22,11 +23,22 @@ from swa_cache_world import (
 )
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator import paged
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
@@ -56,16 +68,18 @@ class DecodeWorld(KVWorld):
         self.rid += 1
         self.req_to_token_pool.alloc([req])
         req.init_next_round_input(tree_cache=self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        cached = len(req.prefix_indices)
+        req.lock = self.cache.lock(req.last_node)
+        cached = req.prefix_len
         row = req.kv.req_pool_idx
         if cached:
-            self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
+            self.req_to_token_pool.write(
+                (row, slice(0, cached)), self.cache.prefix_device_indices(req)
+            )
         req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
         pos = cached
         while pos < len(tokens):
             end = min(pos + chunk, len(tokens))
-            req.set_extend_range(pos, end)
+            req.prefix_len, req.extend_end = pos, end
             self.req_to_token_pool.write(
                 (row, slice(pos, end)), self._alloc(tokens[pos:end], pos)
             )
@@ -85,22 +99,20 @@ class DecodeWorld(KVWorld):
         for _ in range(steps):
             self.decode_step(req)
             if cap_every and req.decode_batch_idx % cap_every == 0:
-                self.cache.evict_sliding_windows(
-                    req, req.seqlen - 1, eviction_interval=1
-                )
+                retire_window(req, req.seqlen - 1, self.cache, eviction_interval=1)
                 self.cache.cap_release(req)
 
     def finish(self, req: Req) -> None:
         req.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(req, self.cache)
+        release_kv_cache(req, self.cache, checkpoint=True)
 
     # -- inspection
     def locked_range(self, req: Req) -> tuple[int, int] | None:
         """[start, end) token positions of the request's SWA segment lock."""
-        if req.swa_prefix_lock_released or req.last_node is None:
+        if req.lock is None or req.lock.swa_released or req.last_node is None:
             return None
         swa = self.cache.components[SWA]
-        uuid = req.lock_receipt.get_lock_uuid(SWA)
+        uuid = req.lock.receipt.get_lock_uuid(SWA)
         path = swa._path_with_positions(self.cache.tree_core.node_by_id(req.last_node))
         top = path[-1][1]
         for n, start, _ in path:
@@ -205,7 +217,7 @@ class TestSWACap(unittest.TestCase):
         b = w.admit(base[: self.PROMPT - 2 * PAGE] + _tokens(3, 2 * PAGE), self.CHUNK)
         b_states = {(s, e): ref for s, e, ref, _ in w.node_states(b)}
         w.decode(a, 3 * WINDOW, cap_every=32)  # A's window leaves its prompt
-        self.assertTrue(a.swa_prefix_lock_released)
+        self.assertTrue(a.lock.swa_released)
         b_rng = w.locked_range(b)
         for s, e, ref, live in w.node_states(b):
             if e <= b_rng[0]:
@@ -268,10 +280,10 @@ class TestSWACap(unittest.TestCase):
         w.poison_free_swa()
         for toks in reqs:
             m = w.match(toks)
-            n = len(m.device_indices)
+            n = m.device_prefix_len
             if n == 0:
                 continue
-            full = m.device_indices.to(torch.int64)
+            full = w.device_indices(m).to(torch.int64)
             want = [
                 float(torch.tensor(kv_value(t, p)).to(torch.bfloat16))
                 for p, t in enumerate(toks[:n])
@@ -306,7 +318,7 @@ class TestSWACap(unittest.TestCase):
                 w.finish(o)
             w.evict(swa_tokens=10**6)
             m = w.match(sys_prompt + media + _tokens(99, 2 * PAGE))
-            results[anchors] = len(m.device_indices)
+            results[anchors] = m.device_prefix_len
             if anchors:
                 self.assertEqual(len(w.cache._cap_anchors), 1)
         self.assertGreaterEqual(
@@ -403,7 +415,7 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
             w.finish(r)
         w.evict(swa_tokens=10**6, full_tokens=10**6)  # all that is evictable
         self.assertEqual(len(w.cache._cap_anchors), 4)
-        self.assertEqual(w.cache.swa_protected_size(), 384)
+        self.assertEqual(w.cache.window_protected_size(SWA_POOL), 384)
         return w
 
     def _parked_chunk_world(self) -> tuple[DecodeWorld, Req]:
@@ -420,7 +432,7 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         self.assertIs(adder.new_chunked_req, req, "admitted, in chunks")
         # Its first chunk, as DecodeWorld.admit runs one.
         w.req_to_token_pool.alloc([req])
-        req.lock_receipt = w.cache.inc_lock_ref(req.last_node).to_dec_params()
+        req.lock = w.cache.lock(req.last_node)
         w.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.CHUNK)),
             w._alloc(list(req.origin_input_ids[: self.CHUNK]), 0),
@@ -428,7 +440,8 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         req.kv.kv_committed_len = req.kv.kv_allocated_len = self.CHUNK
         checkpoint_kv_cache(req, w.cache)
         self.assertEqual(
-            w.allocator.swa_available_size() + w.cache.swa_evictable_size(), 80
+            w.allocator.swa_available_size() + w.cache.window_evictable_size(SWA_POOL),
+            80,
         )
         return w, req
 
@@ -476,14 +489,15 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = True
-        s.waiting_queue = list(waiting)
-        s.chunked_req = chunked_req
+        # Each pass builds fresh lists; move takes a request out of a past one.
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        move(waiting, s.waiting_queue)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        if chunked_req is not None:
+            move([chunked_req], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 8
-        s.policy = SimpleNamespace(
-            calc_priority=lambda *args, **kwargs: None,
-            shortest_prefill_chunk_limit=lambda *args, **kwargs: None,
-        )
+        s.policy = SchedulePolicy("fcfs", w.cache, False, False, False)
         s.processed_tokens_counter = None
         s.chunked_prefill_size = None if chunked_req is None else self.CHUNK
         s.dynamic_chunk_sizer = None
@@ -502,6 +516,14 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         s.dllm_config = None
         s.enable_lora = False
         s.disaggregation_mode = DisaggregationMode.NULL
+        s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        s.prefill_launched_reqs = IndexedReqList(ListKind.PREFILL_LAUNCHED)
+        s.hisparse_coordinator = None
+        s.invariant_checker = mock.Mock()
+        s.request_retirer = mock.Mock()
+        s.lora_drainer = None
+        s._maybe_log_schedule_decision = lambda *args, **kwargs: None
         s.enable_hicache_storage = False
         s.enable_lmcache = False
         s.enable_hierarchical_cache = False
@@ -541,7 +563,7 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         self.assertTrue(w.cache.release_cap_anchor())
         self.assertFalse(w.cache.release_cap_anchor(), "no anchor left")
         self.assertEqual(w.cache.full_protected_size(), 0)
-        self.assertEqual(w.cache.swa_protected_size(), 0)
+        self.assertEqual(w.cache.window_protected_size(SWA_POOL), 0)
         w.cache.sanity_check()
 
     def test_the_anchor_alone_blocks_admission(self):
@@ -644,8 +666,19 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         to prefill is recorded instead."""
         q = DecodePreallocQueue.__new__(DecodePreallocQueue)
         q.pp_size = 1
-        q.queue, q.pending_reqs, q.retracted_queue = [], [], []
+        q.queue = IndexedReqList(ListKind.PD_PREALLOC, req_of=lambda d: d.req)
+        q.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        q.pending_reqs = []
         q.num_reserved_decode_tokens = PAGE
+        q.draft_kv_ring = None
+        q.draft_token_to_kv_pool = None
+        q._num_published_destinations = 0
+        q._defer_publish = False
+        q._pending_publish = []
+        q.host_pool = None
+        q.host_reserved_tokens = 0
+        q.host_window_entries = []
+        q.enable_staging = False
         q.req_to_token_pool = w.req_to_token_pool
         q.token_to_kv_pool = w.kv_pool
         q.token_to_kv_pool_allocator = w.allocator
@@ -653,8 +686,14 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         q.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
             available_size=lambda: 8
         )
-        q.transfer_queue = SimpleNamespace(queue=[])
-        q.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        q.transfer_queue = SimpleNamespace(
+            queue=IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda d: d.req),
+            enable_staging=False,
+            has_pending_deferred_releases=lambda: False,
+        )
+        q.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
         q.scheduler = SimpleNamespace(
             running_batch=SimpleNamespace(reqs=[]),
             waiting_queue=[],
@@ -663,6 +702,8 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
             enable_hisparse=False,
             enable_lora=False,
             enable_decode_hicache=False,
+            enable_overlap=False,
+            enable_staging=False,
             sliding_window_size=WINDOW,
             tp_worker=SimpleNamespace(is_hybrid_swa=True),
         )
@@ -685,19 +726,25 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
             yield
 
     def _pd_decode_pass(self, q: DecodePreallocQueue, reqs: list[Req]) -> list[str]:
-        """One real pop_preallocated pass over ``reqs`` (all waiting for their
+        """One real move_preallocated pass over ``reqs`` (all waiting for their
         KV destination); the rids it preallocated."""
-        q.queue = [
-            DecodeRequest(req=r, kv_receiver=None, waiting_for_input=True) for r in reqs
-        ]
+        q.queue = IndexedReqList(ListKind.PD_PREALLOC, req_of=lambda d: d.req)
+        move(
+            [
+                DecodeRequest(req=r, kv_receiver=None, waiting_for_input=True)
+                for r in reqs
+            ],
+            q.queue,
+        )
+        receiving = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda d: d.req)
         with self._pd_decode_config():
-            preallocated, failed = q.pop_preallocated()
+            preallocated, failed = q.move_preallocated(receiving)
         self.assertEqual(failed, [])
         return [d.req.rid for d in preallocated]
 
     def test_idle_pd_decode_prealloc_releases_the_anchor(self):
         """The case from review on a PD decode server: with nothing running,
-        the anchor alone keeps DecodePreallocQueue.pop_preallocated from
+        the anchor alone keeps DecodePreallocQueue.move_preallocated from
         reserving the prompt (with the flag unset, as on main, on every pass).
         With the flag set, the first pass releases the anchor, refreshes its
         budget and preallocates the prompt."""
@@ -724,7 +771,10 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         with self._anchors_flag():
             self.assertEqual(self._pd_decode_pass(q, [small, big]), [small.rid])
         self.assertEqual(len(w.cache._cap_anchors), 1)
-        q.transfer_queue.queue = [SimpleNamespace(req=small, host_staged=False)]
+        q.transfer_queue.queue = IndexedReqList(
+            ListKind.PD_RECEIVING, req_of=lambda d: d.req
+        )
+        move([SimpleNamespace(req=small, host_staged=False)], q.transfer_queue.queue)
         with self._anchors_flag():
             self.assertEqual(self._pd_decode_pass(q, [big]), [big.rid])
         self.assertEqual(w.cache._cap_anchors, {})
@@ -746,25 +796,26 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         self.assertEqual(list(w.cache._cap_anchors), anchors[1:])
 
     def test_idle_pd_decode_resume_releases_the_anchor(self):
-        """DecodePreallocQueue.resume_retracted_reqs has the same admission
+        """DecodePreallocQueue.move_resumed has the same admission
         check: a retracted request is resumed once the anchor is released."""
         w = self._pressured_world()
         q = self._pd_decode_queue(w)
         req = self._big()
         req.output_ids.append(7)
         req.is_retracted = True
-        q.retracted_queue = [req]
+        move([req], q.retracted_queue)
+        waiting = IndexedReqList(ListKind.WAITING)
         with (
             self._pd_decode_config(),
             mock.patch("sglang.srt.disaggregation.decode.restore_kv_cache") as restore,
         ):
-            self.assertEqual(q.resume_retracted_reqs(), [], "flag unset")
+            self.assertEqual(q.move_resumed(waiting), [], "flag unset")
             self.assertEqual(len(w.cache._cap_anchors), 1)
             with self._anchors_flag():
-                resumed = q.resume_retracted_reqs()
+                resumed = q.move_resumed(waiting)
         self.assertEqual([r.rid for r in resumed], [req.rid])
         self.assertEqual(w.cache._cap_anchors, {})
-        self.assertEqual(q.retracted_queue, [])
+        self.assertEqual(list(q.retracted_queue), [])
         self.assertIs(restore.call_args.args[0], req)
         self.assertFalse(req.is_retracted)
 
@@ -903,9 +954,9 @@ class TestSWACapText(unittest.TestCase):
         w.evict(swa_tokens=WINDOW + 1)
         w.poison_free_swa()
         m = w.match(prompt)
-        n = len(m.device_indices)
+        n = m.device_prefix_len
         if n:
-            full = m.device_indices.to(torch.int64)
+            full = w.device_indices(m).to(torch.int64)
             want = [
                 float(torch.tensor(kv_value(t, p)).to(torch.bfloat16))
                 for p, t in enumerate(prompt[:n])

@@ -9,10 +9,12 @@ from array import array
 from unittest import mock
 
 import torch
-from swa_cache_world import PAGE, POISON, SWA, WINDOW, KVWorld, kv_value
+from swa_cache_world import PAGE, POISON, SWA, SWA_POOL, WINDOW, KVWorld, kv_value
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -62,12 +64,12 @@ class PrefillWorld(KVWorld):
             self.rid += 1
             self.req_to_token_pool.alloc([req])
             req.init_next_round_input(tree_cache=self.cache)
-            req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-            cached = len(req.prefix_indices)
+            req.lock = self.cache.lock(req.last_node)
+            cached = req.prefix_len
             row = req.kv.req_pool_idx
             if cached:
                 self.req_to_token_pool.write(
-                    (row, slice(0, cached)), req.prefix_indices
+                    (row, slice(0, cached)), self.cache.prefix_device_indices(req)
                 )
             req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
             req.cached = cached
@@ -75,7 +77,7 @@ class PrefillWorld(KVWorld):
             pos = cached
             while pos < len(fill):
                 end = min(pos + chunk, len(fill))
-                req.set_extend_range(pos, end)
+                req.prefix_len, req.extend_end = pos, end
                 self.req_to_token_pool.write(
                     (row, slice(pos, end)), self._alloc(fill[pos:end], pos)
                 )
@@ -99,22 +101,20 @@ class PrefillWorld(KVWorld):
             for _ in range(steps):
                 self.decode_step(req)
                 if evict_every and req.decode_batch_idx % evict_every == 0:
-                    self.cache.evict_sliding_windows(
-                        req, req.seqlen - 1, eviction_interval=1
-                    )
-                cursors.append(req.kv.get_evicted_seqlen(SWA))
+                    retire_window(req, req.seqlen - 1, self.cache, eviction_interval=1)
+                cursors.append(req.kv.get_evicted_seqlen(SWA_POOL))
         return cursors
 
     def finish(self, req: Req) -> None:
         with self._env():
             req.finished_reason = FINISH_LENGTH(length=0)
-            release_kv_cache(req, self.cache)
+            release_kv_cache(req, self.cache, checkpoint=True)
 
     def match_profile(self, tokens: list[int], seed: int) -> list[int]:
         """Matched length of ``tokens[:k]`` + a fresh page, for every k."""
         tail = _tokens(seed, PAGE)
         return [
-            len(self.match(tokens[:k] + tail).device_indices)
+            self.match(tokens[:k] + tail).device_prefix_len
             for k in range(1, len(tokens) + 1)
         ]
 
@@ -150,15 +150,16 @@ class TestKeepPrefillChunkWindows(unittest.TestCase):
 
     def test_off_reproduces_the_big_chunk_free(self):
         """Without the flag a chunk longer than window + page frees its first
-        rows at its insert (R7Q): pre_len 127 - 63 = 64 -> [0, 64) and
-        [128, 192) are SWA tombstones, so a match can only end at a chunk end."""
+        rows at its insert (R7Q): the retirement keeps the window plus one page
+        below it, so [0, 48) and [128, 176) are SWA tombstones and a match can
+        only end inside the last window before a chunk end."""
         w = PrefillWorld(keep=False)
         a = w.admit(_tokens(1, self.PROMPT), BIG_CHUNK)
         self.assertEqual(a.chunk_ends, [128, 256])
-        self.assertEqual(w.dead_tokens(a), [(0, 64), (128, 192)])
+        self.assertEqual(w.dead_tokens(a), [(0, 48), (128, 176)])
         prof = w.match_profile(_tokens(1, self.PROMPT), seed=90)
         self.assertEqual(prof[96 - 1], 0, "shared 96 -> nothing (3584 -> 0)")
-        self.assertEqual(prof[112 - 1], 0, "the window ending at 112 is gone")
+        self.assertEqual(prof[112 - 1], 112, "the kept page holds the window to 112")
         self.assertEqual(prof[192 - 1], 128, "shared 192 -> back to the chunk end")
         w.finish(a)
         w.cache.sanity_check()
@@ -217,7 +218,7 @@ class TestKeepPrefillChunkWindows(unittest.TestCase):
             w.finish(a)
             w.evict(swa_tokens=10**6)  # tombstone every unlocked window
             pre = w.match(again)
-            self.assertEqual(len(pre.device_indices), 0)
+            self.assertEqual(pre.device_prefix_len, 0)
             self.assertIsNotNone(pre.swa_branching_seqlen, name)
             b = w.admit(again, chunk)
             dead[name] = w.dead_tokens(b)
@@ -243,7 +244,9 @@ class TestKeepPrefillChunkWindows(unittest.TestCase):
         tree-owned prefix keeps the chunk live, one below it keeps more."""
         for floor in (10**9, 0, None):
             w = PrefillWorld(keep=True)
-            with mock.patch.object(w.cache, "swa_retain_floor", lambda req: floor):
+            with mock.patch.object(
+                w.cache, "swa_retain_floor", lambda req, **kwargs: floor
+            ):
                 a = w.admit(_tokens(1, self.PROMPT), BIG_CHUNK)
             self.assertEqual(w.dead_tokens(a), [], floor)
 
@@ -329,9 +332,9 @@ class TestKeepPrefillChunkWindows(unittest.TestCase):
         want = [_bf16(kv_value(t, p)) for p, t in enumerate(base)]
         for k in (64, 80, 96, 112, 192, 208, 224, 240):
             m = w.match(base[:k] + _tokens(60 + k, PAGE))
-            n = len(m.device_indices)
+            n = m.device_prefix_len
             self.assertEqual(n, k, f"a hit ends at {k}")
-            full = m.device_indices.to(torch.int64)
+            full = w.device_indices(m).to(torch.int64)
             self.assertEqual(w.full_values(full), want[:n])
             lo = max(0, n - (WINDOW + 1))
             got = w.swa_values(full[lo:])

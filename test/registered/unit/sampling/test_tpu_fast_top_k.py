@@ -19,7 +19,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -517,7 +518,12 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
     def test_model_requiring_full_logits_disables_global_top_k(self):
         execution = SimpleNamespace(
-            features=SimpleNamespace(enable_fp32_lm_head=False, enable_mis=False),
+            features=SimpleNamespace(
+                enable_fp32_lm_head=False,
+                enable_mis=False,
+                aux_hidden_state_capture=None,
+                return_aux_hidden_state_layer_ids=None,
+            ),
             deterministic=SimpleNamespace(rl_on_policy_target=None),
             kernel=SimpleNamespace(sampling_backend="tpu"),
         )
@@ -1268,9 +1274,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         with (
             patch.object(logits_processor_module, "_is_tpu", True),
@@ -1297,9 +1303,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         with (
             patch.object(logits_processor_module, "_is_tpu", True),
@@ -1329,9 +1335,9 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         seen = []
         original = LogitsProcessor._compute_lm_head_rows
 
-        def record(self_, hidden_states, head, bias=None):
+        def record(self_, hidden_states, head, bias=None, *, out=None):
             seen.append(tuple(hidden_states.shape))
-            return original(self_, hidden_states, head, bias)
+            return original(self_, hidden_states, head, bias, out=out)
 
         scoped = MagicMock()
         scoped.scoped.return_value.__enter__ = lambda *a: None

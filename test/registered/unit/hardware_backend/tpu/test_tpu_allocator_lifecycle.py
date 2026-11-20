@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.allocator import swa
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.log_utils import print_warning_once
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
@@ -427,7 +427,7 @@ class TestHostExtendAllocation(CustomTestCase):
             # the skipped env must be reported with its reason.
             allocator.full_to_swa_index_mapping = mapping.to("meta")
             print_warning_once.cache_clear()
-            with self.assertLogs("sglang.srt.utils.common", level="WARNING") as logs:
+            with self.assertLogs("sglang.srt.utils.log_utils", level="WARNING") as logs:
                 batch.input_tensor_device = TpuSRTPlatform().get_batch_input_device(
                     batch
                 )

@@ -488,7 +488,8 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
                 ),
                 patch.object(muse_mod, "get_parallel", return_value=fake_parallel),
                 patch(
-                    "sglang.srt.utils.common.get_parallel", return_value=fake_parallel
+                    "sglang.srt.layers.utils.layer_list.get_parallel",
+                    return_value=fake_parallel,
                 ),
                 patch.object(muse_mod, "VocabParallelEmbedding", _FakeEmbed),
                 patch.object(muse_mod, "MuseSparkDecoderLayer", _FakeLayer),
@@ -615,10 +616,8 @@ class TestMuseSparkHostFp8ExpertLoad(CustomTestCase):
         from unittest.mock import patch
 
         import sglang_tpu.models.muse_spark as muse_mod
-        from sglang.srt.layers.quantization.fp8 import (
-            _scaled_fp8_quant_tpu_weight,
-            fp8_dtype,
-        )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+        from sglang.srt.layers.quantization.fp8 import _scaled_fp8_quant_tpu_weight
 
         torch.manual_seed(17)
         num_experts, two_inter, hidden = 8, 32, 16

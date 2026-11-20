@@ -16,7 +16,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -963,6 +968,8 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     in-flight queue's release consensus, which needs every stage drained."""
     from sglang.srt.disaggregation import prefill
     from sglang.srt.managers import scheduler
+    from sglang.srt.managers.scheduler_components import request_retirer
+    from sglang.test.scheduler_test_utils import release_only_retirer
 
     w = staged
     claim_without_landing(w)
@@ -981,7 +988,7 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     sender.abort = lambda: s.manager._aborted.update({ROOM: time.time()})
     sender.clear = lambda: None
     released = []
-    for module in (prefill, scheduler):
+    for module in (prefill, request_retirer):
         monkeypatch.setattr(
             module, "release_kv_cache", lambda req, *a, **k: released.append(req)
         )
@@ -992,7 +999,13 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     sched.req_to_metadata_buffer_idx_allocator = None
     sched.tree_cache = SimpleNamespace(finish=lambda *args: None)
     sched._deferred_chunked_sender_aborts = []
-    sched.disagg_prefill_inflight_queue = []
+    sched.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+    sched.hisparse_coordinator = None
+    # Releases with defer_kv_release keep the pages for the drain to free.
+    sched.request_retirer = SimpleNamespace(
+        release=lambda req, **kwargs: None,
+        release_deferred_kv=release_only_retirer(sched.tree_cache).release_deferred_kv,
+    )
     sched.scheduler_stage_metrics = None
     req = SimpleNamespace(
         rid="r",
@@ -1011,9 +1024,9 @@ def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
     poll(s)
     assert sender.drained()
     sched._drain_deferred_chunked_sender_aborts()
-    sched.process_disagg_prefill_inflight_queue([])
+    sched.process_disagg_prefill_transfer_queue({})
     assert released == []
-    sched.process_disagg_prefill_inflight_queue([req.rid])
+    sched.process_disagg_prefill_transfer_queue({req.rid: False})
     assert released == [req] and not sched._deferred_chunked_sender_aborts
 
 

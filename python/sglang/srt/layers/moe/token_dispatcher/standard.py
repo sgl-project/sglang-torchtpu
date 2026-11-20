@@ -24,16 +24,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_hip,
-    is_tpu,
-)
+from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import get_device, is_hip, is_tpu
 
 _is_hip = is_hip()
 _is_tpu = is_tpu()
@@ -45,9 +41,10 @@ _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
-from sglang.srt.utils.common import is_cuda, is_flashinfer_available
+from sglang.srt.utils.device import is_cuda, is_flashinfer_available
 
 fp4_quantize_flashinfer = None
 nvfp4_block_scale_interleave_flashinfer = None
@@ -58,7 +55,7 @@ if is_cuda() and is_flashinfer_available():
             nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
         )
 
-        from sglang.srt.layers.quantization.modelopt_quant import (
+        from sglang.srt.layers.quantization.fp4_utils import (
             fp4_quantize as fp4_quantize_flashinfer,
         )
     except (ImportError, AttributeError):
@@ -98,39 +95,64 @@ class StandardCombineInput(NamedTuple):
 assert isinstance(StandardCombineInput, CombineInput)
 
 
+def _map_topk_ids_to_local_experts(
+    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+) -> torch.Tensor:
+    """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    return torch.where(
+        topk_ids < 0,
+        -1,
+        local_expert_mapping[topk_ids.clamp_min(0)],
+    )
+
+
+def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
+    # The TPU runner takes global IDs and translates/masks them itself
+    # (mask_tpu_moe_non_local_experts); keeping the mapping out of the
+    # dispatcher also keeps lazily-created module state out of the compiled
+    # graph, whose guards precompiled TPU programs depend on.
+    if _is_tpu:
+        return True
+    return backend is not None and (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_trtllm()
+        or backend.is_flashinfer_trtllm_routed()
+        or backend.is_hpc_ops()
+        or backend.is_flashinfer_megamoe()
+        or backend.is_flashinfer_mxfp4()
+    )
+
+
 class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = get_moe_runner_backend()
-        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
-        self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
-        self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
-        # AITER fast paths can be on while the MoE runner stays Triton; only the
-        # AITER runner keeps global expert IDs, so Triton must remap to local range.
-        self.use_aiter_moe_runner = backend.is_aiter() or (
-            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
+        backend = moe_runner_config.runner_backend
+        self.runner_backend = backend
+        self.enable_flashinfer_cutlass_moe = (
+            backend is not None and backend.is_flashinfer_cutlass()
         )
-        # Skip local expert mapping when the backend handles EP with global expert IDs:
-        # - cutlass / cutedsl / trtllm_routed handle EP internally
-        # - mxfp4 dispatcher mapping is already global
-        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
-        # - the TPU runner takes global IDs and translates/masks them itself
-        #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
-        #   dispatcher also keeps lazily-created module state out of the
-        #   compiled graph, whose guards precompiled TPU programs depend on
-        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
-        self.skip_local_expert_mapping = (
-            backend.is_flashinfer_cutlass()
-            or backend.is_flashinfer_cutedsl()
-            or backend.is_flashinfer_trtllm()
-            or backend.is_experimental_sgl_trtllm()
-            or backend.is_flashinfer_trtllm_routed()
-            or backend.is_hpc_ops()
-            or backend.is_flashinfer_megamoe()
-            or self.enable_flashinfer_mxfp4_moe
-            or _is_tpu
+        self.enable_flashinfer_mxfp4_moe = (
+            backend is not None and backend.is_flashinfer_mxfp4()
         )
+        self.enable_flashinfer_trtllm_routed_moe = (
+            backend is not None and backend.is_flashinfer_trtllm_routed()
+        )
+        self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
+        self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
+        if (
+            self.moe_ep_size > 1
+            and (
+                _keeps_global_expert_ids(get_moe_runner_backend())
+                != self.skip_local_expert_mapping
+            )
+            and (get_lora().enable_lora or get_lora().lora_paths)
+        ):
+            raise ValueError(
+                "LoRA with expert parallelism requires the layer's MoE runner "
+                "to use the requested runner's expert-ID convention."
+            )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
@@ -145,7 +167,24 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        needs_dp_allgather = should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_fp4_payload = (
+            needs_dp_allgather
+            and self.enable_flashinfer_cutlass_moe
+            and self.quant_config.get("input_global_scale") is not None
+        )
+        if needs_dp_allgather and not use_fp4_payload:
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                topk_output = topk_output.to_standard()
+            topk_weights, topk_ids, hidden_states = get_parallel().tp_group.all_gatherv(
+                [topk_output.topk_weights, topk_output.topk_ids, hidden_states],
+                sizes=get_dp_global_num_tokens(),
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights, topk_ids, topk_output.router_logits
+            )
+            hidden_states_scale = None
+        elif needs_dp_allgather:
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None
@@ -199,7 +238,7 @@ class StandardDispatcher(BaseDispatcher):
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
-                device = hidden_states.device
+                device = get_device()
                 self.local_expert_mapping = torch.full(
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
@@ -235,20 +274,18 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    topk_ids_local = _map_topk_ids_to_local_experts(
+                        topk_output.topk_ids, self.local_expert_mapping
+                    )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
                     # wasted compute (and a masked-grouped-GEMM workspace
-                    # blow-up when they collide on the same top-k).  Must
-                    # run POST-translation (a pre-translation -1 aliases to
-                    # the mapping table's last entry); -1 is the drop
-                    # sentinel both the triton and deep_gemm runners honor.
+                    # blow-up when they collide on the same top-k). -1 is the
+                    # drop sentinel both the triton and deep_gemm runners honor.
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
-                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

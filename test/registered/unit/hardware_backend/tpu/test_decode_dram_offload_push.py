@@ -13,7 +13,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -252,47 +252,29 @@ class TestPrefillQueueHooks(CustomTestCase):
         )
 
     def test_queue_step_is_driven_before_and_settled_after(self):
-        for returned in (["a"], (["a"], ["failed"])):
-            with self.subTest(returned=returned):
-                calls = []
-                extension = _prefill_end()
-                extension.recall.advance.side_effect = lambda *a, **k: calls.append(
-                    "recall"
-                )
-                extension.push.advance.side_effect = lambda **k: calls.append("push")
-                extension.recall.insert_recalled_host_prefix.side_effect = lambda req: (
-                    calls.append("insert") or True
-                )
-                extension.push.note_decode_of.side_effect = lambda *a, **k: (
-                    calls.append("note")
-                )
-                extension.recall.drop_departed.side_effect = lambda q: calls.append(
-                    "drop"
-                )
-                upstream = MagicMock(
-                    side_effect=lambda *a, **k: calls.append("pop") or returned
-                )
-                queue, found = self._queue(extension)
-                with found:
-                    result = dram_offload_hooks._pop_bootstrapped(
-                        upstream, queue, return_failed_reqs=True
-                    )
-                self.assertEqual(result, returned)
-                self.assertEqual(
-                    calls, ["recall", "push", "pop", "insert", "note", "drop"]
-                )
-                extension.recall.advance.assert_called_once_with(
-                    queue.queue, waiting_reqs=["waiting"]
-                )
-                extension.push.advance.assert_called_once_with(serving=True)
-                extension.recall.insert_recalled_host_prefix.assert_called_once_with(
-                    "a"
-                )
-                extension.push.note_decode_of.assert_called_once_with(
-                    "a", recalled=True
-                )
-                extension.recall.drop_departed.assert_called_once_with(queue.queue)
-                upstream.assert_called_once_with(queue, return_failed_reqs=True)
+        calls = []
+        extension = _prefill_end()
+        extension.recall.advance.side_effect = lambda *a, **k: calls.append("recall")
+        extension.push.advance.side_effect = lambda **k: calls.append("push")
+        extension.recall.insert_recalled_host_prefix.side_effect = lambda req: (
+            calls.append("insert") or True
+        )
+        extension.push.note_decode_of.side_effect = lambda *a, **k: calls.append("note")
+        extension.recall.drop_departed.side_effect = lambda q: calls.append("drop")
+        upstream = MagicMock(side_effect=lambda *a, **k: calls.append("pop") or ["a"])
+        queue, found = self._queue(extension)
+        with found:
+            result = dram_offload_hooks._move_bootstrapped(upstream, queue, "dst")
+        self.assertEqual(result, ["a"])
+        self.assertEqual(calls, ["recall", "push", "pop", "insert", "note", "drop"])
+        extension.recall.advance.assert_called_once_with(
+            queue.queue, waiting_reqs=["waiting"]
+        )
+        extension.push.advance.assert_called_once_with(serving=True)
+        extension.recall.insert_recalled_host_prefix.assert_called_once_with("a")
+        extension.push.note_decode_of.assert_called_once_with("a", recalled=True)
+        extension.recall.drop_departed.assert_called_once_with(queue.queue)
+        upstream.assert_called_once_with(queue, "dst")
 
     def test_engine_serves_while_a_request_is_queued_or_running(self):
         for running in (False, True):
@@ -300,8 +282,8 @@ class TestPrefillQueueHooks(CustomTestCase):
                 extension = _prefill_end()
                 queue, found = self._queue(extension, queued=False, running=running)
                 with found:
-                    dram_offload_hooks._pop_bootstrapped(
-                        MagicMock(return_value=[]), queue
+                    dram_offload_hooks._move_bootstrapped(
+                        MagicMock(return_value=[]), queue, []
                     )
                 extension.push.advance.assert_called_once_with(serving=running)
 

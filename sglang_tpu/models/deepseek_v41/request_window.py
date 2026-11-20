@@ -186,6 +186,8 @@ class DSV41TPURequestWindow:
                 f"the V4.1 TPU request window keeps {RING_TOKENS} tokens per slot, "
                 f"{capacity} were asked for"
             )
+        # Rows per slot the core compares against a draft ring's.
+        self.capacity = capacity
         chunk_tokens = get_schedule().chunked_prefill_size or 0
         self.workspace_first_page = RESERVED_PAGES + RING_PAGES * num_slots
         self.workspace_pages = _workspace_pages(
