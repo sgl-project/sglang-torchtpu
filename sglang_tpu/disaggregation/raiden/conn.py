@@ -1690,6 +1690,7 @@ class RaidenKVManager(
                     self._decode.remote_swa_endpoint,
                     self._decode.remote_draft_endpoint,
                     self._decode.remote_state_endpoint,
+                    self._decode.page_tags,
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,

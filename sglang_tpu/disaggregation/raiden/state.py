@@ -89,6 +89,8 @@ class DecodeState:
     remote_swa_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_draft_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_state_endpoint: Dict[int, str] = field(default_factory=dict)
+    # Page tags BLOCKS carried: (full pages', SWA pages', first SWA page index).
+    page_tags: Dict[int, Tuple[bytes, bytes, int]] = field(default_factory=dict)
 
     # Announcement time by read id; expired reads must never be issued.
     announced_at: Dict[str, float] = field(default_factory=dict)

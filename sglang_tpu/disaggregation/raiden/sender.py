@@ -14,7 +14,7 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
@@ -44,6 +44,31 @@ from sglang_tpu.disaggregation.raiden.serde import (
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
+# Optional per-page tag source (e.g. a KV integrity checker): called with
+# ("kv" | "swa", the room's page ids) when BLOCKS is built, after the prefill's
+# last chunk was processed; returns one fixed-size record per page, or b"".
+_PAGE_TAG_SOURCE: Optional[Callable[[str, List[int]], bytes]] = None
+
+
+def set_page_tag_source(source: Optional[Callable[[str, List[int]], bytes]]) -> None:
+    """Register the source of the per-page tags BLOCKS carries."""
+    global _PAGE_TAG_SOURCE
+    _PAGE_TAG_SOURCE = source
+
+
+def page_tag_fields(blocks: List[int], swa_blocks: List[int]) -> dict:
+    """The page tag fields of a room's BLOCKS: none without a registered source,
+    so the message keeps the wire format of a sender without tags."""
+    if _PAGE_TAG_SOURCE is None:
+        return {}
+    fields = {"page_tags": _PAGE_TAG_SOURCE("kv", blocks)}
+    if swa_blocks:
+        fields["swa_page_tags"] = _PAGE_TAG_SOURCE("swa", swa_blocks)
+        # The window pages are the request's last pages.
+        fields["swa_page_tags_first"] = max(0, len(blocks) - len(swa_blocks))
+    return fields
+
 
 # Send errors whose cause belongs to one peer, so they cost that peer's room
 # rather than the engine. An errno not listed here is assumed engine-wide
@@ -747,6 +772,7 @@ class RaidenSenderMixin:
                 kv_layout=self.kv_layout,
                 draft_endpoint=self.draft_raiden_endpoint or "",
                 draft_swa_blocks=draft_swa_blocks,
+                **page_tag_fields(blocks, swa_blocks),
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
