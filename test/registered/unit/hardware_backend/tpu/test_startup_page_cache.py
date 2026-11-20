@@ -137,11 +137,8 @@ def test_startup_discovers_files_only_on_the_host_leader(tmp_path):
     "enabled,mode,rank",
     [(False, "serial", 0), (True, "overlap", 0), (True, "serial", 1)],
 )
-def test_checkpoint_overlap_skip_preserves_collective_order(
-    monkeypatch, enabled, mode, rank
-):
-    group = Mock()
-    monkeypatch.setenv("LOCAL_RANK", str(rank))
+def test_checkpoint_overlap_skip_preserves_collective_order(enabled, mode, rank):
+    group = Mock(local_rank=rank)
     with (
         get_context().override_server_args(startup_weight_load_mode=mode),
         get_parallel().override(world_group=group),
@@ -152,6 +149,23 @@ def test_checkpoint_overlap_skip_preserves_collective_order(
     group.barrier.assert_called_once_with()
     advise.assert_not_called()
     assert page_cache._checkpoint_release is None
+
+
+def test_the_worker_that_joins_the_checkpoint_release_starts_it(monkeypatch):
+    """World-group local rank 0 joins the release at startup, so it must also
+    start it when LOCAL_RANK names another device (a remapped binding)."""
+    monkeypatch.setenv("LOCAL_RANK", "6")
+    with (
+        get_context().override_server_args(startup_weight_load_mode="serial"),
+        get_parallel().override(world_group=Mock(local_rank=0)),
+        tpu_envs.SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE.override(True),
+        patch.object(page_cache, "_model_paths", return_value=["model"]),
+        patch.object(page_cache, "release_checkpoint_page_cache") as release,
+        patch.object(page_cache, "_checkpoint_release", None),
+    ):
+        page_cache.start_checkpoint_page_cache_release()
+        page_cache._checkpoint_release.result()
+    release.assert_called_once_with(["model"])
 
 
 @pytest.mark.parametrize(

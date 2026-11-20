@@ -211,7 +211,9 @@ def start_checkpoint_page_cache_release() -> None:
         or get_model().is_startup_weight_load_overlap
     ):
         return
-    if int(os.environ["LOCAL_RANK"]) != 0 or _checkpoint_release is not None:
+    # The same owner as release_startup_page_cache, which joins this release;
+    # LOCAL_RANK names the bound device, which pipeline placement can remap.
+    if get_parallel().world_group.local_rank != 0 or _checkpoint_release is not None:
         return
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tpu-checkpoint")
     _checkpoint_release = executor.submit(release_checkpoint_page_cache, _model_paths())
