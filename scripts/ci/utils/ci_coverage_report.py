@@ -41,6 +41,7 @@ BACKEND_DISPLAY_ORDER = (
     "NPU",
     "CPU",
     "XPU",
+    "TPU",
     "MUSA",
     "MLX",
     "MPS",
