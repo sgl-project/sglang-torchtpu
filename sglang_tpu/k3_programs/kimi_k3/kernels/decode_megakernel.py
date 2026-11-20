@@ -19,6 +19,7 @@ from jax import typing as jax_typing
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
+from sglang_tpu.k3_programs._support.logger import init_logger
 from sglang_tpu.k3_programs.common import collectives32, pool_alias
 from sglang_tpu.k3_programs.common.vmem_pool import VmemPool
 from sglang_tpu.k3_programs.kimi_k3 import kernels as kimi
@@ -31,6 +32,8 @@ from sglang_tpu.k3_programs.kimi_k3.kernels import (
     token_kernels,
 )
 from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
+
+logger = init_logger(__name__)
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
 
@@ -13321,7 +13324,7 @@ def stack(
         if pool is not None:
             pool.loop(1, layers)(layer)
             if pool.report:
-                print(pool.timeline(), flush=True)
+                logger.debug("%s", pool.timeline())
         else:
             pl.loop(1, layers)(layer)
         if output_round_next_layer and layers > 1:
@@ -13574,26 +13577,23 @@ def stack(
             "moe_prepare": sum(_mib(n) for n in MOE_PREPARE_WEIGHTS),
             "latent_up": _mib("latent_up"),
         }
-        print(
-            "pool region A (MiB):",
-            {k: round(v, 2) for k, v in region_a.items()},
-            flush=True,
+        logger.debug(
+            "pool region A (MiB): %s", {k: round(v, 2) for k, v in region_a.items()}
         )
         if pool_managed:
-            print(
-                f"arena (managed region A): {pool_layout['arena_bytes'] / 2**20:.2f} MiB, "
-                f"attention {pool_layout['attention_bytes'] / 2**20:.2f}, dense slabs "
-                f"{dense_slabs * dense_slab_bytes / 2**20:.2f}",
-                flush=True,
+            logger.debug(
+                "arena (managed region A): %.2f MiB, attention %.2f, dense slabs %.2f",
+                pool_layout["arena_bytes"] / 2**20,
+                pool_layout["attention_bytes"] / 2**20,
+                dense_slabs * dense_slab_bytes / 2**20,
             )
-        print(
-            "pool region B (MiB):",
+        logger.debug(
+            "pool region B (MiB): %s %s",
             {k: round(v, 2) for k, v in region_b.items()},
             {
                 n: round(_mib(n), 2)
                 for n in (*MLA_EXTRA_WEIGHTS, *MOE_PREPARE_WEIGHTS, "latent_up")
             },
-            flush=True,
         )
     assert pool_bytes >= expert_pool_bytes and pool_bytes % 128 == 0
     scratch = (
@@ -14007,12 +14007,11 @@ def stack(
             ]
             vmem_report, vmem_peak = _vmem_budget(persistent, regions)
         if _config().vmem_report:
-            print(
-                f"arena with spare VMEM: {pool_layout['arena_bytes'] / 2**20:.2f} MiB",
-                flush=True,
+            logger.debug(
+                "arena with spare VMEM: %.2f MiB", pool_layout["arena_bytes"] / 2**20
             )
     if _config().vmem_report:
-        print(f"VMEM plan, batch {batch_size}:\n{vmem_report}", flush=True)
+        logger.debug("VMEM plan, batch %s:\n%s", batch_size, vmem_report)
     if vmem_peak > VMEM_LIMIT_BYTES:
         raise ValueError(
             f"The decoder's static VMEM plan exceeds the limit:\n{vmem_report}"

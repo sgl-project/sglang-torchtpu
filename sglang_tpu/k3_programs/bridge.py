@@ -240,12 +240,13 @@ def _register(
 
 
 def _sync_debug(name: str, op: Any) -> Any:
-    """``K3_SYNC_OPS=1`` (debugging): every call's outputs are read back at
-    once, so an op that fails (e.g. on a donated input) raises at its own call
-    and logs its name. Precompilation calls ``_unsynced`` (placeholders)."""
-    import os
+    """``SGLANG_TPU_K3_PROGRAM_DEBUG_SYNC_OPS=1`` (debugging): every call's
+    outputs are read back at once, so an op that fails (e.g. on a donated input)
+    raises at its own call and logs its name. Precompilation calls
+    ``_unsynced`` (placeholders)."""
+    from sglang_tpu.envs import envs as tpu_envs
 
-    if os.environ.get("K3_SYNC_OPS") != "1":
+    if not tpu_envs.SGLANG_TPU_K3_PROGRAM_DEBUG_SYNC_OPS.get():
         return op
 
     def call(*args):
@@ -258,7 +259,10 @@ def _sync_debug(name: str, op: Any) -> Any:
                     materialize(tensor)
                 except Exception as exc:
                     logger.error(
-                        "K3_SYNC_OPS: %s output %d failed: %s", name, index, exc
+                        "SGLANG_TPU_K3_PROGRAM_DEBUG_SYNC_OPS: %s output %d failed: %s",
+                        name,
+                        index,
+                        exc,
                     )
                     raise
         return out

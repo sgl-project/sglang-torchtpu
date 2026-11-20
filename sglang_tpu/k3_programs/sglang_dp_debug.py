@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DP2 P/D transfer diagnostics (``K3_DP_DEBUG=1``): per-rank checksums of
-MLA layer 0's pool rows on the prefill (the rows it sends) and on the decode
-(in-place, landing and swapped rows around the swap), logged as ``K3DBG``."""
+"""DP2 P/D transfer diagnostics (``SGLANG_TPU_K3_PROGRAM_DEBUG_DP_TRANSFER=1``):
+per-rank checksums of MLA layer 0's pool rows on the prefill (the rows it
+sends) and on the decode (in-place, landing and swapped rows around the swap),
+logged as ``K3DBG``."""
 
 from __future__ import annotations
 

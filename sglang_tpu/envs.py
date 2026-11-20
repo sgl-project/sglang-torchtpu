@@ -277,6 +277,9 @@ class TpuEnvs:
     # torch_tpu writes the scheduler leaves between steps are otherwise compiled
     # into the program's next op, one executable per mix.
     SGLANG_TPU_K3_PROGRAM_DISABLE_DEFERRED_GUARD = EnvBool(False)
+    # Debug: read every program op's outputs back at its call, so an op that
+    # fails raises there and logs its name (k3_programs/bridge.py).
+    SGLANG_TPU_K3_PROGRAM_DEBUG_SYNC_OPS = EnvBool(False)
     # Overlap scheduling on the K3_PROGRAM decode role: the program's next
     # step launches while the scheduler processes the last one's tokens (as
     # vLLM's async scheduling runs it).
@@ -310,6 +313,9 @@ class TpuEnvs:
     SGLANG_TPU_K3_PROGRAM_ATTENTION_DP = EnvInt(1)
     # Colocated attention DP2: B rows reserved per KV page (sglang_dp.ColoRows).
     SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE = EnvFloat(0.5)
+    # Debug: log per-rank checksums of MLA layer 0's transferred pool rows on a
+    # DP2 P/D prefill and decode (k3_programs/sglang_dp_debug.py).
+    SGLANG_TPU_K3_PROGRAM_DEBUG_DP_TRANSFER = EnvBool(False)
     # K3_PROGRAM host tier (k3_programs/sglang_hicache.py): KDA checkpoints the
     # host holds beside its KV pages (three host blocks each).
     SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS = EnvInt(512)

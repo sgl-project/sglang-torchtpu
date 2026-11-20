@@ -588,7 +588,7 @@ class KernelConfig:
     load_inflight_gb: float = 16.0
     # Diagnostics (off in serving): dcp_skip and debug_skip skip named work, so
     # results are invalid (timing or hang bisection only); the rest add trace
-    # scopes, VMEM reports or VMEM padding.
+    # scopes, VMEM reports (logged at debug level) or VMEM padding.
     dcp_skip: tuple[str, ...] = ()
     debug_skip: tuple[str, ...] = ()
     phase_scopes: bool = False
