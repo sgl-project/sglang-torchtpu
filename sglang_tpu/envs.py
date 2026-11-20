@@ -449,6 +449,11 @@ class TpuEnvs:
     SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # Sequence parallelism (--enable-attn-tp-input-scattered): all-gather each
+    # stage input as 1-byte FP8 rows plus an fp32 per-row scale instead of bf16,
+    # halving the gather bytes; the receiver dequantizes to bf16. The residual
+    # stays bf16 on each rank's slice (hooks/sp_fp8_gather.py).
+    SGLANG_TPU_SP_FP8_ALL_GATHER = EnvBool(False)
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
     # device on Kimi-K2.6). vmem-fp8 always uses f32.
     SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)

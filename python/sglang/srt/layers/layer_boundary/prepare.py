@@ -529,6 +529,17 @@ def _attn_tp_slice_update_read(
     return read.update_and_read(update, hidden_states, residual, norm)
 
 
+def sp_gather_stage_input(hidden_states: torch.Tensor, shard: torch.Tensor) -> None:
+    """Gather every attention-TP rank's normed ``shard`` back into the full
+    rows of ``hidden_states``: the stage input on an input-scattered (sequence-
+    parallel) batch, whose residual stays on the slice.
+
+    The seam lets a platform plugin move a narrower encoding of the rows (for
+    example 1-byte FP8 plus a per-row scale); the residual is never gathered,
+    so only the stage input sees that encoding."""
+    attn_tp_all_gather_into_tensor(hidden_states, shard)
+
+
 def _tp_reduce_scatter_update_read_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -555,7 +566,7 @@ def _tp_reduce_scatter_update_read_gather(
     else:
         shard = shard.clone()
     shard, residual = read.update_and_read(update, shard, residual, norm)
-    attn_tp_all_gather_into_tensor(hidden_states, shard)
+    sp_gather_stage_input(hidden_states, shard)
     return hidden_states, residual
 
 
