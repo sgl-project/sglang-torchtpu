@@ -622,6 +622,47 @@ class TestRingDraftWithVerify(CustomTestCase):
         with self.assertRaises(NotImplementedError):
             d.single_parts(control, packet=True)
 
+    def test_lean_epilogue_matches(self):
+        # KernelConfig.ring_draft_lean_epilogue: the same outputs, any slot
+        # (0 included), accepted count and bonus.
+        import dataclasses
+
+        control = Control(5, 4, 3)
+        ops = {}
+        for lean in (False, True):
+            d = self._draft()
+            d.config = dataclasses.replace(d.config, lean_epilogue=lean)
+            with (
+                mock.patch.object(
+                    dspark, "make_fused_draft", lambda *a, **k: _stub_fused_single
+                ),
+                mock.patch.object(
+                    draft_mod, "register_global_op", lambda n, m, fn, *a, **k: fn
+                ),
+            ):
+                ops[lean] = (d._build_single(control), d.single_parts(control)[0])
+        rows = dspark.ROWS
+        rng = np.random.default_rng(7)
+        for trial in range(12):
+            ids = rng.integers(1, 99, 3 * rows + 1 + rows * control.pages)
+            ids[2 * rows] = trial % 5  # the slot, 0 included
+            operands = (
+                jnp.zeros((1, 4)),
+                jnp.zeros((1, 2, 4, 8), jnp.bfloat16),
+                jnp.zeros((1, 4), jnp.int32),
+                jnp.full((5, rows, 16), trial, jnp.bfloat16),
+                jnp.zeros((1, rows, 32), jnp.float32),
+                jnp.zeros((1, 128), jnp.int32),
+                jnp.asarray(ids, jnp.int32),
+                jnp.asarray(rng.integers(0, 9, control.size), jnp.int32),
+                jnp.asarray([[trial % rows, 40 + trial]], jnp.int32),
+            )
+            for which in (0, 1):  # the single op, then the verify op's step
+                for a, b in zip(
+                    ops[False][which](*operands), ops[True][which](*operands)
+                ):
+                    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
     def test_operands_and_finish(self):
         d = self._draft()
         d.weights = {"w": "weight"}

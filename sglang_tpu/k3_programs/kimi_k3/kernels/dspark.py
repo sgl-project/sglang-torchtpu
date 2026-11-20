@@ -77,6 +77,13 @@ class DraftConfig:
     # kernel's row-major layout every call. VMEM tiles hold 192 lanes as 256
     # anyway; the kernel keeps the products' first 192 columns.
     q_padded: bool = False
+    # KernelConfig.ring_draft_lean_epilogue (draft.lean_epilogue): not read by
+    # the kernel; kept here so the draft ops' export keys follow it.
+    lean_epilogue: bool = False
+    # KernelConfig.ring_draft_flat_norms: ln1, ln2, qnorm and kvnorm stored
+    # [layers, width] rather than [layers, 1, width], whose singleton tile
+    # XLA re-tiles for the kernel on every call.
+    flat_norms: bool = False
 
     @property
     def q_width(self) -> int:
@@ -1430,6 +1437,13 @@ def _make_body(
             [scalars[2 * R + j] for j in range(R)]
         )  # [R]: >= 0 fixes the bonus token (sampled by the caller); else the target at ``count``
 
+        def norm_row(name, layer):
+            """A layer's ln1 / ln2 / qnorm / kvnorm row ``[1, width]`` (stored
+            ``[layers, width]`` with DraftConfig.flat_norms)."""
+            if c.flat_norms:
+                return small[name][pl.ds(layer, 1)]
+            return small[name][layer]
+
         # ---------------- DMA helpers ----------------
         def copy(src, dst, sem):
             return tpu.make_async_copy(src, dst, dma_sems.at[sem])
@@ -2061,7 +2075,7 @@ def _make_body(
             sumsq = _grouped_sumsq(_f32(kv), small["kv_ones"][...])  # K lanes only
             lane_index = jax.lax.broadcasted_iota(jnp.int32, kv.shape, 1)
             normed = _f32(kv) * jax.lax.rsqrt(sumsq * (1.0 / c.head_dim) + eps)
-            k_scaled = _bf16(_f32(_bf16(normed)) * _f32(small["kvnorm"][layer]))
+            k_scaled = _bf16(_f32(_bf16(normed)) * _f32(norm_row("kvnorm", layer)))
             kv = jnp.where(lane_index < c.head_dim, k_scaled, kv)
             return _rope(kv, small["rot_kv"][...], cos32, sin32)  # sin is 0 on V lanes
 
@@ -2137,7 +2151,7 @@ def _make_body(
         # ---------------- layers ----------------
         for layer in range(layers):
             scope = _phase_start("r_qkv")
-            h = _rms_norm(x, small["ln1"][layer], eps)
+            h = _rms_norm(x, norm_row("ln1", layer), eps)
             block_kv = kv_rows(
                 h, layer, cos_kv, sin_kv
             )  # the block's own K/V (kv weights of this layer)
@@ -2154,7 +2168,7 @@ def _make_body(
                 pending["q"].start()
             sumsq = _grouped_sumsq(_f32(q), small["head_ones"][...])
             normed = _f32(q) * jax.lax.rsqrt(sumsq * (1.0 / c.head_dim) + eps)
-            q = _bf16(_f32(_bf16(normed)) * _f32(small["qnorm"][layer]))
+            q = _bf16(_f32(_bf16(normed)) * _f32(norm_row("qnorm", layer)))
             q = _rope(q, small["rot_q"][...], cos_q, sin_q)
 
             _phase_end(scope)
@@ -2227,7 +2241,7 @@ def _make_body(
 
             _phase_end(scope)
             scope = _phase_start("r_mlp")
-            h2 = _rms_norm(x, small["ln2"][layer], eps)
+            h2 = _rms_norm(x, norm_row("ln2", layer), eps)
             pending["gate"].wait()
             gate = _bf16(_dot(h2, gate_buf[...]))  # [T, 512], zero beyond 448
             pending["up"].wait()

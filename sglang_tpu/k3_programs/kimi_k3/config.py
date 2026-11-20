@@ -483,6 +483,12 @@ class KernelConfig:
     # The ring draft's q projection and head_place stored padded to 256 columns
     # per rank (DraftConfig.q_padded): no per-call relayout copies of them.
     ring_draft_q_padded: bool = False
+    # The ring draft's single op builds its emitted tokens, next ids and control
+    # state with one masked select each (draft.lean_epilogue).
+    ring_draft_lean_epilogue: bool = False
+    # The ring draft's per-layer norm weights uploaded [layers, width]
+    # (DraftConfig.flat_norms): no per-call re-tiling copies of them.
+    ring_draft_flat_norms: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's

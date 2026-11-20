@@ -49,6 +49,8 @@ from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, kernel_modules
 logger = init_logger(__name__)
 
 AXIS = "tp"
+# DraftConfig.flat_norms: these kernel arrays upload as [layers, width].
+FLAT_NORMS = ("ln1", "ln2", "qnorm", "kvnorm")
 
 
 @dataclasses.dataclass
@@ -192,6 +194,55 @@ def _batched_fn(
     return fn
 
 
+def lean_epilogue(dspark: Any, control: Any, rows: int, vector, ids, state):
+    """KernelConfig.ring_draft_lean_epilogue: the single op's ``(emitted [rows],
+    next ids, control state)`` -- the values its epilogue builds with
+    concatenations and indexed updates -- as one iota-masked select per
+    output (each one XLA fusion instead of a chain of small ops). The next
+    ids are ``ids`` with the tokens (the bonus, then the drafts), positions
+    and state row replaced; the control takes the slot's next token, position
+    and accepted count, and clears its reset."""
+    import jax.numpy as jnp
+
+    tokens, base, slot = ids[:rows], ids[rows], ids[2 * rows]
+    accepted, bonus = vector[0, dspark.OUT_COUNT], vector[0, dspark.OUT_BONUS]
+    row = jnp.arange(rows, dtype=jnp.int32)
+    emitted = jnp.where(
+        row < accepted,
+        tokens[jnp.minimum(row + 1, rows - 1)],
+        jnp.where(row == accepted, bonus, -1),
+    ).astype(jnp.int32)
+    following = jnp.concatenate(
+        (bonus[None], vector[0, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + rows - 1])
+    )
+    lane = jnp.arange(ids.shape[0], dtype=jnp.int32)
+    following_ids = jnp.where(
+        lane < rows,
+        jnp.pad(following, (0, ids.shape[0] - rows)),
+        jnp.where(
+            lane < 2 * rows,
+            base + accepted + 1 + lane - rows,
+            jnp.where(lane == 3 * rows, accepted, ids),
+        ),
+    ).astype(jnp.int32)
+    index = jnp.arange(state.shape[0], dtype=jnp.int32)
+    reset = control.plan_start + control.RESET
+    state = jnp.where(
+        index == slot,
+        bonus,
+        jnp.where(
+            index == control.slots + slot,
+            base + accepted + 1,
+            jnp.where(
+                index == 2 * control.slots + slot,
+                accepted,
+                jnp.where((index == reset) & (slot != 0), 0, state),
+            ),
+        ),
+    ).astype(jnp.int32)
+    return emitted, following_ids, state
+
+
 def draft_class(checkpoint) -> type:
     """The draft implementation for the speculator checkpoint: the MLA draft
     (``Inferact/Kimi-K3-DSpark``, :mod:`draft_mla`) or :class:`DsparkDraft`
@@ -226,6 +277,8 @@ class DsparkDraft:
             rope_bf16=kernel_config.active().draft_rope_bf16,
             lm_prefetch=kernel_config.active().ring_draft_lm_prefetch,
             q_padded=kernel_config.active().ring_draft_q_padded,
+            lean_epilogue=kernel_config.active().ring_draft_lean_epilogue,
+            flat_norms=kernel_config.active().ring_draft_flat_norms,
         )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         if self.rank == 0:
@@ -292,6 +345,8 @@ class DsparkDraft:
                 )
                 if name in ("q", "head_place") and self.config.q_padded:
                     value = np.pad(value, ((0, 0), (0, 0), (0, 256 - value.shape[-1])))
+                if name in FLAT_NORMS and self.config.flat_norms:
+                    value = value.reshape(value.shape[0], value.shape[-1])
             self.weights[name] = upload(value)
         materialize(self.weights[self.names[-1]])
         wall = time.perf_counter() - started
@@ -355,6 +410,7 @@ class DsparkDraft:
 
         dspark, rows = self.dspark, self.dspark.ROWS
         fused = dspark.make_fused_draft(self.config, self.mesh, rows, requests=1)
+        lean = self.config.lean_epilogue
         names = self.names
         count = len(names)
 
@@ -378,6 +434,11 @@ class DsparkDraft:
                 forced_count[None],
                 forced_anchor[None],
             )
+            if lean:
+                emitted, following_ids, state = lean_epilogue(
+                    dspark, control, rows, vector, ids, state
+                )
+                return vector, cache, positions, emitted[None], following_ids, state
             accepted, bonus = vector[0, dspark.OUT_COUNT], vector[0, dspark.OUT_BONUS]
             row = jnp.arange(rows, dtype=jnp.int32)
             emitted = jnp.where(
@@ -472,6 +533,7 @@ class DsparkDraft:
             self.config, self.mesh, rows, requests=1, local_only=True
         )
         count = len(names)
+        lean = self.config.lean_epilogue
 
         def step(*args):
             import jax.numpy as jnp
@@ -493,6 +555,11 @@ class DsparkDraft:
                 forced_count[None],
                 forced_anchor[None],
             )
+            if lean:
+                emitted, following_ids, state = lean_epilogue(
+                    dspark, control, rows, vector, ids, state
+                )
+                return vector, cache, positions, emitted[None], following_ids, state
             accepted, bonus = vector[0, dspark.OUT_COUNT], vector[0, dspark.OUT_BONUS]
             row = jnp.arange(rows, dtype=jnp.int32)
             emitted = jnp.where(
