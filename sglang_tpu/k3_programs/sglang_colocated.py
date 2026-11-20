@@ -154,15 +154,18 @@ def share_first_aux(prefiller: Any, decoder: Any) -> bool:
     and the decode program drafts from them before the request's first
     verify, which then takes a speculative step's tokens instead of one.
     Needs the MLA draft on both programs (its context in the draft pools, no
-    ring) and one-request speculation (attention DP1); returns whether it is
+    ring) -- or the ring draft with KernelConfig.ring_draft_first_step -- and
+    one-request speculation (attention DP1); returns whether it is
     on. Before warmup: both programs warm the ops it adds."""
-    if getattr(prefiller, "draft_latents", None) is None:
-        return False
-    draft = getattr(decoder, "draft", None)
-    if draft is None or getattr(draft, "imports_ring", True):
-        return False
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
+    # KernelConfig.ring_draft_first_step: the ring draft's prefill keeps them too.
+    ring = getattr(prefiller, "ring", None) if active().ring_draft_first_step else None
+    if getattr(prefiller, "draft_latents", None) is None and ring is None:
+        return False
+    draft = getattr(decoder, "draft", None)
+    if draft is None or (getattr(draft, "imports_ring", True) and ring is None):
+        return False
     if getattr(active(), "attention_dp", 1) != 1:
         return False
     prefiller.first_aux = decoder.first_aux = {}

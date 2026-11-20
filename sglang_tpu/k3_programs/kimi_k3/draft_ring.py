@@ -154,6 +154,40 @@ class PrefillRing:
             if self.sources[layer] == "entering"
         )
 
+    def first_aux(
+        self, window: int, blocks, entering: dict, picked: np.ndarray
+    ) -> tuple[torch.Tensor, ...]:
+        """First-step drafts (KernelConfig.ring_draft_first_step): the decode's
+        first-speculation aux operand of each of the window's slots
+        (``draft_mla_prefill.first_aux_fn``, as the MLA draft's prefill keeps
+        it); ``picked[s]`` slot ``s``'s last prompt row in ownership order, -1
+        for none."""
+        from sglang_tpu.k3_programs.kimi_k3.draft_mla_prefill import (
+            FIRST_AUX_ROWS,
+            first_aux_fn,
+        )
+
+        key = ("first_aux", window, len(picked))
+        if key not in self._ops:
+            c, axis = self.config, self.axis
+            self._ops[key] = register_op(
+                f"pallas::k3_prefill_draft_ring_first_aux_w{window}_s{len(picked)}",
+                self.mesh,
+                first_aux_fn(tuple(c.aux_layers), axis, len(picked), FIRST_AUX_ROWS),
+                (P(axis),) * (1 + len(self.entering_layers)) + (P(),),
+                (P(),) * len(picked),
+                export_key=repr(
+                    ("prefill_draft_ring_first_aux", window, len(picked), c.aux_layers)
+                ),
+            )
+        return tuple(
+            self._ops[key](
+                blocks,
+                *(entering[layer] for layer in self.entering_layers),
+                torch.from_numpy(np.ascontiguousarray(picked, np.int32)).to("tpu"),
+            )
+        )
+
     def update(
         self,
         blocks: torch.Tensor,

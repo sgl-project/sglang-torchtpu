@@ -1735,10 +1735,19 @@ class KimiPrefiller:
             # The ring update takes rows in ownership order.
             positions, sequences = positions[order], sequences[order]
 
+            # First-step drafts (KernelConfig.ring_draft_first_step): as the
+            # MLA draft's, each finishing prompt keeps its last row's streams.
+            if self.first_aux is not None:
+                picked = last_prompt_rows(rows, members, order, count)
+
             def ring_hook(blocks, prefix, middle, entering):
                 ring_out["after"], ring_out["at"] = self.ring.update(
                     blocks, entering, positions, sequences, ends, stops, rings
                 )
+                if picked is not None:
+                    ring_out["first_aux"] = self.ring.first_aux(
+                        window, blocks, entering, picked
+                    )
 
         recurrent, conv = self.program.stack_states(states)
         shard = (
@@ -2060,6 +2069,11 @@ class KimiPrefiller:
                         [-1] * count,
                         [self.ring.zero()] * count,
                     )
+                    if self.first_aux is not None:
+                        # Compiled here, not on a request's last chunk.
+                        ring_out["first_aux"] = self.ring.first_aux(
+                            window, blocks, entering, np.zeros(count, np.int32)
+                        )
 
             if self.draft_latents is not None:
                 order = self.program.sp_order(window)

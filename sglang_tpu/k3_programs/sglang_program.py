@@ -233,7 +233,10 @@ def build_from_server():
             if tp_rank == 0:
                 logger.info(
                     "K3_PROGRAM: first-step drafts %s",
-                    "on" if on else "off (needs the MLA draft at attention DP1)",
+                    "on"
+                    if on
+                    else "off (needs the MLA draft, or the ring draft with "
+                    "ring_draft_first_step, at attention DP1)",
                 )
     for program in programs.values():
         program.load_weights()

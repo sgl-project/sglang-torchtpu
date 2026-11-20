@@ -470,6 +470,10 @@ class KernelConfig:
     # The Qwen3-style DSpark draft's RoPE tables in BF16 (kernels.dspark
     # DraftConfig.rope_bf16): the same drafts, half the tables' HBM.
     draft_rope_bf16: bool = False
+    # First-step drafts (SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS) for the
+    # Qwen3-style DSpark ring draft too: the prefill keeps each finishing
+    # prompt's last-position aux streams beside the ring it writes.
+    ring_draft_first_step: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's

@@ -466,6 +466,85 @@ class TestDecoderWithRingDraft(CustomTestCase):
         self.assertFalse(sglang_colocated.share_first_aux(prefiller, decoder))
 
 
+class TestRingFirstStepDrafts(CustomTestCase):
+    """KernelConfig.ring_draft_first_step: first-step drafts for the ring draft."""
+
+    def _share(self, knob, prefiller, draft):
+        from sglang_tpu.k3_programs.kimi_k3 import config
+
+        decoder = SimpleNamespace(draft=draft)
+        with mock.patch.object(
+            config,
+            "active",
+            return_value=config.KernelConfig(ring_draft_first_step=knob),
+        ):
+            return (
+                sglang_colocated.share_first_aux(prefiller, decoder),
+                prefiller,
+                decoder,
+            )
+
+    def test_gate(self):
+        def ring_prefiller():
+            return SimpleNamespace(draft_latents=None, ring=_ring(K31_AUX))
+
+        on, _, _ = self._share(False, ring_prefiller(), RingDraft())
+        self.assertFalse(on)
+        on, prefiller, decoder = self._share(True, ring_prefiller(), RingDraft())
+        self.assertTrue(on)
+        self.assertIs(prefiller.first_aux, decoder.first_aux)
+        # The MLA draft's gate is unchanged by the knob.
+        for knob in (False, True):
+            mla = SimpleNamespace(draft_latents=object(), ring=None)
+            on, _, _ = self._share(knob, mla, SimpleNamespace(imports_ring=False))
+            self.assertTrue(on)
+
+    def test_prefill_keeps_the_last_rows(self):
+        calls = {}
+
+        def register(name, mesh, fn, in_specs, out_specs, export_key=None):
+            calls.update(name=name, specs=(in_specs, out_specs), key=export_key)
+            return lambda *operands: calls.setdefault("operands", operands)
+
+        ring = _ring(K31_AUX)
+        ring.mesh, ring.axis, ring._ops = None, "tp", {}
+        entering = {layer: ("stream", layer) for layer in (3, 76, 80, 84, 88, 92)}
+        with (
+            mock.patch.object(draft_ring, "register_op", register),
+            mock.patch.object(torch.Tensor, "to", lambda self, device: self),
+        ):
+            ring.first_aux(256, "blocks", entering, np.array([5, -1], np.int32))
+        self.assertIn("first_aux_w256_s2", calls["name"])
+        blocks, *taps, picked = calls["operands"]
+        self.assertEqual(blocks, "blocks")
+        self.assertEqual(taps, [("stream", layer) for layer in (76, 80, 88, 92)])
+        self.assertEqual(picked.tolist(), [5, -1])
+        self.assertEqual(len(calls["specs"][0]), 1 + 4 + 1)
+
+    def test_first_verify_takes_the_predrafts(self):
+        dec = TestDecoderWithRingDraft._decoder(self)
+        dec.first_aux = {"a": "aux_a"}
+        dec._predraft_logits = torch.zeros((1, 8, 4), dtype=torch.float32)
+        table = np.array([3, 5, 0, 0], np.int32)
+        request = RequestInput(
+            req_id="a", computed=10, scheduled=8,
+            token_ids=np.arange(11, dtype=np.int32), num_tokens=11, num_prompt_tokens=10,
+            block_tables=(table,), sampling=SamplingSpec(),
+        )  # fmt: skip
+        emitted = dec._speculate(request, [(1, True, 10, 10, GREEDY)], [table], False)
+        predraft, after = dec.draft.calls
+        # The draft op drafts from the imported ring and the prompt's last
+        # streams, none accepted and the prefill's token as the bonus.
+        self.assertEqual(predraft["state"].vector, ("ring", "ring_a"))
+        self.assertEqual(predraft["decisions"].tolist(), [[0, 10]])
+        # The first verify then verifies those drafts (mode 1, chained).
+        self.assertEqual(dec.verifies[0]["ids"], ("following", 0))
+        self.assertEqual(dec.verifies[0]["mode"], "mode1")
+        self.assertIsNone(dec.verifies[0]["packet"])
+        self.assertEqual(emitted, ("emitted", 1))
+        self.assertEqual(dec.stats["predrafts"], 1)
+
+
 class TestDraftRevision(CustomTestCase):
     def test_revision_pinned_checkpoint(self):
         with mock.patch(
