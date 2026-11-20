@@ -275,7 +275,8 @@ def test_view_tail_is_cloned_on_the_submitting_thread(monkeypatch):
 
 def test_copy_to_host_resolves_after_the_transfer_lands(monkeypatch):
     """A single-tensor copy is issued on the worker's stream and resolves only
-    once its event has synchronized; a view is cloned on the submitting thread."""
+    once its event has synchronized. A view is copied as it is: a device clone
+    would add an eager program per step at the live batch shape."""
     steps = []
     private_stream = object()
     landed = Event()
@@ -305,13 +306,8 @@ def test_copy_to_host_resolves_after_the_transfer_lands(monkeypatch):
         lambda value: contextmanager(lambda: (yield))(),
     )
     host = object()
-    cloned = Mock(_base=None)
-    cloned.to.side_effect = lambda *args, **kwargs: steps.append("copy") or host
     view = Mock(_base=object())
-    clone_threads = []
-    view.clone.side_effect = lambda: (
-        clone_threads.append(threading.current_thread()) or cloned
-    )
+    view.to.side_effect = lambda *args, **kwargs: steps.append("copy") or host
 
     worker = TPUAsyncCopyWorker()
     try:
@@ -323,9 +319,8 @@ def test_copy_to_host_resolves_after_the_transfer_lands(monkeypatch):
     finally:
         landed.set()
         worker.close()
-    assert clone_threads == [threading.current_thread()]
-    view.to.assert_not_called()
-    cloned.to.assert_called_once_with("cpu", non_blocking=True)
+    view.clone.assert_not_called()
+    view.to.assert_called_once_with("cpu", non_blocking=True)
     assert steps == [
         ("enter", private_stream),
         "copy",

@@ -97,10 +97,11 @@ class TPUAsyncCopyWorker:
 
     def copy_to_host(self, tensor: torch.Tensor) -> Future[torch.Tensor]:
         """Copy one tensor to the host on the worker; the future resolves to
-        the host tensor once the transfer has landed."""
-        if tensor._base is not None:
-            # As in submit(): never read a view of a buffer a later step donates.
-            tensor = tensor.clone()
+        the host tensor once the transfer has landed.
+
+        Views are copied as they are, with no device clone, so the caller must
+        not pass a view of a buffer a later step donates.
+        """
         return self.executor.submit(self._copy_to_host, tensor)
 
     def close(self) -> None:

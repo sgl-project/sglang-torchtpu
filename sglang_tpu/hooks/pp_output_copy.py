@@ -22,8 +22,8 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers import scheduler_pp_mixin
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
