@@ -28,6 +28,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # scan can infer.
 _HOT_PATH = [
     ("compilation/compiled_forward_shim.py", None, "_pad_mamba_tracking"),
+    ("compilation/logit_rows.py", None, "build_logit_rows"),
     ("experimental/speculative/draft_forward.py", None, "forward_draft_rows"),
     (
         "experimental/speculative/chain_draft_worker.py",

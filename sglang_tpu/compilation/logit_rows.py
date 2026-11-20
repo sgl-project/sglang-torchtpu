@@ -1,6 +1,5 @@
 """Logit rows of a TPU prefill (EXTEND) forward, for models whose compiled
-forward can run the last decoder layer's FFN on those rows only (the Watermelon
-RMT four-stage path, "LR1").
+forward can run the last decoder layer's FFN on those rows only.
 
 A prefill forward takes the logits of each request's last row only. With
 ``SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS=1`` (sglang_tpu.envs) the compiled-forward
@@ -23,9 +22,10 @@ from typing import Any
 import torch
 
 from sglang_tpu.envs import envs
+from sglang_tpu.host_upload import upload
 
-# One row per request: a prefill forward holds at most --prefill-max-requests
-# requests (4 in the served recipes); more requests take the identity path.
+# One row per request, at most this many; a forward with more requests takes
+# the identity path (its last layer runs every row).
 MAX_LOGIT_ROWS = 4
 PACKED_WIDTH = MAX_LOGIT_ROWS + 2  # rows, count, identity
 
@@ -87,7 +87,9 @@ def build_logit_rows(
             end += int(length)
             rows.append(end - 1)
         packed = rows + [0] * (MAX_LOGIT_ROWS - len(rows)) + [len(rows), 0]
-    return torch.tensor(packed, dtype=torch.int32).to(device)
+    # A blocking upload waits for the running forward, so the host could no
+    # longer prepare the next one under it.
+    return upload(torch.tensor(packed, dtype=torch.int32), device)
 
 
 def _real_extend_lens(forward_batch: Any, real_b: int | None) -> list[int] | None:
