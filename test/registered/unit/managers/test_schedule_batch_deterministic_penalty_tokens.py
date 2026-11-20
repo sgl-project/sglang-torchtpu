@@ -242,9 +242,9 @@ def _prefill_again_after_retraction(overlap, spec):
     req = Req("req", "", array("q", PROMPT), SamplingParams(), False)
     req.output_ids.extend([101, 102])
     req.refresh_fill_ids()
-    req.prefix_indices = torch.arange(0)
+    req.prefix_len = 0
     n = len(req.full_untruncated_fill_ids)
-    req.set_extend_range(0, n)
+    req.extend_end = n
     batch = ScheduleBatch(
         reqs=[req],
         device="meta",

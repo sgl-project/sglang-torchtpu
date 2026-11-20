@@ -17,8 +17,8 @@ from torch import nn
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class ColumnParallelMtpFusionProj(ColumnParallelLinear):
@@ -38,8 +38,6 @@ class ColumnParallelMtpFusionProj(ColumnParallelLinear):
         *,
         params_dtype: torch.dtype,
         prefix: str,
-        tp_rank: int,
-        tp_size: int,
         use_attn_tp_group: bool,
     ) -> None:
         self.prefix = prefix
@@ -52,8 +50,8 @@ class ColumnParallelMtpFusionProj(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=None,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            # Under attention TP, forward gathers on attn_tp_group itself.
+            parallel_group="attn_tp" if use_attn_tp_group else None,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
@@ -82,7 +80,6 @@ def shard_nextn_eh_proj(
     parallel = get_parallel()
     sub_tp = is_dp_attention_enabled() or getattr(parallel, "attn_cp_size", 1) > 1
     tp_size = parallel.attn_tp_size if sub_tp else parallel.tp_size
-    tp_rank = parallel.attn_tp_rank if sub_tp else parallel.tp_rank
     if tp_size <= 1 or eh_proj.out_features % tp_size != 0:
         return result
 
@@ -92,8 +89,6 @@ def shard_nextn_eh_proj(
             eh_proj.out_features,
             params_dtype=eh_proj.weight.dtype,
             prefix=add_prefix("eh_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             use_attn_tp_group=sub_tp,
         )
     return result

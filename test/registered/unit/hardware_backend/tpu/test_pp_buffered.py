@@ -19,10 +19,8 @@ from sglang.srt.layers.aux_hidden_states import (  # noqa: E402
     AUX_HIDDEN_STATES_PROXY_KEY,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (  # noqa: E402
     SpecAuxHiddenStateConfig,
 )

@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.base.conn import KVPoll  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
-from sglang.srt.utils.common import point_to_point_pyobj  # noqa: E402
+from sglang.srt.utils.process_group import point_to_point_pyobj  # noqa: E402
 from sglang_tpu.pp_scheduler import (  # noqa: E402
     PPDecodeTransferStatus,
 )
@@ -44,14 +44,22 @@ class Receiver:
         self.failed = True
 
 
+class _Items(list):
+    """The transfer queue's item list, read through ``items()`` like the
+    IndexedReqList it stands in for."""
+
+    def items(self):
+        return iter(self)
+
+
 class TransferQueue:
     """Record terminal releases without allocating model or KV tensors."""
 
     def __init__(self, receivers):
-        self.queue = [
+        self.queue = _Items(
             SimpleNamespace(req=SimpleNamespace(rid=rid), kv_receiver=receiver)
             for rid, receiver in receivers.items()
-        ]
+        )
         self.failed_rids = []
         self.resolve_deferred_releases = Mock()
         self.enable_staging = False
@@ -68,17 +76,21 @@ class TransferQueue:
             for item in self.queue
         ]
 
-    def pop_transferred(self, rids):
-        released, remaining = [], []
+    def move_transferred_with_outcomes(self, dst, rids):
+        released, remaining, outcomes = [], _Items(), {}
         for item, status in zip(self.queue, self._poll_with_metadata_gate()):
-            if item.req.rid not in rids or status == KVPoll.Transferring:
+            rid = item.req.rid
+            if rid not in rids or status == KVPoll.Transferring:
                 remaining.append(item)
-            elif status == KVPoll.Failed:
-                self.failed_rids.append(item.req.rid)
+            elif status == KVPoll.Failed or rids[rid]:
+                self.failed_rids.append(rid)
+                outcomes[rid] = True
             else:
                 released.append(item.req)
+                outcomes[rid] = False
         self.queue = remaining
-        return released
+        dst.extend(released)
+        return released, outcomes
 
 
 def scheduler(rank, receivers, size=3):

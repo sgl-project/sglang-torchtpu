@@ -19,6 +19,7 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
@@ -143,6 +144,8 @@ class TestHybridSplitPoolState(CustomTestCase):
         kv_pool = object.__new__(HybridLinearKVPool)
         kv_pool.full_kv_pool = split
         req_pool = object.__new__(HybridReqToTokenPool)
+        # mamba_pool is a view of the request table's state storage.
+        req_pool.state = StateStorage.empty(req_pool.state_sub_pool)
         req_pool.mamba_pool = mamba
         state = hybrid_linear_kv_pool_state(kv_pool=kv_pool, req_to_token_pool=req_pool)
 

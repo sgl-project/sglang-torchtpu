@@ -16,17 +16,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    ForwardMode,
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
     _reset_windows_and_collect_hits,
     folded_replay_rows,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -34,13 +31,12 @@ class _FakeReq:
     real Req methods so the array bookkeeping is not re-implemented here."""
 
     refresh_fill_ids = Req.refresh_fill_ids
-    set_extend_range = Req.set_extend_range
 
     def __init__(self, *, num_prompt_tokens: int, num_output_tokens: int):
         self.origin_input_ids = array("l", range(num_prompt_tokens))
         self.output_ids = list(range(num_output_tokens))
         self.full_untruncated_fill_ids = array("l", self.origin_input_ids)
-        self.extend_range = None
+        self.extend_end = None
         self.beam_group = None
 
 
@@ -73,7 +69,7 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(batch.extend_lens, [1] * len(seq_lens))
         self.assertEqual(batch.extend_num_tokens, len(seq_lens))
         for req, seq_len in zip(batch.reqs, seq_lens, strict=True):
-            self.assertEqual(tuple(req.extend_range), (seq_len - 1, seq_len))
+            self.assertEqual(req.extend_end, seq_len)
         # What the attention path actually consumes: arange(prefix, prefix+len)
         # must land on the slot prepare_for_decode allocated, at seq_len - 1.
         for prefix_len, extend_len, seq_len in zip(

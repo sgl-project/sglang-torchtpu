@@ -307,17 +307,17 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_device_memory_capacity_matches_mode_a(self):
         """Mode B reported HBM here; above 60 GiB that floors the mamba/GDN
         pre-capture activation reserve at 10 GiB, shrinking the KV pool."""
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device
 
         for platform in (self.TpuSRTPlatform(), self.platform):
             with (
                 self.subTest(platform=type(platform).__name__),
-                patch.object(common, "current_platform", platform),
+                patch.object(device, "current_platform", platform),
                 patch.object(
                     type(platform), "get_device_total_memory", return_value=96 << 30
                 ),
             ):
-                self.assertIsNone(common.get_device_memory_capacity("tpu"))
+                self.assertIsNone(device.get_device_memory_capacity("tpu"))
 
     # -- profiler ----------------------------------------------------------
 
@@ -580,7 +580,7 @@ class TestTpuPluginHooksLoad(CustomTestCase):
         from sglang.srt.plugins.hook_registry import HookRegistry, HookType
         from sglang_tpu import hooks
 
-        target = "sglang.srt.utils.common.get_device_name"
+        target = "sglang.srt.utils.device.get_device_name"
         fake_hook = (target, lambda result, *a, **k: result, HookType.AFTER)
         for is_tpu, expected in ((True, 1), (False, 0)):
             with self.subTest(is_tpu=is_tpu):

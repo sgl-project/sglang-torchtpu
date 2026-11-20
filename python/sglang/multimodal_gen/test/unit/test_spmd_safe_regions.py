@@ -125,8 +125,13 @@ class TestFusionBarrier(unittest.TestCase):
             _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
         )
         with (
-            patch.object(wanvideo, "fused_gelu_active", return_value=False),
-            patch.object(wanvideo, "nvfp4_bias_gelu_active", return_value=False),
+            # Class-level: NVFP4_BIAS_GELU's instance attributes are read-only.
+            patch.object(
+                type(wanvideo.FUSED_LINEAR_GELU), "is_enabled", return_value=False
+            ),
+            patch.object(
+                type(wanvideo.NVFP4_BIAS_GELU), "is_enabled", return_value=False
+            ),
             patch.object(
                 wanvideo.current_platform,
                 "fusion_barrier",
@@ -227,7 +232,10 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
         # 7 per rank: the last rank's shard ends in a pad token.
         world_size = 4
         forward_batch = SimpleNamespace(
-            enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
+            enable_sequence_shard=True,
+            enable_teacache=False,
+            enable_spectrum=False,
+            extra={},
         )
         context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
         for latent_shape, batch, per_token_timestep in (
@@ -309,7 +317,11 @@ class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
 
     def test_wrapped_blocks_compile_with_fullgraph(self):
         forward_batch = SimpleNamespace(
-            enable_sequence_shard=False, enable_teacache=False, enable_spectrum=False
+            enable_sequence_shard=False,
+            enable_teacache=False,
+            enable_spectrum=False,
+            # The Wan forward caches text K/V across steps in req.extra.
+            extra={},
         )
         with (
             _sp_rank(0, 1),

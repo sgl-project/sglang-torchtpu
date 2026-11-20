@@ -9,7 +9,7 @@ checkpoint tokenizer and its chat template.
 class MuseSparkNativeProcessor:
     @classmethod
     def from_pretrained(cls, name, *args, **kwargs):
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         kwargs.pop("use_fast", None)
         return get_tokenizer(name, *args, **kwargs)

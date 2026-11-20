@@ -9,21 +9,24 @@ import jax.numpy as jnp
 from .cache import gather_csa2_kv_sc
 from .csa2 import csa2
 
-# Measured v7x TP1, 64 heads, page 64, bq 6: the DSpark K5 decode bucket of
-# 48 x 6 queries takes 257 us in 96-row chunks against 285 us in one chunk,
-# with bitwise-equal results. 144-, 72- and 48-row chunks were all slower
-# than one chunk, so other small buckets keep a single chunk until measured.
-_SMALL_CHUNKS = {288: 96}
+# Measured v7x TP1, 64 heads, page 64, bq 6, DSpark K5 verify buckets (B x 6
+# queries), one CSA2 call, bitwise-equal results: from 97 to 384 rows, 96-row
+# chunks beat one chunk at every bucket, full or with a quarter of the rows
+# padding (144 rows -8.5 %, 192 -2.3 %, 240 -15.5 %, 288 -3.6 %, 336 -16.9 %,
+# 384 -3.7 %). Up to 96 rows one chunk is fastest; 24- and 48-row chunks lose
+# everywhere. 385-512 rows are unmeasured and keep a single chunk.
+_SMALL_CHUNK = 96
+_SMALL_CHUNK_MAX_TOKENS = 384
 
 
 def csa2_gather_chunk_size(num_tokens: int) -> int:
     # On v7x TP1 with 64 heads, 128-row chunks overlap SC gather with TC
     # attention while retaining full gathered KV for subsequent layers.
-    # Up to 512 queries, one gather and one attention is the default; see
-    # `_SMALL_CHUNKS` for the measured exceptions.
     if num_tokens > 512:
         return 128
-    return _SMALL_CHUNKS.get(num_tokens, num_tokens)
+    if _SMALL_CHUNK < num_tokens <= _SMALL_CHUNK_MAX_TOKENS:
+        return _SMALL_CHUNK
+    return num_tokens
 
 
 @functools.partial(

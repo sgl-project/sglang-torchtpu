@@ -24,7 +24,7 @@ class _Tree:
         self.calls = []
 
     def defer_chunk_checkpoint(self, req):
-        self.calls.append(("defer", req.extend_range.end))
+        self.calls.append(("defer", req.extend_end))
         return self.defers
 
     def checkpoint(self, req, *, up_to):
@@ -36,7 +36,8 @@ def _run(stride, mid_prefill, start=4096, end=8192, tree=None):
         rid="r",
         finished=lambda: False,
         skip_radix_cache_insert=False,
-        extend_range=SimpleNamespace(start=start, end=end),
+        prefix_len=start,
+        extend_end=end,
     )
     tree = tree or _Tree()
     with envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride):
@@ -89,7 +90,7 @@ def _req(**overrides):
         kv=SimpleNamespace(cache_protected_len=0, cache_inserted_len=0, req_pool_idx=1),
         priority=None,
         kv_rotation_base=None,
-        prefix_indices=None,
+        prefix_len=0,
     )
     attrs.update(overrides)
     return SimpleNamespace(**attrs)
@@ -105,7 +106,7 @@ class TestUnifiedDeferChunkCheckpoint(unittest.TestCase):
         ):
             self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
             cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
-            self.assertIsNone(req.prefix_indices)
+            self.assertEqual(req.prefix_len, 0)
 
 
 if __name__ == "__main__":

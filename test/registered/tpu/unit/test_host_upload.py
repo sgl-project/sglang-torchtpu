@@ -1,10 +1,11 @@
-"""Host-to-TPU uploads on the decode hot path must not wait for queued TPU work.
+"""Host-to-TPU uploads on hot paths must not wait for queued TPU work.
 
 On torch_tpu a blocking H2D copy returns only after every program already
 queued on the TPU has finished. In GLM-5.3-Flash MTP the track-id upload in
 ``_pad_mamba_tracking`` and the row-count uploads waited for the draft or the
 whole target verify every round, and the TPU then idled while the host caught
-up. Each case below queues ~100 ms of TPU work and times the host call: a call
+up. Multimodal row placement had the same wait right after the vision encoder
+launch. Each case below queues ~100 ms of TPU work and times the host call: a call
 that waited for the queue takes ~100 ms instead of well under 5 ms.
 
 The last case pins the torch_tpu behavior the helpers rely on: a non-blocking
@@ -117,6 +118,45 @@ class TestHostUploadDoesNotWait(CustomTestCase):
         self.assertEqual(
             batch.mamba_track_indices.cpu().tolist(), [3, 5, 7, 0, 0, 0, 0, 0]
         )
+
+    def test_scatter_mm_on_device(self):
+        """Bug regression: the host-built row indices and mask were uploaded
+        blocking right after the vision encoder launch, so the host waited for
+        the encoder before it could prepare the next prefill chunk."""
+        from sglang_tpu.mm_embed_tpu import scatter_mm_on_device
+
+        rows = torch.tensor([1, 4, 6])
+        mask = torch.zeros(8, 1, dtype=torch.bool)
+        mask[rows] = True
+        src = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).to(DEV)
+        dest = torch.full((8, 4), -1.0, dtype=torch.bfloat16, device=DEV)
+
+        self._assert_no_wait(
+            "scatter_mm_on_device", lambda: scatter_mm_on_device(dest, mask, src)
+        )
+        expected = torch.full((8, 4), -1.0, dtype=torch.bfloat16)
+        expected[rows] = src.cpu()
+        self.assertTrue(torch.equal(dest.cpu(), expected))
+
+    def test_apply_host_mm_embeds(self):
+        from sglang_tpu.mm_embed_tpu import apply_host_mm_embeds
+
+        host_mask = torch.zeros(8, 1, dtype=torch.bool)
+        host_mask[[0, 5]] = True
+        host_src = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        input_embeds = torch.full((8, 4), -1.0, dtype=torch.bfloat16, device=DEV)
+
+        out = self._assert_no_wait(
+            "apply_host_mm_embeds",
+            lambda: apply_host_mm_embeds(
+                input_embeds=input_embeds, host_src=host_src, host_mask=host_mask
+            ),
+        )
+        expected = torch.where(
+            host_mask, host_src.to(torch.bfloat16), input_embeds.cpu()
+        )
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(out.cpu(), expected))
 
     def test_upload_copies_host_bytes_at_call_time(self):
         from sglang_tpu.host_upload import upload

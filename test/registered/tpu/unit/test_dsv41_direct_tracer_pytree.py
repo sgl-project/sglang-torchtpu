@@ -30,7 +30,7 @@ def _metadata(engram=None) -> DSV41TPUForwardMetadata:
     inputs = {
         name: torch.arange(4, dtype=torch.int32) + i
         for i, name in enumerate(_METADATA_INPUT_FIELDS)
-        if name not in ("low_ratio", "engram")
+        if name not in ("low_ratio", "engram", "swa_window_plan")
     }
     low = LowRatioMetadata(*(torch.zeros(4, dtype=torch.int32) for _ in range(3)))
     return DSV41TPUForwardMetadata(**inputs, low_ratio={1: low, 2: low}, engram=engram)
@@ -54,7 +54,9 @@ class TestDSV41MetadataPytree(CustomTestCase):
             if f.default is dataclasses.MISSING
             and f.default_factory is dataclasses.MISSING
         ]
-        self.assertEqual(list(_METADATA_INPUT_FIELDS), [*required, "engram"])
+        self.assertEqual(
+            list(_METADATA_INPUT_FIELDS), [*required, "engram", "swa_window_plan"]
+        )
 
     def test_scratch_does_not_change_the_structure(self):
         clean = _metadata()

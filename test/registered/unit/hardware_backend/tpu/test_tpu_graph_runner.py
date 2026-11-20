@@ -768,6 +768,8 @@ class TestDraftTorchCompileInstall(CustomTestCase):
             server_args=SimpleNamespace(forward_hooks=[]),
             forward_stream=None,
             canary_manager=None,
+            # Decode capture first offers the Unlimited-OCR greedy recorder.
+            maybe_init_uocr_greedy_graph=lambda: None,
         )
 
     def _call(self, device, enable_torch_compile):
@@ -857,7 +859,7 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         self.addCleanup(stack.close)
         stack.enter_context(get_flags().capture.override(enable_torch_compile=True))
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
-        worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
+        worker.parallel_layout = object()
         worker.draft_owns_attention = False
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
@@ -902,6 +904,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",
                 side_effect=contextlib.nullcontext,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_tp_context",
+                side_effect=lambda _layout: contextlib.nullcontext(),
             ),
         ):
             worker.init_cuda_graphs()

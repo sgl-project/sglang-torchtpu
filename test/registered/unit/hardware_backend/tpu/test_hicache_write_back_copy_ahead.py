@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu import hicache_write_back_copy_ahead as copy_ahead_module
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.hicache_write_back_copy_ahead import (
@@ -176,7 +177,7 @@ def _build_cache(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
         page_size=1,
-        tree_components=(FULL,),
+        tree_slots=tree_slots_of((FULL,)),
         tree_core_backend="python",
     )
     return UnifiedRadixCache(params), allocator
@@ -215,7 +216,7 @@ def _build_swa_cache(
         token_to_kv_pool_allocator=allocator,
         page_size=1,
         sliding_window_size=sliding_window_size,
-        tree_components=(FULL, SWA),
+        tree_slots=tree_slots_of((FULL, SWA), window=sliding_window_size),
         tree_core_backend="python",
     )
     return UnifiedRadixCache(params), allocator

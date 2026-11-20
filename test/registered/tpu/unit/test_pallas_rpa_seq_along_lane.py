@@ -48,16 +48,16 @@ class TestKvLayoutSelection(CustomTestCase):
         )
         from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-        # get_mha_kv_pool_cls reads the exec bag; publish the backend.
+        # get_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(
             attention_backend="pallas_tpu_rpa_batched"
         ):
             self.assertIs(
-                TpuSRTPlatform().get_mha_kv_pool_cls(), TpuFusedMHATokenToKVPool
+                TpuSRTPlatform().get_kv_pool_cls(kind="mha"), TpuFusedMHATokenToKVPool
             )
             with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
                 self.assertIs(
-                    TpuSRTPlatform().get_mha_kv_pool_cls(), TpuSeqAlongLaneKVPool
+                    TpuSRTPlatform().get_kv_pool_cls(kind="mha"), TpuSeqAlongLaneKVPool
                 )
 
 

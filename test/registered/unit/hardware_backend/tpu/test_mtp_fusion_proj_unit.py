@@ -53,6 +53,12 @@ def _parallel(
     )
 
 
+def _linear_parallel(par: SimpleNamespace) -> SimpleNamespace:
+    """``par`` as the linear layer reads it: with no communication groups, it
+    owns its shard through a logical group built from the rank/size fields."""
+    return SimpleNamespace(**{**vars(par), "tp_group": None, "attn_tp_group": None})
+
+
 class TestMtpFusionProjHookRegistration(CustomTestCase):
     def test_hook_is_registered_and_targets_resolve(self):
         # Every NextN draft that builds eh_proj as a replicated nn.Linear;
@@ -99,8 +105,14 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
                     full.out_features,
                     dtype=full.weight.dtype,
                 )
-                with mock.patch.object(
-                    mtp_fusion_proj, "get_parallel", return_value=par
+                with (
+                    mock.patch.object(
+                        mtp_fusion_proj, "get_parallel", return_value=par
+                    ),
+                    mock.patch(
+                        "sglang.srt.layers.linear.get_parallel",
+                        return_value=_linear_parallel(par),
+                    ),
                 ):
                     hook_shard_eh_proj(None, model, prefix="model")
                 proj = model.eh_proj
@@ -286,6 +298,10 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
             ),
             mock.patch.object(
                 mtp_fusion_proj, "get_parallel", return_value=_parallel(tp_size=8)
+            ),
+            mock.patch(
+                "sglang.srt.layers.linear.get_parallel",
+                return_value=_linear_parallel(_parallel(tp_size=8)),
             ),
         ):
             hook_shard_eh_proj(None, m_meta, prefix="model")

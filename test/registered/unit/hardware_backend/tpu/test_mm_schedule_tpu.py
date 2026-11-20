@@ -16,7 +16,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import mm_schedule_tpu

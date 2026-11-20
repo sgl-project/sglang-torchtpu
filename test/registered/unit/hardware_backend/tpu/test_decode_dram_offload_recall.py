@@ -387,7 +387,9 @@ class TestEnginesAreValidatedAtStart(CustomTestCase):
         }
         self.assertIn(("PrefillBootstrapQueue", "_init_kv_manager"), installed)
         self.assertIn(("DecodePreallocQueue", "_init_kv_manager"), installed)
-        self.assertIn(("DecodeTransferQueue", "pop_transferred"), installed)
+        self.assertIn(
+            ("DecodeTransferQueue", "move_transferred_with_outcomes"), installed
+        )
         self.assertIn(
             ("SchedulerWeightUpdaterManager", "release_memory_occupation"), installed
         )
@@ -952,7 +954,9 @@ class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
                 queue, _ = self._queue(*rids)
                 calls = []
                 upstream = MagicMock(
-                    side_effect=lambda q, r: calls.append("pop") or ["transferred"]
+                    side_effect=lambda q, d, r: (
+                        calls.append("pop") or (["transferred"], {})
+                    )
                 )
                 offload = SimpleNamespace(source=MagicMock())
                 offload.source.close_departed_offers.side_effect = lambda: calls.append(
@@ -961,11 +965,13 @@ class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
                 with patch.object(
                     dram_offload_hooks, "_extension", return_value=offload
                 ):
-                    result = dram_offload_hooks._pop_transferred(upstream, queue, ["b"])
-                self.assertEqual(result, ["transferred"])
+                    result = dram_offload_hooks._move_transferred_with_outcomes(
+                        upstream, queue, "dst", {"b": False}
+                    )
+                self.assertEqual(result, (["transferred"], {}))
                 # A request can leave by abort while the queue is empty of work.
                 self.assertEqual(calls, ["pop", "release"])
-                upstream.assert_called_once_with(queue, ["b"])
+                upstream.assert_called_once_with(queue, "dst", {"b": False})
 
 
 if __name__ == "__main__":

@@ -5,24 +5,36 @@ Every rank maps the same memfd copy of each layer's table, so under attention
 DP a rank looks up its own tokens only: no id all-gather, no value all-reduce,
 no table in HBM and no gather of a 100 GB table inside the compiled graph.
 
-On the fast serving path (decode, extend, mixed, idle without spec/beam/CP/PP):
+On the fast serving path (decode, extend with or without folded encoder SWA
+bounded replay, speculative extend, mixed, and idle without beam/CP/PP):
 1. ``HostEngramCoordinator.prepare_if_supported`` snapshots each scheduled
-   chunk and its ``n - 1`` predecessors on CPU without waiting for step N-1's
-   in-flight sampled token (marking it as a hole in ``DeferredEngramInputs``).
-2. Right before the compiled forward, ``stage_all`` resolves any hole (waiting
-   for ``copy_done``), hashes on CPU with ``hash_on_host``, packs each layer's
-   FP8 rows and aligned E8M0 scale bytes into one flat ``int32`` buffer using
+   chunk (including folded ``<= 128`` encoder SWA replay prefixes) and its
+   ``n - 1`` predecessors on CPU without waiting for step N-1's in-flight
+   sampled token (marking it as a hole in ``DeferredEngramInputs``).
+2. Right before the compiled forward, ``stage_all`` flushes any deferred
+   speculative verify history commits, resolves any hole (waiting for
+   ``copy_done``), hashes on CPU with ``hash_on_host``, packs each layer's FP8
+   rows and aligned E8M0 scale bytes into one flat ``int32`` buffer using
    single-threaded NumPy (``pack_rows``), and uploads via double-buffered async
    raw DMA (``PreparedEngramUpload``).
-3. After the compiled forward is dispatched, ``finish_forward`` prefetches the
+3. On speculative ``TARGET_VERIFY``, ``stage_verify`` reads host
+   ``req_pool_indices_cpu`` and ``spec_info.live_seq_lens_cpu`` (skipping the
+   ``positions`` D2H whenever all live requests already have ``>= n - 1``
+   committed tokens) plus the drafted verify tokens, builds predecessor
+   windows from ``hasher.history`` in single-threaded NumPy
+   (``verify_inputs_from_host``), hashes via ``hash_on_host``, and stages
+   through the same double-buffered async DMA slots, while
+   ``defer_engram_commit`` defers post-verify history updates to the next host
+   staging point so the host never stalls on verify acceptance.
+4. After the compiled forward is dispatched, ``finish_forward`` prefetches the
    next same-size chunked-prefill chunk into the inactive double-buffer slots.
-4. Inside the compiled graph, ``EngramHasher.forward`` returns cached
+5. Inside the compiled graph, ``EngramHasher.forward`` returns cached
    ``local_row_ids`` (token indices ``0..T-1``) and ``staged_lookup`` unpacks
    and dequantizes the staged ``int32`` payload (``unpack_rows``), slicing rows
    first if a late-layer tail selected a subset of tokens.
 
-Unsupported or warmup paths (warmup/precompile, speculative target-verify,
-folded encoder SWA replay, beam search, PP/CP/DCP > 1) fall back cleanly to
+Unsupported or warmup paths (non-verify warmup/precompile, non-folded two-pass
+encoder SWA replay hits, beam search, PP/CP/DCP > 1) fall back cleanly to
 ``host_hash_ids`` + ``stage_from_hashes``, producing the exact same packed
 ``int32`` graph input signature with zero recompilation.
 """
@@ -30,7 +42,9 @@ folded encoder SWA replay, beam search, PP/CP/DCP > 1) fall back cleanly to
 from __future__ import annotations
 
 import contextlib
+import logging
 import sys
+import weakref
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -40,6 +54,8 @@ import numpy as np
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+
+logger = logging.getLogger(__name__)
 
 # Per-call inputs the host stage sets; None outside a staged V4.1 forward.
 ForwardBatch.tpu_engram_local_ids = None
@@ -190,6 +206,145 @@ def capture_inputs(
         ),
         holes=holes,
     )
+
+
+def _verify_positions_from_host(
+    live_seq_lens_cpu: torch.Tensor | None,
+    slots_np: np.ndarray,
+    *,
+    bs: int,
+    block: int,
+    ngram: int,
+) -> np.ndarray | None:
+    """Build verify positions on CPU without a ``positions`` D2H copy when safe.
+
+    ``hash_on_host`` only checks ``positions < ngram - 1`` to block lookbacks
+    before sequence start. Under 1-step overlap, ``live_seq_lens_cpu`` holds the
+    host committed base (``<= device seq_lens``) for the ``bs_live`` live rows,
+    while padded rows (slot 0) have ``seq_lens == 0``. Whenever every live row
+    already has ``live_seq_lens_cpu >= ngram - 1``, ``device_pos >= ngram - 1``
+    holds for every live verify token, so host-built positions yield identical
+    lookback masks with zero D2H on ``positions``; shorter prompts fall back to
+    the device ``positions`` D2H so 1-step overlap lag stays exact.
+    """
+    if (
+        live_seq_lens_cpu is None
+        or not isinstance(live_seq_lens_cpu, torch.Tensor)
+        or live_seq_lens_cpu.device.type != "cpu"
+        or live_seq_lens_cpu.ndim != 1
+    ):
+        return None
+    bs_live = int(live_seq_lens_cpu.shape[0])
+    if bs_live > bs or np.any(slots_np[bs_live:] != 0):
+        return None
+    live_np = np.asarray(live_seq_lens_cpu, dtype=np.int64)
+    if np.any(live_np < ngram - 1):
+        return None
+    base_pos = np.zeros(bs, dtype=np.int64)
+    base_pos[:bs_live] = live_np
+    return (base_pos[:, None] + np.arange(block, dtype=np.int64)[None, :]).reshape(
+        bs * block
+    )
+
+
+def verify_inputs_from_host(
+    history: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    req_slots: torch.Tensor,
+    *,
+    block: int,
+    ngram: int,
+    live_seq_lens_cpu: torch.Tensor | None = None,
+) -> HostEngramInputs:
+    """Build ``[bs * block, ngram]`` verify windows on CPU in single-threaded NumPy."""
+    if block <= 0 or ngram <= 0:
+        raise ValueError("Verify block width and ngram size must be positive")
+    bs = int(req_slots.shape[0])
+    num_tokens = int(input_ids.shape[0])
+    if num_tokens != bs * block or int(positions.shape[0]) != num_tokens:
+        raise ValueError("Verify batch shapes must equal [bs * block]")
+    if num_tokens == 0:
+        return HostEngramInputs(
+            tokens=np.empty((0, ngram), dtype=np.int64),
+            positions=np.empty(0, dtype=np.int64),
+        )
+    hist_np = np.asarray(history.detach().cpu(), dtype=np.int64)
+    if hist_np.ndim != 2 or hist_np.shape[1] != ngram - 1:
+        raise ValueError("EngramHasher.history shape does not match ngram - 1")
+    slots_np = np.asarray(req_slots.detach().cpu(), dtype=np.int64).reshape(bs)
+    if np.any((slots_np < 0) | (slots_np >= hist_np.shape[0])):
+        raise IndexError("Verify request slot is outside EngramHasher.history")
+    pos_np = _verify_positions_from_host(
+        live_seq_lens_cpu, slots_np, bs=bs, block=block, ngram=ngram
+    )
+    if pos_np is None:
+        pos_np = np.asarray(positions.detach().cpu(), dtype=np.int64).reshape(
+            num_tokens
+        )
+    ver_np = np.asarray(input_ids.detach().cpu(), dtype=np.int64).reshape(bs, block)
+    window = np.concatenate([hist_np[slots_np], ver_np], axis=1)
+    cols = (
+        (ngram - 1)
+        + np.arange(block, dtype=np.int64)[:, None]
+        - np.arange(ngram, dtype=np.int64)[None, :]
+    )
+    tokens = window[:, cols].reshape(num_tokens, ngram)
+    return HostEngramInputs(tokens=tokens, positions=pos_np)
+
+
+def _resolve_extend_ranges(
+    batch,
+    *,
+    enable_encoder_swa_bounded_replay: bool = False,
+    folds_encoder_swa_replay: bool = False,
+    has_request_window: bool = False,
+) -> tuple[list[int], list[int], bool] | None:
+    """Return ``(starts, lengths, any_folded)`` for an extend batch, or ``None``.
+
+    Mirrors ``encoder_swa_replay.fold_encoder_swa_replay`` and
+    ``run_encoder_swa_replay`` so folded and cache-miss extends under
+    ``--enable-encoder-swa-bounded-replay`` stay on the zero-D2H host fast path.
+    """
+    reqs = batch.reqs
+    prefix_lens = batch.prefix_lens
+    extend_lens = batch.extend_lens
+    if (
+        reqs is None
+        or prefix_lens is None
+        or extend_lens is None
+        or len(prefix_lens) != len(reqs)
+        or len(extend_lens) != len(reqs)
+    ):
+        return None
+    starts = [int(p) for p in prefix_lens]
+    lengths = [int(n) for n in extend_lens]
+    if not enable_encoder_swa_bounded_replay:
+        return starts, lengths, False
+    if not folds_encoder_swa_replay and not has_request_window:
+        return None
+    if not has_request_window:
+        return starts, lengths, False
+    resets = getattr(batch, "encoder_swa_reset", None)
+    if resets is None or len(resets) != len(reqs):
+        return None
+    if not folds_encoder_swa_replay:
+        # Separate replay forward runs iff a reset request has cached prefix tokens.
+        if any(bool(rst) and p > 0 for rst, p in zip(resets, starts, strict=True)):
+            return None
+        return starts, lengths, False
+    from sglang.srt.model_executor.encoder_swa_replay import replay_len
+
+    if any(bool(rst) and (p % 2 != 0) for rst, p in zip(resets, starts, strict=True)):
+        # Let core fold_encoder_swa_replay raise its odd-boundary ValueError.
+        return None
+    replays = [
+        replay_len(p) if (bool(rst) and p > 0) else 0
+        for rst, p in zip(resets, starts, strict=True)
+    ]
+    folded_starts = [p - r for p, r in zip(starts, replays, strict=True)]
+    folded_lengths = [n + r for n, r in zip(lengths, replays, strict=True)]
+    return folded_starts, folded_lengths, any(r > 0 for r in replays)
 
 
 def hash_on_host(
@@ -598,6 +753,7 @@ class HostEngramCoordinator:
         self._next_prompt_spec: tuple[tuple[Any, ...], list[int], list[int]] | None = (
             None
         )
+        self._prepared_extend_ranges: tuple[list[int], list[int]] | None = None
         self._prefetch: _EngramPrefetch | None = None
 
     def _next_prompt_prediction(
@@ -679,6 +835,7 @@ class HostEngramCoordinator:
         self._step_inputs = None
         self._history_commit = []
         self._next_prompt_spec = None
+        self._prepared_extend_ranges = None
         self.started = False
 
     @staticmethod
@@ -696,10 +853,12 @@ class HostEngramCoordinator:
     def _commit_history(self) -> None:
         """Mirror fast-path n-1 token tails into ``hasher.history`` on CPU.
 
-        Keeps ``EngramHasher.history`` current when a later decode batch falls
-        back to ``host_hash_ids`` (for example, when a beam-search request
-        joins the running batch).
+        Keeps ``EngramHasher.history`` current when a later decode or
+        speculative verify step reads ``hasher.history`` on CPU. Any queued
+        verify history commits are flushed first so a freed slot reused by an
+        extend batch is never overwritten out of order.
         """
+        flush_engram_commits(self._hasher)
         if not self._history_commit or self._step_inputs is None:
             return
         history = self._hasher.history
@@ -729,22 +888,50 @@ class HostEngramCoordinator:
         history[slot_tensor] = tail_tensor
         self._history_commit = []
 
-    def prepare(self, batch) -> tuple[list, list[int]]:
+    def prepare(
+        self,
+        batch,
+        *,
+        starts: list[int] | None = None,
+        lengths: list[int] | None = None,
+        any_folded: bool = False,
+    ) -> tuple[list, list[int]]:
         """Capture this batch's host Engram windows (raising if unsupported)."""
-        if not batch.spec_algorithm.is_none():
-            raise NotImplementedError(
-                "Host Engram does not yet support speculative decode"
-            )
+        spec_active = (
+            batch.spec_algorithm is not None and not batch.spec_algorithm.is_none()
+        )
         if any(req.beam_group is not None for req in batch.reqs):
             raise NotImplementedError("Host Engram does not yet support beam search")
         mode = batch.forward_mode
+        is_plain_extend = (
+            mode.is_extend_without_speculative()
+            and not getattr(mode, "is_dllm_extend", lambda: False)()
+            and not getattr(mode, "is_split_prefill", lambda: False)()
+        )
         if mode.is_decode():
+            if spec_active:
+                raise NotImplementedError(
+                    "Host Engram decode capture does not serve speculative decode"
+                )
             requests = list(batch.reqs)
             starts = [int(n) - 1 for n in batch.seq_lens_cpu.tolist()]
             lengths = [1] * len(requests)
-        elif mode.is_extend_without_speculative():
+        elif is_plain_extend:
+            if spec_active and getattr(mode, "is_mixed", lambda: False)():
+                raise NotImplementedError(
+                    "Host Engram does not support mixed speculative extend"
+                )
             requests = list(batch.reqs)
-            starts, lengths = list(batch.prefix_lens), list(batch.extend_lens)
+            if starts is None or lengths is None:
+                starts = [int(p) for p in batch.prefix_lens]
+                lengths = [int(n) for n in batch.extend_lens]
+            if spec_active and any(
+                s + n > len(req.origin_input_ids) + len(req.output_ids)
+                for req, s, n in zip(requests, starts, lengths, strict=True)
+            ):
+                raise NotImplementedError(
+                    "Speculative extend requires host-resident chunk tokens"
+                )
         elif mode.is_idle():
             requests, starts, lengths = [], [], []
         else:
@@ -752,8 +939,11 @@ class HostEngramCoordinator:
         self._discard_staged_uploads()
         self._next_prompt_spec = (
             self._next_prompt_prediction(requests, starts, lengths)
-            if mode.is_extend_without_speculative()
+            if is_plain_extend and not any_folded
             else None
+        )
+        self._prepared_extend_ranges = (
+            (list(starts), list(lengths)) if is_plain_extend else None
         )
         row_end = 0
         commit: list[tuple[int, int]] = []
@@ -770,7 +960,7 @@ class HostEngramCoordinator:
         self._prefetch = None
         if (
             prefetched is not None
-            and mode.is_extend_without_speculative()
+            and is_plain_extend
             and prefetched.matches(requests, starts, lengths, self.ngram)
         ):
             self.hashes = prefetched.hashes
@@ -797,9 +987,12 @@ class HostEngramCoordinator:
         *,
         parallel: Any = None,
         enable_encoder_swa_bounded_replay: bool = False,
+        folds_encoder_swa_replay: bool = False,
+        has_request_window: bool = False,
+        is_dllm: bool = False,
     ) -> tuple[list, list[int]] | None:
         """Capture fast-path inputs when supported; otherwise reset for fallback."""
-        if batch is None:
+        if batch is None or is_dllm:
             self._reset_step_inputs()
             return None
         if parallel is not None and (
@@ -809,29 +1002,54 @@ class HostEngramCoordinator:
         ):
             self._reset_step_inputs()
             return None
-        if batch.spec_algorithm is not None and not batch.spec_algorithm.is_none():
-            self._reset_step_inputs()
-            return None
         if batch.reqs is None or any(req.beam_group is not None for req in batch.reqs):
             self._reset_step_inputs()
             return None
+        spec_active = (
+            batch.spec_algorithm is not None and not batch.spec_algorithm.is_none()
+        )
         mode = batch.forward_mode
+        is_plain_extend = (
+            mode.is_extend_without_speculative()
+            and not getattr(mode, "is_dllm_extend", lambda: False)()
+            and not getattr(mode, "is_split_prefill", lambda: False)()
+        )
         if mode.is_decode():
-            if batch.seq_lens_cpu is None:
-                self._reset_step_inputs()
-                return None
-        elif mode.is_extend_without_speculative():
             if (
-                enable_encoder_swa_bounded_replay
-                or batch.prefix_lens is None
-                or batch.extend_lens is None
+                spec_active
+                or batch.seq_lens_cpu is None
+                or len(batch.seq_lens_cpu) != len(batch.reqs)
             ):
                 self._reset_step_inputs()
                 return None
-        elif not mode.is_idle():
-            self._reset_step_inputs()
-            return None
-        return self.prepare(batch)
+            return self.prepare(batch)
+        if is_plain_extend:
+            if spec_active and getattr(mode, "is_mixed", lambda: False)():
+                self._reset_step_inputs()
+                return None
+            resolved = _resolve_extend_ranges(
+                batch,
+                enable_encoder_swa_bounded_replay=enable_encoder_swa_bounded_replay,
+                folds_encoder_swa_replay=folds_encoder_swa_replay,
+                has_request_window=has_request_window,
+            )
+            if resolved is None:
+                self._reset_step_inputs()
+                return None
+            starts, lengths, any_folded = resolved
+            if spec_active and any(
+                s + n > len(req.origin_input_ids) + len(req.output_ids)
+                for req, s, n in zip(batch.reqs, starts, lengths, strict=True)
+            ):
+                self._reset_step_inputs()
+                return None
+            return self.prepare(
+                batch, starts=starts, lengths=lengths, any_folded=any_folded
+            )
+        if mode.is_idle():
+            return self.prepare(batch)
+        self._reset_step_inputs()
+        return None
 
     def resolve(self) -> torch.Tensor | None:
         """Fill overlap holes (waiting for copy_done) and hash on host.
@@ -850,11 +1068,43 @@ class HostEngramCoordinator:
             self.deferred = None
         return self.hashes
 
+    def _matches_forward_extend_ranges(self, forward_batch: Any) -> bool:
+        """Verify predicted extend ranges match the actually-folded ForwardBatch."""
+        if forward_batch is None or self._prepared_extend_ranges is None:
+            return True
+        if getattr(forward_batch, "encoder_swa_replay", False):
+            return False
+        expected_starts, expected_lengths = self._prepared_extend_ranges
+        n_reqs = len(expected_lengths)
+        for attr, expected in (
+            ("extend_seq_lens_cpu", expected_lengths),
+            ("extend_prefix_lens_cpu", expected_starts),
+        ):
+            actual = getattr(forward_batch, attr, None)
+            if actual is None:
+                continue
+            if isinstance(actual, torch.Tensor):
+                if actual.device.type != "cpu":
+                    continue
+                actual = actual.tolist()
+            if len(actual) < n_reqs:
+                return False
+            if [int(x) for x in actual[:n_reqs]] != expected:
+                return False
+            if any(int(x) != 0 for x in actual[n_reqs:]):
+                return False
+        return True
+
     def _stage_layers(
         self, hashes: torch.Tensor, padded_tokens: int, *, use_prestaged: bool
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
         if hashes.shape[0] > padded_tokens:
             raise ValueError("Host Engram rows exceed the padded local token count")
+        if not use_prestaged:
+            # Verify and fallback staging bypass prepare(), so any pending
+            # next-chunk prefetch must be dropped before _reserve_upload can
+            # reuse its slot on the same padded token bucket.
+            self._discard_prefetch()
         if not use_prestaged or (
             self._staged_uploads
             and self._staged_padded_tokens is not None
@@ -883,9 +1133,17 @@ class HostEngramCoordinator:
         return tuple(upload.device for upload in ordered), ordered, num_cols
 
     def stage_all(
-        self, padded_tokens: int
-    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
+        self, padded_tokens: int, *, forward_batch: Any = None
+    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Resolve deferred overlap tokens (if any) and stage every Engram layer."""
+        if not self._matches_forward_extend_ranges(forward_batch):
+            logger.warning(
+                "Host Engram predicted extend ranges %s did not match ForwardBatch; "
+                "falling back to host_hash_ids.",
+                self._prepared_extend_ranges,
+            )
+            self._reset_step_inputs()
+            return None
         hashes = self.resolve()
         if hashes is None:
             if self.started:
@@ -895,6 +1153,61 @@ class HostEngramCoordinator:
             )
         self._commit_history()
         return self._stage_layers(hashes, padded_tokens, use_prestaged=True)
+
+    def stage_verify(
+        self, input_ids: torch.Tensor, forward_batch
+    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
+        """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
+        self._discard_prefetch()
+        flush_engram_commits(self._hasher)
+        if not forward_batch.forward_mode.is_target_verify():
+            return None
+        history = self._hasher.history
+        spec_info = getattr(forward_batch, "spec_info", None)
+        # Upstream keeps the ragged layout on the forward batch, not spec_info.
+        assert getattr(forward_batch, "ragged_verify_layout", None) is None, (
+            "Host Engram stage_verify assumes uniform draft_token_num per request "
+            "and does not yet support ragged verify"
+        )
+        block = int(getattr(spec_info, "draft_token_num", 0) or 0)
+        if history is None or block <= 0 or history.shape[1] != self.ngram - 1:
+            return None
+        req_slots = getattr(forward_batch, "req_pool_indices_cpu", None)
+        if (
+            req_slots is None
+            or not isinstance(req_slots, torch.Tensor)
+            or req_slots.device.type != "cpu"
+            or req_slots.shape != forward_batch.req_pool_indices.shape
+        ):
+            req_slots = _cpu(forward_batch.req_pool_indices)
+        padded_tokens = int(input_ids.shape[0])
+        bs = int(req_slots.shape[0])
+        assert padded_tokens == bs * block, (
+            "Host Engram stage_verify expects one equal block per request "
+            f"(ragged verify not yet supported), got {padded_tokens} tokens for "
+            f"{bs} requests of {block}"
+        )
+        if int(forward_batch.positions.shape[0]) != padded_tokens:
+            return None
+        try:
+            inputs = verify_inputs_from_host(
+                history,
+                input_ids,
+                forward_batch.positions,
+                req_slots,
+                block=block,
+                ngram=self.ngram,
+                live_seq_lens_cpu=getattr(spec_info, "live_seq_lens_cpu", None),
+            )
+        except (ValueError, IndexError):
+            return None
+        hashes = hash_on_host(
+            inputs,
+            **self.tables,
+            pad_id=self.pad_id,
+            image_token_id=self.image_token_id,
+        )
+        return self._stage_layers(hashes, padded_tokens, use_prestaged=False)
 
     def stage_from_hashes(
         self, hashes: torch.Tensor, padded_tokens: int
@@ -1048,6 +1361,7 @@ class HostEngramCoordinator:
         self._step_inputs = None
         self._history_commit = []
         self._next_prompt_spec = None
+        self._prepared_extend_ranges = None
         self.started = False
 
 
@@ -1192,8 +1506,9 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
     """[T, L, C] int64 hash ids of the padded batch, history committed on CPU.
 
     Fallback path for warmup and modes not handled by ``HostEngramCoordinator``
-    (speculative verify, folded encoder replay, beam search, PP/CP/DCP > 1).
+    (non-verify warmup, two-pass encoder SWA replay hits, beam search, PP/CP/DCP > 1).
     """
+    flush_engram_commits(hasher)
     num_tokens = input_ids.shape[0]
     num_layers, num_cols = hasher.offsets.shape
     mode = forward_batch.forward_mode
@@ -1214,6 +1529,8 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
             _cpu(forward_batch.engram_history), forward_batch.req_pool_indices
         ),
         tpu_engram_local_ids=None,
+        # Engram.forward reads it in target-verify mode; None is equal blocks.
+        ragged_verify_layout=getattr(forward_batch, "ragged_verify_layout", None),
     )
     return hasher(_cpu(input_ids), batch)
 
@@ -1239,3 +1556,81 @@ def without_cuda_host_register():
         yield
     finally:
         torch.cuda.cudart = original
+
+
+# hasher -> verify commits not yet applied to its host history, oldest first.
+_PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def commit_engram_history(
+    hasher,
+    *,
+    verify_ids_2d: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Core EngramHasher.commit_after_verify on the host history.
+
+    Each request's history becomes the last n - 1 of history + its first
+    commit_lens verify tokens, oldest first. Padded rows (commit_lens 0) write
+    the hasher's pad row: core writes them into req slot 0, a live slot.
+    """
+    history = hasher.history
+    if history is None:
+        return
+    # The history lives on the host; the verify tensors come from the device.
+    device = history.device
+    verify_ids_2d, req_pool_indices, commit_lens = (
+        t.to(device) for t in (verify_ids_2d, req_pool_indices, commit_lens)
+    )
+    n1 = hasher.max_ngram_size - 1
+    if n1 <= 0 or req_pool_indices.numel() == 0:
+        return
+    req = req_pool_indices.to(torch.int64)
+    clamped_ids = verify_ids_2d.clamp_max(_MM_PAD_SHIFT_VALUE).to(history.dtype)
+    window = torch.cat([history[req], clamped_ids], dim=1)
+    cols = commit_lens.clamp_min(0).to(torch.int64).unsqueeze(-1) + torch.arange(
+        n1, device=window.device
+    )
+    values = window.gather(1, cols)
+    rows = torch.where(commit_lens > 0, req, torch.full_like(req, hasher.pad_row))
+    history.copy_(history.index_put((rows,), values))
+
+
+def defer_engram_commit(
+    hasher,
+    *,
+    verify_ids_2d: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Queue a verify's Engram commit for flush_engram_commits.
+
+    Committing in the verify step copies the verify outputs to the host and
+    blocks it until the verify finishes; the next reader of the history runs
+    after the next draft is dispatched.
+    """
+    commit = (verify_ids_2d, req_pool_indices, commit_lens)
+    _PENDING_COMMITS.setdefault(hasher, []).append(commit)
+
+
+def has_pending_engram_commits(hasher) -> bool:
+    # Only DSpark verify queues; without a queue the hasher is never weak-referenced.
+    return bool(
+        hasher is not None and _PENDING_COMMITS and _PENDING_COMMITS.get(hasher)
+    )
+
+
+def flush_engram_commits(hasher) -> None:
+    """Apply the queued verify commits in order; call before reading or writing history."""
+    if hasher is None or not _PENDING_COMMITS:
+        return
+    for verify_ids_2d, req_pool_indices, commit_lens in _PENDING_COMMITS.pop(
+        hasher, ()
+    ):
+        commit_engram_history(
+            hasher,
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )

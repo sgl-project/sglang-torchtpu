@@ -7,7 +7,7 @@ no per-model files. (For the separate sglang-jax engine, see
 
 ```
 launch_server.sh     # start the server
-bench_serving.sh     # run sglang.bench_serving (single run or sweep)
+bench_serving.sh     # run sglang.benchmark.serving (single run or sweep)
 run_eval.sh          # run sglang.test.run_eval (e.g. MMLU, GSM8K)
 run_lm_eval.sh       # run lm-eval against a live server and check baselines
 warmup.sh            # optional compile-bucket pre-warmup (stopgap)
