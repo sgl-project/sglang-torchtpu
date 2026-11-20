@@ -89,11 +89,11 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     draft_input.dsa_topk_indices = None
 
     from sglang.srt.managers.overlap_utils import (
-        _DEBUG_ASSERT,
         _assert_nonneg_and_invalidate,
+        _consume_asserts,
     )
 
-    if _DEBUG_ASSERT:
+    if _consume_asserts():
         _assert_nonneg_and_invalidate(bonus, future_map.output_tokens_buf, indices)
     return True
 
