@@ -193,28 +193,16 @@ class TestRuntimeEnvironment(unittest.TestCase):
                     load_recipe(name, concurrency)
 
     def test_glm_flash_agentx_per_concurrency_recipes(self):
-        """Each agentx_cc<N>.py pins its measured cap and pool; the split cache
-        drops the host tier and keeps the megakernel; MTP 8 steps up to c8, else 3."""
-        root = "recipe/configs/glm_5_3_flash/experimental/agentx/agentx_cc"
-        expected = {1: (2, 3407872), 4: (2, 3407872), 8: (16, 3407872)}
-        expected.update({16: (16, 9437184), 32: (16, 9437184)})
-        for cc, (max_running, pool) in expected.items():
-            with self.subTest(cc=cc):
-                config = load_recipe(f"{root}{cc}.py")
-                args, env = config["server_args"], config["runtime_env"]
-                self.assertEqual(args["max_running_requests"], max_running)
-                self.assertEqual(args["max_total_tokens"], pool)
-                self.assertEqual(env["SGLANG_TPU_DSA_KPOOL_RAW_RING"], "1")
-                split = cc >= 16
-                self.assertEqual(
-                    args["max_mamba_cache_size"], 800 if split else 5 * max_running + 64
-                )
-                self.assertEqual("enable_hierarchical_cache" in args, not split)
-                self.assertEqual(env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"], "1")
-                self.assertEqual(args["speculative_num_steps"], 3 if split else 8)
-                self.assertEqual(
-                    env.get("SGLANG_TPU_DSA_MLA_KV_SHARDS"), "8" if split else None
-                )
+        """Each agentx_cc<N>.py renders the launch JSON of its chart point; only the
+        real-weight settings may differ."""
+        from benchmark.tpu.recipe.configs.glm_5_3_flash.experimental.agentx import (
+            check_recipes,
+        )
+
+        for recipe, run in check_recipes.POINTS.items():
+            with self.subTest(recipe=recipe):
+                lines, ok = check_recipes.check(recipe, run)
+                self.assertTrue(ok, "\n".join(lines))
 
     def test_agentx_pd_modes(self):
         """A PP prefill must run without the megakernel (the model rejects it under PP)."""
