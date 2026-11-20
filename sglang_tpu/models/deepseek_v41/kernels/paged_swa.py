@@ -61,7 +61,11 @@ def write_swa_pages(
 
         if prep.admit(
             "swa_pack",
-            None if page_size == 64 else f"SWA page size {page_size}, kernel 64",
+            (
+                None
+                if page_size in (64, 256)
+                else f"SWA page size {page_size}, kernel 64 or 256"
+            ),
             tokens=records.shape[0],
             buckets=prep.SWA_PACK_TOKENS,
         ):

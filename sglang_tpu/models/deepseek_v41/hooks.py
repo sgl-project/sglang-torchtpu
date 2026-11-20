@@ -6,11 +6,12 @@ through to ``original``. They are appended after sglang_tpu/hooks/dsv4.py so
 that, on shared targets, they are the outer wrapper.
 
 build_tpu_dsv41_kv_pool, get_tpu_dsv41_bytes_per_swa_token,
-get_tpu_dsv41_bytes_per_full_token
+get_tpu_dsv41_bytes_per_full_token, get_tpu_dsv41_c2_state_fixed_bytes
   Why: KVCacheConfigurator._build_dsv4_kv_pool hardcodes DeepSeekV4TokenToKVPool
        and the V4 TPU hook rebinds it to DSV4TPUTokenToKVPool, which rejects
-       ratios 1/2; DSV4PoolConfigurator budgets FlashMLA bytes per token.
-  How: AROUND the three targets, bodies in
+       ratios 1/2; DSV4PoolConfigurator budgets FlashMLA bytes per token and
+       unpadded ratio-2 pair-state rows rather than tile-aligned TPU roots.
+  How: AROUND the four targets, bodies in
        sglang_tpu.models.deepseek_v41.memory_pool (owned by the pool module).
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: KVCacheConfigurator and DSV4PoolConfigurator query
@@ -337,6 +338,16 @@ def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
     return _impl(original, configurator)
 
 
+def get_tpu_dsv41_c2_state_fixed_bytes(
+    original, configurator, max_running_requests: int
+) -> int:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        get_tpu_dsv41_c2_state_fixed_bytes as _impl,
+    )
+
+    return _impl(original, configurator, max_running_requests)
+
+
 def select_tpu_dsv41_loader(result, load_config, model_config=None):
     from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
     from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
@@ -654,6 +665,11 @@ def hook_specs():
         (
             f"{cfg}._get_swa_fixed_bytes",
             get_tpu_dsv41_swa_fixed_bytes,
+            HookType.AROUND,
+        ),
+        (
+            f"{cfg}._get_c2_state_fixed_bytes",
+            get_tpu_dsv41_c2_state_fixed_bytes,
             HookType.AROUND,
         ),
         (f"{cfg}.__init__", init_tpu_dsv41_pool_configurator, HookType.AROUND),
