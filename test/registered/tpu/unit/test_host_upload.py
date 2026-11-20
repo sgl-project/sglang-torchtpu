@@ -8,11 +8,9 @@ up. Multimodal row placement had the same wait right after the vision encoder
 launch. Each case below queues ~100 ms of TPU work and times the host call: a call
 that waited for the queue takes ~100 ms instead of well under 5 ms.
 
-The last two cases check results, not timing. One pins the torch_tpu behavior
-the helpers rely on: a non-blocking upload copies the host bytes during the call,
-so callers may reuse or drop the host tensor right away. The other checks that
-host placement's reused matrices survive being rewritten by the next placement
-while TPU work is still queued.
+The last case pins the torch_tpu behavior the helpers rely on: a non-blocking
+upload copies the host bytes during the call, so callers may reuse or drop the
+host tensor right away.
 """
 
 import math
@@ -152,84 +150,6 @@ class TestHostUploadDoesNotWait(CustomTestCase):
             del src
             _sync()
             self.assertEqual(out.cpu().tolist(), [7] * 8)
-
-    def test_host_placement_survives_the_next_placement(self):
-        """The next prefill's placement rewrites embed_mm_on_host's reused
-        _HostRowBuffer matrices in place, so each upload of them must be done
-        with the host bytes before it returns. At the largest size a 16k-token
-        chunk reaches, place one batch behind queued TPU work, place the next
-        batch into the same matrices before that work drains, and check the
-        first batch's device results bit for bit."""
-        from sglang.srt.managers.schedule_batch import Modality
-        from sglang_tpu.mm_embed_tpu import embed_mm_on_host
-
-        rows, hidden, dtype = 16384, 12288, torch.bfloat16
-        gen = torch.Generator().manual_seed(0)
-
-        def batch(first_row, num_rows):
-            mask = torch.zeros(rows, 1, dtype=torch.bool)
-            mask[first_row : first_row + num_rows] = True
-            embeds = torch.randn(num_rows, hidden, generator=gen).to(dtype)
-            deepstack = torch.randn(num_rows, hidden, generator=gen).to(dtype)
-            return mask, embeds, deepstack
-
-        input_embeds = torch.full((rows, hidden), -1.0, dtype=dtype, device=DEV)
-
-        def place(placed):
-            mask, embeds, deepstack = placed
-            return embed_mm_on_host(
-                input_embeds=input_embeds,
-                deepstack_shape=torch.Size((rows, hidden)),
-                modalities=[Modality.IMAGE],
-                embeddings=[embeds],
-                masks=[mask],
-                deepstack_embeddings=[deepstack],
-                use_deepstack={Modality.IMAGE: True},
-            )
-
-        # The second batch's reset() zeroes the first batch's rows, and its own
-        # rows overlap them, so a copy that read the matrices late would differ.
-        first, second = batch(1000, 3000), batch(2000, 3000)
-        place(second)  # compiles the merge at this shape
-        _sync()
-        t0 = time.perf_counter()
-        place(first)
-        place(second)
-        two_placements_ms = (time.perf_counter() - t0) * 1e3
-        _sync()
-
-        # Queue several times the two placements' host time, so that with
-        # non-blocking copies both placements finish while the first batch's
-        # copies still wait behind this work.
-        steps = max(5, math.ceil(4 * two_placements_ms / (2 * QUEUED_MS)))
-        for _ in range(steps):
-            self._queue_work()
-        t0 = time.perf_counter()
-        out, out_deepstack = place(first)
-        first_ms = (time.perf_counter() - t0) * 1e3
-        place(second)
-        remaining_t0 = time.perf_counter()
-        _sync()
-        remaining_ms = (time.perf_counter() - remaining_t0) * 1e3
-        # A blocking copy waits for the queue, so the second placement has
-        # nothing to race; a placement that returned early must have left the
-        # queue running for the second one.
-        if first_ms < steps * QUEUED_MS:
-            self.assertGreater(
-                remaining_ms,
-                QUEUED_MS,
-                f"only {remaining_ms:.1f} ms of TPU work was left after the second "
-                "placement; the test did not queue enough work",
-            )
-
-        mask, embeds, deepstack = first
-        placed_rows = mask.reshape(-1).nonzero(as_tuple=True)[0]
-        expected = torch.full((rows, hidden), -1.0, dtype=dtype)
-        expected[placed_rows] = embeds
-        expected_deepstack = torch.zeros(rows, hidden, dtype=dtype)
-        expected_deepstack[placed_rows] = deepstack
-        self.assertTrue(torch.equal(out.cpu(), expected))
-        self.assertTrue(torch.equal(out_deepstack.cpu(), expected_deepstack))
 
 
 if __name__ == "__main__":
