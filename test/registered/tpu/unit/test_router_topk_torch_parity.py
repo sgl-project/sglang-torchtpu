@@ -87,6 +87,7 @@ class TestRouterTopkTorchParity(CustomTestCase):
                 )
                 msg = f"{case} {tokens=}"
                 with self.subTest(msg=msg):
+                    self.assertTrue(self.rt.fits_sigmoid_router_topk(tokens), msg)
                     out = ms.MuseSparkMoE._route(moe, None)
                     ref_w, ref_ids = ms._sort_router_topk(
                         lt * mult, bt, 8, eps=ms._ROUTE_EPS, scale=1.0

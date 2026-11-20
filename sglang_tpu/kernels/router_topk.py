@@ -145,6 +145,24 @@ def _topk_kernel_1tok(
     ids_ref[...] = ids
 
 
+def _vmem_limit(tokens: int, block: int, experts: int, k: int, itemsize: int) -> int:
+    """Scoped VMEM from the tile working set: input/output refs (double-buffered
+    across a multi-step grid), bias, the transposed [E, block] f32 arrays
+    (scores, choice, expert) plus temporary/spill headroom and a 2 MiB margin."""
+    from sglang_tpu.kernels.vmem_limit import padded_bytes
+
+    mib = 1 << 20
+    bufs = 2 if tokens > block else 1
+    need = (
+        bufs * padded_bytes((block, experts), itemsize)
+        + padded_bytes((experts,), 4)
+        + 2 * bufs * padded_bytes((k, block), 4)
+        + 5 * padded_bytes((experts, block), 4)
+        + 2 * mib
+    )
+    return min(32 * mib, -(-need // mib) * mib)
+
+
 def router_topk_jax(
     logits,
     bias,
@@ -188,6 +206,9 @@ def router_topk_jax(
     block = min(
         tokens, max(128, min(_BLOCK_TOKENS, _BLOCK_ELEMS // experts) // 128 * 128)
     )
+    vmem_limit = _vmem_limit(
+        tokens, block, experts, k, jnp.dtype(logits.dtype).itemsize
+    )
     out_spec = pl.BlockSpec((k, block), lambda i: (0, i))
     weights, ids = pl.pallas_call(
         functools.partial(_topk_kernel, **params),
@@ -200,7 +221,7 @@ def router_topk_jax(
         out_specs=(out_spec, out_spec),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
-            vmem_limit_bytes=32 * 1024 * 1024,
+            vmem_limit_bytes=vmem_limit,
             allow_input_fusion=[True, False],
         ),
         interpret=interpret,
