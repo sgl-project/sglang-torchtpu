@@ -1045,6 +1045,31 @@ class TestHostPadFieldSelection(CustomTestCase):
             with self.assertRaises(RuntimeError):
                 relay.gather(indices)
 
+    def test_bucketed_relay_keeps_consume_checks_when_async_asserts_are_unset(self):
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.managers.overlap_utils import RelayPayload
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros((9, 16), dtype=torch.int32),
+            _tpu_relay_bucketer=Bucketer("Bs", [1, 2, 4, 8]),
+        )
+        check = overlap_utils._assert_nonneg_and_invalidate
+        check = getattr(check, "_torchdynamo_orig_callable", check)
+        with (
+            patch.object(overlap_utils, "_DEBUG_ASSERT", True),
+            patch.dict(os.environ),
+            patch.object(overlap_utils, "_assert_nonneg_and_invalidate", check),
+        ):
+            os.environ.pop("SGLANG_ENABLE_ASYNC_ASSERT", None)
+            relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+            indices = torch.tensor([7, 1, 4])
+            relay.stash(indices, RelayPayload(bonus_tokens=torch.arange(8) + 10))
+            relay.gather(indices)
+            with self.assertRaises(RuntimeError):
+                relay.gather(indices)
+
     def test_bucketed_relay_skips_consume_checks_without_async_asserts(self):
         from sglang.srt.managers import overlap_utils
         from sglang.srt.managers.overlap_utils import RelayPayload
