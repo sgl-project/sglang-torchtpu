@@ -71,6 +71,12 @@ class DraftConfig:
     # first chunk loads once its gate/up buffers are read (under its down
     # projection's reduction) instead of after the final norm.
     lm_prefetch: bool = False
+    # KernelConfig.ring_draft_q_padded: each rank's q projection [layers, hidden,
+    # 192] and head_place [3, 128, 192] are stored with 64 zero columns (256):
+    # with 192 the device keeps them transposed and XLA copies them to the
+    # kernel's row-major layout every call. VMEM tiles hold 192 lanes as 256
+    # anyway; the kernel keeps the products' first 192 columns.
+    q_padded: bool = False
 
     @property
     def q_width(self) -> int:
@@ -2140,7 +2146,9 @@ def _make_body(
                 pending["kv"].start()
 
             pending["q"].wait()
-            q = _bf16(_dot(h, q_buf[...]))  # [T, 192]
+            q = _bf16(_dot(h, q_buf[...]))  # [T, 192] ([T, 256] when padded)
+            if c.q_padded:
+                q = q[:, :q_width]
             if layer + 1 < layers:
                 pending["q"] = layer_copy("q", layer + 1)
                 pending["q"].start()
@@ -2187,9 +2195,10 @@ def _make_body(
                     out = _dot(_bf16(p_ctx * inverse), ring_tile) + _dot(
                         _bf16(p_blk * inverse), block_tile[j]
                     )
-                    attended_j = attended_j + _dot(
-                        _bf16(out), small["head_place"][head]
-                    )  # V lanes -> head lanes
+                    placed = _dot(_bf16(out), small["head_place"][head])
+                    if c.q_padded:  # head_place's 64 zero columns
+                        placed = placed[:, :q_width]
+                    attended_j = attended_j + placed  # V lanes -> head lanes
                 attended_rows.append(attended_j)
                 item = copy(ring_vmem.at[b], cache_out.at[j, layer], SEM_RING + 2 + b)
                 item.start()
@@ -2439,7 +2448,8 @@ def make_fused_draft(
             tpu.VMEM(
                 (FC_IN, 1024), jnp.bfloat16
             ),  # a_buf: fc columns in 896 of 1024 lanes, then projection/LM scratch
-            tpu.VMEM((hidden, 3 * c.head_dim), jnp.bfloat16),  # q_buf
+            # q_buf (DraftConfig.q_padded: 256 lanes, as VMEM tiles hold 192 anyway)
+            tpu.VMEM((hidden, 256 if c.q_padded else 3 * c.head_dim), jnp.bfloat16),
             tpu.VMEM((hidden, 2 * c.head_dim), jnp.bfloat16),  # kv_buf
             tpu.VMEM(
                 (3 * c.head_dim, CHUNK if R > 4 else hidden), jnp.bfloat16

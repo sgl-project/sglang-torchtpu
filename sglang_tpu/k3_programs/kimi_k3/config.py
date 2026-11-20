@@ -480,6 +480,9 @@ class KernelConfig:
     # The ring draft kernel starts its LM head's first chunk loads in its last
     # layer, under the down projection's reduction (DraftConfig.lm_prefetch).
     ring_draft_lm_prefetch: bool = False
+    # The ring draft's q projection and head_place stored padded to 256 columns
+    # per rank (DraftConfig.q_padded): no per-call relayout copies of them.
+    ring_draft_q_padded: bool = False
     # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
     # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
     # block, as attention DP2's plain decode does) instead of the pool's

@@ -225,6 +225,7 @@ class DsparkDraft:
             self.dspark.DraftConfig.from_checkpoint(checkpoint),
             rope_bf16=kernel_config.active().draft_rope_bf16,
             lm_prefetch=kernel_config.active().ring_draft_lm_prefetch,
+            q_padded=kernel_config.active().ring_draft_q_padded,
         )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         if self.rank == 0:
@@ -289,6 +290,8 @@ class DsparkDraft:
                     .view(dtype)
                     .reshape(spec["shape"])
                 )
+                if name in ("q", "head_place") and self.config.q_padded:
+                    value = np.pad(value, ((0, 0), (0, 0), (0, 256 - value.shape[-1])))
             self.weights[name] = upload(value)
         materialize(self.weights[self.names[-1]])
         wall = time.perf_counter() - started
