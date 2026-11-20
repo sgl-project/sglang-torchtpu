@@ -23,7 +23,7 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,6 +90,7 @@ def _mla_attention(*, rope_dim: int, rope) -> DeepseekV2AttentionMLA:
     attn.qk_nope_head_dim = nope_dim
     attn.qk_head_dim = nope_dim + rope_dim
     attn.num_local_heads = _HEADS
+    attn.dcp_size = 1
     attn.q_a_layernorm = RMSNorm(q_lora_rank)
     attn.kv_a_layernorm = RMSNorm(kv_lora_rank)
     attn.kv_a_layernorm.weight.data.uniform_(0.5, 1.5)
