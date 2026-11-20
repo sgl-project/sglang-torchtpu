@@ -13,7 +13,7 @@ import importlib
 import os
 from collections.abc import Sequence
 
-from sglang.utils import LazyImport
+from sglang._lazy_import import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs
 
