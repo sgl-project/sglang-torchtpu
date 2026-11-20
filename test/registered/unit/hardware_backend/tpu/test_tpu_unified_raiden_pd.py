@@ -15,8 +15,10 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
+from sglang.srt.disaggregation.utils import get_kv_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import (
     PER_LAYER_KV_LAYOUT,
@@ -24,6 +26,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardBlocks,
     ReshardChunk,
 )
+from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
 from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -43,10 +46,33 @@ _fake_tpu_sync = _harness._fake_tpu_sync
 _FakeRaidenEngine = _harness._FakeRaidenEngine
 
 
-def _pool(swa_layers=(1, 2, 4, 5, 6), *, head_num=2, dtype=torch.bfloat16):
+def _pool(
+    swa_layers=(1, 2, 4, 5, 6),
+    *,
+    head_num=2,
+    dtype=torch.bfloat16,
+    sal=False,
+    page_size=4,
+):
+    if sal:
+        with patch(
+            "sglang_tpu.kv_pool._seq_along_lane_head_dim",
+            side_effect=lambda *, head_dim, kv_packing: head_dim,
+        ):
+            return TpuUnifiedSWAKVPool(
+                size=16 * page_size,
+                page_size=page_size,
+                dtype=dtype,
+                full=AttnLayerSpec(head_num=head_num, head_dim=128, layer_ids=(0, 3)),
+                swa=AttnLayerSpec(
+                    head_num=head_num, head_dim=128, layer_ids=swa_layers
+                ),
+                device="cpu",
+                token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+            )
     return TpuUnifiedSWAKVPool(
-        size=64,
-        page_size=4,
+        size=16 * page_size,
+        page_size=page_size,
         dtype=dtype,
         full=AttnLayerSpec(head_num=head_num, head_dim=128, layer_ids=(0, 3)),
         swa=AttnLayerSpec(head_num=head_num, head_dim=128, layer_ids=swa_layers),
@@ -76,8 +102,11 @@ def _fake_pb2_modules(engine_cls=None) -> dict[str, types.ModuleType]:
 
 class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
     def _unified(self, mgr, pool: TpuUnifiedSWAKVPool, *, chunked: bool = False):
+        groups = get_raiden_kv_caches(pool)
         mgr._unified_swa_pool, mgr.kv_layout = pool, UNIFIED_SWA_KV_LAYOUT
-        mgr._kv_caches = pool.kv_pool.page_buffers()
+        mgr._kv_caches = groups.full
+        mgr._kv_head_nums = tuple(groups.full_head_nums)
+        mgr._seq_along_lane = groups.seq_along_lane
         mgr._deferred_ack_targets, mgr._staging_outstanding = {}, {}
         mgr._deferred_ack_poisoned_rooms, mgr.deferred_bootstrap = set(), None
         mgr.chunked_transfer = chunked
@@ -354,31 +383,169 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
                 dec._dispatch(bad.to_frames())
                 self.assertEqual(dec.request_status[room], KVPoll.Failed)
 
+            sal_p = _pool(head_num=1, sal=True, page_size=256)
+            sal_d = _pool(head_num=2, sal=True, page_size=256)
             for via_chunk in (False, True):
                 with self.subTest(seq_along_lane_reshard=True, via_chunk=via_chunk):
-                    ps, dec = _trio(via_chunk)
-                    dec._seq_along_lane = True
-                    room = 8260 + int(via_chunk)
-                    dec.register_decode_request(
-                        room,
-                        [20],
-                        d_swa,
-                        None,
-                        [
-                            {"rank_ip": "127.0.0.1", "rank_port": p.rank_port}
-                            for p in ps
-                        ],
+                    self._check_sal_reshard_push(
+                        via_chunk=via_chunk, sal_p=sal_p, sal_d=sal_d
                     )
-                    self._pump(*ps, dec)
-                    for p in ps:
-                        p.append_send_blocks(room, [1], swa_block_ids=p_swa)
-                        if via_chunk:
-                            p._announce_reshard_chunk(room, 0, [1], total_pages=1)
-                        p.finalize_send(room, aux_index=None)
-                    self._pump(*ps, dec)
-                    self.assertTrue(dec.is_failed(room))
-                    self.assertIn("5D token-major", dec.failure_records[room])
-                    self.assertEqual(ps[0]._engine.pushes, [])
+
+    def _check_sal_reshard_push(
+        self, *, via_chunk: bool, sal_p: TpuUnifiedSWAKVPool, sal_d: TpuUnifiedSWAKVPool
+    ) -> None:
+        sal_p_swa = sal_p.expand_swa_pages([5, 6])
+        sal_d_swa = sal_d.expand_swa_pages([8, 9])
+        ps = [
+            self._unified(
+                mgr=self._prefill(attn_tp_rank=r, attn_tp_size=4, page_size=256),
+                pool=sal_p,
+                chunked=via_chunk,
+            )
+            for r in (0, 1)
+        ]
+        dec = self._unified(
+            mgr=self._decode(attn_tp_rank=0, attn_tp_size=2, page_size=256),
+            pool=sal_d,
+            chunked=via_chunk,
+        )
+        for m in (*ps, dec):
+            m.kv_args.total_kv_head_num = 4
+        room = 8260 + int(via_chunk)
+        dec.register_decode_request(
+            room=room,
+            local_blocks=[20],
+            local_swa_blocks=sal_d_swa,
+            aux_index=None,
+            bootstrap_infos=[
+                {"rank_ip": "127.0.0.1", "rank_port": p.rank_port} for p in ps
+            ],
+        )
+        self._pump(*ps, dec)
+        for p in ps:
+            p.append_send_blocks(room=room, block_ids=[1], swa_block_ids=sal_p_swa)
+            if via_chunk:
+                p._announce_reshard_chunk(
+                    room=room, start=0, block_ids=[1], total_pages=1
+                )
+            p.finalize_send(room=room, aux_index=None)
+        self._pump(*ps, dec)
+        self.assertFalse(dec.is_failed(room))
+        l0_pushes = [(a[2], a[3]) for a, _ in ps[0]._engine.pushes if a[4] == 0]
+        expected_pushes = (
+            [([1], [20]), (sal_p_swa, sal_d_swa)]
+            if via_chunk
+            else [([1] + sal_p_swa, [20] + sal_d_swa)]
+        )
+        self.assertEqual(l0_pushes, expected_pushes)
+
+    def test_unified_pool_advertises_inner_kv_layout(self):
+        padded = _pool()
+        sal = _pool(sal=True, page_size=256)
+        self.assertIsNone(padded.disagg_kv_layout)
+        self.assertIsNone(get_kv_layout(padded))
+        self.assertEqual(sal.disagg_kv_layout, TpuSeqAlongLaneKVPool.disagg_kv_layout)
+        self.assertEqual(get_kv_layout(sal), "seq_along_lane")
+
+    def test_unified_layout_mismatch_refused(self):
+        """RaidenKVReceiver.init refuses a unified pair when only one side uses SAL,
+        at both equal and unequal attention TP."""
+        padded = _pool(head_num=2, page_size=256)
+        sal = _pool(head_num=2, sal=True, page_size=256)
+        addr = "127.0.0.1:8998"
+        for idx, (pre_pool, dec_pool, src_tp) in enumerate(
+            (
+                (sal, padded, 4),
+                (sal, padded, 8),
+                (padded, sal, 4),
+                (padded, sal, 8),
+            )
+        ):
+            with self.subTest(
+                pre_sal=pre_pool is sal, dec_sal=dec_pool is sal, src_tp=src_tp
+            ):
+                room = 8300 + idx
+                dec = self._unified(
+                    mgr=self._decode(attn_tp_size=4, page_size=256), pool=dec_pool
+                )
+                dec.kv_args.kv_layout = get_kv_layout(dec_pool)
+                dec.addr_to_rooms_tracker = defaultdict(set)
+                infos = [
+                    {"rank_ip": "127.0.0.1", "rank_port": 44000 + i}
+                    for i in range(src_tp // 4)
+                ]
+
+                def common_init(
+                    recv_self,
+                    _dp_rank,
+                    *,
+                    pre_layout=get_kv_layout(pre_pool),
+                    tp=src_tp,
+                    bs=infos,
+                ):
+                    recv_self.prefill_info = SimpleNamespace(
+                        kv_layout=pre_layout, attn_tp_size=tp
+                    )
+                    recv_self.target_pp_ranks = [0]
+                    recv_self.target_cp_ranks = [0]
+                    recv_self.bootstrap_infos = bs
+                    recv_self.kv_mgr.update_status(
+                        bootstrap_room=recv_self.bootstrap_room,
+                        status=KVPoll.WaitingForInput,
+                    )
+
+                recv = RaidenKVReceiver(
+                    mgr=dec, bootstrap_addr=addr, bootstrap_room=room
+                )
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                        common_init,
+                    ),
+                    patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+                ):
+                    recv.init(0)
+                self.assertEqual(recv.conclude_state, KVPoll.Failed)
+                self.assertEqual(dec.check_status(room), KVPoll.Failed)
+                self.assertIn("KV layout mismatch", dec.failure_records[room])
+                abort.assert_called_once()
+
+    def test_unified_spec_draft_reshard_refused_at_init(self):
+        sal = _pool(head_num=2, sal=True, page_size=256)
+        room = 8310
+        dec = self._unified(mgr=self._decode(attn_tp_size=4, page_size=256), pool=sal)
+        dec._draft_kv_caches = (sal.kv_pool.page_buffers()[0],)
+        dec.kv_args.kv_layout = get_kv_layout(sal)
+        dec.addr_to_rooms_tracker = defaultdict(set)
+        infos = [{"rank_ip": "127.0.0.1", "rank_port": 44010 + i} for i in range(2)]
+
+        def common_init(recv_self, _dp_rank, *, layout=dec.kv_args.kv_layout, bs=infos):
+            recv_self.prefill_info = SimpleNamespace(kv_layout=layout, attn_tp_size=8)
+            recv_self.target_pp_ranks = [0]
+            recv_self.target_cp_ranks = [0]
+            recv_self.bootstrap_infos = bs
+            recv_self.kv_mgr.update_status(
+                bootstrap_room=recv_self.bootstrap_room,
+                status=KVPoll.WaitingForInput,
+            )
+
+        recv = RaidenKVReceiver(
+            mgr=dec, bootstrap_addr="127.0.0.1:8998", bootstrap_room=room
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                common_init,
+            ),
+            patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+        ):
+            recv.init(0)
+        self.assertEqual(recv.conclude_state, KVPoll.Failed)
+        self.assertEqual(dec.check_status(room), KVPoll.Failed)
+        self.assertIn(
+            "speculative draft KV over TpuUnifiedSWAKVPool", dec.failure_records[room]
+        )
+        abort.assert_called_once()
 
 
 if __name__ == "__main__":

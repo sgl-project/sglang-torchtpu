@@ -4,6 +4,7 @@ import ast
 import itertools
 import pathlib
 import unittest
+from collections.abc import Sequence
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -255,7 +256,6 @@ class TestTpuReshardLayout(unittest.TestCase):
 
         for label, bufs, seq_lane in (
             ("mxint8_3d", [torch.zeros(9, 576, 128, dtype=torch.int8)], False),
-            ("seq_along_lane_5d", lane_grp.full, lane_grp.seq_along_lane),
         ):
             with self.subTest(layout=label):
                 mgr = object.__new__(RaidenKVManager)
@@ -1308,26 +1308,225 @@ class TestRefusalWithSlidingWindow(unittest.TestCase):
                         self.assertEqual(allowed, exact)
 
 
-def _unified_seq_along_lane_pool():
+def _unified_sal_pool(
+    *,
+    dtype: torch.dtype,
+    heads: int,
+    page_size: int = SAL_PAGE,
+    full_layers: int = 2,
+    swa_layers: int = 2,
+    pages: int = 8,
+) -> TpuUnifiedSWAKVPool:
+    full_ids = tuple(range(full_layers))
+    swa_ids = tuple(range(full_layers, full_layers + swa_layers))
     with patch(
-        "sglang_tpu.kv_pool._seq_along_lane_head_dim",
-        side_effect=lambda *, head_dim, kv_packing: head_dim,
+        "sglang_tpu.kv_pool._seq_along_lane_head_dim", new=_sublane_tile_head_dim
     ):
-        return TpuUnifiedSWAKVPool(
-            size=32,
-            page_size=4,
-            dtype=torch.bfloat16,
-            full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=(0, 2)),
-            swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=(1, 3)),
+        pool = TpuUnifiedSWAKVPool(
+            size=pages * page_size,
+            page_size=page_size,
+            dtype=dtype,
+            full=AttnLayerSpec(head_num=heads, head_dim=128, layer_ids=full_ids),
+            swa=AttnLayerSpec(head_num=heads, head_dim=128, layer_ids=swa_ids),
             device="cpu",
             token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
         )
+    extra_groups = pool.swa_group_pages.shape[0]
+    if extra_groups > 0:
+        stride = pages // (1 + extra_groups)
+        for group in range(extra_groups):
+            for page in range(1, stride + 1):
+                pool.swa_group_pages[group, page] = page + (group + 1) * stride
+    return pool
+
+
+def _fill_unified_sal_pool(
+    *,
+    pool: TpuUnifiedSWAKVPool,
+    heads: list[int],
+    full_pages: list[int],
+    swa_pages: list[int],
+) -> None:
+    for buf in pool.kv_pool.page_buffers():
+        buf.view(torch.uint8).fill_(0xFF)
+    sample = pool.kv_pool.page_buffers()[0].view(torch.uint8)
+    w, r, b = (torch.arange(n) for n in sample.shape[2:])
+    pos = w[:, None, None] * 5 + r[None, :, None] * 3 + b[None, None, :] * 7
+
+    def write_page(*, layer_id: int, block: int, ordinal: int) -> None:
+        raw = pool.get_fused_kv_buffer(layer_id).view(torch.uint8)
+        salt = (layer_id + 1) * 19 + ordinal * 11
+        for local, head in enumerate(heads):
+            for kv in (0, 1):
+                tag = ((2 * head + kv) * 131 + salt + pos) % 251
+                raw[block, 2 * local + kv] = tag.to(torch.uint8)
+
+    for ordinal, block in enumerate(full_pages):
+        for layer_id in pool.full.layer_ids:
+            write_page(layer_id=layer_id, block=block, ordinal=ordinal)
+    for ordinal, logical_page in enumerate(swa_pages):
+        slot = torch.tensor([logical_page * pool.page_size], dtype=torch.long)
+        for layer_id in pool.swa.layer_ids:
+            group = pool.swa_page_group(layer_id)
+            mapped = pool._map_swa_group_indices(group=group, swa_indices_cpu=slot)
+            phys_block = int(mapped[0]) // pool.page_size
+            write_page(layer_id=layer_id, block=phys_block, ordinal=ordinal)
+
+
+def _unified_sal_manager(
+    *, pool: TpuUnifiedSWAKVPool, total_heads: int, tp: int, mode: DisaggregationMode
+) -> RaidenKVManager:
+    groups = get_raiden_kv_caches(pool)
+    mgr = object.__new__(RaidenKVManager)
+    mgr.attn_tp_size = tp
+    mgr.disaggregation_mode = mode
+    mgr._unified_swa_pool = groups.unified_swa_pool
+    mgr._kv_caches = groups.full
+    mgr._swa_kv_caches = groups.swa
+    mgr._kv_head_nums = tuple(groups.full_head_nums)
+    mgr._swa_kv_head_nums = tuple(groups.swa_head_nums)
+    mgr._seq_along_lane = groups.seq_along_lane
+    mgr._kv_pack_heads = groups.kv_pack_heads
+    mgr.kv_args = SimpleNamespace(
+        total_kv_head_num=total_heads,
+        total_swa_kv_head_num=total_heads,
+        page_size=pool.page_size,
+        sliding_window_size=None,
+    )
+    return mgr
+
+
+def _copy_unified_contribution(
+    *,
+    src_caches: Sequence[torch.Tensor],
+    dst_caches: Sequence[torch.Tensor],
+    send_geom: ReshardGeometry,
+    recv_geom: ReshardGeometry,
+    src_rank: int,
+    dst_rank: int,
+    src_blocks: list[int],
+    dst_blocks: list[int],
+) -> bool:
+    src_off, size, src_stride, _, _ = send_geom.entry_bytes(
+        prefill_rank=src_rank, decode_rank=dst_rank
+    )
+    _, _, _, dst_off, dst_stride = recv_geom.entry_bytes(
+        prefill_rank=src_rank, decode_rank=dst_rank
+    )
+    count = send_geom.count_for(SAL_PAGE)
+    if recv_geom.count_for(SAL_PAGE) != count:
+        return False
+    for src_buf, dst_buf in zip(src_caches, dst_caches, strict=True):
+        src_raw, dst_raw = src_buf.view(torch.uint8), dst_buf.view(torch.uint8)
+        for s_blk, d_blk in zip(src_blocks, dst_blocks, strict=True):
+            s_page, d_page = src_raw[s_blk].flatten(), dst_raw[d_blk].flatten()
+            for step in range(count):
+                a, b = src_off + step * src_stride, dst_off + step * dst_stride
+                if a + size > s_page.numel() or b + size > d_page.numel():
+                    return False
+                d_page[b : b + size] = s_page[a : a + size]
+    return True
+
+
+def _replay_unified(
+    *,
+    total_heads: int,
+    src_tp: int,
+    dst_tp: int,
+    dtype: torch.dtype,
+    swa_groups: int,
+) -> bool:
+    full_layers, swa_layers = 2, 2 * swa_groups
+    src_full, src_swa = [1, 2], [3, 4]
+    dst_full, dst_swa = [2, 1], [5, 4]
+    src_heads_per_rank = max(1, total_heads // src_tp)
+    dst_heads_per_rank = max(1, total_heads // dst_tp)
+    for dst_rank in range(dst_tp):
+        want_pool = _unified_sal_pool(
+            dtype=dtype,
+            heads=dst_heads_per_rank,
+            full_layers=full_layers,
+            swa_layers=swa_layers,
+            pages=10 * swa_groups,
+        )
+        _fill_unified_sal_pool(
+            pool=want_pool,
+            heads=_rank_heads(total=total_heads, tp=dst_tp, rank=dst_rank),
+            full_pages=dst_full,
+            swa_pages=dst_swa,
+        )
+        got_pool = _unified_sal_pool(
+            dtype=dtype,
+            heads=dst_heads_per_rank,
+            full_layers=full_layers,
+            swa_layers=swa_layers,
+            pages=10 * swa_groups,
+        )
+        for buf in got_pool.kv_pool.page_buffers():
+            buf.view(torch.uint8).fill_(0xFF)
+        receiver = _unified_sal_manager(
+            pool=got_pool,
+            total_heads=total_heads,
+            tp=dst_tp,
+            mode=DisaggregationMode.DECODE,
+        )
+        if receiver.reshard_refusal(src_attn_tp=src_tp, dst_attn_tp=dst_tp) is not None:
+            return False
+        recv_geom = receiver._make_geometry(
+            src_attn_tp=src_tp, dst_attn_tp=dst_tp, swa=False
+        )
+        dst_blocks = dst_full + got_pool.expand_swa_pages(dst_swa)
+        ratio = recv_geom.ratio
+        for src_rank in range(dst_rank * ratio, (dst_rank + 1) * ratio):
+            src_pool = _unified_sal_pool(
+                dtype=dtype,
+                heads=src_heads_per_rank,
+                full_layers=full_layers,
+                swa_layers=swa_layers,
+                pages=8 * swa_groups,
+            )
+            _fill_unified_sal_pool(
+                pool=src_pool,
+                heads=_rank_heads(total=total_heads, tp=src_tp, rank=src_rank),
+                full_pages=src_full,
+                swa_pages=src_swa,
+            )
+            sender = _unified_sal_manager(
+                pool=src_pool,
+                total_heads=total_heads,
+                tp=src_tp,
+                mode=DisaggregationMode.PREFILL,
+            )
+            if (
+                sender.reshard_refusal(src_attn_tp=src_tp, dst_attn_tp=dst_tp)
+                is not None
+            ):
+                return False
+            send_geom = sender._make_geometry(
+                src_attn_tp=src_tp, dst_attn_tp=dst_tp, swa=False
+            )
+            if not _copy_unified_contribution(
+                src_caches=sender._kv_caches,
+                dst_caches=receiver._kv_caches,
+                send_geom=send_geom,
+                recv_geom=recv_geom,
+                src_rank=src_rank,
+                dst_rank=dst_rank,
+                src_blocks=src_full + src_pool.expand_swa_pages(src_swa),
+                dst_blocks=dst_blocks,
+            ):
+                return False
+        for got_buf, want_buf in zip(
+            got_pool.kv_pool.page_buffers(),
+            want_pool.kv_pool.page_buffers(),
+            strict=True,
+        ):
+            if not torch.equal(got_buf.view(torch.uint8), want_buf.view(torch.uint8)):
+                return False
+    return True
 
 
 class TestSeqAlongLaneUnequalTP(unittest.TestCase):
-    """_make_geometry refuses SEQ_ALONG_LANE at unequal TP only inside the
-    unified SWA pool; a regular SEQ_ALONG_LANE pool reshards by head runs."""
-
     def test_regular_pool_is_allowed_and_byte_correct(self):
         # 4 kv heads: TP8 -> TP4 and TP8 -> TP2, full and sliding-window.
         for dtype in (torch.bfloat16, _FP8):
@@ -1341,31 +1540,45 @@ class TestSeqAlongLaneUnequalTP(unittest.TestCase):
                             True,
                         )
 
-    def test_unified_pool_stays_refused(self):
-        lane_pool = _unified_seq_along_lane_pool()
-        lane_grp = get_raiden_kv_caches(lane_pool)
-        for seq_lane in (False, True):
+    def test_unified_pool_reshards_byte_exact(self):
+        for dtype in (torch.bfloat16, _FP8):
             for src_tp, dst_tp in ((8, 4), (8, 2)):
-                with self.subTest(seq_along_lane=seq_lane, tp=(src_tp, dst_tp)):
-                    mgr = object.__new__(RaidenKVManager)
-                    mgr._kv_caches = lane_grp.full
-                    mgr._unified_swa_pool = lane_pool
-                    mgr._seq_along_lane = seq_lane
-                    mgr.kv_args = SimpleNamespace(total_kv_head_num=8)
-                    with self.assertRaisesRegex(
-                        ValueError, "5D token-major fused KV tensors"
-                    ):
-                        mgr._make_geometry(src_tp, dst_tp)
+                for swa_groups in (1, 2):
+                    for total_heads in (4, 8):
+                        with self.subTest(
+                            dtype=dtype,
+                            tp=(src_tp, dst_tp),
+                            swa_groups=swa_groups,
+                            total_heads=total_heads,
+                        ):
+                            self.assertTrue(
+                                _replay_unified(
+                                    total_heads=total_heads,
+                                    src_tp=src_tp,
+                                    dst_tp=dst_tp,
+                                    dtype=dtype,
+                                    swa_groups=swa_groups,
+                                )
+                            )
 
-    def test_negative_control_only_the_unified_pool_refuses(self):
-        # One regular SEQ_ALONG_LANE manager: it builds a geometry at 8 -> 4,
-        # and attaching a unified SEQ_ALONG_LANE pool alone makes it refuse.
-        mgr = _manager(torch.bfloat16, 4, 4, 4, sal=True)
-        self.assertIsNone(mgr._unified_swa_pool)
-        self.assertEqual(mgr._make_geometry(8, 4).ratio, 2)
-        mgr._unified_swa_pool = _unified_seq_along_lane_pool()
-        with self.assertRaisesRegex(ValueError, "5D token-major fused KV tensors"):
-            mgr._make_geometry(8, 4)
+    def test_non_5d_pool_still_refused(self):
+        pool = _unified_sal_pool(
+            dtype=torch.bfloat16, heads=1, page_size=SAL_PAGE, pages=4
+        )
+        mgr = _unified_sal_manager(
+            pool=pool, total_heads=4, tp=4, mode=DisaggregationMode.DECODE
+        )
+        self.assertEqual(
+            mgr._make_geometry(src_attn_tp=8, dst_attn_tp=4, swa=False).ratio, 2
+        )
+        mgr._kv_caches = [torch.zeros(9, 4, 128, 256, dtype=torch.bfloat16)]
+        for src_tp in (8, 4):
+            with self.subTest(src_tp=src_tp):
+                with self.assertRaisesRegex(
+                    ValueError, "5D token-major fused KV tensors"
+                ) as cm:
+                    mgr._make_geometry(src_attn_tp=src_tp, dst_attn_tp=4, swa=False)
+                self.assertNotIn("seq-along-lane", str(cm.exception))
 
 
 if __name__ == "__main__":
