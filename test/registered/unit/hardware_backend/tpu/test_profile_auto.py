@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,

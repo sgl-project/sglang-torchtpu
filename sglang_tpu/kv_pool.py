@@ -319,6 +319,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+
+    def get_device_pool_infos(self):
+        """Name this pool's KV layers for HiCache host assembly.
+
+        No upstream buffer info describes the fused pages, and the TPU host
+        pool is built from this pool itself (``get_device_pool_kv_host_cls``),
+        so ``buffer_info`` is None rather than the K/V-buffer description
+        ``MHATokenToKVPool`` builds from buffers this pool does not have.
+        """
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=None,
+            ),
+        )
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
@@ -996,6 +1019,8 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
         self._synchronize_device()
 
     def get_contiguous_buf_infos(self):
+        if self.layer_num == 0:
+            return [], [], []
         # One item = one block's bundle row, every layer included.
         return (
             [self.kv_bundle.data_ptr()],
@@ -1114,6 +1139,9 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
             device=self.device,
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self._finalize_allocation_log(size)
 
@@ -1266,7 +1294,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     * NoPE, ``[num_pages, page_size, 4, 128]``: 512 bytes per token.
     * RoPE, ``[num_pages, page_size // 4, 4, 128]``: 64 bytes per token, padded
-      to 128.
+      to 128. A model without RoPE dims (``qk_rope_head_dim == 0``,
+      GLM-5.3-Flash) never writes or reads it (the ops attend with a zero rope
+      lane), so it gets a one-row placeholder instead, and the pool's bytes per
+      token leave it out.
 
     The values are FP8, stored as raw bytes.
 
@@ -1364,6 +1395,9 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
         # page 0 is never a real page.
         self.num_pages = self.size // self.page_size + 1
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
 
         self._create_buffers()
         self._finalize_allocation_log(size)
@@ -1376,14 +1410,20 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_key_layers: list[bool],
         index_kpool: int,
         raw_ring: bool = False,
+        qk_rope_head_dim: int = 64,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
         A raw ring is sized by request slots, not tokens, so it is not counted."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
-        layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
+        layer_bytes = cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim)
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
+
+    @classmethod
+    def rope_bytes_per_token(cls, qk_rope_head_dim: int) -> int:
+        """RoPE cache bytes per token: one lane, or none without RoPE dims."""
+        return cls.LANE_BYTES if qk_rope_head_dim > 0 else 0
 
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:
@@ -1406,12 +1446,18 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             self.NOPE_BYTES // self.LANE_BYTES,
             self.LANE_BYTES,
         )
-        rope_shape = (
-            self.num_pages,
-            rows_per_page,
-            self.TOKENS_PER_ROW,
-            self.LANE_BYTES,
-        )
+        if self.qk_rope_head_dim > 0:
+            rope_shape = (
+                self.num_pages,
+                rows_per_page,
+                self.TOKENS_PER_ROW,
+                self.LANE_BYTES,
+            )
+        else:
+            # No RoPE dims: the ops neither write nor read the rope cache
+            # (zero_rope), so one row stands in for it. It is not a page
+            # buffer: P/D transfer and HiCache leave it out.
+            rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
             self.num_pages,
             rows_per_page // self._index_kpool,
@@ -1515,6 +1561,12 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def set_state(self, state: list[torch.Tensor]) -> None:
         """Install a list laid out like ``get_state``; absent buffers stay None."""
+        expected = len(self.get_state())
+        if len(state) != expected:
+            raise ValueError(
+                f"TpuSplitMLATokenToKVPool.set_state expects {expected} tensors, "
+                f"got {len(state)}"
+            )
         it = iter(state)
 
         def take(kind: list) -> list:
@@ -1524,16 +1576,15 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self.rope_buffer = take(self.rope_buffer)
         self.index_key_buffer = take(self.index_key_buffer)
         self.kpool_raw_buffer = take(self.kpool_raw_buffer)
-        leftover = sum(1 for _ in it)
-        assert leftover == 0, f"set_state got {leftover} extra tensors"
 
     def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
         """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
         index keys and raw key|gate when it has them. Each leads with
         ``num_pages``, so a request's page ids address it in all of them."""
         i = layer_id - self.start_layer
+        rope = (self.rope_buffer[i],) if self.qk_rope_head_dim > 0 else ()
         optional = (self.index_key_buffer[i], self._paged_raw_buffers()[i])
-        return [self.nope_buffer[i], self.rope_buffer[i]] + [
+        return [self.nope_buffer[i], *rope] + [
             buf for buf in optional if buf is not None
         ]
 
@@ -1548,9 +1599,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
 
         Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
-        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) only
-        writes zeros to its RoPE buffer, so the buffer stays behind: the
-        receiver's starts zeroed too.
+        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) has only
+        a placeholder RoPE buffer that no op reads, so it stays behind.
         """
         kinds = [self.nope_buffer]
         if self.qk_rope_head_dim > 0:

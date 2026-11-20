@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
 

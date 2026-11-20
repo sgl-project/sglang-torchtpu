@@ -23,7 +23,8 @@ import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import mm_schedule_tpu

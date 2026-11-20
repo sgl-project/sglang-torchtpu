@@ -2,12 +2,13 @@
 folded batch and the paths that consume it. CPU only."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
@@ -18,22 +19,39 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
+    late_layer_whole_extend,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.mm_utils import pad_mm_tokens
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
     _fold_batch,
     drop_folded_rows,
     folded_replay_rows,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+# The fake request window's zero row: past every slot the fixtures use.
+_ZERO_ROW = 64 * 2 * SWA_WINDOW
+
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 MAX_CTX = 1024
 
 
@@ -75,6 +93,7 @@ class _Fixture:
             reqs=reqs,
             encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
+            req_pool_indices_cpu=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
             extend_num_tokens=self.extend_num_tokens,
@@ -122,14 +141,81 @@ def _backend(fx):
     backend.low_ratios = ()
     backend.has_c4 = backend.has_c128 = False
     backend.trtllm_attn = False
+    backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
     backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
     backend.token_to_kv_pool = SimpleNamespace(
-        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
+        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW, zero_row=_ZERO_ROW)
     )
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
+    backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
+    backend.is_dspark_draft = False
+    backend.topk = backend.speculative_num_steps = 0
     return backend
 
 
+def _build_metadata(fx, forward_batch, *, use_prefill_cuda_graph=False):
+    with (
+        patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+        patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+    ):
+        return _backend(fx)._build_forward_metadata(
+            forward_batch, use_prefill_cuda_graph=use_prefill_cuda_graph
+        )
+
+
 class TestFoldedExtendRows(CustomTestCase):
+    def test_image_prefix_hit_reembeds_replay_rows_at_absolute_offsets(self):
+        fx = _Fixture()
+        embedding = torch.nn.Embedding(5000, 3)
+        image_id = 42
+        mm_inputs = [None]
+        expected = []
+        scheduled_ids = []
+        for i, ((slot, prefix, length), req) in enumerate(zip(REQS, fx.batch.reqs)):
+            ids = array("q", req.full_untruncated_fill_ids)
+            full_embeddings = embedding(torch.tensor(ids)).detach()
+            if i:
+                # The long hit begins replay inside an image; the short hit
+                # replays both text and image rows from the start of the prompt.
+                start, end = (380, 530) if i == 1 else (8, 75)
+                features = torch.arange((end - start + 1) * 3).reshape(-1, 3).float()
+                item = MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    hash=i,
+                    offsets=[(start, end)],
+                    precomputed_embeddings=features,
+                )
+                item.set_pad_value()
+                mm = MultimodalInputs(mm_items=[item], im_token_id=image_id)
+                mm_inputs.append(mm)
+                ids[start : end + 1] = array("q", [image_id] * len(features))
+                ids = pad_mm_tokens(ids, mm)
+                full_embeddings[start : end + 1] = features
+            req.full_untruncated_fill_ids = ids
+            scheduled_ids.extend(ids[prefix : prefix + length])
+            expected.append(full_embeddings[max(0, prefix - 128) : prefix + length])
+        fx.batch.input_ids = torch.tensor(scheduled_ids)
+        fx.batch.multimodal_inputs = mm_inputs
+        original_ids = fx.batch.input_ids.clone()
+        folded = _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
+        fb = SimpleNamespace(
+            mm_inputs=folded.batch.multimodal_inputs,
+            extend_prefix_lens_cpu=folded.batch.prefix_lens,
+            extend_seq_lens_cpu=folded.batch.extend_lens,
+            mm_input_embeds=None,
+        )
+        model = SimpleNamespace(
+            get_input_embeddings=lambda: embedding,
+            get_image_feature=MagicMock(side_effect=AssertionError("cached features")),
+        )
+        actual = DeepseekV4ForCausalLM._prepare_mm_embeddings(
+            model, folded.batch.input_ids, fb
+        )
+        torch.testing.assert_close(actual, torch.cat(expected))
+        torch.testing.assert_close(fx.batch.input_ids, original_ids)
+        self.assertIs(fb.mm_inputs, mm_inputs)
+        model.get_image_feature.assert_not_called()
+
     def test_mixed_hit_and_miss_fold_maps_every_row(self):
         """Hits extend from their replay start into their cached KV slots; every
         per-row view (tokens, KV slots, window floor, logprob range, hidden rows)
@@ -162,7 +248,8 @@ class TestFoldedExtendRows(CustomTestCase):
         ]
         self.assertEqual(sum(logprob_rows), fx.batch.global_num_tokens_for_logprob[0])
         # Full hidden states of the folded forward reduce to the scheduled rows.
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[:, None].float(),
             hidden_states_token_indices=None,
         )
@@ -181,12 +268,12 @@ class TestFoldedExtendRows(CustomTestCase):
 
 
 class TestFoldWithDecoderSwaTail(CustomTestCase):
-    """--enable-encoder-swa-bounded-replay with --enable-decoder-swa-bounded-replay:
+    """Encoder SWA bounded replay combined with decoder SWA bounded replay:
     the late layers run only each request's last SWA_WINDOW folded rows."""
 
     def test_tail_keeps_its_own_floor_under_fold(self):
         """A prefix hit with both flags on builds the tail metadata; each tail row
-        is floored at its tail start or its request's replay start, whichever is
+        is floored one window back or at its request's replay start, whichever is
         later. It used to take the fold's per-row floor of all folded rows and
         fail a row-count assert."""
         fx = _Fixture()
@@ -200,6 +287,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             req_pool_indices=fb.req_pool_indices,
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=False,
         )
         with (
             patch.object(DSV4AttnMetadata, "init_compression_metadata"),
@@ -216,6 +305,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         expected = window_layout(
             req,
             tail.positions,
+            zero_row=_ZERO_ROW,
             capacity=2 * SWA_WINDOW,
             floor=floor,
             num_groups=3,
@@ -224,6 +314,25 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         torch.testing.assert_close(layout.lengths, expected.lengths)
         torch.testing.assert_close(layout.indices, expected.indices)
 
+    def test_short_tail_floors_one_window_back(self):
+        """A final chunk shorter than a window reads the rows the previous chunk's
+        tail wrote, so its tail is floored at seq_len - SWA_WINDOW."""
+        cpu = torch.device("cpu")
+        _, _, floor = late_layer_tail_layout(
+            extend_lens_cpu=[40], seq_lens_cpu=[300], tail_len=SWA_WINDOW, device=cpu
+        )
+        torch.testing.assert_close(floor, torch.full((40,), 172, dtype=torch.int32))
+
+        # A short chunk, a full-window tail, and a short fresh request.
+        _, _, floor = late_layer_tail_layout(
+            extend_lens_cpu=[40, 200, 50],
+            seq_lens_cpu=[300, 200, 50],
+            tail_len=SWA_WINDOW,
+            device=cpu,
+        )
+        expected = torch.tensor([172] * 40 + [72] * 128 + [0] * 50, dtype=torch.int32)
+        torch.testing.assert_close(floor, expected)
+
     def test_tail_hidden_rows_map_to_scheduled_rows(self):
         """With DSpark the model returns the tail's hidden rows and their indices
         into the folded extend. The draft indexes scheduled-row cache locations
@@ -231,17 +340,19 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         replayed rows."""
         fx = _Fixture()
         fb = fx.folded.batch
-        token_indices, _, _ = late_layer_tail_layout(
+        token_indices, tail_lens, _ = late_layer_tail_layout(
             extend_lens_cpu=list(fb.extend_lens),
             seq_lens_cpu=fx.folded_seq_lens(),
             tail_len=SWA_WINDOW,
             device=torch.device("cpu"),
         )
-        out = SimpleNamespace(
+        self.assertEqual(tail_lens, [40, 128, 84])
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[token_indices][:, None].float(),
             hidden_states_token_indices=token_indices,
         )
-        drop_folded_rows(logits_output=out, folded=fx.folded)
+        drop_folded_rows(logits_output=out, folded=fx.folded, tail_lens=tail_lens)
 
         # Kept: all 40 miss rows, the hit's 30 new rows, the small hit's 20.
         expected = torch.cat(
@@ -252,30 +363,70 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             out.hidden_states, fx.batch.input_ids[expected][:, None].float()
         )
 
+    def test_prompt_logprob_reader_keeps_its_whole_tail(self):
+        """A prompt-logprob reader's tail is its whole folded extend, replay rows included."""
+        fx = _Fixture()
+        fx.batch.extend_logprob_start_lens = [40, 10, 5]
+        folded = _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
+        fb = folded.batch
+        whole = late_layer_whole_extend(
+            SimpleNamespace(
+                extend_seq_lens_cpu=list(fb.extend_lens),
+                extend_logprob_start_lens_cpu=fb.extend_logprob_start_lens,
+                return_logprob=True,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            ),
+            dspark=True,
+        )
+        self.assertEqual(whole, [False, True, True])
+        token_indices, tail_lens, _ = late_layer_tail_layout(
+            extend_lens_cpu=list(fb.extend_lens),
+            seq_lens_cpu=fx.folded_seq_lens(),
+            tail_len=SWA_WINDOW,
+            device=torch.device("cpu"),
+            whole_extend=whole,
+        )
+        self.assertEqual(tail_lens, [40, 158, 84])
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=fb.input_ids[token_indices][:, None].float(),
+            hidden_states_token_indices=token_indices,
+        )
+        drop_folded_rows(logits_output=out, folded=folded, tail_lens=tail_lens)
+
+        torch.testing.assert_close(out.hidden_states_token_indices, torch.arange(90))
+        torch.testing.assert_close(
+            out.hidden_states, fx.batch.input_ids[:, None].float()
+        )
+
+
+def _extend_batch(fx):
+    """The folded extend's forward batch, as the backend's metadata reads it."""
+    fb = fx.folded.batch
+    seq_lens = fx.folded_seq_lens()
+    lens = torch.tensor(fb.extend_lens)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=len(fb.extend_lens),
+        spec_info=None,
+        max_seq_len_override=None,
+        extend_seq_lens=lens,
+        extend_seq_lens_cpu=list(fb.extend_lens),
+        extend_start_loc=torch.cumsum(lens, 0) - lens,
+        seq_lens_cpu=torch.tensor(seq_lens),
+        seq_lens=torch.tensor(seq_lens),
+        req_pool_indices=fb.req_pool_indices,
+        out_cache_loc=fb.out_cache_loc,
+        positions=fx.folded_positions(),
+        encoder_swa_replay=False,
+        encoder_swa_row_floor=fx.folded.row_floor,
+        encoder_swa_compress_rows=fx.folded.keep_rows,
+    )
+
 
 class TestFoldedReplayCompressorWrites(CustomTestCase):
     """Folded replay rows rebuild only their SWA window: their main KV, compressed
     groups and index keys are cached, so the compressors write only the new rows."""
-
-    def _forward_batch(self, fx):
-        fb = fx.folded.batch
-        seq_lens = fx.folded_seq_lens()
-        lens = torch.tensor(fb.extend_lens)
-        return SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=len(fb.extend_lens),
-            spec_info=None,
-            max_seq_len_override=None,
-            extend_seq_lens=lens,
-            extend_seq_lens_cpu=list(fb.extend_lens),
-            extend_start_loc=torch.cumsum(lens, 0) - lens,
-            seq_lens_cpu=torch.tensor(seq_lens),
-            seq_lens=torch.tensor(seq_lens),
-            req_pool_indices=fb.req_pool_indices,
-            out_cache_loc=fb.out_cache_loc,
-            positions=fx.folded_positions(),
-            encoder_swa_compress_rows=fx.folded.keep_rows,
-        )
 
     def _expected_out_loc(self, fx):
         """Replay rows on the padding slot, new rows on their own KV slots."""
@@ -292,16 +443,7 @@ class TestFoldedReplayCompressorWrites(CustomTestCase):
 
     def test_extend_metadata_puts_replay_rows_on_the_padding_slot(self):
         fx = _Fixture()
-        backend = _backend(fx)
-        backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
-        backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
-        backend.is_dspark_draft = False
-        backend.topk = backend.speculative_num_steps = 0
-        with (
-            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
-            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
-        ):
-            metadata = backend._build_forward_metadata(self._forward_batch(fx))
+        metadata = _build_metadata(fx, _extend_batch(fx))
 
         raw_out_loc = metadata.core_attn_metadata.raw_out_loc
         self.assertEqual(int((raw_out_loc == 0).sum()), REPLAY_ROWS)
@@ -328,7 +470,7 @@ class TestFoldedReplayCompressorWrites(CustomTestCase):
         fb = fx.folded.batch
         req = fb.req_pool_indices.repeat_interleave(torch.tensor(fb.extend_lens))
         rows = torch.arange(out_loc.shape[0], dtype=torch.float32)[:, None]
-        forward_batch = self._forward_batch(fx)
+        forward_batch = _extend_batch(fx)
         backend._low_ratio_compress(
             layer, rows, req, forward_batch.positions, forward_batch
         )
@@ -336,6 +478,100 @@ class TestFoldedReplayCompressorWrites(CustomTestCase):
         ((kv, slots),) = written
         torch.testing.assert_close(kv, rows)
         torch.testing.assert_close(slots, out_loc)
+
+
+class TestFoldedReplayUnderPrefillGraph(CustomTestCase):
+    """The breakable prefill graph replays a folded batch padded to its captured
+    bucket and refreshes the captured metadata in place before each replay."""
+
+    PAD = 32
+
+    def _graph_batch(self, fx, *, compress_rows):
+        fb = _extend_batch(fx)
+        pad = torch.zeros(self.PAD, dtype=fb.out_cache_loc.dtype)
+        fb.out_cache_loc = torch.cat([fb.out_cache_loc, pad])
+        fb.positions = torch.cat([fb.positions, pad])
+        fb.encoder_swa_compress_rows = compress_rows
+        return fb
+
+    def test_padding_rows_get_no_window_and_commit_nowhere(self):
+        fx = _Fixture()
+        live = sum(fx.folded.batch.extend_lens)
+        graph = _build_metadata(
+            fx,
+            self._graph_batch(fx, compress_rows=fx.folded.keep_rows),
+            use_prefill_cuda_graph=True,
+        ).core_attn_metadata.request_window_layout
+        eager = _build_metadata(
+            fx, _extend_batch(fx)
+        ).core_attn_metadata.request_window_layout
+
+        self.assertEqual(graph.pos.numel(), live + self.PAD)
+        # The graph fixes its window groups, so workspace offsets differ from
+        # eager; each live row still sees the same window and commits the same.
+        live_rows = graph.leading_rows(live)
+        torch.testing.assert_close(live_rows.lengths, eager.lengths)
+        torch.testing.assert_close(live_rows.commit_mask, eager.commit_mask)
+        torch.testing.assert_close(
+            (live_rows.indices >= 0).sum(-1), (eager.indices >= 0).sum(-1)
+        )
+        self.assertEqual(live_rows.write_loc.unique().numel(), live)
+        self.assertFalse(bool(graph.commit_mask[live:].any()))
+        self.assertTrue(bool((graph.lengths[live:] == 0).all()))
+        self.assertTrue(bool((graph.indices[live:] == -1).all()))
+        self.assertTrue(
+            bool((graph.write_loc[live:] > graph.write_loc[:live].max()).all())
+        )
+
+    def test_graph_slots_do_not_alias_the_static_out_cache_loc(self):
+        """A capture has no replay rows; the replay that has them refreshes the
+        captured slots in place, which must leave the batch's input untouched."""
+        fx = _Fixture()
+        fb = self._graph_batch(fx, compress_rows=None)
+        raw = _build_metadata(
+            fx, fb, use_prefill_cuda_graph=True
+        ).core_attn_metadata.raw_out_loc
+        self.assertNotEqual(
+            raw.untyped_storage().data_ptr(),
+            fb.out_cache_loc.untyped_storage().data_ptr(),
+        )
+        torch.testing.assert_close(raw, fb.out_cache_loc)
+
+
+class TestEncoderReplayPrefillGraphGate(CustomTestCase):
+    def _validate(self, prefill_backend):
+        args = ServerArgs(
+            model_path="local-deepseek-v41",
+            attention_backend="dsv4",
+            enable_encoder_swa_bounded_replay=True,
+            enable_decoder_swa_bounded_replay=False,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=prefill_backend)
+            ),
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with patch(f"{_ENV_GATE}.is_unified_kv_triton", return_value=False):
+            deepseek_v4_hook.validate_deepseek_v41_features(args)
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_cuda_accepts_only_the_breakable_prefill_graph(self):
+        self._validate(Backend.BREAKABLE)
+        for backend in (Backend.FULL, Backend.TC_PIECEWISE):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "other than breakable"),
+            ):
+                self._validate(backend)
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_rocm_rejects_the_prefill_graph(self):
+        with (
+            patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
+            self.assertRaisesRegex(ValueError, "prefill CUDA graph on ROCm"),
+        ):
+            self._validate(Backend.BREAKABLE)
 
 
 class TestFoldMlpSync(CustomTestCase):
@@ -374,13 +610,11 @@ class TestFoldMlpSync(CustomTestCase):
         return fb
 
     def _mlp_sync(self, fb):
-        runner = MagicMock()
+        runner = MagicMock(compile_policy=NoopCompilePolicy())
         runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = 1
         runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
         runner.is_draft_worker = False
         runner.attn_tp_sequence_sharded.return_value = False
-        # ModelRunner's default; the policy pads DP counts to the attention TP size.
-        runner.compile_policy = NoopCompilePolicy()
         tp_group = GroupCoordinator.__new__(GroupCoordinator)
         tp_group.world_size = self.ATTN_TP
         tp_group.rank_in_group = 0
@@ -407,7 +641,8 @@ class TestFoldMlpSync(CustomTestCase):
         torch.testing.assert_close(fb.input_ids[:282], fx.folded.batch.input_ids)
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [17])
         # Hidden states of the padded forward still reduce to the scheduled rows.
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[:, None].float(),
             hidden_states_token_indices=None,
         )

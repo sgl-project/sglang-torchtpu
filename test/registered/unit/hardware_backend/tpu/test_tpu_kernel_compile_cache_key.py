@@ -384,6 +384,12 @@ def _is_kernel_source(path: Path) -> bool:
 
 
 class TestKernelSourcesAreHashed(CustomTestCase):
+    def test_source_roots_resolve_when_sglang_is_a_namespace_package(self):
+        """A namespace `sglang` has no `__file__`; the srt root must still resolve."""
+        with patch.object(sglang, "__file__", None):
+            roots = compile_cache.kernel_source_roots()
+        self.assertEqual(roots[1][1], _SRT_ROOT)
+
     def test_kernel_api_detector(self):
         for source, expected in (
             ("from jax.experimental import pallas as pl", True),

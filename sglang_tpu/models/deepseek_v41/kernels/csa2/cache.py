@@ -125,10 +125,8 @@ def _gather_sc_banked(words, scales, records):
                         word_buf[slot, stream] = jnp.zeros((lanes, 128), jnp.int32)
                         scale_buf[slot, stream] = jnp.zeros((lanes,), jnp.float32)
                     for bank in range(len(words)):
-                        own = (selected >= 0) & (
-                            selected >= split if bank else selected < split
-                        )
                         local = selected - split if bank else selected
+                        own = (local >= 0) & (local < word_refs[bank].shape[0])
                         indexed = plsc.Indices(
                             jnp.where(own, local, -1), ignored_value=-1
                         )
@@ -236,8 +234,12 @@ def _gather_sc_banked_deep(words, scales, records):
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    # One zero row per (subcore, stream, lane): concurrent invalid lanes read
+    # distinct rows. When every lane gathered row 0, each negative id cost
+    # ~40 ns (v7x); one row per lane shared by all subcores still cost ~5 ns.
+    zero_rows = cores * streams * lanes
+    zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
+    zero_scales = jnp.zeros((zero_rows,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -270,11 +272,11 @@ def _gather_sc_banked_deep(words, scales, records):
                 for stream in range(streams):
                     selected = ids[pl.ds((step * streams + stream) * lanes, lanes)]
                     targets = []
+                    any_own = jnp.zeros(selected.shape, jnp.bool_)
                     for bank in range(len(words)):
-                        own = (selected >= 0) & (
-                            selected >= split if bank else selected < split
-                        )
                         local = selected - split if bank else selected
+                        own = (local >= 0) & (local < word_refs[bank].shape[0])
+                        any_own = any_own | own
                         targets.append(
                             (
                                 word_refs[bank],
@@ -282,8 +284,15 @@ def _gather_sc_banked_deep(words, scales, records):
                                 jnp.where(own, local, -1),
                             )
                         )
+                    lane_rows = (
+                        core * streams + stream
+                    ) * lanes + jax.lax.broadcasted_iota(jnp.int32, selected.shape, 0)
                     targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                        (
+                            zero_word_ref,
+                            zero_scale_ref,
+                            jnp.where(~any_own, lane_rows, -1),
+                        )
                     )
                     for word_src, scale_src, rows in targets:
                         indexed = plsc.Indices(rows, ignored_value=-1)

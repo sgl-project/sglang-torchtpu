@@ -13,6 +13,7 @@ import importlib
 import os
 from collections.abc import Sequence
 
+from sglang._lazy_import import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs
 
@@ -72,6 +73,9 @@ def _register_tpu_compile_backend() -> None:
 
 
 _tpu_sampler_backend_registered = False
+# This module is also imported before worker bootstrap prepares TorchTPU.
+_output_topk = LazyImport("sglang.kernels.ops.sampling", "output_topk")
+_output_logprob_topk = LazyImport("sglang_tpu.top_k", "output_logprob_topk")
 
 
 def _register_tpu_sampler_backend() -> None:
@@ -86,6 +90,10 @@ def _register_tpu_sampler_backend() -> None:
     from sglang_tpu.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
+    output_topk = _output_topk._load()
+    output_topk.register_oot_forward(
+        type(output_topk), _output_logprob_topk._load(), "tpu"
+    )
     _tpu_sampler_backend_registered = True
 
 
@@ -680,16 +688,16 @@ def _patch_support_triton_for_tpu() -> None:
         return
     _support_triton_patched = True
 
-    import sglang.srt.utils.common as _utils_common
+    import sglang.srt.utils.triton_utils as _triton_utils
 
-    orig = _utils_common.support_triton
+    orig = _triton_utils.support_triton
 
     def support_triton(backend: str) -> bool:
         if backend in _PALLAS_TPU_BACKENDS:
             return False
         return orig(backend)
 
-    _utils_common.support_triton = support_triton
+    _triton_utils.support_triton = support_triton
 
     # Rebind the by-value imports (and the package re-export).
     for modname in (
@@ -856,12 +864,12 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     # Each polled request's time stats -> its sender, during the poll only.
     polled_senders = {}
     orig_poll = (
-        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue
+        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue
     )
     orig_set_finish = SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
 
-    def process_disagg_prefill_inflight_queue(self, *args, **kwargs):
-        for req in self.disagg_prefill_inflight_queue:
+    def process_disagg_prefill_transfer_queue(self, *args, **kwargs):
+        for req in self.disagg_prefill_transfer_queue:
             polled_senders[id(req.time_stats)] = req.disagg_kv_sender
         try:
             return orig_poll(self, *args, **kwargs)
@@ -877,8 +885,8 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
                 ts = max(finish, self.prefill_transfer_queue_entry_time)
         orig_set_finish(self, ts)
 
-    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue = (
-        process_disagg_prefill_inflight_queue
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue = (
+        process_disagg_prefill_transfer_queue
     )
     SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = (
         set_prefill_kv_transfer_finish_time

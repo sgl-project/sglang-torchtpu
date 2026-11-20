@@ -9,16 +9,16 @@ a proper :class:`torch.nn.Module` and covers **two independent dimensions**:
 - **Kernel backend (provenance)** — where an implementation comes from
   (:class:`~sglang.kernels.spec.KernelBackend`): ``forward_native`` (pure
   torch, required), ``forward_torch_compile``, ``forward_triton``,
-  ``forward_jit``, ``forward_aot``, ``forward_cute_dsl``,
+  ``forward_jit``, ``forward_aot``, ``forward_cute_dsl``, ``forward_helion``,
   ``forward_flashinfer``, ``forward_deepgemm``, ``forward_aiter``,
   ``forward_torch_npu``. Which *devices* a backend supports is per-``(op,
   backend)`` metadata (:attr:`BaseFusedOp.capabilities`), never implied by the
   backend name.
 - **Platform / device** — device-specific composite paths inherited from
   ``MultiPlatformOp``: ``forward_cuda``, ``forward_hip``, ``forward_npu``,
-  ``forward_xpu``, ``forward_musa``, ``forward_cpu``, plus ``forward_<key>``
-  for out-of-tree (OOT) platform plugins. CUDA / HIP are **not** kernel
-  backends.
+  ``forward_xpu``, ``forward_musa``, ``forward_mlu``, ``forward_cpu``, plus
+  ``forward_<key>`` for out-of-tree (OOT) platform plugins. CUDA / HIP are
+  **not** kernel backends.
 
 Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
 
@@ -28,19 +28,20 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
    Best-effort: an op that does not implement the forced backend falls back
    to normal dispatch with a one-time warning, so the debug switch works on
    whole models that contain device-only ops.
-3. **OOT platform override** — on an out-of-tree platform, a forward
-   registered via :meth:`BaseFusedOp.register_oot_forward`, then a
-   ``forward_<dispatch_key>`` method, then ``forward_native``.
+3. **Plugin platform override** — a forward registered via
+   :meth:`BaseFusedOp.register_oot_forward` for the active platform key.
+   Out-of-tree platforms then try ``forward_<dispatch_key>`` and
+   ``forward_native``.
 4. **Optimized kernel backends** — the first backend in :attr:`priority`
    whose method is overridden, that is *declared* in :attr:`capabilities`,
    and whose :class:`~sglang.kernels.spec.CapabilityRequirement` set matches
    the detected platform. Ops may extend :meth:`backend_eligible` with
-   per-call shape/dtype gates; overriding it switches this step from a
+   per-call applicability gates; overriding it switches this step from a
    statically cached choice to per-call selection.
 5. **Platform-specific forward** — ``forward_cuda`` on CUDA, ``forward_hip``
    (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` on MUSA,
-   ``forward_npu`` / ``forward_xpu`` on Ascend / XPU, ``forward_cpu`` on
-   AMX-capable CPUs.
+   ``forward_npu`` / ``forward_xpu`` / ``forward_mlu`` on Ascend / XPU / MLU,
+   ``forward_cpu`` on AMX-capable CPUs.
 6. **Native fallback** — ``forward_native``.
 
 Steps 3-6 are static per process, so their outcome is resolved once (lazily,
@@ -49,12 +50,13 @@ may pre-seed that attribute to pin an instance to a specific path (e.g. the
 env-gated aiter paths in ``srt/layers``). Steps 1-2 stay per-call so tests and
 tools can flip backends on live instances.
 
-torch.compile integration: :meth:`enter_torch_compile` switches the op to its
-compile-safe path (``forward_native`` by default; see
-:meth:`_torch_compile_forward` for the TopK / FusedMoE special cases) so an
-*outer* ``torch.compile`` never traces device-specific kernels, and
-:meth:`leave_torch_compile` restores the original dispatch. Both are
-idempotent because one module instance may be shared by many layers.
+torch.compile integration: :meth:`enter_torch_compile` selects the function to
+use when compiling the model. An OOT compile function registered for the active
+platform takes precedence over :meth:`_torch_compile_forward`, which selects
+``forward_native`` by default (TopK / FusedMoE have their own selection rules).
+Dynamo traces the selected function's body. :meth:`leave_torch_compile` restores
+the previous forward function. Repeated enter/leave calls are safe because one
+module instance may be shared by many layers.
 
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
@@ -67,6 +69,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import types
 from abc import ABC, abstractmethod
 from typing import (
     AbstractSet,
@@ -86,12 +89,11 @@ from torch import nn
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.registry import register_kernel
+from sglang.kernels.selector import _platform
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
-    PlatformInfo,
     capabilities_satisfied,
 )
 
@@ -108,7 +110,10 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
     KernelBackend.FLYDSL: "forward_flydsl",
+    KernelBackend.HELION: "forward_helion",
     KernelBackend.KDA: "forward_kda",
+    KernelBackend.CAKE: "forward_cake",
+    KernelBackend.PLUGIN: "forward_plugin",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
@@ -124,11 +129,14 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 # explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
+    KernelBackend.CAKE,
+    KernelBackend.PLUGIN,
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.FLASHINFER,
     KernelBackend.DEEPGEMM,
     KernelBackend.CUTE_DSL,
+    KernelBackend.HELION,
     KernelBackend.AITER,
     KernelBackend.TORCH_NPU,
     KernelBackend.TRITON,
@@ -154,13 +162,9 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
     "tpu": ("forward_tpu",),
+    "mlu": ("forward_mlu",),
     "cpu": ("forward_cpu",),
 }
-
-
-@functools.lru_cache(maxsize=1)
-def _platform() -> PlatformInfo:
-    return PlatformInfo.detect()
 
 
 @functools.lru_cache(maxsize=1)
@@ -176,6 +180,7 @@ def _platform_key() -> str:
         is_cpu,
         is_cuda,
         is_hip,
+        is_mlu,
         is_musa,
         is_npu,
         is_tpu,
@@ -196,6 +201,8 @@ def _platform_key() -> str:
         return "xpu"
     if is_musa():
         return "musa"
+    if is_mlu():
+        return "mlu"
     return ""
 
 
@@ -207,13 +214,6 @@ def _oot_dispatch_key() -> Optional[str]:
     if current_platform.is_out_of_tree():
         return current_platform.get_dispatch_key_name()
     return None
-
-
-def clear_platform_caches() -> None:
-    """Drop the cached platform detection (used by tests that mock platforms)."""
-    _platform.cache_clear()
-    _platform_key.cache_clear()
-    _oot_dispatch_key.cache_clear()
 
 
 # --- global backend override ------------------------------------------------
@@ -298,6 +298,12 @@ def _dispatch_label(method: Callable) -> str:
     ``forward_native`` traces as ``"torch"``, matching explicit-backend
     calls); platform forwards trace as their device key (``"cuda"``, ...).
     """
+    # For OOT calls, derive the trace label from the registered function's name.
+    func = getattr(method, "__func__", None)
+    if func is BaseFusedOp._forward_oot:
+        method = method.__self__._resolved_oot_forward
+    elif func is BaseFusedOp._forward_oot_compile:
+        method = method.__self__._resolved_oot_compile_forward
     name = getattr(method, "__name__", "")
     label = _METHOD_BACKEND_LABELS.get(name)
     if label is not None:
@@ -352,7 +358,7 @@ class BaseFusedOp(nn.Module, ABC):
     Class attributes
     ----------------
     op:
-        Operator id, ``"<group>.<name>"`` (e.g. ``"layernorm.rmsnorm"``).
+        Operator id, ``"<group>.<name>"`` (e.g. ``"activation.silu_and_mul"``).
         Required for :func:`register_fused_op`; layer-style subclasses that
         are not registered in the kernel registry may leave it empty.
     priority:
@@ -370,10 +376,6 @@ class BaseFusedOp(nn.Module, ABC):
         the ``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` shortcuts,
         e.g. ``{KernelBackend.AOT: {CapabilityRequirement.CUDA,
         CapabilityRequirement.HIP}}``.
-    format_signature:
-        Data-contract description shared by all backends of this op.
-    descriptions:
-        Optional per-backend one-liners for the registry inventory.
     """
 
     op: ClassVar[str] = ""
@@ -381,20 +383,43 @@ class BaseFusedOp(nn.Module, ABC):
     capabilities: ClassVar[
         Mapping[KernelBackend, AbstractSet[CapabilityRequirement]]
     ] = {}
-    format_signature: ClassVar[FormatSignature] = FormatSignature()
-    descriptions: ClassVar[Mapping[KernelBackend, str]] = {}
 
     # OOT forward registry shared by all fused ops: platform dispatch key ->
     # {op class -> forward fn}. Populated by out-of-tree platform plugins.
     _oot_forward_registry: ClassVar[Dict[str, Dict[type, Callable]]] = {}
+    _oot_compile_forward_registry: ClassVar[Dict[str, Dict[type, Callable]]] = {}
 
     @classmethod
     def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
-        """Register an OOT forward implementation for a specific op class and
-        platform. ``fn`` is bound to the instance at dispatch time (it receives
-        the op as ``self``) and takes precedence over ``forward_<platform_key>``
-        methods on that exact class."""
+        """Register a plugin forward for an exact op class and platform key.
+
+        The key may identify an in-tree or out-of-tree platform. Register before
+        the op's first call, since each instance caches its dispatch target.
+        ``fn`` receives the op instance as ``self`` and takes precedence over
+        ``forward_<platform_key>`` methods on that exact class.
+        Model compilation uses :meth:`_torch_compile_forward` unless a separate
+        OOT compile function is registered.
+        """
         cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
+
+    @classmethod
+    def register_oot_compile_forward(
+        cls, op_cls: type, fn: Callable, platform_key: str
+    ) -> None:
+        """Register an OOT function to use when compiling the model.
+
+        ``fn`` must accept the op instance as its first argument and have the
+        same signature and behavior as the eager implementation.
+        :meth:`enter_torch_compile` selects it for exactly ``op_cls`` on the
+        active OOT platform, before calling the subclass's
+        :meth:`_torch_compile_forward`. Eager registration is independent.
+
+        Dynamo traces the function's body as part of the model compilation;
+        unsupported operations still fail with ``fullgraph=True``.
+        Register before calling :meth:`enter_torch_compile`. The selected
+        function is stored on the instance until :meth:`leave_torch_compile`.
+        """
+        cls._oot_compile_forward_registry.setdefault(platform_key, {})[op_cls] = fn
 
     def __init__(self) -> None:
         super().__init__()
@@ -403,6 +428,13 @@ class BaseFusedOp(nn.Module, ABC):
         # so module-level op instances never trigger platform detection at
         # import time. Subclass __init__ may overwrite it to pin a path.
         self._forward_method: Optional[Callable] = None
+        # Store plugin functions without binding them to this instance.
+        # _forward_oot and _forward_oot_compile pass self when calling them.
+        # Dynamo may look up the current or saved forward method by name when
+        # saving compiler guards. Both methods are defined on BaseFusedOp, so
+        # these lookups work without adding plugin function names to the class.
+        self._resolved_oot_forward: Optional[Callable] = None
+        self._resolved_oot_compile_forward: Optional[Callable] = None
         # torch.compile mode bookkeeping (see enter/leave_torch_compile).
         self._original_forward_method: Optional[Callable] = None
         self.is_torch_compile = False
@@ -440,8 +472,20 @@ class BaseFusedOp(nn.Module, ABC):
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no cute_dsl backend")
 
+    def forward_flydsl(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no flydsl backend")
+
+    def forward_helion(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no helion backend")
+
     def forward_kda(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no KDA backend")
+
+    def forward_cake(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no Cake backend")
+
+    def forward_plugin(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no plugin backend")
 
     def forward_flashinfer(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flashinfer backend")
@@ -479,10 +523,12 @@ class BaseFusedOp(nn.Module, ABC):
 
         The base implementation checks the backend's
         :class:`CapabilityRequirement` set (OR semantics) against the detected
-        platform. Subclasses may extend it with per-call shape/dtype gates so
-        auto-selection bounces to the next backend instead of raising;
-        overriding this method switches backend auto-selection from a cached
-        static choice to per-call resolution.
+        platform. Subclasses may extend it with per-call gates for operands the
+        kernel does not cover, where the next backend computes the same result;
+        operands that violate the op's contract are a caller bug the backend's
+        launcher must raise on, not a reason to bounce. Overriding this method
+        switches backend auto-selection from a cached static choice to per-call
+        resolution.
         """
         return capabilities_satisfied(
             self.capabilities.get(backend, frozenset()), _platform()
@@ -541,12 +587,20 @@ class BaseFusedOp(nn.Module, ABC):
 
     def _resolve_forward_method(self) -> Callable:
         """Resolve dispatch steps 3-6 (see module docstring) to one callable."""
-        # 3) OOT platform override.
+        # 3) Plugin override, including plugins serving an in-tree identity.
         oot_key = _oot_dispatch_key()
+        platform_key = oot_key if oot_key is not None else _platform_key()
+        registered = self._oot_forward_registry.get(platform_key, {}).get(type(self))
+        if registered is not None:
+            # A registered method may belong to another instance. Extract
+            # its function so this op is passed as self when it is called.
+            self._resolved_oot_forward = (
+                registered.__func__
+                if isinstance(registered, types.MethodType)
+                else registered
+            )
+            return self._forward_oot
         if oot_key is not None:
-            registered = self._oot_forward_registry.get(oot_key, {}).get(type(self))
-            if registered is not None:
-                return registered.__get__(self)
             method = self._platform_method(oot_key)
             if method is not None:
                 return method
@@ -567,25 +621,36 @@ class BaseFusedOp(nn.Module, ABC):
                     return getattr(self, BACKEND_METHODS[backend])
 
         # 5) Platform-specific forward; 6) native fallback.
-        method = self._platform_method(_platform_key())
+        method = self._platform_method(platform_key)
         return method if method is not None else self.forward_native
+
+    def _forward_oot(self, *args, **kwargs):
+        """Call the selected eager OOT function, passing this op as self."""
+        return self._resolved_oot_forward(self, *args, **kwargs)
 
     def _forward_backend_dynamic(self, *args, **kwargs):
         """Per-call backend selection for ops with input-dependent gates."""
         for backend in self._dynamic_backend_candidates:
             if self.backend_eligible(backend, *args, **kwargs):
-                return getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
+                result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
+                if _trace_enabled:
+                    _record_trace(self, backend.value, args, kwargs)
+                return result
         method = self._platform_method(_platform_key())
-        return (method or self.forward_native)(*args, **kwargs)
-
-    def dispatch_forward(self) -> Callable:
-        """The static dispatch target for this op on the current platform."""
-        return self._resolve_forward_method()
+        method = method or self.forward_native
+        result = method(*args, **kwargs)
+        if _trace_enabled:
+            _record_trace(self, _dispatch_label(method), args, kwargs)
+        return result
 
     # --- torch.compile mode ---
 
+    def _forward_oot_compile(self, *args, **kwargs):
+        """Call the selected OOT compile function, passing this op as self."""
+        return self._resolved_oot_compile_forward(self, *args, **kwargs)
+
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
-        """The forward to use while the outer model is under ``torch.compile``.
+        """Compile forward when no OOT compile implementation is registered.
 
         Returning ``None`` keeps the current dispatch (used by the TopK /
         FusedMoE overrides, whose optimized paths stay active for
@@ -610,7 +675,21 @@ class BaseFusedOp(nn.Module, ABC):
         # _resolve_forward_method().
         get_fused_op_backend()
         self._original_forward_method = self._forward_method
-        compile_forward = self._torch_compile_forward(num_tokens=num_tokens)
+        oot_key = _oot_dispatch_key()
+        registered = (
+            self._oot_compile_forward_registry.get(oot_key, {}).get(type(self))
+            if oot_key is not None
+            else None
+        )
+        if registered is not None:
+            self._resolved_oot_compile_forward = (
+                registered.__func__
+                if isinstance(registered, types.MethodType)
+                else registered
+            )
+            compile_forward = self._forward_oot_compile
+        else:
+            compile_forward = self._torch_compile_forward(num_tokens=num_tokens)
         if compile_forward is not None:
             self._forward_method = compile_forward
         elif self._forward_method is None:
@@ -623,6 +702,7 @@ class BaseFusedOp(nn.Module, ABC):
             return
         self._forward_method = self._original_forward_method
         self._original_forward_method = None
+        self._resolved_oot_compile_forward = None
         self.is_torch_compile = False
 
     # --- dispatch ---
@@ -661,7 +741,10 @@ class BaseFusedOp(nn.Module, ABC):
         if method is None:
             method = self._forward_method = self._resolve_forward_method()
         result = method(*args, **kwargs)
-        if _trace_enabled:
+        if _trace_enabled and (
+            getattr(method, "__func__", None)
+            is not BaseFusedOp._forward_backend_dynamic
+        ):
             _record_trace(self, _dispatch_label(method), args, kwargs)
         return result
 
@@ -673,7 +756,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
     ``KernelSpec.load()`` can lazily resolve e.g.
     ``"<module>:<attr>.forward_aot"`` to the bound backend method. Returns
     ``instance`` so group packages can write
-    ``_RMSNORM = register_fused_op(_RMSNormOp(), __name__, "_RMSNORM")``.
+    ``_SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")``.
     """
     for backend in instance.available_backends():
         register_kernel(
@@ -682,8 +765,6 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
                 backend=backend,
                 target=f"{module}:{attr}.{BACKEND_METHODS[backend]}",
                 capabilities=frozenset(instance.capabilities.get(backend, ())),
-                format_signature=instance.format_signature,
-                description=instance.descriptions.get(backend, ""),
             )
         )
     return instance

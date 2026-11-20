@@ -451,5 +451,50 @@ class TestGmmV2LhsScalePerRow(
         )
 
 
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestGmmV2ThreeDScales(unittest.TestCase):
+    """Block scales given 3-D [G, blocks, N] must give the 4-D [G, blocks, 1, N] result bit
+    for bit. Regression: Muse EP prefill passes its experts' 3-D scales as they are; when
+    gmm_v2 took only 4-D, the program reshaped them in-line and served GSM8K fell from 0.95
+    to about 0.47."""
+
+    def test_fp4_block256_3d_scales(self):
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+
+        # prefill/spep's expert call: a leading receive-padding group behind group_offset 1,
+        # per-row e4m3 lhs, bf16 block-256 scales
+        num_groups, pad, batch_size, in_size, out_size = 4, 16, 1024, 512, 1024
+        key_l, key_r, key_s = jax.random.split(jax.random.key(0), 3)
+        lhs = jax.random.uniform(key_l, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.normal(
+            key_r, (num_groups, in_size, out_size), jnp.float32
+        ).astype(jnp.float4_e2m1fn)
+        scale_3d = jax.random.uniform(
+            key_s, (num_groups, in_size // 256, out_size), jnp.float32, 0.005, 0.02
+        ).astype(jnp.bfloat16)
+        per_group = (batch_size - pad) // num_groups
+        group_sizes = jnp.array([pad] + [per_group] * num_groups, jnp.int32)
+
+        def run(scale):
+            return gmm_v2(
+                lhs,
+                rhs,
+                group_sizes,
+                rhs_scale=scale,
+                group_offset=jnp.ones((1,), jnp.int32),
+                zero_initialize=False,
+                preferred_element_type=jnp.bfloat16,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+                maybe_quantize_lhs=True,
+                lhs_scale_per_row=True,
+                tile_info=TileSizes(64, in_size, out_size // 2),
+            )
+
+        rows = slice(pad, pad + per_group * num_groups)
+        y3 = run(scale_3d)[rows]
+        y4 = run(scale_3d[:, :, None, :])[rows]
+        self.assertTrue(bool(jnp.array_equal(y3, y4)), "3-D scales differ from 4-D")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,12 +11,9 @@ from torch_tpu._internal import execution_mode
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule, mm_utils
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu import mm_embed_tpu
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
@@ -85,8 +82,12 @@ class TestDeviceEncoderScatter(unittest.TestCase):
                 item.set_hash(key)
             else:
                 item = MultimodalDataItem(
-                    modality=modality, hash=key, pad_value=key, offsets=[(start, end)]
+                    modality=modality, hash=key, offsets=[(start, end)]
                 )
+                # MultimodalInputs.from_dict derives the pad sentinels before the
+                # prompt is padded; the embedding cache lookup would otherwise
+                # derive them mid-prefill, after the tokens were built.
+                item.set_pad_value()
             items.append(item)
             width = 12 if modality == Modality.IMAGE else 4
             sources[key] = (
@@ -162,7 +163,7 @@ class TestDeviceEncoderScatter(unittest.TestCase):
                 self.assertEqual(image_encoder.call_count, 2 if chunk_size < 20 else 1)
                 self.assertEqual(audio_encoder.call_count, 1)
                 for item in items:
-                    cached = cache.get_single(item.hash)
+                    cached = cache.get_single(item.cache_key)
                     self.assertIsNotNone(cached)
                     self.assertEqual(cached.embedding.device.type, encoder_device)
                     self.assertEqual(cached.embedding.dtype, sources[item.hash].dtype)

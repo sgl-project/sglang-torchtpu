@@ -16,10 +16,10 @@ __all__ = [
     "register_npu_ci",
     "register_tpu_ci",
     "register_xpu_ci",
-    "register_musa_ci",
     "register_mlx_ci",
     "register_mps_ci",
     "register_ppu_ci",
+    "register_mlu_ci",
     "ut_parse_one_file",
 ]
 
@@ -43,6 +43,7 @@ class HWBackend(Enum):
     MLX = auto()
     MPS = auto()
     PPU = auto()
+    MLU = auto()
 
 
 @dataclass
@@ -210,6 +211,19 @@ def register_mps_ci(
     return None
 
 
+def register_mlu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MLU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
@@ -218,10 +232,10 @@ REGISTER_MAPPING = {
     "register_npu_ci": HWBackend.NPU,
     "register_xpu_ci": HWBackend.XPU,
     "register_tpu_ci": HWBackend.TPU,
-    "register_musa_ci": HWBackend.MUSA,
     "register_mlx_ci": HWBackend.MLX,
     "register_mps_ci": HWBackend.MPS,
     "register_ppu_ci": HWBackend.PPU,
+    "register_mlu_ci": HWBackend.MLU,
 }
 
 

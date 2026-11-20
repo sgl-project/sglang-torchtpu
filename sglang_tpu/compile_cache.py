@@ -216,9 +216,10 @@ def kernel_source_roots(
     if package_root is None:
         package_root = Path(__file__).resolve().parent
     if srt_root is None:
-        import sglang
+        from sglang.srt import environ
 
-        srt_root = Path(sglang.__file__).resolve().parent / "srt"
+        # `sglang` can resolve as a namespace package, which has no __file__.
+        srt_root = Path(environ.__file__).resolve().parent
     return (
         ("sglang_tpu", package_root, (".",)),
         ("sglang/srt", srt_root, TPU_KERNEL_CORE_FILES),

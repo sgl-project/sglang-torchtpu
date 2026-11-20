@@ -63,6 +63,10 @@ def node_fanout_enabled() -> bool:
         reason = "requires tp_size to be divisible by nnodes"
     elif parallel.attn_dp_enabled:
         reason = "does not support DP attention"
+    elif parallel.num_dp_ranks > 1:
+        # TODO: size fan-out on a replica's nodes, create its groups members-only,
+        # and keep tensors inline for leaders off the tokenizer's node.
+        reason = "does not support DP replicas"
     elif get_serving().skip_tokenizer_init:
         reason = "requires tokenizer initialization"
     else:

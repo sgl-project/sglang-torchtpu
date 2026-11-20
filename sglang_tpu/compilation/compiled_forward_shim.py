@@ -26,7 +26,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import ceil_align, next_power_of_2, print_warning_once
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.log_utils import print_warning_once
+from sglang.srt.utils.triton_utils import next_power_of_2
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
@@ -49,6 +51,7 @@ from sglang_tpu.cp_forward import (
     pinned_extend_seq_lens_cpu,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.host_upload import upload
 
 if TYPE_CHECKING:
@@ -697,16 +700,38 @@ def _pad_batch_fields(
     (context-parallel batches present their local rows to the graph instead);
     ``real_b`` is the live request count the CPU mirrors must cover.
     """
-    if pad_t is not None:
-        _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
-
+    # Uploads first: they stay out of the deferred padding program below.
     _pad_mamba_tracking(forward_batch, pad_b)
-    for field in _BS_FIELDS:
-        if field in _MAMBA_TRACK_FIELDS:
-            continue
-        val = getattr(forward_batch, field, None)
-        if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
-            setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
+    # The pads of the device fields run as one program, not one per field
+    # (fused_eager.py: a decode step's eager ops between two graphs must stay
+    # under PJRT's 32 executions in flight). Only modes with a fixed token count
+    # per request fuse: a fused program is keyed by every field's live shape, and
+    # prompt lengths would make one per combination, which warm-up cannot cover.
+    mode = forward_batch.forward_mode
+    fuse = (
+        mode.is_decode()
+        or mode.is_idle()
+        or mode.is_target_verify()
+        or mode.is_draft_extend_v2()
+    )
+    with fused_eager_ops(fuse) as fused:
+        if pad_t is not None:
+            _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
+        for field in _BS_FIELDS:
+            if field in _MAMBA_TRACK_FIELDS:
+                continue
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
+                setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
+    if fused:
+        spec_info = forward_batch.spec_info
+        submit(
+            (
+                *(getattr(forward_batch, field, None) for field in _TOKEN_FIELDS),
+                *(getattr(forward_batch, field, None) for field in _BS_FIELDS),
+                getattr(spec_info, "hidden_states", None),
+            )
+        )
 
     # Normalize tensor/None values to padded lists so every extend batch
     # presents the same type to the compiled graph (the precompile dummy uses
@@ -948,18 +973,22 @@ class CompiledForwardShim:
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
-        # Read once: the flag decides which extend variant warmup compiled, so
-        # it is frozen for this shim's lifetime. Caching it also keeps the
-        # disabled path at a single attribute read per forward.
-        self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
-        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
-        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
-        self._logit_rows_enabled = logit_rows_enabled()
         runner = policy.model_runner
         # Draft models read the multimodal embeds inside their forward.
         self._draft_worker = bool(
             runner is not None and getattr(runner, "is_draft_worker", False)
         )
+        # Read once: the flag decides which extend variant warmup compiled, so
+        # it is frozen for this shim's lifetime. Caching it also keeps the
+        # disabled path at a single attribute read per forward. A draft never
+        # serves input logprobs, and its prompt extend is warmed and consumed
+        # as LAST capture (one row per request), so it keeps the flag off.
+        self._prompt_logprob_enabled = (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get() and not self._draft_worker
+        )
+        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
+        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
+        self._logit_rows_enabled = logit_rows_enabled()
         # Prefill context parallelism: above 1, extend batches present their
         # local zigzag rows to the graph and a batch-independent
         # extend_seq_lens_cpu (see __call__).

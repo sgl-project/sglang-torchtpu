@@ -25,7 +25,7 @@ class TestNodeNormalization(unittest.TestCase):
     def test_reversed_hostnames_produce_the_same_launch_plan(self):
         import torch.distributed as dist
 
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import ServerArgs
         from sglang_tpu import node_normalization as normalization
 

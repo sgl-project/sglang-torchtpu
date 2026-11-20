@@ -180,7 +180,6 @@ VOLATILE_SERVER_ARGS = frozenset(
         "remote_instance_weight_loader_seed_instance_ip",
         "remote_instance_weight_loader_seed_instance_service_port",
         "remote_instance_weight_loader_send_weights_group_ports",
-        "smg_http_sidecar_port",
         "torch_tpu_slicebuilder_addresses",
         "tpu_worker_hostnames",
         "weight_cache_socket",

@@ -15,14 +15,12 @@ maybe_stub_sgl_kernel()
 
 import torch  # noqa: E402
 
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang_tpu.pp_wave import PPWave  # noqa: E402
 
@@ -158,17 +156,24 @@ def stage(fabric, rank, mode, schedule):
     processed = []
     scheduler.disaggregation_mode = mode
     scheduler.waiting_queue = []
-    scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_transfer_queue = []
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
     scheduler.device_module = Mock()
+    scheduler.token_to_kv_pool_allocator = Mock()
     scheduler.forward_stream_ctx = nullcontext()
     scheduler.copy_stream_ctx = nullcontext()
     scheduler.use_overlap_streams = False
     scheduler.enable_staging = False
     scheduler.process_pending_chunked_abort = Mock()
     scheduler.process_prefill_chunk = Mock()
+    scheduler.increment_scheduler_iterations = Mock()
+    scheduler.pause_state = SimpleNamespace(may_launch=lambda: True)
+    scheduler.invariant_checker = Mock()
+    scheduler._apply_war_barrier = Mock()
+    scheduler._flush_staging_scatters = Mock()
+    scheduler._on_step_processed = Mock()
     scheduler.dp_attn_adapter = SimpleNamespace(
         maybe_prepare_mlp_sync_batch=lambda x: x
     )
@@ -199,7 +204,7 @@ def stage(fabric, rank, mode, schedule):
     scheduler.pp_group.send_object = send_consensus
     scheduler.pp_group.recv_object = recv_consensus
 
-    def receive_requests():
+    def receive_requests(**kwargs):
         if fabric.stop.is_set():
             raise Stopped
         step[0] += 1
@@ -221,7 +226,6 @@ def stage(fabric, rank, mode, schedule):
         return get
 
     scheduler._pp_pd_stage_ready = Mock()
-    scheduler._pp_pd_get_bootstrapped_ids = votes("bootstrap")
     scheduler._pp_pd_get_prefill_transferred_ids = votes("transfer")
     scheduler._pp_pd_get_retract_ids = votes("retract")
     scheduler._pp_pd_get_prealloc_ids = votes("prealloc")
@@ -234,8 +238,9 @@ def stage(fabric, rank, mode, schedule):
 
         return process
 
-    scheduler.process_bootstrapped_queue = released("bootstrap")
-    scheduler.process_disagg_prefill_inflight_queue = released("transfer")
+    # Bootstrap admission takes no cross-stage vote.
+    scheduler.process_bootstrapped_queue = Mock()
+    scheduler.process_disagg_prefill_transfer_queue = released("transfer")
     scheduler.process_retract_queue = released("retract")
     scheduler.process_prealloc_queue = released("prealloc")
     scheduler.process_decode_transfer_queue = released("transfer")
@@ -349,6 +354,9 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
 
                 stage_parallel = threading.local()
                 with (
+                    # The PP loop fences on torch.accelerator.current_stream();
+                    # CPU CI has no accelerator, so stub it like device_module.
+                    patch.object(torch.accelerator, "current_stream"),
                     patch.object(scheduler_pp_mixin, "_is_tpu", True),
                     patch.object(
                         scheduler_pp_mixin,

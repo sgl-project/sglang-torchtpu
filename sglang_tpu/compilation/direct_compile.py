@@ -7,10 +7,11 @@ import inspect
 import logging
 import pickle
 import time
+import types
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Protocol
 
@@ -878,6 +879,7 @@ class CompiledFunction:
                 self._kv_pool.set_state(kv_pool_trace_inputs)
                 stack.callback(self._kv_pool.set_state, previous_state)
             trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
+            stack.enter_context(_trace_forward_context(call, trace_arguments))
             with _collect_callbacks() as inserted_callbacks:
                 outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
             if rng_device is not None:
@@ -1426,6 +1428,55 @@ def _interface_mismatch(
             _argument_layouts(selected),
         )
     return None
+
+
+@contextmanager
+def _trace_forward_context(call: Any, trace_call: Any) -> Iterator[None]:
+    """Point the published MoE padded-row bound at the traced ForwardBatch.
+
+    The serving forward context binds ``moe_num_token_non_padded`` to the live
+    batch, whose tensors are runtime values, not graph inputs. Tracing through
+    that getter would capture the live tensor as an argument the executable is
+    never given. Rebind it to the reconstructed batch, so the bound comes from
+    the same placeholder leaf that serving later feeds from its own batch.
+    """
+    from sglang.srt.model_executor.forward_context import (
+        forward_context,
+        get_forward_context,
+        has_forward_context,
+    )
+
+    getter = (
+        get_forward_context().moe_num_token_non_padded
+        if has_forward_context()
+        else None
+    )
+    owner = getattr(getter, "__self__", None)
+    if not isinstance(owner, ForwardBatch):
+        yield
+        return
+
+    def is_batch(value: Any) -> bool:
+        return isinstance(value, ForwardBatch)
+
+    live = tree_util.tree_leaves(call, is_leaf=is_batch)
+    traced = tree_util.tree_leaves(trace_call, is_leaf=is_batch)
+    pairs = [(a, b) for a, b in zip(live, traced, strict=True) if is_batch(a)]
+    match = [b for a, b in pairs if a is owner]
+    if not match and len(pairs) == 1:
+        # precompile/warmup_async may hand _compile a tree_map copy of the batch.
+        match = [pairs[0][1]]
+    if not match:
+        # Otherwise leave it; tracing then fails loudly on the captured tensor
+        # rather than masking with another batch's bound.
+        yield
+        return
+    ctx = replace(
+        get_forward_context(),
+        moe_num_token_non_padded=types.MethodType(getter.__func__, match[0]),
+    )
+    with forward_context(ctx):
+        yield
 
 
 def _tensor_version(tensor: torch.Tensor) -> int | None:

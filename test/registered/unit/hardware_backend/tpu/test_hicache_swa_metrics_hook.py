@@ -10,17 +10,21 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 from sglang_tpu.hooks import HOOKS, hicache_swa_metrics
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _build_host_pair(page_size: int = 4):
-    bundle = init_unified_swa_pools(
+    setup_allocator_context()
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=2,
@@ -43,7 +47,7 @@ def _build_host_pair(page_size: int = 4):
     # The host pool keeps a fixed RAM reserve; low-memory CI runners fall below it.
     with host_memory_budget_scope(1 << 40):
         return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
-            device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+            device_pools=tuple(map(pool.layer_router.view, ("full", "swa"))),
             host_to_device_ratio=1.0,
             host_size=0,
             page_size=pool.page_size,

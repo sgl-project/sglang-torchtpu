@@ -548,15 +548,20 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                 )
 
     def _check_prefill_tiles(self, variants):
-        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows) variant."""
+        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows,
+        (k_scale, v_scale)) variant."""
         import jax
 
         from sglang_tpu.envs import envs as tpu_envs
 
-        for env, windows in variants:
+        for env, windows, (k_scale, v_scale) in variants:
             for sliding_window in windows:
                 with (
-                    self.subTest(env=env, sliding_window=sliding_window),
+                    self.subTest(
+                        env=env,
+                        sliding_window=sliding_window,
+                        kv_scales=(k_scale, v_scale),
+                    ),
                     unittest.mock.patch.dict(os.environ, env),
                 ):
                     # The wrapper reads the flags while tracing; drop cached traces.
@@ -566,38 +571,43 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                         seqs=self.EXTEND_SEQS,
                         padded_tokens=self.EXTEND_TOKENS,
                         kv_dtype_name="float8_e4m3fn",
-                        k_scale=1.0,
-                        v_scale=1.0,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
                         sliding_window=sliding_window,
                         seq_along_lane=True,
                     )
         jax.clear_caches()
 
     def test_seq_along_lane_softmax_variants(self):
-        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone."""
+        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone.
+
+        Ones-in-V also runs with a v scale other than 1, which must scale the output
+        but not the row sums riding in the accumulator."""
         # Each variant recompiles; the combination is covered by the transposed test.
         self._check_prefill_tiles(
             (
-                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,)),
-                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,)),
-                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,)),
+                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (0.5, 0.25)),
+                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,), (1.0, 1.0)),
             )
         )
 
     def test_seq_along_lane_transposed(self):
-        """The transposed prefill tile (scores^T, split fp8 q), alone and with every other tile."""
+        """The transposed prefill tile (scores^T, split fp8 q), alone, with every other
+        tile, and with KV scales other than 1, which it must apply. The sequences end in
+        partial q blocks, whose padded compute blocks the tile skips."""
+        all_tiles = {
+            "SGLANG_TPU_RPA_TRANSPOSED": "1",
+            "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+            "SGLANG_TPU_RPA_ONES_V": "1",
+        }
         self._check_prefill_tiles(
             (
-                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,)),
-                (
-                    {
-                        "SGLANG_TPU_RPA_TRANSPOSED": "1",
-                        "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
-                        "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
-                        "SGLANG_TPU_RPA_ONES_V": "1",
-                    },
-                    (None, 128),
-                ),
+                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,), (1.0, 1.0)),
+                (all_tiles, (None, 128), (1.0, 1.0)),
+                (all_tiles, (None,), (0.5, 0.25)),
             )
         )
 

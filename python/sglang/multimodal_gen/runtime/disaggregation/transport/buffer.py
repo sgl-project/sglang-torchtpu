@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -23,9 +23,6 @@ class SlotHandle:
     request_id: str
     offset: int  # byte offset in the pool
     size: int  # allocated size in bytes
-    tensor_views: dict[str, torch.Tensor | list[torch.Tensor]] = field(
-        default_factory=dict
-    )
 
 
 class TransferTensorBuffer:
@@ -176,7 +173,7 @@ class TransferTensorBuffer:
 
         # Ensure copy stream sees all prior compute kernels
         if stream is not None:
-            stream.wait_stream(torch.get_device_module().current_stream())
+            stream.wait_stream(torch.accelerator.current_stream())
 
         for name, value in tensors.items():
             if value is None:

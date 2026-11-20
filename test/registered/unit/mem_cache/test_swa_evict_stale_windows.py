@@ -9,10 +9,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from swa_cache_world import cpu_ci_tree_core_selection
+from swa_cache_world import SWA_POOL, cpu_ci_tree_core_selection
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -21,15 +22,14 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.tree_slots import tree_slots_of
 
 # A 2047-token window on 512-token pages, scaled 1/32: a window spans 4 pages.
 PAGE, WINDOW = 16, 63
@@ -74,7 +74,9 @@ class PrefillWorld:
                 page_size=PAGE,
                 disable=False,
                 sliding_window_size=WINDOW,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=WINDOW
+                ),
                 eviction_policy="lru",
             )
         )
@@ -116,16 +118,18 @@ class PrefillWorld:
         self.rid += 1
         self.req_to_token_pool.alloc([req])
         req.init_next_round_input(tree_cache=self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        cached = len(req.prefix_indices)
+        req.lock = self.cache.lock(req.last_node)
+        cached = req.prefix_len
         row = req.kv.req_pool_idx
         if cached:
-            self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
+            self.req_to_token_pool.write(
+                (row, slice(0, cached)), self.cache.prefix_device_indices(req)
+            )
         req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
         pos = cached
         while pos < len(tokens):
             end = min(pos + chunk, len(tokens))
-            req.set_extend_range(pos, end)
+            req.prefix_len, req.extend_end = pos, end
             self.req_to_token_pool.write((row, slice(pos, end)), self._alloc(end - pos))
             req.kv.kv_committed_len = req.kv.kv_allocated_len = end
             pos = end
@@ -148,7 +152,7 @@ class PrefillWorld:
             req.output_ids.extend([output + 1] * (decode - 1))
             req.kv.kv_committed_len = req.kv.kv_allocated_len = n + decode
         req.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(req, self.cache)
+        release_kv_cache(req, self.cache, checkpoint=True)
         return cached
 
     def match(self, tokens: list[int]):
@@ -243,7 +247,7 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
             )
 
     def _evict_swa(self, w: PrefillWorld, num_tokens: int) -> None:
-        w.cache.evict(EvictParams(num_tokens=0, swa_num_tokens=num_tokens))
+        w.cache.evict(EvictParams(window_num_tokens={SWA_POOL: num_tokens}))
 
     def test_other_conversation_tail_keeps_its_place(self):
         """A leaf beside the path holding another conversation's prompt is not an
@@ -407,6 +411,7 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
                 swa,
                 device_frees={ct: []},
                 host_frees={ct: []},
+                cache_actions=[],
                 target=EvictLayer.DEVICE,
             )
 
@@ -460,10 +465,12 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         keep = 6 * (WINDOW + 1)  # two windows per tail plus the shared window
         w.cache.evict(
             EvictParams(
-                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
+                window_num_tokens={
+                    SWA_POOL: w.cache.window_evictable_size(SWA_POOL) - keep
+                }
             )
         )
-        self.assertEqual(len(w.match(shared + _tokens(10, 200)).device_indices), 160)
+        self.assertEqual(w.match(shared + _tokens(10, 200)).device_prefix_len, 160)
         w.cache.sanity_check()
 
 
@@ -501,10 +508,12 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
         keep = 4 * (WINDOW + 1)
         w.cache.evict(
             EvictParams(
-                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
+                window_num_tokens={
+                    SWA_POOL: w.cache.window_evictable_size(SWA_POOL) - keep
+                }
             )
         )
-        hit = len(w.match(media + _tokens(3, 200)).device_indices)
+        hit = w.match(media + _tokens(3, 200)).device_prefix_len
         w.cache.sanity_check()
         return hit
 
@@ -581,10 +590,12 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
         keep = 6 * (WINDOW + 1)
         w.cache.evict(
             EvictParams(
-                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
+                window_num_tokens={
+                    SWA_POOL: w.cache.window_evictable_size(SWA_POOL) - keep
+                }
             )
         )
-        self.assertEqual(len(w.match(shared + _tokens(10, 200)).device_indices), 160)
+        self.assertEqual(w.match(shared + _tokens(10, 200)).device_prefix_len, 160)
         w.cache.sanity_check()
 
 

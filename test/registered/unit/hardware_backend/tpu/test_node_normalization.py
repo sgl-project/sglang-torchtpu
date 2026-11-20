@@ -97,6 +97,8 @@ class TestNodeNormalization(unittest.TestCase):
         )
         with (
             patch.object(sys, "path", ["/first", "", "/second"]),
+            # A launcher's distributed env must not reach the local probe.
+            patch.dict(os.environ, {"WORLD_SIZE": "128", "RANK": "3"}),
             patch("subprocess.run", return_value=completed) as run,
         ):
             coords = normalization._query_local_device_coords(timeout=15)
@@ -117,6 +119,8 @@ class TestNodeNormalization(unittest.TestCase):
             os.pathsep.join(["/first", "/second"]),
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 15)
+        self.assertNotIn("WORLD_SIZE", run.call_args.kwargs["env"])
+        self.assertNotIn("RANK", run.call_args.kwargs["env"])
 
         with (
             patch(
@@ -285,7 +289,7 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         )
 
     def test_automatic_launch_declares_ranks_once_and_dp_ports_follow(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import PortArgs
 
         # Attention DP is declared by width now; the deprecated flag alone
@@ -317,6 +321,32 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         with patch("sglang.srt.arg_groups.overrides.declare_resolution") as declare:
             normalization.prepare_tpu_environment(self.server_args)
         declare.assert_not_called()
+
+    def test_dp_replicas_get_the_hosts_of_their_box(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            nnodes=4,
+            node_rank=1,
+            dp_size=2,
+            tp_size=16,
+            dist_init_addr="h0:29500",
+        )
+        self.resolve.return_value = [0, 1, 2, 3]
+        environment = {
+            "TPU_WORKER_HOSTNAMES": "h0,h1,h2,h3",
+            "TORCH_TPU_TOPOLOGY": "4,4,1,2",
+            "SGLANG_TPU_DP_REPLICA_SHAPE": "2x4x1",
+        }
+        with patch.dict(os.environ, environment):
+            normalization.prepare_tpu_environment(server_args)
+        cfg = resolving_view(server_args)
+        # Replica 0 runs on h0 and h2, replica 1 on h1 and h3.
+        self.assertEqual(cfg.tpu_worker_hostnames, "h0,h2,h1,h3")
+        self.assertEqual(cfg.node_rank, 2)
 
     def test_cli_flag_defaults_on_and_opt_out_preserves_existing_inputs(self):
         from sglang.srt.server_args import ServerArgs

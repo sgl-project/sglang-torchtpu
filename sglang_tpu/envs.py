@@ -28,6 +28,9 @@ EnvField._allow_set_name = True
 class TpuEnvs:
     # Parent-selected rendezvous port for the host-wide DP replica process group.
     SGLANG_TPU_DP_SESSION_PORT = EnvInt(None)
+    # Chip box (XxYxZ) of each --dp-size replica of a multi-host launch, e.g. 2x2x4 for
+    # one replica per z column of a 4x4x4 (node_normalization.order_hosts_by_replica).
+    SGLANG_TPU_DP_REPLICA_SHAPE = EnvStr(None)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
@@ -269,6 +272,9 @@ class TpuEnvs:
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
     SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
+    # Multiplier applied to max_running_requests * sliding_window when sizing the
+    # compact SWA draft KV pool on TpuUnifiedSWAKVPool under hierarchical cache.
+    SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER = EnvFloat(4.0)
 
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
@@ -315,6 +321,10 @@ class TpuEnvs:
     # same set of indices, but their order (and so the sparse-MLA summation order
     # downstream) can differ from the partitioned path.
     SGLANG_TPU_SCTOPK_SHORT_ROWS = EnvBool(True)
+    # Expert-TP fused-RS as a two-level reduce-scatter: the two cores of a chip add their
+    # partials on-chip, then send one chip sum per row to another chip's owner, halving
+    # off-chip bytes (one extra bf16 rounding).
+    SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL = EnvBool(False)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
@@ -394,6 +404,10 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+    # Separate copy-ahead token budget for the SWA eviction order under write_back
+    # (independent of the Full leaf window when set). Unset: 131072 on the unified
+    # KV pool, else 1/4 of SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS.
+    SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS = EnvInt(None)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.
@@ -482,6 +496,9 @@ class TpuEnvs:
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE under EP, off the dense permute, with the SparseCore gather and combine:
+    # route on local expert ids (counting sort) and gather only this rank's rows.
+    SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, the permute is dense below this many tokens per
@@ -523,6 +540,11 @@ class TpuEnvs:
     # Share one page pool between full-attention and sliding-window KV on TPU
     # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
     SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
+    # Cap SWA resident host usage at this share of the TPU unified HiCache host
+    # arena and reclaim Full KV before SWA below the cap (<= 0 disables the
+    # policy and restores request-order reclaim; >= 1 disables the cap while
+    # keeping Full-first reclaim).
+    SGLANG_TPU_UNIFIED_HICACHE_SWA_SHARE = EnvFloat(0.3)
 
     # Sampling
     # Keep the repetition-penalty state padded to the power-of-two logits row
@@ -626,7 +648,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
-    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
+    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded) |
+    # mixed (gather up to 128 rows, a2a above).
     SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
     # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
     # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.

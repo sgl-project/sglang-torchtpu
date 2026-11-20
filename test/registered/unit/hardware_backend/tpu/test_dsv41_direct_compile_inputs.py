@@ -101,6 +101,22 @@ class TestCarryEngram(CustomTestCase):
         self.assertIsInstance(metadata.engram[1], tuple)
         self.assertIs(metadata.engram[1][0][0], rows[0][0])
 
+    def test_puts_packed_staged_tensors_on_the_metadata_without_unbinding(self):
+        ids = torch.zeros(4, 2, 2, dtype=torch.int32)
+        packed0 = torch.zeros(16, dtype=torch.int32)
+        packed1 = torch.ones(16, dtype=torch.int32)
+        batch = SimpleNamespace(
+            tpu_engram_local_ids=ids, tpu_engram_staged=[packed0, packed1]
+        )
+        metadata = SimpleNamespace(engram=None)
+        out, calls = self._call(batch, metadata)
+        self.assertEqual(out, "out")
+        self.assertEqual(calls, [("ids", "pos", batch, "extra")])
+        self.assertIs(metadata.engram[0], ids)
+        self.assertEqual(len(metadata.engram[1]), 2)
+        self.assertIs(metadata.engram[1][0], packed0)
+        self.assertIs(metadata.engram[1][1], packed1)
+
     def test_needs_built_metadata(self):
         ids, rows = _staged()
         batch = SimpleNamespace(tpu_engram_local_ids=ids, tpu_engram_staged=rows)
