@@ -15,6 +15,7 @@ import torch
 import torch._dynamo
 from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
+from sglang.srt.arg_groups.platform_hook import torch_compile_bundle_dirs
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
@@ -188,10 +189,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
         self.eager_fn = method
         # Read off the runtime context: the EPD encoder installs with no ModelRunner.
         graph_config = get_exec().graph
-        use_bundle = (
-            graph_config.unsafe_save_torch_compile_bundle is not None
-            or graph_config.unsafe_load_torch_compile_bundle is not None
-        )
+        save_bundle, load_bundle = torch_compile_bundle_dirs(graph_config)
+        use_bundle = save_bundle is not None or load_bundle is not None
         self.compiled_fn = self._compile_method(method, use_bundle=use_bundle)
         setattr(runner, self.method_name, self.compiled_fn)
 
