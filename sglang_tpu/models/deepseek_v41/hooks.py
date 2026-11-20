@@ -71,11 +71,12 @@ tpu_dsv41_engram_worker_forward
        8 scheduler processes. Core TpModelWorker.forward_batch_generation has
        no host-input preparation seam before ForwardBatch construction.
   How: AROUND TpModelWorker.forward_batch_generation captures the scheduled
-       batch's host Engram windows without waiting for step N-1's sampled token
+       batch's host Engram windows (including folded encoder SWA replay prefixes
+       and speculative extends) without waiting for step N-1's sampled token
        (overlap holes are resolved right before the compiled forward), records
-       PendingTokens after sampling, and clears per-step state in finally.
-       Unsupported modes (warmup, speculative verify, folded CED replay, beam
-       search, PP/CP/DCP > 1) fall back cleanly to host_hash_ids.
+       PendingTokens after non-speculative sampling, and clears per-step state
+       in finally. Unsupported modes (warmup, non-folded two-pass SWA replay
+       hits, beam search, PP/CP/DCP > 1) fall back cleanly.
   Upstream PR or issue: not filed (ported from sgl-project/sglang-torchtpu#2092).
   Remove when: upstream exposes a worker-level host-input preparation seam.
 
@@ -452,6 +453,15 @@ def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
     if coordinator is None:
         return original(worker, batch, *args, **kwargs)
     is_verify = bool(kwargs.get("is_verify", False))
+    spec_active = (
+        batch is not None
+        and batch.spec_algorithm is not None
+        and not batch.spec_algorithm.is_none()
+    )
+    is_dllm_fn = getattr(worker, "is_dllm", None)
+    is_dllm = bool(is_dllm_fn()) if callable(is_dllm_fn) else False
+    attn_backend = getattr(runner, "attn_backend", None)
+    kv_pool = getattr(runner, "token_to_kv_pool", None)
     prepared = (
         None
         if is_verify
@@ -461,14 +471,19 @@ def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
             enable_encoder_swa_bounded_replay=bool(
                 get_exec().features.enable_encoder_swa_bounded_replay
             ),
+            folds_encoder_swa_replay=bool(
+                getattr(attn_backend, "folds_encoder_swa_replay", False)
+            ),
+            has_request_window=getattr(kv_pool, "request_window", None) is not None,
+            is_dllm=is_dllm,
         )
     )
     try:
         result = original(worker, batch, *args, **kwargs)
-        if prepared is not None:
+        if prepared is not None and not spec_active:
             requests, positions = prepared
             coordinator.remember(requests, positions, result)
-        elif is_verify:
+        elif is_verify or spec_active:
             coordinator.pending = None
         else:
             coordinator.remember_fallback_if_applicable(batch, result)
