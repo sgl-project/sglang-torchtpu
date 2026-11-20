@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.sample.moss_image import resolve_uncond_skip_layers
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @dataclass
@@ -52,8 +53,14 @@ class MOSSImagePipelineConfig(SpatialImagePipelineConfig):
     def validate_server_args(self, server_args):
         if server_args.tp_size != 1:
             raise ValueError("MOSSImage supports sequence and CFG parallelism, not TP.")
-        if server_args.enable_torch_compile:
-            raise ValueError("MOSSImage torch.compile support has not been validated.")
+        if server_args.enable_torch_compile and not (
+            # The TPU plugin compiles the joint blocks, one program per bucket.
+            current_platform.is_tpu() and server_args.regional_compile
+        ):
+            raise ValueError(
+                "MOSSImage torch.compile support has not been validated "
+                "(on TPU: with --regional-compile)."
+            )
         if not server_args.disable_autocast:
             raise ValueError(
                 "MOSSImage requires disabled autocast to preserve reference precision."
