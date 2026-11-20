@@ -15,6 +15,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_local_torch_device,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    world_group_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -93,7 +97,9 @@ class Kandinsky6SRInputStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         tiling_scale, pre_upscale = resolve_scale_request(batch.sr_resolution_scale)
-        if batch.is_warmup:
+        # the torch.compile real-path prewarm carries no video either
+        synthetic = batch.is_warmup or batch.extra.get("server_internal_prewarm")
+        if synthetic:
             height, width = WARMUP_CLIP_HW
             clip = DecodedClip(
                 frames=synthetic_clip(
@@ -124,7 +130,7 @@ class Kandinsky6SRInputStage(PipelineStage):
         batch.num_frames = frames
         batch.height = requested_h * tiling_scale
         batch.width = requested_w * tiling_scale
-        if not batch.is_warmup:
+        if not synthetic:
             audio = extract_source_audio(
                 path,
                 sample_rate=SOURCE_AUDIO_SAMPLE_RATE,
@@ -438,6 +444,17 @@ class Kandinsky6SROutputStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         tiles = batch.extra.pop(SR_TILES_KEY)
         plan = batch.extra.pop(SR_PLAN_KEY)
+        rank = get_world_rank() if world_group_is_initialized() else 0
+        if rank and rank % max(1, server_args.num_gpus // (server_args.dp_size or 1)):
+            # only the replica's output rank returns the video; the others
+            # would stitch the same frames on the host concurrently
+            return OutputBatch(
+                audio=batch.audio,
+                audio_sample_rate=batch.audio_sample_rate,
+                fps=batch.fps,
+                metrics=batch.metrics,
+                usage=batch.usage,
+            )
         video = stitch_tiles(tiles, plan)
         del tiles
 
