@@ -144,5 +144,5 @@ def write_target_hidden_kv(
         attn = stage.self_attn
         kv, _ = attn.wkv(main_x)
         kv = apply_rope(attn.kv_norm(kv), positions, attn.freqs_cis)
-        pages = pool.get_swa_pages(attn.layer_id)
-        pages.copy_(csa2.publish_swa(pages, records, kv))
+        swa_root = pool.get_swa_root(attn.layer_id)
+        swa_root.copy_(csa2.publish_swa(swa_root, records, kv))

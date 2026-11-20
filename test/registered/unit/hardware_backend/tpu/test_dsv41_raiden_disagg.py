@@ -1455,6 +1455,71 @@ class TestDSV41RaidenDisaggregation(CustomTestCase):
         # State engine always keeps full mirrors.
         self.assertIsNone(engines[2].get("num_staging_layers"))
 
+    def test_dspark_write_target_hidden_kv_publishes_to_swa_root(self):
+        """DSpark draft SWA publish must donate/write the 256-token root, not a 64-token view."""
+        import sglang_tpu.models.deepseek_v41.ops as dsv41_ops
+        from sglang_tpu.models.deepseek_v41 import dspark
+
+        pool = _make_dsv41_pool(self, num_req_slots=4, full_pages=4, swa_pages=2)
+        stages = [
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    layer_id=layer_id,
+                    wkv=lambda x, offset=layer_id: (x + float(offset + 1), None),
+                    kv_norm=lambda x: x,
+                    freqs_cis=None,
+                )
+            )
+            for layer_id in (0, 1)
+        ]
+        model = SimpleNamespace(project_target_hidden=lambda x: x, stages=stages)
+        seen_roots = []
+        ptrs_before = [pool.get_swa_root(i).data_ptr() for i in (0, 1)]
+
+        def _fake_publish_swa(pages, records, kv):
+            self.assertIsNone(
+                pages._base, "publish_swa must receive a base root tensor, not a view"
+            )
+            self.assertEqual(pages.shape[1:], (256, 512))
+            seen_roots.append(id(pages))
+            out = pages.clone()
+            flat = out.view(-1, 512)
+            for rec, row in zip(records.tolist(), kv):
+                if rec >= 0:
+                    flat[rec] = row
+            return out
+
+        fake_csa2 = types.ModuleType("sglang_tpu.models.deepseek_v41.ops.csa2")
+        fake_csa2.publish_swa = _fake_publish_swa
+
+        main_hidden = torch.arange(3 * 512, dtype=torch.bfloat16).reshape(3, 512) / 512
+        swa_loc = torch.tensor([256, -1, 258], dtype=torch.int64)
+        positions = torch.tensor([0, 1, 2], dtype=torch.int64)
+        with (
+            patch.object(dspark, "apply_rope", side_effect=lambda x, pos, freqs: x),
+            patch.dict(
+                sys.modules,
+                {"sglang_tpu.models.deepseek_v41.ops.csa2": fake_csa2},
+            ),
+            patch.object(dsv41_ops, "csa2", fake_csa2, create=True),
+        ):
+            dspark.write_target_hidden_kv(
+                model,
+                main_hidden=main_hidden,
+                swa_loc=swa_loc,
+                positions=positions,
+                pool=pool,
+            )
+
+        self.assertEqual(seen_roots, [id(pool.get_swa_root(i)) for i in (0, 1)])
+        self.assertEqual([pool.get_swa_root(i).data_ptr() for i in (0, 1)], ptrs_before)
+        for layer_id in (0, 1):
+            view = pool.get_swa_pages(layer_id).view(-1, 512)
+            expected = main_hidden + float(layer_id + 1)
+            torch.testing.assert_close(view[256], expected[0])
+            torch.testing.assert_close(view[257], torch.zeros_like(view[257]))
+            torch.testing.assert_close(view[258], expected[2])
+
 
 if __name__ == "__main__":
     unittest.main()
