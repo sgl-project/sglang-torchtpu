@@ -24,6 +24,8 @@ from benchmark.tpu.recipe.configs.deepseek_v41_flash import CONFIG as BASE_CONFI
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(
     {
+        # Measured at this context; not yet validated at the target's 1M.
+        "context_length": 103424,
         # The draft weights are the mtp.* tensors of the target checkpoint.
         "speculative_algorithm": "DSPARK",
         # 5 draft tokens per step: the verify runs 6 rows per request.
