@@ -52,7 +52,8 @@ def flash_attention_qk_softmax(
     # With exp2 the scores carry log2e, so exp2(x) == exp(x / log2e).
     score_scale = cfgs.model.sm_scale * (LOG2E if cfgs.serve.exp2_softmax else 1.0)
     if fold_sm_scale:
-        q = q * jnp.asarray(score_scale, q.dtype)
+        # In f32: with log2e the scale is not representable in q's dtype.
+        q = (q.astype(jnp.float32) * score_scale).astype(q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -280,7 +281,13 @@ def flash_attention_pv(
     pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
 
     if cfgs.serve.scale_v is not None:
-        pv *= cfgs.serve.scale_v
+        if cfgs.serve.ones_v:
+            # The lanes above the head hold the row sums, which stay unscaled.
+            lane = lax.broadcasted_iota(jnp.int32, pv.shape, pv.ndim - 1)
+            head = lane < cfgs.aligned_kv_head_dim
+            pv = jnp.where(head, pv * cfgs.serve.scale_v, pv)
+        else:
+            pv *= cfgs.serve.scale_v
 
     o_next_list = []
     for b_idx in range(cfgs.block.batch_size):
