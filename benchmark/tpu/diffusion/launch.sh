@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Shared launcher for the diffusion recipes in this directory. Model scripts set
-# MODEL, PARALLEL_ARGS and MODEL_ARGS; each can be overridden from the
-# environment (an empty value drops the default), and extra arguments are
-# passed to the server.
+# MODEL, PARALLEL_ARGS and MODEL_ARGS (and SERVER_ARGS, the backend flags all
+# recipes share); each can be overridden from the environment (an empty value
+# drops the default), and extra arguments are passed to the server.
 set -euo pipefail
 
 export SGLANG_PLATFORM="${SGLANG_PLATFORM:-tpu}"
@@ -23,6 +23,7 @@ export LIBTPU_INIT_ARGS
 NUM_GPUS="${NUM_GPUS:-8}"
 PARALLEL_ARGS="${PARALLEL_ARGS-}"
 MODEL_ARGS="${MODEL_ARGS-}"
+SERVER_ARGS="${SERVER_ARGS---attention-backend tpu_splash_attn --enable-torch-compile --encoder-parallel fold --text-encoder-cpu-offload false}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 
@@ -32,10 +33,7 @@ exec python3 -m sglang.multimodal_gen.runtime.launch_server \
   --num-gpus "${NUM_GPUS}" \
   ${PARALLEL_ARGS} \
   ${MODEL_ARGS} \
-  --attention-backend tpu_splash_attn \
-  --enable-torch-compile \
-  --encoder-parallel fold \
-  --text-encoder-cpu-offload false \
+  ${SERVER_ARGS} \
   --host "${HOST}" \
   --port "${PORT}" \
   "$@"
