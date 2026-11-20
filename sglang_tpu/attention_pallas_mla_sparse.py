@@ -439,6 +439,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         split = _split_pool(self.token_to_kv_pool)
         self.mla_shards, self.mla_role = split.mla_shards, split.mla_role
         self._kv_shard_owned_op = None
+        self._kv_shard_bf16_merge = (
+            tpu_envs.SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE.get()
+        )
         if self.mla_shards <= 1:
             return
         from sglang_tpu.attention.pallas.mla_sparse.kernel import (
@@ -939,7 +942,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
         if self.mla_shards > 1:
             owned = self._kv_shard_owned_rows(forward_batch, q.shape[0])
-            out = self._forward_mla_kv_shard(args, topk_indices, owned=owned)
+            bf16_sum = (
+                self._kv_shard_bf16_merge
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            out = self._forward_mla_kv_shard(
+                args, topk_indices, owned=owned, bf16_sum=bf16_sum
+            )
             return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
@@ -1031,11 +1040,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         return out.view(world * rows, heads, nope)[:num_tokens]
 
     def _forward_mla_kv_shard(
-        self, args: tuple, topk_indices: torch.Tensor, owned: bool = False
+        self,
+        args: tuple,
+        topk_indices: torch.Tensor,
+        owned: bool = False,
+        bf16_sum: bool = False,
     ):
         """Attention over a latent cache sharded across the group: gather the
         group's queries, attend this rank's candidates, merge into own heads.
-        ``owned``: through the owned-rows op (_kv_shard_owned_rows)."""
+        ``owned``: through the owned-rows op (_kv_shard_owned_rows);
+        ``bf16_sum``: see merge_kv_shards."""
         from sglang_tpu.attention_pallas_mla_kv_shard import merge_kv_shards
 
         (ql_nope, q_pe, new_kv_c, new_k_pe, cache_nope, cache_rope, kv_lens,
@@ -1067,7 +1081,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self.mla_role,
             max(self._kpool, 1),
         )
-        return merge_kv_shards(out, lse, group)
+        return merge_kv_shards(out, lse, group, bf16_sum=bf16_sum)
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool

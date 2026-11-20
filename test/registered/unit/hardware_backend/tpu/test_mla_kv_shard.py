@@ -82,6 +82,39 @@ class _FakeGroup:
             out.copy_(sum(f[self.rank_in_group] for f in self.fed).unsqueeze(0))
 
 
+def _merge_inputs(shards, *, seed, tokens=37, heads=2, dim=128):
+    """Each rank's bf16 partial over all group heads and its lse (spread over
+    ~30 nats, ranks with no candidate, padding tokens); the f64 merge of those
+    partials (own heads in rank order) and its per-element sum of |terms|."""
+    rng = np.random.default_rng(seed)
+    group_heads = shards * heads
+    out = rng.normal(size=(shards, tokens, group_heads, dim)).astype(np.float32)
+    out = torch.from_numpy(out).bfloat16().float().numpy()  # the kernel's rounding
+    lse = rng.normal(0.0, 4.0, (shards, tokens, group_heads)) + rng.normal(
+        0.0, 8.0, (1, tokens, 1)
+    )
+    lse = lse.astype(np.float32)
+    lse[rng.random((shards, tokens, group_heads)) < 0.2] = -np.inf  # empty owner
+    lse[:, -3:] = -np.inf  # padding tokens: no rank has a candidate
+    held = np.isfinite(lse)
+    l64 = lse.astype(np.float64)
+    m = np.where(held.any(0), np.where(held, l64, -np.inf).max(0), 0.0)
+    w = np.where(held, np.exp(l64 - m), 0.0)
+    w = w / np.maximum(w.sum(0), 1e-300)
+    terms = np.where(held[..., None], out.astype(np.float64), 0.0) * w[..., None]
+    want, scale = terms.sum(0), np.abs(terms).sum(0)
+    out[~held] = np.nan  # the lse must mask it
+    outs = [torch.from_numpy(out[r]).bfloat16() for r in range(shards)]
+    lses = [torch.from_numpy(lse[r]) for r in range(shards)]
+    return outs, lses, want, scale
+
+
+def _bf16_half_step(x):
+    """Half the bf16 spacing at |x| (the rounding bound of one cast)."""
+    mag = np.maximum(np.abs(x), np.finfo(np.float32).tiny)
+    return np.exp2(np.floor(np.log2(mag)) - 8)
+
+
 class TestMlaKvShard(CustomTestCase):
     def test_compact_left_is_a_stable_partition(self):
         # Shifts applied bit by bit must never land two kept entries on one slot.
@@ -152,6 +185,31 @@ class TestMlaKvShard(CustomTestCase):
         np.testing.assert_allclose(
             torch.cat(got, dim=1).numpy(), want, rtol=1e-5, atol=1e-6
         )
+
+    def test_merge_rounding(self):
+        # The FP32 merge rounds once: within half a bf16 step of the f64 merge
+        # (plus FP32 slack). The bf16 sum rounds each weighted term and each
+        # partial sum (2 * shards roundings, each <= 2^-9 of at most sum|terms|),
+        # so it only keeps that looser bound; it must still mask empty ranks.
+        for shards in (2, 4, 8):
+            outs, lses, want, scale = _merge_inputs(shards, seed=shards)
+            for bf16_sum in (False, True):
+                with self.subTest(shards=shards, bf16_sum=bf16_sum):
+                    fed = []
+                    for _ in range(2):  # record every rank's input, then reduce
+                        got = [
+                            merge_kv_shards(
+                                outs[r], lses[r], _FakeGroup(r, lses, fed),
+                                bf16_sum=bf16_sum,
+                            )
+                            for r in range(shards)
+                        ]  # fmt: skip
+                    got = torch.cat(got, dim=1).double().numpy()
+                    bound = _bf16_half_step(want) + 1e-6 * scale
+                    if bf16_sum:
+                        bound = bound + 2.0**-8 * shards * scale
+                    self.assertTrue(np.all(np.abs(got - want) <= bound))
+                    np.testing.assert_array_equal(got[-3:], 0.0)  # padding tokens
 
     def test_own_page_slots_route_every_offset_to_one_rank(self):
         shards, page_size, pages = 8, 128, 5

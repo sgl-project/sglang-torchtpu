@@ -148,10 +148,14 @@ def build_kv_shard_attention_op(
     return custom_op
 
 
-def merge_kv_shards(out: torch.Tensor, lse: torch.Tensor, group) -> torch.Tensor:
+def merge_kv_shards(
+    out: torch.Tensor, lse: torch.Tensor, group, bf16_sum: bool = False
+) -> torch.Tensor:
     """Merge the group's partials (each rank: ``out`` [T, Hg, D] for all group
     heads, ``lse`` f32[T, Hg], -inf where it held no candidate) into this rank's
-    heads, [T, Hg / shards, D]."""
+    heads, [T, Hg / shards, D]. ``bf16_sum``: reduce-scatter the weighted
+    partials in ``out``'s dtype instead of FP32 (half the bytes; not correctly
+    rounded)."""
     shards = group.world_size
     num_tokens, group_heads, dim = out.shape
     heads = group_heads // shards
@@ -163,6 +167,8 @@ def merge_kv_shards(out: torch.Tensor, lse: torch.Tensor, group) -> torch.Tensor
     held = torch.isfinite(lse).unsqueeze(-1)
     partial = torch.where(held, out.float(), torch.zeros((), device=out.device))
     partial = partial * mine.unsqueeze(-1)
+    if bf16_sum:
+        partial = partial.to(out.dtype)
     # [shards, T, heads, D]: chunk r is rank r's heads, summed over the group.
     partial = partial.view(num_tokens, shards, heads, dim).transpose(0, 1).contiguous()
     merged = partial.new_empty((1, num_tokens, heads, dim))

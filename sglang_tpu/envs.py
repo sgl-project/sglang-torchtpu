@@ -220,6 +220,10 @@ class TpuEnvs:
     # each page's offsets); each rank attends its own offsets and the group merges
     # partials. 1 = replicated.
     SGLANG_TPU_DSA_MLA_KV_SHARDS = EnvInt(1)
+    # Prefill reduce-scatters those lse-weighted partials in bf16 instead of FP32: half
+    # the bytes (-22 ms per 4096-token chunk at 8 shards on one 2x2x1 host), but the
+    # output is no longer correctly rounded (~45% of elements off by a bf16 step).
+    SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
