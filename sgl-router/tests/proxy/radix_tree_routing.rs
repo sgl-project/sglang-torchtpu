@@ -75,6 +75,7 @@ async fn lora_requests_match_only_their_adapter_blocks() {
             block_hashes: (0..ids.len()).map(|i| 1000 + i as i64).collect(),
             parent_block_hash: None,
             token_ids: ids.clone(),
+            token_shape: None,
             block_size: 1,
             lora_id: None,
             lora_name: Some("adapter-a".into()),

@@ -428,7 +428,14 @@ async fn pump_learns_unigram_hashing_from_events_despite_eagle_guess() {
 
     assert!(!oracle.is_bigram(), "the published unigram mode must win");
     let provider = RadixTreePrefixProvider::new(tree, oracle);
-    assert_eq!(provider.rank_depths(&tokens, "http://w1"), vec![(3, 3)]);
+    assert_eq!(
+        provider.rank_depths(
+            &tokens,
+            &crate::state::kv_events::CacheNamespace::default(),
+            "http://w1",
+        ),
+        vec![(3, 3)]
+    );
 }
 
 /// The pump must carry each event's `medium` into the tree. The engine's
