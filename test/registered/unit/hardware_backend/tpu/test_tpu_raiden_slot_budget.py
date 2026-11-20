@@ -11,6 +11,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 
 from sglang_tpu.disaggregation.raiden.host_pool import (
+    has_heterogeneous_page_layouts,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
@@ -49,10 +50,40 @@ class TestSlotHostBytes(unittest.TestCase):
         large = slot_host_bytes(_pool(48), 2048)
         self.assertEqual(large, small * 32)
 
-    def test_uses_the_widest_layer(self):
+    def test_sums_each_layer_for_full_mirror(self):
+        narrow = 128 * 2 * 1 * 128 * 2
+        widest = 128 * 2 * 16 * 128 * 2
+        mixed = _pool(2) + [_Buffer((4096, 128, 2, 16, 128))]
+        expected = (2 * narrow + widest) * 8
+        self.assertEqual(slot_host_bytes(mixed, 8), expected)
+        self.assertEqual(slot_host_bytes(mixed, 8, layers=3), expected)
+
+    def test_uses_the_widest_layer_for_shared_staging(self):
         mixed = _pool(2) + [_Buffer((4096, 128, 2, 16, 128))]
         widest = 128 * 2 * 16 * 128 * 2
-        self.assertEqual(slot_host_bytes(mixed, 8), widest * 3 * 8)
+        self.assertEqual(slot_host_bytes(mixed, 8, layers=2), widest * 2 * 8)
+
+
+class TestHeterogeneousPageLayouts(unittest.TestCase):
+    def test_uniform_pool_is_homogeneous(self):
+        self.assertFalse(has_heterogeneous_page_layouts(_pool(4)))
+        self.assertFalse(has_heterogeneous_page_layouts([]))
+
+    def test_different_page_sizes_are_heterogeneous(self):
+        mixed = _pool(2) + [_Buffer((4096, 128, 2, 16, 128))]
+        self.assertTrue(has_heterogeneous_page_layouts(mixed))
+
+    def test_same_bytes_with_different_shape_or_dtype_is_heterogeneous(self):
+        same_bytes_diff_shape = [
+            _Buffer((64, 128, 128), itemsize=2),
+            _Buffer((64, 64, 256), itemsize=2),
+        ]
+        self.assertTrue(has_heterogeneous_page_layouts(same_bytes_diff_shape))
+        same_bytes_diff_elem = [
+            _Buffer((64, 128, 128), itemsize=2),
+            _Buffer((64, 128, 128), itemsize=4),
+        ]
+        self.assertTrue(has_heterogeneous_page_layouts(same_bytes_diff_elem))
 
 
 class TestRanksPerNode(unittest.TestCase):

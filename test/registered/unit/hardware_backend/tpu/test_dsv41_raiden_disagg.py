@@ -1391,6 +1391,64 @@ class TestDSV41RaidenDisaggregation(CustomTestCase):
             )
             self.assertIn("func.func", exp_pair.mlir_module())
 
+    def test_raiden_kv_manager_disables_shared_staging_for_heterogeneous_full_pool(
+        self,
+    ):
+        """DSV4.1 full-KV roots are heterogeneous, so Raiden must keep full mirrors."""
+        import sys
+        import types
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
+        pool = _make_dsv41_pool(self, num_req_slots=4, full_pages=4, swa_pages=2)
+        groups = get_raiden_kv_caches(pool)
+
+        engines = []
+
+        class _FakeEngine:
+            def __init__(self, **kwargs):
+                engines.append(kwargs)
+
+        fake_mod = types.ModuleType("tpu_sync.api.torch.kv_cache_manager")
+        fake_mod.KVCacheManager = _FakeEngine
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {fake_mod.__name__: fake_mod}))
+            manager = object.__new__(RaidenKVManager)
+            manager._engine = None
+            manager._kv_caches = list(groups.full)
+            manager._swa_kv_caches = list(groups.swa)
+            manager._state_kv_caches = tuple(groups.state)
+            manager._state_max_blocks = groups.state_max_blocks
+            manager._dynamic_host_staging = True
+            manager._staging_layers_total = 8
+            manager._slot_ceiling = lambda: 32
+            manager._max_request_blocks = lambda: 37
+            manager._swa_max_request_blocks = lambda: 2
+            manager.attn_tp_rank = 0
+            manager.attn_tp_size = 1
+            manager.attn_dp_size = 8
+            manager.system_dp_size = manager.attn_cp_size = 1
+            manager.pp_size = 1
+            manager.server_args = SimpleNamespace(nnodes=1)
+            manager.local_ip = "127.0.0.1"
+            manager._local_rank = 0
+            manager._control_port = 31000
+            manager._timeout_s = 120
+            manager._transfer_parallelism = 4
+            manager.chunked_transfer = True
+            manager._build_engine()
+
+        self.assertEqual(len(engines), 3)
+        # Full engine has heterogeneous KV/scale/indexer roots -> full mirror.
+        self.assertEqual(engines[0]["num_staging_layers"], len(groups.full))
+        # SWA engine is homogeneous -> shares bounded staging layers safely.
+        self.assertEqual(engines[1]["num_staging_layers"], min(len(groups.swa), 8))
+        # State engine always keeps full mirrors.
+        self.assertIsNone(engines[2].get("num_staging_layers"))
+
 
 if __name__ == "__main__":
     unittest.main()
