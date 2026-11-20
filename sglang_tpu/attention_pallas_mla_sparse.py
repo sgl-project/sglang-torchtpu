@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
+    mla_latents_for_store,
 )
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
@@ -40,6 +41,11 @@ from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_kpool_topk_split_op,
     indexer_forward,
     kpool_indexer_forward,
+)
+from sglang_tpu.dsa_layer_kv_store_op import (
+    call_op,
+    plain_store_op_name,
+    pooled_store_op_name,
 )
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pallas_export import (
@@ -898,3 +904,100 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # has one. The op takes them in this order.
         pool = self.token_to_kv_pool
         return (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
+
+    def store_layer_kv(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer: "RadixAttention",
+        index_layer_id: int,
+        k: torch.Tensor,  # [num_tokens, 1, kv_lora_rank], as _forward_mla's k
+        k_rope: torch.Tensor,  # [num_tokens, 1, rope_dim], as _forward_mla's k_rope
+        index_keys: torch.Tensor,  # [num_tokens, index_head_dim], as index_topk's key
+        key_store: str,
+    ) -> None:
+        """Plain DSA: store one layer's latents and index keys, without
+        attending or scoring.
+
+        The caches end up as ``_forward_mla`` and ``index_topk`` leave them
+        for the same inputs: every token of the batch is stored, on every
+        attention-TP rank, as under the token splits.
+        """
+        if self._kpool > 1:
+            raise NotImplementedError(
+                "the pooled indexer stores through store_layer_kv_pooled"
+            )
+        new_kv_c, new_k_pe = self._latents_for_store(layer=layer, k=k, k_rope=k_rope)
+        metadata = self.forward_metadata
+        call_op(
+            plain_store_op_name(key_store, write_rope=not self._zero_rope),
+            new_kv_c,
+            new_k_pe,
+            index_keys.contiguous(),
+            *self._kv_cache_buffers(layer.layer_id),
+            self.token_to_kv_pool.get_index_key_cache(index_layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+        )
+
+    def store_layer_kv_pooled(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer: "RadixAttention",
+        index_layer_id: int,
+        k: torch.Tensor,  # [num_tokens, 1, kv_lora_rank], as _forward_mla's k
+        k_rope: torch.Tensor,  # [num_tokens, 1, rope_dim], as _forward_mla's k_rope
+        keys: torch.Tensor,  # [num_tokens, index_head_dim], as index_topk_kpool's key
+        gates: torch.Tensor,  # [num_tokens, index_head_dim], as its gate
+        ape: torch.Tensor,  # [kpool, index_head_dim], f32, as its ape
+    ) -> None:
+        """Pooled indexer: store one layer's latents and raw key | gate
+        records and close the step's pools, without attending or scoring.
+
+        The caches end up as ``_forward_mla`` and ``index_topk_kpool`` leave
+        them for the same inputs, on every attention-TP rank.
+        """
+        if self._kpool == 1:
+            raise NotImplementedError("plain DSA stores through store_layer_kv")
+        new_kv_c, new_k_pe = self._latents_for_store(layer=layer, k=k, k_rope=k_rope)
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
+        call_op(
+            pooled_store_op_name(
+                self._kpool,
+                _kpool_query_bound(metadata, num_tokens=keys.shape[0]),
+                raw_ring_pages_cnt,
+                write_rope=not self._zero_rope,
+            ),
+            new_kv_c,
+            new_k_pe,
+            keys.contiguous(),
+            gates.contiguous(),
+            ape.contiguous(),
+            *self._kv_cache_buffers(layer.layer_id),
+            pool.get_kpool_raw_cache(index_layer_id),
+            pool.get_index_key_cache(index_layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            raw_page_base,
+        )
+
+    def _latents_for_store(
+        self, *, layer: "RadixAttention", k: torch.Tensor, k_rope: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._zero_rope:
+            # As in _forward_mla: the zero-rope store is exact only without rope.
+            assert layer.qk_head_dim == layer.v_head_dim, (
+                f"layer {layer.layer_id} has rope dims, but the store ops were "
+                "built for a model without rope."
+            )
+        new_kv_c, new_k_pe, _, _ = mla_latents_for_store(
+            k=k, k_rope=k_rope, layer=layer, quant_dtype=self.kv_cache_quant_dtype
+        )
+        return new_kv_c, new_k_pe
