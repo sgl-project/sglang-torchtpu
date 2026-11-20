@@ -46,6 +46,18 @@ sglang_tpu_e2e_test(
 )
 
 sglang_tpu_e2e_test(
+    name = "test_tpu_qwen3_0_6b_singlehost_true_on_policy",
+    srcs = ["test_tpu_qwen3_0_6b_singlehost_true_on_policy.py"],
+    data = ["//benchmark/tpu:runtime"],
+    main = "test_tpu_qwen3_0_6b_singlehost_true_on_policy.py",
+    tags = ["requires-tpu-v7x"],
+    deps = [
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
+sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_smoke",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_smoke.py"],
     data = ["//benchmark/tpu:runtime"],

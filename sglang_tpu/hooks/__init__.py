@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.envs import envs
 from sglang_tpu.hooks.all_gather_via_all_reduce import (
     gather_and_crop_vocab,
     gather_attn_tp_logits,
@@ -458,6 +459,13 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+if envs.SGLANG_TPU_ENABLE_TRUE_ON_POLICY.get():
+    # Imported only with the mode on: the package registers its Pallas kernels at import.
+    from sglang_tpu.rl.true_on_policy.hooks import hook_specs as true_on_policy_hooks
+
+    HOOKS.extend(true_on_policy_hooks())
+
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
 
