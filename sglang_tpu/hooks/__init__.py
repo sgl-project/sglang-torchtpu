@@ -97,6 +97,11 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.pp_output_copy import (
+    copy_outputs_at_launch,
+    send_copied_outputs,
+    send_copied_prefill_outputs,
+)
 from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
 from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
@@ -174,6 +179,21 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
         skip_spec_op_precompile_without_draft,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler.Scheduler._pp_launch_batch",
+        copy_outputs_at_launch,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler.Scheduler._pp_send_output_to_next_stage",
+        send_copied_outputs,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler.Scheduler._pp_pd_send_deferred_output",
+        send_copied_prefill_outputs,
         HookType.AROUND,
     ),
     (

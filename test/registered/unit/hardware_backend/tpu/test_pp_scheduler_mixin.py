@@ -11,6 +11,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 import unittest  # noqa: E402
+from collections import deque  # noqa: E402
+from concurrent.futures import Future  # noqa: E402
 from contextlib import contextmanager, nullcontext  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
@@ -32,6 +34,8 @@ from sglang_tpu.compilation.bucketer import (  # noqa: E402
 from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.hooks import pp_output_copy  # noqa: E402
+from sglang_tpu.hooks.pp_output_copy import PPOutputCopies  # noqa: E402
 
 
 def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
@@ -200,6 +204,127 @@ class TestStreamFences(_StreamPatchedTestCase):
         scheduler.copy_stream.wait_stream.assert_called_once_with(
             scheduler.schedule_stream
         )
+
+
+class _FakeCopyWorker:
+    """Hands out one unresolved future per copy, so a test decides when it lands."""
+
+    def __init__(self):
+        self.copies = []
+
+    def copy_to_host(self, tensor):
+        future = _UnwaitedFuture()
+        self.copies.append((tensor, future))
+        return future
+
+
+class _UnwaitedFuture(Future):
+    """Fails instead of hanging when waited on before it lands."""
+
+    def result(self, timeout=None):
+        if not self.done():
+            raise AssertionError("waited for a copy that has not landed")
+        return super().result(timeout)
+
+
+class _DeviceTokens(torch.Tensor):
+    """Device tokens whose blocking host copy must not run in the send."""
+
+    @property
+    def is_cpu(self):
+        return False
+
+    def cpu(self, *args, **kwargs):
+        raise AssertionError("the deferred send copied the device tokens itself")
+
+
+class TestLaunchTimeOutputCopy(_StreamPatchedTestCase):
+    """The last stage's deferred send ships the host copies started at the
+    outputs' launch; copying them in the send waits for the forward launched
+    since, and stalls the first stage."""
+
+    def setUp(self):
+        super().setUp()
+        self.worker = _FakeCopyWorker()
+        patcher = patch.object(
+            pp_output_copy, "_copies", PPOutputCopies(self.worker.copy_to_host)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _launched(self):
+        scheduler = _single_queue_scheduler(is_last_rank=True)
+        scheduler.device = "tpu"
+        scheduler._pp_output_send_deferred = lambda: True
+        tokens = torch.tensor([5]).as_subclass(_DeviceTokens)
+        scheduler._pp_prepare_tensor_dict = lambda result, batch: {
+            "next_token_ids": tokens
+        }
+        queue = deque()
+        pp_output_copy.copy_outputs_at_launch(
+            SchedulerPPMixin._pp_launch_batch,
+            scheduler,
+            0,
+            SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE),
+            None,
+            [None],
+            queue,
+        )
+        [(source, landed)] = self.worker.copies
+        self.assertIs(source, tokens)
+        return scheduler, queue, landed
+
+    def _target(self):
+        return SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+
+    def _send(self, scheduler, queue, *, skip):
+        scheduler._pp_send_dict_to_next_stage = MagicMock(return_value=["work"])
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+            return_value=skip,
+        ):
+            return pp_output_copy.send_copied_outputs(
+                SchedulerPPMixin._pp_send_output_to_next_stage,
+                scheduler,
+                0,
+                [self._target()],
+                queue,
+                None,
+            )
+
+    def test_send_ships_the_copy_started_at_launch(self):
+        scheduler, queue, landed = self._launched()
+        host = torch.tensor([5])
+        landed.set_result(host)
+        self.assertEqual(self._send(scheduler, queue, skip=False), ["work"])
+        sent = scheduler._pp_send_dict_to_next_stage.call_args.args[0]
+        self.assertIs(sent["next_token_ids"], host)
+
+    def test_skipped_send_does_not_wait_for_the_copy(self):
+        scheduler, queue, landed = self._launched()
+        self.assertEqual(self._send(scheduler, queue, skip=True), [])
+        scheduler._pp_send_dict_to_next_stage.assert_not_called()
+
+    def test_prefill_send_hands_the_kv_manager_the_launch_copy(self):
+        scheduler, queue, landed = self._launched()
+        host = torch.tensor([5])
+        landed.set_result(host)
+        scheduler.last_rank_comm_queue = queue
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        scheduler.mbs = [self._target()]
+        scheduler._pp_send_deferred_output = MagicMock()
+        manager = scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=MagicMock()
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+            return_value=False,
+        ):
+            pp_output_copy.send_copied_prefill_outputs(
+                SchedulerPPMixin._pp_pd_send_deferred_output, scheduler, 0
+            )
+        manager.kv_manager.on_outputs_copied.assert_called_once_with(0, host)
+        scheduler._pp_send_deferred_output.assert_called_once_with(0)
 
 
 class TestProxyReceive(_StreamPatchedTestCase):
