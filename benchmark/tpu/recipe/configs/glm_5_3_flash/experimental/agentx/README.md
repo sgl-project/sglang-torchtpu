@@ -232,6 +232,33 @@ These are not folded into the results above:
 - c48 at max running 48 with split 8 + token split, on the same tree (job ccd1).
 - `prefill_decode_interval` arms at c32 on the same tree (job 754a).
 
+## Tunable configs
+
+Values as the run JSONs set them, c1 / c4 / c8 / c16 / c32 (c16 alt in parentheses where
+it differs); unset = server default. Evidence is a job ID; ix numbers are p90.
+
+| knob | where set | c1 / c4 / c8 / c16 / c32 | what it trades | evidence |
+|---|---|---|---|---|
+| prefill-decode interval | `prefill_decode_interval` | unset (0, off) at every point | N decode steps between prefill batches: higher ix, later TTFT; a fixed N starves admission at high concurrency | c16 N=16, split 8 before token split: ix 84.9 -> 91.3, tok/s -0.5%, TTFT p90 2.06 -> 2.95 s (ff06). Muse Spark c10, N=64 vs its shipped profile: ix 169 vs 116 (Haolin's perf KB, F-0069..71). c32 N=16/64, c48 N=16: running (754a, ccd1) |
+| latent-cache split | env `SGLANG_TPU_DSA_MLA_KV_SHARDS` | unset (1) / unset / 2 / 2 / 8 | fewer shards: cheaper prefill merge, more KV bytes per rank (host KV 30,720 / 18,432 / 12,288 B/token/pod at 2 / 4 / 8; the split-2 pool is HBM-bound below the 9.4M cap) | c16 split 2 vs 8: ix +18.9%, tok/s +6.7%; split 4: ix 98.1 (8c26). c32 at max running 32, split 4 vs 8: 38,807 vs 38,149 tok/s, ix 41.2 vs 39.9 (3ca4, 175a). c4 unsplit vs split 8: ix 337.7 vs 287.5 (6076) |
+| token split | env `SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT` | unset / unset / 1 / 1 / 1 | each selected cache row gathered by one rank, plus an all-to-all of queries and outputs | c16 split 8: ix 83.7 -> 93.5, tok/s 23,207 -> 24,407; c8: ix 175.0 -> 188.1; neutral on the unsplit c1/c4 (fee5) |
+| device KV pool | `max_total_tokens` (cap; HBM may bound it lower), `mem_fraction_static` 0.9 | 3,407,872 / 3,407,872 / 9,437,184 / 9,437,184 / 9,437,184 (boot sizes in the per-point table) | HBM for KV tokens vs device KDA slots | c16 alt (8.64M -> 5.66M tokens, 800 -> 1,400 slots): state evictions 6,399 -> 2,192 per h, tok/s and ix within noise (8c26) |
+| device KDA slots | `max_mamba_cache_size` | 74 / 384 / 800 / 800 (1,400) / 800 | HBM for KDA checkpoints vs KV pool; sized for the conversations AgentX keeps cached, not from max running | c16 1,100: 26,004 / ix 111.6; 1,400: hit gap 0.36 vs 0.50 pt (8c26). c32 1,600: no gain (98c5) |
+| host KV tier | `hicache_ratio` (x device pool) | 2 / 2 / 1.5 / 1.07 (1.7) / 2.5 | host-hit reach vs host RAM | c32 at max running 32 fit with 2.0 (R6c, 175a) and 1.33 at split 4 (R7, 3ca4) |
+| host KDA states | env `SGLANG_TPU_HICACHE_STATE_RATIO` (x device KDA slots; unset = `hicache_ratio`) | unset / unset / unset / 2.5 (1.429) / unset | host states (~19.6 MB/rank each) give the host-tier hits after idle gaps vs host RAM | c16 2,001 states reach ~15 min; ratio 1.5 would cut them to 1,201, ~9 min (8c26) |
+| max running | `max_running_requests`, `torch_compile_max_bs` | 2 / 4 / 8 / 16 / 16 | decode batch vs step time; c32's other 16 sessions queue | c32 at 32: tok/s flat, ix -24 to -27% (175a, 3ca4). c48 at 48: running (ccd1) |
+| decode buckets | `tpu_compile_bs` | 1..max running at every point | unpadded decode steps vs host RAM per program | c32 at max running 32: buckets 1..32 ran out of host RAM at boot, 1..16 + 20..32 was OOM-killed in the window, 10 buckets ran (175a) |
+| MTP draft length | `speculative_num_steps` = K (`speculative_num_draft_tokens` K + 1, `speculative_eagle_topk` 1) | 7 / 7 / 3 / 3 / 3 | more tokens per step at low batch vs more verify work at high batch | at the golden AL: c4 K=3 vs 8 ix 282.5 vs 236.4; c8 175.0 vs 148.8; c1 K=7 vs 8 421.5 vs 352.5 (2460) |
+| simulated acceptance | env `SGLANG_SIMULATE_ACC_LEN`, `SGLANG_SIMULATE_ACC_METHOD`, `SGLANG_SIMULATE_ACC_TOKEN_MODE` | 3.93 / 3.93 / 3.0 / 3.0 / 3.0; `match-expected`; `fixed` | not a perf knob: AL = `GOLDEN_AL[K]`, never 3.5. Token mode `fixed` vs `real-draft-token`: same accepted count, only the emitted token ids differ | token mode untested (question 1 below) |
+| prefill chunk | `chunked_prefill_size`, `max_prefill_tokens`, `tpu_compile_tokens` | 4096, 4096, [1024, 2048, 3072, 4096] at every point | bigger chunks: less fixed cost per token vs longer decode stalls, more programs | 8192: -2.2% per token, stalls ~2x, +18 programs/rank (dcd8). c16 at 2048: ix 73.4 vs 83.7 (6076) |
+| expert parallel | `ep_size` (`tp_size` 8) | 1 at every point | expert-TP vs expert-parallel MoE | untested; judged not worth it for c32+ |
+| top-k width buckets | env `SGLANG_TPU_SCTOPK_LONG_ROWS` | not on this branch; on by default on `qinghan-glm-prefill-combo` (0 disables) | exact; faster prefill top-k | with the bf16 merge at split 8 + token split: 4k chunk 0.2432 -> 0.2204 s at ctx 0, 0.2795 -> 0.2393 s at 256k (2507). c32 AgentX running (15c4) |
+| bf16 split-cache merge | env `SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE=1` | not on this branch; opt-in on `qinghan-glm-prefill-combo` | bf16 instead of fp32 reduce-scatter for the prefill merge | as above; GSM8K-1319 0.9060 on vs 0.9037 off (2507) |
+
+- Host RAM: resident host memory grows ~34-39 MB per compiled program per rank (3ca4), so
+  decode buckets cost host RAM. When a config does not fit, shrink the host tier first and
+  keep the buckets: host-tier hits are fine as long as nothing is evicted or thrashing.
+
 ## Open InferenceX questions
 
 1. **Token mode.** The points ran `SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed`. InferenceX's
@@ -247,11 +274,6 @@ These are not folded into the results above:
 4. **Cache flush.** InferenceX says "do not flush caches or reuse a live server across
    concurrency points". Each point had its own fresh server, but the harness flushed once
    before the window to drop the warm-up prompts.
-5. **Weights revision.** InferenceX's GB300 FP8 recipe pins `zai-org/GLM-5.3-Flash` at
-   revision `46a050bec13002ad29ee795c16e61cf4fa3c4a9c`. The revision under
-   `/weights/GLM-5.3-Flash` is not recorded.
-6. **Which c16 to submit.** The chart's c16 point is C16_S2ts. The kda1400 alternative is
-   within noise on throughput and ix, and its hit gap is 0.36 pt instead of 0.50.
 
 ## Files
 
