@@ -116,7 +116,8 @@ def _self_check(op, tp_group) -> str | None:
     rows, hidden = NUM_DEVICES * _ROW_BLOCK, 256
     gen = torch.Generator().manual_seed(1234 + rank)
     x = (torch.randn(rows, hidden, generator=gen) * (rank + 1)).to(torch.bfloat16)
-    x = x.to(tp_group.device)
+    # Each process owns one TensorCore (tp_group.device is the CPU group device).
+    x = x.to("tpu")
     want = torch.empty(rows // NUM_DEVICES, hidden, dtype=x.dtype, device=x.device)
     tp_group.reduce_scatter_tensor(want, x.clone())
     got = op(x)
