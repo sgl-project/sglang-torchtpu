@@ -23,7 +23,7 @@ from sglang_tpu.hooks.dflash_mla import (
     dflash_mla_head_dims,
     select_dflash_mla_attention,
 )
-from sglang_tpu.hooks.dp_encoder_gather import broadcast_rank_embeddings
+from sglang_tpu.hooks.dp_encoder_gather import gather_rank_embeddings_tpu
 from sglang_tpu.hooks.draft_kv_pool import (
     attach_unified_draft_kv_pool,
     bind_unified_swa_draft_host_pool,
@@ -165,7 +165,7 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.multimodal.mm_utils.gather_dp_encoder_rank_embeddings",
-        broadcast_rank_embeddings,
+        gather_rank_embeddings_tpu,
         HookType.AROUND,
     ),
     (

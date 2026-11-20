@@ -54,6 +54,10 @@ class TestKernelInputsDigest(CustomTestCase):
             "sglang_tpu/monitor.py",
             "CHECK = tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
         )
+        self.write(
+            "sglang_tpu/hooks/dp_encoder_gather.py",
+            "GATHER_MODE = tpu_envs.SGLANG_TPU_DP_ENCODER_GATHER_MODE.get()\n",
+        )
         enter_scope(
             self,
             patch.dict(
@@ -65,6 +69,9 @@ class TestKernelInputsDigest(CustomTestCase):
             ),
         )
         enter_scope(self, tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False))
+        enter_scope(
+            self, tpu_envs.SGLANG_TPU_DP_ENCODER_GATHER_MODE.override("all_gather")
+        )
         enter_scope(self, tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
         enter_scope(self, envs.SGLANG_TPU_INT4_MOE_MODE.override(None))
         enter_scope(self, tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False))
@@ -173,6 +180,9 @@ class TestKernelInputsDigest(CustomTestCase):
             self.assertEqual(self.digest(), self.base)
         # The buffered PP hand-off's send queue depth is read in pp_scheduler.py.
         with tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.override(5):
+            self.assertEqual(self.digest(), self.base)
+        # Eager DP-encoder gather collective mode does not alter compiled graphs.
+        with tpu_envs.SGLANG_TPU_DP_ENCODER_GATHER_MODE.override("broadcast"):
             self.assertEqual(self.digest(), self.base)
 
     def test_unkeyed_env_knobs_are_all_read_by_the_kernel_sources(self):
