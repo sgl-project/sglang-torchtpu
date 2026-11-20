@@ -1164,7 +1164,8 @@ class HostEngramCoordinator:
             return None
         history = self._hasher.history
         spec_info = getattr(forward_batch, "spec_info", None)
-        assert getattr(spec_info, "ragged_verify_layout", None) is None, (
+        # Upstream keeps the ragged layout on the forward batch, not spec_info.
+        assert getattr(forward_batch, "ragged_verify_layout", None) is None, (
             "Host Engram stage_verify assumes uniform draft_token_num per request "
             "and does not yet support ragged verify"
         )
@@ -1528,6 +1529,8 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
             _cpu(forward_batch.engram_history), forward_batch.req_pool_indices
         ),
         tpu_engram_local_ids=None,
+        # Engram.forward reads it in target-verify mode; None is equal blocks.
+        ragged_verify_layout=getattr(forward_batch, "ragged_verify_layout", None),
     )
     return hasher(_cpu(input_ids), batch)
 
