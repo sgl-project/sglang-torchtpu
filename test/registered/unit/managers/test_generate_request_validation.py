@@ -27,7 +27,9 @@ class TestGenerateRequestValidation(CustomTestCase):
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = True
         self.manager.is_generation = True
-        self.manager.model_config = SimpleNamespace(vocab_size=_VOCAB_SIZE)
+        self.manager.model_config = SimpleNamespace(
+            vocab_size=_VOCAB_SIZE, joint_head_config=None, pointer_head=None
+        )
 
     def _validate(self, req, input_ids=None):
         # Mirror the HTTP path: the request is normalized before validation.

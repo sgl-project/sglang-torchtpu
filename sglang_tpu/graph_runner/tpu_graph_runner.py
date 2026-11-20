@@ -156,6 +156,10 @@ def _resolve_fused_op_dispatch(model: Any) -> None:
 class TpuGraphRunner:
     """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
+    # Graph-runner contract (capture_decode_graph logs it): TPU captures no
+    # per-batch-size graphs, its compile policies own the bucket lists.
+    capture_bs: tuple[int, ...] = ()
+
     def __init__(self, model_runner: ModelRunner) -> None:
         assert model_runner.server_args.enable_torch_compile, (
             "TpuGraphRunner should only be initialized when enable_torch_compile=True."

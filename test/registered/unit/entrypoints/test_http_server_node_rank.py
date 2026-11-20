@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -27,7 +28,7 @@ class TestHttpServerNodeRank(unittest.TestCase):
     def check_launch(self, initial_rank, final_rank, rust, custom_engine):
         server_args = SimpleNamespace(node_rank=initial_rank)
         resolved = SimpleNamespace(node_rank=initial_rank)
-        scheduler = Mock(scheduler_infos=[{}])
+        scheduler = Mock(scheduler_infos=[{}], rust_listener_procs=[])
         tokenizer, template, ports, watchdog = (object() for _ in range(4))
 
         def launch(**kwargs):
@@ -50,6 +51,11 @@ class TestHttpServerNodeRank(unittest.TestCase):
             patch.object(http_server.envs.SGLANG_RUST_SERVER, "get", return_value=rust),
             patch.object(http_server, "_setup_and_run_http_server") as serve,
             patch.object(http_server, "_execute_server_warmup") as warmup,
+            patch.object(http_server, "_reserve_http_socket", return_value=None),
+            patch.object(http_server, "node_hosts_rust_server", return_value=True),
+            patch.object(
+                http_server, "rust_server_sidecar", return_value=nullcontext()
+            ),
         ):
             kwargs = {"engine_class": engine} if custom_engine else {}
             http_server.launch_server(server_args, launch_callback=callback, **kwargs)
@@ -68,8 +74,9 @@ class TestHttpServerNodeRank(unittest.TestCase):
             callback.assert_not_called()
             scheduler.block_until_scheduler_exits.assert_not_called()
         elif rust:
+            # Each Rust listener warms itself up; the main process does not.
             serve.assert_not_called()
-            warmup.assert_called_once_with(server_args)
+            warmup.assert_not_called()
             callback.assert_called_once_with()
             scheduler.block_until_scheduler_exits.assert_called_once_with()
         else:
@@ -82,6 +89,7 @@ class TestHttpServerNodeRank(unittest.TestCase):
                 watchdog,
                 execute_warmup_func=http_server._execute_server_warmup,
                 launch_callback=callback,
+                reserved_socket=None,
             )
             warmup.assert_not_called()
             callback.assert_not_called()

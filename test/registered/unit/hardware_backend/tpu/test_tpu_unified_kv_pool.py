@@ -26,15 +26,18 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import base as pool_host_base
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -42,6 +45,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu import hooks, tpu_dma_hicache
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.envs import envs as tpu_envs
@@ -413,10 +417,15 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
         mock_cache.supports_prefix_sharing.return_value = True
         self.assertFalse(alloc.evict_to_free_tokens(mock_cache, 8, swa_num_tokens=8))
         self.assertEqual(
-            mock_cache.evict_for_alloc.call_args_list,
+            mock_cache.evict.call_args_list,
             [
-                call(EvictParams(num_tokens=20, swa_num_tokens=0)),
-                call(EvictParams(num_tokens=0, swa_num_tokens=8)),
+                call(EvictParams(num_tokens=20)),
+                call(
+                    EvictParams(
+                        num_tokens=0,
+                        window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: 8},
+                    )
+                ),
             ],
         )
 
@@ -430,39 +439,45 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
                 page_size=4,
                 disable=False,
                 sliding_window_size=8,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=8
+                ),
                 eviction_policy="lru",
                 tree_core_backend="python",
             )
         )
         cache.insert(InsertParams(key=RadixKey(array("q", range(1, 9))), value=out))
         self.assertEqual(
-            (cache.full_evictable_size(), cache.swa_evictable_size()), (8, 8)
+            (
+                cache.full_evictable_size(),
+                cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
+            ),
+            (8, 8),
         )
 
-        self.assertIsNone(alloc.reclaim_for_prealloc(cache, 8, 8))
+        W = BaseSWAKVPool.WINDOW_SUB_POOL
+
+        def demand(full, swa):
+            return KVDemand(full_tokens=full, window_tokens={W: swa})
+
+        def fits(full, swa, full_budget):
+            return alloc.prealloc_fits(
+                demand(full, swa),
+                evictable=evictable_by_sub_pool(cache, alloc),
+                full_budget_tokens=full_budget,
+                window_budget_tokens={W: 12},
+            )
+
+        self.assertIsNone(alloc.reclaim_for_prealloc(cache, demand(8, 8)))
         self.assertEqual(alloc._free_page_count(), 15)
-        self.assertIsNotNone(alloc.reclaim_for_prealloc(cache, 16, 16))
-        self.assertTrue(alloc.prealloc_fits_assumes_reclaim())
-        self.assertTrue(alloc.prealloc_ceiling_fits(8, 8))
+        self.assertIsNotNone(alloc.reclaim_for_prealloc(cache, demand(16, 16)))
+        self.assertTrue(alloc.prealloc_ceiling_fits(demand(8, 8)))
         # 15 free phys pages (ps=4, M_swa=4): full_available=60, swa_available=12, evictable=0.
-        self.assertTrue(
-            alloc.prealloc_fits(
-                cache, 28, 8, full_budget_tokens=60, swa_budget_tokens=12
-            )
-        )
+        self.assertTrue(fits(28, 8, 60))
         # Individually 48 <= 60 and 8 <= 12, but jointly 12 + 4*2 = 20 > 15 phys pages -> False.
-        self.assertFalse(
-            alloc.prealloc_fits(
-                cache, 48, 8, full_budget_tokens=60, swa_budget_tokens=12
-            )
-        )
+        self.assertFalse(fits(48, 8, 60))
         # Deducting 8 reserved Full tokens (full_budget=52) leaves 13 phys pages -> 28+8 needs 15 -> False.
-        self.assertFalse(
-            alloc.prealloc_fits(
-                cache, 28, 8, full_budget_tokens=52, swa_budget_tokens=12
-            )
-        )
+        self.assertFalse(fits(28, 8, 52))
         # Pool size_full=80, ps=4, M_swa=4: window=8 reserves 4*(8+4)=48 -> max_request_tokens=32; None -> 16.
         self.assertEqual(alloc.max_request_tokens(8), 32)
         self.assertEqual(alloc.max_request_tokens(None), 16)
@@ -533,7 +548,9 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
                     page_size=4,
                     disable=False,
                     sliding_window_size=4,
-                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.SWA), window=4
+                    ),
                     eviction_policy="lru",
                     tree_core_backend="python",
                 )
@@ -575,7 +592,11 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
             match_a = cache.match_prefix(MatchPrefixParams(key=key_a))
             cache.inc_lock_ref(match_a.last_device_node)
             self.assertEqual(
-                (cache.full_evictable_size(), cache.swa_evictable_size()), (4, 4)
+                (
+                    cache.full_evictable_size(),
+                    cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
+                ),
+                (4, 4),
             )
             return alloc, cache
 
@@ -587,7 +608,11 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
         self.assertTrue(alloc.evict_to_free_tokens(cache, 12, swa_num_tokens=4))
         self.assertEqual(alloc._free_page_count(), 8)
         self.assertEqual(
-            (cache.full_evictable_size(), cache.swa_evictable_size()), (0, 0)
+            (
+                cache.full_evictable_size(),
+                cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
+            ),
+            (0, 0),
         )
 
         # Mode B (over-eviction regression): 11 total - 10 (A) - 1 (B) = 0 free pages.
@@ -598,7 +623,11 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
         self.assertTrue(alloc.evict_to_free_tokens(cache, 4, swa_num_tokens=0))
         self.assertEqual(alloc._free_page_count(), 1)
         self.assertEqual(
-            (cache.full_evictable_size(), cache.swa_evictable_size()), (0, 4)
+            (
+                cache.full_evictable_size(),
+                cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
+            ),
+            (0, 4),
         )
 
 
@@ -773,7 +802,7 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             )
 
     def test_unsupported_configurations_rejected(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1029,7 +1058,7 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         )
 
     def test_mxint8_unified_blocked_sizing_and_pool(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import ServerArgs
         from sglang_tpu import tpu_platform
         from sglang_tpu.kv_mxint8 import (
@@ -1321,7 +1350,7 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             page_size=4,
             disable=False,
             sliding_window_size=8,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA), window=8),
             eviction_policy="lru",
             tree_core_backend="python",
         )
@@ -1592,7 +1621,9 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             page_size=ps,
             disable=False,
             sliding_window_size=ps,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA), window=ps
+            ),
             eviction_policy="lru",
             tree_core_backend="python",
         )
@@ -1613,12 +1644,6 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             self.assertIsInstance(ctrl, TpuDMAHybridCacheController)
             self.assertIsInstance(pool.layer_transfer_counter, BatchDoneCounter)
             self.assertIsNone(pool.kv_pool.layer_transfer_counter)
-            # Must NOT wire CUDA virtual-ID bind_swa_for_loaded_rows even with enable_unified_memory=True.
-            self.assertIsNone(
-                cache.host_pool_group.entry_map[
-                    PoolName.SWA
-                ].device_indices_from_anchor_fn
-            )
             domain = cache.host_pool_group.get_pool(
                 PoolName.KV
             ).shared_allocation_domain
@@ -1652,7 +1677,11 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             self.assertEqual(len(domain.free_pages), 4)
 
             # Evict A completely from device and zero device buffers.
-            cache.evict_for_alloc(EvictParams(num_tokens=4, swa_num_tokens=4))
+            cache.evict(
+                EvictParams(
+                    num_tokens=4, window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: 4}
+                )
+            )
             self.assertEqual(alloc._free_page_count(), 32)
             for buf in pool.kv_pool.kv_buffer:
                 buf.zero_()
@@ -1660,13 +1689,15 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             # Match A -> hits on host -> H2D reload restores Full AND all 3 SWA groups!
             match_a = cache.match_prefix(MatchPrefixParams(key=key_a))
             self.assertEqual(match_a.host_hit_length, 4)
-            self.assertEqual(match_a.swa_host_hit_length, 4)
+            self.assertEqual(
+                match_a.window_host_hit_lengths[BaseSWAKVPool.WINDOW_SUB_POOL], 4
+            )
             self.assertTrue(cache.load_back(match_a.best_match_node))
             ctrl.start_loading()
             cache.loading_check()
-            loaded_full = cache.match_prefix(
-                MatchPrefixParams(key=key_a)
-            ).device_indices
+            loaded_full = cache.path_device_indices(
+                cache.match_prefix(MatchPrefixParams(key=key_a)).last_device_node
+            )
             self.assertEqual(len(loaded_full), 4)
 
             reloaded_fp = int(loaded_full[0] // ps)
@@ -1717,11 +1748,15 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
                 cache.host_pool_group.get_pool(PoolName.SWA).live_tokens(), 8
             )
             match_e = cache.match_prefix(MatchPrefixParams(key=key_e))
-            self.assertEqual(len(match_e.device_indices), 8)
+            self.assertEqual(match_e.device_prefix_len, 8)
             host_lock_e = cache.inc_host_lock_ref(
                 match_e.last_host_node
             ).to_dec_params()
-            cache.evict_for_alloc(EvictParams(num_tokens=8, swa_num_tokens=8))
+            cache.evict(
+                EvictParams(
+                    num_tokens=8, window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: 8}
+                )
+            )
 
             # Insert 8-token Full-only prompt B (needs 2 Full host pages, 0 free, Full host is locked ->
             # candidates[0]=KV evicts 0, candidates[1]=SWA tombstones A's 3 SWA host pages -> 3-2=1 free!).
@@ -1752,7 +1787,7 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
                 cache.host_pool_group.get_pool(PoolName.KV).live_tokens(), 16
             )
             cache.dec_host_lock_ref(match_e.last_host_node, host_lock_e)
-            cache.evict_for_alloc(EvictParams(num_tokens=8))
+            cache.evict(EvictParams(num_tokens=8))
 
             # Replace host contents with 32-token Full-only prompt C (8 Full host pages) -> 0 free host
             # pages and ZERO SWA pages on host (all 8 physical host pages are Full-only!).
@@ -1787,7 +1822,7 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             # Evict C from device so host holds 8 Full-only pages and 0 SWA pages; insert 4-token
             # prompt D (needs 1 Full + 1 SWA = 4 phys host pages). SWA has 0 host pages to evict, so
             # _alloc_shared_host_requests_with_reclaim MUST call host_full_evict_fn to evict Full!
-            cache.evict_for_alloc(EvictParams(num_tokens=32))
+            cache.evict(EvictParams(num_tokens=32))
             out_d = alloc.alloc_extend(
                 prefix_lens=torch.tensor([0]),
                 prefix_lens_cpu=torch.tensor([0]),
@@ -1833,7 +1868,7 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
 
             tpu = types.SimpleNamespace(is_tpu=lambda: True)
             noop_hook = (
-                "sglang.srt.utils.common.get_device_name",
+                "sglang.srt.utils.device.get_device_name",
                 lambda r, *a, **k: r,
                 hooks.HookType.AFTER,
             )
@@ -1881,13 +1916,16 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
         queue.token_to_kv_pool_allocator = alloc
         self.assertTrue(queue._uses_swa_tail_prealloc())
 
+        # PD peers register through the storage the scheduler builds over the
+        # allocator.
+        storage = kv_storage_of(req_pool, alloc)
         kv_args = KVArgs()
         (
             kv_args.kv_data_ptrs,
             kv_args.kv_data_lens,
             kv_args.kv_item_lens,
-        ) = get_kv_transfer_buf_infos(pool)
-        setup_state_kv_args(kv_args, pool)
+        ) = get_kv_transfer_buf_infos(storage)
+        setup_state_kv_args(kv_args, storage)
         self.assertEqual(
             (kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens),
             pool.kv_pool.get_contiguous_buf_infos(),

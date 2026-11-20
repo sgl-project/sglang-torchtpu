@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import restore_kv_cache
@@ -136,6 +137,11 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         draft_worker = object.__new__(EagleDraftWorker)
         draft_worker.draft_worker = draft_tp_worker
         draft_worker.draft_runner = draft_tp_worker.model_runner
+        # init_token_map is patched out: full draft vocabulary, no hot-token map.
+        draft_worker.hot_token_id = None
+        draft_worker.target_worker = SimpleNamespace(
+            model_config=SimpleNamespace(vocab_size=128)
+        )
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = draft_worker
         with (
@@ -157,13 +163,24 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         batch.tree_cache = Mock(
             token_to_kv_pool_allocator=self.allocator,
             req_to_token_pool=self.req_pool,
+            logical_page_size=1,
             **{
                 "claim_kv_row.return_value": False,
                 "supports_prefix_sharing.return_value": False,
             },
         )
         batch.hisparse_coordinator = None
-        self.assertTrue(batch.release_req(0, 0, draft_kv_pools=self.draft_kv_pools))
+        retirer = RequestRetirer(
+            tree_cache=batch.tree_cache,
+            beam_coordinator=Mock(),
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=Mock(),
+            stream_output=Mock(),
+        )
+        self.assertTrue(
+            batch.release_req(0, 0, retirer, draft_kv_pools=self.draft_kv_pools)
+        )
 
         _poison(self.target)
         for draft in self.drafts:

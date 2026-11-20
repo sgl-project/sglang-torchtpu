@@ -46,12 +46,13 @@ _MAX_NEW_TOKENS = 16
 # Generous: the first probe is a cold prefill on a freshly compiled server.
 _REQUEST_TIMEOUT = 900
 
-# Under overlap scheduling, a request that finishes is still in the next forward's
-# batch, which writes the KV of its last token. When prompt plus output is a page
-# multiple, that slot completes a page that release inserts into the radix tree and
-# write-through backs up to host while the forward may still be writing it. Every
-# tail request is sized that way; whether a given backup reads the page early is
-# timing, so several requests each get a chance.
+# A tail request finishes by length, and under overlap scheduling the scheduler
+# leaves such a request out of the forward launched with its last token in flight,
+# so that token's KV is never written. The committed tokens -- prompt plus every
+# output but the last -- are sized to a page multiple, so the final decode step
+# completes a page that release inserts into the radix tree and write-through backs
+# up to host. Each request has a different output length, so the backups land on
+# different steps, next to different in-flight forwards.
 _TAIL_REQUESTS = 8
 # A prefix match is capped one token short of the input and floored to a page, so
 # a replay of only the committed tokens would recompute the tail page instead of
@@ -74,7 +75,8 @@ class CacheObservation(msgspec.Struct, frozen=True):
 
 
 class TailReplay(msgspec.Struct, frozen=True):
-    """One decode tail's committed tokens, replayed from device and from host."""
+    """One decode tail's committed tokens (prompt plus all outputs but the last),
+    replayed from device and from host."""
 
     committed_tokens: int
     device: CacheObservation
@@ -265,8 +267,10 @@ def spec_failures(*, probe: KvOffloadProbe) -> List[str]:
 def tail_shapes(*, page_size: int) -> List[Tuple[int, int]]:
     """``(prompt_tokens, max_new_tokens)`` for each decode-tail request.
 
-    Each pair sums to a page multiple. The output lengths differ, so the requests
-    finish on different decode steps and their backups are separate exposures.
+    Each pair sums to one past a page multiple, so the committed tokens (all but
+    the last output, whose KV is never written) end on a page boundary. The output
+    lengths differ, so the requests finish on different decode steps and their
+    backups are separate exposures.
     """
     # Keeps a replay from completing a page of its own, which would add tree and
     # host state the eviction plan does not count.
@@ -277,7 +281,7 @@ def tail_shapes(*, page_size: int) -> List[Tuple[int, int]]:
     shapes = []
     for i in range(_TAIL_REQUESTS):
         max_new_tokens = page_size // 2 + i
-        shapes.append(((2 + i % 2) * page_size - max_new_tokens, max_new_tokens))
+        shapes.append(((2 + i % 2) * page_size + 1 - max_new_tokens, max_new_tokens))
     return shapes
 
 
@@ -297,7 +301,7 @@ def tail_failures(*, tails: Sequence[TailReplay]) -> List[str]:
                 f"decode tail {i}: the device replay matched {device.device_tokens} "
                 f"device and {device.host_tokens} host tokens, expected all "
                 f"{committed} committed tokens on device, so the tail page was not "
-                "in the tree and nothing was checked (is overlap scheduling on?)"
+                "in the tree and nothing was checked"
             )
         elif host.device_tokens or host.host_tokens != committed:
             failures.append(
@@ -476,7 +480,8 @@ def run_probe(
                 f"decode tail {i} generated {len(out.output_ids)} tokens, expected "
                 f"{max_new_tokens}"
             )
-        return ids + list(out.output_ids)
+        # The last output's KV is never written, so it is not committed.
+        return ids + list(out.output_ids)[:-1]
 
     def replay(committed: List[int]) -> CacheObservation:
         return generate(
@@ -560,7 +565,7 @@ def kv_offload_runner(
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
     ``spec_decoding`` additionally enables the speculative-decoding checks.
     ``decode_tails`` additionally checks that host copies of page-aligned decode
-    KV match the device; it needs overlap scheduling.
+    KV match the device.
     """
     if decode_tails and (spec_decoding or dp_size != 1):
         raise ValueError(

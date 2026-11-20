@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import MultimodalInputs
+    from sglang.srt.managers.req_types import MultimodalInputs
 
 # Host time spent dropping parked features before one device wait.
 _DRAIN_BUDGET_NS = 4_000_000

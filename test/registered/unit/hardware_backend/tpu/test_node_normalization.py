@@ -289,7 +289,7 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         )
 
     def test_automatic_launch_declares_ranks_once_and_dp_ports_follow(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import PortArgs
 
         # Attention DP is declared by width now; the deprecated flag alone
@@ -323,7 +323,7 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         declare.assert_not_called()
 
     def test_dp_replicas_get_the_hosts_of_their_box(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import ServerArgs
 
         server_args = ServerArgs(

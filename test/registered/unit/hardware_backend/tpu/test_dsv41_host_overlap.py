@@ -1037,6 +1037,8 @@ def test_fast_path_commits_hasher_history_for_fallback_decode():
         is_decode=lambda: True,
         is_target_verify=lambda: False,
         is_extend=lambda: False,
+        # The merged EngramHasher checks is_idle() first.
+        is_idle=lambda: False,
     )
     fallback_fb = SimpleNamespace(
         forward_mode=decode_mode,
@@ -1795,7 +1797,9 @@ def test_target_verify_single_threaded_numpy_staging_matches_engram_hasher():
     # Ragged verify (explicit layout or non-uniform token count) must assert.
     ragged_layout_fb = SimpleNamespace(
         forward_mode=verify_mode,
-        spec_info=SimpleNamespace(draft_token_num=4, ragged_verify_layout=object()),
+        spec_info=SimpleNamespace(draft_token_num=4),
+        # The sync keeps the ragged layout on the forward batch.
+        ragged_verify_layout=object(),
         positions=torch.arange(8, dtype=torch.int64),
         req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
         req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int64),

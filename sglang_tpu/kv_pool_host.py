@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.hicache_auto_size import register_sizeable_pool
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -50,7 +51,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
-    host_memory_budget_bytes,
+    host_memory_preflight,
     sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
@@ -134,12 +135,25 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         # (layer_num = target + draft); TPU has no packed draft pools, so the
         # target layer count is the whole pool.
         self.target_layer_num = device_pool.layer_num
+        # Upstream HostKVCache takes explicit geometry instead of the device
+        # pool; derive it from the live fused pool (get_size_per_token reads
+        # self.device_pool / self.page_size and sets self.layer_num).
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self._transfer_device = device_pool.device
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
+            dtype=device_pool.store_dtype,
+            device_capacity_tokens=device_capacity,
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
             pin_memory=pin_memory,
             device=device,
             allocator_type=allocator_type,
@@ -463,7 +477,7 @@ class TpuDMAHostKVPool(HostKVCache):
             )
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
+        _, available_bytes = host_memory_preflight([requested_bytes])
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -745,7 +759,7 @@ class _SharedUnifiedDMAHostState:
             )
 
         requested_bytes = self.page_num * self.bytes_per_page
-        available_bytes = host_memory_budget_bytes(requested_bytes)
+        _, available_bytes = host_memory_preflight([requested_bytes])
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -1104,7 +1118,9 @@ def _evict_swa_for_device_alloc(cache, required_size: int) -> None:
     available_size = cache.token_to_kv_pool_allocator.swa_available_size()
     shortfall = max(0, required_size - available_size)
     if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+        cache.evict(
+            EvictParams(window_num_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: shortfall})
+        )
 
 
 class _TpuUnifiedSwaStrategy(StackStrategy):

@@ -129,7 +129,7 @@ mkdir -p "$OUTPUT_DIR"
 # A torch_tpu built from source with Bazel keeps jax/jaxlib/ml_dtypes/
 # opt_einsum/scipy in its Bazel external repo. If you built that way, point
 # JAX_BAZEL at <bazel-output-user-root>/<hash>/external so `python -m
-# sglang.bench_serving` can import them. Pip-installed torch_tpu does not
+# sglang.benchmark.serving` can import them. Pip-installed torch_tpu does not
 # need this — leave JAX_BAZEL unset. (See ./launch_server.sh / ./README.md.)
 JAX_BAZEL=${JAX_BAZEL:-}
 if [[ -n "$JAX_BAZEL" ]]; then
@@ -181,7 +181,7 @@ run_one() {
     [[ "$warmup_n" == "auto" ]] && warmup_n=$((2 * bs))
 
     local args=(
-        -m sglang.bench_serving
+        -m sglang.benchmark.serving
         --backend "$BACKEND"
         --base-url "$BASE_URL"
         --model "$MODEL"

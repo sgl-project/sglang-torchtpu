@@ -181,14 +181,16 @@ def price_unified_hicache_draft_bytes(original, target, draft) -> int:
     return _pool_bytes(draft) * target.size // draft.size
 
 
-def bind_unified_swa_draft_host_pool(result, *, draft_kv_pool, tree_cache):
+def bind_unified_swa_draft_host_pool(
+    result, *, draft_kv_pool, tree_cache, target_window_host
+):
     _, entries = result
     if entries:
-        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang_tpu.kv_pool_host import TpuDMAUnifiedHostKVPool
 
+        # The target window's host pool, which the draft SWA sidecar follows.
         swa_entry = tree_cache.cache_controller.mem_pool_host.entry_map.get(
-            PoolName.SWA
+            target_window_host
         )
         if swa_entry is not None and isinstance(
             swa_entry.host_pool, TpuDMAUnifiedHostKVPool

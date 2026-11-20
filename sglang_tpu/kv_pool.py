@@ -319,6 +319,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+
+    def get_device_pool_infos(self):
+        """Name this pool's KV layers for HiCache host assembly.
+
+        No upstream buffer info describes the fused pages, and the TPU host
+        pool is built from this pool itself (``get_device_pool_kv_host_cls``),
+        so ``buffer_info`` is None rather than the K/V-buffer description
+        ``MHATokenToKVPool`` builds from buffers this pool does not have.
+        """
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=None,
+            ),
+        )
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
@@ -1117,6 +1140,9 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             dtype=torch.uint64,
             device=self.device,
         )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
         self._finalize_allocation_log(size)
 
     # ------------------------------------------------------------------ #
@@ -1369,6 +1395,9 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
         # page 0 is never a real page.
         self.num_pages = self.size // self.page_size + 1
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
 
         self._create_buffers()
         self._finalize_allocation_log(size)
