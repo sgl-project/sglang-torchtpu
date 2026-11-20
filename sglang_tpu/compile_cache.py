@@ -76,6 +76,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # Serving-time recompile monitor.
         "SGLANG_TPU_CHECK_RECOMPILATION",
         "SGLANG_TPU_CHECK_RECOMPILATION_SITES",
+        # Pallas export static-arg cardinality warning (diagnostic only).
+        "SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD",
         # PD KV transfer and its tracing, on the host.
         "SGLANG_DEBUG_TPU_KV_STATS_EVERY",
         "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING",

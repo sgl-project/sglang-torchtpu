@@ -52,7 +52,8 @@ class TestKernelInputsDigest(CustomTestCase):
         )
         self.write(
             "sglang_tpu/monitor.py",
-            "CHECK = tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
+            "CHECK = tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n"
+            "LIMIT = tpu_envs.SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD.get()\n",
         )
         enter_scope(
             self,
@@ -170,6 +171,8 @@ class TestKernelInputsDigest(CustomTestCase):
     def test_env_knobs_that_change_no_program_stay_out_of_the_digest(self):
         # The recompile monitor is read in a hashed file but is not keyed.
         with tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
+            self.assertEqual(self.digest(), self.base)
+        with tpu_envs.SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD.override(0):
             self.assertEqual(self.digest(), self.base)
         # The buffered PP hand-off's send queue depth is read in pp_scheduler.py.
         with tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.override(5):
