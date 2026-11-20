@@ -2,31 +2,42 @@
 its model, its DSpark draft at a pinned revision and its pre-shard
 (:func:`apply`), and the colocated AgentX settings (:func:`colocated_defaults`).
 
-The decode verifies its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS gives
-simulated mean acceptance lengths per draft width ("drafts:length,...", bonus
-token included): each verify then accepts a drawn number of drafts without
-checking them and takes the target's greedy token after them, whatever the
-request's sampling parameters, and the worker logs a warning with the rates.
-InferenceX AgentX's Kimi-K3.1-Pro DSpark curves (infx/golden_al_distribution;
-drafts sampled probabilistically, block verification):
-
-* the preview draft served here (DRAFT at DRAFT_REVISION; InferenceX #4851):
-  7:3.69,3:2.88,1:1.82;
-* the released draft Inferact/Kimi-K3.1-Pro-DSpark, InferenceX's K3.1 curve
-  since 2026-11-17 (InferenceX #5102): 7:4.16,3:3.08,1:1.86. The released
-  draft (GQA layers with a sliding window) is not an MLA draft, which the
-  programs need.
+K3_PROGRAM_K31_DRAFT selects the draft (DRAFTS): "preview" (the default) or
+"released". The decode verifies its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS
+asks for simulated acceptance: "curve" simulates the selected draft's
+InferenceX AgentX curve (infx/golden_al_distribution; drafts sampled
+probabilistically, block verification), and "drafts:length,..." gives mean
+acceptance lengths per draft width (bonus token included). Each verify then
+accepts a drawn number of drafts without checking them and takes the target's
+greedy token after them, whatever the request's sampling parameters, and the
+worker logs a warning with the rates.
 """
 
 import os
 import re
 
 MODEL = "moonshotai/Kimi-K3.1-Pro"
-# The MLA DSpark draft, at the revision InferenceX's preview-draft curve was
-# measured with (--speculative-draft-model-revision; the worker loads it from
-# the Hugging Face cache and logs the revision it loaded).
-DRAFT = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
-DRAFT_REVISION = "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94"
+# The DSpark drafts, each pinned (id@revision; the worker loads it from the
+# Hugging Face cache and logs the revision it loaded) at the revision its
+# InferenceX curve was collected with, and that curve per draft width.
+DRAFTS = {
+    # Inferact/Kimi-K3.1-Pro-DSpark, a Qwen3-style speculator (GQA, 2048-token
+    # sliding window) drafting from a ring, which shares the target's embedding
+    # and LM head; InferenceX's Kimi-K3.1 curve since 2026-11-17 (InferenceX
+    # #5102). Its pre-shard reads them from the target checkpoint (preshard
+    # dspark --draft DIR --checkpoint DIR).
+    "released": (
+        "Inferact/Kimi-K3.1-Pro-DSpark@e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f",
+        "7:4.16,3:3.08,1:1.86",
+    ),
+    # Inferact/Kimi-K3.1-Pro-DSpark-preview, the MLA draft (InferenceX #4851).
+    "preview": (
+        "Inferact/Kimi-K3.1-Pro-DSpark-preview@6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+        "7:3.69,3:2.88,1:1.82",
+    ),
+}
+DEFAULT_DRAFT = "preview"
+DRAFT, ACC_LENGTHS = DRAFTS[DEFAULT_DRAFT]
 # The decode indexer selects every key at or above the top-2048 threshold's
 # 20-bit bin (five 4-bit rounds over the DCP group): a superset of the top-2048
 # (the bin's other keys too), three exchange rounds fewer than the exact
@@ -114,16 +125,24 @@ LIBTPU_EXTRA = "--xla_tpu_dvfs_p_state=7"
 
 def apply(config: dict) -> dict:
     """``config`` (a Kimi-K3 program recipe's CONFIG) for Kimi-K3.1-Pro."""
-    config["server_args"].update(
-        model_path=MODEL, speculative_draft_model_revision=DRAFT_REVISION
-    )
+    config["server_args"]["model_path"] = MODEL
     env = config["runtime_env"]
     if env.get("SGLANG_TPU_K3_PROGRAM_ATTENTION_DP", "1") != "1":
         # The DSA indexer gathers its 32 query heads over a DCP32 group.
         raise ValueError(
             "Kimi-K3.1 on the K3 programs decodes with attention DP1 (DCP32)"
         )
-    env["SGLANG_TPU_K3_PROGRAM_DRAFT"] = DRAFT
+    choice = os.environ.get("K3_PROGRAM_K31_DRAFT") or DEFAULT_DRAFT
+    if choice not in DRAFTS:
+        raise ValueError(
+            f"K3_PROGRAM_K31_DRAFT is one of {sorted(DRAFTS)}, not {choice!r}"
+        )
+    draft, curve = DRAFTS[choice]
+    env["SGLANG_TPU_K3_PROGRAM_DRAFT"] = draft
+    lengths = os.environ.get("K3_PROGRAM_SIMULATE_ACC_LENGTHS", "")
+    env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"] = (
+        curve if lengths == "curve" else lengths
+    )
     env["SGLANG_TPU_K3_PROGRAM_PRESHARDED"] = os.environ.get(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded-k31"
     )

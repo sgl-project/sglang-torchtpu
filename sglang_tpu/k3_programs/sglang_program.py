@@ -76,13 +76,22 @@ def parse_spec_schedule(text: str):
 
 
 def _local_checkpoint(path: str, revision: str | None = None) -> Path:
-    """A checkpoint argument (directory, or Hugging Face id at ``revision``:
-    default its main branch) as its local directory, from the cache only."""
+    """A checkpoint argument (directory, Hugging Face id or ``id@revision``) as
+    its local directory, from the cache only. ``revision`` pins a plain id's
+    revision (default its main branch)."""
     if Path(path).is_dir():
         return Path(path)
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(path, revision=revision, local_files_only=True))
+    repo, _, pinned = path.partition("@")
+    if pinned and revision and pinned != revision:
+        raise ValueError(
+            f"K3_PROGRAM: the draft {path} names revision {pinned}, and "
+            f"--speculative-draft-model-revision {revision}"
+        )
+    return Path(
+        snapshot_download(repo, revision=pinned or revision, local_files_only=True)
+    )
 
 
 def _snapshot_revision(checkpoint: Path) -> str | None:
@@ -162,10 +171,12 @@ def build_from_server():
     )
     if not draft_path:
         raise ValueError(
-            "K3_PROGRAM needs SGLANG_TPU_K3_PROGRAM_DRAFT (the MLA DSpark draft, "
-            "Inferact/Kimi-K3-DSpark): both roles hold its KV"
+            "K3_PROGRAM needs SGLANG_TPU_K3_PROGRAM_DRAFT (the DSpark draft: the "
+            "MLA one, e.g. Inferact/Kimi-K3-DSpark, both roles holding its KV, or "
+            "a Qwen3-style speculator, e.g. Inferact/Kimi-K3.1-Pro-DSpark)"
         )
-    # --speculative-draft-model-revision pins a Hugging Face id's revision.
+    # An id@revision draft, or --speculative-draft-model-revision, pins the
+    # Hugging Face revision.
     draft = _local_checkpoint(
         str(draft_path), get_spec().speculative_draft_model_revision
     )
@@ -177,9 +188,15 @@ def build_from_server():
             _snapshot_revision(draft) or "unknown, a local directory",
             draft,
         )
-    if not dspark_mla.is_mla_draft(draft):
-        raise ValueError(f"K3_PROGRAM: {draft} is not the MLA DSpark draft")
-    layers = dspark_mla.MlaDraftConfig.from_checkpoint(draft).layers
+    if dspark_mla.is_mla_draft(draft):
+        layers = dspark_mla.MlaDraftConfig.from_checkpoint(draft).layers
+    else:
+        # A Qwen3-style speculator (kernels.dspark): its context is a ring the
+        # prefill writes beside the KDA states, so the draft pools stay unused.
+        # from_checkpoint refuses configs the fused kernel does not run.
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark
+
+        layers = dspark.DraftConfig.from_checkpoint(draft).layers
     if layers != bridge.DSPARK_DRAFT_LAYERS:
         raise ValueError(
             f"K3_PROGRAM: the draft has {layers} layers; the unified pools hold "

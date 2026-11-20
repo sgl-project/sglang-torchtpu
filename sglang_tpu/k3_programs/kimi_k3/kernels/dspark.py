@@ -79,6 +79,7 @@ class DraftConfig:
     @classmethod
     def from_checkpoint(cls, directory: Path) -> DraftConfig:
         raw = json.loads((Path(directory) / "config.json").read_text())
+        check_speculator_config(raw, directory)
         layer = raw["transformer_layer_config"]
         return cls(
             hidden=layer["hidden_size"],
@@ -95,6 +96,82 @@ class DraftConfig:
             eps=layer["rms_norm_eps"],
             markov_rank=raw["markov_rank"],
         )
+
+
+# What the fused kernel implements; a speculator config outside it is refused
+# rather than drafted with the wrong attention, RoPE or shapes.
+KERNEL_SHAPE = {
+    "hidden_size": 7168,
+    "num_hidden_layers": 5,
+    "num_attention_heads": 96,
+    "num_key_value_heads": 16,
+    "head_dim": 64,
+    "intermediate_size": 14336,
+    "vocab_size": 163840,
+}
+MARKOV_RANKS = (256, 512)  # compiled and VMEM-checked (``DsparkDraft.parts``)
+
+
+def check_speculator_config(raw: dict, directory: Path | str = "") -> None:
+    """Refuse a speculators-format DSpark config the kernel does not implement:
+    Qwen3 layers of ``KERNEL_SHAPE``, sliding-window attention in every layer
+    with causal block rows, default RoPE, five aux streams, the target's
+    vocabulary, drafts sampled from the anchor and a 7- or 8-token block (the
+    kernel runs eight causal rows and the verify takes the first seven)."""
+    layer = raw.get("transformer_layer_config") or {}
+    rope = layer.get("rope_parameters") or {}
+    problems = [
+        f"{key} {layer.get(key)} (the kernel's is {value})"
+        for key, value in KERNEL_SHAPE.items()
+        if layer.get(key) != value
+    ]
+    if raw.get("speculators_model_type", "dspark") != "dspark":
+        problems.append(f"speculators_model_type {raw.get('speculators_model_type')}")
+    if layer.get("model_type") != "qwen3":
+        problems.append(f"layer model_type {layer.get('model_type')}")
+    types = layer.get("layer_types") or []
+    if not layer.get("sliding_window") or any(t != "sliding_attention" for t in types):
+        problems.append(f"layer types {types} (sliding attention in every layer)")
+    if raw.get("sliding_window_non_causal", False):
+        problems.append("non-causal sliding-window block rows")
+    if rope.get("rope_type", "default") != "default":
+        problems.append(f"RoPE {rope}")
+    if len(raw.get("aux_hidden_state_layer_ids") or ()) != 5:
+        problems.append(f"aux layers {raw.get('aux_hidden_state_layer_ids')}")
+    if raw.get("draft_vocab_size", layer.get("vocab_size")) != layer.get("vocab_size"):
+        problems.append(f"draft vocabulary {raw.get('draft_vocab_size')}")
+    if raw.get("target_hidden_size") not in (None, layer.get("hidden_size")):
+        problems.append(f"target hidden size {raw.get('target_hidden_size')}")
+    if not raw.get("sample_from_anchor", True):
+        problems.append("drafts not sampled from the anchor")
+    if int(raw.get("block_size", ROWS)) not in (ROWS - 1, ROWS):
+        problems.append(f"block size {raw.get('block_size')}")
+    if raw.get("markov_head_type", "vanilla") != "vanilla":
+        problems.append(f"Markov head {raw.get('markov_head_type')}")
+    if raw.get("markov_rank") not in MARKOV_RANKS:
+        problems.append(f"Markov rank {raw.get('markov_rank')}")
+    if problems:
+        raise ValueError(
+            f"{directory}: not a DSpark speculator the fused draft kernel runs: "
+            + "; ".join(problems)
+        )
+
+
+# The embedding and LM head a speculator may share with the target instead of
+# carrying copies (Inferact/Kimi-K3.1-Pro-DSpark), and the target's names.
+SHARED_WITH_TARGET = {
+    "embed_tokens.weight": "language_model.model.embed_tokens.weight",
+    "lm_head.weight": "language_model.lm_head.weight",
+}
+
+
+def missing_shared(directory: Path) -> tuple[str, ...]:
+    """The ``SHARED_WITH_TARGET`` tensors the speculator checkpoint lacks."""
+    from safetensors import safe_open
+
+    with safe_open(str(Path(directory) / "model.safetensors"), framework="np") as f:
+        names = set(f.keys())
+    return tuple(name for name in SHARED_WITH_TARGET if name not in names)
 
 
 # Checkpoint tensor names (PyTorch ``[out, in]`` layouts) and their shapes.
@@ -787,8 +864,12 @@ def make_row_sampler(mesh, rows: int, vocab: int, candidates: int = 128):
     )
 
 
-def load_checkpoint_weights(directory: Path, c: DraftConfig | None = None):
-    """Read the safetensors file into checkpoint-named bf16 arrays."""
+def load_checkpoint_weights(
+    directory: Path, c: DraftConfig | None = None, shared: dict | None = None
+):
+    """Read the safetensors file into checkpoint-named bf16 arrays. ``shared``:
+    the ``SHARED_WITH_TARGET`` tensors (the target's) for a checkpoint without
+    them."""
     from safetensors.numpy import load_file
 
     directory = Path(directory)
@@ -796,9 +877,15 @@ def load_checkpoint_weights(directory: Path, c: DraftConfig | None = None):
     import ml_dtypes
 
     raw = load_file(str(directory / "model.safetensors"))
+    absent = [name for name in SHARED_WITH_TARGET if name not in raw]
+    if absent and not all(name in (shared or {}) for name in absent):
+        raise ValueError(
+            f"{directory} has no {absent}: pass the target's (its "
+            f"{[SHARED_WITH_TARGET[n] for n in absent]})"
+        )
     weights = {}
     for name, shape in weight_shapes(c).items():
-        value = raw[name]
+        value = raw[name] if name in raw else shared[name]
         if tuple(value.shape) != shape:
             raise ValueError(f"{name}: expected {shape}, found {value.shape}")
         # safetensors' numpy loader hands bf16 back as uint16 bit patterns.

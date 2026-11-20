@@ -1396,9 +1396,12 @@ class KimiPrefiller:
         self._kda_groups = [(of[n], int(groups[of[n]].block_size)) for n in kda_names]
 
     def _draft_keep(self) -> tuple[int, ...]:
-        """Residual streams the MLA draft's aux layers need kept (pair inputs)."""
+        """Residual streams the draft's aux layers need kept (pair inputs): the
+        MLA draft's latents or the DSpark ring's."""
         if self.draft_latents is None:
-            return ()
+            # The DSpark ring (none: nothing kept).
+            ring = getattr(self, "ring", None)
+            return () if ring is None else ring.entering_layers
         from sglang_tpu.k3_programs.kimi_k3.draft_mla_prefill import stream_source
 
         # Layers read from the blocks (multiples of 12) need no stream kept.
@@ -1734,7 +1737,7 @@ class KimiPrefiller:
 
             def ring_hook(blocks, prefix, middle, entering):
                 ring_out["after"], ring_out["at"] = self.ring.update(
-                    blocks, prefix, middle, positions, sequences, ends, stops, rings
+                    blocks, entering, positions, sequences, ends, stops, rings
                 )
 
         recurrent, conv = self.program.stack_states(states)
@@ -1948,8 +1951,7 @@ class KimiPrefiller:
                     ring._update_op(window, count),
                     (
                         blocks,
-                        stream,
-                        stream,
+                        *(stream,) * len(ring.entering_layers),
                         i32(window),
                         i32(window),
                         i32(count),
@@ -2051,8 +2053,7 @@ class KimiPrefiller:
                 ):
                     ring_out["after"], ring_out["at"] = self.ring.update(
                         blocks,
-                        prefix,
-                        middle,
+                        entering,
                         none,
                         none,
                         [-1] * count,

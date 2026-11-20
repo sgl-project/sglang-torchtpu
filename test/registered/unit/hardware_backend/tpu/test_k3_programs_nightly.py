@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(
-    est_time=1200,
+    est_time=1260,
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=1,
@@ -37,6 +37,7 @@ MODULES = (
     "test_k3_program_hicache.py",
     "test_k3_program_host_relay.py",
     "test_k3_program_k31.py",
+    "test_k3_program_k31_released_draft.py",
     "test_k3_program_pools.py",
     "test_k3_program_prefill_plan.py",
     "test_k3_program_tails.py",

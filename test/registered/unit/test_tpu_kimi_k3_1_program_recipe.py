@@ -25,6 +25,9 @@ MODULES = (
 )
 FP8_WEIGHTS = ("decode_router_fp8", "kda_fp8_projections")
 PREVIEW_CURVE = "7:3.69,3:2.88,1:1.82"
+RELEASED_CURVE = "7:4.16,3:3.08,1:1.86"
+# K3_PROGRAM_K31_DRAFT unset.
+DEFAULT_DRAFT = "preview"
 
 
 def resolve(**env):
@@ -79,10 +82,13 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
         )
 
     def test_agentx_server_settings(self):
-        args = resolve()["server_args"]
+        config = resolve()
+        args = config["server_args"]
         self.assertEqual(args["model_path"], "moonshotai/Kimi-K3.1-Pro")
+        # The draft id carries its pinned revision.
+        self.assertNotIn("speculative_draft_model_revision", args)
         self.assertEqual(
-            args["speculative_draft_model_revision"], self.program().DRAFT_REVISION
+            config["runtime_env"]["SGLANG_TPU_K3_PROGRAM_DRAFT"], self.program().DRAFT
         )
         self.assertTrue(args["enable_metrics"])
         self.assertNotIn("reasoning_parser", args)
@@ -121,6 +127,39 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
         self.assertEqual(
             env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"], PREVIEW_CURVE
         )
+
+    def test_draft_selection(self):
+        program = self.program()
+        self.assertEqual(
+            program.DRAFTS,
+            {
+                "released": (
+                    "Inferact/Kimi-K3.1-Pro-DSpark"
+                    "@e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f",
+                    RELEASED_CURVE,
+                ),
+                "preview": (
+                    "Inferact/Kimi-K3.1-Pro-DSpark-preview"
+                    "@6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+                    PREVIEW_CURVE,
+                ),
+            },
+        )
+        env = resolve()["runtime_env"]
+        self.assertEqual(
+            env["SGLANG_TPU_K3_PROGRAM_DRAFT"], program.DRAFTS[DEFAULT_DRAFT][0]
+        )
+        for choice, (draft, curve) in program.DRAFTS.items():
+            env = resolve(K3_PROGRAM_K31_DRAFT=choice)["runtime_env"]
+            self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_DRAFT"], draft)
+            self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"], "")
+            # "curve": the selected draft's InferenceX curve.
+            env = resolve(
+                K3_PROGRAM_K31_DRAFT=choice, K3_PROGRAM_SIMULATE_ACC_LENGTHS="curve"
+            )["runtime_env"]
+            self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"], curve)
+        with self.assertRaisesRegex(ValueError, "K3_PROGRAM_K31_DRAFT"):
+            resolve(K3_PROGRAM_K31_DRAFT="other")
 
     def test_environment_overrides(self):
         config = resolve(

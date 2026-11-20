@@ -6,11 +6,15 @@
 
 The decoder's draft (:mod:`draft`) attends a ring of the last 2048 positions'
 projected keys and values of the target's residual streams entering the aux
-layers (24, 48, 72, 88, 92); a decoder that starts it empty drafts poorly until
-it fills. :class:`PrefillRing` computes it window by window from the prefill
-stack's residual streams, the pool writer stores it in the draft rows of the
-request's KDA state blocks (``pools.write_draft_rings``), and the KV transfer
-carries it to ``KdaImporter.import_ring``. Each rank gathers the draft's
+layers (Kimi-K3's speculator: 24, 48, 72, 88, 92; Kimi-K3.1-Pro-DSpark: 76, 80,
+84, 88, 92); a decoder that starts it empty drafts poorly until it fills.
+:class:`PrefillRing` computes it window by window from the prefill stack's
+residual streams, the pool writer stores it in the draft rows of the request's
+KDA state blocks (``pools.write_draft_rings``), and the KV transfer (colocated:
+the decoder's import from the same pools) carries it to
+``KdaImporter.import_ring``. Under simulated acceptance the emitted tokens at
+accepted positions are the draft's, so the ring must hold the prompt's context
+before the first decode step. Each rank gathers the draft's
 ``fc``, ``kv``, ``kvnorm`` and ``hidden_norm`` shards (``dspark-<revision>`` in
 the pre-shard directory) into replicated weights and projects its own window
 rows for every KV head (``kernels.dspark.prefill_ring_update``).
@@ -34,12 +38,20 @@ from sglang_tpu.k3_programs.kimi_k3.program import kernel_modules
 
 logger = init_logger(__name__)
 
-# The residual streams the prefill window ops expose for the aux layers:
-# ``blocks`` slot L // 12 holds the stream entering layer L (L a multiple of
-# 12), the regular pair 10's middle output enters layer 88, and the prefix
-# into the final op enters layer 92.
-AUX_LAYERS = (24, 48, 72, 88, 92)
+# The residual stream entering an aux layer comes from the prefill's AttnRes
+# block snapshots (``blocks`` slot L // 12, L a multiple of 12) or from its
+# ``entering`` streams (each pair's input -- kept only on request -- middle
+# and tap, the final op's input): ``draft_mla_prefill.stream_source``.
 WEIGHT_ARRAYS = ("fc", "kv", "kvnorm", "hidden_norm")
+
+
+def aux_streams(aux_layers, blocks, taps: dict):
+    """``[len(aux_layers), rows, hidden]``: each aux layer's stream in aux order,
+    ``taps[layer]`` (this rank's rows of an ``entering`` stream) or the block
+    snapshot ``blocks[layer // 12]`` (``blocks`` ``[8, rows, hidden]``)."""
+    return jnp.stack(
+        [taps[layer] if layer in taps else blocks[layer // 12] for layer in aux_layers]
+    )
 
 
 class PrefillRing:
@@ -50,11 +62,10 @@ class PrefillRing:
     ) -> None:
         (self.dspark,) = kernel_modules("dspark")
         self.config = self.dspark.DraftConfig.from_checkpoint(checkpoint)
-        if tuple(self.config.aux_layers) != AUX_LAYERS:
-            raise NotImplementedError(
-                f"the prefill ring taps aux layers {AUX_LAYERS}; the draft "
-                f"{checkpoint} reads {self.config.aux_layers}"
-            )
+        from sglang_tpu.k3_programs.kimi_k3.draft_mla_prefill import stream_source
+
+        # Each aux layer's stream exists (stream_source raises otherwise).
+        self.sources = {layer: stream_source(layer) for layer in self.config.aux_layers}
         self.mesh, self.rank, self.axis = mesh, rank, axis
         self._directory = (
             Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
@@ -133,11 +144,20 @@ class PrefillRing:
             self._zero = self.empty(0)
         return self._zero
 
+    @property
+    def entering_layers(self) -> tuple[int, ...]:
+        """The aux layers whose streams come from ``entering``, in aux order
+        (the pair inputs among them must be kept: ``run_packed``'s ``keep``)."""
+        return tuple(
+            layer
+            for layer in self.config.aux_layers
+            if self.sources[layer] == "entering"
+        )
+
     def update(
         self,
         blocks: torch.Tensor,
-        prefix: torch.Tensor,
-        middle: torch.Tensor,
+        entering: dict,
         positions: np.ndarray,
         sequences: np.ndarray,
         ends: list[int],
@@ -145,8 +165,8 @@ class PrefillRing:
         rings: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[list, list]:
         """One packed window (``slots`` sequences): its residual streams
-        (``blocks``, the pair-10 ``middle``, the ``prefix`` into the final
-        op) into each sequence's ring. ``positions`` / ``sequences``
+        (``blocks`` and the ``entering`` streams ``run_packed`` passes its ring
+        hook) into each sequence's ring. ``positions`` / ``sequences``
         ``[window]`` per window row (``-1``: padding); ``ends`` / ``stops``
         per sequence (``-1``: no checkpoint). Returns the ``(cache, meta)``
         rings after the window and at the checkpoints."""
@@ -157,8 +177,7 @@ class PrefillRing:
 
         out = self._update_op(window, slots)(
             blocks,
-            prefix,
-            middle,
+            *(entering[layer] for layer in self.entering_layers),
             device(positions),
             device(sequences),
             device(ends),
@@ -176,15 +195,17 @@ class PrefillRing:
         key = ("update", window, slots)
         if key not in self._ops:
             c, axis, dspark = self.config, self.axis, self.dspark
+            taps = self.entering_layers
 
-            def body(blocks, prefix, middle, positions, sequences, ends, stops, *rest):
+            def body(blocks, *args):
+                streams = {layer: tap[0] for layer, tap in zip(taps, args)}
+                positions, sequences, ends, stops = args[len(taps) : len(taps) + 4]
+                rest = args[len(taps) + 4 :]
                 weights = dict(
                     zip(("fc", "kv", "k_norm", "hidden_norm"), rest[:4], strict=True)
                 )
                 caches, metas = rest[4 : 4 + slots], rest[4 + slots :]
-                aux = jnp.stack(
-                    (blocks[0, 2], blocks[0, 4], blocks[0, 6], middle[0], prefix[0])
-                )
+                aux = aux_streams(c.aux_layers, blocks[0], streams)
                 after, at = dspark.prefill_ring_update(
                     c,
                     weights,
@@ -208,7 +229,7 @@ class PrefillRing:
                 f"pallas::k3_prefill_draft_ring_w{window}_s{slots}",
                 self.mesh,
                 body,
-                (P(axis),) * 3
+                (P(axis),) * (1 + len(taps))
                 + (P(),) * 4
                 + (P(),) * 4
                 + (P(axis),) * slots

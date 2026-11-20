@@ -448,12 +448,17 @@ class DsparkDraft:
             )
         return self._ops[key]
 
-    @staticmethod
-    def parts(requests: int, rows_per: int) -> list[tuple[int, int]]:
+    def parts(self, requests: int, rows_per: int) -> list[tuple[int, int]]:
         """``(first, count)`` of each fused draft call after a verify of
         ``requests`` requests: the fused kernel drafts at most 16 requests of
-        up to four rows, or 8 of more."""
-        size = 16 if rows_per <= 4 else 8
+        up to four rows, or 8 of more. With a rank-512 Markov head (its ``w2t``
+        buffer twice the rank-256 one) its VMEM holds two requests while it
+        keeps whole o / down weights (up to four requests) and eight while it
+        streams them (``kernels.dspark._fused_rows``)."""
+        if self.config.markov_rank <= 256:
+            size = 16 if rows_per <= 4 else 8
+        else:
+            size = 2 if requests <= 4 else 8
         return [
             (first, min(size, requests - first)) for first in range(0, requests, size)
         ]

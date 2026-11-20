@@ -147,13 +147,14 @@ class TestServerConfig(CustomTestCase):
         ):
             sglang_program.build_from_server()
 
-    def test_the_draft_must_be_the_mla_draft(self):
+    def test_the_draft_must_be_one_the_kernels_run(self):
+        # Neither the MLA draft nor a speculator the fused GQA kernel runs.
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
             with (
                 _Patched(_server(draft=d)),
                 tpu_envs.SGLANG_TPU_K3_PROGRAM_PRESHARDED.override("/presharded"),
-                self.assertRaisesRegex(ValueError, "not the MLA DSpark draft"),
+                self.assertRaisesRegex(ValueError, "not a DSpark speculator"),
             ):
                 sglang_program.build_from_server()
 
@@ -168,7 +169,7 @@ class TestServerConfig(CustomTestCase):
                 mock.patch(
                     "huggingface_hub.snapshot_download", return_value=str(snapshot)
                 ) as download,
-                self.assertRaisesRegex(ValueError, "not the MLA DSpark draft"),
+                self.assertRaisesRegex(ValueError, "not a DSpark speculator"),
             ):
                 sglang_program.build_from_server()
             download.assert_called_once_with(

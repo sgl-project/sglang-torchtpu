@@ -5,7 +5,7 @@
 
     preshard k3 --output DIR [--checkpoint DIR] [--ranks 0,1,..] [--in-flight 4]
     preshard prefill --output DIR --checkpoint DIR
-    preshard dspark --output DIR [--draft DIR] [--max-position 16384]
+    preshard dspark --output DIR --draft DIR [--checkpoint DIR] [--max-position 16384]
     preshard verify [--against DIR] [--rank R] [--layers 1,46,92]
 
 The HF checkpoint is organized by layer (every expert of a layer spread over
@@ -90,6 +90,12 @@ def add_arguments(parser) -> None:
     draft = sub.add_parser("dspark", help="the DSpark speculator")
     draft.add_argument(
         "--draft", required=True, help="the DSpark speculator checkpoint"
+    )
+    draft.add_argument(
+        "--checkpoint",
+        default="",
+        help="the target checkpoint, for a speculator that shares the target's "
+        "embedding and LM head (Inferact/Kimi-K3.1-Pro-DSpark)",
     )
     draft.add_argument("--output", required=True)
     draft.add_argument(
@@ -460,9 +466,11 @@ def write_prefill(args, log) -> None:
     )
 
 
-def draft_shards(dspark, draft: str, max_position: int):
+def draft_shards(dspark, draft: str, max_position: int, checkpoint: str = ""):
     """The draft's kernel-layout shards: the MLA draft (``Inferact/Kimi-K3-
-    DSpark``, ``kernels.dspark_mla``) or the Qwen3-style one (``kernels.dspark``)."""
+    DSpark``, ``kernels.dspark_mla``) or the Qwen3-style one (``kernels.dspark``).
+    A Qwen3-style speculator without its own embedding and LM head takes the
+    target's from ``checkpoint``."""
     mla = _mla_module()
     if mla.is_mla_draft(Path(draft)):
         config = mla.MlaDraftConfig.from_checkpoint(Path(draft))
@@ -470,7 +478,20 @@ def draft_shards(dspark, draft: str, max_position: int):
             config, mla.load_checkpoint_weights(Path(draft), config)
         )
     config = dspark.DraftConfig.from_checkpoint(Path(draft))
-    weights = dspark.load_checkpoint_weights(Path(draft), config)
+    shared = None
+    missing = dspark.missing_shared(Path(draft))
+    if missing:
+        if not checkpoint:
+            raise ValueError(
+                f"{draft} shares the target's {list(missing)}: pass --checkpoint "
+                "(the target checkpoint)"
+            )
+        load, _ = _modules()
+        target = load.Checkpoint(checkpoint)
+        shared = {
+            name: target.read(dspark.SHARED_WITH_TARGET[name]) for name in missing
+        }
+    weights = dspark.load_checkpoint_weights(Path(draft), config, shared)
     return dspark.kernel_weight_shards(config, weights, max_position=max_position)
 
 
@@ -481,7 +502,7 @@ def draft_directory(output: str, draft: str) -> Path:
 def write_dspark(args, log) -> None:
     _, dspark = _modules()
     started = time.perf_counter()
-    shards = draft_shards(dspark, args.draft, args.max_position)
+    shards = draft_shards(dspark, args.draft, args.max_position, args.checkpoint)
     log(f"kernel layout built in {time.perf_counter() - started:.0f} s")
     directory = draft_directory(args.output, args.draft)
     mla = _mla_module()
@@ -592,7 +613,7 @@ def verify(args, log) -> bool:
 
     directory = draft_directory(args.against, args.draft)
     index = json.loads((directory / "index.json").read_text())
-    shards = draft_shards(dspark, args.draft, 16384)
+    shards = draft_shards(dspark, args.draft, 16384, args.checkpoint)
     raw = np.fromfile(directory / f"rank{args.rank:02d}.bin", dtype=np.uint8)
     for name, spec in index["arrays"].items():
         count = int(np.prod(spec["shape"])) * np.dtype(spec["dtype"]).itemsize
