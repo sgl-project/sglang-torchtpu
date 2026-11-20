@@ -155,6 +155,37 @@ class TestTpuSyncHostApi(CustomTestCase):
             },
         )
 
+    def test_skipping_host_duplicate_reclaim_under_write_back_warns_at_start(self):
+        """The engine starts, but says that its host pool will fill up: with
+        core's reclaim of host duplicates off, write-back keeps both copies
+        of every session it loads back."""
+        flag = startup_validation._SKIP_RECLAIM
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role), flag.override(True):
+                with self.assertLogs(startup_validation.logger, "WARNING") as logs:
+                    validate_engine_as(supported_engine(), role=role)
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(flag.name, logs.output[0])
+                self.assertIn("write_back", logs.output[0])
+
+    def test_no_reclaim_warning_under_write_through_or_with_the_default(self):
+        flag = startup_validation._SKIP_RECLAIM
+        quiet = (("write_through", True), ("write_back", False))
+        for policy, skip in quiet:
+            with self.subTest(policy=policy, skip=skip), flag.override(skip):
+                engine = supported_engine()
+                engine.memory.hicache_write_policy = policy
+                with self.assertNoLogs(startup_validation.logger, "WARNING"):
+                    validate_engine_as(engine, role="prefill")
+
+    def test_refused_engine_is_refused_before_any_warning(self):
+        with startup_validation._SKIP_RECLAIM.override(True):
+            with self.assertNoLogs(startup_validation.logger, "WARNING"):
+                with self.assertRaises(startup_validation.UnsupportedDramOffloadConfig):
+                    validate_engine_as(
+                        _broken("scheduler.server_args.pp_size", 2), role="prefill"
+                    )
+
     def test_probe_names_exactly_the_host_parameters_a_build_lacks(self):
         class Current:
             def register_read(self, req_id, uuid, blocks, source="device"): ...
