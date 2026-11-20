@@ -74,12 +74,13 @@ logger = logging.getLogger(__name__)
 
 
 def rope_table(freqs: torch.Tensor) -> torch.Tensor:
-    """fp32 ``[max_pos, rope_dim]`` ``[cos | sin]`` table of a layer's ``freqs_cis``
-    (complex, or already converted by ``_prewarm_model_caches``)."""
+    """Lane-packed fp32 ``[ceil(max_pos / 2), 128]`` ``[cos | sin]`` table of a
+    layer's ``freqs_cis`` (complex, or already converted by
+    ``_prewarm_model_caches``); see ``get_or_build_rope_lane_table``."""
     if freqs.is_complex():
-        from sglang_tpu.dsv4.dsv4_memory_pool import get_or_build_cos_sin_cache
+        from sglang_tpu.dsv4.dsv4_memory_pool import get_or_build_rope_lane_table
 
-        return get_or_build_cos_sin_cache(freqs)
+        return get_or_build_rope_lane_table(freqs)
     return freqs
 
 
@@ -89,11 +90,14 @@ def rope_reference(
     table: torch.Tensor,
     inverse: bool = False,
 ) -> torch.Tensor:
-    """Core ``rope_tail`` numerics on a ``[cos | sin]`` table: rotate the last
-    ``rope_dim`` features as interleaved (even, odd) complex pairs, in fp32."""
-    rope_dim = table.shape[-1]
+    """Core ``rope_tail`` numerics on a plain or lane-packed ``[cos | sin]``
+    table: rotate the last ``rope_dim`` features as interleaved (even, odd)
+    complex pairs, in fp32."""
+    from sglang_tpu.dsv4.dsv4_memory_pool import lookup_cos_sin
+
+    rows = lookup_cos_sin(table, positions).float()
+    rope_dim = rows.shape[-1]
     half = rope_dim // 2
-    rows = table[positions].float()
     cos, sin = rows[:, :half], rows[:, half:]
     if inverse:
         sin = -sin
@@ -651,8 +655,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
-        """Convert complex freqs_cis to [cos | sin] tables outside any trace and
-        record each attention layer's table by layer id."""
+        """Convert complex freqs_cis to lane-packed [cos | sin] tables outside any
+        trace and record each attention layer's table owner by layer id."""
         model = self.model_runner.model
         if model is None:
             return

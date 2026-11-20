@@ -98,7 +98,8 @@ def qnorm_rope_ref_impl(x, positions, cos_sin_cache, eps, inverse=False):
 def assert_bits_equal(actual, expected):
     """Byte-for-byte equality, for dtypes NumPy will not compare directly."""
     np.testing.assert_array_equal(
-        np.asarray(actual).view(np.uint8), np.asarray(expected).view(np.uint8)
+        np.ascontiguousarray(actual).view(np.uint8),
+        np.ascontiguousarray(expected).view(np.uint8),
     )
 
 
@@ -303,6 +304,36 @@ class QNormRopeTest(parameterized.TestCase):
             inverse=False,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+class LaneTableTest(parameterized.TestCase):
+    """A lane-packed table (two positions per 128-lane row) gives the plain
+    table's bits through every kernel, compiled for the TPU."""
+
+    @parameterized.parameters(8, 48, 384)
+    def test_matches_plain_table_bitwise(self, num_tokens):
+        max_position = 4096
+        plain = make_cos_sin_cache(max_position, ROTARY_DIM)
+        lanes = jnp.asarray(plain.reshape(-1, 2 * ROTARY_DIM))
+        plain = jnp.asarray(plain)
+        rng = np.random.default_rng(num_tokens)
+        positions = rng.integers(0, max_position, size=(num_tokens,))
+        positions[:4] = (0, 1, max_position - 2, max_position - 1)
+        positions = jnp.asarray(positions.astype(np.int32))
+        x = rng.normal(size=(num_tokens, 8, HEAD_DIM)).astype(jnp.bfloat16)
+        x_quant = rng.normal(size=(num_tokens, 8, 128)).astype(jnp.bfloat16)
+
+        calls = [
+            lambda table: rope(jnp.asarray(x), positions, table),
+            lambda table: rope(jnp.asarray(x), positions, table, inverse=True),
+            lambda table: qnorm_rope(jnp.asarray(x), positions, table),
+            lambda table: rope_quant(jnp.asarray(x_quant), positions, table),
+        ]
+        for call in calls:
+            for old, new in zip(
+                jax.tree.leaves(call(plain)), jax.tree.leaves(call(lanes)), strict=True
+            ):
+                assert_bits_equal(new, old)
 
 
 if __name__ == "__main__":
