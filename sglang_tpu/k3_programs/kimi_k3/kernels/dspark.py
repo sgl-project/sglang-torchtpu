@@ -2312,6 +2312,7 @@ def make_fused_draft(
     eps: float | None = None,
     stop_after: str = "full",
     host_bf16: bool = True,
+    local_only: bool = False,
     requests: int = 1,
 ):
     """``(weights, cache, positions, aux, logits, previous, positions0, forced_counts[, forced_anchors])`` ->
@@ -2476,6 +2477,11 @@ def make_fused_draft(
         if R == 1:
             return tokens, cache_out[0][None], positions_out
         return tokens, cache_out[None], positions_out[None]
+
+    if local_only:
+        # The per-rank function, for a caller's own shard_map (the verify's
+        # op with KernelConfig.ring_draft_with_verify); forced_anchor required.
+        return local
 
     program = jax.jit(
         jax.shard_map(

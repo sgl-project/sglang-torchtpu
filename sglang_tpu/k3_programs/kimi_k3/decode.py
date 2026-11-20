@@ -893,8 +893,10 @@ class KimiDecoder:
     def _one_program(self) -> bool:
         """KernelConfig.draft_with_verify for this decoder's draft (the MLA
         draft's single-request op runs inside the verify's)."""
-        return kernel_config.active().draft_with_verify and hasattr(
-            self.draft, "single_parts"
+        return (
+            kernel_config.active().draft_with_verify
+            and hasattr(self.draft, "single_parts")
+            and getattr(self.draft, "with_verify", True)
         )
 
     def _verify_then_draft(
@@ -909,6 +911,8 @@ class KimiDecoder:
         assert self.draft is not None and self.draft_state is not None
         rates = self.draft._synthetic_rates(self.WIDTH - 1)
         if self._one_program():
+            if hasattr(self.draft, "bind_single"):  # the ring draft's state
+                self.draft.bind_single(self.draft_state)
             outputs = self.ops.verify_and_draft(
                 self.draft,
                 ids,

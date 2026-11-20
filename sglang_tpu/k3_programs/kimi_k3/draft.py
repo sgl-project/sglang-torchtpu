@@ -424,6 +424,119 @@ class DsparkDraft:
         )
         return self._ops[key]
 
+    # KernelConfig.ring_draft_with_verify (with draft_with_verify): the single
+    # op runs inside the verify's (DecodeOps._build_verify_draft) as the MLA
+    # draft's does, the request's ring and positions in its pools' place.
+    single_pool_count = 2
+    target_weights: dict[str, str] = {}
+
+    @property
+    def with_verify(self) -> bool:
+        return kernel_config.active().ring_draft_with_verify
+
+    def bind_single(self, state: DraftState) -> None:
+        """The single-request state the next verify-and-draft op takes."""
+        self._single = state
+
+    def single_operands(self) -> tuple[torch.Tensor, ...]:
+        """The verify-and-draft op's draft operands: the weights, then the bound
+        state's ring and positions (shape-only before a state is bound)."""
+        c, state = self.config, getattr(self, "_single", None)
+        if state is None:
+            ring = (
+                torch.empty(
+                    (1, c.layers, c.window, 2 * c.head_dim), dtype=torch.bfloat16
+                ),
+                torch.empty((1, c.window), dtype=torch.int32),
+            )
+        else:
+            ring = (state.cache, state.positions)
+        return (*(self.weights[n] for n in self.names), *ring)
+
+    def single_parts(self, control: Any, packet: bool = False, defer: bool = False):
+        """``(step, in_specs, out_specs, donated, export key)`` of the single op
+        for a caller's shard_map: ``step(*weights, ring, positions, aux,
+        logits, previous, ids, state, decisions)`` -> ``(vector, ring,
+        positions, emitted [1, 8], next ids, state)``, :meth:`_build_single`'s
+        op per rank (its epilogue on the replicated values)."""
+        if packet or defer:
+            raise NotImplementedError(
+                "the ring draft's single op has no verify packet or deferred commit"
+            )
+        dspark, rows, names = self.dspark, self.dspark.ROWS, self.names
+        local = dspark.make_fused_draft(
+            self.config, self.mesh, rows, requests=1, local_only=True
+        )
+        count = len(names)
+
+        def step(*args):
+            import jax.numpy as jnp
+
+            weights = {name: args[i] for i, name in enumerate(names)}
+            cache, positions, aux, logits, previous, ids, state, decisions = args[
+                count:
+            ]
+            tokens, base, slot = ids[:rows], ids[rows], ids[2 * rows]
+            forced_count, forced_anchor = decisions[0, 0], decisions[0, 1]
+            vector, cache, positions = local(
+                weights,
+                cache,
+                positions,
+                aux,
+                logits,
+                previous,
+                base[None],
+                forced_count[None],
+                forced_anchor[None],
+            )
+            accepted, bonus = vector[0, dspark.OUT_COUNT], vector[0, dspark.OUT_BONUS]
+            row = jnp.arange(rows, dtype=jnp.int32)
+            emitted = jnp.where(
+                row < accepted,
+                tokens[jnp.minimum(row + 1, rows - 1)],
+                jnp.where(row == accepted, bonus, -1),
+            ).astype(jnp.int32)
+            following = jnp.concatenate(
+                (
+                    bonus[None],
+                    vector[0, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + rows - 1],
+                )
+            )
+            following_ids = jnp.concatenate(
+                (
+                    following,
+                    base + accepted + 1 + row,
+                    ids[2 * rows : 3 * rows],
+                    accepted[None],
+                    ids[3 * rows + 1 :],
+                )
+            ).astype(jnp.int32)
+            state = state.at[slot].set(bonus)
+            state = state.at[control.slots + slot].set(base + accepted + 1)
+            state = state.at[2 * control.slots + slot].set(accepted)
+            reset = control.plan_start + control.RESET
+            state = state.at[reset].set(jnp.where(slot != 0, 0, state[reset]))
+            return vector, cache, positions, emitted[None], following_ids, state
+
+        in_specs = (P(AXIS),) * count + (P(AXIS), P(), P(), P(AXIS), P(), P(), P(), P())
+        out_specs = (P(), P(AXIS), P(), P(), P(), P())
+        key = (
+            "dspark_single_parts",
+            control.key(),
+            names,
+            self.max_position,
+            dataclasses.astuple(self.config),
+        )
+        return step, in_specs, out_specs, (count, count + 1), key
+
+    def finish_single(self, out) -> tuple:
+        """The verify-and-draft op's draft outputs as :meth:`step_single`
+        returns them: ``(state, emitted, next ids, control state)``."""
+        vector, cache, positions, emitted, following, control_state = out
+        self._single = None  # its ring was donated to the op
+        state = _settled(DraftState(cache, positions, vector))
+        return state, emitted, following, control_state
+
     def _build_metadata(self, requests: int) -> Any:
         """Pack replicated metadata before the large-batch draft boundary.
 

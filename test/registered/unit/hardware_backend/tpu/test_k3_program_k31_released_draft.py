@@ -545,6 +545,147 @@ class TestRingFirstStepDrafts(CustomTestCase):
         self.assertEqual(dec.stats["predrafts"], 1)
 
 
+def _stub_fused_single(
+    weights, cache, positions, aux, logits, previous, base, count, anchor
+):
+    vector = jnp.zeros((1, 128), jnp.int32)
+    vector = (
+        vector.at[0, dspark.OUT_COUNT]
+        .set(count[0])
+        .at[0, dspark.OUT_BONUS]
+        .set(anchor[0])
+    )
+    drafts = jnp.arange(dspark.ROWS, dtype=jnp.int32) + aux[0, 0, 0].astype(jnp.int32)
+    vector = vector.at[0, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + dspark.ROWS].set(
+        drafts
+    )
+    return vector, cache + 1, positions + base[0]
+
+
+class TestRingDraftWithVerify(CustomTestCase):
+    """KernelConfig.ring_draft_with_verify: the ring draft's single op inside the
+    verify's op computes what its own op does."""
+
+    def _draft(self):
+        d = object.__new__(draft_mod.DsparkDraft)
+        d.dspark, d.config, d.mesh, d.max_position = (
+            dspark,
+            dspark.DraftConfig(),
+            None,
+            99,
+        )
+        d.names, d._ops = ("w",), {}
+        return d
+
+    def test_single_parts_match_the_single_op(self):
+        d, control = self._draft(), Control(5, 4, 2)
+        captured = {}
+
+        def register_global_op(name, mesh, fn, *rest, **kwargs):
+            captured["fn"] = fn
+            return fn
+
+        with (
+            mock.patch.object(
+                dspark, "make_fused_draft", lambda *a, **k: _stub_fused_single
+            ),
+            mock.patch.object(draft_mod, "register_global_op", register_global_op),
+        ):
+            op = d._build_single(control)
+            step, d_in, d_out, donated, _ = d.single_parts(control)
+        rng = np.random.default_rng(1)
+        rows = dspark.ROWS
+        ids = jnp.asarray(
+            rng.integers(1, 50, 3 * rows + 1 + rows * control.pages), jnp.int32
+        )
+        ids = ids.at[2 * rows].set(3)  # slot 3
+        state = jnp.asarray(rng.integers(0, 9, control.size), jnp.int32)
+        operands = (
+            jnp.zeros((1, 4)),  # the weight
+            jnp.zeros((1, 2, 4, 8), jnp.bfloat16),
+            jnp.zeros((1, 4), jnp.int32),
+            jnp.full((5, rows, 16), 7, jnp.bfloat16),
+            jnp.zeros((1, rows, 32), jnp.float32),
+            jnp.zeros((1, 128), jnp.int32),
+            ids,
+            state,
+            jnp.asarray([[3, 42]], jnp.int32),
+        )
+        ours = step(*operands)
+        theirs = op(*operands)
+        self.assertEqual(len(ours), len(theirs))
+        for a, b in zip(ours, theirs):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        self.assertEqual(donated, (1, 2))
+        self.assertEqual(len(d_in), 1 + 8)
+        self.assertEqual(len(d_out), 6)
+        with self.assertRaises(NotImplementedError):
+            d.single_parts(control, packet=True)
+
+    def test_operands_and_finish(self):
+        d = self._draft()
+        d.weights = {"w": "weight"}
+        shapes = [tuple(t.shape) for t in d.single_operands()[1:]]
+        self.assertEqual(shapes, [(1, 5, 2048, 128), (1, 2048)])
+        d.bind_single(SimpleNamespace(cache="ring", positions="pos"))
+        self.assertEqual(d.single_operands(), ("weight", "ring", "pos"))
+        with mock.patch.object(draft_mod, "_settled", lambda state: state):
+            state, emitted, following, control = d.finish_single(
+                ("vec", "ring2", "pos2", "emitted", "following", "control")
+            )
+        self.assertEqual(
+            (state.cache, state.positions, state.vector), ("ring2", "pos2", "vec")
+        )
+        self.assertEqual(
+            (emitted, following, control), ("emitted", "following", "control")
+        )
+        self.assertIsNone(d._single)
+
+    def test_decoder_routes_through_the_verify_op(self):
+        from sglang_tpu.k3_programs.kimi_k3 import config
+
+        dec = TestDecoderWithRingDraft._decoder(self)
+        draft = self._draft()
+        draft.calls, draft._aux_layers = [], K31_AUX
+        draft._synthetic_rates = lambda drafts: None
+        calls = []
+
+        def verify_and_draft(
+            d, ids, aux_layers, layout, control, mode, previous, rates
+        ):
+            calls.append((d._single, previous, mode))
+            return ("vec", "ring2", "pos2", "emitted", "following", control)
+
+        dec.draft, dec.ops.verify_and_draft = draft, verify_and_draft
+        dec.draft_state = SimpleNamespace(
+            cache="ring", positions="pos", vector="vector"
+        )
+        for knob, expected in ((False, False), (True, True)):
+            with mock.patch.object(
+                config,
+                "active",
+                return_value=config.KernelConfig(
+                    draft_with_verify=True, ring_draft_with_verify=knob
+                ),
+            ):
+                self.assertEqual(dec._one_program(), expected)
+        with (
+            mock.patch.object(
+                config,
+                "active",
+                return_value=config.KernelConfig(
+                    draft_with_verify=True, ring_draft_with_verify=True
+                ),
+            ),
+            mock.patch.object(draft_mod, "_settled", lambda state: state),
+        ):
+            emitted, following, packet = dec._verify_then_draft("ids", "mode1", None)
+        self.assertEqual(calls[0][1:], ("vector", "mode1"))
+        self.assertEqual(calls[0][0].cache, "ring")
+        self.assertEqual((emitted, following, packet), ("emitted", "following", None))
+        self.assertEqual(dec.draft_state.cache, "ring2")
+
+
 class TestDraftRevision(CustomTestCase):
     def test_revision_pinned_checkpoint(self):
         with mock.patch(

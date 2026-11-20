@@ -849,7 +849,9 @@ class DecodeOps:
             aux_layers, control, synthetic_rates
         )
         step, d_in, d_out, d_donated, d_key = draft.single_parts(control, packet=False)
-        names, layers = tuple(draft.names), int(draft.config.layers)
+        # The draft's pool operands (the ring draft: its ring and positions).
+        names = tuple(draft.names)
+        layers = int(getattr(draft, "single_pool_count", draft.config.layers))
         operands = len(v_in) - 1  # the verify's operands before its packet
         shared = {
             i: self.names.index(draft.target_weights[name])
