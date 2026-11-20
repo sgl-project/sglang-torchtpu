@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """TP16/EP16 execution gate for supported NVFP4 fused-RS block sizes.
 
-For block sizes 128, 256, and 512, run the packed-FP4 fused-RS kernel and
+For block sizes 16, 32, 64, 128, 256, and 512, run the packed-FP4 fused-RS kernel and
 compare its token shard with a distributed sum of the stock BF16 MoE kernel
 using weights dequantized from the exact same FP4 codes and block scales.
+Block 512 also compares against the stock packed-FP4 fallback.
 """
 
 import argparse
 import gc
+import math
 import os
 import types
 
@@ -31,7 +33,7 @@ import torch
 import torch.distributed as dist
 from torch_tpu._internal.distributed import tpu_distributed
 
-SUPPORTED_BLOCK_SIZES = (128, 256, 512)
+SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128, 256, 512)
 E2M1_VALUES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] * 2,
     dtype=torch.float32,
@@ -246,6 +248,20 @@ def main() -> None:
         reference_w2 = reference_w2.to(device)
         layer = layer.to(device)
 
+        stock_fp4_layer = None
+        if block_size == 512:
+            stock_fp4_layer = _make_local_nvfp4_layer(
+                local_experts,
+                hidden_size,
+                intermediate_size,
+                rank,
+                block_size,
+                activation=args.activation,
+            ).to(device)
+            prepare_tpu_nvfp4_moe_weights(
+                stock_fp4_layer, group_size=block_size, use_fused_rs=False
+            )
+
         original_prepare = fused_moe_rs_op.prepare_fused_moe_rs
         fused_moe_rs_op.prepare_fused_moe_rs = lambda _: None
         try:
@@ -307,6 +323,33 @@ def main() -> None:
             dist.all_reduce(reference, op=dist.ReduceOp.SUM)
             shard_tokens = padded_tokens // world_size
             expected = reference[rank * shard_tokens : (rank + 1) * shard_tokens].cpu()
+            if not torch.isfinite(expected).all().item():
+                raise AssertionError("non-finite BF16 reference output")
+
+            stock_expected = None
+            if stock_fp4_layer is not None:
+                with tpu_info_for_cpu_export():
+                    stock_reference = fused_moe_call(
+                        hidden_states=hidden_device,
+                        w1=stock_fp4_layer.w13_weight,
+                        w2=stock_fp4_layer.w2_weight,
+                        w1_scale=stock_fp4_layer.w13_weight_scale,
+                        w2_scale=stock_fp4_layer.w2_weight_scale,
+                        topk_weights=topk_weights_device,
+                        topk_ids=topk_ids_device,
+                        topk=topk,
+                        activation=args.activation,
+                        global_num_experts=global_experts,
+                        expert_group_offset=rank * local_experts,
+                    )
+                dist.all_reduce(stock_reference, op=dist.ReduceOp.SUM)
+                stock_expected = stock_reference[
+                    rank * shard_tokens : (rank + 1) * shard_tokens
+                ].cpu()
+                if not torch.isfinite(stock_expected).all().item():
+                    raise AssertionError("non-finite stock packed-FP4 reference output")
+                if stock_expected.shape != expected.shape:
+                    raise AssertionError("stock packed-FP4 reference shape mismatch")
 
             previous = None
             for iteration in range(2):
@@ -345,17 +388,47 @@ def main() -> None:
                     cos = torch.nn.functional.cosine_similarity(
                         actual_float.flatten(), expected_float.flatten(), dim=0
                     ).item()
-                    if rel_mean >= 0.08:
+                    if not math.isfinite(rel_mean) or rel_mean >= 0.08:
                         raise AssertionError(
                             f"block={block_size}, tokens={tokens}: "
                             f"rel_mean={rel_mean} >= 0.08"
                         )
-                    if cos <= 0.995:
+                    if not math.isfinite(cos) or cos <= 0.995:
                         raise AssertionError(
                             f"block={block_size}, tokens={tokens}: cos={cos} <= 0.995"
                         )
 
                 checksum = actual_float.abs().sum().item()
+                stock_metrics = ""
+                if stock_expected is not None:
+                    stock_float = stock_expected.float()
+                    stock_denom = stock_float.abs().mean().item()
+                    if stock_denom == 0:
+                        torch.testing.assert_close(
+                            actual_float, stock_float, rtol=0, atol=0
+                        )
+                        stock_rel_mean, stock_cos = 0.0, 1.0
+                    else:
+                        stock_rel_mean = (
+                            actual_float - stock_float
+                        ).abs().mean().item() / stock_denom
+                        stock_cos = torch.nn.functional.cosine_similarity(
+                            actual_float.flatten(), stock_float.flatten(), dim=0
+                        ).item()
+                        if (
+                            not math.isfinite(stock_rel_mean)
+                            or not math.isfinite(stock_cos)
+                            or stock_rel_mean >= 0.08
+                            or stock_cos <= 0.995
+                        ):
+                            raise AssertionError(
+                                "fused-RS differs from stock packed-FP4: "
+                                f"rel_mean={stock_rel_mean}, cos={stock_cos}"
+                            )
+                    stock_metrics = (
+                        f" stock_fp4_rel_mean={stock_rel_mean:.6f}"
+                        f" stock_fp4_cos={stock_cos:.6f}"
+                    )
                 dist.barrier()
                 print(
                     "NVFP4_FUSED_RS_EXECUTE_PASS "
@@ -363,12 +436,15 @@ def main() -> None:
                     f"activation={args.activation} input_scale={args.input_scale} "
                     f"tokens={tokens} iteration={iteration} "
                     f"shape={tuple(actual.shape)} checksum={checksum:.6f} "
-                    f"rel_mean={rel_mean:.6f} cos={cos:.6f}",
+                    f"rel_mean={rel_mean:.6f} cos={cos:.6f}{stock_metrics}",
                     flush=True,
                 )
 
-        del compiled, layer, reference_w1, reference_w2
+        del compiled, layer, reference_w1, reference_w2, stock_fp4_layer
         gc.collect()
+        # All block sizes share the kernel code object. Isolate each block's
+        # shape specializations instead of exhausting Dynamo's cache limit.
+        torch._dynamo.reset()
         dist.barrier()
 
     dist.destroy_process_group()
