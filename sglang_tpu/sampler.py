@@ -338,13 +338,14 @@ def _sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
     The compiled boundary keeps pending probability views out of the draw,
     so warmup and serving reuse the same program.
 
-    Eagerly, the draw runs as one program instead of seven
-    (fused_eager.py): the random bits, the generator's state and every value
-    are those of the per-op programs, as the argmax picks the same index in
-    any reduction order.
+    Eagerly, the ops after the random draw run as one program (fused_eager.py):
+    every value is that of the per-op programs, as the argmax picks the same
+    index in any reduction order.
     """
+    # The random draw stays outside the fused region: a fused program that
+    # draws gets a different cache key on repeat calls, so it would recompile.
+    u = torch.rand_like(probs)
     with fused_eager_ops(probs.device.type == "tpu") as fused:
-        u = torch.rand_like(probs)
         # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
         e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
         token_ids = torch.argmax(probs / e, dim=-1).to(torch.int32)

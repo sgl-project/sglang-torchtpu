@@ -704,8 +704,14 @@ def _pad_batch_fields(
     _pad_mamba_tracking(forward_batch, pad_b)
     # The pads of the device fields run as one program, not one per field
     # (fused_eager.py: a decode step's eager ops between two graphs must stay
-    # under PJRT's 32 executions in flight).
-    with fused_eager_ops() as fused:
+    # under PJRT's 32 executions in flight). Only modes with a fixed token count
+    # per request fuse: a fused program is keyed by every field's live shape, and
+    # prompt lengths would make one per combination, which warm-up cannot cover.
+    mode = forward_batch.forward_mode
+    fuse = (
+        mode.is_decode_or_idle() or mode.is_target_verify() or mode.is_draft_extend_v2()
+    )
+    with fused_eager_ops(fuse) as fused:
         if pad_t is not None:
             _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
         for field in _BS_FIELDS:
