@@ -145,6 +145,20 @@ Startup checks:
 Known gap: DFlash with HiCache under DP attention passes GSM8K, but the KV
 offload probe sees one verify forward fewer on a host reload than on a device hit.
 
+## MTP draft prompt pass in two passes
+
+For a DeepSeek-family NextN draft with a sparse MLA (DSA) layer, a prefill
+step's draft prompt pass is split where its token bucket is at least
+max(1024, 2 x the extend cap's bucket): pass 1 only stores the draft layer's
+latent and index-key caches for every row (`mtp/kv_only_prompt.py`, through
+`dsa_layer_kv_write.py`), pass 2 runs the warmed draft prompt program on each
+request's last row. Outputs cannot change; the proposals match the single
+pass's up to rounding, since pass 2 runs the last rows in a smaller program.
+Always on where it applies; to keep the single pass while debugging, set
+`KV_ONLY_PROMPT_ENABLED = False` in `mtp/kv_only_prompt.py`. The startup log
+says which way it went and why; DP attention, P/D and the DSA attention token
+split keep the single pass.
+
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
