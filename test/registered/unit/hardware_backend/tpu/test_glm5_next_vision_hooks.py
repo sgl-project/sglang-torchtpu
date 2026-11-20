@@ -400,10 +400,8 @@ class TestGlm5NextVisionHooks(CustomTestCase):
         from sglang.srt.layers.layer_boundary.adapters.attention import (
             get_attn_tp_context,
         )
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardMode,
-            LogitsOutputMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.mm_embed_tpu import embed_mm_inputs_tpu
 
@@ -538,7 +536,7 @@ class TestGlm5NextVisionHooks(CustomTestCase):
         from sglang.srt.layers.layer_boundary.adapters.attention import (
             get_attn_tp_context,
         )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.runtime_context import get_parallel
 
         attn_tp_ctx = get_attn_tp_context()

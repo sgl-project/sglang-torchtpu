@@ -15,11 +15,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-    LogitsOutputMode,
-)
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
