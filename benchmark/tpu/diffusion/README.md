@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `hy_nomas.sh` | `tencent/Hy-Nomas` | 4 or 1 | Ulysses = cores (16 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,9 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| HY-Nomas | 2 events x 120 frames, 352x640, 8 steps each (17 DiT passes) | 4 | 3.45 s | 0.121 s | 0.90 s | 38.9 GB |
+| HY-Nomas | 2 events x 120 frames, 704x1280, 8 steps each (17 DiT passes) | 4 | 13.25 s | 0.469 s | 3.89 s | 53.0 GB |
+| HY-Nomas | 2 events x 120 frames, 352x640, 8 steps each (17 DiT passes) | 1 | 8.06 s | 0.243 s | 3.27 s | 53.9 GB |
 
 
 ## Example requests
@@ -63,6 +67,11 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
   "size": "1280x720", "num_frames": 121, "num_inference_steps": 40, "guidance_scale": 4.0, "seed": 42
 }'
 ```
+
+HY-Nomas (`hy_nomas.sh`) takes the event requests and the realtime client of
+[its cookbook](../../../docs/cookbook/diffusion/HY-Nomas/HY-Nomas.mdx) unchanged: `/v1/videos` for jobs,
+`ws://localhost:30000/v1/realtime_video/generate` for sessions. A session of the same two events streams its 240
+frames (84, 120 and 36) in 3.7 s at Ulysses 4.
 
 Wan2.2-TI2V-5B (`wan22_ti2v_5b.sh`):
 
