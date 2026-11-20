@@ -328,6 +328,9 @@ class TpuEnvs:
     # same set of indices, but their order (and so the sparse-MLA summation order
     # downstream) can differ from the partitioned path.
     SGLANG_TPU_SCTOPK_SHORT_ROWS = EnvBool(True)
+    # SparseCore top-k: rows longer than one slice scan the narrowest long-row
+    # bucket that holds the longest row, not the full padded width. Same selection.
+    SGLANG_TPU_SCTOPK_LONG_ROWS = EnvBool(True)
     # Expert-TP fused-RS as a two-level reduce-scatter: the two cores of a chip add their
     # partials on-chip, then send one chip sum per row to another chip's owner, halving
     # off-chip bytes (one extra bf16 rounding).

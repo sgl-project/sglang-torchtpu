@@ -52,6 +52,8 @@ NUM_BUCKETS = 256
 MAX_SLICE_WORDS = 32 * 1024
 # Width step of the short-row buckets.
 SHORT_ROW_BUCKET = 4096
+# Long-row bucket widths are 3 * 2**m and 4 * 2**m times this.
+LONG_ROW_BUCKET = 16 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -831,9 +833,9 @@ def sparsecore_topk(
     candidates back to HBM.
 
     ``branch_max_len`` replaces ``max(row_lengths)`` when choosing the
-    short-row width branch. A caller that selects a slice of a larger batch's
-    rows passes the larger batch's longest row, so every row runs the same
-    branch (same width, same tie-breaking) as in the unsliced call.
+    width branch. A caller that selects a slice of a larger batch's rows
+    passes the larger batch's longest row, so every row runs the same branch
+    (same width, same tie-breaking) as in the unsliced call.
     """
     del stage2_scheduling_group_id
     if scores.ndim != 2:
@@ -853,55 +855,51 @@ def sparsecore_topk(
 
     p = _pick_partition(b, n, k)
 
-    # A pool sized for long contexts pads every row to n, but rows whose valid
-    # prefix fits one slice (all short sequences) need no multi-subcore
-    # partition: pick at run time.
-    if p > 1 and _short_rows_fast_path():
-        widths = [
+    def _run(width, width_p):
+        return lambda _: _sc_topk_direct(
+            scores if width == n else scores[:, :width],
+            k,
+            row_lengths,
+            p=width_p,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+        )
+
+    # A pool sized for long contexts pads every row to n; scan only the
+    # narrowest bucket that holds the longest row, picked at run time.
+    buckets = _width_buckets(b, n, k) if p > 1 else []
+    if not buckets:
+        return _run(n, p)(None)
+    max_len = (
+        jnp.max(row_lengths)
+        if branch_max_len is None
+        else jnp.asarray(branch_max_len, jnp.int32)
+    )
+    branch = jnp.sum(jnp.asarray([w for w, _ in buckets], jnp.int32) < max_len)
+    return jax.lax.switch(
+        branch, [_run(w, wp) for w, wp in buckets] + [_run(n, p)], None
+    )
+
+
+def _width_buckets(b: int, n: int, k: int) -> list[tuple[int, int]]:
+    """(width, P) of the run-time width branches narrower than ``n``, ascending."""
+    widths = []
+    if _short_rows_fast_path():
+        widths += [
             w
             for w in range(SHORT_ROW_BUCKET, MAX_SLICE_WORDS + 1, SHORT_ROW_BUCKET)
             if w >= k
         ]
-
-        def _short(width):
-            return lambda _: _sc_topk_direct(
-                scores[:, :width],
-                k,
-                row_lengths,
-                p=1,
-                write_empty=write_empty_rows,
-                return_scores=return_scores,
-                scheduling_group_id=scheduling_group_id,
-            )
-
-        def _long(_):
-            return _sc_topk_direct(
-                scores,
-                k,
-                row_lengths,
-                p=p,
-                write_empty=write_empty_rows,
-                return_scores=return_scores,
-                scheduling_group_id=scheduling_group_id,
-            )
-
-        max_len = (
-            jnp.max(row_lengths)
-            if branch_max_len is None
-            else jnp.asarray(branch_max_len, jnp.int32)
+    if _long_rows_fast_path():
+        # A long bucket saves at least one slice's scan over the full row.
+        widths += sorted(
+            c * LONG_ROW_BUCKET << m
+            for m in range(n.bit_length())
+            for c in (3, 4)
+            if MAX_SLICE_WORDS < c * LONG_ROW_BUCKET << m <= n - MAX_SLICE_WORDS
         )
-        branch = jnp.sum(jnp.asarray(widths, jnp.int32) < max_len)
-        return jax.lax.switch(branch, [_short(w) for w in widths] + [_long], None)
-
-    return _sc_topk_direct(
-        scores,
-        k,
-        row_lengths,
-        p=p,
-        write_empty=write_empty_rows,
-        return_scores=return_scores,
-        scheduling_group_id=scheduling_group_id,
-    )
+    return [(w, _pick_partition(b, w, k)) for w in widths]
 
 
 def _short_rows_fast_path() -> bool:
@@ -909,6 +907,13 @@ def _short_rows_fast_path() -> bool:
     from sglang_tpu.envs import envs as tpu_envs
 
     return tpu_envs.SGLANG_TPU_SCTOPK_SHORT_ROWS.get()
+
+
+def _long_rows_fast_path() -> bool:
+    # Read at trace time; a process keeps one value.
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_SCTOPK_LONG_ROWS.get()
 
 
 @functools.partial(

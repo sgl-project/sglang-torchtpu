@@ -442,8 +442,9 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
         return out, out
 
     monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
-    # Only the partitioned path: the short-row branches would add their own calls.
+    # Only the partitioned path: the width branches would add their own calls.
     monkeypatch.setattr(sc_module, "_short_rows_fast_path", lambda: False)
+    monkeypatch.setattr(sc_module, "_long_rows_fast_path", lambda: False)
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
     return seen
 
@@ -562,3 +563,89 @@ def test_short_rows_take_one_slice_with_the_same_selection(max_len):
     slow = _run_short_rows(scores, k, row_lengths, False)
     assert _mismatch(scores, fast, k, row_lengths) is None
     np.testing.assert_array_equal(np.sort(fast, axis=1), np.sort(slow, axis=1))
+
+
+# --------------------------------------------------------------------------- #
+# Long-row width buckets (pooled DSA indexer: 512 rows per rank, 1M-context pools).
+# --------------------------------------------------------------------------- #
+
+N_POOLS_1M = 263168
+LONG_EDGES = [32769] + [
+    w + d for w in (49152, 65536, 98304, 131072, 196608) for d in (-1, 0, 1)
+]
+_LONG_ROWS_FNS = {}
+
+
+def _run_long_rows(scores, k, row_lengths, enabled: bool, **kwargs):
+    from sglang_tpu.envs import envs as tpu_envs
+
+    # One jit per setting, traced under it: the env is read at trace time.
+    key = (enabled, k, tuple(sorted(kwargs)))
+    if key not in _LONG_ROWS_FNS:
+        _LONG_ROWS_FNS[key] = jax.jit(
+            sc_module.sparsecore_topk.__wrapped__,
+            static_argnames=("k", "return_scores"),
+        )
+    with tpu_envs.SGLANG_TPU_SCTOPK_LONG_ROWS.override(enabled):
+        out = _LONG_ROWS_FNS[key](
+            jnp.asarray(scores), k=k, row_lengths=jnp.asarray(row_lengths), **kwargs
+        )
+    return jax.tree.map(np.asarray, jax.block_until_ready(out))
+
+
+def _long_scores(kind, b, n, rng):
+    if kind == "neg_inf":
+        s = rng.standard_normal((b, n), dtype=np.float32)
+        s[rng.random((b, n)) < 0.7] = -np.inf
+        return s
+    return _scores(kind, b, n, rng)
+
+
+def _ragged_to(max_len, b):
+    lengths = np.array([max_len - (i * 7919) % max_len for i in range(b)], np.int32)
+    lengths[0] = max_len
+    lengths[1] = 0
+    return lengths
+
+
+@pytest.mark.parametrize("kind", ["random", "heavy_ties", "strict_desc", "neg_inf"])
+def test_long_row_buckets_return_the_full_width_result(kind):
+    """The narrowest bucket holding the longest row returns the same array as
+    the full-width scan: same set, same order, -1 suffix. Lengths sit at and
+    around every bucket edge; columns past a row's length hold 1e30."""
+    b, n, k = 64, N_POOLS_1M, 512
+    rng = np.random.default_rng(SEED)
+    for max_len in LONG_EDGES:
+        scores = _long_scores(kind, b, n, rng)
+        lengths = _ragged_to(max_len, b)
+        scores[np.arange(n)[None, :] >= lengths[:, None]] = 1e30
+        bucketed = _run_long_rows(scores, k, lengths, True)
+        full = _run_long_rows(scores, k, lengths, False)
+        np.testing.assert_array_equal(bucketed, full, err_msg=f"{max_len=}")
+        assert _mismatch(scores, bucketed, k, lengths) is None, max_len
+
+
+@pytest.mark.parametrize("max_len", [66560, 132096])
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+def test_long_row_buckets_at_the_indexer_shape(kind, max_len):
+    """512 rows of a 4096-token chunk on 8 shards at 256k and 512k context."""
+    b, n, k = 512, N_POOLS_1M, 512
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    lengths = _ragged_to(max_len, b)
+    bucketed = _run_long_rows(scores, k, lengths, True)
+    np.testing.assert_array_equal(bucketed, _run_long_rows(scores, k, lengths, False))
+    assert _mismatch(scores, bucketed, k, lengths) is None
+
+
+@pytest.mark.parametrize("max_len", [49153, 131073])
+def test_long_row_buckets_return_the_same_scores(max_len):
+    b, n, k = 64, N_POOLS_1M, 2048
+    rng = np.random.default_rng(SEED)
+    scores = _scores("heavy_ties", b, n, rng)
+    lengths = _ragged_to(max_len, b)
+    on = _run_long_rows(scores, k, lengths, True, return_scores=True)
+    off = _run_long_rows(scores, k, lengths, False, return_scores=True)
+    np.testing.assert_array_equal(on[0], off[0])
+    np.testing.assert_array_equal(on[1], off[1])
+    assert _mismatch(scores, on[0], k, lengths) is None
