@@ -11,10 +11,16 @@ VERIFY_SPMD_SAFE=1 passed on all 8 ranks for the target graphs; the four
 draft block graphs share the compile too, and every rank's accept length
 matched the per-rank compile (4.2-4.6).
 
-Measured on one tpu7x-8 with MODEL=gs://... (weights and Engram streamed
-from object storage, tokenizer from a local copy), cold compile caches:
-ready in 10.5 min; 1024 in / 1024 out random-ids c64 1782 tok/s and c128
-2999 tok/s at accept length 4.3-4.4; GSM8K 1319 at c128 0.970.
+Measured at 103k on one tpu7x-8 with MODEL=gs://... (weights and Engram
+streamed from object storage, tokenizer from a local copy), cold compile
+caches: ready in 10.5 min; 1024 in / 1024 out random-ids c64 1782 tok/s and
+c128 2999 tok/s at accept length 4.3-4.4.
+
+At 1M with the radix cache and SWA bounded replay: ready in 12 min, 18.5M-token
+KV pool per worker, ~15.8 GB HBM left after precompile. GSM8K 1319 (5-shot,
+c128) 0.911 at accept length 3.5, the same as at 103k without the radix cache.
+AgentX traces with chunked_prefill_size 8192 and 128 running requests,
+accept length simulated at 3.51: c8 6179 and c32 12348 output tok/s/chip.
 """
 
 from copy import deepcopy
@@ -24,8 +30,6 @@ from benchmark.tpu.recipe.configs.deepseek_v41_flash import CONFIG as BASE_CONFI
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(
     {
-        # Measured at this context; not yet validated at the target's 1M.
-        "context_length": 103424,
         # The draft weights are the mtp.* tensors of the target checkpoint.
         "speculative_algorithm": "DSPARK",
         # 5 draft tokens per step: the verify runs 6 rows per request.
@@ -37,6 +41,10 @@ CONFIG["server_args"].update(
         # 1024-token prefills stall all 8 ranks' spec decode; batching them
         # takes c64 from 1004 to 1900 tok/s.
         "enable_prefill_delayer": True,
+        # Keeps only request-owned SWA windows, so prefix hits replay the
+        # bounded SWA tail instead of reserving an SWA pool.
+        "disable_radix_cache": False,
+        "enable_encoder_swa_bounded_replay": True,
     }
 )
 CONFIG["runtime_env"].update({"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"})
