@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -336,11 +337,21 @@ def _sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
     ``torch.multinomial`` runs eagerly on TPU. All-zero rows return 0.
     The compiled boundary keeps pending probability views out of the draw,
     so warmup and serving reuse the same program.
+
+    Eagerly, the ops after the random draw run as one program (fused_eager.py):
+    every value is that of the per-op programs, as the argmax picks the same
+    index in any reduction order.
     """
+    # The random draw stays outside the fused region: a fused program that
+    # draws gets a different cache key on repeat calls, so it would recompile.
     u = torch.rand_like(probs)
-    # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
-    e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
-    return torch.argmax(probs / e, dim=-1).to(torch.int32)
+    with fused_eager_ops(probs.device.type == "tpu") as fused:
+        # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
+        e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
+        token_ids = torch.argmax(probs / e, dim=-1).to(torch.int32)
+    if fused:
+        submit((token_ids,))
+    return token_ids
 
 
 _compiled_sample_exponential_race = compiled_op(uses_rng=True)(_sample_exponential_race)

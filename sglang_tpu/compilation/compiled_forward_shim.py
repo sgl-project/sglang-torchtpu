@@ -51,6 +51,7 @@ from sglang_tpu.cp_forward import (
     pinned_extend_seq_lens_cpu,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.host_upload import upload
 
 if TYPE_CHECKING:
@@ -699,16 +700,38 @@ def _pad_batch_fields(
     (context-parallel batches present their local rows to the graph instead);
     ``real_b`` is the live request count the CPU mirrors must cover.
     """
-    if pad_t is not None:
-        _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
-
+    # Uploads first: they stay out of the deferred padding program below.
     _pad_mamba_tracking(forward_batch, pad_b)
-    for field in _BS_FIELDS:
-        if field in _MAMBA_TRACK_FIELDS:
-            continue
-        val = getattr(forward_batch, field, None)
-        if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
-            setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
+    # The pads of the device fields run as one program, not one per field
+    # (fused_eager.py: a decode step's eager ops between two graphs must stay
+    # under PJRT's 32 executions in flight). Only modes with a fixed token count
+    # per request fuse: a fused program is keyed by every field's live shape, and
+    # prompt lengths would make one per combination, which warm-up cannot cover.
+    mode = forward_batch.forward_mode
+    fuse = (
+        mode.is_decode()
+        or mode.is_idle()
+        or mode.is_target_verify()
+        or mode.is_draft_extend_v2()
+    )
+    with fused_eager_ops(fuse) as fused:
+        if pad_t is not None:
+            _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
+        for field in _BS_FIELDS:
+            if field in _MAMBA_TRACK_FIELDS:
+                continue
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
+                setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
+    if fused:
+        spec_info = forward_batch.spec_info
+        submit(
+            (
+                *(getattr(forward_batch, field, None) for field in _TOKEN_FIELDS),
+                *(getattr(forward_batch, field, None) for field in _BS_FIELDS),
+                getattr(spec_info, "hidden_states", None),
+            )
+        )
 
     # Normalize tensor/None values to padded lists so every extend batch
     # presents the same type to the compiled graph (the precompile dummy uses
