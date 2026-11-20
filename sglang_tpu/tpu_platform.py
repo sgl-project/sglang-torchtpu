@@ -890,8 +890,11 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
-# The attention backend TPU decode context parallelism runs on.
+# The attention backend TPU decode context parallelism defaults to, and the
+# backends that implement it (the sparse MLA one for DSA models).
 _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
+_DCP_SPARSE_MLA_BACKEND = "pallas_tpu_mla_sparse"
+_DCP_ATTENTION_BACKENDS = (_DCP_ATTENTION_BACKEND, _DCP_SPARSE_MLA_BACKEND)
 
 # The chunk handle_gpu_memory_settings declares later for an unset
 # --chunked-prefill-size on TPU, whose device memory capacity it does not know.
@@ -916,12 +919,14 @@ def _validate_decode_context_parallel(server_args) -> None:
     if dcp_size <= 1:
         return
 
-    if cfg.attention_backend != _DCP_ATTENTION_BACKEND:
+    if cfg.attention_backend not in _DCP_ATTENTION_BACKENDS:
         raise ValueError(
             "--decode-context-parallel-size > 1 on TPU requires "
-            f"--attention-backend {_DCP_ATTENTION_BACKEND}, got "
+            f"--attention-backend {' or '.join(_DCP_ATTENTION_BACKENDS)}, got "
             f"{cfg.attention_backend!r}."
         )
+    if cfg.attention_backend == _DCP_SPARSE_MLA_BACKEND:
+        _validate_sparse_mla_decode_context_parallel(cfg)
     if cfg.tp_size % dcp_size != 0:
         raise ValueError(
             f"--tensor-parallel-size ({cfg.tp_size}) must be divisible by "
@@ -1020,6 +1025,41 @@ def _validate_decode_context_parallel(server_args) -> None:
             f"{dcp_size}: with more ranks the forward stalls in warmup with the "
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
+        )
+
+
+def _validate_sparse_mla_decode_context_parallel(cfg) -> None:
+    """The sparse MLA backend's DCP path (attention_pallas_mla_sparse_dcp)
+    stripes the latent cache by page and keeps the indexer replicated; refuse
+    what it does not implement on top of the checks shared with batched RPA."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get():
+        raise ValueError(
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL is not supported with "
+            "--decode-context-parallel-size > 1: the decode megakernel reads an "
+            "unsharded latent cache."
+        )
+    if tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get():
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT is not supported with "
+            "--decode-context-parallel-size > 1: each rank holds a different "
+            "stripe of the latent cache."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-mixed-chunk is not supported with "
+            "--decode-context-parallel-size > 1 and pallas_tpu_mla_sparse."
+        )
+    if cfg.dcp_replicate_q_proj:
+        raise ValueError(
+            "--dcp-replicate-q-proj is not supported with pallas_tpu_mla_sparse: "
+            "the backend gathers the DCP group's query heads itself."
+        )
+    if cfg.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+        raise ValueError(
+            "pallas_tpu_mla_sparse needs --kv-cache-dtype fp8_e4m3 with "
+            f"--decode-context-parallel-size > 1, got {cfg.kv_cache_dtype!r}."
         )
 
 
@@ -1488,8 +1528,14 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
-        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.kv_pool import (
+            TpuDcpSplitMLATokenToKVPool,
+            TpuSplitMLATokenToKVPool,
+        )
 
+        if get_parallel().attn_dcp_size > 1:
+            return TpuDcpSplitMLATokenToKVPool
         return TpuSplitMLATokenToKVPool
 
     def get_kv_pool_cls(self, *, kind):
@@ -1640,6 +1686,12 @@ class TpuSRTPlatform(SRTPlatform):
 
     def dcp_replicates_q_heads(self) -> bool:
         return True
+
+    def runs_mla_dcp_in_model(self) -> bool:
+        # The sparse MLA backend gathers the group's query heads, attends its
+        # own KV shard and merges by LSE itself; the core path's Triton merge
+        # and compiled cross-chip all_gather do not run on TPU.
+        return False
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True

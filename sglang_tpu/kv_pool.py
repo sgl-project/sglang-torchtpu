@@ -1398,6 +1398,13 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self.model_layer_ids = tuple(
             range(self.start_layer, self.start_layer + self.layer_num)
         )
+        self.index_dcp = self.index_dcp_size()
+        if self.index_dcp > 1 and index_kpool > 1 and not self.raw_ring_pages_cnt:
+            raise ValueError(
+                "Decode context parallelism already replicates indexer, so use "
+                "SGLANG_TPU_DSA_KPOOL_RAW_RING=1"
+            )
+        self.index_num_pages = self.num_pages * self.index_dcp
 
         self._create_buffers()
         self._finalize_allocation_log(size)
@@ -1411,14 +1418,20 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_kpool: int,
         raw_ring: bool = False,
         qk_rope_head_dim: int = 64,
+        index_dcp: int = 1,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
         A raw ring is sized by request slots, not tokens, so it is not counted."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
+        index_bytes *= index_dcp
         layer_bytes = cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim)
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
+
+    @classmethod
+    def index_dcp_size(cls) -> int:
+        return 1
 
     @classmethod
     def rope_bytes_per_token(cls, qk_rope_head_dim: int) -> int:
@@ -1459,7 +1472,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             # buffer: P/D transfer and HiCache leave it out.
             rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
-            self.num_pages,
+            self.index_num_pages,
             rows_per_page // self._index_kpool,
             self.TOKENS_PER_ROW,
             self.index_key_record_bytes(self._index_head_dim),
@@ -1684,6 +1697,23 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def set_mla_kv_buffer(self, *args, **kwargs):
         self._unsupported("set_mla_kv_buffer")
+
+
+class TpuDcpSplitMLATokenToKVPool(TpuSplitMLATokenToKVPool):
+    """TpuSplitMLATokenToKVPool under decode context parallelism.
+
+    The latent buffers hold this rank's page stripe; the index-key buffers are
+    replicated over the DCP group and span the allocator's whole slot space,
+    ``attn_dcp_size`` pages per latent page (attention_pallas_mla_sparse_dcp).
+    Page copies (P/D, host tier) address every buffer by one page id, so they
+    are refused under DCP (tpu_platform._validate_decode_context_parallel).
+    """
+
+    @classmethod
+    def index_dcp_size(cls) -> int:
+        from sglang.srt.runtime_context import get_parallel
+
+        return get_parallel().attn_dcp_size
 
 
 # raiden copies whole pages by their dim-0 block id, so it serves any

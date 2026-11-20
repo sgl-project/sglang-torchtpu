@@ -29,7 +29,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 from sglang_tpu.dp_replicas import ReplicaSession
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -150,6 +150,7 @@ class TestTpuPlatformIdentity(CustomTestCase):
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())
         self.assertTrue(self.platform.dcp_shards_every_kv_pool())
+        self.assertFalse(self.platform.runs_mla_dcp_in_model())
 
     def test_dispatch_key(self):
         self.assertEqual(self.platform.get_dispatch_key_name(), "tpu")
@@ -1006,11 +1007,38 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         )
 
     def test_refuses_another_attention_backend(self):
-        for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_flash", "torch_native"):
+        for backend in (
+            "pallas_tpu_rpa_v3",
+            "pallas_tpu_flash",
+            "torch_native",
+            "pallas_tpu_mla",
+        ):
             with self.subTest(backend=backend):
                 self._assert_refused(
                     "(?i)attention[-_ ]backend", attention_backend=backend
                 )
+
+    def test_sparse_mla_admits_only_what_its_dcp_path_implements(self):
+        """The sparse MLA DCP path stripes the latent cache and gathers the query
+        heads itself; a feature that reads the unsharded cache or the heads
+        differently must stop the launch instead of attending the wrong keys."""
+        sparse = dict(
+            attention_backend="pallas_tpu_mla_sparse", kv_cache_dtype="fp8_e4m3"
+        )
+        self._validate(self._args(**sparse))
+        self._assert_refused(
+            "(?i)kv[-_ ]cache[-_ ]dtype", **{**sparse, "kv_cache_dtype": "bfloat16"}
+        )
+        self._assert_refused("(?i)mixed[-_ ]chunk", **sparse, enable_mixed_chunk=True)
+        self._assert_refused(
+            "(?i)replicate[-_ ]q[-_ ]proj", **sparse, dcp_replicate_q_proj=True
+        )
+        for flag in (
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL",
+            "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT",
+        ):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, flag):
+                self._validate(self._args(**sparse), env={flag: "1"})
 
     def test_refuses_a_tp_size_the_dcp_group_does_not_divide(self):
         self._assert_refused(
@@ -1180,8 +1208,19 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
     def test_dsa_pool_is_the_split_pool(self):
-        cls = self.platform.get_dsa_kv_pool_cls()
-        self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
+        """Under DCP the index-key buffers span dcp allocator slots per latent
+        slot; a pool sized for one would index past its end."""
+        from sglang_tpu.kv_pool import (
+            TpuDcpSplitMLATokenToKVPool,
+            TpuSplitMLATokenToKVPool,
+        )
+
+        cases = ((1, TpuSplitMLATokenToKVPool), (8, TpuDcpSplitMLATokenToKVPool))
+        for dcp, want in cases:
+            with self.subTest(dcp=dcp), published_topology(tp_size=8, dcp_size=dcp):
+                cls = self.platform.get_dsa_kv_pool_cls()
+                self.assertIs(cls, want)
+                self.assertEqual(cls.index_dcp_size(), dcp)
 
     def test_hybrid_linear_dsa_leaf_is_the_split_pool(self):
         # get_kv_pool_cls(kind="dsa") is None on TPU; the hybrid-linear leaf

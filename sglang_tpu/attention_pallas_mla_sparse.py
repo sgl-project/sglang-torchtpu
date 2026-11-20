@@ -19,6 +19,7 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,6 +33,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
+from sglang_tpu.attention_pallas_mla_sparse_dcp import (
+    build_sparse_mla_dcp_op,
+    index_page_indices,
+)
+from sglang_tpu.attention_pallas_rpa_dcp import gather_heads, merge_across_ranks
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
@@ -52,6 +58,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
+logger = logging.getLogger(__name__)
 
 _PALLAS_SPARSE_MLA_OPS = {}
 
@@ -326,6 +334,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
+    runs_own_dcp_forward = True
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -347,6 +356,22 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
         self._init_attention_token_split()
+        self._init_dcp()
+
+    def _init_dcp(self) -> None:
+        """Build the DCP attention op; the base class set up the DCP group."""
+        if self._dcp == 1:
+            return
+        if self._prefill_op is not None:
+            # TODO(weiyulin): Supports SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL with DCP 
+            logger.info(
+                "Decode context parallelism: SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_"
+                "PREFILL is ignored"
+            )
+            self._prefill_op = None
+        self._dcp_op = build_sparse_mla_dcp_op(
+            dcp_size=self._dcp, zero_rope=self._zero_rope
+        )
 
     def _init_attention_token_split(self) -> None:
         """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
@@ -372,6 +397,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 "(index kpool 1) and an attention-TP group that spans the "
                 "world in rank order."
             )
+        if self._dcp > 1:
+            raise RuntimeError(
+                "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT splits prefill "
+                "attention over the attention-TP ranks, whose KV caches hold "
+                "different stripes under decode context parallelism."
+            )
         from sglang_tpu.oneshot_collectives import get_oneshot_all_to_all_op
 
         get_oneshot_all_to_all_op(world)  # build before torch.compile traces
@@ -379,9 +410,29 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._attn_split_world = world
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self._dcp > 1 and forward_batch.forward_mode.is_mixed():
+            # The base DCP metadata re-splits a mixed batch's distribution in
+            # the batched RPA kernel's terms, which the MLA kernels read
+            # differently.
+            raise NotImplementedError(
+                "Decode context parallelism with pallas_tpu_mla_sparse does not "
+                "run mixed prefill + decode batches; disable --enable-mixed-chunk."
+            )
         super().init_forward_metadata(forward_batch)
         if self.raw_ring_pages_cnt:
             self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
+        if self._dcp > 1:
+            self._rebind_dcp_metadata()
+
+    def _rebind_dcp_metadata(self) -> None:
+        """Recompuate DCP metadata for backend.
+        """
+        metadata = self.forward_metadata
+        metadata.dcp_latent_page_indices = metadata.page_indices
+        metadata.page_indices = index_page_indices(
+            metadata.page_indices, num_seqs=metadata.cu_q_lens.shape[0] - 1, dcp=self._dcp
+        )
+        metadata.kv_lens = metadata.dcp_kv_lens_global
 
     def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """i32[rows]: each row's first raw-ring page, its request slot times the ring."""
@@ -795,6 +846,59 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._kpool_width,
         )
 
+    def _forward_mla_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # TODO(weiyulin): Current collectives for RPA DCP is not optimal. 
+        # We should replace it with AG + RS or two A2A
+        args = list(
+            self._mla_kernel_args(
+                q=q,
+                k=k,
+                layer=layer,
+                forward_batch=forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
+        )
+        # _mla_kernel_args passes page_indices, the indexer's under DCP.
+        args[7] = self.forward_metadata.dcp_latent_page_indices
+        ql_nope, q_pe = args[0], args[1]
+        nope = ql_nope.shape[-1]
+        # One gather for both nope and pe.
+        q_all = gather_heads(
+            torch.cat([ql_nope, q_pe], dim=-1).contiguous(),
+            self._dcp_group,
+            self._dcp,
+            self._cp_rank_mask,
+        )
+        out, lse = self._dcp_op(
+            q_all[..., :nope].contiguous(),
+            q_all[..., nope:].contiguous(),
+            *args[2:],
+            topk_indices.contiguous(),
+            self._cp_rank_t,
+        )
+        out, _ = merge_across_ranks(
+            out.float(),
+            lse,
+            self._dcp_group,
+            self._dcp,
+            self._cp_rank_mask,
+            self._cp_rank_index,
+        )
+        return out.to(ql_nope.dtype).reshape(
+            q.shape[0], layer.tp_q_head_num * layer.v_head_dim
+        )
+
     def _forward_mla(
         self,
         q: torch.Tensor,
@@ -817,6 +921,17 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             assert layer.qk_head_dim == layer.v_head_dim, (
                 f"layer {layer.layer_id} has rope dims, but the sparse MLA ops "
                 "were built for a model without rope."
+            )
+        if self._dcp > 1:
+            return self._forward_mla_dcp(
+                q,
+                k,
+                layer,
+                forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+                **kwargs,
             )
         args = self._mla_kernel_args(
             q=q,
