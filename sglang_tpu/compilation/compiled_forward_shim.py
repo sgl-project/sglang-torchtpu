@@ -709,7 +709,10 @@ def _pad_batch_fields(
     # prompt lengths would make one per combination, which warm-up cannot cover.
     mode = forward_batch.forward_mode
     fuse = (
-        mode.is_decode_or_idle() or mode.is_target_verify() or mode.is_draft_extend_v2()
+        mode.is_decode()
+        or mode.is_idle()
+        or mode.is_target_verify()
+        or mode.is_draft_extend_v2()
     )
     with fused_eager_ops(fuse) as fused:
         if pad_t is not None:
