@@ -3,7 +3,7 @@
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/deepseek_v41_flash_dspark.py
 
-The deepseek_v41_flash_direct_spmd.py deployment with DSpark on the
+The deepseek_v41_flash.py deployment with DSpark on the
 experimental TPU spec worker: the target and draft graphs are traced by the
 direct tracer and each compiled once on an owner rank (--use-spmd-compile).
 The draft's MoE shards over the target's EP8 group (~1.6 GB/device).
@@ -19,9 +19,7 @@ ready in 10.5 min; 1024 in / 1024 out random-ids c64 1782 tok/s and c128
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.deepseek_v41_flash_direct_spmd import (
-    CONFIG as BASE_CONFIG,
-)
+from benchmark.tpu.recipe.configs.deepseek_v41_flash import CONFIG as BASE_CONFIG
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(
