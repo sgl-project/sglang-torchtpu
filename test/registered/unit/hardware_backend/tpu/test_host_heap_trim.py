@@ -155,6 +155,7 @@ class TestInstall(CustomTestCase):
                 "CPU backend",
                 "collect",
                 "req",
+                "collect",
                 "after warmup",
             ],
         )
@@ -176,6 +177,42 @@ class TestInstall(CustomTestCase):
             self.cls().handle_freeze_gc("req")
         self.assertIsNone(alive())
 
+    def test_full_collections_resume_after_the_freeze(self):
+        # A full collection before the freeze leaves CPython's long-lived
+        # baseline at the whole heap; without a collection after the freeze,
+        # automatic full collections stay skipped for a quarter of that heap
+        # in promotions, and cycles in the oldest generation stay alive.
+        heap = [[i] for i in range(200_000)]
+        with (
+            patch.object(tpu, "trim_host_heap"),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
+        ):
+            self.cls().handle_freeze_gc("req")
+        del heap
+        thresholds, enabled = gc.get_threshold(), gc.isenabled()
+        gc.disable()
+        try:
+            node = _Node()
+            node.ref = node
+            alive = weakref.ref(node)
+            gc.collect(1)  # promote the cycle to the oldest generation
+            del node
+            gc.set_threshold(1, 1, 1)
+            gc.enable()
+            # Net allocations drive the automatic collections. Don't call
+            # alive() in between: a collection can run while its result is on
+            # the stack.
+            keep = [[] for _ in range(1_000)]
+            del keep
+        finally:
+            gc.set_threshold(*thresholds)
+            if enabled:
+                gc.enable()
+            else:
+                gc.disable()
+        self.assertIsNone(alive())
+
     def test_env_turns_startup_compiler_cleanup_and_trim_off(self):
         with (
             patch.object(tpu, "trim_host_heap") as trim,
@@ -192,7 +229,8 @@ class TestInstall(CustomTestCase):
         self.clear.assert_not_called()
         clear_jax.assert_not_called()
         release_cpu.assert_not_called()
-        collect.assert_not_called()
+        # Only the collection after the freeze remains.
+        collect.assert_called_once_with()
         self.advise.assert_called_once()
 
     def test_failed_cache_save_does_not_clear_records_or_freeze(self):
