@@ -494,8 +494,10 @@ def register() -> None:
     register_tpu_dsv4_resolution_hooks()
     register_unified_hicache_strategy()
 
-    # Before server arguments name it: --speculative-algorithm K3_PROGRAM.
-    from sglang_tpu.k3_programs.sglang_worker import register as register_k3_program
+    # Before server arguments name it: --speculative-algorithm K3_PROGRAM. The
+    # registration imports no program module (jax): those load once a server
+    # selects the algorithm.
+    from sglang_tpu.k3_programs.sglang_algorithm import register as register_k3_program
 
     register_k3_program()
 

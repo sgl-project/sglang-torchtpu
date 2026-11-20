@@ -8,6 +8,7 @@ that turns a device pool into the per-namespace tensor lists raiden registers.
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
@@ -145,14 +146,16 @@ def _k3_program_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
     is three consecutive rows (``UnifiedPoolPlan.state_row``) of the 23 pools
     that host KDA layers. The state engine registers those pools too.
     """
+    # Such a pool exists only once a K3_PROGRAM server imported its module:
+    # every other pool is told apart without importing the programs (jax).
+    k3_pools = sys.modules.get("sglang_tpu.k3_programs.sglang_pools")
+    full_pool = getattr(pool, "full_kv_pool", None)
+    if k3_pools is None or not isinstance(full_pool, k3_pools.K3UnifiedKVPool):
+        return None
     from sglang_tpu.k3_programs import sglang_bridge as bridge
     from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
     from sglang_tpu.k3_programs.kimi_k3.pools import draft_raw_pools
-    from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
 
-    full_pool = getattr(pool, "full_kv_pool", None)
-    if not isinstance(full_pool, K3UnifiedKVPool):
-        return None
     caches, plan = full_pool.caches, full_pool.plan
     target = [caches[bridge.mla_layer_name(layer)] for layer in MLA]
     draft = draft_raw_pools(caches)

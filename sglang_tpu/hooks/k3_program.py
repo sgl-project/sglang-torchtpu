@@ -156,15 +156,25 @@ skip_k3_program_backends, skip_k3_program_graphs
 
 from __future__ import annotations
 
+import sys
 from typing import Any
+
+
+def _imported(module: str):
+    """``sglang_tpu.k3_programs.<module>`` if this process imported it, else
+    None. The programs' pools, allocator and steps exist only once a
+    K3_PROGRAM server imported their modules, so the hooks on paths every
+    server runs test for them through this instead of importing the programs
+    (jax). The K3_PROGRAM checks below compare the name as a literal for the
+    same reason."""
+    return sys.modules.get(f"sglang_tpu.k3_programs.{module}")
 
 
 def k3_program_selected(server_args: Any) -> bool:
     from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang_tpu.k3_programs.sglang_worker import ALGORITHM
 
     algorithm = resolving_view(server_args).speculative_algorithm
-    return str(algorithm or "").upper() == ALGORITHM
+    return str(algorithm or "").upper() == "K3_PROGRAM"
 
 
 def allow_k3_program_spec(original, server_args: Any, *args, **kwargs) -> None:
@@ -176,10 +186,9 @@ def allow_k3_program_spec(original, server_args: Any, *args, **kwargs) -> None:
 
 def k3_program_kv_layer_ids(original, pool: Any, *args, **kwargs) -> list[int]:
     """AROUND HybridLinearKVPool.get_kv_layer_ids."""
-    from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
-
+    k3_pools = _imported("sglang_pools")
     full = getattr(pool, "full_kv_pool", None)
-    if isinstance(full, K3UnifiedKVPool):
+    if k3_pools is not None and isinstance(full, k3_pools.K3UnifiedKVPool):
         return full.get_kv_layer_ids()
     return original(pool, *args, **kwargs)
 
@@ -188,11 +197,10 @@ def k3_program_active() -> bool:
     """Whether this server runs K3_PROGRAM (from the runtime context; no
     published configuration, as before server arguments resolve: no)."""
     from sglang.srt.runtime_context import get_context, get_spec
-    from sglang_tpu.k3_programs.sglang_worker import ALGORITHM
 
     if not get_context().is_config_namespace_published("spec"):
         return False
-    return str(get_spec().speculative_algorithm or "").upper() == ALGORITHM
+    return str(get_spec().speculative_algorithm or "").upper() == "K3_PROGRAM"
 
 
 def attach_k3_program(result: None, causal_lm: Any, *args, **kwargs) -> None:
@@ -364,21 +372,23 @@ def _dp2() -> bool:
 
 
 def _dp_allocator(queue: Any):
-    from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
-
+    dp_alloc = _imported("sglang_dp_alloc")
     allocator = queue.token_to_kv_pool_allocator
-    return allocator if isinstance(allocator, K3DpPagedAllocator) else None
+    if dp_alloc is None or not isinstance(allocator, dp_alloc.K3DpPagedAllocator):
+        return None
+    return allocator
 
 
 def k3_program_dp_allocator(original, platform: Any, *args, **kwargs) -> type:
     """AROUND TpuSRTPlatform.get_paged_allocator_cls (the P/D decode's
     regions; a colocated server keeps sglang's allocator, sglang_dp.ColoRows)."""
-    from sglang_tpu.k3_programs.sglang_program import server_role
+    if _dp2() and k3_program_active():
+        from sglang_tpu.k3_programs.sglang_program import server_role
 
-    if _dp2() and k3_program_active() and server_role() == "decode":
-        from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
+        if server_role() == "decode":
+            from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
 
-        return K3DpPagedAllocator
+            return K3DpPagedAllocator
     return original(platform, *args, **kwargs)
 
 
@@ -474,9 +484,8 @@ def k3_program_dp_group_cap(
     """AROUND SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch: a
     P/D DP2 decode starts a transferred request only while its group has
     room (half the running requests), as groups are fixed at prealloc."""
-    from sglang_tpu.k3_programs import sglang_dp_alloc
-
-    allocator = sglang_dp_alloc.active()
+    dp_alloc = _imported("sglang_dp_alloc")
+    allocator = dp_alloc.active() if dp_alloc is not None else None
     if allocator is None or not scheduler.waiting_queue:
         return original(scheduler, running_batch, *args, **kwargs)
     cap = -(-int(scheduler.max_running_requests) // 2)
@@ -528,14 +537,14 @@ def k3_program_hicache_layout(original, server_args: Any, *args, **kwargs):
 
 def k3_program_dp_release(result: Any, req: Any, *args, **kwargs) -> None:
     """AFTER mem_cache.common.release_kv_cache."""
-    from sglang_tpu.k3_programs import sglang_dp_alloc, sglang_worker
-
-    steps = sglang_worker.colo_steps()
+    k3_worker = _imported("sglang_worker")
+    steps = k3_worker.colo_steps() if k3_worker is not None else None
     if steps is not None:
         # Colocated DP2: the request's decode-written halves back to the
         # DCP32 rows the radix cache now holds, before any prefill reads them.
         steps.colo_release(req.rid)
-    allocator = sglang_dp_alloc.active()
+    dp_alloc = _imported("sglang_dp_alloc")
+    allocator = dp_alloc.active() if dp_alloc is not None else None
     if allocator is None:
         return result
     landing = getattr(req, "_k3_dp_landing", None)
