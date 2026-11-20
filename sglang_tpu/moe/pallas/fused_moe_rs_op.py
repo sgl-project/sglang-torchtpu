@@ -17,13 +17,13 @@ _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 _FUSED_RS_MAX_SAFE_ROUTED_ROWS = 262144
 
 
-def fused_moe_rs_expert_tp_max_tokens(topk: int, tp_size: int) -> int:
+def fused_moe_rs_expert_tp_max_tokens(topk: int) -> int:
     """Largest power-of-two token count one expert-TP call can route.
 
-    Expert TP routes every (token, slot) to all ``tp_size`` expert slices, so a
-    call carries ``tokens * topk * tp_size`` kernel rows.
+    Expert TP routes every (token, slot) to all TP expert slices, but each device's
+    kernel indexes only its own ``tokens * topk`` rows.
     """
-    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // (topk * tp_size)
+    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // topk
     return 1 << (max_tokens.bit_length() - 1)
 
 
@@ -282,7 +282,7 @@ def fused_moe_rs_gather(
     import torch.distributed as dist
 
     if expert_tp:
-        max_tokens = fused_moe_rs_expert_tp_max_tokens(topk, world_size)
+        max_tokens = fused_moe_rs_expert_tp_max_tokens(topk)
         if hidden_states.shape[0] > max_tokens:
             if keep_token_shard:
                 raise NotImplementedError(
