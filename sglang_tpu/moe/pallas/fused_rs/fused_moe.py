@@ -44,6 +44,7 @@ from sglang_tpu.moe.pallas.fused_rs.utils import (
     get_moe_expert_axis,
 )
 from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
+from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
 # ============================================================================
 # SMEM safety guard
@@ -140,8 +141,6 @@ def _ep_ranks_pair_cores(ep_size: int) -> bool:
     """Whether expert ranks 2c and 2c + 1 are the two TensorCores of one chip, as the
     fused-RS two-level reduce-scatter assumes. Holds for torch ranks under get_pallas_mesh
     on TPU7x (see k3_megakernel/config.py); needs at least two chips."""
-    from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
-
     if ep_size < 4 or ep_size % 2:
         return False
     try:
