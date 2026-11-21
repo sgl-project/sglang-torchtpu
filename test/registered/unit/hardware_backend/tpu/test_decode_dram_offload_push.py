@@ -307,7 +307,10 @@ class TestPrefillQueueHooks(CustomTestCase):
     def test_queue_step_is_driven_before_and_settled_after(self):
         calls = []
         extension = _prefill_end()
-        extension.recall.advance.side_effect = lambda *a, **k: calls.append("recall")
+        extension.recall.advance.side_effect = lambda *a, **k: (
+            calls.append("recall") or True
+        )
+        extension.push._under_host_pressure.return_value = True
         extension.push.advance.side_effect = lambda **k: calls.append("push")
         extension.recall.insert_recalled_host_prefix.side_effect = lambda req: (
             calls.append("insert") or True
@@ -321,9 +324,11 @@ class TestPrefillQueueHooks(CustomTestCase):
         self.assertEqual(result, ["a"])
         self.assertEqual(calls, ["recall", "push", "pop", "insert", "note", "drop"])
         extension.recall.advance.assert_called_once_with(
-            queue.queue, waiting_reqs=["waiting"]
+            queue.queue, waiting_reqs=["waiting"], push_under_pressure=True
         )
-        extension.push.advance.assert_called_once_with(serving=True)
+        extension.push.advance.assert_called_once_with(
+            serving=True, selection_agreed=True
+        )
         extension.recall.insert_recalled_host_prefix.assert_called_once_with("a")
         extension.push.note_decode_of.assert_called_once_with("a", recalled=True)
         extension.recall.drop_departed.assert_called_once_with(queue.queue)
@@ -338,7 +343,9 @@ class TestPrefillQueueHooks(CustomTestCase):
                     dram_offload_hooks._move_bootstrapped(
                         MagicMock(return_value=[]), queue, []
                     )
-                extension.push.advance.assert_called_once_with(serving=running)
+                extension.push.advance.assert_called_once_with(
+                    serving=running, selection_agreed=True
+                )
 
     def test_memory_release_first_lets_go_of_the_pages_of_the_prefill_end(self):
         calls = []

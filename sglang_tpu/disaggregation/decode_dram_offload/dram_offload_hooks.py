@@ -187,10 +187,22 @@ def _move_bootstrapped(upstream: Callable, queue: Any, *args, **kwargs) -> Any:
     end before the step, settle the requests that left bootstrap after it."""
     scheduler = queue.scheduler
     extension = _extension(scheduler.tree_cache)
-    extension.recall.advance(queue.queue, waiting_reqs=scheduler.waiting_queue)
-    extension.push.advance(
-        serving=bool(queue.queue or scheduler.waiting_queue)
+    serving = (
+        bool(queue.queue or scheduler.waiting_queue)
         or not scheduler.running_batch.is_empty()
+    )
+    # Intake and queue moves are synchronized across attention-TP ranks. Only
+    # their shared idle state can skip selection without a pressure vote.
+    # With bootstrap requests, piggyback the vote on recall-status agreement.
+    selection_agreed = extension.recall.advance(
+        queue.queue,
+        waiting_reqs=scheduler.waiting_queue,
+        push_under_pressure=extension.push._under_host_pressure()
+        if queue.queue
+        else None,
+    )
+    extension.push.advance(
+        serving=serving, selection_agreed=selection_agreed if queue.queue else True
     )
     bootstrapped = upstream(queue, *args, **kwargs)
     # Core all-reduces the polls, so every rank bootstraps and drops the same
