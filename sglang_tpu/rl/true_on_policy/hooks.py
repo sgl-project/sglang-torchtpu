@@ -6,28 +6,36 @@ Registered only with SGLANG_TPU_ENABLE_TRUE_ON_POLICY=1; unset, sglang_tpu/hooks
 Why: an RL trainer recomputes the rollout's log-probs in one packed forward. They equal the engine's bit for
      bit only if every op gives a row the same bytes whatever else shares its batch: XLA's dot, log-softmax and
      RMSNorm do not (they tile per shape), and the batched RPA kernel picks a different KV block for decode than
-     for prefill. The kernels are the other modules of this package.
+     for prefill. The gated-delta-net kernel prefills with a chunked solve and decodes with a recurrence, and
+     the MoE combine changes with the routed-row count. The kernels are the other modules of this package.
 How: AROUND UnquantizedLinearMethod.apply and LogitsProcessor._compute_lm_head_rows (fixed-tile matmul),
-     AROUND RMSNorm.forward_native (fixed-tile norm), AROUND Sampler.forward and InputLogprobProcessor.forward
+     AROUND RMSNorm.forward_native, GemmaRMSNorm.forward_native and RMSNormGated.forward (fixed-tile norms),
+     AROUND fused_conv1d_gdn (every tile runs the recurrence), AROUND fused_moe_call (one kernel, combine in
+     slot order), AROUND Sampler.forward and InputLogprobProcessor.forward
      (the returned token log-probs come from the fixed-tile log-prob kernel; top-k and token-id log-probs stay
      on the stock path), AFTER batched RPA calculate_block_sizes (one KV block, the page size, for decode and
      prefill), AFTER SamplingParams.verify (a request asking for a logit transform the log-prob does not model
-     gets a 400). The engine does not check the server configuration: the trainer that launches it (miles)
-     refuses the ones these programs do not cover (TP above 1, another attention backend or KV layout).
+     gets a 400). The engine does not check the rest of the server configuration: the trainer that launches
+     it (miles) refuses what these programs do not cover (TP above 1, another attention backend, quantized
+     weights).
 Upstream PR or issue: not filed (prototype).
 Remove when: core exposes batch-invariant op seams on TPU.
 """
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
+import jax.numpy as jnp
 import torch
 
+from sglang_tpu.envs import envs
 from sglang_tpu.rl.true_on_policy import (
     attention_kernel,
     logprob_kernel,
     matmul_kernel,
+    moe_kernel,
     norm_kernel,
 )
 
@@ -86,15 +94,74 @@ def true_on_policy_rms_norm(
         raise ValueError(
             "TPU true on-policy RMSNorm covers the plain bf16 norm (with or without residual) only"
         )
+    return _fixed_tile_norm(x, residual, self.weight, self.variance_epsilon)
+
+
+def true_on_policy_gemma_rms_norm(
+    original, self, x: torch.Tensor, residual=None, post_residual_addition=None
+):
+    """AROUND GemmaRMSNorm.forward_native: the fixed-tile norm with the Gemma weight and rounding."""
+    if x.device.type != "tpu":
+        return original(self, x, residual, post_residual_addition)
+    if (
+        post_residual_addition is not None
+        or x.dtype != torch.bfloat16
+        or self.weight.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "TPU true on-policy GemmaRMSNorm covers the bf16 norm (with or without residual) only"
+        )
+    return _fixed_tile_norm(x, residual, self.weight, self.variance_epsilon, gemma=True)
+
+
+def _fixed_tile_norm(x, residual, weight, eps, *, gemma=False):
     h = x.shape[-1]
     flat = x.reshape(-1, h)
     if residual is None:
-        out = norm_kernel.rms_norm(flat, None, self.weight, self.variance_epsilon)
+        out = norm_kernel.rms_norm(flat, None, weight, eps, gemma=gemma)
         return out.reshape(x.shape)
     out, new_residual = norm_kernel.rms_norm(
-        flat, residual.reshape(-1, h), self.weight, self.variance_epsilon
+        flat, residual.reshape(-1, h), weight, eps, gemma=gemma
     )
     return out.reshape(x.shape), new_residual.reshape(x.shape)
+
+
+def true_on_policy_gated_rms_norm(original, self, x: torch.Tensor, z=None):
+    """AROUND RMSNormGated.forward: the fixed-tile norm of x, gated by silu(z), rounded once."""
+    if x.device.type != "tpu":
+        return original(self, x, z)
+    if z is None or x.dtype != torch.bfloat16:
+        raise ValueError(
+            "TPU true on-policy RMSNormGated covers the bf16 norm with its gate only"
+        )
+    h = x.shape[-1]
+    out = norm_kernel.gated_rms_norm(
+        x.reshape(-1, h), z.reshape(-1, h), self.weight, self.eps
+    )
+    return out.reshape(x.shape)
+
+
+def recurrent_gated_delta_net(original, *args, **kwargs):
+    """AROUND fused_conv1d_gdn: every tile runs the per-token recurrence, as a decode step does."""
+    call = inspect.signature(original).bind(*args, **kwargs)
+    a_log = call.arguments["a_log"]
+    # The model holds A_log in fp32 (every other parameter in bf16); a trainer's forward reads the bf16
+    # rounding of its fp32 weights, so the two differ after the first optimizer step.
+    call.arguments["a_log"] = a_log.astype(jnp.bfloat16).astype(a_log.dtype)
+    return original(*call.args, **{**call.kwargs, "recurrent_scan": True})
+
+
+def true_on_policy_moe(original, **kwargs):
+    """AROUND fused_moe_call: one kernel for every row count, its combine in slot order on the TensorCore."""
+    moe_kernel.refuse_moe_rounding_flags()
+    with (
+        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.override(False),
+        envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.override(0),
+        envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.override(False),
+        # A single-row call would otherwise take its own kernel.
+        envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.override(False),
+    ):
+        return original(**kwargs)
 
 
 def true_on_policy_sampler(
@@ -199,7 +266,7 @@ def refuse_transformed_sampling(result, self, vocab_size) -> Any:
 def pin_kv_block(result, model_cfgs, serve_cfgs, vmem_limit_bytes) -> Any:
     """AFTER batched RPA calculate_block_sizes: one KV block (the page) for decode and prefill alike."""
     attention_kernel.refuse_rpa_rounding_flags()
-    return attention_kernel.pin_kv_block(*result, serve_cfgs.page_size)
+    return attention_kernel.pin_kv_block(*result, serve_cfgs)
 
 
 def hook_specs():
@@ -219,6 +286,26 @@ def hook_specs():
         (
             "sglang.srt.layers.layernorm.RMSNorm.forward_native",
             true_on_policy_rms_norm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.layernorm.GemmaRMSNorm.forward_native",
+            true_on_policy_gemma_rms_norm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.attention.native_torch.layernorm_gated.RMSNormGated.forward",
+            true_on_policy_gated_rms_norm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn",
+            recurrent_gated_delta_net,
+            HookType.AROUND,
+        ),
+        (
+            "sglang_tpu.moe.pallas.fused_moe_op.fused_moe_call",
+            true_on_policy_moe,
             HookType.AROUND,
         ),
         (

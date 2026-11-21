@@ -20,14 +20,18 @@ from sglang_tpu.rl.true_on_policy.common import refuse_flags, register
 PAGE_SIZE = 256
 
 
-def pin_kv_block(decode, prefill, page_size):
-    """One KV block, the page, for the decode and the prefill launches."""
-    if page_size != PAGE_SIZE:
+def pin_kv_block(decode, prefill, serve_cfgs):
+    """One KV block, the page, for the decode and the prefill launches of the cache the contract covers."""
+    from sglang_tpu.attention.pallas.batched_rpa import configs
+
+    cache = (serve_cfgs.page_size, serve_cfgs.kv_layout, serve_cfgs.dtype_kv)
+    if cache != (PAGE_SIZE, configs.KVLayout.SEQ_ALONG_LANE, jnp.bfloat16):
         raise ValueError(
-            f"True on-policy attention runs {PAGE_SIZE}-token pages, got {page_size}"
+            f"True on-policy attention runs a bf16 SEQ_ALONG_LANE KV cache with {PAGE_SIZE}-token pages "
+            f"(SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1, --page-size {PAGE_SIZE}), got {cache}"
         )
-    return dataclasses.replace(decode, bkv_sz=page_size), dataclasses.replace(
-        prefill, bkv_sz=page_size
+    return dataclasses.replace(decode, bkv_sz=PAGE_SIZE), dataclasses.replace(
+        prefill, bkv_sz=PAGE_SIZE
     )
 
 
@@ -50,7 +54,7 @@ def _pinned_kv_blocks():
 
     def pinned(model_cfgs, serve_cfgs, vmem_limit_bytes):
         return pin_kv_block(
-            *original(model_cfgs, serve_cfgs, vmem_limit_bytes), serve_cfgs.page_size
+            *original(model_cfgs, serve_cfgs, vmem_limit_bytes), serve_cfgs
         )
 
     wrapper.calculate_block_sizes = pinned
