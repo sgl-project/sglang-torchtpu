@@ -116,6 +116,30 @@ class TestRouterTopkTorchParity(CustomTestCase):
             with self.subTest(msg=msg):
                 self._compare(logits, bias, 8, True, True, msg, exact=True)
 
+    def test_prefill_kernel_matches_the_argmax_rounds(self):
+        """SGLANG_TPU_ROUTER_TOPK_KERNEL_PREFILL: prefill batches (whole 256-row
+        blocks) through the gridded kernel give the argmax rounds' ids and
+        weights bit for bit, with random and tied scores."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        g = torch.Generator().manual_seed(3)
+        for tokens in (256, 1024, 4096):
+            for case in ("random", "ties"):
+                logits = torch.randn(tokens, 288, generator=g) * 2.0
+                if case == "ties":
+                    logits = torch.round(logits * 2) / 2
+                lt = logits.to(torch.bfloat16).to("tpu")
+                bt = (torch.randn(288, generator=g) * 0.05).float().to("tpu")
+                want_w, want_ids = (
+                    t.cpu() for t in self.rt._large_batch_topk(lt, bt, 8, True, SCALE, True)
+                )
+                with tpu_envs.SGLANG_TPU_ROUTER_TOPK_KERNEL_PREFILL.override(True):
+                    self.assertTrue(self.rt._prefill_kernel_eligible(lt, bt, 8, 0))
+                    got_w, got_ids = (t.cpu() for t in self._grouped(lt, bt))
+                with self.subTest(tokens=tokens, case=case):
+                    self.assertTrue(torch.equal(got_ids.long(), want_ids.long()))
+                    self.assertTrue(torch.equal(got_w.float(), want_w.float()))
+
     def test_grouped_top8_ties_pick_the_lowest_ids(self):
         """Exact choice ties (a few logit values, a bias on a 0.25 grid): the
         kernel (up to 128 tokens) and the argmax rounds past it both take the

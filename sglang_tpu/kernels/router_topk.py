@@ -15,6 +15,8 @@ import functools
 # One token with at most this many experts (a multiple of 128) takes the rank
 # formulation (_topk_kernel_1tok); its compares grow as experts^2.
 _RANK_MAX_EXPERTS = 1024
+# Rows per grid step for batches past one block (prefill); fits the 4 MiB VMEM limit.
+_ROW_BLOCK = 256
 
 
 def _topk_kernel(
@@ -168,6 +170,10 @@ def router_topk_jax(
 
     tokens, experts = logits.shape
     full = lambda shape: pl.BlockSpec(shape, lambda i: (0,) * len(shape))
+    # Prefill batches run in row blocks; rows are independent, so each row's
+    # result is the single-block kernel's.
+    block = _ROW_BLOCK if tokens > _ROW_BLOCK and tokens % _ROW_BLOCK == 0 else tokens
+    rows = lambda shape: pl.BlockSpec(shape, lambda i: (i, 0))
     return pl.pallas_call(
         functools.partial(
             _topk_kernel, k=k, renormalize=renormalize, eps=eps, scale=scale
@@ -176,11 +182,11 @@ def router_topk_jax(
             jax.ShapeDtypeStruct((tokens, k), jnp.float32),
             jax.ShapeDtypeStruct((tokens, k), jnp.int32),
         ),
-        grid=(1,),
+        grid=(tokens // block,),
         # The bias stays 1-D: reshaping it to [1, E] outside the kernel is a
         # relayout op per call (f32 [E] and [1, E] tile differently).
-        in_specs=[full((tokens, experts)), full((experts,))],
-        out_specs=(full((tokens, k)), full((tokens, k))),
+        in_specs=[rows((block, experts)), full((experts,))],
+        out_specs=(rows((block, k)), rows((block, k))),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=4 * 1024 * 1024,
             allow_input_fusion=[True, False],

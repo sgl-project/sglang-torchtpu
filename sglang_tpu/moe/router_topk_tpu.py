@@ -121,6 +121,25 @@ def _run(
     )
 
 
+def _prefill_kernel_eligible(
+    gating_output, correction_bias, topk, num_fused_shared_experts
+) -> bool:
+    """Prefill batches the gridded kernel takes instead of the argmax rounds
+    (SGLANG_TPU_ROUTER_TOPK_KERNEL_PREFILL): top-8, whole 256-row blocks, an f32
+    bias as the kernel adds it."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return (
+        tpu_envs.SGLANG_TPU_ROUTER_TOPK_KERNEL_PREFILL.get()
+        and topk <= 8
+        and gating_output.shape[0] % 256 == 0
+        and correction_bias.dtype == torch.float32
+        and _large_batch_eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
+    )
+
+
 def _large_batch_eligible(
     gating_output, correction_bias, topk, num_fused_shared_experts
 ):
@@ -195,6 +214,21 @@ def biased_topk_around(
     if (
         scoring_func == "sigmoid"
         and expert_location_dispatch_info is None
+        and _prefill_kernel_eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
+    ):
+        return _run(
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+    if (
+        scoring_func == "sigmoid"
+        and expert_location_dispatch_info is None
         and _large_batch_eligible(
             gating_output, correction_bias, topk, num_fused_shared_experts
         )
@@ -250,6 +284,21 @@ def biased_grouped_topk_around(
 ):
     """AROUND hook for ``topk.biased_grouped_topk_impl``: with one expert group
     the group mask keeps every expert, so it is the plain biased top-k."""
+    if (
+        num_expert_group in (None, 1)
+        and topk_group in (None, 1)
+        and _prefill_kernel_eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
+    ):
+        return _run(
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
     if (
         num_expert_group in (None, 1)
         and topk_group in (None, 1)

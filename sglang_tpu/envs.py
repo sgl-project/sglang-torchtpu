@@ -208,6 +208,9 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
+    # With the router top-k kernel on: prefill batches (whole 256-row blocks, top-8)
+    # take the gridded kernel instead of the argmax rounds. Same picks and weights.
+    SGLANG_TPU_ROUTER_TOPK_KERNEL_PREFILL = EnvBool(False)
     # GLM-5.3-Flash: target steps (the MTP verify, or decode without speculation)
     # as one Pallas call per device (glm_flash_megakernel/); other steps run the
     # model as usual. ..._MAX_LEN caps the request length the kernel takes
