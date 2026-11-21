@@ -1475,6 +1475,15 @@ class TpuSpecWorker(BaseSpecWorker):
                     relays.append(
                         (bonus_tokens, compact_rows, self.make_dummy_carry(bs))
                     )
+                # Extend publishes batch.seq_lens, a [:bs] view of the seq_lens the
+                # batch padding sized to a batch bucket: the store reads that view.
+                for padded_bs in sorted(
+                    {self._pad_bs(bs), *self._decode_buckets_for(bs)}
+                ):
+                    seq_lens = torch.zeros(
+                        (padded_bs,), dtype=torch.int64, device=self.device
+                    )[:bs]
+                    relays.append((compact_rows, seq_lens, self.make_dummy_carry(bs)))
                 for bonus_tokens, seq_lens, carry in relays:
                     future_map.publish(indices, seq_lens)
                     future_map.stash(

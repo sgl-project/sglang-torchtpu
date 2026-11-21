@@ -1343,9 +1343,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.forward_mode = ForwardMode.DECODE
         # Scheduler idle locations are int64; active decode and warmup use
         # the allocator dtype. Normalize before padding materializes KV slots.
-        forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(
-            dtype=self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
-        )
+        loc = forward_batch.out_cache_loc
+        dtype = self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
+        if loc.dtype != dtype:
+            # An idle batch's locations are empty: allocate them in the target
+            # dtype rather than cast, which compiles an s32[0] device program the
+            # first time a server relabels an idle rank.
+            forward_batch.out_cache_loc = (
+                torch.empty((0,), dtype=dtype, device=loc.device)
+                if loc.numel() == 0
+                else loc.to(dtype=dtype)
+            )
         self._match_busiest_dp_decode_rows(forward_batch)
 
     def _match_busiest_dp_decode_rows(self, forward_batch: ForwardBatch) -> None:

@@ -1725,13 +1725,21 @@ class TestExperimentalSpecHooks(CustomTestCase):
     ):
         from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 
-        all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
+        all_warmups = [
+            "base",
+            "block",
+            "sampling",
+            "extend",
+            "folded",
+            "engram",
+            "snapshot",
+        ]
         cases = (
             (1, "null", all_warmups),
             (1, "prefill", all_warmups),
             (1, "decode", all_warmups),
-            (8, "prefill", ["base", "extend", "snapshot"]),
-            (8, "null", ["base", "extend", "snapshot"]),
+            (8, "prefill", ["base", "extend", "folded", "snapshot"]),
+            (8, "null", ["base", "extend", "folded", "snapshot"]),
             (8, "decode", all_warmups),
         )
         for pp_size, mode, expected in cases:
@@ -1742,6 +1750,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
                 worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
                 worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
+                worker._warmup_folded_drop_draft_kv = lambda c=calls: c.append("folded")
+                worker._warmup_engram_commit_ids = lambda c=calls: c.append("engram")
                 with (
                     patch.object(
                         TpuSpecWorker,

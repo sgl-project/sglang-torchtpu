@@ -283,7 +283,9 @@ class _SlotsOnDevice:
         self._device = device
 
     def __getitem__(self, key) -> torch.Tensor:
-        return self._table[key].to(device=self._device, dtype=torch.int64)
+        # Cast where the table lives, then copy: a cast on the device after the
+        # copy is a program per replay length.
+        return self._table[key].to(torch.int64).to(self._device)
 
 
 def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
@@ -335,6 +337,20 @@ def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
         folded,
         scheduled_row=folded.scheduled_row.to(runner.device, non_blocking=True),
     )
+
+
+def skip_tpu_noop_pad(original, forward_batch, tensor, size, *, value=0):
+    """AROUND ForwardBatch._pad_tensor_to_size: on the V4.1 TPU pool, return a
+    tensor already at ``size`` as is. The original concatenates a zero-row
+    tensor, and on TPU that no-op cat is a program per row count, compiled at
+    serving time on the DP rank whose batch sets the padded size. No V4.1 path
+    modifies these batch fields in place, so dropping the copy is safe there;
+    other models keep the original."""
+    from sglang_tpu.models.deepseek_v41.memory_pool import dsv41_pool_active
+
+    if tensor.shape[0] == size and dsv41_pool_active():
+        return tensor
+    return original(forward_batch, tensor, size, value=value)
 
 
 def drop_tpu_dsv41_folded_rows(original, *, logits_output, folded, tail_lens=None):
@@ -746,6 +762,12 @@ def hook_specs():
         (
             "sglang.srt.model_executor.encoder_swa_replay.drop_folded_rows",
             drop_tpu_dsv41_folded_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
+            "_pad_tensor_to_size",
+            skip_tpu_noop_pad,
             HookType.AROUND,
         ),
         (

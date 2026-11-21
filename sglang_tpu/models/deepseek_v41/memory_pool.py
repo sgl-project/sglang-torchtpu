@@ -31,6 +31,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    ONLINE_C128,
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -419,6 +420,7 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             swa_storage = "draft ring"
         else:
             swa_storage = "paged"
+        self.precompile_request_slot_clear()
         logger.info(
             "DSV41 TPU pool: swa_pages64=%d (%s), sources=%s, main_records=%s, "
             "index_pages=%s",
@@ -556,9 +558,68 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def clear_request_slots(self, req_pool_indices: Sequence[int]) -> None:
         """ReqToTokenPool on_alloc_rows hook: reset each reused slot's ratio-2
-        pending-pair ring through the core clear_request_scoped_state."""
-        for req_pool_idx in req_pool_indices:
-            self.clear_request_scoped_state(int(req_pool_idx))
+        pending-pair ring (what the core clear_request_scoped_state does).
+
+        The core clears ``buffer[start : start + ring]`` per slot, and the slot
+        offset is a constant of that program, so every slot index compiled its
+        own program at serving time. Here one host-built row index, padded to a
+        power-of-two slot count, scatters the cleared rows into every ring: one
+        program per bucket, compiled at pool construction.
+        """
+        slots = [int(i) for i in req_pool_indices]
+        if not slots:
+            return
+        pools = self._ring_pools()
+        if pools is None:
+            for req_pool_idx in slots:
+                self.clear_request_scoped_state(req_pool_idx)
+            return
+        step = self._max_clear_slots()
+        for start in range(0, len(slots), step):
+            self._clear_ring_rows(pools, slots[start : start + step])
+
+    def _ring_pools(self):
+        """Request-scoped ratio-2 rings sharing one ring size, None otherwise."""
+        pools = [
+            p for p in self.compress_state_pools if p is not None and p.request_scoped
+        ]
+        if not pools or any(p.ratio == 128 and ONLINE_C128 for p in pools):
+            return None
+        if len({p.ring_size for p in pools}) != 1:
+            return None
+        return pools
+
+    def _max_clear_slots(self) -> int:
+        return 1 << (int(self.num_req_slots) - 1).bit_length()
+
+    def _clear_ring_rows(self, pools, slots: Sequence[int]) -> None:
+        ring = pools[0].ring_size
+        bucket = 1 << (len(slots) - 1).bit_length()
+        # Padding repeats the first slot: clearing a row twice is idempotent.
+        padded = torch.tensor(slots + [slots[0]] * (bucket - len(slots)))
+        rows = (padded[:, None] * ring + torch.arange(ring)).reshape(-1)
+        rows = rows.to(pools[0].kv_score_buffer.kv_score.device, non_blocking=True)
+        for pool in pools:
+            kv_score = pool.kv_score_buffer.kv_score
+            half = kv_score.shape[-1] // 2
+            cleared = torch.cat(
+                [
+                    kv_score.new_zeros((1, half)),
+                    kv_score.new_full((1, half), float("-inf")),
+                ],
+                dim=-1,
+            )
+            kv_score.index_copy_(0, rows, cleared.expand(rows.shape[0], -1))
+
+    def precompile_request_slot_clear(self) -> None:
+        """Compile the slot clear at every bucket on slot 0, before serving."""
+        pools = self._ring_pools()
+        if pools is None:
+            return
+        bucket = 1
+        while bucket <= self._max_clear_slots():
+            self._clear_ring_rows(pools, [0] * bucket)
+            bucket *= 2
 
     # ------------------------------------------------------------------ #
     # Kernel buffer accessors (absolute layer ids)
@@ -682,6 +743,14 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 # ---------------------------------------------------------------------- #
 
 
+# Set once this process builds the V4.1 TPU pool (target or draft).
+_DSV41_POOL_ACTIVE = False
+
+
+def dsv41_pool_active() -> bool:
+    return _DSV41_POOL_ACTIVE
+
+
 def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
     """AROUND KVCacheConfigurator._build_dsv4_kv_pool: build DSV41TPUTokenToKVPool
     for a V4.1 model and reset ratio-2 pair state whenever a request slot is
@@ -693,6 +762,8 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
         return original(kvc, *args, **kwargs)
     from sglang_tpu.hooks.dsv4 import build_with_row_reset
 
+    global _DSV41_POOL_ACTIVE
+    _DSV41_POOL_ACTIVE = True
     # The V4 TPU hook would rebind the pool class and register its own slot reset.
     core_build = inspect.unwrap(original)
     with patch.object(kvc_mod, "DeepSeekV4TokenToKVPool", DSV41TPUTokenToKVPool):

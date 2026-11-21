@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -144,6 +144,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             if self._sampled_drafts:
                 self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
+        self._warmup_folded_drop_draft_kv()
+        if not is_pp_non_decode:
+            self._warmup_engram_commit_ids()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -573,6 +576,59 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     torch.zeros((tokens,), dtype=dtype).to(
                         self.device, non_blocking=True
                     ).cpu()
+
+    def _warmup_engram_commit_ids(self) -> None:
+        """commit's Engram verify ids (committed_verify_ids over finalize_accept
+        outputs) and their host copy for the deferred history commit, at every
+        decode batch bucket."""
+        ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if ngram is None or ngram.engram_hasher is None:
+            return
+        with torch.no_grad():
+            for padded_bs in self._bucket_sizes():
+                accept = self._warmup_accept(padded_bs, self.num_verify_rows)
+                committed_verify_ids(accept.bonus_tokens, accept.accept_tokens).cpu()
+                accept.accept_lens.cpu()
+
+    def _warmup_folded_drop_draft_kv(self) -> None:
+        """A folded encoder-replay extend hands the draft KV writer hidden rows
+        gathered by a host-built index (the V4.1 folded-row drop) instead of the
+        target's own output. Warm that gather feeding the writer at every extend
+        token bucket, as serving runs it, so a server's first replay batch does
+        not compile it."""
+        runner = self.target_worker.model_runner
+        if (
+            not get_exec().features.enable_encoder_swa_bounded_replay
+            or not getattr(runner.attn_backend, "folds_encoder_swa_replay", False)
+            or self.ships_pd_hidden
+        ):
+            return
+        compile_policy = runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        assert compile_policy.t_bucketer is not None
+        hidden_size = (
+            self._block_draft_worker._compile_policy().dflash_target_hidden_size
+        )
+        loc_dtype = compile_policy.live_cache_loc_dtype()
+        with torch.no_grad():
+            for tokens in compile_policy.t_bucketer.buckets:
+                hidden = torch.zeros(
+                    (tokens, hidden_size), dtype=runner.dtype, device=self.device
+                )
+                # As drop_tpu_dsv41_folded_rows: a host index of the hidden's rows.
+                index = torch.full((tokens,), tokens - 1, dtype=torch.int64)
+                gathered = hidden[index.to(self.device, non_blocking=True)]
+                positions = torch.zeros((tokens,), dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                )
+                # Padding rows write slot 0, as in extend.
+                cache_loc = torch.zeros((tokens,), dtype=loc_dtype).to(
+                    self.device, non_blocking=True
+                )
+                with self._block_draft_worker.draft_context():
+                    self._block_draft_worker.write_draft_kv(
+                        target_hidden=gathered, positions=positions, cache_loc=cache_loc
+                    )
 
     # FIXME(junyanxu): metrics_reporter calls this on every DSPARK decode log;
     # report the block-accept estimate once the confidence budget is ported.

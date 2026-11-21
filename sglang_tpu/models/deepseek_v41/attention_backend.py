@@ -232,9 +232,19 @@ def _register_metadata_pytree() -> None:
 _register_metadata_pytree()
 
 
+def _host_int64(values: torch.Tensor) -> torch.Tensor:
+    """``values`` as int64 on the host, copied first and cast there.
+
+    ``.to("cpu", torch.int64)`` on a device tensor of another dtype casts on
+    the device before the copy: a program per shape, so a compile per batch
+    size or token count at serving time.
+    """
+    return values.detach().to("cpu").to(torch.int64)
+
+
 def _as_cpu_int64(values, length: int) -> torch.Tensor:
     if isinstance(values, torch.Tensor):
-        out = values.detach().to(device="cpu", dtype=torch.int64)
+        out = _host_int64(values)
     else:
         out = torch.tensor(list(values), dtype=torch.int64)
     out = out[:length]
@@ -308,7 +318,7 @@ def _full_page_table(
 ) -> torch.Tensor:
     """[B, columns] int64: page p of a request is req_to_token[req, 256 p] // 256."""
     starts = req_to_token[req_pool_indices.to(req_to_token.device), ::FULL_PAGE_TOKENS]
-    starts = starts[:, :columns].to("cpu", torch.int64)
+    starts = _host_int64(starts[:, :columns])
     if starts.shape[1] < columns:
         starts = F.pad(starts, (0, columns - starts.shape[1]))
     return starts // FULL_PAGE_TOKENS
@@ -325,7 +335,7 @@ def _swa_page_table(
     else:
         mapping = full_to_swa_index_mapping
         lookup = (full_pages * FULL_PAGE_TOKENS).clamp(0, mapping.shape[0] - 1)
-        swa_starts = mapping[lookup.to(mapping.device)].to("cpu", torch.int64)
+        swa_starts = _host_int64(mapping[lookup.to(mapping.device)])
     sub_pages = FULL_PAGE_TOKENS // SWA_PAGE_TOKENS
     pages = swa_starts[..., None] // SWA_PAGE_TOKENS + torch.arange(sub_pages)
     pages = torch.where((swa_starts > 0)[..., None], pages, 0)
@@ -378,7 +388,7 @@ def _fold_masks(
     counts = query_start_loc[1:] - query_start_loc[:-1]
     floor = torch.where(counts > 0, floor_rows[first_rows], 0)
     compress = torch.zeros(num_tokens, dtype=torch.bool)
-    keep = forward_batch.encoder_swa_compress_rows.detach().to("cpu", torch.int64)
+    keep = _host_int64(forward_batch.encoder_swa_compress_rows)
     compress[keep] = True
     return floor, valid & compress
 

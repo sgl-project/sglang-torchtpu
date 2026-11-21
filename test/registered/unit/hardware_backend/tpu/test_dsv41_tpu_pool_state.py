@@ -98,6 +98,49 @@ class TestDSV41TPUPoolState(CustomTestCase):
             all(id(t) in replacement_ids for t in _accessor_tensors(self.pool))
         )
 
+    def _rings(self) -> list[torch.Tensor]:
+        return [
+            p.kv_score_buffer.kv_score
+            for p in self.pool.compress_state_pools
+            if p is not None and p.request_scoped
+        ]
+
+    def test_slot_clear_matches_the_core_per_slot_clear(self):
+        rings = self._rings()
+        self.assertTrue(rings)
+        for ring in rings:
+            ring.copy_(torch.randn_like(ring))
+        expected = [ring.clone() for ring in rings]
+        actual = rings
+        # The core per-slot clear on the copies, the bucketed clear in place.
+        for ring, copy in zip(actual, expected):
+            ring.data, copy.data = copy.data, ring.data
+        for slot in (3, 1, 4):
+            self.pool.clear_request_scoped_state(slot)
+        for ring, copy in zip(actual, expected):
+            ring.data, copy.data = copy.data, ring.data
+        self.pool.clear_request_slots([3, 1, 4])
+        for ring, want in zip(actual, expected):
+            torch.testing.assert_close(ring, want)
+
+    def test_slot_clear_leaves_other_slots(self):
+        rings = self._rings()
+        for ring in rings:
+            ring.fill_(7.0)
+        self.pool.clear_request_slots([2])
+        ring_size = next(
+            p.ring_size
+            for p in self.pool.compress_state_pools
+            if p is not None and p.request_scoped
+        )
+        for ring in rings:
+            half = ring.shape[-1] // 2
+            rows = slice(2 * ring_size, 3 * ring_size)
+            self.assertTrue(torch.all(ring[rows, :half] == 0))
+            self.assertTrue(torch.all(ring[rows, half:] == float("-inf")))
+            self.assertTrue(torch.all(ring[: 2 * ring_size] == 7.0))
+            self.assertTrue(torch.all(ring[3 * ring_size :] == 7.0))
+
     def test_set_state_rejects_a_wrong_length(self):
         with self.assertRaises(ValueError):
             self.pool.set_state(self.pool.get_state()[:-1])
