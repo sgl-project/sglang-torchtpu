@@ -307,9 +307,8 @@ def moe_gmm_local_rs_nodedup(
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
 
     if expert_tp:
-        # An expert id outside [0, E) (a NaN router score can produce one) drops out of
-        # group_sizes but keeps its sorted row; the ranks then disagree on the rows they
-        # exchange and the kernel halts or hangs. Route it to expert 0 with weight 0.
+        # An id outside [0, E) (a NaN router score) leaves group_sizes but keeps its row,
+        # and the kernel halts or hangs: send it to expert 0 with weight 0.
         routed_ok = (topk_indices >= 0) & (topk_indices < num_local_experts)
         topk_indices = jnp.where(routed_ok, topk_indices, 0)
         if sp_enabled:  # topk_weights holds only this rank's tokens

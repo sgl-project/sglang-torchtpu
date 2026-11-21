@@ -3,8 +3,9 @@
 """Two-level fused-RS post-kernel combine for models with a post-expert norm.
 
 Sums the receive blocks, applies the post-expert RMS norm and each row's top-k weight in
-one Pallas pass. Every bf16 cast of the JAX reference is kept (torch_tpu compiles without
-XLA excess precision), so results differ only in f32 summation order.
+one Pallas pass; the scatter variant also adds the rows into their tokens in VMEM. Every
+bf16 cast of the JAX reference is kept (torch_tpu compiles without XLA excess precision),
+so results differ only in f32 summation order.
 """
 
 import functools
@@ -16,11 +17,14 @@ from jax.experimental.pallas import tpu as pltpu
 
 # Receive-block bytes per grid step (scoped VMEM holds 1.5x this).
 _BLOCK_BYTES = 8 << 20
-# Share of VMEM the scatter combine may take; the rest is Mosaic's internal scratch.
+# Share of VMEM the scatter combine's buffers may take. Arbitrary; the Muse TP8
+# 16384-token call (47.5 MiB of 64) compiled and ran with it.
 _SCATTER_VMEM_FRACTION = 0.75
+# Scoped-VMEM limit above the buffers, for Mosaic's [rows, H] f32 norm temporaries.
+_SCATTER_VMEM_HEADROOM = 16 << 20
 
 
-def _normed_weighted_rows(block, blocks, gain, w, *, eps, dtype):
+def _normed_weighted_rows(*, block, blocks, gain, w, eps, dtype):
     """[rb, H1, H2] in dtype: sum of block(0..blocks-1), post-expert RMS norm, weight w."""
     acc = block(0).astype(jnp.float32)
     for e in range(1, blocks):
@@ -34,10 +38,10 @@ def _normed_weighted_rows(block, blocks, gain, w, *, eps, dtype):
 
 def _twolevel_combine_kernel(x_ref, gain_ref, w_ref, o_ref, *, eps):
     o_ref[...] = _normed_weighted_rows(
-        lambda e: x_ref[e],
-        x_ref.shape[0],
-        gain_ref[...],
-        w_ref[...][:, :1],
+        block=lambda e: x_ref[e],
+        blocks=x_ref.shape[0],
+        gain=gain_ref[...],
+        w=w_ref[...][:, :1],
         eps=eps,
         dtype=x_ref.dtype,
     ).astype(o_ref.dtype)
@@ -95,16 +99,23 @@ def _scatter_tiles(
     out_b = _pow2_divisor(chunk, 256)
     if not out_b:
         return None
-    budget = int(pltpu.get_tpu_info().vmem_capacity_bytes * _SCATTER_VMEM_FRACTION)
+    info = pltpu.get_tpu_info()
+    budget = int(info.vmem_capacity_bytes * _SCATTER_VMEM_FRACTION)
+
+    def padded(dt):
+        """Bytes of one [H1, 128] row in dtype, H1 padded to whole sublane tiles."""
+        sub = info.get_sublane_tiling(dt)
+        return -(-(h // 128) // sub) * sub * 128 * jnp.dtype(dt).itemsize
+
     fixed = (
-        chunk * h * 4  # f32 accumulator
+        chunk * padded(jnp.float32)  # accumulator
         + rows * 128 * 4  # lane-broadcast weights
-        + h * 4  # gain
-        + out_b * h * jnp.dtype(out_dtype).itemsize
+        + padded(jnp.float32)  # gain
+        + out_b * padded(out_dtype)
     )
     rb = _pow2_divisor(rows, 128)
     while rb >= 8:
-        need = fixed + (2 * blocks + 1) * rb * h * jnp.dtype(dtype).itemsize
+        need = fixed + (2 * blocks + 1) * rb * padded(dtype)
         if need <= budget:
             return rb, out_b, need
         rb //= 2
@@ -173,10 +184,10 @@ def _twolevel_combine_scatter_kernel(
         slot = step % 2
         _in_copy(slot, step).wait()
         row_buf_ref[...] = _normed_weighted_rows(
-            lambda e: x_buf_ref[slot, e],
-            blocks,
-            gain_ref[...],
-            w_ref[pl.ds(step * rb, rb), :1],
+            block=lambda e: x_buf_ref[slot, e],
+            blocks=blocks,
+            gain=gain_ref[...],
+            w=w_ref[pl.ds(step * rb, rb), :1],
             eps=eps,
             dtype=row_buf_ref.dtype,
         )
@@ -261,7 +272,7 @@ def twolevel_post_combine_scatter(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=int(min(capacity * 0.95, need + (16 << 20))),
+            vmem_limit_bytes=int(min(capacity * 0.95, need + _SCATTER_VMEM_HEADROOM)),
         ),
         name=f"twolevel_post_combine_scatter-C_{chunk}-R_{rows}",
     )(rank_token.astype(jnp.int32), recv.reshape(blocks, rows, h1, h2), gain, w)
