@@ -152,6 +152,32 @@ class TestPositionOnHost(CustomTestCase):
                     self.assertEqual(uploads[0].tolist(), expected_positions)
                     self.assertEqual(uploads[1].tolist(), expected_starts)
 
+    def test_compute_position_torch_cpu_staged_uses_host_lens(self):
+        """Given the host copies, the staged path reads no length tensor back."""
+        prefixes = torch.tensor([2, 10, 5], dtype=torch.int32)
+        lengths = torch.tensor([2, 0, 3], dtype=torch.int32)
+
+        def no_readback(tensor):
+            raise AssertionError("a length tensor was read back")
+
+        with (
+            patch.object(patches, "_compute_position_torch_patched", False),
+            patch.object(
+                forward_batch_info,
+                "compute_position_torch",
+                forward_batch_info.compute_position_torch,
+            ),
+            patch.object(torch.Tensor, "tolist", no_readback),
+        ):
+            patches._patch_compute_position_torch()
+            positions, starts = forward_batch_info.compute_position_torch(
+                prefixes, lengths, host_lens=([2, 10, 5], [2, 0, 3])
+            )
+
+        self.assertEqual(positions.dtype, torch.int64)
+        self.assertTrue(torch.equal(positions, torch.tensor([2, 3, 5, 6, 7])))
+        self.assertTrue(torch.equal(starts, torch.tensor([0, 2, 2], dtype=torch.int32)))
+
 
 class TestPadTensor(CustomTestCase):
     """Padding preserves values on the input's device and handles token axes."""

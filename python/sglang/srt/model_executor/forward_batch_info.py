@@ -1262,6 +1262,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
                     ret.extend_num_tokens,
+                    host_lens=(
+                        None
+                        if ret.extend_seq_lens_cpu is None
+                        else (ret.extend_prefix_lens_cpu, ret.extend_seq_lens_cpu)
+                    ),
                 )
             else:
                 positions, ret.extend_start_loc, _ = extend_position_info
@@ -2497,7 +2502,10 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    host_lens: Optional[Tuple[List[int], List[int]]] = None,
 ):
+    """``host_lens``: optional host copies ``(prefix_lens, seq_lens)`` of the two
+    length tensors, so the torch path need not read them back."""
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
@@ -2506,20 +2514,25 @@ def compute_position(
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens, extend_seq_lens, host_lens=host_lens
         )
     return positions, extend_start_loc
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    host_lens: Optional[Tuple[List[int], List[int]]] = None,
 ):
+    prefix_lens, seq_lens = (
+        (extend_prefix_lens, extend_seq_lens) if host_lens is None else host_lens
+    )
     positions = torch.cat(
         [
             torch.arange(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
             )
-            for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
+            for prefix_len, extend_len in zip(prefix_lens, seq_lens)
         ],
         axis=0,
     )
