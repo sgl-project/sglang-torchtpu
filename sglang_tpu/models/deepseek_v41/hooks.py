@@ -56,6 +56,17 @@ tpu_dsv41_hc_combine
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
 
+tpu_dsv4_hc_split_sinkhorn
+  Why: deepseek_v4_mhc._mix_stats_impl takes its sinkhorn from get_mhc_ops()
+       on XPU only and calls the TileLang hc_split_sinkhorn everywhere else,
+       which does not run on TPU ("tilelang is not installed").
+  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn runs the
+       torch reference (deepseek_v4._hc_split_sinkhorn_torch, the same
+       arguments) for non-CUDA tensors.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: _mix_stats_impl takes the sinkhorn from get_mhc_ops() on every
+       platform.
+
 tpu_dsv4_live_hc_sublayers
   Why: DeepseekV4DecoderLayerBase keeps attn_hc / ffn_hc, HcSubLayer named
        tuples holding the layer's mHC parameters by reference. The direct
@@ -454,6 +465,15 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
+def tpu_dsv4_hc_split_sinkhorn(original, mixes, *args, **kwargs):
+    """hc_split_sinkhorn in torch for non-CUDA tensors (TileLang is CUDA-only)."""
+    if mixes.is_cuda:
+        return original(mixes, *args, **kwargs)
+    from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+
+    return _hc_split_sinkhorn_torch(mixes, *args, **kwargs)
+
+
 _HC_SUBLAYER_FIELDS = {
     "attn_hc": (
         "hc_attn_fn",
@@ -805,6 +825,11 @@ def hook_specs():
         (
             "sglang.kernels.ops.layernorm.mhc.mhc_combine",
             tpu_dsv41_hc_combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
+            tpu_dsv4_hc_split_sinkhorn,
             HookType.AROUND,
         ),
         (
