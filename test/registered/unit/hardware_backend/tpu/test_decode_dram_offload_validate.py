@@ -33,7 +33,6 @@ _UNSUPPORTED = (
     ("scheduler.tree_cache.tree_core", object(), "Python unified radix tree"),
     ("memory.hicache_io_backend", "kernel", "--hicache-io-backend must be raiden"),
     ("memory.hicache_storage_backend", "file", "--hicache-storage-backend"),
-    ("memory.enable_unified_memory", True, "--enable-unified-memory"),
     ("parallel.attn_cp_size", 2, "context parallelism"),
     ("mambaish", object(), "GDN/Mamba"),
     ("scheduler.spec_algorithm.is_none", lambda: False, "speculative decoding"),
@@ -185,14 +184,23 @@ class TestTpuSyncHostApi(CustomTestCase):
 class TestEngineRefusalsExtra(CustomTestCase):
     def test_every_problem_is_reported_at_once(self):
         engine = supported_engine()
-        engine.memory.enable_unified_memory = True
+        engine.device.sleep_on_idle = True
         engine.scheduler.server_args.pp_size = 2
         with self.assertRaises(
             startup_validation.UnsupportedDramOffloadConfig
         ) as raised:
             validate_engine_as(engine)
-        self.assertIn("--enable-unified-memory", str(raised.exception))
+        self.assertIn("--sleep-on-idle", str(raised.exception))
         self.assertIn("pipeline parallelism", str(raised.exception))
+
+    def test_unified_memory_engine_is_accepted_on_both_roles(self):
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                engine = supported_engine()
+                engine.memory.enable_unified_memory = True
+                engine.scheduler.model_config.is_hybrid_swa = True
+                engine.scheduler.tree_cache.tree_core.has_swa_host_pool = True
+                validate_engine_as(engine, role=role)
 
 
 class TestPairRefusals(CustomTestCase):

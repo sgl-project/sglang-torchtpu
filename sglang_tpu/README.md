@@ -131,8 +131,8 @@ SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 ```
 
 Unsupported settings are refused, never run without the offload. An engine
-stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
-pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
+stops at start, naming the setting, with: a GDN/Mamba model, pipeline
+parallelism (`--pp-size` above 1) or the Raiden pipeline
 transfer, context or data parallelism,
 speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
 other than raiden, an
@@ -142,8 +142,11 @@ tpu-sync build without the host-to-host read API
 or later). A pair fails its requests with the reason when the switch is on for
 one role only or when the roles differ in attention-TP size (resharding).
 
-On a hybrid sliding-window model (GPT-OSS) the offload also moves the last
-sliding window of each branch, through an SWA host pool on both roles. The
+On a hybrid sliding-window model (such as GPT-OSS or `--enable-unified-memory`
+over `TpuUnifiedSWAKVPool`) the offload also moves the last
+sliding window of each branch, through an SWA host pool on both roles (sharing
+the single host arena and expanding all `M_swa` companion physical pages per
+logical window page when `--enable-unified-memory` is enabled). The
 pool is sized as upstream sizes a hybrid host stack, by `--hicache-ratio` or
 a `--hicache-size` split by device bytes, and the model needs `--page-size`
 above 1. Such a model resumes at a length only with the window

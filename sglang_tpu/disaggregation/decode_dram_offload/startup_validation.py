@@ -100,10 +100,6 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             "--hicache-storage-backend (an L3 tier) is not supported",
         ),
         (
-            not memory.enable_unified_memory,
-            "the unified KV pool (--enable-unified-memory) is not supported",
-        ),
-        (
             python_tree,
             "the Python unified radix tree is required (the Rust tree core is not supported)",
         ),

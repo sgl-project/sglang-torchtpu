@@ -27,11 +27,14 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_backed_prefix,
     host_page_ids,
+    host_pages_per_logical_page,
     insert_host_prefix,
     lock_host_path,
+    make_shared_host_room,
     offer_limit,
     prefix_radix_key,
     reclaim_full_host_duplicates,
+    shared_host_domain,
     unlock_host_path,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
@@ -115,6 +118,7 @@ class PrefillDramPrefixPuller:
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
         self._swa_host_pool = ctx.swa_host_pool
+        self._swa_pages_per_logical = host_pages_per_logical_page(ctx.swa_host_pool)
         self._window_pages = ctx.window_tokens // ctx.page_size
         self._lockstep = ctx.lockstep
         # Landing pages of in-flight recalls sit outside the tree until
@@ -244,7 +248,10 @@ class PrefillDramPrefixPuller:
         """A hybrid model resumes at the offered length only with the window
         that ends there: the offer must carry one whole window (or the whole
         prefix when that is shorter). A full-only model carries no window."""
-        return len(swa_blocks) == min(len(blocks), self._window_pages)
+        return (
+            len(swa_blocks)
+            == min(len(blocks), self._window_pages) * self._swa_pages_per_logical
+        )
 
     def _ask_decode_for_agreed_ranges(
         self, proposals: Dict[int, Optional[_PullProposal]]
@@ -258,6 +265,12 @@ class PrefillDramPrefixPuller:
         swa_budget = (
             self._max_inflight_swa_tokens - self._inflight_swa_tokens()
         ) // page
+        shared_budget = (
+            (self._max_inflight_tokens - self._inflight_tokens()) // page
+            - (self._inflight_swa_tokens() // page) * self._swa_pages_per_logical
+            if shared_host_domain(self._host_pool, self._swa_host_pool) is not None
+            else (1 << 60)
+        )
         # MIN of a value and of its negation gives its minimum and maximum.
         rows = [
             [0, 0, 0, 0]
@@ -265,8 +278,8 @@ class PrefillDramPrefixPuller:
             else [1, len(p.blocks), -len(p.blocks), p.have_pages]
             for p in proposals.values()
         ]
-        *agreed, (budget, swa_budget, _, _) = self._lockstep.reduce(
-            [*rows, [budget, swa_budget, 0, 0]], dist.ReduceOp.MIN
+        *agreed, (budget, swa_budget, shared_budget, _) = self._lockstep.reduce(
+            [*rows, [budget, swa_budget, shared_budget, 0]], dist.ReduceOp.MIN
         )
         asked = []
         for (room, proposal), (ok, want, neg_want, first) in zip(
@@ -274,12 +287,20 @@ class PrefillDramPrefixPuller:
         ):
             count = want - first
             window = min(want, self._window_pages)
-            if not ok or want != -neg_want or count > budget or window > swa_budget:
+            phys = count + window * self._swa_pages_per_logical
+            if (
+                not ok
+                or want != -neg_want
+                or count > budget
+                or window > swa_budget
+                or phys > shared_budget
+            ):
                 self.stats["over_budget"] += int(bool(ok) and want == -neg_want)
                 self._channel.resolve_prefix_pull(room)
                 continue
             budget -= count
             swa_budget -= window
+            shared_budget -= phys
             have = (
                 torch.cat(proposal.have_indices)
                 if proposal.have_indices
@@ -347,7 +368,9 @@ class PrefillDramPrefixPuller:
         )
         inserted = node is not None
         if inserted:
-            swa_tokens = len(plan.swa_remote) * self._page_size
+            swa_tokens = (
+                len(plan.swa_remote) // self._swa_pages_per_logical
+            ) * self._page_size
             self._pins[req.bootstrap_room] = _RecalledPrefixPin(
                 req=req,
                 node=node,
@@ -421,7 +444,8 @@ class PrefillDramPrefixPuller:
     def _inflight_swa_tokens(self) -> int:
         """Window tokens reserved by pulls not yet admitted, zombies included."""
         return self._page_size * sum(
-            len(p.swa_remote) for p in (*self._plans.values(), *self._zombies)
+            len(p.swa_remote) // self._swa_pages_per_logical
+            for p in (*self._plans.values(), *self._zombies)
         ) + sum(p.swa_tokens for p in self._pins.values())
 
     def _reserve_host_landing(self, room: int) -> bool:
@@ -429,9 +453,20 @@ class PrefillDramPrefixPuller:
         window pages of a hybrid model, each in its own pool."""
         plan = self._plans[room]
         full_tokens = plan.num_pages * self._page_size
-        swa_tokens = len(plan.swa_remote) * self._page_size
-        self._make_host_room(self._host_pool, full_tokens, ComponentType.FULL)
-        self._make_host_room(self._swa_host_pool, swa_tokens, ComponentType.SWA)
+        swa_tokens = (
+            len(plan.swa_remote) // self._swa_pages_per_logical
+        ) * self._page_size
+        if not make_shared_host_room(
+            self._cache,
+            self._lockstep,
+            self._host_pool,
+            self._swa_host_pool,
+            full_tokens,
+            swa_tokens,
+            allow_duplicate_reclaim=True,
+        ):
+            self._make_host_room(self._host_pool, full_tokens, ComponentType.FULL)
+            self._make_host_room(self._swa_host_pool, swa_tokens, ComponentType.SWA)
         landings = alloc_host_pages_agreed(
             lockstep=self._lockstep,
             pools=[(self._host_pool, full_tokens), (self._swa_host_pool, swa_tokens)],

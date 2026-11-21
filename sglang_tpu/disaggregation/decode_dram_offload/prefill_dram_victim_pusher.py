@@ -26,11 +26,13 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_pages,
+    host_pages_per_logical_page,
     is_live_host_backed_leaf,
     leaf_of,
     lock_host_path,
     mark_next_victim,
     path_tokens,
+    shared_host_domain,
     unlock_host_path,
     window_host_pages,
 )
@@ -91,8 +93,9 @@ def victim_transfer_id(prefill: str, seq: int, *, swa: bool = False) -> str:
     return f"victim:{prefill}:{seq}" + (":swa" if swa else "")
 
 
-def _transfer_uuid(prefill: str, seq: int) -> int:
-    digest = hashlib.blake2b(f"{prefill}:{seq}".encode(), digest_size=8).digest()
+def _transfer_uuid(prefill: str, seq: int, *, swa: bool = False) -> int:
+    label = f"{prefill}:{seq}" + (":swa" if swa else "")
+    digest = hashlib.blake2b(label.encode(), digest_size=8).digest()
     return (int.from_bytes(digest, "little") & ((1 << 63) - 1)) or 1
 
 
@@ -166,6 +169,16 @@ class PrefillDramVictimPusher:
         log_offload_stats(self.stats, "push", self._last_log)
 
     def _under_host_pressure(self) -> bool:
+        domain = shared_host_domain(self._host_pool, self._swa_host_pool)
+        if domain is not None:
+            m_swa = host_pages_per_logical_page(self._swa_host_pool)
+            free_tokens = len(domain.free_pages) * self._page_size
+            reserve = (
+                _PUSH_FULL_FREE_TOKENS
+                + _PUSH_SWA_FREE_WINDOWS * self._window_tokens * m_swa
+            )
+            if free_tokens < reserve:
+                return True
         host_free = self._cache.cache_controller.mem_pool_host.available_size()
         return host_free < _PUSH_FULL_FREE_TOKENS or (
             self._swa_host_pool is not None
@@ -255,6 +268,9 @@ class PrefillDramVictimPusher:
         seq = self._next_seq
         self._next_seq += 1
         uuid = _transfer_uuid(self._namespace, seq)
+        swa_uuid = _transfer_uuid(self._namespace, seq, swa=True) if swa_pages else 0
+        if swa_pages and swa_uuid == uuid:
+            swa_uuid = (uuid % ((1 << 63) - 2)) + 1
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
@@ -263,7 +279,9 @@ class PrefillDramVictimPusher:
         )
         self._pushes[seq] = push
         self.stats["started"] += 1
-        push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
+        push.registered = self._register_leaf_pages(
+            push, uuid, pages, swa_pages, swa_uuid=swa_uuid
+        )
         if not self._lockstep.all(push.registered) or not (
             self._channel.send_victim_push(
                 decode=decode,
@@ -275,22 +293,31 @@ class PrefillDramVictimPusher:
                 uuid=uuid,
                 extra_key=leaf.key.extra_key,
                 cache_salt=leaf.key.cache_salt,
+                **(dict(swa_uuid=swa_uuid) if swa_pages else {}),
             )
         ):
             push.stored = False
 
     def _register_leaf_pages(
-        self, push: _PushInFlight, uuid: int, pages: List[int], swa_pages: List[int]
+        self,
+        push: _PushInFlight,
+        uuid: int,
+        pages: List[int],
+        swa_pages: List[int],
+        *,
+        swa_uuid: int = 0,
     ) -> bool:
         """Register the leaf's host pages as the sources of the decode's reads:
-        the full pages, and on a hybrid model the window pages under the same
-        UUID on their own pool. An accepted registration stays in ``read_ids``
-        when a later one is refused: it drains before the push settles."""
-        for swa, part in ((False, pages), (True, swa_pages)):
+        the full pages, and on a hybrid model the window pages under ``swa_uuid``
+        so unified pools sharing one KVCacheManager never collide on UUIDs."""
+        for swa, part, part_uuid in (
+            (False, pages, uuid),
+            (True, swa_pages, swa_uuid or uuid),
+        ):
             if not part:
                 continue
             read_id = victim_transfer_id(self._namespace, push.seq, swa=swa)
-            if not self._channel.register_host_read(read_id, uuid, part, swa=swa):
+            if not self._channel.register_host_read(read_id, part_uuid, part, swa=swa):
                 return False
             push.read_ids.append(read_id)
         return True
