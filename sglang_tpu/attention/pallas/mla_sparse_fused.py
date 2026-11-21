@@ -44,6 +44,7 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     KVCacheType,
     SparseMLAKVCacheSpec,
 )
+from sglang_tpu.attention.pallas.mla_sparse.ragged import sparse_attention_ragged
 from sglang_tpu.attention.pallas.mla_sparse_qblock import (
     MIN_QUERY_BLOCK,
     QUERY_BLOCK,
@@ -308,6 +309,7 @@ def sparse_mla_attention_kv_shard(
     zero_rope: bool = False,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
     owned_width: int = 0,
+    ragged_block: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``sparse_mla_attention_fused`` on a latent cache split inside every page
     (mla_sparse/kv_shard.py): store the step's tokens at this rank's offsets,
@@ -317,6 +319,9 @@ def sparse_mla_attention_kv_shard(
     ``owned_width`` > 0 (SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT prefill)
     packs each row's own entries first and gathers ``owned_width`` slots per
     token instead of the whole row (``sparse_attention_owned_rows``), exactly.
+
+    ``ragged_block`` > 0: decode-sized batches gather and attend only each row's
+    own candidates, in blocks of that many slots (mla_sparse/ragged.py), exactly.
 
     Returns ``(output, lse, cache_nope, cache_rope)``: the partial output
     ``[max_num_tokens, group_heads, 512]`` normalized over this rank's
@@ -372,8 +377,16 @@ def sparse_mla_attention_kv_shard(
             gather_rope=not zero_rope,
         )
         return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
+    q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+    if _takes_ragged(ragged_block, num_tokens, width):
+        out, lse = sparse_attention_ragged(
+            q, cache_nope, cache_rope, topk_indices, page_indices, cu_q_lens,
+            distribution, sm_scale=sm_scale, k_scale=k_scale, block=ragged_block,
+            kv_shards=(shards, role, kpool), gather_rope=not zero_rope,
+        )  # fmt: skip
+        return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
     out, lse = sparse_ragged_paged_attention(
-        jnp.concatenate([ql_nope, q_pe], axis=-1),
+        q,
         cache_nope,
         cache_rope,
         topk_indices,
@@ -389,6 +402,18 @@ def sparse_mla_attention_kv_shard(
         kv_shards=(shards, role, kpool),
     )
     return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
+
+
+# Decode-sized batches only (verify and draft rows): prefill keeps the per-query
+# kernel, whose gather chunks suit thousands of rows.
+RAGGED_MAX_ROWS = 256
+
+
+def _takes_ragged(ragged_block: int, num_tokens: int, width: int) -> bool:
+    """Whether a split-cache call attends through mla_sparse/ragged.py."""
+    return 0 < ragged_block and width % ragged_block == 0 and (
+        num_tokens <= RAGGED_MAX_ROWS
+    )
 
 
 def qblock_kpool_supported(

@@ -18,7 +18,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"
@@ -239,6 +239,126 @@ class TestMlaKvShardKernel(CustomTestCase):
                     ref = jax.jit(lambda r: kv_shard.owned_rows(r, **kw))(rows)
                     got = owned_rows_kernel(rows, **kw)
                     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+
+# Verify-shaped decode rows: a 2048-token budget of pools plus the open pool,
+# padded to whole lanes (topk_row_width).
+RAGGED_TOPK, RAGGED_WIDTH, RAGGED_QUERY = 2048, 2176, 4
+
+
+def _verify_rows(rng, prefixes, *, shards, skew):
+    """Rows of RAGGED_QUERY verify tokens per request after ``prefixes[i]`` tokens.
+    ``skew[i]``: None picks pools anywhere, r only pools at rank r's offsets."""
+    sub = PAGE // shards
+    rows = []
+    for prefix, role in zip(prefixes, skew):
+        for j in range(RAGGED_QUERY):
+            pos = prefix + j
+            closed = (pos + 1) // KPOOL
+            pools = np.arange(closed)
+            if role is not None:
+                pools = pools[(pools * KPOOL % PAGE) // sub == role]
+            n = min(len(pools), RAGGED_TOPK // KPOOL)
+            pick = np.sort(rng.choice(pools, size=n, replace=False))
+            toks = (pick[:, None] * KPOOL + np.arange(KPOOL)).reshape(-1).tolist()
+            toks += list(range(closed * KPOOL, pos + 1))
+            row = np.full(RAGGED_WIDTH, -1, np.int32)
+            row[: len(toks)] = toks
+            rows.append(row)
+    return np.stack(rows)
+
+
+def _bf16_ulps(got, want):
+    """max |got - want| per token, in bf16 ulps of that token's max |want|."""
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    rows = want.reshape(want.shape[0], -1)
+    diff = np.abs(got.reshape(rows.shape) - rows).max(axis=1)
+    mag = np.maximum(np.abs(rows).max(axis=1), 1e-30)
+    return diff / 2.0 ** (np.floor(np.log2(mag)) - 7)
+
+
+class TestMlaKvShardRagged(CustomTestCase):
+    """``ragged_block``: each rank gathers and attends only its own candidates of a
+    verify batch, in blocks. Without rope lanes the partials and caches must equal
+    the per-query kernel's bit for bit: rows of zero, one and many blocks (up to the
+    whole row on one rank), padding rows, and batches above one 64-row chunk. With
+    rope a score may round differently (the dot's K-chunk order follows the width):
+    outputs within 2 bf16 ulps, lse within 1e-6 relative."""
+
+    def _check(self, shards, prefixes, skew, pad_rows, zero_rope):
+        rng = np.random.default_rng(100 * shards + len(prefixes))
+        sub = PAGE // shards
+        n = len(prefixes)
+        kv_lens = np.asarray(prefixes) + RAGGED_QUERY
+        pps = int(-(-kv_lens.max() // PAGE))
+        num_pages = 1 + n * pps
+        page_indices = jnp.asarray(rng.permutation(np.arange(1, num_pages)), jnp.int32)
+        f8 = ml_dtypes.float8_e4m3fn
+        rope = 0.0 if zero_rope else 1.0
+        total = int(sum(prefixes))
+        pre = (
+            jnp.asarray(rng.normal(size=(total, 512)).astype(f8)),
+            jnp.asarray((rope * rng.normal(size=(total, 64))).astype(f8)),
+            jnp.asarray(prefixes, jnp.int32),
+            page_indices,
+            jnp.asarray(np.concatenate([[0], np.cumsum(prefixes)]), jnp.int32),
+            jnp.asarray([0, n, n], jnp.int32),
+        )
+        rows = _verify_rows(rng, prefixes, shards=shards, skew=skew)
+        tokens = rows.shape[0] + pad_rows
+        rows = jnp.asarray(np.pad(rows, ((0, pad_rows), (0, 0)), constant_values=-1))
+        cu = np.minimum(np.arange(n + 2) * RAGGED_QUERY, n * RAGGED_QUERY)
+        meta = (
+            jnp.asarray(np.append(kv_lens, 1), jnp.int32),
+            jnp.asarray(np.append(np.asarray(page_indices), np.zeros(pps, np.int32))),
+            jnp.asarray(cu, jnp.int32),
+            jnp.asarray([n, n, n], jnp.int32),
+        )
+        step = _step_inputs(rng, tokens, zero_rope)
+        real = n * RAGGED_QUERY
+
+        def run(block, role):
+            return jax.jit(
+                lambda *a: sparse_mla_attention_kv_shard(
+                    *a, sm_scale=SM_SCALE, k_scale=0.75, shards=shards, role=role,
+                    kpool=KPOOL, zero_rope=zero_rope, ragged_block=block,
+                )
+            )  # fmt: skip
+
+        # Roles are symmetric: the first, the last and those the skewed rows sit on.
+        for role in sorted({0, shards - 1} | {r for r in skew if r is not None}):
+            cache = jax.jit(
+                lambda *a, role=role: _store_step(
+                    *a, write_rope=not zero_rope, kv_shards=(shards, role)
+                )
+            )(*_caches(sub, num_pages), *pre)
+            base = run(0, role)(*step, *cache, *meta, rows)
+            got = run(128, role)(*step, *cache, *meta, rows)
+            # Output and lse of the real rows (padding rows are never read), caches whole.
+            for i, (want, have) in enumerate(zip(base, got)):
+                want, have = np.asarray(want), np.asarray(have)
+                if i < 2:
+                    want, have = want[:real], have[:real]
+                if zero_rope or i >= 2:
+                    np.testing.assert_array_equal(have, want, f"role {role} output {i}")
+                elif i == 0:
+                    self.assertLessEqual(float(_bf16_ulps(have, want).max()), 2)
+                else:
+                    np.testing.assert_allclose(have, want, rtol=1e-6, atol=0)
+
+    def test_ragged_matches_per_query_kernel_bit_for_bit(self):
+        cases = [
+            # (shards, prefixes, skew, padding rows): one row of blocks per rank,
+            # short contexts (every pool picked), rows wholly on one rank or none.
+            (8, [9000, 700, 12000, 3000], [None, None, 0, 3], 0),
+            (2, [9000, 1500, 9000], [None, 0, 1], 4),
+            (2, [9000] * 20, [None] * 18 + [0, 1], 8),  # 80 rows: two chunks
+            (8, [6000] * 9, [None] * 9, 0),
+        ]
+        for shards, prefixes, skew, pad in cases:
+            for zero_rope in (True, False):
+                with self.subTest(shards=shards, rows=len(prefixes), rope=not zero_rope):
+                    self._check(shards, prefixes, skew, pad, zero_rope)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
     entries on one slot (the shifts never decrease along the row), so every
     stage is a static slice and a select instead of a sort or scatter.
     """
-    shift = jnp.cumsum(~keep, axis=1, dtype=jnp.int32)  # dropped entries up to here
+    shift = _inclusive_count(~keep)  # dropped entries up to here
     groups = keep.shape[1]
     bit = 1
     while bit < groups:
@@ -59,6 +59,27 @@ def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
         keep = arrive | stay
         bit *= 2
     return values
+
+
+# Widths up to this take the matmul prefix count (a [G, G] bf16 triangle).
+_MATMUL_COUNT_MAX_WIDTH = 2048
+
+
+def _inclusive_count(flags: jax.Array) -> jax.Array:
+    """``jnp.cumsum(flags, axis=1)`` for bool ``[N, G]`` as i32. On TPU XLA lowers the
+    cumsum to a reduce-window; a 0/1 bf16 matmul with an upper triangle accumulates
+    in f32 and is exact for counts below 2**24."""
+    assert flags.ndim == 2, flags.shape
+    width = flags.shape[1]
+    if width > _MATMUL_COUNT_MAX_WIDTH:
+        return jnp.cumsum(flags, axis=1, dtype=jnp.int32)
+    row = jax.lax.broadcasted_iota(jnp.int32, (width, width), 0)
+    col = jax.lax.broadcasted_iota(jnp.int32, (width, width), 1)
+    upper = (row <= col).astype(jnp.bfloat16)
+    count = jnp.dot(
+        flags.astype(jnp.bfloat16), upper, preferred_element_type=jnp.float32
+    )
+    return count.astype(jnp.int32)
 
 
 def owned_rows(

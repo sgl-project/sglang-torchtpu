@@ -25,7 +25,11 @@ def build_kv_shard_attention_op(
     this rank's candidates of the indexer's rows; returns (output
     bf16[T, Hg, 512], lse f32[T, Hg]). ``owned_width``: see
     sparse_mla_attention_kv_shard."""
-    key = ("attention", zero_rope, gather_chunk_tokens, owned_width)
+    from sglang_tpu.envs import envs
+
+    # Read when the op is built: the block is part of the op's name and its key.
+    ragged_block = envs.SGLANG_TPU_DSA_KV_SHARD_RAGGED_BLOCK.get()
+    key = ("attention", zero_rope, gather_chunk_tokens, owned_width, ragged_block)
     if key in _OPS:
         return _OPS[key]
 
@@ -41,6 +45,8 @@ def build_kv_shard_attention_op(
         op_name += "_zero_rope"
     if owned_width:
         op_name += f"_owned{owned_width}"
+    if ragged_block:
+        op_name += f"_ragged{ragged_block}"
 
     def _wrapped(
         ql_nope: jax.Array,
@@ -80,6 +86,7 @@ def build_kv_shard_attention_op(
             zero_rope=zero_rope,
             gather_chunk_tokens=gather_chunk_tokens,
             owned_width=owned_width,
+            ragged_block=ragged_block,
         )
 
     nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
