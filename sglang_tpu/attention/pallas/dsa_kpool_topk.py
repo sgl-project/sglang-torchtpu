@@ -164,23 +164,35 @@ def _should_use_page_write(
 
     Models XLA's three scatter lowerings (in-VMEM, sort+stream, per-row RMW) at
     trace time using worst-case active runs ``R = T // page_size + 2 * S``
-    (validated on Ghostfish TPU7x in cl/1025124431).
+    (validated on Ghostfish TPU7x in cl/1027000430).
+
+    Args:
+        num_tokens: Padded token count in the step.
+        num_seqs: Static max concurrent sequence slots.
+        num_raw: Total pages in ``raw_cache``.
+        page_size: Slots per page.
+        raw_dim: Row width in bf16 elements (``2 * head_dim``).
     """
     if num_tokens <= 16 or num_seqs <= 0 or num_raw <= 0:
         return False
     # TPU7x DMA latency (cycles) / bandwidth (B/cycle) and VMEM budgets.
     dma_in, dma_out, dma_smem, bw, bw_smem = 692.0, 594.0, 722.0, 1688.0, 32.0
-    vmem_win = 32 * 1024 * 1024 * 39 // 40  # 32 MiB VMEM leaving 1/40 headroom
+    vmem_window_staging = 32 * 1024 * 1024 * 39 // 40  # 32 MiB, leaving 1/40 headroom
+    vmem_staging_bytes = 32704 * 1024  # ~31.9 MiB before staging spills to HBM
+    old_sort, new_sort = 9000.0, 15000.0  # one-time sort+stream index sort
+    old_fmt, new_fmt = 55.0, 125.0  # VMEM bf16 <-> f32 unpack/repack per page
+    old_row, new_row = 10.4, 9.5  # in-VMEM row update cycles
+    rw_passes, rand_cyc = 2.0, 38.0  # HBM read+write passes, non-contiguous penalty
     row_b, page_b = float(raw_dim * 2), float(page_size * raw_dim * 2)
     tile_b = 8.0 * row_b  # default T(8,128)(2,1) copies an 8-row tile per RMW
     n_win = max(
         1,
-        (vmem_win - 2 * min(512, num_tokens) * raw_dim * 4)
+        (vmem_window_staging - 2 * min(512, num_tokens) * raw_dim * 4)
         // (page_size * raw_dim * 4),
     )
     log2_t = max(1, math.ceil(math.log2(max(2, num_tokens))))
     t, r = num_tokens, num_tokens // page_size + 2 * num_seqs
-    fits = r * page_b + t * row_b <= 32704 * 1024
+    fits = r * page_b + t * row_b <= vmem_staging_bytes
 
     def branch(n_pages: int) -> str:
         if t < 1024:
@@ -197,11 +209,11 @@ def _should_use_page_write(
     # Old path: raw_cache.at[page, slot].set(raw).
     if old_br == "sort+stream":
         old_cyc = (
-            9000.0
+            old_sort
             + math.ceil(num_raw / n_win) * (dma_in + dma_out)
-            + 2.0 * num_raw * page_b / bw
-            + 55.0 * num_raw
-            + 10.4 * t
+            + rw_passes * num_raw * page_b / bw
+            + old_fmt * num_raw
+            + old_row * t
         )
     else:
         iters = math.ceil(t / 16.0)
@@ -210,37 +222,47 @@ def _should_use_page_write(
         dma = (
             iters * (dma_in + dma_out)
             + (t * (tile_b + row_b) + uniq * tile_b) / bw
-            + ((t + uniq) * 38.0 if uniq > 16 else uniq * 15.0)
+            + ((t + uniq) * rand_cyc if uniq > 16 else uniq * 15.0)
         )
         tc = iters * (1860.0 if uniq > 16 else 650.0)
         old_cyc = max(6500.0, smem + dma + tc - (8000.0 if t >= 256 else 0.0))
 
-    # New path: 4-step page staging (run ids, gather, inner scatter, write-back).
+    # Step 1: run-id cumsum and run_page scatter.
     s1 = dma_smem + 4.0 * t / bw_smem + 1.5 * t + 6.0 * r
+    # Step 2: gather R pages HBM -> VMEM (plus HBM spill if > VMEM).
     s2_dma = (
         math.ceil(r / 16.0) * dma_in
         + r * page_b / bw
-        + r * (38.0 if t >= 1024 else 12.0)
+        + r * (rand_cyc if t >= 1024 else 12.0)
     )
     if not fits:
         s2_dma += math.ceil(r / 16.0) * dma_out + r * page_b / bw
     s2 = dma_smem + 4.0 * r / bw_smem + max(s2_dma, 24.0 * r)
+    # Step 3: row scatter into the [R, page_size, raw_dim] staging buffer.
     if new_br == "in-vmem":
-        s3 = 5000.0 + dma_in + t * row_b / bw + 125.0 * r + 9.5 * t
+        s3 = 5000.0 + dma_in + t * row_b / bw + new_fmt * r + new_row * t
     elif new_br == "sort+stream":
         nw = math.ceil(r / n_win)
         if fits:
-            s3 = 15000.0 + nw * 2500.0 + dma_in + t * row_b / bw + 155.0 * r + 9.5 * t
+            s3 = (
+                new_sort
+                + nw * 2500.0
+                + dma_in
+                + t * row_b / bw
+                + 155.0 * r
+                + new_row * t
+            )
         else:
             s3 = (
-                15000.0
+                new_sort
                 + nw * (dma_in + dma_out)
-                + 2.0 * r * page_b / bw
+                + rw_passes * r * page_b / bw
                 + 65.0 * r
-                + 9.5 * t
+                + new_row * t
             )
     else:
         s3 = dma_smem + math.ceil(t / 16.0) * 1560.0
+    # Step 4: scatter R updated pages VMEM -> HBM (worst case R_act = R).
     scan = 95.0 if (t >= 1024 or not fits) else 45.0
     s4 = (
         dma_smem
