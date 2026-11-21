@@ -5,6 +5,7 @@ base tensors (no uint8 view), the per-tensor quantizer, and the backend's
 fp8 branch handing quantized latents plus one shared scale to the kernel op.
 """
 
+import contextlib
 import functools
 import unittest
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from sglang_tpu.attention_pallas_mla_sparse import (
 from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import (
     TpuFusedMLATokenToKVPool,
     TpuSplitMLATokenToKVPool,
@@ -136,6 +138,82 @@ class TestZerosKvBuffer(CustomTestCase):
                         * pool.page_size
                         + placeholder_bytes,
                     )
+
+    def _split_pool(self, page_size=64, index_kpool=1):
+        return TpuSplitMLATokenToKVPool(
+            size=128,
+            page_size=page_size,
+            dtype=FP8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            index_head_dim=128,
+            index_key_layers=[True, True],
+            index_kpool=index_kpool,
+        )
+
+    def test_split_pool_sparsecore_layout_matches_the_kernel_specs(self):
+        # The sparse kernel checks its buffers against SparseMLAKVCacheSpec and
+        # picks the native SparseCore gather from the NoPE dtype; the KV budget
+        # divides free memory by bytes_per_token. The RoPE packing (tokens per
+        # row) depends on page_size, so both must follow the specs, not a copy.
+        from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
+            KVCacheLayout,
+        )
+        from sglang_tpu.attention.pallas.mla_sparse_fused import _split_specs
+
+        with tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.override(True):
+            pool = self._split_pool()
+            per_token = TpuSplitMLATokenToKVPool.bytes_per_token(
+                index_head_dim=128,
+                index_key_layers=[True, True],
+                index_kpool=1,
+                page_size=pool.page_size,
+            )
+        specs = _split_specs(pool.num_pages, pool.page_size, KVCacheLayout.SPARSECORE)
+        for layer_id in range(2):
+            bufs = (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
+            for buf, spec in zip(bufs, specs):
+                self.assertEqual(tuple(buf.shape), tuple(spec.shape))
+                self.assertEqual(buf.dtype, torch.uint32)
+                self.assertIsNone(buf._base)
+        self.assertEqual(
+            pool.get_kv_size_bytes(), per_token * pool.num_pages * pool.page_size
+        )
+
+    def test_split_pool_keeps_the_tensorcore_layout_outside_page_64_plain_dsa(self):
+        # The SparseCore layout is on by default only where it was validated:
+        # plain DSA (index kpool 1) at page size 64, without the attention token
+        # split, whose window kernel reads TensorCore pages.
+        cases = (
+            ("page 32", {"page_size": 32}, {}),
+            ("pooled indexer", {"index_kpool": 4}, {}),
+            (
+                "attention token split",
+                {},
+                {"SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": True},
+            ),
+            ("env off", {}, {"SGLANG_TPU_DSA_SPARSECORE_KV_CACHE": False}),
+        )
+        for name, pool_kwargs, env in cases:
+            with self.subTest(name), contextlib.ExitStack() as stack:
+                for key, value in env.items():
+                    stack.enter_context(getattr(tpu_envs, key).override(value))
+                pool = self._split_pool(**pool_kwargs)
+                self.assertEqual(pool.get_nope_cache(0).dtype, torch.uint8)
+                self.assertEqual(
+                    pool.get_kv_size_bytes(),
+                    TpuSplitMLATokenToKVPool.bytes_per_token(
+                        index_head_dim=128,
+                        index_key_layers=[True, True],
+                        index_kpool=pool._index_kpool,
+                        page_size=pool.page_size,
+                    )
+                    * pool.num_pages
+                    * pool.page_size,
+                )
 
 
 class TestQuantizeKvToFp8(CustomTestCase):
