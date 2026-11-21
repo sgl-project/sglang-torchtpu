@@ -172,6 +172,7 @@ class FakeRaidenController(TpuDMAHybridCacheController):
 
     def __init__(self, *, host_capacity: int):
         self.write_policy = "write_back"
+        self.enable_storage = False
         self.host = FakeHostPool(host_capacity)
         self.mem_pool_host = SimpleNamespace(
             anchor_entry=SimpleNamespace(host_pool=self.host, host_evict_fn=None),
@@ -669,6 +670,7 @@ def _bare_prefill_manager():
     engine, on which a real RaidenKVSender can be built."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
     mgr.attn_tp_rank = 0
+    mgr.attn_tp_size = 4
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
@@ -721,6 +723,7 @@ def _bare_decode_manager():
     mgr._swa_engine = None
     mgr._pulling = None
     mgr.attn_tp_rank = 0
+    mgr.attn_tp_size = 2
     mgr.request_status = {}
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()

@@ -211,12 +211,12 @@ class DecodeDramVictimReceiver:
 
     def _start_window_read(self, landing: _DramLanding) -> bool:
         """Read the pushed window pages into the landing's SWA pages; the
-        prefill registered them under the push's UUID on its SWA pool."""
+        prefill registered them under ``swa_uuid`` (or ``uuid``) on its SWA pool."""
         push = landing.push
         read_id = victim_transfer_id(push.prefill, push.seq, swa=True)
         started = self._channel.start_host_read(
             read_id,
-            push.uuid,
+            getattr(push, "swa_uuid", 0) or push.uuid,
             push.swa_address,
             list(push.swa_blocks),
             host_page_ids(self._swa_host_pool, landing.swa_indices),
