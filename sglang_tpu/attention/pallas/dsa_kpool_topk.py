@@ -59,18 +59,6 @@ _CHUNK_TOKENS = 2048
 # Row-chunk only when one pass's f32 score buffer would exceed this; an
 # unchunked 8k prefill at 10k context is ~84 MiB.
 _MAX_UNCHUNKED_SCORE_BYTES = 512 << 20
-# TPU7x DMA latency / bandwidth constants and XLA scatter lowering cutoffs
-# used by _should_use_page_write to compare expected cycles at trace time
-# (validated on Ghostfish TPU7x in cl/1025124431).
-_DMA_HBM_TO_VMEM = 692.0
-_DMA_VMEM_TO_HBM = 594.0
-_DMA_HBM_TO_SMEM = 722.0
-_BW_HBM = 1688.0  # B/cycle HBM <-> VMEM
-_BW_SMEM = 32.0  # B/cycle HBM -> SMEM
-# ~31.2 MiB scatter window (32 MiB VMEM leaving 1/40 headroom).
-_VMEM_WINDOW_BYTES = 32 * 1024 * 1024 * 39 // 40
-_VMEM_STAGING_BYTES = 32704 * 1024  # ~31.9 MiB before staging spills to HBM
-_FLAT_MIN_TOKENS = 1024  # below this XLA keeps 3-D scatter on per-row path
 
 
 def _hadamard_matrix(n: int) -> np.ndarray:
@@ -169,176 +157,99 @@ def _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs):
     return raw_cache.at[run_page].set(pages, mode="drop")
 
 
-def _vmem_window_pages(num_tokens: int, page_size: int, raw_dim: int) -> int:
-    """Max pages fitting in one f32-unpacked VMEM scatter window (241 for 128x256)."""
-    upd_i = min(512, num_tokens)
-    avail = _VMEM_WINDOW_BYTES - 2 * upd_i * raw_dim * 4
-    return max(1, avail // (page_size * raw_dim * 4))
-
-
-def _xla_scatter_branch(
-    num_tokens: int, num_pages: int, page_size: int, raw_dim: int
-) -> str:
-    """XLA TPU scatter lowering branch selected from static shapes."""
-    if num_tokens < _FLAT_MIN_TOKENS:
-        return "per-row"
-    if num_pages <= _vmem_window_pages(num_tokens, page_size, raw_dim):
-        return "in-vmem"
-    log2_t = max(1, math.ceil(math.log2(max(2, num_tokens))))
-    if (
-        11 * num_tokens
-        + page_size * num_pages
-        + int(0.01 * num_tokens * log2_t * log2_t)
-        < 80 * num_tokens
-    ):
-        return "sort+stream"
-    return "per-row"
-
-
-def _row_scatter_cycles(
-    num_tokens: int, num_raw: int, page_size: int, raw_dim: int
-) -> float:
-    """Estimated TPU7x cycles for ``raw_cache.at[page, slot].set(raw)``."""
-    row_bytes = float(raw_dim * 2)
-    page_bytes = float(page_size * raw_dim * 2)
-    # Default T(8,128)(2,1) layout copies an 8-row tile per single-row RMW.
-    tile_bytes = 8.0 * row_bytes
-    n_win = _vmem_window_pages(num_tokens, page_size, raw_dim)
-    branch = _xla_scatter_branch(num_tokens, num_raw, page_size, raw_dim)
-    if branch == "in-vmem":
-        return 10.4 * num_tokens + 8.0 * num_raw
-    if branch == "sort+stream":
-        num_windows = math.ceil(num_raw / n_win)
-        dma = (
-            num_windows * (_DMA_HBM_TO_VMEM + _DMA_VMEM_TO_HBM)
-            + 2.0 * (num_raw * page_bytes) / _BW_HBM
-        )
-        return 9000.0 + dma + 55.0 * num_raw + 10.4 * num_tokens
-    # Per-row HBM read-modify-write, 16 rows per non-pipelined iteration.
-    smem = math.ceil(num_tokens / 256) * (_DMA_HBM_TO_SMEM + 1024.0 / _BW_SMEM)
-    iters = math.ceil(num_tokens / 16.0)
-    uniq = (
-        min(num_tokens, math.ceil(num_tokens / 8.0) + 1)
-        if num_tokens < 256
-        else num_tokens
-    )
-    dma = (
-        iters * (_DMA_HBM_TO_VMEM + _DMA_VMEM_TO_HBM)
-        + (num_tokens * (tile_bytes + row_bytes) + uniq * tile_bytes) / _BW_HBM
-        + ((num_tokens + uniq) * 38.0 if uniq > 16 else uniq * 15.0)
-    )
-    tc = iters * (1860.0 if uniq > 16 else 650.0)
-    startup = 8000.0 if num_tokens >= 256 else 0.0
-    return max(6500.0, smem + dma + tc - startup)
-
-
-def _page_write_cycles(
-    num_tokens: int,
-    num_seqs: int,
-    num_raw: int,
-    page_size: int,
-    raw_dim: int,
-) -> float:
-    """Estimated worst-case TPU7x cycles for ``_write_raw_pages`` (R_act = R)."""
-    max_runs = num_tokens // page_size + 2 * num_seqs
-    row_bytes = float(raw_dim * 2)
-    page_bytes = float(page_size * raw_dim * 2)
-    tile_bytes = 8.0 * row_bytes
-    n_win = _vmem_window_pages(num_tokens, page_size, raw_dim)
-    branch = _xla_scatter_branch(num_tokens, max_runs, page_size, raw_dim)
-    fits_vmem = max_runs * page_bytes + num_tokens * row_bytes <= _VMEM_STAGING_BYTES
-
-    # Step 1: run-id cumsum and run_page scatter.
-    s1 = (
-        _DMA_HBM_TO_SMEM
-        + (4.0 * num_tokens) / _BW_SMEM
-        + 1.5 * num_tokens
-        + 6.0 * max_runs
-    )
-
-    # Step 2: gather max_runs whole pages HBM -> VMEM (spills if > VMEM budget).
-    s2_dma = (
-        math.ceil(max_runs / 16.0) * _DMA_HBM_TO_VMEM
-        + (max_runs * page_bytes) / _BW_HBM
-        + max_runs * (38.0 if num_tokens >= _FLAT_MIN_TOKENS else 12.0)
-    )
-    if not fits_vmem:
-        s2_dma += (
-            math.ceil(max_runs / 16.0) * _DMA_VMEM_TO_HBM
-            + (max_runs * page_bytes) / _BW_HBM
-        )
-    s2 = _DMA_HBM_TO_SMEM + (4.0 * max_runs) / _BW_SMEM + max(s2_dma, 24.0 * max_runs)
-
-    # Step 3: row scatter into the small [max_runs, page_size, raw_dim] buffer.
-    if branch == "in-vmem":
-        setup = 0.0 if (num_raw <= n_win and max_runs <= 16) else 5000.0
-        s3 = (
-            setup
-            + _DMA_HBM_TO_VMEM
-            + (num_tokens * row_bytes) / _BW_HBM
-            + 125.0 * max_runs
-            + 9.5 * num_tokens
-        )
-    elif branch == "sort+stream":
-        num_windows = math.ceil(max_runs / n_win)
-        if fits_vmem:
-            s3 = (
-                15000.0
-                + num_windows * 2500.0
-                + _DMA_HBM_TO_VMEM
-                + (num_tokens * row_bytes) / _BW_HBM
-                + 155.0 * max_runs
-                + 9.5 * num_tokens
-            )
-        else:
-            s3 = (
-                15000.0
-                + num_windows * (_DMA_HBM_TO_VMEM + _DMA_VMEM_TO_HBM)
-                + 2.0 * (max_runs * page_bytes) / _BW_HBM
-                + 65.0 * max_runs
-                + 9.5 * num_tokens
-            )
-    else:
-        iters = math.ceil(num_tokens / 16.0)
-        if fits_vmem:
-            s3 = _DMA_HBM_TO_SMEM + iters * 1560.0
-        else:
-            s3 = _DMA_HBM_TO_SMEM + iters * (
-                _DMA_HBM_TO_VMEM
-                + _DMA_VMEM_TO_HBM
-                + (32.0 * tile_bytes + 16.0 * row_bytes) / _BW_HBM
-                + 32.0 * 38.0
-                + 1860.0
-            )
-
-    # Step 4: whole-page scatter VMEM -> HBM (worst case: all max_runs active).
-    scan = 95.0 if (num_tokens >= _FLAT_MIN_TOKENS or not fits_vmem) else 45.0
-    s4 = (
-        _DMA_HBM_TO_SMEM
-        + (4.0 * max_runs) / _BW_SMEM
-        + scan * max_runs
-        + math.ceil(max_runs / 16.0) * _DMA_VMEM_TO_HBM
-        + (max_runs * page_bytes) / _BW_HBM
-        + 85.0 * max_runs
-    )
-    return s1 + s2 + s3 + s4
-
-
 def _should_use_page_write(
-    num_tokens: int,
-    num_seqs: int,
-    num_raw: int,
-    page_size: int,
-    raw_dim: int,
+    num_tokens: int, num_seqs: int, num_raw: int, page_size: int, raw_dim: int
 ) -> bool:
-    """Picks ``_write_raw_pages`` when its worst-case cycle cost beats row scatter."""
-    # A single <=16-row scatter iteration (or empty input) never pays off 4-step
-    # page staging.
+    """Picks ``_write_raw_pages`` when its worst-case TPU7x cycle estimate beats row scatter.
+
+    Models XLA's three scatter lowerings (in-VMEM, sort+stream, per-row RMW) at
+    trace time using worst-case active runs ``R = T // page_size + 2 * S``
+    (validated on Ghostfish TPU7x in cl/1025124431).
+    """
     if num_tokens <= 16 or num_seqs <= 0 or num_raw <= 0:
         return False
-    return _page_write_cycles(
-        num_tokens, num_seqs, num_raw, page_size, raw_dim
-    ) < _row_scatter_cycles(num_tokens, num_raw, page_size, raw_dim)
+    # TPU7x DMA latency (cycles) / bandwidth (B/cycle) and VMEM budgets.
+    dma_in, dma_out, dma_smem, bw, bw_smem = 692.0, 594.0, 722.0, 1688.0, 32.0
+    vmem_win = 32 * 1024 * 1024 * 39 // 40  # 32 MiB VMEM leaving 1/40 headroom
+    row_b, page_b = float(raw_dim * 2), float(page_size * raw_dim * 2)
+    tile_b = 8.0 * row_b  # default T(8,128)(2,1) copies an 8-row tile per RMW
+    n_win = max(
+        1,
+        (vmem_win - 2 * min(512, num_tokens) * raw_dim * 4)
+        // (page_size * raw_dim * 4),
+    )
+    log2_t = max(1, math.ceil(math.log2(max(2, num_tokens))))
+    t, r = num_tokens, num_tokens // page_size + 2 * num_seqs
+    fits = r * page_b + t * row_b <= 32704 * 1024
+
+    def branch(n_pages: int) -> str:
+        if t < 1024:
+            return "per-row"
+        if n_pages <= n_win:
+            return "in-vmem"
+        sort_cost = 11 * t + page_size * n_pages + int(0.01 * t * log2_t * log2_t)
+        return "sort+stream" if sort_cost < 80 * t else "per-row"
+
+    old_br, new_br = branch(num_raw), branch(r)
+    if old_br == "in-vmem" or (new_br == "per-row" and not fits):
+        return False
+
+    # Old path: raw_cache.at[page, slot].set(raw).
+    if old_br == "sort+stream":
+        old_cyc = (
+            9000.0
+            + math.ceil(num_raw / n_win) * (dma_in + dma_out)
+            + 2.0 * num_raw * page_b / bw
+            + 55.0 * num_raw
+            + 10.4 * t
+        )
+    else:
+        iters = math.ceil(t / 16.0)
+        uniq = min(t, math.ceil(t / 8.0) + 1) if t < 256 else t
+        smem = math.ceil(t / 256) * (dma_smem + 1024.0 / bw_smem)
+        dma = (
+            iters * (dma_in + dma_out)
+            + (t * (tile_b + row_b) + uniq * tile_b) / bw
+            + ((t + uniq) * 38.0 if uniq > 16 else uniq * 15.0)
+        )
+        tc = iters * (1860.0 if uniq > 16 else 650.0)
+        old_cyc = max(6500.0, smem + dma + tc - (8000.0 if t >= 256 else 0.0))
+
+    # New path: 4-step page staging (run ids, gather, inner scatter, write-back).
+    s1 = dma_smem + 4.0 * t / bw_smem + 1.5 * t + 6.0 * r
+    s2_dma = (
+        math.ceil(r / 16.0) * dma_in
+        + r * page_b / bw
+        + r * (38.0 if t >= 1024 else 12.0)
+    )
+    if not fits:
+        s2_dma += math.ceil(r / 16.0) * dma_out + r * page_b / bw
+    s2 = dma_smem + 4.0 * r / bw_smem + max(s2_dma, 24.0 * r)
+    if new_br == "in-vmem":
+        s3 = 5000.0 + dma_in + t * row_b / bw + 125.0 * r + 9.5 * t
+    elif new_br == "sort+stream":
+        nw = math.ceil(r / n_win)
+        if fits:
+            s3 = 15000.0 + nw * 2500.0 + dma_in + t * row_b / bw + 155.0 * r + 9.5 * t
+        else:
+            s3 = (
+                15000.0
+                + nw * (dma_in + dma_out)
+                + 2.0 * r * page_b / bw
+                + 65.0 * r
+                + 9.5 * t
+            )
+    else:
+        s3 = dma_smem + math.ceil(t / 16.0) * 1560.0
+    scan = 95.0 if (t >= 1024 or not fits) else 45.0
+    s4 = (
+        dma_smem
+        + 4.0 * r / bw_smem
+        + (scan + 85.0) * r
+        + math.ceil(r / 16.0) * dma_out
+        + r * page_b / bw
+    )
+    return s1 + s2 + s3 + s4 < old_cyc
 
 
 def _align(x: int, m: int) -> int:
