@@ -80,7 +80,14 @@ class TestKdaSpecVerify(CustomTestCase):
         """
         self._check_window_against_decode(n_v=DP_HEADS, window=4, read_offsets=[2, 0])
 
-    def _check_window_against_decode(self, *, n_v, window, read_offsets):
+    def test_narrow_verify_inside_wider_pool_windows(self):
+        """A draft-step schedule verifies 4 rows in pool windows sized for 8: it
+        resumes from any of the 8 rows and writes only its first 4."""
+        self._check_window_against_decode(
+            n_v=TP8_HEADS, window=4, read_offsets=[7, 2], stride=8
+        )
+
+    def _check_window_against_decode(self, *, n_v, window, read_offsets, stride=None):
         from sglang_tpu.kda_layout import (
             kda_packed_weights_shape,
         )
@@ -89,9 +96,10 @@ class TestKdaSpecVerify(CustomTestCase):
         context = 20
         bs = len(read_offsets)
         rng = np.random.default_rng(7)
-        # Group g owns slots [g * window, (g + 1) * window); group 0 is null.
-        slots = (bs + 1) * window
-        bases = [(s + 1) * window for s in range(bs)]
+        # Group g owns slots [g * stride, (g + 1) * stride); group 0 is null.
+        stride = stride or window
+        slots = (bs + 1) * stride
+        bases = [(s + 1) * stride for s in range(bs)]
         conv = rng.normal(size=(slots, K - 1, dim)).astype(np.float32)
         rec = (0.1 * rng.normal(size=(slots, n_v, D, D))).astype(np.float32)
         rows, width = kda_packed_weights_shape(K, dim, n_v, D)

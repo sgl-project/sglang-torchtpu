@@ -26,6 +26,7 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import itertools
 from abc import abstractmethod
@@ -82,6 +83,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_pin_memory_available
+from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -96,6 +98,11 @@ from sglang_tpu.experimental import (
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
+)
+from sglang_tpu.experimental.speculative.adaptive_steps import (
+    DraftStepSchedule,
+    check_draft_step_schedule,
+    draft_step_schedule,
 )
 from sglang_tpu.experimental.speculative.draft_forward import set_bucket_dp_metadata
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
@@ -155,6 +162,11 @@ from sglang_tpu.top_k import register_tpu_top_k_ops
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
+logger = get_logger(__name__)
+
+# Decode steps between logs of the draft-step counts a schedule ran.
+_DRAFT_STEPS_LOG_INTERVAL = 4096
+
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
 _SIMULATED_TOKEN = 100
 
@@ -200,6 +212,10 @@ class TpuSpecWorker(BaseSpecWorker):
     # Opt in only when verification applies the scheduler's additive snapshot
     # at the padded batch size. Live penalizer state is still unsupported.
     supports_additive_penalties = False
+    # Whether the family serves SGLANG_TPU_SPEC_STEPS_BY_RUNNING.
+    supports_draft_step_schedule = False
+    # Draft steps by running requests (adaptive_steps); None drafts num_drafts every step.
+    _step_schedule: DraftStepSchedule | None = None
 
     def __init__(
         self,
@@ -229,6 +245,9 @@ class TpuSpecWorker(BaseSpecWorker):
         self._draft_worker = draft_worker
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
+        # The launch count; a schedule's steps lower num_drafts per decode step.
+        self._max_drafts = num_drafts
+        self._step_schedule = draft_step_schedule()
         self.device = target_worker.device
         # Ranks that share one batch: the attention-TP group under DP attention.
         self._tp_group = get_dp_tp_group()
@@ -284,14 +303,32 @@ class TpuSpecWorker(BaseSpecWorker):
             and not self._dp_attention
             and negotiate_distributed_argmax(runner.model)
         )
+        self._simulate_acc_len_by_steps = self._init_draft_step_schedule()
+        self._draft_steps_ct: collections.Counter[int] = collections.Counter()
+        self._logs_draft_steps = parallel.tp_rank == 0
         # Filled per batch bucket in init_cuda_graphs when simulating.
-        self._simulated_drafts: dict[int, torch.Tensor] = {}
+        self._simulated_drafts: dict[tuple[int, int], torch.Tensor] = {}
         self._simulated_bonus: dict[int, torch.Tensor] = {}
         # Per (batch bucket, forced num_correct_drafts).
         self._simulated_correct: dict[tuple[int, int], torch.Tensor] = {}
         register_host_batch_padder(self._pad_bs)
         # Built in init_cuda_graphs: the target KV pool it pages after does not exist yet.
         self._pd_hidden_pool: PdHiddenPool | None = None
+
+    def _init_draft_step_schedule(self) -> dict[int, float]:
+        """Validate the draft-step schedule; the simulated AL per step count it reaches."""
+        if self._step_schedule is None:
+            return {}
+        if not self.supports_draft_step_schedule:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not serve SGLANG_TPU_SPEC_STEPS_BY_RUNNING."
+            )
+        return check_draft_step_schedule(
+            self._step_schedule,
+            launch_steps=self._max_drafts,
+            simulate_acc_len=self._simulate_acc_len,
+            dp_attention=self._dp_attention,
+        )
 
     def _init_pd_hidden_pool(self) -> PdHiddenPool | None:
         """The PD hidden pool when the decode runs the draft prompt pass, else None."""
@@ -431,6 +468,14 @@ class TpuSpecWorker(BaseSpecWorker):
             )
             for padded_bs in self._b_bucketer().buckets
         }
+        # The schedule's shorter draft counts, per (batch bucket, drafts).
+        self._short_drafts = {
+            (pbs, width - 1): torch.full(
+                (pbs,), width - 1, dtype=torch.int32, device=self.device
+            )
+            for width, pbs in self._bucket_widths(self._b_bucketer().buckets)
+            if width - 1 != self._max_drafts
+        }
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
@@ -448,10 +493,10 @@ class TpuSpecWorker(BaseSpecWorker):
             # never baked into a program).
             buckets = self._b_bucketer().buckets
             self._simulated_drafts = {
-                pbs: torch.full(
-                    (pbs, self.num_drafts), _SIMULATED_TOKEN, dtype=torch.int64
+                (pbs, width - 1): torch.full(
+                    (pbs, width - 1), _SIMULATED_TOKEN, dtype=torch.int64
                 ).to(self.device)
-                for pbs in buckets
+                for width, pbs in self._bucket_widths(buckets)
             }
             self._simulated_bonus = {
                 pbs: torch.full((pbs,), _SIMULATED_TOKEN, dtype=torch.int64).to(
@@ -482,7 +527,56 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def verify_widths(self) -> Sequence[int]:
         """Active widths to warm; adaptive workers override with every reachable width."""
+        if self._step_schedule is not None:
+            return self._step_schedule.widths()
         return (self.num_verify_rows,)
+
+    def _bucket_widths(self, buckets: Sequence[int]) -> list[tuple[int, int]]:
+        """(width, padded_bs) pairs serving runs on these buckets."""
+        schedule = self._step_schedule
+        if schedule is None:
+            return list(itertools.product(self.verify_widths(), buckets))
+        all_buckets = self._b_bucketer().buckets
+        return [
+            (width, pbs)
+            for pbs in buckets
+            for width in schedule.widths_for_bucket(pbs, all_buckets)
+        ]
+
+    def _live_bucket_widths(self, bs: int) -> list[tuple[int, int]]:
+        """(width, padded_bs) pairs a step with bs live requests runs."""
+        schedule = self._step_schedule
+        if schedule is None:
+            return list(
+                itertools.product(self.verify_widths(), self._decode_buckets_for(bs))
+            )
+        # Schedules exclude DP attention: one bucket per live size.
+        return [(schedule.steps_for(bs) + 1, self._pad_bs(bs))]
+
+    def _num_verify_drafts(self, padded_bs: int, num_drafts: int) -> torch.Tensor:
+        """[pbs] int32 drafts each row verifies, uploaded at warmup."""
+        if num_drafts == self._max_drafts:
+            return self._all_drafts[padded_bs]
+        return self._short_drafts[(padded_bs, num_drafts)]
+
+    def _activate_draft_steps(self, bs: int) -> None:
+        """Set this decode step's draft count from the running-request schedule."""
+        schedule = self._step_schedule
+        if schedule is None:
+            return
+        steps = schedule.steps_for(bs)
+        self.num_drafts, self.num_verify_rows = steps, steps + 1
+        if self._simulate_acc_len_by_steps:
+            self._simulate_acc_len = self._simulate_acc_len_by_steps[steps]
+        self._draft_steps_ct[steps] += 1
+        if (
+            self._logs_draft_steps
+            and self._draft_steps_ct.total() % _DRAFT_STEPS_LOG_INTERVAL == 0
+        ):
+            logger.info(
+                "Decode steps by draft count: %s",
+                dict(sorted(self._draft_steps_ct.items())),
+            )
 
     def _warmup_logical_bs_ops(
         self, *, batch_sizes: Sequence[int] | None = None
@@ -536,7 +630,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 materialize(
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
                 )
-            for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
+            for width, pbs in self._bucket_widths(bucket_sizes):
                 # The generic spec-op context only knows the active width. The
                 # worker owns the full-capacity candidate shape used in serving.
                 warmup_compiled_op(
@@ -563,9 +657,7 @@ class TpuSpecWorker(BaseSpecWorker):
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         top_k_width = 1 if self._verify_argmax_only else self._verify_top_k_width
         with torch.no_grad():
-            for width, pbs in itertools.product(
-                self.verify_widths(), self._b_bucketer().buckets
-            ):
+            for width, pbs in self._bucket_widths(self._b_bucketer().buckets):
                 tail = (
                     torch.zeros(
                         (pbs, width - 1), dtype=torch.int64, device=self.device
@@ -954,7 +1046,7 @@ class TpuSpecWorker(BaseSpecWorker):
         return (
             self._simulated_correct[(padded_bs, commit_len - 1)],
             self._simulated_bonus[padded_bs],
-            self._simulated_drafts[padded_bs],
+            self._simulated_drafts[(padded_bs, self.num_drafts)],
         )
 
     def step(
@@ -1064,6 +1156,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self, batch: ScheduleBatch, *, grammar_barrier: Callable[[], None] | None = None
     ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
+        self._activate_draft_steps(bs)
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
             batch, self.num_verify_rows, padded_bs
@@ -1262,9 +1355,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """Target-only acceptance, target filter included, per batch bucket."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         with torch.no_grad():
-            for width, padded_bs in itertools.product(
-                self.verify_widths(), self._b_bucketer().buckets
-            ):
+            for width, padded_bs in self._bucket_widths(self._b_bucketer().buckets):
                 warmup_compiled_op(
                     accept_target_only_step,
                     torch.zeros(
@@ -1496,9 +1587,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 # Decode relays [:bs] views of finalize_accept's outputs at each bucket
                 # the rank can run; extend relays a compact seq_lens upload.
                 relays = []
-                for width, padded_bs in itertools.product(
-                    self.verify_widths(), self._decode_buckets_for(bs)
-                ):
+                for width, padded_bs in self._live_bucket_widths(bs):
                     accept = self._warmup_accept(padded_bs, width)
                     relays.append(
                         (
@@ -1551,9 +1640,7 @@ class TpuSpecWorker(BaseSpecWorker):
                     ):
                         if tensor is not None:
                             tensor.cpu()
-                for width, padded_bs in itertools.product(
-                    self.verify_widths(), self._decode_buckets_for(bs)
-                ):
+                for width, padded_bs in self._live_bucket_widths(bs):
                     if padded_bs != bs:
                         # _pack_decode_result's rows.
                         warmup_compiled_op(
@@ -1569,9 +1656,7 @@ class TpuSpecWorker(BaseSpecWorker):
                             bs,
                         )
             if self._dp_attention:
-                for width, padded_bs in itertools.product(
-                    self.verify_widths(), self._b_bucketer().buckets
-                ):
+                for width, padded_bs in self._bucket_widths(self._b_bucketer().buckets):
                     # _forward_idle_step's all-padding drafts.
                     torch.zeros(
                         (padded_bs, width - 1),

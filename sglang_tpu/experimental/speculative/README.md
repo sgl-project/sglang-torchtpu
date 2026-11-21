@@ -126,6 +126,22 @@ generic spec-op context only knows the active width. Width-dependent worker
 warmups iterate the hook without changing runtime width state; the plugin still
 owns its adaptive policy and model compilation for those widths.
 
+## Draft steps by running requests
+
+`SGLANG_TPU_SPEC_STEPS_BY_RUNNING="1:7,5:3"` makes the chain worker (MTP,
+EAGLE3) draft 7 steps while 1-4 requests run and 3 from 5 up
+(`adaptive_steps.py`). Launch with the largest count
+(`--speculative-num-steps 7 --speculative-num-draft-tokens 8`): it sizes the
+verify window, the KV reservation and the linear-attention checkpoint windows,
+and a narrower verify writes the first rows of its window. Each decode step
+sets `num_drafts` / `num_verify_rows` from the live batch size before it plans
+the verify. Warmup compiles every (batch bucket, width) pair a live size
+reaches, so a tier boundary on a bucket boundary adds no programs; the RPA and
+GDN backends take every scheduled width as a static verify width. With
+`SGLANG_SIMULATE_ACC_LEN`, `SGLANG_TPU_SPEC_SIMULATE_ACC_LEN_BY_STEPS="3:3.00,7:3.93"`
+gives the length per step count (its launch-count entry must equal
+`SGLANG_SIMULATE_ACC_LEN`). Not with DP attention.
+
 ## DP attention
 
 Both families serve `--enable-dp-attention`. Drafts are greedy under DP attention,

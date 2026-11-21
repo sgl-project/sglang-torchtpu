@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -15,6 +17,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.experimental.speculative.adaptive_steps import draft_step_schedule
 from sglang_tpu.sampler import negotiated_distributed_top_k_width
 
 
@@ -45,6 +48,36 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         ):
             return (LogitsOutputMode.DISTRIBUTED_TOP_K,)
         return super().target_verify_logits_output_modes()
+
+    def verify_bucket_widths(self) -> list[tuple[int, int]]:
+        """(verify width, bs) pairs the worker runs; a draft-step schedule's when set."""
+        assert self.b_bucketer is not None
+        buckets = list(self.b_bucketer.buckets)
+        schedule = draft_step_schedule()
+        if schedule is None:
+            return [(self.draft_token_num, bs) for bs in buckets]
+        return [
+            (width, bs)
+            for bs in buckets
+            for width in schedule.widths_for_bucket(bs, buckets)
+        ]
+
+    def _target_verify_shapes(self) -> list[tuple[int, int]]:
+        return self.verify_bucket_widths()
+
+    def _verify_spec_info(self, width: int) -> DFlashVerifyInput:
+        if width == self.draft_token_num:
+            return self.make_verify_spec_info()
+        return DFlashVerifyInput(
+            draft_token=torch.empty(
+                (0,), dtype=torch.int64, device=self.model_runner.device
+            ),
+            positions=torch.empty(
+                (0,), dtype=torch.int64, device=self.model_runner.device
+            ),
+            draft_token_num=width,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
         return make_draft_block_spec_info(

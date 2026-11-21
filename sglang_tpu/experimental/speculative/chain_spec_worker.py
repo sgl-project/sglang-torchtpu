@@ -23,7 +23,6 @@ capture and every draft step reuses. Under PD, prefill ships it along with g.
 
 from __future__ import annotations
 
-import itertools
 from collections.abc import Sequence
 
 import torch
@@ -89,6 +88,9 @@ _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuChainDraftWorker]] = {
 
 
 class TpuChainSpecWorker(TpuSpecWorker):
+    # The fused draft and commit rows take their draft count from the verify rows.
+    supports_draft_step_schedule = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -195,7 +197,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         return DraftResult(
             draft_tokens=draft_tokens,
             draft_logits=draft_logits,
-            num_verify_drafts=self._all_drafts[padded_bs],
+            num_verify_drafts=self._num_verify_drafts(
+                padded_bs, rows.positions.shape[1] - 1
+            ),
         )
 
     def _run_fused_draft(
@@ -625,9 +629,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         """Eager draft/commit ops around the compiled draft programs, per batch bucket."""
         drafter = self._chain_draft_worker
         with torch.no_grad():
-            for width, pbs in itertools.product(
-                self.verify_widths(), self._b_bucketer().buckets
-            ):
+            for width, pbs in self._bucket_widths(self._b_bucketer().buckets):
                 self._warmup_draft_chain(pbs, width)
                 rows = _dummy_verify_rows(pbs, width, self.device)
                 accept_tokens = torch.zeros(
@@ -739,9 +741,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             return torch.zeros(shape, dtype=torch.int64).to(self.device)
 
         with torch.no_grad():
-            for width, padded_bs in itertools.product(
-                self.verify_widths(), self._b_bucketer().buckets
-            ):
+            for width, padded_bs in self._bucket_widths(self._b_bucketer().buckets):
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
                     upload(padded_bs, 2 * self.verify_window_rows + 1),

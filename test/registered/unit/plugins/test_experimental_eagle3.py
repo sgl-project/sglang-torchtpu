@@ -1145,8 +1145,9 @@ class TestChainDsaIndexShare(CustomTestCase):
                     forward_batch,
                     torch.zeros((5, self.HIDDEN)),
                     req_pool_indices,
-                    torch.zeros((2, 3), dtype=torch.int64),
-                    torch.zeros((2, 3), dtype=torch.int64),
+                    # Verify rows [pbs, N + 1]: N = 3 drafts.
+                    torch.zeros((2, 4), dtype=torch.int64),
+                    torch.zeros((2, 4), dtype=torch.int64),
                     torch.zeros(2, dtype=torch.int64),
                     None,
                     None,

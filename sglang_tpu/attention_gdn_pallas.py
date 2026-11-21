@@ -602,8 +602,10 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # verify window too); the kernel derives has_initial_state from it.
         # _kernel_seq_lens casts and bumps it inside the compiled forward.
         self._seq_lens = forward_batch.seq_lens
+        # A draft-step schedule verifies fewer rows than the checkpoint window.
+        verify_width = forward_batch.spec_info.num_tokens_per_req if is_verify else 1
         self._seq_lens_bump = device_scalar(
-            self._spec_window if is_verify else 0, torch.int32, device
+            verify_width if is_verify else 0, torch.int32, device
         )
         # Build only TPU metadata. The GPU base constructs variable-length
         # tracked-row selections and reads device masks on the host. Here every
@@ -613,7 +615,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
-            step = self._spec_window if is_verify else 1
+            step = verify_width
             self._query_start_loc = self._uniform_query_start_loc(
                 padded_bs, step, device
             )
@@ -678,12 +680,12 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             return
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            # Checkpoint rows are laid out per pool window; a different verify
-            # width (adaptive spec) would read and commit the wrong rows.
-            assert forward_batch.spec_info.num_tokens_per_req == self._spec_window
+            # Windows keep their pool stride; a narrower verify writes its first rows.
+            width = forward_batch.spec_info.num_tokens_per_req
+            assert 1 < width <= self._spec_window, (width, self._spec_window)
             self._read_offsets = self._read_offsets_pool
             self._req_pool_indices = forward_batch.req_pool_indices
-            self._num_spec_tokens = self._spec_window - 1
+            self._num_spec_tokens = width - 1
         elif mode.is_extend():
             # Extend reads and writes the slot row, so that row is committed.
             self._read_offsets_pool.index_fill_(

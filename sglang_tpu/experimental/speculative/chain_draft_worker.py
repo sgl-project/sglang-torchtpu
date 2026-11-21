@@ -253,14 +253,14 @@ class TpuChainDraftWorker(TpuDraftWorker):
         rng_step: torch.Tensor | None,
         dsa_seed_topk_table: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Traced once per (batch bucket, sampled): d_1 from the carry, then N - 1 draft forwards."""
+        """Traced once per (batch bucket, sampled, N): d_1 from the carry, then N - 1 draft forwards."""
+        # N from the verify rows: a draft-step schedule runs several per bucket.
+        num_drafts = positions.shape[1] - 1
         # Every rank holds the same rng_step, so ranks draw alike without a broadcast.
         uniforms = (
             None
             if rng_step is None
-            else hash_uniforms(
-                rng_step, STREAM_DRAFT, (seq_lens.shape[0], self.num_drafts)
-            )
+            else hash_uniforms(rng_step, STREAM_DRAFT, (seq_lens.shape[0], num_drafts))
         )
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, ChainDraftForwardInput)
@@ -277,7 +277,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
             forward_batch.reuse_dsa_topk_indices = True
         tokens: list[torch.Tensor] = []
         dense_logits: list[torch.Tensor] = []
-        for step in range(self.num_drafts):
+        for step in range(num_drafts):
             if step > 0:
                 # Step s reads d_s at verify row s - 1 and writes its draft KV there;
                 # RPA writes at kv_len - 1, so kv_len is the absolute seq_lens + s.
@@ -333,10 +333,9 @@ class TpuChainDraftWorker(TpuDraftWorker):
         token = torch.where(top_ks <= 1, torch.argmax(dense, dim=-1), drawn)
         return token, dense
 
-    def _warmup_fused_draft(self, bs: int, sampled: bool) -> None:
-        """One fused draft call per (batch bucket, sampled) on the dummy KV slot."""
+    def _warmup_fused_draft(self, bs: int, sampled: bool, width: int) -> None:
+        """One fused draft call per (batch bucket, sampled, verify width) on the dummy KV slot."""
         device = self.model_runner.device
-        width = self.num_drafts + 1
         # Pool row 1 and slot 1 are the policies' dummy request and KV slot.
         self.model_runner.req_to_token_pool.req_to_token[1, :width] = 1
         ones = torch.ones((bs,), dtype=torch.int64, device=device)

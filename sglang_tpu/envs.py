@@ -280,6 +280,11 @@ class TpuEnvs:
     # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
     # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
     SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
+    # TpuChainSpecWorker draft steps by running requests, "R:K,..." (from R running
+    # draft K; e.g. "1:7,5:3"); launch speculative_num_steps = largest K. Unset: fixed.
+    SGLANG_TPU_SPEC_STEPS_BY_RUNNING = EnvStr(None)
+    # SGLANG_SIMULATE_ACC_LEN per draft-step count of that schedule, "K:AL,...".
+    SGLANG_TPU_SPEC_SIMULATE_ACC_LEN_BY_STEPS = EnvStr(None)
     # PD on the experimental spec worker: the prefill ships the target's draft-input
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.

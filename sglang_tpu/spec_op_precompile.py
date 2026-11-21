@@ -19,6 +19,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.warmup_queue import (
     current_warmup_queue,
 )
+from sglang_tpu.experimental.speculative.adaptive_steps import draft_step_schedule
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
 logger = logging.getLogger(__name__)
@@ -35,10 +36,18 @@ def precompile_spec_v2_ops(
     hidden_dtype: torch.dtype,
 ) -> None:
     """Warm up Spec V2 helper graphs for every physical batch bucket."""
-    shapes = tuple(
-        (physical_bs, physical_bs * num_verify_tokens)
+    schedule = draft_step_schedule()
+    # (bucket, verify width); a draft-step schedule's widths per bucket when set.
+    widths = [
+        (physical_bs, width)
         for physical_bs in physical_batch_buckets
-    )
+        for width in (
+            (num_verify_tokens,)
+            if schedule is None
+            else schedule.widths_for_bucket(physical_bs, physical_batch_buckets)
+        )
+    ]
+    shapes = tuple((physical_bs, physical_bs * width) for physical_bs, width in widths)
     if not shapes:
         return
 
@@ -46,13 +55,13 @@ def precompile_spec_v2_ops(
         SpecOpWarmupContext(
             device=device,
             physical_bs=physical_bs,
-            num_verify_tokens=num_verify_tokens,
+            num_verify_tokens=width,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
         )
-        for physical_bs, _ in shapes
+        for physical_bs, width in widths
     ]
     registered_ops = get_compiled_ops()
 

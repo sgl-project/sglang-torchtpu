@@ -256,7 +256,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         *,
         model_extra_tensor_attrs: tuple[str, ...] = (),
     ) -> Callable[..., Any]:
-        """One program per (batch bucket, sampled) for the whole draft chain."""
+        """One program per (batch bucket, sampled, draft count) for the whole draft chain."""
         if self.tracer != "direct":
             return torch.compile(
                 fn,
@@ -280,8 +280,8 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         def specialization_key(
             _attention_metadata: Any, forward_batch: ForwardBatch, *args: Any, **_: Any
         ) -> tuple[Any, ...]:
-            # args[5] is temperatures: None for an all-greedy batch.
-            return (forward_batch.batch_size, args[5] is None)
+            # args[2] is positions [pbs, N + 1]; args[5] is temperatures, None if all greedy.
+            return (forward_batch.batch_size, args[5] is None, args[2].shape[1])
 
         call = self._direct_compile_draft(
             trace,
@@ -329,7 +329,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         *,
         target_feature_size: int,
         dsa_seed_topk_width: int | None,
-        fused_draft_warmup: Callable[[int, bool], None],
+        fused_draft_warmup: Callable[[int, bool, int], None],
     ) -> None:
         """Compile the fused draft, commit's draft rows and the draft prompt extend.
 
@@ -365,23 +365,27 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         )
 
     def _precompile_fused_draft(
-        self, fused_draft_warmup: Callable[[int, bool], None]
+        self, fused_draft_warmup: Callable[[int, bool, int], None]
     ) -> None:
         assert self.b_bucketer is not None
         shapes = [
-            (bs, sampled) for bs in self.b_bucketer.buckets for sampled in (False, True)
+            (bs, sampled, width)
+            for width, bs in self.verify_bucket_widths()
+            for sampled in (False, True)
         ]
         logger.info(
-            "[spec compile policy] %s FUSED DRAFT: %d shapes (bs=%s, greedy and sampled)",
+            "[spec compile policy] %s FUSED DRAFT: %d shapes (bs=%s, verify rows=%s, "
+            "greedy and sampled)",
             self.algo_label,
             len(shapes),
             list(self.b_bucketer.buckets),
+            sorted({width for _, _, width in shapes}),
         )
 
-        def run(shape: tuple[int, bool]) -> str:
-            bs, sampled = shape
-            fused_draft_warmup(bs, sampled)
-            return f"bs={bs}, sampled={sampled}"
+        def run(shape: tuple[int, bool, int]) -> str:
+            bs, sampled, width = shape
+            fused_draft_warmup(bs, sampled, width)
+            return f"bs={bs}, sampled={sampled}, rows={width}"
 
         self._precompile_shapes(f"{self.algo_label} FUSED DRAFT", shapes, run)
 
@@ -394,17 +398,17 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     ) -> None:
         """commit's draft forward over the N + 1 verify rows on target features."""
         assert self.b_bucketer is not None
-        width = self.draft_token_num
-        buckets = list(self.b_bucketer.buckets)
+        shapes = self.verify_bucket_widths()
         logger.info(
-            "[spec compile policy] %s DRAFT ROWS: %d shapes (bs=%s, verify rows=%d)",
+            "[spec compile policy] %s DRAFT ROWS: %d shapes (bs=%s, verify rows=%s)",
             self.algo_label,
-            len(buckets),
-            buckets,
-            width,
+            len(shapes),
+            list(self.b_bucketer.buckets),
+            sorted({width for width, _ in shapes}),
         )
 
-        def run(bs: int) -> str:
+        def run(shape: tuple[int, int]) -> str:
+            width, bs = shape
             self._run_one(
                 num_tokens=bs * width,
                 bs=bs,
@@ -419,7 +423,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             )
             return f"bs={bs}, rows={width}"
 
-        self._precompile_shapes(f"{self.algo_label} DRAFT ROWS", buckets, run)
+        self._precompile_shapes(f"{self.algo_label} DRAFT ROWS", shapes, run)
 
     def _precompile_draft_prompt_extend(
         self, target_feature_size: int, *, dsa_seed_topk_width: int | None

@@ -61,6 +61,7 @@ from sglang_tpu.cp_forward import (
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
 from sglang_tpu.envs import envs
+from sglang_tpu.experimental.speculative.adaptive_steps import adaptive_verify_widths
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.host_upload import device_scalar
 from sglang_tpu.kv_row_write import (
@@ -589,6 +590,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
 
+    # Narrower static verify widths a draft-step schedule adds (adaptive_steps).
+    _extra_query_sizes: frozenset[int] = frozenset()
+
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
@@ -719,6 +723,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             supports_decode_query_size=self.kernel_spec.supports_decode_query_size,
             spec_enabled=not model_runner.spec_algorithm.is_none(),
         )
+        if self.decode_query_size > 1:
+            self._extra_query_sizes = frozenset(adaptive_verify_widths())
 
         self.forward_metadata: PallasForwardMetadata | None = None
         # Cached ``distribution`` tensors on TPU, keyed by
@@ -835,16 +841,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         extension carries it as a uniform ``extend_seq_lens``. A widened DP
         window or the ragged prompt-phase extension stays on MIXED.
         """
-        width = self.decode_query_size
-        if width == 1:
+        if self.decode_query_size == 1:
             return 1
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            return width if forward_batch.spec_info.num_tokens_per_req == width else 1
+            width = forward_batch.spec_info.num_tokens_per_req
+            return width if self._is_query_size(width) else 1
         if self._is_draft_extend(mode):
             lens = forward_batch.extend_seq_lens_cpu
-            return width if lens and all(n == width for n in lens) else 1
+            uniform = bool(lens) and all(n == lens[0] for n in lens)
+            return lens[0] if uniform and self._is_query_size(lens[0]) else 1
         return 1
+
+    def _is_query_size(self, width: int) -> bool:
+        return width == self.decode_query_size or width in self._extra_query_sizes
 
     def warmup_distributions(self, max_live: int, device) -> None:
         """Warm fixed-shape metadata; live row counts are tensor values."""
