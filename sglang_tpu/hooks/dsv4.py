@@ -131,8 +131,24 @@ def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
         pool = original(kvc, *args, **kwargs)
     req_to_token_pool = kwargs["req_to_token_pool"]
     if not kvc.is_draft_worker and not pool._unified_kv:
-        req_to_token_pool.register_on_alloc_rows(pool.clear_c4_req_states)
+        chain_on_alloc_rows(req_to_token_pool, pool.clear_c4_req_states)
     return pool
+
+
+def chain_on_alloc_rows(req_to_token_pool, hook) -> None:
+    """Run ``hook`` after the row-allocation hook the core pool build registered
+    (its C4 ring and request-window resets), if any: the pool takes one hook."""
+    core = req_to_token_pool._on_alloc_rows
+    if core is None:
+        req_to_token_pool.register_on_alloc_rows(hook)
+        return
+
+    def both(rows):
+        core(rows)
+        hook(rows)
+
+    req_to_token_pool._on_alloc_rows = None
+    req_to_token_pool.register_on_alloc_rows(both)
 
 
 def get_tpu_dsv4_bytes_per_swa_token(original, configurator) -> float:
