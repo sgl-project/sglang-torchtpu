@@ -561,6 +561,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     # Encoder replay rows run inside the extend forward (see the module docstring).
     folds_encoder_swa_replay: bool = True
+    # TpModelWorker reads it after an encoder-replay fold to drop the decoder
+    # late-layer tail's rows; this backend runs no decoder tail.
+    tail_forward_metadata = None
 
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__()

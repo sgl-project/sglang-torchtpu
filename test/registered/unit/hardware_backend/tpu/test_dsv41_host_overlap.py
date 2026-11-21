@@ -2490,3 +2490,14 @@ def test_text_only_serving_drops_the_engram_image_mask():
 
     assert engram.image_token_id is None
     assert model.model.config.vision_n_layers == 0
+
+
+def test_attention_backend_reports_no_decoder_tail():
+    """Regression: TpModelWorker reads attn_backend.tail_forward_metadata after
+    every encoder-replay fold, and the TPU V4.1 backend did not define it, so
+    the first prefix-cache hit under load killed the scheduler."""
+    from sglang_tpu.models.deepseek_v41.attention_backend import DSV41TPUAttnBackend
+
+    backend = object.__new__(DSV41TPUAttnBackend)
+
+    assert backend.tail_forward_metadata is None
