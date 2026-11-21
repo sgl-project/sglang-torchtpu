@@ -87,6 +87,21 @@ tpu_dsv4_get_last_loc
   Upstream PR or issue: not filed.
   Remove when: get_last_loc dispatches on the tensor device, not backend names.
 
+tpu_dsv4_live_hc_sublayers
+  Why: DeepseekV4DecoderLayerBase._init_hyper_connections binds each layer's
+       hc_{attn,ffn}_{fn,scale,base} parameters into mhc.HcSubLayer tuples
+       (attn_hc / ffn_hc), which the mHC forward reads. The direct tracer swaps
+       a module's parameters by attribute path; a tuple's alias is never
+       swapped, so the trace read the real [3] fp32 scale as an unprovided
+       constant ("build_mlir(): ... argument that was not provided: 3xfloat32").
+  How: AFTER _init_hyper_connections, off CUDA, attn_hc / ffn_hc become
+       LiveHcSubLayer views whose fields read the layer's attributes on each
+       access, so a trace sees the swapped parameters and eager code the
+       loaded ones.
+  Upstream PR or issue: not filed.
+  Remove when: the mHC forward reads the layer's parameters, or HcSubLayer is
+       rebuilt per forward.
+
 tpu_dsv4_hc_split_sinkhorn
   Why: the mHC mix stats (deepseek_v4_mhc._mix_stats_impl, which the shifted
        post fusion runs) call the TileLang hc_split_sinkhorn off CUDA too; only
@@ -379,6 +394,56 @@ def tpu_dsv4_get_last_loc(
     return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
 
+class LiveHcSubLayer:
+    """mhc.HcSubLayer whose fields read one of ``layer``'s two hyper-connections
+    at access time."""
+
+    __slots__ = ("_layer", "_attn")
+
+    def __init__(self, layer, *, attn: bool):
+        self._layer = layer
+        self._attn = attn
+
+    @property
+    def cfg(self):
+        return self._layer.hc_cfg
+
+    @property
+    def fn(self):
+        return self._layer.hc_attn_fn if self._attn else self._layer.hc_ffn_fn
+
+    @property
+    def scale(self):
+        return self._layer.hc_attn_scale if self._attn else self._layer.hc_ffn_scale
+
+    @property
+    def base(self):
+        return self._layer.hc_attn_base if self._attn else self._layer.hc_ffn_base
+
+    @property
+    def norm(self):
+        layer = self._layer
+        return layer.input_layernorm if self._attn else layer.post_attention_layernorm
+
+    @property
+    def tf32_parts(self):
+        layer = self._layer
+        return layer._hc_attn_tf32_parts if self._attn else layer._hc_ffn_tf32_parts
+
+    @property
+    def bf16_parts(self):
+        layer = self._layer
+        return layer._hc_attn_bf16_parts if self._attn else layer._hc_ffn_bf16_parts
+
+
+def tpu_dsv4_live_hc_sublayers(result, layer, *args, **kwargs) -> None:
+    """AFTER _init_hyper_connections: read the hyper-connections live off CUDA."""
+    if layer.attn_hc is None or layer.hc_attn_fn.is_cuda:
+        return
+    layer.attn_hc = LiveHcSubLayer(layer, attn=True)
+    layer.ffn_hc = LiveHcSubLayer(layer, attn=False)
+
+
 def tpu_dsv4_hc_split_sinkhorn(original, mixes, *args, **kwargs):
     """AROUND hc_split_sinkhorn: the core torch reference off CUDA."""
     if mixes.is_cuda:
@@ -497,5 +562,10 @@ def hook_specs():
             "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
             tpu_dsv4_hc_split_sinkhorn,
             HookType.AROUND,
+        ),
+        (
+            f"{dsv4}.DeepseekV4DecoderLayerBase._init_hyper_connections",
+            tpu_dsv4_live_hc_sublayers,
+            HookType.AFTER,
         ),
     ]

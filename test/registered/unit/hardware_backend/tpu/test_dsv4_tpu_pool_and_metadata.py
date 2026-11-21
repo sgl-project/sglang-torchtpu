@@ -717,6 +717,45 @@ class TestDSV4TPUPatches(CustomTestCase):
         for got, want in zip((pre, post, comb), ref):
             self.assertTrue(torch.equal(got, want.squeeze(1)))
 
+    def test_hyper_connections_follow_reparametrized_weights(self):
+        """Regression: the mHC forward read each layer's hyper-connection weights
+        from tuples bound at load, so the direct tracer's parameter swap missed
+        them and compile failed on an unprovided [3] fp32 constant. Under a
+        reparametrization they must read the swapped tensors."""
+        from torch.nn.utils.stateless import _reparametrize_module
+
+        from sglang.srt.models import deepseek_v4_mhc
+        from sglang.srt.models.deepseek_v4 import DeepseekV4PlatformDecoderLayer
+        from sglang_tpu.hooks.dsv4 import tpu_dsv4_live_hc_sublayers
+
+        layer = object.__new__(DeepseekV4PlatformDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.hc_pre_from_prev_sublayer = True
+        layer.hc_cfg = deepseek_v4_mhc.HcConfig(4, 20, 1e-6, 1e-6, 8, True, False)
+        for site in ("attn", "ffn"):
+            for name, shape in (("fn", (24, 32)), ("scale", (3,)), ("base", (24,))):
+                setattr(
+                    layer,
+                    f"hc_{site}_{name}",
+                    torch.nn.Parameter(torch.zeros(shape), requires_grad=False),
+                )
+        layer.input_layernorm = torch.nn.Identity()
+        layer.post_attention_layernorm = torch.nn.Identity()
+        layer._hc_attn_tf32_parts = layer._hc_ffn_tf32_parts = None
+        layer._hc_attn_bf16_parts = layer._hc_ffn_bf16_parts = None
+        layer._init_hyper_connections()
+        tpu_dsv4_live_hc_sublayers(None, layer)
+
+        swapped = {
+            "hc_attn_scale": torch.ones(3),
+            "hc_ffn_fn": torch.ones(24, 32),
+        }
+        with _reparametrize_module(layer, swapped):
+            self.assertIs(layer.attn_hc.scale, swapped["hc_attn_scale"])
+            self.assertIs(layer.ffn_hc.fn, swapped["hc_ffn_fn"])
+            self.assertIs(layer.ffn_hc.norm, layer.post_attention_layernorm)
+        self.assertIs(layer.attn_hc.scale, layer.hc_attn_scale)
+
     def test_dsv4_tpu_compressor_and_resolution_hooks(self):
         from unittest.mock import MagicMock
 
