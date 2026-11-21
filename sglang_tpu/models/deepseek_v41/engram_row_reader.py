@@ -45,9 +45,23 @@ def is_engram_table(name: str) -> bool:
     return _ENGRAM_TABLE.fullmatch(name) is not None
 
 
-def tp_row_range(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
-    """The ``[start, end)`` rows ``EngramEmbedding`` assigns to ``tp_rank``."""
-    return num_rows * tp_rank // tp_size, num_rows * (tp_rank + 1) // tp_size
+def engram_row_ranges(
+    names: Iterable[str], *, layout, tp_rank: int, tp_size: int
+) -> dict[str, tuple[int, int]]:
+    """Table name -> the ``[start, end)`` rows ``EngramEmbedding`` assigns to
+    ``tp_rank``: core ``shard_range`` over the layer's hash-column bounds."""
+    from sglang.srt.layers.engram import shard_range
+
+    ranges = {}
+    for name in names:
+        index = layout.layer_ids.index(int(_ENGRAM_TABLE.fullmatch(name).group(1)))
+        ranges[name] = shard_range(
+            layout.num_embeddings[index],
+            layout.column_bounds(index),
+            tp_rank,
+            tp_size,
+        )
+    return ranges
 
 
 def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
@@ -85,10 +99,10 @@ def _read_safetensors_header(path: str) -> tuple[int, dict]:
 
 
 def _read_row_ranges(
-    path: str, names: set[str], *, tp_rank: int, tp_size: int
+    path: str, names: set[str], *, row_ranges: Mapping[str, tuple[int, int]]
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield this TP rank's rows of each 2-D tensor in ``names`` in blocks of at
-    most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``."""
+    """Yield rows ``row_ranges[name]`` of each 2-D tensor in ``names`` in blocks of
+    at most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``."""
     header_len, header = _read_safetensors_header(path)
     data_base = 8 + header_len
     for name in sorted(names):
@@ -97,7 +111,9 @@ def _read_row_ranges(
         num_rows, *row_shape = meta["shape"]
         start, end = meta["data_offsets"]
         row_bytes = (end - start) // num_rows
-        lo, hi = tp_row_range(num_rows, tp_rank, tp_size)
+        lo, hi = row_ranges[name]
+        if not 0 <= lo <= hi <= num_rows:
+            raise ValueError(f"{name}: rows [{lo}, {hi}) outside its {num_rows} rows")
         block_rows = max(1, _ROW_BLOCK_BYTES // row_bytes)
         t0 = perf_counter()
         for first in range(lo, hi, block_rows):
@@ -119,17 +135,15 @@ def _read_row_ranges(
 
 
 def iter_row_tables(
-    *, shard_of: Mapping[str, str], names: Iterable[str], tp_rank: int, tp_size: int
+    *, shard_of: Mapping[str, str], row_ranges: Mapping[str, tuple[int, int]]
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """This TP rank's rows of the Engram tables ``names``, shard by shard;
+    """Rows ``row_ranges[name]`` of each Engram table, shard by shard;
     ``shard_of`` maps a tensor name to its local shard path."""
     by_shard: dict[str, set[str]] = {}
-    for name in names:
+    for name in row_ranges:
         by_shard.setdefault(shard_of[name], set()).add(name)
     for path in sorted(by_shard):
-        yield from _read_row_ranges(
-            path, by_shard[path], tp_rank=tp_rank, tp_size=tp_size
-        )
+        yield from _read_row_ranges(path, by_shard[path], row_ranges=row_ranges)
 
 
 def load_local_rows(original, embedding, param, loaded_weight):

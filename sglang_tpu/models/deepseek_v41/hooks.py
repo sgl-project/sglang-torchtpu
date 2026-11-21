@@ -88,7 +88,8 @@ tpu_dsv41_hasher_forward
        and its offloaded gather halted a SparseCore. _HostTable pins its
        mapping with cudaHostRegister, and the core lookup reads it from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
-       builds the table with cudaHostRegister stubbed out. The V4 compile
+       builds the table with cudaHostRegister and the GPU row-order probe
+       (sglang#45879) stubbed out. The V4 compile
        policy and its forward shim (deepseek_v41/compile_policy.py) hash on the
        host and stage packed rows via double-buffered async raw DMA; inside the
        graph EngramHasher.forward returns the staged row ids and
