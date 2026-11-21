@@ -130,6 +130,8 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Run the token-recurrent scan for every tile.
+    recurrent_scan: bool = False
     # KDA only: the small weights arrive as one f32 array (see
     # memory_ref.unpack_kda_weights) instead of three kernel operands.
     packed_weights: bool = False
@@ -202,8 +204,9 @@ class GDNConfig:
 
         Keeping more than one state checkpoint mandates the recurrent scan,
         since the chunked path only ever produces the final state.
+        `recurrent_scan` asks for it on every tile.
         """
-        return self.chunk_size == 1 or self.window_size > 1
+        return self.recurrent_scan or self.chunk_size == 1 or self.window_size > 1
 
     @property
     def v_dim_size(self) -> int:

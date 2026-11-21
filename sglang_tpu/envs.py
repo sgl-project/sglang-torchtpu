@@ -466,6 +466,8 @@ class TpuEnvs:
     # so a prefill chunk larger than the grid hands the epilogue the same row sets as
     # grid-sized chunks. 0 registers no hook.
     SGLANG_TPU_LOGPROB_GRID_ROWS = EnvInt(0)
+    # True on-policy RL: serve with the batch-invariant kernels (rl/true_on_policy/hooks.py).
+    SGLANG_TPU_ENABLE_TRUE_ON_POLICY = EnvBool(False)
     # Put each request's logit row on ForwardBatch.logit_rows before every plain
     # EXTEND forward (compilation/logit_rows.py), for models that run their last
     # layer on those rows only. Off leaves the field None.
