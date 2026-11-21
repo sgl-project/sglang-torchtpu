@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
+    from sglang_tpu.pp_stage_chips import PipelinePlacement
 
 logger = get_logger(__name__)
 
@@ -1701,12 +1702,19 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     _dp_replica_session: Optional[dp_replicas.ReplicaSession] = None
+    # Set by prepare_worker for a scheduler worker outside engine DP.
+    _pipeline_placement: Optional[PipelinePlacement] = None
 
     def prepare_worker(
         self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ) -> None:
         cfg = _resolving_view(server_args)
         if cfg.dp_size <= 1:
+            from sglang_tpu.pp_stage_chips import pipeline_placement
+
+            self._pipeline_placement = pipeline_placement(
+                cfg, tp_rank=tp_rank, pp_rank=pp_rank
+            )
             return
         dp_replicas.validate_dp_replicas(cfg)
         if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
@@ -1752,6 +1760,13 @@ class TpuSRTPlatform(SRTPlatform):
                 raise RuntimeError(
                     "TorchTPU backend initialization requires worker WORLD_SIZE. "
                     "Initialize it from the scheduler worker bootstrap."
+                )
+            placement = self._pipeline_placement
+            device = None if placement is None else placement.local_device
+            if device is not None:
+                # Both, as co-located P/D sets them: torch_tpu pins its chip to LOCAL_RANK.
+                os.environ["LOCAL_RANK"] = os.environ["TPU_VISIBLE_DEVICES"] = str(
+                    device
                 )
             shared = shared_slice.spec()
             if shared is not None:
@@ -1879,7 +1894,11 @@ class TpuSRTPlatform(SRTPlatform):
             validate_chips_for_pp,
         )
 
-        validate_chips_for_pp(get_parallel())
+        placement = self._pipeline_placement
+        validate_chips_for_pp(
+            get_parallel(),
+            ring_expected=placement is not None and placement.ring_expected,
+        )
         # Before the first collective and before torch.compile traces the model.
         from sglang_tpu.twolevel_allreduce import register_from_parallel_state
 

@@ -421,6 +421,11 @@ class TpuEnvs:
     # Discovery store port; unset uses the --dist-init-addr port plus one.
     SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT = EnvInt(None)
 
+    # Pipeline stage placement (pp_stage_chips.py)
+    # Start even when single-chip pipeline stages hand off across more than one
+    # ICI hop within a slice; those hand-offs are then warned about.
+    SGLANG_TPU_PP_ALLOW_DISTANT_STAGES = EnvBool(False)
+
     # Pipeline-parallel prefill chunking
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
