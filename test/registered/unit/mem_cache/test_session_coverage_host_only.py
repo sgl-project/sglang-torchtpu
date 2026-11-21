@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -26,8 +27,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 FULL, SWA = ComponentType.FULL, ComponentType.SWA
+SWA_POOL = BaseSWAKVPool.WINDOW_SUB_POOL
 WINDOW = 4
 LAYERS, FULL_LAYERS = 4, (3,)
 
@@ -67,7 +70,7 @@ def make_cache(host_only, size=512):
             enable_session_radix_cache=True,
             session_leaf_at_prompt_end=True,
             session_coverage_host_only=host_only,
-            tree_components=(FULL, SWA),
+            tree_slots=tree_slots_of((FULL, SWA), window=WINDOW),
         )
     )
 
@@ -109,7 +112,7 @@ def setup_idle_then_active(host_only):
     cache = make_cache(host_only)
     idle = finish_turn(cache, IDLE, [190, 191], "idle")
     # The idle session's output branch is uncovered and goes first in both modes.
-    cache.evict(EvictParams(num_tokens=2, swa_num_tokens=2))
+    cache.evict(EvictParams(num_tokens=2, window_num_tokens={SWA_POOL: 2}))
     active = insert(cache, ACTIVE)
     assert cache.components[SWA].session_ref(idle) == 1
     assert cache.components[SWA].session_ref(active) == 0
@@ -130,7 +133,9 @@ class TestDeviceOrder(CustomTestCase):
     def test_default_keeps_the_covered_window_on_device(self):
         cache, idle, active = setup_idle_then_active(host_only=False)
         # One prompt's SWA: its out-of-window part and its last window (split nodes).
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(ACTIVE)))
+        cache.evict(
+            EvictParams(num_tokens=0, window_num_tokens={SWA_POOL: len(ACTIVE)})
+        )
         # Covered windows go last on device: the active request loses its window.
         self.assertTrue(has_swa(idle))
         self.assertFalse(has_swa(active))
@@ -139,7 +144,9 @@ class TestDeviceOrder(CustomTestCase):
     def test_host_only_keeps_the_active_window_on_device(self):
         cache, idle, active = setup_idle_then_active(host_only=True)
         # One prompt's SWA: its out-of-window part and its last window (split nodes).
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(ACTIVE)))
+        cache.evict(
+            EvictParams(num_tokens=0, window_num_tokens={SWA_POOL: len(ACTIVE)})
+        )
         # Plain LRU on device: the idle session's older window goes first.
         self.assertFalse(has_swa(idle))
         self.assertTrue(has_swa(active))
@@ -171,7 +178,9 @@ class TestMambaDeviceWalk(CustomTestCase):
         mamba = ComponentType.MAMBA
         ordered = not host_only
         lru = UnifiedLRUList(
-            mamba, (FULL, mamba), is_referenced=(lambda node: False) if ordered else None
+            mamba,
+            (FULL, mamba),
+            is_referenced=(lambda node: False) if ordered else None,
         )
         comp = SimpleNamespace(
             component_type=mamba,
@@ -212,7 +221,7 @@ class TestHostOrder(CustomTestCase):
         )
         evicted = []
 
-        def evict(node, comp, target, tracker, device_frees, host_frees):
+        def evict(node, comp, target, tracker, device_frees, host_frees, cache_actions):
             evicted.append(node)
             tracker[SWA] += len(node.component_data[SWA].host_value)
             node.component_data[SWA].host_value = None
@@ -234,7 +243,7 @@ class TestHostOrder(CustomTestCase):
             node.component_data[SWA].session_ref = ref
             host_lru.insert_mru(node)
         tracker = {SWA: 0}
-        comp.drive_host_eviction(WINDOW, tracker, {}, {})
+        comp.drive_host_eviction(WINDOW, tracker, {}, {}, [])
         self.assertEqual(evicted, [active])
 
 

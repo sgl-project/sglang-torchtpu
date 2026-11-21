@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -29,8 +30,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 FULL, SWA = ComponentType.FULL, ComponentType.SWA
+SWA_POOL = BaseSWAKVPool.WINDOW_SUB_POOL
 WINDOW = 4
 LAYERS, FULL_LAYERS = 4, (3,)
 
@@ -70,7 +73,7 @@ def make_cache(size=512, prompt_end=False, release_evicted=False):
             enable_session_radix_cache=True,
             session_leaf_at_prompt_end=prompt_end,
             session_release_evicted_leaf=release_evicted,
-            tree_components=(FULL, SWA),
+            tree_slots=tree_slots_of((FULL, SWA), window=WINDOW),
         )
     )
 
@@ -298,7 +301,9 @@ class TestEvictedLeafBoundsCoverage(CustomTestCase):
             output = [5000 + 10 * i + k for k in range(4)]
             need = len(prompt) + len(prompt) + len(output)
             if min(alloc.full_available_size(), alloc.swa_available_size()) < need:
-                cache.evict(EvictParams(num_tokens=need, swa_num_tokens=need))
+                cache.evict(
+                    EvictParams(num_tokens=need, window_num_tokens={SWA_POOL: need})
+                )
             finish_turn(cache, prompt, output, f"conv-{i}")
             holders = [s for s in cache.components[SWA]._session_leaves]
             covered = sum(swa_covered(cache, s) for s in holders)
@@ -362,7 +367,7 @@ class TestSWAHostPartition(CustomTestCase):
         )
         evicted = []
 
-        def evict(node, comp, target, tracker, device_frees, host_frees):
+        def evict(node, comp, target, tracker, device_frees, host_frees, cache_actions):
             evicted.append(node)
             tracker[SWA] += len(node.component_data[SWA].host_value)
             node.component_data[SWA].host_value = None
@@ -389,7 +394,7 @@ class TestSWAHostPartition(CustomTestCase):
 
     def drive(self, comp, num_tokens):
         tracker = {SWA: 0}
-        comp.drive_host_eviction(num_tokens, tracker, {}, {})
+        comp.drive_host_eviction(num_tokens, tracker, {}, {}, [])
         return tracker[SWA]
 
     def test_uncovered_windows_go_first_then_covered_in_lru_order(self):
@@ -404,6 +409,7 @@ class TestSWAHostPartition(CustomTestCase):
         comp._refresh_session_partition(nodes[0])
         self.assertEqual(self.drive(comp, 2 * WINDOW), 2 * WINDOW)
         self.assertEqual(evicted, [nodes[1], nodes[2]])
+
 
 if __name__ == "__main__":
     unittest.main()
