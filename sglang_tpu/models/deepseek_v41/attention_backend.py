@@ -626,11 +626,12 @@ class DSV41TPUAttnBackend(AttentionBackend):
     @staticmethod
     def _drop_text_only_image_mask(model_runner) -> None:
         """Without multimodal serving no prompt holds image tokens, so the forward's
-        image-token torch.where after each Engram layer is the identity.
+        image-token torch.where in each Engram gate is the identity.
 
         The vision tower, MoE correction bias and hasher read vision_n_layers at
-        construction, already done; only that where reads it in the forward, and
-        its fused select has no valid TPU window ("Cannot find a valid window").
+        construction, already done; the forward reads it, and each Engram layer
+        its image_token_id, only for that where, whose fused select has no valid
+        TPU window ("Cannot find a valid window").
         """
         model = model_runner.model
         if model is None or model_runner.model_config.is_multimodal:
@@ -638,6 +639,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
         config = model.model.config
         if config.vision_n_layers > 0:
             config.vision_n_layers = 0
+        for layer in model.model.layers:
+            if layer.engram is not None:
+                layer.engram.image_token_id = None
 
     @staticmethod
     def _register_ops():

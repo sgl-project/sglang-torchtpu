@@ -61,7 +61,7 @@ tpu_dsv41_engram_gate
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
   How: AROUND engram_gate keeps the original on CUDA; elsewhere computes the
        same gate via engram_host.signed_sqrt (int32 sign-bit check so -0.0
-       preserves its sign, matching copysign).
+       preserves its sign, matching copysign), then the core's image-token mask.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
 
@@ -431,10 +431,22 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
-def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value):
+def tpu_dsv41_engram_gate(
+    original,
+    x,
+    kv,
+    q_weight,
+    k_weight,
+    eps,
+    clamp_value,
+    input_ids=None,
+    image_token_id=None,
+):
     """engram_gate without torch.copysign (no TorchTPU kernel)."""
     if x.is_cuda:
-        return original(x, kv, q_weight, k_weight, eps, clamp_value)
+        return original(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     from sglang_tpu.models.deepseek_v41.engram_host import signed_sqrt
 
     hc_mult, dim = x.shape[-2:]
@@ -447,7 +459,10 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     gate = torch.sigmoid(signed_sqrt(dot, clamp_value))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if input_ids is not None:
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
 
 
 def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):

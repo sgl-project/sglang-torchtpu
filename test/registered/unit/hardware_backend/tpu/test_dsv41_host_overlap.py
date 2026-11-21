@@ -2447,3 +2447,46 @@ def test_encoder_replay_validation_leaves_decoder_replay_off():
         )
 
     assert resolving_view(args).enable_decoder_swa_bounded_replay is False
+
+
+def test_engram_gate_hook_matches_core_with_image_mask():
+    """Regression: core engram_gate gained the image-token mask arguments and
+    the TPU gate hook rejected the call at compile tracing. Called as the core
+    calls it, the hook must give core's result, image rows keeping x."""
+    from sglang.srt.layers.engram import engram_gate
+
+    gen = torch.Generator().manual_seed(0)
+    tokens, hc_mult, dim = 5, 4, 64
+    x = torch.randn(tokens, hc_mult, dim, generator=gen)
+    kv = torch.randn(tokens, (hc_mult + 1) * dim, generator=gen)
+    q_weight = torch.randn(dim, generator=gen)
+    k_weight = torch.randn(dim, generator=gen)
+    input_ids = torch.tensor([3, 7, 3, 9, 7])
+    args = (x, kv, q_weight, k_weight, 1e-6, 1e-6, input_ids, 7)
+
+    got = hooks.tpu_dsv41_engram_gate(engram_gate, *args)
+
+    torch.testing.assert_close(got, engram_gate(*args))
+    assert torch.equal(got[input_ids == 7], x[input_ids == 7])
+
+
+def test_text_only_serving_drops_the_engram_image_mask():
+    """Text-only serving must run no image-token select in the Engram gates;
+    TPU finds no valid window for it."""
+    from sglang_tpu.models.deepseek_v41.attention_backend import DSV41TPUAttnBackend
+
+    engram = SimpleNamespace(image_token_id=7)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            config=SimpleNamespace(vision_n_layers=2),
+            layers=[SimpleNamespace(engram=None), SimpleNamespace(engram=engram)],
+        )
+    )
+    runner = SimpleNamespace(
+        model=model, model_config=SimpleNamespace(is_multimodal=False)
+    )
+
+    DSV41TPUAttnBackend._drop_text_only_image_mask(runner)
+
+    assert engram.image_token_id is None
+    assert model.model.config.vision_n_layers == 0
