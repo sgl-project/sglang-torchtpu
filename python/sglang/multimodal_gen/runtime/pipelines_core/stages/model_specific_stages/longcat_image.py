@@ -300,5 +300,6 @@ class LongCatPromptRewriteStage(PipelineStage):
         # Always set: the CPU generator governs latent noise for seed
         # reproducibility (diffusers randn_tensor generates on CPU then moves
         # to device, so CPU and CUDA generators differ for the same seed).
-        batch.generator = torch.Generator(device="cpu").manual_seed(batch.seed)
+        seed = batch.seed[0] if isinstance(batch.seed, list) else batch.seed
+        batch.generator = torch.Generator(device="cpu").manual_seed(seed)
         return batch
