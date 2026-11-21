@@ -37,12 +37,14 @@ SEED = 20261120
 INT_MIN = np.iinfo(np.int32).min
 
 
-def _ref_kernel(scores, k, row_lengths, *, return_scores, **_):
+def _ref_kernel(scores, k, row_lengths, *, return_scores, width=None, **_):
     words = (
         scores
         if scores.dtype == jnp.int32
         else jax.lax.bitcast_convert_type(scores, jnp.int32)
     )
+    if width is not None:
+        words = words[:, :width]  # the kernel's in-place read of each row's prefix
     b, n = words.shape
     key = words ^ ((words >> 31) & sc.MONO_MASK)
     lengths = jnp.minimum(row_lengths, n)
@@ -57,8 +59,14 @@ def _ref_kernel(scores, k, row_lengths, *, return_scores, **_):
     return idx
 
 
-def _width_kernel(scores, k, row_lengths, **_):
-    return jnp.full((scores.shape[0], k), scores.shape[1], jnp.int32)
+def _width_kernel(scores, k, row_lengths, width=None, **_):
+    return jnp.full((scores.shape[0], k), width or scores.shape[1], jnp.int32)
+
+
+def _flat_kernel(scores, k, row_lengths, width=None, **_):
+    """1 per row when a narrower bucket reads the full-width rows in place."""
+    in_place = width is not None and scores.shape[1] == N
+    return jnp.full((scores.shape[0], k), int(in_place), jnp.int32)
 
 
 def _topk(monkeypatch, kernel, scores, row_lengths, *, long_rows=True, **kwargs):
@@ -109,6 +117,15 @@ def test_branch_is_the_narrowest_bucket_holding_the_longest_row(monkeypatch, max
     want = min([w for w in LADDER + [N] if w >= max_len])
     got = _topk(monkeypatch, _width_kernel, scores, lengths)
     assert (got == want).all(), (max_len, got[0, 0], want)
+
+
+@pytest.mark.parametrize("max_len", [32769, 65537, 98305, 196608])
+def test_long_buckets_read_rows_in_place(monkeypatch, max_len):
+    """Long buckets get the unsliced rows plus a width: an XLA slice of the padded
+    rows would relayout the whole buffer on every call."""
+    lengths = np.full(B, max_len, np.int32)
+    got = _topk(monkeypatch, _flat_kernel, np.zeros((B, N), np.float32), lengths)
+    assert (got == 1).all(), max_len
 
 
 @pytest.mark.parametrize("max_len", [32769, 65537, 196609])

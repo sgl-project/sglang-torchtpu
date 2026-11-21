@@ -49,6 +49,7 @@ so the comparison helper is run a second time against deliberately corrupted
 output and is required to reject it.
 """
 
+import functools
 import os
 import sys
 
@@ -649,3 +650,23 @@ def test_long_row_buckets_return_the_same_scores(max_len):
     np.testing.assert_array_equal(on[0], off[0])
     np.testing.assert_array_equal(on[1], off[1])
     assert _mismatch(scores, on[0], k, lengths) is None
+
+
+@pytest.mark.parametrize(
+    "b,width", [(3, 65536), (16, 8192), (16, 98304), (64, 49152), (128, 196608)]
+)
+def test_in_place_rows_equal_sliced_rows(b, width):
+    """A width bucket reads each row's first ``width`` words in place at the full
+    row stride: the same indices and scores as the kernel on the sliced rows."""
+    n, k = N_POOLS_1M, 512
+    p = _pick_partition(b, width, k)
+    assert sc_module.strided_reads_fit(n, width, p), (b, width, p)
+    rng = np.random.default_rng(SEED)
+    scores = _scores("heavy_ties", b, n, rng)
+    scores[:, width:] = 1e30  # never read: past every row's length
+    lengths = jnp.asarray(_ragged_to(width, b))
+    run = functools.partial(sc_module._sc_topk_direct, k=k, p=p, return_scores=True)
+    in_place = jax.jit(lambda s, l: run(s, row_lengths=l, width=width))(scores, lengths)
+    sliced = jax.jit(lambda s, l: run(s[:, :width], row_lengths=l))(scores, lengths)
+    for got, want in zip(in_place, sliced):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

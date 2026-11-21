@@ -101,6 +101,7 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    row_stride: int | None = None,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -557,11 +558,27 @@ def _topk_body(
     cores_per_chip = num_sc_cores * num_subcores
     # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
     buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
+
+    def strided_spec():
+        """Slice s of row r at word r * row_stride + s * slice_len of the unpadded rows
+        (rows past b read the last real row; their length is 0)."""
+
+        def offset(w):
+            slot = w * cores_per_chip + flat
+            row = jnp.minimum(jnp.right_shift(slot, int(np.log2(p))), b - 1)
+            return (row * row_stride + jnp.bitwise_and(slot, p - 1) * slice_len,)
+
+        return pl.BlockSpec(
+            (pl.Element(slice_len),), offset, pipeline_mode=pl.Buffered(buf_count)
+        )
+
     if p == 1:
         in_specs = (
             # scores_hbm may hold only the b real rows. A subcore past them reads
             # the last real row instead and ignores it (its length is 0).
-            pl.BlockSpec(
+            strided_spec()
+            if row_stride is not None
+            else pl.BlockSpec(
                 (slice_len,),
                 lambda w: (
                     (w * cores_per_chip + flat,)
@@ -632,7 +649,9 @@ def _topk_body(
             _run_step(scores_vmem, len_slice_vmem)
 
         in_specs = (
-            pl.BlockSpec(
+            strided_spec()
+            if row_stride is not None
+            else pl.BlockSpec(
                 (slice_len,),
                 lambda w: (w * cores_per_chip + flat,),
                 pipeline_mode=pl.Buffered(buf_count),
@@ -661,6 +680,7 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    width: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -670,8 +690,12 @@ def _sc_topk_direct(
 
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
+
+    ``width`` < n: top-k over each row's first ``width`` words, read in place at
+    the row stride ``n`` (no XLA slice of the rows; see strided_reads_fit).
     """
-    b, n = scores.shape
+    b, row_stride = scores.shape
+    n = row_stride if width is None else width
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -686,12 +710,16 @@ def _sc_topk_direct(
     slice_len = _align_to(n // p, LANES)
     num_waves = _cdiv(b, groups_per_chip)
     padded_b = num_waves * groups_per_chip
-    # When p == 1 and not dcp_merge, only lengths and outputs need padded_b
-    # rows: padding scores would copy a decode step's few rows out to 32.
-    pad_b = 0 if (p == 1 and local_idxs is None) else (padded_b - b)
-    pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+    strided = width is not None
+    if strided:
+        assert local_idxs is None and strided_reads_fit(row_stride, width, p)
+    else:
+        # When p == 1 and not dcp_merge, only lengths and outputs need padded_b
+        # rows: padding scores would copy a decode step's few rows out to 32.
+        pad_b = 0 if (p == 1 and local_idxs is None) else (padded_b - b)
+        pad_n = slice_len * p - n
+        if pad_b > 0 or pad_n > 0:
+            words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
     if p > 1:
@@ -751,6 +779,7 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        row_stride=row_stride if strided else None,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -766,7 +795,8 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}",
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}"
+        + (f"_s{row_stride}" if strided else ""),
     )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
@@ -855,15 +885,19 @@ def sparsecore_topk(
 
     p = _pick_partition(b, n, k)
 
-    def _run(width, width_p):
+    def _run(width, width_p, rows=scores):
+        # A narrower bucket reads each row's first `width` words in place: an XLA
+        # slice of the rows would relayout the whole padded buffer every call.
+        strided = width < n and strided_reads_fit(n, width, width_p)
         return lambda _: _sc_topk_direct(
-            scores if width == n else scores[:, :width],
+            rows if width == n or strided else rows[:, :width],
             k,
             row_lengths,
             p=width_p,
             write_empty=write_empty_rows,
             return_scores=return_scores,
             scheduling_group_id=scheduling_group_id,
+            width=width if strided else None,
         )
 
     # A pool sized for long contexts pads every row to n; scan only the
@@ -877,9 +911,25 @@ def sparsecore_topk(
         else jnp.asarray(branch_max_len, jnp.int32)
     )
     branch = jnp.sum(jnp.asarray([w for w, _ in buckets], jnp.int32) < max_len)
+    # Flat before the switch, so the row-contiguous producer's buffer reaches every
+    # branch as a bitcast rather than in a tiled 2-D layout.
+    flat = (
+        scores
+        if scores.dtype == jnp.int32
+        else jax.lax.bitcast_convert_type(scores, jnp.int32)
+    ).reshape(-1)
+    rows = flat.reshape(b, n)
     return jax.lax.switch(
-        branch, [_run(w, wp) for w, wp in buckets] + [_run(n, p)], None
+        branch,
+        [_run(w, wp, rows) for w, wp in buckets] + [_run(n, p, rows)],
+        None,
     )
+
+
+def strided_reads_fit(row_stride: int, width: int, p: int) -> bool:
+    """Whether p slices of a row's first ``width`` words stay inside the row
+    (a padded slice tail would read past the last row)."""
+    return _align_to(width // p, LANES) * p <= row_stride and row_stride % LANES == 0
 
 
 def _width_buckets(b: int, n: int, k: int) -> list[tuple[int, int]]:
