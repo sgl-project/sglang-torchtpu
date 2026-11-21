@@ -38,10 +38,16 @@ CONFIG["server_args"].update(
         # At 0.85 the larger KV pool leaves the 2048-token extend program
         # ~280 MB short of HBM at load; 0.83 loads every graph.
         "mem_fraction_static": 0.83,
-        # Under attention DP every rank runs a peer's prefill step, so lone
-        # 1024-token prefills stall all 8 ranks' spec decode; batching them
-        # takes c64 from 1004 to 1900 tok/s.
-        "enable_prefill_delayer": True,
+        # Under attention DP any rank's prefill chunk stalls all 8 ranks' spec
+        # decode. The prefill delayer batched lone prefills (random 1k/1k c64:
+        # 1004 -> 1900 tok/s) but on AgentX it only adds TTFT: it holds a lone
+        # request up to 30 passes, re-matching its prefix each pass. Instead,
+        # run 4 decode rounds after each prefill step. AgentX FAST, same pod
+        # (j-1b901cb8-32f5-4331-ba04), vs delayer on: c32 +30% tok/s, +160%
+        # p90 interactivity, p90 TTFT +10%; c8 +4% tok/s, -6% p90, p90 TTFT
+        # -30%.
+        "enable_prefill_delayer": False,
+        "prefill_decode_interval": 4,
         # Keeps only request-owned SWA windows, so prefix hits replay the
         # bounded SWA tail instead of reserving an SWA pool.
         "disable_radix_cache": False,
