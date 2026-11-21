@@ -118,10 +118,6 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             f"({tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name} is set)",
         ),
         (
-            server_args.dp_size == 1 and server_args.attn_dp_size == 1,
-            "data parallelism is not supported",
-        ),
-        (
             get_parallel().attn_cp_size == 1,
             "context parallelism is not supported",
         ),

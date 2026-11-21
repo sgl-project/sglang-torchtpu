@@ -133,14 +133,25 @@ SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 Unsupported settings are refused, never run without the offload. An engine
 stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
 pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
-transfer, context or data parallelism,
+transfer, context parallelism,
 speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
 other than raiden, an
 L3 storage backend, HiCache or the radix cache off, the Rust radix tree, or a
 tpu-sync build without the host-to-host read API
 ([google/tpu-sync@32568d35](https://github.com/google/tpu-sync/commit/32568d35)
 or later). A pair fails its requests with the reason when the switch is on for
-one role only or when the roles differ in attention-TP size (resharding).
+one role only or when prefill attention-TP is not a multiple of decode
+attention-TP.
+
+Data parallelism (`--dp-size` and `--enable-dp-attention`) and push-resharding
+(`src_attn_tp > dst_attn_tp`, e.g. an 8TP prefill feeding a 4TP or 4TP2DP
+decode) are supported. When `src_attn_tp > dst_attn_tp`, each decode rank keeps
+`ratio = src_attn_tp // dst_attn_tp` host-only Raiden pools in the prefill
+writers' block layout (sized by `SGLANG_PD_OFFLOAD_RESHARD_STORE_GB`, or the
+rank's HiCache host budget by default; full pages budgeted per SWA window page
+can be tuned via `SGLANG_PD_OFFLOAD_RESHARD_PAGES_PER_WINDOW_PAGE`, default
+`4`) and offers stored prefixes on
+`RESHARD_REQ`.
 
 On a hybrid sliding-window model (GPT-OSS) the offload also moves the last
 sliding window of each branch, through an SWA host pool on both roles. The

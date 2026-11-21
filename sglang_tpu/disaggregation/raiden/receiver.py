@@ -1066,6 +1066,14 @@ class RaidenReceiverMixin:
             self._decode.reshard_swa_sources[room] = {}
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
+            prefix_blocks: List[int] = []
+            prefix_swa_blocks: List[int] = []
+            if self.dram_offload_channel is not None:
+                prefix_blocks, prefix_swa_blocks = (
+                    self.dram_offload_channel.offered_reshard_blocks_locked(
+                        room, bootstrap_infos
+                    )
+                )
         payload = ReshardReq(
             room=room,
             decode_ip=self.local_ip,
@@ -1075,6 +1083,8 @@ class RaidenReceiverMixin:
             dst_attn_tp=self.attn_tp_size,
             decode_swa_blocks=list(local_swa_blocks or []),
             swa_push_endpoint=swa_push_endpoint,
+            prefix_blocks=prefix_blocks,
+            prefix_swa_blocks=prefix_swa_blocks,
             kv_offload=self.dram_offload_channel is not None,
         ).to_frames()
         for info in bootstrap_infos:

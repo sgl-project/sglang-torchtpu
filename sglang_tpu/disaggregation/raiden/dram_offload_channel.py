@@ -42,6 +42,10 @@ from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
     HostPageMetadata,
     discard_host_page_metadata,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.reshard_host_store import (
+    ReshardPoolLayout,
+    ReshardPush,
+)
 from sglang_tpu.disaggregation.raiden import sender as raiden_sender
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -72,16 +76,23 @@ def peer_switch_mismatch(*, decode_enabled: bool) -> Optional[str]:
     )
 
 
-def resharding_refusal(*, decode_enabled: bool) -> Optional[str]:
+def resharding_refusal(
+    *, decode_enabled: bool, src_attn_tp: int = 0, dst_attn_tp: int = 0
+) -> Optional[str]:
     """Why a prefill refuses a decode that asks for a resharded (different
-    attention TP) transfer: the switch is on here, or on the decode only (it
-    would then run without the offload and never say so); None otherwise."""
+    attention TP) transfer: the switch differs between roles, or prefill
+    attention TP is not a strict multiple of decode attention TP."""
+    mismatch = peer_switch_mismatch(decode_enabled=decode_enabled)
+    if mismatch is not None:
+        return mismatch
     if not _SWITCH.get():
-        return peer_switch_mismatch(decode_enabled=decode_enabled)
+        return None
+    if src_attn_tp > dst_attn_tp > 0 and src_attn_tp % dst_attn_tp == 0:
+        return None
     return (
-        f"{_SWITCH.name}=1 does not support resharding: the decode "
-        "runs at a different attention TP size than this prefill; use equal "
-        f"attention TP on both roles or unset {_SWITCH.name}"
+        f"{_SWITCH.name}=1 supports resharding only when prefill attention TP "
+        f"({src_attn_tp}) is a multiple larger than decode attention TP "
+        f"({dst_attn_tp}); adjust attention TP or unset {_SWITCH.name}"
     )
 
 
@@ -127,6 +138,56 @@ class _OfferState(msgspec.Struct):
     pages: List[int]
     swa_pages: List[int]
     prefill_addr: str = ""
+    prefill_addrs: Dict[int, str] = msgspec.field(default_factory=dict)
+
+
+class ReshardPushPart(msgspec.Struct, frozen=True):
+    """Decode: one prefill writer's share of an asymmetric victim push."""
+
+    seq: int
+    writer: int
+    ack_endpoint: str
+    blocks: List[int]
+    swa_blocks: List[int]
+    uuid: int
+    swa_uuid: int
+    address: str
+    swa_address: str
+    layout: ReshardPoolLayout
+    swa_layout: ReshardPoolLayout
+    page_metadata: List[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: List[bytes] = msgspec.field(default_factory=list)
+
+    @classmethod
+    def of(cls, push: VictimPush) -> ReshardPushPart:
+        def build_layout(
+            tensors: list, page_bytes: int, window: bool
+        ) -> ReshardPoolLayout:
+            return ReshardPoolLayout(
+                writer=push.writer,
+                writers=push.writers,
+                tensors=tuple(
+                    (str(d), tuple(int(x) for x in shape)) for d, shape in tensors
+                ),
+                page_bytes=page_bytes,
+                window=window,
+            )
+
+        return cls(
+            seq=push.seq,
+            writer=push.writer,
+            ack_endpoint=push.ack_endpoint,
+            blocks=list(push.blocks),
+            swa_blocks=list(push.swa_blocks),
+            uuid=push.uuid,
+            swa_uuid=push.swa_uuid,
+            address=push.address,
+            swa_address=push.swa_address,
+            layout=build_layout(push.layout, push.page_bytes, False),
+            swa_layout=build_layout(push.swa_layout, push.swa_page_bytes, True),
+            page_metadata=list(push.page_metadata),
+            swa_page_metadata=list(push.swa_page_metadata),
+        )
 
 
 class DramOffloadChannel:
@@ -158,6 +219,12 @@ class DramOffloadChannel:
         self._replies: Dict[int, Optional[bool]] = {}
         # Push, decode: pushes received and not yet taken, by (prefill, seq).
         self._pushes: Dict[Tuple[str, int], VictimPush] = {}
+        # Asymmetric attention TP (src_tp > dst_tp): pushes, pools, offers, and
+        # per-room ((decode_ip, decode_port), writers, writer_index) on prefill.
+        self._reshard_pushes: Dict[Tuple[str, int], ReshardPush] = {}
+        self._reshard_pools: Any = None
+        self._reshard_offers: Dict[int, _OfferState] = {}
+        self._reshard_peers: Dict[int, Tuple[Tuple[str, int], int, int]] = {}
 
     @property
     def _lock(self) -> Any:
@@ -174,9 +241,14 @@ class DramOffloadChannel:
     def forget_room_locked(self, room: int) -> None:
         self._recalls.pop(room, None)
         self._offers.pop(room, None)
-        for req_id in (self.prefix_req_id(room), self.prefix_req_id(room, swa=True)):
-            if self._reads.get(req_id) is not None:
-                del self._reads[req_id]
+        self._reshard_offers.pop(room, None)
+        self._reshard_peers.pop(room, None)
+        for req_id in [
+            req_id
+            for req_id, done in self._reads.items()
+            if done is not None and req_id.startswith(f"{room}#px")
+        ]:
+            del self._reads[req_id]
 
     def _send(self, *, endpoint: str, message: Any) -> bool:
         # A peer that cannot be reached costs only this recall or push; the
@@ -264,12 +336,34 @@ class DramOffloadChannel:
         """Read a peer's registered host pages into this engine's host pages
         (of its SWA pool with ``swa``); no device page and no staging slot is
         involved."""
+        pool = self._host_pools[swa]
+        return self._start_read(
+            req_id,
+            uuid,
+            endpoint,
+            remote,
+            local,
+            pool.transfer,
+            discard_metadata=lambda: discard_host_page_metadata(pool, local),
+        )
+
+    def _start_read(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        transfer: Any,
+        *,
+        discard_metadata: Optional[Callable[[], None]] = None,
+    ) -> bool:
         with self._lock:
             if self._mgr._room_of(req_id) in self._mgr._aborted:
                 return False
-            transfer = self._host_pools[swa].transfer
             try:
-                discard_host_page_metadata(self._host_pools[swa], local)
+                if discard_metadata is not None:
+                    discard_metadata()
                 transfer.start_read(req_id, uuid, endpoint, remote, local)
             except Exception as exc:  # noqa: BLE001 - the caller gives the read up
                 logger.warning("Cannot start host read %s: %s", req_id, exc)
@@ -277,6 +371,39 @@ class DramOffloadChannel:
             self._reads[req_id] = None
             self._read_transfers[req_id] = transfer
             return True
+
+    def bind_reshard_pools(self, pools: Any) -> None:
+        with self._lock:
+            self._reshard_pools = pools
+
+    def start_reshard_read(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        *,
+        writer: int,
+        swa: bool = False,
+    ) -> bool:
+        """Read a prefill writer's registered host pages into this decode rank's
+        matching writer pool."""
+        pools = self._reshard_pools
+        discard = (
+            (lambda: pools.discard_metadata(local, writer=writer, swa=swa))
+            if hasattr(pools, "discard_metadata")
+            else None
+        )
+        return self._start_read(
+            req_id,
+            uuid,
+            endpoint,
+            remote,
+            local,
+            pools.transfer(writer, swa=swa),
+            discard_metadata=discard,
+        )
 
     def poll_host_reads(self, req_ids: Sequence[str]) -> Optional[bool]:
         """None while raiden may still read or write any of the reads' pages,
@@ -411,15 +538,44 @@ class DramOffloadChannel:
             if recall is not None:
                 recall.resolved = True
 
+    def accept_reshard_req_locked(
+        self,
+        room: int,
+        *,
+        decode_ip: str,
+        decode_port: int,
+        dst_attn_tp: int,
+        blocks: List[int],
+        swa_blocks: List[int],
+    ) -> None:
+        """Record the asymmetric decode peer and offered reshard prefix for ``room``."""
+        src_tp = int(getattr(self._mgr, "attn_tp_size", 1))
+        writers = max(1, src_tp // max(1, dst_attn_tp))
+        writer = int(self._mgr.attn_tp_rank) % writers
+        self._reshard_peers[room] = ((decode_ip, decode_port), writers, writer)
+        self.accept_prefix_offer_locked(room, blocks, swa_blocks)
+
     def ask_prefix_pull(self, room: int, first_page: int, num_pages: int) -> bool:
         """Ask the decode to register offered pages [first_page, +num_pages)."""
         with self._lock:
+            if room in self._mgr._aborted:
+                return False
             addr = self._mgr._prefill.decode_addr.get(room)
-            if room in self._mgr._aborted or addr is None:
+            writer = -1
+            if addr is None:
+                peer = self._reshard_peers.get(room)
+                if peer is not None:
+                    addr, _, writer = peer
+            if addr is None:
                 return False
         return self._send(
             endpoint=_tcp_endpoint(ip=addr[0], port=addr[1]),
-            message=PrefixPull(room=room, first_page=first_page, num_pages=num_pages),
+            message=PrefixPull(
+                room=room,
+                first_page=first_page,
+                num_pages=num_pages,
+                writer=writer,
+            ),
         )
 
     def _on_prefix_ready(self, msg: List[bytes]) -> None:
@@ -452,13 +608,37 @@ class DramOffloadChannel:
                     swa_pages=[int(x) for x in swa_page_ids],
                 )
 
+    def offer_reshard_prefix(
+        self, room: int, page_ids: Sequence[int], swa_page_ids: Sequence[int] = ()
+    ) -> None:
+        """Offer page ids out of this decode rank's reshard-layout store."""
+        with self._lock:
+            if page_ids and room not in self._mgr._aborted:
+                self._reshard_offers[room] = _OfferState(
+                    pages=[int(x) for x in page_ids],
+                    swa_pages=[int(x) for x in swa_page_ids],
+                )
+
+    def offered_reshard_blocks_locked(
+        self, room: int, bootstrap_infos: List[dict]
+    ) -> Tuple[List[int], List[int]]:
+        """Page ids offered in RESHARD_REQ; records each writer's prefill endpoint."""
+        offer = self._reshard_offers.get(room)
+        if offer is None:
+            return [], []
+        offer.prefill_addrs = {
+            writer: _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
+            for writer, info in enumerate(bootstrap_infos)
+        }
+        return offer.pages, offer.swa_pages
+
     def release_prefix_offer(self, room: int) -> None:
         # A late PREFIX_PULL must not register pages the queue relinquished;
         # it is still answered, with a refusal.
         with self._lock:
-            offer = self._offers.get(room)
-            if offer is not None:
-                offer.pages = offer.swa_pages = []
+            for offer in (self._offers.get(room), self._reshard_offers.get(room)):
+                if offer is not None:
+                    offer.pages = offer.swa_pages = []
 
     def host_prefix_pending(self, room: int) -> bool:
         with self._lock:
@@ -481,6 +661,9 @@ class DramOffloadChannel:
         # Any refusal answers with uuid 0, so the prefill computes the prompt
         # at once; a prefix read never fails the decode's own room.
         req = PrefixPull.from_frames(msg)
+        if req.writer >= 0:
+            self._on_reshard_prefix_pull(req)
+            return
         room = req.room
         registration = PrefixRegistration()
         with self._lock:
@@ -552,12 +735,191 @@ class DramOffloadChannel:
             swa_page_metadata=swa_metadata,
         )
 
+    @staticmethod
+    def reshard_prefix_req_id(room: int, writer: int, *, swa: bool = False) -> str:
+        return f"{room}#px{'s' * swa}.w{writer}"
+
+    def _on_reshard_prefix_pull(self, req: PrefixPull) -> None:
+        room, writer = req.room, req.writer
+        registration = PrefixRegistration()
+        with self._lock:
+            offer = self._reshard_offers.get(room)
+            if offer is None:
+                return
+            reply_endpoint = offer.prefill_addrs.get(writer)
+            if reply_endpoint is None:
+                return
+            wanted = offer.pages[req.first_page : req.first_page + req.num_pages]
+            if room in self._mgr._aborted or len(wanted) != req.num_pages:
+                logger.warning(
+                    "RaidenKVManager rank%d room %s: writer %d PREFIX_PULL for "
+                    "pages [%d, %d) of %d offered cannot be served, refusing",
+                    self._mgr.attn_tp_rank,
+                    room,
+                    writer,
+                    req.first_page,
+                    req.first_page + req.num_pages,
+                    len(offer.pages),
+                )
+            else:
+                registration = self._register_reshard_pull_locked(
+                    room, writer, wanted, offer.swa_pages
+                )
+        self._send(
+            endpoint=reply_endpoint,
+            message=PrefixReady(
+                room=room,
+                uuid=registration.uuid,
+                endpoint=registration.endpoint,
+                swa_uuid=registration.swa_uuid,
+                swa_endpoint=registration.swa_endpoint,
+                page_metadata=registration.page_metadata,
+                swa_page_metadata=registration.swa_page_metadata,
+            ),
+        )
+
+    def _register_reshard_pull_locked(
+        self, room: int, writer: int, pages: List[int], swa_pages: List[int]
+    ) -> PrefixRegistration:
+        pools = self._reshard_pools
+        if pools is None or not pools.has(writer):
+            return PrefixRegistration()
+        if swa_pages and not pools.has(writer, swa=True):
+            return PrefixRegistration()
+        try:
+            metadata = (
+                pools.export_metadata(writer, pages, swa=False)
+                if hasattr(pools, "export_metadata")
+                else []
+            )
+            swa_metadata = (
+                pools.export_metadata(writer, swa_pages, swa=True)
+                if swa_pages and hasattr(pools, "export_metadata")
+                else []
+            )
+        except Exception:  # noqa: BLE001 - refuse the recall without registering reads
+            logger.exception(
+                "Cannot export reshard prefix host metadata for room %s writer %d",
+                room,
+                writer,
+            )
+            return PrefixRegistration()
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
+        transfer = pools.transfer(writer, swa=False)
+        req_id = self.reshard_prefix_req_id(room, writer, swa=False)
+        try:
+            transfer.register_read(req_id, uuid, pages)
+        except Exception as exc:  # noqa: BLE001 - prefill computes instead
+            logger.warning("Cannot register reshard host read %s: %s", req_id, exc)
+            return PrefixRegistration()
+        self._reads[req_id] = None
+        self._read_transfers[req_id] = transfer
+        endpoint = transfer.host_control_address(self._mgr.local_ip)
+        if not swa_pages:
+            return PrefixRegistration(
+                uuid=uuid,
+                endpoint=endpoint,
+                page_metadata=metadata,
+            )
+        if not pools.has(writer, swa=True):
+            return PrefixRegistration()
+        swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
+        while swa_uuid == uuid:
+            swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
+        swa_transfer = pools.transfer(writer, swa=True)
+        swa_req_id = self.reshard_prefix_req_id(room, writer, swa=True)
+        try:
+            swa_transfer.register_read(swa_req_id, swa_uuid, swa_pages)
+        except Exception as exc:  # noqa: BLE001 - prefill computes instead
+            logger.warning("Cannot register reshard host read %s: %s", swa_req_id, exc)
+            return PrefixRegistration()
+        self._reads[swa_req_id] = None
+        self._read_transfers[swa_req_id] = swa_transfer
+        return PrefixRegistration(
+            uuid=uuid,
+            endpoint=endpoint,
+            swa_uuid=swa_uuid,
+            swa_endpoint=swa_transfer.host_control_address(self._mgr.local_ip),
+            page_metadata=metadata,
+            swa_page_metadata=swa_metadata,
+        )
+
     # ----- push (prefill_dram_victim_pusher.py, decode_dram_victim_receiver.py) ------------------------
 
     def decode_peer(self, room: int) -> Optional[Tuple[str, int]]:
-        """(ip, port) of the decode rank whose PULL_REQ named the room."""
+        """(ip, port) of the decode rank whose PULL_REQ or RESHARD_REQ named the room."""
         with self._lock:
-            return self._mgr._prefill.decode_addr.get(room)
+            addr = self._mgr._prefill.decode_addr.get(room)
+            if addr is not None:
+                return addr
+            peer = self._reshard_peers.get(room)
+            return None if peer is None else peer[0]
+
+    def reshard_route(self, room: int) -> Optional[Tuple[int, int]]:
+        """(writers, writer_index) when ``room`` serves a resharded decode, else None."""
+        with self._lock:
+            peer = self._reshard_peers.get(room)
+            return None if peer is None else (peer[1], peer[2])
+
+    def send_reshard_victim_push(
+        self,
+        *,
+        decode: Tuple[str, int],
+        prefill: str,
+        seq: int,
+        writer: int,
+        writers: int,
+        tokens: List[int],
+        blocks: List[int],
+        uuid: int,
+        extra_key: Optional[str],
+        cache_salt: Optional[str],
+        window_pages: int,
+        layout: ReshardPoolLayout,
+        swa_layout: Optional[ReshardPoolLayout] = None,
+        swa_blocks: Sequence[int] = (),
+        swa_uuid: int = 0,
+        page_metadata: Sequence[bytes] = (),
+        swa_page_metadata: Sequence[bytes] = (),
+    ) -> bool:
+        """Offer this prefill writer's registered host pages to its decode rank."""
+        with self._lock:
+            self._replies[seq] = None
+
+        def wire(pool_layout: Optional[ReshardPoolLayout]) -> list:
+            return [
+                [d, list(shape)]
+                for d, shape in (pool_layout.tensors if pool_layout else ())
+            ]
+
+        return self._send(
+            endpoint=_tcp_endpoint(ip=decode[0], port=decode[1]),
+            message=VictimPush(
+                prefill=prefill,
+                seq=seq,
+                ack_endpoint=_tcp_endpoint(
+                    ip=self._mgr.local_ip, port=self._mgr.rank_port
+                ),
+                tokens=list(tokens) if writer == 0 else [],
+                blocks=list(blocks),
+                uuid=uuid,
+                address=self.host_control_address(),
+                swa_blocks=list(swa_blocks),
+                swa_uuid=swa_uuid,
+                swa_address=self.host_control_address(swa=True) if swa_blocks else "",
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+                page_metadata=list(page_metadata),
+                swa_page_metadata=list(swa_page_metadata),
+                writer=writer,
+                writers=writers,
+                window_pages=window_pages,
+                layout=wire(layout),
+                page_bytes=layout.page_bytes,
+                swa_layout=wire(swa_layout),
+                swa_page_bytes=swa_layout.page_bytes if swa_layout else 0,
+            ),
+        )
 
     def send_victim_push(
         self,
@@ -571,6 +933,7 @@ class DramOffloadChannel:
         extra_key: Optional[str],
         cache_salt: Optional[str],
         swa_blocks: Sequence[int] = (),
+        swa_uuid: int = 0,
         page_metadata: Sequence[bytes] = (),
         swa_page_metadata: Sequence[bytes] = (),
     ) -> bool:
@@ -591,6 +954,7 @@ class DramOffloadChannel:
                 uuid=uuid,
                 address=self.host_control_address(),
                 swa_blocks=list(swa_blocks),
+                swa_uuid=swa_uuid if swa_blocks else 0,
                 swa_address=self.host_control_address(swa=True) if swa_blocks else "",
                 extra_key=extra_key,
                 cache_salt=cache_salt,
@@ -618,7 +982,24 @@ class DramOffloadChannel:
     def _on_victim_push(self, msg: List[bytes]) -> None:
         push = VictimPush.from_frames(msg)
         with self._lock:
-            self._pushes[(push.prefill, push.seq)] = push
+            if push.writers <= 1:
+                self._pushes[(push.prefill, push.seq)] = push
+                return
+            entry = self._reshard_pushes.setdefault(
+                (push.prefill, push.seq), ReshardPush()
+            )
+            if push.tokens:
+                entry.header = push
+            if push.uuid and push.writer >= 0:
+                entry.parts[push.writer] = ReshardPushPart.of(push)
+
+    def received_reshard_pushes(self) -> Dict[Tuple[str, int], ReshardPush]:
+        with self._lock:
+            return dict(self._reshard_pushes)
+
+    def take_reshard_push(self, key: Tuple[str, int]) -> Optional[ReshardPush]:
+        with self._lock:
+            return self._reshard_pushes.pop(key, None)
 
     def received_pushes(self) -> Dict[Tuple[str, int], VictimPush]:
         """Pushes received and not yet taken."""

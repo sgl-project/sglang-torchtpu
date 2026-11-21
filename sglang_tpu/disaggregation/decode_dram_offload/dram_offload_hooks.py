@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Union
 
 import msgspec
 
+from sglang.srt.disaggregation.base.conn import KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -41,10 +42,12 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller im
 )
 from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher import (
     PrefillDramVictimPusher,
+    log_offload_stats,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     anchor_host_pool,
     deletion_orphans_host_only_child,
+    offer_limit,
     swa_host_pool,
     window_tokens,
 )
@@ -52,9 +55,16 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
     RankLockstep,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.reshard_host_store import (
+    DecodeReshardBranchOfferer,
+    DecodeReshardBranchReceiver,
+    ReshardPoolSet,
+    build_reshard_pool,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.startup_validation import (
     validate_engine_args,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
 _is_installed = False
@@ -74,9 +84,77 @@ class DecodeDramOffloadExtension(msgspec.Struct, frozen=True):
 
     landing: DecodeDramVictimReceiver
     source: DecodeDramPrefixOfferer
+    reshard_landing: Optional[DecodeReshardBranchReceiver] = None
+    reshard_source: Optional[DecodeReshardBranchOfferer] = None
 
 
 DramOffloadExtension = Union[PrefillDramOffloadExtension, DecodeDramOffloadExtension]
+
+
+def _reshard_store_budget(host_pool: Any) -> int:
+    configured = int(tpu_envs.SGLANG_PD_OFFLOAD_RESHARD_STORE_GB.get() * 2**30)
+    if configured > 0:
+        return configured
+    size_per_token = int(getattr(host_pool, "size_per_token", 0) or 0)
+    if size_per_token > 0:
+        return int(host_pool.size) * size_per_token
+    tensors = [
+        t for layer in getattr(host_pool.transfer, "_device_tensors", ()) for t in layer
+    ]
+    if tensors:
+        page_bytes = sum(int(t.nbytes) // int(t.shape[0]) for t in tensors)
+        return page_bytes * int(host_pool.transfer.num_host_pages)
+    return max(1, int(getattr(host_pool, "size", 1)))
+
+
+def _build_reshard_workers(
+    *,
+    channel: Any,
+    lockstep: RankLockstep,
+    host_pool: Any,
+    page_size: int,
+    decode_queue: Any,
+) -> tuple[DecodeReshardBranchReceiver, DecodeReshardBranchOfferer]:
+    mgr = getattr(channel, "_mgr", None)
+    rank = int(getattr(mgr, "attn_tp_rank", 0))
+    tensors = getattr(host_pool.transfer, "_device_tensors", None)
+    device = tensors[0][0].device if tensors else "cpu"
+    pools = ReshardPoolSet(
+        rank=rank,
+        budget_bytes=_reshard_store_budget(host_pool),
+        build_pool=functools.partial(build_reshard_pool, device=device),
+    )
+    bind_fn = getattr(channel, "bind_reshard_pools", None)
+    if callable(bind_fn):
+        bind_fn(pools)
+    last_log = [0.0]
+    landing = DecodeReshardBranchReceiver(
+        channel=channel,
+        lockstep=lockstep,
+        pools=pools,
+        page_size=page_size,
+        log_stats=lambda stats: (
+            log_offload_stats(stats, "reshard landing", last_log)
+            if any(stats.values())
+            else None
+        ),
+    )
+
+    def owned_rooms():
+        rooms = {dr.req.bootstrap_room for dr in getattr(decode_queue, "queue", ())}
+        rooms.update(
+            entry[0].req.bootstrap_room
+            for entry in getattr(decode_queue, "_deferred_releases", ())
+        )
+        return rooms
+
+    source = DecodeReshardBranchOfferer(
+        channel=channel,
+        lockstep=lockstep,
+        receiver=landing,
+        owned_rooms=owned_rooms,
+    )
+    return landing, source
 
 
 def attach_dram_offload_extension(
@@ -89,25 +167,34 @@ def attach_dram_offload_extension(
         host_pool, swa_pool, retain_metadata=decode_queue is not None
     )
     page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
+    lockstep = RankLockstep.of(scheduler)
     ctx = DramOffloadWorkerContext(
         cache=cache,
         host_pool=host_pool,
         page_size=page_size,
         channel=channel,
-        lockstep=RankLockstep.of(scheduler),
+        lockstep=lockstep,
         swa_host_pool=swa_pool,
         window_tokens=window_tokens(cache, page_size),
     )
-    extension = (
-        PrefillDramOffloadExtension(
+    if decode_queue is None:
+        extension: DramOffloadExtension = PrefillDramOffloadExtension(
             recall=PrefillDramPrefixPuller(ctx), push=PrefillDramVictimPusher(ctx)
         )
-        if decode_queue is None
-        else DecodeDramOffloadExtension(
+    else:
+        reshard_landing, reshard_source = _build_reshard_workers(
+            channel=channel,
+            lockstep=lockstep,
+            host_pool=host_pool,
+            page_size=page_size,
+            decode_queue=decode_queue,
+        )
+        extension = DecodeDramOffloadExtension(
             landing=DecodeDramVictimReceiver(ctx),
             source=DecodeDramPrefixOfferer(ctx, decode_queue),
+            reshard_landing=reshard_landing,
+            reshard_source=reshard_source,
         )
-    )
     cache.cache_controller.decode_dram_extension = extension
     return extension
 
@@ -129,6 +216,12 @@ def _settle_host_transfers(extension: DramOffloadExtension) -> None:
     else:
         extension.source.settle_offers()
         extension.landing.finish_agreed_landings()
+        reshard_source = getattr(extension, "reshard_source", None)
+        reshard_landing = getattr(extension, "reshard_landing", None)
+        if reshard_source is not None:
+            reshard_source.settle_offers()
+        if reshard_landing is not None:
+            reshard_landing.finish_agreed_landings()
 
 
 def _holds_host_pages_outside_tree(extension: DramOffloadExtension) -> bool:
@@ -137,7 +230,14 @@ def _holds_host_pages_outside_tree(extension: DramOffloadExtension) -> bool:
             extension.recall.holds_host_landing_pages()
             or extension.push.has_pushes_in_flight()
         )
-    return bool(extension.source.offers) or extension.landing.has_host_landings()
+    reshard_source = getattr(extension, "reshard_source", None)
+    reshard_landing = getattr(extension, "reshard_landing", None)
+    return (
+        bool(extension.source.offers)
+        or extension.landing.has_host_landings()
+        or bool(reshard_source and reshard_source.offers)
+        or bool(reshard_landing and reshard_landing.has_host_landings())
+    )
 
 
 def _release_all(extension: DramOffloadExtension) -> None:
@@ -147,6 +247,12 @@ def _release_all(extension: DramOffloadExtension) -> None:
     else:
         extension.landing.release_all()
         extension.source.release_all()
+        reshard_landing = getattr(extension, "reshard_landing", None)
+        reshard_source = getattr(extension, "reshard_source", None)
+        if reshard_landing is not None:
+            reshard_landing.release_all()
+        if reshard_source is not None:
+            reshard_source.release_all()
 
 
 def _decode_add(
@@ -221,6 +327,11 @@ def _record_scheduler_state_for_paused_engine(upstream: Callable, scheduler: Any
     return upstream(scheduler)
 
 
+def _is_reshard_request(decode_req: Any) -> bool:
+    infos = getattr(getattr(decode_req, "kv_receiver", None), "bootstrap_infos", None)
+    return isinstance(infos, list) and len(infos) > 1
+
+
 def _send_kv_metadata(
     upstream: Callable,
     queue: DecodePreallocQueue,
@@ -232,11 +343,22 @@ def _send_kv_metadata(
 ) -> Any:
     """Wraps ``DecodePreallocQueue._send_kv_metadata``: pin and offer the
     pushed prefix this decode holds for the request first, so that its
-    PULL_REQ names the pages. Every rank pre-allocates the same requests in the
-    same order in a step, so the host pins agree; a request the decode holds no
-    page of (a host receive included) offers nothing."""
-    if kwargs["decode_prefix_len"] >= page_size:
-        _extension(queue.tree_cache).source.offer_host_prefix(decode_req)
+    PULL_REQ or RESHARD_REQ names the pages. Every rank pre-allocates the same
+    requests in the same order in a step, so the host pins agree; a request the
+    decode holds no page of (a host receive included) offers nothing."""
+    if kwargs.get("destination") != KVTransferDestination.HOST:
+        if _is_reshard_request(decode_req):
+            ext = _extension(queue.tree_cache)
+            if ext is not None and ext.reshard_source is not None:
+                req = decode_req.req
+                limit = offer_limit(req=req, page_size=page_size)
+                ext.reshard_source.offer_reshard_prefix(
+                    room=req.bootstrap_room,
+                    tokens=list(req.origin_input_ids[:limit]),
+                    scope=(req.extra_key, req.cache_salt),
+                )
+        elif kwargs["decode_prefix_len"] >= page_size:
+            _extension(queue.tree_cache).source.offer_host_prefix(decode_req)
     return upstream(queue, decode_req, kv_indices, page_size, *args, **kwargs)
 
 
@@ -246,7 +368,11 @@ def _move_transferred_with_outcomes(
     """Wraps ``DecodeTransferQueue.move_transferred_with_outcomes``: close the
     offers of the requests that left the queue in this step, on every rank."""
     result = upstream(queue, *args, **kwargs)
-    _extension(queue.tree_cache).source.close_departed_offers()
+    extension = _extension(queue.tree_cache)
+    extension.source.close_departed_offers()
+    reshard_source = getattr(extension, "reshard_source", None)
+    if reshard_source is not None:
+        reshard_source.close_departed_offers()
     return result
 
 
@@ -257,6 +383,12 @@ def _resolve_deferred_releases(upstream: Callable, queue: DecodeTransferQueue) -
     extension = _extension(queue.tree_cache)
     extension.source.settle_offers()
     extension.landing.advance()
+    reshard_source = getattr(extension, "reshard_source", None)
+    reshard_landing = getattr(extension, "reshard_landing", None)
+    if reshard_source is not None:
+        reshard_source.settle_offers()
+    if reshard_landing is not None:
+        reshard_landing.advance()
     return result
 
 
