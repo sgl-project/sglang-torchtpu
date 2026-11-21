@@ -687,6 +687,7 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
     for a V4.1 model and reset ratio-2 pair state whenever a request slot is
     (re)allocated. Other DeepSeek-V4 models fall through to ``original``."""
     import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+    from sglang_tpu.hooks.dsv4 import chain_on_alloc_rows
 
     # Keyed on the target's ratios, so a V4.1 draft worker gets this pool too.
     if not uses_dsv41_pool(kvc.model_config.compress_ratios):
@@ -697,7 +698,7 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
         pool = core_build(kvc, *args, **kwargs)
     # The draft pool has only ratio-0 layers and shares this req pool.
     if not kvc.is_draft_worker:
-        kwargs["req_to_token_pool"].register_on_alloc_rows(pool.clear_request_slots)
+        chain_on_alloc_rows(kwargs["req_to_token_pool"], pool.clear_request_slots)
     return pool
 
 
