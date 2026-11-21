@@ -25,8 +25,15 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang_tpu.attention_pallas_mla_sparse import topk_row_width
+from sglang_tpu.experimental.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
+)
 from sglang_tpu.experimental.speculative.chain_draft_worker import (
     TpuChainDraftWorker,
+)
+from sglang_tpu.experimental.speculative.mtp.kv_only_prompt import (
+    KvOnlyPromptPlan,
+    kv_only_prompt_plan,
 )
 
 # Each reads the target hidden from spec_info.hidden_states and returns its own
@@ -61,6 +68,16 @@ class TpuMtpDraftWorker(TpuChainDraftWorker):
         # The fused draft is shared by all TP ranks, so shard bounds come from a rank buffer.
         draft_model.model.embed_tokens.lift_rank_to_input()
         self._draft_model = draft_model
+
+    def kv_only_prompt_plan(
+        self, compile_policy: TpuChainSpecDecodeCompilePolicyMixin
+    ) -> KvOnlyPromptPlan | None:
+        return kv_only_prompt_plan(
+            draft_model=self._draft_model,
+            attn_backend=self.model_runner.attn_backend,
+            buckets=list(compile_policy.t_bucketer.buckets),
+            last_row_tokens=compile_policy.kv_only_last_row_tokens(),
+        )
 
     def first_draft_logits(self, carry: torch.Tensor) -> torch.Tensor:
         # The carry is the logits input the draft's final norm already produced.

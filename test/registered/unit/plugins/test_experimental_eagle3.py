@@ -1008,6 +1008,9 @@ class TestChainDsaIndexShare(CustomTestCase):
             carry=torch.zeros((rows, self.HIDDEN)),
             dsa_seed_topk_width=None if seed_table is None else self.WIDTH,
             dsa_seed_topk_table=seed_table,
+            # No bucket takes the two-pass draft prompt pass.
+            kv_only_prompt_tokens=frozenset(),
+            kv_only_last_row_tokens=0,
         )
 
     def _commit(self, *, seed_table, rows_topk, num_correct_drafts, req_pool_indices):
