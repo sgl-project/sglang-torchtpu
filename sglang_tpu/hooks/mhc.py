@@ -29,13 +29,20 @@ _kernel: ModuleType | None = None
 
 def _kernel_for_batch() -> ModuleType | None:
     """The kernel, except on input-scattered (sequence-parallel) prefill
-    batches: there the residual is this rank's token slice, which the kernel's
-    site wiring does not handle, and the torch path runs on 1/tp of the tokens."""
+    batches unless SGLANG_TPU_FUSED_MHC_INPUT_SCATTERED: there a site's residual
+    is this rank's token slice (the kernel is per token; shapes it does not take
+    still decline to the torch path)."""
     from sglang.srt.layers.layer_boundary.adapters.attention import (
         get_attn_tp_context,
     )
+    from sglang_tpu.envs import envs as tpu_envs
 
-    if _kernel is None or get_attn_tp_context().input_scattered:
+    if _kernel is None:
+        return None
+    if (
+        get_attn_tp_context().input_scattered
+        and not tpu_envs.SGLANG_TPU_FUSED_MHC_INPUT_SCATTERED.get()
+    ):
         return None
     return _kernel
 

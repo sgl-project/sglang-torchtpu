@@ -152,6 +152,9 @@ class TpuEnvs:
     # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch
     # hc_pre / hc_post (see mhc.py and hooks/mhc.py).
     SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC = EnvBool(False)
+    # With the fused mHC kernel on: also run it on input-scattered (sequence-parallel)
+    # prefill batches instead of the torch path.
+    SGLANG_TPU_FUSED_MHC_INPUT_SCATTERED = EnvBool(False)
     # Drop Dynamo guards on nn.Module state (attributes, submodules, parameters)
     # for the decoder graph; input and global guards stay (see
     # decoder_compile_policy._guard_filter_options). Assumes module state is
