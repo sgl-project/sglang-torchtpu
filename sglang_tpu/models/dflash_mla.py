@@ -170,7 +170,10 @@ class DFlashMLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        zero_allocator=None,
     ) -> torch.Tensor:
+        # Core passes zero_allocator to every MLA draft layer; the MHA path needs none.
+        del zero_allocator
         q_nope, q_pe = self._project_q(hidden_states)
         k_nope, k_pe, v = self._project_kv(hidden_states)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
