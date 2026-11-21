@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
+import threading
 import weakref
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
@@ -1545,17 +1546,39 @@ def _padded_history(history, req_pool_indices):
     return torch.cat([history, history.new_zeros(missing, history.shape[1])])
 
 
+# Serializes host_table_without_cuda: overlapping uses would restore each
+# other's stubs as the "originals".
+_HOST_TABLE_STUB_LOCK = threading.Lock()
+
+
 @contextlib.contextmanager
-def without_cuda_host_register():
-    """_HostTable pins its mapping with cudaHostRegister for GPU reads; the TPU
-    lookup gathers on the host, so the pin is a no-op here."""
+def host_table_without_cuda():
+    """Build an EngramEmbedding host table without its CUDA calls.
+
+    _HostTable pins its mapping with cudaHostRegister, and EngramEmbedding asks
+    the current CUDA device whether host rows must be read in address order.
+    Both serve GPU reads; the TPU lookup gathers on the host, so the pin is a
+    no-op and the order flag keeps its default (False)."""
+    from sglang.srt.layers import engram
+
     stub = SimpleNamespace(cudaHostRegister=lambda *args: 0)
-    original = torch.cuda.cudart
-    torch.cuda.cudart = lambda: stub
-    try:
-        yield
-    finally:
-        torch.cuda.cudart = original
+    with _HOST_TABLE_STUB_LOCK:
+        saved = (
+            torch.cuda.cudart,
+            torch.cuda.current_device,
+            engram._sorted_host_reads,
+        )
+        torch.cuda.cudart = lambda: stub
+        torch.cuda.current_device = lambda: 0
+        engram._sorted_host_reads = lambda device: False
+        try:
+            yield
+        finally:
+            (
+                torch.cuda.cudart,
+                torch.cuda.current_device,
+                engram._sorted_host_reads,
+            ) = saved
 
 
 # hasher -> verify commits not yet applied to its host history, oldest first.

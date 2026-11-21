@@ -2294,3 +2294,117 @@ def test_stage_all_falls_back_when_folded_extend_lens_drift():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+
+
+# One Engram layer with two hash columns: primes 5 and 7 (above
+# engram_vocab_size - 1), so the column-aligned split over TP 2 is [0, 5) and
+# [5, 12) while an equal-row split would be [0, 6) and [6, 12).
+_ENGRAM_CONFIG = SimpleNamespace(
+    engram_layer_ids=[1],
+    engram_max_ngram_size=2,
+    engram_n_heads=2,
+    engram_vocab_size=5,
+    engram_num_embeddings=[12],
+    engram_head_dim=128,
+)
+
+
+def _host_engram_embedding(monkeypatch, *, tp_rank: int, tp_size: int):
+    """A real EngramEmbedding host table built through the TPU init hook, as on a
+    TPU host (no CUDA)."""
+    from sglang.srt.arg_groups.engram_config import (
+        EngramConfig,
+        EngramLookup,
+        EngramPlacement,
+        EngramReplication,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers import engram
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        engram,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, tp_group=None),
+    )
+    config = EngramConfig(
+        placement=EngramPlacement.CPU,
+        replication=EngramReplication.NONE,
+        lookup=EngramLookup.ALL_REDUCE,
+    )
+    monkeypatch.setattr(engram, "resolve_engram_config", lambda columns: config)
+    # Skip dropping the checkpoint page cache; there is no model directory here.
+    monkeypatch.setattr(engram, "_page_cache_dropped", True)
+    layout = engram.EngramLayout.from_config(_ENGRAM_CONFIG)
+    embedding = engram.EngramEmbedding.__new__(engram.EngramEmbedding)
+    with (
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(True),
+        envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.override("shared"),
+    ):
+        hooks.tpu_dsv41_engram_embed_init(
+            engram.EngramEmbedding.__init__,
+            embedding,
+            layout.num_embeddings[0],
+            layout.head_dim,
+            1,
+            column_bounds=layout.column_bounds(0),
+        )
+    return embedding
+
+
+def test_engram_host_table_init_needs_no_cuda(monkeypatch):
+    """Regression: the TPU init hook built the host table with only
+    cudaHostRegister stubbed, and the core later started asking
+    torch.cuda.current_device() for its host read order, so every rank died
+    at model init on a machine without CUDA."""
+    embedding = _host_engram_embedding(monkeypatch, tp_rank=0, tp_size=1)
+
+    assert embedding.host_table is not None
+    assert not embedding.shared_host_table_without_ats
+
+
+def test_engram_row_reader_loads_each_ranks_rows(monkeypatch, tmp_path):
+    """Regression: the TPU loader read each rank's Engram rows as an equal-row
+    split after the core moved EngramEmbedding to hash-column boundaries, so
+    loading rejected every rank's rows. Each rank must read exactly the rows
+    its EngramEmbedding owns, and get the checkpoint's bytes."""
+    from safetensors.torch import save_file
+
+    from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+    from sglang_tpu.models.deepseek_v41 import engram_row_reader as reader
+
+    weight = torch.arange(12 * 128, dtype=torch.float32).remainder(200)
+    weight = weight.view(12, 128).to(torch.float8_e4m3fn)
+    blocks = 128 // FP8_BLOCK_SIZE
+    scale = torch.arange(12 * blocks, dtype=torch.float32).remainder(20).exp2()
+    scale = scale.view(12, blocks).to(torch.float8_e8m0fnu)
+    names = {"weight": "layers.1.engram.embed.weight"}
+    names["scale"] = "layers.1.engram.embed.scale"
+    path = str(tmp_path / "model-00001.safetensors")
+    save_file({names["weight"]: weight, names["scale"]: scale}, path)
+    raw = open(path, "rb").read()
+
+    def read_range(_path, offset, out):
+        out.copy_(
+            torch.frombuffer(
+                bytearray(raw[offset : offset + out.numel()]), dtype=torch.uint8
+            )
+        )
+
+    monkeypatch.setattr(reader, "_read_range", read_range)
+    for tp_rank in range(2):
+        embedding = _host_engram_embedding(monkeypatch, tp_rank=tp_rank, tp_size=2)
+        ranges = reader.engram_row_ranges(
+            names.values(), _ENGRAM_CONFIG, tp_rank=tp_rank, tp_size=2
+        )
+        shard_of = dict.fromkeys(names.values(), path)
+        for name, rows in reader.iter_row_tables(shard_of=shard_of, ranges=ranges):
+            param = embedding.weight if name == names["weight"] else embedding.scale
+            reader.load_local_rows(None, embedding, param, rows)
+        owned = slice(embedding.row_start, embedding.row_start + embedding.rows)
+        assert torch.equal(
+            embedding.weight.view(torch.uint8), weight[owned].view(torch.uint8)
+        )
+        assert torch.equal(
+            embedding.scale.view(torch.uint8), scale[owned].view(torch.uint8)
+        )

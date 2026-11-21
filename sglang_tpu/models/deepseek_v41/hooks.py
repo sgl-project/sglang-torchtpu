@@ -86,12 +86,15 @@ tpu_dsv41_hasher_forward
        ranks (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1, layout "shared"); the
        in-graph lookup of HBM tables returned wrong outputs under attention DP
        and its offloaded gather halted a SparseCore. _HostTable pins its
-       mapping with cudaHostRegister, and the core lookup reads it from a GPU.
+       mapping with cudaHostRegister, EngramEmbedding queries the current CUDA
+       device for its host read order, and the core lookup reads the table
+       from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
-       builds the table with cudaHostRegister stubbed out. The V4 compile
-       policy and its forward shim (deepseek_v41/compile_policy.py) hash on the
-       host and stage packed rows via double-buffered async raw DMA; inside the
-       graph EngramHasher.forward returns the staged row ids and
+       builds the table with cudaHostRegister and the CUDA device query
+       stubbed out. The V4 compile policy and its forward shim
+       (deepseek_v41/compile_policy.py) hash on the host and stage packed rows
+       via double-buffered async raw DMA; inside the graph
+       EngramHasher.forward returns the staged row ids and
        EngramEmbedding.forward unpacks and dequantizes the staged rows.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: the device can read host tables, or the in-graph HBM lookup
@@ -521,9 +524,9 @@ def tpu_dsv41_engram_embed_init(original, embedding, *args, **kwargs):
             "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 and "
             "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared"
         )
-    from sglang_tpu.models.deepseek_v41.engram_host import without_cuda_host_register
+    from sglang_tpu.models.deepseek_v41.engram_host import host_table_without_cuda
 
-    with without_cuda_host_register():
+    with host_table_without_cuda():
         return original(embedding, *args, **kwargs)
 
 
