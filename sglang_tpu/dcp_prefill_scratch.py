@@ -9,14 +9,16 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-# Per slot: (request id, tokens stored), or None when free.
-SlotState = list[Optional[tuple[str, int]]]
+# Per slot: (request/attempt ownership token, tokens stored), or None when free.
+# Retaining this small token prevents its identity from being recycled while
+# the slot still contains that request's history; it must not retain the Req.
+SlotState = list[Optional[tuple[object, int]]]
 
 
 def plan_scratch_slots(
     state: SlotState,
     *,
-    rids: Sequence[str],
+    owners: Sequence[object],
     prefix_lens: Sequence[int],
     seq_lens: Sequence[int],
 ) -> Optional[list[int]]:
@@ -27,30 +29,31 @@ def plan_scratch_slots(
     at token 0; a slot is free once its request is absent from a prefill batch.
     Anything else (a radix prefix hit, more rows than slots) returns None and
     drops the batch's slots, so those requests gather from then on. ``state``
-    is updated in place.
+    is updated in place. Owners are compared by identity: two completed and
+    new requests can have equal public IDs and equal-valued cache handles.
     """
-    live = set(rids)
+    live = {id(owner) for owner in owners}
     slots: list[int] = []
-    for rid, prefix in zip(rids, prefix_lens):
+    for owner, prefix in zip(owners, prefix_lens):
         slot = next(
-            (s for s, held in enumerate(state) if held and held[0] == rid), None
+            (s for s, held in enumerate(state) if held and held[0] is owner), None
         )
         if slot is None and prefix == 0:
             slot = next(
                 (
                     s
                     for s, held in enumerate(state)
-                    if s not in slots and (held is None or held[0] not in live)
+                    if s not in slots and (held is None or id(held[0]) not in live)
                 ),
                 None,
             )
         held = None if slot is None else state[slot]
-        if slot is None or (held and held[0] == rid and prefix > held[1]):
+        if slot is None or (held and held[0] is owner and prefix > held[1]):
             for s, other in enumerate(state):
-                if other and other[0] in live:
+                if other and id(other[0]) in live:
                     state[s] = None
             return None
         slots.append(slot)
-    for slot, rid, seq_len in zip(slots, rids, seq_lens):
-        state[slot] = (rid, int(seq_len))
+    for slot, owner, seq_len in zip(slots, owners, seq_lens):
+        state[slot] = (owner, int(seq_len))
     return slots

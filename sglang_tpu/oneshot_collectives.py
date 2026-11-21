@@ -135,3 +135,52 @@ def oneshot_all_to_all(x: torch.Tensor, *, world_size: int) -> torch.Tensor:
         x.contiguous().view(world_size, padded // 128, 128)
     ).view(world_size, padded)
     return out if padded == n else out[:, :n].contiguous()
+
+
+_GROUP_OPS: dict[tuple[int, int], Callable] = {}
+
+
+def _build_dcp_group_all_gather_op(world_size: int, group_size: int) -> Callable:
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.kernels.dcp_group_all_gather import dcp_group_all_gather
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    mesh = _get_mesh(world_size)
+    # One group spanning the mesh gives every device the same result, as the
+    # world all-gather above; several groups give each group its own.
+    out_spec = P() if world_size == group_size else P("model")
+    sharded = jax.shard_map(
+        functools.partial(dcp_group_all_gather, group_size=group_size),
+        mesh=mesh,
+        in_specs=(P("model"), P("model")),
+        out_specs=out_spec,
+        check_vma=False,
+    )
+
+    def _wrapped(x: jax.Array, rank_input: jax.Array) -> jax.Array:
+        return sharded(x, rank_input)
+
+    return cpu_export_jax_op(
+        f"sglang_tpu_pallas::dcp_group_all_gather_tp{world_size}_g{group_size}",
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(P("model"), P("model")),
+        output_partition_specs=(out_spec,),
+    )
+
+
+def get_dcp_group_all_gather_op(world_size: int, group_size: int) -> Callable:
+    """Op ``(x [rows, 128], dcp_rank i32[1])`` -> [group_size, rows, 128]: the
+    all-gather of ``x`` over this rank's DCP group, by DCP rank; each group gets
+    its own result. Build it outside traced code."""
+    key = (world_size, group_size)
+    op = _GROUP_OPS.get(key)
+    if op is None:
+        with _OPS_LOCK:
+            op = _GROUP_OPS.get(key)
+            if op is None:
+                op = _build_dcp_group_all_gather_op(world_size, group_size)
+                _GROUP_OPS[key] = op
+    return op
