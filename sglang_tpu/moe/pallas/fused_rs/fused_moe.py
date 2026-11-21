@@ -37,7 +37,11 @@ from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
 )
-from sglang_tpu.moe.pallas.fused_rs.post_combine import twolevel_post_combine
+from sglang_tpu.moe.pallas.fused_rs.post_combine import (
+    supports_twolevel_post_combine_scatter,
+    twolevel_post_combine,
+    twolevel_post_combine_scatter,
+)
 from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
     get_mesh_shape_product,
@@ -163,7 +167,8 @@ def _twolevel_post_combine(
     """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
 
     Rank r is the r-th row owned by this rank in the kernel's row order (expert-sorted,
-    then token-sorted); the weighted sum maps ranks back to tokens with a 0/1 matmul.
+    then token-sorted). Ranks go back to tokens by an f32 scatter-add in VMEM when the
+    [chunk, hidden] accumulator fits, else by a 0/1 matmul.
     """
     rows = chunk_size * topk
     # The kernel's row order is a stable sort by expert of the flat (token, slot)
@@ -183,6 +188,19 @@ def _twolevel_post_combine(
     )
     token = flat // topk
     out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    if post_expert_norm_weight is not None and supports_twolevel_post_combine_scatter(
+        recv, rows=rows, chunk=chunk_size, out_dtype=out_dtype
+    ):
+        return twolevel_post_combine_scatter(
+            recv,
+            post_expert_norm_weight,
+            weight,
+            token,
+            rows=rows,
+            chunk=chunk_size,
+            eps=1e-8,
+            out_dtype=out_dtype,
+        ).reshape(chunk_size, hidden_size)
     if post_expert_norm_weight is not None and recv.ndim == 3:
         weighted = twolevel_post_combine(
             recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
@@ -287,6 +305,17 @@ def moe_gmm_local_rs_nodedup(
         )
         topk_indices = routing[..., 0].astype(jnp.int32)
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
+
+    if expert_tp:
+        # An id outside [0, E) (a NaN router score) leaves group_sizes but keeps its row,
+        # and the kernel halts or hangs: send it to expert 0 with weight 0.
+        routed_ok = (topk_indices >= 0) & (topk_indices < num_local_experts)
+        topk_indices = jnp.where(routed_ok, topk_indices, 0)
+        if sp_enabled:  # topk_weights holds only this rank's tokens
+            routed_ok = jax.lax.dynamic_slice_in_dim(
+                routed_ok, my_id * chunk_size, chunk_size, axis=0
+            )
+        topk_weights = jnp.where(routed_ok, topk_weights, 0).astype(topk_weights.dtype)
 
     # Expert TP: every rank holds a 1/ep_size slice of every expert's
     # intermediate dim, addressed as virtual experts

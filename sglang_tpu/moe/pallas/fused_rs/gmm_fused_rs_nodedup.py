@@ -1190,14 +1190,14 @@ def kernel_main_fused_rs(
                 _row_window(run_len, _add)
 
     @jax.named_scope("twolevel_issue")
-    def _twolevel_issue(g, stg, row0):
-        """Issue tile g's runs: own and sibling rows carry this core's partial; the run
-        for chip my_chip + k carries the chip sum to the core of this parity there, into
-        that owner's receive block 1 + (num_chips - k) % num_chips."""
+    def _twolevel_issue(g, stg, row0, targets):
+        """Issue tile g's runs `targets`: own and sibling rows (0, 1) carry this core's
+        partial; the run for chip my_chip + k carries the chip sum to the core of this
+        parity there, into that owner's receive block 1 + (num_chips - k) % num_chips."""
         my_chip = my_id // 2
         rows_per_block = out_buf_ref.shape[0] // n_targets
         sent = jnp.int32(0)
-        for t in range(n_targets):
+        for t in targets:
             run_len, src_off, rank = _twolevel_run(g, t)
             if t == 0:
                 d, block, src = my_id, 0, scatter_staging_3x_ref
@@ -1258,6 +1258,8 @@ def kernel_main_fused_rs(
         m_en = metadata_ref.gm_id_to_m_offset[g + 1]
         row0 = m_st % _sls_twolevel
         n_pieces = _twolevel_count_pieces(m_en - m_st)
+        # Own and sibling runs need only this core's partial: send them before the wait.
+        _twolevel_issue(g, stg, row0, (0, 1))
 
         @pl.when(n_pieces > 0)
         def _():
@@ -1269,7 +1271,7 @@ def kernel_main_fused_rs(
             device_id={ep_axis_name: sibling},
             device_id_type=pl.DeviceIdType.MESH,
         )
-        _twolevel_issue(g, stg, row0)
+        _twolevel_issue(g, stg, row0, range(2, n_targets))
 
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, _):
