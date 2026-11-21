@@ -24,8 +24,9 @@ def _norm_kernel(*refs, eps, has_residual, gemma):
         s = x_ref[...].astype(jnp.float32) + r_ref[...].astype(jnp.float32)
         ro_ref[...] = s.astype(ro_ref.dtype)
         if gemma:
-            # GemmaRMSNorm adds in the activation dtype, so it normalizes the rounded sum.
-            s = s.astype(ro_ref.dtype).astype(jnp.float32)
+            # GemmaRMSNorm adds in the activation dtype, so it normalizes the rounded sum. Read back the stored
+            # one: casting s to bf16 and back in place gave other bytes in a 4+ row decode program (v7x).
+            s = ro_ref[...].astype(jnp.float32)
     else:
         x_ref, w_ref, o_ref = refs
         s = x_ref[...].astype(jnp.float32)
