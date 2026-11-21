@@ -7,10 +7,27 @@ capacity; receiving a new occupant replaces or clears the old entry.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from weakref import WeakKeyDictionary
 
 _codecs: WeakKeyDictionary = WeakKeyDictionary()
+_retained_rows: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def discard_host_page_metadata(pool: Any, pages: Iterable[int] | None = None) -> None:
+    """Invalidate opaque tags before their host pages are freed or rewritten.
+
+    Registered codecs own their own page lifecycle; this only clears rows
+    retained on behalf of a peer when this pool has no metadata owner.
+    """
+    rows = _retained_rows.get(pool)
+    if rows is None:
+        return
+    if pages is None:
+        rows.clear()
+    else:
+        for page in pages:
+            rows.pop(page, None)
 
 
 def register_host_page_metadata(
@@ -29,7 +46,9 @@ class HostPageMetadata:
     def __init__(self, pool: Any, *, retain: bool = True) -> None:
         self.pool = pool
         self._retain = retain
-        self._rows: dict[int, bytes] = {}
+        self._rows: dict[int, bytes] = (
+            _retained_rows.setdefault(pool, {}) if retain and pool is not None else {}
+        )
 
     def export(self, pages: list[int]) -> list[bytes]:
         codec = _codecs.get(self.pool)

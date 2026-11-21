@@ -16,6 +16,9 @@ import zmq
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    register_host_page_metadata,
+)
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import (
     DramOffloadChannel,
     PrefixRegistration,
@@ -178,6 +181,54 @@ class TestHybridWindowOnTheWire(DecodeOffersItsPrefixFixture, CustomTestCase):
         ready = self._served(mgr, 0, 4)
         self.assertEqual((ready.uuid, ready.swa_uuid), (0, 0))
         self.assertFalse(mgr.is_failed(ROOM))
+
+    def test_metadata_export_failure_refuses_before_registering_either_pool(self):
+        for is_swa in (False, True):
+            for invalid_count in (False, True):
+                with self.subTest(swa=is_swa, invalid_count=invalid_count):
+                    mgr, swa = self._hybrid_decode()
+                    pool = mgr.dram_offload_channel._host_pools[is_swa]
+                    export = (
+                        Mock(return_value=[b"wrong count"])
+                        if invalid_count
+                        else Mock(side_effect=RuntimeError("unsealed page"))
+                    )
+                    register_host_page_metadata(pool, export=export, restore=Mock())
+                    with self.assertLogs(
+                        "sglang_tpu.disaggregation.raiden", level="ERROR"
+                    ):
+                        ready = self._served(mgr, 0, 4)
+                    self.assertEqual(ready, PrefixReady(room=ROOM, uuid=0, endpoint=""))
+                    host_transfer_of(mgr).register_read.assert_not_called()
+                    swa.register_read.assert_not_called()
+                    self.assertFalse(mgr.room_has_active_io(ROOM))
+                    self.assertFalse(mgr.is_failed(ROOM))
+
+    def test_invalid_metadata_page_index_also_refuses_the_pull(self):
+        mgr, swa = self._hybrid_decode()
+        mgr.dram_offload_channel._offers[ROOM].pages = [64]
+        with self.assertLogs("sglang_tpu.disaggregation.raiden", level="ERROR"):
+            ready = self._served(mgr, 0, 1)
+        self.assertEqual(ready, PrefixReady(room=ROOM, uuid=0, endpoint=""))
+        host_transfer_of(mgr).register_read.assert_not_called()
+        swa.register_read.assert_not_called()
+
+    def test_host_read_rewrite_discards_old_tags_before_start(self):
+        for is_swa in (False, True):
+            with self.subTest(swa=is_swa):
+                mgr, swa = self._hybrid_decode()
+                channel = mgr.dram_offload_channel
+                channel.restore_host_metadata([3, 4], [b"old3", b"old4"], swa=is_swa)
+                transfer = swa if is_swa else host_transfer_of(mgr)
+                transfer.start_read.side_effect = lambda *_: self.assertEqual(
+                    channel.export_host_metadata([3, 4], swa=is_swa), []
+                )
+                self.assertTrue(
+                    channel.start_host_read(
+                        PX, 7, DECODE_RAIDEN, [0, 1], [3, 4], swa=is_swa
+                    )
+                )
+                self.assertTrue(channel.host_prefix_pending(ROOM))
 
 
 class TestPrefillWaitsForTheRecall(CustomTestCase):

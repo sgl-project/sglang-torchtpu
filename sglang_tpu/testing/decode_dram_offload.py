@@ -41,6 +41,9 @@ from sglang_tpu.disaggregation.decode_dram_offload import (
     radix_host_ops,
     startup_validation,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    discard_host_page_metadata,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller import (
     PrefillDramPrefixPuller,
 )
@@ -165,9 +168,11 @@ class FakeHostPool:
         return indices
 
     def free(self, indices) -> None:
+        discard_host_page_metadata(self, self._to_page_ids(indices))
         self.used -= len(indices)
 
     def clear(self) -> None:
+        discard_host_page_metadata(self)
         self.used = 0
 
 

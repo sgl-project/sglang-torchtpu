@@ -40,6 +40,7 @@ import zmq
 
 from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
     HostPageMetadata,
+    discard_host_page_metadata,
 )
 from sglang_tpu.disaggregation.raiden import sender as raiden_sender
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -268,6 +269,7 @@ class DramOffloadChannel:
                 return False
             transfer = self._host_pools[swa].transfer
             try:
+                discard_host_page_metadata(self._host_pools[swa], local)
                 transfer.start_read(req_id, uuid, endpoint, remote, local)
             except Exception as exc:  # noqa: BLE001 - the caller gives the read up
                 logger.warning("Cannot start host read %s: %s", req_id, exc)
@@ -519,8 +521,12 @@ class DramOffloadChannel:
         fails. The prefill reads from the host pools' own control endpoints."""
         # Independent prefills share a decoder's native UUID map; zero means
         # no transfer, as in _announce_chunk.
-        metadata = self.export_host_metadata(pages)
-        swa_metadata = self.export_host_metadata(swa_pages, swa=True)
+        try:
+            metadata = self.export_host_metadata(pages)
+            swa_metadata = self.export_host_metadata(swa_pages, swa=True)
+        except Exception:  # noqa: BLE001 - refuse the recall without registering reads
+            logger.exception("Cannot export prefix host metadata for room %s", room)
+            return PrefixRegistration()
         uuid = secrets.randbelow((1 << 63) - 1) + 1
         if not self._register_host_read_locked(self.prefix_req_id(room), uuid, pages):
             return PrefixRegistration()

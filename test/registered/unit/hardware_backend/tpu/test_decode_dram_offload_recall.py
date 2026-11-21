@@ -605,6 +605,50 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
         decode.source.settle_offers()
         decode.landing.advance()
 
+    def test_export_failure_releases_prefill_bootstrap_without_a_timeout(self):
+        p, d = self._engine(prefill_manager()), self._engine(decode_manager())
+        prefill = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(p.ctx), push=PrefillDramVictimPusher(p.ctx)
+        )
+        register_host_page_metadata(
+            d.host,
+            export=MagicMock(side_effect=RuntimeError("unsealed source")),
+            restore=MagicMock(),
+        )
+        req = pushed_req(room=ROOM, tokens=[1, 2, 3, 4, 5])
+        sender = sender_on(p.mgr)
+        d.mgr.dram_offload_channel.offer_resident_prefix(ROOM, [3, 4])
+        d.mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+        with SWITCH.override(True):
+            self._deliver(d, p)
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+        self._prefill_step(prefill, [req])
+        with self.assertLogs("sglang_tpu.disaggregation.raiden", level="ERROR"):
+            self._deliver(p, d)
+        self._deliver(d, p)
+        self._prefill_step(prefill, [req])
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(p.host.used, 0)
+        self.assertFalse(d.mgr.room_has_active_io(ROOM))
+        self.assertFalse(p.mgr.is_failed(ROOM))
+
+    def test_host_eviction_and_local_backup_do_not_forward_old_page_tags(self):
+        d = self._engine(decode_manager())
+        old_tokens, new_tokens = list(range(8)), list(range(100, 108))
+        indices = d.host.alloc(8)
+        radix_host_ops.insert_host_prefix(
+            d.cache, RadixKey(array("q", old_tokens)), indices, 1
+        )
+        d.mgr.dram_offload_channel.restore_host_metadata(list(range(8)), [b"old"] * 8)
+        d.cache.evict_host(8, FULL)
+        self.assertEqual(d.host.used, 0)
+        insert_tokens(d.cache, d.allocator, new_tokens)
+        d.cache.evict(EvictParams(num_tokens=8))
+        self.assertEqual(host_hit(d.cache, new_tokens), 8)
+        self.assertEqual(
+            d.mgr.dram_offload_channel.export_host_metadata(list(range(8))), []
+        )
+
     def test_cold_branch_is_pushed_to_the_decode_and_recalled_when_it_returns(self):
         p, d = self._engine(prefill_manager()), self._engine(decode_manager())
         prefill = PrefillDramOffloadExtension(
