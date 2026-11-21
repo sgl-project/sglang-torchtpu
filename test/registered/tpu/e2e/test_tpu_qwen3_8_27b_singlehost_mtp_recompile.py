@@ -70,10 +70,9 @@ class TestQwen38MtpServesWithoutRecompile(TPULauncherTestCase):
             metas = list(pool.map(_generate, range(CONCURRENCY)))
 
         verify_count = sum(meta.get("spec_verify_ct", 0) for meta in metas)
-        completion_tokens = sum(meta["completion_tokens"] for meta in metas)
+        correct_drafts = sum(meta.get("spec_num_correct_drafts", 0) for meta in metas)
         self.assertGreater(verify_count, 0, "speculative verification never ran")
-        # Every verify commits at least one token, so this is accept length > 1.
-        self.assertGreater(completion_tokens, verify_count, "no draft was accepted")
+        self.assertGreater(correct_drafts, 0, "no draft was accepted")
 
         with log.open(errors="replace") as f:
             f.seek(served_from)
