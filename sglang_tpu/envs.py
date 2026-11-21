@@ -486,6 +486,10 @@ class TpuEnvs:
     # Override the computed ladder's rung count, trading compiles against
     # padding waste. Unset leaves each encoder on the count it picked.
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
+    # Multimodal DP-encoder rank gather (hooks/dp_encoder_gather.py): "all_gather"
+    # runs one padded attention-TP all-gather with materialized non-metadata
+    # inputs; "broadcast" runs one attention-TP broadcast per non-empty rank.
+    SGLANG_TPU_DP_ENCODER_GATHER_MODE = EnvStr("all_gather")
     # Text-only serving of a VL decoder: warm only the token-id ("text_ids") EXTEND graphs, not
     # the input_embeds ones. Each variant is a separate large graph (Kimi-K3.1 93L TP32: about
     # 100 GB of host RAM per host to compile them). Compilation is frozen after warmup, so

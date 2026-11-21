@@ -104,6 +104,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
         "SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS",
         "SGLANG_TPU_VIT_PRECOMPILE_SIZES",
+        # Eager DP-encoder gather collective mode; runs outside torch.compile.
+        "SGLANG_TPU_DP_ENCODER_GATHER_MODE",
         # Host-side radix tree implementation.
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND",
     }
