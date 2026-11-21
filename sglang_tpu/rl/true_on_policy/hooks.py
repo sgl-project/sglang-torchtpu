@@ -6,8 +6,8 @@ Registered only with SGLANG_TPU_ENABLE_TRUE_ON_POLICY=1.
 Why: an RL trainer recomputes the rollout's log-probs in one packed forward; they equal the engine's only if
      every op gives a row the same bytes in any batch.
 How: AROUND the unquantized linear and the lm_head (matmul), the RMSNorm variants (norm kernels),
-     fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), fused_topk_native and the
-     Qwen2-MoE shared expert (a single row runs as two), Sampler.forward and
+     fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), fused_topk_native (a single
+     row runs as two), the Qwen2-MoE shared-expert gate (matmul), Sampler.forward and
      InputLogprobProcessor.forward (log-prob kernel); AFTER batched RPA calculate_block_sizes (KV block = page)
      and SamplingParams.verify (refuses logit transforms). Not covered: TP above 1, other attention backends,
      quantized weights.
@@ -144,7 +144,7 @@ def recurrent_gated_delta_net(original, *args, **kwargs):
 
 
 def _one_row_as_two(x: torch.Tensor) -> torch.Tensor:
-    # XLA lowers a one-row softmax or dot in another reduction order than a multi-row one
+    # XLA lowers a one-row softmax in another reduction order than a multi-row one
     return torch.nn.functional.pad(x, (0, 0, 0, 1))
 
 
@@ -162,13 +162,14 @@ def true_on_policy_router(original, *, hidden_states, gating_output, **kwargs):
     return weights[:1], ids[:1]
 
 
-def true_on_policy_shared_experts(original, self, hidden_states, *args, **kwargs):
-    """AROUND Qwen2MoeSparseMoeBlock._forward_shared_experts: a single row is gated as two (the gate is a plain
-    nn.Linear)."""
-    if hidden_states.shape[0] != 1:
-        return original(self, hidden_states, *args, **kwargs)
-    out = original(self, _one_row_as_two(hidden_states), *args, **kwargs)
-    return None if out is None else out[:1]
+def true_on_policy_shared_experts(original, self, hidden_states, apply_gate=True):
+    """AROUND Qwen2MoeSparseMoeBlock._forward_shared_experts: the gate, a plain nn.Linear the linear hook does not
+    see, runs on the fixed-tile matmul."""
+    out = original(self, hidden_states, apply_gate=False)
+    if out is None or not apply_gate or self.shared_expert_gate is None:
+        return out
+    gate = matmul_kernel.matmul(hidden_states, self.shared_expert_gate.weight)
+    return torch.sigmoid(gate) * out
 
 
 def true_on_policy_moe(original, **kwargs):
