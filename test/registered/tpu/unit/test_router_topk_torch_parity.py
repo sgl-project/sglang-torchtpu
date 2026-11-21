@@ -17,7 +17,7 @@ try:
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
-E, K, SCALE = 896, 16, 2.5
+SCALE = 2.5
 
 
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
@@ -29,17 +29,50 @@ class TestRouterTopkTorchParity(CustomTestCase):
         rt.register_router_topk_op()
         cls.rt = rt
 
-    def _compare(self, logits, bias, apply_on_output, msg):
-        from sglang.srt.layers.moe.topk import biased_topk_impl
+    def _compare(self, logits, bias, k, apply_on_output, grouped, msg, exact=False):
+        from sglang.srt.layers.moe import topk as srt_topk
 
         lt, bt = logits.to("tpu"), bias.to("tpu")
-        self.assertTrue(self.rt._eligible(lt, bt, K, 0), msg)
-        args = (lt, lt, bt, K, True, "sigmoid", 0, SCALE, None, None, apply_on_output)
-        ref_w, ref_ids = (t.cpu() for t in biased_topk_impl(*args))
-        got_w, got_ids = (
-            t.cpu() for t in self.rt.biased_topk_around(biased_topk_impl, *args)
+        tokens = logits.shape[0]
+        self.assertTrue(
+            self.rt._eligible(lt, bt, k, 0)
+            or self.rt._large_batch_eligible(lt, bt, k, 0),
+            msg,
         )
-        for t in range(logits.shape[0]):
+        if grouped:
+            impl, hook = (
+                srt_topk.biased_grouped_topk_impl,
+                self.rt.biased_grouped_topk_around,
+            )
+            args = (lt, lt, bt, k, True, 1, 1, 0, SCALE, apply_on_output)
+        else:
+            impl, hook = srt_topk.biased_topk_impl, self.rt.biased_topk_around
+            args = (
+                lt,
+                lt,
+                bt,
+                k,
+                True,
+                "sigmoid",
+                0,
+                SCALE,
+                None,
+                None,
+                apply_on_output,
+            )
+        # The eager, unhooked function, as TPU runs it.
+        impl = getattr(impl, "_torchdynamo_orig_callable", impl)
+        self.assertTrue(impl.__code__.co_filename.endswith("moe/topk.py"), impl)
+        ref_w, ref_ids = (t.cpu() for t in impl(*args))
+        got_w, got_ids = (t.cpu() for t in hook(impl, *args))
+        if exact:
+            # Same ids in the same order and bit-identical weights as the sort.
+            self.assertTrue(
+                torch.equal(got_ids.to(torch.int64), ref_ids.to(torch.int64)), msg
+            )
+            self.assertTrue(torch.equal(got_w.float(), ref_w.float()), msg)
+            return
+        for t in range(tokens):
             want = dict(zip(ref_ids[t].tolist(), ref_w[t].tolist()))
             got = dict(zip(got_ids[t].tolist(), got_w[t].tolist()))
             self.assertEqual(set(got), set(want), f"{msg} row {t}")
@@ -47,18 +80,66 @@ class TestRouterTopkTorchParity(CustomTestCase):
                 self.assertAlmostEqual(got[i], x, delta=1e-6 * max(1.0, abs(x)))
 
     def test_matches_biased_topk_impl(self):
+        """Kimi-K3: top-16 of 896 through biased_topk_impl."""
         g = torch.Generator().manual_seed(0)
         for dtype in (torch.bfloat16, torch.float32):
             for case in ("random", "ties"):
                 for tokens in (1, 8, 64):
                     for apply_on_output in (False, True):
-                        logits = torch.randn(tokens, E, generator=g) * 2.0
+                        logits = torch.randn(tokens, 896, generator=g) * 2.0
                         if case == "ties":
                             logits = torch.round(logits * 2) / 2  # ~17 values
-                        bias = (torch.randn(E, generator=g) * 0.05).float()
+                        bias = (torch.randn(896, generator=g) * 0.05).float()
                         msg = f"{dtype} {case} {tokens=} {apply_on_output=}"
                         with self.subTest(msg=msg):
-                            self._compare(logits.to(dtype), bias, apply_on_output, msg)
+                            self._compare(
+                                logits.to(dtype), bias, 16, apply_on_output, False, msg
+                            )
+
+    def _grouped(self, logits, bias):
+        from sglang.srt.layers.moe import topk as srt_topk
+
+        args = (logits, logits, bias, 8, True, 1, 1, 0, SCALE, True)
+        impl = srt_topk.biased_grouped_topk_impl
+        impl = getattr(impl, "_torchdynamo_orig_callable", impl)
+        return self.rt.biased_grouped_topk_around(impl, *args)
+
+    def test_grouped_top8_of_288_matches_the_sort(self):
+        """GLM-5.3-Flash: top-8 of 288, one group, bf16 logits, f32 bias. The
+        kernel serves up to 128 tokens; without exact ties its ids (in order)
+        and weights equal biased_grouped_topk_impl's bit for bit."""
+        g = torch.Generator().manual_seed(1)
+        for tokens in (1, 16, 64, 128):
+            logits = (torch.randn(tokens, 288, generator=g) * 2.0).to(torch.bfloat16)
+            bias = (torch.randn(288, generator=g) * 0.05).float()
+            msg = f"{tokens=}"
+            with self.subTest(msg=msg):
+                self._compare(logits, bias, 8, True, True, msg, exact=True)
+
+    def test_grouped_top8_ties_pick_the_lowest_ids(self):
+        """Exact choice ties (a few logit values, a bias on a 0.25 grid): the
+        kernel (up to 128 tokens) and the argmax rounds past it both take the
+        lowest tied expert ids. torch.topk on TPU breaks ties in another order,
+        so a stable CPU sort is the reference."""
+        from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
+
+        g = torch.Generator().manual_seed(2)
+        for tokens in (1, 16, 64, 128, 136):
+            logits = (torch.randint(-6, 7, (tokens, 288), generator=g) / 2).to(
+                torch.bfloat16
+            )
+            bias = torch.randint(0, 4, (288,), generator=g).float() * 0.25
+            scores = torch.sigmoid(logits.float()).to(torch.bfloat16).float()
+            choice = scores + bias[None, :]
+            want = torch.sort(choice, dim=-1, descending=True, stable=True).indices[
+                :, :8
+            ]
+            want_w = scores.gather(1, want)
+            want_w = want_w / (want_w.sum(-1, keepdim=True) + _RENORMALIZE_SUM_EPSILON)
+            w, ids = (t.cpu() for t in self._grouped(logits.to("tpu"), bias.to("tpu")))
+            with self.subTest(tokens=tokens):
+                self.assertTrue(torch.equal(ids.long(), want), f"{tokens=}")
+                torch.testing.assert_close(w.float(), want_w * SCALE, rtol=1e-6, atol=0)
 
 
 if __name__ == "__main__":

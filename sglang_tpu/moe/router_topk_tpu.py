@@ -21,6 +21,9 @@ import torch
 
 # Batch sizes the kernel serves; larger batches keep the sort.
 MAX_TOKENS = 64
+# Top-8 routing: the kernel also takes these batch sizes (speculative verify
+# windows) from the argmax rounds below; bit-identical and cheaper.
+MAX_TOKENS_TOP8 = 128
 # Expert counts validated against biased_topk_impl on TPU: Kimi-K3 (top-16 of
 # 896) and GLM-5.3-Flash (top-8 of 288). Other sigmoid routers (e.g. Kimi-K2.x
 # with 384) keep the sort until they are measured.
@@ -85,7 +88,7 @@ def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) ->
         # the sum to bf16 in torch, so it keeps the sort.
         and correction_bias.dtype == torch.float32
         and gating_output.dim() == 2
-        and 0 < gating_output.shape[0] <= MAX_TOKENS
+        and 0 < gating_output.shape[0] <= (MAX_TOKENS_TOP8 if topk <= 8 else MAX_TOKENS)
         and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
         and topk <= 128
     )
@@ -133,6 +136,9 @@ def _large_batch_eligible(
         and gating_output.shape[0] > MAX_TOKENS
         and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
         and topk <= 8
+        and not _eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
     )
 
 

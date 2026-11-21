@@ -66,11 +66,24 @@ class TestRouterTopkHooks(CustomTestCase):
                 self.assertEqual(self._grouped(**case), ("sort_w", "sort_ids"))
                 self.original.assert_called_once()
 
+    def test_top8_verify_window_takes_the_kernel(self):
+        # GLM-5.3-Flash verify at 32 running: 128 tokens, top-8 of 288. A bf16
+        # bias keeps the argmax rounds, whose sum rounds like torch's.
+        logits, bias = _logits(tokens=rt.MAX_TOKENS_TOP8, experts=288), _bias(288)
+        args = (logits, logits, bias, 8, True, 1, 1, 0, 2.5, True)
+        self.assertEqual(
+            rt.biased_grouped_topk_around(self.original, *args), self.kernel_out
+        )
+        bf16_args = (logits, logits, bias.bfloat16(), 8, True, 1, 1, 0, 2.5, True)
+        w, ids = rt.biased_grouped_topk_around(self.original, *bf16_args)
+        self.assertEqual(tuple(ids.shape), (rt.MAX_TOKENS_TOP8, 8))
+        self.original.assert_not_called()
+
     def test_large_batch_matches_the_sort(self):
-        # GLM-5.3-Flash prefill: top-8 of 288, one group, past the kernel's MAX_TOKENS.
+        # GLM-5.3-Flash prefill: top-8 of 288, one group, past the kernel's MAX_TOKENS_TOP8.
         from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
-        logits, bias = _logits(tokens=rt.MAX_TOKENS + 7, experts=288), _bias(288)
+        logits, bias = _logits(tokens=rt.MAX_TOKENS_TOP8 + 7, experts=288), _bias(288)
         args = (logits, logits, bias, 8, True, 1, 1, 0, 2.5, True)
         w, ids = rt.biased_grouped_topk_around(self.original, *args)
         self.original.assert_not_called()
