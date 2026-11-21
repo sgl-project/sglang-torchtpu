@@ -669,6 +669,18 @@ class TpuEnvs:
     # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
 
+    # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
+    # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
+    # backlog exceeds the least backlogged rank's by more than m x the prompt.
+    SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN = EnvFloat(0.0)
+    # Treat routed_dp_rank (X-Data-Parallel-Rank) as an affinity hint: prompts no
+    # rank holds may go to a less backlogged rank, continuations follow the rank
+    # holding them. False keeps it a hard route.
+    SGLANG_TPU_DP_PROMPT_BACKLOG_ROUTED = EnvBool(False)
+    # > 0 also moves continuations of routed requests when the backlog gap exceeds
+    # this x the prompt (they then recompute it elsewhere). 0 = never.
+    SGLANG_TPU_DP_PROMPT_BACKLOG_CONTINUATION_MARGIN = EnvFloat(0.0)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

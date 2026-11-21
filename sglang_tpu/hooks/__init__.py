@@ -24,6 +24,7 @@ from sglang_tpu.hooks.dflash_mla import (
     dflash_mla_head_dims,
     select_dflash_mla_attention,
 )
+from sglang_tpu.hooks.dp_prompt_backlog import hook_specs as dp_prompt_backlog_hooks
 from sglang_tpu.hooks.draft_kv_pool import (
     attach_unified_draft_kv_pool,
     bind_unified_swa_draft_host_pool,
@@ -486,6 +487,9 @@ HOOKS.extend(padded_logits_sampling_hooks())
 HOOKS.extend(logprob_grid_hooks())
 
 HOOKS.extend(replay_chunk_fit_hooks())
+# DP routing by pending uncached prompt tokens (pass-through unless
+# SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN > 0).
+HOOKS.extend(dp_prompt_backlog_hooks())
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
 
