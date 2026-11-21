@@ -434,6 +434,9 @@ class TpuEnvs:
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
     SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
+    # DeepSeek-V4.1 attention metadata: also read the device positions / request
+    # rows the host mirrors replace and raise if they differ (debug; adds the reads back).
+    SGLANG_TPU_DSV41_CHECK_HOST_METADATA = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

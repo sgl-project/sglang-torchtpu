@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang_tpu.compilation import host_input_mirror
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
 
 # The pool owns the page layout the kernels read; the backend only indexes it.
@@ -238,6 +239,38 @@ def _as_cpu_int64(values, length: int) -> torch.Tensor:
     return out
 
 
+def _host_or_read(forward_batch: ForwardBatch, name: str, length: int) -> torch.Tensor:
+    """[length] int64 host value of ``forward_batch.<name>``.
+
+    The compile policy keeps the host tensor it uploaded at the bucket shape
+    (``host_input_mirror``); that copy replaces the blocking device read. Fields it
+    did not upload, or that changed since, are read from the device as before.
+    """
+    from sglang_tpu.envs import envs as tpu_envs
+
+    device_value = getattr(forward_batch, name)
+    host_value = host_input_mirror.host_copy(forward_batch, name)
+    if host_value is None:
+        return _as_cpu_int64(device_value, length)
+    host_value = _as_cpu_int64(host_value, length)
+    if tpu_envs.SGLANG_TPU_DSV41_CHECK_HOST_METADATA.get():
+        read = _as_cpu_int64(device_value, length)
+        if not torch.equal(read, host_value):
+            raise AssertionError(
+                f"DSV4.1 host {name} differs from the device value: "
+                f"host={host_value.tolist()} device={read.tolist()}"
+            )
+        _HOST_CHECKS[name] = _HOST_CHECKS.get(name, 0) + 1
+        total = sum(_HOST_CHECKS.values())
+        if total == 1 or total % 1000 == 0:
+            logger.info("DSV4.1 host metadata matched the device: %s", _HOST_CHECKS)
+    return host_value
+
+
+# Host copies compared with the device under SGLANG_TPU_DSV41_CHECK_HOST_METADATA.
+_HOST_CHECKS: Dict[str, int] = {}
+
+
 def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
     """[B] int64 query rows of each batch row; bucket-padding rows get 0."""
     mode = forward_batch.forward_mode
@@ -386,9 +419,9 @@ def build_forward_metadata(
 ) -> DSV41TPUForwardMetadata:
     """Host-side metadata from the sglang batch, moved to ``device`` once."""
     bs = int(forward_batch.batch_size)
-    positions = forward_batch.positions.detach().to("cpu", torch.int64)
-    num_tokens = positions.shape[0]
-    out_cache_loc = _as_cpu_int64(forward_batch.out_cache_loc, num_tokens)
+    num_tokens = forward_batch.positions.shape[0]
+    positions = _host_or_read(forward_batch, "positions", num_tokens)
+    out_cache_loc = _host_or_read(forward_batch, "out_cache_loc", num_tokens)
 
     counts = _request_token_counts(forward_batch, bs)
     query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
@@ -398,7 +431,8 @@ def build_forward_metadata(
     token_rows[:real_tokens] = torch.repeat_interleave(torch.arange(bs), counts)
     valid = (token_rows >= 0) & (out_cache_loc > 0)
     token_rows = token_rows.masked_fill(~valid, -1)
-    req_pool_indices = _as_cpu_int64(forward_batch.req_pool_indices, bs)
+    req_pool_indices = _host_or_read(forward_batch, "req_pool_indices", bs)
+    host_input_mirror.release(forward_batch)
     token_req_pool = req_pool_indices[token_rows.clamp_min(0)].masked_fill(~valid, 0)
 
     swa_minimum, compress_valid = _fold_masks(

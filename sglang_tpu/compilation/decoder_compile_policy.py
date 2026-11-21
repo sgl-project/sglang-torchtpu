@@ -53,7 +53,7 @@ from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang_tpu._logging import get_logger
-from sglang_tpu.compilation import aot_fast_runtime_wrapper
+from sglang_tpu.compilation import aot_fast_runtime_wrapper, host_input_mirror
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
     use_attention_rank_tensors,
@@ -1267,11 +1267,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ):
             value = getattr(forward_batch, name, None)
             if isinstance(value, torch.Tensor) and value.device.type == "cpu":
-                setattr(
-                    forward_batch,
-                    name,
-                    value.to(self.model_runner.device, non_blocking=True),
-                )
+                self._upload_field(forward_batch, name, value)
+
+    def _upload_field(
+        self, forward_batch: ForwardBatch, name: str, value: torch.Tensor
+    ) -> None:
+        """Upload one host field; keep its host copy for the attention metadata."""
+        uploaded = value.to(self.model_runner.device, non_blocking=True)
+        setattr(forward_batch, name, uploaded)
+        host_input_mirror.record_upload(forward_batch, name, value, uploaded)
 
     def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
         """HOST_PADDED inputs were padded on host above; upload them at the bucket shape."""
@@ -1284,11 +1288,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 continue
             value = getattr(forward_batch, name, None)
             if isinstance(value, torch.Tensor) and value.device.type == "cpu":
-                setattr(
-                    forward_batch,
-                    name,
-                    value.to(self.model_runner.device, non_blocking=True),
-                )
+                self._upload_field(forward_batch, name, value)
 
     def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend batch runs the context-parallel program."""
