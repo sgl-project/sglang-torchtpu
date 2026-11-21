@@ -206,6 +206,21 @@ tpu_dsv41_dspark_compute_base_logits
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: compute_base_logits gathers over the lm_head's own group.
 
+tpu_dsv41_vocab_parallel_load_weights, tpu_dsv41_vocab_parallel_lm_head
+  Why: under attention DP at attention TP 1 every rank holds the whole LM head
+       and reads all 1.32 GB of it at every target verify and DSpark draft call
+       to score its own few rows; core has no head split over the DP ranks that
+       keeps each rank's own rows (--enable-tp-lm-head-all-to-all shards over
+       the TP group, which DSpark under DP rejects).
+  How: with SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD, AROUND
+       DeepseekV4ForCausalLM.load_weights keeps only this rank's vocab slice of
+       a V4.1 target's head (vocab_parallel_head.shard_lm_head), and AROUND
+       LogitsProcessor._compute_lm_head_rows scores a split head through the
+       vocab-parallel op; the DSpark draft's tpu_compute_base_logits shares it.
+  Upstream PR or issue: not filed (V4.1 TPU serving).
+  Remove when: core shards the LM head over the vocab across the DP ranks
+       with each rank's logits rows returned to it.
+
 tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
   Why: the target's Engram history lives on the host (engram_host), so
        committing a verify reads its outputs back and blocks the host for the
@@ -677,6 +692,49 @@ def tpu_dsv41_dspark_compute_base_logits(original, model, x):
     return tpu_compute_base_logits(model, x)
 
 
+def tpu_dsv41_vocab_parallel_load_weights(original, model, weights, *args, **kwargs):
+    """AROUND DeepseekV4ForCausalLM.load_weights: split a V4.1 target's LM head."""
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.models.deepseek_v41.vocab_parallel_head import (
+        VocabParallelLMHead,
+        shard_lm_head,
+    )
+
+    if isinstance(model.lm_head, VocabParallelLMHead):
+        raise RuntimeError(
+            "Cannot reload weights: the LM head is vocab-parallel and holds only "
+            "this rank's vocab rows"
+        )
+    result = original(model, weights, *args, **kwargs)
+    is_nextn = kwargs.get("is_nextn", args[0] if args else False)
+    if (
+        not torch.cuda.is_available()
+        and not is_nextn
+        and model.config.model_type == "deepseek_v41"
+        and tpu_envs.SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD.get()
+    ):
+        shard_lm_head(model)
+    return result
+
+
+def tpu_dsv41_vocab_parallel_lm_head(
+    original, processor, hidden_states, lm_head, embedding_bias=None, *, out=None
+):
+    """AROUND LogitsProcessor._compute_lm_head_rows: score a split head.
+
+    ``out`` is core's optional logits buffer; the split head returns its own tensor.
+    """
+    from sglang_tpu.models.deepseek_v41.vocab_parallel_head import (
+        VocabParallelLMHead,
+        vocab_parallel_logits,
+    )
+
+    if not isinstance(lm_head, VocabParallelLMHead):
+        return original(processor, hidden_states, lm_head, embedding_bias, out=out)
+    assert embedding_bias is None, "the vocab-parallel head has no bias"
+    return vocab_parallel_logits(lm_head, hidden_states)
+
+
 def tpu_dsv41_defer_engram_commit(
     original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
 ):
@@ -838,6 +896,16 @@ def hook_specs():
         (
             f"{dspark}.compute_base_logits",
             tpu_dsv41_dspark_compute_base_logits,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.load_weights",
+            tpu_dsv41_vocab_parallel_load_weights,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head_rows",
+            tpu_dsv41_vocab_parallel_lm_head,
             HookType.AROUND,
         ),
         (

@@ -10,7 +10,8 @@ vllm-torchtpu ``models/vllm/deepseek_v41/v2/dspark.py``:
   so only ``wo_a`` / ``wo_b`` remain.
 - draft tokens: greedy Markov chain in the draft graph,
   ``z_j = lm_head(norm(h_j)) + markov_w2(markov_w1(d_{j-1}))``, ``d_0`` the anchor.
-- base logits: this rank's full-vocab rows (no TP gather) at attention TP 1.
+- base logits: this rank's full-vocab rows (no TP gather) at attention TP 1,
+  through the vocab-parallel head when the target's head is split.
 - context KV: ``main_norm(main_proj(target aux hidden))`` projected by each
   stage's ``wkv``, kv-normed, RoPE'd and published into the stage's SWA pages.
 """
@@ -68,10 +69,21 @@ def tpu_compute_base_logits(
     keeps TP rank 0's logits on every rank.
     """
     from sglang.srt.models.dspark import project_through_lm_head
+    from sglang_tpu.models.deepseek_v41.vocab_parallel_head import (
+        VocabParallelLMHead,
+        vocab_parallel_logits,
+    )
 
     lm_head = model.lm_head
     x_post_hc = model.collapse_hc_head(x)
     x = model.stages[-1].norm(x_post_hc)
+    if isinstance(lm_head, VocabParallelLMHead):
+        if model._use_fp32_lm_head:
+            raise ValueError(
+                "SGLANG_DSPARK_FP32_LM_HEAD needs the whole LM head; unset "
+                "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD"
+            )
+        return vocab_parallel_logits(lm_head, x), x_post_hc
     weight = lm_head.weight
     # As core _logits_from_x_post_hc: SGLANG_DSPARK_FP32_LM_HEAD projects in fp32.
     if model._use_fp32_lm_head and weight.is_floating_point():

@@ -253,6 +253,11 @@ class TpuEnvs:
     # experimental spec worker, which keeps their metadata on the host as well.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(True)
 
+    # DeepSeek-V4.1 under attention DP at attention TP 1: split the LM head over
+    # the vocab across the ranks (models/deepseek_v41/vocab_parallel_head.py),
+    # equal up to BF16 rounding; setups it cannot serve keep the whole head.
+    SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD = EnvBool(False)
+
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.

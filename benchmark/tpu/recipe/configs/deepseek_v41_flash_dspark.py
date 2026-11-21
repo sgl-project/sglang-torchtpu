@@ -54,4 +54,11 @@ CONFIG["server_args"].update(
         "enable_encoder_swa_bounded_replay": True,
     }
 )
-CONFIG["runtime_env"].update({"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"})
+CONFIG["runtime_env"].update(
+    {
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # Each rank holds 1/8 of the LM head; the target verify and the draft
+        # score their rows through one all-to-all pair; GSM8K 0.914 vs 0.911.
+        "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD": "1",
+    }
+)
