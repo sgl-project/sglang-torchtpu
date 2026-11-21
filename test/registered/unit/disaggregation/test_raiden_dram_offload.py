@@ -316,8 +316,8 @@ class TestPairRefusals(CustomTestCase):
                 self.assertFalse(mgr.is_failed(ROOM))
                 self.assertIn(ROOM, mgr._prefill.decode_addr)
 
-    def test_resharded_transfer_is_refused_while_the_switch_is_on(self):
-        req = ReshardReq(
+    def test_resharded_transfer_refuses_switch_mismatch_and_invalid_tp_ratio(self):
+        mismatch_req = ReshardReq(
             room=ROOM,
             decode_ip="10.0.0.2",
             decode_port=5555,
@@ -330,7 +330,26 @@ class TestPairRefusals(CustomTestCase):
         mgr = prefill_manager()
         sender_on(mgr)
         with tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(True):
-            mgr._dispatch(req)
+            mgr._dispatch(mismatch_req)
+        reason = self._failure(mgr)
+        self.assertIn("same value on both roles", reason)
+        self.assertNotIn(ROOM, mgr._prefill.reshard_req)
+
+        bad_ratio_req = ReshardReq(
+            room=ROOM,
+            decode_ip="10.0.0.2",
+            decode_port=5555,
+            push_endpoint="10.0.0.2:31030",
+            decode_blocks=[1, 2],
+            dst_attn_tp=3,
+            decode_swa_blocks=[],
+            swa_push_endpoint="",
+            kv_offload=True,
+        ).to_frames()
+        mgr = prefill_manager()
+        sender_on(mgr)
+        with tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(True):
+            mgr._dispatch(bad_ratio_req)
         reason = self._failure(mgr)
         self.assertIn("resharding", reason)
         self.assertNotIn(ROOM, mgr._prefill.reshard_req)

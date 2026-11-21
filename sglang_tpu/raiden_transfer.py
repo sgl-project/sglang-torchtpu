@@ -109,11 +109,37 @@ HOST_POOL_CONTROL_PORT_OFFSET = PORTS_PER_RANK * 64
 # A rank's full KV pool, and the sliding-window pool of a hybrid model.
 HOST_POOLS_PER_RANK = 2
 _host_pools_built = 0
+_bound_control_ports: set[int] = set()
+
+
+def _worker_port_rank() -> int:
+    """Distinct rank of this worker among every worker on its node, matching
+    RaidenKVManager so DP-attention, system-DP, and PP workers never share host
+    pool control ports; falls back to TP rank when runtime context is unset."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.disaggregation.raiden.host_pool import node_worker_rank
+
+        parallel = get_parallel()
+        system_dp_rank = 0 if int(parallel.attn_dp_size) > 1 else int(parallel.dp_rank)
+        return node_worker_rank(
+            int(parallel.attn_tp_rank),
+            int(parallel.attn_tp_size),
+            int(parallel.attn_dp_rank),
+            int(parallel.attn_dp_size),
+            system_dp_rank,
+            int(parallel.attn_cp_rank),
+            int(parallel.attn_cp_size),
+            int(parallel.pp_rank),
+            int(parallel.pp_size),
+        )
+    except Exception:  # noqa: BLE001 - runtime context is unset in unit tests
+        return get_tensor_model_parallel_rank()
 
 
 def host_control_port_candidates():
-    """Ports for a host pool's control server: a deterministic one per TP rank
-    and host pool above the Raiden KV ports first, then free ephemeral ports.
+    """Ports for a host pool's control server: a deterministic one per worker
+    rank and host pool above the Raiden KV ports first, then free ephemeral ports.
 
     A port found free by ``get_free_port`` is bound only later, by the native
     constructor, and the kernel can hand it to an outgoing connection in
@@ -126,15 +152,23 @@ def host_control_port_candidates():
     global _host_pools_built
     index, _host_pools_built = _host_pools_built, _host_pools_built + 1
     if index < HOST_POOLS_PER_RANK:
-        rank = get_tensor_model_parallel_rank()
-        yield (
+        rank = _worker_port_rank()
+        port = (
             envs.SGLANG_RAIDEN_KV_PORT.get()
             + HOST_POOL_CONTROL_PORT_OFFSET
             + rank * HOST_POOLS_PER_RANK
             + index
         )
-    for _ in range(2):
-        yield get_free_port()
+        if port not in _bound_control_ports:
+            yield port
+    yielded = 0
+    for _ in range(8):
+        if yielded >= 2:
+            break
+        port = get_free_port()
+        if port not in _bound_control_ports:
+            yielded += 1
+            yield port
 
 
 class RaidenKVTransfer:
@@ -207,6 +241,7 @@ class RaidenKVTransfer:
                     logger.warning("host pool control port %d is taken", port)
                     continue
                 self._host_control_port = port
+                _bound_control_ports.add(port)
                 break
             else:
                 raise RuntimeError(

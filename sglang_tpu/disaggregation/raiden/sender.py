@@ -832,10 +832,14 @@ class RaidenSenderMixin:
                 reason=reason,
             )
             return
-        reason = raiden_offload.resharding_refusal(decode_enabled=req.kv_offload)
+        reason = raiden_offload.resharding_refusal(
+            decode_enabled=req.kv_offload,
+            src_attn_tp=self.attn_tp_size,
+            dst_attn_tp=req.dst_attn_tp,
+        )
         if reason is not None:
-            # A decode at another attention TP cannot take host pages rank to
-            # rank; serving it without the offload would hide that.
+            # A decode whose attention TP cannot pair with this prefill's
+            # offload fails closed instead of running without the offload.
             logger.error(
                 "RaidenKVManager rank%d room %s: %s",
                 self.attn_tp_rank,
@@ -869,6 +873,15 @@ class RaidenSenderMixin:
                     decode_swa_blocks=decode_swa_blocks,
                     swa_push_endpoint=swa_push_endpoint,
                 )
+                if self.dram_offload_channel is not None:
+                    self.dram_offload_channel.accept_reshard_req_locked(
+                        room,
+                        decode_ip=decode_ip,
+                        decode_port=decode_port,
+                        dst_attn_tp=dst_attn_tp,
+                        blocks=req.prefix_blocks,
+                        swa_blocks=req.prefix_swa_blocks,
+                    )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
         if failed_reason is not None:

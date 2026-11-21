@@ -58,8 +58,6 @@ _UNSUPPORTED = (
         2,
         "pipeline parallelism is not supported (--pp-size 2)",
     ),
-    ("scheduler.server_args.dp_size", 2, "data parallelism"),
-    ("scheduler.server_args.attn_dp_size", 2, "data parallelism"),
 )
 
 
@@ -210,19 +208,54 @@ class TestPairRefusals(CustomTestCase):
                     raiden_offload.peer_switch_mismatch(decode_enabled=value)
                 )
 
-    def test_resharding_is_refused_only_with_the_switch_on(self):
+    def test_resharding_refuses_switch_mismatch_and_non_multiple_tp_ratios(self):
         with SWITCH.override(True):
             self.assertIn(
-                "resharding", raiden_offload.resharding_refusal(decode_enabled=False)
+                "same value on both roles",
+                raiden_offload.resharding_refusal(decode_enabled=False),
+            )
+            self.assertIsNone(
+                raiden_offload.resharding_refusal(
+                    decode_enabled=True, src_attn_tp=8, dst_attn_tp=4
+                )
+            )
+            self.assertIn(
+                "resharding",
+                raiden_offload.resharding_refusal(
+                    decode_enabled=True, src_attn_tp=4, dst_attn_tp=8
+                ),
+            )
+            self.assertIn(
+                "resharding",
+                raiden_offload.resharding_refusal(
+                    decode_enabled=True, src_attn_tp=6, dst_attn_tp=4
+                ),
             )
         with SWITCH.override(False):
-            self.assertIsNone(raiden_offload.resharding_refusal(decode_enabled=False))
+            self.assertIsNone(
+                raiden_offload.resharding_refusal(
+                    decode_enabled=False, src_attn_tp=8, dst_attn_tp=4
+                )
+            )
             # A decode with the switch on would otherwise run without the
             # offload and never say so.
             self.assertIn(
                 "same value on both roles",
-                raiden_offload.resharding_refusal(decode_enabled=True),
+                raiden_offload.resharding_refusal(
+                    decode_enabled=True, src_attn_tp=8, dst_attn_tp=4
+                ),
             )
+
+    def test_dp_attention_and_system_dp_engines_pass_startup_validation(self):
+        for dp_size, attn_dp_size in ((2, 2), (2, 1)):
+            for role in ("prefill", "decode"):
+                with self.subTest(
+                    dp_size=dp_size, attn_dp_size=attn_dp_size, role=role
+                ):
+                    engine = supported_engine()
+                    engine.scheduler.server_args.dp_size = dp_size
+                    engine.scheduler.server_args.attn_dp_size = attn_dp_size
+                    validate_engine_as(engine, role=role)
 
 
 if __name__ == "__main__":
