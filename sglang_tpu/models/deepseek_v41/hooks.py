@@ -108,7 +108,9 @@ allow_tpu_dsv41_encoder_replay
        still apply.
   How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
        original with the module's get_platform reporting CUDA and not ROCm, the
-       only two platform facts the validator reads.
+       only two platform facts the validator reads. An unset
+       --enable-decoder-swa-bounded-replay is first resolved off, since the
+       validator defaults it on for CUDA and TPU attention has no decoder replay.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
   Remove when: the validator asks current_platform whether it folds encoder
        SWA replay.
@@ -236,6 +238,7 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     from unittest.mock import patch
 
     from sglang.srt.arg_groups import deepseek_v4_hook as validator
+    from sglang.srt.arg_groups.overrides import declare_resolution
     from sglang.srt.runtime_context import get_platform
 
     cfg = validator.resolving_view(server_args)
@@ -245,6 +248,13 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
         or not cfg.enable_encoder_swa_bounded_replay
     ):
         return original(server_args)
+    if cfg.enable_decoder_swa_bounded_replay is None:
+        # The validator defaults decoder replay on for CUDA; TPU attention has none.
+        declare_resolution(
+            server_args,
+            "allow_tpu_dsv41_encoder_replay",
+            enable_decoder_swa_bounded_replay=False,
+        )
     cuda = SimpleNamespace(is_cuda=True, is_hip=False)
     with patch.object(validator, "get_platform", lambda: cuda):
         return original(server_args)

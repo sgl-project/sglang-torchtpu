@@ -2408,3 +2408,42 @@ def test_engram_row_reader_loads_each_ranks_rows(monkeypatch, tmp_path):
         assert torch.equal(
             embedding.scale.view(torch.uint8), scale[owned].view(torch.uint8)
         )
+
+
+def test_encoder_replay_validation_leaves_decoder_replay_off():
+    """Regression: the TPU encoder-replay hook runs the V4.1 validator as CUDA,
+    which defaults decoder SWA replay on; the TPU attention backend has none,
+    so every worker failed at attention init. An unset flag must resolve off."""
+    from sglang.srt.arg_groups import deepseek_v4_hook
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+    from sglang.srt.runtime_context import override_platform
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(
+        model_path="local-deepseek-v41",
+        attention_backend="dsv4",
+        enable_encoder_swa_bounded_replay=True,
+        cuda_graph_config=CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.DISABLED)
+        ),
+    )
+    args._model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v41")
+    )
+    with (
+        override_platform(is_tpu=True, is_cuda=False, is_hip=False),
+        patch(
+            "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+            return_value=False,
+        ),
+    ):
+        hooks.allow_tpu_dsv41_encoder_replay(
+            deepseek_v4_hook.validate_deepseek_v41_features, args
+        )
+
+    assert resolving_view(args).enable_decoder_swa_bounded_replay is False
