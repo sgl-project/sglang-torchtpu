@@ -665,6 +665,58 @@ class TestDSV4TPUPatches(CustomTestCase):
                 req_to_token_pool._on_alloc_rows([3])
                 self.assertEqual(calls, [("core", [3]), (tpu_reset, [3])])
 
+    def test_mhc_mix_stats_off_cuda_uses_the_torch_sinkhorn(self):
+        """Regression: core's mHC mix stats call the TileLang hc_split_sinkhorn
+        on every platform but XPU, so compile tracing on TPU failed with
+        "tilelang is not installed". Off CUDA they must give the core torch
+        reference's result."""
+        import functools
+        import sys
+        from unittest.mock import patch
+
+        from sglang.kernels.ops.layernorm import mhc as mhc_kernels
+        from sglang.srt.models import deepseek_v4_mhc
+        from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+        from sglang_tpu.hooks.dsv4 import tpu_dsv4_hc_split_sinkhorn
+
+        mult, hidden, tokens = 4, 64, 3
+        cfg = deepseek_v4_mhc.HcConfig(
+            mult=mult,
+            sinkhorn_iters=20,
+            eps=1e-6,
+            rms_eps=1e-6,
+            hidden=hidden,
+            pre_from_prev=True,
+            cp_prefill=False,
+        )
+        gen = torch.Generator().manual_seed(0)
+        hc = deepseek_v4_mhc.HcSubLayer(
+            cfg=cfg,
+            fn=torch.randn((2 + mult) * mult, mult * hidden, generator=gen),
+            scale=torch.rand(3, generator=gen),
+            base=torch.randn((2 + mult) * mult, generator=gen),
+            norm=None,
+        )
+        x = torch.randn(tokens, mult, hidden, generator=gen, dtype=torch.bfloat16)
+        hooked = functools.partial(
+            tpu_dsv4_hc_split_sinkhorn, mhc_kernels.hc_split_sinkhorn
+        )
+        # The TileLang kernel cannot run here; make reaching it fail fast.
+        with (
+            patch.dict(sys.modules, {"tilelang": None}),
+            patch.object(mhc_kernels, "hc_split_sinkhorn", hooked),
+        ):
+            pre, post, comb = deepseek_v4_mhc._mix_stats_impl(hc, x)
+
+        x_flat = x.flatten(1).float()
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + cfg.rms_eps)
+        mixes = (torch.nn.functional.linear(x_flat, hc.fn) * rsqrt).unsqueeze(1)
+        ref = _hc_split_sinkhorn_torch(
+            mixes, hc.scale, hc.base, mult, cfg.sinkhorn_iters, cfg.eps
+        )
+        for got, want in zip((pre, post, comb), ref):
+            self.assertTrue(torch.equal(got, want.squeeze(1)))
+
     def test_dsv4_tpu_compressor_and_resolution_hooks(self):
         from unittest.mock import MagicMock
 

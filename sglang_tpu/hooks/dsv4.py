@@ -86,6 +86,17 @@ tpu_dsv4_get_last_loc
   How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
   Upstream PR or issue: not filed.
   Remove when: get_last_loc dispatches on the tensor device, not backend names.
+
+tpu_dsv4_hc_split_sinkhorn
+  Why: the mHC mix stats (deepseek_v4_mhc._mix_stats_impl, which the shifted
+       post fusion runs) call the TileLang hc_split_sinkhorn off CUDA too; only
+       XPU is routed to get_mhc_ops, whose non-CUDA entry is the torch
+       reference. TileLang does not run on TPU.
+  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn sends
+       non-CUDA tensors to deepseek_v4._hc_split_sinkhorn_torch.
+  Upstream PR or issue: not filed.
+  Remove when: _mix_stats_impl takes hc_split_sinkhorn from get_mhc_ops on
+       every platform.
 """
 
 from __future__ import annotations
@@ -368,6 +379,15 @@ def tpu_dsv4_get_last_loc(
     return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
 
+def tpu_dsv4_hc_split_sinkhorn(original, mixes, *args, **kwargs):
+    """AROUND hc_split_sinkhorn: the core torch reference off CUDA."""
+    if mixes.is_cuda:
+        return original(mixes, *args, **kwargs)
+    from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+
+    return _hc_split_sinkhorn_torch(mixes, *args, **kwargs)
+
+
 def register_tpu_dsv4_resolution_hooks() -> None:
     """Idempotently register TPU DeepSeek-V4 model overrides and resolution hooks."""
     import sglang.srt.arg_groups.model_overrides  # noqa: F401
@@ -471,6 +491,11 @@ def hook_specs():
         (
             "sglang.srt.mem_cache.allocation.get_last_loc",
             tpu_dsv4_get_last_loc,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
+            tpu_dsv4_hc_split_sinkhorn,
             HookType.AROUND,
         ),
     ]
