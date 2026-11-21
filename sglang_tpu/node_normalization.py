@@ -101,7 +101,6 @@ class TopologyConfig:
             raise ValueError("Invalid TPU node rank")
         return {
             "NODE_RANK": str(node_rank),
-            "TPU_WORKER_ID": str(node_rank),
             "NNODES": str(len(self.hosts)),
             "MASTER_ADDR": self.hosts[0],
             "MASTER_PORT": str(self.master_port),

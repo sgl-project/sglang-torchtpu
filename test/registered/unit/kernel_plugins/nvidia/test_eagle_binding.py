@@ -271,7 +271,6 @@ def _decode_forward_batch(committed, seq_lens):
                 lora_id=None,
                 token_type_ids=None,
                 kv=SimpleNamespace(kv_committed_len=length),
-                cache_request_handle=None,
             )
             for i, length in enumerate(committed)
         ],
