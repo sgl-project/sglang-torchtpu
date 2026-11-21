@@ -38,6 +38,14 @@ _PAIR_OPS: dict[tuple[int, ...], Any] = {}
 Payload = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
+def pp_transfer_width(model: nn.Module, model_config: Any) -> int:
+    """Row width of the stage hand-off: the model's ``pp_transfer_hidden_size``
+    when it hands on more than one hidden row per token (Qwen4-Exp carries its
+    hyper-connection streams side by side), else ``hidden_size``."""
+    width = getattr(model, "pp_transfer_hidden_size", None)
+    return int(width if width is not None else model_config.hidden_size)
+
+
 def pipeline_permutation(
     *, pp_ranks: tuple[int, ...], stage_ranks: tuple[int, ...], column: int
 ) -> tuple[tuple[int, int], ...]:

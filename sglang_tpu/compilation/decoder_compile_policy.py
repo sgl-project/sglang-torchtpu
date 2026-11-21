@@ -88,7 +88,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import (
     ordinary_compiled_forward,
 )
-from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.pp_wave import num_relayed_aux_slots, pp_transfer_width
 
 logger = get_logger(__name__)
 
@@ -1109,6 +1109,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is None or pp_group.is_first_rank:
             return {}
         hidden_size = self.model_runner.model_config.hidden_size
+        transfer_width = pp_transfer_width(
+            self.model_runner.model, self.model_runner.model_config
+        )
         # Serving trims the wave's max-bucket buffers to the batch's bucket
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
@@ -1130,8 +1133,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return buffer if buffered else buffer[: shape[0]]
 
         proxy = {
-            "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
-            "residual": zeros((num_tokens, hidden_size), transfer_dtype),
+            "hidden_states": zeros((num_tokens, transfer_width), transfer_dtype),
+            "residual": zeros((num_tokens, transfer_width), transfer_dtype),
         }
         # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
