@@ -23,6 +23,11 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    FreeComponentDeviceSlot,
+    FreeDeviceKV,
+    FreeDeviceKVFullOnly,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -248,7 +253,14 @@ def _drive(
     in_flight = set(sender.in_flight)
     sender.in_flight.clear()
     allocator.freed.clear()
+    sink = scheduler.disagg_prefill_deferred_frees.get(req, [])
+    steps[-1].held_units = cache.deferred_free_units(sink)
+    available = (allocator.full_available_size(), allocator.swa_available_size())
     scheduler._apply_deferred_frees(req)
+    steps[-1].freed_by_pool = (
+        allocator.full_available_size() - available[0],
+        allocator.swa_available_size() - available[1],
+    )
     steps[-1].freed_at_end = set(allocator.freed)
     steps[-1].in_flight = in_flight
     steps[-1].first_tokens = scheduler.first_tokens
@@ -292,6 +304,11 @@ class TestPrefillSendProtection(CustomTestCase):
                 # Published at the result, like the regular path.
                 self.assertEqual(early.protected, regular.protected)
                 self.assertEqual(len(early.freed_at_end), len(regular.freed))
+                # The pool checks count what is held as the request's: exactly
+                # what the transfer's end gives back, per sub-pool.
+                full, windows = early.held_units
+                self.assertEqual((full, windows["swa"]), early.freed_by_pool)
+                self.assertGreater(full, 0)
                 self.assertTrue(early.freed_at_end <= early.in_flight)
                 self.assertFalse(regular.freed_at_end)
                 self.assertEqual(
@@ -321,6 +338,40 @@ class TestPrefillSendProtection(CustomTestCase):
                 ):
                     scheduler.checkpoint_disagg_prefill(req)
                 self.assertEqual(cache.defer_device_frees.called, not pending)
+
+    def test_held_free_units_match_what_applying_gives_back(self):
+        # Each held free kind, measured against the pools after it is applied.
+        with get_context().override_server_args(page_size=1):
+            pool, allocator, cache, _ = _cache("python", 128)
+            cases = (
+                ("combined", lambda ids: FreeDeviceKV(indices=[ids])),
+                ("owner only", lambda ids: FreeDeviceKVFullOnly(indices=[ids])),
+                (
+                    "window slot",
+                    lambda ids: FreeComponentDeviceSlot(
+                        indices=[ids], component_type=ComponentType.SWA
+                    ),
+                ),
+            )
+            for name, make in cases:
+                with self.subTest(name):
+                    ids = allocator.alloc(4)
+                    if name == "owner only":
+                        allocator.free_swa(ids)  # its window rows went back before
+                    sink = [make(ids)]
+                    full, windows = cache.deferred_free_units(sink)
+                    before = (
+                        allocator.full_available_size(),
+                        allocator.swa_available_size(),
+                    )
+                    cache.apply_deferred_frees(sink)
+                    freed = (
+                        allocator.full_available_size() - before[0],
+                        allocator.swa_available_size() - before[1],
+                    )
+                    self.assertEqual((full, windows["swa"]), freed)
+                    if name == "window slot":
+                        allocator.free_full(ids)  # the owner rows, for the next case
 
     def test_eviction_inside_held_frees_frees_at_once(self):
         # An allocation that evicts to make room while frees are held must get

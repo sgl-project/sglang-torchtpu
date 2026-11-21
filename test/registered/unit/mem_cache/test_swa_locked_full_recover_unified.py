@@ -304,11 +304,22 @@ class TestRecoverUnderHeldFrees(_RecoverTestBase):
             "the incoming full must stay allocated while frees are held",
         )
 
+        # The pool checks count the held owner rows, and no window rows.
+        cache.token_to_kv_pool_allocator = allocator
+        cache._sub_pool_roles = functools.partial(
+            UnifiedRadixCache._sub_pool_roles, cache
+        )
+        full, windows = UnifiedRadixCache.deferred_free_units(cache, held)
+        self.assertEqual(full, len(incoming))
+        self.assertFalse(any(windows.values()))
+        swa_live = allocator.swa_attn_allocator.allocated_count()
+
         UnifiedRadixCache.apply_deferred_frees(cache, held)
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
             full_avail + len(incoming),
         )
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), swa_live)
 
 
 class TestStaticPoolPathUnchanged(unittest.TestCase):

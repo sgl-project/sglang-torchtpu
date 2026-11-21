@@ -1973,6 +1973,37 @@ class UnifiedRadixCache(BasePrefixCache):
     def apply_deferred_frees(self, sink: list) -> None:
         self._apply_cache_actions(sink)
 
+    def deferred_free_units(self, sink: list) -> tuple[int, dict[str, int]]:
+        """The owner tokens and each window sub-pool's tokens that ``sink``'s
+        held frees give back once applied; until then no pool count holds them."""
+        _, windows, _ = self._sub_pool_roles()
+        tokens, window_tokens = 0, dict.fromkeys(windows, 0)
+        for action in sink:
+            if isinstance(action, ReleaseRehomedOwnerRows):
+                # The recovery moved the incoming ids' window rows; only the
+                # owner rows remain.
+                tokens += int(action.incoming_full.numel())
+                continue
+            n = sum(int(ids.numel()) for ids in action.indices)
+            if isinstance(action, FreeDeviceKV):
+                # A combined free of segments whose window rows are all bound.
+                tokens += n
+                for name in windows:
+                    window_tokens[name] += n
+            elif isinstance(action, FreeDeviceKVFullOnly):
+                tokens += n
+            elif isinstance(action, FreeComponentDeviceSlot):
+                # State and sidecar slots are not in the token pool checks.
+                if action.component_type == BASE_COMPONENT_TYPE:
+                    tokens += n
+                else:
+                    sub_pool = self._window_sub_pools_by_slot().get(
+                        action.component_type
+                    )
+                    if sub_pool in window_tokens:
+                        window_tokens[sub_pool] += n
+        return tokens, window_tokens
+
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         if self._deferred_free_sink is not None:
             if isinstance(
