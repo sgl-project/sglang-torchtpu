@@ -29,6 +29,10 @@ class TestTpuQwen3535bA3bSinglehostTrueOnPolicy(TrueOnPolicyTestCase):
     def test_decode_log_probs_equal_the_prefix_prefill(self):
         self.assert_decode_equals_prefix_prefill()
 
+    def test_single_request_decode_equals_the_prefix_prefill(self):
+        # a one-row decode step runs the router and the shared-expert gate on a single row
+        self.assert_decode_equals_prefix_prefill(concurrency=1)
+
 
 if __name__ == "__main__":
     unittest.main()

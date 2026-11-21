@@ -6,7 +6,8 @@ Registered only with SGLANG_TPU_ENABLE_TRUE_ON_POLICY=1.
 Why: an RL trainer recomputes the rollout's log-probs in one packed forward; they equal the engine's only if
      every op gives a row the same bytes in any batch.
 How: AROUND the unquantized linear and the lm_head (matmul), the RMSNorm variants (norm kernels),
-     fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), Sampler.forward and
+     fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), fused_topk_native and the
+     Qwen2-MoE shared expert (a single row runs as two), Sampler.forward and
      InputLogprobProcessor.forward (log-prob kernel); AFTER batched RPA calculate_block_sizes (KV block = page)
      and SamplingParams.verify (refuses logit transforms). Not covered: TP above 1, other attention backends,
      quantized weights.
@@ -140,6 +141,32 @@ def recurrent_gated_delta_net(original, *args, **kwargs):
     # A trainer's forward sees A_log in bf16.
     call.arguments["a_log"] = a_log.astype(jnp.bfloat16).astype(a_log.dtype)
     return original(*call.args, **{**call.kwargs, "recurrent_scan": True})
+
+
+def _one_row_as_two(x: torch.Tensor) -> torch.Tensor:
+    # XLA lowers a one-row softmax or dot in another reduction order than a multi-row one
+    return torch.nn.functional.pad(x, (0, 0, 0, 1))
+
+
+def true_on_policy_router(original, *, hidden_states, gating_output, **kwargs):
+    """AROUND fused_topk_native: a single row is routed as two, so its weights match any batch's."""
+    if gating_output.shape[0] != 1:
+        return original(hidden_states=hidden_states, gating_output=gating_output, **kwargs)
+    weights, ids = original(
+        hidden_states=_one_row_as_two(hidden_states),
+        gating_output=_one_row_as_two(gating_output),
+        **kwargs,
+    )
+    return weights[:1], ids[:1]
+
+
+def true_on_policy_shared_experts(original, self, hidden_states, *args, **kwargs):
+    """AROUND Qwen2MoeSparseMoeBlock._forward_shared_experts: a single row is gated as two (the gate is a plain
+    nn.Linear)."""
+    if hidden_states.shape[0] != 1:
+        return original(self, hidden_states, *args, **kwargs)
+    out = original(self, _one_row_as_two(hidden_states), *args, **kwargs)
+    return None if out is None else out[:1]
 
 
 def true_on_policy_moe(original, **kwargs):
@@ -292,6 +319,16 @@ def hook_specs():
         (
             "sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn",
             recurrent_gated_delta_net,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.topk.fused_topk_native",
+            true_on_policy_router,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.qwen2_moe.Qwen2MoeSparseMoeBlock._forward_shared_experts",
+            true_on_policy_shared_experts,
             HookType.AROUND,
         ),
         (

@@ -114,8 +114,8 @@ class TrueOnPolicyTestCase(CustomTestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         return resp.json()
 
-    def _decode_as_one_batch(self, temperature: float):
-        """(prompt ids, [(log-prob, token id), ...]) per prompt, the prompts decoded concurrently."""
+    def _decode(self, temperature: float, concurrency: int = len(PROMPTS)):
+        """(prompt ids, [(log-prob, token id), ...]) per prompt, `concurrency` prompts decoded at a time."""
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(self.model_path)
@@ -131,7 +131,7 @@ class TrueOnPolicyTestCase(CustomTestCase):
             out = self._generate(input_ids=prompts[i], sampling_params=sampling)
             return [(t[0], t[1]) for t in out["meta_info"]["output_token_logprobs"]]
 
-        with ThreadPoolExecutor(len(prompts)) as pool:
+        with ThreadPoolExecutor(concurrency) as pool:
             decoded = list(pool.map(sample, range(len(prompts))))
         for out in decoded:
             self.assertEqual(len(out), RESPONSE_TOKENS)
@@ -139,7 +139,7 @@ class TrueOnPolicyTestCase(CustomTestCase):
 
     def assert_decode_equals_prefill_rescore(self, temperature: float):
         """Decode log-probs equal the prompt log-probs of a prefill over the same tokens."""
-        for prompt, out in self._decode_as_one_batch(temperature):
+        for prompt, out in self._decode(temperature):
             rescore = self._generate(
                 input_ids=prompt + [token for _, token in out],
                 sampling_params={"temperature": 1.0, "max_new_tokens": 1},
@@ -150,11 +150,11 @@ class TrueOnPolicyTestCase(CustomTestCase):
             self.assertEqual([t[1] for t in got], [token for _, token in out])
             self.assertEqual([t[0] for t in got], [logprob for logprob, _ in out])
 
-    def assert_decode_equals_prefix_prefill(self):
+    def assert_decode_equals_prefix_prefill(self, concurrency: int = len(PROMPTS)):
         """A greedy decode step equals the first greedy token of a prefill of the same prefix, from scratch."""
         cases = [
             (prompt + [token for _, token in out[:k]], out[k])
-            for prompt, out in self._decode_as_one_batch(temperature=0.0)
+            for prompt, out in self._decode(temperature=0.0, concurrency=concurrency)
             for k in range(0, RESPONSE_TOKENS, PREFIX_STRIDE)
         ]
 
