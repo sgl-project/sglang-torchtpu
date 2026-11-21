@@ -10,11 +10,17 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
     LogitsOutputMode,
 )
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
@@ -26,6 +32,7 @@ from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental.speculative.spec_types import uniform_ragged_layout
 from sglang_tpu.experimental.speculative.verify_width import verify_width_table
 
 logger = get_logger(__name__)
@@ -41,12 +48,49 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     """
 
     def target_verify_widths(self) -> tuple[int, ...]:
-        # Shared with TpuBlockSpecWorker.verify_widths, which validates the table.
+        # Shared with TpuBlockSpecWorker, which validates the table. compact packs
+        # bucket x width tokens per verify; cap-accept verifies at full width.
         assert self.b_bucketer is not None
         table = verify_width_table(self.draft_token_num)
-        if table is None:
+        if table is None or read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT:
             return (self.draft_token_num,)
         return table.reachable_widths(self.b_bucketer.buckets)
+
+    def draft_commit_widths(self) -> tuple[int, ...]:
+        # compact unpacks the verify outputs back to the full window before commit.
+        if read_ragged_verify_mode() is RaggedVerifyMode.COMPACT:
+            return (self.draft_token_num,)
+        return self.target_verify_widths()
+
+    def _make_dummy_forward_batch(
+        self,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        *,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: DFlashVerifyInput | None = None,
+    ) -> ForwardBatch:
+        batch = super()._make_dummy_forward_batch(
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
+        if (
+            not self.is_draft_worker
+            and mode.is_target_verify()
+            and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+            # A full-width table entry verifies on the plain decode-tile path.
+            and num_tokens < bs * self.draft_token_num
+        ):
+            # Narrower buckets verify through the ragged layout.
+            assert isinstance(batch.spec_info, DFlashVerifyInput)
+            batch.spec_info.ragged_verify_layout = uniform_ragged_layout(
+                seq_lens=batch.seq_lens, num_tokens=num_tokens
+            )
+        return batch
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.

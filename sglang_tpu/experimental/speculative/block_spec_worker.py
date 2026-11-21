@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+from collections.abc import Callable
 
 import torch
 
@@ -36,6 +37,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
@@ -60,14 +62,18 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    build_verify_tokens,
+    pack_verify,
     select_verify_rows,
     truncate_drafts,
+    unpack_verify_outputs,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     CommitResult,
     DraftResult,
+    PackedVerify,
     SpecState,
     TpuSpecVerifyInput,
     VerifyRows,
@@ -79,6 +85,36 @@ from sglang_tpu.experimental.speculative.spec_utils import (
 )
 from sglang_tpu.experimental.speculative.verify_width import verify_width_table
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
+
+
+def _packed_rows(packed: PackedVerify, padded_bs: int) -> VerifyRows:
+    """The packed verify tokens as [pbs, T / pbs] rows for the shared verify forward."""
+    num_tokens = packed.input_ids.shape[0]
+    return VerifyRows(
+        positions=packed.positions.view(padded_bs, num_tokens // padded_bs),
+        cache_locs=packed.cache_locs.view(padded_bs, num_tokens // padded_bs),
+        flat_positions=packed.positions,
+        flat_cache_locs=packed.cache_locs,
+    )
+
+
+def _unpack_logits_output(
+    logits_output: LogitsProcessorOutput, strided_rows: torch.Tensor
+) -> None:
+    """Return a compact verify's per-token outputs to the strided [pbs * (N + 1)] window."""
+    (
+        logits_output.next_token_logits,
+        logits_output.next_token_global_top_k_logits,
+        logits_output.next_token_global_top_k_token_ids,
+        logits_output.hidden_states,
+    ) = unpack_verify_outputs(
+        strided_rows,
+        logits_output.next_token_logits,
+        logits_output.next_token_global_top_k_logits,
+        logits_output.next_token_global_top_k_token_ids,
+        logits_output.hidden_states,
+    )
+
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DFLASH: TpuDflashDraftWorker,
@@ -107,10 +143,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     ) -> None:
         # The scheduler passes these to every spec worker; the draft reuses the target's.
         del server_args, gpu_id, nccl_port
-        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
-            raise NotImplementedError(
-                "TpuBlockSpecWorker only supports SGLANG_RAGGED_VERIFY_MODE=static."
-            )
+        self._ragged_verify_mode = read_ragged_verify_mode()
         target_runner = target_worker.model_runner
         self._spec_algorithm = target_runner.spec_algorithm
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
@@ -131,6 +164,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._verify_width_table = verify_width_table(self.num_verify_rows)
         if self._verify_width_table is not None:
             self._check_verify_width_table_supported()
+        # cap-accept verifies the full window; compact packs only the scheduled rows.
+        self._compact = self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+        self._scheduled_caps = self._compact or (
+            self._ragged_verify_mode is RaggedVerifyMode.CAP_ACCEPT
+        )
+        if self._scheduled_caps:
+            self._check_scheduled_caps_supported()
 
     def _check_verify_width_table_supported(self) -> None:
         if self._spec_algorithm != SpeculativeAlgorithm.DSPARK:
@@ -144,15 +184,88 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS does not support linear-attention targets."
             )
 
-    def verify_widths(self) -> tuple[int, ...]:
+    def _check_scheduled_caps_supported(self) -> None:
+        mode = self._ragged_verify_mode.value
+        if self._simulate_acc_len > 0:
+            # Forced accept lengths would ignore each request's cap; under compact
+            # they would commit rows the target never computed.
+            raise NotImplementedError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode} does not support SGLANG_SIMULATE_ACC_LEN."
+            )
+        drafter = self._block_draft_worker
+        if (
+            not isinstance(drafter, TpuDsparkDraftWorker)
+            or not drafter.has_confidence_head
+        ):
+            raise NotImplementedError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode} needs a DSpark draft with a confidence head."
+            )
         if self._verify_width_table is None:
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode} takes its per-bucket budget "
+                "(mean verify width) from SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS."
+            )
+        if self._compact and (self._dp_attention or self._target_has_linear_attn):
+            raise NotImplementedError(
+                "SGLANG_RAGGED_VERIFY_MODE=compact supports neither DP attention "
+                "nor linear-attention targets."
+            )
+        target_backend = self._target_worker.model_runner.attn_backend
+        if self._compact and not (
+            isinstance(target_backend, BaseTpuPallasRpaAttnBackend)
+            and target_backend.supports_ragged_verify
+        ):
+            # Only the Pallas RPA kernels read the packed rows' ragged layout;
+            # another backend (or MLA's own kernel) would split them at
+            # draft_token_num per request.
+            raise NotImplementedError(
+                "SGLANG_RAGGED_VERIFY_MODE=compact needs a Pallas RPA target attention "
+                f"backend, got {type(target_backend).__name__}."
+            )
+
+    def verify_widths(self) -> tuple[int, ...]:
+        if self._verify_width_table is None or self._scheduled_caps:
             return (self.num_verify_rows,)
         return self._verify_width_table.reachable_widths(self._bucket_sizes())
 
     def verify_width_for(self, padded_bs: int) -> int:
-        if self._verify_width_table is None:
+        if self._verify_width_table is None or self._scheduled_caps:
             return self.num_verify_rows
         return self._verify_width_table.width_for(padded_bs)
+
+    def _caps_bucket(self, padded_bs: int) -> bool:
+        """Whether this bucket schedules per-request caps; a full-width table entry
+        verifies the whole window on the plain decode-tile path instead."""
+        return (
+            self._scheduled_caps
+            and self._drafts_per_live_row(padded_bs) < self.num_drafts
+        )
+
+    def _drafts_per_live_row(self, padded_bs: int) -> int:
+        """Scheduled-caps budget: the table width less the root, per live request."""
+        assert self._verify_width_table is not None
+        return self._verify_width_table.width_for(padded_bs) - 1
+
+    def _schedule_verify_drafts(
+        self,
+        *,
+        block_hidden: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        live_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """[pbs] int32 per-request verify caps from the draft confidence."""
+        drafter = self._block_draft_worker
+        assert isinstance(drafter, TpuDsparkDraftWorker)
+        with drafter.draft_context():
+            num_verify_drafts = drafter.verify_caps(
+                block_hidden=block_hidden,
+                bonus_tokens=bonus_tokens,
+                draft_tokens=draft_tokens,
+                live_mask=live_mask,
+                drafts_per_live_row=self._drafts_per_live_row(live_mask.shape[0]),
+            )
+        return self._tp_sync.sync(SpecTpSyncSite.SPEC_VERIFY_DRAFTS, num_verify_drafts)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -170,6 +283,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._warmup_draft_block_inputs()
             if self._sampled_drafts:
                 self._warmup_draft_sampling()
+            if self._scheduled_caps:
+                self._warmup_verify_caps()
+            if self._compact:
+                self._warmup_compact_verify()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -199,6 +316,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             draft_tokens, _ = self._truncate_drafts(
                 self._sync_greedy_drafts(graph_draft_tokens), None, width
             )
+            if self._caps_bucket(bs):
+                num_verify_drafts = self._schedule_verify_drafts(
+                    block_hidden=block_hidden,
+                    bonus_tokens=state.bonus_tokens,
+                    draft_tokens=draft_tokens,
+                    live_mask=bucket.live_mask,
+                )
             return DraftResult(
                 draft_tokens=draft_tokens,
                 draft_logits=None,
@@ -217,6 +341,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         draft_tokens, draft_logits = self._truncate_drafts(
             sampled.draft_tokens, sampled.draft_logits, width
         )
+        if self._caps_bucket(bs):
+            num_verify_drafts = self._schedule_verify_drafts(
+                block_hidden=block_hidden,
+                bonus_tokens=state.bonus_tokens,
+                draft_tokens=draft_tokens,
+                live_mask=bucket.live_mask,
+            )
         return DraftResult(
             draft_tokens=draft_tokens,
             draft_logits=draft_logits,
@@ -278,6 +409,71 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def _sync_greedy_drafts(self, draft_tokens: torch.Tensor) -> torch.Tensor:
         return self._tp_sync.sync(SpecTpSyncSite.SPEC_DRAFT_GREEDY, draft_tokens)
+
+    def verify(
+        self,
+        batch: ScheduleBatch,
+        bucket: BucketState,
+        rows: VerifyRows,
+        draft_result: DraftResult,
+        verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
+    ) -> tuple[LogitsProcessorOutput, AcceptResult]:
+        if not (self._compact and self._caps_bucket(rows.cache_locs.shape[0])):
+            return super().verify(
+                batch,
+                bucket,
+                rows,
+                draft_result,
+                verify_input,
+                grammar_barrier=grammar_barrier,
+            )
+        # The block worker does not support grammar (supports_grammar is False).
+        del grammar_barrier
+        # compact: the target scores only each request's scheduled rows, packed
+        # into bucket x table-width tokens, then the outputs return to the window.
+        verify_tokens = draft_result.verify_tokens
+        if verify_tokens is None:
+            verify_tokens = build_verify_tokens(
+                bucket.state.bonus_tokens, draft_result.draft_tokens
+            )
+        padded_bs = rows.cache_locs.shape[0]
+        packed = pack_verify(
+            verify_tokens,
+            rows,
+            draft_result.num_verify_drafts,
+            bucket.live_mask,
+            bucket.state.seq_lens,
+            self._packed_tokens(padded_bs),
+        )
+        logits_output = self._forward_target_verify(
+            batch=batch,
+            bucket_state=bucket.state,
+            verify_tokens=packed.input_ids,
+            rows=_packed_rows(packed, padded_bs),
+            verify_input=verify_input,
+            spec_info=DFlashVerifyInput(
+                draft_token=packed.input_ids,
+                positions=packed.positions,
+                # Tokens per request as the compile shim pads them (bucket x width);
+                # the backend reads the per-request rows from the layout.
+                draft_token_num=self._packed_tokens(padded_bs) // padded_bs,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                live_seq_lens_cpu=batch.seq_lens_cpu,
+                ragged_verify_layout=packed.layout(),
+            ),
+            logits_output_mode=self._verify_logits_output_mode(bucket, draft_result),
+        )
+        _unpack_logits_output(logits_output, packed.strided_rows)
+        accept = self._accept(bucket, draft_result, logits_output)
+        self._check_rank_agreement(accept)
+        return logits_output, accept
+
+    def _packed_tokens(self, padded_bs: int) -> int:
+        """compact verify tokens at a bucket; covers the per-live-row draft budget plus roots."""
+        return padded_bs * (self._drafts_per_live_row(padded_bs) + 1)
 
     def commit(
         self,
@@ -604,6 +800,81 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         ),
                         None,
                         width - 1,
+                    )
+
+    def _warmup_verify_caps(self) -> None:
+        """The confidence/caps program and caps sync per scheduling bucket."""
+        hidden_size = self._draft_runner.model_config.hidden_size
+        with torch.no_grad():
+            for padded_bs in filter(self._caps_bucket, self._bucket_sizes()):
+                # Materialized like the draft graph's flat hidden output.
+                block_hidden = (
+                    torch.zeros(
+                        (padded_bs * self._draft_block_width, hidden_size),
+                        dtype=self._draft_runner.dtype,
+                    )
+                    .to(self.device)
+                    .view(padded_bs, self._draft_block_width, -1)
+                )
+                live_mask = (
+                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device)
+                    != 0
+                )
+                self._schedule_verify_drafts(
+                    block_hidden=block_hidden,
+                    bonus_tokens=self._device_zeros(padded_bs),
+                    draft_tokens=torch.zeros(
+                        (padded_bs, self.num_drafts),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    live_mask=live_mask,
+                ).cpu()
+
+    def _warmup_compact_verify(self) -> None:
+        """compact's pack op and the unpack of every verify output, per batch bucket."""
+        runner = self.target_worker.model_runner
+        vocab_size = runner.model_config.vocab_size
+        hidden_size = self._block_draft_worker.target_hidden_size
+        width = self.num_verify_rows
+        with torch.no_grad():
+            for padded_bs in filter(self._caps_bucket, self._bucket_sizes()):
+                num_tokens = self._packed_tokens(padded_bs)
+
+                def zeros(
+                    *shape: int, dtype: torch.dtype = torch.int64
+                ) -> torch.Tensor:
+                    return torch.zeros(shape, dtype=dtype, device=self.device)
+
+                packed = pack_verify(
+                    zeros(padded_bs * width),
+                    VerifyRows(
+                        positions=zeros(padded_bs, width),
+                        cache_locs=zeros(padded_bs, width),
+                        flat_positions=zeros(padded_bs * width),
+                        flat_cache_locs=zeros(padded_bs * width),
+                    ),
+                    zeros(padded_bs, dtype=torch.int32),
+                    zeros(padded_bs) != 0,
+                    zeros(padded_bs),
+                    num_tokens,
+                )
+                logits = zeros(num_tokens, vocab_size, dtype=torch.float32)
+                hidden = zeros(num_tokens, hidden_size, dtype=runner.dtype)
+                # Each logits mode leaves a different set of outputs None.
+                variants = [(logits, None, None, hidden)]
+                if self._verify_top_k_width is not None:
+                    top_logits = zeros(
+                        num_tokens, TARGET_CANDIDATES, dtype=torch.float32
+                    )
+                    top_ids = zeros(num_tokens, TARGET_CANDIDATES, dtype=torch.int32)
+                    variants += [
+                        (None, top_logits, top_ids, hidden),
+                        (logits, top_logits, top_ids, hidden),
+                    ]
+                for variant in variants:
+                    warmup_compiled_op(
+                        unpack_verify_outputs, packed.strided_rows, *variant
                     )
 
     def _warmup_draft_sampling(self) -> None:

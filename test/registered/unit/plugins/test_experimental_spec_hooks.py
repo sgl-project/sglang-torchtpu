@@ -237,6 +237,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_verify_passes_current_draft_metadata_to_target(self):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 2
+        worker._compact = False
         worker._simulate_acc_len = 0
         worker._tp_sync = MagicMock()
         worker._verify_top_k_width = None
@@ -670,6 +671,23 @@ class TestExperimentalSpecHooks(CustomTestCase):
             torch.tensor([1, 2, 3]), rows, seq_lens, live, 0, 4
         )
         self.assertEqual(block.seq_lens.tolist(), [14, 24, 0])
+
+    def test_block_worker_keeps_the_dspark_confidence_relay_off(self):
+        """A ragged DSpark mode must not make the scheduler build core's confidence
+        relay for TpuBlockSpecWorker, which has no budget prepare (it failed to boot)."""
+        from sglang_tpu.hooks.experimental_spec import needs_confidence_relay
+
+        spec_args = SimpleNamespace(speculative_algorithm="DSPARK")
+        with patch(
+            "sglang_tpu.hooks.experimental_spec.get_spec", return_value=spec_args
+        ):
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+                self.assertFalse(needs_confidence_relay(lambda: True))
+            with (
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                self.assertTrue(needs_confidence_relay(lambda: True))
 
     def test_mtp_takes_the_chain_paths_only_when_enabled(self):
         from sglang_tpu.experimental import is_experimental_spec_worker
@@ -1181,6 +1199,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         worker._all_drafts = {4: None}
         worker.num_verify_rows = 3
+        worker._scheduled_caps = False
         rows = SimpleNamespace(cache_locs=torch.zeros((4, 3), dtype=torch.int64))
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
@@ -1748,6 +1767,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 calls: list[str] = []
                 worker = object.__new__(TpuBlockSpecWorker)
                 worker._sampled_drafts = True
+                worker._scheduled_caps = False
+                worker._compact = False
                 worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
                 worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
                 worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
@@ -1825,11 +1846,262 @@ class TestNarrowVerify(CustomTestCase):
             torch.testing.assert_close(getattr(narrow, field), getattr(capped, field))
         self.assertEqual(narrow.num_correct_drafts.tolist(), [0, 2, 3, 3])
 
+    def test_verify_caps_match_core_topk_schedule(self):
+        """cap-accept caps equal core's ScheduleVerifyLensTopk (minus the root) on live rows,
+        padded rows verify nothing, and the batch never exceeds its draft budget."""
+        from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+            schedule_verify_lens_topk_from_survival,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            DSparkScheduleConfig,
+        )
+        from sglang_tpu.experimental.speculative.spec_ops import schedule_verify_drafts
+
+        gen = torch.Generator().manual_seed(0)
+        gamma = 7
+        for trial in range(100):
+            pbs = int(torch.randint(1, 17, (), generator=gen))
+            live = int(torch.randint(1, pbs + 1, (), generator=gen))
+            drafts_per_row = int(torch.randint(1, gamma + 1, (), generator=gen))
+            confidence = torch.rand(pbs, gamma, generator=gen)
+            if trial % 2:
+                # Quantized confidences force cross-row and in-row ties.
+                confidence = (confidence * 4).round().clamp(min=1) / 4
+            caps = schedule_verify_drafts(
+                confidence, torch.arange(pbs) < live, drafts_per_row
+            )
+            reference = schedule_verify_lens_topk_from_survival(
+                survival_probs=torch.cumprod(confidence[:live].double(), dim=1),
+                budget=live * drafts_per_row,
+                cfg=DSparkScheduleConfig(gamma=gamma),
+            )
+            with self.subTest(trial=trial):
+                # The accept ops are warmed with int32 caps; int64 recompiles while serving.
+                self.assertEqual(caps.dtype, torch.int32)
+                self.assertEqual(caps[:live].tolist(), (reference - 1).tolist())
+                self.assertEqual(caps[live:].tolist(), [0] * (pbs - live))
+                self.assertLessEqual(int(caps.sum()), live * drafts_per_row)
+
+    def test_cap_accept_caps_both_draft_paths(self):
+        """cap-accept verifies full width but caps each request, greedy and sampled alike."""
+        bs, gamma = 4, 7
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = gamma + 1
+        worker.num_drafts = gamma
+        worker._scheduled_caps = True
+        worker._verify_width_table = parse_verify_width_table(
+            "1:4,16:8", max_width=gamma + 1
+        )
+        # A full-width table entry verifies the whole window without scheduling.
+        self.assertEqual(
+            [worker._caps_bucket(pbs) for pbs in (1, bs, 16, 64)],
+            [True, True, False, False],
+        )
+        worker._all_drafts = {bs: torch.full((bs,), gamma, dtype=torch.int32)}
+        greedy = torch.zeros((bs, gamma), dtype=torch.int64)
+        worker._forward_draft_block = lambda **kw: ("hidden", greedy, None)
+        worker._draft_block_rows = lambda rows, verify_input, seq_lens: rows
+        worker._sync_greedy_drafts = lambda tokens: tokens
+        worker._sample_draft_block = lambda *a, **kw: SimpleNamespace(
+            draft_tokens=greedy,
+            draft_logits=torch.zeros(bs, gamma, 3),
+            verify_tokens=None,
+            draft_candidates=None,
+        )
+        caps = torch.tensor([0, 3, 7, 1], dtype=torch.int32)
+        seen = []
+        worker._schedule_verify_drafts = lambda **kw: seen.append(kw) or caps
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.zeros(bs), bonus_tokens="bonus"),
+            live_mask="live",
+            temperatures=torch.ones(bs),
+            top_ks=torch.ones(bs),
+            target_candidates=False,
+        )
+        rows = SimpleNamespace(cache_locs=torch.zeros((bs, gamma + 1)))
+        for sampled in (False, True):
+            worker._sampled_drafts = sampled
+            result = worker.draft(None, bucket, rows, None)
+            self.assertIs(result.num_verify_drafts, caps)
+            self.assertEqual(result.draft_tokens.shape, (bs, gamma))
+        self.assertEqual(
+            [(kw["block_hidden"], kw["bonus_tokens"], kw["live_mask"]) for kw in seen],
+            [("hidden", "bonus", "live")] * 2,
+        )
+
+    def test_compact_verify_accepts_what_full_window_cap_accept_would(self):
+        """Packing the scheduled rows, scoring them and unpacking to the window must
+        accept exactly what a full-window verify capped per request accepts."""
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang_tpu.experimental.speculative.spec_ops import (
+            accept_greedy_step,
+            verify_tokens_of,
+        )
+        from sglang_tpu.experimental.speculative.spec_types import VerifyRows
+
+        pbs, gamma, vocab, table_width = 4, 7, 13, 4
+        width = gamma + 1
+        gen = torch.Generator().manual_seed(0)
+        bonus = torch.randint(vocab, (pbs,), generator=gen)
+        drafts = torch.randint(vocab, (pbs, gamma), generator=gen)
+        seq_lens = torch.tensor([5, 9, 2, 0])
+        live = torch.tensor([True, True, True, False])
+        caps = torch.tensor([3, 1, 5, 0], dtype=torch.int32)  # 3 x (table_width - 1)
+        positions = seq_lens[:, None] + torch.arange(width)
+        rows = VerifyRows(
+            positions=positions,
+            cache_locs=positions + 100,
+            flat_positions=positions.reshape(-1),
+            flat_cache_locs=(positions + 100).reshape(-1),
+        )
+
+        def target_logits(tokens, token_positions):
+            # Each row's argmax depends only on its own (position, token).
+            return torch.nn.functional.one_hot(
+                (token_positions * 7 + tokens * 3) % vocab, vocab
+            ).float()
+
+        # Drafts match the target's argmax for a few rows so acceptance is non-trivial.
+        verify_tokens = verify_tokens_of(bonus, drafts).view(pbs, width)
+        for _ in range(width):
+            argmax = target_logits(verify_tokens, positions).argmax(-1)
+            drafts = torch.where(
+                torch.rand(pbs, gamma, generator=gen) < 0.8, argmax[:, :gamma], drafts
+            )
+            verify_tokens = verify_tokens_of(bonus, drafts).view(pbs, width)
+        expected = accept_greedy_step(
+            target_logits(verify_tokens, positions).view(pbs * width, vocab),
+            drafts,
+            caps,
+            seq_lens,
+            live,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = width
+        worker.num_drafts = gamma
+        worker._scheduled_caps = True
+        worker._compact = True
+        worker._simulate_acc_len = 0
+        worker._verify_top_k_width = None
+        worker._rank_check_interval = 0
+        worker._verify_width_table = parse_verify_width_table(
+            f"1:{table_width}", max_width=width
+        )
+        seen = {}
+
+        def forward_target_verify(**kw):
+            seen.update(kw)
+            return LogitsProcessorOutput(
+                next_token_logits=target_logits(
+                    kw["verify_tokens"], kw["spec_info"].positions
+                ),
+                hidden_states=kw["spec_info"].positions[:, None].float(),
+            )
+
+        worker._forward_target_verify = forward_target_verify
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(bonus_tokens=bonus, seq_lens=seq_lens),
+            live_mask=live,
+            temperatures=None,
+            top_ks=None,
+        )
+        draft_result = DraftResult(
+            draft_tokens=drafts, draft_logits=None, num_verify_drafts=caps
+        )
+        logits_output, accept = worker.verify(
+            SimpleNamespace(seq_lens_cpu=seq_lens), bucket, rows, draft_result, None
+        )
+        self.assertEqual(seen["verify_tokens"].shape, (pbs * table_width,))
+        layout = seen["spec_info"].ragged_verify_layout
+        self.assertEqual(layout.verify_lens.tolist(), [4, 2, 6, 0])
+        # Padded rows are never live, so only live rows must agree.
+        for field in (
+            "num_correct_drafts",
+            "bonus_tokens",
+            "accept_lens",
+            "next_seq_lens",
+        ):
+            torch.testing.assert_close(
+                getattr(accept, field)[live], getattr(expected, field)[live]
+            )
+        self.assertTrue(int(expected.num_correct_drafts[live].sum()) > 0)
+        # Hidden rows return to the window, so commit reads each accepted row's own position.
+        hidden = logits_output.hidden_states.view(pbs, width)
+        for r in range(pbs):
+            n = int(accept.accept_lens[r])
+            self.assertEqual(hidden[r, :n].tolist(), positions[r, :n].float().tolist())
+
+    def test_block_verify_forwards_grammar_barrier(self):
+        """step() passes grammar_barrier to verify(); the block worker's override must
+        accept it and hand it to the base verify on its non-compact path."""
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._compact = False
+        barrier = MagicMock()
+        with patch.object(
+            base_spec_worker.TpuSpecWorker, "verify", return_value="base"
+        ) as base_verify:
+            out = worker.verify(1, 2, 3, 4, 5, grammar_barrier=barrier)
+        self.assertEqual(out, "base")
+        self.assertIs(base_verify.call_args.kwargs["grammar_barrier"], barrier)
+
+    def test_scheduled_caps_reject_simulated_acceptance(self):
+        """Forced accept lengths ignore per-request caps; under compact they would commit
+        target rows that were never computed, so startup refuses the combination."""
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._ragged_verify_mode = SimpleNamespace(value="compact")
+        worker._simulate_acc_len = 3
+        with self.assertRaisesRegex(NotImplementedError, "SIMULATE_ACC_LEN"):
+            worker._check_scheduled_caps_supported()
+
+    def test_compact_rejects_non_rpa_target_backends(self):
+        """Only the Pallas RPA backends read the packed ragged layout; another backend
+        (e.g. the DeepSeek-V4 one) would give every request draft_token_num rows and
+        attend across request boundaries, so startup refuses compact there."""
+        from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
+            TpuDsparkDraftWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._ragged_verify_mode = SimpleNamespace(value="compact")
+        worker._simulate_acc_len = 0
+        worker._block_draft_worker = MagicMock(
+            spec=TpuDsparkDraftWorker, has_confidence_head=True
+        )
+        worker._verify_width_table = MagicMock()
+        worker._adaptive_width = None
+        worker._compact = True
+        worker._dp_attention = False
+        worker._target_has_linear_attn = False
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=object())
+        )
+        with self.assertRaisesRegex(NotImplementedError, "Pallas RPA"):
+            worker._check_scheduled_caps_supported()
+        # MLA reuses the RPA metadata but runs its own kernel, not validated ragged.
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        worker._target_worker.model_runner.attn_backend = object.__new__(
+            TpuPallasMlaAttnBackend
+        )
+        with self.assertRaisesRegex(NotImplementedError, "Pallas RPA"):
+            worker._check_scheduled_caps_supported()
+        worker._target_worker.model_runner.attn_backend = object.__new__(
+            TpuPallasRpaV3AttnBackend
+        )
+        worker._check_scheduled_caps_supported()
+        # cap-accept verifies the plain window, so any backend serves it.
+        worker._ragged_verify_mode = SimpleNamespace(value="cap-accept")
+        worker._compact = False
+        worker._check_scheduled_caps_supported()
+
     def test_block_draft_truncates_to_width(self):
         bs, gamma, vocab, width = 4, 7, 11, 3
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = gamma + 1
         worker.num_drafts = gamma
+        worker._scheduled_caps = False
         greedy = torch.arange(bs * gamma).view(bs, gamma)
         full_rows = SimpleNamespace(cache_locs=torch.zeros((bs, gamma + 1)))
         seen_rows = []

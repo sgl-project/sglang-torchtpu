@@ -17,6 +17,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
+from sglang_tpu.ragged_verify_layout import TpuRaggedVerifyLayout
 
 
 class SpecState(NamedTuple):
@@ -169,6 +170,66 @@ class AcceptResult(NamedTuple):
     window_seq_lens: torch.Tensor
     live_mask: torch.Tensor
     last_steps: torch.Tensor
+
+
+class PackedVerify(NamedTuple):
+    """A ragged verify packed into T token rows (compact mode), [pbs] requests.
+
+    Request r verifies verify_lens[r] = 1 + caps[r] rows [r, d_1, ...], at token
+    rows cu_q_lens[r] .. cu_q_lens[r + 1]; rows past active_num_tokens are padding
+    (token 0, position 0, KV slot 0).
+
+    Attributes:
+      input_ids: [T] int64 tokens.
+      positions: [T] int64.
+      cache_locs: [T] int64 KV slots.
+      verify_lens: [pbs] int32, 0 on padded requests.
+      cu_q_lens: [pbs + 1] int32 query offsets.
+      query_starts: [pbs] int32 cu_q_lens[:-1] as its own graph output.
+      kv_lens: [pbs] int32 RPA kv lengths, seq_lens + verify_lens.
+      active_num_tokens: [] int32 sum(verify_lens).
+      strided_rows: [pbs * (N + 1)] int64 packed row of each strided verify row;
+        rows past a request's verify_lens point at row 0 (their outputs are never read).
+    """
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    cache_locs: torch.Tensor
+    verify_lens: torch.Tensor
+    cu_q_lens: torch.Tensor
+    query_starts: torch.Tensor
+    kv_lens: torch.Tensor
+    active_num_tokens: torch.Tensor
+    strided_rows: torch.Tensor
+
+    def layout(self) -> TpuRaggedVerifyLayout:
+        return TpuRaggedVerifyLayout(
+            verify_lens=self.verify_lens,
+            graph_num_tokens=self.input_ids.shape[0],
+            extend_start_loc=self.query_starts,
+            qo_indptr_device=self.cu_q_lens,
+            kv_lens=self.kv_lens,
+            active_num_tokens=self.active_num_tokens,
+        )
+
+
+def uniform_ragged_layout(
+    *, seq_lens: torch.Tensor, num_tokens: int
+) -> TpuRaggedVerifyLayout:
+    """A ragged verify layout giving every row num_tokens // bs tokens (compile warmup)."""
+    bs = seq_lens.shape[0]
+    device = seq_lens.device
+    verify_lens = torch.full((bs,), num_tokens // bs, dtype=torch.int32)
+    cu_q_lens = torch.zeros((bs + 1,), dtype=torch.int32)
+    cu_q_lens[1:] = torch.cumsum(verify_lens, dim=0)
+    return TpuRaggedVerifyLayout(
+        verify_lens=verify_lens.to(device),
+        graph_num_tokens=num_tokens,
+        extend_start_loc=cu_q_lens[:-1].contiguous().to(device),
+        qo_indptr_device=cu_q_lens.to(device),
+        kv_lens=(seq_lens.cpu() + verify_lens).to(torch.int32).to(device),
+        active_num_tokens=torch.tensor(num_tokens, dtype=torch.int32).to(device),
+    )
 
 
 class DraftBlockInputs(NamedTuple):
