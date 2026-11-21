@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode-context-parallel for the TPU sparse MLA backend.
-"""
+"""Decode-context-parallel for the TPU sparse MLA backend."""
 
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
@@ -22,8 +21,7 @@ _OPS: dict = {}
 def build_sparse_mla_dcp_op(
     *, dcp_size: int, zero_rope: bool, gather_chunk_tokens: Optional[int] = None
 ):
-    """Register `sparse_mla_attention_dcp` as a torch custom op, once per key.
-    """
+    """Register `sparse_mla_attention_dcp` as a torch custom op, once per key."""
     key = (dcp_size, zero_rope, gather_chunk_tokens)
     if key in _OPS:
         return _OPS[key]
@@ -151,8 +149,8 @@ def index_page_indices(page_indices: torch.Tensor, *, num_seqs: int, dcp: int):
 
     Since latent cache is sharded on DCP axis and indexer is replicated,
     each indexer cache page spans page_size * dcp tokens.
-    
-    If we view indexer cache in page_size granularity, we then need this function 
+
+    If we view indexer cache in page_size granularity, we then need this function
     to compute the mappins.
 
     E.g. page_indices [1, 4] with dcp=4 -> [4, 5, 6, 7, 16, 17, 18, 19].

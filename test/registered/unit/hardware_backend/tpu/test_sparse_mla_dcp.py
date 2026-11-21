@@ -119,7 +119,9 @@ class TestForwardSparseMlaDcp(CustomTestCase):
             args = (mine, torch.zeros(tokens, heads, 2)) + ("indexer",) * 12
             backend = SimpleNamespace(
                 _mla_kernel_args=lambda **_: args,
-                forward_metadata=SimpleNamespace(dcp_latent_page_indices="latent stripe"),
+                forward_metadata=SimpleNamespace(
+                    dcp_latent_page_indices="latent stripe"
+                ),
                 _dcp_op=kernel,
                 _dcp_group=group,
                 _dcp=world,
