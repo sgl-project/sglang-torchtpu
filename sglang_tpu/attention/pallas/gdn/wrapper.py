@@ -495,8 +495,7 @@ def fused_conv1d_gdn(
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
         recurrent_scan: Run the token-recurrent scan on every tile instead of
-            the chunked solve. A token then gets the bytes a 1-token decode
-            gives it, however the sequence is split into calls and tiles.
+            the chunked solve.
         packed_weights: KDA only, no conv bias: conv weight, dt_bias and a_log
             packed into one f32 array (kda_layout.kda_packed_weights_shape),
             used instead of `conv_weight` / `dt_bias` / `a_log`.

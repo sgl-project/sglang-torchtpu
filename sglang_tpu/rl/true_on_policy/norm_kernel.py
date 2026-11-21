@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch-invariant RMSNorm: a row is one reduction, whatever the call's row count."""
 
-# NOTE: do *not* add ``from __future__ import annotations`` here: the torch_tpu
-# Pallas bridge reads the wrapped functions' annotations (``jax.Array``).
+# No ``from __future__ import annotations``: the Pallas bridge reads the annotations.
 
 import functools
 
@@ -14,7 +13,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.rl.true_on_policy.common import register, row_block
 
-# Elements per norm block (rows x row width); measured up to a 5120-wide row.
+# Elements per norm block (rows x row width).
 _NORM_BLOCK_ELEMS = 1 << 20
 
 
@@ -24,8 +23,7 @@ def _norm_kernel(*refs, eps, has_residual, gemma):
         s = x_ref[...].astype(jnp.float32) + r_ref[...].astype(jnp.float32)
         ro_ref[...] = s.astype(ro_ref.dtype)
         if gemma:
-            # GemmaRMSNorm adds in the activation dtype, so it normalizes the rounded sum. Read back the stored
-            # one: casting s to bf16 and back in place gave other bytes in a 4+ row decode program (v7x).
+            # GemmaRMSNorm normalizes the rounded sum: read it back, do not recast s.
             s = ro_ref[...].astype(jnp.float32)
     else:
         x_ref, w_ref, o_ref = refs
@@ -65,7 +63,7 @@ def _norm_call(args, kernel, n_out=1):
     )(*row_inputs, w.reshape(1, h))
 
 
-# eps and gemma are static (non-tensor) op arguments: one program per value.
+# eps and gemma are static op arguments.
 def _jax_rms_norm(x: jax.Array, w: jax.Array, eps: float, gemma: bool) -> jax.Array:
     kernel = functools.partial(_norm_kernel, eps=eps, has_residual=False, gemma=gemma)
     return _norm_call((x, w), kernel)
@@ -94,8 +92,7 @@ def rms_norm(
 ):
     """[M, H] x (and residual) -> out, or (out, new residual) when a residual is given.
 
-    As RMSNorm.forward_native rounds: the fp32 sum is normalized and rounded once. With gemma, as
-    GemmaRMSNorm.forward_native: the weight is 1 + weight, and the sum is rounded before it is normalized.
+    Rounds as RMSNorm.forward_native does, or with gemma as GemmaRMSNorm.forward_native does.
     """
     if residual is None:
         return _rms_norm(x, weight, eps, gemma)
@@ -103,7 +100,7 @@ def rms_norm(
 
 
 def gated_rms_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float):
-    """[M, H] x and gate input z -> rms_norm(x) * silu(z), as the pure-torch RMSNormGated computes it."""
+    """[M, H] x and gate input z -> rms_norm(x) * silu(z), as RMSNormGated."""
     return _gated_rms_norm(x, z, weight, eps)
 
 
@@ -118,7 +115,7 @@ def _norm_input_grad(s, w, grad_out, eps):
 
 
 def _norm_setup(ctx, inputs, output):
-    # The trailing static arguments (eps, gemma) are kept on ctx; their gradient slots below are None.
+    # Static arguments (eps, gemma) are kept on ctx; their gradient slots are None.
     tensors = [arg for arg in inputs if isinstance(arg, torch.Tensor)]
     ctx.save_for_backward(*tensors)
     ctx.static = inputs[len(tensors) :]

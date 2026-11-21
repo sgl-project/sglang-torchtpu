@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoE experts: the engine's fused MoE op with its combine pinned.
-
-A token's expert outputs are summed in slot order on the TensorCore. The default SparseCore combine sums them as
-a tree, and only above a routed-row count.
-"""
+"""MoE experts: the engine's fused MoE op with its combine in slot order."""
 
 import torch
 
@@ -12,7 +8,7 @@ from sglang_tpu.rl.true_on_policy.common import refuse_flags
 
 
 def refuse_moe_rounding_flags():
-    """The MoE kernel flags that change rounding must be unset in every process that traces these experts."""
+    """Refuse the MoE flags that change rounding."""
     flags = (
         "SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL",
         "SGLANG_TPU_PALLAS_VMEM_RIGHTSIZE",
@@ -20,7 +16,6 @@ def refuse_moe_rounding_flags():
     refuse_flags(flags, "MoE")
 
 
-# Registered at import, outside any trace, as the other ops are; the engine's MoE layers share this op.
 _fused_moe = _build_fused_moe_op()
 
 
@@ -32,11 +27,10 @@ def moe_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
 ):
-    """The routed experts of one MoE block, [M, H] -> [M, H], as the engine's fused MoE op computes them.
+    """The routed experts of one MoE block, [M, H] -> [M, H].
 
-    w1 [E, H, 2 * I] (gate || up) and w2 [E, I, H], the op's layout, holding every expert: an expert-parallel
-    shard is not supported. topk_weights [M, k] in the activation dtype and topk_ids [M, k] int32, in the router's
-    slot order. Forward only; a trainer supplies the gradient.
+    w1 [E, H, 2 * I] (gate || up) and w2 [E, I, H], every expert; topk_weights [M, k] in the activation dtype and
+    topk_ids [M, k] int32, in the router's slot order. Forward only.
     """
     refuse_moe_rounding_flags()
     return _fused_moe(

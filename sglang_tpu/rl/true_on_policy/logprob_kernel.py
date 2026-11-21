@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch-invariant log-prob of a target token: log-softmax over ``_LP_COLS``-column tiles, in order."""
 
-# NOTE: do *not* add ``from __future__ import annotations`` here: the torch_tpu
-# Pallas bridge reads the wrapped functions' annotations (``jax.Array``).
+# No ``from __future__ import annotations``: the Pallas bridge reads the annotations.
 
 import functools
 
@@ -32,7 +31,7 @@ def _lp_kernel(
     x = logits_ref[...].astype(jnp.float32) / temp_ref[...]
     x = jnp.where(col < vocab, x, -jnp.inf)
     m_new = jnp.maximum(m_ref[...], jnp.max(x, axis=1, keepdims=True))
-    # While every logit so far is -inf the max is -inf: rescale against 0 there, not -inf - -inf = NaN.
+    # An all -inf prefix: rescale against 0, not -inf.
     m_safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
     s_ref[...] = s_ref[...] * jnp.exp(m_ref[...] - m_safe) + jnp.sum(
         jnp.exp(x - m_safe), axis=1, keepdims=True
@@ -83,7 +82,7 @@ logprob = register("logprob", _jax_logprob)
 def _logprob_grad(ctx, grad):
     logits, temperature, target = ctx.saved_tensors
     t = temperature.float()[:, None]
-    # (onehot(target) - softmax) * grad / T, built in the softmax's own [M, V] fp32 buffer.
+    # (onehot(target) - softmax) * grad / T, in place.
     g = torch.softmax(logits.float() / t, dim=-1).neg_()
     g.scatter_add_(1, target.long()[:, None], torch.ones_like(t))
     return g.mul_(grad.float()[:, None] / t).to(logits.dtype), None, None

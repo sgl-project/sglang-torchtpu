@@ -126,8 +126,7 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
-    # Run the token-recurrent scan for every tile, whatever its size. Its bytes
-    # do not depend on how tokens are grouped into tiles; the chunked solve's do.
+    # Run the token-recurrent scan for every tile.
     recurrent_scan: bool = False
     # KDA only: the small weights arrive as one f32 array (see
     # memory_ref.unpack_kda_weights) instead of three kernel operands.

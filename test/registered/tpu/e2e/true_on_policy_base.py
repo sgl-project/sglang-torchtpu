@@ -1,10 +1,4 @@
-"""One TP1 engine in true on-policy mode, and the checks every model's registered test runs against it.
-
-An RL trainer recomputes the rollout's log-probs in one packed prefill-shaped forward. With
-SGLANG_TPU_ENABLE_TRUE_ON_POLICY the engine runs batch-invariant programs, so a token's log-prob is the same whether
-it was decoded inside a batch of concurrent requests or computed by a prefill. Without the mode they differ from the
-first token on.
-"""
+"""One TP1 engine in true on-policy mode, and the checks each model's registered test runs against it."""
 
 import os
 import unittest
@@ -24,8 +18,7 @@ from sglang.test.test_utils import (
 )
 from sglang_tpu.envs import envs
 
-# run_suite requires every file under test/registered to carry a registration; same convention as
-# bench_matrix_base.py.
+# Every file under test/registered carries a registration.
 register_tpu_ci(
     est_time=0,
     suite="stage-b-test-tpu-4-v7",
@@ -40,9 +33,9 @@ PROMPTS = [
     "Describe a binary search algorithm.",
     "Why do leaves change color in autumn?",
 ]
-# Past one 256-token KV page, so decode and prefill walk more than one KV block.
+# Past one 256-token KV page.
 RESPONSE_TOKENS = 300
-# Arbitrary; every 7th prefix of each response is prefilled from scratch.
+# Every 7th prefix of each response is prefilled from scratch.
 PREFIX_STRIDE = 7
 
 
@@ -51,8 +44,7 @@ class TrueOnPolicyTestCase(CustomTestCase):
 
     model_path: ClassVar[str] = ""
     model_args: ClassVar[tuple[str, ...]] = ()
-    # A vision-language checkpoint, served as its language model (model_args set language_model_only): the
-    # vision tower has biased linears the mode refuses, and the TPU engine returns no prompt log-probs for it.
+    # A vision-language checkpoint served as its language model (model_args set language_model_only).
     vision_language: ClassVar[bool] = False
 
     @classmethod
@@ -65,8 +57,7 @@ class TrueOnPolicyTestCase(CustomTestCase):
         ]
         if cls.vision_language:
             flags.append(envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND)
-            # The server's own warmup request carries an image; a cached prefix would make the prefix check
-            # an extend of decode-written state, not a prefill.
+            # The warmup request carries an image; the prefix check needs prefills from scratch.
             mode_args = ["--skip-server-warmup", "--disable-radix-cache"]
         else:
             flags.append(envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB)
@@ -199,6 +190,5 @@ class TrueOnPolicyTestCase(CustomTestCase):
 
 
 if __name__ == "__main__":
-    # The model files subclass TrueOnPolicyTestCase and run there; this satisfies the dead-TestCase lint for
-    # the class defined in this helper (nothing is collected here).
+    # Nothing is collected here; the model files subclass TrueOnPolicyTestCase.
     unittest.main()

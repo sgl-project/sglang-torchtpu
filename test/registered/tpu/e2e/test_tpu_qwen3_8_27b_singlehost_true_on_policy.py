@@ -1,8 +1,4 @@
-"""True on-policy mode on four layers of Qwen3.8-27B: a decode step equals a prefill of the same prefix.
-
-The first four layers are one period of the hybrid backbone: three gated-delta-net layers and one attention
-layer, each with a dense MLP.
-"""
+"""True on-policy mode on four layers of Qwen3.8-27B: a decode step equals a prefill of the same prefix."""
 
 import importlib.util
 import unittest

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch-invariant matmul: fp32 accumulation over K in ``_MM_BK`` steps, in order."""
 
-# NOTE: do *not* add ``from __future__ import annotations`` here: the torch_tpu
-# Pallas bridge reads the wrapped functions' annotations (``jax.Array``).
+# No ``from __future__ import annotations``: the Pallas bridge reads the annotations.
 
 import functools
 
@@ -14,12 +13,10 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.rl.true_on_policy.common import register, row_block, save_inputs
 
 _MM_BM, _MM_BN, _MM_BK = 1024, 2048, 512
-# Scoped VMEM the 1024 x 2048 block was measured with (fp32 accumulator plus tiles, about 30 MiB).
 _MM_VMEM_BYTES = 48 << 20
 
 
-# The last grid step is bound in Python: pl.num_programs inside a kernel function reused for another grid with
-# the same block shapes returned the first grid's extent (v7x, jax 0.11), ending the K loop early.
+# nk is passed in: pl.num_programs returned a stale extent here.
 def _mm_kernel(x_ref, w_ref, o_ref, acc_ref, *, nk):
     k = pl.program_id(2)
 

@@ -1,8 +1,4 @@
-"""Batch invariance of the true on-policy kernels (sglang_tpu/rl/true_on_policy/).
-
-An RL trainer recomputes the rollout's log-probs in one packed forward; they equal the engine's bit for bit only if
-a row's bytes do not depend on how many rows share its call. XLA's dot, log-softmax and RMSNorm do not hold this.
-"""
+"""Batch invariance of the true on-policy kernels (sglang_tpu/rl/true_on_policy/)."""
 
 import importlib.util
 import unittest

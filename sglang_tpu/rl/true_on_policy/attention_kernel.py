@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Packed causal attention: the engine's batched RPA kernel with its KV block pinned to the page.
+"""Packed causal attention: the engine's batched RPA kernel with its KV block pinned to the page."""
 
-Decode, prefill, chunked prefill and a packed training batch then walk a row's keys in the same blocks. The
-SEQ_ALONG_LANE layout and the page size are part of the contract: the two layouts round differently.
-"""
-
-# NOTE: do *not* add ``from __future__ import annotations`` here: the torch_tpu
-# Pallas bridge reads the wrapped functions' annotations (``jax.Array``).
+# No ``from __future__ import annotations``: the Pallas bridge reads the annotations.
 
 import contextlib
 import dataclasses
@@ -21,7 +16,7 @@ PAGE_SIZE = 256
 
 
 def pin_kv_block(decode, prefill, serve_cfgs):
-    """One KV block, the page, for the decode and the prefill launches of the cache the contract covers."""
+    """One KV block, the page, for decode and prefill, on a bf16 SEQ_ALONG_LANE cache."""
     from sglang_tpu.attention.pallas.batched_rpa import configs
 
     cache = (serve_cfgs.page_size, serve_cfgs.kv_layout, serve_cfgs.dtype_kv)
@@ -36,7 +31,7 @@ def pin_kv_block(decode, prefill, serve_cfgs):
 
 
 def refuse_rpa_rounding_flags():
-    """The RPA tile flags that change rounding must be unset in every process that traces this attention."""
+    """Refuse the RPA flags that change rounding."""
     flags = (
         "SGLANG_TPU_RPA_EXP2_SOFTMAX",
         "SGLANG_TPU_RPA_ONES_V",
@@ -47,7 +42,7 @@ def refuse_rpa_rounding_flags():
 
 @contextlib.contextmanager
 def _pinned_kv_blocks():
-    """Pin the KV block while the trainer's attention is traced (the engine pins it with a hook)."""
+    """Pin the KV block while the attention is traced."""
     from sglang_tpu.attention.pallas.batched_rpa import wrapper
 
     original = wrapper.calculate_block_sizes
@@ -67,12 +62,10 @@ def _pinned_kv_blocks():
 def _jax_packed_causal_attention(
     q: jax.Array, k: jax.Array, v: jax.Array, cu_seqlens: jax.Array, sm_scale: float
 ) -> jax.Array:
-    """Causal attention within each packed sequence, as the engine computes it.
+    """Causal attention within each packed sequence.
 
     q [T, Hq, D], k and v [T, Hkv, D] bf16; cu_seqlens [n + 1] int32 sequence starts (rows past cu_seqlens[-1] are
-    padding); sm_scale is the layer's softmax scale (a static argument). Each sequence gets its own pages; the
-    kernel writes its K/V there and attends, as an engine extend with no cached prefix does. Plain causal attention
-    over a bf16 cache only: no sliding window, logit cap or attention sink.
+    padding); sm_scale is static. No sliding window, logit cap or attention sink.
     """
     from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
@@ -88,7 +81,7 @@ def _jax_packed_causal_attention(
     page_indices = jnp.minimum(
         first_page[:, None] + jnp.arange(pages_per_seq)[None, :], num_pages - 1
     )
-    # One idle sequence slot past the batch, as the serving backend pads it.
+    # One idle sequence slot past the batch.
     page_indices = jnp.concatenate(
         [page_indices, jnp.zeros((1, pages_per_seq), page_indices.dtype)]
     ).reshape(-1)
@@ -96,7 +89,6 @@ def _jax_packed_causal_attention(
     cu_q_lens = jnp.concatenate([cu_seqlens, cu_seqlens[-1:]]).astype(jnp.int32)
     layout = configs.KVLayout.SEQ_ALONG_LANE
     distribution = jnp.full((3,), n, jnp.int32)  # every sequence is an extend
-    # The kernel sizes its cache and tiles from the physical TPU's metadata while it is traced, as in the engine.
     with tpu_info_for_cpu_export(), _pinned_kv_blocks():
         kv_cache = jnp.zeros(
             wrapper.get_kv_cache_shape(

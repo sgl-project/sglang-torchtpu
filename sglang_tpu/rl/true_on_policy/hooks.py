@@ -1,23 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""True on-policy mode: every op whose bytes could depend on the batch runs a batch-invariant program.
+"""True on-policy mode: engine ops whose bytes could depend on the batch run batch-invariant kernels.
 
-Registered only with SGLANG_TPU_ENABLE_TRUE_ON_POLICY=1; unset, sglang_tpu/hooks does not import this module.
+Registered only with SGLANG_TPU_ENABLE_TRUE_ON_POLICY=1.
 
-Why: an RL trainer recomputes the rollout's log-probs in one packed forward. They equal the engine's bit for
-     bit only if every op gives a row the same bytes whatever else shares its batch: XLA's dot, log-softmax and
-     RMSNorm do not (they tile per shape), and the batched RPA kernel picks a different KV block for decode than
-     for prefill. The gated-delta-net kernel prefills with a chunked solve and decodes with a recurrence, and
-     the MoE combine changes with the routed-row count. The kernels are the other modules of this package.
-How: AROUND UnquantizedLinearMethod.apply and LogitsProcessor._compute_lm_head_rows (fixed-tile matmul),
-     AROUND RMSNorm.forward_native, GemmaRMSNorm.forward_native and RMSNormGated.forward (fixed-tile norms),
-     AROUND fused_conv1d_gdn (every tile runs the recurrence), AROUND fused_moe_call (one kernel, combine in
-     slot order), AROUND Sampler.forward and InputLogprobProcessor.forward
-     (the returned token log-probs come from the fixed-tile log-prob kernel; top-k and token-id log-probs stay
-     on the stock path), AFTER batched RPA calculate_block_sizes (one KV block, the page size, for decode and
-     prefill), AFTER SamplingParams.verify (a request asking for a logit transform the log-prob does not model
-     gets a 400). The engine does not check the rest of the server configuration: the trainer that launches
-     it (miles) refuses what these programs do not cover (TP above 1, another attention backend, quantized
-     weights).
+Why: an RL trainer recomputes the rollout's log-probs in one packed forward; they equal the engine's only if
+     every op gives a row the same bytes in any batch.
+How: AROUND the unquantized linear and the lm_head (matmul), the RMSNorm variants (norm kernels),
+     fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), Sampler.forward and
+     InputLogprobProcessor.forward (log-prob kernel); AFTER batched RPA calculate_block_sizes (KV block = page)
+     and SamplingParams.verify (refuses logit transforms). Not covered: TP above 1, other attention backends,
+     quantized weights.
 Upstream PR or issue: not filed (prototype).
 Remove when: core exposes batch-invariant op seams on TPU.
 """
@@ -145,8 +137,7 @@ def recurrent_gated_delta_net(original, *args, **kwargs):
     """AROUND fused_conv1d_gdn: every tile runs the per-token recurrence, as a decode step does."""
     call = inspect.signature(original).bind(*args, **kwargs)
     a_log = call.arguments["a_log"]
-    # The model holds A_log in fp32 (every other parameter in bf16); a trainer's forward reads the bf16
-    # rounding of its fp32 weights, so the two differ after the first optimizer step.
+    # A trainer's forward sees A_log in bf16.
     call.arguments["a_log"] = a_log.astype(jnp.bfloat16).astype(a_log.dtype)
     return original(*call.args, **{**call.kwargs, "recurrent_scan": True})
 
@@ -177,7 +168,7 @@ def true_on_policy_sampler(
     token_ids = original(
         self, logits_output, sampling_info, return_logprob, *args, **kwargs
     )
-    # An all-greedy batch leaves its sampling parameters on the host (TpuSampler.forward).
+    # An all-greedy batch keeps its sampling parameters on the host.
     temperature = sampling_info.temperatures.reshape(-1).to(
         logits.device, torch.float32
     )
@@ -215,7 +206,7 @@ def true_on_policy_input_logprobs(
     )
     targets = logits_metadata.extend_input_logprob_token_ids_gpu.to(torch.int32)
     token_logprobs = []
-    # The kernels give a row the same bytes in any chunk, so the chunk only bounds the [rows, vocab] logits.
+    # The chunk only bounds the [rows, vocab] logits.
     for start in range(0, input_logprob_indices.shape[0], self.logprobs_chunk_size):
         chunk = slice(start, start + self.logprobs_chunk_size)
         logits = get_logits_fn(
@@ -224,7 +215,7 @@ def true_on_policy_input_logprobs(
             logits_metadata,
             use_logits_buffer=False,
         )
-        # Prompt log-probs carry no temperature in sglang.
+        # Prompt log-probs carry no temperature.
         ones = torch.ones(logits.shape[0], dtype=torch.float32, device=logits.device)
         token_logprobs.append(logprob_kernel.logprob(logits, ones, targets[chunk]))
     result.token_logprobs = torch.cat(token_logprobs)
@@ -237,7 +228,7 @@ def refuse_transformed_sampling(result, self, vocab_size) -> Any:
 
     transforms = {
         "top_p": self.top_p < 1.0,
-        # greedy is top_k 1 at temperature 1: its log-prob is the plain log_softmax
+        # greedy is top_k 1
         "top_k": 1 < self.top_k < TOP_K_ALL,
         "min_p": self.min_p > 0.0,
         "penalties": (
