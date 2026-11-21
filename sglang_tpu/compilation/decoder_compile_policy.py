@@ -88,6 +88,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import (
     ordinary_compiled_forward,
 )
+from sglang_tpu.host_upload import upload
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -1921,19 +1922,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # Draft scopes narrow attention-DP to one but retain the target's
         # gathered token counts. Match that gather, not the local topology.
         dp_size = dp_gather_width()
-        device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
         forward_batch.is_extend_in_batch = mode == ForwardMode.EXTEND
         forward_batch.global_num_tokens_cpu = list(global_num_tokens)
         forward_batch.original_global_num_tokens_cpu = list(global_num_tokens)
-        forward_batch.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, device=device
-        )
+        forward_batch.global_num_tokens_gpu = self._dp_count_tensor(global_num_tokens)
         forward_batch.global_num_tokens_for_logprob_cpu = [bs] * dp_size
-        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            [bs] * dp_size, dtype=torch.int64, device=device
+        forward_batch.global_num_tokens_for_logprob_gpu = self._dp_count_tensor(
+            [bs] * dp_size
         )
+
+    def _dp_count_tensor(self, counts: list[int]) -> torch.Tensor:
+        """``counts`` on the device without waiting for the dispatched programs.
+
+        torch.tensor(list, device=TPU) blocks the host until the device finishes
+        the programs already dispatched, so every spec step's draft and verify
+        preparation waited here for the previous program. A fresh tensor per
+        forward: prepare_mlp_sync_batch writes the counts in place.
+        """
+        return upload(torch.tensor(counts, dtype=torch.int64), self.model_runner.device)
 
     def _dummy_kv_slot(self) -> int:
         """KV-pool slot for dummy ``req_pool_indices``/``out_cache_loc``."""

@@ -82,6 +82,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_pin_memory_available
+from sglang_tpu.compilation import host_input_mirror
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -100,6 +101,11 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
 from sglang_tpu.experimental.speculative.draft_forward import set_bucket_dp_metadata
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.experimental.speculative.host_verify_rows import (
+    HostVerifyRows,
+    StepHostRows,
+    record_host_rows,
+)
 from sglang_tpu.experimental.speculative.pd_draft_prefill import (
     build_pd_hidden_pool,
     prebuilt_extend_groups,
@@ -255,6 +261,8 @@ class TpuSpecWorker(BaseSpecWorker):
             mambaish_config(target_worker.model_runner.model_config) is not None
         )
         self._bucket: BucketState | None = None
+        # The running step's host rows, shared by its draft and verify forwards.
+        self._step_host_rows: StepHostRows | None = None
         # hash_uniforms counter; every TP rank advances it identically, once per sampled step.
         self._rng_step = torch.zeros((1,), dtype=torch.int64).to(self.device)
         self._accept_threshold_single = get_spec().speculative_accept_threshold_single
@@ -712,6 +720,11 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input=verify_input,
             spec_info=spec_info,
             logits_output_mode=self._verify_logits_output_mode(bucket, draft_result),
+            host_rows=(
+                None
+                if self._step_host_rows is None
+                else self._step_host_rows.verify_rows()
+            ),
         )
         accept = self._accept(bucket, draft_result, logits_output)
         self._check_rank_agreement(accept)
@@ -925,15 +938,21 @@ class TpuSpecWorker(BaseSpecWorker):
             bucket.state.seq_lens,
             self.num_verify_rows,
         )
-        draft_result = self.draft(batch, bucket, rows, verify_input)
-        logits_output, accept = self.verify(
-            batch,
-            bucket,
-            rows,
-            draft_result,
-            verify_input,
-            grammar_barrier=grammar_barrier,
+        self._step_host_rows = self._new_step_host_rows(
+            seq_lens=bucket.state.seq_lens, verify_input=verify_input
         )
+        try:
+            draft_result = self.draft(batch, bucket, rows, verify_input)
+            logits_output, accept = self.verify(
+                batch,
+                bucket,
+                rows,
+                draft_result,
+                verify_input,
+                grammar_barrier=grammar_barrier,
+            )
+        finally:
+            self._step_host_rows = None
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
                 batch=batch,
@@ -1171,6 +1190,53 @@ class TpuSpecWorker(BaseSpecWorker):
             temperatures=None,
             top_ks=None,
         )
+        # Idle rows hold seq_lens 0: no read, and the active ranks' collectives
+        # wait on this rank's forwards.
+        self._step_host_rows = self._new_step_host_rows(
+            seq_lens=state.seq_lens,
+            verify_input=verify_input,
+            seq_lens_cpu=torch.zeros(state.seq_lens.shape, dtype=torch.int64),
+        )
+        try:
+            self._forward_idle_draft_verify(
+                batch=batch,
+                state=state,
+                rows=rows,
+                verify_input=verify_input,
+                idle_bucket=idle_bucket,
+                live_mask=live_mask,
+            )
+        finally:
+            self._step_host_rows = None
+
+    def _new_step_host_rows(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        verify_input: TpuSpecVerifyInput,
+        seq_lens_cpu: torch.Tensor | None = None,
+    ) -> StepHostRows | None:
+        """The step's host rows, or None where no attention backend reads them:
+        their seq_lens read would only add a host sync."""
+        if not host_input_mirror.has_consumer():
+            return None
+        return StepHostRows(
+            seq_lens=seq_lens,
+            verify_input=verify_input,
+            num_rows=self.num_verify_rows,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
+    def _forward_idle_draft_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        state: SpecState,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+        idle_bucket: BucketState,
+        live_mask: torch.Tensor,
+    ) -> None:
         draft_result = self.draft(batch, idle_bucket, rows, verify_input)
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
@@ -1215,6 +1281,11 @@ class TpuSpecWorker(BaseSpecWorker):
                 batch=batch, verify_tokens=verify_tokens, rows=rows
             ),
             logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            host_rows=(
+                None
+                if self._step_host_rows is None
+                else self._step_host_rows.verify_rows()
+            ),
         )
 
     def _warmup_target_only_accept(self) -> None:
@@ -1729,6 +1800,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
         spec_info: SpecInput,
         logits_output_mode: LogitsOutputMode,
+        host_rows: HostVerifyRows | None = None,
     ) -> LogitsProcessorOutput:
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
@@ -1739,6 +1811,7 @@ class TpuSpecWorker(BaseSpecWorker):
             spec_info=spec_info,
         )
         verify_forward_batch.logits_output_mode = logits_output_mode
+        record_host_rows(verify_forward_batch, host_rows)
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
         verify_forward_batch.spec_info.keep_outputs_padded = True

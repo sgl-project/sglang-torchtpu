@@ -16,6 +16,10 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
+from sglang_tpu.experimental.speculative.host_verify_rows import (
+    HostVerifyRows,
+    record_host_rows,
+)
 from sglang_tpu.experimental.speculative.spec_types import (
     DraftBlockInputs,
     TpuSpecVerifyInput,
@@ -55,6 +59,7 @@ def forward_draft_rows(
     spec_info: DFlashVerifyInput,
     capture_hidden_mode: CaptureHiddenMode,
     publish_dsa_topk: bool = False,
+    host_rows: HostVerifyRows | None = None,
 ) -> LogitsProcessorOutput:
     """Draft forward of width rows per request, offset rows past seq_lens, at the batch bucket.
 
@@ -107,6 +112,7 @@ def forward_draft_rows(
         # spec_info.dsa_topk_indices (IndexTopKShareState.publish).
         reuse_dsa_topk_indices=publish_dsa_topk,
     )
+    record_host_rows(forward_batch, host_rows)
     set_bucket_dp_metadata(
         forward_batch,
         runner=draft_runner,

@@ -221,6 +221,19 @@ tpu_dsv41_vocab_parallel_load_weights, tpu_dsv41_vocab_parallel_lm_head
   Remove when: core shards the LM head over the vocab across the DP ranks
        with each rank's logits rows returned to it.
 
+tpu_dsv41_carry_mirrored_padding
+  Why: host_input_mirror hands build_forward_metadata the host copies of a
+       batch's positions, out_cache_loc and req_pool_indices only while the
+       batch holds the exact device tensors they describe, and
+       ForwardBatch._pad_inputs_to_size (DP MLP sync) rebuilds all three with
+       torch.cat, a new tensor even at an unchanged size; every record a spec
+       worker made before the runner fell back to a blocking device read.
+  How: AROUND _pad_inputs_to_size moves each record to the padded tensor and
+       zero-pads its host copy the same way (host_input_mirror.carry_padding).
+  Upstream PR or issue: not filed (V4.1 TPU serving).
+  Remove when: the padding returns a field unchanged when it has nothing to
+       append, and records follow the fields they describe.
+
 tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
   Why: the target's Engram history lives on the host (engram_host), so
        committing a verify reads its outputs back and blocks the host for the
@@ -735,6 +748,19 @@ def tpu_dsv41_vocab_parallel_lm_head(
     return vocab_parallel_logits(lm_head, hidden_states)
 
 
+def tpu_dsv41_carry_mirrored_padding(original, forward_batch, *args, **kwargs):
+    """AROUND ForwardBatch._pad_inputs_to_size: keep host_input_mirror records valid."""
+    from sglang_tpu.compilation import host_input_mirror
+
+    before = {
+        name: getattr(forward_batch, name) for name in host_input_mirror.MIRRORED_FIELDS
+    }
+    result = original(forward_batch, *args, **kwargs)
+    for name, old in before.items():
+        host_input_mirror.carry_padding(forward_batch, name, old)
+    return result
+
+
 def tpu_dsv41_defer_engram_commit(
     original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
 ):
@@ -906,6 +932,11 @@ def hook_specs():
         (
             "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head_rows",
             tpu_dsv41_vocab_parallel_lm_head,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch._pad_inputs_to_size",
+            tpu_dsv41_carry_mirrored_padding,
             HookType.AROUND,
         ),
         (

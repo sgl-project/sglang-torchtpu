@@ -619,6 +619,10 @@ class DSV41TPUAttnBackend(AttentionBackend):
         config = model_config.hf_text_config
         _check_supported(config)
         self.model_runner = model_runner
+        # build_forward_metadata reads the host copies the forwards record.
+        from sglang_tpu.compilation import host_input_mirror
+
+        host_input_mirror.register_consumer()
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool

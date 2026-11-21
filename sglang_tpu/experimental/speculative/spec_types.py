@@ -202,6 +202,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
       verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live rows,
         which a hybrid-SWA draft maps to its SWA slots; None with no token slots.
       committed_lens: [pbs] device int64 committed base, or None with no token slots.
+      committed_lens_cpu: [bs] host committed base of the live rows (the upload's
+        source), or None with no token slots.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
       req_pool_indices_cpu: [pbs] host pool rows for host-built metadata.
@@ -214,6 +216,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     verify_cache_candidates: torch.Tensor | None
     verify_cache_candidates_cpu: torch.Tensor | None
     committed_lens: torch.Tensor | None
+    committed_lens_cpu: torch.Tensor | None
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -273,6 +276,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 if draft_input.needs_verify_cache_locs
                 else None
             ),
+            committed_lens_cpu=(
+                committed_lens if draft_input.needs_verify_cache_locs else None
+            ),
             # The scheduler already owns device pool rows. Only padding needs
             # another upload; exact buckets can reuse them across decode steps.
             req_pool_indices=(
@@ -305,6 +311,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 (0, 2 * verify_window_rows), dtype=torch.int64
             ),
             committed_lens=zeros.to(device, non_blocking=True),
+            committed_lens_cpu=torch.zeros((0,), dtype=torch.int64),
             req_pool_indices=zeros.to(device, non_blocking=True),
             req_pool_indices_cpu=zeros,
             seq_lens_cpu=torch.zeros((0,), dtype=torch.int64),

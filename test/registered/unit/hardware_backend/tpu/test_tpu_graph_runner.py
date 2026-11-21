@@ -15,11 +15,14 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -987,6 +990,45 @@ class TestTorchCompileBundleTracer(CustomTestCase):
         self.assertEqual(self._init_all_cuda_graphs("dynamo", save="/tmp/b"), (1, 0, 1))
         self.assertEqual(self._init_all_cuda_graphs("dynamo", load="/tmp/b"), (1, 1, 0))
         self.assertEqual(self._init_all_cuda_graphs("dynamo"), (0, 0, 0))
+
+
+class TestDpAttentionMetadataCounts(CustomTestCase):
+    def test_counts_upload_without_blocking_and_stay_per_forward(self):
+        """A blocking torch.tensor(list, device=TPU) per forward held the host until
+        the device drained, every spec step; the counts must upload non-blocking, and
+        each forward gets its own tensors since prepare_mlp_sync_batch writes them."""
+        policy = DecoderTpuCompilePolicy.__new__(DecoderTpuCompilePolicy)
+        policy.model_runner = SimpleNamespace(device="cpu")
+        uploads = []
+        real_to = torch.Tensor.to
+
+        def record_to(tensor, *args, **kwargs):
+            uploads.append(kwargs.get("non_blocking"))
+            return real_to(tensor, *args, **kwargs)
+
+        calls = [(96, 16), (192, 32), (96, 16)]
+        batches = [SimpleNamespace() for _ in calls]
+        with (
+            patch(
+                "sglang_tpu.compilation.decoder_compile_policy.dp_gather_width",
+                return_value=8,
+            ),
+            patch.object(torch.Tensor, "to", record_to),
+        ):
+            for batch, (tokens, bs) in zip(batches, calls):
+                policy.set_dp_attention_metadata(
+                    batch, tokens, bs, ForwardMode.TARGET_VERIFY
+                )
+        self.assertEqual(uploads, [True] * 6)
+        small, large, small_again = batches
+        self.assertEqual(small.global_num_tokens_gpu.tolist(), [96] * 8)
+        self.assertEqual(small.global_num_tokens_for_logprob_gpu.tolist(), [16] * 8)
+        self.assertEqual(large.global_num_tokens_gpu.tolist(), [192] * 8)
+        self.assertEqual(large.global_num_tokens_for_logprob_gpu.tolist(), [32] * 8)
+        self.assertIsNot(small_again.global_num_tokens_gpu, small.global_num_tokens_gpu)
+        self.assertIsNot(
+            small.global_num_tokens_gpu, small.global_num_tokens_for_logprob_gpu
+        )
 
 
 if __name__ == "__main__":

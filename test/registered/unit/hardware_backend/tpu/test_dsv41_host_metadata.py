@@ -257,3 +257,206 @@ def test_check_mode_catches_a_mismatch():
     ):
         with pytest.raises(AssertionError, match="req_pool_indices"):
             _metadata(fb)
+
+
+# ----------------------------------------------------------------------------
+# Spec verify / draft rows: the TPU spec worker's host twin of select_verify_rows.
+
+VERIFY_ROWS, CAPACITY = 6, 6
+
+
+def _verify_plan(seed=0, *, live=5, padded=8):
+    """A host plan as TpuSpecVerifyInput.from_batch holds it, and the device seq_lens."""
+    gen = torch.Generator().manual_seed(seed)
+    slots = torch.randperm(SLOTS - 1, generator=gen)[:live] + 1
+    committed = torch.randint(64, 3000, (live,), generator=gen)
+    columns = committed[:, None] + torch.arange(2 * CAPACITY)
+    candidates = _req_to_token()[slots[:, None], columns]
+    # One commit past the host base; row 0 trails it (offset clamps at 0) and
+    # row 1 is a full capacity past it (offset clamps at CAPACITY).
+    seq_lens = torch.zeros(padded, dtype=torch.int64)
+    seq_lens[:live] = committed + torch.randint(0, CAPACITY + 1, (live,), generator=gen)
+    seq_lens[0] = committed[0] - 3
+    seq_lens[1] = committed[1] + CAPACITY + 2
+    return SimpleNamespace(
+        slots=slots,
+        committed=committed,
+        candidates=candidates,
+        seq_lens=seq_lens,
+        req_pool_cpu=F.pad(slots, (0, padded - live)),
+    )
+
+
+def _verify_input(plan):
+    return SimpleNamespace(
+        verify_cache_candidates_cpu=plan.candidates,
+        committed_lens_cpu=plan.committed,
+        req_pool_indices_cpu=plan.req_pool_cpu,
+    )
+
+
+def _device_rows(plan):
+    """select_verify_rows on the zero-padded device uploads (padded_h2d)."""
+    from sglang_tpu.dflash_utils_tpu import select_dflash_verify_cache_locs_tpu
+
+    padded = plan.seq_lens.shape[0]
+    candidates = F.pad(plan.candidates, (0, 0, 0, padded - plan.candidates.shape[0]))
+    committed = F.pad(plan.committed, (0, padded - plan.committed.shape[0]))
+    cache_locs = select_dflash_verify_cache_locs_tpu(
+        candidates, plan.seq_lens, committed, VERIFY_ROWS
+    )
+    positions = plan.seq_lens[:, None] + torch.arange(VERIFY_ROWS)
+    return positions.reshape(-1), cache_locs.reshape(-1)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_host_verify_rows_match_select_verify_rows(seed):
+    from sglang_tpu.experimental.speculative.host_verify_rows import host_verify_rows
+
+    plan = _verify_plan(seed)
+    host = host_verify_rows(
+        seq_lens=plan.seq_lens,
+        candidates_cpu=plan.candidates,
+        committed_lens_cpu=plan.committed,
+        req_pool_indices_cpu=plan.req_pool_cpu,
+        num_rows=VERIFY_ROWS,
+    )
+    positions, cache_locs = _device_rows(plan)
+    assert host.positions.dtype == host.out_cache_loc.dtype == torch.int64
+    assert torch.equal(host.positions, positions)
+    assert torch.equal(host.out_cache_loc, cache_locs)
+    assert torch.equal(host.req_pool_indices, plan.req_pool_cpu)
+
+
+class _CountingTensor(torch.Tensor):
+    reads = 0
+
+    def to(self, *args, **kwargs):
+        type(self).reads += 1
+        return torch.Tensor.to(self.as_subclass(torch.Tensor), *args, **kwargs)
+
+
+def _step_rows(plan, **kwargs):
+    from sglang_tpu.experimental.speculative.host_verify_rows import StepHostRows
+
+    return StepHostRows(
+        seq_lens=plan.seq_lens.as_subclass(_CountingTensor),
+        verify_input=_verify_input(plan),
+        num_rows=VERIFY_ROWS,
+        **kwargs,
+    )
+
+
+def test_step_host_rows_read_seq_lens_once_for_draft_and_verify():
+    """The draft block runs the first width verify rows (spec_ops._block_inputs);
+    one seq_lens read must serve both forwards."""
+    plan = _verify_plan()
+    _CountingTensor.reads = 0
+    step = _step_rows(plan)
+    width = 4
+    draft = step.draft_rows(width)
+    verify = step.verify_rows()
+    assert _CountingTensor.reads == 1
+    positions, cache_locs = _device_rows(plan)
+    padded = plan.seq_lens.shape[0]
+    assert torch.equal(verify.positions, positions)
+    assert torch.equal(verify.out_cache_loc, cache_locs)
+    assert torch.equal(
+        draft.positions, positions.view(padded, -1)[:, :width].reshape(-1)
+    )
+    assert torch.equal(
+        draft.out_cache_loc, cache_locs.view(padded, -1)[:, :width].reshape(-1)
+    )
+    assert torch.equal(draft.req_pool_indices, plan.req_pool_cpu)
+
+
+def test_step_host_rows_skip_the_read_given_host_seq_lens():
+    plan = _verify_plan()
+    _CountingTensor.reads = 0
+    step = _step_rows(plan, seq_lens_cpu=plan.seq_lens.clone())
+    assert torch.equal(step.verify_rows().positions, _device_rows(plan)[0])
+    assert _CountingTensor.reads == 0
+
+
+def test_step_host_rows_none_without_token_slots():
+    plan = _verify_plan()
+    plan.candidates = None
+    assert _step_rows(plan).verify_rows() is None
+    assert _step_rows(plan).draft_rows(4) is None
+
+
+def _spec_verify_batch(plan, device="cpu"):
+    positions, cache_locs = _device_rows(plan)
+    return FB(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=plan.seq_lens.shape[0],
+        positions=positions.to(device),
+        out_cache_loc=cache_locs.to(torch.int32).to(device),
+        extend_seq_lens=None,
+        extend_seq_lens_cpu=None,
+        extend_prefix_lens_cpu=None,
+        req_pool_indices=plan.req_pool_cpu.to(device),
+        req_pool_indices_cpu=None,
+        encoder_swa_row_floor=None,
+        spec_info=SimpleNamespace(draft_token_num=VERIFY_ROWS),
+        **{ab._REAL_B_KEY: plan.slots.shape[0]},
+    )
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_recorded_verify_rows_replace_every_device_read(seed):
+    """The verify forward's fields are device tensors built before the draft was
+    dispatched; with the host twin recorded the metadata reads none of them."""
+    from sglang_tpu.experimental.speculative.host_verify_rows import record_host_rows
+
+    plan = _verify_plan(seed)
+    reference = _metadata(_spec_verify_batch(plan))
+    fb = _spec_verify_batch(plan, device="meta")  # a device read would raise
+    record_host_rows(fb, _step_rows(plan, seq_lens_cpu=plan.seq_lens).verify_rows())
+    _assert_same(_metadata(fb), reference)
+
+
+def _dp_pad(fb, num_tokens, bs):
+    """What ForwardBatch._pad_inputs_to_size does to the mirrored fields: torch.cat
+    with a zero tail, a new tensor even when nothing is appended."""
+    for name, size in (("positions", num_tokens), ("out_cache_loc", num_tokens)):
+        t = getattr(fb, name)
+        setattr(fb, name, torch.cat([t, t.new_zeros(size - t.shape[0])]))
+    t = fb.req_pool_indices
+    fb.req_pool_indices = torch.cat([t, t.new_zeros(bs - t.shape[0])])
+
+
+@pytest.mark.parametrize("extra_rows", [0, 2])
+def test_records_survive_the_dp_padding(extra_rows):
+    """The DP MLP sync re-pads the mirrored fields before the metadata is built;
+    without carrying the records every host copy fell back to a device read."""
+    from sglang_tpu.experimental.speculative.host_verify_rows import record_host_rows
+    from sglang_tpu.models.deepseek_v41.hooks import tpu_dsv41_carry_mirrored_padding
+
+    plan = _verify_plan()
+    reference_fb = _spec_verify_batch(plan)
+    fb = _spec_verify_batch(plan, device="meta")
+    record_host_rows(fb, _step_rows(plan, seq_lens_cpu=plan.seq_lens).verify_rows())
+    num_tokens = fb.positions.shape[0] + extra_rows * VERIFY_ROWS
+    bs = fb.req_pool_indices.shape[0] + extra_rows
+    tpu_dsv41_carry_mirrored_padding(_dp_pad, fb, num_tokens, bs)
+    _dp_pad(reference_fb, num_tokens, bs)
+    for name in UPLOADED:
+        assert host_input_mirror.host_copy(fb, name) is not None, name
+    reference_fb.batch_size = fb.batch_size = bs
+    _assert_same(_metadata(fb), _metadata(reference_fb))
+
+
+def test_spec_worker_builds_host_rows_only_for_a_consumer():
+    from sglang_tpu.experimental.speculative.block_spec_worker import (
+        TpuBlockSpecWorker,
+    )
+
+    worker = object.__new__(TpuBlockSpecWorker)
+    worker.num_verify_rows = VERIFY_ROWS
+    plan = _verify_plan()
+    kwargs = dict(seq_lens=plan.seq_lens, verify_input=_verify_input(plan))
+    with patch.object(host_input_mirror, "_consumers", 0):
+        assert worker._new_step_host_rows(**kwargs) is None
+    with patch.object(host_input_mirror, "_consumers", 1):
+        assert worker._new_step_host_rows(**kwargs) is not None

@@ -456,6 +456,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._mask_token_id,
             width,
         )
+        # Read here, after the inputs are queued: the read waits for the previous verify.
+        host_rows = (
+            None
+            if self._step_host_rows is None
+            else self._step_host_rows.draft_rows(width)
+        )
         # Writes the block's draft KV into the same slots target verify uses next.
         with self._block_draft_worker.draft_context():
             logits_output = forward_draft_rows(
@@ -468,6 +474,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 width=width,
                 spec_info=self._draft_block_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                host_rows=host_rows,
             )
         hidden = logits_output.hidden_states
         draft_tokens = logits_output.next_draft_tokens

@@ -214,6 +214,7 @@ class TestExperimentalEagle3(CustomTestCase):
             verify_cache_candidates=torch.zeros((2, 8), dtype=torch.int64),
             verify_cache_candidates_cpu=zeros,
             committed_lens=zeros,
+            committed_lens_cpu=zeros,
             req_pool_indices=zeros,
             req_pool_indices_cpu=zeros,
             seq_lens_cpu=torch.tensor(host_lens),

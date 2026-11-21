@@ -68,3 +68,42 @@ def release(forward_batch: Any) -> None:
 def clear() -> None:
     global _record
     _record = None
+
+
+def carry_padding(forward_batch: Any, name: str, old: torch.Tensor) -> None:
+    """Move ``name``'s record from ``old`` to the zero-padded tensor that replaced it.
+
+    ForwardBatch._pad_inputs_to_size rebuilds every mirrored field with a
+    zero-filled tail (a new tensor even when nothing is appended); the host
+    copy gets the same tail, so the record still describes the field.
+    """
+    if _record is None or _record[0]() is not forward_batch:
+        return
+    entry = _record[1].get(name)
+    new = getattr(forward_batch, name, None)
+    if entry is None or entry[1] is not old or new is old or new is None:
+        return
+    host = entry[0]
+    rows = new.shape[0]
+    if rows < host.shape[0] or tuple(new.shape[1:]) != tuple(host.shape[1:]):
+        del _record[1][name]
+        return
+    if rows > host.shape[0]:
+        host = torch.cat(
+            [host, host.new_zeros((rows - host.shape[0], *host.shape[1:]))]
+        )
+    _record[1][name] = (host, new)
+
+
+_consumers = 0
+
+
+def register_consumer() -> None:
+    """Called by an attention backend that reads the host copies."""
+    global _consumers
+    _consumers += 1
+
+
+def has_consumer() -> bool:
+    """Whether recording host copies saves any device read in this process."""
+    return _consumers > 0

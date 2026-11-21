@@ -234,6 +234,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._tp_sync = MagicMock()
         worker._verify_top_k_width = None
         worker._rank_check_interval = 0
+        worker._step_host_rows = None
         logits = SimpleNamespace(
             next_token_logits=torch.zeros(2, 4), has_next_token_global_top_k=False
         )
@@ -1063,6 +1064,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             ("commit", args[4], args[5].accept_lens.tolist())
         )
         worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
+        worker.num_verify_rows = 3
         zeros = torch.zeros((4,), dtype=torch.int64)
         state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
         worker._forward_idle_step(batch=None, state=state, rows=None, verify_input=None)
