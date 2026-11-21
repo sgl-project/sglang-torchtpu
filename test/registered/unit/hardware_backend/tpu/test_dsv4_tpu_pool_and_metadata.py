@@ -698,6 +698,15 @@ class TestDSV4TPUPatches(CustomTestCase):
                 allow_tpu_dsv41_encoder_replay(original, args)
         self.assertEqual(seen, [(True, False), (True, True)])
 
+    def test_v41_backend_has_no_decoder_replay_tail(self):
+        """TpModelWorker reads attn_backend.tail_forward_metadata after a folded
+        encoder replay; the TPU backend has no decoder replay, so it is None."""
+        from sglang_tpu.models.deepseek_v41.attention_backend import (
+            DSV41TPUAttnBackend,
+        )
+
+        self.assertIsNone(DSV41TPUAttnBackend.tail_forward_metadata)
+
     def test_hc_sublayers_read_through_the_layer(self):
         """attn_hc rebuilds from the layer's current attributes on every read, so
         a swapped parameter (the tracer's placeholder) reaches the tuple; it is
