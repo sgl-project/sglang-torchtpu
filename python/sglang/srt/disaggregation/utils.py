@@ -1019,8 +1019,12 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
-    def set_buf(self, req: Req):
-        self.set_buf_with_first_token(req, req.output_ids[0])
+    def set_buf(self, req: Req, first_output_id: Optional[int] = None):
+        # first_output_id: the sampled first token, for a send made before the
+        # request's result appends it to output_ids.
+        self.set_buf_with_first_token(
+            req, req.output_ids[0] if first_output_id is None else first_output_id
+        )
 
     def set_buf_with_first_token(self, req: Req, first_token: int):
         """set_buf with the first output token passed in, for a token known

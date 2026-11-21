@@ -27,7 +27,9 @@ a prefix `match_prefix` cannot honor and trips
 `new_prefix_len <= len(new_indices)` in `checkpoint`.
 """
 
+import functools
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -44,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     tree_slot_ids,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
@@ -263,6 +266,48 @@ class TestRecoverActionHandler(_RecoverTestBase):
         self.assertTrue(
             bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "after recovery the node's ids must address live swa pages",
+        )
+
+
+class TestRecoverUnderHeldFrees(_RecoverTestBase):
+    def test_recovery_publishes_at_once_and_holds_the_incoming_full(self):
+        """A PD transfer sent before the checkpoint may still read the incoming
+        full pages: under defer_device_frees the recovery publishes at once, and
+        the incoming full comes back only when the held frees are applied."""
+        probe, allocator = self._probe()
+        kept, incoming = self._two_ranges(allocator)
+        allocator.free_swa(kept)  # what eviction does when it tombstones
+        full_avail = allocator.full_attn_allocator.available_size()
+        window = _window_slot(allocator.storage)
+        cache = SimpleNamespace(components={window: probe}, _deferred_free_sink=None)
+        for name in ("_apply_cache_action", "_apply_cache_actions"):
+            setattr(
+                cache, name, functools.partial(getattr(UnifiedRadixCache, name), cache)
+            )
+
+        held = []
+        with UnifiedRadixCache.defer_device_frees(cache, held):
+            cache._apply_cache_action(
+                RecoverSWAWithLockedFull(
+                    node_id=7,
+                    kept_full=kept,
+                    incoming_full=incoming,
+                    component_type=window,
+                )
+            )
+        ((node_id, _, value),) = probe.tree_core.set_calls
+        self.assertEqual(node_id, 7)
+        self.assertTrue(bool((value > 0).all()))
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_avail,
+            "the incoming full must stay allocated while frees are held",
+        )
+
+        UnifiedRadixCache.apply_deferred_frees(cache, held)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_avail + len(incoming),
         )
 
 

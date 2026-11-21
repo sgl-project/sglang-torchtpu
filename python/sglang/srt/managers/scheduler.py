@@ -1705,6 +1705,7 @@ class Scheduler(
         self.disagg_prefill_transfer_queue = IndexedReqList(
             ListKind.PD_SENDING, abort=self._abort_prefill_transfer
         )
+        self.disagg_prefill_deferred_frees = {}
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 

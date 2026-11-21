@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RebuildFullToSWAMapping,
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
+    ReleaseRehomedOwnerRows,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import (
@@ -1905,6 +1906,14 @@ class SWAComponent(TreeComponent):
         for host_value in host_values:
             self.cache.host_pool_group.free(host_value, pool=self.pool_name)
 
+    def recover_swa_with_locked_full(self, action: RecoverSWAWithLockedFull) -> None:
+        """Keep the locked full and store on the node the incoming ids' swa
+        pages; the caller frees the incoming full's owner rows."""
+        swa_value = self._set_swa(action.kept_full, action.incoming_full)
+        self.tree_core.set_component_device_value(
+            action.node_id, self.component_type, swa_value
+        )
+
     def apply_component_action(self, action: ComponentAction) -> None:
         storage, sub_pool = self.storage_and_sub_pool()
         if isinstance(action, FreeComponentDeviceSlot):
@@ -1930,13 +1939,11 @@ class SWAComponent(TreeComponent):
             self._set_swa(action.kept_full, action.incoming_full)
             return
         if isinstance(action, RecoverSWAWithLockedFull):
-            # Keep the locked full; hand the node the INCOMING ids' swa pages,
-            # freeing only the incoming full, then store the swa on the node.
-            swa_value = self._set_swa(action.kept_full, action.incoming_full)
+            self.recover_swa_with_locked_full(action)
             storage.release_rehomed_owner_rows(action.incoming_full)
-            self.tree_core.set_component_device_value(
-                action.node_id, self.component_type, swa_value
-            )
+            return
+        if isinstance(action, ReleaseRehomedOwnerRows):
+            storage.release_rehomed_owner_rows(action.incoming_full)
             return
         if isinstance(action, SWARebuild):
             if not self._independent:

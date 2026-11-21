@@ -3,11 +3,12 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -24,7 +25,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,19 +83,22 @@ def _scheduler(cache, allocator, pool):
     scheduler.enable_overlap = False
     scheduler.enable_staging = False
     scheduler.kv_checksum_computer = None
-    scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
+    # The first token each last-chunk send writes; None reads req.output_ids.
+    scheduler.first_tokens = first_tokens = []
+    scheduler.disagg_metadata_buffers = SimpleNamespace(
+        set_buf=lambda req, first_output_id=None: first_tokens.append(first_output_id)
+    )
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
         kv_manager=SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
         )
     )
     scheduler.disagg_prefill_pending_chunk_rids = set()
+    scheduler.disagg_prefill_deferred_frees = {}
     return scheduler
 
 
-def _drive(
-    backend, chunk_ends, *, sibling, swa_size=128, unpublished=False, skip_insert=False
-):
+def _cache(backend, swa_size):
     pool = ReqToTokenPool(
         size=4, max_context_len=128, device="cpu", enable_memory_saver=False
     )
@@ -138,6 +142,24 @@ def _drive(
         )
         allocator.free(indices[: result.prefix_len])
 
+    return pool, allocator, cache, insert
+
+
+def _drive(
+    backend,
+    chunk_ends,
+    *,
+    sibling,
+    swa_size=128,
+    unpublished=False,
+    skip_insert=False,
+    early_final=None,
+):
+    """``early_final`` ("hold" or "skip") sends the last chunk before its result's
+    checkpoint, from a sender that exposes pages and holds the checkpoint's frees
+    or leaves the insert to release."""
+    pool, allocator, cache, insert = _cache(backend, swa_size)
+
     prefix = list(range(1, 5))
     old_suffix = list(range(100, 116))
     insert(prefix)
@@ -163,6 +185,9 @@ def _drive(
     req.extend_end = len(prefix)
     req.lock = cache.lock(req.last_node)
     req.disagg_kv_sender = sender = _Sender()
+    sender.holds_checkpoint_frees = early_final == "hold"
+    if early_final is not None:
+        sender.pages_exposed_before_result = True
     req.pending_bootstrap = unpublished
     req.skip_radix_cache_insert = skip_insert
     scheduler = _scheduler(cache, allocator, pool)
@@ -194,6 +219,11 @@ def _drive(
             scheduler.checkpoint_disagg_prefill(req)
         elif end < len(tokens):
             scheduler.process_prefill_chunk(last_batch=None, running_batch=running)
+        elif early_final is not None:
+            # Before the result appends the sampled token to output_ids.
+            scheduler.send_kv_chunk(req, last_chunk=True, first_output_id=7)
+            in_flight = set(sender.in_flight)
+            scheduler.checkpoint_disagg_prefill(req)
         else:
             scheduler.checkpoint_disagg_prefill(req)
             scheduler.send_kv_chunk(req, last_chunk=True)
@@ -215,8 +245,15 @@ def _drive(
             )
         )
 
+    in_flight = set(sender.in_flight)
     sender.in_flight.clear()
+    allocator.freed.clear()
+    scheduler._apply_deferred_frees(req)
+    steps[-1].freed_at_end = set(allocator.freed)
+    steps[-1].in_flight = in_flight
+    steps[-1].first_tokens = scheduler.first_tokens
     release_kv_cache(req, cache, checkpoint=False)
+    assert req not in scheduler.disagg_prefill_deferred_frees
     cache.sanity_check()
     return steps
 
@@ -236,6 +273,114 @@ class TestPrefillSendProtection(CustomTestCase):
                 self.assertEqual((first.protected, first.sent), (12, 12))
                 self.assertEqual(len(second.freed), 8)
                 self.assertEqual((second.protected, second.sent), (28, 28))
+
+    def test_early_last_send_holds_checkpoint_frees_until_transfer_end(self):
+        for backend in ("python", "rust"):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(page_size=1),
+            ):
+                regular = _drive(backend, (20, 28), sibling=True)[-1]
+                early = _drive(backend, (20, 28), sibling=True, early_final="hold")[-1]
+                skip = _drive(backend, (20, 28), sibling=True, early_final="skip")[-1]
+                # The early send read the request's own pages, 8 of which the
+                # sibling's insert also holds.
+                self.assertEqual(early.sent, 28)
+                self.assertFalse(
+                    early.freed_in_flight, "checkpoint freed pages still being sent"
+                )
+                # Published at the result, like the regular path.
+                self.assertEqual(early.protected, regular.protected)
+                self.assertEqual(len(early.freed_at_end), len(regular.freed))
+                self.assertTrue(early.freed_at_end <= early.in_flight)
+                self.assertFalse(regular.freed_at_end)
+                self.assertEqual(
+                    (early.first_tokens, regular.first_tokens), ([7], [None])
+                )
+                # Without the opt-in the result does not publish and frees nothing.
+                self.assertLess(skip.protected, regular.protected)
+                self.assertFalse(skip.freed or skip.freed_at_end)
+
+    def test_parked_result_does_not_hold_frees(self):
+        # A result still waiting for its bootstrap has sent nothing; it keeps the
+        # skip path, which publishes at release.
+        for pending in (False, True):
+            with self.subTest(pending_bootstrap=pending):
+                cache = MagicMock(spec=UnifiedRadixCache)
+                req = Req("parked", None, array("q", range(8)), SamplingParams())
+                req.extend_end = 8
+                req.pending_bootstrap = pending
+                req.disagg_kv_sender = SimpleNamespace(
+                    pages_exposed_before_result=True, holds_checkpoint_frees=True
+                )
+                scheduler = SchedulerDisaggregationPrefillMixin()
+                scheduler.tree_cache = cache
+                with patch(
+                    "sglang.srt.disaggregation.prefill._uses_write_through_cache",
+                    return_value=False,
+                ):
+                    scheduler.checkpoint_disagg_prefill(req)
+                self.assertEqual(cache.defer_device_frees.called, not pending)
+
+    def test_eviction_inside_held_frees_frees_at_once(self):
+        # An allocation that evicts to make room while frees are held must get
+        # the room; eviction takes only unlocked nodes, never a transfer's pages.
+        for backend in ("python", "rust"):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(page_size=1),
+            ):
+                _, allocator, cache, insert = _cache(backend, swa_size=128)
+                insert(list(range(1, 17)))
+                available = allocator.available_size()
+                held = []
+                with cache.defer_device_frees(held):
+                    cache.evict(EvictParams(num_tokens=16))
+                self.assertFalse(held)
+                self.assertEqual(allocator.available_size(), available + 16)
+                cache.sanity_check()
+
+    def test_transfer_end_applies_held_frees_before_release(self):
+        for poll in (KVPoll.Success, KVPoll.Failed):
+            with (
+                self.subTest(poll=poll),
+                patch(
+                    "sglang.srt.disaggregation.prefill."
+                    "poll_and_all_reduce_attn_cp_tp_group",
+                    return_value=[poll],
+                ),
+                patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+                patch(
+                    "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+                ),
+                get_parallel().override(tp_rank=0),
+            ):
+                order = MagicMock()
+                req = MagicMock(pending_bootstrap=False, return_routed_experts=False)
+                scheduler = SchedulerDisaggregationPrefillMixin()
+                scheduler.tree_cache = order.cache
+                scheduler.request_retirer = order.retirer
+                for name in (
+                    "output_streamer",
+                    "metrics_reporter",
+                    "metrics_collector",
+                ):
+                    setattr(scheduler, name, MagicMock())
+                scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+                scheduler.scheduler_stage_metrics = None
+                scheduler.req_to_metadata_buffer_idx_allocator = None
+                scheduler._release_mm_inputs = lambda req: None
+                scheduler.disagg_prefill_transfer_queue = [req]
+                held = ["free"]
+                scheduler.disagg_prefill_deferred_frees = {req: held}
+                scheduler.process_disagg_prefill_transfer_queue()
+                calls = [c[0] for c in order.mock_calls]
+                self.assertIn("cache.apply_deferred_frees", calls)
+                self.assertLess(
+                    calls.index("cache.apply_deferred_frees"),
+                    calls.index("retirer.release"),
+                )
+                self.assertFalse(scheduler.disagg_prefill_deferred_frees)
 
     def test_long_branch_keeps_checkpointing_and_releasing_swa(self):
         ends = tuple(range(20, 125, 8))

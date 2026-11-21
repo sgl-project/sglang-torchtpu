@@ -102,6 +102,14 @@ class RecoverSWAWithLockedFull(ComponentAction, frozen=True):
     component_type: ComponentType = ComponentType.SWA
 
 
+class ReleaseRehomedOwnerRows(ComponentAction, frozen=True):
+    """The owner-row free of a RecoverSWAWithLockedFull, held apart from its
+    recovery until nothing reads the incoming full."""
+
+    incoming_full: torch.Tensor
+    component_type: ComponentType = ComponentType.SWA
+
+
 class RecoverEvictedSWA(ComponentAction, frozen=True):
     """Recover evicted SWA on kept Full IDs by moving the incoming SWA mapping,
     leaving Full cleanup and tree publication to the caller."""
