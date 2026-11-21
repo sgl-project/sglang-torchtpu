@@ -59,8 +59,76 @@ def path_tokens(cache: Any, leaf: Any) -> List[int]:
 
 
 def host_page_ids(host_pool: Any, indices: Any) -> List[int]:
-    """The host page ids of the host KV ``indices``."""
+    """The physical host transfer page ids of the host KV ``indices``."""
+    transfer_ids = getattr(host_pool, "transfer_page_ids", None)
+    if callable(transfer_ids):
+        return [int(p) for p in transfer_ids(indices)]
     return [int(p) for p in host_pool._to_page_ids(indices)]
+
+
+def host_pages_per_logical_page(host_pool: Any) -> int:
+    """Physical transfer pages backing one logical page of ``host_pool`` (M_swa
+    >= 1 on a unified SWA host pool, 1 otherwise)."""
+    return max(1, int(getattr(host_pool, "_pages_per_logical", 1)))
+
+
+def shared_host_domain(full_pool: Any, swa_pool: Any) -> Any:
+    """Shared allocation domain when ``full_pool`` and ``swa_pool`` allocate
+    from the same physical page arena, else None."""
+    if full_pool is None or swa_pool is None:
+        return None
+    domain = getattr(full_pool, "shared_allocation_domain", None)
+    if (
+        domain is None
+        or getattr(swa_pool, "shared_allocation_domain", None) is not domain
+    ):
+        return None
+    return domain
+
+
+def make_shared_host_room(
+    cache: Any,
+    lockstep: Any,
+    full_pool: Any,
+    swa_pool: Any,
+    full_tokens: int,
+    swa_tokens: int,
+    *,
+    allow_duplicate_reclaim: bool = False,
+) -> bool:
+    """Evict from a unified shared host arena until combined physical pages fit
+    ``full_tokens`` + ``swa_tokens`` across all ranks; returns False when the
+    pools do not share an allocation domain."""
+    domain = shared_host_domain(full_pool, swa_pool)
+    if domain is None:
+        return False
+    page_size = int(full_pool.page_size)
+    m_swa = host_pages_per_logical_page(swa_pool)
+    required_phys = (full_tokens // page_size) + (swa_tokens // page_size) * m_swa
+    if required_phys <= 0:
+        return True
+    short_phys = lockstep.max(max(0, required_phys - len(domain.free_pages)))
+    while short_phys > 0:
+        swa_target = ((short_phys + m_swa - 1) // m_swa) * page_size
+        full_target = short_phys * page_size
+        # Evict SWA first when SWA pages are requested or SWA holds a cap share,
+        # then FULL, and optionally reclaim device-duplicate FULL host copies.
+        order = (
+            ((_SWA, swa_target), (_FULL, full_target))
+            if swa_tokens > 0
+            else ((_FULL, full_target), (_SWA, swa_target))
+        )
+        for comp, target in order:
+            cache.evict_host(target, comp)
+            if lockstep.max(max(0, required_phys - len(domain.free_pages))) == 0:
+                return True
+        if allow_duplicate_reclaim:
+            reclaim_full_host_duplicates(cache, full_target)
+        next_short = lockstep.max(max(0, required_phys - len(domain.free_pages)))
+        if next_short == 0 or next_short >= short_phys:
+            break
+        short_phys = next_short
+    return True
 
 
 def host_pages(

@@ -160,8 +160,10 @@ class VictimPush(WireMessage, omit_defaults=True):
     uuid: int = 0
     address: str = ""
     # Hybrid sliding-window models: the page-aligned trailing SWA window in
-    # the producer's SWA host pool, registered under the same UUID there.
+    # the producer's SWA host pool, registered under ``swa_uuid`` when shared
+    # with the full pool's KVCacheManager (or ``uuid`` when omitted).
     swa_blocks: list[int] = msgspec.field(default_factory=list)
+    swa_uuid: int = 0
     swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None

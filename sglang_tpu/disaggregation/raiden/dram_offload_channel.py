@@ -539,6 +539,8 @@ class DramOffloadChannel:
         # The full pages' registration stays owned by its native read when the
         # window's is refused: raiden cannot withdraw it.
         swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
+        while swa_uuid == uuid:
+            swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
         if not self._register_host_read_locked(
             self.prefix_req_id(room, swa=True), swa_uuid, swa_pages, swa=True
         ):
@@ -571,6 +573,7 @@ class DramOffloadChannel:
         extra_key: Optional[str],
         cache_salt: Optional[str],
         swa_blocks: Sequence[int] = (),
+        swa_uuid: int = 0,
         page_metadata: Sequence[bytes] = (),
         swa_page_metadata: Sequence[bytes] = (),
     ) -> bool:
@@ -591,6 +594,7 @@ class DramOffloadChannel:
                 uuid=uuid,
                 address=self.host_control_address(),
                 swa_blocks=list(swa_blocks),
+                swa_uuid=swa_uuid if swa_blocks else 0,
                 swa_address=self.host_control_address(swa=True) if swa_blocks else "",
                 extra_key=extra_key,
                 cache_salt=cache_salt,
