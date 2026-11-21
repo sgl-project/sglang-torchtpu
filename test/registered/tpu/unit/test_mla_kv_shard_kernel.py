@@ -218,6 +218,28 @@ class TestMlaKvShardKernel(CustomTestCase):
                 with self.subTest(shards=shards, zero_rope=zero_rope):
                     self._check_owned(zero_rope, shards)
 
+    def test_owned_rows_kernel_equals_xla(self):
+        """owned_rows_kernel (one VMEM pass) returns kv_shard.owned_rows' rows exactly."""
+        from sglang_tpu.attention.pallas.mla_sparse.owned_rows_kernel import (
+            owned_rows_kernel,
+        )
+
+        rng = np.random.default_rng(3)
+        for tokens, width, shards, owned in ((1024, 2048, 2, 1408), (256, 2048, 8, 512)):
+            pools = rng.integers(0, 20000, size=(tokens, width // 4))
+            rows = (pools[..., None] * 4 + np.arange(4)).reshape(tokens, width)
+            valid = rng.integers(0, width // 4 + 1, size=tokens) * 4
+            rows = np.where(np.arange(width) < valid[:, None], rows, -1)
+            rows[::5, -3:] = -1  # a partial last pool
+            rows = jnp.asarray(rows, jnp.int32)
+            out_width = -(-width // owned) * owned
+            for role in range(shards):
+                with self.subTest(shards=shards, role=role):
+                    kw = dict(page_size=128, shards=shards, role=role, group=4, out_width=out_width)
+                    ref = jax.jit(lambda r: kv_shard.owned_rows(r, **kw))(rows)
+                    got = owned_rows_kernel(rows, **kw)
+                    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
 
 if __name__ == "__main__":
     unittest.main()

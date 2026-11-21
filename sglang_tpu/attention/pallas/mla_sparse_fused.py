@@ -22,15 +22,22 @@ TODO(sglang-torchtpu#1072): measure the kernels' other layout (SparseCore),
 which is meant to gather keys faster.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils, kv_shard
 from sglang_tpu.attention.pallas.mla_sparse.kernel import (
     DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
     TENSORCORE_CACHE_LAYOUT,
     sparse_attention_owned_rows,
     sparse_ragged_paged_attention,
+)
+from sglang_tpu.attention.pallas.mla_sparse.owned_rows_kernel import (
+    owned_rows_kernel,
+    supported as owned_rows_supported,
 )
 from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     KVCacheLayout,
@@ -332,14 +339,22 @@ def sparse_mla_attention_kv_shard(
     group = max(kpool, 1)
     padded = -(-width // group) * group
     if 0 < owned_width < padded and num_tokens % chunk == 0:
-        rows = kv_shard.owned_rows(
-            topk_indices,
+        owned = functools.partial(
+            kv_shard.owned_rows,
             page_size=cache_nope.shape[1] * shards,
             shards=shards,
             role=role,
             group=group,
             out_width=-(-padded // owned_width) * owned_width,
         )
+        if tpu_envs.SGLANG_TPU_DSA_OWNED_ROWS_KERNEL.get() and owned_rows_supported(
+            topk_indices.shape,
+            page_size=cache_nope.shape[1] * shards,
+            shards=shards,
+            group=group,
+        ):
+            owned = functools.partial(owned_rows_kernel, **owned.keywords)
+        rows = owned(topk_indices)
         out, lse = sparse_attention_owned_rows(
             ql_nope,
             q_pe,

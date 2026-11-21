@@ -133,6 +133,9 @@ class TpuEnvs:
     # SGLANG_TPU_DSA_MLA_KV_SHARDS each row is already attended by its owner, so
     # prefill gathers only each rank's own entries of a row instead of all of it.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
+    # Split-cache token-split prefill: filter + compact each top-k row to this rank's
+    # pools in one Pallas pass (owned_rows_kernel) instead of XLA stages. Same values.
+    SGLANG_TPU_DSA_OWNED_ROWS_KERNEL = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
