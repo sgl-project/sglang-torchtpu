@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang_tpu import patches
 from sglang_tpu.overlap_utils_tpu import (
+    device_accept_resolved_tpu,
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )
@@ -29,12 +30,20 @@ def tpu_future_map():
         for name in (
             "stash",
             "publish",
+            "_store",
             "stash_bonus_tokens",
             "resolve_mixed_spec_tails",
         ):
             stack.enter_context(patch.object(FutureMap, name, getattr(FutureMap, name)))
-        for name in ("tpu_direct_handoff", "tpu_published_seq_lens"):
+        for name in (
+            "tpu_direct_handoff",
+            "tpu_published_seq_lens",
+            "tpu_handed_off_draft",
+        ):
             stack.enter_context(patch.object(FutureMap, name, None, create=True))
+        stack.enter_context(
+            patch.object(FutureMap, "tpu_defer_seq_lens_store", False, create=True)
+        )
         stack.enter_context(
             patch.object(patches, "_future_map_direct_handoff_patched", False)
         )
@@ -271,6 +280,62 @@ class TestDirectHandoff(CustomTestCase):
         ):
             stash(fm, indices, payload, seq_lens, published=None)
         self.assertIsNone(fm.dsa_topk_indices_buf)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
+
+
+def make_chain_case():
+    """A chain (MTP / experimental EAGLE3) round: it relays only bonus tokens."""
+    fm, _, indices, _, seq_lens = make_case()
+    fm.need_topk = fm.need_hidden_states = False
+    payload = RelayPayload(bonus_tokens=torch.tensor([11, 12]))
+    draft = SimpleNamespace(future_indices=indices, bonus_tokens=payload.bonus_tokens)
+    return fm, SimpleNamespace(spec_info=draft), indices, payload, seq_lens
+
+
+@contextmanager
+def chain_worker():
+    # A store lazily asks the spec config whether hidden states are relayed.
+    with (
+        patch("sglang_tpu.experimental.experimental_spec_enabled", return_value=True),
+        patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=False,
+        ),
+    ):
+        yield
+
+
+class TestChainHandoff(CustomTestCase):
+    def test_unchanged_round_relays_without_store_or_gather(self):
+        fm, batch, indices, payload, seq_lens = make_chain_case()
+        with chain_worker():
+            self.assertTrue(stash(fm, indices, payload, seq_lens))
+            # Neither publish nor stash wrote the relay buffers.
+            self.assertEqual(fm.new_seq_lens_buf.count_nonzero().item(), 0)
+            self.assertEqual(fm.output_tokens_buf.count_nonzero().item(), 0)
+            self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
+        self.assertIs(batch.spec_info.bonus_tokens, payload.bonus_tokens)
+        torch.testing.assert_close(batch.seq_lens, seq_lens)
+        # The extras resolve skips its gather exactly once, for this round.
+        self.assertTrue(device_accept_resolved_tpu(fm, batch))
+        self.assertFalse(device_accept_resolved_tpu(fm, batch))
+
+    def test_changed_rows_flush_lengths_and_tokens_first(self):
+        fm, batch, indices, payload, seq_lens = make_chain_case()
+        with chain_worker():
+            self.assertTrue(stash(fm, indices, payload, seq_lens))
+            batch.spec_info.future_indices = indices[:1]
+            self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
+        torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
+        self.assertIsNone(fm.tpu_direct_handoff)
+
+    def test_payload_with_extras_stores_the_deferred_lengths(self):
+        fm, _, indices, payload, seq_lens = make_chain_case()
+        payload.hidden_states = torch.zeros(2, 3)
+        with chain_worker():
+            self.assertFalse(stash(fm, indices, payload, seq_lens))
+        torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
         torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
 
 

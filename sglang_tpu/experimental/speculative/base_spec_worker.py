@@ -125,6 +125,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     finalize_accept,
     live_result_rows,
     pad_state_rows,
+    rank_digest,
     select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
@@ -511,7 +512,7 @@ class TpuSpecWorker(BaseSpecWorker):
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [
-                ((pbs, 2 * self.verify_window_rows), torch.int64)
+                ((pbs, 2 * self.verify_window_rows + 1), torch.int64)
                 for pbs in bucket_sizes
             ]
         )
@@ -541,17 +542,21 @@ class TpuSpecWorker(BaseSpecWorker):
                 warmup_compiled_op(
                     select_verify_rows,
                     torch.zeros(
-                        (pbs, 2 * self.verify_window_rows),
+                        (pbs, 2 * self.verify_window_rows + 1),
                         dtype=torch.int64,
                         device=self.device,
                     ),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
-                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     width,
                 )
-                # Eager ops compile per input layout, so bump finalize_accept's output.
-                next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
-                materialize((next_seq_lens + width).to(torch.int32))
+                # The periodic rank check runs on finalize_accept's outputs.
+                accept = self._warmup_accept(pbs, width)
+                warmup_compiled_op(
+                    rank_digest,
+                    self._rng_step,
+                    accept.accept_tokens,
+                    accept.next_seq_lens,
+                )
 
     def _warmup_real_draft_accept(self) -> None:
         """The real-draft-token accept per width and bucket, on each logits form the verify returns."""
@@ -769,12 +774,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._verify_ct += 1
         if self._verify_ct % self._rank_check_interval:
             return
-        digest = torch.stack(
-            [
-                self._rng_step.view(()),
-                accept.accept_tokens.sum(),
-                accept.next_seq_lens.sum(),
-            ]
+        digest = rank_digest(
+            self._rng_step, accept.accept_tokens, accept.next_seq_lens
         ).cpu()
         gathered = [torch.empty_like(digest) for _ in range(self._tp_group.world_size)]
         torch.distributed.all_gather(gathered, digest, group=self._tp_group.cpu_group)
@@ -966,10 +967,7 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
         # Algorithms that only need these rows after drafting can fuse their preparation.
         rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            bucket.state.seq_lens,
-            self.num_verify_rows,
+            verify_input.verify_plan, bucket.state.seq_lens, self.num_verify_rows
         )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
@@ -1182,10 +1180,7 @@ class TpuSpecWorker(BaseSpecWorker):
             draft_carry=self.make_dummy_carry(padded_bs),
         )
         rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            state.seq_lens,
-            self.num_verify_rows,
+            verify_input.verify_plan, state.seq_lens, self.num_verify_rows
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
@@ -1600,7 +1595,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 # int32 like the GDN metadata slots; the null slot 0 is never written.
                 slots = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
                 accept_lens = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
-                slots, steps = slots.clamp(min=0), accept_lens.to(torch.int64) - 1
+                steps = accept_lens.to(torch.int64) - 1
                 warmup_compiled_op(
                     committed_read_offsets,
                     mamba_pool.checkpoint_read_offsets,

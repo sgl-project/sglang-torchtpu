@@ -109,6 +109,7 @@ class VerifyRows(NamedTuple):
       cache_locs: [pbs, N + 1] int64 KV slots; dummy slot 0 on padded rows.
       flat_positions: [pbs * (N + 1)] positions as its own graph output.
       flat_cache_locs: [pbs * (N + 1)] cache_locs as its own graph output.
+      first_cache_locs: [pbs] cache_locs[:, 0] as its own graph output.
     """
 
     positions: torch.Tensor
@@ -116,6 +117,8 @@ class VerifyRows(NamedTuple):
     # A reshape view fed to direct_compile costs an eager as_strided program per bucket.
     flat_positions: torch.Tensor
     flat_cache_locs: torch.Tensor
+    # The fused draft batch's out_cache_loc; slicing it eagerly is a copy program.
+    first_cache_locs: torch.Tensor
 
 
 class DraftResult(NamedTuple):
@@ -196,14 +199,14 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     """Addressing for one verify step; the scheduler's plan already padded it to the bucket.
 
     Attributes:
-      verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
-        [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
-        None when the algorithm does not need token-slot addressing.
+      verify_plan: [pbs, 2 * capacity + 1] device int64, one upload: the KV slots
+        of [base, base + 2 * capacity), then the committed base; active verify rows
+        are picked without a D2H sync. None when the algorithm does not need
+        token-slot addressing.
       verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live rows,
         which a hybrid-SWA draft maps to its SWA slots; None with no token slots.
-      committed_lens: [pbs] device int64 committed base, or None with no token slots.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
-        in all three device fields.
+        here and in verify_plan.
       req_pool_indices_cpu: [pbs] host pool rows for host-built metadata.
       seq_lens_cpu: [bs] host committed base.
       host_len_slack: Rows the host lengths may trail the device by.
@@ -211,9 +214,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         first overlap relay.
     """
 
-    verify_cache_candidates: torch.Tensor | None
+    verify_plan: torch.Tensor | None
     verify_cache_candidates_cpu: torch.Tensor | None
-    committed_lens: torch.Tensor | None
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -262,17 +264,16 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # The plan stays on host until the forward fixes its bucket;
         # 0 is the reserved row and slot.
         return cls(
-            verify_cache_candidates=(
-                padded_h2d(candidates, padded_bs, batch.device)
+            verify_plan=(
+                padded_h2d(
+                    torch.cat((candidates, committed_lens[:, None]), dim=1),
+                    padded_bs,
+                    batch.device,
+                )
                 if draft_input.needs_verify_cache_locs
                 else None
             ),
             verify_cache_candidates_cpu=candidates,
-            committed_lens=(
-                padded_h2d(committed_lens, padded_bs, batch.device)
-                if draft_input.needs_verify_cache_locs
-                else None
-            ),
             # The scheduler already owns device pool rows. Only padding needs
             # another upload; exact buckets can reuse them across decode steps.
             req_pool_indices=(
@@ -298,13 +299,12 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         """
         zeros = torch.zeros((padded_bs,), dtype=torch.int64)
         return cls(
-            verify_cache_candidates=torch.zeros(
-                (padded_bs, 2 * verify_window_rows), dtype=torch.int64
+            verify_plan=torch.zeros(
+                (padded_bs, 2 * verify_window_rows + 1), dtype=torch.int64
             ).to(device, non_blocking=True),
             verify_cache_candidates_cpu=torch.zeros(
                 (0, 2 * verify_window_rows), dtype=torch.int64
             ),
-            committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),
             req_pool_indices_cpu=zeros,
             seq_lens_cpu=torch.zeros((0,), dtype=torch.int64),

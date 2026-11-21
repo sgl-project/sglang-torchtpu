@@ -208,7 +208,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        padded_bs = state.seq_lens.shape[0]
         drafter = self._chain_draft_worker
         forward_batch = drafter.fused_draft_batch(
             spec_algorithm=self._spec_algorithm,
@@ -217,19 +216,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
             req_pool_indices_cpu=req_pool_indices_cpu,
             seq_lens=state.seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            out_cache_loc=rows.cache_locs[:, 0].contiguous(),
+            out_cache_loc=rows.first_cache_locs,
         )
         sampled = temperatures is not None and top_ks is not None
-        uniforms = (
-            # Ranks draw alike from rank 0's uniforms, so the fused chain needs no sync.
-            self._tp_sync.sync(
-                SpecTpSyncSite.SPEC_DRAFT_SAMPLE,
-                torch.rand((padded_bs, self.num_drafts), device=self.device),
-            )
-            if sampled
-            else None
-        )
-        draft_tokens, draft_logits = drafter.run_fused_draft(
+        draft_tokens, draft_logits, rng_step = drafter.run_fused_draft(
             forward_batch,
             req_pool_indices=state.req_pool_indices,
             positions=rows.positions,
@@ -237,8 +227,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seq_lens=state.seq_lens,
             temperatures=temperatures if sampled else None,
             top_ks=top_ks if sampled else None,
-            uniforms=uniforms,
+            rng_step=self._rng_step if sampled else None,
         )
+        if rng_step is not None:
+            self._rng_step = rng_step
         if not sampled:
             draft_tokens = self._tp_sync.sync(
                 SpecTpSyncSite.SPEC_DRAFT_GREEDY, draft_tokens
@@ -679,11 +671,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
         seq_lens = upload(pbs)
         rows = select_verify_rows(
-            upload(pbs, 2 * self.verify_window_rows), upload(pbs), seq_lens, width
+            upload(pbs, 2 * self.verify_window_rows + 1), seq_lens, width
         )
-        # The fused draft batch takes this slice eagerly. A later blocking H2D
-        # can materialize it independently of the compiled draft's consumers.
-        rows.cache_locs[:, 0].contiguous().cpu()
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -755,8 +744,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             ):
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
-                    upload(padded_bs, 2 * self.verify_window_rows),
-                    upload(padded_bs),
+                    upload(padded_bs, 2 * self.verify_window_rows + 1),
                     upload(padded_bs),
                     width,
                 )
@@ -926,4 +914,5 @@ def _dummy_verify_rows(pbs: int, width: int, device: torch.device) -> VerifyRows
         cache_locs=zeros(pbs, width),
         flat_positions=zeros(pbs * width),
         flat_cache_locs=zeros(pbs * width),
+        first_cache_locs=zeros(pbs),
     )

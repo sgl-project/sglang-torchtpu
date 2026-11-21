@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     mamba_cache_chunk_size,
 )
+from sglang_tpu.host_upload import device_scalar
 from sglang_tpu.mamba_pool import AT_SLOT
 
 if TYPE_CHECKING:
@@ -429,6 +430,8 @@ class GdnTracedMetadata(NamedTuple):
     read_offsets: Optional[torch.Tensor]
     # A verify's request pool rows, which select its checkpoint windows.
     req_pool_indices: Optional[torch.Tensor] = None
+    # i32 scalar added to the cast seq_lens where read; None when seq_lens is final.
+    seq_lens_bump: Optional[torch.Tensor] = None
 
 
 class TpuGDNAttnBackend(MambaAttnBackendBase):
@@ -474,6 +477,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # carried by the shared ForwardMetadata dataclass.
         self._distribution: Optional[torch.Tensor] = None
         self._seq_lens: Optional[torch.Tensor] = None
+        self._seq_lens_bump: Optional[torch.Tensor] = None
         self._state_indices: Optional[torch.Tensor] = None
         self._query_start_loc: Optional[torch.Tensor] = None
         self._track_indices: Optional[torch.Tensor] = None
@@ -596,9 +600,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._is_decode = is_decode
         # Full per-request sequence length including this forward's tokens (the
         # verify window too); the kernel derives has_initial_state from it.
-        self._seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if is_verify:
-            self._seq_lens = self._seq_lens + self._spec_window
+        # _kernel_seq_lens casts and bumps it inside the compiled forward.
+        self._seq_lens = forward_batch.seq_lens
+        self._seq_lens_bump = device_scalar(
+            self._spec_window if is_verify else 0, torch.int32, device
+        )
         # Build only TPU metadata. The GPU base constructs variable-length
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
@@ -718,6 +724,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             track_end=self._track_end,
             read_offsets=self._read_offsets,
             req_pool_indices=self._req_pool_indices,
+            seq_lens_bump=self._seq_lens_bump,
         )
 
     @contextmanager
@@ -739,6 +746,13 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._track_end = metadata.track_end
         self._read_offsets = metadata.read_offsets
         self._req_pool_indices = metadata.req_pool_indices
+        self._seq_lens_bump = metadata.seq_lens_bump
+
+    def _kernel_seq_lens(self) -> torch.Tensor:
+        """i32 lengths including this forward's tokens."""
+        if self._seq_lens_bump is None:
+            return self._seq_lens
+        return self._seq_lens.to(torch.int32) + self._seq_lens_bump
 
     def commit_verified_states(
         self,
@@ -752,9 +766,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         """Point each verified slot's next read at its last accepted checkpoint,
         and snapshot boundary checkpoints into radix track slots."""
         mamba_pool = self.req_to_token_pool.mamba_pool
-        mamba_pool.select_checkpoints(
-            state_indices_tensor.clamp(min=0), last_correct_step_indices
-        )
+        mamba_pool.select_checkpoints(state_indices_tensor, last_correct_step_indices)
         if mamba_track_indices is None:
             return
         # As core's PLE commit, the caller resolves the boundary steps.
@@ -805,7 +817,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             query_start_loc,
             state_rows,
             self._distribution,
-            self._seq_lens,
+            self._kernel_seq_lens(),
             layer.num_k_heads,
             layer.num_v_heads,
             layer.head_k_dim,

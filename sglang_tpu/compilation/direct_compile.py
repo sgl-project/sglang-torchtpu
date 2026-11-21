@@ -46,6 +46,7 @@ from sglang_tpu.compilation.spmd_compiler import (
     InputSpec,
     SPMDCompiler,
 )
+from sglang_tpu.compilation.tensor_rebind import rebind_tensor
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
 
@@ -240,8 +241,10 @@ def direct_compile(
     Tracing leaves the serving generator unchanged; execution advances it.
 
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
-    them are assumed to be mutated during inference and are copied back
-    after execution. Explicit function inputs must be immutable.
+    them are assumed to be mutated during inference. They are donated, and
+    after execution each live tensor is rebound to its output, which reuses
+    the donated HBM, so no copy or device op runs. Explicit function inputs
+    must be immutable.
 
     Common problems/assumptions:
 
@@ -746,11 +749,10 @@ class CompiledFunction:
         trace_inputs = list(graph_inputs)
         trace_leaves = [leaf for _, leaf in path_leaves]
 
-        # Clone mutated KV inputs; XLA will optimize these away.
-        # The strategy for these is that during runtime, we will copy_ the
-        # updated values back into the original Tensors. copy_ doesn't launch a
-        # kernel, it just swizzles some metadata around (the KV pool buffers
-        # are base tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
+        # Clone mutated KV inputs; XLA will optimize these away. At runtime the
+        # donated inputs come back as outputs in the same HBM, and rebind_tensor
+        # points each live tensor at its output (the KV pool buffers are base
+        # tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
@@ -1180,12 +1182,11 @@ class _CompiledArtifact:
                 tpu_torch_compile.set_device_state_tensor(generator, outputs[-1])
                 outputs = outputs[:-1]
 
-        # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():
             for tensor, replacement in zip(
                 kv_pool_inputs, outputs[self.output_count :]
             ):
-                tensor.copy_(replacement)
+                rebind_tensor(tensor, replacement)
             mutated_start = self.output_count + len(kv_pool_inputs)
             for path, replacement in zip(
                 self.mutated_input_paths,

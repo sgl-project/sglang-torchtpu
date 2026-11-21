@@ -28,12 +28,15 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.experimental.speculative.spec_ops import STREAM_DRAFT, hash_uniforms
 from sglang_tpu.host_upload import device_scalar
 
 # (forward_batch, carry, req_pool_indices, positions, cache_locs, seq_lens,
-#  temperatures, top_ks, uniforms, dsa_seed_topk_table)
-#  -> (drafts [pbs, N], dense logits [pbs, N, V] | None).
-FusedDraft = Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
+#  temperatures, top_ks, rng_step, dsa_seed_topk_table)
+#  -> (drafts [pbs, N], dense logits [pbs, N, V] | None, next rng_step | None).
+FusedDraft = Callable[
+    ..., tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+]
 
 
 class TpuChainDraftWorker(TpuDraftWorker):
@@ -207,9 +210,10 @@ class TpuChainDraftWorker(TpuDraftWorker):
         seq_lens: torch.Tensor,
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
-        uniforms: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Drafts [pbs, N] (and dense q logits when sampling) from one compiled program."""
+        rng_step: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Drafts [pbs, N] (and dense q logits and the advanced rng_step when sampling)
+        from one compiled program."""
         assert self._fused_draft is not None, "precompile_draft has not run"
         shim = self._compile_policy().compiled_forward_shim
         assert shim is not None
@@ -232,7 +236,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
                 seq_lens,
                 temperatures,
                 top_ks,
-                uniforms,
+                rng_step,
                 self.dsa_seed_topk_table,
             )
 
@@ -246,10 +250,18 @@ class TpuChainDraftWorker(TpuDraftWorker):
         seq_lens: torch.Tensor,
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
-        uniforms: torch.Tensor | None,
+        rng_step: torch.Tensor | None,
         dsa_seed_topk_table: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Traced once per (batch bucket, sampled): d_1 from the carry, then N - 1 draft forwards."""
+        # Every rank holds the same rng_step, so ranks draw alike without a broadcast.
+        uniforms = (
+            None
+            if rng_step is None
+            else hash_uniforms(
+                rng_step, STREAM_DRAFT, (seq_lens.shape[0], self.num_drafts)
+            )
+        )
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, ChainDraftForwardInput)
         model = self.model_runner.model
@@ -297,6 +309,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
         return (
             torch.stack(tokens, dim=1),
             torch.stack(dense_logits, dim=1) if dense_logits else None,
+            None if rng_step is None else rng_step + 1,
         )
 
     def _choose_token(
@@ -337,13 +350,13 @@ class TpuChainDraftWorker(TpuDraftWorker):
             out_cache_loc=ones,
         )
         grid = torch.ones((bs, width), dtype=torch.int64, device=device)
-        temperatures = top_ks = uniforms = None
+        temperatures = top_ks = rng_step = None
         if sampled:
             temperatures = torch.ones((bs,), dtype=torch.float32, device=device)
             top_ks = torch.ones((bs,), dtype=torch.int32, device=device)
-            uniforms = torch.rand((bs, self.num_drafts), device=device)
+            rng_step = torch.zeros((1,), dtype=torch.int64, device=device)
         with torch.no_grad():
-            tokens, dense = self.run_fused_draft(
+            tokens, dense, _ = self.run_fused_draft(
                 forward_batch,
                 req_pool_indices=ones,
                 positions=grid - 1,
@@ -351,7 +364,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
                 seq_lens=torch.zeros((bs,), dtype=torch.int64, device=device),
                 temperatures=temperatures,
                 top_ks=top_ks,
-                uniforms=uniforms,
+                rng_step=rng_step,
             )
         tokens.cpu()
         if dense is not None:

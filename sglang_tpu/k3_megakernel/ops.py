@@ -693,7 +693,7 @@ class K3MegakernelRuntime:
                 pages = F.pad(pages, (0, pad))
         mode = forward_batch.forward_mode
         captures = tuple(sorted(model.dspark_layers_to_capture or ()))
-        kv_len = full_md.kv_lens[0].to(torch.int32)
+        kv_len = full_md.device_kv_lens()[0].to(torch.int32)
         slot = (
             lin._state_indices[0].to(torch.int32).clamp(min=0)
         )  # padded / warmup rows carry -1

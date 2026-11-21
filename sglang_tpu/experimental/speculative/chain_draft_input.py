@@ -52,16 +52,22 @@ def chain_draft_forward_input(
     dsa_seed_topk_capture: torch.Tensor | None = None,
     dsa_seed_topk_select: torch.Tensor | None = None,
 ) -> ChainDraftForwardInput:
-    device = hidden_states.device
+    empty = _empty_ids(hidden_states.device)
     return ChainDraftForwardInput(
-        draft_token=torch.empty((0,), dtype=torch.long, device=device),
-        positions=torch.empty((0,), dtype=torch.int64, device=device),
+        draft_token=empty,
+        positions=empty,
         draft_token_num=width,
         custom_mask=None,
         hidden_states=hidden_states,
         dsa_seed_topk_capture=dsa_seed_topk_capture,
         dsa_seed_topk_select=dsa_seed_topk_select,
     )
+
+
+@functools.cache
+def _empty_ids(device: torch.device) -> torch.Tensor:
+    # Allocated once: a fresh empty per draft forward is an eager TPU op.
+    return torch.empty((0,), dtype=torch.int64, device=device)
 
 
 def dsa_seed_topk_buffer(

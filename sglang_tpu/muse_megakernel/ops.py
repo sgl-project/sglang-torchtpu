@@ -1153,7 +1153,7 @@ class MuseMegakernel(torch.nn.Module):
         hidden, aux = torch.ops.sglang_tpu_pallas.muse_prefill(
             meta,
             positions.to(torch.int32),
-            md.kv_lens,
+            md.device_kv_lens(),
             md.cu_q_lens,
             md.distribution,
             md.page_indices,

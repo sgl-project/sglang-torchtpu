@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from jax import tree_util
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
@@ -36,6 +37,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
 )
 from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.tensor_rebind import rebind_tensor
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
@@ -1932,6 +1934,70 @@ class TestDirectCompileDpRanks(unittest.TestCase):
                 actual = compiled(*inputs).cpu()
                 torch.testing.assert_close(actual, expected)
                 self.assertIs(dp_attention._RANK_TENSORS, cache)
+
+
+class _DispatchCount(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.ops.append(func.overloadpacket.__name__)
+        return func(*args, **(kwargs or {}))
+
+
+class TestRebindKVState(unittest.TestCase):
+    def test_base_tensor_takes_the_update_without_a_dispatch(self):
+        live = torch.zeros(4)
+        holder = [live]
+        update = torch.arange(4.0)
+        with _DispatchCount() as count:
+            rebind_tensor(live, update)
+        self.assertEqual(count.ops, [])
+        self.assertIs(holder[0], live)
+        self.assertEqual(live.data_ptr(), update.data_ptr())
+        torch.testing.assert_close(live, torch.arange(4.0))
+
+    def test_view_copies_into_its_base(self):
+        base = torch.zeros(6)
+        view = base[2:]
+        rebind_tensor(view, torch.ones(4))
+        torch.testing.assert_close(base, torch.tensor([0.0, 0, 1, 1, 1, 1]))
+
+    def test_inference_flag_is_kept(self):
+        live = torch.zeros(3)
+        with torch.inference_mode():
+            update = torch.ones(3)
+        rebind_tensor(live, update)
+        self.assertFalse(live.is_inference())
+        self.assertNotEqual(live.data_ptr(), update.data_ptr())
+        torch.testing.assert_close(live, torch.ones(3))
+
+    def test_artifact_rebinds_pool_tensors_in_place(self):
+        kv_pool = _KVPool(torch.zeros(2))
+        pool_input = kv_pool.value
+        holder = kv_pool.get_state()
+        artifact = direct_compile._CompiledArtifact(
+            executable=object(),
+            model_inputs=(),
+            kv_pool=kv_pool,
+            tensor_inputs_key_paths=(),
+            tensor_inputs_traced_shapes=(),
+            output_treespec=tree_util.tree_structure(()),
+            output_count=0,
+        )
+        update = torch.full((2,), 3.0)
+        with (
+            patch.object(
+                direct_compile.tpu_torch_compile, "execute", return_value=[update]
+            ),
+            _DispatchCount() as count,
+        ):
+            artifact(((), {}))
+        self.assertEqual(count.ops, [])
+        self.assertIs(kv_pool.value, pool_input)
+        self.assertIs(holder[0], pool_input)
+        torch.testing.assert_close(pool_input, update)
 
 
 if __name__ == "__main__":

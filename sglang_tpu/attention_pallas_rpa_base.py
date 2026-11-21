@@ -62,6 +62,7 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.cp_layout import TpuCpHostLayout
 from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
+from sglang_tpu.host_upload import device_scalar
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,
     kv_write_segments,
@@ -106,8 +107,9 @@ def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
 class PallasForwardMetadata:
     """Per-forward-pass metadata shared by every attention layer."""
 
-    # i32[max_num_seqs]  total KV length per sequence (after appending new K/V)
-    kv_lens: torch.Tensor
+    # i32[max_num_seqs]  total KV length per sequence (after appending new K/V);
+    # None while kv_lens_pending holds it. Read it through device_kv_lens().
+    kv_lens: torch.Tensor | None
     # i32[max_num_seqs + 1]  cumulative sum of query lengths (starts at 0)
     cu_q_lens: torch.Tensor
     # i32[max_num_seqs + 1]  cumulative sum of page-aligned KV lengths
@@ -157,8 +159,18 @@ class PallasForwardMetadata:
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
-    # i32[max_num_seqs]  first ring page of each row's request slot
-    raw_page_base: torch.Tensor | None = None
+    # i64[max_num_seqs]  each row's request slot (device), whose ring starts at
+    # slot * raw_ring_pages_cnt
+    raw_ring_slots: torch.Tensor | None = None
+    # (batch seq_lens, i32 scalar bump): kv_lens before its cast and bump, which
+    # device_kv_lens() applies where kv_lens is read, in-graph under compile.
+    kv_lens_pending: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def device_kv_lens(self) -> torch.Tensor:
+        if self.kv_lens is not None:
+            return self.kv_lens
+        seq_lens, bump = self.kv_lens_pending
+        return seq_lens.to(torch.int32) + bump
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -1136,15 +1148,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
-            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
             query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
             query_lens = self._extend_query_lens(forward_batch, bs)
         else:
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -1153,8 +1162,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # speculative_step_id.  Bump seq_lens so the kernel sees KV
                 # entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
-                kv_lens = kv_lens + kv_len_bump
             query_width = 1
+        # The cast and bump run where kv_lens is read, inside the compiled forward.
+        kv_lens = None
+        kv_lens_pending = (
+            forward_batch.seq_lens,
+            device_scalar(kv_len_bump, torch.int32, device),
+        )
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
@@ -1234,6 +1248,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 return out.to(device, non_blocking=True)
 
             kv_lens = _padded(self._dcp_lens(target_host))
+            kv_lens_pending = None
             dcp_kv_lens_global = _padded(target_global)
             dcp_cp_rank = self._cp_rank_t
 
@@ -1287,6 +1302,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Page tables change with KV growth, so they are value-checked.
         return PallasForwardMetadata(
             kv_lens=kv_lens,
+            kv_lens_pending=kv_lens_pending,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=self._value_metadata(
@@ -1559,7 +1575,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
         if draft_kv_lens is not None:
             return draft_kv_lens
-        return self.forward_metadata.kv_lens
+        return self.forward_metadata.device_kv_lens()
 
     def _layer_page_indices(self, layer_id: int, *, is_swa_layer: bool) -> torch.Tensor:
         """Page table for ``layer_id``."""
@@ -1831,7 +1847,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 k,
                 v,
                 kv_cache,
-                md.kv_lens,
+                md.device_kv_lens(),
                 page_indices,
                 md.cu_q_lens,
                 md.distribution,
@@ -1900,7 +1916,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k,
             v,
             kv_cache,
-            md.kv_lens,
+            md.device_kv_lens(),
             page_indices,
             md.cu_q_lens,
             md.distribution,

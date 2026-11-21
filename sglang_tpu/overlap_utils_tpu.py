@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 
-from sglang_tpu.experimental import uses_host_batch
+from sglang_tpu.experimental import is_experimental_chain, uses_host_batch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -30,6 +30,10 @@ def device_accept_resolved_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
     """True if resolve_seq_lens_cpu already resolved this batch's spec extras
     on device, so _resolve_spec_extras has nothing left to do."""
     draft_input = batch.spec_info
+    if draft_input is not None and draft_input is future_map.tpu_handed_off_draft:
+        # A chain handoff already installed this round's bonus tokens.
+        future_map.tpu_handed_off_draft = None
+        return True
     return (
         # Only the EAGLE relay (need_topk) has a selected window field.
         future_map.need_topk
@@ -102,20 +106,46 @@ class DirectHandoff(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     payload: Any
     seq_lens: torch.Tensor
+    # False when publish left the seq_lens store to the flush (chain handoff).
+    seq_lens_stored: bool = True
 
 
 class PublishedSeqLens(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     seq_lens: torch.Tensor
+    stored: bool = True
+
+
+def defers_publish_tpu(future_map: FutureMap, indices: torch.Tensor) -> bool:
+    """Whether publish leaves its seq_lens store to the chain handoff (or its flush)."""
+    return (
+        is_experimental_chain(future_map.spec_algo)
+        and indices.shape[0] > 0
+        and not future_map.needs_confidence_relay
+    )
 
 
 def publish_tpu(
-    future_map: FutureMap, indices: torch.Tensor, new_seq_lens: torch.Tensor
+    future_map: FutureMap,
+    indices: torch.Tensor,
+    new_seq_lens: torch.Tensor,
+    *,
+    stored: bool = True,
 ) -> None:
     # The overlap forward publishes, then stashes the same indices object;
     # stash_tpu pairs the two so the next step can skip the seq_lens gather.
     future_map.tpu_published_seq_lens = PublishedSeqLens(
-        indices=indices, seq_lens=new_seq_lens
+        indices=indices, seq_lens=new_seq_lens, stored=stored
+    )
+
+
+def _store_published_seq_lens(
+    future_map: FutureMap, indices: torch.Tensor, seq_lens: torch.Tensor
+) -> None:
+    future_map._store(
+        future_map.new_seq_lens_buf,
+        indices,
+        seq_lens.to(future_map.new_seq_lens_buf.dtype),
     )
 
 
@@ -125,6 +155,8 @@ def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
         return
     # Clear before calling the normal store path, which also checks for a flush.
     future_map.tpu_direct_handoff = None
+    if not pending.seq_lens_stored:
+        _store_published_seq_lens(future_map, pending.indices, pending.seq_lens)
     future_map.stash(pending.indices, pending.payload)
 
 
@@ -140,6 +172,16 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     future_map.tpu_published_seq_lens = None
     # A different batch may still need rows from the previous pending result.
     flush_direct_handoff_tpu(future_map)
+    if _chain_handoff(future_map, published, indices, payload):
+        future_map.tpu_direct_handoff = DirectHandoff(
+            indices=indices,
+            payload=payload,
+            seq_lens=published.seq_lens,
+            seq_lens_stored=published.stored,
+        )
+        return True
+    if published is not None and not published.stored:
+        _store_published_seq_lens(future_map, published.indices, published.seq_lens)
     # Only gate what the resolve step itself relies on. Anything about the next
     # batch (device acceptance, filtering, merging) is re-checked there, and a
     # mismatch just flushes the pending payload into the normal store.
@@ -166,10 +208,54 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     return True
 
 
+def _chain_handoff(
+    future_map: FutureMap,
+    published: PublishedSeqLens | None,
+    indices: torch.Tensor,
+    payload: Any,
+) -> bool:
+    """A chain decode round relays only bonus tokens and lengths, which the next
+    round reads in place while its rows are unchanged."""
+    return (
+        published is not None
+        and published.indices is indices
+        and is_experimental_chain(future_map.spec_algo)
+        and indices.shape[0] > 0
+        and payload.bonus_tokens is not None
+        and payload.topk_p is None
+        and payload.topk_index is None
+        and payload.hidden_states is None
+        and payload.draft_probs is None
+        and payload.dsa_topk_indices is None
+    )
+
+
+def _resolve_chain_handoff(
+    future_map: FutureMap, batch: ScheduleBatch, pending: DirectHandoff
+) -> bool:
+    draft = batch.spec_info
+    # filter_batch and merge_batch rebind future_indices and the relayed tensors.
+    if (
+        draft.future_indices is not pending.indices
+        or draft.bonus_tokens is not pending.payload.bonus_tokens
+    ):
+        flush_direct_handoff_tpu(future_map)
+        return False
+    draft.bonus_tokens = pending.payload.bonus_tokens.to(
+        future_map.output_tokens_buf.dtype
+    )
+    batch.seq_lens = pending.seq_lens.to(future_map.new_seq_lens_buf.dtype)
+    future_map.tpu_direct_handoff = None
+    future_map.tpu_handed_off_draft = draft
+    return True
+
+
 def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
     pending = future_map.tpu_direct_handoff
     if pending is None:
         return False
+    if pending.payload.topk_index is None:
+        return _resolve_chain_handoff(future_map, batch, pending)
     draft = batch.spec_info
     # filter_batch and merge_batch rebind future_indices and the draft tensors.
     # Never compare device values on the host; the payload tensors are the

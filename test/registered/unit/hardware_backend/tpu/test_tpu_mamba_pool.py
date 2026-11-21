@@ -100,9 +100,15 @@ class TestTpuMambaPool(CustomTestCase):
         self.assertEqual(pool.mamba_cache.temporal[0].shape[0], 20)
         pool.select_checkpoints(torch.tensor([1, 3]), torch.tensor([2, 0]))
         self.assertEqual(pool.checkpoint_read_offsets.tolist(), [-1, 2, -1, 0])
-        # Reordered batch, null padding, and inactive rows do not change another request.
-        pool.select_checkpoints(torch.tensor([3, 1, 0]), torch.tensor([3, -1, 2]))
+        # Reordered batch, null and DP-pad (-1) padding, and inactive rows do not
+        # change another request.
+        offsets = pool.checkpoint_read_offsets
+        pool.select_checkpoints(
+            torch.tensor([3, 1, 0, -1]), torch.tensor([3, -1, 2, 1])
+        )
         self.assertEqual(pool.checkpoint_read_offsets.tolist(), [-1, 2, -1, 3])
+        # Holders of the offsets (the GDN backend's read view) see the commit.
+        self.assertIs(pool.checkpoint_read_offsets, offsets)
         pool.clear_slots(torch.tensor([1]))
         self.assertEqual(pool.checkpoint_read_offsets.tolist(), [-1, -1, -1, 3])
         # fp32 accounting covers all allocated slot and window rows.

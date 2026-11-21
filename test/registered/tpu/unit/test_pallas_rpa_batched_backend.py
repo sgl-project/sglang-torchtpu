@@ -121,8 +121,10 @@ class TestBatchedRpaMetadataDecode(CustomTestCase):
 
     def test_kv_lens_matches_seq_lens(self):
         meta = self._build()
-        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
-        self.assertEqual(meta.kv_lens.dtype, torch.int32)
+        self.assertTrue(
+            torch.equal(meta.device_kv_lens(), self.seq_lens.to(torch.int32))
+        )
+        self.assertEqual(meta.device_kv_lens().dtype, torch.int32)
 
     def test_cu_q_lens_decode_is_arange(self):
         meta = self._build()
@@ -211,7 +213,9 @@ class TestBatchedRpaMetadataExtend(CustomTestCase):
 
     def test_kv_lens_is_full_seq_lens(self):
         meta = self._build()
-        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+        self.assertTrue(
+            torch.equal(meta.device_kv_lens(), self.seq_lens.to(torch.int32))
+        )
 
 
 class TestBatchedRpaDistributionEncoding(CustomTestCase):

@@ -54,7 +54,7 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             self._query_start_loc,
             state_rows,
             self._distribution,
-            self._seq_lens,
+            self._kernel_seq_lens(),
             layer.num_k_heads,
             n_v,
             d_k,

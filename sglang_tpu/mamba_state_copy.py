@@ -65,13 +65,47 @@ def compiled_state_copy():
     def fake(pool, src, dst, count):
         return torch.empty_like(pool), src.new_empty(())
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def run(pools, src, dst, count):
-        # A single dispatch covers every layer and both state kinds. Passing
-        # owning tensors lets XLA alias the donated outputs without pool copies.
-        for pool in pools:
+    from sglang_tpu.compilation.direct_compile import direct_compile
+
+    pools = _CallStates()
+
+    def copy(src, dst, count):
+        # A single dispatch covers every layer and both state kinds.
+        marker = None
+        for pool in pools.states:
             result, marker = op(pool, src, dst, count)
             pool.copy_(result)
         return marker
 
+    # The states are donated KV-pool state: updated in place, rebound on return.
+    compiled = direct_compile(
+        copy,
+        specialization_key=lambda src, dst, count: (
+            tuple(src.shape),
+            tuple((tuple(t.shape), t.dtype) for t in pools.states),
+        ),
+        kv_pool=pools,
+    )
+
+    def run(states, src, dst, count):
+        pools.states = list(states)
+        try:
+            return compiled(src, dst, count)
+        finally:
+            pools.states = []
+
+    run.compiled = compiled
     return run
+
+
+class _CallStates:
+    """KVPool over the state tensors of the copy in progress."""
+
+    def __init__(self) -> None:
+        self.states: list[torch.Tensor] = []
+
+    def get_state(self) -> list[torch.Tensor]:
+        return self.states
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        self.states = list(state)

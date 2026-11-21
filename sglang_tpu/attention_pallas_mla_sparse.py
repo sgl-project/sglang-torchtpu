@@ -459,10 +459,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.raw_ring_pages_cnt:
-            self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
+            self.forward_metadata.raw_ring_slots = self._raw_ring_slots(forward_batch)
 
-    def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """i32[rows]: each row's first raw-ring page, its request slot times the ring."""
+    def _raw_ring_slots(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """[rows] request slots on device; _raw_ring_args scales them in-graph."""
         from sglang_tpu.cp_forward import get_tpu_cp_layout
 
         if get_tpu_cp_layout(forward_batch) is not None:
@@ -470,19 +470,18 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 "The pooled indexer's raw ring addresses one row per request; "
                 "prefill context parallelism runs two pseudo-rows per request."
             )
-        rows = forward_batch.req_pool_indices_cpu
-        if rows is None:
-            rows = forward_batch.req_pool_indices
-        base = rows.to(torch.int32) * self.raw_ring_pages_cnt
-        return base.to(forward_batch.seq_lens.device, non_blocking=True)
+        return forward_batch.req_pool_indices.to(
+            forward_batch.seq_lens.device, non_blocking=True
+        )
 
     def _raw_ring_args(self) -> tuple[torch.Tensor, int]:
         """(raw_page_base, raw_ring_pages_cnt) for the pooled indexer ops. Without a
         ring the op ignores the base, so kv_lens stands in as an i32[rows] input."""
         metadata = self.forward_metadata
         if self.raw_ring_pages_cnt:
-            return metadata.raw_page_base, self.raw_ring_pages_cnt
-        return metadata.kv_lens, 0
+            base = metadata.raw_ring_slots.to(torch.int32) * self.raw_ring_pages_cnt
+            return base, self.raw_ring_pages_cnt
+        return metadata.device_kv_lens(), 0
 
     def _init_indexer_token_split(self) -> None:
         """Set up the DSA indexer token split (always on with attn-TP > 1)."""

@@ -166,11 +166,13 @@ def _run_forward_mla(*, quant_dtype, k_scale_float, draft_kv_lens=None):
     """Drive ``_forward_mla`` on a stand-in backend with a mocked kernel op."""
     T, H, R, D = 3, 4, 512, 64
     op = MagicMock(return_value=torch.zeros(T, H, R))
+    kv_lens = torch.zeros(1, dtype=torch.int32)
     backend = SimpleNamespace(
         kv_cache_quant_dtype=quant_dtype,
         _op=op,
         forward_metadata=SimpleNamespace(
-            kv_lens=torch.zeros(1, dtype=torch.int32),
+            kv_lens=kv_lens,
+            device_kv_lens=lambda: kv_lens,
             page_indices=torch.zeros(1, dtype=torch.int32),
             cu_q_lens=torch.zeros(2, dtype=torch.int32),
             cu_kv_lens=torch.zeros(2, dtype=torch.int32),
@@ -270,7 +272,7 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             mla_shards=1,  # replicated latent cache: the unsharded path
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
-                kv_lens="kv_lens",
+                device_kv_lens=lambda: "kv_lens",
                 page_indices="page_indices",
                 cu_q_lens="cu_q_lens",
                 cu_kv_lens="cu_kv_lens",
@@ -341,13 +343,13 @@ class TestSparseIndexerKvLens(CustomTestCase):
             _kpool_width=8,
             raw_ring_pages_cnt=0,
             forward_metadata=SimpleNamespace(
-                kv_lens="kv_lens",
+                device_kv_lens=lambda: "kv_lens",
                 page_indices="page_indices",
                 cu_q_lens="cu_q_lens",
                 distribution="distribution",
                 decode_query_size=1,
                 segments="all",
-                raw_page_base="raw_page_base",
+                raw_ring_slots=torch.tensor([1, 3]),
             ),
             token_to_kv_pool=SimpleNamespace(
                 get_index_key_cache=lambda layer_id: f"index{layer_id}",
@@ -420,7 +422,10 @@ class TestSparseIndexerKvLens(CustomTestCase):
             kpool=4,
         )
         args = backend._index_topk_op.call_args.args
-        self.assertEqual((args[11], args[-1]), ("raw_page_base", 66))
+        # Each row's ring starts at its request slot times the ring pages.
+        self.assertEqual(args[-1], 66)
+        self.assertEqual(args[11].dtype, torch.int32)
+        self.assertEqual(args[11].tolist(), [66, 198])
 
     def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
         # Decode and uniform verify/draft extend take their static per-request

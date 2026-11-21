@@ -106,12 +106,13 @@ def pad_state_rows(
 
 @compiled_op()
 def select_verify_rows(
-    verify_cache_candidates: torch.Tensor,
-    committed_lens: torch.Tensor,
+    verify_plan: torch.Tensor,
     seq_lens: torch.Tensor,
     num_rows: int | None = None,
 ) -> VerifyRows:
-    """Select active rows; the worker warms its capacity/width combinations."""
+    """Select active rows of a TpuSpecVerifyInput.verify_plan (candidate slots,
+    then the committed base); the worker warms its capacity/width combinations."""
+    verify_cache_candidates, committed_lens = verify_plan[:, :-1], verify_plan[:, -1]
     if num_rows is None:
         num_rows = verify_cache_candidates.shape[1] // 2
     cache_locs = select_dflash_verify_cache_locs_tpu(
@@ -124,6 +125,7 @@ def select_verify_rows(
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+        first_cache_locs=cache_locs[:, 0],
     )
 
 
@@ -923,6 +925,14 @@ def accept_greedy_top_k_step(
         seq_lens,
         live_mask,
     )
+
+
+@compiled_op()
+def rank_digest(
+    rng_step: torch.Tensor, accept_tokens: torch.Tensor, next_seq_lens: torch.Tensor
+) -> torch.Tensor:
+    """[rng_step, sum(accept_tokens), sum(next_seq_lens)], the TP rank-agreement check."""
+    return torch.stack([rng_step.view(()), accept_tokens.sum(), next_seq_lens.sum()])
 
 
 @compiled_op()

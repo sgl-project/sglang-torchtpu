@@ -6,8 +6,9 @@ tree_util: for GLM-5.3-Flash's HybridLinearAttnBackend that is the sparse MLA
 backend's PallasForwardMetadata and the KDA backend's GdnTracedMetadata. A
 deferred call fetches every leaf back through its key path. Guards that every
 key path resolves the way direct_compile resolves it, that the pooled
-indexer's raw-ring bases are a graph input rather than a constant, and that
-the only non-tensor leaves are the static scalars direct_compile bakes in.
+indexer's raw-ring slots and the pending kv_lens are graph inputs rather than
+constants, and that the only non-tensor leaves are the static scalars
+direct_compile bakes in.
 Runs on the host; JAX comes with the TPU stack.
 """
 
@@ -40,14 +41,16 @@ def _i32(n: int, start: int = 0) -> torch.Tensor:
 
 
 def _sparse_mla_metadata(raw_ring: bool) -> PallasForwardMetadata:
+    # As _build_metadata_host leaves it: kv_lens cast and bumped in-graph.
     return PallasForwardMetadata(
-        kv_lens=_i32(BS),
+        kv_lens=None,
+        kv_lens_pending=(torch.arange(BS), torch.tensor(4, dtype=torch.int32)),
         cu_q_lens=_i32(BS + 1),
         cu_kv_lens=_i32(BS + 1),
         page_indices=_i32(BS * 8),
         distribution=_i32(3),
         active_num_tokens=torch.tensor(BS, dtype=torch.int32),
-        raw_page_base=_i32(BS, start=100) if raw_ring else None,
+        raw_ring_slots=torch.arange(BS) if raw_ring else None,
     )
 
 
@@ -63,6 +66,7 @@ def _kda_backend(verify: bool) -> TpuGDNAttnBackend:
             track_end=_i32(BS) if verify else None,
             read_offsets=_i32(8) if verify else None,
             req_pool_indices=_i32(BS) if verify else None,
+            seq_lens_bump=torch.tensor(4 if verify else 0, dtype=torch.int32),
         )
     )
     return backend
@@ -106,15 +110,21 @@ class TestGlm5NextMetadataPytree(CustomTestCase):
                         )
                         self.assertIs(_resolve(metadata, path), leaf)
 
-    def test_raw_ring_bases_are_a_graph_input(self):
-        """Each row's first ring page depends on its request slot: a constant
-        would bake one batch's slots into the graph."""
+    def test_per_batch_values_are_graph_inputs(self):
+        """Ring slots, pending lengths and their bumps vary per batch or per
+        backend: a constant would bake one batch's values into the graph."""
         metadata = traced_attention_metadata(
-            _hybrid_backend(raw_ring=True, verify=False)
+            _hybrid_backend(raw_ring=True, verify=True)
         )
-        full, _ = metadata
+        full, linear = metadata
         leaves = tree_util.tree_leaves(metadata)
-        self.assertTrue(any(leaf is full.raw_page_base for leaf in leaves))
+        for tensor in (
+            full.raw_ring_slots,
+            *full.kv_lens_pending,
+            linear.seq_lens,
+            linear.seq_lens_bump,
+        ):
+            self.assertTrue(any(leaf is tensor for leaf in leaves))
 
     def test_only_static_scalars_besides_tensors(self):
         """Scalars are baked into the trace; anything else must be a tensor."""
@@ -129,7 +139,7 @@ class TestGlm5NextMetadataPytree(CustomTestCase):
         never change the flattened structure the executable binds."""
         a = traced_attention_metadata(_hybrid_backend(raw_ring=True, verify=True))
         b = traced_attention_metadata(_hybrid_backend(raw_ring=True, verify=True))
-        b[0].kv_lens.add_(7)
+        b[0].kv_lens_pending[0].add_(7)
         self.assertEqual(tree_util.tree_structure(a), tree_util.tree_structure(b))
 
 

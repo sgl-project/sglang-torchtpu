@@ -224,7 +224,7 @@ class TestGDNVerifyMetadata(CustomTestCase):
         backend.init_forward_metadata(self._batch(ForwardMode.TARGET_VERIFY))
         self.assertEqual(backend._distribution.tolist(), [2, 2, 2])
         self.assertEqual(backend._query_start_loc.tolist(), [0, 3, 6, 9])
-        self.assertEqual(backend._seq_lens.tolist(), [20, 32, 3])
+        self.assertEqual(backend._kernel_seq_lens().tolist(), [20, 32, 3])
         self.assertEqual(backend._state_indices.tolist(), [2, 1, -1])
         self.assertIs(backend._read_offsets, offsets)
         self.assertEqual(backend._req_pool_indices.tolist(), [2, 1, -1])
@@ -274,14 +274,14 @@ class TestGDNVerifyMetadata(CustomTestCase):
     def test_commit_selects_checkpoints_for_the_verified_slots(self):
         backend = self._backend(torch.zeros(3, dtype=torch.int32))
         steps = torch.tensor([1, -1])
-        # A DP pad slot (-1) maps to the null slot, which the pool keeps inert.
+        # A DP pad slot (-1) goes through; the pool maps it to the inert null slot.
         backend.commit_verified_states(
             None, torch.tensor([2, -1]), steps, None, None, None
         )
         slots, got_steps = (
             backend.req_to_token_pool.mamba_pool.select_checkpoints.call_args.args
         )
-        self.assertEqual(slots.tolist(), [2, 0])
+        self.assertEqual(slots.tolist(), [2, -1])
         self.assertIs(got_steps, steps)
 
     def test_commit_snapshots_the_tracked_checkpoints(self):

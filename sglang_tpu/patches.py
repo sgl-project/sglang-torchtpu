@@ -757,7 +757,8 @@ _future_map_direct_handoff_patched = False
 
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
-    unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
+    unchanged EAGLE3 top-k-1 or chain decode batch skips the store/gather round
+    trip (the chain also defers its seq_lens store).
     The resolve side is already hooked via resolve_device_accept_seq_lens_tpu.
     stash also keeps the chain drafter's DSA top-k seeds out of FutureMap."""
     global _future_map_direct_handoff_patched
@@ -768,6 +769,7 @@ def _patch_future_map_direct_handoff() -> None:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang_tpu.experimental import is_experimental_chain
     from sglang_tpu.overlap_utils_tpu import (
+        defers_publish_tpu,
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
@@ -775,10 +777,13 @@ def _patch_future_map_direct_handoff() -> None:
 
     orig_stash = FutureMap.stash
     orig_publish = FutureMap.publish
+    orig_store = FutureMap._store
     orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
     orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
+    FutureMap.tpu_handed_off_draft = None
+    FutureMap.tpu_defer_seq_lens_store = False
 
     def stash(self, future_indices, payload):
         if is_experimental_chain(self.spec_algo):
@@ -789,8 +794,19 @@ def _patch_future_map_direct_handoff() -> None:
             orig_stash(self, future_indices, payload)
 
     def publish(self, future_indices, new_seq_lens, confidence=None):
-        orig_publish(self, future_indices, new_seq_lens, confidence)
-        publish_tpu(self, future_indices, new_seq_lens)
+        deferred = defers_publish_tpu(self, future_indices)
+        self.tpu_defer_seq_lens_store = deferred
+        try:
+            orig_publish(self, future_indices, new_seq_lens, confidence)
+        finally:
+            self.tpu_defer_seq_lens_store = False
+        publish_tpu(self, future_indices, new_seq_lens, stored=not deferred)
+
+    # A deferred publish stores its lengths at the stash or flush instead.
+    def _store(self, buf, indices, values):
+        if self.tpu_defer_seq_lens_store and buf is self.new_seq_lens_buf:
+            return
+        orig_store(self, buf, indices, values)
 
     # Every other buffer reader or writer must see the pending rows stored first.
     def stash_bonus_tokens(self, indices, bonus_tokens):
@@ -804,6 +820,7 @@ def _patch_future_map_direct_handoff() -> None:
 
     FutureMap.stash = stash
     FutureMap.publish = publish
+    FutureMap._store = _store
     FutureMap.stash_bonus_tokens = stash_bonus_tokens
     FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
 

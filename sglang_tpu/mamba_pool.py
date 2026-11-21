@@ -46,6 +46,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang_tpu.compilation.tensor_rebind import rebind_tensor
 from sglang_tpu.host_upload import upload
 
 logger = logging.getLogger(__name__)
@@ -58,13 +59,14 @@ AT_SLOT = -1
 
 @compiled_op()
 def committed_read_offsets(read_offsets, indices, steps):
-    """(int64 slots, int32 read offsets) select_checkpoints commits, in one
-    launch. Negative steps (inactive requests) and the null slot keep their
-    previous offset."""
-    indices = indices.to(torch.int64)
+    """read_offsets with each slot's committed checkpoint step, in one launch.
+    Negative steps (inactive requests), padded slots (-1) and the null slot
+    keep their previous offset."""
+    indices = indices.clamp(min=0).to(torch.int64)
     steps = steps.to(torch.int32)
     previous = read_offsets.index_select(0, indices)
-    return indices, torch.where((indices > 0) & (steps >= 0), steps, previous)
+    offsets = torch.where((indices > 0) & (steps >= 0), steps, previous)
+    return read_offsets.index_copy(0, indices, offsets)
 
 
 @compiled_op()
@@ -295,12 +297,14 @@ class TpuMambaPool(MambaPool):
         """Record the state after the final accepted verify input, without copying HBM."""
         if self.checkpoint_read_offsets is None:
             raise RuntimeError("GDN checkpoint storage was not allocated")
-        indices, offsets = committed_read_offsets(
+        rebind_tensor(
             self.checkpoint_read_offsets,
-            upload(indices, self.device),
-            upload(last_correct_step_indices, self.device),
+            committed_read_offsets(
+                self.checkpoint_read_offsets,
+                upload(indices, self.device),
+                upload(last_correct_step_indices, self.device),
+            ),
         )
-        self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
 
     def clear_slots(self, indices: torch.Tensor):
         """Point the slots' committed state back at their own rows.

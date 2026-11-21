@@ -161,7 +161,8 @@ def test_window_selection_matches_direct_lookup_for_every_commit_length(
             ]
         )
         torch.testing.assert_close(selected, expected)
-        verify = select_verify_rows(candidates, base, seq_lens, width)
+        plan = torch.cat((candidates, base[:, None]), dim=1)
+        verify = select_verify_rows(plan, seq_lens, width)
         assert torch.equal(verify.cache_locs, expected)
         assert torch.equal(verify.positions, seq_lens[:, None] + torch.arange(width))
 

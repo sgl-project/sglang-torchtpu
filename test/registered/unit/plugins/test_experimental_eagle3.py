@@ -124,6 +124,7 @@ class TestExperimentalEagle3(CustomTestCase):
         worker.num_verify_rows = 4
         worker._dp_attention = False
         worker._sampled_drafts = False
+        worker._rng_step = torch.zeros((1,), dtype=torch.int64)
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(max_running_requests=2)
         )
@@ -135,10 +136,10 @@ class TestExperimentalEagle3(CustomTestCase):
         selections = []
         drafts = []
 
-        def select(candidates, committed, seq_lens, width):
-            selections.append((tuple(candidates.shape), width))
-            self.assertIsNot(committed, seq_lens)
-            return spec_ops.select_verify_rows(candidates, committed, seq_lens, width)
+        def select(plan, seq_lens, width):
+            selections.append((tuple(plan.shape), width))
+            self.assertIsNot(plan, seq_lens)
+            return spec_ops.select_verify_rows(plan, seq_lens, width)
 
         def warmup(op, *args):
             return select(*args) if op is spec_ops.select_verify_rows else op(*args)
@@ -154,7 +155,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 torch.full((bs,), width - 1, dtype=torch.int32),
             )
 
-        expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
+        expected = {((bs, 9), width) for bs in (1, 2) for width in (2, 4)}
         with (
             patch.object(torch.accelerator, "current_stream") as stream,
             patch.object(
@@ -181,7 +182,7 @@ class TestExperimentalEagle3(CustomTestCase):
             )
         stream.assert_called_once_with()
         stream.return_value.synchronize.assert_called_once_with()
-        self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
+        self.assertEqual(idle.verify_plan.shape, (2, 9))
         self.assertEqual(
             set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
         )
@@ -211,9 +212,8 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         zeros = torch.zeros(2, dtype=torch.int64)
         verify_input = TpuSpecVerifyInput(
-            verify_cache_candidates=torch.zeros((2, 8), dtype=torch.int64),
+            verify_plan=torch.zeros((2, 9), dtype=torch.int64),
             verify_cache_candidates_cpu=zeros,
-            committed_lens=zeros,
             req_pool_indices=zeros,
             req_pool_indices_cpu=zeros,
             seq_lens_cpu=torch.tensor(host_lens),
@@ -927,7 +927,7 @@ class TestExperimentalEagle3(CustomTestCase):
             seq_lens=None,
             temperatures=None,
             top_ks=None,
-            uniforms=None,
+            rng_step=None,
         )
 
     def test_fused_draft_runs_as_a_decode_program(self):

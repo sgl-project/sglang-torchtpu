@@ -236,9 +236,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         swa_candidates = self._draft_swa_candidates(verify_input)
         if swa_candidates is not None:
+            # seq_lens_cpu is the committed base the plan was gathered from.
+            swa_plan = torch.cat(
+                (swa_candidates, verify_input.seq_lens_cpu[:, None]), dim=1
+            )
             rows = select_verify_rows(
-                padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
-                verify_input.committed_lens,
+                padded_h2d(swa_plan, rows.cache_locs.shape[0], self.device),
                 state.seq_lens,
                 self.num_verify_rows,
             )
@@ -508,6 +511,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                             (padded_bs * width,),
                             dtype=torch.int64,
                             device=self.device,
+                        ),
+                        first_cache_locs=torch.zeros(
+                            (padded_bs,), dtype=torch.int64, device=self.device
                         ),
                     ),
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),

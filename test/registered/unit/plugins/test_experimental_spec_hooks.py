@@ -156,9 +156,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._target_has_linear_attn = True
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
         bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
-        addressing = SimpleNamespace(
-            verify_cache_candidates=object(), committed_lens=object()
-        )
+        addressing = SimpleNamespace(verify_plan=object())
         grammar_barrier = MagicMock()
         calls = MagicMock()
         calls.select.return_value = rows
@@ -181,10 +179,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             ["select", "draft", "verify", "linear", "commit"],
         )
         calls.select.assert_called_once_with(
-            addressing.verify_cache_candidates,
-            addressing.committed_lens,
-            bucket.state.seq_lens,
-            8,
+            addressing.verify_plan, bucket.state.seq_lens, 8
         )
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
         calls.verify.assert_called_once_with(
@@ -650,6 +645,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             cache_locs=positions,
             flat_positions=positions.reshape(-1),
             flat_cache_locs=positions.reshape(-1),
+            first_cache_locs=positions[:, 0],
         )
         step = build_chain_block_inputs(
             torch.tensor([1, 2, 3]), rows, seq_lens, live, 2
@@ -1643,7 +1639,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         plan.verify_cache_candidates_cpu,
                         draft.tpu_verify_cache_candidates,
                     )
-                    self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
+                    # One upload: each row's window slots, then its committed base.
+                    self.assertEqual(
+                        plan.verify_plan.tolist(),
+                        [list(range(37, 43)) + [5], list(range(74, 80)) + [10]]
+                        + [[0] * 7] * (padded_bs - 2),
+                    )
                     self.assertEqual(
                         plan.req_pool_indices.tolist(), [1, 2] + [0] * (padded_bs - 2)
                     )
@@ -1673,8 +1674,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 plan = TpuSpecVerifyInput.from_batch(
                     batch, num_verify_rows=2, padded_bs=2
                 )
-                self.assertIsNone(plan.verify_cache_candidates)
-                self.assertIsNone(plan.committed_lens)
+                self.assertIsNone(plan.verify_plan)
                 self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
                 self.assertEqual(plan.host_len_slack, num_draft_tokens)
                 self.assertEqual(plan.seq_lens_cpu.tolist(), [5, 10])
@@ -1715,7 +1715,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             draft.prepare_for_decode(batch)
             plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
             self.assertEqual(plan.host_len_slack, num_draft_tokens)
-            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            self.assertEqual(plan.verify_plan.shape, (4, 7))
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):

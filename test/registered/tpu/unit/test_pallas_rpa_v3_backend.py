@@ -266,8 +266,10 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
 
     def test_kv_lens_matches_seq_lens(self):
         meta = self._build()
-        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
-        self.assertEqual(meta.kv_lens.dtype, torch.int32)
+        self.assertTrue(
+            torch.equal(meta.device_kv_lens(), self.seq_lens.to(torch.int32))
+        )
+        self.assertEqual(meta.device_kv_lens().dtype, torch.int32)
 
     def test_cu_q_lens_decode_is_arange(self):
         # Each sequence contributes one query token, so cu_q_lens = [0,1,2,...,bs].
@@ -496,7 +498,7 @@ class TestPallasRpaHostLensReuse(CustomTestCase):
         self.assertIs(first.cu_q_lens, second.cu_q_lens)
         self.assertEqual(second.page_indices[0].item(), 64)
         self.assertEqual(first.page_indices[0].item(), 0)
-        self.assertTrue(torch.equal(second.kv_lens, torch.tensor([27, 37])))
+        self.assertTrue(torch.equal(second.device_kv_lens(), torch.tensor([27, 37])))
 
     def test_layout_changes_and_empty_batch(self):
         backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
@@ -587,7 +589,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         meta = _build_meta(backend, fb)
         # KV cache already holds the draft tokens: kv_lens = seq_lens + draft.
         expected_kv = (self.seq_lens + self.DRAFT_TOKEN_NUM).to(torch.int32)
-        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        self.assertTrue(torch.equal(meta.device_kv_lens(), expected_kv))
         # Each sequence verifies draft_token_num query tokens.
         expected_cu_q = (torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM).to(
             torch.int32
@@ -618,7 +620,9 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         meta = _build_meta(backend, fb)
 
         self.assertTrue(
-            torch.equal(meta.kv_lens, (self.seq_lens + verify_width).to(torch.int32))
+            torch.equal(
+                meta.device_kv_lens(), (self.seq_lens + verify_width).to(torch.int32)
+            )
         )
         self.assertTrue(
             torch.equal(
@@ -641,7 +645,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         meta = _build_meta(backend, fb)
         # Draft step sees KV entries from prior steps: kv_lens += step_id + 1.
         expected_kv = (self.seq_lens + step_id + 1).to(torch.int32)
-        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        self.assertTrue(torch.equal(meta.device_kv_lens(), expected_kv))
         # One query token per sequence, as in plain decode.
         expected_cu_q = torch.arange(self.bs + 1, dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
@@ -657,7 +661,9 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
             spec_info=self.spec_info,
         )
         meta = _build_meta(backend, fb)
-        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+        self.assertTrue(
+            torch.equal(meta.device_kv_lens(), self.seq_lens.to(torch.int32))
+        )
         expected_cu_q = torch.tensor([0, 3, 4, 6], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
 

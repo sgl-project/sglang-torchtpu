@@ -177,8 +177,8 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         self.assertIs(first.cu_q_lens, second.cu_q_lens)
         self.assertIs(first.cu_kv_lens, second.cu_kv_lens)
         self.assertIs(first.active_num_tokens, second.active_num_tokens)
-        self.assertEqual(first.kv_lens.tolist(), [63])
-        self.assertEqual(second.kv_lens.tolist(), [65])
+        self.assertEqual(first.device_kv_lens().tolist(), [63])
+        self.assertEqual(second.device_kv_lens().tolist(), [65])
         self.assertEqual(first.page_indices[0].item(), 0)
         self.assertEqual(second.page_indices[0].item(), 2)
 
@@ -281,8 +281,8 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             SimpleNamespace(num_tokens_per_req=self.DRAFT_TOKENS),
         )
         capacity = metadata.cu_kv_lens[1].item()
-        self.assertEqual(metadata.kv_lens.item(), self.CONTEXT_LEN + 6)
-        self.assertLessEqual(metadata.kv_lens.item(), capacity)
+        self.assertEqual(metadata.device_kv_lens().item(), self.CONTEXT_LEN + 6)
+        self.assertLessEqual(metadata.device_kv_lens().item(), capacity)
         self.assertEqual(metadata.page_indices.numel(), 2050)
 
     def test_target_verify_rejects_bump_above_page_stride(self):
@@ -307,8 +307,8 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             SimpleNamespace(),
         )
         capacity = metadata.cu_kv_lens[1].item()
-        self.assertEqual(metadata.kv_lens.item(), self.CONTEXT_LEN + 6)
-        self.assertLessEqual(metadata.kv_lens.item(), capacity)
+        self.assertEqual(metadata.device_kv_lens().item(), self.CONTEXT_LEN + 6)
+        self.assertLessEqual(metadata.device_kv_lens().item(), capacity)
 
     def test_multistep_decode_rejects_bump_above_page_stride(self):
         for req_to_token_device in ("cpu", "meta"):

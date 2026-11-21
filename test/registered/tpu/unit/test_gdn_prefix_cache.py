@@ -94,12 +94,11 @@ class TestGDNPrefixCache(CustomTestCase):
             )
 
     def test_copy_buckets_preserve_states_without_recompilation(self):
-        from torch._dynamo.utils import counters
-
         from sglang_tpu.mamba_pool import (
             TpuMambaPool,
             TpuPerLayerState,
         )
+        from sglang_tpu.mamba_state_copy import compiled_state_copy
 
         pool = TpuMambaPool.__new__(TpuMambaPool)
         pool.device = "tpu"
@@ -113,7 +112,8 @@ class TestGDNPrefixCache(CustomTestCase):
             temporal=[t.to("tpu") for t in rec],
         )
         pool.warmup_state_copy(33)
-        graphs = counters["stats"]["unique_graphs"]
+        compiled = compiled_state_copy().compiled
+        graphs = len(compiled.cache)
         for count in (0, 1, 2, 7, 8, 9, 31, 32, 33, 1):
             pool.copy_from(
                 torch.ones(count, dtype=torch.long),
@@ -130,7 +130,7 @@ class TestGDNPrefixCache(CustomTestCase):
                         rtol=0,
                     )
                 torch.testing.assert_close(actual[35:], original[35:], atol=0, rtol=0)
-        self.assertEqual(graphs, counters["stats"]["unique_graphs"])
+        self.assertEqual(graphs, len(compiled.cache))
 
     def test_copy_skips_padding_and_large_slots(self):
         from sglang_tpu.mamba_state_copy import compiled_state_copy

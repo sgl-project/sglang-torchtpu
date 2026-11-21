@@ -706,7 +706,9 @@ class TestTpuDebtRatchet(CustomTestCase):
 
 # Attributes a patch creates on a core class rather than replaces.
 ADDED_BY_PATCHES = {
+    "sglang.srt.managers.overlap_utils.FutureMap.tpu_defer_seq_lens_store",
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_direct_handoff",
+    "sglang.srt.managers.overlap_utils.FutureMap.tpu_handed_off_draft",
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_published_seq_lens",
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._write_back_copy_ahead",
 }
