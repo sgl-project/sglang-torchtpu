@@ -698,6 +698,24 @@ class TestDSV4TPUPatches(CustomTestCase):
                 allow_tpu_dsv41_encoder_replay(original, args)
         self.assertEqual(seen, [(True, False), (True, True)])
 
+    def test_hc_split_sinkhorn_runs_the_torch_reference_off_cuda(self):
+        """Off CUDA the TileLang sinkhorn is replaced by the torch reference with
+        the same arguments; the original is never called."""
+        from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+        from sglang_tpu.models.deepseek_v41.hooks import tpu_dsv4_hc_split_sinkhorn
+
+        def tilelang(*args, **kwargs):
+            raise AssertionError("TileLang sinkhorn called off CUDA")
+
+        torch.manual_seed(0)
+        hc = 4
+        mixes = torch.randn(3, 1, (2 + hc) * hc)
+        scale, base = torch.rand(3), torch.randn((2 + hc) * hc)
+        got = tpu_dsv4_hc_split_sinkhorn(tilelang, mixes, scale, base, hc, 20, 1e-6)
+        want = _hc_split_sinkhorn_torch(mixes, scale, base, hc, 20, 1e-6)
+        for g, w in zip(got, want):
+            self.assertTrue(torch.equal(g, w))
+
     def test_v41_backend_has_no_decoder_replay_tail(self):
         """TpModelWorker reads attn_backend.tail_forward_metadata after a folded
         encoder replay; the TPU backend has no decoder replay, so it is None."""
