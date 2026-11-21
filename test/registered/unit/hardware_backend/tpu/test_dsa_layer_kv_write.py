@@ -15,6 +15,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import base as rope_base
@@ -28,13 +29,19 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 from sglang_tpu.dsa_indexer_tpu import (
     index_key,
     indexer_forward,
+    key_store_mode,
     kpool_indexer_forward,
     pooled_index_key_and_gate,
 )
-from sglang_tpu.dsa_layer_kv_write import mla_cache_latents
+from sglang_tpu.dsa_layer_kv_write import (
+    dsa_layer_kv_unsupported_reason,
+    mla_cache_latents,
+    write_dsa_layer_kv,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -250,6 +257,147 @@ class TestPooledIndexKeyAndGate(CustomTestCase):
 
         self.assertTrue(torch.equal(key, stored["key"]))
         self.assertTrue(torch.equal(gate, stored["gate"]))
+
+
+def _sparse_backend(*, kpool: int) -> TpuPallasSparseMlaAttnBackend:
+    backend = TpuPallasSparseMlaAttnBackend.__new__(TpuPallasSparseMlaAttnBackend)
+    backend._kpool = kpool
+    return backend
+
+
+class TestUnsupportedReason(CustomTestCase):
+    def test_refuses_each_path_where_the_full_layer_stores_otherwise(self):
+        """None only for core's DSA MLA layer with its own indexer on the sparse
+        backend, without context parallelism; otherwise a reason naming the
+        path. The context-parallel cases guard a future platform that allows
+        them."""
+        layer = dict(use_dsa=True, q_lora_rank=16, skip_topk=True, is_nextn=True)
+        parallel = dict(dcp_enabled=False, attn_cp_size=1)
+
+        def attention(**changes):
+            attn = _mla_attention(rope_dim=0, rope=None)
+            for name, value in {**layer, **changes}.items():
+                setattr(attn, name, value)
+            return attn
+
+        class _OwnAbsorb(DeepseekV2AttentionMLA):
+            def forward_absorb_prepare(self, *args, **kwargs):
+                raise NotImplementedError
+
+        own_absorb = _OwnAbsorb.__new__(_OwnAbsorb)
+        cases = [
+            (attention(), {}, None),
+            (attention(use_dsa=False), {}, "not a DSA layer"),
+            (attention(q_lora_rank=None), {}, "q_lora_rank"),
+            (attention(is_nextn=False), {}, "reuses another layer's top-k"),
+            (attention(), dict(dcp_enabled=True), "decode context parallelism"),
+            (attention(), dict(attn_cp_size=2), "prefill context parallelism"),
+            (SimpleNamespace(**layer), {}, "not DeepseekV2AttentionMLA"),
+            (own_absorb, {}, "overrides forward_absorb_prepare"),
+        ]
+        for attn, parallel_change, expected in cases:
+            with self.subTest(expected=expected, parallel=parallel_change):
+                with get_parallel().override(**{**parallel, **parallel_change}):
+                    reason = dsa_layer_kv_unsupported_reason(
+                        attn=attn, backend=_sparse_backend(kpool=1)
+                    )
+                if expected is None:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIn(expected, reason)
+        with get_parallel().override(**parallel):
+            reason = dsa_layer_kv_unsupported_reason(
+                attn=attention(), backend=SimpleNamespace()
+            )
+        self.assertIn("not pallas_tpu_mla_sparse", reason)
+
+    def test_each_store_refuses_the_other_indexer_before_writing(self):
+        args = dict(
+            forward_batch=None, layer=None, index_layer_id=0, k=None, k_rope=None
+        )
+        with self.assertRaisesRegex(NotImplementedError, "store_layer_kv_pooled"):
+            TpuPallasSparseMlaAttnBackend.store_layer_kv(
+                _sparse_backend(kpool=4), **args, index_keys=None, key_store="xla"
+            )
+        with self.assertRaisesRegex(NotImplementedError, "store_layer_kv"):
+            TpuPallasSparseMlaAttnBackend.store_layer_kv_pooled(
+                _sparse_backend(kpool=1), **args, keys=None, gates=None, ape=None
+            )
+
+
+class _RecordingBackend:
+    def __init__(self):
+        self.calls = []
+
+    def store_layer_kv(self, **kwargs):
+        self.calls.append(("plain", kwargs))
+
+    def store_layer_kv_pooled(self, **kwargs):
+        self.calls.append(("pooled", kwargs))
+
+
+class TestWriteDsaLayerKv(CustomTestCase):
+    def _attention(self, indexer):
+        attn = _mla_attention(rope_dim=8, rope=_plain_rope(8, neox=False))
+        attn.layer_id = 7
+        attn.attn_mqa = SimpleNamespace(layer_id=7)
+        attn.indexer = indexer
+        return attn
+
+    def test_hands_each_store_the_layers_ids_latents_and_index_inputs(self):
+        """Plain DSA gets the index key and the indexer's writer choice; the
+        pooled indexer gets its key, gate and ape; both get the attention's
+        RadixAttention and the indexer's layer id."""
+        with ExitStack() as stack:
+            for module in (rope_base, rope_variant):
+                stack.enter_context(patch.object(module, "_is_tpu", True))
+            torch.manual_seed(0)
+            positions = torch.arange(_T)
+            hidden = torch.randn(_T, _HIDDEN, dtype=torch.bfloat16)
+            pooled = IndexerKPool.__new__(IndexerKPool)
+            nn.Module.__init__(pooled)
+            for name, value in vars(_indexer(rope_dim=0)).items():
+                object.__setattr__(pooled, name, value)
+            object.__setattr__(
+                pooled,
+                "index_kpool_compress_gate",
+                torch.randn(32, _HIDDEN, dtype=torch.bfloat16),
+            )
+            object.__setattr__(pooled, "index_kpool_compress_ape", torch.randn(4, 32))
+            for indexer, kind in ((_indexer(rope_dim=16), "plain"), (pooled, "pooled")):
+                with self.subTest(kind):
+                    attn = self._attention(indexer)
+                    qkv_latent = torch.randn(_T, 16 + 32 + 8, dtype=torch.bfloat16)
+                    backend = _RecordingBackend()
+                    write_dsa_layer_kv(
+                        attn,
+                        backend=backend,
+                        forward_batch="fb",
+                        qkv_latent=qkv_latent,
+                        hidden_states=hidden,
+                        positions=positions,
+                    )
+                    [(got_kind, kwargs)] = backend.calls
+                    self.assertEqual(got_kind, kind)
+                    self.assertEqual(kwargs["forward_batch"], "fb")
+                    self.assertIs(kwargs["layer"], attn.attn_mqa)
+                    self.assertEqual(kwargs["index_layer_id"], 7)
+                    k, k_rope = mla_cache_latents(
+                        attn, qkv_latent=qkv_latent, positions=positions
+                    )
+                    self.assertTrue(torch.equal(kwargs["k"], k))
+                    self.assertTrue(torch.equal(kwargs["k_rope"], k_rope))
+                    if kind == "plain":
+                        want = index_key(indexer, x=hidden, positions=positions)
+                        self.assertTrue(torch.equal(kwargs["index_keys"], want))
+                        self.assertEqual(
+                            kwargs["key_store"], key_store_mode(indexer, _T)
+                        )
+                    else:
+                        keys, gates = pooled_index_key_and_gate(indexer, hidden)
+                        self.assertTrue(torch.equal(kwargs["keys"], keys))
+                        self.assertTrue(torch.equal(kwargs["gates"], gates))
+                        self.assertIs(kwargs["ape"], indexer.index_kpool_compress_ape)
 
 
 if __name__ == "__main__":
