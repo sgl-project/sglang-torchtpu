@@ -95,6 +95,11 @@ class TpuEnvs:
     # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
     # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
+    # MoE: one kernel streaming each distinct FP8 expert once through a VMEM ring for
+    # MIN..MAX tokens (moe/pallas/moe_ring.py); checked before the streaming kernel.
+    SGLANG_TPU_ENABLE_MOE_RING_KERNEL = EnvBool(False)
+    SGLANG_TPU_MOE_RING_MIN_TOKENS = EnvInt(2)
+    SGLANG_TPU_MOE_RING_MAX_TOKENS = EnvInt(256)
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
