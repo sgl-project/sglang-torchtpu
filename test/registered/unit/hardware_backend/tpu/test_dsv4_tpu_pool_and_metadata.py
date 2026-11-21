@@ -664,6 +664,40 @@ class TestDSV4TPUPatches(CustomTestCase):
         self.assertTrue(torch.equal(masked[0], plain[0]))
         self.assertFalse(torch.equal(plain[1], x[1]))
 
+    def test_encoder_replay_hook_keeps_decoder_replay_off(self):
+        """The validator runs with get_platform reporting CUDA, where it turns
+        decoder SWA bounded replay on by default; the TPU attention backend has
+        none, so an unset flag is declared off first and an explicit one kept."""
+        from unittest import mock
+
+        from sglang.srt.arg_groups import deepseek_v4_hook as validator
+        from sglang_tpu.models.deepseek_v41.hooks import allow_tpu_dsv41_encoder_replay
+
+        seen = []
+
+        def original(server_args):
+            cfg = validator.resolving_view(server_args)
+            seen.append(
+                (
+                    validator.get_platform().is_cuda,
+                    cfg.enable_decoder_swa_bounded_replay,
+                )
+            )
+
+        v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+        tpu = SimpleNamespace(is_tpu=True)
+        with (
+            mock.patch("sglang.srt.runtime_context.get_platform", lambda: tpu),
+            mock.patch.object(validator, "model_config_of", lambda _: v41),
+        ):
+            for decoder in (None, True):
+                args = SimpleNamespace(
+                    enable_encoder_swa_bounded_replay=True,
+                    enable_decoder_swa_bounded_replay=decoder,
+                )
+                allow_tpu_dsv41_encoder_replay(original, args)
+        self.assertEqual(seen, [(True, False), (True, True)])
+
     def test_hc_sublayers_read_through_the_layer(self):
         """attn_hc rebuilds from the layer's current attributes on every read, so
         a swapped parameter (the tracer's placeholder) reaches the tuple; it is
