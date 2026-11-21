@@ -1414,7 +1414,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if forward_batch.seq_lens.shape[0] != 0:
             return False
 
-        device = forward_batch.seq_lens.device
+        device = self._dp_idle_extend_device(forward_batch)
         seq_dtype = forward_batch.seq_lens.dtype
         forward_batch.extend_num_tokens = num_tokens
         forward_batch.extend_seq_lens = torch.tensor(
@@ -1458,6 +1458,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if isinstance(forward_batch.req_pool_indices_cpu, torch.Tensor):
                 forward_batch.req_pool_indices_cpu = torch.zeros(1, dtype=pool_dtype)
         return True
+
+    def _dp_idle_extend_device(self, forward_batch: ForwardBatch) -> torch.device:
+        """Where materialize_dp_idle_extend builds the dummy request's tensors."""
+        return forward_batch.seq_lens.device
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""

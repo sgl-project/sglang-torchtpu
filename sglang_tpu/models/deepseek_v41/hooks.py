@@ -125,12 +125,27 @@ fold_tpu_dsv41_encoder_replay
   How: AROUND _fold_batch for the V4.1 TPU pool: runs the original against a
        runner view whose device is input_ids' device and whose req_to_token
        returns int64 slots on out_cache_loc's device, with out_cache_loc cast to
-       int64 once up front; then casts the folded out_cache_loc back to the
-       scheduled dtype and moves the row maps and Engram history to the runner's
-       device, where the original places them.
+       int64 once up front and the slots read from req_pool_indices_cpu; then
+       casts the folded out_cache_loc back to the scheduled dtype and moves
+       scheduled_row and the Engram history to the runner's device, where the
+       original places them. keep_rows and row_floor stay on the host: the
+       attention metadata reads them there, and a device copy at the live row
+       count would cost a readback per extend.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
   Remove when: _fold_batch builds the replay rows on the scheduled tensors'
        devices and keeps out_cache_loc's dtype.
+
+drop_tpu_dsv41_folded_rows
+  Why: encoder_swa_replay.drop_folded_rows gathers the scheduled rows of a
+       folded extend's hidden at their live count. On TPU that gather, and the
+       draft KV writer's re-pad of its result, compile a program per extend
+       length; the spec workers read the hidden at the token bucket.
+  How: AROUND drop_folded_rows for host keep_rows (fold_tpu_dsv41_encoder_replay):
+       gathers with a host-built index of the hidden's own row count whose head
+       is keep_rows; the tail rows repeat the last row, and the spec workers write
+       rows past the live tokens to slot 0, as for the target's padding rows.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up).
+  Remove when: drop_folded_rows keeps the hidden's row count.
 
 init_tpu_dsv41_pool_configurator
   Why: DSV4PoolConfigurator.__init__ counts the DSpark draft layers kept in a
@@ -290,6 +305,11 @@ def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
     scheduled = copy(batch)
     # One cast here makes the original's per-request .long() calls no-ops.
     scheduled.out_cache_loc = loc.to(torch.int64)
+    slots_cpu = batch.req_pool_indices_cpu
+    if slots_cpu is not None:
+        # The original indexes the host req_to_token by each request's slot; a
+        # device slot would be read back (and flush the device queue) per hit.
+        scheduled.req_pool_indices = slots_cpu
     # The original reads only these three runner fields.
     view = SimpleNamespace(
         device=batch.input_ids.device,
@@ -302,20 +322,42 @@ def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
     )
     folded = original(batch=scheduled, runner=view, rows=rows)
     folded.batch.out_cache_loc = folded.batch.out_cache_loc.to(loc.dtype)
+    folded.batch.req_pool_indices = batch.req_pool_indices
     if folded.batch.engram_history is not None:
         folded.batch.engram_history = folded.batch.engram_history.to(
             runner.device, non_blocking=True
         )
 
-    def put(t: torch.Tensor) -> torch.Tensor:
-        return t.to(runner.device, non_blocking=True)
-
+    # keep_rows and row_floor stay where the fold built them (the host, with the
+    # spec worker's host-staged input_ids): the metadata reads them on the host and
+    # drop_tpu_dsv41_folded_rows builds its gather index from keep_rows there.
     return msgspec.structs.replace(
         folded,
-        keep_rows=put(folded.keep_rows),
-        scheduled_row=put(folded.scheduled_row),
-        row_floor=put(folded.row_floor),
+        scheduled_row=folded.scheduled_row.to(runner.device, non_blocking=True),
     )
+
+
+def drop_tpu_dsv41_folded_rows(original, *, logits_output, folded, tail_lens=None):
+    """AROUND encoder_swa_replay.drop_folded_rows: keep the hidden's row count."""
+    hidden = logits_output.hidden_states
+    keep_rows = folded.keep_rows
+    if (
+        hidden is None
+        or logits_output.hidden_states_token_indices is not None
+        or keep_rows.device.type != "cpu"
+        or hidden.shape[0] < folded.num_rows
+    ):
+        return original(logits_output=logits_output, folded=folded, tail_lens=tail_lens)
+    rows = hidden.shape[0]
+    # The tail repeats the last row: those rows are past the live tokens, whose
+    # draft KV rows the spec workers send to slot 0.
+    index = torch.full((rows,), rows - 1, dtype=torch.int64)
+    index[: keep_rows.shape[0]] = keep_rows
+    index = index.to(hidden.device, non_blocking=True)
+    logits_output.hidden_states = hidden[index]
+    last = getattr(logits_output, "last_hidden_states", None)
+    if last is not None and last.shape[0] == rows:
+        logits_output.last_hidden_states = last[index]
 
 
 def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
@@ -699,6 +741,11 @@ def hook_specs():
         (
             "sglang.srt.model_executor.encoder_swa_replay._fold_batch",
             fold_tpu_dsv41_encoder_replay,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.encoder_swa_replay.drop_folded_rows",
+            drop_tpu_dsv41_folded_rows,
             HookType.AROUND,
         ),
         (

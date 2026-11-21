@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.models.deepseek_v41 import engram_host
 
 
@@ -302,6 +303,16 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # host Engram staging so the TPU gather overlaps with overlap-token
         # resolution and NumPy row packing.
         self._embed_outside_graph(forward_batch)
+
+    def _dp_idle_extend_device(self, forward_batch: ForwardBatch) -> torch.device:
+        # An idle DP rank's dummy request spans the busiest rank's live tokens;
+        # built on the device, it compiles per extend length on every idle rank.
+        # A HOST_PADDED batch pads it on the host and uploads it at the bucket
+        # (_upload_host_padded_inputs), as the busy ranks' inputs.
+        sampling_info = forward_batch.sampling_info
+        if sampling_info is not None and is_host_padded(sampling_info):
+            return torch.device("cpu")
+        return super()._dp_idle_extend_device(forward_batch)
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         model = self.model_runner.model
