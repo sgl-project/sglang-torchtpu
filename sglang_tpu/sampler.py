@@ -189,6 +189,93 @@ def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
     )
 
 
+def negotiated_distributed_top_k_width(model) -> Optional[int]:
+    """The width a past negotiation fixed for the model's logits processor; never negotiates."""
+    state = _DISTRIBUTED_TOP_K_STATES.get(id(getattr(model, "logits_processor", None)))
+    return (
+        None if state is None or state.config is None else state.config.candidate_width
+    )
+
+
+def negotiate_distributed_argmax(model) -> bool:
+    """Fix the model's DISTRIBUTED_TOP_K width at 1: an exact argmax over vocab shards.
+
+    For a verify that reads only the target's argmax. Collective over the LM-head
+    group, so call it on every rank at init, outside any trace; without a
+    consensus nothing is registered and every rank keeps full-vocabulary logits.
+    """
+    from sglang.srt.distributed import model_parallel_is_initialized
+    from sglang_tpu.top_k import TpuVocabShard
+
+    logits_processor = getattr(model, "logits_processor", None)
+    output_head = _distributed_top_k_output_head(model)
+    if (
+        output_head is None
+        or not getattr(logits_processor, "use_tpu_distributed_top_k", False)
+        or not model_parallel_is_initialized()
+    ):
+        return False
+    if id(logits_processor) in _DISTRIBUTED_TOP_K_STATES:
+        return negotiated_distributed_top_k_width(model) == 1
+    group = (
+        get_parallel().attn_tp_group
+        if logits_processor.use_attn_tp_group
+        else get_parallel().tp_group
+    )
+    reasons = group.all_gather_object(
+        _distributed_argmax_fallback_reason(logits_processor, output_head, group)
+    )
+    reason = next(
+        (f"rank {rank}: {r}" for rank, r in enumerate(reasons) if r is not None), None
+    )
+    if group.rank_in_group == 0:
+        logger.info(
+            "Distributed argmax for the verify %s",
+            "enabled" if reason is None else f"disabled: {reason}",
+        )
+    if reason is not None:
+        return False
+    _DISTRIBUTED_TOP_K_STATES[id(logits_processor)] = _DistributedTopKState(
+        logits_processor=logits_processor,
+        lm_head=output_head,
+        config=PallasDistributedTopKConfig(
+            shard=TpuVocabShard.from_lm_head(output_head),
+            world_size=group.world_size,
+            model_rank=group.rank_in_group,
+            candidate_width=1,
+            output_dtype=torch.float32,
+        ),
+        fallback_reason=None,
+    )
+    return True
+
+
+def _distributed_argmax_fallback_reason(logits_processor, lm_head, group) -> str | None:
+    from sglang_tpu.top_k import TpuVocabShard, distributed_argmax_layout
+
+    if group.world_size == 1:
+        return "a single rank gathers no logits"
+    if (
+        not logits_processor.do_tensor_parallel_all_gather
+        or logits_processor.do_tensor_parallel_all_gather_dp_attn
+    ):
+        return "the logits processor does not use a supported TP gather"
+    if logits_processor.final_logit_softcapping:
+        # Softcap after the merge can round two maxima to a tie the full row breaks by id.
+        return "final logit softcapping"
+    try:
+        shard = TpuVocabShard.from_lm_head(lm_head)
+    except (AttributeError, TypeError, ValueError):
+        return "the LM head lacks an explicit sharded-vocabulary layout"
+    if int(lm_head.tp_size) != group.world_size:
+        return f"LM-head TP size {lm_head.tp_size} != group size {group.world_size}"
+    if logits_processor.vocab_size != shard.org_vocab_size:
+        return "the full-vocabulary path trims the LM-head vocabulary"
+    if not distributed_argmax_layout(shard, group.rank_in_group, group.world_size):
+        return "the vocabulary shard is padded or not canonical"
+    return None
+
+
 def _use_bsearch_filtering(probs: torch.Tensor) -> bool:
     """The sort-free mask is a TPU custom op; CPU tensors (unit tests, other
     devices) keep the generic torch fallback."""

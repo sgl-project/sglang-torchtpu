@@ -35,6 +35,7 @@ from sglang_tpu.sampler import (
     TpuSampler,
     distributed_top_k_candidate_width,
     distributed_top_k_for_batch,
+    negotiate_distributed_argmax,
     sample_from_global_top_k_logits,
     select_logits_output_mode,
 )
@@ -42,7 +43,10 @@ from sglang_tpu.top_k import (
     PallasDistributedTopKConfig,
     PallasDistributedTopKNegotiation,
     TpuVocabShard,
+    distributed_argmax_layout,
     distributed_tpu_top_k,
+    local_argmax_pairs,
+    merge_argmax_pairs,
     negotiate_pallas_distributed_top_k_config,
     supports_distributed_tpu_top_k,
     tpu_top_k,
@@ -1471,6 +1475,167 @@ class TestHostSamplingWarmupCoverage(CustomTestCase):
         warmed = self._kernel_calls(self._warmup_infos)
         served = self._kernel_calls(self._serving_infos)
         self.assertLessEqual(served, warmed)
+
+
+def _argmax_shard(width: int, world_size: int, rank: int, **overrides) -> TpuVocabShard:
+    fields = dict(
+        width=width,
+        global_vocab_size=width * world_size,
+        org_vocab_size=width * world_size,
+        org_vocab_start=rank * width,
+        org_vocab_count=width,
+        org_vocab_padded_count=width,
+        added_vocab_start=width * world_size,
+        added_vocab_count=0,
+    )
+    fields.update(overrides)
+    return TpuVocabShard(**fields)
+
+
+class TestDistributedArgmax(CustomTestCase):
+    WIDTH = 96
+
+    def _shards(self, world_size: int, rows: int = 33, seed: int = 0):
+        gen = torch.Generator().manual_seed(seed)
+        # Four distinct bf16 values: the row maximum ties within and across shards.
+        logits = torch.randint(0, 4, (rows, world_size * self.WIDTH), generator=gen)
+        logits = logits.to(torch.bfloat16)
+        logits[0] = 1.0  # one value everywhere: the global id must be 0
+        logits[1, : self.WIDTH] = -torch.inf  # rank 0 holds no candidate
+        return logits, logits.split(self.WIDTH, dim=-1)
+
+    def test_shard_pairs_merge_to_the_full_row_argmax(self):
+        for world_size, seed in product((1, 2, 8), range(3)):
+            with self.subTest(world_size=world_size, seed=seed):
+                logits, shards = self._shards(world_size, seed=seed)
+                pairs = torch.stack([local_argmax_pairs(s) for s in shards])
+                values, ids = merge_argmax_pairs(pairs, self.WIDTH)
+                self.assertEqual(ids.dtype, torch.int32)
+                self.assertTrue(torch.equal(ids[:, 0].long(), logits.argmax(-1)))
+                self.assertTrue(torch.equal(values[:, 0], logits.float().amax(-1)))
+
+    def test_top_1_gathers_rank_pairs_not_logits(self):
+        world_size = 8
+        logits, shards = self._shards(world_size, seed=5)
+        gathered_inputs = []
+
+        def all_gather(pairs, dim):
+            gathered_inputs.append(pairs.shape)
+            return torch.cat([local_argmax_pairs(s) for s in shards], dim=dim)
+
+        group = SimpleNamespace(
+            world_size=world_size, rank_in_group=3, all_gather=all_gather
+        )
+        # k=1 never reaches the Pallas kernel, which rejects CPU tensors.
+        values, ids = distributed_tpu_top_k(
+            shards[3], _argmax_shard(self.WIDTH, world_size, 3), 1, group=group
+        )
+        self.assertEqual(gathered_inputs, [torch.Size([logits.shape[0], 2])])
+        self.assertTrue(torch.equal(ids[:, 0].long(), logits.argmax(-1)))
+        self.assertEqual(values.dtype, torch.float32)
+
+    def test_padded_or_added_vocab_is_rejected(self):
+        width, world_size = self.WIDTH, 8
+        self.assertTrue(
+            distributed_argmax_layout(
+                _argmax_shard(width, world_size, 7), 7, world_size
+            )
+        )
+        bad = {
+            "padded tail": dict(
+                org_vocab_count=width - 4, org_vocab_size=8 * width - 4
+            ),
+            "added vocab": dict(added_vocab_count=4, global_vocab_size=8 * width + 4),
+            "wrong rank": dict(org_vocab_start=0),
+        }
+        for name, overrides in bad.items():
+            with self.subTest(name):
+                shard = _argmax_shard(width, world_size, 7, **overrides)
+                self.assertFalse(distributed_argmax_layout(shard, 7, world_size))
+                group = SimpleNamespace(world_size=world_size, rank_in_group=7)
+                with self.assertRaisesRegex(RuntimeError, "unpadded canonical"):
+                    distributed_tpu_top_k(torch.ones(2, width), shard, 1, group=group)
+
+    def _model(self, rank: int = 0, world_size: int = 8):
+        width = self.WIDTH
+        indices = VocabParallelEmbeddingShardIndices(
+            padded_org_vocab_start_index=rank * width,
+            padded_org_vocab_end_index=(rank + 1) * width,
+            padded_added_vocab_start_index=world_size * width,
+            padded_added_vocab_end_index=world_size * width,
+            org_vocab_start_index=rank * width,
+            org_vocab_end_index=(rank + 1) * width,
+            added_vocab_start_index=world_size * width,
+            added_vocab_end_index=world_size * width,
+        )
+        processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            use_attn_tp_group=False,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+            final_logit_softcapping=None,
+            vocab_size=world_size * width,
+        )
+        lm_head = SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=world_size * width,
+            org_vocab_size=world_size * width,
+            tp_size=world_size,
+            num_embeddings_per_partition=width,
+            shard_indices=indices,
+        )
+        return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
+
+    def _negotiate(self, model, peer_reasons):
+        group = SimpleNamespace(
+            world_size=8,
+            rank_in_group=0,
+            all_gather_object=MagicMock(side_effect=lambda own: [own, *peer_reasons]),
+        )
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang_tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
+            ),
+        ):
+            return negotiate_distributed_argmax(model), group
+
+    def test_negotiation_needs_every_rank(self):
+        states = tpu_sampler_module._DISTRIBUTED_TOP_K_STATES
+        model = self._model()
+        processor = model.logits_processor
+        try:
+            agreed, group = self._negotiate(model, [None] * 6 + ["padded"])
+            self.assertFalse(agreed)
+            self.assertNotIn(id(processor), states)
+
+            agreed, group = self._negotiate(model, [None] * 7)
+            self.assertTrue(agreed)
+            group.all_gather_object.assert_called_once_with(None)
+            self.assertEqual(
+                distributed_top_k_candidate_width(processor, model.lm_head), 1
+            )
+        finally:
+            states.pop(id(processor), None)
+
+    def test_negotiation_keeps_an_existing_candidate_contract(self):
+        model = _distributed_top_k_model()
+        processor = model.logits_processor
+        try:
+            with patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ):
+                self.assertFalse(negotiate_distributed_argmax(model))
+            self.assertEqual(
+                distributed_top_k_candidate_width(processor, model.lm_head), 64
+            )
+        finally:
+            tpu_sampler_module._DISTRIBUTED_TOP_K_STATES.pop(id(processor), None)
 
 
 if __name__ == "__main__":

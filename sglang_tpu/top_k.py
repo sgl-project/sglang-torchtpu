@@ -403,6 +403,70 @@ def output_logprob_topk(
     return top_values[:, :k], top_ids[:, :k]
 
 
+def distributed_argmax_layout(shard: TpuVocabShard, rank: int, world_size: int) -> bool:
+    """Whether rank r owns exactly ids [r * width, (r + 1) * width): no padding, no added vocab."""
+    return (
+        shard.added_vocab_count == 0
+        and shard.org_vocab_count == shard.org_vocab_padded_count == shard.width
+        and shard.org_vocab_start == rank * shard.width
+        and shard.org_vocab_size == shard.global_vocab_size == world_size * shard.width
+    )
+
+
+def local_argmax_pairs(local_logits: torch.Tensor) -> torch.Tensor:
+    """[rows, 2] float32 (row max, its lowest column) of one vocab shard."""
+    column = torch.argmax(local_logits, dim=-1, keepdim=True)
+    value = local_logits.amax(dim=-1, keepdim=True)
+    # Exact: shard columns stay below 2**24.
+    return torch.cat([value.float(), column.float()], dim=-1)
+
+
+def merge_argmax_pairs(
+    pairs: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Global top-1 (logit [rows, 1] float32, id [rows, 1] int32) of rank-ordered [world, rows, 2] pairs.
+
+    Rank r owns ids from r * width, so the lowest rank among tied maxima holds the
+    lowest id: ties resolve as torch.argmax over the gathered row does.
+    """
+    values, columns = pairs[..., 0], pairs[..., 1]
+    best = torch.argmax(values, dim=0)
+    ranks = torch.arange(pairs.shape[0], dtype=best.dtype, device=pairs.device)
+    onehot = ranks[:, None] == best[None, :]
+    value = torch.where(onehot, values, 0).sum(dim=0)
+    column = torch.where(onehot, columns, 0).sum(dim=0)
+    ids = best.to(torch.int32) * width + column.to(torch.int32)
+    return value[:, None], ids[:, None]
+
+
+def distributed_argmax(
+    local_logits: torch.Tensor, shard: TpuVocabShard, *, group
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact global top-1 over vocab shards with no sort and no logits gather.
+
+    Each rank reduces its shard to (max, lowest column); the group gathers only
+    those pairs, [world, rows, 2] float32.
+    """
+    world_size = int(group.world_size)
+    if not distributed_argmax_layout(shard, int(group.rank_in_group), world_size):
+        raise RuntimeError("distributed argmax needs an unpadded canonical vocab shard")
+    if local_logits.shape[0] == 0:
+        return (
+            local_logits.new_empty((0, 1), dtype=torch.float32),
+            local_logits.new_empty((0, 1), dtype=torch.int32),
+        )
+    pairs = local_argmax_pairs(local_logits)
+    if world_size == 1:
+        gathered = pairs
+    elif torch.compiler.is_dynamo_compiling():
+        from sglang_tpu.all_gather_via_all_reduce import gather_blocks_via_all_reduce
+
+        gathered = gather_blocks_via_all_reduce(group, pairs)
+    else:
+        gathered = group.all_gather(pairs, dim=0)
+    return merge_argmax_pairs(gathered.view(world_size, *pairs.shape), shard.width)
+
+
 def distributed_tpu_top_k(
     local_logits: torch.Tensor,
     shard: TpuVocabShard,
@@ -410,7 +474,10 @@ def distributed_tpu_top_k(
     *,
     group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run exact distributed TopK through the direct-HBM Pallas ring."""
+    """Run exact distributed TopK through the direct-HBM Pallas ring; top-1 needs no sort."""
+
+    if k == 1:
+        return distributed_argmax(local_logits, shard, group=group)
 
     from sglang_tpu.kernels.distributed_topk import (
         MAX_DISTRIBUTED_TOP_K,

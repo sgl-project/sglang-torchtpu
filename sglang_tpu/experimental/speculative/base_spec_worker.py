@@ -115,6 +115,8 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_candidates_step,
     accept_greedy_step,
     accept_greedy_top_k_step,
+    accept_real_draft_step,
+    accept_real_draft_top_k_step,
     accept_sampled_filtered_step,
     accept_sampled_step,
     accept_target_only_step,
@@ -124,7 +126,6 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     live_result_rows,
     pad_state_rows,
     select_verify_rows,
-    simulated_real_draft_accept_inputs,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -147,7 +148,7 @@ from sglang_tpu.mamba_pool import (
     verify_track_steps,
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
-from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.sampler import TpuSampler, negotiate_distributed_argmax
 from sglang_tpu.top_k import register_tpu_top_k_ops
 
 if TYPE_CHECKING:
@@ -274,6 +275,14 @@ class TpuSpecWorker(BaseSpecWorker):
         # real-draft-token commits the draft's real tokens and the target's greedy bonus,
         # so the output is model text (reasoning/tool parsers see real output).
         self._simulate_real_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+        # That accept reads only the target's argmax: reduce it over vocab shards in the verify.
+        self._verify_argmax_only = (
+            self._simulate_acc_len > 0
+            and self._simulate_real_tokens
+            and self._verify_top_k_width is None
+            and not self._dp_attention
+            and negotiate_distributed_argmax(runner.model)
+        )
         # Filled per batch bucket in init_cuda_graphs when simulating.
         self._simulated_drafts: dict[int, torch.Tensor] = {}
         self._simulated_bonus: dict[int, torch.Tensor] = {}
@@ -454,6 +463,8 @@ class TpuSpecWorker(BaseSpecWorker):
                 for pbs in buckets
                 for n in range(self.num_verify_rows)
             }
+            if self._simulate_real_tokens:
+                self._warmup_real_draft_accept()
         self._snapshot_warm_baseline()
 
     @staticmethod
@@ -541,6 +552,40 @@ class TpuSpecWorker(BaseSpecWorker):
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
                 materialize((next_seq_lens + width).to(torch.int32))
+
+    def _warmup_real_draft_accept(self) -> None:
+        """The real-draft-token accept per width and bucket, on each logits form the verify returns."""
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        top_k_width = 1 if self._verify_argmax_only else self._verify_top_k_width
+        with torch.no_grad():
+            for width, pbs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                tail = (
+                    torch.zeros(
+                        (pbs, width - 1), dtype=torch.int64, device=self.device
+                    ),
+                    self._simulated_correct[(pbs, 0)],
+                    torch.full(
+                        (pbs,), width - 1, dtype=torch.int32, device=self.device
+                    ),
+                    self._device_zeros(pbs),
+                    torch.ones((pbs,), dtype=torch.bool, device=self.device),
+                )
+                if top_k_width is not None:
+                    top_ids = torch.zeros(
+                        (pbs * width, top_k_width),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    warmup_compiled_op(accept_real_draft_top_k_step, top_ids, *tail)
+                if not self._verify_argmax_only:
+                    logits = torch.zeros(
+                        (pbs * width, vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    warmup_compiled_op(accept_real_draft_step, logits, *tail)
 
     def _warmup_accept(self, padded_bs: int, width: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
@@ -744,6 +789,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self, bucket: BucketState, draft_result: DraftResult
     ) -> LogitsOutputMode:
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
+        if self._verify_argmax_only:
+            return LogitsOutputMode.DISTRIBUTED_TOP_K
         if self._verify_top_k_width is None:
             return LogitsOutputMode.FULL_VOCAB
         # A simulated accept reads no logits; keep serving's mode so the benchmark
@@ -764,20 +811,19 @@ class TpuSpecWorker(BaseSpecWorker):
         if self._simulate_acc_len > 0 and self._simulate_real_tokens:
             forced_correct, _, _ = self._simulated_accept(draft_tokens.shape[0])
             if logits_output.has_next_token_global_top_k:
-                target_argmax = logits_output.next_token_global_top_k_token_ids[:, 0]
-            else:
-                target_argmax = torch.argmax(logits_output.next_token_logits, dim=-1)
-            bs, n = draft_tokens.shape
-            num_correct_drafts, bonus_tokens = simulated_real_draft_accept_inputs(
-                target_argmax.reshape(bs, n + 1),
+                return accept_real_draft_top_k_step(
+                    logits_output.next_token_global_top_k_token_ids,
+                    draft_tokens,
+                    forced_correct,
+                    draft_result.num_verify_drafts,
+                    state.seq_lens,
+                    bucket.live_mask,
+                )
+            return accept_real_draft_step(
+                logits_output.next_token_logits,
                 draft_tokens,
                 forced_correct,
                 draft_result.num_verify_drafts,
-            )
-            return finalize_accept(
-                draft_tokens,
-                num_correct_drafts,
-                bonus_tokens,
                 state.seq_lens,
                 bucket.live_mask,
             )

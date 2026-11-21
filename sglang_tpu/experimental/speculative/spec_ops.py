@@ -617,40 +617,74 @@ def accept_drafts_target_only(
     )
 
 
-def simulated_real_draft_accept_inputs(
+@compiled_op()
+def accept_real_draft_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    forced_correct: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """_accept_real_draft on full-vocabulary verify logits; the owner warms it."""
+    bs, n = draft_tokens.shape
+    target_argmax = torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1)
+    return _accept_real_draft(
+        target_argmax,
+        draft_tokens,
+        forced_correct,
+        num_verify_drafts,
+        seq_lens,
+        live_mask,
+    )
+
+
+@compiled_op()
+def accept_real_draft_top_k_step(
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    forced_correct: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """_accept_real_draft on the verify's descending top-k ids (any width); the owner warms it."""
+    bs, n = draft_tokens.shape
+    return _accept_real_draft(
+        top_ids[:, 0].view(bs, n + 1),
+        draft_tokens,
+        forced_correct,
+        num_verify_drafts,
+        seq_lens,
+        live_mask,
+    )
+
+
+def _accept_real_draft(
     target_argmax: torch.Tensor,
     draft_tokens: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
+    forced_correct: torch.Tensor,
     num_verify_drafts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
     """SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token: forced accept length, real tokens.
 
-    Follows the upstream spec_utils rule: the accepted rows commit the draft's own tokens
-    and the bonus is the target's token at the first unaccepted row. Eager on purpose: the
-    outputs feed finalize_accept, whose programs warmup already builds per bucket.
-
-    Args:
-        target_argmax: [bs, N + 1] the target's greedy token id at each verify row.
-        draft_tokens: [bs, N] the draft tokens verified this step; sets the bonus dtype.
-        num_correct_drafts: [bs] forced number of accepted drafts, from the simulated
-            accept-length sampler.
-        num_verify_drafts: [bs] drafts each request can verify this step; caps
-            num_correct_drafts.
-
-    Returns:
-        num_correct_drafts clamped to num_verify_drafts, and the [bs] bonus tokens
-        (target_argmax at that row, in draft_tokens' dtype).
+    As upstream spec_utils: commit min(forced_correct, num_verify_drafts) of the draft's
+    own tokens, then the target's [pbs, N + 1] argmax at the next row as the bonus.
     """
-    bs = draft_tokens.shape[0]
+    # int32 compares and picks: int64 lanes are emulated on TPU.
     num_correct = torch.minimum(
-        num_correct_drafts, num_verify_drafts.to(num_correct_drafts.dtype)
+        forced_correct.to(torch.int32), num_verify_drafts.to(torch.int32)
     )
-    bonus = torch.gather(
-        target_argmax.to(draft_tokens.dtype),
-        1,
-        num_correct.reshape(bs, 1).to(torch.int64),
-    ).reshape(bs)
-    return num_correct, bonus
+    bonus = pick(target_argmax.to(torch.int32), num_correct)
+    return _finalize(
+        draft_tokens,
+        num_correct.to(forced_correct.dtype),
+        bonus.to(draft_tokens.dtype),
+        seq_lens,
+        live_mask,
+    )
 
 
 @compiled_op(warmup=lambda ctx: _finalize_warmup_args(ctx))

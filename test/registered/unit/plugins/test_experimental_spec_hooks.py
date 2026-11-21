@@ -233,6 +233,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._simulate_acc_len = 0
         worker._tp_sync = MagicMock()
         worker._verify_top_k_width = None
+        worker._verify_argmax_only = False
         worker._rank_check_interval = 0
         logits = SimpleNamespace(
             next_token_logits=torch.zeros(2, 4), has_next_token_global_top_k=False

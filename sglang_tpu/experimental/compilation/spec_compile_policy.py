@@ -6,6 +6,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -14,6 +15,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.sampler import negotiated_distributed_top_k_width
 
 
 class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
@@ -34,6 +36,15 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
 
     def _precompile_extend(self) -> list[PendingCall]:
         return []
+
+    def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+        # TpuSpecWorker negotiated the width-1 argmax for a verify that reads only it.
+        if (
+            not self.is_draft_worker
+            and negotiated_distributed_top_k_width(self.model_runner.model) == 1
+        ):
+            return (LogitsOutputMode.DISTRIBUTED_TOP_K,)
+        return super().target_verify_logits_output_modes()
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
         return make_draft_block_spec_info(
