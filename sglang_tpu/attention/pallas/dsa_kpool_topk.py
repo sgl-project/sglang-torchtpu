@@ -25,6 +25,7 @@ with a closed-pools-only causal mask.
 """
 
 import logging
+import math
 from typing import Any
 
 import jax
@@ -137,6 +138,120 @@ def _raw_page_slot(
     return page, pos % loc["page_size"]
 
 
+def _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs):
+    """``raw_cache.at[page, slot].set(raw, mode="drop")`` a page at a time.
+
+    A request fills consecutive slots of pages no other request writes, so a
+    step is one run of rows per (request, page), each on its own page. The
+    runs' pages are read into a small buffer, the rows scattered there (far
+    cheaper on a small table than on the cache), and written back by one scatter.
+    """
+    num_raw = raw_cache.shape[0]
+    tok = jnp.arange(raw.shape[0], dtype=jnp.int32)
+    first = valid & ((tok == 0) | (req != jnp.roll(req, 1)) | (slot == 0))
+    run = jnp.where(valid, jnp.cumsum(first) - 1, max_runs)
+    run_page = jnp.full((max_runs,), num_raw, page.dtype)
+    run_page = run_page.at[run].set(page, mode="drop")
+    pages = raw_cache[jnp.minimum(run_page, num_raw - 1)]
+    pages = pages.at[run, slot].set(raw, mode="drop")
+    return raw_cache.at[run_page].set(pages, mode="drop")
+
+
+def _should_use_page_write(
+    num_tokens: int, num_seqs: int, num_raw: int, page_size: int, raw_dim: int
+) -> bool:
+    """Picks ``_write_raw_pages`` when its worst-case TPU7x cycle estimate beats row scatter.
+
+    Models XLA's three scatter lowerings (in-VMEM, sort+stream, per-row RMW) at
+    trace time using worst-case active runs ``R = T // page_size + 2 * S``
+    (validated on Ghostfish TPU7x in cl/1025124431).
+    """
+    if num_tokens <= 16 or num_seqs <= 0 or num_raw <= 0:
+        return False
+    # TPU7x DMA latency (cycles) / bandwidth (B/cycle) and VMEM budgets.
+    dma_in, dma_out, dma_smem, bw, bw_smem = 692.0, 594.0, 722.0, 1688.0, 32.0
+    vmem_win = 32 * 1024 * 1024 * 39 // 40  # 32 MiB VMEM leaving 1/40 headroom
+    row_b, page_b = float(raw_dim * 2), float(page_size * raw_dim * 2)
+    tile_b = 8.0 * row_b  # default T(8,128)(2,1) copies an 8-row tile per RMW
+    n_win = max(
+        1,
+        (vmem_win - 2 * min(512, num_tokens) * raw_dim * 4)
+        // (page_size * raw_dim * 4),
+    )
+    log2_t = max(1, math.ceil(math.log2(max(2, num_tokens))))
+    t, r = num_tokens, num_tokens // page_size + 2 * num_seqs
+    fits = r * page_b + t * row_b <= 32704 * 1024
+
+    def branch(n_pages: int) -> str:
+        if t < 1024:
+            return "per-row"
+        if n_pages <= n_win:
+            return "in-vmem"
+        sort_cost = 11 * t + page_size * n_pages + int(0.01 * t * log2_t * log2_t)
+        return "sort+stream" if sort_cost < 80 * t else "per-row"
+
+    old_br, new_br = branch(num_raw), branch(r)
+    if old_br == "in-vmem" or (new_br == "per-row" and not fits):
+        return False
+
+    # Old path: raw_cache.at[page, slot].set(raw).
+    if old_br == "sort+stream":
+        old_cyc = (
+            9000.0
+            + math.ceil(num_raw / n_win) * (dma_in + dma_out)
+            + 2.0 * num_raw * page_b / bw
+            + 55.0 * num_raw
+            + 10.4 * t
+        )
+    else:
+        iters = math.ceil(t / 16.0)
+        uniq = min(t, math.ceil(t / 8.0) + 1) if t < 256 else t
+        smem = math.ceil(t / 256) * (dma_smem + 1024.0 / bw_smem)
+        dma = (
+            iters * (dma_in + dma_out)
+            + (t * (tile_b + row_b) + uniq * tile_b) / bw
+            + ((t + uniq) * 38.0 if uniq > 16 else uniq * 15.0)
+        )
+        tc = iters * (1860.0 if uniq > 16 else 650.0)
+        old_cyc = max(6500.0, smem + dma + tc - (8000.0 if t >= 256 else 0.0))
+
+    # New path: 4-step page staging (run ids, gather, inner scatter, write-back).
+    s1 = dma_smem + 4.0 * t / bw_smem + 1.5 * t + 6.0 * r
+    s2_dma = (
+        math.ceil(r / 16.0) * dma_in
+        + r * page_b / bw
+        + r * (38.0 if t >= 1024 else 12.0)
+    )
+    if not fits:
+        s2_dma += math.ceil(r / 16.0) * dma_out + r * page_b / bw
+    s2 = dma_smem + 4.0 * r / bw_smem + max(s2_dma, 24.0 * r)
+    if new_br == "in-vmem":
+        s3 = 5000.0 + dma_in + t * row_b / bw + 125.0 * r + 9.5 * t
+    elif new_br == "sort+stream":
+        nw = math.ceil(r / n_win)
+        if fits:
+            s3 = 15000.0 + nw * 2500.0 + dma_in + t * row_b / bw + 155.0 * r + 9.5 * t
+        else:
+            s3 = (
+                15000.0
+                + nw * (dma_in + dma_out)
+                + 2.0 * r * page_b / bw
+                + 65.0 * r
+                + 9.5 * t
+            )
+    else:
+        s3 = dma_smem + math.ceil(t / 16.0) * 1560.0
+    scan = 95.0 if (t >= 1024 or not fits) else 45.0
+    s4 = (
+        dma_smem
+        + 4.0 * r / bw_smem
+        + (scan + 85.0) * r
+        + math.ceil(r / 16.0) * dma_out
+        + r * page_b / bw
+    )
+    return s1 + s2 + s3 + s4 < old_cyc
+
+
 def _align(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
@@ -231,7 +346,14 @@ def store_pooled_keys(
     # 1. Raw key | gate records of this step's tokens.
     page, slot = _raw_page_slot(req, pos, valid=valid, **raw_loc)
     raw = jnp.concatenate([key, gate], axis=-1).astype(raw_cache.dtype)
-    raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
+    # Runs: a page per page_size tokens and two partial pages per request.
+    max_runs = num_tokens // page_size + 2 * num_seqs
+    if _should_use_page_write(
+        num_tokens, num_seqs, num_raw, page_size, raw_cache.shape[2]
+    ):
+        raw_cache = _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs)
+    else:
+        raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
     # 2. Compress the pools this step closes, reading the cache just written.
     fused = (
