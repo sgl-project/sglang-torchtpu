@@ -126,11 +126,17 @@ def mamba_v2_sharded_weight_loader(
             shard_size = full_dim // tp_size
 
             # - compute the rank into the loaded shard.
-            # - if there is replication, different TP shards will
-            #   take from the same rank.
-            # NOTE: currently we only support duplication
-            # in the case where num_groups == 1
-            rank = 0 if duplicate_groups else tp_rank
+            # - if there is replication, consecutive TP shards sharing a
+            #   replicated group/head read from the same unreplicated shard.
+            if duplicate_groups:
+                unreplicated_dim = full_dim - extra
+                assert unreplicated_dim > 0 and full_dim % unreplicated_dim == 0, (
+                    f"Invalid replicated shard spec: full_dim={full_dim}, extra={extra}"
+                )
+                rep = full_dim // unreplicated_dim
+                rank = tp_rank // rep
+            else:
+                rank = tp_rank
 
             # - leftmost boundary index into loaded weight.
             loaded_skip = rank * shard_size

@@ -23,6 +23,13 @@ _READ_CHUNK_BYTES = 64 * 1024 * 1024
 # extra read for fewer seeks on network filesystems (not tuned).
 _SPAN_MERGE_GAP_BYTES = 16 * 1024 * 1024
 _EXPERT_ID_KEY_RE = re.compile(r"^(.*)\.experts\.(\d+)\.")
+_UNUSED_TARGET_PREFIXES = ("mtp.", "model.mtp.")
+
+
+def is_unused_target_key(name: str) -> bool:
+    """True for MTP draft-only checkpoint keys that target CausalLM loads drop."""
+    return name.startswith(_UNUSED_TARGET_PREFIXES)
+
 
 _SAFETENSORS_DTYPES = {
     "BOOL": torch.bool,
@@ -67,7 +74,12 @@ def _log_whole_shards(reason: str) -> None:
 # Core model classes opted in from the plugin, so core carries no TPU-only flag.
 # Every `.experts.<id>.` checkpoint key of these loads into FusedMoE expert <id>.
 _PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = frozenset(
-    {"sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"}
+    {
+        "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM",
+        "sglang.srt.models.qwen3_5.Qwen3_5MoeForConditionalGeneration",
+        "sglang.srt.models.qwen3_5.Qwen3_5TextForCausalLM",
+        "sglang.srt.models.qwen3_5_text.Qwen3_5MoeForCausalLM",
+    }
 )
 
 
@@ -143,12 +155,14 @@ class EpLocalExpertReader:
             weight_map = json.load(f)["weight_map"]
         self.indexed_files = set(weight_map.values())
         # Index entries for this rank's routed experts in the shards this load
-        # reads: all must be read.
+        # reads: all must be read (excluding unused MTP draft keys on target loads).
         loaded = {os.path.basename(path) for path in hf_weights_files}
         self.expected: set[str] = {
             name
             for name, shard in weight_map.items()
-            if shard in loaded and self._local_expert_id(name) not in (None, -1)
+            if shard in loaded
+            and not is_unused_target_key(name)
+            and self._local_expert_id(name) not in (None, -1)
         }
         self.seen: set[str] = set()
         self._seen_lock = threading.Lock()
@@ -200,7 +214,7 @@ class EpLocalExpertReader:
                 )
             kept, unviewable = [], []
             for name, meta in header.items():
-                if self._local_expert_id(name) == -1:
+                if self._local_expert_id(name) == -1 or is_unused_target_key(name):
                     continue
                 if meta["dtype"] not in _SAFETENSORS_DTYPES:
                     unviewable.append(name)

@@ -21,6 +21,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -1387,6 +1388,44 @@ def draft_kv_ring_row_pairs(
     return [a for a, _ in pairs], [b for _, b in pairs]
 
 
+def _resolve_conv_subblock(
+    entry: Union[int, Tuple[int, int]], tp_size: int
+) -> Tuple[int, int]:
+    """Return ``(local_sub_dim, tp_rep)`` for one conv sub-block at ``tp_size``.
+
+    ``entry`` is either ``(full_dim, head_dim)`` (head-sharded at ``head_dim``
+    granularity and replicated when ``tp_size > full_dim // head_dim``) or a
+    plain ``int`` ``full_dim`` (unreplicated ``head_dim = 1``).
+    """
+    if isinstance(entry, (tuple, list)):
+        if len(entry) != 2:
+            raise ValueError(
+                f"Expected (full_dim, head_dim) conv_shard_groups entry, got {entry!r}"
+            )
+        full_sd, head_sd = int(entry[0]), int(entry[1])
+    else:
+        full_sd, head_sd = int(entry), 1
+    if full_sd <= 0 or head_sd <= 0 or full_sd % head_sd != 0:
+        raise ValueError(
+            f"Invalid conv_shard_groups entry {(full_sd, head_sd)}: "
+            "full_dim must be positive and divisible by head_dim"
+        )
+    num_heads = full_sd // head_sd
+    if num_heads >= tp_size:
+        if num_heads % tp_size != 0:
+            raise ValueError(
+                f"Conv sub-block num_heads={num_heads} (full_dim={full_sd}, "
+                f"head_dim={head_sd}) is not divisible by attn_tp_size={tp_size}"
+            )
+        return full_sd // tp_size, 1
+    if tp_size % num_heads != 0:
+        raise ValueError(
+            f"attn_tp_size={tp_size} is not divisible by conv sub-block "
+            f"num_heads={num_heads} (full_dim={full_sd}, head_dim={head_sd})"
+        )
+    return head_sd, tp_size // num_heads
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -1394,7 +1433,7 @@ def compute_mamba_state_slice_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None,
 ) -> List[Tuple[int, int, int]]:
     """Blocks to copy one mamba state item across differing attn-TP sizes.
 
@@ -1403,57 +1442,78 @@ def compute_mamba_state_slice_blocks(
     ``conv_shard_groups`` is None) return one contiguous block -- byte-identical to
     the legacy behavior.
 
-    GDN conv_state is ``cat([query | key | value])`` where each sub-block (full
-    dims == ``conv_shard_groups``, e.g. ``[key_dim, key_dim, value_dim]``) is
-    head-sharded INDEPENDENTLY across attn-TP. In the SCATTER direction
-    (1 prefill rank -> several decode ranks) a single contiguous slice straddles
-    the q/k/v boundaries and delivers wrong channels. The AGGREGATION direction
-    (several prefill ranks -> 1 decode rank) has the symmetric problem: a single
-    contiguous write interleaves the sub-blocks by writer. Both directions emit one
-    block per sub-block for conv_state; temporal_state and non-GDN states (when
-    ``conv_shard_groups`` is None) keep the single contiguous slice.
+    GDN conv_state is ``cat([query | key | value])`` where each sub-block
+    (``conv_shard_groups``, e.g. ``[(key_dim, head_k_dim), (key_dim, head_k_dim),
+    (value_dim, head_v_dim)]``) is head-sharded or head-replicated independently
+    across attn-TP. When ``attn_tp_size > num_k_heads``, each Q/K head is
+    replicated across ``qk_rep = attn_tp_size // num_k_heads`` consecutive TP
+    ranks. In the SCATTER direction (1 prefill rank -> several decode ranks) each
+    sub-block gathers the decode rank's head group; in the AGGREGATION direction
+    (several prefill ranks -> 1 decode rank) replicated Q/K writers are
+    deduplicated via ``dup_writers = max(1, src_rep // dst_rep)`` and placed at
+    their grouped sub-block offsets.
     """
-    use_subdims = (
-        conv_shard_groups is not None
-        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
-    )
+    if src_attn_tp_size <= 0 or dst_attn_tp_size <= 0:
+        raise ValueError(
+            f"Attention TP sizes must be positive: src={src_attn_tp_size}, "
+            f"dst={dst_attn_tp_size}"
+        )
+    larger_tp = max(src_attn_tp_size, dst_attn_tp_size)
+    smaller_tp = min(src_attn_tp_size, dst_attn_tp_size)
+    if larger_tp % smaller_tp != 0:
+        raise ValueError(
+            "One attention TP size must divide the other for Mamba state slice "
+            f"transfer: src={src_attn_tp_size}, dst={dst_attn_tp_size}"
+        )
 
-    if src_attn_tp_size > dst_attn_tp_size:
-        # Aggregation: several prefill ranks each write their shard into one decode slot.
-        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
-        local_writer_idx = local_tp_rank_in_group % writers_per_decode
-        if not use_subdims:
+    if conv_shard_groups is None:
+        if src_dim * src_attn_tp_size != dst_dim * dst_attn_tp_size:
+            raise ValueError(
+                "Mamba state tensor has replicated channels across attention TP "
+                f"(src_dim={src_dim} * src_tp={src_attn_tp_size} != "
+                f"dst_dim={dst_dim} * dst_tp={dst_attn_tp_size}), which requires "
+                "conv_shard_groups metadata for heterogeneous TP transfer"
+            )
+        if src_attn_tp_size > dst_attn_tp_size:
+            writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+            local_writer_idx = local_tp_rank_in_group % writers_per_decode
             return [(0, local_writer_idx * src_dim, src_dim)]
-        # conv_state: a plain contiguous write would interleave the sub-blocks by
-        # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
-        # independently head-sharded sub-block at its grouped offset so the decode
-        # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
-        blocks: List[Tuple[int, int, int]] = []
-        src_off = 0
-        dst_off = 0
-        for full_sd in conv_shard_groups:
-            src_sub = full_sd // src_attn_tp_size
-            dst_sub = full_sd // dst_attn_tp_size
-            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
+        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+        return [(src_dim_start, 0, dst_dim)]
+
+    src_subs = [_resolve_conv_subblock(e, src_attn_tp_size) for e in conv_shard_groups]
+    dst_subs = [_resolve_conv_subblock(e, dst_attn_tp_size) for e in conv_shard_groups]
+    expected_src_dim = sum(s for s, _ in src_subs)
+    expected_dst_dim = sum(d for d, _ in dst_subs)
+    if expected_src_dim != src_dim or expected_dst_dim != dst_dim:
+        raise ValueError(
+            "Mamba conv_shard_groups does not match per-rank conv dims: "
+            f"conv_shard_groups={conv_shard_groups}, "
+            f"src_dim={src_dim} (expected {expected_src_dim} at tp={src_attn_tp_size}), "
+            f"dst_dim={dst_dim} (expected {expected_dst_dim} at tp={dst_attn_tp_size})"
+        )
+
+    blocks: List[Tuple[int, int, int]] = []
+    src_off = 0
+    dst_off = 0
+    if src_attn_tp_size > dst_attn_tp_size:
+        # Aggregation: several prefill ranks write their shard into one decode slot.
+        # When src_rep > dst_rep on a replicated Q/K sub-block, consecutive prefill
+        # writers hold identical copies of the same Q/K head; only the canonical
+        # writer (local_tp_rank_in_group % dup_writers == 0) transfers it.
+        for (src_sub, src_rep), (dst_sub, dst_rep) in zip(src_subs, dst_subs):
+            dup_writers = max(1, src_rep // dst_rep)
+            if local_tp_rank_in_group % dup_writers == 0:
+                dst_sub_off = ((local_tp_rank_in_group // src_rep) * src_sub) % dst_sub
+                blocks.append((src_off, dst_off + dst_sub_off, src_sub))
             src_off += src_sub
             dst_off += dst_sub
         return blocks
 
     # Scatter: 1 prefill rank feeds several decode ranks.
-    if not use_subdims:
-        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-        return [(src_dim_start, 0, dst_dim)]
-
-    # conv_state: gather the decode rank's [q | k | v] shard from the three
-    # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
-    blocks: List[Tuple[int, int, int]] = []
-    src_off = 0
-    dst_off = 0
-    for full_sd in conv_shard_groups:
-        src_sub = full_sd // src_attn_tp_size  # this prefill rank's shard of sub-block
-        dst_sub = full_sd // dst_attn_tp_size  # this decode rank's shard of sub-block
-        src_start = src_off + (dst_tp_rank_in_group * dst_sub) % src_sub
-        blocks.append((src_start, dst_off, dst_sub))
+    for (src_sub, _), (dst_sub, dst_rep) in zip(src_subs, dst_subs):
+        src_sub_off = ((dst_tp_rank_in_group // dst_rep) * dst_sub) % src_sub
+        blocks.append((src_off + src_sub_off, dst_off, dst_sub))
         src_off += src_sub
         dst_off += dst_sub
     return blocks
@@ -1470,7 +1530,7 @@ def compute_mamba_state_slice_byte_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None,
 ) -> List[Tuple[int, int, int]]:
     """Convert logical TP slices into physical byte blocks for one state slot.
 

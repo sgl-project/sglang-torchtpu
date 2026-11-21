@@ -52,6 +52,12 @@
     "qwen3.8-27b": {
       "name": "Qwen3.8-27B"
     },
+    "qwen3.8-max": {
+      "name": "Qwen3.8-2.4T-A95B FP8",
+      "aliases": [
+        "qwen3.8-2.4t"
+      ]
+    },
     "mimo-v2.5-pro": {
       "name": "MiMo-V2.5-Pro"
     },
@@ -99,6 +105,7 @@
     "dpa": "DP attention",
     "hybrid": "DP attention hybrid (attn-TP>1)",
     "tp": "Tensor parallel",
+    "dcp": "Decode context parallel",
     "pcp": "Prefill context parallel",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
