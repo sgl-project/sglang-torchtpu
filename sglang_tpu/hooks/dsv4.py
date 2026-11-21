@@ -85,6 +85,18 @@ tpu_dsv4_get_last_loc
   How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
   Upstream PR or issue: not filed.
   Remove when: get_last_loc dispatches on the tensor device, not backend names.
+
+allow_tpu_dsv4_kv_pool
+  Why: sglang#35594 rejects an out-of-tree platform before
+       KVCacheConfigurator._build_dsv4_kv_pool, since get_kv_pool_cls has no
+       DeepSeek-V4 kind. TPU registers as out-of-tree and builds that pool in
+       build_tpu_dsv4_kv_pool, which the check never lets run.
+  How: AROUND KVCacheConfigurator._build_token_to_kv_pool lifts only the
+       "the DeepSeek-V4 KV pool" check for the call; every other subsystem the
+       builder guards still raises.
+  Upstream PR or issue: not filed.
+  Remove when: get_kv_pool_cls takes a DeepSeek-V4 kind and the TPU platform
+       supplies its pool through it.
 """
 
 from __future__ import annotations
@@ -93,6 +105,22 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
+
+# Must match the subsystem KVCacheConfigurator._build_token_to_kv_pool passes.
+_DSV4_POOL_SUBSYSTEM = "the DeepSeek-V4 KV pool"
+
+
+def allow_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+    reject = kvc_mod.reject_out_of_tree_path
+
+    def reject_except_dsv4_pool(platform, *, subsystem):
+        if subsystem != _DSV4_POOL_SUBSYSTEM:
+            reject(platform, subsystem=subsystem)
+
+    with patch.object(kvc_mod, "reject_out_of_tree_path", reject_except_dsv4_pool):
+        return original(kvc, *args, **kwargs)
 
 
 def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
@@ -359,6 +387,11 @@ def hook_specs():
     htk = "sglang.srt.layers.moe.hash_topk.HashTopK"
     dsv4 = "sglang.srt.models.deepseek_v4"
     return [
+        (
+            f"{kvc}._build_token_to_kv_pool",
+            allow_tpu_dsv4_kv_pool,
+            HookType.AROUND,
+        ),
         (
             f"{kvc}._build_dsv4_kv_pool",
             build_tpu_dsv4_kv_pool,

@@ -795,5 +795,36 @@ class TestDSV4TPUPatches(CustomTestCase):
         self.assertTrue(model_stub._mhc_prewarmed_at_load)
 
 
+class TestTpuDsv4KvPoolOutOfTreeCheck(CustomTestCase):
+    def test_only_the_dsv4_pool_check_is_lifted(self):
+        """The out-of-tree TPU platform must reach the DeepSeek-V4 pool builder,
+        or every DeepSeek-V4 / V4.1 server fails while building its KV pool; the
+        builder's other out-of-tree checks must still raise."""
+        import inspect
+
+        import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+        from sglang_tpu.hooks import dsv4 as hooks
+
+        build = inspect.unwrap(kvc_mod.KVCacheConfigurator._build_token_to_kv_pool)
+        self.assertIn(
+            f'subsystem="{hooks._DSV4_POOL_SUBSYSTEM}"', inspect.getsource(build)
+        )
+        oot = SimpleNamespace(is_out_of_tree=lambda: True, device_name="tpu")
+        reject = kvc_mod.reject_out_of_tree_path
+        with self.assertRaises(NotImplementedError):
+            reject(oot, subsystem=hooks._DSV4_POOL_SUBSYSTEM)
+
+        def build_pools(kvc):
+            kvc_mod.reject_out_of_tree_path(oot, subsystem=hooks._DSV4_POOL_SUBSYSTEM)
+            with self.assertRaises(NotImplementedError):
+                kvc_mod.reject_out_of_tree_path(
+                    oot, subsystem="the HiSparse DSA KV pool"
+                )
+            return "pool"
+
+        self.assertEqual(hooks.allow_tpu_dsv4_kv_pool(build_pools, None), "pool")
+        self.assertIs(kvc_mod.reject_out_of_tree_path, reject)
+
+
 if __name__ == "__main__":
     unittest.main()
