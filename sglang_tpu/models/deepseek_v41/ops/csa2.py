@@ -15,9 +15,11 @@ Layouts (``memory_pool.DSV41TPUTokenToKVPool``):
   feature ``128 g + l``) plus FP32 per-record scales ``[R]``. Record
   ``full_loc // r``; one main page is ``256 // r`` records and its id is the
   full page id.
-- ``cos_sin``: the layer's FP32 ``[max_position, 64]`` ``[cos | sin]`` table,
-  ``sglang_tpu.dsv4.dsv4_memory_pool.get_or_build_cos_sin_cache(
-  layer.freqs_cis)``. Pass the attention layer's own table: compressed layers
+- ``cos_sin``: the layer's FP32 ``[cos | sin]`` table from
+  ``sglang_tpu.dsv4.dsv4_memory_pool``: plain ``[max_position, 64]``
+  (``get_or_build_cos_sin_cache``) or lane-packed
+  ``[ceil(max_position / 2), 128]`` (``get_or_build_rope_lane_table``). Pass
+  the attention layer's own table: compressed layers
   use the compressed YaRN RoPE, ratio-0 layers the main RoPE. RoPE pairs are
   interleaved (``2 i``, ``2 i + 1``) over the last 64 of the 512 features.
 
@@ -35,6 +37,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from sglang_tpu.dsv4.rope import cos_sin_positions, cos_sin_rows
 from sglang_tpu.models.deepseek_v41.kernels.csa2.cache import (
     encode_csa2_kv,
     prepare_main_records,
@@ -123,9 +126,8 @@ def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     Q and K carry RoPE; out = conj(e^{i theta}) * o on each interleaved pair
     of the last 64 features. The first 64 of the 128 pass through.
     """
-    rows = jnp.take(
-        cos_sin, jnp.clip(positions, 0, cos_sin.shape[0] - 1), axis=0
-    ).astype(jnp.float32)
+    clipped = jnp.clip(positions, 0, cos_sin_positions(cos_sin) - 1)
+    rows = cos_sin_rows(cos_sin, clipped).astype(jnp.float32)
     half = ROPE_DIM // 2
     tokens = positions.shape[0]
     cos = jnp.concatenate(
@@ -506,8 +508,11 @@ def attention(
     """
     if not q.shape[0]:
         return torch.empty_like(q)
-    if cos_sin.dim() != 2 or cos_sin.shape[1] != ROPE_DIM:
-        raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
+    if cos_sin.dim() != 2 or cos_sin.shape[1] not in (ROPE_DIM, 2 * ROPE_DIM):
+        raise ValueError(
+            f"cos_sin must be [max_position, {ROPE_DIM}] or lane-packed "
+            f"[ceil(max_position / 2), {2 * ROPE_DIM}]"
+        )
     if swa_bounds is not None and main is not None:
         raise ValueError("non-causal SWA bounds serve ratio-0 layers without main KV")
     if keep_gathered and main is None:

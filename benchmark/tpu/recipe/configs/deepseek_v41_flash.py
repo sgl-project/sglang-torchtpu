@@ -67,7 +67,10 @@ CONFIG["runtime_env"].update(
         "TPU_ENABLE_TELEMETRY_HARVESTING": "0",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
         "OMP_NUM_THREADS": "4",
-        "SGLANG_TPU_CHECK_RECOMPILATION": "1",
+        # The checker syncs before a compiled call whenever its tier-1 miss counter
+        # moved, waiting out the in-flight program: 0.6-10.7 ms per DSpark decode
+        # step in probes. Set it to "1" to find serving-time recompiles.
+        "SGLANG_TPU_CHECK_RECOMPILATION": "0",
         # One Engram table in host memory, shared by the 8 ranks.
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared",
