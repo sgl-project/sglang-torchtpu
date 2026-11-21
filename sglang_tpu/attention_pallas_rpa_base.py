@@ -159,6 +159,10 @@ class PallasForwardMetadata:
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
+    # Sparse MLA under DCP only: i32[max_num_seqs * pages_per_seq]  the latent
+    # stripe's page table. ``page_indices`` then covers the allocator's whole
+    # slot space (the replicated indexer's) and ``kv_lens`` is global.
+    dcp_latent_page_indices: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -573,6 +577,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # True for a subclass whose own forward reads the DCP metadata (global
+    # lengths, stripe page table) correctly; the base DCP init refuses any other
+    # subclass that overrides forward_decode / forward_extend.
+    runs_own_dcp_forward: ClassVar[bool] = False
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -627,7 +636,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
                 )
             cls = type(self)
-            if (
+            if not cls.runs_own_dcp_forward and (
                 cls.forward_decode is not BaseTpuPallasRpaAttnBackend.forward_decode
                 or cls.forward_extend is not BaseTpuPallasRpaAttnBackend.forward_extend
             ):
@@ -650,7 +659,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 torch.arange(self._dcp, dtype=torch.int64, device=self.device)
                 == self._dcp_rank
             )
-            self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
+            if not cls.runs_own_dcp_forward:
+                self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
 
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
