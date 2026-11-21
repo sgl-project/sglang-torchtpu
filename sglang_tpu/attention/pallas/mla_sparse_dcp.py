@@ -32,8 +32,7 @@ def localize_topk(
     dcp_size: int,
     interleave_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """This rank's share of every row, in local positions.
-    """
+    """This rank's share of every row, in local positions."""
     num_rows, width = topk_indices.shape
     chunk = topk_indices // interleave_size
     owned = (topk_indices >= 0) & (chunk % dcp_size == dcp_rank)

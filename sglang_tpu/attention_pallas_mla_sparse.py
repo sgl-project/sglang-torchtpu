@@ -369,7 +369,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         if self._dcp == 1:
             return
         if self._prefill_op is not None:
-            # TODO(weiyulin): Supports SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL with DCP 
+            # TODO(weiyulin): Supports SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL with DCP
             logger.info(
                 "Decode context parallelism: SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_"
                 "PREFILL is ignored"
@@ -431,12 +431,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._rebind_dcp_metadata()
 
     def _rebind_dcp_metadata(self) -> None:
-        """Recompuate DCP metadata for backend.
-        """
+        """Recompuate DCP metadata for backend."""
         metadata = self.forward_metadata
         metadata.dcp_latent_page_indices = metadata.page_indices
         metadata.page_indices = index_page_indices(
-            metadata.page_indices, num_seqs=metadata.cu_q_lens.shape[0] - 1, dcp=self._dcp
+            metadata.page_indices,
+            num_seqs=metadata.cu_q_lens.shape[0] - 1,
+            dcp=self._dcp,
         )
         metadata.kv_lens = metadata.dcp_kv_lens_global
 
@@ -863,7 +864,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # TODO(weiyulin): Current collectives for RPA DCP is not optimal. 
+        # TODO(weiyulin): Current collectives for RPA DCP is not optimal.
         # We should replace it with AG + RS or two A2A
         args = list(
             self._mla_kernel_args(
