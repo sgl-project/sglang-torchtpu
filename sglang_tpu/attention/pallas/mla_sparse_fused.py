@@ -404,9 +404,9 @@ def sparse_mla_attention_kv_shard(
     return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
 
 
-# Decode-sized batches only (verify and draft rows): prefill keeps the per-query
-# kernel, whose gather chunks suit thousands of rows.
-RAGGED_MAX_ROWS = 256
+# Decode-sized batches only: one 64-row chunk. At 2 shards (~1100 own slots of 2176)
+# a 128-row verify measured +1.4 ms per step on the ragged path vs the per-query kernel.
+RAGGED_MAX_ROWS = 64
 
 
 def _takes_ragged(ragged_block: int, num_tokens: int, width: int) -> bool:

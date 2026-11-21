@@ -238,7 +238,7 @@ class TpuEnvs:
     # the bytes (-22 ms per 4096-token chunk at 8 shards on one 2x2x1 host), but the
     # output is no longer correctly rounded (~45% of elements off by a bf16 step).
     SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE = EnvBool(False)
-    # SGLANG_TPU_DSA_MLA_KV_SHARDS: decode-sized batches gather and attend only each
+    # SGLANG_TPU_DSA_MLA_KV_SHARDS: batches of <= 64 rows gather and attend only each
     # row's own candidates, in blocks of this many slots (a divisor of the row width;
     # mla_sparse/ragged.py), instead of every slot of the row. 0 = off. Bit-exact without
     # rope lanes; with rope a score can differ by one f32 rounding.
