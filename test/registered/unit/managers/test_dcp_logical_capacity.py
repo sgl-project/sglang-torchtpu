@@ -173,6 +173,27 @@ class TestDcpLogicalCapacity(CustomTestCase):
         with self.assertNoLogs("sglang.srt.managers.tp_worker", "WARNING"):
             TpModelWorker.get_worker_info(self.make_worker(2))
 
+    def test_draft_pool_page_size(self):
+        """Only a draft under DCP pages its pool differently, and only when the
+        platform opts in; the default keeps the allocator's widened page."""
+        enter_scope(self, published_topology(tp_size=8, dcp_size=8))
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.get_schedule",
+            return_value=NS(page_size=128),
+        ):
+            for token_pages, draft_page in ((False, 128 * 8), (True, 128)):
+                with (
+                    self.subTest(token_pages=token_pages),
+                    patch.object(
+                        current_platform,
+                        "dcp_draft_pool_uses_token_pages",
+                        return_value=token_pages,
+                    ),
+                ):
+                    draft = make_configurator(is_draft_worker=True)
+                    self.assertEqual(draft.pool_page_size, draft_page)
+                    self.assertEqual(make_configurator().pool_page_size, 128)
+
 
 if __name__ == "__main__":
     unittest.main()

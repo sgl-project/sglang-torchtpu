@@ -187,12 +187,15 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
         variants = self._extend_serving_variants()
+        # Sparse MLA under DCP has one prefill graph per gathered-page bucket
+        # (and the scratch prefill); serving picks among them by history length.
         valid_shapes = [
-            (t, bs, has_spec_info, variant)
+            (t, bs, has_spec_info, variant, gather_bucket)
             for t in self.t_bucketer.buckets
             if t >= bs
             for has_spec_info in (False, True)
             for variant in variants
+            for gather_bucket in self._dcp_gather_buckets(bs)
         ]
         logger.info(
             "[spec compile policy] EXTEND(FULL): %d shapes (bs=%d, token_buckets=%s, "
@@ -212,24 +215,25 @@ class BaseSpecDecodeCompilePolicyMixin:
             else valid_shapes
         )
         pending = []
-        for num_tokens, bs, has_spec_info, variant in compile_range:
+        for num_tokens, bs, has_spec_info, variant, gather_bucket in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            warmup = self._run_one(
-                num_tokens=num_tokens,
-                bs=bs,
-                mode=ForwardMode.EXTEND,
-                variant=variant,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self.make_null_spec_info() if has_spec_info else None,
-            )
+            with self._warm_dcp_gather_bucket(gather_bucket):
+                warmup = self._run_one(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=ForwardMode.EXTEND,
+                    variant=variant,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=self.make_null_spec_info() if has_spec_info else None,
+                )
             if warmup is not None:
                 pending.append(warmup)
             if get_parallel().tp_rank == 0:
                 status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
                     f"{status} EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
-                    f"variant={variant}, "
+                    f"variant={variant}, gather_bucket={gather_bucket}, "
                     f"spec_info={'set' if has_spec_info else 'none'})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )

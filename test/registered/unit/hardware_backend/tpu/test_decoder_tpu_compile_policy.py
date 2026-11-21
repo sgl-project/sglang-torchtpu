@@ -1525,7 +1525,9 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             pass
 
         policy = object.__new__(_SpecQwenPolicy)
-        policy.model_runner = SimpleNamespace(model=SimpleNamespace())
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(), attn_backend=None
+        )
         policy.owner = policy.model_runner.model
         policy.t_bucketer = SimpleNamespace(buckets=(1024,))
         policy.b_bucketer = SimpleNamespace(buckets=(1,))

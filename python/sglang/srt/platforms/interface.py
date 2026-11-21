@@ -506,6 +506,13 @@ class SRTPlatform(DeviceMixin):
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
         return False
 
+    def dcp_draft_pool_uses_token_pages(self) -> bool:
+        """Whether a speculative draft's KV pool, which is unsharded and spans
+        the allocator's widened locs under decode context parallelism, pages
+        that space at ``page_size`` rather than ``page_size * attn_dcp_size``.
+        The widened space is a multiple of ``page_size``, so no page falls short."""
+        return False
+
     def dcp_replicates_q_heads(self) -> bool:
         """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention."""
         return False
