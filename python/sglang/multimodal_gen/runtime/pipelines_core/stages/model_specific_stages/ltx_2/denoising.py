@@ -327,7 +327,8 @@ class LTX2DenoisingStage(DenoisingStage):
     def _get_ltx2_stage1_guider_params(
         self, batch: Req, server_args: ServerArgs, stage: str
     ) -> dict[str, object] | None:
-        if stage != "stage1":
+        # The guider reads the negative prompt, which is encoded only with CFG on.
+        if stage != "stage1" or not batch.do_classifier_free_guidance:
             return None
         return batch.extra.get("ltx2_stage1_guider_params")
 
