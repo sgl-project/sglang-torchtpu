@@ -51,8 +51,8 @@
     "speculative_algorithm": "NEXTN",
     "speculative_draft_model_path": "/weights/GLM-5.3-Flash",
     "speculative_eagle_topk": 1,
-    "speculative_num_steps": 3,
-    "speculative_num_draft_tokens": 4,
+    "speculative_num_steps": 7,
+    "speculative_num_draft_tokens": 8,
     "gc_threshold": [
       50000,
       100,
@@ -104,7 +104,7 @@
     "SGLANG_SPEC_TP_SYNC": "rng",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-    "SGLANG_SIMULATE_ACC_LEN": "3.0",
+    "SGLANG_SIMULATE_ACC_LEN": "3.93",
     "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
     "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
     "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "0",
@@ -116,6 +116,8 @@
     "SGLANG_TPU_DSA_MLA_KV_SHARDS": "2",
     "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": "1",
     "SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S": "2400",
-    "SGLANG_TPU_ENABLE_MOE_RING_KERNEL": "1"
+    "SGLANG_TPU_ENABLE_MOE_RING_KERNEL": "1",
+    "SGLANG_TPU_SPEC_STEPS_BY_RUNNING": "1:7,2:3",
+    "SGLANG_TPU_SPEC_SIMULATE_ACC_LEN_BY_STEPS": "3:3.00,7:3.93"
   }
 }
