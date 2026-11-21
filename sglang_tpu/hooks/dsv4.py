@@ -12,7 +12,8 @@ get_tpu_dsv4_fixed_c4_state_bytes
        ring + 2048-page scratch compressor state pools.
   How: AROUND KVCacheConfigurator._build_dsv4_kv_pool binds
        DeepSeekV4TokenToKVPool to DSV4TPUTokenToKVPool for the call and registers
-       the per-request C4/C128 state-shift reset callback on ReqToTokenPool.
+       the per-request C4/C128 state-shift reset callback on ReqToTokenPool,
+       chained after the row reset the core build registers.
        AROUND DSV4PoolConfigurator._get_bytes_per_swa_token,
        _get_bytes_per_full_token, _get_c128_state_fixed_bytes, and
        _fixed_c4_state_bytes delegate the byte budget to DSV4TPUTokenToKVPool.
@@ -89,22 +90,55 @@ tpu_dsv4_get_last_loc
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, List, Optional
 from unittest.mock import patch
 
 import torch
+
+
+def build_with_row_reset(
+    *,
+    build: Callable[[], Any],
+    req_to_token_pool,
+    tpu_reset: Callable[[Any], Optional[Callable[[List[int]], None]]],
+):
+    """Run the core KV pool ``build``, then register ``tpu_reset(pool)`` (None: no
+    reset) after any row reset the build registered itself; ReqToTokenPool
+    holds a single on-alloc-rows callback."""
+    resets = []
+    with patch.object(req_to_token_pool, "register_on_alloc_rows", resets.append):
+        pool = build()
+    reset = tpu_reset(pool)
+    if reset is not None:
+        resets.append(reset)
+    if len(resets) == 1:
+        req_to_token_pool.register_on_alloc_rows(resets[0])
+    elif resets:
+
+        def reset_rows(rows):
+            for reset in resets:
+                reset(rows)
+
+        req_to_token_pool.register_on_alloc_rows(reset_rows)
+    return pool
 
 
 def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
     import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
     from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
+    def c4_reset(pool):
+        # Core resets C4 state itself only for the unified KV layout.
+        if kvc.is_draft_worker or pool._unified_kv:
+            return None
+        return pool.clear_c4_req_states
+
     with patch.object(kvc_mod, "DeepSeekV4TokenToKVPool", DSV4TPUTokenToKVPool):
-        pool = original(kvc, *args, **kwargs)
-    req_to_token_pool = kwargs["req_to_token_pool"]
-    if not kvc.is_draft_worker and not pool._unified_kv:
-        req_to_token_pool.register_on_alloc_rows(pool.clear_c4_req_states)
-    return pool
+        return build_with_row_reset(
+            build=lambda: original(kvc, *args, **kwargs),
+            req_to_token_pool=kwargs["req_to_token_pool"],
+            tpu_reset=c4_reset,
+        )
 
 
 def get_tpu_dsv4_bytes_per_swa_token(original, configurator) -> float:

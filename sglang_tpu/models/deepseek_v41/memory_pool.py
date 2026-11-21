@@ -685,20 +685,25 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
     """AROUND KVCacheConfigurator._build_dsv4_kv_pool: build DSV41TPUTokenToKVPool
     for a V4.1 model and reset ratio-2 pair state whenever a request slot is
-    (re)allocated. Other DeepSeek-V4 models fall through to ``original``."""
+    (re)allocated, after the core row reset. Other DeepSeek-V4 models fall through to ``original``."""
     import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
 
     # Keyed on the target's ratios, so a V4.1 draft worker gets this pool too.
     if not uses_dsv41_pool(kvc.model_config.compress_ratios):
         return original(kvc, *args, **kwargs)
+    from sglang_tpu.hooks.dsv4 import build_with_row_reset
+
     # The V4 TPU hook would rebind the pool class and register its own slot reset.
     core_build = inspect.unwrap(original)
     with patch.object(kvc_mod, "DeepSeekV4TokenToKVPool", DSV41TPUTokenToKVPool):
-        pool = core_build(kvc, *args, **kwargs)
-    # The draft pool has only ratio-0 layers and shares this req pool.
-    if not kvc.is_draft_worker:
-        kwargs["req_to_token_pool"].register_on_alloc_rows(pool.clear_request_slots)
-    return pool
+        return build_with_row_reset(
+            build=lambda: core_build(kvc, *args, **kwargs),
+            req_to_token_pool=kwargs["req_to_token_pool"],
+            # The draft pool has only ratio-0 layers and shares this req pool.
+            tpu_reset=lambda pool: (
+                None if kvc.is_draft_worker else pool.clear_request_slots
+            ),
+        )
 
 
 def get_tpu_dsv41_bytes_per_swa_token(original, configurator) -> float:

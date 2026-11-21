@@ -627,6 +627,44 @@ class TestDSV4TPUPatches(CustomTestCase):
             pool.clear_c4_req_states
         )
 
+    def test_pool_hooks_chain_the_core_row_reset(self):
+        """Regression: the core pool build registers its own row reset on the req
+        pool, which holds one callback, so the TPU pool hooks' second
+        registration failed every target worker at KV pool init. Both resets
+        must run on each allocation, core first."""
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang_tpu.hooks.dsv4 import build_tpu_dsv4_kv_pool
+        from sglang_tpu.models.deepseek_v41.memory_pool import build_tpu_dsv41_kv_pool
+
+        calls = []
+        pool = SimpleNamespace(
+            _unified_kv=False,
+            clear_c4_req_states=lambda rows: calls.append(("tpu_c4", rows)),
+            clear_request_slots=lambda rows: calls.append(("tpu_slots", rows)),
+        )
+
+        def core_build(kvc, *, req_to_token_pool):
+            req_to_token_pool.register_on_alloc_rows(
+                lambda rows: calls.append(("core", rows))
+            )
+            return pool
+
+        cases = (
+            (build_tpu_dsv4_kv_pool, [4, 128], "tpu_c4"),
+            (build_tpu_dsv41_kv_pool, [0, 2, 4, 128], "tpu_slots"),
+        )
+        for hook, ratios, tpu_reset in cases:
+            with self.subTest(hook=hook.__name__):
+                calls.clear()
+                req_to_token_pool = object.__new__(ReqToTokenPool)
+                kvc = SimpleNamespace(
+                    is_draft_worker=False,
+                    model_config=SimpleNamespace(compress_ratios=ratios),
+                )
+                hook(core_build, kvc, req_to_token_pool=req_to_token_pool)
+                req_to_token_pool._on_alloc_rows([3])
+                self.assertEqual(calls, [("core", [3]), (tpu_reset, [3])])
+
     def test_dsv4_tpu_compressor_and_resolution_hooks(self):
         from unittest.mock import MagicMock
 
