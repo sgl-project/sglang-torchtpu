@@ -118,8 +118,12 @@ cached branch, prefill pushes its full-attention KV from its own DRAM into the
 DRAM of the decode that served the branch. When the branch returns and misses
 on prefill, prefill recalls it from decode DRAM into its own DRAM, and normal
 admission loads it into HBM. No HBM page and no staging slot is used on either
-role, and both HiCache write policies are supported. The decode keeps pushed
-branches only; it does not cache its own generation requests.
+role, and both HiCache write policies are supported. By default the decode
+keeps pushed branches only (`skip_radix_cache_insert=True`); setting
+`SGLANG_PD_OFFLOAD_SYMMETRIC_DECODE_CACHE=1` on decode also checkpoints and
+backs up completed decode sequences (prompt + generated assistant tokens) into
+decode DRAM so subsequent multi-turn requests recall generated assistant KV
+without recomputing it on prefill.
 
 Enable HiCache on both roles with `--enable-hierarchical-cache
 --hicache-io-backend raiden` and decode radix caching with

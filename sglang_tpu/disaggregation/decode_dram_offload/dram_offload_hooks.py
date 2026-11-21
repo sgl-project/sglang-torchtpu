@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Union
 
 import msgspec
 
+from sglang.srt.disaggregation.base.conn import KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -44,7 +45,9 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
 )
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     anchor_host_pool,
+    backup_decode_leaf_path,
     deletion_orphans_host_only_child,
+    offer_limit,
     swa_host_pool,
     window_tokens,
 )
@@ -55,6 +58,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
 from sglang_tpu.disaggregation.decode_dram_offload.startup_validation import (
     validate_engine_args,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
 _is_installed = False
@@ -150,8 +154,10 @@ def _release_all(extension: DramOffloadExtension) -> None:
 def _decode_add(
     upstream: Callable, queue: DecodePreallocQueue, req: Any, *args, **kwargs
 ):
-    """Wraps ``DecodePreallocQueue.add``: the decode caches only pushed sessions."""
-    req.skip_radix_cache_insert = True
+    """Wraps ``DecodePreallocQueue.add``: the decode caches only pushed sessions
+    unless symmetric decode caching is opted in."""
+    if not tpu_envs.SGLANG_PD_OFFLOAD_SYMMETRIC_DECODE_CACHE.get():
+        req.skip_radix_cache_insert = True
     return upstream(queue, req, *args, **kwargs)
 
 
@@ -233,7 +239,13 @@ def _send_kv_metadata(
     PULL_REQ names the pages. Every rank pre-allocates the same requests in the
     same order in a step, so the host pins agree; a request the decode holds no
     page of (a host receive included) offers nothing."""
-    if kwargs["decode_prefix_len"] >= page_size:
+    if kwargs.get("destination") != KVTransferDestination.HOST and (
+        kwargs["decode_prefix_len"] >= page_size
+        or (
+            tpu_envs.SGLANG_PD_OFFLOAD_SYMMETRIC_DECODE_CACHE.get()
+            and offer_limit(req=decode_req.req, page_size=page_size) >= page_size
+        )
+    ):
         _extension(queue.tree_cache).source.offer_host_prefix(decode_req)
     return upstream(queue, decode_req, kv_indices, page_size, *args, **kwargs)
 
@@ -323,11 +335,28 @@ def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: An
 
 def _checkpoint(upstream, cache, req, **kwargs):
     """Wraps ``UnifiedRadixCache.checkpoint``: route the request's leaf to
-    the decode that served it."""
+    the decode that served it, or back up decode-generated KV under symmetric
+    decode caching."""
     result = upstream(cache, req, **kwargs)
     extension = _extension(cache)
     if isinstance(extension, PrefillDramOffloadExtension):
         extension.push.track_host_leaf(req)
+    elif (
+        isinstance(extension, DecodeDramOffloadExtension)
+        and tpu_envs.SGLANG_PD_OFFLOAD_SYMMETRIC_DECODE_CACHE.get()
+        and getattr(req, "last_node", None) is not None
+    ):
+        ctx = extension.source._ctx
+        backup_decode_leaf_path(
+            cache,
+            ctx.lockstep,
+            req.last_node,
+            host_pool=ctx.host_pool,
+            swa_host_pool=ctx.swa_host_pool,
+            window_tokens=ctx.window_tokens,
+        )
+        if getattr(cache.cache_controller, "write_queue", None):
+            cache.cache_controller.start_writing()
     return result
 
 

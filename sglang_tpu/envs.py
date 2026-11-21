@@ -355,6 +355,10 @@ class TpuEnvs:
 
     # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # KV offload to decode DRAM: when enabled on decode, cache completed decode
+    # sequences (prompt + generated assistant tokens) in decode's radix/host
+    # cache and offer them back to prefill on subsequent multi-turn requests.
+    SGLANG_PD_OFFLOAD_SYMMETRIC_DECODE_CACHE = EnvBool(False)
     # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
     # instead of fixed max-length slots; asymmetric attention TP needs it.
     SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
