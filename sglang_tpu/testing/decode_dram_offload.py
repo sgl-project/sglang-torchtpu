@@ -172,7 +172,9 @@ class FakeRaidenController(TpuDMAHybridCacheController):
 
     def __init__(self, *, host_capacity: int):
         self.write_policy = "write_back"
+        self.enable_storage = False
         self.host = FakeHostPool(host_capacity)
+        self.extra_pools: dict = {}
         self.mem_pool_host = SimpleNamespace(
             anchor_entry=SimpleNamespace(host_pool=self.host, host_evict_fn=None),
             available_size=self.host.available_size,
@@ -189,6 +191,18 @@ class FakeRaidenController(TpuDMAHybridCacheController):
         host_indices = self.host.alloc(len(device_indices))
         if host_indices is None:
             return None
+        allocated_extras = []
+        for xfer in extra_pools or ():
+            pool = self.extra_pools.get(xfer.name)
+            if pool is not None:
+                extra_idx = pool.alloc(len(xfer.device_indices))
+                if extra_idx is None:
+                    self.host.free(host_indices)
+                    for prev_pool, prev_idx in allocated_extras:
+                        prev_pool.free(prev_idx)
+                    return None
+                xfer.host_indices = extra_idx
+                allocated_extras.append((pool, extra_idx))
         self.write_queue.append((host_indices, device_indices, node_id))
         if flush:
             self.start_writing()
@@ -285,6 +299,7 @@ def hybrid_cache(*, window=128):
     controller = FakeRaidenController(host_capacity=4096)
     controller.host.page_size = HYBRID_PAGE
     swa = FakeHostPool(1024, page_size=HYBRID_PAGE)
+    controller.extra_pools[PoolName.SWA] = swa
     cache.cache_controller = controller
     # As on an engine without a storage backend, nothing drains the L3 release
     # queue: a page handed to it would never return to its pool.
