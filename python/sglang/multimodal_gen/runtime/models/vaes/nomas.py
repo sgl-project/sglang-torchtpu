@@ -756,7 +756,9 @@ class NomasPixelUMMDecoder(nn.Module):
             gathered[(i % world) * per_rank + i // world] for i in range(len(starts))
         ]
 
-    @torch.inference_mode()
+    # Not inference_mode: DecodingStage normalizes the pixels in place, outside
+    # inference mode on platforms whose stages run under no_grad (TPU).
+    @torch.no_grad()
     def decode(self, latent, return_dict=True, generator=None):
         if latent.ndim != 5 or latent.shape[1] != 32:
             raise ValueError("PixelUMM expects [B,32,T,H,W] latents")
