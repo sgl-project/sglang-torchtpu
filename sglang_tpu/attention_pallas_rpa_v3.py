@@ -14,12 +14,13 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from typing import Optional
+from typing import ClassVar, Optional
 
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
+    ragged_verify_layout,
 )
 
 __all__ = [
@@ -56,6 +57,7 @@ def _invoke_v3_kernel(
     v_scale,
     decode_query_size=1,
     use_causal_mask=True,
+    mixed_max_q_len=None,
 ):
     return jax_rpa(
         queries,
@@ -76,6 +78,7 @@ def _invoke_v3_kernel(
         k_scale=k_scale,
         v_scale=v_scale,
         decode_query_size=decode_query_size,
+        mixed_max_q_len=mixed_max_q_len,
     )
 
 
@@ -87,6 +90,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=True,
     is_batched=False,
     supports_decode_query_size=True,
+    supports_mixed_max_q_len=True,
 )
 
 
@@ -94,6 +98,22 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
     """RPA v3 attention backend (``--attention-backend pallas_tpu_rpa_v3``)."""
 
     kernel_spec = RPA_V3_SPEC
+    # RPA v3 specializes its decode tiles per forward's static width; a subclass
+    # with its own kernel (MLA) needs exactly the configured width.
+    narrow_verify_decode_tiles: ClassVar[bool] = True
+
+    def _forward_decode_query_size(self, forward_batch) -> int:
+        if (
+            self.narrow_verify_decode_tiles
+            and forward_batch.forward_mode.is_target_verify()
+            and ragged_verify_layout(forward_batch) is None
+        ):
+            width = forward_batch.spec_info.num_tokens_per_req
+            # RPA v3 specializes its decode tiles per forward's static width, so a
+            # verify narrower than the configured window keeps the decode tiles.
+            if 1 < width <= self.decode_query_size:
+                return width
+        return super()._forward_decode_query_size(forward_batch)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int] = None

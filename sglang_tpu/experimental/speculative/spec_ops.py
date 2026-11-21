@@ -127,6 +127,16 @@ def select_verify_rows(
     )
 
 
+@compiled_op()
+def truncate_drafts(
+    draft_tokens: torch.Tensor, draft_logits: torch.Tensor | None, num_drafts: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The first num_drafts of [pbs, gamma] drafts and their [pbs, gamma, V] q; the owner warms it."""
+    if draft_logits is not None:
+        draft_logits = draft_logits[:, :num_drafts].contiguous()
+    return draft_tokens[:, :num_drafts].contiguous(), draft_logits
+
+
 @compiled_op(warmup=lambda ctx: _verify_tokens_warmup_args(ctx))
 def build_verify_tokens(
     bonus_tokens: torch.Tensor, draft_tokens: torch.Tensor

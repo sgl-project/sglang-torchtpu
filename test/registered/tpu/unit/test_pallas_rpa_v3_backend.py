@@ -27,6 +27,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
+import dataclasses
 import types
 import unittest
 from typing import Optional
@@ -182,6 +183,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             decode_query_size=1,
             use_causal_mask=True,
             layer_idx=None,
+            mixed_max_q_len=0,
         ):
             captured["sliding_window"] = sliding_window
             captured["use_causal_mask"] = use_causal_mask
@@ -760,6 +762,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
             decode_query_size=1,
             use_causal_mask=True,
             layer_idx=None,
+            mixed_max_q_len=0,
         ):
             captured["width"] = decode_query_size
 
@@ -823,6 +826,67 @@ class TestFixedWidthAsDecode(CustomTestCase):
             self._forward_width(backend, ForwardMode.TARGET_VERIFY, self.WIDTH),
             self.WIDTH,
         )
+
+    def test_narrower_verify_keeps_its_own_decode_tiles(self):
+        backend = self._backend(5)
+        # Alternating widths on one backend must not mutate the configured width
+        # or the cached distributions.
+        for width in (4, 5, 2, 5):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    self._forward_width(backend, ForwardMode.TARGET_VERIFY, width),
+                    width,
+                )
+                meta = backend.forward_metadata
+                self.assertEqual(
+                    meta.cu_q_lens.tolist(), [0, width, 2 * width, 3 * width]
+                )
+                self.assertEqual(meta.distribution.tolist(), [3, 3, 3])
+                self.assertEqual(backend.decode_query_size, 5)
+
+    def test_ragged_verify_takes_device_offsets_on_mixed_tiles(self):
+        """A compact verify packs per-request lengths: query offsets, KV lengths and the
+        active token count come from its layout, and it never takes the decode tiles."""
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang_tpu.ragged_verify_layout import TpuRaggedVerifyLayout
+
+        backend = self._backend(self.WIDTH)
+        verify_lens = torch.tensor([2, 4, 1], dtype=torch.int32)
+        cu_q_lens = torch.tensor([0, 2, 6, 7], dtype=torch.int32)
+        spec_info = DFlashVerifyInput(
+            draft_token=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            draft_token_num=self.WIDTH,
+            ragged_verify_layout=TpuRaggedVerifyLayout(
+                verify_lens=verify_lens,
+                graph_num_tokens=8,
+                extend_start_loc=cu_q_lens[:-1],
+                qo_indptr_device=cu_q_lens,
+                kv_lens=(torch.tensor([10, 24, 33]) + verify_lens).to(torch.int32),
+                active_num_tokens=torch.tensor(7, dtype=torch.int32),
+            ),
+        )
+        seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
+        fb = _make_forward_batch(
+            seq_lens=seq_lens,
+            req_pool_indices=torch.tensor([5, 2, 7], dtype=torch.int64),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=spec_info,
+        )
+        meta = _build_meta(backend, fb)
+        self.assertEqual(backend._forward_decode_query_size(fb), 1)
+        self.assertEqual(meta.cu_q_lens.tolist(), cu_q_lens.tolist())
+        self.assertEqual(meta.kv_lens.tolist(), (seq_lens + verify_lens).tolist())
+        self.assertEqual(int(meta.active_num_tokens), 7)
+        self.assertEqual(meta.distribution.tolist(), [0, 3, 3])
+        # MIXED gets decode-shaped tiles bounded by the verify window.
+        self.assertEqual(meta.mixed_max_q_len, self.WIDTH)
+        # A kernel without the hint (e.g. batched RPA) keeps its default MIXED tiles;
+        # passing the keyword to it fails target precompilation.
+        backend.kernel_spec = dataclasses.replace(
+            backend.kernel_spec, supports_mixed_max_q_len=False
+        )
+        self.assertEqual(_build_meta(backend, fb).mixed_max_q_len, 0)
 
     def test_other_modes_keep_single_token_decode(self):
         # A width on spec_info is also present during draft decode and the

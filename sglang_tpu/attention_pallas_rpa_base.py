@@ -45,6 +45,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.attention_pallas_rpa_dcp import (
     build_dcp_kernel_op,
@@ -68,6 +69,7 @@ from sglang_tpu.kv_row_write import (
     write_run_bound,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+from sglang_tpu.ragged_verify_layout import TpuRaggedVerifyLayout
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -125,6 +127,8 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
+    # A ragged verify's per-request query bound; 0 keeps prefill-shaped MIXED tiles.
+    mixed_max_q_len: int = 0
     # Kernel passes ``distribution`` can populate ("all" | "decode" | "mixed"),
     # chosen with it in _build_metadata. Only the MLA v2 kernel reads it.
     segments: str = "all"
@@ -168,6 +172,22 @@ def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch
     # [new_bs + 1] even though the scalar's logical shape remains unchanged.
     # Compiler-level tracking: https://github.com/sgl-project/sglang-torchtpu/issues/565
     return cu_q_lens[non_empty_bs].clone()
+
+
+def ragged_verify_layout(forward_batch) -> TpuRaggedVerifyLayout | None:
+    """The per-request verify layout of a ragged (compact) TARGET_VERIFY, else None."""
+    spec_info = forward_batch.spec_info
+    if not forward_batch.forward_mode.is_target_verify() or not isinstance(
+        spec_info, DFlashVerifyInput
+    ):
+        return None
+    layout = spec_info.ragged_verify_layout
+    if layout is not None and not isinstance(layout, TpuRaggedVerifyLayout):
+        raise TypeError(
+            "A ragged TARGET_VERIFY on TPU needs TpuRaggedVerifyLayout's device "
+            f"kv lengths and token count, got {type(layout).__name__}."
+        )
+    return layout
 
 
 def _is_fixed_width_eagle_refresh(forward_batch) -> bool:
@@ -297,6 +317,9 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
+    # Whether the kernel takes ``mixed_max_q_len`` (decode-shaped MIXED tiles for a
+    # ragged verify); others keep their default MIXED tiles.
+    supports_mixed_max_q_len: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -416,6 +439,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         prefill_kv_tile_hint: jax.Array | None = None,
         use_causal_mask: bool = True,
         layer_idx: jax.Array | None = None,
+        mixed_max_q_len: int = 0,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -435,6 +459,8 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             if prefill_kv_tile_hint is None
             else {"prefill_kv_tile_hint": prefill_kv_tile_hint}
         )
+        if mixed_max_q_len:
+            hint_options["mixed_max_q_len"] = mixed_max_q_len
         output, updated = spec.invoke_kernel(
             _jax_rpa,
             queries=queries,
@@ -465,8 +491,8 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
         # 15=decode_query_size, 17=use_causal_mask. 16=prefill_kv_tile_hint and
         # 18=layer_idx are traced; a traced layer_idx lets every layer share one
-        # program.
-        static_argnums=(10, 11, 12, 13, 14, 15, 17),
+        # program. 19=mixed_max_q_len is static.
+        static_argnums=(10, 11, 12, 13, 14, 15, 17, 19),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -497,6 +523,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         prefill_kv_tile_hint: torch.Tensor | None = None,
         use_causal_mask: bool = True,
         layer_idx: torch.Tensor | None = None,
+        mixed_max_q_len: int = 0,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -519,6 +546,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 prefill_kv_tile_hint,
                 use_causal_mask,
                 layer_idx,
+                mixed_max_q_len,
             )
         return output
 
@@ -572,6 +600,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
+    # Whether this backend's kernel reads a ragged TARGET_VERIFY layout (compact
+    # verify); a subclass with its own kernel turns it off until validated.
+    supports_ragged_verify: ClassVar[bool] = True
 
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
@@ -828,6 +859,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return 1
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
+            if ragged_verify_layout(forward_batch) is not None:
+                return 1
             return width if forward_batch.spec_info.num_tokens_per_req == width else 1
         if self._is_draft_extend(mode):
             lens = forward_batch.extend_seq_lens_cpu
@@ -939,6 +972,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "request-to-token table: the on-device metadata path reads the "
                 "page table at the unsharded page stride. Set "
                 "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
+            )
+
+        if ragged_verify_layout(forward_batch) is not None:
+            raise ValueError(
+                "A ragged TARGET_VERIFY needs the host-resident request-to-token table."
             )
 
         # -------------------------------------------------------------- #
@@ -1132,7 +1170,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         kv_len_bump = 0
         query_width = None
         query_lens = None
-        if forward_batch.forward_mode.is_target_verify():
+        ragged = ragged_verify_layout(forward_batch)
+        if ragged is not None:
+            if self._dcp > 1:
+                raise ValueError("A ragged TARGET_VERIFY does not support DCP.")
+            # Per-request lengths stay on device; the configured window bounds them.
+            kv_len_bump = max(
+                self.decode_query_size, forward_batch.spec_info.draft_token_num
+            )
+            kv_lens = ragged.kv_lens
+            # Width 1 only fixes cu_kv_lens; the query offsets come from the layout.
+            query_width = 1
+        elif forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
@@ -1251,6 +1300,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             query_width=query_width,
             query_lens=query_lens,
         )
+        if ragged is not None:
+            cu_q_lens = ragged.qo_indptr_device
+            active_num_tokens = ragged.active_num_tokens
 
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
         # slot per page), not the full [bs, max_ctx] row.
@@ -1300,6 +1352,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             dcp_cp_rank=dcp_cp_rank,
             decode_query_size=decode_query_size,
             segments=segments,
+            # Every request of a ragged verify holds at most the window's rows.
+            mixed_max_q_len=(
+                kv_len_bump
+                if ragged is not None and self.kernel_spec.supports_mixed_max_q_len
+                else 0
+            ),
         )
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:
@@ -1747,6 +1805,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 self.forward_metadata.decode_query_size,
                 use_causal_mask=use_causal_mask,
                 layer_idx=kv_layer_idx,
+                mixed_max_q_len=self.forward_metadata.mixed_max_q_len,
             )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)

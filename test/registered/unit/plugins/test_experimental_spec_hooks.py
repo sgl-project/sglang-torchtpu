@@ -31,9 +31,13 @@ from sglang_tpu.experimental.speculative.block_info import (
 )
 from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.experimental.speculative.spec_ops import accept_greedy_step
 from sglang_tpu.experimental.speculative.spec_types import (
     DraftResult,
     TpuSpecVerifyInput,
+)
+from sglang_tpu.experimental.speculative.verify_width import (
+    parse_verify_width_table,
 )
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
@@ -154,8 +158,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 8
         worker._target_has_linear_attn = True
+        worker._verify_width_table = None
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
-        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=SimpleNamespace(shape=(4,)))
+        )
         addressing = SimpleNamespace(
             verify_cache_candidates=object(), committed_lens=object()
         )
@@ -1173,6 +1180,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
             draft_candidates=None,
         )
         worker._all_drafts = {4: None}
+        worker.num_verify_rows = 3
+        rows = SimpleNamespace(cache_locs=torch.zeros((4, 3), dtype=torch.int64))
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
             live_mask=None,
@@ -1183,7 +1192,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         results = {}
         for sampled in (True, False):
             worker._sampled_drafts = sampled
-            results[sampled] = worker.draft(None, bucket, None, None)
+            results[sampled] = worker.draft(None, bucket, rows, None)
         self.assertEqual(results[True].draft_tokens, "sampled")
         self.assertIs(results[False].draft_tokens, greedy)
         self.assertIsNone(results[False].draft_logits)
@@ -1763,6 +1772,99 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 ):
                     worker.init_cuda_graphs()
                 self.assertEqual(calls, expected)
+
+
+class TestVerifyWidthTable(CustomTestCase):
+    def test_bucket_takes_last_step_at_or_below(self):
+        table = parse_verify_width_table("16:6, 1:8,64:4", max_width=8)
+        widths = {bs: table.width_for(bs) for bs in (1, 8, 16, 32, 64, 128)}
+        self.assertEqual(widths, {1: 8, 8: 8, 16: 6, 32: 6, 64: 4, 128: 4})
+        self.assertEqual(table.reachable_widths([1, 2, 4, 8, 16]), (6, 8))
+        # Buckets below the first step take its width.
+        self.assertEqual(parse_verify_width_table("8:4", max_width=8).width_for(1), 4)
+
+    def test_rejects_invalid_tables(self):
+        for spec in ("", "1:9", "1:1", "0:4", "1:4,1:6", "4", "a:b"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                parse_verify_width_table(spec, max_width=8)
+
+
+class TestNarrowVerify(CustomTestCase):
+    def test_narrow_greedy_accept_matches_capped_full_accept(self):
+        """Verifying only the first width - 1 drafts accepts what a full verify capped there would."""
+        torch.manual_seed(0)
+        bs, gamma, vocab, width = 4, 7, 11, 4
+        full_logits = torch.randn(bs, gamma + 1, vocab)
+        targets = full_logits.argmax(-1)
+        # Drafts agree with the target for a per-row prefix, then diverge.
+        draft_tokens = targets[:, :gamma].clone()
+        for row, agree in enumerate((0, 2, 5, 7)):
+            draft_tokens[row, agree:] = (targets[row, agree:gamma] + 1) % vocab
+        seq_lens = torch.arange(bs, dtype=torch.int64) * 10
+        live = torch.ones(bs, dtype=torch.bool)
+        capped = accept_greedy_step(
+            full_logits.reshape(-1, vocab),
+            draft_tokens,
+            torch.full((bs,), width - 1, dtype=torch.int32),
+            seq_lens,
+            live,
+        )
+        narrow = accept_greedy_step(
+            full_logits[:, :width].reshape(-1, vocab),
+            draft_tokens[:, : width - 1],
+            torch.full((bs,), width - 1, dtype=torch.int32),
+            seq_lens,
+            live,
+        )
+        for field in (
+            "num_correct_drafts",
+            "bonus_tokens",
+            "accept_lens",
+            "next_seq_lens",
+        ):
+            torch.testing.assert_close(getattr(narrow, field), getattr(capped, field))
+        self.assertEqual(narrow.num_correct_drafts.tolist(), [0, 2, 3, 3])
+
+    def test_block_draft_truncates_to_width(self):
+        bs, gamma, vocab, width = 4, 7, 11, 3
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = gamma + 1
+        worker.num_drafts = gamma
+        greedy = torch.arange(bs * gamma).view(bs, gamma)
+        full_rows = SimpleNamespace(cache_locs=torch.zeros((bs, gamma + 1)))
+        seen_rows = []
+        worker._forward_draft_block = lambda **kw: (
+            seen_rows.append(kw["rows"]) or (None, greedy, None)
+        )
+        worker._draft_block_rows = lambda rows, verify_input, seq_lens: full_rows
+        worker._sync_greedy_drafts = lambda tokens: tokens
+        logits = torch.randn(bs, gamma, vocab)
+        worker._sample_draft_block = lambda *a, **kw: SimpleNamespace(
+            draft_tokens=greedy,
+            draft_logits=logits,
+            verify_tokens=None,
+            draft_candidates=None,
+        )
+        worker._narrow_drafts = {
+            (bs, width): torch.full((bs,), width - 1, dtype=torch.int32)
+        }
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.zeros(bs), bonus_tokens=None),
+            live_mask=None,
+            temperatures=torch.ones(bs),
+            top_ks=torch.ones(bs),
+            target_candidates=False,
+        )
+        rows = SimpleNamespace(cache_locs=torch.zeros((bs, width)))
+        for sampled in (False, True):
+            worker._sampled_drafts = sampled
+            result = worker.draft(None, bucket, rows, None)
+            torch.testing.assert_close(result.draft_tokens, greedy[:, : width - 1])
+            self.assertEqual(result.num_verify_drafts.tolist(), [width - 1] * bs)
+            if sampled:
+                torch.testing.assert_close(result.draft_logits, logits[:, : width - 1])
+        # The draft block itself still runs over the full gamma + 1 rows.
+        self.assertTrue(all(r is full_rows for r in seen_rows))
 
 
 if __name__ == "__main__":
