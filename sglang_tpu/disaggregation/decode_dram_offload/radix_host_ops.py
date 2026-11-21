@@ -20,7 +20,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentHostSlot
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BackupKV,
+    FreeComponentHostSlot,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.utils import get_hash_str
@@ -460,3 +463,147 @@ def deletion_orphans_host_only_child(cache: Any, node_id: Any) -> Optional[bool]
             for child in node.children.values()
         )
     )
+
+
+def backup_decode_leaf_path(
+    cache: Any,
+    lockstep: Any,
+    node_id: Any,
+    *,
+    host_pool: Any,
+    swa_host_pool: Any = None,
+    window_tokens: int = 0,
+) -> int:
+    """With symmetric decode caching enabled, stage any unbacked device node
+    along ``node_id``'s root-to-leaf path (such as under ``write_back`` or
+    ``write_through_selective``) into the decode's host pools so subsequent
+    multi-turn requests can offer generated KV from decode DRAM before HBM
+    eviction."""
+    if node_id is None or cache.cache_controller is None:
+        return 0
+    core = cache.tree_core
+    try:
+        leaf = core.node_by_id(node_id)
+    except KeyError:
+        leaf = core.root_node
+    path = list(reversed(list(_path_to_root(cache, leaf))))
+    has_swa = (
+        window_tokens > 0
+        and swa_host_pool is not None
+        and _SWA in getattr(cache, "components", {})
+    )
+    in_swa_window: set[Any] = set()
+    if has_swa:
+        covered = 0
+        for n in reversed(path):
+            if covered >= window_tokens:
+                break
+            in_swa_window.add(n.id)
+            covered += len(n.key)
+
+    full_unbacked = []
+    swa_unbacked = []
+    to_backup = []
+    for n in path:
+        if n.write_through_pending_id is not None:
+            continue
+        full_cd = n.component_data[_FULL]
+        if full_cd.value is None:
+            continue
+        needs_full = full_cd.host_value is None
+        needs_swa = False
+        if has_swa and n.id in in_swa_window:
+            swa_cd = n.component_data[_SWA]
+            needs_swa = swa_cd.value is not None and swa_cd.host_value is None
+        if needs_full:
+            full_unbacked.append(n)
+        if needs_swa:
+            swa_unbacked.append(n)
+        if needs_full or needs_swa:
+            to_backup.append(n)
+
+    full_tokens = sum(len(n.component_data[_FULL].value) for n in full_unbacked)
+    swa_need = 0
+    if has_swa:
+        seen_swa = {n.id for n in swa_unbacked}
+        swa_tokens = sum(len(n.component_data[_SWA].value) for n in swa_unbacked)
+        for n in full_unbacked:
+            if n.id in seen_swa:
+                continue
+            swa_cd = n.component_data[_SWA]
+            if swa_cd.value is not None and swa_cd.host_value is None:
+                swa_tokens += len(swa_cd.value)
+        swa_need = swa_tokens
+    if not lockstep.agree([len(to_backup), full_tokens, swa_need]) or not to_backup:
+        return 0
+    shared = (
+        getattr(host_pool, "shared_allocation_domain", None)
+        if swa_host_pool is not None
+        and getattr(host_pool, "shared_allocation_domain", None)
+        is getattr(swa_host_pool, "shared_allocation_domain", None)
+        else None
+    )
+    if shared is not None and full_tokens + swa_need > 0:
+        swa_scale = max(1, int(getattr(swa_host_pool, "_pages_per_logical", 1)))
+        need_physical_tokens = full_tokens + swa_need * swa_scale
+        page_size = int(getattr(host_pool, "page_size", 1) or 1)
+
+        def _shared_free_tokens() -> int:
+            free_pages = getattr(shared, "free_pages", None)
+            if free_pages is not None:
+                return len(free_pages) * page_size
+            return int(host_pool.available_size())
+
+        short_shared = lockstep.max(
+            max(0, need_physical_tokens - _shared_free_tokens())
+        )
+        while short_shared > 0:
+            short_pages = (short_shared + page_size - 1) // page_size
+            swa_target = (
+                ((short_pages + swa_scale - 1) // swa_scale) * page_size
+                if swa_scale > 1
+                else short_shared
+            )
+            order = (
+                ((_SWA, swa_target), (_FULL, short_shared))
+                if swa_need > 0
+                else ((_FULL, short_shared), (_SWA, swa_target))
+            )
+            for comp, target in order:
+                cache.evict_host(target, comp)
+                if (
+                    lockstep.max(max(0, need_physical_tokens - _shared_free_tokens()))
+                    == 0
+                ):
+                    short_shared = 0
+                    break
+            if short_shared == 0:
+                break
+            next_short = lockstep.max(
+                max(0, need_physical_tokens - _shared_free_tokens())
+            )
+            if next_short >= short_shared:
+                break
+            short_shared = next_short
+    else:
+        short_full = lockstep.max(max(0, full_tokens - host_pool.available_size()))
+        if short_full:
+            cache.evict_host(short_full, _FULL)
+        if swa_need and swa_host_pool is not None:
+            short_swa = lockstep.max(max(0, swa_need - swa_host_pool.available_size()))
+            if short_swa:
+                cache.evict_host(short_swa, _SWA)
+    written = cache._execute_and_commit_kv_backup(
+        BackupKV(node_ids=[n.id for n in to_backup]), write_back=False
+    )
+    # A node whose FULL KV was already on host writes no FULL tokens, so count
+    # the SWA tokens staged for it; otherwise an SWA-only backup reports 0.
+    full_ids = {n.id for n in full_unbacked}
+    written += sum(
+        len(n.component_data[_SWA].host_value)
+        for n in swa_unbacked
+        if n.id not in full_ids and n.component_data[_SWA].host_value is not None
+    )
+    if written > 0 or getattr(cache.cache_controller, "write_queue", None):
+        cache.cache_controller.start_writing()
+    return written
