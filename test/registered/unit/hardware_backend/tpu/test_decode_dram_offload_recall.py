@@ -6,10 +6,14 @@ prefill computing the prompt, with no page leaked and no lock held."""
 
 import unittest
 from array import array
+from datetime import timedelta
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -55,6 +59,7 @@ from sglang_tpu.testing.decode_dram_offload import (
     SWITCH,
     DecodeQueueHooksFixture,
     HostRecallEdgeCasesFixture,
+    PrefillPusherFixture,
     RecallLifecycleFixture,
     decode_manager,
     device_hit,
@@ -70,7 +75,147 @@ from sglang_tpu.testing.decode_dram_offload import (
     sender_on,
 )
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+
+def _rank_coordination_worker(rank, store_path):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{store_path}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        fixture = PrefillPusherFixture()
+        fixture.setUp()
+        ctx = DramOffloadWorkerContext(
+            cache=fixture.cache,
+            host_pool=fixture.host,
+            page_size=1,
+            channel=fixture.mgr,
+            lockstep=RankLockstep(dist.group.WORLD),
+        )
+        push = PrefillDramVictimPusher(ctx)
+        for room, tokens in ((1, fixture.a), (2, fixture.b)):
+            push.note_decode_of(pushed_req(room=room, tokens=tokens), recalled=False)
+        recall = PrefillDramPrefixPuller(ctx)
+        extension = PrefillDramOffloadExtension(recall=recall, push=push)
+        scheduler = SimpleNamespace(
+            tree_cache=fixture.cache,
+            waiting_queue=[],
+            running_batch=SimpleNamespace(is_empty=lambda: True),
+        )
+        queue = SimpleNamespace(queue=[], scheduler=scheduler)
+        fixture.mgr.prefix_req_id.side_effect = lambda room, swa=False: f"{room}#px"
+        fixture.mgr.ask_prefix_pull.return_value = True
+        fixture.mgr.prefix_ready.return_value = None
+        fixture.mgr.take_prefix_offer.return_value = None
+        with (
+            patch.object(dram_offload_hooks, "_extension", return_value=extension),
+            patch.object(ctx.lockstep, "reduce", wraps=ctx.lockstep.reduce) as reduce,
+        ):
+
+            def step():
+                return dram_offload_hooks._move_bootstrapped(
+                    lambda q, dst: [], queue, []
+                )
+
+            # Different local pressure cannot send an idle peer into selection.
+            if rank == 1:
+                fixture.host.capacity = 100000
+            step()
+            assert reduce.call_count == 0
+            assert not push.has_pushes_in_flight()
+
+            req = pushed_req(room=ROOM, tokens=list(range(300, 332)))
+            queue.queue = [req]
+            fixture.mgr.take_prefix_offer.return_value = (
+                (list(range(16)), []) if rank == 0 else None
+            )
+            step()
+            assert reduce.call_count == 1
+            assert not recall._plans and not push.has_pushes_in_flight()
+
+            # The first rank retains its offer until the delayed peer has one.
+            fixture.mgr.take_prefix_offer.return_value = (list(range(16)), [])
+            step()
+            assert ROOM in recall._plans
+            ready = PrefixRegistration(uuid=11, endpoint="10.0.0.2:5")
+            fixture.mgr.prefix_ready.return_value = ready if rank == 0 else None
+            step()
+            assert recall._plans[ROOM].new_indices is None
+
+            # READY arrives on both ranks; one listener drops it between the
+            # status vote and read start. The peer's accepted read still owns
+            # its landing, and both ranks abandon the plan in the same step.
+            fixture.mgr.prefix_ready.side_effect = (
+                [ready, None] if rank == 0 else [ready, ready]
+            )
+            step()
+            assert not recall._plans and len(recall._zombies) == 1
+            queue.queue = []
+            step()
+            assert len(recall._zombies) == 1
+            try:
+                recall.release_all()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("reset released a pending peer read")
+            fixture.host.transfer.complete("received")
+            step()
+            assert not recall.holds_host_landing_pages()
+            assert fixture.host.used == 16
+
+            # Push retirement cannot be suppressed by the shared idle gate:
+            # an ACK on one rank and pending native reads keep both pins alive.
+            fixture.host.capacity = 32
+            scheduler.running_batch.is_empty = lambda: False
+            step()
+            assert push.has_pushes_in_flight()
+            sent = fixture.mgr.send_victim_push.call_args.kwargs
+            fixture.replies[sent["seq"]] = True if rank == 0 else None
+            fixture.host.transfer.complete("sent")
+            scheduler.running_batch.is_empty = lambda: True
+            step()
+            assert push.has_pushes_in_flight()
+            try:
+                push.release_all()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("reset released an unacknowledged push")
+            fixture.replies[sent["seq"]] = True
+            step()
+            assert not push.has_pushes_in_flight() and push.stats["stored"] == 1
+
+            # A second victim uses the same shared idle/active transitions;
+            # the delayed ACK is now on the other rank.
+            scheduler.running_batch.is_empty = lambda: False
+            step()
+            assert push.has_pushes_in_flight()
+            sent = fixture.mgr.send_victim_push.call_args.kwargs
+            fixture.replies[sent["seq"]] = True if rank == 1 else None
+            fixture.host.transfer.complete("sent")
+            scheduler.running_batch.is_empty = lambda: True
+            step()
+            assert push.has_pushes_in_flight()
+            fixture.replies[sent["seq"]] = True
+            step()
+            assert not push.has_pushes_in_flight() and push.stats["stored"] == 2
+            push.release_all()
+            recall.release_all()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestRankCoordination(CustomTestCase):
+    def test_delayed_offers_cancelled_reads_and_idle_retirement_on_two_ranks(self):
+        """Use actual CPU collectives to expose divergent collective order
+        and premature landing/source release when listener state differs."""
+        with TemporaryDirectory() as root:
+            mp.spawn(_rank_coordination_worker, args=(f"{root}/store",), nprocs=2)
 
 
 class TestRecallLifecycle(
@@ -589,8 +734,14 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
     @staticmethod
     def _prefill_step(prefill, reqs):
         """What the bootstrap-queue hook runs before core's step."""
-        prefill.recall.advance(reqs, waiting_reqs=[])
-        prefill.push.advance(serving=True)
+        scheduler = SimpleNamespace(
+            tree_cache=None,
+            waiting_queue=[],
+            running_batch=SimpleNamespace(is_empty=lambda: False),
+        )
+        queue = SimpleNamespace(queue=reqs, scheduler=scheduler)
+        with patch.object(dram_offload_hooks, "_extension", return_value=prefill):
+            dram_offload_hooks._move_bootstrapped(lambda q, dst: [], queue, [])
 
     @staticmethod
     def _commit(prefill, req):

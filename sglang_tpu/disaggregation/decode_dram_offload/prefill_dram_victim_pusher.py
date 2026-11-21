@@ -156,13 +156,15 @@ class PrefillDramVictimPusher:
                 # Not pushed back at the length it was recalled at.
                 self._pushed_len[node] = len(tokens)
 
-    def advance(self, *, serving: bool) -> None:
+    def advance(self, *, serving: bool, selection_agreed: bool = True) -> None:
         """Every bootstrap step, every rank; no tree decision uses a local
         clock. Pushes start only while the engine serves requests: an engine
         left alone settles the pushes in flight and goes idle, so that it can
-        be flushed."""
+        be flushed. ``serving`` comes from replicated scheduler queues;
+        ``selection_agreed`` must be shared, never a rank-local pressure test."""
         self.retire_settled_pushes()
-        self._start_push_if_agreed(serving=serving)
+        if serving and selection_agreed:
+            self._start_push_if_agreed(serving=serving)
         log_offload_stats(self.stats, "push", self._last_log)
 
     def _under_host_pressure(self) -> bool:
