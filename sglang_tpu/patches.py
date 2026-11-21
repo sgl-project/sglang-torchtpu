@@ -458,6 +458,7 @@ def _patch_compute_position_torch() -> None:
     import torch
 
     from sglang.srt.model_executor import forward_batch_info
+    from sglang_tpu.host_upload import upload
 
     def compute_position_torch_cpu_staged(
         extend_prefix_lens: torch.Tensor,
@@ -490,7 +491,9 @@ def _patch_compute_position_torch() -> None:
                 dim=0,
                 dtype=torch.int32,
             )
-        return positions_cpu.to(device), extend_start_loc_cpu.to(device)
+        # Non-blocking for the same reason: a blocking upload would wait for
+        # the queued forwards too.
+        return upload(positions_cpu, device), upload(extend_start_loc_cpu, device)
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 
