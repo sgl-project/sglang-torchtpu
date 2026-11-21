@@ -139,6 +139,10 @@ class TpuEnvs:
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
     # bit-exact with it: the kernel scores in f32, the torch path in bf16.
     SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
+    # With it: prefill batches (at least 256 tokens, whole 32-token tiles) run
+    # the same per-token math as a grid of token tiles instead of the torch
+    # reference, which materializes [T, nvb + 1, H] at each aggregation point.
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL = EnvBool(False)
     # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch
     # hc_pre / hc_post (see mhc.py and hooks/mhc.py).
     SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC = EnvBool(False)

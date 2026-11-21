@@ -1,17 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3 attention-residual decode kernel (opt-in).
+"""Kimi-K3 attention-residual decode and prefill kernels (opt-in).
 
 register_attn_residual_ops
-  Why: the TPU Pallas decode kernel (sglang_tpu.kimi_attn_residual) must stay
-       out of core, and its custom ops must exist before torch.compile traces
-       the model.
+  Why: the TPU Pallas kernels (sglang_tpu.kimi_attn_residual) must stay out of
+       core, and their custom ops must exist before torch.compile traces the
+       model.
   How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops and
        registers aggregate with attn_residual.register_aggregate_impl. Passes
        through unless SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1 when the model is
-       built. The platform's process_model_after_loading then calls
-       prepare_attn_residual_kernel.
+       built; SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL=1 also routes
+       prefill-sized calls. The platform's process_model_after_loading then
+       calls prepare_attn_residual_kernel.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1428.
   Remove when: core registers attention-residual ops ahead of the trace.
+
+block_major_bank
+  Why: the prefill kernel needs each bank block as a dense [T, H] slab; core
+       allocates the bank token-major ([T, NB, H]).
+  How: AFTER AttnResidual.__init__, with the prefill flag and a prefill-sized
+       batch, replaces block_residual with a [T, NB, H] view of [NB, T, H]
+       storage. Core's writes and reads use the view unchanged.
+  Remove when: core lets a platform choose the bank layout.
 """
 
 from __future__ import annotations
@@ -30,12 +39,14 @@ _KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 # torch.compile, instead of reading os.environ per call; with the flag off
 # nothing imports the kernel module (or JAX).
 _kernel: ModuleType | None = None
+# SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL, read with the flag above.
+_prefill = False
 
 
 def register_attn_residual_ops(result: None, model: Any, *args, **kwargs) -> None:
     """AFTER KimiK3LinearModel.__init__: building an op inside the dynamo trace
     fails, so register both decode ops before it."""
-    global _kernel
+    global _kernel, _prefill
     from sglang_tpu.envs import envs as tpu_envs
 
     if not tpu_envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.get():
@@ -45,10 +56,29 @@ def register_attn_residual_ops(result: None, model: Any, *args, **kwargs) -> Non
     from sglang.srt.layers.attn_residual import register_aggregate_impl
     from sglang.srt.platforms import current_platform
 
+    prefill = tpu_envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL.get()
     kernel = importlib.import_module(_KERNEL_MODULE)
-    kernel.register_kimi_attn_res_decode_ops()
+    kernel.register_kimi_attn_res_decode_ops(prefill=prefill)
     _kernel = kernel
+    _prefill = prefill
     register_aggregate_impl(current_platform.get_dispatch_key_name(), aggregate)
+
+
+def block_major_bank(
+    result: None, attn_res: Any, hidden_states: Any, block_num: int, *args, **kwargs
+) -> None:
+    """AFTER AttnResidual.__init__ with SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL:
+    store a prefill-sized bank block-major. Core keeps the [T, NB, H] view, in
+    which bank[:, j, :] (the row a block-boundary write fills) is a dense
+    [T, H] slab; the prefill kernel reads the [NB, T, H] storage."""
+    if not _prefill or not _kernel.prefill_tokens_supported(hidden_states.shape[0]):
+        return
+    tokens, hidden = hidden_states.shape
+    view = hidden_states.new_empty((block_num, tokens, hidden)).permute(1, 0, 2)
+    nvb = attn_res.num_valid_blocks
+    if nvb:  # rows inherited from the previous PP rank
+        view[:, :nvb].copy_(attn_res.block_residual[:, :nvb])
+    attn_res.block_residual = view
 
 
 def prepare_attn_residual_kernel(causal_lm: Any) -> None:
@@ -107,7 +137,9 @@ def _tag_ar1_fusion(model) -> None:
 
 def aggregate(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm):
     """attn_residual's registered aggregation: decode-sized calls in one kernel
-    call for the pending add, mix and output norm. Returns (normed, prefix)
+    call for the pending add, mix and output norm, and with
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_PREFILL_KERNEL prefill-sized calls in the
+    token-tiled prefill kernel. Returns (normed, prefix)
     with prefix = prefix_a + prefix_b (prefix_a if None), or None to leave the
     call to core."""
     from sglang.srt.layers.attn_residual import get_cw
@@ -145,12 +177,18 @@ def aggregate(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm):
             raise RuntimeError(
                 "deferred o_proj all-reduce reached an unsupported aggregation"
             )
-    if _kernel is None or not _kernel.supports_attn_res_decode(
+    if _kernel is None:
+        return None
+    if _kernel.supports_attn_res_decode(prefix_a, prefix_b, bank, score_norm, out_norm):
+        run = _kernel.attention_residual_decode_tpu
+    elif _prefill and _kernel.supports_attn_res_prefill(
         prefix_a, prefix_b, bank, score_norm, out_norm
     ):
+        run = _kernel.attention_residual_prefill_tpu
+    else:
         return None
 
-    return _kernel.attention_residual_decode_tpu(
+    return run(
         prefix_a,
         prefix_b,
         bank,
