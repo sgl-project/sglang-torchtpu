@@ -459,6 +459,58 @@ def pack_rows(
     return result
 
 
+class PackedSlotViews(msgspec.Struct, frozen=True):
+    """Views of one upload slot's packed bytes: payload, scales and alignment tail."""
+
+    packed: Any  # [padded_tokens, row_bytes] uint8
+    raw: Any  # [padded_tokens, heads, dim] uint8
+    scales: Any  # [padded_tokens, heads, blocks] uint8
+    tail: Any  # [padded_tokens, pad bytes] uint8, or None when scales fill the row
+
+    @classmethod
+    def build(cls, host_words: torch.Tensor, *, heads: int, dim: int, blocks: int):
+        raw_bytes, scale_bytes = heads * dim, heads * blocks
+        row_bytes = raw_bytes + ((scale_bytes + 3) // 4) * 4
+        packed = host_words.view(torch.uint8).numpy().reshape(-1, row_bytes)
+        raw = packed[:, :raw_bytes].reshape(-1, heads, dim)
+        scales = packed[:, raw_bytes : raw_bytes + scale_bytes].reshape(
+            -1, heads, blocks
+        )
+        tail = (
+            packed[:, raw_bytes + scale_bytes :]
+            if row_bytes > raw_bytes + scale_bytes
+            else None
+        )
+        for view in (raw, scales):
+            # reshape silently copies when it cannot view; a copy would drop writes.
+            if not np.shares_memory(view, packed):
+                raise RuntimeError("Engram packed slot views must alias the slot")
+        return cls(packed=packed, raw=raw, scales=scales, tail=tail)
+
+
+def pack_full_table_rows(
+    raw: np.ndarray, scale: np.ndarray, indices: np.ndarray, views: PackedSlotViews
+) -> None:
+    """``pack_rows`` for a full shared table (row_start 0, every index in range).
+
+    Byte-identical to ``pack_rows``: gathered rows, zero payload and invalid scales
+    on padding rows, invalid alignment bytes. Indices are [tokens, heads] int64.
+    """
+    tokens, heads = indices.shape
+    if tokens:
+        # take on flat ids: fancy indexing with 2-D ids is ~4x slower for prefill.
+        flat = indices.reshape(-1)
+        views.raw[:tokens] = np.take(raw, flat, axis=0).reshape(tokens, heads, -1)
+        views.scales[:tokens] = np.take(scale, flat, axis=0).reshape(tokens, heads, -1)
+        if views.tail is not None:
+            views.tail[:tokens] = _INVALID_SCALE
+    if tokens < views.packed.shape[0]:
+        views.raw[tokens:] = 0
+        views.packed[tokens:, views.raw.shape[1] * views.raw.shape[2] :] = (
+            _INVALID_SCALE
+        )
+
+
 def unpack_rows(
     packed: torch.Tensor,
     *,
@@ -549,6 +601,14 @@ class _BatchTransfer:
     def h2d_async(self) -> Any:
         return self._mod.batch_transfer_h2d(self._host, self._device)
 
+    @staticmethod
+    def h2d_many(transfers: list[_BatchTransfer]) -> Any:
+        """One TransferFuture for several slots' host-to-device copies."""
+        return transfers[0]._mod.batch_transfer_h2d(
+            [host for t in transfers for host in t._host],
+            [device for t in transfers for device in t._device],
+        )
+
 
 class PreparedEngramUpload:
     """One immutable device allocation, its host storage and consumer lifetime."""
@@ -568,6 +628,7 @@ class PreparedEngramUpload:
         self.consumer_event: Any = None
         self.consumers: list[torch.Tensor] = []
         self.needs_consumer = False
+        self.pack_views: PackedSlotViews | None = None
         if num_words == 0 or (dev.type == "cpu" and batch_transfer_mod is None):
             self.device = torch.zeros(num_words, dtype=torch.int32, device=dev)
             self.host_buffer = torch.zeros(num_words, dtype=torch.int32, device="cpu")
@@ -616,11 +677,15 @@ class PreparedEngramUpload:
             self.consumers = []
 
     def start(self) -> None:
+        self.prepare_start()
+        with torch.profiler.record_function("engram::h2d_submit"):
+            self.pending = self.transfer.h2d_async()
+
+    def prepare_start(self) -> None:
+        """Checks and consumer release that must precede overwriting the device slot."""
         if self.needs_consumer:
             raise RuntimeError("Record the Engram consumer before overwriting its slot")
         self.release_consumers()
-        with torch.profiler.record_function("engram::h2d_submit"):
-            self.pending = self.transfer.h2d_async()
 
     def wait(self) -> None:
         if self.pending is not None:
@@ -698,6 +763,51 @@ class _EngramPrefetch:
         self.uploads.clear()
 
 
+def _full_table_views(
+    embeddings: list[tuple[int, Any]], *, primes: np.ndarray, offsets: np.ndarray
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """(raw, scale) uint8 views per hash index whose table holds every id the hasher emits."""
+    views = {}
+    for layer_index, embedding in embeddings:
+        max_id = int((offsets[layer_index] + primes[layer_index].reshape(-1)).max()) - 1
+        if max_id < embedding.weight.shape[0]:
+            views[layer_index] = (
+                embedding.weight.detach().view(torch.uint8).numpy(),
+                embedding.scale.detach().view(torch.uint8).numpy(),
+            )
+    return views
+
+
+class _SharedTransferWait:
+    """One TransferFuture shared by every slot submitted in the same DMA call."""
+
+    def __init__(self, future: Any) -> None:
+        self._future = future
+        self._done = False
+
+    def wait(self) -> None:
+        if not self._done:
+            self._future.wait()
+            self._done = True
+
+
+def _submit_together(uploads: list[PreparedEngramUpload]) -> None:
+    """Start every slot's H2D DMA, as one batch_transfer call when they all support it."""
+    if len(uploads) < 2 or not all(
+        isinstance(upload.transfer, _BatchTransfer) for upload in uploads
+    ):
+        for upload in uploads:
+            upload.start()
+        return
+    for upload in uploads:
+        upload.prepare_start()
+    with torch.profiler.record_function("engram::h2d_submit"):
+        future = _BatchTransfer.h2d_many([upload.transfer for upload in uploads])
+    shared = _SharedTransferWait(future)
+    for upload in uploads:
+        upload.pending = shared
+
+
 class HostEngramCoordinator:
     """Overlap host Engram input capture, NumPy row packing, and async raw DMA."""
 
@@ -726,6 +836,11 @@ class HostEngramCoordinator:
         self.image_token_id = hasher.image_token_id
         self.embeddings = list(embeddings)
         self.by_layer = dict(embeddings)
+        self._full_tables = _full_table_views(
+            self.embeddings,
+            primes=self.tables["primes"],
+            offsets=self.tables["offsets"],
+        )
         self.device = torch.device(device)
         self._batch_transfer_mod = batch_transfer_mod
         self._layout_mod = layout_mod
@@ -803,17 +918,41 @@ class HostEngramCoordinator:
         padded_tokens: int,
         hashes: torch.Tensor,
     ) -> PreparedEngramUpload:
+        upload = self._pack_layer_upload(layer_index, padded_tokens, hashes)
+        upload.start()
+        return upload
+
+    def _pack_layer_upload(
+        self,
+        layer_index: int,
+        padded_tokens: int,
+        hashes: torch.Tensor,
+    ) -> PreparedEngramUpload:
         embedding = self.by_layer[layer_index]
         upload = self._reserve_upload(layer_index, padded_tokens)
-        pack_rows(
-            embedding.weight,
-            embedding.scale,
-            hashes[:, layer_index],
-            row_start=0,
-            padded_tokens=padded_tokens,
-            out=upload.acquire(),
+        out = upload.acquire()
+        tables = self._full_tables.get(layer_index)
+        if tables is None:
+            pack_rows(
+                embedding.weight,
+                embedding.scale,
+                hashes[:, layer_index],
+                row_start=0,
+                padded_tokens=padded_tokens,
+                out=out,
+            )
+            return upload
+        raw, scale = tables
+        if upload.pack_views is None:
+            upload.pack_views = PackedSlotViews.build(
+                out,
+                heads=int(self.tables["offsets"].shape[1]),
+                dim=raw.shape[1],
+                blocks=scale.shape[1],
+            )
+        pack_full_table_rows(
+            raw, scale, hashes[:, layer_index].numpy(), upload.pack_views
         )
-        upload.start()
         return upload
 
     def _discard_staged_uploads(self) -> None:
@@ -881,11 +1020,15 @@ class HostEngramCoordinator:
             np.minimum(self._step_inputs.tokens[rows, :n1], _MM_PAD_SHIFT_VALUE),
             0,
         )[:, ::-1]
-        tail_tensor = torch.as_tensor(
-            np.ascontiguousarray(tail), dtype=history.dtype, device=history.device
-        )
-        slot_tensor = torch.tensor(slots, dtype=torch.int64, device=history.device)
-        history[slot_tensor] = tail_tensor
+        if history.device.type == "cpu":
+            # Same write through a NumPy view; torch index_put dominates this tiny write.
+            history.numpy()[slots] = tail
+        else:
+            tail_tensor = torch.as_tensor(
+                np.ascontiguousarray(tail), dtype=history.dtype, device=history.device
+            )
+            slot_tensor = torch.tensor(slots, dtype=torch.int64, device=history.device)
+            history[slot_tensor] = tail_tensor
         self._history_commit = []
 
     def prepare(
@@ -1111,16 +1254,18 @@ class HostEngramCoordinator:
             and self._staged_padded_tokens != padded_tokens
         ):
             self._discard_staged_uploads()
-        # Pass 1: start any un-staged layers immediately so layer i's H2D DMA
-        # overlaps with layer i+1's single-threaded NumPy pack_rows.
+        # Pass 1: pack every un-staged layer, then submit them in one DMA call.
         uploads: list[tuple[int, PreparedEngramUpload]] = []
+        to_submit: list[PreparedEngramUpload] = []
         for layer_index, _ in self.embeddings:
             upload = (
                 self._staged_uploads.pop(layer_index, None) if use_prestaged else None
             )
             if upload is None:
-                upload = self._start_layer_upload(layer_index, padded_tokens, hashes)
+                upload = self._pack_layer_upload(layer_index, padded_tokens, hashes)
+                to_submit.append(upload)
             uploads.append((layer_index, upload))
+        _submit_together(to_submit)
         self._staged_padded_tokens = None
         # Pass 2: wait for every layer's H2D DMA and mark slots active.
         ordered: list[PreparedEngramUpload] = []
