@@ -33,9 +33,11 @@ from absl.testing import parameterized
 
 from sglang_tpu.dsv4.streamindex_topk import metadata
 from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
+    _PAGE_GROUP,
     _BlockedPrefillConfig,
     _effective_row_lengths,
     get_kv_cache_shape,
+    page_group_starts,
 )
 
 
@@ -569,6 +571,27 @@ class ChunkedMetadataTest(parameterized.TestCase):
             compression_ratio=4,
         )
         np.testing.assert_array_equal(np.array(row_lens), [0, 0, 0, 1, 1, 1, 1, 2])
+
+
+
+class PageGroupStartsTest(parameterized.TestCase):
+    """A group's single DMA must read exactly the pages the per-page DMAs would:
+    only a run of consecutive ids inside the cache gets its first id; an
+    all-padding group (page 0) gets 0; anything else (a gap, a run past the
+    cache, live pages mixed with padding) keeps the per-page fetch (-1)."""
+
+    def test_groups(self):
+        g = _PAGE_GROUP
+        run = list(range(40, 40 + g))
+        gap = run[:-1] + [run[-1] + 1]
+        live_then_pad = [7] + [0] * (g - 1)
+        past_cache = list(range(96, 96 + g))
+        rows = np.array(
+            [run + [0] * g, gap + live_then_pad, past_cache + list(range(1, g + 1))],
+            np.int32,
+        )
+        got = np.asarray(page_group_starts(jnp.asarray(rows), num_pages=100))
+        np.testing.assert_array_equal(got, [[40, 0], [-1, -1], [-1, 1]])
 
 
 if __name__ == "__main__":
