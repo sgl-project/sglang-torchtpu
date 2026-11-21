@@ -151,7 +151,9 @@ def _one_row_as_two(x: torch.Tensor) -> torch.Tensor:
 def true_on_policy_router(original, *, hidden_states, gating_output, **kwargs):
     """AROUND fused_topk_native: a single row is routed as two, so its weights match any batch's."""
     if gating_output.shape[0] != 1:
-        return original(hidden_states=hidden_states, gating_output=gating_output, **kwargs)
+        return original(
+            hidden_states=hidden_states, gating_output=gating_output, **kwargs
+        )
     weights, ids = original(
         hidden_states=_one_row_as_two(hidden_states),
         gating_output=_one_row_as_two(gating_output),

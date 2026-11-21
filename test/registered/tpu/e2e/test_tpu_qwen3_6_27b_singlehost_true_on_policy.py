@@ -12,6 +12,7 @@ register_tpu_ci(
     est_time=600,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3.6-27b", "accuracy", "logprob", "seq-along-lane"],
+    disabled="Pending Qwen3.6-27B checkpoint staging on shared CI PVC",
 )
 
 
