@@ -8,8 +8,8 @@ DMA at a time (about one stream of HBM bandwidth); here the kernel keeps
 ``slots - 1`` experts in flight, each split into several DMAs, and computes
 each expert for its routed rows only:
 
-  * XLA builds an expert-major pair list (one sort of the routed slots) and
-    per-expert counts and offsets;
+  * XLA builds an expert-major pair list (pairwise compares of the routed
+    slots, no sort) and per-expert counts and offsets;
   * the kernel compacts the hit experts, starts their weight DMAs, quantizes
     x once as gmm_v2 quantizes its lhs (per row per 512 columns, bf16 scales);
   * per expert: gather its rows (an 8-, 16- or 32-row tile by its pair count,
@@ -103,17 +103,18 @@ def _route(topk_ids, topk_weights, num_experts):
         axis=0,
     )
     offsets = jnp.cumsum(counts) - counts
-    shift = max(1, (p - 1).bit_length())
-    srt = jnp.sort((key << shift) | jnp.arange(p, dtype=jnp.int32))
-    slot = srt & ((1 << shift) - 1)
-    tok = slot // k
-    wt = topk_weights.reshape(p).astype(jnp.float32)[slot]
-    return (
-        counts.astype(jnp.int32),
-        offsets.astype(jnp.int32),
-        tok.astype(jnp.int32),
-        wt,
+    # Each slot's row in (expert, slot) order from pairwise compares, then a
+    # one-hot select per row: no sort or gather over the <= 2048 slots.
+    slot = jnp.arange(p, dtype=jnp.int32)
+    before = (key[None, :] < key[:, None]) | (
+        (key[None, :] == key[:, None]) & (slot[None, :] < slot[:, None])
     )
+    row = jnp.sum(before, axis=1, dtype=jnp.int32)
+    hit = row[None, :] == slot[:, None]
+    tok = jnp.sum(jnp.where(hit, (slot // k)[None, :], 0), axis=1, dtype=jnp.int32)
+    weights = topk_weights.reshape(p).astype(jnp.float32)
+    wt = jnp.sum(jnp.where(hit, weights[None, :], 0.0), axis=1)
+    return counts.astype(jnp.int32), offsets.astype(jnp.int32), tok, wt
 
 
 def _gate_up(xq, xs, w_ref, s_row, *, limit):
