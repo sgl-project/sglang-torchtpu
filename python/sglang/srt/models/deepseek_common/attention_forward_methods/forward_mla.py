@@ -59,7 +59,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_sail,
     _is_tpu,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -184,7 +183,7 @@ class DeepseekMLAForwardMixin:
     def is_dcp_mla_decode_phase(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        if self.dcp_size == 1 or current_platform.dcp_attention_backend_merges_mla():
+        if self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
         return (
@@ -775,10 +774,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if (
-            self.dcp_size > 1
-            and not current_platform.dcp_attention_backend_merges_mla()
-        ):
+        if self.dcp_size > 1:
             if self.is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(

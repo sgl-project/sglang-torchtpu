@@ -19,7 +19,7 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -28,25 +28,10 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     get_dsa_mtp_topk_width,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
     mla_latents_for_store,
-)
-from sglang_tpu.attention_pallas_rpa_base import _get_pages_per_seq
-from sglang_tpu.attention_pallas_rpa_dcp import (
-    _all_reduce_gather,
-    gather_heads,
-    merge_across_ranks,
-)
-from sglang_tpu.dcp_prefill_scratch import SlotState, plan_scratch_slots
-from sglang_tpu.dsa_dcp_ops import (
-    build_dsa_index_topk_dcp_op,
-    build_dsa_topk_merge_dcp_op,
-    build_index_key_store_gather_dcp_op,
-    build_sparse_mla_attention_dcp_op,
-    build_sparse_mla_kv_store_gather_dcp_op,
 )
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
@@ -63,7 +48,6 @@ from sglang_tpu.dsa_layer_kv_store_op import (
     pooled_store_op_name,
 )
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.kv_pool import _zeros_kv_buffer
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
@@ -343,20 +327,11 @@ def _split_pool(pool):
     return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
 
 
-# dcp_gather_buckets() entry that warms the scratch prefill instead of a gather.
-_DCP_SCRATCH_BUCKET = -1
-
-
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
-    # Set by the compile policy to warm one dcp_gather_buckets() length.
-    _dcp_gather_bucket_override: Optional[int] = None
-    # Under DCP this backend shards the latents and index keys itself and
-    # merges the partial attention (_forward_mla_dcp).
-    _dcp_owns_forward: ClassVar[bool] = True
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -376,24 +351,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             pool.attach_raw_ring(self.req_to_token_pool.req_to_token.shape[0])
         else:
             self._index_topk_op = build_dsa_index_topk_op()
-        # Prefill under DCP: gather an unsharded cache, or the decode path.
-        self._dcp_gathers_prefill = (
-            self._dcp > 1 and not tpu_envs.SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL.get()
-        )
-        self._dcp_scratch_slots = (
-            tpu_envs.SGLANG_TPU_DCP_PREFILL_SCRATCH.get()
-            if self._dcp_gathers_prefill
-            else 0
-        )
-        self._dcp_scratch_state: SlotState = [None] * self._dcp_scratch_slots
-        # layer id -> (NoPE, RoPE, index keys or None), unsharded, in place.
-        self._dcp_scratch: dict[int, tuple] = {}
-        if self._dcp > 1:
-            self._init_dcp_ops()
-        # The head-parallel DCP prefill runs the sharded decode ops: no token split.
-        self._init_indexer_token_split(
-            enabled=not self._dcp > 1 or self._dcp_gathers_prefill
-        )
+        self._init_indexer_token_split()
         self._init_attention_token_split()
 
     def _init_attention_token_split(self) -> None:
@@ -430,8 +388,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         super().init_forward_metadata(forward_batch)
         if self.raw_ring_pages_cnt:
             self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
-        if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
-            self._add_dcp_gather_metadata(forward_batch)
 
     def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """i32[rows]: each row's first raw-ring page, its request slot times the ring."""
@@ -456,42 +412,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             return metadata.raw_page_base, self.raw_ring_pages_cnt
         return metadata.kv_lens, 0
 
-    def _init_dcp_ops(self) -> None:
-        """Ops of the DCP path. The latents and index keys are page-striped:
-        rank r holds the r-th page_size run of every widened page."""
-        if self._kpool > 1:
-            raise ValueError(
-                "Decode context parallelism supports plain DSA only, not the "
-                f"pooled indexer (index_kpool={self._kpool})."
-            )
-        # The DCP path scores only the shard; the token split has nothing to do.
-        self._idx_split_group = None
-        self._dcp_interleave = self.page_size
-        self._index_topk_dcp_op = build_dsa_index_topk_dcp_op(
-            self._dcp, self._dcp_interleave
-        )
-        self._topk_merge_dcp_op = build_dsa_topk_merge_dcp_op(
-            self._dcp, self._dcp_interleave
-        )
-        self._attention_dcp_op = build_sparse_mla_attention_dcp_op(
-            self._dcp, self._dcp_interleave
-        )
-        self._index_key_store_gather_op = build_index_key_store_gather_dcp_op(
-            self._dcp, self._dcp_interleave
-        )
-        self._kv_store_gather_op = build_sparse_mla_kv_store_gather_dcp_op(
-            self._dcp, self._dcp_interleave
-        )
-
-    def _init_indexer_token_split(self, *, enabled: bool) -> None:
-        """Set up the DSA indexer token split (on with attn-TP > 1 unless disabled)."""
+    def _init_indexer_token_split(self) -> None:
+        """Set up the DSA indexer token split (always on with attn-TP > 1)."""
         self._idx_split_group = None
         self._idx_split_size = 1
         self._idx_split_min_tokens = 0
         self._index_topk_split_op = None
         self._kpool_expand_op = None
-        if not enabled:
-            return
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -595,10 +522,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # per-query kernel.
         self._prefill_op = None
         zero_rope = self._zero_rope
-        if (
-            not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get()
-            or self._dcp > 1
-        ):
+        if not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get():
             return _build_pallas_sparse_mla_kernel_op(zero_rope=zero_rope)
         if self._kpool == 1:
             # Plain DSA: token-bitmap q-block prefill. Its fallback (short or
@@ -664,25 +588,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
-        if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
-            return self._index_topk_dcp_dense(
-                forward_batch=forward_batch,
-                seq_lens=self._dcp_seq_lens(forward_batch),
-                layer_id=layer_id,
-                query=query,
-                key=key,
-                head_weights=head_weights,
-                weight_scale=weight_scale,
-            )
-        if self._dcp > 1:
-            return self._index_topk_dcp(
-                seq_lens=self._dcp_seq_lens(forward_batch),
-                layer_id=layer_id,
-                query=query,
-                key=key,
-                head_weights=head_weights,
-                weight_scale=weight_scale,
-            )
         metadata = self.forward_metadata
         num_tokens = query.shape[0]
         split_rows = self._indexer_split_rows(forward_batch, num_tokens)
@@ -715,266 +620,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key_store,
         )
 
-    def dcp_gather_buckets(self, batch_size: int) -> list[int]:
-        """Lengths ``dcp_gather_index`` takes for prefill batches of
-        ``batch_size`` rows; each is a compiled prefill variant."""
-        if not self._dcp_gathers_prefill:
-            return []
-        cap = batch_size * _get_pages_per_seq(self.max_context_len, self._page_stride)
-        # Powers of 4: half the compiled prefill variants of powers of 2 (each
-        # a cold compile), for at most 4x the gathered pages.
-        buckets = [4**i for i in range(cap.bit_length()) if 4**i < cap]
-        scratch = [_DCP_SCRATCH_BUCKET] if batch_size <= self._dcp_scratch_slots else []
-        return scratch + buckets + [cap]
-
-    def _dcp_scratch_plan(
-        self, forward_batch: ForwardBatch, need: list[int], seq_lens: list[int]
-    ) -> Optional[list[int]]:
-        """Scratch slot of each row (plan_scratch_slots), or None when this
-        batch gathers; the scratch warmup takes slot ``row``."""
-        state = self._dcp_scratch_state
-        if self._dcp_gather_bucket_override == _DCP_SCRATCH_BUCKET:
-            return list(range(len(need))) if len(need) <= len(state) else None
-        rids = forward_batch.rids
-        prefix = forward_batch.extend_prefix_lens_cpu
-        if (
-            not state
-            or self._dcp_gather_bucket_override is not None
-            or rids is None
-            or prefix is None
-        ):
-            return None
-        rows = len(rids)
-        # Rows past the requests are padding and must read nothing.
-        if rows > len(need) or any(need[rows:]):
-            return None
-        slots = plan_scratch_slots(
-            state,
-            rids=rids,
-            prefix_lens=[int(n) for n in prefix[:rows]],
-            seq_lens=seq_lens[:rows],
-        )
-        return None if slots is None else slots + [0] * (len(need) - rows)
-
-    def _ensure_dcp_scratch(self, pages_per_slot: int) -> None:
-        """Allocate the scratch once: every full-attention layer's buffers with
-        ``slots * pages_per_slot`` unsharded pages."""
-        if self._dcp_scratch:
-            return
-        pool = self.token_to_kv_pool
-        if isinstance(pool, HybridLinearKVPool):
-            layer_ids = sorted(pool.full_attention_layer_id_mapping)
-        else:
-            layer_ids = range(pool.start_layer, pool.start_layer + pool.layer_num)
-        pages = self._dcp_scratch_slots * pages_per_slot
-
-        def like(buf: torch.Tensor) -> torch.Tensor:
-            return _zeros_kv_buffer((pages, *buf.shape[1:]), buf.dtype, buf.device)
-
-        for layer_id in layer_ids:
-            try:
-                index_keys = like(pool.get_index_key_cache(layer_id))
-            except ValueError:  # the layer reuses the previous layer's top-k
-                index_keys = None
-            self._dcp_scratch[layer_id] = (
-                like(pool.get_nope_cache(layer_id)),
-                like(pool.get_rope_cache(layer_id)),
-                index_keys,
-            )
-
-    def _add_dcp_gather_metadata(self, forward_batch: ForwardBatch) -> None:
-        """Gather list and dense page table for this prefill: only the live
-        sequences' widened pages, padded to a bucket (page 0 of row 0)."""
-        md = self.forward_metadata
-        bs = md.cu_q_lens.shape[0] - 1
-        pages_per_seq = md.page_indices.shape[0] // bs
-        seq_lens = forward_batch.seq_lens_cpu
-        seq_lens = (
-            list(seq_lens) if isinstance(seq_lens, list) else seq_lens.tolist()
-        )[:bs]
-        need = [-(-int(n) // self._page_stride) for n in seq_lens]
-        device = md.page_indices.device
-        slots = self._dcp_scratch_plan(forward_batch, need, seq_lens)
-        if slots is not None:
-            # No gather: one dummy page keeps the store op's signature.
-            slot_pages = pages_per_seq * self._dcp
-            self._ensure_dcp_scratch(slot_pages)
-            dense = torch.zeros(bs, slot_pages, dtype=torch.int32)
-            for row, n in enumerate(need):
-                n = min(n, pages_per_seq) * self._dcp
-                dense[row, :n] = slots[row] * slot_pages + torch.arange(
-                    n, dtype=torch.int32
-                )
-            md.dcp_gather_index = self._value_metadata(
-                name="dcp_gather_index",
-                value=torch.zeros(1, dtype=torch.int64),
-                device=device,
-            )
-            md.dcp_dense_pages = self._value_metadata(
-                name="dcp_dense_pages", value=dense.reshape(-1), device=device
-            )
-            md.dcp_scratch = True
-            return
-        total = sum(need)
-        size = self._dcp_gather_bucket_override or next(
-            b for b in self.dcp_gather_buckets(bs) if b >= total
-        )
-        gather = torch.zeros(size, dtype=torch.int64)
-        dense = torch.zeros(bs, pages_per_seq * self._dcp, dtype=torch.int32)
-        offset = 0
-        for row, n in enumerate(need):
-            # Only a warmup bucket below the need truncates (its rows are dummies).
-            n = max(0, min(n, size - offset))
-            gather[offset : offset + n] = row * pages_per_seq + torch.arange(n)
-            dense[row, : n * self._dcp] = offset * self._dcp + torch.arange(
-                n * self._dcp, dtype=torch.int32
-            )
-            offset += n
-        md.dcp_gather_index = self._value_metadata(
-            name="dcp_gather_index", value=gather, device=device
-        )
-        md.dcp_dense_pages = self._value_metadata(
-            name="dcp_dense_pages", value=dense.reshape(-1), device=device
-        )
-
-    @staticmethod
-    def _dcp_seq_lens(forward_batch: ForwardBatch) -> torch.Tensor:
-        """Unsharded KV length per sequence, counting this step's tokens: the
-        kv_lens of an unsharded forward (DCP rejects speculative modes)."""
-        return forward_batch.seq_lens.to(torch.int32)
-
-    def _dcp_gather_page_ids(self) -> torch.Tensor:
-        """i32[G]: this rank's physical page of each widened page listed in
-        ``dcp_gather_index``."""
-        md = self.forward_metadata
-        return md.page_indices.index_select(0, md.dcp_gather_index).to(torch.int32)
-
-    def _dcp_dense_cache(self, pages: torch.Tensor) -> torch.Tensor:
-        """The group's pages put together unsharded, at the page table
-        ``dcp_dense_pages``: dense page ``g * dcp + r`` is rank r's ``pages[g]``,
-        rank r's run of the g-th listed widened page."""
-        # Zero-padded int32 sums are exact; bytes are summed as words.
-        words = pages.view(torch.int32)
-        gathered = _all_reduce_gather(
-            words, self._dcp_group, self._dcp, self._cp_rank_mask, dim=1
-        )
-        return (
-            gathered.reshape(pages.shape[0] * self._dcp, *words.shape[1:])
-            .view(pages.dtype)
-            .contiguous()
-        )
-
-    def _index_topk_dcp_dense(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        seq_lens: torch.Tensor,
-        layer_id: int,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        head_weights: torch.Tensor,
-        weight_scale: float,
-    ) -> torch.Tensor:
-        """index_topk under DCP for prefill: the unsharded indexer over the
-        gathered index keys (rows identical to an unsharded server), and the
-        owned keys stored in this rank's shard."""
-        md = self.forward_metadata
-        shard = self.token_to_kv_pool.get_index_key_cache(layer_id)
-        # One op stores the owned keys and reads the listed pages back: a
-        # second op on the donated shard made XLA copy the whole shard.
-        pages = self._index_key_store_gather_op(
-            key.contiguous(),
-            shard,
-            seq_lens,
-            md.page_indices,
-            md.cu_q_lens,
-            md.distribution,
-            self._cp_rank_t,
-            self._dcp_gather_page_ids(),
-        )
-        # The scratch is every rank's unsharded copy; the ops below store this
-        # chunk's keys into it, as they do into an unsharded pool.
-        dense = (
-            self._dcp_scratch[layer_id][2]
-            if md.dcp_scratch
-            else self._dcp_dense_cache(pages)
-        )
-        # Every attention-TP rank now holds the unsharded cache, as without
-        # DCP, so the token split applies unchanged: each rank scores a slice
-        # of the rows instead of all of them against the whole history.
-        split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
-        if split_rows:
-            return self._index_topk_token_split(
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                query=query,
-                key=key,
-                head_weights=head_weights,
-                weight_scale=weight_scale,
-                key_store="xla",
-                split_rows=split_rows,
-                index_key_cache=dense,
-                page_indices=md.dcp_dense_pages,
-                kv_lens=seq_lens,
-            )
-        return self._index_topk_op(
-            query.contiguous(),
-            key.contiguous(),
-            head_weights.contiguous(),
-            dense,
-            seq_lens,
-            self.forward_metadata.dcp_dense_pages,
-            md.cu_q_lens,
-            md.distribution,
-            weight_scale,
-            self._topk,
-            md.decode_query_size,
-            md.segments,
-            "xla",
-        )
-
-    def _index_topk_dcp(
-        self,
-        *,
-        seq_lens: torch.Tensor,
-        layer_id: int,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        head_weights: torch.Tensor,
-        weight_scale: float,
-    ) -> torch.Tensor:
-        """index_topk under DCP: this rank's rows of the global top-k, as
-        rank-local positions (what _forward_mla_dcp hands the kernel)."""
-        metadata = self.forward_metadata
-        indices, scores = self._index_topk_dcp_op(
-            query.contiguous(),
-            key.contiguous(),
-            head_weights.contiguous(),
-            self.token_to_kv_pool.get_index_key_cache(layer_id),
-            seq_lens,
-            metadata.page_indices,
-            metadata.cu_q_lens,
-            metadata.distribution,
-            self._cp_rank_t,
-            weight_scale,
-            self._topk,
-            metadata.segments,
-        )
-        # One gather for both: int32 sums of zero-padded blocks are exact.
-        candidates = _all_reduce_gather(
-            torch.stack([indices, scores]).unsqueeze(0),
-            self._dcp_group,
-            self._dcp,
-            self._cp_rank_mask,
-            dim=0,
-        )  # i32[dcp, 2, num_tokens, topk]
-        return self._topk_merge_dcp_op(
-            candidates[:, 0].contiguous(),
-            candidates[:, 1].contiguous(),
-            self._cp_rank_t,
-            self._topk,
-        )
-
     def _index_topk_token_split(
         self,
         *,
@@ -986,9 +631,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         weight_scale: float,
         key_store: str,
         split_rows: int,
-        index_key_cache: Optional[torch.Tensor] = None,
-        page_indices: Optional[torch.Tensor] = None,
-        kv_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """index_topk with the DSA indexer token split.
 
@@ -999,10 +641,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         token split, each rank attends its own slice and gets ``i32[split_rows,
         topk]`` back instead. The rank enters as a device tensor, so all ranks
         run one compiled program.
-
-        The gathered DCP prefill passes the unsharded cache it gathered, its
-        page table and the unsharded lengths; by default they are this layer's
-        pool cache, the batch's page table and kv lengths.
         """
         from sglang.srt.layers.dp_attention import _rank_tensor
 
@@ -1014,13 +652,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             query.contiguous(),
             key.contiguous(),
             head_weights.contiguous(),
-            (
-                index_key_cache
-                if index_key_cache is not None
-                else self.token_to_kv_pool.get_index_key_cache(layer_id)
-            ),
-            kv_lens if kv_lens is not None else self._kv_lens(forward_batch),
-            page_indices if page_indices is not None else metadata.page_indices,
+            self.token_to_kv_pool.get_index_key_cache(layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
             metadata.cu_q_lens,
             metadata.distribution,
             row_start,
@@ -1198,15 +832,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-        if self._dcp > 1:
-            seq_lens = self._dcp_seq_lens(forward_batch)
-            if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
-                out = self._forward_mla_dcp_dense(
-                    args, topk_indices, seq_lens, layer.layer_id
-                )
-            else:
-                out = self._forward_mla_dcp(args, topk_indices, seq_lens)
-            return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
             out = self._forward_mla_token_split(args, topk_indices, split_rows)
@@ -1273,124 +898,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         out = out.view(rows, world, heads, nope).transpose(0, 1)
         out = oneshot_all_to_all(out.reshape(world, -1), world_size=world)
         return out.view(world * rows, heads, nope)[:num_tokens]
-
-    def _forward_mla_dcp_dense(
-        self,
-        args: tuple,
-        topk_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        layer_id: int,
-    ) -> torch.Tensor:
-        """Prefill under DCP: the unsharded op, with this rank's heads, over the
-        gathered latents; the owned latents stored in this rank's shards.
-
-        ``topk_indices`` are unsharded rows from ``_index_topk_dcp_dense``.
-        """
-        (
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            cache_nope,
-            cache_rope,
-            _kv_lens,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            distribution,
-            sm_scale,
-            k_scale,
-            v_scale,
-        ) = args
-        # Store and read back in one op (see _index_topk_dcp_dense).
-        nope_pages, rope_pages = self._kv_store_gather_op(
-            new_kv_c,
-            new_k_pe,
-            cache_nope,
-            cache_rope,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            self._cp_rank_t,
-            self._dcp_gather_page_ids(),
-        )
-        if self.forward_metadata.dcp_scratch:
-            dense_nope, dense_rope, _ = self._dcp_scratch[layer_id]
-        else:
-            dense_nope = self._dcp_dense_cache(nope_pages)
-            dense_rope = self._dcp_dense_cache(rope_pages)
-        return self._op(
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            dense_nope,
-            dense_rope,
-            seq_lens,
-            self.forward_metadata.dcp_dense_pages,
-            cu_q_lens,
-            cu_kv_lens,
-            distribution,
-            sm_scale,
-            k_scale,
-            v_scale,
-            topk_indices,
-        )
-
-    def _forward_mla_dcp(
-        self, args: tuple, topk_indices: torch.Tensor, seq_lens: torch.Tensor
-    ) -> torch.Tensor:
-        """Attend with the DCP group's heads over this rank's winners, then
-        merge the group's partials by log-sum-exp and keep this rank's heads.
-
-        ``topk_indices`` are rank-local rows from ``_index_topk_dcp``.
-        """
-        (
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            cache_nope,
-            cache_rope,
-            _kv_lens,
-            page_indices,
-            cu_q_lens,
-            _cu_kv_lens,
-            distribution,
-            sm_scale,
-            k_scale,
-            _v_scale,
-        ) = args
-        md = self.forward_metadata
-        group, cp, rank_mask = self._dcp_group, self._dcp, self._cp_rank_mask
-        nope_dim = ql_nope.shape[-1]
-        q_all = gather_heads(
-            torch.cat([ql_nope, q_pe], dim=-1), group, cp, rank_mask
-        )  # [T, heads * dcp, 576]
-        out, lse = self._attention_dcp_op(
-            q_all[..., :nope_dim].contiguous(),
-            q_all[..., nope_dim:].contiguous(),
-            new_kv_c,
-            new_k_pe,
-            cache_nope,
-            cache_rope,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            self._cp_rank_t,
-            topk_indices,
-            sm_scale,
-            k_scale,
-        )
-        # A row with no owned winner (or a padding row) has l = 0: its lse is
-        # -inf or NaN. NaN would poison the group-wide max, so pin it to -inf.
-        lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, float("-inf")))
-        merged, _ = merge_across_ranks(
-            out.float(), lse, group, cp, rank_mask, self._cp_rank_index
-        )
-        return merged.to(ql_nope.dtype)
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool

@@ -900,11 +900,8 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
-# The attention backend TPU decode context parallelism runs on by default.
+# The attention backend TPU decode context parallelism runs on.
 _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
-# Sparse MLA (DSA models) shards its latents and index keys and merges the
-# partial attention in the backend (TpuPallasSparseMlaAttnBackend).
-_DCP_SPARSE_MLA_BACKEND = "pallas_tpu_mla_sparse"
 
 # The chunk handle_gpu_memory_settings declares later for an unset
 # --chunked-prefill-size on TPU, whose device memory capacity it does not know.
@@ -929,15 +926,12 @@ def _validate_decode_context_parallel(server_args) -> None:
     if dcp_size <= 1:
         return
 
-    if cfg.attention_backend not in (_DCP_ATTENTION_BACKEND, _DCP_SPARSE_MLA_BACKEND):
+    if cfg.attention_backend != _DCP_ATTENTION_BACKEND:
         raise ValueError(
             "--decode-context-parallel-size > 1 on TPU requires "
-            f"--attention-backend {_DCP_ATTENTION_BACKEND} (or "
-            f"{_DCP_SPARSE_MLA_BACKEND} for DSA models), got "
+            f"--attention-backend {_DCP_ATTENTION_BACKEND}, got "
             f"{cfg.attention_backend!r}."
         )
-    if cfg.attention_backend == _DCP_SPARSE_MLA_BACKEND:
-        _validate_sparse_mla_dcp(cfg)
     if cfg.tp_size % dcp_size != 0:
         raise ValueError(
             f"--tensor-parallel-size ({cfg.tp_size}) must be divisible by "
@@ -1036,31 +1030,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             f"{dcp_size}: with more ranks the forward stalls in warmup with the "
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
-        )
-
-
-def _validate_sparse_mla_dcp(cfg: Any) -> None:
-    """Sparse MLA DCP has no q-block prefill kernel and no attention token split
-    (its gathered prefill attends full rows, its head-parallel prefill runs the
-    sharded decode ops); refuse the switches that would ask for them. Its index
-    top-k is rank-local, so it cannot return the indexer top-k either."""
-    from sglang_tpu.envs import envs as tpu_envs
-
-    for env in (
-        tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL,
-        tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT,
-    ):
-        if env.get():
-            raise ValueError(
-                f"{env.name}=1 is not supported with "
-                "--decode-context-parallel-size > 1 and "
-                f"--attention-backend {_DCP_SPARSE_MLA_BACKEND}."
-            )
-    if cfg.enable_return_indexer_topk:
-        raise ValueError(
-            "--enable-return-indexer-topk is not supported with "
-            "--decode-context-parallel-size > 1 and "
-            f"--attention-backend {_DCP_SPARSE_MLA_BACKEND}."
         )
 
 
@@ -1686,10 +1655,6 @@ class TpuSRTPlatform(SRTPlatform):
         return True
 
     def dcp_replicates_q_heads(self) -> bool:
-        return True
-
-    def dcp_attention_backend_merges_mla(self) -> bool:
-        # pallas_tpu_mla_sparse gathers the heads and merges the partials itself.
         return True
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
