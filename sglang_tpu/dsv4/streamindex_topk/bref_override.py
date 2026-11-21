@@ -17,6 +17,7 @@
 """Custom BufferedRef overrides for StreamIndex Top-K kernel."""
 
 import dataclasses
+import functools
 from typing import Any
 
 import jax
@@ -90,6 +91,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
     chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
+    # > 0: page-table rows end with page_group_starts (one entry per group).
+    page_group: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -106,6 +109,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        page_group: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -123,6 +127,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            page_group=page_group,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -143,6 +148,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        page_group: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -158,6 +164,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
+            page_group=page_group,
         )
 
     def copy_in(
@@ -194,32 +201,53 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
                 batch_idx=batch_idx,
                 bkv_idx=bkv_idx,
             )
-            for i in range(self.bkv_p):
-                page = _page_id(
-                    page_table,
-                    page_rows,
-                    seq_idx=effective_seq_idx + batch_idx,
-                    batch_idx=batch_idx,
-                    page_col=kv_p_start + i,
-                    pages_per_seq=self.pages_per_seq,
-                )
-                safe_page_offset = jnp.minimum(
-                    page * self.page_size_per_kv_packing,
-                    jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
-                )
-                pltpu.make_async_copy(
-                    reshaped_cache_hbm_ref.at[
-                        pl.ds(safe_page_offset, self.page_size_per_kv_packing)
-                    ],
-                    vmem_dst.at[
-                        batch_idx,
-                        pl.ds(
-                            i * self.page_size_per_kv_packing,
-                            self.page_size_per_kv_packing,
-                        ),
-                    ],
-                    sem,
-                ).start()
+            group = self.page_group if page_rows is not None else 0
+            for g in range(0, self.bkv_p, max(group, 1)):
+                pages = range(g, g + group) if group else (g,)
+                if group:
+                    start = page_rows[
+                        batch_idx, self.pages_per_seq + (kv_p_start + g) // group
+                    ]
+                    pl.when(start >= 0)(
+                        functools.partial(
+                            self._copy_pages, reshaped_cache_hbm_ref, vmem_dst, sem,
+                            start * self.page_size_per_kv_packing, batch_idx, g, group,
+                        )
+                    )  # fmt: skip
+
+                def per_page(pages=pages):
+                    for i in pages:
+                        page = _page_id(
+                            page_table,
+                            page_rows,
+                            seq_idx=effective_seq_idx + batch_idx,
+                            batch_idx=batch_idx,
+                            page_col=kv_p_start + i,
+                            pages_per_seq=self.pages_per_seq,
+                        )
+                        safe_page_offset = jnp.minimum(
+                            page * self.page_size_per_kv_packing,
+                            jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
+                        )
+                        self._copy_pages(
+                            reshaped_cache_hbm_ref, vmem_dst, sem, safe_page_offset,
+                            batch_idx, i, 1,
+                        )  # fmt: skip
+
+                if group:
+                    pl.when(start < 0)(per_page)
+                else:
+                    per_page()
+
+    def _copy_pages(self, src, vmem_dst, sem, src_row, batch_idx, first, count):
+        """Start one DMA of ``count`` pages from row ``src_row`` into slot pages
+        ``first``.. of sequence ``batch_idx``."""
+        rows = self.page_size_per_kv_packing
+        pltpu.make_async_copy(
+            src.at[pl.ds(src_row, count * rows)],
+            vmem_dst.at[batch_idx, pl.ds(first * rows, count * rows)],
+            sem,
+        ).start()
 
     def wait_in(
         self,

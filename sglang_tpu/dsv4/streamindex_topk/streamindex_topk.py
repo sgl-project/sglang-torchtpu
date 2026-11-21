@@ -183,8 +183,13 @@ def kernel(
     buffer_count: int = 3,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_idx: int = 0,
+    page_group: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
+
+    ``page_group`` > 0: the HBM page table carries, after each row's page ids,
+    one entry per group of ``page_group`` pages (page_group_starts); a group
+    with an entry >= 0 is fetched with one DMA.
 
     Refs: scalar prefetch (seq_lens [max_num_seqs], page table when it is
     prefetched [max_num_seqs * pages_per_seq], cu_q_lens [max_num_seqs + 1],
@@ -211,7 +216,9 @@ def kernel(
             *score_refs,
             page_rows_ref,
         ) = refs
-        pages_per_seq = page_table_ref.shape[1]
+        pages_per_seq = page_table_ref.shape[1] * page_group // (page_group + 1)
+        if not page_group:
+            pages_per_seq = page_table_ref.shape[1]
     else:
         (
             seq_lens_ref,
@@ -355,6 +362,7 @@ def kernel(
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            page_group=page_group,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -852,6 +860,24 @@ def _effective_row_lengths(
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
+# KV pages fetched by one DMA when their ids are consecutive: at 8 KB pages a DMA
+# start costs about as much as its bytes, and prefill allocates pages in runs.
+_PAGE_GROUP = 8
+
+
+def page_group_starts(page_table: jax.Array, *, num_pages: int) -> jax.Array:
+    """i32[seqs, pages_per_seq // _PAGE_GROUP]: the first page of each group of
+    consecutive page ids, 0 for a group of page-0 padding (past the sequence, so any
+    in-range rows will do), else -1 (fetched page by page)."""
+    seqs, pages = page_table.shape
+    ids = page_table.reshape(seqs, pages // _PAGE_GROUP, _PAGE_GROUP)
+    first = ids[..., 0]
+    run = jnp.all(ids == first[..., None] + jnp.arange(_PAGE_GROUP), axis=-1)
+    run &= first + _PAGE_GROUP <= num_pages
+    pad = jnp.all(ids == 0, axis=-1)
+    return jnp.where(run, first, jnp.where(pad, 0, -1)).astype(jnp.int32)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1088,6 +1114,17 @@ def streamindex_topk(
         align_to(pages_per_seq, bkv_p) * page_size // 128
         for bkv_p in num_kv_pages_per_blocks
     )
+    group_starts = None
+    if (
+        page_table_in_hbm
+        and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+        and pages_per_seq % _PAGE_GROUP == 0
+        and all(bkv_p % _PAGE_GROUP == 0 for bkv_p in num_kv_pages_per_blocks)
+    ):
+        group_starts = page_group_starts(
+            page_indices.reshape(max_num_seqs, pages_per_seq),
+            num_pages=cache_kv.shape[0],
+        )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
         """Query and KV block sizes a pass runs with."""
@@ -1149,9 +1186,12 @@ def streamindex_topk(
             pass_meta,
         )
         if page_table_in_hbm:
-            hbm_inputs = (page_indices.reshape(max_num_seqs, pages_per_seq),)
+            table = page_indices.reshape(max_num_seqs, pages_per_seq)
+            if group_starts is not None:
+                table = jnp.concatenate([table, group_starts], axis=1)
+            hbm_inputs = (table,)
             # One page-table row per sequence in flight.
-            scratch_shapes = [pltpu.SMEM((seq_batch_size, pages_per_seq), jnp.int32)]
+            scratch_shapes = [pltpu.SMEM((seq_batch_size, table.shape[1]), jnp.int32)]
         else:
             hbm_inputs = ()
             scratch_shapes = []
@@ -1177,6 +1217,7 @@ def streamindex_topk(
                     buffer_count=buffer_count,
                     kv_layout=kv_layout,
                     chunk_idx=chunk_idx,
+                    page_group=_PAGE_GROUP if group_starts is not None else 0,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
