@@ -420,7 +420,9 @@ class UNetUp(nn.Module):
             )
 
     def forward(self, x, t, token_h, token_w):
-        x = rearrange(x, "b (h w) c -> b c h w", h=token_h, w=token_w)
+        # Contiguous: torch_tpu's group_norm views its input, which fails on the
+        # strided result of the rearrange.
+        x = rearrange(x, "b (h w) c -> b c h w", h=token_h, w=token_w).contiguous()
         for module in self.model:
             if isinstance(module, _ResBlock):
                 x = module(x, t)
@@ -1100,6 +1102,14 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if timestep is not None:
             self.maybe_cache_states(output, hidden_states)
         return output
+
+    def post_load_weights(self) -> None:
+        # srt's model loader finishes every FusedMoE with its quant method's
+        # process_weights_after_loading (on TPU: the experts move to the fused
+        # MoE kernel's layout); this loader must run it too.
+        for module in self.modules():
+            if isinstance(module, FusedMoE):
+                module.quant_method.process_weights_after_loading(module)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
