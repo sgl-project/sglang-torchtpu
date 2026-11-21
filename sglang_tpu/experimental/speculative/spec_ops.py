@@ -1027,6 +1027,16 @@ def live_result_rows(
     return accept_tokens[:bs].reshape(-1), accept_lens[:bs]
 
 
+@compiled_op()
+def live_cap_lens(num_verify_drafts: torch.Tensor, bs: int) -> torch.Tensor:
+    """[bs] int32 verified rows (root plus capped drafts) of the live requests.
+
+    The scheduler's cap_lens, as core DSpark reports them; compiled for the same
+    reason as live_result_rows.
+    """
+    return 1 + num_verify_drafts[:bs].to(torch.int32)
+
+
 def _verify_mask(num_verify_drafts: torch.Tensor, n: int) -> torch.Tensor:
     steps = torch.arange(
         n, dtype=num_verify_drafts.dtype, device=num_verify_drafts.device

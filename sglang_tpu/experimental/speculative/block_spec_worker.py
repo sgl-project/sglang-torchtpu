@@ -12,9 +12,13 @@ extend: target forward on new prompt tokens, inject every row's target feature
 
 from __future__ import annotations
 
+import collections
 import functools
 import itertools
+import time
+import weakref
 from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 
@@ -37,10 +41,15 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu._logging import get_logger
 from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
+)
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
@@ -63,6 +72,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
     build_verify_tokens,
+    live_cap_lens,
     pack_verify,
     select_verify_rows,
     truncate_drafts,
@@ -83,7 +93,11 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     padded_h2d,
     prompt_positions,
 )
-from sglang_tpu.experimental.speculative.verify_width import verify_width_table
+from sglang_tpu.experimental.speculative.verify_width import (
+    AdaptiveVerifyWidth,
+    verify_width_candidates,
+    verify_width_table,
+)
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 
@@ -115,6 +129,21 @@ def _unpack_logits_output(
         logits_output.hidden_states,
     )
 
+
+class _PendingStep(NamedTuple):
+    """A dispatched decode step awaiting its host-side accept counts."""
+
+    bucket: int
+    width: int
+    bs: int
+    extend_ct: int
+    # Set when caps vary per request: the scheduler's result copy swaps its
+    # cap_lens for a host tensor before on_verify_complete_cpu reads it. Weak, so
+    # an unreported step does not pin the result's device outputs.
+    result: weakref.ref[GenerationBatchResult] | None = None
+
+
+logger = get_logger(__name__)
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DFLASH: TpuDflashDraftWorker,
@@ -162,8 +191,29 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             draft_token_num=self._draft_block_width, device=self.device
         )
         self._verify_width_table = verify_width_table(self.num_verify_rows)
-        if self._verify_width_table is not None:
+        candidates = verify_width_candidates(self.num_verify_rows)
+        if self._verify_width_table is not None and candidates is not None:
+            raise ValueError(
+                "Set SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS or "
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_CANDIDATES, not both."
+            )
+        self._adaptive_width = (
+            None
+            if candidates is None
+            else AdaptiveVerifyWidth(candidates, num_drafts=self.num_drafts)
+        )
+        if self._verify_width_table is not None or candidates is not None:
             self._check_verify_width_table_supported()
+        # The width this decode step uses (begin_decode_step) and the steps whose
+        # results the scheduler has not reported yet, oldest first.
+        self._step_width = self.num_verify_rows
+        self._pending_steps: collections.deque[_PendingStep] = collections.deque(
+            maxlen=16
+        )
+        self._extend_ct = 0
+        self._last_completion: tuple[float, int] | None = None
+        # [pbs] int32 caps the current decode step scheduled, for its cap_lens.
+        self._step_caps: torch.Tensor | None = None
         # cap-accept verifies the full window; compact packs only the scheduled rows.
         self._compact = self._ragged_verify_mode is RaggedVerifyMode.COMPACT
         self._scheduled_caps = self._compact or (
@@ -183,6 +233,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             raise NotImplementedError(
                 "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS does not support linear-attention targets."
             )
+        if self._adaptive_width is not None and self._dp_attention:
+            # DP ranks run one bucket but would each measure and pick a width.
+            raise NotImplementedError(
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_CANDIDATES does not support DP attention."
+            )
 
     def _check_scheduled_caps_supported(self) -> None:
         mode = self._ragged_verify_mode.value
@@ -200,10 +255,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             raise NotImplementedError(
                 f"SGLANG_RAGGED_VERIFY_MODE={mode} needs a DSpark draft with a confidence head."
             )
-        if self._verify_width_table is None:
+        if self._verify_width_table is None and self._adaptive_width is None:
             raise ValueError(
                 f"SGLANG_RAGGED_VERIFY_MODE={mode} takes its per-bucket budget "
-                "(mean verify width) from SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS."
+                "(mean verify width) from SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS or "
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_CANDIDATES."
             )
         if self._compact and (self._dp_attention or self._target_has_linear_attn):
             raise NotImplementedError(
@@ -224,27 +280,153 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
 
     def verify_widths(self) -> tuple[int, ...]:
-        if self._verify_width_table is None or self._scheduled_caps:
+        if self._scheduled_caps:
             return (self.num_verify_rows,)
-        return self._verify_width_table.reachable_widths(self._bucket_sizes())
+        return tuple(
+            sorted(
+                {w for pbs in self._bucket_sizes() for w in self._budget_widths(pbs)}
+            )
+        )
 
     def verify_width_for(self, padded_bs: int) -> int:
-        if self._verify_width_table is None or self._scheduled_caps:
+        if self._scheduled_caps:
             return self.num_verify_rows
-        return self._verify_width_table.width_for(padded_bs)
+        return self._budget_width(padded_bs)
+
+    def _budget_widths(self, padded_bs: int) -> tuple[int, ...]:
+        """Every width a step at this bucket may use, which warmup compiles."""
+        if self._adaptive_width is not None:
+            return self._adaptive_width.candidates
+        if self._verify_width_table is not None:
+            return (self._verify_width_table.width_for(padded_bs),)
+        return (self.num_verify_rows,)
+
+    def _budget_width(self, padded_bs: int) -> int:
+        """This step's mean verify rows per request (uniform width in static mode)."""
+        if self._adaptive_width is not None:
+            return self._step_width
+        return self._budget_widths(padded_bs)[0]
 
     def _caps_bucket(self, padded_bs: int) -> bool:
-        """Whether this bucket schedules per-request caps; a full-width table entry
+        """Whether this step schedules per-request caps; a full-width budget
         verifies the whole window on the plain decode-tile path instead."""
         return (
             self._scheduled_caps
-            and self._drafts_per_live_row(padded_bs) < self.num_drafts
+            and self._budget_width(padded_bs) < self.num_verify_rows
         )
 
-    def _drafts_per_live_row(self, padded_bs: int) -> int:
-        """Scheduled-caps budget: the table width less the root, per live request."""
-        assert self._verify_width_table is not None
-        return self._verify_width_table.width_for(padded_bs) - 1
+    def _caps_shapes(self) -> list[tuple[int, int]]:
+        """Every (bucket, budget width) that schedules caps, which warmup compiles."""
+        if not self._scheduled_caps:
+            return []
+        return [
+            (pbs, width)
+            for pbs in self._bucket_sizes()
+            for width in self._budget_widths(pbs)
+            if width < self.num_verify_rows
+        ]
+
+    def begin_decode_step(self, padded_bs: int, bs: int) -> None:
+        # A DP-idle draft schedules caps that no result reports.
+        self._step_caps = None
+        if self._adaptive_width is None:
+            return
+        width = self._adaptive_width.width_for_step(
+            padded_bs,
+            agree=functools.partial(self._tp_group.broadcast_object, src=0),
+        )
+        if width != self._step_width and self._tp_group.rank_in_group == 0:
+            summary = self._adaptive_width.summary(padded_bs)
+            logger.info(
+                "Adaptive verify width at bucket %d: %d -> %d "
+                "(predicted tokens/req %s, step ms %s)",
+                padded_bs,
+                self._step_width,
+                width,
+                {
+                    w: None if t is None else round(t, 2)
+                    for w, (t, _) in summary.items()
+                },
+                {
+                    w: None if s is None else round(s * 1e3, 2)
+                    for w, (_, s) in summary.items()
+                },
+            )
+        self._step_width = width
+        self._pending_steps.append(
+            _PendingStep(
+                bucket=padded_bs,
+                width=self._step_width,
+                bs=bs,
+                extend_ct=self._extend_ct,
+            )
+        )
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """Feed the adaptive width: the scheduler reports decode results in dispatch order."""
+        if self._adaptive_width is None:
+            return
+        while self._pending_steps and self._pending_steps[0].bs != batch_size:
+            self._pending_steps.popleft()  # a step whose result went unreported
+        if not self._pending_steps or batch_size == 0:
+            return
+        step = self._pending_steps.popleft()
+        now = time.perf_counter()
+        # An interval spanning a prefill measures the prefill, not this width: the
+        # overlap scheduler may dispatch one after this step but before its result.
+        last = self._last_completion
+        seconds = (
+            now - last[0]
+            if last is not None and last[1] == step.extend_ct == self._extend_ct
+            else None
+        )
+        self._last_completion = (now, self._extend_ct)
+        if step.result is None:
+            num_verify_drafts = [step.width - 1] * batch_size
+        else:
+            result = step.result()
+            cap_lens = None if result is None else result.cap_lens
+            if (
+                cap_lens is None
+                or not cap_lens.is_cpu
+                or cap_lens.numel() != batch_size
+            ):
+                # A stray pairing (by batch size) with a step whose result is gone:
+                # keep its step time, drop its acceptance rather than guess the caps.
+                num_correct_drafts_per_req, num_verify_drafts = [], []
+            else:
+                num_verify_drafts = [n - 1 for n in cap_lens.tolist()]
+        self._adaptive_width.record(
+            step.bucket,
+            step.width,
+            num_correct_drafts=num_correct_drafts_per_req,
+            num_verify_drafts=num_verify_drafts,
+            seconds=seconds,
+        )
+
+    def _pack_decode_result(
+        self,
+        *,
+        bs: int,
+        next_state: SpecState,
+        logits_output: LogitsProcessorOutput,
+        accept: AcceptResult,
+    ) -> GenerationBatchResult:
+        result = super()._pack_decode_result(
+            bs=bs, next_state=next_state, logits_output=logits_output, accept=accept
+        )
+        if self._step_caps is None:
+            return result
+        # The scheduler's async result copy brings these to the host with accept_lens.
+        result.cap_lens = live_cap_lens(self._step_caps, bs)
+        self._step_caps = None
+        if self._adaptive_width is not None:
+            self._pending_steps[-1] = self._pending_steps[-1]._replace(
+                result=weakref.ref(result)
+            )
+        return result
 
     def _schedule_verify_drafts(
         self,
@@ -253,6 +435,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
         draft_tokens: torch.Tensor,
         live_mask: torch.Tensor,
+        budget_width: int,
     ) -> torch.Tensor:
         """[pbs] int32 per-request verify caps from the draft confidence."""
         drafter = self._block_draft_worker
@@ -263,7 +446,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 bonus_tokens=bonus_tokens,
                 draft_tokens=draft_tokens,
                 live_mask=live_mask,
-                drafts_per_live_row=self._drafts_per_live_row(live_mask.shape[0]),
+                drafts_per_live_row=budget_width - 1,
             )
         return self._tp_sync.sync(SpecTpSyncSite.SPEC_VERIFY_DRAFTS, num_verify_drafts)
 
@@ -287,9 +470,50 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 self._warmup_verify_caps()
             if self._compact:
                 self._warmup_compact_verify()
+            if (
+                self._adaptive_width is not None
+                and get_disagg().disaggregation_mode != "prefill"
+                and not tpu_envs.SGLANG_TPU_SPEC_VERIFY_WIDTH_DISABLE_PROFILE.get()
+            ):
+                self._profile_verify_widths()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
+
+    def _profile_verify_widths(self) -> None:
+        """Seed the adaptive width with each (bucket, candidate)'s verify-forward time."""
+        assert self._adaptive_width is not None
+        candidates = self._adaptive_width.candidates
+        # cap-accept verifies the full window whatever the budget: time that forward.
+        served = {
+            width: self.num_verify_rows
+            if self._scheduled_caps and not self._compact
+            else width
+            for width in candidates
+        }
+        shapes = sorted(
+            {
+                (pbs, served[width])
+                for pbs in self._bucket_sizes()
+                for width in candidates
+            }
+        )
+        policy = self._compile_policy()
+        assert isinstance(policy, TpuBlockSpecDecodeCompilePolicyMixin), type(policy)
+        timed = policy.profile_target_verify(shapes)
+        # Rank 0's timings for everyone, so TP ranks rank widths alike.
+        timed = self._tp_group.broadcast_object(timed, src=0)
+        profile = {
+            (pbs, width): timed[(pbs, served[width])]
+            for pbs in self._bucket_sizes()
+            for width in candidates
+        }
+        self._adaptive_width.seed(profile)
+        if self._tp_group.rank_in_group == 0:
+            logger.info(
+                "Adaptive verify width profile (verify ms per bucket/width): %s",
+                {f"{b}/{w}": round(s * 1e3, 2) for (b, w), s in profile.items()},
+            )
 
     def draft(
         self,
@@ -322,7 +546,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     bonus_tokens=state.bonus_tokens,
                     draft_tokens=draft_tokens,
                     live_mask=bucket.live_mask,
+                    budget_width=self._budget_width(bs),
                 )
+                self._step_caps = num_verify_drafts
             return DraftResult(
                 draft_tokens=draft_tokens,
                 draft_logits=None,
@@ -347,7 +573,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 bonus_tokens=state.bonus_tokens,
                 draft_tokens=draft_tokens,
                 live_mask=bucket.live_mask,
+                budget_width=self._budget_width(bs),
             )
+            self._step_caps = num_verify_drafts
         return DraftResult(
             draft_tokens=draft_tokens,
             draft_logits=draft_logits,
@@ -439,13 +667,14 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
         padded_bs = rows.cache_locs.shape[0]
+        budget_width = self._budget_width(padded_bs)
         packed = pack_verify(
             verify_tokens,
             rows,
             draft_result.num_verify_drafts,
             bucket.live_mask,
             bucket.state.seq_lens,
-            self._packed_tokens(padded_bs),
+            self._packed_tokens(padded_bs, budget_width),
         )
         logits_output = self._forward_target_verify(
             batch=batch,
@@ -458,7 +687,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 positions=packed.positions,
                 # Tokens per request as the compile shim pads them (bucket x width);
                 # the backend reads the per-request rows from the layout.
-                draft_token_num=self._packed_tokens(padded_bs) // padded_bs,
+                draft_token_num=budget_width,
                 custom_mask=None,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 live_seq_lens_cpu=batch.seq_lens_cpu,
@@ -471,9 +700,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._check_rank_agreement(accept)
         return logits_output, accept
 
-    def _packed_tokens(self, padded_bs: int) -> int:
-        """compact verify tokens at a bucket; covers the per-live-row draft budget plus roots."""
-        return padded_bs * (self._drafts_per_live_row(padded_bs) + 1)
+    @staticmethod
+    def _packed_tokens(padded_bs: int, budget_width: int) -> int:
+        """compact verify tokens: the per-live-row draft budget plus roots, at the bucket."""
+        return padded_bs * budget_width
 
     def commit(
         self,
@@ -548,6 +778,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def extend(
         self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
     ) -> GenerationBatchResult:
+        # Marks decode intervals that span this prefill (on_verify_complete_cpu).
+        self._extend_ct += 1
         result = self.target_worker.forward_batch_generation(
             batch,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -803,10 +1035,24 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     )
 
     def _warmup_verify_caps(self) -> None:
-        """The confidence/caps program and caps sync per scheduling bucket."""
+        """The confidence/caps program and caps sync per scheduling bucket, and
+        the result's cap_lens per live bs."""
         hidden_size = self._draft_runner.model_config.hidden_size
+        caps_buckets = {pbs for pbs, _ in self._caps_shapes()}
+        runner = self.target_worker.model_runner
+        max_bs = min(runner.max_running_requests, self._b_bucketer().max_val)
         with torch.no_grad():
-            for padded_bs in filter(self._caps_bucket, self._bucket_sizes()):
+            for bs in range(1, max_bs + 1):
+                for padded_bs in self._decode_buckets_for(bs):
+                    if padded_bs in caps_buckets:
+                        warmup_compiled_op(
+                            live_cap_lens,
+                            torch.zeros(
+                                (padded_bs,), dtype=torch.int32, device=self.device
+                            ),
+                            bs,
+                        )
+            for padded_bs, budget_width in self._caps_shapes():
                 # Materialized like the draft graph's flat hidden output.
                 block_hidden = (
                     torch.zeros(
@@ -829,6 +1075,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         device=self.device,
                     ),
                     live_mask=live_mask,
+                    budget_width=budget_width,
                 ).cpu()
 
     def _warmup_compact_verify(self) -> None:
@@ -838,8 +1085,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         hidden_size = self._block_draft_worker.target_hidden_size
         width = self.num_verify_rows
         with torch.no_grad():
-            for padded_bs in filter(self._caps_bucket, self._bucket_sizes()):
-                num_tokens = self._packed_tokens(padded_bs)
+            for padded_bs, budget_width in self._caps_shapes():
+                num_tokens = self._packed_tokens(padded_bs, budget_width)
 
                 def zeros(
                     *shape: int, dtype: torch.dtype = torch.int64

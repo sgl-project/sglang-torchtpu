@@ -33,7 +33,10 @@ from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.spec_types import uniform_ragged_layout
-from sglang_tpu.experimental.speculative.verify_width import verify_width_table
+from sglang_tpu.experimental.speculative.verify_width import (
+    verify_width_candidates,
+    verify_width_table,
+)
 
 logger = get_logger(__name__)
 
@@ -51,8 +54,13 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         # Shared with TpuBlockSpecWorker, which validates the table. compact packs
         # bucket x width tokens per verify; cap-accept verifies at full width.
         assert self.b_bucketer is not None
+        if read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT:
+            return (self.draft_token_num,)
+        candidates = verify_width_candidates(self.draft_token_num)
+        if candidates is not None:
+            return candidates
         table = verify_width_table(self.draft_token_num)
-        if table is None or read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT:
+        if table is None:
             return (self.draft_token_num,)
         return table.reachable_widths(self.b_bucketer.buckets)
 
@@ -91,6 +99,36 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 seq_lens=batch.seq_lens, num_tokens=num_tokens
             )
         return batch
+
+    def profile_target_verify(
+        self, shapes: list[tuple[int, int]], *, repeats: int = 3
+    ) -> dict[tuple[int, int], float]:
+        """Seconds of the warmed TARGET_VERIFY forward per (bucket, width), fastest of repeats.
+
+        Runs the programs warmup compiled (compact buckets narrower than the window
+        through the ragged layout), never a new shape. The dummy batch's short
+        contexts understate attention, so callers treat the result as a prior.
+        """
+        logits_output_mode = self.target_verify_logits_output_modes()[-1]
+        profile = {}
+        for bs, width in shapes:
+            times = []
+            for _ in range(repeats + 1):
+                started = time.perf_counter()
+                out = self._run_one(
+                    num_tokens=bs * width,
+                    bs=bs,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    logits_output_mode=logits_output_mode,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=self.make_verify_spec_info(width=width),
+                )
+                if isinstance(out, PendingCall):
+                    out.wait()
+                times.append(time.perf_counter() - started)
+            # The first run pays one-off host work (dummy inputs, caches).
+            profile[(bs, width)] = min(times[1:])
+        return profile
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.
