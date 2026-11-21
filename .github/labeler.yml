@@ -163,6 +163,11 @@ tpu:
       # LTX-2 two-stage placement on platforms whose subgroup collectives need every rank.
       - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising_av.py'
       - 'python/sglang/multimodal_gen/test/unit/test_ltx2_two_stage_cfg_parallel.py'
+      # The Wan-Animate-2 DiT, blocks and config that
+      # sglang_tpu/multimodal_gen/wan_animate_2.py patches.
+      - 'python/sglang/multimodal_gen/runtime/models/dits/wan_animate_2.py'
+      - 'python/sglang/multimodal_gen/runtime/models/dits/wan_animate_2_block.py'
+      - 'python/sglang/multimodal_gen/configs/pipeline_configs/wan.py'
       - 'python/pyproject_tpu.toml'
       - 'benchmark/tpu/**'
       - 'docker/tpu.Dockerfile'
