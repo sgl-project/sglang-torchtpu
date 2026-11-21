@@ -183,6 +183,21 @@ class TpuEnvs:
     # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
     # sums. Only changes anything with more than one host.
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # Sparse MLA DCP prefill (EXTEND / MIXED) on the decode path: each rank scores and
+    # attends over its own shard with the group's query heads, and the group merges
+    # the top-k candidates and the partial outputs. Per-chunk traffic depends on the
+    # chunk only. False gathers the batch's pages into an unsharded cache instead,
+    # whose traffic and temporaries grow with the gathered history.
+    SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL = EnvBool(False)
+    # Gathered sparse MLA DCP prefill: unsharded scratch slots (requests in
+    # prefill at once) every rank keeps, so a request prefilled from its first
+    # token reads its history there instead of gathering it at every chunk.
+    # Each slot holds max-context latents and index keys; 0 gathers always.
+    SGLANG_TPU_DCP_PREFILL_SCRATCH = EnvInt(0)
+    # That all-reduce: the most rows (decode batch size) it takes; larger
+    # batches keep XLA's all-reduce. 1 = single-token decode only, where it
+    # was measured; the kernel packs up to MAX_ELEMS elements.
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_MAX_ROWS = EnvInt(1)
     # That all-reduce: Kimi-K3's merged MoE reduce also applies the routed
     # latent RMSNorm in the kernel (one op instead of the reduce + two norm
     # fusions). The norm runs on the [1, H] row, which reproduces XLA's f32

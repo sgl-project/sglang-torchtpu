@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError(
             "Kimi-K3 does not support --enable-prefill-cp yet (Kimi-K3.1 does)."
         )
+    if cfg.dcp_size > 1 and current_platform.dcp_attention_backend_merges_mla():
+        # The platform's own MLA backend serves DCP; the GPU backend policy
+        # below does not apply.
+        return {}
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:
@@ -184,6 +189,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if cfg.dcp_size > 1 and current_platform.dcp_attention_backend_merges_mla():
+        # The platform's own MLA backend serves DCP; the GPU backend policy
+        # below does not apply.
+        return {}
     overrides = {}
     if cfg.dcp_size > 1:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
