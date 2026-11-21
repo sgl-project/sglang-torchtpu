@@ -118,11 +118,17 @@ DECODE_SETTINGS = (
     "moe_host_round_odd_cores=true",
     "decode_embedding_replicated=true",
     # The released draft's ring draft (kernels.dspark): q staged padded, the
-    # single-request op inside the verify's, the LM head prefetched, and
-    # first-step drafts. The MLA draft does not read them.
+    # lean epilogue, flat norm weights, a fresh ring output, the Markov trim,
+    # the single-request op inside the verify's, the LM head prefetched, BF16
+    # RoPE tables and first-step drafts. The MLA draft does not read them.
     "ring_draft_q_padded=true",
+    "ring_draft_lean_epilogue=true",
+    "ring_draft_flat_norms=true",
+    "ring_draft_ring_fresh=true",
+    "ring_draft_markov_trim=true",
     "ring_draft_with_verify=true",
     "ring_draft_lm_prefetch=true",
+    "draft_rope_bf16=true",
     "ring_draft_first_step=true",
 )
 # The TensorCore's highest DVFS clock (p-state 7): the MXU, vector and scalar

@@ -111,11 +111,20 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
         self.assertEqual(len(kernel_items(config)), len(settings))
         # The released draft's ring-draft settings on by default.
         self.assertEqual(
-            {name for name in settings if name.startswith("ring_draft_")},
+            {
+                name
+                for name in settings
+                if name.startswith("ring_draft_") or name == "draft_rope_bf16"
+            },
             {
                 "ring_draft_q_padded",
+                "ring_draft_lean_epilogue",
+                "ring_draft_flat_norms",
+                "ring_draft_ring_fresh",
+                "ring_draft_markov_trim",
                 "ring_draft_with_verify",
                 "ring_draft_lm_prefetch",
+                "draft_rope_bf16",
                 "ring_draft_first_step",
             },
         )
