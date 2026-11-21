@@ -162,10 +162,6 @@ POSITIONAL_FIELD_ORDER = (
     "incremental_streaming_output",
     "enable_streaming_session",
     "enable_session_radix_cache",
-    "session_leaf_at_prompt_end",
-    "session_release_evicted_leaf",
-    "session_coverage_host_only",
-    "session_id_header",
     "log_level",
     "log_level_http",
     "log_requests",
@@ -591,5 +587,9 @@ POSITIONAL_FIELD_ORDER = (
     "torch_tpu_topology",
     "custom_pull_weights_pre_read_hook",
     "tpu_node_normalization",
+    "session_leaf_at_prompt_end",
+    "session_release_evicted_leaf",
+    "session_coverage_host_only",
+    "session_id_header",
 )
 # fmt: on
