@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -272,6 +273,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         override = get_context().override_server_args(device="cpu")
         override.install()
         self.addCleanup(override.restore)
+        handle = CacheRequestHandle("one", 0)
         batch = ScheduleBatch(
             reqs=[
                 SimpleNamespace(
@@ -281,6 +283,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     kv=SimpleNamespace(kv_committed_len=64),
                     extend_end=65,
                     full_untruncated_fill_ids=[3] * 65,
+                    cache_request_handle=handle,
                 )
             ],
             device="cpu",
@@ -325,6 +328,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
+        self.assertIs(forward.cache_request_handles[0], handle)
         for target, source in (
             ("mamba_prefill_track_mask_cpu", "mamba_prefill_track_mask_cpu"),
             ("mamba_track_seqlens_cpu", "mamba_track_seqlens_cpu"),
