@@ -1,29 +1,47 @@
 #!/bin/bash
-# Launch the GLM-5.3-Flash AgentX server of one point on one tpu7x 2x2x1 host (tp8), as the
-# measurement harness did. Ready when the log prints "The server is fired up and ready to roll".
-# usage: launch_agentx.sh <1|4|8|16|16-kda1400|32> [--dry-run]
+# Launch one GLM-5.3-Flash AgentX point on one tpu7x 2x2x1 host (tp8) from its run JSON, as job e2df
+# ran the real-weight curve. Ready when the log prints "The server is fired up and ready to roll".
+# usage: launch_agentx.sh <1|4|8|16|32|48> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)
-#   AGENTX_DUMMY=1       random weights: the measured config exactly (default: real weights)
-#   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as the c4-c32 points ran
-#   --dry-run            print the resolved command and server args; start nothing
+#   AGENTX_DEPS=<dir>    pip --target dir: transformers 5.19.0, blake3, timm 1.0.25 (default $CACHE_ROOT/pydeps)
+#   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as c1-c32 ran
+#   AGENTX_NO_SPMD=1     c1 only: use_spmd_compile false (torch_tpu 0.2.0), as c1 ran; writes the JSON to the cache dir
+#   --dry-run            print the resolved env, command and server args; start nothing
+# Removed: point 16-kda1400 and AGENTX_DUMMY, which launched the dummy-weight agentx_cc<N>.py recipes.
 set -euo pipefail
-POINT=${1:-}
-case "$POINT" in
-  1 | 4 | 8 | 16 | 32) RECIPE=agentx_cc$POINT ;;
-  16-kda1400) RECIPE=agentx_cc16_kda1400 ;;
-  *) echo "usage: $0 <1|4|8|16|16-kda1400|32> [--dry-run]" >&2; exit 2 ;;
+case "${1:-}" in
+  1) RUN=R1b_c1_real_l3_ring ;;
+  4) RUN=C4u_c4_real_l3_ring ;;
+  8) RUN=K2ts_c8_real_l3_ring ;;
+  16) RUN=C16_S2ts_kda1400_bf16_real_l3_ring ;;
+  32) RUN=R10_c32_mr32_combo_real_l3_ring ;;
+  48) RUN=R9_c48_mr48_real_l3_ring ;;
+  *) echo "usage: $0 <1|4|8|16|32|48> [--dry-run]" >&2; exit 2 ;;
 esac
+POINT=$1
 case "${2:-}" in
   "") DRY_RUN= ;;
-  --dry-run) DRY_RUN=--dry-run ;;
+  --dry-run) DRY_RUN=1 ;;
   *) echo "unknown argument: $2" >&2; exit 2 ;;
 esac
 [ $# -le 2 ] || { echo "too many arguments" >&2; exit 2; }
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../../../.." && pwd)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$HERE/../../../../../../.." && pwd)
+CFG=$HERE/runs/$RUN.json
 CR=${CACHE_ROOT:-/cache/agentx}/c$POINT
-# The branch's sglang and sglang_tpu, not the image's.
-export PYTHONSAFEPATH=1 PYTHONPATH=$ROOT/python:$ROOT PYTHONFAULTHANDLER=1
+DEPS=${AGENTX_DEPS:-${CACHE_ROOT:-/cache/agentx}/pydeps}
+if [ "${AGENTX_NO_SPMD:-0}" = 1 ]; then
+  [ "$POINT" = 1 ] || { echo "AGENTX_NO_SPMD=1 applies to c1 only" >&2; exit 2; }
+  mkdir -p "$CR"
+  python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); d["server_args"]["use_spmd_compile"] = False; open(sys.argv[2], "w").write(json.dumps(d, indent=2) + "\n")' \
+    "$CFG" "$CR/${RUN}_nospmd.json"
+  CFG=$CR/${RUN}_nospmd.json
+fi
+[ -d "$DEPS" ] || echo "[launch_agentx] warning: no $DEPS; the images lack transformers 5.19.0, blake3, timm 1.0.25" >&2
+unset ENABLE_PROFILER_ENDPOINT SGLANG_TORCH_PROFILER_DIR # no profiler, as measured
+# DEPS first, then the branch's sglang and sglang_tpu, not the image's.
+export PYTHONSAFEPATH=1 PYTHONPATH=$DEPS:$ROOT/python:$ROOT PYTHONFAULTHANDLER=1 HF_HUB_OFFLINE=1
 export TMPDIR=$CR/tmp PROMETHEUS_MULTIPROC_DIR=$CR/prom SGLANG_CACHE_DIR=$CR/sglang
 export TORCHINDUCTOR_CACHE_DIR=$CR/inductor TORCH_TPU_TIER3_ROOT=$CR/tier3
 export TORCH_TPU_TIER2_NAME=agentx_c$POINT
@@ -44,8 +62,9 @@ if [ -z "$DRY_RUN" ]; then
   ln -sfn "$SGLANG_CACHE_DIR" "$HOME/.cache/sglang"
 fi
 cd "$ROOT"
-WEIGHTS=real
-[ "${AGENTX_DUMMY:-0}" = 1 ] && WEIGHTS=dummy
-echo "[launch_agentx] point c$POINT: $RECIPE.py, caches $CR, $WEIGHTS weights" >&2
-exec python3 -u -m benchmark.tpu.launch_server \
-  --config "recipe/configs/glm_5_3_flash/experimental/agentx/$RECIPE.py" $DRY_RUN
+CMD=(python3 -u -m benchmark.tpu.launch_server --config "@$CFG")
+if [ -n "$DRY_RUN" ]; then CMD+=(--dry-run); fi
+env | grep -E '^(PYTHON|HF_HUB_OFFLINE|TMPDIR|PROMETHEUS|SGLANG_CACHE|TORCH|FORCE_SINGLE|TPU_|HOST_BOUNDS|CHIPS_PER)' |
+  sort | sed 's/^/[launch_agentx] env /' >&2
+echo "[launch_agentx] c$POINT, in $ROOT: ${CMD[*]}" >&2
+exec "${CMD[@]}"

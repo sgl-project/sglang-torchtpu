@@ -7,6 +7,8 @@ AL 3.93. One run JSON in `runs/` per point.
 
 ## Results
 
+Chart v29 (artifact version `1795270961-d2fb`), measured and read 2026-11-21.
+
 Real weights, this branch at `f568acf704`, one 1 h window per point (job e2df).
 
 | cc | tok/s/chip | M tokens/$ | 1/ITL p50 / p90 | TTFT p90 s | E2E latency p90 s | prefix hit / ideal % | vs 301e | vs dummy | run JSON |
@@ -138,7 +140,15 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
 
 ### Server
 
-From the repo root, with the run JSON from the table:
+`launch_agentx.sh <1|4|8|16|32|48>` runs the steps below on the point's run JSON
+(`--dry-run` prints the env, command and server args; the usage text lists its knobs):
+
+```bash
+CACHE_ROOT=/cache/agentx AGENTX_HALF_SLICE=1 \
+  benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh 16
+```
+
+By hand, from the repo root, with the run JSON from the table:
 
 ```bash
 A=benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx
@@ -154,7 +164,8 @@ ulimit -c 0
 python3 -u -m benchmark.tpu.launch_server --config @$CFG    # --dry-run prints the command only
 ```
 
-- One host of a 2x2x2 slice run alone, as the dev-pod points ran: export this first.
+- One host of a 2x2x2 slice run alone, as the dev-pod points ran: export this first
+  (launcher: `AGENTX_HALF_SLICE=1`).
 
   ```bash
   export FORCE_SINGLE_HOST=1 TPU_TOPOLOGY=2x2x1 TPU_HOST_BOUNDS=1,1,1 HOST_BOUNDS=1,1,1 \
@@ -162,7 +173,7 @@ python3 -u -m benchmark.tpu.launch_server --config @$CFG    # --dry-run prints t
     TPU_WORKER_ID=0 TPU_PROCESS_ADDRESSES=localhost:8471 TPU_ACCELERATOR_TYPE=tpu7x-8
   ```
 
-- c1 on torch_tpu 0.2.0, as measured:
+- c1 on torch_tpu 0.2.0, as measured (launcher: `AGENTX_NO_SPMD=1`):
 
   ```bash
   python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); d["server_args"]["use_spmd_compile"] = False; json.dump(d, open(sys.argv[2], "w"), indent=2)' \
@@ -225,8 +236,8 @@ python3 $A/summarize.py --md $OUT
     token mode `real-draft-token` and request time stats;
   - `*_real_l3.json`: plus `hybrid_cache_checkpoints_level` 3;
   - `*_real_l3_ring.json`: plus the ring kernel. c1/c4/c8 also get the draft-step changes.
-- The recipes (`agentx_cc<N>.py`, `launch_agentx.sh`, `check_recipes.py`) still build and
-  check the previous dummy-weight points' configs, not these.
+- `launch_agentx.sh` launches these JSONs. The recipes (`agentx_cc<N>.py`,
+  `check_recipes.py`) still build and check the previous dummy-weight points' configs.
 
 ## Other measured runs
 
@@ -330,8 +341,10 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 - `runs/*_real_l3_ring.json`: the launch JSONs of the Results points.
 - `runs/*.json`: the launch JSONs of all measured runs, which are the measurement record.
 - `summarize.py`: computes the metrics of one client output dir.
-- `_base.py`, `agentx_cc<N>.py`, `launch_agentx.sh`, `check_recipes.py`: build, launch and
-  check the previous dummy-weight points' configs. `benchmark/tpu/test_launch_server.py`
-  also runs `check_recipes.py`.
+- `launch_agentx.sh`: launches one Results point from its `*_real_l3_ring.json`, as job
+  e2df ran it (Replicate, Server).
+- `_base.py`, `agentx_cc<N>.py`, `check_recipes.py`: build and check the previous
+  dummy-weight points' configs. `benchmark/tpu/test_launch_server.py` also runs
+  `check_recipes.py`.
 
 Chart: [GLM Flash AgentX Curves](https://claude.ai/artifact/JnGfziw2GBSqDx5LCZArVf)
