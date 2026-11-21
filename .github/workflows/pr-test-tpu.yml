@@ -135,6 +135,10 @@ jobs:
               # LTX-2 two-stage placement on platforms whose subgroup collectives need every rank.
               - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/ltx_2/denoising_av.py'
               - 'python/sglang/multimodal_gen/test/unit/test_ltx2_two_stage_cfg_parallel.py'
+              # Shared Kandinsky 6 SR files sglang_tpu/multimodal_gen/kandinsky6_sr.py patches.
+              - 'python/sglang/multimodal_gen/runtime/models/dits/kandinsky6_sr.py'
+              - 'python/sglang/multimodal_gen/runtime/models/vaes/kandinsky6_sr_vae.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/kandinsky6_sr/stages.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
