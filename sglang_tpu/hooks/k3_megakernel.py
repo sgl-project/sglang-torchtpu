@@ -70,8 +70,10 @@ def _enabled() -> bool:
 
 def _owns_weights() -> bool:
     from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.hooks.k3_program import k3_program_active
 
-    return (
+    # K3_PROGRAM's program owns the decoder weights the same way (hooks/k3_program.py).
+    return k3_program_active() or (
         _enabled() and not tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS.get()
     )
 

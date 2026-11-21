@@ -8,6 +8,7 @@ that turns a device pool into the per-namespace tensor lists raiden registers.
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
@@ -135,6 +136,54 @@ def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
                 f"Raiden requires root tensors (not views) for {name}[{idx}] "
                 "so PJRT buffer registration remains valid."
             )
+
+
+def _k3_program_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
+    """The Kimi-K3 programs' unified pools (K3_PROGRAM), or None.
+
+    KV page ``p`` is row ``p`` of every pool (the 24 MLA pools, then the
+    DSpark draft's five, sharing the target's pages); a Mamba slot's KDA state
+    is three consecutive rows (``UnifiedPoolPlan.state_row``) of the 23 pools
+    that host KDA layers. The state engine registers those pools too.
+    """
+    # Such a pool exists only once a K3_PROGRAM server imported its module:
+    # every other pool is told apart without importing the programs (jax).
+    k3_pools = sys.modules.get("sglang_tpu.k3_programs.sglang_pools")
+    full_pool = getattr(pool, "full_kv_pool", None)
+    if k3_pools is None or not isinstance(full_pool, k3_pools.K3UnifiedKVPool):
+        return None
+    from sglang_tpu.k3_programs import sglang_bridge as bridge
+    from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
+    from sglang_tpu.k3_programs.kimi_k3.pools import draft_raw_pools
+
+    caches, plan = full_pool.caches, full_pool.plan
+    target = [caches[bridge.mla_layer_name(layer)] for layer in MLA]
+    draft = draft_raw_pools(caches)
+    hosts = list(
+        {
+            caches[bridge.kda_layer_name(k)].data_ptr(): caches[
+                bridge.kda_layer_name(k)
+            ]
+            for k in KDA
+        }.values()
+    )
+    # Kimi-K3.1: the DSA index-key pools (target state, after the MLA pools)
+    # share the KV pages' block ids; their ids follow the draft band.
+    index = list(getattr(full_pool, "index_pools", ()))
+    _assert_root_buffers("K3 unified pools", target + index + draft)
+    index_ids = range(NUM_LAYERS + len(draft), NUM_LAYERS + len(draft) + len(index))
+    return RaidenKVCacheGroups(
+        full=target + index + draft,
+        swa=[],
+        full_layer_ids=list(MLA)
+        + list(index_ids)
+        + list(range(NUM_LAYERS, NUM_LAYERS + len(draft))),
+        num_draft_full=len(draft),
+        state=hosts,
+        state_type=StateType.MAMBA,
+        state_max_blocks=bridge.KDA_PER_POOL,
+        committed_state_row=plan.state_row,
+    )
 
 
 def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
@@ -295,6 +344,9 @@ def get_raiden_kv_caches(
             full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
         )
 
+    k3 = _k3_program_groups(pool)
+    if k3 is not None:
+        return k3
     # Lazy: the experimental spec package loads after the platform.
     from sglang_tpu.experimental.speculative.pd_hidden_pool import get_pd_hidden_pool
 
