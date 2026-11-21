@@ -52,6 +52,12 @@ CONFIG["server_args"].update(
         "weight_loader_prefetch_checkpoints": True,
         # Each rank's host-tier replica plus the load's page cache evicts the pod: drop it.
         "weight_loader_drop_cache_after_load": True,
+        # Session-aware host KV eviction keyed on AgentX's X-Correlation-ID header (#2369).
+        "enable_session_radix_cache": True,
+        "session_coverage_host_only": True,
+        "session_id_header": "X-Correlation-ID",
+        "session_leaf_at_prompt_end": True,
+        "session_release_evicted_leaf": True,
     }
 )
 CONFIG["runtime_env"].update(

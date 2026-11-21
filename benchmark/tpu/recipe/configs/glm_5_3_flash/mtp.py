@@ -35,6 +35,14 @@ _args.update(
         # Young-generation GC ~70x rarer: a collection on one TP rank stalls
         # every rank at the next all-reduce.
         "gc_threshold": [50000, 100, 100],
+        # For AgentX / multi-turn benchmarks that send X-Correlation-ID, we
+        # recommend enabling session-aware host KV eviction (see
+        # experimental/agentx_1m.py and #2369):
+        # "enable_session_radix_cache": True,
+        # "session_coverage_host_only": True,
+        # "session_id_header": "X-Correlation-ID",
+        # "session_leaf_at_prompt_end": True,
+        # "session_release_evicted_leaf": True,
     }
 )
 CONFIG["runtime_env"].update(
