@@ -499,3 +499,63 @@ def build_sparse_mla_kv_store_gather_dcp_op(dcp_size: int, interleave_size: int)
     custom_op.register_fake(_fake_impl)
     _OPS[key] = custom_op
     return custom_op
+
+
+def build_dsa_topk_threshold_merge_dcp_op(dcp_size: int, interleave_size: int):
+    """Register ``merge_dcp_topk_threshold`` as a torch custom op, once per layout."""
+    key = ("threshold_merge", dcp_size, interleave_size)
+    if key in _OPS:
+        return _OPS[key]
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_index_topk import merge_dcp_topk_threshold
+
+    op_name = (
+        f"sglang_tpu_pallas::dsa_topk_threshold_merge_dcp{dcp_size}_i{interleave_size}"
+    )
+
+    def _wrapped(
+        all_scores: jax.Array,
+        own_indices: jax.Array,
+        own_scores: jax.Array,
+        dcp_rank: jax.Array,
+        topk: int,
+    ) -> jax.Array:
+        return merge_dcp_topk_threshold(
+            all_scores,
+            own_indices,
+            own_scores,
+            dcp_rank,
+            topk=topk,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=argnums(_wrapped, "topk"),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(op_name, mutates_args=(), device_types=["tpu"])
+    def custom_op(
+        all_scores: torch.Tensor,
+        own_indices: torch.Tensor,
+        own_scores: torch.Tensor,
+        dcp_rank: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return jax_kernel(all_scores, own_indices, own_scores, dcp_rank, topk)
+
+    def _fake_impl(all_scores, own_indices, own_scores, dcp_rank, topk):
+        return torch.empty(
+            (own_indices.shape[0], topk), dtype=torch.int32, device=own_indices.device
+        )
+
+    custom_op.register_fake(_fake_impl)
+    _OPS[key] = custom_op
+    return custom_op

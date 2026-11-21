@@ -183,6 +183,10 @@ class TpuEnvs:
     # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
     # sums. Only changes anything with more than one host.
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # Sparse MLA DCP: merge the group's DSA top-k by a score threshold, so only
+    # scores cross the group and no rank gathers another rank's indices; the
+    # index-gathering merge costs ~1 ms per DSA layer at 64 rows on tpu7x.
+    SGLANG_TPU_DCP_TOPK_THRESHOLD_MERGE = EnvBool(False)
     # Sparse MLA DCP prefill (EXTEND / MIXED) on the decode path: each rank scores and
     # attends over its own shard with the group's query heads, and the group merges
     # the top-k candidates and the partial outputs. Per-chunk traffic depends on the
