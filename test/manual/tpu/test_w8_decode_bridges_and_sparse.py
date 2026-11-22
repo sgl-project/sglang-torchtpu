@@ -701,10 +701,10 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
                     ((b_lc, H_MOE), jnp.bfloat16),
                     ((H_MOE, H), jnp.float8_e4m3fn),
                     ((1, H), jnp.float32),
-                    ((1, H), jnp.float32),
-                    ((1, H), jnp.float32),
-                    ((1, H), jnp.float32),
-                    ((1, H), jnp.float32),
+                    ((H,), jnp.float32),
+                    ((H,), jnp.float32),
+                    ((H,), jnp.float32),
+                    ((H,), jnp.float32),
                     ((H, W * 1280), jnp.float8_e4m3fn),
                     ((1, W * 1280), jnp.float32),
                     ((H, W * 1024), jnp.float8_e4m3fn),
@@ -714,7 +714,7 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
                 check_t16_bf16=(b_lc >= 16),
             )
         _assert_spmd_export_clean(
-            "tok_b1_2d_gains_ws_direct_b64",
+            "tok_b1_1d_gains_ws_direct_b64",
             functools.partial(attn_to_moe_tok_sharded_bridge_jax, world_size=W),
             (P("model", None), P(None, "model"), P("model", None), P("model"), P(), P(), P(), P(None, "model"), P(None, "model"), P(), P()),
             (P("model", None), P(), P()),
@@ -723,13 +723,13 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
                 ((64, W * 1024), jnp.bfloat16),
                 ((W * 1024, H), jnp.float8_e4m3fn),
                 ((W, H), jnp.float32),
-                ((1, H), jnp.float32),
-                ((1, H), jnp.float32),
-                ((1, H), jnp.float32),
+                ((H,), jnp.float32),
+                ((H,), jnp.float32),
+                ((H,), jnp.float32),
                 ((H, W * 2048), jnp.float8_e4m3fn),
                 ((1, W * 2048), jnp.float32),
                 ((H, 256), jnp.bfloat16),
-                ((1, H_MOE), jnp.float32),
+                ((H_MOE,), jnp.float32),
             ],
             check_t16_bf16=False,
         )
@@ -941,19 +941,19 @@ def test_w11_norm_before_s3_b8_b16_and_2d_gains() -> None:
     sg_d = jax.device_put(sg, NamedSharding(mesh, P(None, "model")))
     # Use pre-shaped (1, H) float32 gains & residual gate alphas/betas!
     g1_2d = jax.device_put(
-        jax.random.uniform(jax.random.PRNGKey(93), (1, H), dtype=jnp.float32) + 0.5,
+        jax.random.uniform(jax.random.PRNGKey(93), (H,), dtype=jnp.float32) + 0.5,
         NamedSharding(mesh, P()),
     )
     al_2d = jax.device_put(
-        jax.random.uniform(jax.random.PRNGKey(94), (1, H), dtype=jnp.float32) + 0.5,
+        jax.random.uniform(jax.random.PRNGKey(94), (H,), dtype=jnp.float32) + 0.5,
         NamedSharding(mesh, P()),
     )
     be_2d = jax.device_put(
-        jax.random.uniform(jax.random.PRNGKey(95), (1, H), dtype=jnp.float32) + 0.5,
+        jax.random.uniform(jax.random.PRNGKey(95), (H,), dtype=jnp.float32) + 0.5,
         NamedSharding(mesh, P()),
     )
     g2_2d = jax.device_put(
-        jax.random.uniform(jax.random.PRNGKey(96), (1, H), dtype=jnp.float32) + 0.5,
+        jax.random.uniform(jax.random.PRNGKey(96), (H,), dtype=jnp.float32) + 0.5,
         NamedSharding(mesh, P()),
     )
     rope_tbl = jax.random.normal(jax.random.PRNGKey(97), (256, 128), dtype=jnp.float32) * 0.4

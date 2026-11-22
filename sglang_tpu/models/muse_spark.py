@@ -143,7 +143,7 @@ def _can_use_bridge_qkv_epi(
     )
     allow_small_qkv_epi = os.environ.get(
         "SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI_SMALL", "1"
-    ).strip() not in ("0", "false", "False")
+    ) not in ("0", "false", "False")
     valid_qkv_tok = (
         (n_tok == 8 or (16 <= n_tok <= max_tok and n_tok % 16 == 0))
         if allow_small_qkv_epi
@@ -492,15 +492,12 @@ class MuseSparkRMSNorm(nn.Module):
         )
         # fp32 gain cached by precompute_gain() (SGLANG_TPU_MUSE_KERNEL_ENABLED).
         self.register_buffer("cached_gain", None, persistent=False)
-        self.register_buffer("cached_gain_2d", None, persistent=False)
 
     @torch.no_grad()
     def precompute_gain(self) -> None:
-        """Caches 1D and (1, D) fp32 gain so decode bridges skip per-step reshapes."""
+        """Caches gain() so decode stops recomputing `weight + center` every step."""
         if self.weight is not None:
-            g = (self.weight.float() + self.gain_center).contiguous()
-            self.cached_gain = g
-            self.cached_gain_2d = g.reshape(1, -1).contiguous()
+            self.cached_gain = self.gain()
 
     def gain(self) -> Optional[torch.Tensor]:
         if self.cached_gain is not None:
@@ -508,12 +505,6 @@ class MuseSparkRMSNorm(nn.Module):
         if self.weight is None:
             return None
         return self.weight.float() + self.gain_center
-
-    def gain_2d(self) -> Optional[torch.Tensor]:
-        if self.cached_gain_2d is not None:
-            return self.cached_gain_2d
-        g = self.gain()
-        return g.reshape(1, -1) if g is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gain = self.gain()
@@ -539,18 +530,14 @@ class MuseSparkGatedResidual(nn.Module):
         self.gate = nn.Parameter(torch.empty(dim), requires_grad=False)
         self.register_buffer("alpha", torch.ones(dim), persistent=False)
         self.register_buffer("beta", torch.ones(dim), persistent=False)
-        self.register_buffer("alpha_2d", torch.ones(1, dim), persistent=False)
-        self.register_buffer("beta_2d", torch.ones(1, dim), persistent=False)
 
     @torch.no_grad()
     def precompute_coefficients(self) -> None:
         scaled = self.gate.float() / self.temperature
         beta = torch.sigmoid(scaled)
         alpha = torch.sqrt(torch.clamp(torch.sigmoid(-scaled) * (1.0 + beta), self.eps))
-        self.alpha = alpha.to(self.gate.device).contiguous()
-        self.beta = beta.to(self.gate.device).contiguous()
-        self.alpha_2d = self.alpha.reshape(1, -1).contiguous()
-        self.beta_2d = self.beta.reshape(1, -1).contiguous()
+        self.alpha = alpha.to(self.gate.device)
+        self.beta = beta.to(self.gate.device)
 
     def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
         return self.alpha * stream + self.beta * branch.to(stream.dtype)
@@ -3561,10 +3548,10 @@ class MuseSparkDecoderLayer(nn.Module):
                     attn_input = self.input_layernorm(stream).to(torch.bfloat16)
 
             if b1_kind > 0:
-                pa_alpha_arg = self.post_attention_residual_gate.alpha_2d
-                pa_beta_arg = self.post_attention_residual_gate.beta_2d
-                pre_ff_gain = self.pre_feedforward_layernorm.gain_2d()
-                pre_exp_gain = self.mlp.pre_expert_norm.gain_2d()
+                pa_alpha_arg = self.post_attention_residual_gate.alpha
+                pa_beta_arg = self.post_attention_residual_gate.beta
+                pre_ff_gain = self.pre_feedforward_layernorm.gain()
+                pre_exp_gain = self.mlp.pre_expert_norm.gain()
                 assert pre_ff_gain is not None and pre_exp_gain is not None
                 prerouted_topk = False
                 if b1_kind == 2:
@@ -3766,9 +3753,9 @@ class MuseSparkDecoderLayer(nn.Module):
                     and moe_out.shape[0] >= 8
                     and moe_out.shape[0] % 8 == 0
                 )
-                post_ff_gain = self.post_feedforward_layernorm.gain_2d()
-                pf_alpha_arg = self.post_feedforward_residual_gate.alpha_2d
-                pf_beta_arg = self.post_feedforward_residual_gate.beta_2d
+                post_ff_gain = self.post_feedforward_layernorm.gain()
+                pf_alpha_arg = self.post_feedforward_residual_gate.alpha
+                pf_beta_arg = self.post_feedforward_residual_gate.beta
                 assert post_ff_gain is not None
                 use_qkv_epi = (
                     b2_kind == 3
@@ -3796,7 +3783,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             next_input_layernorm is not None
                             and next_layer_attn is not None
                         )
-                        next_in_gain = next_input_layernorm.gain_2d()
+                        next_in_gain = next_input_layernorm.gain()
                         assert next_in_gain is not None
                         next_has_rope = next_layer_attn.rotary_emb is not None
                         if use_qkv_epi:
@@ -3878,7 +3865,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             bool(next_input_layernorm.scale_input),
                         )
                     if final_layernorm is not None:
-                        fin_gain = final_layernorm.gain_2d()
+                        fin_gain = final_layernorm.gain()
                         assert fin_gain is not None
                         hid_f = get_moe_post_tok_sharded_final_norm_op(
                             tp, return_stream_too=False
@@ -3898,7 +3885,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         )
                         return (hid_f,)
                     assert next_input_layernorm is not None
-                    next_in_gain = next_input_layernorm.gain_2d()
+                    next_in_gain = next_input_layernorm.gain()
                     assert next_in_gain is not None
                     return get_moe_post_tok_sharded_final_norm_op(
                         tp, return_stream_too=True
@@ -3923,7 +3910,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     assert (
                         next_input_layernorm is not None and next_layer_attn is not None
                     )
-                    next_in_gain = next_input_layernorm.gain_2d()
+                    next_in_gain = next_input_layernorm.gain()
                     assert next_in_gain is not None
                     wq_next = next_layer_attn._buffers["_w7_wqkv_w8k"]
                     wg_next = next_layer_attn._buffers["_w7_wgate_w8k"]
@@ -4118,7 +4105,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     )
                 if b2_kind == 2:
                     assert next_input_layernorm is not None
-                    next_in_gain = next_input_layernorm.gain_2d()
+                    next_in_gain = next_input_layernorm.gain()
                     assert next_in_gain is not None
                     return get_moe_post_ag_res_norm_op(tp, sharded_moe_in=sharded_in)(
                         stream,
@@ -4139,7 +4126,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         get_moe_post_ag_final_norm_op,
                     )
 
-                    fin_gain = final_layernorm.gain_2d()
+                    fin_gain = final_layernorm.gain()
                     assert fin_gain is not None
                     hid_w7 = get_moe_post_ag_final_norm_op(
                         tp, sharded_moe_in=sharded_in
@@ -4642,7 +4629,7 @@ class MuseSparkTextModel(nn.Module):
                 )
 
                 l0_ln = self.layers[self.start_layer].input_layernorm
-                l0_gain = l0_ln.gain_2d()
+                l0_gain = l0_ln.gain()
                 assert l0_gain is not None
                 stream, carried_attn_input = get_decode_vocab_embed_tok_sharded_op(8)(
                     input_ids.to(torch.int32),
