@@ -2109,16 +2109,29 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
-                local_topk_ids_u8_b, global_topk_u8_b, _ = (
-                    jax.lax.optimization_barrier(
-                        (local_topk_ids_u8, global_topk_u8, i8_1)
+                ovl_deq0_env = getattr(
+                    envs, "SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG", None
+                )
+                use_ovl_deq0 = bool(ovl_deq0_env is not None and ovl_deq0_env.get())
+                if use_ovl_deq0 and not (dequant_1pass or _use_pq_lhs_fp8):
+                    ag_i8_0_b, _ = jax.lax.optimization_barrier((ag_i8_0, i8_1))
+                    hs_4d = dequant_half_gmm_layout(ag_i8_0_b, None)
+                    hs_4d, local_topk_ids_u8_b, global_topk_u8_b = (
+                        jax.lax.optimization_barrier(
+                            (hs_4d, local_topk_ids_u8, global_topk_u8)
+                        )
                     )
-                )
-                hs_4d = (
-                    None
-                    if (dequant_1pass or _use_pq_lhs_fp8)
-                    else dequant_half_gmm_layout(ag_i8_0, None)
-                )
+                else:
+                    local_topk_ids_u8_b, global_topk_u8_b, _ = (
+                        jax.lax.optimization_barrier(
+                            (local_topk_ids_u8, global_topk_u8, i8_1)
+                        )
+                    )
+                    hs_4d = (
+                        None
+                        if (dequant_1pass or _use_pq_lhs_fp8)
+                        else dequant_half_gmm_layout(ag_i8_0, None)
+                    )
                 eff_n_loc_rt = num_local_experts + eff_cm_slots_pipe
                 eff_go_rt = my_id * eff_n_loc_rt if eff_cm_pipe else go_val
                 (

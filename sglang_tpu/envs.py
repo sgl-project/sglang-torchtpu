@@ -1106,6 +1106,13 @@ class TpuEnvs:
     # Wave-8 prefill stream All-Gather: quantize full-stream gathers to per-row FP8 + packed bf16
     # scale before all-gather and fuse chunk-major unpermute on 1-byte FP8 before dequantization.
     SGLANG_TPU_MUSE_KERNEL_FP8_STREAM_GATHER = EnvBool(False)
+    # Wave-9 prefill CCS fused AG+A1: fuse next-chunk all_gather(rest_in[k+1]) inside a1_chunk's
+    # shard_map MLIR module so SparseCore/ICI AG overlaps directly under pallas_a1_chunk_1way
+    # (0 = off, 1 = lax.all_gather / XOR1_BRIDGE_AG, 2 = force xor1_bridge_all_gather on CCS AG).
+    SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 = EnvInt(0)
+    # Wave-9 prefill FUSED_B1_B2=3/4 overlap: run dequant_half_gmm_layout(ag_i8_0) before waiting
+    # on global_topk_u8's optimization_barrier so dequant_half0 overlaps global_topk_u8 + ag_i8_1.
+    SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG = EnvBool(False)
     # Muse prefill kernel A1: zero-copy 2D tiled all-gather, unsliced 2D RoPE, direct 4D
     # RPA KV layout, and fused kv_local strided-128 s8 pre-quantization.
     SGLANG_TPU_MUSE_KERNEL_A1_ZC = EnvBool(False)

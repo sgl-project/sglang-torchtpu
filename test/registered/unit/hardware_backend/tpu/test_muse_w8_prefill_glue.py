@@ -31,6 +31,8 @@ _W8_FLAGS = (
     "SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST",
     "SGLANG_TPU_MUSE_KERNEL_ZERO_SORT_ROUTING",
     "SGLANG_TPU_MUSE_KERNEL_FP8_STREAM_GATHER",
+    "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1",
+    "SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG",
 )
 
 
@@ -67,6 +69,8 @@ def test_w8_prefill_glue_flags_default_off_and_dot_get():
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_ZERO_SORT_ROUTING.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_FP8_STREAM_GATHER.get() is False
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() == 0
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get() is False
 
     repo = pathlib.Path(__file__).resolve().parents[5]
     checked = set(_W8_FLAGS)
@@ -1028,3 +1032,301 @@ def test_row_tiled_dequant_gmm_layout_16k_28k_32k_parity_and_hlo():
                 .as_text("stablehlo")
             )
             assert "dequant_both_halves_gmm_layout_psc" in h_both
+
+
+
+def test_ccs_fuse_ag_a1_and_overlap_deq0_routing_ag_8dev_hlo_and_parity():
+    """Verify fused CCS a1_chunk_agd (modes 1 & 2) bit-exact parity + OVERLAP_DEQ0_ROUTING_AG HLO ordering."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax import lax
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+
+    if len(jax.devices()) < 8:
+        pytest.skip("Requires >=8 virtual/physical JAX devices")
+
+    mesh = Mesh(np.array(jax.devices()[:8]), ("model",))
+    tp_d = 8
+    c_k = 128
+    c_next = 128
+    h_q_local = 16
+    h_kv_local = 2
+    hidden = 8192
+    q_cols = h_q_local * 64
+    qg_cols = 2 * q_cols + 2 * h_kv_local * 64
+
+    def _make_fused_and_sep(fuse_mode: int, *, rpa_layout: bool = True):
+        use_xor1 = fuse_mode == 2
+
+        def _prep_fp8(x_sl):
+            if x_sl.dtype != jnp.float8_e4m3fn:
+                return jnp.clip(
+                    x_sl.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT,
+                    -448.0,
+                    448.0,
+                ).astype(jnp.float8_e4m3fn)
+            return x_sl
+
+        def _ag(x_f8):
+            if use_xor1:
+                return xor1_bridge_all_gather(x_f8, axis_name="model", tiled=False)
+            return lax.all_gather(x_f8, "model", axis=0, tiled=False)
+
+        def _a1_body(ag_k, wqkvg, wqkvg_sc, cos_k, sin_k):
+            w_sc = wqkvg_sc * kernel_a1.STATIC_A1_ACT_SCALE
+            q_k, gate_k, kv_k = kernel_a1.pallas_a1_chunk_1way(
+                ag_k,
+                wqkvg,
+                w_sc,
+                cos_k.reshape(tp_d, c_k, 128),
+                sin_k.reshape(tp_d, c_k, 128),
+                None,
+                t_shard=c_k,
+                row_off=0,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+                rpa_layout=rpa_layout,
+                mode="all",
+                tp_axis="model",
+                tm=128,
+            )
+            c_tok = tp_d * c_k
+            if rpa_layout:
+                return (
+                    q_k.reshape(1, c_tok, h_q_local // 2, 2, 128),
+                    gate_k.reshape(c_tok, h_q_local * 64),
+                    kv_k.reshape(c_tok, 1, 4, 128),
+                )
+            return (
+                q_k.reshape(c_tok, h_q_local * 64),
+                gate_k.reshape(c_tok, h_q_local * 64),
+                kv_k.reshape(c_tok, 2 * h_kv_local * 64),
+            )
+
+        def _fused_body(ag_k, next_sl, wqkvg, wqkvg_sc, cos_k, sin_k):
+            nf8 = _prep_fp8(next_sl)
+            nf8_b, ag_b = lax.optimization_barrier((nf8, ag_k))
+            ag_next = _ag(nf8_b)
+            q_o, g_o, kv_o = _a1_body(ag_b, wqkvg, wqkvg_sc, cos_k, sin_k)
+            return q_o, g_o, kv_o, ag_next
+
+        fused_sm = jax.shard_map(
+            _fused_body,
+            mesh=mesh,
+            in_specs=(P("model"),) * 6,
+            out_specs=(P("model"),) * 4,
+            check_vma=False,
+        )
+        ag_sm = jax.shard_map(
+            lambda x: _ag(_prep_fp8(x)),
+            mesh=mesh,
+            in_specs=(P("model"),),
+            out_specs=P("model"),
+            check_vma=False,
+        )
+        a1_sm = jax.shard_map(
+            _a1_body,
+            mesh=mesh,
+            in_specs=(P("model"),) * 5,
+            out_specs=(P("model"),) * 3,
+            check_vma=False,
+        )
+        return fused_sm, ag_sm, a1_sm
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        for fm in (1, 2):
+            fused_sm, _, _ = _make_fused_and_sep(fm)
+            for ndtype in (jnp.bfloat16, jnp.float8_e4m3fn):
+                hlo = (
+                    jax.jit(fused_sm)
+                    .trace(
+                        jax.ShapeDtypeStruct((tp_d * tp_d, c_k, hidden), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((tp_d * c_next, hidden), ndtype),
+                        jax.ShapeDtypeStruct((tp_d * hidden, qg_cols), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((tp_d, qg_cols), jnp.float32),
+                        jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+                        jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+                    )
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text("stablehlo")
+                )
+                assert "pallas_a1_1way_all" in hlo
+                assert "partition_id" not in hlo
+                if fm == 1:
+                    assert "all_gather" in hlo
+
+        rng = np.random.default_rng(2029)
+        ag_k_np = rng.standard_normal((tp_d * tp_d, c_k, hidden)).astype(np.float32) * 0.2
+        next_np = rng.standard_normal((tp_d * c_next, hidden)).astype(np.float32) * 0.2
+        wqg_np = rng.standard_normal((tp_d * hidden, qg_cols)).astype(np.float32) * 0.05
+        wsc_np = rng.uniform(0.01, 0.05, size=(tp_d, qg_cols)).astype(np.float32)
+        cos_np = np.ones((tp_d * tp_d * c_k, 128), dtype=np.float32)
+        sin_np = np.zeros((tp_d * tp_d * c_k, 128), dtype=np.float32)
+
+        fused_sm1, ag_sm1, a1_sm1 = _make_fused_and_sep(1, rpa_layout=False)
+        with _interpret_on_cpu():
+            ag_k_j = jnp.asarray(ag_k_np).astype(jnp.float8_e4m3fn)
+            wqg_j = jnp.asarray(wqg_np).astype(jnp.float8_e4m3fn)
+            wsc_j = jnp.asarray(wsc_np)
+            cos_j = jnp.asarray(cos_np)
+            sin_j = jnp.asarray(sin_np)
+            for next_j in (
+                jnp.asarray(next_np, dtype=jnp.bfloat16),
+                jnp.clip(jnp.asarray(next_np) * 32.0, -448.0, 448.0).astype(
+                    jnp.float8_e4m3fn
+                ),
+            ):
+                q_f, g_f, kv_f, agn_f = fused_sm1(
+                    ag_k_j, next_j, wqg_j, wsc_j, cos_j, sin_j
+                )
+                agn_ref = ag_sm1(next_j)
+                q_r, g_r, kv_r = a1_sm1(ag_k_j, wqg_j, wsc_j, cos_j, sin_j)
+                np.testing.assert_array_equal(
+                    np.asarray(q_f.astype(jnp.float32)),
+                    np.asarray(q_r.astype(jnp.float32)),
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(g_f.astype(jnp.float32)),
+                    np.asarray(g_r.astype(jnp.float32)),
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(kv_f.astype(jnp.float32)),
+                    np.asarray(kv_r.astype(jnp.float32)),
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(agn_f.astype(jnp.float32)),
+                    np.asarray(agn_ref.astype(jnp.float32)),
+                )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_LAYOUT_DEQUANT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_B2_PACK_BF16_SCALE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+                "SGLANG_TPU_MUSE_KERNEL_B1_B2_PREPACK": "1",
+                "SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_OPT": "3",
+                "SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG": "1",
+            },
+        ):
+            in_specs = (
+                P("model", None),
+                P("model", None),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P("model"),
+                P("model"),
+                P("model"),
+                P("model"),
+                P(),
+                P("model"),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+            )
+            out_specs = (
+                P("model", None),
+                P("model", None),
+                P("model", None),
+                P("model", None),
+                P(None, None, None),
+            )
+            shmapped = jax.shard_map(
+                lambda a, s, b1v, d1, d2, wr, eb, wp, b2v, pew, w1, w2, s1, s2, pnw, go, wu, wus, pffnw, affn, bffn, ninw: fused_moe_full_bridge_and_ffn(
+                    a,
+                    s,
+                    b1v,
+                    d1,
+                    d2,
+                    wr,
+                    eb,
+                    wp,
+                    b2v,
+                    pew,
+                    w1,
+                    w2,
+                    s1,
+                    s2,
+                    pnw,
+                    go,
+                    wu,
+                    wus,
+                    pffnw,
+                    affn,
+                    bffn,
+                    ninw,
+                    mesh=mesh,
+                    router_mode="bf16_hilo_pre",
+                    b2_layout="nstream",
+                    b2_two_half=True,
+                    b2_deq0_first=True,
+                    hoist_routing=True,
+                    d_layout="4slab",
+                    d_tok_tile=64,
+                    in_shard_map=True,
+                    b2_deq0_new_buffer=True,
+                    next_in_gather_rows=256,
+                    next_in_gather_static_fp8=True,
+                ),
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )
+            hlo_ovl = (
+                jax.jit(shmapped)
+                .trace(
+                    jax.ShapeDtypeStruct((8192, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8192, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16384, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256, 128), jnp.float32),
+                    jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8, 4096), jnp.float32),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((256, 16, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256, 16, 4096), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8,), jnp.int32),
+                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                )
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+            assert "partition_id" not in hlo_ovl
+            pos_deq0 = hlo_ovl.find("dequant_half0_gmm_layout_psc")
+            pos_sort = hlo_ovl.find("stablehlo.sort")
+            assert pos_deq0 != -1 and pos_sort != -1
+            assert pos_deq0 < pos_sort, "dequant_half0 must precede routing sort!"

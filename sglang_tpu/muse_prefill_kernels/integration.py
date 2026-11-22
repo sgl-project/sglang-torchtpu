@@ -64,6 +64,7 @@ class _Ops(NamedTuple):
     # SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM: per-chunk AG + A1 (+ optional A3 prologue) ops.
     ag_chunk: object = None
     a1_chunk: object = None
+    a1_chunk_agd: object = None
     a3_prologue_chunk: object = None
     a3_wo: object = None
     gather_fp8_stream: object = None
@@ -1051,6 +1052,8 @@ def _ops(
     b1_b2_fast: bool = False,
     zero_sort_routing: bool = False,
     fp8_stream_gather: bool = False,
+    ccs_fuse_ag_a1: int = 0,
+    overlap_deq0_routing_ag: bool = False,
     carb_tag: str = "",
 ) -> _Ops:
     """Per-rank torch ops: every tensor is this rank's block (P("model") on dim 0)."""
@@ -1387,6 +1390,7 @@ def _ops(
         + ("_b12f" if b1_b2_fast else "")
         + ("_b12p" if b1_b2_prepack and not b1_b2_fast else "")
         + ("_zsr" if zero_sort_routing else "")
+        + ("_odeq0" if overlap_deq0_routing_ag else "")
         + (
             "_dcoal"
             if tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_COAL_GATHER.get()
@@ -1490,13 +1494,16 @@ def _ops(
         )
     ag_chunk_op = None
     a1_chunk_op = None
+    a1_chunk_agd_op = None
     if causal_chunk_stream:
         import jax.numpy as jnp
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
 
-        def ag_chunk_body(x_slice):
+        use_xor1_ccs_ag = (xor1_ag_mode >= 1) or (ccs_fuse_ag_a1 == 2)
+
+        def _prep_ccs_fp8_slice(x_slice):
             if x_slice.dtype != jnp.float8_e4m3fn:
-                x_slice = (
+                return (
                     jnp.clip(
                         x_slice.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT,
                         -_FP8_MAX,
@@ -1505,9 +1512,15 @@ def _ops(
                     if x_slice.shape[0] > 0
                     else x_slice.astype(jnp.float8_e4m3fn)
                 )
-            if xor1_ag_mode >= 1:
-                return xor1_bridge_all_gather(x_slice, axis_name=_AXIS, tiled=False)
-            return lax.all_gather(x_slice, _AXIS, axis=0, tiled=False)
+            return x_slice
+
+        def _ccs_all_gather(x_fp8):
+            if use_xor1_ccs_ag:
+                return xor1_bridge_all_gather(x_fp8, axis_name=_AXIS, tiled=False)
+            return lax.all_gather(x_fp8, _AXIS, axis=0, tiled=False)
+
+        def ag_chunk_body(x_slice):
+            return _ccs_all_gather(_prep_ccs_fp8_slice(x_slice))
 
         ag_chunk_sm = shard(ag_chunk_body, 1, 1)
 
@@ -1553,13 +1566,49 @@ def _ops(
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return a1_chunk_sm(ag_k, wqkvg, wqkvg_scale, cos_k, sin_k)
 
+        ccs_ag_sfx = (
+            f"_xag{xor1_ag_mode}"
+            if xor1_ag_mode > 0
+            else ("_xagccs" if use_xor1_ccs_ag else "")
+        )
         ag_chunk_op = export(
-            "ag_chunk" + (f"_xag{xor1_ag_mode}" if xor1_ag_mode > 0 else ""),
+            "ag_chunk" + ccs_ag_sfx,
             ag_chunk,
             1,
             1,
         )
         a1_chunk_op = export("a1_chunk_v6_rpal" + a1_w8_tag, a1_chunk, 5, 3)
+        if ccs_fuse_ag_a1 > 0:
+
+            def a1_chunk_agd_body(ag_k, next_slice, wqkvg, wqkvg_scale, cos_k, sin_k):
+                next_fp8 = _prep_ccs_fp8_slice(next_slice)
+                next_fp8_b, ag_k_b = lax.optimization_barrier((next_fp8, ag_k))
+                ag_next = _ccs_all_gather(next_fp8_b)
+                q_out, gate_out, kv_out = a1_chunk_body(
+                    ag_k_b, wqkvg, wqkvg_scale, cos_k, sin_k
+                )
+                return q_out, gate_out, kv_out, ag_next
+
+            a1_chunk_agd_sm = shard(a1_chunk_agd_body, 6, 4)
+
+            def a1_chunk_agd(
+                ag_k: jax.Array,
+                next_slice: jax.Array,
+                wqkvg: jax.Array,
+                wqkvg_scale: jax.Array,
+                cos_k: jax.Array,
+                sin_k: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                return a1_chunk_agd_sm(
+                    ag_k, next_slice, wqkvg, wqkvg_scale, cos_k, sin_k
+                )
+
+            a1_chunk_agd_op = export(
+                "a1_chunk_agd_v6_rpal" + a1_w8_tag + ccs_ag_sfx,
+                a1_chunk_agd,
+                6,
+                4,
+            )
     a3_pro_chunk_op = None
     a3_wo_op = None
     if causal_chunk_stream and a3_variant == "v16" and ccs_chunk_a3_prologue:
@@ -1793,6 +1842,7 @@ def _ops(
         else None,
         ag_chunk=ag_chunk_op,
         a1_chunk=a1_chunk_op,
+        a1_chunk_agd=a1_chunk_agd_op,
         a3_prologue_chunk=a3_pro_chunk_op,
         a3_wo=a3_wo_op,
         gather_fp8_stream=gather_fp8_op,
@@ -2213,6 +2263,8 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST.get(),
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_ZERO_SORT_ROUTING.get(),
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_FP8_STREAM_GATHER.get(),
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get(),
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get(),
             _w8_carb_cache_tag(),
         )
         self.a3_kdeep_wo = int(
@@ -2792,17 +2844,32 @@ class MusePrefillKernels(torch.nn.Module):
                 rest_off = chunks[0]
             q_parts, gate_parts, kv_parts = [], [], []
             for k, c_k in enumerate(chunks):
-                if k + 1 < len(chunks):
+                has_next_c = k + 1 < len(chunks)
+                if has_next_c and self.ops.a1_chunk_agd is not None:
                     c_next = chunks[k + 1]
-                    ag_next = self.ops.ag_chunk(rest_in[rest_off : rest_off + c_next])
+                    q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
+                        ag_cur,
+                        rest_in[rest_off : rest_off + c_next],
+                        weights.wqkvg,
+                        wqkvg_scale,
+                        rope_chunks[k][0],
+                        rope_chunks[k][1],
+                    )
                     rest_off += c_next
-                q_k, gate_k, kv_k = self.ops.a1_chunk(
-                    ag_cur,
-                    weights.wqkvg,
-                    wqkvg_scale,
-                    rope_chunks[k][0],
-                    rope_chunks[k][1],
-                )
+                else:
+                    if has_next_c:
+                        c_next = chunks[k + 1]
+                        ag_next = self.ops.ag_chunk(
+                            rest_in[rest_off : rest_off + c_next]
+                        )
+                        rest_off += c_next
+                    q_k, gate_k, kv_k = self.ops.a1_chunk(
+                        ag_cur,
+                        weights.wqkvg,
+                        wqkvg_scale,
+                        rope_chunks[k][0],
+                        rope_chunks[k][1],
+                    )
                 be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k])
                 q_parts.append(q_k)
                 gate_parts.append(gate_k.reshape(-1, q_size))
@@ -3145,17 +3212,32 @@ class MusePrefillKernels(torch.nn.Module):
             out_tail: tuple[int, ...] = ()
             q_size = attn.num_heads * 64
             for k, c_k in enumerate(chunks):
-                if k + 1 < len(chunks):
+                has_next_c = k + 1 < len(chunks)
+                if has_next_c and self.ops.a1_chunk_agd is not None:
                     c_next = chunks[k + 1]
-                    ag_next = self.ops.ag_chunk(rest_in[rest_off : rest_off + c_next])
+                    q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
+                        ag_cur,
+                        rest_in[rest_off : rest_off + c_next],
+                        weights.wqkvg,
+                        wqkvg_scale,
+                        rope_chunks[k][0],
+                        rope_chunks[k][1],
+                    )
                     rest_off += c_next
-                q_k, gate_k, kv_k = self.ops.a1_chunk(
-                    ag_cur,
-                    weights.wqkvg,
-                    wqkvg_scale,
-                    rope_chunks[k][0],
-                    rope_chunks[k][1],
-                )
+                else:
+                    if has_next_c:
+                        c_next = chunks[k + 1]
+                        ag_next = self.ops.ag_chunk(
+                            rest_in[rest_off : rest_off + c_next]
+                        )
+                        rest_off += c_next
+                    q_k, gate_k, kv_k = self.ops.a1_chunk(
+                        ag_cur,
+                        weights.wqkvg,
+                        wqkvg_scale,
+                        rope_chunks[k][0],
+                        rope_chunks[k][1],
+                    )
                 if self.a3_rpa_out:
                     out_k = self._forward_rpa_raw_packed(
                         q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
@@ -3307,17 +3389,29 @@ class MusePrefillKernels(torch.nn.Module):
         q_last_loc = None
         for k, _c_k in enumerate(chunks):
             has_next = k + 1 < len(chunks)
-            if has_next:
+            if has_next and self.ops.a1_chunk_agd is not None:
                 c_next = chunks[k + 1]
-                ag_next = self.ops.ag_chunk(rest_in[rest_off : rest_off + c_next])
+                q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
+                    ag_cur,
+                    rest_in[rest_off : rest_off + c_next],
+                    weights.wqkvg,
+                    wqkvg_scale,
+                    rope_chunks[k][0],
+                    rope_chunks[k][1],
+                )
                 rest_off += c_next
-            q_k, gate_k, kv_k = self.ops.a1_chunk(
-                ag_cur,
-                weights.wqkvg,
-                wqkvg_scale,
-                rope_chunks[k][0],
-                rope_chunks[k][1],
-            )
+            else:
+                if has_next:
+                    c_next = chunks[k + 1]
+                    ag_next = self.ops.ag_chunk(rest_in[rest_off : rest_off + c_next])
+                    rest_off += c_next
+                q_k, gate_k, kv_k = self.ops.a1_chunk(
+                    ag_cur,
+                    weights.wqkvg,
+                    wqkvg_scale,
+                    rope_chunks[k][0],
+                    rope_chunks[k][1],
+                )
             if self.a3_rpa_out:
                 out_k = self._forward_rpa_raw_packed(
                     q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
@@ -3542,6 +3636,11 @@ class MusePrefillKernels(torch.nn.Module):
             + (
                 "_zsr"
                 if tpu_envs.SGLANG_TPU_MUSE_KERNEL_ZERO_SORT_ROUTING.get()
+                else ""
+            )
+            + (
+                "_odeq0"
+                if tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get()
                 else ""
             )
             + (
