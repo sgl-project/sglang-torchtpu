@@ -1235,15 +1235,13 @@ def _decode_fast_kernel(
         base_r = pg_idx * phys_page_rows
         n_subs = phys_page_rows // 128
 
-        def _sub_mask(sub_i, _):
+        for sub_i in range(n_subs):
             row_off = sub_i * 128
             src_off = pl.multiple_of(base_r + row_off, 128)
             blk = u32_flat[pl.ds(src_off, 128)]
             u32_flat[pl.ds(src_off, 128)] = _mask_slice_u32(
                 blk, row_off, 128, lo, hi
             )
-
-        lax.fori_loop(0, n_subs, _sub_mask, None)
 
     def _zero_pages_u32(slot, start_pg, end_pg):
         if interpret_mode:
@@ -1325,10 +1323,8 @@ def _decode_fast_kernel(
         """
         n_pg = (rel_end + page_size - 1) // page_size
         last_p = jnp.clip(n_pg - 1, 0, active_pages - 1)
-        if sliding_window is not None:
-            @pl.when((rel_first > 0) & (last_p > 0))
-            def _clean_pg0_swa():
-                _sanitize_page_u32(slot, 0, rel_first, rel_end)
+        if sliding_window is not None and active_pages * page_size >= sliding_window:
+            _sanitize_page_u32(slot, 0, rel_first, rel_end)
         if cfg.lazy_slot_zero:
             hwm_b0 = written_cnt_smem_ref[2 + slot]
             start_b0 = jnp.maximum(n_pg, hwm_b0)
