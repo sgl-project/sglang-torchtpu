@@ -35,6 +35,7 @@ MAX_DISTRIBUTED_TOP_K = 64
 _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
     1, envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.get()
 )
+_MUSE_GREEDY_TOPK1_AUTO_MIN_BATCH_SIZE = 8
 # Kill switch for the sort-free top-k/top-p/min-p filtering path.
 _BSEARCH_SAMPLING_ENABLED = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
 
@@ -56,6 +57,26 @@ _DISTRIBUTED_TOP_K_STATES: dict[int, _DistributedTopKState] = {}
 
 def distributed_top_k_min_batch_size() -> int:
     return _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+
+
+def _muse_greedy_topk1_auto_enabled() -> bool:
+    auto_greedy_env = getattr(envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
+    return bool(auto_greedy_env is not None and auto_greedy_env.get())
+
+
+def _fused_fp8_lm_head_enabled() -> bool:
+    fused_env = getattr(envs, "SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK", None)
+    return bool(fused_env is not None and fused_env.get())
+
+
+def effective_distributed_top_k_min_batch_size(*, greedy: bool = False) -> int:
+    """Return the physical batch cutoff, lowering to 8 under opt-in Muse auto-routing."""
+    min_bs = distributed_top_k_min_batch_size()
+    if _muse_greedy_topk1_auto_enabled() and (
+        greedy or _fused_fp8_lm_head_enabled()
+    ):
+        return min(min_bs, _MUSE_GREEDY_TOPK1_AUTO_MIN_BATCH_SIZE)
+    return min_bs
 
 
 def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int]:
@@ -252,10 +273,7 @@ def distributed_top_k_for_batch(
     # Mode selection happens after TPU padding, so use the physical batch size.
     # The logical size must not become a compile-time guard.
     batch_size = getattr(forward_batch, "batch_size", 0)
-    if (
-        getattr(forward_batch, "return_logprob", False)
-        or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
-    ):
+    if getattr(forward_batch, "return_logprob", False):
         return None
 
     mode = forward_batch.forward_mode
@@ -263,9 +281,12 @@ def distributed_top_k_for_batch(
         return None
 
     info = forward_batch.sampling_info
-    greedy_topk = envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get() and getattr(
-        info, "is_all_greedy", False
-    )
+    greedy_topk = (
+        envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
+        or _muse_greedy_topk1_auto_enabled()
+    ) and getattr(info, "is_all_greedy", False)
+    if batch_size < effective_distributed_top_k_min_batch_size(greedy=greedy_topk):
+        return None
     if not greedy_topk:
         top_k = info.uniform_top_k
         if (
@@ -345,7 +366,7 @@ def _can_use_fused_gumbel_max_for_batch(forward_batch, model) -> bool:
     if (
         info is None
         or getattr(forward_batch, "return_logprob", False)
-        or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+        or batch_size < effective_distributed_top_k_min_batch_size()
     ):
         return False
     mode = forward_batch.forward_mode
@@ -399,10 +420,9 @@ def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
         return LogitsOutputMode.FULL_VOCAB
     if requested_top_k > candidate_width:
         return LogitsOutputMode.FULL_VOCAB
-    auto_greedy_env = getattr(envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
     if requested_top_k == 1 and (
         envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
-        or (auto_greedy_env is not None and auto_greedy_env.get())
+        or _muse_greedy_topk1_auto_enabled()
     ):
         return LogitsOutputMode.DISTRIBUTED_GREEDY
     return LogitsOutputMode.DISTRIBUTED_TOP_K

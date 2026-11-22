@@ -660,3 +660,107 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
             page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
         )
         assert m_dec2.swa_page_indices.tolist() == [9, 11, 0, 0, 10, 12, 0, 0]
+
+
+
+def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
+    """SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO unlocks bs>=8 while preserving .default==64."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang_tpu import sampler as tpu_sampler
+    from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
+    from sglang_tpu.envs import envs as tpu_envs
+
+    assert tpu_envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.default == 64
+    assert tpu_envs.SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO.default is False
+
+    class _FakeInfo(SimpleNamespace):
+        def __len__(self):
+            return int(self.temperatures.shape[0])
+
+    def _make_fb(bs: int, *, greedy: bool, top_k: int | None):
+        info = _FakeInfo(
+            is_all_greedy=greedy,
+            is_any_greedy=greedy,
+            uniform_top_k=top_k,
+            sampling_seed=None,
+            need_top_k_sampling=(not greedy and top_k is not None),
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            sampling_support_logprobs_capture_indices=None,
+            has_custom_logit_processor=False,
+            logit_bias=None,
+            grammars=None,
+            sampling_mask_batch_indices=None,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            penalizer_orchestrator=None,
+            sampling_params_on_cpu=True,
+            temperatures=torch.full((bs, 1), 0.0 if greedy else 0.8, dtype=torch.float32),
+            device="cpu",
+        )
+        return SimpleNamespace(
+            spec_info=None,
+            spec_algorithm=None,
+            sampling_info=info,
+            batch_size=bs,
+            return_logprob=False,
+            forward_mode=ForwardMode.DECODE,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+            gumbel_temperatures=None,
+        )
+
+    model = SimpleNamespace(
+        lm_head=SimpleNamespace(fp8_w8k=torch.empty(1, dtype=torch.int8)),
+        logits_processor=SimpleNamespace(final_logit_softcapping=None),
+    )
+
+    pol = object.__new__(DecoderTpuCompilePolicy)
+    pol.model_runner = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        device="cpu",
+        model_config=SimpleNamespace(vocab_size=204800),
+    )
+    pol._distributed_top_k_width = lambda: 64
+
+    with mock.patch("sglang_tpu.sampler.distributed_top_k_candidate_width_for_model", return_value=64):
+        # Default (AUTO=False): bs=16 stays FULL_VOCAB everywhere.
+        with mock.patch("sglang_tpu.sampler.distributed_top_k_min_batch_size", return_value=64):
+            assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.FULL_VOCAB
+            assert pol._warmup_logits_output_modes(16) == (LogitsOutputMode.FULL_VOCAB,)
+
+            # AUTO=True without FUSED_FP8_LM_HEAD_TOPK: unlocks bs>=8 greedy only, not non-greedy TopK.
+            with (
+                tpu_envs.SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO.override(True),
+                tpu_envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.override(False),
+                tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.override(False),
+            ):
+                assert tpu_sampler.select_logits_output_mode(_make_fb(4, greedy=True, top_k=1), model) is LogitsOutputMode.FULL_VOCAB
+                assert tpu_sampler.select_logits_output_mode(_make_fb(8, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
+                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
+                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=50), model) is LogitsOutputMode.FULL_VOCAB
+                assert pol._warmup_logits_output_modes(4) == (LogitsOutputMode.FULL_VOCAB,)
+                assert pol._warmup_logits_output_modes(16) == (
+                    LogitsOutputMode.DISTRIBUTED_GREEDY,
+                    LogitsOutputMode.FULL_VOCAB,
+                )
+
+            # AUTO=True + FUSED_FP8_LM_HEAD_TOPK=True (+ GUMBEL_MAX=True): unlocks bs>=8 across greedy, TopK, Gumbel-max.
+            with (
+                tpu_envs.SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO.override(True),
+                tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.override(True),
+                tpu_envs.SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD.override(True),
+            ):
+                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
+                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=50), model) is LogitsOutputMode.DISTRIBUTED_TOP_K
+                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=None), model) is LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX
+                assert pol._warmup_logits_output_modes(16) == (
+                    LogitsOutputMode.DISTRIBUTED_GREEDY,
+                    LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX,
+                    LogitsOutputMode.DISTRIBUTED_TOP_K,
+                    LogitsOutputMode.FULL_VOCAB,
+                )

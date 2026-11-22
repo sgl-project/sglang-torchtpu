@@ -1174,29 +1174,43 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
             return (LogitsOutputMode.FULL_VOCAB,)
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.sampler import (
-            distributed_top_k_min_batch_size,
+            effective_distributed_top_k_min_batch_size,
         )
 
-        if batch_size < distributed_top_k_min_batch_size():
+        auto_greedy_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
+        auto_greedy = bool(auto_greedy_env is not None and auto_greedy_env.get())
+        greedy_min_bs = effective_distributed_top_k_min_batch_size(greedy=True)
+        topk_min_bs = effective_distributed_top_k_min_batch_size(greedy=False)
+        if batch_size < min(greedy_min_bs, topk_min_bs):
             return (LogitsOutputMode.FULL_VOCAB,)
-        from sglang_tpu.envs import envs as tpu_envs
 
         modes: list[LogitsOutputMode] = []
-        auto_greedy_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
-        if (
-            tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
-            or (auto_greedy_env is not None and auto_greedy_env.get())
-        ) and tpu_envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get():
-            modes.append(LogitsOutputMode.DISTRIBUTED_GREEDY)
-        gumbel_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD", None)
-        if (
-            gumbel_env is not None
-            and gumbel_env.get()
-            and tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.get()
+        if batch_size >= greedy_min_bs and (
+            auto_greedy
+            or (
+                tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
+                and tpu_envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
+            )
         ):
-            modes.append(LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX)
-        modes.extend((LogitsOutputMode.DISTRIBUTED_TOP_K, LogitsOutputMode.FULL_VOCAB))
+            modes.append(LogitsOutputMode.DISTRIBUTED_GREEDY)
+        if batch_size >= topk_min_bs:
+            gumbel_env = getattr(
+                tpu_envs, "SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD", None
+            )
+            fused_env = getattr(
+                tpu_envs, "SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK", None
+            )
+            if (
+                gumbel_env is not None
+                and gumbel_env.get()
+                and fused_env is not None
+                and fused_env.get()
+            ):
+                modes.append(LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX)
+            modes.append(LogitsOutputMode.DISTRIBUTED_TOP_K)
+        modes.append(LogitsOutputMode.FULL_VOCAB)
         return tuple(modes)
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
