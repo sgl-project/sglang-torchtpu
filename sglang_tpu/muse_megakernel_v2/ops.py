@@ -194,11 +194,6 @@ def _check_ep_serving(parallel) -> None:
         raise NotImplementedError(
             f"SGLANG_TPU_MUSE_MOE_MODE=ep needs SGLANG_TPU_MUSE_MK_QBLOCK={KPERM_BLOCK}"
         )
-    if tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_GROUP.get():
-        raise NotImplementedError(
-            "SGLANG_TPU_MUSE_MOE_MODE=ep: no stacked expert groups "
-            "(SGLANG_TPU_MUSE_MK_EXPERT_GROUP=0)"
-        )
     required = (
         tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL,
         tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP,
