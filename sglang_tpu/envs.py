@@ -1446,6 +1446,12 @@ class TpuEnvs:
     # 1 = Pallas 2D (128,128) VMEM+MXU compaction + 32k/64k/full lax.switch power-of-2 sort;
     # 2 = pure-XLA 4096-chunk pre-compacted 32k sort + lax.cond exact fallback).
     SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT = EnvInt(0)
+    # Wave-12 prefill zero-concat 2-chunk CCS A3 Wo: pass (q_part0_3d, q_part1_3d) directly into
+    # _opt_wo_2chunk_kernel without torch.cat(q_parts, dim=1) (%pad_maximum_fusion).
+    SGLANG_TPU_MUSE_KERNEL_A3_CCS_2CHUNK = EnvBool(False)
+    # Wave-12 prefill enable 1-op Pallas VMEM+SMEM chipmate router during TorchTPU CPU export
+    # (via get_tpu_info_or_none() is not None instead of jax.default_backend() == 'tpu').
+    SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

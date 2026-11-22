@@ -68,6 +68,7 @@ class _Ops(NamedTuple):
     a1_chunk_agd: object = None
     a3_prologue_chunk: object = None
     a3_wo: object = None
+    a3_wo_2chunk: object = None
     gather_fp8_stream: object = None
     # Wave-8 CCS Mode-2 K-deep A3 ops (per-chunk prologue+A2A + fused last-chunk K-deep Wo).
     a3_pro_a2a_chunk: object = None
@@ -988,6 +989,8 @@ def _w8_carb_cache_tag() -> str:
         f"_w4u{tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()}"
         f"_rnp{int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get())}"
         f"_cls{tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()}"
+        f"_a32c{int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_CCS_2CHUNK.get())}"
+        f"_pcmr{int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get())}"
     )
 
 
@@ -1419,6 +1422,11 @@ def _ops(
             if tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()
             else ""
         )
+        + (
+            "_pcmr"
+            if tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get()
+            else ""
+        )
     )
     fp8_tiles_tag = tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_FP8_GMM_TILES.get().replace(
         ",", "_"
@@ -1624,6 +1632,7 @@ def _ops(
             )
     a3_pro_chunk_op = None
     a3_wo_op = None
+    a3_wo_2chunk_op = None
     if causal_chunk_stream and a3_variant == "v16" and ccs_chunk_a3_prologue:
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
 
@@ -1717,6 +1726,41 @@ def _ops(
             a3_wo_n_in,
             1,
         )
+        if (
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_CCS_2CHUNK.get()
+            and a3_opt
+            and not a3_skip
+            and a3_kdeep_ccs_wo1 == 0
+            and w4_wo_ccs_mode == 0
+        ):
+
+            def a3_wo_2chunk_body(q0_3d, q1_3d, wo_in, wo_sc_in):
+                return kernel_a3.pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
+                    q0_3d,
+                    q1_3d,
+                    wo_in,
+                    wo_sc_in,
+                    tp_axis=_AXIS,
+                )
+
+            a3_wo_2c_sm = shard(a3_wo_2chunk_body, 4, 1)
+
+            def a3_wo_2chunk(
+                q0_3d: jax.Array,
+                q1_3d: jax.Array,
+                wo_in: jax.Array,
+                wo_sc_in: jax.Array,
+            ) -> jax.Array:
+                return a3_wo_2c_sm(q0_3d, q1_3d, wo_in, wo_sc_in)
+
+            a3_wo_2chunk_op = export(
+                "a3_v16_wo_2chunk"
+                + (f"_ss{a3_stage_sends}" if a3_stage_sends else "")
+                + ("_bn2k" if a3_bn2k_ccs else ""),
+                a3_wo_2chunk,
+                4,
+                1,
+            )
     a3_pro_a2a_chunk_op = None
     a3_pro_last_chunk_op = None
     a3_kdeep_ccs_op = None
@@ -1905,6 +1949,7 @@ def _ops(
         a1_chunk_agd=a1_chunk_agd_op,
         a3_prologue_chunk=a3_pro_chunk_op,
         a3_wo=a3_wo_op,
+        a3_wo_2chunk=a3_wo_2chunk_op,
         gather_fp8_stream=gather_fp8_op,
         a3_pro_a2a_chunk=a3_pro_a2a_chunk_op,
         a3_pro_last_chunk=a3_pro_last_chunk_op,
@@ -3322,8 +3367,17 @@ class MusePrefillKernels(torch.nn.Module):
                 if k + 1 < len(chunks):
                     ag_cur = ag_next
             if use_chunk_pro:
-                q_3d = torch.cat(q_parts, dim=1)
-                attn_out_shard = self.ops.a3_wo(q_3d, wo, wo_scale, *a3_extra)
+                if (
+                    self.ops.a3_wo_2chunk is not None
+                    and len(q_parts) == 2
+                    and not a3_extra
+                ):
+                    attn_out_shard = self.ops.a3_wo_2chunk(
+                        q_parts[0], q_parts[1], wo, wo_scale
+                    )
+                else:
+                    q_3d = torch.cat(q_parts, dim=1)
+                    attn_out_shard = self.ops.a3_wo(q_3d, wo, wo_scale, *a3_extra)
             else:
                 out = torch.cat(out_parts, dim=1).reshape(-1, *out_tail)
                 gate = torch.cat(gate_parts, dim=1).reshape(-1, q_size)
@@ -3726,6 +3780,11 @@ class MusePrefillKernels(torch.nn.Module):
             + (
                 f"_cls{tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()}"
                 if tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()
+                else ""
+            )
+            + (
+                "_pcmr"
+                if tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get()
                 else ""
             )
         )

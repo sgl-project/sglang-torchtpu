@@ -2900,6 +2900,337 @@ def pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
     )(src_4d, wo_fp8_xor_3d, wo_scale_2d)
 
 
+
+def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
+    q_part0_3d: jax.Array,
+    q_part1_3d: jax.Array,
+    wo_fp8_xor_3d: jax.Array,
+    wo_scale_2d: jax.Array,
+    *,
+    tp_axis: str = "model",
+    bn: int = 1024,
+    vmem_limit_mb: int = 62,
+    d_order: tuple[int, ...] | None = None,
+    stage_sends_mode: int | None = None,
+) -> jax.Array:
+    """Zero-concat 2-chunk CCS variant of ``_opt_wo_kernel`` reading ``(q_part0_3d, q_part1_3d)`` directly.
+
+    Eliminates the external ``torch.cat(q_parts, dim=1)`` (``%pad_maximum_fusion``: ``+5.14 ms/fwd``
+    and ``+2.94 GB/fwd`` at ``c24k``) by issuing 64-row-aligned local/remote DMAs directly from
+    ``q_part0_3d [tp, c0, k_local]`` and ``q_part1_3d [tp, c1, k_local]`` into ``recv_vmem``.
+    """
+    from sglang_tpu.envs import envs as _tpu_envs
+
+    tp_deg, c0, k_local = q_part0_3d.shape
+    tp_deg_1, c1, k_local_1 = q_part1_3d.shape
+    assert tp_deg == tp_deg_1 and k_local == k_local_1
+    t_shard = c0 + c1
+    if c0 < 64 or c1 < 64 or c0 % 64 != 0 or c1 % 64 != 0:
+        return pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+            jnp.concatenate([q_part0_3d, q_part1_3d], axis=1),
+            wo_fp8_xor_3d,
+            wo_scale_2d,
+            tp_axis=tp_axis,
+            bn=bn,
+            vmem_limit_mb=vmem_limit_mb,
+            opt_wo=True,
+            d_order=d_order,
+            stage_sends_mode=stage_sends_mode,
+        )
+
+    _, _, n_dim = wo_fp8_xor_3d.shape
+    ss_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS", None)
+    eff_stage_mode = (
+        int(stage_sends_mode)
+        if stage_sends_mode is not None
+        else (int(ss_env.get()) if ss_env is not None else 0)
+    )
+    use_parity_stagger = (
+        d_order is None and tp_deg == 8 and eff_stage_mode in (1, 2)
+    )
+    bn2048_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A3_BN2048", None)
+    allow_bn2048 = bool(
+        bn2048_env is not None
+        and bn2048_env.get()
+        and t_shard <= 4096
+        and (t_shard <= 2048 or t_shard % 512 == 0)
+    )
+    bn_eff = (
+        2048
+        if ((t_shard <= 1024 or allow_bn2048) and n_dim % 2048 == 0)
+        else bn
+    )
+    max_tm_half = (
+        1024
+        if (t_shard <= 2048 or (t_shard == 3072 and bn_eff == 1024))
+        else 512
+    )
+    tm_half = next(
+        (
+            t
+            for t in (1024, 512, 256, 128)
+            if t <= max_tm_half and t <= t_shard and t_shard % t == 0
+        ),
+        t_shard,
+    )
+    num_t_half = t_shard // tm_half
+    num_j = n_dim // bn_eff
+    step_xors = tuple(range(tp_deg)) if d_order is None else tuple(d_order)
+
+    # Static DMA segment table: each entry is (seg_id, th_i, part_idx, src_r0, dst_r0, nrows).
+    segs: list[tuple[int, int, int, int, int, int]] = []
+    th_segs: list[list[tuple[int, int, int, int, int, int]]] = [
+        [] for _ in range(num_t_half)
+    ]
+    for th_i in range(num_t_half):
+        r0 = th_i * tm_half
+        r1 = r0 + tm_half
+        if r1 <= c0:
+            item = (len(segs), th_i, 0, r0, 0, tm_half)
+            segs.append(item)
+            th_segs[th_i].append(item)
+        elif r0 >= c0:
+            item = (len(segs), th_i, 1, r0 - c0, 0, tm_half)
+            segs.append(item)
+            th_segs[th_i].append(item)
+        else:
+            len0 = c0 - r0
+            len1 = r1 - c0
+            item0 = (len(segs), th_i, 0, r0, 0, len0)
+            segs.append(item0)
+            th_segs[th_i].append(item0)
+            item1 = (len(segs), th_i, 1, 0, len0, len1)
+            segs.append(item1)
+            th_segs[th_i].append(item1)
+    num_segs = len(segs)
+
+    def _opt_wo_2chunk_kernel(
+        src0_hbm_ref,
+        src1_hbm_ref,
+        w_xor_ref,
+        w_sc_ref,
+        out_hbm_ref,
+        recv_vmem,
+        acc_vmem,
+        out_vmem,
+        rsems,
+        ssems,
+        out_sems,
+    ):
+        t_half = pl.program_id(0)
+        step = pl.program_id(1)
+        j = pl.program_id(2)
+        me = lax.axis_index(tp_axis)
+
+        def _src_slice(p_idx: int, r_idx, s_r0: int, nr: int):
+            ref = src0_hbm_ref if p_idx == 0 else src1_hbm_ref
+            return ref.at[pl.ds(r_idx, 1), pl.ds(s_r0, nr), :]
+
+        def _dst_slice(th_i: int, d_idx, d_r0: int, nr: int):
+            return recv_vmem.at[pl.ds(th_i * tp_deg + d_idx, 1), pl.ds(d_r0, nr), :]
+
+        def _send_remote(th_idx: int, d_idx: int):
+            peer = _a3_v16_step_peer_jax(
+                me,
+                d_idx,
+                tp_deg,
+                step_xors=step_xors,
+                parity_stagger=use_parity_stagger,
+            )
+            for seg_id, _, p_idx, s_r0, d_r0, nr in th_segs[th_idx]:
+                pltpu.make_async_remote_copy(
+                    src_ref=_src_slice(p_idx, peer, s_r0, nr),
+                    dst_ref=_dst_slice(th_idx, d_idx, d_r0, nr),
+                    send_sem=ssems.at[seg_id, d_idx],
+                    recv_sem=rsems.at[seg_id, d_idx],
+                    device_id={tp_axis: peer},
+                ).start()
+
+        @pl.when((t_half == 0) & (step == 0) & (j == 0))
+        def _():
+            for seg_id, th_i, p_idx, s_r0, d_r0, nr in segs:
+                pltpu.make_async_copy(
+                    _src_slice(p_idx, me, s_r0, nr),
+                    _dst_slice(th_i, 0, d_r0, nr),
+                    rsems.at[seg_id, 0],
+                ).start()
+            if tp_deg > 1:
+                barrier = pltpu.get_barrier_semaphore()
+                for d in range(1, tp_deg):
+                    pl.semaphore_signal(
+                        barrier, device_id={tp_axis: lax.rem(me + d, tp_deg)}
+                    )
+                pl.semaphore_wait(barrier, tp_deg - 1)
+                if eff_stage_mode == 2:
+                    for d in range(1, min(3, tp_deg)):
+                        _send_remote(0, d)
+                elif eff_stage_mode in (1, 3):
+                    for d in range(1, tp_deg):
+                        _send_remote(0, d)
+                else:
+                    for th_i in range(num_t_half):
+                        for d in range(1, tp_deg):
+                            _send_remote(th_i, d)
+            for seg_id, th_i, _, _, d_r0, nr in segs:
+                pltpu.make_async_copy(
+                    _dst_slice(th_i, 0, d_r0, nr),
+                    _dst_slice(th_i, 0, d_r0, nr),
+                    rsems.at[seg_id, 0],
+                ).wait()
+
+        @pl.when(step == 0)
+        def _():
+            acc_vmem[j, :, :] = jnp.dot(
+                recv_vmem[t_half * tp_deg, :, :],
+                w_xor_ref[0, :, :],
+                preferred_element_type=jnp.float32,
+            )
+
+        @pl.when((step > 0) & (j == 0))
+        def _():
+            if eff_stage_mode == 2:
+                for _th in range(num_t_half):
+
+                    @pl.when(t_half == _th)
+                    def _(_th=_th):
+                        for _d in range(1, tp_deg):
+
+                            @pl.when(step == _d)
+                            def _(_d=_d):
+                                for seg_id, _, _, _, d_r0, nr in th_segs[_th]:
+                                    pltpu.make_async_copy(
+                                        _dst_slice(_th, _d, d_r0, nr),
+                                        _dst_slice(_th, _d, d_r0, nr),
+                                        rsems.at[seg_id, _d],
+                                    ).wait()
+                                if tp_deg > 1:
+                                    next_d = _d + 1
+                                    if _d >= 2 and next_d < tp_deg:
+                                        _send_remote(_th, next_d)
+                                    elif _d == tp_deg - 1 and _th + 1 < num_t_half:
+                                        for d_init in range(1, min(3, tp_deg)):
+                                            _send_remote(_th + 1, d_init)
+            else:
+                for _th in range(num_t_half):
+
+                    @pl.when(t_half == _th)
+                    def _(_th=_th):
+                        for seg_id, _, _, _, d_r0, nr in th_segs[_th]:
+                            pltpu.make_async_copy(
+                                _dst_slice(_th, step, d_r0, nr),
+                                _dst_slice(_th, step, d_r0, nr),
+                                rsems.at[seg_id, step],
+                            ).wait()
+                        if (
+                            tp_deg > 1
+                            and eff_stage_mode in (1, 3)
+                            and _th + 1 < num_t_half
+                        ):
+
+                            @pl.when(step == tp_deg - 1)
+                            def _(_next_th=_th + 1):
+                                for d in range(1, tp_deg):
+                                    _send_remote(_next_th, d)
+
+        @pl.when((step > 0) & (step < tp_deg - 1))
+        def _():
+            acc_vmem[j, :, :] = acc_vmem[j, :, :] + jnp.dot(
+                recv_vmem[t_half * tp_deg + step, :, :],
+                w_xor_ref[0, :, :],
+                preferred_element_type=jnp.float32,
+            )
+
+        @pl.when(step == tp_deg - 1)
+        def _():
+            out_slot = lax.rem(j, 2)
+            slot_row0 = pl.multiple_of(out_slot * tm_half, 8)
+
+            @pl.when((t_half > 0) | (j >= 2))
+            def _():
+                pltpu.make_async_copy(
+                    out_vmem.at[pl.ds(slot_row0, tm_half), :],
+                    out_hbm_ref.at[pl.ds(0, tm_half), pl.ds(0, bn_eff)],
+                    out_sems.at[out_slot],
+                ).wait()
+
+            acc_vmem[j, :, :] = acc_vmem[j, :, :] + jnp.dot(
+                recv_vmem[t_half * tp_deg + step, :, :],
+                w_xor_ref[0, :, :],
+                preferred_element_type=jnp.float32,
+            )
+            sub_r = min(128, tm_half)
+            sub_c = min(256, bn_eff)
+            for rb in range(tm_half // sub_r):
+                r0_b, r1_b = rb * sub_r, (rb + 1) * sub_r
+                dst_r0 = pl.multiple_of(out_slot * tm_half + r0_b, 8)
+                for cb in range(bn_eff // sub_c):
+                    c0_b, c1_b = cb * sub_c, (cb + 1) * sub_c
+                    sc_sub = w_sc_ref[:, c0_b:c1_b] * STATIC_A3_ACT_SCALE
+                    out_vmem[pl.ds(dst_r0, sub_r), c0_b:c1_b] = (
+                        acc_vmem[j, r0_b:r1_b, c0_b:c1_b] * sc_sub
+                    ).astype(jnp.bfloat16)
+
+            pltpu.make_async_copy(
+                out_vmem.at[pl.ds(slot_row0, tm_half), :],
+                out_hbm_ref.at[
+                    pl.ds(t_half * tm_half, tm_half),
+                    pl.ds(j * bn_eff, bn_eff),
+                ],
+                out_sems.at[out_slot],
+            ).start()
+
+        @pl.when(
+            (t_half == num_t_half - 1) & (step == tp_deg - 1) & (j == num_j - 1)
+        )
+        def _():
+            for s in range(min(2, num_j)):
+                pltpu.make_async_copy(
+                    out_vmem.at[pl.ds(s * tm_half, tm_half), :],
+                    out_hbm_ref.at[pl.ds(0, tm_half), pl.ds(0, bn_eff)],
+                    out_sems.at[s],
+                ).wait()
+            if tp_deg > 1:
+                for seg_id, _, p_idx, s_r0, _, nr in segs:
+                    for d in range(1, tp_deg):
+                        pltpu.make_async_copy(
+                            _src_slice(p_idx, 0, s_r0, nr),
+                            _src_slice(p_idx, 0, s_r0, nr),
+                            ssems.at[seg_id, d],
+                        ).wait()
+
+    any_spec = pl.BlockSpec(memory_space=getattr(pltpu, "ANY", pltpu.HBM))
+    scratches = [
+        pltpu.VMEM((num_t_half * tp_deg, tm_half, k_local), jnp.float8_e4m3fn),
+        pltpu.VMEM((num_j, tm_half, bn_eff), jnp.float32),
+        pltpu.VMEM((2 * tm_half, bn_eff), jnp.bfloat16),
+        pltpu.SemaphoreType.DMA((num_segs, tp_deg)),
+        pltpu.SemaphoreType.DMA((num_segs, tp_deg)),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    cp = pltpu.CompilerParams(
+        dimension_semantics=("arbitrary", "arbitrary", "arbitrary"),
+        collective_id=6 if tp_deg > 1 else None,
+        vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+    )
+    ss_tag = f"_ss{eff_stage_mode}" if eff_stage_mode > 0 else ""
+    return pl.pallas_call(
+        _opt_wo_2chunk_kernel,
+        grid=(num_t_half, tp_deg, num_j),
+        in_specs=[
+            any_spec,
+            any_spec,
+            pl.BlockSpec(
+                (1, k_local, bn_eff), lambda t_half, step, j: (step, 0, j)
+            ),
+            pl.BlockSpec((1, bn_eff), lambda t_half, step, j: (0, j)),
+        ],
+        out_specs=any_spec,
+        out_shape=jax.ShapeDtypeStruct((t_shard, n_dim), jnp.bfloat16),
+        scratch_shapes=scratches,
+        compiler_params=cp,
+        name=f"pallas_a3_wo_2chunk_c{c0}_{c1}_bn{bn_eff}{ss_tag}",
+    )(q_part0_3d, q_part1_3d, wo_fp8_xor_3d, wo_scale_2d)
+
 def a3_v16_option3d_zero_copy9_persrc_sem_async_a2a_wo_3d_sp(
     normed_attn_out: jax.Array,
     gate: jax.Array,

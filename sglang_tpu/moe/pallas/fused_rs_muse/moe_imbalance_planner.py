@@ -2732,8 +2732,15 @@ def _can_use_tpu_pallas_prefill_router(total_elems: int, use_pallas: bool | None
         return True
     try:
         import jax
+        from sglang_tpu.envs import envs as _tpu_envs
 
-        return jax.default_backend() == "tpu"
+        if jax.default_backend() == "tpu":
+            return True
+        if _tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get():
+            from sglang_tpu.pallas_export import get_tpu_info_or_none
+
+            return get_tpu_info_or_none() is not None
+        return False
     except Exception:
         return False
 
