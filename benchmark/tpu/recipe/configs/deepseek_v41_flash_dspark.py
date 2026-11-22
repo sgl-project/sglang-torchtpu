@@ -52,13 +52,22 @@ CONFIG["server_args"].update(
         # bounded SWA tail instead of reserving an SWA pool.
         "disable_radix_cache": False,
         "enable_encoder_swa_bounded_replay": True,
+        # Decoder SWA bounded replay (CED prefill): a prefix hit recomputes only
+        # the late-layer rows each request keeps ("prompt" rows below).
+        "enable_decoder_swa_bounded_replay": True,
     }
 )
 CONFIG["runtime_env"].update(
     {
         "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-        # Each rank holds 1/8 of the LM head; the target verify and the draft
-        # score their rows through one all-to-all pair; GSM8K 0.914 vs 0.911.
-        "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD": "1",
+        # The vocab-parallel head (each rank holds 1/8 of the LM head) stays
+        # off in the interim recipe; "1" turns it on.
+        "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD": "0",
+        # Decoder replay keeps each extend request's prompt tail rows.
+        "SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS": "prompt",
+        # DP routing by pending uncached prompt tokens; routed_dp_rank is an
+        # affinity hint (new prompts may move, continuations follow their cache).
+        "SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN": "0.25",
+        "SGLANG_TPU_DP_PROMPT_BACKLOG_ROUTED": "1",
     }
 )
