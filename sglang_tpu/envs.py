@@ -270,6 +270,11 @@ class TpuEnvs:
     # drops the last turn's content and continues from the turn before it then
     # resumes at that turn's tail, not at the page boundary.
     SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS_KEEP_EXTENDED = EnvBool(False)
+    # A Kimi tokenizer's chat segment encodings reused across requests
+    # (sglang_tpu/hooks/kimi_tokenizer.py): up to this many cached tokens, the
+    # least recently used out first (0: off). A session's next turn encodes
+    # only its new messages.
+    SGLANG_TPU_KIMI_TOKENIZER_SEGMENT_CACHE_TOKENS = EnvInt(0)
     # The decode program's DSpark schedule, "min:max:drafts,..." per batch size
     # (drafts 7 or 3 through batch 8, 3 through 16). Empty: 7 through four
     # requests, 3 through eight.

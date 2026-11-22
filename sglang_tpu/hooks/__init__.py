@@ -76,6 +76,7 @@ from sglang_tpu.hooks.kimi_k3_vision import (
     encode_with_k3_vision_runner,
     pass_through_projected_features,
 )
+from sglang_tpu.hooks.kimi_tokenizer import hook_specs as kimi_tokenizer_hooks
 from sglang_tpu.hooks.logprob_grid import hook_specs as logprob_grid_hooks
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
@@ -481,6 +482,8 @@ HOOKS.extend(swa_miss_metrics_hooks())
 HOOKS.extend(hook_specs())
 
 HOOKS.extend(k3_program_hooks())
+
+HOOKS.extend(kimi_tokenizer_hooks())
 
 HOOKS.extend(padded_logits_sampling_hooks())
 
