@@ -1,11 +1,11 @@
 #!/bin/bash
 # Launch one GLM-5.3-Flash AgentX point on one tpu7x 2x2x1 host (tp8) from its run JSON, as jobs
-# 36d0 (c1-c16) and e2df (c32/c48) ran them. Ready when the log prints "The server is fired up and
-# ready to roll".
-# usage: launch_agentx.sh <1|4|8|16|32|48> [--dry-run]
+# 36d0 (c1-c16), 83cb (c32), ae9c (c36) and e2df (c48) ran them. Ready when the log prints "The
+# server is fired up and ready to roll".
+# usage: launch_agentx.sh <1|4|8|16|32|36|48> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)
 #   AGENTX_DEPS=<dir>    pip --target dir: transformers 5.19.0, blake3, timm 1.0.25 (default $CACHE_ROOT/pydeps)
-#   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as c1-c32 ran
+#   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as c1-c36 ran
 #   AGENTX_NO_SPMD=1     c1 only: use_spmd_compile false (torch_tpu 0.2.0), as c1 ran; writes the JSON to the cache dir
 #   --dry-run            print the resolved env, command and server args; start nothing
 # Removed: point 16-kda1400 and AGENTX_DUMMY, which launched the dummy-weight agentx_cc<N>.py recipes.
@@ -15,9 +15,10 @@ case "${1:-}" in
   4) RUN=C4u_c4_real_l3_ring_full ;;
   8) RUN=K2ts_c8_real_l3_ring_full ;;
   16) RUN=C16_S2ts_kda1400_bf16_real_l3_ring_full ;;
-  32) RUN=R10_c32_mr32_combo_real_l3_ring ;;
+  32) RUN=R10_c32_mr32_combo_real_l3_ring_full_ixsplit ;;
+  36) RUN=R10_c36_mr32_combo_real_l3_ring_full_ixsplit ;; # client CC=36, 32 running
   48) RUN=R9_c48_mr48_real_l3_ring ;;
-  *) echo "usage: $0 <1|4|8|16|32|48> [--dry-run]" >&2; exit 2 ;;
+  *) echo "usage: $0 <1|4|8|16|32|36|48> [--dry-run]" >&2; exit 2 ;;
 esac
 POINT=$1
 case "${2:-}" in

@@ -7,13 +7,14 @@ AL 3.93. One run JSON in `runs/` per point.
 
 ## Results
 
-Chart v31 (artifact version `1795298646-bc4f`), measured and read 2026-11-21.
+Chart v41 (artifact version `1795340173-cab4`), read 2026-11-22.
 
 Real weights, one 1 h window per point.
 - c1-c16: this branch's integrated tree (`b38e84a11e`, job 36d0): the final curve plus the
   prefill and decode commits and prefill-decode interval 16 (What changed).
-- c32/c48: the final curve (`f568acf704`, job e2df), still the latest measured. Both are over
-  the latency limit.
+- c32/c36: the integrated tree plus the DSA index-key cache split (`f977f22c30`, jobs 83cb /
+  ae9c). Both are within the latency limit.
+- c48: the final curve (`f568acf704`, job e2df), over the latency limit.
 
 | cc | tok/s/chip | M tokens/$ | 1/ITL p50 / p90 | TTFT p90 s | E2E latency p90 / limit s | prefix hit / ideal % | vs final curve: tok/s / 1/ITL p90 | run JSON |
 |---|---|---|---|---|---|---|---|---|
@@ -21,21 +22,25 @@ Real weights, one 1 h window per point.
 | 4 | 8,876 | 31.0 | 420.0 / 321.5 | 0.79 | 10.1 / 20.4 | 97.67 / 97.88 | +0.2% / +3.0% | `runs/C4u_c4_real_l3_ring_full.json` |
 | 8 | 14,920 | 52.1 | 327.3 / 208.3 | 0.97 | 10.2 / 19.6 | 97.48 / 97.78 | +0.6% / +11.0% | `runs/K2ts_c8_real_l3_ring_full.json` |
 | 16 | 26,360 | 92.1 | 201.5 / 118.5 | 2.40 | 13.9 / 20.3 | 97.23 / 97.60 | +4.1% / +28.0% | `runs/C16_S2ts_kda1400_bf16_real_l3_ring_full.json` |
-| 32 | 35,338 | 123.5 | 73.2 / 35.0 | 3.26 | 43.1 / 28.2 **over** | 96.82 / 97.63 | (final curve) | `runs/R10_c32_mr32_combo_real_l3_ring.json` |
+| 32 | 46,314 | 161.9 | 141.4 / 60.9 | 2.38 | 25.67 / 28.2 | 97.03 / 97.79 | +31.1% / +74.0% | `runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json` |
+| 36 | 49,097 | 171.6 | 126.0 / 62.8 | 2.33 | 27.41 / ~30.3 | 96.97 / 97.72 | (none) | `runs/R10_c36_mr32_combo_real_l3_ring_full_ixsplit.json` |
 | 48 | 37,460 | 130.9 | 40.5 / 23.1 | 3.55 | 70.2 / 37.4 **over** | 96.16 / 97.23 | (final curve) | `runs/R9_c48_mr48_real_l3_ring.json` |
 
 - Latency limit: a point's p90 E2E latency may not exceed GB300's p90 at the same concurrency
   plus 10 s. GB300 p90 (InferenceX run 42026173061, the chart's GB300 line): c1 14.0, c4 10.4,
-  c8 9.6, c16 10.3, c32 18.2, c48 27.4 s.
-  - c32 is being reworked with scheduler changes that are not on this branch.
-  - c48 is dropped; a c36 point replaces it (in progress).
+  c8 9.6, c16 10.3, c32 18.2, c40 22.3, c48 27.4 s.
+  - c36: GB300 has no c36 run; the limit interpolates c32 and c40 (20.25 + 10 = ~30.3 s).
+  - c48 is over the limit; c36 replaces it on the curve.
+- c32/c36 set `SGLANG_TPU_DSA_INDEX_KV_SHARD=1`: the DSA index-key cache is split like the latent
+  cache (the exact prefill exchange needs `SGLANG_TPU_DSA_MLA_KV_SHARDS=8`). c36 spends the freed
+  HBM on a larger device KV pool (14.2M tokens, 1.5x c32) and runs 36 sessions on 32 running.
 - 1/ITL = output tok/s per user = 1000 / inter-token latency (ms) at that percentile. The
   chart plots tokens/$ against 1/ITL p90.
 - Tokens/$ = tok/s/chip x 3600 / $1.03 per chip-hour (InferenceX's TPU7x rate), in millions.
 - tok/s/chip counts prompt and completion tokens, cached prompt tokens included.
 - Ideal = aiperf's theoretical prefix-cache hit, the figure InferenceX publishes.
-- vs final curve: the same point's final-curve run (Previous). Against dummy weights at the same
-  config, c1-c16 tok/s/chip is +3.7 / -0.9 / +1.5 / 0.0%.
+- vs final curve: the same point's final-curve run (Previous); c36 has none. Against dummy
+  weights at the same config, c1-c16 tok/s/chip is +3.7 / -0.9 / +1.5 / 0.0%.
 - c1 and c4 are flat because one request runs 98% / 83% of the time: the interval and the
   batch-side kernels have little to act on.
 - Every point: 0 recompiles after ready, 0 OOM, 0 scheduler exceptions, 1-2 failed requests
@@ -43,16 +48,15 @@ Real weights, one 1 h window per point.
 - Hosts:
   - c1-c16: one host of a 2x2x2 dev pod, libtpu 0.0.50, torch_tpu 0.2.0; c1/c16 on one pod,
     c4/c8 on the other.
-  - c32: one host of a 2x2x2 dev pod, image `sha256:5448af1b…` (libtpu 0.0.50, torch_tpu
-    0.2.0). The registry's cleanup policy has since deleted that image.
+  - c32/c36: one host each of the same two dev pods, libtpu 0.0.50.
   - c48: tpuq slice, image `sglang-tpu@sha256:1affcdb…` (jax 0.11.2, libtpu 0.0.50,
     torch_tpu 0.2.1.dev20261028). It ran at `c3157c5ff1`; `f568acf704` only changes the
     c1/c4/c8 JSONs.
 
 ### Previous
 
-Final curve (`*_real_l3_ring.json` on `f568acf704`, job e2df) at c1-c16, and the same configs on
-dummy weights. c32/c48 final-curve rows are in Results.
+Final curve (`*_real_l3_ring.json` on `f568acf704`, job e2df) at c1-c32, and the same configs on
+dummy weights. The c48 final-curve row is in Results.
 
 | cc | final-curve run JSON | tok/s/chip | 1/ITL p50 / p90 | TTFT p90 s | E2E latency p90 s | prefix hit / ideal % | dummy tok/s/chip (run) |
 |---|---|---|---|---|---|---|---|
@@ -60,9 +64,11 @@ dummy weights. c32/c48 final-curve rows are in Results.
 | 4 | `runs/C4u_c4_real_l3_ring.json` | 8,855 | 418.2 / 312.1 | 0.76 | 10.3 | 97.68 / 97.89 | 8,958 (`runs/C4u_c4.json`) |
 | 8 | `runs/K2ts_c8_real_l3_ring.json` | 14,838 | 315.2 / 187.7 | 0.73 | 10.2 | 97.51 / 97.81 | 14,705 (`runs/K2ts_c8.json`) |
 | 16 | `runs/C16_S2ts_kda1400_bf16_real_l3_ring.json` | 25,327 | 181.2 / 92.6 | 1.17 | 15.1 | 97.14 / 97.52 | 26,359 (`runs/C16_S2ts_kda1400.json`, no bf16 merge) |
-| 32 | Results | | | | | | 40,220 (R10, job 5196) |
+| 32 | `runs/R10_c32_mr32_combo_real_l3_ring.json` | 35,338 | 73.2 / 35.0 | 3.26 | 43.1 (limit 28.2) | 96.82 / 97.63 | 40,220 (R10, job 5196) |
 | 48 | Results | | | | | | 42,219 (R9, job ccd1) |
 
+- Final-curve c32 ran on a dev pod, image `sha256:5448af1b…` (libtpu 0.0.50, torch_tpu 0.2.0),
+  since deleted by the registry's cleanup policy.
 - Dummy runs used older trees. The chart's dummy line (token mode `fixed`, harness 1.0.12)
   differs at c16 (`runs/C16_S2ts.json`, 26,037) and c32 (`R8_c32_combo.json`, 39,770, job 15c4;
   commit `4ea6597f8b`, not in `runs/`).
@@ -72,9 +78,10 @@ dummy weights. c32/c48 final-curve rows are in Results.
 
 ## What changed since the final curve
 
-c1-c16 only: each `*_real_l3_ring_full.json` is the final-curve JSON plus the five flags below and
-`prefill_decode_interval` 16. c32/c48 run without them. The split-cache flags (owned rows, ragged
-block) are no-ops on c1/c4's unsplit cache.
+c1-c16: each `*_real_l3_ring_full.json` is the final-curve JSON plus the five flags below and
+`prefill_decode_interval` 16. c32/c36: the c32 final-curve JSON plus the five flags, interval 0 and
+the index-key cache split. c48 runs without them. The split-cache flags (owned rows, ragged block)
+are no-ops on c1/c4's unsplit cache.
 
 - Prefill:
   - `48111c842b` (Haolin): MoE prefill dispatches pre-quantized fp8 rows over a pure-DMA
@@ -95,6 +102,13 @@ block) are no-ops on c1/c4's unsplit cache.
     test `8747991baa`).
   - Together: decode step -5.1 / -7.2 / -6.3 / -9.8% at 4 / 8 / 16 / 32 running (real 88-211k
     contexts).
+- Index-key cache split (c32/c36):
+  - `fb535ea2d4`: the pooled DSA indexer splits its key cache like the latent cache, each rank
+    scoring its own pools (`SGLANG_TPU_DSA_INDEX_KV_SHARD=1`).
+  - `f977f22c30`: prefill hands each rank its row slice of the scores (two one-shot
+    all-to-alls) instead of all-gathering them; exact.
+  - c32 against the same JSON without the split (`R10_c32_mr32_combo_real_l3_ring_full.json`,
+    job c49c): 38,539 -> 46,314 tok/s/chip, 1/ITL p90 42.7 -> 60.9, E2E latency p90 36.7 -> 25.7 s.
 - `prefill_decode_interval` 16: about +17% 1/ITL p90 at c16 on top of the kernels; little
   effect at c1/c4.
 - Configs: `ad1d4aefa1` (c8/c16) and `b38e84a11e` (c1/c4).
@@ -113,7 +127,8 @@ Final curve vs 301e (job IDs):
 
 ## Accuracy
 
-- Integrated tree (c1-c16 configs): pending; no accuracy check has run on it yet.
+- Integrated tree (c1-c16 configs) and the index-key split (c32/c36): pending; no accuracy check
+  has run on them yet.
 - Final curve: GSM8K-200 (`few_shot_gsm8k`, parallel 8) on `f568acf704` with the c8 config,
   simulated acceptance off: 0.930. Gate 0.88; the ring-kernel-only tree scored 0.925. With
   that ring-only run's exact config, its greedy output equals the ring-only tree's on 8/8
@@ -149,7 +164,8 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
 | c4 | `C4u_c4_real_l3_ring_full.json` | 4 | 3 / 3.00 | 4 | 1..4 | 3,407,872 | 384 | none / off | 6.82M / 769 | 676 GB | 966 |
 | c8 | `K2ts_c8_real_l3_ring_full.json` | 8 | `1:7,2:3` / 3.93, 3.00 | 8 | 1..8 | 8,604,416 (9,437,184) | 800 | 2 / on | 12.9M / 1,201 | 833 GB | 1,316 |
 | c16 | `C16_S2ts_kda1400_bf16_real_l3_ring_full.json` | 16 | 3 / 3.00 | 16 | 1..16 | 5,643,136 (9,437,184) | 1,400 | 2 / on | 9.59M / 2,002 | 871 GB | 1,846 |
-| c32 | `R10_c32_mr32_combo_real_l3_ring.json` | 32 | 3 / 3.00 | 32 | 1, 2, 4, 8, 12..32 by 4 | 9,437,184 | 800 | 8 / on | 18.9M / 2,001 | 917 GB | 1,425 |
+| c32 | `R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json` | 32 | 3 / 3.00 | 32 | 1, 2, 4, 8, 12..32 by 4 | 9,437,184 | 800 | 8 / on | 18.9M / 2,001 | 777 GB | 1,446 |
+| c36 | `R10_c36_mr32_combo_real_l3_ring_full_ixsplit.json` | 36 | 3 / 3.00 | 32 | 1, 2, 4, 8, 12..32 by 4 | 14,155,776 | 800 | 8 / on | 33.5M / 2,001 | 861 GB | 1,795 |
 | c48 | `R9_c48_mr48_real_l3_ring.json` | 48 | 3 / 3.00 | 48 | 1..16, 20..48 by 4 | 16,000,000 | 800 | 8 / on | 18.0M / 2,001 | 984 GB | 2,116 |
 
 - K = `speculative_num_steps`, giving K + 1 draft tokens and topk 1. `1:7,2:3` = 7 draft
@@ -180,12 +196,12 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
   - checkpoint prefetch, page cache dropped after load, 2400 s unbalanced-load timeout;
   - served name `zai-org/GLM-5.3-Flash`, parsers glm45 / glm47, `127.0.0.1:30000`.
 - c16-c48 also set the bf16 split-cache merge (`SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE=1`).
-- c1-c16 also set `prefill_decode_interval` 16 and the five flags in What changed; c32/c48 do
-  not.
+- c1-c16 also set `prefill_decode_interval` 16 and the five flags in What changed; c32/c36 set
+  the five flags, interval 0 and `SGLANG_TPU_DSA_INDEX_KV_SHARD=1`; c48 sets none of them.
 
 ### Server
 
-`launch_agentx.sh <1|4|8|16|32|48>` runs the steps below on the point's run JSON
+`launch_agentx.sh <1|4|8|16|32|36|48>` runs the steps below on the point's run JSON
 (`--dry-run` prints the env, command and server args; the usage text lists its knobs):
 
 ```bash
@@ -268,7 +284,7 @@ python3 $A/summarize.py --md $OUT
 - Prefix hit = (device + host hits) / all prefill tokens on TP0, from the
   `--server-metrics` CSV.
 - Ideal = aiperf `theoretical_prefix_cache_hit`.
-- On the six output dirs it gives the Results table's tok/s/chip, TTFT and E2E latency,
+- On the seven output dirs it gives the Results table's tok/s/chip, TTFT and E2E latency,
   1/ITL within 0.4 and hit within 0.02 pt.
 
 ### Submission vs measured
@@ -281,7 +297,11 @@ python3 $A/summarize.py --md $OUT
     token mode `real-draft-token` and request time stats;
   - `*_real_l3.json`: plus `hybrid_cache_checkpoints_level` 3;
   - `*_real_l3_ring.json`: plus the ring kernel. c1/c4/c8 also get the draft-step changes;
-  - `*_real_l3_ring_full.json` (c1-c16): plus `prefill_decode_interval` 16 and the five flags.
+  - `*_real_l3_ring_full.json`: plus the five flags; c1-c16 also `prefill_decode_interval` 16,
+    c32/c48 interval 0;
+  - `*_real_l3_ring_full_ixsplit.json` (c32/c36): the c32 `*_full` JSON plus
+    `SGLANG_TPU_DSA_INDEX_KV_SHARD=1`; c36 also sets `max_total_tokens` 14,155,776 and
+    `hicache_ratio` 2.37.
 - `launch_agentx.sh` launches these JSONs. The recipes (`agentx_cc<N>.py`,
   `check_recipes.py`) still build and check the previous dummy-weight points' configs.
 
@@ -298,6 +318,7 @@ c8 / c16 / c32 / c48):
 | `*_real_l3.json` | 301e | + level 3: hit gap back to the dummy level | 5,988 / 8,678 / 14,049 / 20,213 / 28,854 / 31,960 |
 | `*_real_l3_ring.json` | e2df | + ring kernel, draft-step changes: the final curve | 6,406 / 8,855 / 14,838 / 25,327 / 35,338 / 37,460 |
 | `*_real_l3_ring_full.json` | 36d0 | + prefill and decode commits, interval 16 (What changed) | Results (c1-c16 only) |
+| `*_real_l3_ring_full_ixsplit.json` | 83cb, ae9c | + index-key cache split, interval 0; c36 larger pool | Results (c32/c36 only) |
 
 The rest are dummy-weight 1 h windows unless stated otherwise.
 
@@ -334,9 +355,7 @@ Earlier arms, superseded by the points above (tok/s/chip, 1/ITL p90):
 
 ## Pending
 
-- c32 under its 28.2 s latency limit, with scheduler changes not on this branch.
-- c36 in place of c48 (in progress).
-- Accuracy on the integrated tree.
+- Accuracy on the integrated tree and with the index-key split.
 - InferenceX question 3 below (draft steps per decode step).
 
 ## Tunable configs
@@ -346,8 +365,9 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 
 | knob | where set | c1 / c4 / c8 / c16 / c32 / c48 | what it trades | evidence |
 |---|---|---|---|---|
-| prefill-decode interval | `prefill_decode_interval` | 16 / 16 / 16 / 16 / unset / unset | N decode steps between prefill batches: higher 1/ITL, later TTFT; a fixed N starves admission at high concurrency | integrated tree, N=16: about +17% 1/ITL at c16 on top of the kernels, little effect at c1/c4 (36d0). Earlier: c16 N=16, split 8 before token split: 1/ITL 84.9 -> 91.3, tok/s -0.5%, TTFT p90 2.06 -> 2.95 s (ff06). c32 N=16: 1/ITL +38%, tok/s -1.8%, TTFT p90 12.7 -> 17.8 s; N=64 worse (754a). c48 N=16: max prefill wait 96 s (ccd1). Muse Spark c10, N=64 vs its shipped profile: 1/ITL 169 vs 116 (Haolin's perf KB, F-0069..71) |
+| prefill-decode interval | `prefill_decode_interval` | 16 / 16 / 16 / 16 / 0 / unset | N decode steps between prefill batches: higher 1/ITL, later TTFT; a fixed N starves admission at high concurrency | integrated tree, N=16: about +17% 1/ITL at c16 on top of the kernels, little effect at c1/c4 (36d0). Earlier: c16 N=16, split 8 before token split: 1/ITL 84.9 -> 91.3, tok/s -0.5%, TTFT p90 2.06 -> 2.95 s (ff06). c32 N=16: 1/ITL +38%, tok/s -1.8%, TTFT p90 12.7 -> 17.8 s; N=64 worse (754a). c48 N=16: max prefill wait 96 s (ccd1). Muse Spark c10, N=64 vs its shipped profile: 1/ITL 169 vs 116 (Haolin's perf KB, F-0069..71) |
 | latent-cache split | env `SGLANG_TPU_DSA_MLA_KV_SHARDS` | unset (1) / unset / 2 / 2 / 8 / 8 | fewer shards: cheaper prefill merge, more KV bytes per rank (host KV 30,720 / 18,432 / 12,288 B/token/pod at 2 / 4 / 8; the split-2 pool is HBM-bound below the 9.4M cap) | c16 split 2 vs 8: 1/ITL +18.9%, tok/s +6.7%; split 4: 1/ITL 98.1 (8c26). c32 at max running 32, split 4 vs 8: 38,807 vs 38,149 tok/s, 1/ITL 41.2 vs 39.9 (3ca4, 175a). c4 unsplit vs split 8: 1/ITL 337.7 vs 287.5 (6076) |
+| index-key cache split | env `SGLANG_TPU_DSA_INDEX_KV_SHARD` | unset / unset / unset / unset / 1 / unset | the pooled indexer's key cache split like the latent cache: HBM freed for the KV pool; exact prefill exchange needs split 8 | c32: 38,539 -> 46,314 tok/s, 1/ITL 42.7 -> 60.9, E2E p90 36.7 -> 25.7 s (c49c, 83cb) |
 | token split | env `SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT` | unset / unset / 1 / 1 / 1 / 1 | each selected cache row gathered by one rank, plus an all-to-all of queries and outputs | c16 split 8: 1/ITL 83.7 -> 93.5, tok/s 23,207 -> 24,407; c8: 1/ITL 175.0 -> 188.1; neutral on the unsplit c1/c4 (fee5) |
 | device KV pool | `max_total_tokens` (cap; HBM may bound it lower), `mem_fraction_static` 0.9 | 3,407,872 / 3,407,872 / 9,437,184 / 9,437,184 / 9,437,184 / 16,000,000 (boot sizes in the per-point table) | HBM for KV tokens vs device KDA slots | c16 (8.64M -> 5.66M tokens, 800 -> 1,400 slots): state evictions 6,399 -> 2,192 per h, tok/s and 1/ITL within noise (8c26) |
 | device KDA slots | `max_mamba_cache_size` | 74 / 384 / 800 / 1,400 / 800 / 800 | HBM for KDA checkpoints vs KV pool; sized for the conversations AgentX keeps cached, not from max running | c16 1,100: 26,004 / 1/ITL 111.6; 1,400: hit gap 0.36 vs 0.50 pt (8c26). c32 1,600: no gain (98c5) |
@@ -365,6 +385,7 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 | top-k width buckets | env `SGLANG_TPU_SCTOPK_LONG_ROWS` | on by default (0 disables) | exact; faster prefill top-k | with the bf16 merge at split 8 + token split: 4k chunk 0.2432 -> 0.2204 s at ctx 0, 0.2795 -> 0.2393 s at 256k (2507) |
 | bf16 split-cache merge | env `SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE=1` | unset / unset / unset / 1 / 1 / 1 | bf16 instead of fp32 reduce-scatter for the prefill merge | as above; GSM8K-1319 0.9060 on vs 0.9037 off (2507). c32 with both: 39,770 vs 38,358, 1/ITL 59.6 vs 54.4 (15c4) |
 
+- c36 = the c32 column except device KV pool 14,155,776 and host KV tier 2.37 (ae9c).
 - Host RAM: resident host memory grows ~34-39 MB per compiled program per rank (3ca4), so
   decode buckets cost host RAM. When a config does not fit, shrink the host tier first and
   keep the buckets: host-tier hits are fine as long as nothing is evicted or thrashing.
@@ -384,12 +405,12 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 
 ## Files
 
-- `runs/*_real_l3_ring_full.json` (c1-c16) and `runs/*_real_l3_ring.json` (c32/c48): the
-  launch JSONs of the Results points.
+- `runs/*_real_l3_ring_full.json` (c1-c16), `runs/*_real_l3_ring_full_ixsplit.json` (c32/c36)
+  and `runs/R9_c48_mr48_real_l3_ring.json` (c48): the launch JSONs of the Results points.
 - `runs/*.json`: the launch JSONs of all measured runs, which are the measurement record.
 - `summarize.py`: computes the metrics of one client output dir.
-- `launch_agentx.sh`: launches one Results point from its run JSON, as jobs 36d0 (c1-c16) and
-  e2df (c32/c48) ran them (Replicate, Server).
+- `launch_agentx.sh`: launches one Results point from its run JSON, as jobs 36d0 (c1-c16), 83cb
+  (c32), ae9c (c36) and e2df (c48) ran them (Replicate, Server).
 - `_base.py`, `agentx_cc<N>.py`, `check_recipes.py`: build and check the previous
   dummy-weight points' configs. `benchmark/tpu/test_launch_server.py` also runs
   `check_recipes.py`.
