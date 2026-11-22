@@ -23,6 +23,7 @@ def pallas_local_inv_perm_and_counts(
     total_id_buckets: int,
     has_pad_sentinel: bool = False,
     zero_local_start: bool = True,
+    native_pack: bool | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Single-op Pallas VMEM+MXU kernel replacing local argsorts and 3D count broadcasts.
@@ -41,14 +42,29 @@ def pallas_local_inv_perm_and_counts(
     assert t_local % LANE == 0 and (t_local * topk) % LANE == 0
     assert num_local_experts <= LANE and ep_size <= LANE
 
+    if native_pack is None:
+        from sglang_tpu.envs import envs as _tpu_envs
+
+        use_native_pack = bool(
+            topk == 8
+            and _tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get()
+        )
+    else:
+        use_native_pack = bool(native_pack and topk == 8)
+
     b_strips = (total_id_buckets + LANE - 1) // LANE
     b_pad = b_strips * LANE
     n_tok_blks = t_local // LANE
     g_rows_per_chip = (t_local * topk) // LANE
 
-    local_pad = jnp.pad(
-        local_topk_ids.astype(jnp.int32), ((0, 0), (0, LANE - topk))
-    )
+    if use_native_pack:
+        local_in = local_topk_ids.astype(jnp.int32).reshape(
+            n_tok_blks * 8, LANE
+        )
+    else:
+        local_in = jnp.pad(
+            local_topk_ids.astype(jnp.int32), ((0, 0), (0, LANE - topk))
+        )
     global_2d = global_topk_ids.astype(jnp.int32).reshape(
         ep_size * g_rows_per_chip, LANE
     )
@@ -80,86 +96,223 @@ def pallas_local_inv_perm_and_counts(
         row_128 = lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
         l_128 = (row_128 > lane_128).astype(jnp.bfloat16)
         u_128 = (row_128 < lane_128).astype(jnp.bfloat16)
+        if use_native_pack:
+            sub_8 = lax.broadcasted_iota(jnp.int32, (8, LANE), 0)
+            base_lane = (row_128 & jnp.int32(15)) * jnp.int32(8)
+            slot_masks = [lane_128 == (base_lane + k) for k in range(topk)]
+
+            def _load_cols_k(b_idx: int):
+                blk_8 = local_pad_ref[pl.ds(pl.multiple_of(b_idx * 8, 8), 8), :]
+                rows_128 = jnp.concatenate(
+                    [
+                        jnp.broadcast_to(
+                            jnp.sum(
+                                jnp.where(sub_8 == r, blk_8, 0),
+                                axis=0,
+                                keepdims=True,
+                            ),
+                            (16, LANE),
+                        )
+                        for r in range(8)
+                    ],
+                    axis=0,
+                )
+                return [
+                    jnp.sum(
+                        jnp.where(slot_masks[k], rows_128, 0),
+                        axis=1,
+                        keepdims=True,
+                    )
+                    for k in range(topk)
+                ]
+        else:
+            slot_masks = None
+
+            def _load_cols_k(b_idx: int):
+                ids_blk = local_pad_ref[pl.ds(b_idx * LANE, LANE), :]
+                return [
+                    jnp.sum(
+                        jnp.where(lane_128 == k, ids_blk, 0),
+                        axis=1,
+                        keepdims=True,
+                    )
+                    for k in range(topk)
+                ]
 
         # Part A: Exact VMEM+MXU counting-sort rank for `inv_perm_c`.
-        for b in range(n_tok_blks):
-            r_sl = pl.ds(b * LANE, LANE)
-            ids_blk = local_pad_ref[r_sl, :]
-            cols_k = [
-                jnp.sum(jnp.where(lane_128 == k, ids_blk, 0), axis=1, keepdims=True)
-                for k in range(topk)
-            ]
-            for s in range(b_strips):
-                c_sl = pl.ds(s * LANE, LANE)
-                iota_s = s * LANE + lane_128
-                oh_bs = (cols_k[0] == iota_s).astype(jnp.bfloat16)
-                for k in range(1, topk):
-                    oh_bs = oh_bs + (cols_k[k] == iota_s).astype(jnp.bfloat16)
-                oh_vmem_ref[r_sl, c_sl] = oh_bs
-                b_cnt = jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True)
-                blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl] = jnp.broadcast_to(
-                    b_cnt, (8, LANE)
-                )
-
-        starts_strips = []
-        carry_total = jnp.zeros((8, 1), dtype=jnp.int32)
-        for s in range(b_strips):
-            c_sl = pl.ds(s * LANE, LANE)
-            cnt_s = blk_sum_vmem_ref[pl.ds(0, 8), c_sl]
-            for b in range(1, n_tok_blks):
-                cnt_s = cnt_s + blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl]
-            lo7 = (cnt_s & jnp.int32(127)).astype(jnp.bfloat16)
-            hi7 = lax.shift_right_logical(cnt_s, jnp.int32(7)).astype(jnp.bfloat16)
-            p_lo = jnp.matmul(lo7, u_128, preferred_element_type=jnp.float32).astype(
-                jnp.int32
-            )
-            p_hi = jnp.matmul(hi7, u_128, preferred_element_type=jnp.float32).astype(
-                jnp.int32
-            )
-            excl_s = lax.shift_left(p_hi, jnp.int32(7)) + p_lo + carry_total
-            starts_strips.append(excl_s)
-            carry_total = carry_total + jnp.max(
-                jnp.sum(cnt_s, axis=1, keepdims=True), axis=0, keepdims=True
+        if use_native_pack:
+            init_cnts = tuple(
+                jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(b_strips)
             )
 
-        running_strips = list(starts_strips)
-        for b in range(n_tok_blks):
-            r_sl = pl.ds(b * LANE, LANE)
-            ids_blk = local_pad_ref[r_sl, :]
-            cols_k = [
-                jnp.sum(jnp.where(lane_128 == k, ids_blk, 0), axis=1, keepdims=True)
-                for k in range(topk)
-            ]
-            rank_strips = []
-            for s in range(b_strips):
-                c_sl = pl.ds(s * LANE, LANE)
-                oh_bs = oh_vmem_ref[r_sl, c_sl]
-                intra_s = jnp.matmul(
-                    l_128, oh_bs, preferred_element_type=jnp.float32
-                ).astype(jnp.int32)
-                run_s = running_strips[s]
-                rank_strips.append(
-                    (intra_s.reshape(LANE // 8, 8, LANE) + run_s[None, :, :]).reshape(
-                        LANE, LANE
-                    )
-                )
-                running_strips[s] = run_s + blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl]
-
-            out_blk = jnp.zeros((LANE, LANE), dtype=jnp.int32)
-            for k in range(topk):
-                ck = cols_k[k]
-                val_k = jnp.zeros((LANE, 1), dtype=jnp.int32)
+            def _pass1_np(b, cnts_acc):
+                cols_k = _load_cols_k(b)
+                r0 = pl.multiple_of(b * LANE, LANE)
+                new_cnts = []
                 for s in range(b_strips):
                     iota_s = s * LANE + lane_128
-                    m_ks = ck == iota_s
-                    val_k = val_k + jnp.sum(
-                        jnp.where(m_ks, rank_strips[s], 0), axis=1, keepdims=True
+                    oh_bs = (cols_k[0] == iota_s).astype(jnp.bfloat16)
+                    for k in range(1, topk):
+                        oh_bs = oh_bs + (cols_k[k] == iota_s).astype(jnp.bfloat16)
+                    oh_vmem_ref[pl.ds(r0, LANE), pl.ds(s * LANE, LANE)] = oh_bs
+                    b_cnt = jnp.broadcast_to(
+                        jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True),
+                        (8, LANE),
                     )
-                    rank_strips[s] = jnp.where(m_ks, rank_strips[s] + 1, rank_strips[s])
-                out_blk = jnp.where(
-                    lane_128 == k, jnp.broadcast_to(val_k, (LANE, LANE)), out_blk
+                    new_cnts.append(cnts_acc[s] + b_cnt)
+                return tuple(new_cnts)
+
+            tot_cnts = lax.fori_loop(0, n_tok_blks, _pass1_np, init_cnts)
+            starts_strips = []
+            carry_total = jnp.zeros((8, 1), dtype=jnp.int32)
+            for s in range(b_strips):
+                cnt_s = tot_cnts[s]
+                lo7 = (cnt_s & jnp.int32(127)).astype(jnp.bfloat16)
+                hi7 = lax.shift_right_logical(cnt_s, jnp.int32(7)).astype(
+                    jnp.bfloat16
                 )
-            inv_pad_out_ref[r_sl, :] = out_blk
+                p_lo = jnp.matmul(
+                    lo7, u_128, preferred_element_type=jnp.float32
+                ).astype(jnp.int32)
+                p_hi = jnp.matmul(
+                    hi7, u_128, preferred_element_type=jnp.float32
+                ).astype(jnp.int32)
+                starts_strips.append(
+                    lax.shift_left(p_hi, jnp.int32(7)) + p_lo + carry_total
+                )
+                carry_total = carry_total + jnp.max(
+                    jnp.sum(cnt_s, axis=1, keepdims=True), axis=0, keepdims=True
+                )
+
+            def _pass2_np(b, run_strips):
+                cols_k = _load_cols_k(b)
+                r0 = pl.multiple_of(b * LANE, LANE)
+                rank_strips = []
+                next_run = []
+                for s in range(b_strips):
+                    oh_bs = oh_vmem_ref[pl.ds(r0, LANE), pl.ds(s * LANE, LANE)]
+                    intra_s = jnp.matmul(
+                        l_128, oh_bs, preferred_element_type=jnp.float32
+                    ).astype(jnp.int32)
+                    run_s = run_strips[s]
+                    rank_strips.append(
+                        (
+                            intra_s.reshape(LANE // 8, 8, LANE) + run_s[None, :, :]
+                        ).reshape(LANE, LANE)
+                    )
+                    b_cnt = jnp.broadcast_to(
+                        jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True),
+                        (8, LANE),
+                    )
+                    next_run.append(run_s + b_cnt)
+                out_blk = jnp.zeros((LANE, LANE), dtype=jnp.int32)
+                for k in range(topk):
+                    ck = cols_k[k]
+                    val_k = jnp.zeros((LANE, 1), dtype=jnp.int32)
+                    for s in range(b_strips):
+                        iota_s = s * LANE + lane_128
+                        m_ks = ck == iota_s
+                        val_k = val_k + jnp.sum(
+                            jnp.where(m_ks, rank_strips[s], 0),
+                            axis=1,
+                            keepdims=True,
+                        )
+                        rank_strips[s] = jnp.where(
+                            m_ks, rank_strips[s] + 1, rank_strips[s]
+                        )
+                    out_blk = jnp.where(
+                        slot_masks[k],
+                        jnp.broadcast_to(val_k, (LANE, LANE)),
+                        out_blk,
+                    )
+                inv_pad_out_ref[pl.ds(pl.multiple_of(b * 8, 8), 8), :] = jnp.sum(
+                    out_blk.reshape(8, 16, LANE), axis=1
+                )
+                return tuple(next_run)
+
+            lax.fori_loop(0, n_tok_blks, _pass2_np, tuple(starts_strips))
+        else:
+            for b in range(n_tok_blks):
+                r_sl = pl.ds(b * LANE, LANE)
+                cols_k = _load_cols_k(b)
+                for s in range(b_strips):
+                    c_sl = pl.ds(s * LANE, LANE)
+                    iota_s = s * LANE + lane_128
+                    oh_bs = (cols_k[0] == iota_s).astype(jnp.bfloat16)
+                    for k in range(1, topk):
+                        oh_bs = oh_bs + (cols_k[k] == iota_s).astype(jnp.bfloat16)
+                    oh_vmem_ref[r_sl, c_sl] = oh_bs
+                    b_cnt = jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True)
+                    blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl] = jnp.broadcast_to(
+                        b_cnt, (8, LANE)
+                    )
+
+            starts_strips = []
+            carry_total = jnp.zeros((8, 1), dtype=jnp.int32)
+            for s in range(b_strips):
+                c_sl = pl.ds(s * LANE, LANE)
+                cnt_s = blk_sum_vmem_ref[pl.ds(0, 8), c_sl]
+                for b in range(1, n_tok_blks):
+                    cnt_s = cnt_s + blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl]
+                lo7 = (cnt_s & jnp.int32(127)).astype(jnp.bfloat16)
+                hi7 = lax.shift_right_logical(cnt_s, jnp.int32(7)).astype(
+                    jnp.bfloat16
+                )
+                p_lo = jnp.matmul(
+                    lo7, u_128, preferred_element_type=jnp.float32
+                ).astype(jnp.int32)
+                p_hi = jnp.matmul(
+                    hi7, u_128, preferred_element_type=jnp.float32
+                ).astype(jnp.int32)
+                excl_s = lax.shift_left(p_hi, jnp.int32(7)) + p_lo + carry_total
+                starts_strips.append(excl_s)
+                carry_total = carry_total + jnp.max(
+                    jnp.sum(cnt_s, axis=1, keepdims=True), axis=0, keepdims=True
+                )
+
+            running_strips = list(starts_strips)
+            for b in range(n_tok_blks):
+                r_sl = pl.ds(b * LANE, LANE)
+                cols_k = _load_cols_k(b)
+                rank_strips = []
+                for s in range(b_strips):
+                    c_sl = pl.ds(s * LANE, LANE)
+                    oh_bs = oh_vmem_ref[r_sl, c_sl]
+                    intra_s = jnp.matmul(
+                        l_128, oh_bs, preferred_element_type=jnp.float32
+                    ).astype(jnp.int32)
+                    run_s = running_strips[s]
+                    rank_strips.append(
+                        (
+                            intra_s.reshape(LANE // 8, 8, LANE)
+                            + run_s[None, :, :]
+                        ).reshape(LANE, LANE)
+                    )
+                    running_strips[s] = (
+                        run_s + blk_sum_vmem_ref[pl.ds(b * 8, 8), c_sl]
+                    )
+
+                out_blk = jnp.zeros((LANE, LANE), dtype=jnp.int32)
+                for k in range(topk):
+                    ck = cols_k[k]
+                    val_k = jnp.zeros((LANE, 1), dtype=jnp.int32)
+                    for s in range(b_strips):
+                        iota_s = s * LANE + lane_128
+                        m_ks = ck == iota_s
+                        val_k = val_k + jnp.sum(
+                            jnp.where(m_ks, rank_strips[s], 0),
+                            axis=1,
+                            keepdims=True,
+                        )
+                        rank_strips[s] = jnp.where(
+                            m_ks, rank_strips[s] + 1, rank_strips[s]
+                        )
+                    out_blk = jnp.where(
+                        lane_128 == k,
+                        jnp.broadcast_to(val_k, (LANE, LANE)),
+                        out_blk,
+                    )
+                inv_pad_out_ref[r_sl, :] = out_blk
 
         # Part B: Exact `chip_before_local`, `local_chip_counts`, `group_sizes`, `group_start_arg`.
         lane_1d = lax.broadcasted_iota(jnp.int32, (8, LANE), 1)
@@ -222,10 +375,11 @@ def pallas_local_inv_perm_and_counts(
             hdr_pad_out_ref[pl.ds(0, 8), pl.ds(hs * LANE, LANE)] = h_strips[hs]
 
     v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
-    inv_pad, gs_pad, hdr_pad = pl.pallas_call(
+    inv_out_rows = (n_tok_blks * 8) if use_native_pack else t_local
+    inv_raw, gs_pad, hdr_pad = pl.pallas_call(
         _kernel,
         out_shape=(
-            jax.ShapeDtypeStruct((t_local, LANE), jnp.int32),
+            jax.ShapeDtypeStruct((inv_out_rows, LANE), jnp.int32),
             jax.ShapeDtypeStruct((8, gs_pad_len), jnp.int32),
             jax.ShapeDtypeStruct((8, hdr_pad_len), jnp.int32),
         ),
@@ -249,12 +403,15 @@ def pallas_local_inv_perm_and_counts(
         ),
         interpret=interpret,
         name=(
-            f"pallas_moe_sortfree_route_tl{t_local}_el{num_local_experts}_b{b_pad}"
+            f"pallas_moe_sortfree_route{'_np' if use_native_pack else ''}"
+            f"_tl{t_local}_el{num_local_experts}_b{b_pad}"
             f"{'_pad' if has_pad_sentinel else ''}"
         ),
-    )(meta_sp, local_pad, global_2d)
+    )(meta_sp, local_in, global_2d)
 
-    inv_perm_c = inv_pad[:, :topk]
+    inv_perm_c = (
+        inv_raw.reshape(t_local, topk) if use_native_pack else inv_raw[:, :topk]
+    )
     group_sizes = gs_pad[0, :num_experts]
     group_start_arg = hdr_pad[0, :hdr_len]
     t_recv_val = group_start_arg[1]
@@ -624,3 +781,188 @@ def pallas_qblock_remap_virtual_ids(
 
     return v_glob_2d.reshape(global_topk_ids.shape), v_loc_2d.reshape(t_local, topk)
 
+
+def pallas_compact_local_packed_keys(
+    global_topk_ids: jax.Array,
+    go_val: jax.Array,
+    my_id: jax.Array,
+    *,
+    num_local_experts: int,
+    ep_size: int = 8,
+    rotate_rs: bool = False,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """2D `(128, 128)` VMEM+MXU local-expert key compactor with lossless overflow tiering.
+
+    Compacts active `(rel_expert << tok_bits) | sort_tok` keys (`rel_expert in [0, num_local_experts)`)
+    from `global_topk_ids` (`[T_global, 8]`, `N_flat = T_global * 8`) into power-of-2 buffers:
+      - `out32`: `int32[32768]` (`2^15`, Tier 0 when `tier == 0`),
+      - `out_mid`: `int32[65536]` (`2^16` for `T_global <= 24576`, else `int32[131072]` = `2^17`,
+        Tier 1 when `tier == 1`),
+      - `tier`: scalar `int32[]` in `{0, 1, 2}` (`2` triggers exact full-batch `jnp.sort` fallback
+        so arbitrary worst-case skew up to `100%` single-expert load never drops a token).
+
+    Inactive / padding slots are filled with `sentinel = num_local_experts << tok_bits`, which
+    sorts strictly after all local keys while satisfying `(sentinel & tok_mask) == 0` so trailing
+    decoded indices are always in-bounds (`0`).
+    """
+    t_global, topk = global_topk_ids.shape
+    n_flat = t_global * topk
+    assert topk == 8 and n_flat >= 65536 and n_flat % (LANE * LANE) == 0
+    assert 0 < num_local_experts <= 120
+
+    n_macro = n_flat // (LANE * LANE)
+    out_mid_rows = 512 if n_macro <= 12 else 1024
+    r_keep1 = min(64, (out_mid_rows // n_macro) & ~7)
+    assert r_keep1 >= 24 and r_keep1 % 8 == 0
+    n_stage2_blks = out_mid_rows // LANE
+    out32_rows = 256
+    r_keep2 = out32_rows // n_stage2_blks
+    assert r_keep2 % 8 == 0
+
+    tok_bits = max(1, (t_global - 1).bit_length())
+    chunk_size = t_global // ep_size
+    sentinel_py = int(num_local_experts) << tok_bits
+
+    g_2d = global_topk_ids.astype(jnp.int32).reshape(n_macro * LANE, LANE)
+    meta_sp = jnp.stack(
+        [
+            go_val.reshape(-1)[0].astype(jnp.int32),
+            my_id.reshape(-1)[0].astype(jnp.int32),
+        ]
+    )
+
+    def _compact_128x128(val, sentinel_v, lane_128, row_128, u_128, l_128):
+        is_act = val < sentinel_v
+        dst_col = jnp.matmul(
+            is_act.astype(jnp.bfloat16), u_128, preferred_element_type=jnp.float32
+        ).astype(jnp.int32)
+        delta = jnp.where(is_act, lane_128 - dst_col, jnp.int32(0))
+        for sh in (1, 2, 4, 8, 16, 32, 64):
+            r_val = jnp.roll(val, -sh, axis=1)
+            r_delta = jnp.roll(delta, -sh, axis=1)
+            move = (delta & sh) != 0
+            stay = (val < sentinel_v) & (~move)
+            r_move = ((r_delta & sh) != 0) & (lane_128 < (LANE - sh))
+            val = jnp.where(r_move, r_val, jnp.where(stay, val, sentinel_v))
+            delta = jnp.where(r_move, r_delta, jnp.where(stay, delta, 0))
+        rot_amt = (row_128 * jnp.int32(17)) & jnp.int32(127)
+        for sh in (1, 2, 4, 8, 16, 32, 64):
+            val = jnp.where((rot_amt & sh) != 0, jnp.roll(val, sh, axis=1), val)
+        is_act2 = val < sentinel_v
+        dst_row = jnp.matmul(
+            l_128, is_act2.astype(jnp.bfloat16), preferred_element_type=jnp.float32
+        ).astype(jnp.int32)
+        delta_r = jnp.where(is_act2, row_128 - dst_row, jnp.int32(0))
+        for sh in (1, 2, 4, 8, 16, 32, 64):
+            r_val = jnp.roll(val, -sh, axis=0)
+            r_delta = jnp.roll(delta_r, -sh, axis=0)
+            move = (delta_r & sh) != 0
+            stay = (val < sentinel_v) & (~move)
+            r_move = ((r_delta & sh) != 0) & (row_128 < (LANE - sh))
+            val = jnp.where(r_move, r_val, jnp.where(stay, val, sentinel_v))
+            delta_r = jnp.where(r_move, r_delta, jnp.where(stay, delta_r, 0))
+        return val
+
+    def _kernel(meta_ref, g_ref, out32_ref, out_mid_ref, flag_out_ref):
+        sentinel = jnp.int32(sentinel_py)
+        go = meta_ref[0]
+        me = meta_ref[1]
+        lane_128 = lax.broadcasted_iota(jnp.int32, (LANE, LANE), 1)
+        row_128 = lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
+        u_128 = (row_128 < lane_128).astype(jnp.bfloat16)
+        l_128 = (row_128 > lane_128).astype(jnp.bfloat16)
+        base_tok = row_128 * jnp.int32(16) + lax.shift_right_logical(
+            lane_128, jnp.int32(3)
+        )
+
+        used_mid_rows = n_macro * r_keep1
+        if used_mid_rows < out_mid_rows:
+            out_mid_ref[pl.ds(used_mid_rows, out_mid_rows - used_mid_rows), :] = (
+                jnp.full(
+                    (out_mid_rows - used_mid_rows, LANE),
+                    sentinel,
+                    dtype=jnp.int32,
+                )
+            )
+
+        def _stage1_body(m, ovf1):
+            r0 = pl.multiple_of(m * LANE, LANE)
+            ids_blk = g_ref[pl.ds(r0, LANE), :]
+            rel = ids_blk - go
+            is_loc = (rel >= 0) & (rel < jnp.int32(num_local_experts))
+            tok_id = m * jnp.int32(2048) + base_tok
+            if rotate_rs:
+                chip_r = jnp.mod(
+                    lax.div(tok_id, jnp.int32(chunk_size)) + (ep_size - 1) - me,
+                    ep_size,
+                )
+                sort_tok = chip_r * jnp.int32(chunk_size) + lax.rem(
+                    tok_id, jnp.int32(chunk_size)
+                )
+            else:
+                sort_tok = tok_id
+            packed_blk = jnp.where(
+                is_loc,
+                lax.shift_left(rel, jnp.int32(tok_bits)) | sort_tok,
+                sentinel,
+            )
+            comp = _compact_128x128(
+                packed_blk, sentinel, lane_128, row_128, u_128, l_128
+            )
+            w0 = pl.multiple_of(m * r_keep1, 8)
+            out_mid_ref[pl.ds(w0, r_keep1), :] = comp[:r_keep1, :]
+            hit_ovf = jnp.any(comp[r_keep1 : r_keep1 + 8, :] < sentinel).astype(
+                jnp.int32
+            )
+            return ovf1 | hit_ovf
+
+        ovf1_any = lax.fori_loop(0, n_macro, _stage1_body, jnp.int32(0))
+
+        def _stage2_body(b, ovf2):
+            r0 = pl.multiple_of(b * LANE, LANE)
+            blk = out_mid_ref[pl.ds(r0, LANE), :]
+            comp2 = _compact_128x128(
+                blk, sentinel, lane_128, row_128, u_128, l_128
+            )
+            w0 = pl.multiple_of(b * r_keep2, 8)
+            out32_ref[pl.ds(w0, r_keep2), :] = comp2[:r_keep2, :]
+            hit_ovf2 = jnp.any(
+                comp2[r_keep2 : r_keep2 + 8, :] < sentinel
+            ).astype(jnp.int32)
+            return ovf2 | hit_ovf2
+
+        ovf2_any = lax.fori_loop(0, n_stage2_blks, _stage2_body, jnp.int32(0))
+        tier = jnp.where(
+            ovf1_any != 0,
+            jnp.int32(2),
+            jnp.where(ovf2_any != 0, jnp.int32(1), jnp.int32(0)),
+        )
+        flag_out_ref[:, :] = jnp.broadcast_to(tier, (8, LANE))
+
+    v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    out32, out_mid, flag_pad = pl.pallas_call(
+        _kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((out32_rows, LANE), jnp.int32),
+            jax.ShapeDtypeStruct((out_mid_rows, LANE), jnp.int32),
+            jax.ShapeDtypeStruct((8, LANE), jnp.int32),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[v_spec],
+            out_specs=[v_spec, v_spec, v_spec],
+            scratch_shapes=[],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=16 * 1024 * 1024,
+        ),
+        interpret=interpret,
+        name=(
+            f"pallas_compact_local_keys_tg{t_global}_el{num_local_experts}"
+            f"{'_rrs' if rotate_rs else ''}"
+        ),
+    )(meta_sp, g_2d)
+    return out32.reshape(-1), out_mid.reshape(-1), flag_pad[0, 0]

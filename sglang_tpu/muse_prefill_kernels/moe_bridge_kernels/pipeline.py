@@ -50,6 +50,7 @@ from .kernel_d import (
     pallas_combine_unpool_residual_nextnorm_nstream,
 )
 from .routing_pallas import (
+    pallas_compact_local_packed_keys,
     pallas_global_local_pos,
     pallas_local_inv_perm_and_counts,
 )
@@ -399,6 +400,111 @@ def _compute_local_inv_perm(local_topk_ids: jax.Array, num_experts: int) -> jax.
     return _inverse_permutation(perm_c).reshape(t_local, topk).astype(jnp.int32)
 
 
+def _sort_local_packed_lhs_indices(
+    *,
+    global_topk_ids: jax.Array,
+    topk_indices_flat: jax.Array,
+    tok_ids_flat: jax.Array,
+    go_val: jax.Array,
+    my_id: jax.Array,
+    num_tokens: int,
+    chunk_size: int,
+    ep_size: int,
+    num_local_experts: int,
+    topk: int,
+    rotate_rs: bool,
+    compact_mode: int,
+) -> jax.Array:
+    """Sort local-expert `(bucket, token)` keys with optional VMEM/chunked compaction."""
+    n_flat = topk_indices_flat.shape[0]
+    tok_bits = max(1, (num_tokens - 1).bit_length())
+    tok_mask = jnp.int32((1 << tok_bits) - 1)
+    sentinel_key = jnp.int32(int(num_local_experts) << tok_bits)
+
+    def _build_full_packed() -> jax.Array:
+        rel_flat = topk_indices_flat.astype(jnp.int32) - go_val
+        bucket_flat = jnp.where(
+            (rel_flat >= 0) & (rel_flat < num_local_experts),
+            rel_flat,
+            jnp.int32(num_local_experts),
+        )
+        if rotate_rs:
+            chip_r = jnp.mod(
+                tok_ids_flat // chunk_size + ep_size - 1 - my_id, ep_size
+            )
+            sort_tok = chip_r * chunk_size + (tok_ids_flat % chunk_size)
+        else:
+            sort_tok = tok_ids_flat
+        return (bucket_flat << tok_bits) | sort_tok
+
+    def _decode_sorted(sorted_keys: jax.Array) -> jax.Array:
+        if rotate_rs:
+            is_valid = sorted_keys < sentinel_key
+            rot_tok = sorted_keys & tok_mask
+            orig_c = jnp.mod(rot_tok // chunk_size + my_id + 1, ep_size)
+            raw_tok = jnp.where(
+                is_valid,
+                orig_c * chunk_size + (rot_tok % chunk_size),
+                jnp.int32(0),
+            )
+        else:
+            raw_tok = sorted_keys & tok_mask
+        if sorted_keys.shape[0] < n_flat:
+            return jnp.pad(raw_tok, (0, n_flat - sorted_keys.shape[0]))
+        return raw_tok
+
+    if (
+        compact_mode == 1
+        and topk == 8
+        and n_flat >= 65536
+        and n_flat % (128 * 128) == 0
+        and 0 < num_local_experts <= 120
+    ):
+        o32, o_mid, tier = pallas_compact_local_packed_keys(
+            global_topk_ids,
+            go_val,
+            my_id,
+            num_local_experts=num_local_experts,
+            ep_size=ep_size,
+            rotate_rs=rotate_rs,
+        )
+        return jax.lax.switch(
+            tier,
+            (
+                lambda _: _decode_sorted(jnp.sort(o32)),
+                lambda _: _decode_sorted(jnp.sort(o_mid)),
+                lambda _: _decode_sorted(jnp.sort(_build_full_packed())),
+            ),
+            operand=None,
+        )
+
+    if compact_mode == 2 and n_flat >= 65536 and n_flat % 4096 == 0:
+        packed_full = _build_full_packed()
+        n_chunks = n_flat // 4096
+        cap_c = min(2048, 32768 // n_chunks)
+        s_chunk = jnp.sort(packed_full.reshape(n_chunks, 4096), axis=1)
+        no_ovf = jnp.min(s_chunk[:, cap_c]) >= sentinel_key
+
+        def _fast_32k(_):
+            cand = s_chunk[:, :cap_c].reshape(-1)
+            if cand.shape[0] < 32768:
+                cand = jnp.pad(
+                    cand,
+                    (0, 32768 - cand.shape[0]),
+                    constant_values=sentinel_key,
+                )
+            return _decode_sorted(jnp.sort(cand))
+
+        return jax.lax.cond(
+            no_ovf,
+            _fast_32k,
+            lambda _: _decode_sorted(jnp.sort(packed_full)),
+            operand=None,
+        )
+
+    return _decode_sorted(jnp.sort(_build_full_packed()))
+
+
 def compute_block_scatter_routing(
     global_topk_ids: jax.Array,
     go_val: jax.Array,
@@ -482,26 +588,23 @@ def compute_block_scatter_routing(
             ).reshape(num_tokens, topk)
             lhs_indices = _mxu_bucket_scatter_lhs_indices(bucket_2d, tok_ids_flat)
         else:
-            tok_bits = max(1, (num_tokens - 1).bit_length())
-            tok_mask = jnp.int32((1 << tok_bits) - 1)
-            rel_flat = topk_indices_flat.astype(jnp.int32) - go_val
-            bucket_flat = jnp.where(
-                (rel_flat >= 0) & (rel_flat < num_local_experts),
-                rel_flat,
-                jnp.int32(num_local_experts),
+            compact_mode = int(
+                envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0
             )
-            if rotate_rs:
-                _chip_r = jnp.mod(
-                    tok_ids_flat // chunk_size + ep_size - 1 - my_id, ep_size
-                )
-                _sort_tok = _chip_r * chunk_size + (tok_ids_flat % chunk_size)
-                packed = (bucket_flat << tok_bits) | _sort_tok
-                _sorted_rot = jnp.sort(packed) & tok_mask
-                _orig_c = jnp.mod(_sorted_rot // chunk_size + my_id + 1, ep_size)
-                lhs_indices = _orig_c * chunk_size + (_sorted_rot % chunk_size)
-            else:
-                packed = (bucket_flat << tok_bits) | tok_ids_flat
-                lhs_indices = jnp.sort(packed) & tok_mask
+            lhs_indices = _sort_local_packed_lhs_indices(
+                global_topk_ids=global_topk_ids,
+                topk_indices_flat=topk_indices_flat,
+                tok_ids_flat=tok_ids_flat,
+                go_val=go_val,
+                my_id=my_id,
+                num_tokens=num_tokens,
+                chunk_size=chunk_size,
+                ep_size=ep_size,
+                num_local_experts=num_local_experts,
+                topk=topk,
+                rotate_rs=rotate_rs,
+                compact_mode=compact_mode,
+            )
         return (lhs_indices, *precomputed_counts)
     if (
         (envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL.get() or use_zero_sort_rt)
@@ -540,6 +643,23 @@ def compute_block_scatter_routing(
             # as the fast merge leaves them.
             bucket_2d = bucket_flat.reshape(num_tokens, topk)
             lhs_indices = _mxu_bucket_scatter_lhs_indices(bucket_2d, tok_ids_flat)
+        elif int(envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0) >= 1:
+            lhs_indices = _sort_local_packed_lhs_indices(
+                global_topk_ids=global_topk_ids,
+                topk_indices_flat=topk_indices_flat,
+                tok_ids_flat=tok_ids_flat,
+                go_val=go_val,
+                my_id=my_id,
+                num_tokens=num_tokens,
+                chunk_size=chunk_size,
+                ep_size=ep_size,
+                num_local_experts=num_local_experts,
+                topk=topk,
+                rotate_rs=False,
+                compact_mode=int(
+                    envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0
+                ),
+            )
         elif sf_scatter == 1:
             # One flat sort measured cheaper than per-rank sort + merge (qp xprof: 30 vs 35 us).
             lhs_indices = jnp.sort(packed) & tok_mask

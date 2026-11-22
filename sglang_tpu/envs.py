@@ -1440,6 +1440,12 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_DECODE_FUSE_FINAL_NORM = EnvBool(False)
     # Wave-8 Pallas owner-row gather / token-shard RS + RMSNorm replacing VocabParallelEmbedding AR.
     SGLANG_TPU_MUSE_DECODE_PALLAS_EMBED = EnvBool(False)
+    # Wave-10 prefill (8, 128)-native zero-pad/zero-slice packing in pallas_local_inv_perm_and_counts.
+    SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK = EnvBool(False)
+    # Wave-10 prefill local-expert key compaction before lhs_indices sort (0 = off;
+    # 1 = Pallas 2D (128,128) VMEM+MXU compaction + 32k/64k/full lax.switch power-of-2 sort;
+    # 2 = pure-XLA 4096-chunk pre-compacted 32k sort + lax.cond exact fallback).
+    SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:

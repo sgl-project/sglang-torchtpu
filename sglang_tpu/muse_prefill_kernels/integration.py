@@ -986,6 +986,8 @@ def _w8_carb_cache_tag() -> str:
         f"_diag{int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_IN_KERNEL_AG.get())}"
         f"_w4o{tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get()}"
         f"_w4u{tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()}"
+        f"_rnp{int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get())}"
+        f"_cls{tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()}"
     )
 
 
@@ -1405,6 +1407,16 @@ def _ops(
         + (
             f"_w4u{tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()}"
             if tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()
+            else ""
+        )
+        + (
+            "_rnp"
+            if tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get()
+            else ""
+        )
+        + (
+            f"_cls{tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()}"
+            if tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()
             else ""
         )
     )
@@ -3704,6 +3716,16 @@ class MusePrefillKernels(torch.nn.Module):
             + (
                 f"_w4u{tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()}"
                 if tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get()
+                else ""
+            )
+            + (
+                "_rnp"
+                if tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get()
+                else ""
+            )
+            + (
+                f"_cls{tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()}"
+                if tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get()
                 else ""
             )
         )
