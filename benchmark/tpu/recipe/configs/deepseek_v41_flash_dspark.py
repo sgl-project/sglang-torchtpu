@@ -55,16 +55,10 @@ CONFIG["server_args"].update(
         # Decoder SWA bounded replay (CED prefill): a prefix hit recomputes only
         # the late-layer rows each request keeps ("prompt" rows below).
         "enable_decoder_swa_bounded_replay": True,
-        # Session-aware radix eviction (#2369): one radix session per
-        # X-Correlation-ID (AIPerf sends one per conversation). Eviction takes
-        # entries no live session references first; a finished request's
-        # session leaf is its prompt end, and a leaf whose KV is gone releases
-        # its coverage. No host KV tier here, so --session-coverage-host-only
-        # stays off.
-        "enable_session_radix_cache": True,
-        "session_id_header": "X-Correlation-ID",
-        "session_leaf_at_prompt_end": True,
-        "session_release_evicted_leaf": True,
+        # Session-aware radix eviction (#2369) stays off: the DeepSeek-V4.1
+        # validator rejects --enable-session-radix-cache together with
+        # --enable-encoder-swa-bounded-replay ("does not support radix sessions
+        # yet"), and this recipe needs encoder replay.
     }
 )
 CONFIG["runtime_env"].update(
