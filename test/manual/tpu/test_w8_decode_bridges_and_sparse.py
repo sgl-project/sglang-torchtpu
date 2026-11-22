@@ -1409,6 +1409,128 @@ def test_w12_1d_fp8_scales_polymorphic_and_tp16_qkv() -> None:
     print("[PASS] Wave-12 1D (N,) FP8 weight scales (_base is None) + polymorphic P('model') bit-exact")
 
 
+def test_w12_unmocked_w8_get_ops_and_musespark_dispatch_gate() -> None:
+    """Verify real cpu_export_jax_op get_*_op wrappers on meta tensors for 1D & 2D scales."""
+    import inspect
+    import os
+    import types
+    from unittest import mock
+
+    import jax
+    import torch
+
+    import sglang_tpu.pallas_jax_op as pjo
+    from sglang_tpu.kernels import decode_collective_bridges as dcb
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as dcbw8
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    n_dev = len(jax.devices())
+    assert n_dev >= 8
+
+    def _meta_tp(aval, sharding, mesh):
+        if not isinstance(aval, jax.core.ShapedArray):
+            return aval
+        dt = pallas_impl.JAX_TO_TORCH_DTYPE_MAP[aval.dtype]
+        spec = getattr(sharding, "spec", None) or getattr(getattr(aval, "sharding", None), "spec", None)
+        sh = pjo._convert_partitioned_shape(aval.shape, mesh, spec, lambda s, a: s // a)
+        if dt == torch.float4_e2m1fn_x2 and sh:
+            sh = sh[:-1] + (sh[-1] // 2,)
+        return torch.empty(sh, dtype=dt, device="meta")
+
+    def _cpu_mesh(w: int):
+        return jax.sharding.Mesh(jax.devices()[:w], ("model",))
+
+    def m(shape, dtype=torch.bfloat16):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    H, H_MOE, N_EXP = 2048, 2048, 256
+    W, O_IN, PRE_PAIR, POST_C, QKV_C, GATE_C = 8, 256, 1024, 256, 1280, 1024
+
+    with (
+        mock.patch.object(pjo, "_torch_placeholder_with_sharding", side_effect=_meta_tp),
+        mock.patch.object(dcb, "_get_tp_mesh", side_effect=_cpu_mesh),
+        mock.patch.object(dcbw8, "_get_tp_mesh", side_effect=_cpu_mesh),
+        mock.patch.dict(dcbw8._MOE_POST_FINAL_NORM_OPS, {}, clear=True),
+        mock.patch.dict(dcbw8._MOE_TO_ATTN_QKV_EPI_OPS, {}, clear=True),
+        mock.patch.dict(dcbw8._DUAL_QKV_EPI_GATE_OPS, {}, clear=True),
+        mock.patch.dict(dcbw8._ATTN_TO_MOE_TOK_SH_OPS, {}, clear=True),
+        mock.patch.dict(dcbw8._MOE_TO_ATTN_TOK_SH_OPS, {}, clear=True),
+        mock.patch.dict(dcbw8._MOE_POST_TOK_SH_FINAL_OPS, {}, clear=True),
+        mock.patch.dict(dcb._ATTN_TO_MOE_OPS, {}, clear=True),
+        mock.patch.dict(dcb._ATTN_OPROJ_AR_RN_OPS, {}, clear=True),
+        mock.patch.dict(dcb._MOE_TO_ATTN_QKVG_OPS, {}, clear=True),
+    ):
+        has_dcb_zg = (
+            "ws[0]" not in inspect.getsource(dcb.get_attn_to_moe_bridge_op)
+            and "1024 if bm <= 16" in inspect.getsource(dcb._dot_fp8_scaled_to_ref)
+        )
+        b_list = (8, 16, 24, 32, 48, 64) if has_dcb_zg else (8, 16, 32, 64)
+        for scale_1d in (True, False):
+            def sc(cols: int):
+                return m((cols,), torch.float32) if scale_1d else m((1, cols), torch.float32)
+
+            for B in b_list:
+                o_fn = dcbw8.get_moe_post_ag_final_norm_op(W, sharded_moe_in=False)(
+                    m((B, H), torch.float32), m((B, H_MOE)), m((H_MOE, POST_C), torch.float8_e4m3fn), sc(POST_C),
+                    m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                    1e-8, True, 1e-5, False,
+                )
+                assert o_fn.shape == (B, H)
+
+                if B == 8 or B % 16 == 0:
+                    o_qe = dcbw8.get_moe_to_attn_qkv_epi_bridge_op(W, sharded_moe_in=False, has_rope=True)(
+                        m((B, H), torch.float32), m((B, H_MOE)), m((H_MOE, POST_C), torch.float8_e4m3fn), sc(POST_C),
+                        m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                        m((H, QKV_C), torch.float8_e4m3fn), sc(QKV_C), m((H, GATE_C), torch.float8_e4m3fn), sc(GATE_C),
+                        m((B, 2, 128), torch.float32),
+                        1e-8, True, 1e-5, False, 1e-5, 5.47, 0.8, 1.2,
+                    )
+                    assert o_qe[0].shape == (B, H) and o_qe[3].shape == (B, GATE_C)
+                    o_l0 = dcbw8.get_fp8_dual_qkv_epi_gate_op(True)(
+                        m((B, H)), m((H, QKV_C), torch.float8_e4m3fn), sc(QKV_C),
+                        m((H, GATE_C), torch.float8_e4m3fn), sc(GATE_C), m((B, 2, 128), torch.float32),
+                        1e-5, 5.47, 0.8, 1.2,
+                    )
+                    assert o_l0[2].shape == (B, GATE_C)
+
+                if B == 64:
+                    r_tok = B // W
+                    ot1 = dcbw8.get_attn_to_moe_tok_sharded_bridge_op(W, bf16_router=True)(
+                        m((r_tok, H), torch.float32), m((B, O_IN)), m((O_IN, H), torch.float8_e4m3fn), sc(H),
+                        m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                        m((H, PRE_PAIR), torch.float8_e4m3fn), sc(PRE_PAIR), m((H, N_EXP)), m((H_MOE,), torch.float32),
+                        1e-8, 1e-5, False, 0.75, 1e-5, True,
+                    )
+                    assert ot1[0].shape == (r_tok, H)
+                    ot2 = dcbw8.get_moe_to_attn_tok_sharded_bridge_op(W, fuse_qkv_epi=True, has_rope=True)(
+                        m((r_tok, H), torch.float32), m((r_tok, H_MOE)), m((H_MOE, POST_C), torch.float8_e4m3fn), sc(POST_C),
+                        m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                        m((H, QKV_C), torch.float8_e4m3fn), sc(QKV_C), m((H, GATE_C), torch.float8_e4m3fn), sc(GATE_C),
+                        m((B, 2, 128), torch.float32),
+                        1e-8, True, 1e-5, False, 1e-5, 5.47, 0.8, 1.2,
+                    )
+                    assert ot2[0].shape == (r_tok, H)
+                    ot3 = dcbw8.get_moe_post_tok_sharded_final_norm_op(W, return_stream_too=False)(
+                        m((r_tok, H), torch.float32), m((r_tok, H_MOE)), m((H_MOE, POST_C), torch.float8_e4m3fn), sc(POST_C),
+                        m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                        1e-8, True, 1e-5, False,
+                    )
+                    assert ot3.shape == (B, H)
+
+                # Also verify dcb.get_attn_to_moe_bridge_op once ws[0] -> ws is integrated
+                if "ws[0]" not in inspect.getsource(dcb.get_attn_to_moe_bridge_op):
+                    ob1 = dcb.get_attn_to_moe_bridge_op(W, bf16_router=True)(
+                        m((B, H), torch.float32), m((B, O_IN)), m((O_IN, H), torch.float8_e4m3fn), sc(H),
+                        m((H,), torch.float32), m((H,), torch.float32), m((H,), torch.float32),
+                        m((H, H_MOE // W), torch.float8_e4m3fn), sc(H_MOE // W),
+                        m((H, N_EXP)), m((H_MOE,), torch.float32),
+                        1e-8, 1e-5, False, 0.75, 1e-5, True,
+                    )
+                    assert ob1[0].shape == (B, H)
+
+    print("[PASS] Unmocked w8 get_*_op meta-export gate across B in (8,16,24,32,48,64), 1D & 2D scales")
+
+
 if __name__ == "__main__":
     test_syntax_and_annotations()
     _install_lightweight_pkg_stubs()
@@ -1418,4 +1540,5 @@ if __name__ == "__main__":
     test_w10_tok_b2_fast_races_and_llo_invariants()
     test_w11_norm_before_s3_b8_b16_and_2d_gains()
     test_w12_1d_fp8_scales_polymorphic_and_tp16_qkv()
+    test_w12_unmocked_w8_get_ops_and_musespark_dispatch_gate()
     print("ALL WAVE-8 DECODE BRIDGE & SPARSE TESTS PASSED!")

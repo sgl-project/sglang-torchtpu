@@ -1693,7 +1693,7 @@ def _dot_fp8_w8_slice_to_ref(
     from jax.experimental import pallas as pl
 
     bm = _pick_strip(n_r, 64)
-    max_tn = min(1024, max(_DOT_TN, (16 // max(bm // 8, 1)) * 128))
+    max_tn = 1024 if bm <= 16 else (512 if bm <= 32 else _DOT_TN)
     static_x0 = isinstance(x_r0, int) and x_r0 == 0
     static_d0 = isinstance(dst_r0, int) and dst_r0 == 0
 
