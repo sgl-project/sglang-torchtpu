@@ -98,6 +98,8 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # DeepSeek-V4.1 on v7: fuse the two output projections with channelwise FP8.
+    SGLANG_TPU_ENABLE_DSV41_FUSED_OUTPUT_PROJECTION = EnvBool(False)
     # Sparse MLA: DSA extend batches of 512+ tokens (prefill, no speculative
     # decoding) through a query-blocked kernel, which fetches a block of queries'
     # pages once and masks each query's selection, instead of gathering every

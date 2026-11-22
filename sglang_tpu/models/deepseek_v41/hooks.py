@@ -91,6 +91,14 @@ tpu_dsv4_fence_hc_mix_stats
   Upstream PR or issue: not filed (follow-up to the upstream sync).
   Remove when: the TPU compiler windows that fusion.
 
+tpu_dsv41_project_attention_output
+  Why: the MQA output projection seam dispatches only on out-of-tree
+       platforms; the in-tree TPU mode uses the same CSA2 backend.
+  How: AROUND MQALayer._project_attention_output delegates compatible inputs
+       to the backend method used in out-of-tree mode.
+  Upstream PR or issue: companion MQA projection seam (d62c67bd97).
+  Remove when: the TPU plugin uses only out-of-tree mode.
+
 tpu_dsv41_engram_gate
   Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
@@ -755,8 +763,45 @@ def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
     return original(manager, batch)
 
 
+def tpu_dsv41_project_attention_output(
+    original,
+    layer,
+    attn_backend,
+    o,
+    *,
+    positions,
+    forward_batch,
+    inv_rope,
+    wo_a_quant_freqs,
+    defer_all_reduce,
+):
+    from sglang.srt.platforms import current_platform
+    from sglang_tpu.models.deepseek_v41.attention_backend import DSV41TPUAttnBackend
+
+    if (
+        not current_platform.is_out_of_tree()
+        and isinstance(attn_backend, DSV41TPUAttnBackend)
+        and inv_rope is None
+        and wo_a_quant_freqs is None
+    ):
+        projected = attn_backend.project_mqa_output(layer, o, positions, forward_batch)
+        if projected is not None:
+            return projected
+    return original(
+        layer,
+        attn_backend,
+        o,
+        positions=positions,
+        forward_batch=forward_batch,
+        inv_rope=inv_rope,
+        wo_a_quant_freqs=wo_a_quant_freqs,
+        defer_all_reduce=defer_all_reduce,
+    )
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
 
     # Declares the ForwardBatch fields the Engram hooks read.
     from sglang_tpu.models.deepseek_v41 import engram_host  # noqa: F401
@@ -768,7 +813,7 @@ def hook_specs():
         "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
         ".NgramEmbeddingManager"
     )
-    return [
+    hooks = [
         (f"{kvc}._build_dsv4_kv_pool", build_tpu_dsv41_kv_pool, HookType.AROUND),
         (
             f"{cfg}._get_bytes_per_swa_token",
@@ -898,3 +943,12 @@ def hook_specs():
             HookType.AROUND,
         ),
     ]
+    if tpu_envs.SGLANG_TPU_ENABLE_DSV41_FUSED_OUTPUT_PROJECTION.get():
+        hooks.append(
+            (
+                "sglang.srt.models.deepseek_v4.MQALayer._project_attention_output",
+                tpu_dsv41_project_attention_output,
+                HookType.AROUND,
+            )
+        )
+    return hooks

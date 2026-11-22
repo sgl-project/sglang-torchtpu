@@ -154,17 +154,10 @@ def _requantize_tpu_block_fp8_to_channelwise(
     layer.weight_block_size = None
 
 
-def _set_channelwise_fp8_weight(
-    layer: Module, weight: torch.Tensor, dtype: torch.dtype
-) -> None:
-    """Quantize an ``[N, K]`` weight with one scale per output row onto ``layer``.
-
-    Stores ``layer.weight`` as a contiguous ``[K, N]`` fp8 tensor and
-    ``layer.weight_scale`` as ``[N, 1]`` float32, the layout
-    ``apply_tpu_fp8_linear`` reads. A row's scale depends only on that row,
-    so rows replicated across TP ranks quantize to the same bytes on every
-    rank (#1767).
-    """
+def quantize_channelwise_fp8_weight(
+    weight: torch.Tensor, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[N, K]`` to contiguous FP8 ``[K, N]`` and FP32 ``[N, 1]``."""
     dtype_max = torch.finfo(dtype).max
     weight_f32 = weight.to(torch.float32)
     weight_scale = torch.clamp(
@@ -177,7 +170,16 @@ def _set_channelwise_fp8_weight(
         max=dtype_max,
     ).to(dtype)
 
-    layer.weight = Parameter(qweight.t().contiguous(), requires_grad=False)
+    return qweight.t().contiguous(), weight_scale
+
+
+def _set_channelwise_fp8_weight(
+    layer: Module, weight: torch.Tensor, dtype: torch.dtype
+) -> None:
+    # A row's scale depends only on that row, so replicated TP ranks quantize
+    # matching rows to the same bytes (#1767).
+    qweight, weight_scale = quantize_channelwise_fp8_weight(weight, dtype)
+    layer.weight = Parameter(qweight, requires_grad=False)
     layer.weight_scale = Parameter(weight_scale, requires_grad=False)
     layer.input_scale = None
 

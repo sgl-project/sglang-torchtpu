@@ -1673,6 +1673,16 @@ class TpuSRTPlatform(SRTPlatform):
         # to True once torch_tpu exposes real multi-stream execution.
         return False
 
+    def post_load_model(self, model: torch.nn.Module) -> None:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_ENABLE_DSV41_FUSED_OUTPUT_PROJECTION.get():
+            from sglang_tpu.models.deepseek_v41.ops.output_projection import (
+                prepare_output_projection_weights,
+            )
+
+            prepare_output_projection_weights(model)
+
     def process_model_after_loading(self, model: torch.nn.Module) -> None:
         from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
 
