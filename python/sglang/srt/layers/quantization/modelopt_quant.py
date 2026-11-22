@@ -3574,6 +3574,10 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         self.quant_config = quant_config
         self.enable_flashinfer_trtllm_moe = False
+        self.use_flashinfer_trtllm_weight_layout = False
+        self._cache_permute_indices = {}
+        self._lora_marlin = False
+        self._moe_runner_backend = get_moe_runner_backend()
 
     def _weight_scale_dtype(self) -> torch.dtype:
         return self._checkpoint_scale_dtype
@@ -3680,6 +3684,8 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
                 "pallas_tpu, or pallas_tpu_fused_rs"
             )
+        self._moe_runner_backend = moe_runner_backend
+        self.runner = None
         # Compatibility is resolved after model setup in _resolve_fused_rs.
 
     def apply(
