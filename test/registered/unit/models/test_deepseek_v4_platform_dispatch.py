@@ -12,8 +12,59 @@ from sglang.srt.models import deepseek_v4_dspark as dspark
 from sglang.srt.models import deepseek_v4_nextn as nextn
 from sglang.srt.models import deepseek_v4_platform_stage as platform_stage
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestMqaOutputProjectionDispatch(CustomTestCase):
+    def test_output_projection_seam_and_collective_fallback(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+        class FusedBackend(AttentionBackend):
+            def project_mqa_output(self, layer, output, positions, forward_batch):
+                return output.sum(dim=-1) + positions[:, None]
+
+        layer = deepseek_v4.MQALayer.__new__(deepseek_v4.MQALayer)
+        torch.nn.Module.__init__(layer)
+        layer._project_wo_a = lambda output, **kwargs: output * 2
+        layer._project_wo_b = lambda output, deferred: (
+            output.sum(dim=-1) - int(deferred)
+        )
+        layer.wo_b = SimpleNamespace(use_decode_attn_tp=False)
+
+        output = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+        positions = torch.tensor([10, 20])
+        fused = output.sum(dim=-1) + positions[:, None]
+        baseline = (output * 2).sum(dim=-1) - 1
+        cases = (
+            (True, 1, False, FusedBackend(), fused),
+            (True, 1, False, AttentionBackend(), baseline),
+            (False, 1, False, FusedBackend(), baseline),
+            (True, 2, False, FusedBackend(), baseline),
+            (True, 1, True, FusedBackend(), baseline),
+        )
+        for oot, tp, decode_tp, backend, expected in cases:
+            with self.subTest(
+                oot=oot, tp=tp, decode_tp=decode_tp, backend=type(backend)
+            ):
+                layer.attn_tp_size = tp
+                layer.wo_b.use_decode_attn_tp = decode_tp
+                with patch.object(
+                    deepseek_v4,
+                    "current_platform",
+                    SimpleNamespace(is_out_of_tree=lambda: oot),
+                ):
+                    actual = layer._project_attention_output(
+                        backend,
+                        output,
+                        positions=positions,
+                        forward_batch=object(),
+                        inv_rope=None,
+                        wo_a_quant_freqs=None,
+                        defer_all_reduce=True,
+                    )
+                self.assertTrue(torch.equal(actual, expected))
 
 
 class TestPlatformDispatch(unittest.TestCase):

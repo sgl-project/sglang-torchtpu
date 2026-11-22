@@ -213,6 +213,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -3055,6 +3056,39 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        return self._project_attention_output(
+            attn_backend,
+            o,
+            positions=positions,
+            forward_batch=forward_batch,
+            inv_rope=inv_rope,
+            wo_a_quant_freqs=wo_a_quant_freqs,
+            defer_all_reduce=defer_all_reduce,
+        )
+
+    def _project_attention_output(
+        self,
+        attn_backend,
+        o,
+        *,
+        positions,
+        forward_batch,
+        inv_rope,
+        wo_a_quant_freqs,
+        defer_all_reduce,
+    ):
+        if (
+            current_platform.is_out_of_tree()
+            and self.attn_tp_size == 1
+            and not self.wo_b.use_decode_attn_tp
+            and inv_rope is None
+            and wo_a_quant_freqs is None
+        ):
+            projected = attn_backend.project_mqa_output(
+                self, o, positions, forward_batch
+            )
+            if projected is not None:
+                return projected
         o = self._project_wo_a(
             o,
             positions=positions,

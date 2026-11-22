@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.models.deepseek_v4 import MQALayer
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -171,6 +172,21 @@ class AttentionBackend(ABC):
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
+
+    def project_mqa_output(
+        self,
+        layer: MQALayer,
+        output: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor | None:
+        """Optionally finish inverse RoPE and both MQA output projections.
+
+        This entry point is for an ordinary attention output on one attention
+        TP rank without deferred reduction. Return None to use the model's
+        projections. The backend owns inverse RoPE if attention did not apply it.
+        """
         return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
