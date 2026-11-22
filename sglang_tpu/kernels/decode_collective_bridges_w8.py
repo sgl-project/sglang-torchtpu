@@ -4470,7 +4470,7 @@ def get_moe_post_ag_final_norm_op(
 
             mesh = _get_tp_mesh(world_size)
             moe_sp = P("model", None) if sharded_moe_in else P()
-            t_specs = (P(), moe_sp, P(None, "model"), P(None, "model"), P(), P(), P(), P())
+            t_specs = (P(), moe_sp, P(None, "model"), P("model"), P(), P(), P(), P())
             in_specs = (*t_specs, None, None, None, None)
 
             def _wrapped(
@@ -4537,15 +4537,15 @@ def get_moe_to_attn_qkv_epi_bridge_op(
                 P(),
                 moe_sp,
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),
                 P(),
                 P(None, "model"),
+                P("model"),
                 P(None, "model"),
-                P(None, "model"),
-                P(None, "model"),
+                P("model"),
             )
             out_specs = (
                 P(),
@@ -4790,7 +4790,7 @@ def get_attn_to_moe_tok_sharded_bridge_op(
                 P(),
                 P(),
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
             )
@@ -4872,15 +4872,15 @@ def get_moe_to_attn_tok_sharded_bridge_op(
                 P("model", None),
                 P("model", None),
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),
                 P(),
                 P(None, "model"),
+                P("model"),
                 P(None, "model"),
-                P(None, "model"),
-                P(None, "model"),
+                P("model"),
             )
 
             if not fuse_qkv_epi:
@@ -5083,7 +5083,7 @@ def get_moe_post_tok_sharded_final_norm_op(
                 P("model", None),
                 P("model", None),
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),

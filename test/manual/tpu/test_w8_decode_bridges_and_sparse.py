@@ -1079,6 +1079,336 @@ def test_w11_norm_before_s3_b8_b16_and_2d_gains() -> None:
     print("[PASS] Wave-11 Normalize-Before-s3 bit-exact + 0 races + B=8/16 QKV_EPI + 2D gains")
 
 
+def test_w12_1d_fp8_scales_polymorphic_and_tp16_qkv() -> None:
+    """Verify 1D (N,) FP8 weight scales (_base is None) + polymorphic P('model') bit-exactness."""
+    _install_lightweight_pkg_stubs()
+    import functools
+    import os
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        attn_to_moe_tok_sharded_bridge_jax,
+        fp8_dual_qkv_epi_gate_jax,
+        moe_post_ag_final_norm_jax,
+        moe_post_tok_sharded_final_norm_jax,
+        moe_to_attn_qkv_epi_bridge_jax,
+        moe_to_attn_tok_sharded_bridge_jax,
+    )
+
+    assert len(jax.devices()) >= 8
+    W = 8
+    mesh = Mesh(jax.devices()[:W], axis_names=("model",))
+    B, R_TOK = 64, 8
+    H, H_MOE = 2048, 512
+    O_IN = H // W
+    PRE_PAIR = H_MOE // 2
+    POST_COLS = H // W
+    QKV_COLS = 1280 * W
+    GATE_COLS = 1024 * W
+    N_EXP = 256
+
+    k = jax.random.PRNGKey(1200)
+    st_sh = jax.device_put(
+        jax.random.normal(k, (B, H), dtype=jnp.float32),
+        NamedSharding(mesh, P("model", None)),
+    )
+    st_rep = jax.device_put(
+        jax.random.normal(k, (B, H), dtype=jnp.float32),
+        NamedSharding(mesh, P()),
+    )
+    ga_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1201), (B, O_IN * W), dtype=jnp.bfloat16),
+        NamedSharding(mesh, P(None, "model")),
+    )
+    wo_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1202), (O_IN * W, H), dtype=jnp.float32).astype(
+            jnp.float8_e4m3fn
+        ),
+        NamedSharding(mesh, P("model", None)),
+    )
+    ws_raw = jnp.abs(jax.random.normal(jax.random.PRNGKey(1203), (W, H), dtype=jnp.float32)) * 0.02 + 1e-4
+    ws_2d = jax.device_put(ws_raw, NamedSharding(mesh, P("model")))
+    ws_1d = jax.device_put(ws_raw.reshape(W * H), NamedSharding(mesh, P("model")))
+
+    wpre_pair_d = jax.device_put(
+        jnp.concatenate(
+            [
+                jnp.tile(
+                    jax.random.normal(jax.random.PRNGKey(1204), (H, PRE_PAIR), dtype=jnp.float32).astype(
+                        jnp.float8_e4m3fn
+                    ),
+                    (1, 4),
+                ),
+                jnp.tile(
+                    jax.random.normal(jax.random.PRNGKey(1205), (H, PRE_PAIR), dtype=jnp.float32).astype(
+                        jnp.float8_e4m3fn
+                    ),
+                    (1, 4),
+                ),
+            ],
+            axis=1,
+        ),
+        NamedSharding(mesh, P(None, "model")),
+    )
+    spre_pair_raw = jnp.concatenate(
+        [
+            jnp.tile(jnp.full((1, PRE_PAIR), 0.015, dtype=jnp.float32), (1, 4)),
+            jnp.tile(jnp.full((1, PRE_PAIR), 0.019, dtype=jnp.float32), (1, 4)),
+        ],
+        axis=1,
+    )
+    spre_2d = jax.device_put(spre_pair_raw.reshape(W, PRE_PAIR), NamedSharding(mesh, P("model")))
+    spre_1d = jax.device_put(spre_pair_raw.reshape(W * PRE_PAIR), NamedSharding(mesh, P("model")))
+
+    wr_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1206), (H, N_EXP), dtype=jnp.bfloat16),
+        NamedSharding(mesh, P()),
+    )
+    g_h = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 0.95, NamedSharding(mesh, P()))
+    al_d = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 0.9, NamedSharding(mesh, P()))
+    be_d = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 0.5, NamedSharding(mesh, P()))
+    g_pre = jax.device_put(jnp.ones((H_MOE,), dtype=jnp.float32) * 1.05, NamedSharding(mesh, P()))
+
+    in_b1 = (
+        P("model", None),
+        P(None, "model"),
+        P("model", None),
+        P("model"),
+        P(),
+        P(),
+        P(),
+        P(None, "model"),
+        P("model"),
+        P(),
+        P(),
+    )
+    b1_fn = jax.shard_map(
+        functools.partial(
+            attn_to_moe_tok_sharded_bridge_jax,
+            world_size=W,
+            pa_eps=1e-8,
+            pre_ff_eps=1e-5,
+            pre_ff_scale_input=False,
+            router_multiplier=0.75,
+            pre_exp_eps=1e-5,
+            pre_exp_scale_input=True,
+            interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=in_b1,
+        out_specs=(P("model", None), P(), P()),
+        check_vma=False,
+    )
+    out_b1_2d = b1_fn(st_sh, ga_d, wo_d, ws_2d, al_d, be_d, g_h, wpre_pair_d, spre_2d, wr_d, g_pre)
+    out_b1_1d = b1_fn(st_sh, ga_d, wo_d, ws_1d, al_d, be_d, g_h, wpre_pair_d, spre_1d, wr_d, g_pre)
+    for a, b in zip(out_b1_2d, out_b1_1d, strict=True):
+        assert jnp.array_equal(a, b), "tok_b1 1D vs 2D scale mismatch"
+
+    mo_sh = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1207), (B, H_MOE), dtype=jnp.bfloat16),
+        NamedSharding(mesh, P("model", None)),
+    )
+    wp_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1208), (H_MOE, H), dtype=jnp.float32).astype(jnp.float8_e4m3fn),
+        NamedSharding(mesh, P(None, "model")),
+    )
+    sp_raw = jnp.abs(jax.random.normal(jax.random.PRNGKey(1209), (1, H), dtype=jnp.float32)) * 0.02 + 1e-4
+    sp_2d = jax.device_put(sp_raw.reshape(W, POST_COLS), NamedSharding(mesh, P("model")))
+    sp_1d = jax.device_put(sp_raw.reshape(W * POST_COLS), NamedSharding(mesh, P("model")))
+
+    wq_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1210), (H, QKV_COLS), dtype=jnp.float32).astype(
+            jnp.float8_e4m3fn
+        ),
+        NamedSharding(mesh, P(None, "model")),
+    )
+    sq_raw = jnp.abs(jax.random.normal(jax.random.PRNGKey(1211), (1, QKV_COLS), dtype=jnp.float32)) * 0.02 + 1e-4
+    sq_2d = jax.device_put(sq_raw.reshape(W, 1280), NamedSharding(mesh, P("model")))
+    sq_1d = jax.device_put(sq_raw.reshape(QKV_COLS), NamedSharding(mesh, P("model")))
+
+    wg_d = jax.device_put(
+        jax.random.normal(jax.random.PRNGKey(1212), (H, GATE_COLS), dtype=jnp.float32).astype(
+            jnp.float8_e4m3fn
+        ),
+        NamedSharding(mesh, P(None, "model")),
+    )
+    sg_raw = jnp.abs(jax.random.normal(jax.random.PRNGKey(1213), (1, GATE_COLS), dtype=jnp.float32)) * 0.02 + 1e-4
+    sg_2d = jax.device_put(sg_raw.reshape(W, 1024), NamedSharding(mesh, P("model")))
+    sg_1d = jax.device_put(sg_raw.reshape(GATE_COLS), NamedSharding(mesh, P("model")))
+
+    rope_tbl = jax.random.normal(jax.random.PRNGKey(1214), (128, 128), dtype=jnp.float32)
+    cs_d = jax.device_put(
+        build_decode_rope_step_tables(jnp.arange(B, dtype=jnp.int32) + 3, rope_tbl),
+        NamedSharding(mesh, P()),
+    )
+
+    in_b2_tok = (
+        P("model", None),
+        P("model", None),
+        P(None, "model"),
+        P("model"),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(None, "model"),
+        P("model"),
+        P(None, "model"),
+        P("model"),
+        P(),
+    )
+    out_epi_sp = (
+        P("model", None),
+        P(None, None, "model", None, None),
+        P(None, "model", None, None),
+        P(None, "model"),
+    )
+    b2_tok_fn = jax.shard_map(
+        functools.partial(
+            moe_to_attn_tok_sharded_bridge_jax,
+            world_size=W,
+            post_ff_eps=1e-8,
+            post_ff_scale_input=True,
+            next_in_eps=1e-5,
+            next_in_scale_input=False,
+            fuse_qkv_epi=True,
+            qkv_norm_eps=1e-5,
+            query_scale=5.47,
+            k_scale=0.8,
+            v_scale=1.2,
+            interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=in_b2_tok,
+        out_specs=out_epi_sp,
+        check_vma=False,
+    )
+    out_b2t_2d = b2_tok_fn(st_sh, mo_sh, wp_d, sp_2d, g_h, al_d, be_d, g_h, wq_d, sq_2d, wg_d, sg_2d, cs_d)
+    out_b2t_1d = b2_tok_fn(st_sh, mo_sh, wp_d, sp_1d, g_h, al_d, be_d, g_h, wq_d, sq_1d, wg_d, sg_1d, cs_d)
+    for a, b in zip(out_b2t_2d, out_b2t_1d, strict=True):
+        av = a.view(jnp.uint8) if a.dtype == jnp.float8_e4m3fn else a
+        bv = b.view(jnp.uint8) if b.dtype == jnp.float8_e4m3fn else b
+        assert jnp.array_equal(av, bv), "tok_b2_epi 1D vs 2D scale mismatch"
+
+    fn_tok_fn = jax.shard_map(
+        functools.partial(
+            moe_post_tok_sharded_final_norm_jax,
+            world_size=W,
+            post_ff_eps=1e-8,
+            post_ff_scale_input=True,
+            final_eps=1e-5,
+            final_scale_input=False,
+            return_stream_too=False,
+            interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=(P("model", None), P("model", None), P(None, "model"), P("model"), P(), P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+    assert jnp.array_equal(
+        fn_tok_fn(st_sh, mo_sh, wp_d, sp_2d, g_h, al_d, be_d, g_h),
+        fn_tok_fn(st_sh, mo_sh, wp_d, sp_1d, g_h, al_d, be_d, g_h),
+    )
+
+    qepi_fn = jax.shard_map(
+        functools.partial(
+            moe_to_attn_qkv_epi_bridge_jax,
+            world_size=W,
+            post_ff_eps=1e-8,
+            post_ff_scale_input=True,
+            next_in_eps=1e-5,
+            next_in_scale_input=False,
+            sharded_moe_in=True,
+            qkv_norm_eps=1e-5,
+            query_scale=5.47,
+            k_scale=0.8,
+            v_scale=1.2,
+            interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=(
+            P(),
+            P("model", None),
+            P(None, "model"),
+            P("model"),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(None, "model"),
+            P("model"),
+            P(),
+        ),
+        out_specs=(P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+        check_vma=False,
+    )
+    out_qe_2d = qepi_fn(st_rep, mo_sh, wp_d, sp_2d, g_h, al_d, be_d, g_h, wq_d, sq_2d, wg_d, sg_2d, cs_d)
+    out_qe_1d = qepi_fn(st_rep, mo_sh, wp_d, sp_1d, g_h, al_d, be_d, g_h, wq_d, sq_1d, wg_d, sg_1d, cs_d)
+    for a, b in zip(out_qe_2d, out_qe_1d, strict=True):
+        av = a.view(jnp.uint8) if a.dtype == jnp.float8_e4m3fn else a
+        bv = b.view(jnp.uint8) if b.dtype == jnp.float8_e4m3fn else b
+        assert jnp.array_equal(av, bv), "qepi 1D vs 2D scale mismatch"
+
+    fn_ag_fn = jax.shard_map(
+        functools.partial(
+            moe_post_ag_final_norm_jax,
+            world_size=W,
+            post_ff_eps=1e-8,
+            post_ff_scale_input=True,
+            final_eps=1e-5,
+            final_scale_input=False,
+            sharded_moe_in=True,
+            interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=(P(), P("model", None), P(None, "model"), P("model"), P(), P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+    assert jnp.array_equal(
+        fn_ag_fn(st_rep, mo_sh, wp_d, sp_2d, g_h, al_d, be_d, g_h),
+        fn_ag_fn(st_rep, mo_sh, wp_d, sp_1d, g_h, al_d, be_d, g_h),
+    )
+
+    # Verify L0 fp8_dual_qkv_epi_gate_jax accepts 1D (N,) scales bit-identically
+    ain_16 = jax.random.normal(jax.random.PRNGKey(1215), (16, H), dtype=jnp.bfloat16)
+    wq_loc = wq_d[:, :1280]
+    wg_loc = wg_d[:, :1024]
+    sq_loc_2d = sq_raw[:, :1280]
+    sq_loc_1d = sq_loc_2d.reshape(1280)
+    sg_loc_2d = sg_raw[:, :1024]
+    sg_loc_1d = sg_loc_2d.reshape(1024)
+    l0_2d = fp8_dual_qkv_epi_gate_jax(ain_16, wq_loc, sq_loc_2d, wg_loc, sg_loc_2d, cs_d[:16], interpret=True)
+    l0_1d = fp8_dual_qkv_epi_gate_jax(ain_16, wq_loc, sq_loc_1d, wg_loc, sg_loc_1d, cs_d[:16], interpret=True)
+    for a, b in zip(l0_2d, l0_1d, strict=True):
+        av = a.view(jnp.uint8) if a.dtype == jnp.float8_e4m3fn else a
+        bv = b.view(jnp.uint8) if b.dtype == jnp.float8_e4m3fn else b
+        assert jnp.array_equal(av, bv), "L0 dual qkv epi 1D vs 2D scale mismatch"
+
+    # Verify _own_storage 1D conversion produces storage-owned (_base is None) 1D float32
+    from sglang_tpu.fp8_moe import _own_storage
+
+    s2 = torch.randn(1, 1280, dtype=torch.float32)
+    s1 = _own_storage(s2.detach().reshape(-1).to(torch.float32).contiguous())
+    assert s1.shape == (1280,)
+    assert s1.dtype == torch.float32
+    assert s1.is_contiguous()
+    assert s1._base is None
+    with mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_DECODE_1D_FP8_SCALES": "0"}):
+        assert os.environ["SGLANG_TPU_MUSE_DECODE_1D_FP8_SCALES"] == "0"
+
+    print("[PASS] Wave-12 1D (N,) FP8 weight scales (_base is None) + polymorphic P('model') bit-exact")
+
+
 if __name__ == "__main__":
     test_syntax_and_annotations()
     _install_lightweight_pkg_stubs()
@@ -1087,4 +1417,5 @@ if __name__ == "__main__":
     test_w8_collective_bridges_8rank()
     test_w10_tok_b2_fast_races_and_llo_invariants()
     test_w11_norm_before_s3_b8_b16_and_2d_gains()
+    test_w12_1d_fp8_scales_polymorphic_and_tp16_qkv()
     print("ALL WAVE-8 DECODE BRIDGE & SPARSE TESTS PASSED!")

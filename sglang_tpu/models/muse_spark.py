@@ -166,6 +166,26 @@ def _can_use_bridge_qkv_epi(
     return bool(fn is not None and fn(attn_mod.attn, forward_batch))
 
 
+def _as_1d_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Materialize FP8 weight scale as a fresh 1D ``(N,) float32`` storage-owned tensor.
+
+    TorchTPU allocates 2D ``(1, N)`` tensors in HBM with ``{1,0:T(8,128)}`` (8 padded
+    sublanes), whereas Pallas ``pltpu.VMEM`` expects ``{1,0:T(1,128)}``, forcing XLA to
+    emit a synchronous ``copy`` op per scale (~290 ops / 0.41 ms per decode step).
+    A storage-owned 1D ``(N,) float32`` tensor uses ``{0:T(1024)}`` and lowers
+    ``s.reshape(1, N)`` inside ``shard_map`` with 0 synchronous ``copy`` ops.
+    """
+    if os.environ.get("SGLANG_TPU_MUSE_DECODE_1D_FP8_SCALES", "1").strip() in (
+        "0",
+        "false",
+        "False",
+    ):
+        return scale
+    from sglang_tpu.fp8_moe import _own_storage
+
+    return _own_storage(scale.detach().reshape(-1).to(torch.float32).contiguous())
+
+
 def _default_tpu7x_chipmate_xor() -> int:
     """Return the verified TPU7x intra-chip chipmate XOR bit (defaults to 1)."""
     try:
@@ -736,6 +756,7 @@ class MuseSparkAttention(nn.Module):
             )
 
             w8k, scale = quantize_fp8_k_major(qkvg)
+            scale = _as_1d_fp8_scale(scale)
             _wait_for(w8k, scale)
             self._qkvg_w8k = w8k
             self._qkvg_scale = scale
@@ -772,6 +793,7 @@ class MuseSparkAttention(nn.Module):
             )
 
             w8k, scale = quantize_fp8_k_major(op.weight)
+            scale = _as_1d_fp8_scale(scale)
             _wait_for(w8k, scale)
             self._o_proj_w8k = w8k
             self._o_proj_scale = scale
@@ -785,11 +807,18 @@ class MuseSparkAttention(nn.Module):
     @torch.no_grad()
     def prepare_w7_qkv_gate_fp8(self, *, free_bf16: bool = False) -> bool:
         """Prepare separate contiguous K-major FP8 ``qkv_proj`` and ``gate_proj`` weights."""
+        import inspect
+
         from sglang_tpu.kernels.decode_collective_bridges import (
             quantize_weight_fp8_k_major,
         )
 
         qp, gp = self.qkv_proj, self.gate_proj
+        supports_128_tail = (
+            "allow_128_tail"
+            in inspect.signature(quantize_weight_fp8_k_major).parameters
+        )
+        qkv_col_align = 128 if supports_128_tail else 256
         if (
             qp.bias is not None
             or gp.bias is not None
@@ -800,13 +829,19 @@ class MuseSparkAttention(nn.Module):
             or qp.weight.shape[0] == 0
             or gp.weight.shape[0] == 0
             or qp.weight.shape[1] != gp.weight.shape[1]
-            or qp.weight.shape[0] % 256 != 0
+            or qp.weight.shape[0] % qkv_col_align != 0
             or gp.weight.shape[0] % 256 != 0
             or qp.weight.shape[1] % 128 != 0
         ):
             return False
-        wq, sq = quantize_weight_fp8_k_major(qp.weight)
+        wq, sq = (
+            quantize_weight_fp8_k_major(qp.weight, allow_128_tail=True)
+            if qp.weight.shape[0] % 256 != 0
+            else quantize_weight_fp8_k_major(qp.weight)
+        )
         wg, sg = quantize_weight_fp8_k_major(gp.weight)
+        sq = _as_1d_fp8_scale(sq)
+        sg = _as_1d_fp8_scale(sg)
         _wait_for(wq, sq, wg, sg)
         self.register_buffer("_w7_wqkv_w8k", wq, persistent=False)
         self.register_buffer("_w7_sqkv", sq, persistent=False)
@@ -849,9 +884,15 @@ class MuseSparkAttention(nn.Module):
             ):
                 return False
             wo, so = quantize_weight_fp8_k_major(op.weight)
+            so = _as_1d_fp8_scale(so)
             _wait_for(wo, so)
             self._o_proj_w8k = wo
             self._o_proj_scale = so
+        elif self._o_proj_scale is not None:
+            so = _as_1d_fp8_scale(self._o_proj_scale)
+            if so is not self._o_proj_scale:
+                _wait_for(so)
+                self._o_proj_scale = so
         if free_bf16 and op.weight.shape[0] > 0 and op.weight.device.type != "meta":
             old_o = op.weight.data
             op.weight = nn.Parameter(
@@ -2503,23 +2544,24 @@ class MuseSparkMoE(nn.Module):
                 and gt_mod.weight.shape[0] % 256 == 0
                 and gt_mod.weight.shape[1] == wp_mod.weight.shape[1]
             ):
-                wpre_q, wpre_s = quantize_weight_fp8_k_major(wp_mod.weight)
+                wpre_q, wpre_s_2d = quantize_weight_fp8_k_major(wp_mod.weight)
+                wpre_s = _as_1d_fp8_scale(wpre_s_2d)
                 r_dt = torch.bfloat16 if router_bf16 else torch.float32
                 wrouter_km = gt_mod.weight.detach().to(r_dt).t().contiguous()
-                _wait_for(wpre_q, wpre_s, wrouter_km)
+                _wait_for(wpre_q, wpre_s_2d, wpre_s, wrouter_km)
                 self.register_buffer("_w7_wpre_w8k", wpre_q, persistent=False)
                 self.register_buffer("_w7_spre", wpre_s, persistent=False)
                 self.register_buffer("_w7_wrouter_km", wrouter_km, persistent=False)
                 if can_pair_ag:
                     full_wpre = tensor_model_parallel_all_gather(wpre_q.contiguous())
-                    full_spre = tensor_model_parallel_all_gather(wpre_s.contiguous())
+                    full_spre = tensor_model_parallel_all_gather(wpre_s_2d.contiguous())
                     half_pre = full_wpre.shape[1] // 2
                     pair_wpre = full_wpre[
                         :, side * half_pre : (side + 1) * half_pre
                     ].contiguous()
-                    pair_spre = full_spre[
-                        :, side * half_pre : (side + 1) * half_pre
-                    ].contiguous()
+                    pair_spre = _as_1d_fp8_scale(
+                        full_spre[:, side * half_pre : (side + 1) * half_pre]
+                    )
                     _wait_for(pair_wpre, pair_spre)
                     del full_wpre, full_spre
                     self.register_buffer(
@@ -2549,6 +2591,7 @@ class MuseSparkMoE(nn.Module):
                 and wpo_mod.weight.shape[1] % 128 == 0
             ):
                 wpost_q, wpost_s = quantize_weight_fp8_k_major(wpo_mod.weight)
+                wpost_s = _as_1d_fp8_scale(wpost_s)
                 _wait_for(wpost_q, wpost_s)
                 self.register_buffer("_w7_wpost_w8k", wpost_q, persistent=False)
                 self.register_buffer("_w7_spost", wpost_s, persistent=False)
@@ -4075,7 +4118,11 @@ class MuseSparkDecoderLayer(nn.Module):
                             k_sc_n,
                             v_sc_n,
                         )
-                    if overlap_epi:
+                    if (
+                        overlap_epi
+                        and wq_next.shape[1] % 256 == 0
+                        and wg_next.shape[1] % 256 == 0
+                    ):
                         from sglang_tpu.kernels.decode_collective_bridges_carb import (
                             get_moe_to_attn_overlap_bridge_op,
                         )
