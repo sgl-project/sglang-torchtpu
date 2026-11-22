@@ -359,6 +359,28 @@ class TestPatchPropagation(_HookTestCase):
         self.assertEqual(source_mod.orig(3), 7)
         self.assertEqual(importer_mod.orig(3), 7)
 
+    def test_class_staticmethod_binding_propagates(self):
+        def orig(x):
+            return x * 2
+
+        source_mod, source_name = _make_module(orig=orig)
+        importer_mod, importer_name = _make_module(orig=orig)
+
+        class Holder:
+            fn = staticmethod(orig)
+
+        Holder.__module__ = importer_name
+        importer_mod.Holder = Holder
+
+        def add_one(fn, x):
+            return fn(x) + 1
+
+        HookRegistry.register(f"{source_name}.orig", add_one, HookType.AROUND)
+        HookRegistry.apply_hooks()
+
+        self.assertEqual(Holder.fn(3), 7)
+        self.assertEqual(Holder().fn(3), 7)
+
 
 # ===========================================================================
 # TestEdgeCases

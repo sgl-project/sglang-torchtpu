@@ -322,12 +322,16 @@ def _propagate_patch(original: object, wrapped: object, source_module: object) -
 
     After ``setattr(source_module, name, wrapped)`` updates the defining module,
     other modules that did ``from source_module import name`` still hold a direct
-    reference to the old *original* object.  This walks ``sys.modules`` and
-    replaces every such stale binding with *wrapped*.
+    reference to the old *original* object — including class-body bindings such as
+    ``Scheduler.resolve_forward_inputs = staticmethod(resolve_forward_inputs)``.
+    This walks ``sys.modules`` and replaces every such stale binding with *wrapped*.
 
-    Returns the number of additional module attributes that were patched.
+    Returns the number of additional module/class attributes that were patched.
     """
     patched_count = 0
+    is_module_fn = isinstance(source_module, types.ModuleType) and not isinstance(
+        original, type
+    )
     for mod in list(sys.modules.values()):
         if mod is source_module or mod is None:
             continue
@@ -344,6 +348,30 @@ def _propagate_patch(original: object, wrapped: object, source_module: object) -
                     patched_count += 1
                 except (AttributeError, TypeError):
                     pass
+            elif (
+                is_module_fn
+                and issubclass(type(attr_value), type)
+                and getattr(attr_value, "__module__", None) == mod.__name__
+            ):
+                for cls_attr, cls_val in list(attr_value.__dict__.items()):
+                    try:
+                        if (
+                            isinstance(cls_val, staticmethod)
+                            and cls_val.__func__ is original
+                        ):
+                            setattr(attr_value, cls_attr, staticmethod(wrapped))
+                            patched_count += 1
+                        elif (
+                            isinstance(cls_val, classmethod)
+                            and cls_val.__func__ is original
+                        ):
+                            setattr(attr_value, cls_attr, classmethod(wrapped))
+                            patched_count += 1
+                        elif cls_val is original:
+                            setattr(attr_value, cls_attr, wrapped)
+                            patched_count += 1
+                    except (AttributeError, TypeError):
+                        pass
     return patched_count
 
 

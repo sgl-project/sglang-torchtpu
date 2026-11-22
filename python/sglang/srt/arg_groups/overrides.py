@@ -313,7 +313,7 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
 def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    if cfg.enable_tf32_matmul is None:
+    if cfg.enable_tf32_matmul is None and get_platform().is_cuda:
         overrides["enable_tf32_matmul"] = True
         logger.info("Enable TF32 matmul by default for Muse Spark")
     if cfg.kv_cache_dtype == "auto":
