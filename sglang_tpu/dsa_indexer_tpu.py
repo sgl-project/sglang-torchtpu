@@ -806,6 +806,228 @@ def build_dsa_kpool_expand_op():
     return custom_op
 
 
+# (shards, role) -> op: the split pooled indexer's two halves (kpool_indexer_local /
+# kpool_merge_rows); the backend all-gathers the local scores between them.
+_KPOOL_SHARD_OPS: dict = {}
+
+
+def build_dsa_kpool_shard_ops(shards: int, role: int):
+    """Register the split pooled indexer as two torch custom ops, once per process:
+    ``local`` stores this rank's pools and returns its local top pools and their
+    score bits; ``merge`` turns every rank's scores into this rank's token rows.
+    ``role`` is static: each rank compiles its own programs."""
+    key = (shards, role)
+    if key in _KPOOL_SHARD_OPS:
+        return _KPOOL_SHARD_OPS[key]
+
+    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_kpool_topk import (
+        kpool_indexer_local,
+        kpool_merge_rows,
+    )
+
+    local_name = f"sglang_tpu_pallas::dsa_kpool_topk_s{shards}r{role}"
+    merge_name = f"sglang_tpu_pallas::dsa_kpool_merge_s{shards}r{role}"
+
+    def _local(
+        query: jax.Array,
+        key: jax.Array,
+        gate: jax.Array,
+        head_weights: jax.Array,
+        ape: jax.Array,
+        raw_cache: jax.Array,
+        pooled_cache: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        raw_page_base: jax.Array,
+        weight_scale: float,
+        topk: int,
+        kpool: int,
+        decode_query_size: int,
+        max_query_length: int,
+        raw_ring_pages_cnt: int,
+    ):
+        return kpool_indexer_local(
+            query,
+            key,
+            gate,
+            head_weights,
+            ape,
+            raw_cache,
+            pooled_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            weight_scale=weight_scale,
+            topk=topk,
+            kpool=kpool,
+            shards=shards,
+            role=role,
+            decode_query_size=decode_query_size,
+            max_query_length=max_query_length or None,
+            raw_page_base=raw_page_base,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
+        )
+
+    raw_argnum, pooled_argnum = argnums(_local, "raw_cache", "pooled_cache")
+    local_kernel = _torch_pallas.custom_jax_kernel(
+        _local,
+        name=f"jax_{local_name}",
+        static_argnums=argnums(
+            _local,
+            "weight_scale",
+            "topk",
+            "kpool",
+            "decode_query_size",
+            "max_query_length",
+            "raw_ring_pages_cnt",
+        ),
+        # Both caches are updated in place: outputs 2 and 3 alias them.
+        donate_argnums=(raw_argnum, pooled_argnum),
+        input_output_aliases={raw_argnum: 2, pooled_argnum: 3},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        local_name, mutates_args=("raw_cache", "pooled_cache"), device_types=["tpu"]
+    )
+    def local_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        raw_cache: torch.Tensor,
+        pooled_cache: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        raw_page_base: torch.Tensor,
+        weight_scale: float,
+        topk: int,
+        kpool: int,
+        decode_query_size: int,
+        max_query_length: int,
+        raw_ring_pages_cnt: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with tpu_info_for_cpu_export():
+            picked, scores, _raw, _pooled = local_kernel(
+                query,
+                key,
+                gate,
+                head_weights,
+                ape,
+                raw_cache,
+                pooled_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                raw_page_base,
+                weight_scale,
+                topk,
+                kpool,
+                decode_query_size,
+                max_query_length,
+                raw_ring_pages_cnt,
+            )
+        return picked, scores
+
+    def _local_fake(query: torch.Tensor, *args, **kwargs):
+        topk, kpool = args[12:14]
+        shape = (query.shape[0], topk // kpool)
+        return (
+            torch.empty(shape, dtype=torch.int32, device=query.device),
+            torch.empty(shape, dtype=torch.int32, device=query.device),
+        )
+
+    local_op.register_fake(_local_fake)
+
+    def _merge(
+        all_scores: jax.Array,
+        picked: jax.Array,
+        kv_lens: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> jax.Array:
+        return kpool_merge_rows(
+            all_scores,
+            picked,
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            shards=shards,
+            role=role,
+            own_pools=own_pools,
+            topk=topk,
+            kpool=kpool,
+            out_width=out_width,
+        )
+
+    merge_kernel = _torch_pallas.custom_jax_kernel(
+        _merge,
+        name=f"jax_{merge_name}",
+        static_argnums=argnums(_merge, "own_pools", "topk", "kpool", "out_width"),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(merge_name, mutates_args=(), device_types=["tpu"])
+    def merge_op(
+        all_scores: torch.Tensor,
+        picked: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return merge_kernel(
+                all_scores,
+                picked,
+                kv_lens,
+                cu_q_lens,
+                distribution,
+                own_pools,
+                topk,
+                kpool,
+                out_width,
+            )
+
+    def _merge_fake(
+        all_scores: torch.Tensor,
+        picked: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ):
+        width = max(out_width, topk + kpool - 1)
+        return torch.empty(
+            (picked.shape[0], width), dtype=torch.int32, device=picked.device
+        )
+
+    merge_op.register_fake(_merge_fake)
+
+    _KPOOL_SHARD_OPS[key] = (local_op, merge_op)
+    return local_op, merge_op
+
+
 def kpool_indexer_forward(
     indexer: "IndexerKPool",
     *,

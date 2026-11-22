@@ -129,6 +129,19 @@ def mla_kv_shard_role(shards: int) -> int:
     return get_parallel().attn_tp_rank % shards
 
 
+def index_kv_shards(kpool: int) -> int:
+    """Ranks that split the pooled indexer's key cache like the latent cache
+    (SGLANG_TPU_DSA_INDEX_KV_SHARD); 1 = every rank keeps all of it."""
+    if kpool <= 1 or not tpu_envs.SGLANG_TPU_DSA_INDEX_KV_SHARD.get():
+        return 1
+    shards = mla_kv_shards()
+    if shards <= 1:
+        raise ValueError(
+            "SGLANG_TPU_DSA_INDEX_KV_SHARD needs SGLANG_TPU_DSA_MLA_KV_SHARDS > 1."
+        )
+    return shards
+
+
 def kpool_raw_ring_pages(*, page_size: int, kpool: int) -> int:
     """Ring pages per request slot for the pooled indexer's raw key|gate rows,
     or 0 to keep one raw row per cached token.
@@ -1398,6 +1411,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self._raw_ring_slots = 0
         self.mla_shards = mla_kv_shards()
         self.mla_role = mla_kv_shard_role(self.mla_shards)
+        # Index-key pages hold this rank's share of each page's pools (same role).
+        self.index_shards = index_kv_shards(index_kpool)
 
         if self.size % self.page_size != 0:
             raise ValueError(
@@ -1415,6 +1430,12 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             raise ValueError(
                 f"page_size ({self.page_size}) must be divisible by {share_unit} "
                 f"to split the latent cache {self.mla_shards} ways."
+            )
+        index_rows = self.page_size // (self.TOKENS_PER_ROW * index_kpool)
+        if index_rows % self.index_shards != 0:
+            raise ValueError(
+                f"{index_rows} index-key rows per page cannot be split "
+                f"{self.index_shards} ways."
             )
         # Allocate one extra page. Token index 0 is the slot used for padded
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
@@ -1437,11 +1458,15 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         raw_ring: bool = False,
         qk_rope_head_dim: int = 64,
         mla_shards: int = 1,
+        index_shards: int = 1,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated (a
-        split latent cache holds 1/mla_shards of every page). A raw ring is
-        sized by request slots, not tokens, so it is not counted."""
-        index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
+        split latent cache holds 1/mla_shards of every page, a split index-key
+        cache 1/index_shards). A raw ring is sized by request slots, not
+        tokens, so it is not counted."""
+        index_bytes = cls.index_key_record_bytes(index_head_dim) // (
+            index_kpool * index_shards
+        )
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
         layer_bytes = _cdiv(
@@ -1491,7 +1516,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
             self.num_pages,
-            rows_per_page // self._index_kpool,
+            rows_per_page // self._index_kpool // self.index_shards,
             self.TOKENS_PER_ROW,
             self.index_key_record_bytes(self._index_head_dim),
         )

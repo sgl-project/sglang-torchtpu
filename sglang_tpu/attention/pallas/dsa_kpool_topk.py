@@ -35,7 +35,9 @@ from sglang_tpu.attention.pallas.kpool_compress import (
     compress_and_store,
     supports_page_size,
 )
+from sglang_tpu.dsv4.sparsecore_topk import sparsecore_topk_dcp_merge
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
+from sglang_tpu.dsv4.streamindex_topk.metadata import cp_local_to_global
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
@@ -189,12 +191,15 @@ def store_pooled_keys(
     max_query_length: int | None = None,
     raw_page_base: jax.Array | None = None,  # i32[max_num_seqs]; raw ring only
     raw_ring_pages_cnt: int = 0,
+    shards: int = 1,
+    role: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's raw key | gate records and compress the pools it
     closes; return ``(raw_cache, pooled_cache)``.
 
     The store half of ``kpool_indexer_step``: any other writer of these caches
-    must call it to leave the indexer step's bytes.
+    must call it to leave the indexer step's bytes. ``shards`` > 1: the pooled
+    cache is rank ``role``'s share of each page (``kpool_indexer_local``).
     """
     num_tokens, d = key.shape
     num_raw, page_size, _ = raw_cache.shape
@@ -203,7 +208,7 @@ def store_pooled_keys(
     num_seqs = kv_lens.shape[0]
     expected = (
         num_pages,
-        page_size // kpool // _TOKENS_PER_ROW,
+        page_size // kpool // _TOKENS_PER_ROW // shards,
         _TOKENS_PER_ROW,
         pooled_record_bytes(d),
     )
@@ -241,6 +246,8 @@ def store_pooled_keys(
         and supports_page_size(page_size)
         and raw_cache.dtype == jnp.bfloat16
     )
+    if shards > 1 and not fused:
+        raise NotImplementedError("a split pooled cache needs the fused pooling kernel")
     if fused:
         # Keep the native cache layout through the update. A generic scatter
         # can introduce full-pool layout conversions even for a few new pools.
@@ -256,6 +263,8 @@ def store_pooled_keys(
             max_query_length=max_query_length,
             raw_page_base=raw_page_base,
             raw_ring_pages_cnt=raw_ring_pages_cnt,
+            shards=shards,
+            role=role,
         )
     else:
         # Logged at trace time, once per compiled shape.
@@ -327,8 +336,6 @@ def kpool_indexer_step(
     ``kpool_expand_rows``; each row then equals the same row of an unsplit call.
     """
     num_tokens = query.shape[0]
-    page_size = raw_cache.shape[1]
-    num_seqs = kv_lens.shape[0]
     if topk % kpool != 0:
         raise ValueError(f"topk ({topk}) must be a multiple of kpool ({kpool})")
     raw_cache, pooled_cache = store_pooled_keys(
@@ -347,14 +354,57 @@ def kpool_indexer_step(
         raw_ring_pages_cnt=raw_ring_pages_cnt,
     )
     _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
+    picked = _score_pools(
+        query,
+        head_weights,
+        pooled_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        weight_scale=weight_scale,
+        topk=topk,
+        kpool=kpool,
+        decode_query_size=decode_query_size,
+        row_start=row_start,
+        row_count=row_count,
+    )  # i32[T or row_count, n_pick], chosen pools first, then -1
+    if row_count:
+        return picked, raw_cache, pooled_cache
+    out = expand_picked(picked, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
+    return out, raw_cache, pooled_cache
 
-    # 3. Score each query against its request's closed pools and keep the best
-    # topk // kpool. The pooled cache is paged like the raw cache with
-    # page_size // kpool pools per page, so the kernel reads the request's own
-    # page table. Pad each row to whole kernel blocks so no block reads past it;
+
+def _score_pools(
+    query: jax.Array,  # bf16[num_tokens, n_heads, d]; not rotated
+    head_weights: jax.Array,  # f32[num_tokens, n_heads]
+    pooled_cache: jax.Array,  # u8[num_pages, rows, 4, record_bytes]
+    kv_lens: jax.Array,
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    weight_scale: float,
+    topk: int,
+    kpool: int,
+    decode_query_size: int,
+    row_start: jax.Array | None = None,
+    row_count: int = 0,
+    **topk_kwargs,
+):
+    """Step 3 of the module docstring on StreamIndex: each query's best
+    ``topk // kpool`` pools of ``pooled_cache`` (``topk_kwargs`` go to
+    streamindex_topk)."""
+    if row_count:
+        topk_kwargs.update(row_start=row_start.reshape(()), row_count=row_count)
+    num_tokens = query.shape[0]
+    num_seqs = kv_lens.shape[0]
+    # The pooled cache is paged like the raw cache (pooled_cache.shape[1] rows of
+    # _TOKENS_PER_ROW pools per page), so the kernel reads the request's own page
+    # table. Pad each row to whole kernel blocks so no block reads past it;
     # page 0 is never a real page and kv_lens masks the padding.
     pages_per_seq = page_indices.shape[0] // num_seqs
-    pool_page_size = page_size // kpool
+    pool_page_size = pooled_cache.shape[1] * _TOKENS_PER_ROW
     block_pages = max(1, _NUM_POOLS_PER_BLOCK // pool_page_size)
     pool_pages = _align(pages_per_seq, block_pages)
     pool_page_indices = jnp.pad(
@@ -365,7 +415,6 @@ def kpool_indexer_step(
     query = hadamard_rotate(query).astype(jnp.bfloat16)
     q_fp8, q_scale, _ = quantize_ue8m0(query)
     w = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale  # [T, H]
-    n_pick = topk // kpool
     # A token split window scores few rows; the kernel takes no row chunks
     # with a window.
     chunked = (
@@ -376,7 +425,7 @@ def kpool_indexer_step(
     )
     # causal_offset = kpool - 1: a query at pos sees pools < (pos + 1) // kpool,
     # the ones closed at or before it.
-    picked = streamindex_topk(
+    return streamindex_topk(
         q_fp8,
         w,
         pooled_cache,
@@ -384,7 +433,7 @@ def kpool_indexer_step(
         pool_page_indices,
         cu_q_lens,
         distribution,
-        k=n_pick,
+        k=topk // kpool,
         compression_ratio=kpool,
         causal_offset=kpool - 1,
         num_kv_pages_per_block=(block_pages,) * 3,
@@ -396,16 +445,113 @@ def kpool_indexer_step(
         page_table_in_hbm=tpu_envs.SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM.get(),
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
         overlap_chunks=False,
-        **(
-            dict(row_start=row_start.reshape(()), row_count=row_count)
-            if row_count
-            else {}
-        ),
-    )  # i32[T or row_count, n_pick], chosen pools first, then -1
-    if row_count:
-        return picked, raw_cache, pooled_cache
-    out = expand_picked(picked, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
-    return out, raw_cache, pooled_cache
+        **topk_kwargs,
+    )
+
+
+def kpool_indexer_local(
+    query: jax.Array,  # bf16[num_tokens, n_heads, d]; wq_b(q_lora), not rotated
+    key: jax.Array,  # bf16[num_tokens, d]
+    gate: jax.Array,  # bf16[num_tokens, d]
+    head_weights: jax.Array,  # f32[num_tokens, n_heads]
+    ape: jax.Array,  # f32[kpool, d]
+    raw_cache: jax.Array,  # bf16[raw_pages, page_size, 2 * d]
+    pooled_cache: jax.Array,  # u8[num_pages, page_size // 16 // shards, 4, record_bytes]
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    weight_scale: float,
+    topk: int,
+    kpool: int,
+    shards: int,
+    role: int,
+    decode_query_size: int = 1,
+    max_query_length: int | None = None,
+    raw_page_base: jax.Array | None = None,
+    raw_ring_pages_cnt: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``kpool_indexer_step`` on a pooled cache split across ``shards`` ranks.
+
+    Rank ``role`` holds the pools at its own offsets of each page (the latent
+    cache's split, attention/pallas/mla_sparse/kv_shard.py): it stores those of
+    this step's closing pools, then scores every query against its own closed
+    pools. Returns ``(picked i32[T, topk // kpool], scores i32[T, topk // kpool],
+    raw_cache, pooled_cache)``: its local top pools (rank-local indices, then -1)
+    and their f32 score bits, for ``kpool_merge_rows`` after an all-gather.
+    """
+    raw_cache, pooled_cache = store_pooled_keys(
+        key,
+        gate,
+        ape,
+        raw_cache,
+        pooled_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        kpool=kpool,
+        max_query_length=max_query_length,
+        raw_page_base=raw_page_base,
+        raw_ring_pages_cnt=raw_ring_pages_cnt,
+        shards=shards,
+        role=role,
+    )
+    own_pools = pooled_cache.shape[1] * _TOKENS_PER_ROW  # per page
+    picked, scores = _score_pools(
+        query,
+        head_weights,
+        pooled_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        weight_scale=weight_scale,
+        topk=topk,
+        kpool=kpool,
+        decode_query_size=decode_query_size,
+        cp_size=shards,
+        cp_rank=role,
+        interleave_size=own_pools * kpool,
+        return_scores=True,
+    )
+    return picked, scores, raw_cache, pooled_cache
+
+
+def kpool_merge_rows(
+    all_scores: jax.Array,  # i32[shards * T, topk // kpool]; ranks' scores, rank-major
+    picked: jax.Array,  # i32[T, topk // kpool]; this rank's local pools
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    shards: int,
+    role: int,
+    own_pools: int,  # this rank's pools per page
+    topk: int,
+    kpool: int,
+    out_width: int = 0,
+) -> jax.Array:
+    """This rank's token rows from ``kpool_indexer_local``: the exact global top
+    ``topk // kpool`` pools over every rank's local ones (ties go to the lower
+    rank), kept where this rank holds them, expanded like ``expand_picked``.
+    The latent cache is split the same way, so these are the candidates this
+    rank attends."""
+    num_tokens, n_pick = picked.shape
+    scores = (
+        all_scores.reshape(shards, num_tokens, n_pick)
+        .transpose(1, 0, 2)
+        .reshape(num_tokens, shards * n_pick)
+    )
+    owned = sparsecore_topk_dcp_merge(
+        scores, picked, n_pick, dcp_rank=jnp.int32(role), dcp_size=shards
+    )  # i32[T, n_pick]; rank-local pools, then -1
+    pools = jnp.where(
+        owned >= 0, cp_local_to_global(owned, role, shards, own_pools), -1
+    )
+    _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
+    return expand_picked(pools, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
 
 
 def expand_picked(

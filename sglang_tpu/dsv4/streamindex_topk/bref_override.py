@@ -93,6 +93,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
     # > 0: page-table rows end with page_group_starts (one entry per group).
     page_group: int = dataclasses.field(default=0, metadata=dict(static=True))
+    # > 0: then one entry per sub-group, tried when a group is not one run.
+    sub_group: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -110,6 +112,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         grid_rank: int = 1,
         chunk_idx: int = 0,
         page_group: int = 0,
+        sub_group: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -128,6 +131,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
             page_group=page_group,
+            sub_group=sub_group,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -149,6 +153,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         grid_rank: int = 1,
         chunk_idx: int = 0,
         page_group: int = 0,
+        sub_group: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -165,6 +170,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
             page_group=page_group,
+            sub_group=sub_group,
         )
 
     def copy_in(
@@ -227,17 +233,62 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
                         )
                         safe_page_offset = jnp.minimum(
                             page * self.page_size_per_kv_packing,
-                            jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
+                            jnp.maximum(
+                                0, max_hbm_pages - self.page_size_per_kv_packing
+                            ),
                         )
                         self._copy_pages(
                             reshaped_cache_hbm_ref, vmem_dst, sem, safe_page_offset,
                             batch_idx, i, 1,
                         )  # fmt: skip
 
-                if group:
+                if group and self.sub_group:
+                    pl.when(start < 0)(
+                        functools.partial(
+                            self._copy_sub_groups, page_table, page_rows,
+                            reshaped_cache_hbm_ref, vmem_dst, sem,
+                            effective_seq_idx + batch_idx, batch_idx, kv_p_start, g,
+                            max_hbm_pages,
+                        )
+                    )  # fmt: skip
+                elif group:
                     pl.when(start < 0)(per_page)
                 else:
                     per_page()
+
+    def _copy_sub_groups(
+        self, page_table, page_rows, src, vmem_dst, sem, seq_idx, batch_idx,
+        kv_p_start, first, max_hbm_pages,
+    ):  # fmt: skip
+        """A group that is not one run: one DMA per sub-group run, else page by page."""
+        sub = self.sub_group
+        sub_base = self.pages_per_seq + self.pages_per_seq // self.page_group
+        rows = self.page_size_per_kv_packing
+        for j in range(first, first + self.page_group, sub):
+            sub_start = page_rows[batch_idx, sub_base + (kv_p_start + j) // sub]
+            pl.when(sub_start >= 0)(
+                functools.partial(
+                    self._copy_pages, src, vmem_dst, sem, sub_start * rows,
+                    batch_idx, j, sub,
+                )
+            )  # fmt: skip
+
+            @pl.when(sub_start < 0)
+            def _(j=j):
+                @pl.loop(0, sub)
+                def _(i):
+                    page = _page_id(
+                        page_table,
+                        page_rows,
+                        seq_idx=seq_idx,
+                        batch_idx=batch_idx,
+                        page_col=kv_p_start + j + i,
+                        pages_per_seq=self.pages_per_seq,
+                    )
+                    offset = jnp.minimum(
+                        page * rows, jnp.maximum(0, max_hbm_pages - rows)
+                    )
+                    self._copy_pages(src, vmem_dst, sem, offset, batch_idx, j + i, 1)
 
     def _copy_pages(self, src, vmem_dst, sem, src_row, batch_idx, first, count):
         """Start one DMA of ``count`` pages from row ``src_row`` into slot pages

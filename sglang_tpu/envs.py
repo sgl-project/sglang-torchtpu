@@ -243,6 +243,10 @@ class TpuEnvs:
     # mla_sparse/ragged.py), instead of every slot of the row. 0 = off. Bit-exact without
     # rope lanes; with rope a score can differ by one f32 rounding.
     SGLANG_TPU_DSA_KV_SHARD_RAGGED_BLOCK = EnvInt(0)
+    # SGLANG_TPU_DSA_MLA_KV_SHARDS > 1, pooled indexer: split its key cache the same way
+    # (each rank stores and scores the pools at its own page offsets; an all-gather of
+    # the local top-k scores picks the exact global top-k).
+    SGLANG_TPU_DSA_INDEX_KV_SHARD = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)

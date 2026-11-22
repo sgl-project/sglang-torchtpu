@@ -37,6 +37,7 @@ from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
     build_dsa_kpool_expand_op,
+    build_dsa_kpool_shard_ops,
     build_dsa_kpool_topk_op,
     build_dsa_kpool_topk_split_op,
     indexer_forward,
@@ -331,6 +332,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
+    # Set by _init_index_kv_shard; tests build the backend without __init__.
+    _index_shards = 1
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -352,7 +355,31 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
         self._init_mla_kv_shards()
+        self._init_index_kv_shard()
         self._init_attention_token_split()
+
+    def _init_index_kv_shard(self) -> None:
+        """SGLANG_TPU_DSA_INDEX_KV_SHARD: the pooled indexer's ops on a key cache
+        split like the latent cache (kpool_indexer_local / kpool_merge_rows)."""
+        pool = _split_pool(self.token_to_kv_pool)
+        self._index_shards = pool.index_shards
+        if self._index_shards <= 1:
+            return
+        if self._index_shards != self.mla_shards:
+            raise ValueError(
+                f"index-key split {self._index_shards} != latent split {self.mla_shards}"
+            )
+        self._index_local_op, self._index_merge_op = build_dsa_kpool_shard_ops(
+            self._index_shards, self.mla_role
+        )
+        self._index_own_pools = self.page_size // self._kpool // self._index_shards
+        logger.info(
+            "Pooled DSA indexer on a split key cache: %d shards, role %d, %d pools "
+            "per page per rank.",
+            self._index_shards,
+            self.mla_role,
+            self._index_own_pools,
+        )
 
     def _init_attention_token_split(self) -> None:
         """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
@@ -788,6 +815,18 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         ``i32[num_tokens, width]`` rows in the format of index_topk."""
         metadata = self.forward_metadata
         pool = self.token_to_kv_pool
+        if self._index_shards > 1:
+            return self._index_topk_kpool_split_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                gate=gate,
+                head_weights=head_weights,
+                ape=ape,
+                weight_scale=weight_scale,
+                kpool=kpool,
+            )
         split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
         if split_rows:
             return self._index_topk_kpool_token_split(
@@ -823,6 +862,60 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
             raw_ring_pages_cnt,
+        )
+
+    def _index_topk_kpool_split_cache(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        weight_scale: float,
+        kpool: int,
+    ) -> torch.Tensor:
+        """index_topk_kpool on a split key cache: every rank scores all rows
+        against its own pools, the group all-gathers the local top-k scores, and
+        each rank keeps the global winners it holds. The latent cache is split
+        the same way, so the rows go straight to this rank's attention."""
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        kv_lens = self._kv_lens(forward_batch)
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
+        picked, scores = self._index_local_op(
+            query.contiguous(),
+            key.contiguous(),
+            gate.contiguous(),
+            head_weights.contiguous(),
+            ape.contiguous(),
+            pool.get_kpool_raw_cache(layer_id),
+            pool.get_index_key_cache(layer_id),
+            kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            raw_page_base,
+            weight_scale,
+            self._topk,
+            kpool,
+            metadata.decode_query_size,
+            _kpool_query_bound(metadata, num_tokens=query.shape[0]),
+            raw_ring_pages_cnt,
+        )  # i32[T, topk // kpool] each: local pools, their score bits
+        all_scores = self._mla_group.all_gather(scores, dim=0)
+        return self._index_merge_op(
+            all_scores,
+            picked,
+            kv_lens,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._index_own_pools,
+            self._topk,
+            kpool,
+            self._kpool_width,
         )
 
     def _index_topk_kpool_token_split(

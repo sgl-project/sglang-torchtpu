@@ -174,6 +174,15 @@ class _BlockedPrefillConfig:
         )
 
 
+def _table_pages(width: int, page_group: int, sub_group: int) -> int:
+    """Page ids in an HBM table row of ``width``: the ids, then one start per
+    ``page_group`` pages, then one per ``sub_group`` pages when it is set."""
+    if not sub_group:
+        return width * page_group // (page_group + 1)
+    unit = page_group * sub_group
+    return width * unit // (unit + sub_group + page_group)
+
+
 def kernel(
     *refs,
     page_table_in_hbm: bool,
@@ -184,12 +193,14 @@ def kernel(
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_idx: int = 0,
     page_group: int = 0,
+    sub_group: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
 
     ``page_group`` > 0: the HBM page table carries, after each row's page ids,
     one entry per group of ``page_group`` pages (page_group_starts); a group
-    with an entry >= 0 is fetched with one DMA.
+    with an entry >= 0 is fetched with one DMA. ``sub_group`` > 0: then one entry
+    per group of ``sub_group`` pages, tried inside a group that is not one run.
 
     Refs: scalar prefetch (seq_lens [max_num_seqs], page table when it is
     prefetched [max_num_seqs * pages_per_seq], cu_q_lens [max_num_seqs + 1],
@@ -216,7 +227,7 @@ def kernel(
             *score_refs,
             page_rows_ref,
         ) = refs
-        pages_per_seq = page_table_ref.shape[1] * page_group // (page_group + 1)
+        pages_per_seq = _table_pages(page_table_ref.shape[1], page_group, sub_group)
         if not page_group:
             pages_per_seq = page_table_ref.shape[1]
     else:
@@ -363,6 +374,7 @@ def kernel(
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
             page_group=page_group,
+            sub_group=sub_group,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -863,17 +875,22 @@ def _effective_row_lengths(
 # KV pages fetched by one DMA when their ids are consecutive: at 8 KB pages a DMA
 # start costs about as much as its bytes, and prefill allocates pages in runs.
 _PAGE_GROUP = 8
+# Smaller pages (a rank's share of a split cache) group up to this many bytes,
+# with _PAGE_GROUP-page runs tried inside a group that is not one run.
+_PAGE_GROUP_BYTES = 64 * 1024
 
 
-def page_group_starts(page_table: jax.Array, *, num_pages: int) -> jax.Array:
-    """i32[seqs, pages_per_seq // _PAGE_GROUP]: the first page of each group of
+def page_group_starts(
+    page_table: jax.Array, *, num_pages: int, group: int = _PAGE_GROUP
+) -> jax.Array:
+    """i32[seqs, pages_per_seq // group]: the first page of each group of
     consecutive page ids, 0 for a group of page-0 padding (past the sequence, so any
     in-range rows will do), else -1 (fetched page by page)."""
     seqs, pages = page_table.shape
-    ids = page_table.reshape(seqs, pages // _PAGE_GROUP, _PAGE_GROUP)
+    ids = page_table.reshape(seqs, pages // group, group)
     first = ids[..., 0]
-    run = jnp.all(ids == first[..., None] + jnp.arange(_PAGE_GROUP), axis=-1)
-    run &= first + _PAGE_GROUP <= num_pages
+    run = jnp.all(ids == first[..., None] + jnp.arange(group), axis=-1)
+    run &= first + group <= num_pages
     pad = jnp.all(ids == 0, axis=-1)
     return jnp.where(run, first, jnp.where(pad, 0, -1)).astype(jnp.int32)
 
@@ -997,10 +1014,11 @@ def streamindex_topk(
                 f" ({decode_req_batch_size * decode_query_size})."
             )
     if decode_query_size > 1:
-        if enable_early_exit or cp_size > 1:
+        # cp_size > 1 is fine: the decode passes take cp-local KV lengths from the
+        # schedule and the row lengths, like every other pass.
+        if enable_early_exit:
             raise NotImplementedError(
-                "decode_query_size > 1 is not supported with enable_early_exit "
-                "or cp_size > 1."
+                "decode_query_size > 1 is not supported with enable_early_exit."
             )
         is_decode = jnp.arange(seq_lens.shape[0]) < distribution[1]
         uniform = jnp.all(~is_decode | (jnp.diff(cu_q_lens) == decode_query_size))
@@ -1115,16 +1133,34 @@ def streamindex_topk(
         for bkv_p in num_kv_pages_per_blocks
     )
     group_starts = None
+    page_group, sub_group = _PAGE_GROUP, 0
+    if kv_layout == KVLayout.HEAD_ALONG_SUBLANE:
+        page_bytes = cache_kv.size * cache_kv.dtype.itemsize // cache_kv.shape[0]
+        wide = _PAGE_GROUP_BYTES // page_bytes
+        if wide > _PAGE_GROUP and all(
+            x % wide == 0 for x in (pages_per_seq, *num_kv_pages_per_blocks)
+        ):
+            page_group, sub_group = wide, _PAGE_GROUP
     if (
         page_table_in_hbm
         and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
-        and pages_per_seq % _PAGE_GROUP == 0
-        and all(bkv_p % _PAGE_GROUP == 0 for bkv_p in num_kv_pages_per_blocks)
+        and pages_per_seq % page_group == 0
+        and all(bkv_p % page_group == 0 for bkv_p in num_kv_pages_per_blocks)
     ):
+        table_2d = page_indices.reshape(max_num_seqs, pages_per_seq)
         group_starts = page_group_starts(
-            page_indices.reshape(max_num_seqs, pages_per_seq),
-            num_pages=cache_kv.shape[0],
+            table_2d, num_pages=cache_kv.shape[0], group=page_group
         )
+        if sub_group:
+            group_starts = jnp.concatenate(
+                [
+                    group_starts,
+                    page_group_starts(
+                        table_2d, num_pages=cache_kv.shape[0], group=sub_group
+                    ),
+                ],
+                axis=1,
+            )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
         """Query and KV block sizes a pass runs with."""
@@ -1217,7 +1253,8 @@ def streamindex_topk(
                     buffer_count=buffer_count,
                     kv_layout=kv_layout,
                     chunk_idx=chunk_idx,
-                    page_group=_PAGE_GROUP if group_starts is not None else 0,
+                    page_group=page_group if group_starts is not None else 0,
+                    sub_group=sub_group if group_starts is not None else 0,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
