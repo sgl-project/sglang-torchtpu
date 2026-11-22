@@ -343,6 +343,48 @@ class TestMuseLcRpaPrefill(unittest.TestCase):
         for tok in ("fp8_qkpv_fast", "vreg_acc1", "mrb1"):
             self.assertIn(tok, captured["_prefill_opts"])
 
+    def test_shared_pages_bs8_dispatch_gate(self):
+        from sglang_tpu.attention.pallas import rpa_v3_decode_fast
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        seen = []
+
+        def _fake_run_decode(*args, **kwargs):
+            seen.append(kwargs.get("shared_pages"))
+            return args[0], args[3]
+
+        for bs, expect_non_none in ((8, True), (4, False)):
+            seen.clear()
+            with (
+                patch.object(rpa_v3_decode_fast, "can_use_decode_fast", return_value=True),
+                patch.object(rpa_v3_decode_fast, "run_decode_fast_rpa", side_effect=_fake_run_decode),
+            ):
+                ragged_paged_attention(
+                    jnp.zeros((1, bs, 8, 2, 128), dtype=jnp.bfloat16),
+                    jnp.zeros((bs, 1, 4, 128), dtype=jnp.float8_e4m3fn),
+                    None,
+                    jnp.zeros((16, 128, 1, 4, 128), dtype=jnp.float8_e4m3fn),
+                    jnp.full((bs,), 1024, dtype=jnp.int32),
+                    jnp.zeros((bs * 129,), dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32) * 1024,
+                    jnp.array([bs, bs, bs, 2], dtype=jnp.int32),
+                    None,
+                    None,
+                    vmem_limit_bytes=125829120,
+                    _decode_fast="shared64,c4096,q512,pbf16,w8",
+                    _skip_mixed=True,
+                    _prepared_inputs=True,
+                    _kv_pack_dense2=True,
+                )
+            self.assertEqual(len(seen), 1)
+            if expect_non_none:
+                self.assertIsNotNone(seen[0])
+            else:
+                self.assertIsNone(seen[0])
+
     def test_fp8_qkpv_dyn_math_parity(self):
         rng = np.random.default_rng(1337)
         w_cols = 256

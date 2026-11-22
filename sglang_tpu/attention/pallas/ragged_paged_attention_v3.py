@@ -5880,9 +5880,9 @@ def ragged_paged_attention(
             sliding_window is not None
             or not _skip_mixed
             or chunk_prefill_size is not None
-            or kv_lens.shape[0] % 16 != 0
+            or kv_lens.shape[0] % 8 != 0
             or q.shape[0] < kv_lens.shape[0]
-            or kv_lens.shape[0] < 16
+            or kv_lens.shape[0] < 8
         ):
             shared_pages = None
         if _use_decode_fast and _skip_mixed and chunk_prefill_size is None:
