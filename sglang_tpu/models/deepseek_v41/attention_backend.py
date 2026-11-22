@@ -299,10 +299,14 @@ def _host_extend_positions(
 def _extend_positions(forward_batch: ForwardBatch, num_tokens: int) -> torch.Tensor:
     from sglang_tpu.envs import envs as tpu_envs
 
+    # The compile policy's host mirror is the exact uploaded tensor: prefer it.
+    # Positions derived from the extend length lists serve only batches it did
+    # not mirror, as those lists can be stale where the mirror is not.
+    if host_input_mirror.host_copy(forward_batch, "positions") is not None:
+        return _host_or_read(forward_batch, "positions", num_tokens)
     positions = _host_extend_positions(forward_batch, num_tokens)
     if positions is None:
-        # Other modes: the compile policy's host mirror, else the device read.
-        return _host_or_read(forward_batch, "positions", num_tokens)
+        return _as_cpu_int64(forward_batch.positions, num_tokens)
     if tpu_envs.SGLANG_TPU_DSV41_CHECK_HOST_POSITIONS.get():
         read = _as_cpu_int64(forward_batch.positions, num_tokens)
         if not torch.equal(read, positions):
