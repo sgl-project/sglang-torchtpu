@@ -96,9 +96,12 @@ def adder(model=None):
     return obj
 
 
-def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0):
+def scheduler(
+    waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0, spread=1.0
+):
     return NS(
         _tpu_pp_chunk_cost=cost(),
+        _tpu_pp_chunk_spread=spread,
         waiting_queue=waiting,
         chunked_req=chunked,
         mbs=list(mbs),
@@ -116,6 +119,44 @@ def test_pending_work_splits_lone_prompt_and_preserves_busy_steps():
     sched = scheduler([req(32768)])
     assert pending_step_limit(sched) == 4096
     sched.waiting_queue = [req(32768, rid=str(i)) for i in range(8)]
+    assert pending_step_limit(sched) == 16384
+
+
+def test_spread_splits_light_load_over_more_steps():
+    assert pending_step_limit(scheduler([req(32768)], spread=2.0)) == 2048
+    # 8 stages x 16K top bucket = 128K; just below it the share is halved.
+    below = [req(16384, rid=str(i)) for i in range(7)] + [req(16000, rid="7")]
+    assert pending_step_limit(scheduler(below)) == 16384
+    assert pending_step_limit(scheduler(below, spread=2.0)) == 8192
+    assert pending_step_limit(scheduler(below, spread=1.5)) == 12288
+
+
+def test_default_spread_keeps_one_step_per_stage():
+    def one_step_per_stage(pending):
+        share = -(-pending // 8)
+        return min(16384, max(2048, -(-share // 2048) * 2048))
+
+    for pending in [*range(0, 140000, 997), 131071, 131072, 131073]:
+        sched = scheduler([req(pending)] if pending else [])
+        assert pending_step_limit(sched) == one_step_per_stage(pending), pending
+
+
+def test_spread_counts_chunks_in_flight_below_a_full_step_per_stage():
+    in_flight = [batch(16384) for _ in range(4)]
+    sched = scheduler([req(32768)], mbs=in_flight, last_mbs=[None] * 4, spread=2.0)
+    assert pending_step_limit(sched) == 6144
+
+
+def test_spread_keeps_the_largest_step_from_one_full_step_per_stage():
+    """A pipeline with a full step of work per stage must keep its largest
+    step whatever the spread, or saturated throughput drops."""
+    at = [req(16384, rid=str(i)) for i in range(8)]
+    deep = [req(32768, rid=str(i)) for i in range(16)]
+    for spread in (1.0, 2.0, 4.0):
+        assert pending_step_limit(scheduler(at, spread=spread)) == 16384
+        assert pending_step_limit(scheduler(deep, spread=spread)) == 16384
+    in_flight = [batch(16384) for _ in range(4)]
+    sched = scheduler([req(65536)], mbs=in_flight, last_mbs=[None] * 4, spread=2.0)
     assert pending_step_limit(sched) == 16384
 
 
@@ -395,6 +436,14 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
         assert not raw.enable_torch_compile
         with pytest.raises(ValueError, match="SLACK must be nonnegative"):
             profile_and_install_cost_model(scheduler)
+        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SLACK", "0.1")
+        for spread in ("0.5", "inf", "nan"):
+            monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SPREAD", spread)
+            with pytest.raises(
+                ValueError, match="SPREAD must be finite and at least 1"
+            ):
+                profile_and_install_cost_model(scheduler)
+        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SPREAD", "1")
         get_context().override("test.no_compile", enable_torch_compile=False)
         with pytest.raises(ValueError, match="require --enable-torch-compile"):
             profile_and_install_cost_model(scheduler)
@@ -410,7 +459,8 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
 
     reports = {
-        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None) for rank in range(4)
+        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None, 1.0)
+        for rank in range(4)
     }
 
     def all_gather_object(out, obj, group):
@@ -446,7 +496,11 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         )
         profile_and_install_cost_model(scheduler)
         models.append(scheduler._tpu_pp_chunk_cost)
+        assert scheduler._tpu_pp_chunk_spread == 1.0
     assert all(model == models[0] for model in models)
+    reports[3] = (*reports[3][:2], 2.0)
+    with pytest.raises(ValueError, match="SPREAD must be the same on every rank"):
+        profile_and_install_cost_model(scheduler)
 
 
 if __name__ == "__main__":

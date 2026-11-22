@@ -245,7 +245,11 @@ fixed compute-time budget, and by the batched attention kernel's schedule
 capacity, so few requests get small steps and later chunks of a long prompt
 shrink with their attention cost. `SGLANG_TPU_PP_DYNAMIC_CHUNKS=0` keeps
 fixed token budgets; `SGLANG_TPU_PP_CHUNK_SLACK` (default `0.1`) is the slack
-above the profiled full-step time.
+above the profiled full-step time. `SGLANG_TPU_PP_CHUNK_SPREAD` (default `1`,
+finite, at least `1`) divides the pending share further while the pending work
+is under one full step per stage, so a lightly loaded pipeline runs more,
+smaller steps and each request crosses the stages sooner; from one full step
+per stage up, every step takes the largest bucket.
 
 ## Notes
 

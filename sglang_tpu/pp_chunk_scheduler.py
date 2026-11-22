@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
@@ -45,8 +46,11 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     not come back. A lone prompt still splits into one chunk per stage; under
     load the chunks grow with the work already in flight, since every stage
     advances in lockstep at the pace of the largest chunk in the pipeline.
+    Below a full step per stage, the work is split over ``spread`` times as
+    many steps; at or above it, every step takes the largest bucket.
     """
     cost = scheduler._tpu_pp_chunk_cost
+    pp_size, top = get_parallel().pp_size, cost.buckets[-1]
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
@@ -73,7 +77,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
             cached = matched_prefix_len(scheduler.tree_cache, req)
             cached_prefix[req.rid] = cached
         pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
-        if pending >= get_parallel().pp_size * cost.buckets[-1]:
+        if pending >= pp_size * top:
             # The limit saturates at a full step; the rest need no match.
             break
     # A micro-batch slot holds its batch until the result is processed, when
@@ -81,9 +85,11 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
+    if pending >= pp_size * top:
+        return top
     granule = cost.granularity
-    share = -(-pending // get_parallel().pp_size)
-    return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
+    granules = math.ceil(pending / (pp_size * scheduler._tpu_pp_chunk_spread * granule))
+    return min(top, max(granule, granules * granule))
 
 
 def _prefill_tokens(batch: ScheduleBatch) -> int:
@@ -209,6 +215,9 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
     if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
         raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
+    spread = envs.SGLANG_TPU_PP_CHUNK_SPREAD.get()
+    if not 1 <= spread < math.inf:
+        raise ValueError("SGLANG_TPU_PP_CHUNK_SPREAD must be finite and at least 1.")
     policy = runner.compile_policy
     granularity = chunk_granularity(
         scheduler.page_size, scheduler.chunked_prefill_size, True
@@ -245,8 +254,13 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     # let the stage leader decide and broadcast, or check agreement in the stage.
     reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.world_group.cpu_group
+        reports, (samples, schedule, spread), group=scheduler.world_group.cpu_group
     )
+    if len({report[2] for report in reports}) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_CHUNK_SPREAD must be the same on every rank; "
+            "ranks that size steps differently deadlock the pipeline."
+        )
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
         [report[0] for report in reports],
@@ -266,6 +280,12 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
                 f"lower --context-length from {context_len} to {longest}."
             )
     scheduler._tpu_pp_chunk_cost = cost
+    scheduler._tpu_pp_chunk_spread = spread
     # Cached prefix tokens of each waiting request, matched once.
     scheduler._tpu_pp_cached_prefix = {}
-    logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
+    logger.info(
+        "TPU pipeline chunks: %s; spread %s; stage samples %s",
+        cost.describe(),
+        spread,
+        samples,
+    )
