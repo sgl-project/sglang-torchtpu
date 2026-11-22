@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -597,6 +598,28 @@ class MuseSparkInterleavedRope(nn.Module):
         return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
 
 
+def _layer_tp_size(layer: nn.Module) -> int:
+    """Return ``tp_size`` for a parallel linear layer or mock."""
+    tp_size = getattr(layer, "tp_size", None)
+    if tp_size is not None:
+        return int(tp_size)
+    tp_group = getattr(layer, "tp_group", None)
+    if tp_group is not None:
+        return int(get_group_rank_size(tp_group)[1])
+    return int(get_parallel().attn_tp_size)
+
+
+def _layer_tp_rank(layer: nn.Module) -> int:
+    """Return ``tp_rank`` for a parallel linear layer or mock."""
+    tp_rank = getattr(layer, "tp_rank", None)
+    if tp_rank is not None:
+        return int(tp_rank)
+    tp_group = getattr(layer, "tp_group", None)
+    if tp_group is not None:
+        return int(get_group_rank_size(tp_group)[0])
+    return int(get_parallel().attn_tp_rank)
+
+
 class MuseSparkAttention(nn.Module):
     """QK-normed attention with a weightless output norm and a sigmoid output gate."""
 
@@ -632,8 +655,7 @@ class MuseSparkAttention(nn.Module):
             bias=False,
             quant_config=None,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         self.gate_proj = ColumnParallelLinear(
             input_size=config.hidden_size,
@@ -642,8 +664,7 @@ class MuseSparkAttention(nn.Module):
             gather_output=False,
             quant_config=None,
             prefix=add_prefix("gate_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         self.o_proj = RowParallelLinear(
             input_size=config.num_attention_heads * self.head_dim,
@@ -652,8 +673,7 @@ class MuseSparkAttention(nn.Module):
             reduce_results=True,
             quant_config=None,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         # Shared across layers; NoPE layers (theta 0) skip it.
         self.rotary_emb = rotary_emb if config.layer_rope_theta[layer_idx] > 0 else None
@@ -690,8 +710,8 @@ class MuseSparkAttention(nn.Module):
             or gp.weight.dtype != torch.bfloat16
             or qp.weight.shape[1] != gp.weight.shape[1]
             or getattr(gp, "gather_output", False)
-            or getattr(qp, "tp_size", 1) != getattr(gp, "tp_size", 1)
-            or getattr(qp, "tp_rank", 0) != getattr(gp, "tp_rank", 0)
+            or _layer_tp_size(qp) != _layer_tp_size(gp)
+            or _layer_tp_rank(qp) != _layer_tp_rank(gp)
         ):
             return False
         qkv_dim = self.q_size + 2 * self.kv_size
@@ -1152,7 +1172,7 @@ class MuseSparkAttention(nn.Module):
             if (
                 skip_o_proj_all_reduce
                 or not self.o_proj.reduce_results
-                or self.o_proj.tp_size <= 1
+                or _layer_tp_size(self.o_proj) <= 1
             ):
                 return o_part
             return tensor_model_parallel_all_reduce(o_part)
@@ -1164,7 +1184,7 @@ class MuseSparkAttention(nn.Module):
             if (
                 skip_o_proj_all_reduce
                 or not self.o_proj.reduce_results
-                or self.o_proj.tp_size <= 1
+                or _layer_tp_size(self.o_proj) <= 1
             ):
                 return o_part
             return tensor_model_parallel_all_reduce(o_part)
@@ -3261,7 +3281,7 @@ class MuseSparkDecoderLayer(nn.Module):
         op = getattr(self.self_attn, "o_proj", None)
         if op is None or not isinstance(op, RowParallelLinear):
             return 0
-        tp = int(op.tp_size)
+        tp = _layer_tp_size(op)
         if (
             tp not in (8, 16)
             or not op.reduce_results
@@ -3310,7 +3330,7 @@ class MuseSparkDecoderLayer(nn.Module):
             get_muse_decode_tp_ar_res_norm_op,
         )
 
-        tp = int(self.self_attn.o_proj.tp_size)
+        tp = _layer_tp_size(self.self_attn.o_proj)
         pre_ff_gain = self.pre_feedforward_layernorm.gain()
         assert pre_ff_gain is not None
         cs_kw = {"cos_sin_step": cos_sin_step} if cos_sin_step is not None else {}
@@ -3392,7 +3412,7 @@ class MuseSparkDecoderLayer(nn.Module):
         op = getattr(self.self_attn, "o_proj", None)
         if op is None or not isinstance(op, RowParallelLinear):
             return 0, 0
-        tp = int(op.tp_size)
+        tp = _layer_tp_size(op)
         if (
             tp not in (8, 16)
             or not op.reduce_results
@@ -3486,7 +3506,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 get_post_attn_to_moe_bridge_op,
             )
 
-            tp = int(self.self_attn.o_proj.tp_size)
+            tp = _layer_tp_size(self.self_attn.o_proj)
             attn_input: Optional[torch.Tensor] = None
             if precomputed_qkv_gate is None and precomputed_prepared_qkvg is None:
                 if precomputed_attn_input is not None:
@@ -4265,7 +4285,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         **cs_kw,
                     )
                     attn_output = get_muse_decode_bridge_ar_op(
-                        int(self.self_attn.o_proj.tp_size)
+                        _layer_tp_size(self.self_attn.o_proj)
                     )(o_part)
                 else:
                     attn_output = self.self_attn(
@@ -4413,7 +4433,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     **cs_kw,
                 )
                 attn_output = get_muse_decode_bridge_ar_op(
-                    int(self.self_attn.o_proj.tp_size)
+                    _layer_tp_size(self.self_attn.o_proj)
                 )(o_part)
             else:
                 attn_output = self.self_attn(
