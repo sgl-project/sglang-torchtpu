@@ -1636,16 +1636,21 @@ class Scheduler(
             self._reset_tpu_prefill_pack_counters()
             return False
 
-        chunk_rem = (
-            max(
+        if self.chunked_req is not None:
+            chunked_prefix_indices = getattr(self.chunked_req, "prefix_indices", None)
+            done_prefix_len = (
+                len(chunked_prefix_indices)
+                if chunked_prefix_indices is not None
+                else int(getattr(self.chunked_req, "prefix_len", 0))
+            )
+            chunk_rem = max(
                 0,
                 len(self.chunked_req.origin_input_ids)
                 + len(self.chunked_req.output_ids)
-                - len(self.chunked_req.prefix_indices),
+                - done_prefix_len,
             )
-            if self.chunked_req is not None
-            else 0
-        )
+        else:
+            chunk_rem = 0
         queue_rem = sum(
             max(
                 1,
@@ -1751,7 +1756,8 @@ class Scheduler(
             or not all(
                 r.extend_end is not None
                 and r.extend_len == 1
-                and r.inflight_middle_chunks == 0
+                and getattr(r, "inflight_steps", 0) == 0
+                and getattr(r, "inflight_middle_chunks", 0) == 0
                 and r.beam_group is None
                 and not r.return_sampling_mask
                 and r.token_indices_to_pool is None

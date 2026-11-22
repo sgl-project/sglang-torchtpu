@@ -364,3 +364,140 @@ def test_decode_fast_host_prepare_for_decode_and_sampler_parity():
         torch.manual_seed(123)
         fast = sample_from_global_top_k_logits(logits, temps, top_ks)
     assert torch.equal(ref, fast)
+
+
+def test_piggyback_single_token_prefill_with_real_req():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    req = Req(
+        rid="r0",
+        origin_input_text="hi",
+        origin_input_ids=[42],
+        sampling_params=SamplingParams(max_new_tokens=4),
+    )
+    req.extend_end = 1
+    req.prefix_len = 0
+    assert req.extend_len == 1
+
+    sched = object.__new__(Scheduler)
+    sched.is_generation = True
+    sched.spec_algorithm = SpeculativeAlgorithm.NONE
+    sched.require_mlp_sync = False
+    sched.enable_hisparse = False
+    sched.dllm_config = None
+    sched.chunked_reqs = []
+    sched.max_running_requests = 64
+    sched.future_map = MagicMock()
+    sched.token_to_kv_pool_allocator = None
+
+    new_batch = ScheduleBatch(
+        reqs=[req],
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        tree_cache=None,
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        device="cpu",
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor([3], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([3], dtype=torch.int64),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        orig_seq_lens=torch.tensor([1], dtype=torch.int32),
+        out_cache_loc=torch.tensor([10], dtype=torch.int32),
+    )
+    new_batch.prefill_input_ids_cpu = torch.tensor([42], dtype=torch.int64)
+    new_batch.multimodal_inputs = None
+
+    running_batch = ScheduleBatch(
+        reqs=[],
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        tree_cache=None,
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        device="cpu",
+    )
+
+    with (
+        patch("sglang.srt.managers.scheduler.current_platform", SimpleNamespace(is_tpu=lambda: True)),
+        patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(pp_size=1, attn_cp_size=1, attn_dcp_size=1),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler.get_exec",
+            return_value=SimpleNamespace(mamba=SimpleNamespace(enable_mamba_extra_buffer=False)),
+        ),
+        _temp_env(SGLANG_TPU_PIGGYBACK_SINGLE_TOKEN_PREFILL="1"),
+    ):
+        nb, rb, piggy = sched._maybe_piggyback_single_token_prefill(new_batch, running_batch)
+    assert nb is None
+    assert piggy is rb
+    assert rb.forward_mode == ForwardMode.DECODE
+    assert getattr(req, "_tpu_piggybacked_prefill", False) is True
+
+
+def test_pack_prefill_to_bucket_with_real_req():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    chunked_req = Req(
+        rid="c0",
+        origin_input_text="x",
+        origin_input_ids=list(range(10000)),
+        sampling_params=SamplingParams(max_new_tokens=4),
+    )
+    chunked_req.prefix_len = 8192
+
+    waiting_req = Req(
+        rid="w0",
+        origin_input_text="y",
+        origin_input_ids=list(range(1000)),
+        sampling_params=SamplingParams(max_new_tokens=4),
+    )
+    waiting_req.num_matched_prefix_tokens = 0
+
+    running_req = Req(
+        rid="r_run",
+        origin_input_text="z",
+        origin_input_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_new_tokens=4),
+    )
+
+    sched = object.__new__(Scheduler)
+    sched.chunked_prefill_size = 16384
+    sched.page_size = 256
+    sched.is_mixed_chunk = False
+    sched.require_mlp_sync = False
+    sched.max_running_requests = 64
+    sched.chunked_reqs = [chunked_req]
+    sched.waiting_queue = [waiting_req]
+    sched._tpu_prefill_delay_steps = 0
+    sched._tpu_prefill_drain_grace_steps = 0
+
+    running_batch = SimpleNamespace(
+        reqs=[running_req] * 62,
+        is_empty=lambda: False,
+        is_prefill_only=False,
+    )
+
+    with (
+        patch("sglang.srt.managers.scheduler.current_platform", SimpleNamespace(is_tpu=lambda: True)),
+        _temp_env(
+            SGLANG_TPU_PACK_PREFILL_TO_BUCKET="1",
+            SGLANG_TPU_PACK_PREFILL_MAX_DELAY_STEPS="14",
+        ),
+    ):
+        # chunk_rem = 10000 - 8192 = 1808, queue_rem = 1000 -> pending = 2808 < 8448 -> defer!
+        assert sched._should_defer_underfilled_prefill(running_batch) is True
+        # Once prefix_len = 0 -> chunk_rem = 10000 >= 8448 -> do not defer!
+        chunked_req.prefix_len = 0
+        assert sched._should_defer_underfilled_prefill(running_batch) is False
