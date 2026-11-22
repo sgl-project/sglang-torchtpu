@@ -52,9 +52,11 @@ def test_syntax_and_annotations() -> None:
         "sglang_tpu/moe/pallas/fused_rs_muse/fused_decode_routing.py",
         "sglang_tpu/moe/pallas/fused_rs_muse/fused_decode_sparse.py",
     )
-    for rel in targets:
-        path = os.path.join(ROOT, rel)
-        py_compile.compile(path, doraise=True)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpd:
+        for i, rel in enumerate(targets):
+            path = os.path.join(ROOT, rel)
+            py_compile.compile(path, cfile=os.path.join(tmpd, f"f{i}.pyc"), doraise=True)
     # Verify PEP 563 stays off in custom-op export modules.
     with open(os.path.join(ROOT, "sglang_tpu/kernels/decode_collective_bridges_w8.py")) as f:
         src = f.read()
@@ -685,6 +687,52 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
                 ],
                 check_t16_bf16=(b_fn >= 128),
             )
+        for b_lc in (8, 16):
+            _assert_spmd_export_clean(
+                f"moe_to_attn_qkv_epi_b{b_lc}",
+                functools.partial(
+                    moe_to_attn_qkv_epi_bridge_jax,
+                    world_size=W, sharded_moe_in=False, query_scale=5.47,
+                ),
+                (P(), P(), P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P()),
+                (P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+                [
+                    ((b_lc, H), jnp.float32),
+                    ((b_lc, H_MOE), jnp.bfloat16),
+                    ((H_MOE, H), jnp.float8_e4m3fn),
+                    ((1, H), jnp.float32),
+                    ((1, H), jnp.float32),
+                    ((1, H), jnp.float32),
+                    ((1, H), jnp.float32),
+                    ((1, H), jnp.float32),
+                    ((H, W * 1280), jnp.float8_e4m3fn),
+                    ((1, W * 1280), jnp.float32),
+                    ((H, W * 1024), jnp.float8_e4m3fn),
+                    ((1, W * 1024), jnp.float32),
+                    ((b_lc, 2, 128), jnp.float32),
+                ],
+                check_t16_bf16=(b_lc >= 16),
+            )
+        _assert_spmd_export_clean(
+            "tok_b1_2d_gains_ws_direct_b64",
+            functools.partial(attn_to_moe_tok_sharded_bridge_jax, world_size=W),
+            (P("model", None), P(None, "model"), P("model", None), P("model"), P(), P(), P(), P(None, "model"), P(None, "model"), P(), P()),
+            (P("model", None), P(), P()),
+            [
+                ((64, H), jnp.float32),
+                ((64, W * 1024), jnp.bfloat16),
+                ((W * 1024, H), jnp.float8_e4m3fn),
+                ((W, H), jnp.float32),
+                ((1, H), jnp.float32),
+                ((1, H), jnp.float32),
+                ((1, H), jnp.float32),
+                ((H, W * 2048), jnp.float8_e4m3fn),
+                ((1, W * 2048), jnp.float32),
+                ((H, 256), jnp.bfloat16),
+                ((1, H_MOE), jnp.float32),
+            ],
+            check_t16_bf16=False,
+        )
     print("[PASS] TPU7x Mosaic T(16,128) + SPMD StableHLO export clean across B=8..384")
 
 
@@ -854,6 +902,183 @@ def test_w10_tok_b2_fast_races_and_llo_invariants() -> None:
     print("[PASS] Wave-10 tok_b2_p8 eager detect_races=True + legacy fallback + 13-matmul/0-scf.for")
 
 
+def test_w11_norm_before_s3_b8_b16_and_2d_gains() -> None:
+    """Verify Wave-11 Normalize-Before-s3 bit-exactness + 0 races, B=8/16 QKV_EPI, and 2D gains."""
+    import jax
+    import jax.numpy as jnp
+    from jax._src.pallas.mosaic.interpret import interpret_pallas_call as tpu_interp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.pallas_export as pe
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import (
+        build_decode_rope_step_tables,
+        run_decode_qkv_epilogue,
+    )
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        attn_to_moe_tok_sharded_bridge_jax,
+        fp8_dual_qkv_epi_gate_jax,
+        moe_post_ag_final_norm_jax,
+        moe_to_attn_qkv_epi_bridge_jax,
+    )
+
+    mesh = Mesh(jax.devices()[:8], ("model",))
+    W, H, H_MOE = 8, 2048, 1024
+    eager_race = pltpu.InterpretParams(dma_execution_mode="eager", detect_races=True)
+
+    def q_fp8(seed: int, k: int, n: int):
+        w = jax.random.normal(jax.random.PRNGKey(seed), (k, n), dtype=jnp.float32) * 0.04
+        sc = jnp.maximum(jnp.max(jnp.abs(w), axis=0, keepdims=True) / 448.0, 1e-12)
+        return (w / sc).astype(jnp.float8_e4m3fn), sc
+
+    wp, sp = q_fp8(90, H_MOE, H)
+    wq, sq = q_fp8(91, H, W * 1280)
+    wg, sg = q_fp8(92, H, W * 1024)
+    wp_d = jax.device_put(wp, NamedSharding(mesh, P(None, "model")))
+    sp_d = jax.device_put(sp, NamedSharding(mesh, P(None, "model")))
+    wq_d = jax.device_put(wq, NamedSharding(mesh, P(None, "model")))
+    sq_d = jax.device_put(sq, NamedSharding(mesh, P(None, "model")))
+    wg_d = jax.device_put(wg, NamedSharding(mesh, P(None, "model")))
+    sg_d = jax.device_put(sg, NamedSharding(mesh, P(None, "model")))
+    # Use pre-shaped (1, H) float32 gains & residual gate alphas/betas!
+    g1_2d = jax.device_put(
+        jax.random.uniform(jax.random.PRNGKey(93), (1, H), dtype=jnp.float32) + 0.5,
+        NamedSharding(mesh, P()),
+    )
+    al_2d = jax.device_put(
+        jax.random.uniform(jax.random.PRNGKey(94), (1, H), dtype=jnp.float32) + 0.5,
+        NamedSharding(mesh, P()),
+    )
+    be_2d = jax.device_put(
+        jax.random.uniform(jax.random.PRNGKey(95), (1, H), dtype=jnp.float32) + 0.5,
+        NamedSharding(mesh, P()),
+    )
+    g2_2d = jax.device_put(
+        jax.random.uniform(jax.random.PRNGKey(96), (1, H), dtype=jnp.float32) + 0.5,
+        NamedSharding(mesh, P()),
+    )
+    rope_tbl = jax.random.normal(jax.random.PRNGKey(97), (256, 128), dtype=jnp.float32) * 0.4
+
+    # 1. Bit-exact parity (max_abs_diff == 0.0) & 0 DMA races for Normalize-Before-s3 (B=32, 64)
+    for b_sz, sh_in in [(32, False), (64, True)]:
+        st_rep = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(100 + b_sz), (b_sz, H), dtype=jnp.float32),
+            NamedSharding(mesh, P()),
+        )
+        mo_sp = P("model", None) if sh_in else P()
+        mo_d = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(110 + b_sz), (b_sz, H_MOE), dtype=jnp.bfloat16),
+            NamedSharding(mesh, mo_sp),
+        )
+        cs_d = jax.device_put(
+            build_decode_rope_step_tables(jnp.arange(b_sz, dtype=jnp.int32) + 5, rope_tbl),
+            NamedSharding(mesh, P()),
+        )
+        in_sp = (P(), mo_sp, P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P())
+        out_sp = (P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model"))
+
+        def _run_qepi(nbs3_flag: bool, interp_arg):
+            return jax.shard_map(
+                functools.partial(
+                    moe_to_attn_qkv_epi_bridge_jax,
+                    world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                    next_in_eps=1e-5, next_in_scale_input=False, sharded_moe_in=sh_in,
+                    qkv_norm_eps=1e-5, query_scale=5.47, k_scale=0.8, v_scale=1.2,
+                    norm_before_s3=nbs3_flag, interpret=interp_arg,
+                ),
+                mesh=mesh, in_specs=in_sp, out_specs=out_sp, check_vma=False,
+            )(st_rep, mo_d, wp_d, sp_d, g1_2d, al_2d, be_2d, g2_2d, wq_d, sq_d, wg_d, sg_d, cs_d)
+
+        out_nbs3 = _run_qepi(True, eager_race)
+        jax.block_until_ready(out_nbs3)
+        assert not tpu_interp.races.races_found, f"DMA race in qepi NBS3 B={b_sz}"
+        out_leg = _run_qepi(False, True)
+        for idx, (a, b) in enumerate(zip(out_nbs3, out_leg, strict=True)):
+            af = a.view(jnp.uint8) if a.dtype == jnp.float8_e4m3fn else a.astype(jnp.float32)
+            bf = b.view(jnp.uint8) if b.dtype == jnp.float8_e4m3fn else b.astype(jnp.float32)
+            diff = float(jnp.max(jnp.abs(af.astype(jnp.float32) - bf.astype(jnp.float32))))
+            assert diff == 0.0, f"qepi NBS3 vs legacy mismatch at B={b_sz} out[{idx}]: {diff}"
+
+        in_fn = (P(), mo_sp, P(None, "model"), P(None, "model"), P(), P(), P(), P())
+        fn_nbs3 = jax.shard_map(
+            functools.partial(
+                moe_post_ag_final_norm_jax,
+                world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                final_eps=1e-5, final_scale_input=True, sharded_moe_in=sh_in,
+                norm_before_s3=True, interpret=eager_race,
+            ),
+            mesh=mesh, in_specs=in_fn, out_specs=P(), check_vma=False,
+        )(st_rep, mo_d, wp_d, sp_d, g1_2d, al_2d, be_2d, g2_2d)
+        jax.block_until_ready(fn_nbs3)
+        assert not tpu_interp.races.races_found, f"DMA race in fnorm NBS3 B={b_sz}"
+        fn_leg = jax.shard_map(
+            functools.partial(
+                moe_post_ag_final_norm_jax,
+                world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                final_eps=1e-5, final_scale_input=True, sharded_moe_in=sh_in,
+                norm_before_s3=False, interpret=True,
+            ),
+            mesh=mesh, in_specs=in_fn, out_specs=P(), check_vma=False,
+        )(st_rep, mo_d, wp_d, sp_d, g1_2d, al_2d, be_2d, g2_2d)
+        fn_diff = float(jnp.max(jnp.abs(fn_nbs3.astype(jnp.float32) - fn_leg.astype(jnp.float32))))
+        assert fn_diff <= 1.6e-2, f"fnorm NBS3 vs legacy diff at B={b_sz}: {fn_diff}"
+
+    # 2. Small-batch B=8 and B=16 QKV_EPI (c=8, 16 Long Context!) numerical parity + TPU7x MLIR
+    for b_lc in (8, 16):
+        st_lc = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(200 + b_lc), (b_lc, H), dtype=jnp.float32),
+            NamedSharding(mesh, P()),
+        )
+        mo_lc = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(210 + b_lc), (b_lc, H_MOE), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P()),
+        )
+        cs_lc = jax.device_put(
+            build_decode_rope_step_tables(jnp.arange(b_lc, dtype=jnp.int32) + 2, rope_tbl),
+            NamedSharding(mesh, P()),
+        )
+        ain_lc = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(220 + b_lc), (b_lc, H), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P()),
+        )
+        # L0 fp8_dual_qkv_epi_gate_jax parity vs standalone run_decode_qkv_epilogue
+        q_l0, kv_l0, g_l0 = jax.shard_map(
+            functools.partial(
+                fp8_dual_qkv_epi_gate_jax,
+                qkv_norm_eps=1e-5, query_scale=5.47, k_scale=0.8, v_scale=1.2, interpret=True,
+            ),
+            mesh=mesh,
+            in_specs=(P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P()),
+            out_specs=(P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+            check_vma=False,
+        )(ain_lc, wq_d, sq_d, wg_d, sg_d, cs_lc)
+        qkv_ref_0 = ((ain_lc.astype(jnp.float32) @ wq[:, :1280].astype(jnp.float32)) * sq[:, :1280]).astype(jnp.bfloat16)
+        q_ref_0, kv_ref_0 = run_decode_qkv_epilogue(
+            qkv_ref_0, cs_lc,
+            norm_eps=1e-5, query_scale=5.47, k_scale=0.8, v_scale=1.2, interpret=True,
+        )
+        assert jnp.array_equal(q_l0[:, :, :1], q_ref_0.reshape(1, b_lc, 8, 2, 128)[:, :, :1])
+        assert jnp.array_equal(kv_l0[:, :1].view(jnp.uint8), kv_ref_0.view(jnp.uint8))
+
+        # L1..60 moe_to_attn_qkv_epi_bridge_jax at B=8 and B=16 (0 races!)
+        out_lc = jax.shard_map(
+            functools.partial(
+                moe_to_attn_qkv_epi_bridge_jax,
+                world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                next_in_eps=1e-5, next_in_scale_input=False, sharded_moe_in=False,
+                qkv_norm_eps=1e-5, query_scale=5.47, k_scale=0.8, v_scale=1.2,
+                interpret=eager_race,
+            ),
+            mesh=mesh,
+            in_specs=(P(), P(), P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P()),
+            out_specs=(P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+            check_vma=False,
+        )(st_lc, mo_lc, wp_d, sp_d, g1_2d, al_2d, be_2d, g2_2d, wq_d, sq_d, wg_d, sg_d, cs_lc)
+        jax.block_until_ready(out_lc)
+        assert not tpu_interp.races.races_found, f"DMA race in qepi B={b_lc}"
+
+    print("[PASS] Wave-11 Normalize-Before-s3 bit-exact + 0 races + B=8/16 QKV_EPI + 2D gains")
+
+
 if __name__ == "__main__":
     test_syntax_and_annotations()
     _install_lightweight_pkg_stubs()
@@ -861,4 +1086,5 @@ if __name__ == "__main__":
     test_sparse_routing_and_k256_opts()
     test_w8_collective_bridges_8rank()
     test_w10_tok_b2_fast_races_and_llo_invariants()
+    test_w11_norm_before_s3_b8_b16_and_2d_gains()
     print("ALL WAVE-8 DECODE BRIDGE & SPARSE TESTS PASSED!")
