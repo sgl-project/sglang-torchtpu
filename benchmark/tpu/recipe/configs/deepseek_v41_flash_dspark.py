@@ -70,9 +70,9 @@ CONFIG["server_args"].update(
 CONFIG["runtime_env"].update(
     {
         "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-        # The vocab-parallel head (each rank holds 1/8 of the LM head) stays
-        # off in the interim recipe; "1" turns it on.
-        "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD": "0",
+        # Each rank holds 1/8 of the LM head; the target verify and the draft
+        # score their rows through one all-to-all pair.
+        "SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD": "1",
         # Decoder replay keeps each extend request's prompt tail rows.
         "SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS": "prompt",
         # DP routing by pending uncached prompt tokens; routed_dp_rank is an
