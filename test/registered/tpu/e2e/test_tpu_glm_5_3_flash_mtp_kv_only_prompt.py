@@ -9,9 +9,10 @@ prefix cache is flushed before every request, and each prompt runs twice.
 
 Pass: the server logs the two-pass branch at 2048, 4096 and 8192 and never at
 1024; nothing recompiles after the post-warmup freeze; every request accepts at
-least MIN_ACCEPT_LENGTH tokens per verify. Except for each request's last row,
-the draft reads the prompt KV pass 1 stored, so a wrong store would lower the
-two-pass prompts' acceptance.
+least MIN_ACCEPT_LENGTH tokens per verify, and every request of a prompt whose
+rows all come from one two-pass prefill (STORE_CHECK_PROMPT_LENS) at least
+MIN_TWO_PASS_ACCEPT_LENGTH. Except for each request's last row, the draft reads
+the prompt KV pass 1 stored, so a wrong store lowers those prompts' acceptance.
 
 That two passes propose what one pass does is covered by the CPU tests
 (test_experimental_kv_only_prompt.py) and the cache-only store's TPU tests
@@ -61,6 +62,13 @@ FREEZE_LOG = "froze torch.compile"
 # Every request must accept at least this many tokens per verify. Measured 4.0
 # on every request, the maximum with 3 draft tokens; the margin is arbitrary.
 MIN_ACCEPT_LENGTH = 3.0
+# Prompts filled by one two-pass prefill (2048, 4096, 8192). The chunked 9000 is
+# left out: its last chunk takes one pass and kept 4.0 with pass 1 corrupted.
+STORE_CHECK_PROMPT_LENS = (1500, 3000, 6000)
+# Measured 4.0 (16 verifies per 64 tokens); with pass 1's store deliberately
+# corrupted, 3.05-3.2 (20-21 verifies). 3.3 passes 19 verifies (up to 3 extra
+# from near-tie draft flips) and fails 20: a margin of one verify on each side.
+MIN_TWO_PASS_ACCEPT_LENGTH = 3.3
 
 # Repetitive prose: the MTP head drafts it well, so acceptance depends on the
 # draft's prompt KV and a wrong store would show up as lower acceptance.
@@ -179,6 +187,12 @@ class TestGlm53FlashMtpKvOnlyPrompt(TPULauncherTestCase):
         for accept in accepts:
             for prompt_len, a in zip(PROMPT_LENS, accept):
                 self.assertGreaterEqual(a, MIN_ACCEPT_LENGTH, f"{prompt_len} tokens")
+                if prompt_len in STORE_CHECK_PROMPT_LENS:
+                    self.assertGreaterEqual(
+                        a,
+                        MIN_TWO_PASS_ACCEPT_LENGTH,
+                        f"{prompt_len} tokens, pass-1 store",
+                    )
 
 
 if __name__ == "__main__":
