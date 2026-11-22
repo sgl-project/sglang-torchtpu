@@ -5,8 +5,9 @@ The CSA2 kernels come from `src/vllm_torchtpu/kernels/deepseek_v41/csa2/` in
 under Apache-2.0. The original port came from vLLM #2868 (`39e7c38b3`).
 
 - `csa2.py` incorporates #3192 (`c4037b568`), including guarded uniform
-  tiles, static bank selection for groups of four tiles, FP8 staging,
-  and softmax normalization after PV. SWA still reads native BF16 pages.
+  tiles, static bank selection for groups of four tiles, and FP8 staging.
+  Softmax keeps SGLang's normalization before PV and the BF16 weight cast
+  to preserve its rounding order. SWA still reads native BF16 pages.
   The shared INT32 SWA word pool (#2970) and block-outer cache layout (#3045)
   are outside this port. SWA page copies retain the existing fallback to
   page zero for invalid addresses.

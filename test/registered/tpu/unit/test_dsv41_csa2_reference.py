@@ -152,5 +152,42 @@ def test_matches_dense_reference(phase, lengths, tokens):
     np.testing.assert_array_equal(actual[live:], 0)
 
 
+def test_casts_normalized_pv_weights_to_bf16():
+    if jax.default_backend() != "tpu":
+        pytest.skip("CSA2 async matmul and DMA require TPU")
+
+    # The first query has one nonzero main key, one zero SWA key, and a
+    # sink. All logits are zero, so each attention weight is 1/3. Folding
+    # the main scale into 1/3 before the BF16 cast returns 0.333984375.
+    # Rounding the unnormalized weight and dividing after PV gives 0.33203125.
+    tokens, heads = 8, 64
+    words, scales = encode_csa2_kv(jnp.ones((1, 512), jnp.bfloat16))
+    q = jnp.zeros((tokens, heads, 512), jnp.bfloat16)
+    main_words = jnp.zeros((tokens, 512, 128), jnp.int32).at[0, 0].set(words[0])
+    main_scales = jnp.zeros((tokens, 512), jnp.float32).at[0, 0].set(scales[0])
+    swa = jnp.zeros((1, 64, 512), jnp.bfloat16)
+    starts = jnp.array([0] + [1] * tokens, jnp.int32)
+    positions = jnp.zeros((tokens,), jnp.int32)
+    sink = jnp.zeros((heads,), jnp.float32)
+    rope = jnp.zeros((tokens, 2, 128), jnp.float32).at[:, 0, :].set(1.0)
+    metadata = jnp.zeros((tokens, 3), jnp.int32)
+    counts = jnp.zeros((tokens,), jnp.int32).at[0].set(1)
+    actual = csa2(
+        q,
+        main_words,
+        main_scales,
+        swa,
+        starts,
+        positions,
+        sink,
+        rope,
+        swa_metadata=metadata,
+        main_lengths=counts,
+        bq=6,
+    )
+    np.testing.assert_array_equal(np.asarray(actual[0], np.float32), 0.333984375)
+    np.testing.assert_array_equal(actual[1:], 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
