@@ -113,6 +113,22 @@ class TestEngineRefusals(CustomTestCase):
                 validate_engine_as(engine, role="decode")
 
 
+class TestPatchActivation(CustomTestCase):
+    def test_plugin_switch_controls_backend_patch_installation(self):
+        from sglang_tpu import patches
+
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                SWITCH.override(enabled),
+                patch(
+                    "sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks.install"
+                ) as install,
+            ):
+                patches._patch_prefill_kv_offload_to_decode_dram()
+                self.assertEqual(install.call_count, int(enabled))
+
+
 class TestHybridModels(CustomTestCase):
     def _hybrid(self):
         engine = supported_engine()

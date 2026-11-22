@@ -91,6 +91,7 @@ class DecodeDramVictimReceiver:
         landing may be in flight."""
         if self._landings:
             raise RuntimeError("victim pushes are landing; the engine is not idle")
+        self._channel.clear_host_metadata()
 
     def advance(self) -> None:
         """Every decode iteration, every rank; acts once per ``_CADENCE``."""
@@ -249,6 +250,26 @@ class DecodeDramVictimReceiver:
                 continue
             landing = self._landings.pop(key)
             self._channel.forget_host_reads(landing.read_ids)
+            if received:
+                # KV has settled; metadata is committed before the tree makes
+                # these pages available to a subsequent prefix offer.
+                restored = False
+                try:
+                    self._channel.restore_host_metadata(
+                        host_page_ids(self._host_pool, landing.indices),
+                        landing.push.page_metadata,
+                    )
+                    self._channel.restore_host_metadata(
+                        host_page_ids(self._swa_host_pool, landing.swa_indices)
+                        if landing.swa_indices is not None
+                        else [],
+                        landing.push.swa_page_metadata,
+                        swa=True,
+                    )
+                    restored = True
+                except Exception:  # noqa: BLE001 - decline on every rank
+                    logger.exception("Cannot restore victim push host metadata")
+                received = self._lockstep.all(restored)
             if received:
                 stored = self._insert_host_only_branch(landing)
             else:
