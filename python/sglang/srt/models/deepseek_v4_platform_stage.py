@@ -217,14 +217,17 @@ class NonCudaDecoderMixin:
             self.post_attention_layernorm,
             accepts_mxfp8=False,
             hc=self.ffn_hc,
+            get_hc=lambda: self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
-        if self._next_layer is not None:
+        next_layer = self._next_layer
+        if next_layer is not None:
             self.next_boundary = mhc.make_boundary(
-                self._next_layer.input_layernorm,
-                accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
-                hc=self._next_layer.attn_hc,
-                accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
+                next_layer.input_layernorm,
+                accepts_mxfp8=next_layer.self_attn.accepts_mxfp8_swizzled_input(),
+                hc=next_layer.attn_hc,
+                accepts_mxfp8_deepgemm=next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
+                get_hc=lambda: next_layer.attn_hc,
             )
 
     def forward(
