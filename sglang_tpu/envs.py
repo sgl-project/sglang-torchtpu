@@ -264,6 +264,12 @@ class TpuEnvs:
     # prompt ends kept past their last full page, so a later prompt's radix match
     # continues inside the page. Each holds a KV block and a KDA state slot.
     SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS = EnvInt(0)
+    # Prefix tails: a tail a later turn's prompt extends stays until the slot is
+    # needed (the oldest such tail goes first, then the least recently used),
+    # rather than handing its slot to that turn's new tail. A turn whose prompt
+    # drops the last turn's content and continues from the turn before it then
+    # resumes at that turn's tail, not at the page boundary.
+    SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS_KEEP_EXTENDED = EnvBool(False)
     # The decode program's DSpark schedule, "min:max:drafts,..." per batch size
     # (drafts 7 or 3 through batch 8, 3 through 16). Empty: 7 through four
     # requests, 3 through eight.

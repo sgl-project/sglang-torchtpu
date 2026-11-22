@@ -62,12 +62,26 @@ class TailIndex:
     extends (the same session's earlier turn, which its next turn no longer
     needs), else the least recently used: with LRU alone, sessions' turns
     evicted each other's live tails while superseded ones lingered (124 of
-    1137 turns an hour recomputed up to a page at AgentX concurrency 8)."""
+    1137 turns an hour recomputed up to a page at AgentX concurrency 8).
 
-    def __init__(self, slots: int, page: int, align: int) -> None:
+    With ``keep_extended``, a tail a later tail extends stays until its slot
+    is needed: a new tail takes a free slot, else the least recently used
+    extended tail, else the least recently used. An AgentX turn may drop the
+    last turn's content and continue from the turn before it (a prompt
+    shorter than the last), inside the last turn's tail: it resumes at the
+    earlier turn's tail rather than at the page boundary, and live tails
+    still go only after every extended one."""
+
+    def __init__(
+        self, slots: int, page: int, align: int, keep_extended: bool = False
+    ) -> None:
         if slots < 1 or page % align:
             raise ValueError(f"{slots} tails, page {page} and alignment {align}")
         self.slots, self.page, self.align = slots, page, align
+        self.keep_extended = keep_extended
+        # keep_extended: the tails each tail's prompt extends (its slot ->
+        # theirs); a tail is extended while another tail lists it.
+        self._extends: dict[int, set[int]] = {}
         self._tails: list[Tail | None] = [None] * slots
         self._by_key: dict[tuple[bytes, int], set[int]] = collections.defaultdict(set)
         self._lru: collections.OrderedDict[int, None] = collections.OrderedDict(
@@ -125,17 +139,19 @@ class TailIndex:
             if tail.end == end and np.array_equal(tail.tokens, tokens):
                 self._lru.move_to_end(t)
                 return None
-        slot = self._superseded(prompt, digests, end, own)
-        if slot is None:
-            slot = next((t for t in self._lru if t not in self._pinned), None)
+        if self.keep_extended:
+            extended = self._extended_by(prompt, digests, end)
+            slot = self._victim(own)
+        else:
+            slot = self._superseded(prompt, digests, end, own)
+            if slot is None:
+                slot = next((t for t in self._lru if t not in self._pinned), None)
         if slot is None:
             return None
-        old = self._tails[slot]
-        if old is not None:
-            self._by_key[old.key].discard(slot)
-            if not self._by_key[old.key]:
-                del self._by_key[old.key]
+        self._forget(slot)
         self._tails[slot] = Tail(floor, end, tokens, key)
+        if self.keep_extended:
+            self._extends[slot] = extended - {slot}
         self._by_key[key].add(slot)
         self._lru.move_to_end(slot)
         self._pinned[slot] += 1
@@ -165,8 +181,38 @@ class TailIndex:
                 best = t
         return best
 
-    def drop(self, slot: int) -> None:
-        """Forget a tail whose blocks were not written."""
+    def _extended_by(
+        self, prompt: np.ndarray, digests: dict[int, bytes], end: int
+    ) -> set[int]:
+        """Every tail ``prompt`` extends that ends before ``end``."""
+        return {
+            t
+            for t, tail in enumerate(self._tails)
+            if tail is not None
+            and tail.end < end
+            and digests.get(tail.floor) == tail.key[0]
+            and np.array_equal(prompt[tail.floor : tail.end], tail.tokens)
+        }
+
+    def _victim(self, own: int | None) -> int | None:
+        """keep_extended: a free slot, else the least recently used tail
+        another tail extends, else the least recently used; never a tail the
+        batch reads or wrote (``own``'s own lookup aside)."""
+        extended = set().union(*self._extends.values()) if self._extends else set()
+        free, stale, used = None, None, None
+        for t in self._lru:
+            if self._pinned[t] - (1 if t == own else 0) > 0:
+                continue
+            if self._tails[t] is None:
+                free = t
+                break
+            if stale is None and t in extended:
+                stale = t
+            if used is None:
+                used = t
+        return next((t for t in (free, stale, used) if t is not None), None)
+
+    def _forget(self, slot: int) -> None:
         tail = self._tails[slot]
         if tail is None:
             return
@@ -174,4 +220,13 @@ class TailIndex:
         if not self._by_key[tail.key]:
             del self._by_key[tail.key]
         self._tails[slot] = None
+        self._extends.pop(slot, None)
+        for extended in self._extends.values():
+            extended.discard(slot)
+
+    def drop(self, slot: int) -> None:
+        """Forget a tail whose blocks were not written."""
+        if self._tails[slot] is None:
+            return
+        self._forget(slot)
         self._lru.move_to_end(slot, last=False)

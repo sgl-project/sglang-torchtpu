@@ -150,6 +150,109 @@ class TestTailReuse(CustomTestCase):
             self.assertEqual(digest, _digest(tokens[:floor]))
 
 
+class TestKeepExtended(CustomTestCase):
+    """keep_extended: a tail a later tail extends stays until its slot is
+    needed, so a turn continuing the turn before the last resumes there."""
+
+    def _turns(self):
+        # Turn 1, turn 2 extending it, turn 3 continuing turn 1 instead (a
+        # prompt that rewrites inside turn 2's tail).
+        base = np.arange(3 * PAGE, dtype=np.int32)
+        t1 = base[: PAGE + 1000]
+        t2 = base[: PAGE + 3000]
+        t3 = base[: PAGE + 4000].copy()
+        t3[PAGE + 1200 :] += 7_000_000
+        return t1, t2, t3
+
+    def test_the_turn_before_the_last_is_still_a_hit(self):
+        t1, t2, t3 = self._turns()
+        e1, e2 = len(t1) // ALIGN * ALIGN, len(t2) // ALIGN * ALIGN
+        for keep, hit in ((False, None), (True, e1)):
+            index = TailIndex(4, PAGE, ALIGN, keep_extended=keep)
+            s1 = index.record(t1, e1)
+            index.begin_step()
+            self.assertEqual(index.lookup(t2, PAGE, len(t2) - 1), (s1, e1))
+            s2 = index.record(t2, e2, own=s1)
+            # Without keep_extended turn 2 takes turn 1's slot.
+            self.assertEqual(s2 == s1, not keep)
+            index.begin_step()
+            got = index.lookup(t3, PAGE, len(t3) - 1)
+            self.assertEqual(got and got[1], hit)
+            if keep:
+                self.assertEqual(got, (s1, e1))
+                # Turn 2's tail is still there for its own continuations.
+                self.assertEqual(index.lookup(t2, PAGE, len(t2) - 1), (s2, e2))
+
+    def test_free_slots_then_extended_tails_then_lru(self):
+        index = TailIndex(3, PAGE, ALIGN, keep_extended=True)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        b = a + 1_000_000
+        sa1 = index.record(a, PAGE + 512)
+        sb = index.record(b, PAGE + 512)
+        index.begin_step()
+        sa2 = index.record(a, PAGE + 1024)  # the last free slot
+        self.assertEqual(len({sa1, sb, sa2}), 3)
+        index.begin_step()
+        # Full: a's next tail takes a's oldest extended tail, not b's live one
+        # (b is the least recently used).
+        self.assertEqual(index.record(a, PAGE + 2048), sa1)
+        index.begin_step()
+        sa3 = sa1
+        # a's extended tails now: sa2 (by sa3). b's next turn takes it.
+        self.assertEqual(index.record(b, PAGE + 1536), sa2)
+        index.begin_step()
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 3000), (sa3, PAGE + 2048))
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 3000), (sa2, PAGE + 1536))
+        # Nothing extended is left unpinned except b's first tail, which b's
+        # second extends: a third session takes it.
+        index.begin_step()
+        c = a + 2_000_000
+        self.assertEqual(index.record(c, PAGE + 512), sb)
+        index.begin_step()
+        # No extended tail left: the least recently used goes (a's).
+        d = a + 3_000_000
+        self.assertEqual(index.record(d, PAGE + 512), sa3)
+
+    def test_pinned_tails_are_not_taken(self):
+        index = TailIndex(2, PAGE, ALIGN, keep_extended=True)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        b = a + 1_000_000
+        sa = index.record(a, PAGE + 512)
+        sb = index.record(b, PAGE + 512)
+        index.begin_step()
+        # a's next turn hits a's tail; b's tail is read by another request.
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1500), (sa, PAGE + 512))
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
+        # Only a's own tail is free to take (its lookup pinned it).
+        self.assertEqual(index.record(a, PAGE + 1024, own=sa), sa)
+        index.begin_step()
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1500), (sa, PAGE + 1024))
+        index.begin_step()
+        index.lookup(a, PAGE, PAGE + 1500)
+        index.lookup(a, PAGE, PAGE + 1500)
+        # Read twice this step: not even its own request takes it.
+        self.assertNotEqual(index.record(a, PAGE + 2048, own=sa), sa)
+
+    def test_a_dropped_tail_no_longer_marks_what_it_extends(self):
+        index = TailIndex(3, PAGE, ALIGN, keep_extended=True)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        b = a + 1_000_000
+        c = a + 2_000_000
+        sa1 = index.record(a, PAGE + 512)
+        sb = index.record(b, PAGE + 512)
+        index.begin_step()
+        sa2 = index.record(a, PAGE + 1024)
+        index.drop(sa2)
+        index.begin_step()
+        # sa2's slot is free again and sa1 is live again: c takes the free
+        # slot, then d the least recently used (sa1), as nothing is extended.
+        self.assertEqual(index.record(c, PAGE + 512), sa2)
+        index.begin_step()
+        d = a + 3_000_000
+        self.assertEqual(index.record(d, PAGE + 512), sa1)
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
+
+
 class StubPrefill:
     """Records step inputs; a request finishing its prompt gets token 77."""
 

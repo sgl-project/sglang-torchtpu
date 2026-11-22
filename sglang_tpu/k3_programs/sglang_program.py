@@ -296,10 +296,16 @@ def _role_steps(role, program, config, pool):
         set_block_copier(block_copier(program))
         tails = None
         if plan.tail_slots:
+            from sglang_tpu.envs import envs as tpu_envs
             from sglang_tpu.k3_programs.sglang_tails import TailIndex
 
             tails = TailIndex(
-                plan.tail_slots, plan.logical_block_tokens, plan.layout.tokens_per_block
+                plan.tail_slots,
+                plan.logical_block_tokens,
+                plan.layout.tokens_per_block,
+                keep_extended=(
+                    tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS_KEEP_EXTENDED.get()
+                ),
             )
         return PrefillSteps(
             program,
