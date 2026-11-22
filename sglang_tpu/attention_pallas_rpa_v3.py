@@ -82,7 +82,9 @@ def _pool_kv_pack_dense2(pool) -> bool:
         for p in pools
     }
     if len(flags) != 1:
-        raise NotImplementedError(f"SWA sub-pools set kv_pack_dense2 differently: {flags}")
+        raise NotImplementedError(
+            f"SWA sub-pools set kv_pack_dense2 differently: {flags}"
+        )
     return flags.pop()
 
 
@@ -137,8 +139,7 @@ def _invoke_v3_kernel(
     if use_dense2:
         extra["_kv_pack_dense2"] = True
     allow_verify_q = decode_query_size == 1 or (
-        decode_query_size > 1
-        and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
+        decode_query_size > 1 and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
     )
     if (
         envs.SGLANG_TPU_MUSE_KERNEL_ENABLED.get()
@@ -200,11 +201,7 @@ def _invoke_v3_kernel(
         ):
             df_val = "w7"
         w8_dec_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_W8", None)
-        if (
-            w8_dec_env is not None
-            and w8_dec_env.get()
-            and "w8" not in df_val.lower()
-        ):
+        if w8_dec_env is not None and w8_dec_env.get() and "w8" not in df_val.lower():
             df_val = f"{df_val}_w8"
         adapt_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE", None)
         if (
@@ -232,10 +229,29 @@ def _invoke_v3_kernel(
         if queries is None
         else (queries.shape[1] if is_prepared else queries.shape[0])
     )
+    # stationary_q requires actual_num_kv_heads == 1 and num_q_heads_per_kv_head == 16;
+    # avoid forcing its large m_block_sizes (e.g. bq4096/bkv8192) onto TP16 fallback.
+    is_sq_head_shape = False
+    if queries is not None:
+        if is_prepared:
+            is_sq_head_shape = (
+                queries.ndim == 5
+                and queries.shape[0] == 1
+                and (queries.shape[2] * queries.shape[3]) == 16
+            )
+        else:
+            is_sq_head_shape = (
+                queries.ndim == 3
+                and keys is not None
+                and keys.ndim == 3
+                and keys.shape[1] == 1
+                and queries.shape[1] == 16
+            )
     use_stationary_q_prefill = (
         not skip_mixed
         and prefill_mode in _STATIONARY_Q_MODES
         and num_q_tokens >= 256
+        and is_sq_head_shape
         and soft_cap is None
         and attention_sink is None
     )
@@ -346,7 +362,9 @@ def _invoke_v3_kernel(
                     else 2048
                 )
             )
-            extra["m_block_sizes"] = (bq_sz, bkv_sz, 256, 256)
+            bkv_csz = max(256, logical_page_size)
+            bkv_sz = max(bkv_sz, bkv_csz)
+            extra["m_block_sizes"] = (bq_sz, bkv_sz, 256, bkv_csz)
         prefill_opts = {
             f"stationary_q_{prefill_mode}",
             "skip_empty_cdma",
@@ -425,9 +443,7 @@ def _invoke_v3_kernel(
                 prefill_opts.add("fold_scale")
         if sliding_window is None and prefill_mode in _STATIONARY_Q_M0_MODES:
             prefill_opts.add("bkv_full_unroll")
-        sw2048_fuse_env = getattr(
-            envs, "SGLANG_TPU_RPA_V3_PREFILL_SW2048_FUSE", None
-        )
+        sw2048_fuse_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_SW2048_FUSE", None)
         if (
             sliding_window == 2048
             and sw2048_fuse_env is not None
@@ -506,12 +522,13 @@ def _invoke_v3_kernel(
             & (2 * ((live + 1023) // 1024) == (live + 511) // 512)
         )
         tile = jnp.where(eligible, jnp.where(live % 2048 == 0, 2, 1), 0)
+        lp_bkv_csz = max(256, logical_page_size)
         return jax.lax.switch(
             tile,
             (
                 run,
-                functools.partial(run, m_block_sizes=(1024, 4096, 1024, 256)),
-                functools.partial(run, m_block_sizes=(2048, 4096, 2048, 256)),
+                functools.partial(run, m_block_sizes=(1024, 4096, 1024, lp_bkv_csz)),
+                functools.partial(run, m_block_sizes=(2048, 4096, 2048, lp_bkv_csz)),
             ),
         )
     return run()
@@ -740,7 +757,9 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             )
             if decode_gate_fuse_env is not None and decode_gate_fuse_env.get():
                 norm_eps = float(
-                    getattr(model_runner.model_config.hf_text_config, "rms_norm_eps", 1e-5)
+                    getattr(
+                        model_runner.model_config.hf_text_config, "rms_norm_eps", 1e-5
+                    )
                 )
                 self._decode_prepared_gated_op = _build_pallas_kernel_op(
                     _decode_gated_spec(
@@ -784,9 +803,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         # Prewarm custom_op outside torch.compile so Dynamo never traces custom_jax_kernel (#1454).
         try:
             self._write_kv_only_op = (
-                _get_write_kv_only_op(self._kv_pack_dense2)
-                if self._dcp == 1
-                else None
+                _get_write_kv_only_op(self._kv_pack_dense2) if self._dcp == 1 else None
             )
         except ImportError:
             self._write_kv_only_op = None
@@ -881,9 +898,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
                 page_indices = md.page_indices
             kv_lens = md.kv_lens
         else:
-            page_indices = self._layer_page_indices(
-                layer.layer_id, is_swa_layer=is_swa
-            )
+            page_indices = self._layer_page_indices(layer.layer_id, is_swa_layer=is_swa)
             kv_lens = self._kv_lens(forward_batch)
         dense2 = bool(getattr(self, "_kv_pack_dense2", False))
         op = getattr(self, "_write_kv_only_op", None)
@@ -936,9 +951,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             kv_lens = md.kv_lens
             decode_query_size = 1
         else:
-            page_indices = self._layer_page_indices(
-                layer.layer_id, is_swa_layer=is_swa
-            )
+            page_indices = self._layer_page_indices(layer.layer_id, is_swa_layer=is_swa)
             kv_lens = self._kv_lens(forward_batch)
             decode_query_size = md.decode_query_size
         out = self._prepared_op(
