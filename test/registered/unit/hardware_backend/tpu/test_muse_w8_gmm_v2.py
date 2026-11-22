@@ -1238,3 +1238,58 @@ def test_w9_l0_l61_large_m_tuned_blocks_and_fused_rs_smem_window(monkeypatch):
                 assert f"M_{t_glob * 8}" in hlo_l0 and f"{t_loc}x4096xbf16" in hlo_l0
         finally:
             jax.clear_caches()
+
+
+def test_w9_muse_spark_real_quant_config_exclude_and_modules_to_not_convert():
+    """Verify ModelOptFp4Config.from_config + _uses_quantized_experts + _experts_quant_config
+    preserve L0/L61 FP8 (unpacked K=4096) and L1..L60 NVFP4 (packed K//2=2048) when config.json
+    contains BOTH exclude_modules AND modules_to_not_convert (with model.language_model.* names)."""
+    from sglang.srt.layers.quantization.modelopt_quant import TpuModelOptCompatibleFp4Config
+    from sglang_tpu.models.muse_spark import (
+        _HostQuantizedFp8Config,
+        _experts_quant_config,
+        _uses_quantized_experts,
+    )
+
+    real_like_qcfg = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "exclude_modules": ["layers.0.", "layers.61.", "self_attn", "lm_head"],
+        "modules_to_not_convert": [
+            "lm_head",
+            "model.audio_tower.layers.0.conv_blocks.0.mlp.fc1",
+            "model.language_model.layers.0.mlp.experts",
+            "model.language_model.layers.0.mlp.pre_expert_proj",
+            "model.language_model.layers.0.mlp.post_expert_proj",
+            "model.language_model.layers.1.mlp.pre_expert_proj",
+            "model.language_model.layers.1.mlp.post_expert_proj",
+            "model.language_model.layers.1.self_attn.q_proj",
+            "model.language_model.layers.61.mlp.experts",
+            "model.language_model.layers.61.mlp.pre_expert_proj",
+            "model.vision_tower.layers.0.mlp.fc1",
+        ],
+    }
+    qcfg = TpuModelOptCompatibleFp4Config.from_config(real_like_qcfg)
+    assert "layers.0." in qcfg.exclude_modules
+    assert "layers.61." in qcfg.exclude_modules
+    assert "self_attn" in qcfg.exclude_modules
+    assert "model.language_model.layers.0.mlp.experts" in qcfg.exclude_modules
+
+    # L0 and L61 must be excluded from NVFP4 -> _HostQuantizedFp8Config
+    for boundary_idx in (0, 61):
+        pfx = f"model.layers.{boundary_idx}.mlp.experts"
+        assert _uses_quantized_experts(qcfg, pfx) is False
+        assert isinstance(_experts_quant_config(qcfg, pfx), _HostQuantizedFp8Config)
+        assert qcfg.is_layer_excluded(pfx) is True
+
+    # L1..L60 must remain NVFP4 -> TpuModelOptCompatibleFp4Config, while dense pre/post/self_attn are excluded
+    for mid_idx in (1, 30, 60):
+        pfx = f"model.layers.{mid_idx}.mlp.experts"
+        assert _uses_quantized_experts(qcfg, pfx) is True
+        assert _experts_quant_config(qcfg, pfx) is qcfg
+        assert qcfg.is_layer_excluded(pfx) is False
+    assert qcfg.is_layer_excluded("model.layers.1.mlp.pre_expert_proj") is True
+    assert qcfg.is_layer_excluded("model.layers.1.mlp.post_expert_proj") is True
+    assert qcfg.is_layer_excluded("model.layers.1.self_attn.qkv_proj") is True
+    assert qcfg.is_layer_excluded("lm_head") is True

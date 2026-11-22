@@ -379,6 +379,10 @@ class ModelOptQuantConfig(QuantizationConfig):
                 expanded.append(name)
                 if name.startswith("language_model."):
                     expanded.append(name.removeprefix("language_model."))
+                elif name.startswith("model.language_model."):
+                    expanded.append(
+                        "model." + name.removeprefix("model.language_model.")
+                    )
             # Preserve order, drop duplicates.
             self.exclude_modules = list(dict.fromkeys(expanded))
 
@@ -399,6 +403,14 @@ class ModelOptQuantConfig(QuantizationConfig):
         prefixes_to_check = [prefix]
         if prefix.startswith("language_model."):
             prefixes_to_check.append(prefix.removeprefix("language_model."))
+        elif prefix.startswith("model.language_model."):
+            prefixes_to_check.append(
+                "model." + prefix.removeprefix("model.language_model.")
+            )
+        elif prefix.startswith("model."):
+            prefixes_to_check.append(
+                "model.language_model." + prefix.removeprefix("model.")
+            )
 
         # Fused module patterns: the exclude list may reference a sub-component
         # (e.g., "q_a_proj") that is fused into a combined parameter name
@@ -1727,9 +1739,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get(
-                "ignore",
-                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            exclude_modules = list(
+                dict.fromkeys(
+                    list(config.get("ignore") or [])
+                    + list(config.get("exclude_modules") or [])
+                    + list(config.get("modules_to_not_convert") or [])
+                )
             )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)

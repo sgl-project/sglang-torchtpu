@@ -1209,8 +1209,20 @@ def _uses_quantized_experts(
         raise ValueError(
             f"Muse Spark supports BF16 or ModelOpt NVFP4, got {quant_config.get_name()}"
         )
+    norm_prefixes = [experts_prefix + "."]
+    if experts_prefix.startswith("model.") and not experts_prefix.startswith(
+        "model.language_model."
+    ):
+        norm_prefixes.append(
+            "model.language_model." + experts_prefix.removeprefix("model.") + "."
+        )
+    elif experts_prefix.startswith("model.language_model."):
+        norm_prefixes.append(
+            "model." + experts_prefix.removeprefix("model.language_model.") + "."
+        )
     return not any(
-        pattern in experts_prefix + "." for pattern in quant_config.exclude_modules
+        any(pattern in pfx or pfx[:-1] == pattern for pfx in norm_prefixes)
+        for pattern in quant_config.exclude_modules
     )
 
 
