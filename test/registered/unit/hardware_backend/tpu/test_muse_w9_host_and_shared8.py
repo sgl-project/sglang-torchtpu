@@ -501,3 +501,50 @@ def test_pack_prefill_to_bucket_with_real_req():
         # Once prefix_len = 0 -> chunk_rem = 10000 >= 8448 -> do not defer!
         chunked_req.prefix_len = 0
         assert sched._should_defer_underfilled_prefill(running_batch) is False
+
+
+def test_build_metadata_host_with_shared_decode_repeated_steps():
+    from sglang_tpu.host_metadata_cache import HostMetadataCache
+
+    bs, page_size, pps = 8, 256, 132
+    pool = ReqToTokenPool(size=16, max_context_len=pps * page_size, device="tpu", enable_memory_saver=False)
+    shared_tokens = torch.arange(128 * page_size, dtype=torch.int32) + page_size
+    for r in range(bs):
+        pool.write((r, slice(0, 128 * page_size)), shared_tokens)
+        pool.write((r, slice(128 * page_size, 129 * page_size)), torch.arange(page_size, dtype=torch.int32) + (200 + r) * page_size)
+
+    fast_be = _make_backend(False, HostMetadataCache())
+    fast_be._page_stride = page_size
+    fast_be.page_size = page_size
+    fast_be.max_context_len = pps * page_size
+    fast_be.supports_shared_decode_batch = lambda b: b >= 8 and b % 8 == 0
+    fast_be.shared_decode_group_size = lambda b: 8
+
+    req_rows = torch.arange(bs, dtype=torch.int32)
+    dist = torch.tensor([bs, bs, bs], dtype=torch.int32)
+
+    def _fb(lens):
+        return SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+            seq_lens=torch.tensor(lens, dtype=torch.int32),
+            seq_lens_cpu=torch.tensor(lens, dtype=torch.int32),
+            req_pool_indices_cpu=req_rows,
+        )
+
+    with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="1"):
+        # Step 1: cold miss -> _build_shared_dist populates shared_dist_cache
+        m1 = fast_be._build_metadata_host(_fb([128 * page_size + 10] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        assert m1.full_decode_distribution is not None
+        assert m1.full_decode_distribution.tolist() == [bs, bs, bs, 128]
+
+        # Step 2: cache hit -> hits cached_dist is not None and np.array_equal(cached_dist[0], plan)
+        m2 = fast_be._build_metadata_host(_fb([128 * page_size + 11] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        assert m2.full_decode_distribution is m1.full_decode_distribution
+
+        # Step 3: incremental decode patch crossing page boundary
+        locs = torch.full((bs,), 129 * page_size, dtype=torch.int32)
+        vals = torch.tensor([(300 + i) * page_size for i in range(bs)], dtype=torch.int32)
+        pool.write((req_rows, locs), vals, bump_page_table=True, is_decode_step=True)
+        m3 = fast_be._build_metadata_host(_fb([129 * page_size + 1] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        assert m3.full_decode_distribution.tolist() == [bs, bs, bs, 128]

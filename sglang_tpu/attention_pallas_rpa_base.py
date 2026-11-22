@@ -38,6 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
+import numpy as np
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
