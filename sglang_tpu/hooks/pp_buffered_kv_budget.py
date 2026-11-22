@@ -23,11 +23,11 @@ size_pp_stage_on_its_own_memory
 reserve_pp_buffered_handoff
   Why: the buffered hand-off (SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF) allocates
        landing buffers for its receives and holds its queued sends while
-       serving, after the KV pool is sized: up to 7 receives plus the send
-       depth + 2 transfers at the largest token bucket, and one zero residual
-       per bucket (about 1.14 GiB for GPT-OSS-120B at 16384 rows). Sized from
-       free memory, the pool can leave no room for them, and the stage runs
-       out of memory under load.
+       serving, after the KV pool is sized: up to 7 receives and their
+       layout copies, plus the send depth + 2 transfers at the largest token
+       bucket, and one zero residual per bucket (about 1.76 GiB for
+       GPT-OSS-120B at 16384 rows). Sized from free memory, the pool can leave
+       no room for them, and the stage runs out of memory under load.
   How: AROUND KVCacheConfigurator._profile_available_bytes: with the switch on
        and more than one pipeline stage, subtract this stage's worst case
        (pp_scheduler.buffered_handoff_reserve_bytes: the first stage receives

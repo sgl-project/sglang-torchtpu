@@ -299,6 +299,43 @@ class TestPPBufferedHandoffBounds(unittest.TestCase):
         self.assertEqual(len(handoff._transport.synced), 12 - _MAX_RECEIVES)
         self.assertEqual(handoff._transport.flushed_all, 12)
 
+    def test_a_consumed_receive_keeps_no_landing_buffer(self):
+        """Once a forward has its inputs, neither the receive's callable (the
+        scheduler keeps it until the next receive) nor the posting thread holds
+        its landing buffers, which only the receive flags bound."""
+        net = FakeNet()
+        handoff = make_handoff(1, 2, net)
+        handoff._transport.wait_landed = lambda tensor: None
+        landing_refs = []
+        landing_buffer = handoff._transport.landing_buffer
+
+        def recording_landing_buffer(shape, dtype, device):
+            tensor = landing_buffer(shape, dtype, device)
+            landing_refs.append(weakref.ref(tensor))
+            return tensor
+
+        handoff._transport.landing_buffer = recording_landing_buffer
+        # The first seven posts run inline; the eighth waits for a receive flag
+        # on the posting thread.
+        for _ in range(_MAX_RECEIVES + 1):
+            handoff.begin_iteration(True)
+            pending = handoff.post_receive(8)
+            inputs = pending()
+            handoff.end_iteration(None)
+        self.assertEqual(len(handoff._transport.synced), 1)
+        del inputs
+        net.posted.clear()  # nothing sends here, so the fake still holds them
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            gc.collect()
+            if all(r() is None for r in landing_refs):
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(landing_refs), _MAX_RECEIVES + 1)
+        self.assertEqual([r() for r in landing_refs], [None] * len(landing_refs))
+        self.assertTrue(callable(pending))
+        handoff.close()
+
     def test_an_aux_transfer_takes_one_receive_flag(self):
         """Both tensors of a transfer are posted in one call, so the hidden
         states and the aux slots together count once against the flags."""
@@ -497,8 +534,9 @@ class TestWarmup(unittest.TestCase):
 
 class TestHbmReserve(unittest.TestCase):
     def test_worst_case_counts_receives_sends_and_zero_residuals(self):
-        # GPT-OSS-120B PP8 at 16384 rows: 7 receives + 4 sends of 94 MiB, plus
-        # one zero residual per bucket (512..16384 tokens, 8..64 requests).
+        # GPT-OSS-120B PP8 at 16384 rows: 7 receives, their layout copies and 4
+        # sends of 90 MiB, plus one zero residual per bucket (512..16384 tokens,
+        # 8..64 requests).
         transfer = 16384 * 2880 * 2
         zero_rows = 512 + 1024 + 2048 + 4096 + 8192 + 16384 + 8 + 16 + 32 + 64
         args = dict(
@@ -510,11 +548,11 @@ class TestHbmReserve(unittest.TestCase):
             zero_residual_rows=zero_rows,
         )
         plain = hbm_reserve_bytes(num_aux=0, **args)
-        self.assertEqual(plain, 11 * transfer + zero_rows * 2880 * 2)
-        self.assertAlmostEqual(plain / (1 << 30), 1.14, places=2)
+        self.assertEqual(plain, 18 * transfer + zero_rows * 2880 * 2)
+        self.assertAlmostEqual(plain / (1 << 30), 1.76, places=2)
         # Three Eagle3 aux slots travel in the same transfers.
         self.assertEqual(
-            hbm_reserve_bytes(num_aux=3, **args), 44 * transfer + zero_rows * 2880 * 2
+            hbm_reserve_bytes(num_aux=3, **args), 72 * transfer + zero_rows * 2880 * 2
         )
 
     def test_start_up_check_allocates_the_worst_case(self):
@@ -528,8 +566,8 @@ class TestHbmReserve(unittest.TestCase):
         zero = zero_rows * HIDDEN * 4
         want = {
             0: 4 * transfer,
-            1: 11 * transfer + zero,
-            2: 11 * transfer + zero,
+            1: 18 * transfer + zero,
+            2: 18 * transfer + zero,
         }
         for rank, nbytes in want.items():
             handoff = make_handoff(rank, 3, FakeNet(), max_rows=64, depth=2)
@@ -624,7 +662,7 @@ class TestKvBudgetReserve(unittest.TestCase):
         # stage receives nothing (4 sends); the last keeps the full bound.
         transfer, zero = 256 * 16 * 4, (64 + 256 + 1 + 32) * 16 * 4
         self.assertEqual(
-            got, {0: 4 * transfer, 3: 11 * transfer + zero, 7: 11 * transfer + zero}
+            got, {0: 4 * transfer, 3: 18 * transfer + zero, 7: 18 * transfer + zero}
         )
 
 
