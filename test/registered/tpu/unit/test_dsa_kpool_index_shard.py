@@ -5,6 +5,8 @@ Each rank holds the pools at its own offsets of every page; it scores all rows
 against them, and the merge of every rank's local top-k scores keeps the global
 winners it holds. The union over ranks must equal the unsplit selection, and a
 rank's split cache must hold exactly its share of the unsplit cache's bytes.
+Prefill exchanges row slices instead (kpool_slice_cuts / kpool_cut_rows): each
+rank's rows must attend exactly the merge's candidates, in the same order.
 StreamIndex and the SparseCore top-k need a TPU; the ranks run one by one here.
 """
 
@@ -27,6 +29,7 @@ import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
+from sglang_tpu.attention.pallas.mla_sparse import kv_shard
 
 D, HEADS, KPOOL, PAGE, TOPK, SHARDS = 128, 32, 4, 128, 2048, 8
 N_PICK = TOPK // KPOOL
@@ -40,6 +43,40 @@ def _split(pooled: jax.Array, role: int) -> jax.Array:
     """Rank ``role``'s share of an unsplit pooled cache."""
     rows = pooled.shape[1] // SHARDS
     return pooled[:, role * rows : (role + 1) * rows]
+
+
+def _slice_exchange(locals_, kv, cu, dist):
+    """Every rank's rows from the prefill exchange: owner r cuts rows ``[r * R,
+    (r + 1) * R)`` from every rank's local scores, each rank keeps its pools
+    above its cuts. The all-to-alls are slices here."""
+    num_tokens = locals_[0][0].shape[0]
+    rows = -(-(-(-num_tokens // SHARDS)) // 8) * 8
+    pad = ((0, SHARDS * rows - num_tokens), (0, 0))
+    scores = [jnp.pad(s, pad, constant_values=-(1 << 23)) for _, s in locals_]
+    cuts = [
+        kp.kpool_slice_cuts(jnp.stack([s[r * rows : (r + 1) * rows] for s in scores]))
+        for r in range(SHARDS)
+    ]  # cuts[r][s]: owner r's cuts of its rows for rank s
+    return [
+        np.asarray(
+            kp.kpool_cut_rows(
+                picked, sc, jnp.concatenate([c[role] for c in cuts]), kv, cu, dist,
+                shards=SHARDS, role=role, own_pools=OWN_POOLS, topk=TOPK, kpool=KPOOL,
+            )
+        )
+        for role, (picked, sc) in enumerate(locals_)
+    ]  # fmt: skip
+
+
+def _attended(rows: np.ndarray, role: int) -> np.ndarray:
+    """A rank's rows as its attention packs them (owned_rows)."""
+    width = -(-rows.shape[1] // KPOOL) * KPOOL
+    return np.asarray(
+        kv_shard.owned_rows(
+            jnp.asarray(rows), page_size=PAGE, shards=SHARDS, role=role,
+            group=KPOOL, out_width=width,
+        )
+    )  # fmt: skip
 
 
 def _page_table(rng, lens, pages_per_seq):
@@ -88,7 +125,14 @@ class TestKpoolIndexSplitCache(CustomTestCase):
             )
             for role, (picked, _) in enumerate(locals_)
         ]  # fmt: skip
-        return rows, cands
+        cut_rows = _slice_exchange(locals_, kv, cu, dist)
+        for role in range(SHARDS):
+            np.testing.assert_array_equal(
+                _attended(cut_rows[role], role),
+                _attended(rows[role], role),
+                f"rank {role}: the exchange's rows differ from the merge's",
+            )
+        return rows, cut_rows, cands
 
     def _check_batch(self, name, q, w, pooled, table, *, dqs, q_lens, kv_lens, dist):
         cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
@@ -100,13 +144,15 @@ class TestKpoolIndexSplitCache(CustomTestCase):
         )  # fmt: skip
         _, pos, valid = kp._token_rows(kv, cu, dist, q.shape[0])
         ref_rows = np.asarray(kp.expand_picked(ref, pos, valid, topk=TOPK, kpool=KPOOL))
-        rows, cands = self._split_rows(
+        rows, cut_rows, cands = self._split_rows(
             q, w, pooled, table, cu=cu, dist=dist, kv=kv, dqs=dqs
         )
         identical = ties = other = 0
         for t in range(int(cu[-1])):
             want = {int(x) for x in ref_rows[t] if x >= 0}
             got = set().union(*({int(x) for x in r[t] if x >= 0} for r in rows))
+            cut = set().union(*({int(x) for x in r[t] if x >= 0} for r in cut_rows))
+            self.assertEqual(cut, got, f"{name} row {t}: exchange vs merge")
             if got == want:
                 identical += 1
                 continue
@@ -132,14 +178,19 @@ class TestKpoolIndexSplitCache(CustomTestCase):
         records = kp._pool_records(jnp.asarray(keys), RECORD)
         pooled = records.reshape(num_pages, PAGE // 16, 4, RECORD)
         flat_table = jnp.asarray(table.reshape(-1))
-        # The prefill batch extends sequences 4 and 7 by 96 and 160 rows.
+        # The prefill batches extend sequences 4 and 7 by 96 and 160 rows, and
+        # sequence 7 by a 1000-row chunk (24 padding rows, 128 rows per slice).
         pre_table = np.zeros_like(table)
         pre_table[:2] = table[[4, 7]]
+        chunk_table = np.zeros_like(table)
+        chunk_table[0] = table[7]
         batches = (
             ("decode", 1, [1] * 8, lens, [8, 8, 8], flat_table, 128),
             ("verify", 4, [4] * 8, lens, [8, 8, 8], flat_table, 128),
             ("prefill", 1, [96, 160] + [0] * 6, [lens[4], lens[7]] + [0] * 6,
              [0, 0, 2], jnp.asarray(pre_table.reshape(-1)), 256),
+            ("chunk", 1, [1000] + [0] * 7, [lens[7]] + [0] * 7, [0, 0, 1],
+             jnp.asarray(chunk_table.reshape(-1)), 1024),
         )  # fmt: skip
         for name, dqs, q_lens, kv, dist, tab, n_tok in batches:
             q = jnp.asarray(rng.normal(size=(n_tok, HEADS, D)), jnp.bfloat16)

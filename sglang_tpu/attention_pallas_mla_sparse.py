@@ -37,6 +37,7 @@ from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
     build_dsa_kpool_expand_op,
+    build_dsa_kpool_row_split_ops,
     build_dsa_kpool_shard_ops,
     build_dsa_kpool_topk_op,
     build_dsa_kpool_topk_split_op,
@@ -292,6 +293,9 @@ def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
     return num_tokens
 
 
+# f32 -inf as int32 bits: the local scores' padding, below every score.
+_SCORE_BITS_NEG_INF = -(1 << 23)
+
 # Token split: fewer rows per rank than this would make the SparseCore top-k
 # pick a different partition than the unsplit call (_pick_partition depends
 # on the row count below 32), so rows could be ordered or tie-broken
@@ -334,6 +338,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     _prefill_op = None
     # Set by _init_index_kv_shard; tests build the backend without __init__.
     _index_shards = 1
+    _index_row_split = False
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -373,13 +378,40 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_shards, self.mla_role
         )
         self._index_own_pools = self.page_size // self._kpool // self._index_shards
+        self._index_row_split = self._init_index_row_split()
         logger.info(
             "Pooled DSA indexer on a split key cache: %d shards, role %d, %d pools "
-            "per page per rank.",
+            "per page per rank, prefill row-slice exchange %s.",
             self._index_shards,
             self.mla_role,
             self._index_own_pools,
+            self._index_row_split,
         )
+
+    def _init_index_row_split(self) -> bool:
+        """Whether prefill takes the row-slice exchange (_index_rows_by_slice):
+        the one-shot all-to-all addresses peers by mesh position, so the shard
+        group must be the whole world in rank order. Otherwise prefill keeps the
+        all-gather."""
+        import torch.distributed as dist
+
+        from sglang.srt.runtime_context import get_parallel
+
+        if (
+            self._idx_split_size != self._index_shards
+            or dist.get_world_size() != self._index_shards
+            or get_parallel().attn_tp_rank != dist.get_rank()
+        ):
+            return False
+        from sglang_tpu.oneshot_collectives import get_oneshot_all_to_all_op
+
+        get_oneshot_all_to_all_op(
+            self._index_shards
+        )  # build before torch.compile traces
+        self._index_cuts_op, self._index_cut_rows_op = build_dsa_kpool_row_split_ops(
+            self._index_shards, self.mla_role
+        )
+        return True
 
     def _init_attention_token_split(self) -> None:
         """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
@@ -878,9 +910,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         kpool: int,
     ) -> torch.Tensor:
         """index_topk_kpool on a split key cache: every rank scores all rows
-        against its own pools, the group all-gathers the local top-k scores, and
-        each rank keeps the global winners it holds. The latent cache is split
-        the same way, so the rows go straight to this rank's attention."""
+        against its own pools and keeps the global winners it holds, found from
+        every rank's local top-k scores: all-gathered, or for prefill batches
+        the token split would split, exchanged by row slice
+        (_index_rows_by_slice). The latent cache is split the same way, so the
+        rows go straight to this rank's attention."""
         metadata = self.forward_metadata
         pool = self.token_to_kv_pool
         kv_lens = self._kv_lens(forward_batch)
@@ -905,10 +939,65 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
             raw_ring_pages_cnt,
         )  # i32[T, topk // kpool] each: local pools, their score bits
+        if self._index_row_split:
+            split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
+            if split_rows:
+                return self._index_rows_by_slice(
+                    picked=picked,
+                    scores=scores,
+                    kv_lens=kv_lens,
+                    kpool=kpool,
+                    split_rows=split_rows,
+                )
         all_scores = self._mla_group.all_gather(scores, dim=0)
         return self._index_merge_op(
             all_scores,
             picked,
+            kv_lens,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._index_own_pools,
+            self._topk,
+            kpool,
+            self._kpool_width,
+        )
+
+    def _index_rows_by_slice(
+        self,
+        *,
+        picked: torch.Tensor,
+        scores: torch.Tensor,
+        kv_lens: torch.Tensor,
+        kpool: int,
+        split_rows: int,
+    ) -> torch.Tensor:
+        """The merge's rows from a row-slice exchange: rank r owns rows ``[r *
+        split_rows, (r + 1) * split_rows)``. An all-to-all hands it every rank's
+        local scores of them, it cuts each row at the exact global top-k
+        (kpool_slice_cuts; ties to the lower rank, as the merge), a second
+        all-to-all hands each rank its cuts of every row, and the rank keeps its
+        local pools above them. The pool ids never move."""
+        from sglang_tpu.oneshot_collectives import oneshot_all_to_all
+
+        metadata = self.forward_metadata
+        world = self._index_shards
+        num_tokens, n_pick = scores.shape
+        slices = scores
+        if world * split_rows != num_tokens:
+            slices = torch.nn.functional.pad(
+                slices,
+                (0, 0, 0, world * split_rows - num_tokens),
+                value=_SCORE_BITS_NEG_INF,
+            )
+        slices = oneshot_all_to_all(
+            slices.reshape(world, split_rows * n_pick), world_size=world
+        )  # block i: rank i's local scores of this rank's rows
+        cuts = self._index_cuts_op(slices, n_pick)  # block s: rank s's cuts
+        cuts = oneshot_all_to_all(cuts, world_size=world)  # block r: rows of slice r
+        return self._index_cut_rows_op(
+            picked,
+            scores,
+            cuts,
             kv_lens,
             metadata.cu_q_lens,
             metadata.distribution,

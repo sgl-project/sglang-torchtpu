@@ -38,7 +38,7 @@ def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
     entries on one slot (the shifts never decrease along the row), so every
     stage is a static slice and a select instead of a sort or scatter.
     """
-    shift = _inclusive_count(~keep)  # dropped entries up to here
+    shift = inclusive_count(~keep)  # dropped entries up to here
     groups = keep.shape[1]
     bit = 1
     while bit < groups:
@@ -65,7 +65,7 @@ def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
 _MATMUL_COUNT_MAX_WIDTH = 2048
 
 
-def _inclusive_count(flags: jax.Array) -> jax.Array:
+def inclusive_count(flags: jax.Array) -> jax.Array:
     """``jnp.cumsum(flags, axis=1)`` for bool ``[N, G]`` as i32. On TPU XLA lowers the
     cumsum to a reduce-window; a 0/1 bf16 matmul with an upper triangle accumulates
     in f32 and is exact for counts below 2**24."""

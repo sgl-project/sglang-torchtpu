@@ -245,7 +245,8 @@ class TpuEnvs:
     SGLANG_TPU_DSA_KV_SHARD_RAGGED_BLOCK = EnvInt(0)
     # SGLANG_TPU_DSA_MLA_KV_SHARDS > 1, pooled indexer: split its key cache the same way
     # (each rank stores and scores the pools at its own page offsets; an all-gather of
-    # the local top-k scores picks the exact global top-k).
+    # the local top-k scores picks the exact global top-k, in prefill an all-to-all by
+    # row slice). Ties at the k-th score go to the lower rank.
     SGLANG_TPU_DSA_INDEX_KV_SHARD = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).

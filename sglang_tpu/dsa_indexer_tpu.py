@@ -1028,6 +1028,136 @@ def build_dsa_kpool_shard_ops(shards: int, role: int):
     return local_op, merge_op
 
 
+# (shards, role) -> (cuts op, rows op): the split pooled indexer's prefill
+# exchange (kpool_slice_cuts / kpool_cut_rows); the backend runs the all-to-alls.
+_KPOOL_ROW_SPLIT_OPS: dict = {}
+
+
+def build_dsa_kpool_row_split_ops(shards: int, role: int):
+    """Register the split pooled indexer's prefill exchange as two torch custom
+    ops, once per process: ``cuts`` turns every rank's local scores of this
+    rank's row slice (``i32[shards, rows * n_pick]``) into each rank's cuts
+    (``i32[shards, rows * 2]``); ``rows`` turns this rank's local pools and the
+    cuts it received into its token rows, as the merge op would."""
+    key = (shards, role)
+    if key in _KPOOL_ROW_SPLIT_OPS:
+        return _KPOOL_ROW_SPLIT_OPS[key]
+
+    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_kpool_topk import (
+        kpool_cut_rows,
+        kpool_slice_cuts,
+    )
+
+    cuts_name = f"sglang_tpu_pallas::dsa_kpool_cuts_s{shards}"
+    rows_name = f"sglang_tpu_pallas::dsa_kpool_cut_rows_s{shards}r{role}"
+
+    def _cuts(slice_scores: jax.Array, n_pick: int) -> jax.Array:
+        cuts = kpool_slice_cuts(slice_scores.reshape(shards, -1, n_pick))
+        return cuts.reshape(shards, -1)
+
+    cuts_kernel = _torch_pallas.custom_jax_kernel(
+        _cuts,
+        name=f"jax_{cuts_name}",
+        static_argnums=argnums(_cuts, "n_pick"),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(cuts_name, mutates_args=(), device_types=["tpu"])
+    def cuts_op(slice_scores: torch.Tensor, n_pick: int) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return cuts_kernel(slice_scores, n_pick)
+
+    def _cuts_fake(slice_scores: torch.Tensor, n_pick: int):
+        rows = slice_scores.shape[1] // n_pick
+        return slice_scores.new_empty((shards, rows * 2))
+
+    cuts_op.register_fake(_cuts_fake)
+
+    def _rows(
+        picked: jax.Array,
+        scores: jax.Array,
+        cuts: jax.Array,
+        kv_lens: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> jax.Array:
+        return kpool_cut_rows(
+            picked,
+            scores,
+            cuts.reshape(-1, 2),
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            shards=shards,
+            role=role,
+            own_pools=own_pools,
+            topk=topk,
+            kpool=kpool,
+            out_width=out_width,
+        )
+
+    rows_kernel = _torch_pallas.custom_jax_kernel(
+        _rows,
+        name=f"jax_{rows_name}",
+        static_argnums=argnums(_rows, "own_pools", "topk", "kpool", "out_width"),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(rows_name, mutates_args=(), device_types=["tpu"])
+    def rows_op(
+        picked: torch.Tensor,
+        scores: torch.Tensor,
+        cuts: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return rows_kernel(
+                picked,
+                scores,
+                cuts,
+                kv_lens,
+                cu_q_lens,
+                distribution,
+                own_pools,
+                topk,
+                kpool,
+                out_width,
+            )
+
+    def _rows_fake(
+        picked: torch.Tensor,
+        scores: torch.Tensor,
+        cuts: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        own_pools: int,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ):
+        width = max(out_width, topk + kpool - 1)
+        return picked.new_empty((picked.shape[0], width))
+
+    rows_op.register_fake(_rows_fake)
+
+    _KPOOL_ROW_SPLIT_OPS[key] = (cuts_op, rows_op)
+    return cuts_op, rows_op
+
+
 def kpool_indexer_forward(
     indexer: "IndexerKPool",
     *,

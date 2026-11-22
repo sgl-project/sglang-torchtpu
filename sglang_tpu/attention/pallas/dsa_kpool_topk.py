@@ -35,7 +35,8 @@ from sglang_tpu.attention.pallas.kpool_compress import (
     compress_and_store,
     supports_page_size,
 )
-from sglang_tpu.dsv4.sparsecore_topk import sparsecore_topk_dcp_merge
+from sglang_tpu.attention.pallas.mla_sparse.kv_shard import inclusive_count
+from sglang_tpu.dsv4.sparsecore_topk import sparsecore_topk, sparsecore_topk_dcp_merge
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
 from sglang_tpu.dsv4.streamindex_topk.metadata import cp_local_to_global
 from sglang_tpu.envs import envs as tpu_envs
@@ -551,6 +552,90 @@ def kpool_merge_rows(
         owned >= 0, cp_local_to_global(owned, role, shards, own_pools), -1
     )
     _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
+    return expand_picked(pools, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
+
+
+# Threshold key of a row with no candidate: above every score's key.
+_NO_CUT_KEY = np.iinfo(np.int32).max
+
+
+def _score_key(bits: jax.Array) -> jax.Array:
+    """f32 score bits -> i32 keys in the SparseCore top-k's order (its
+    ``monotone_key``): -0.0 sorts below +0.0, which f32 compares equal."""
+    return bits ^ ((bits >> 31) & 0x7FFFFFFF)
+
+
+def kpool_slice_cuts(
+    slice_scores: jax.Array,  # i32[shards, rows, n_pick]; rank i's local top scores
+) -> jax.Array:
+    """The exact global top ``n_pick`` of each row of this rank's slice over
+    every rank's local candidates (``kpool_indexer_local`` scores of the same
+    rows), as a cut per destination rank: ``i32[shards, rows, 2]`` of (threshold
+    key, last tied slot). Rank ``s`` keeps its candidates above the threshold
+    and those equal to it at local slots <= its last tied slot.
+
+    Ties at the threshold go to the lower rank, then the lower local slot: the
+    SparseCore top-k's column order on rank-major rows, as
+    ``sparsecore_topk_dcp_merge`` breaks them, so each rank keeps exactly the
+    pools ``kpool_merge_rows`` keeps. The unsplit top-k may break such a tie the
+    other way."""
+    shards, rows, n_pick = slice_scores.shape
+    scores = slice_scores.transpose(1, 0, 2).reshape(rows, shards * n_pick)
+    won, won_bits = sparsecore_topk(scores, n_pick, return_scores=True)
+    won_key = jnp.where(won >= 0, _score_key(won_bits), _NO_CUT_KEY)
+    cut = jnp.min(won_key, axis=1)  # [rows]; _NO_CUT_KEY without a winner
+    n_tied = jnp.sum((won >= 0) & (won_key == cut[:, None]), axis=1)
+    tied = _score_key(slice_scores) == cut[None, :, None]  # [shards, rows, n_pick]
+    per_rank = jnp.sum(tied, axis=2, dtype=jnp.int32)
+    before = jnp.cumsum(per_rank, axis=0) - per_rank  # lower ranks' tied entries
+    quota = n_tied[None, :] - before  # tied entries rank s keeps, if positive
+    rank_in = inclusive_count(tied.reshape(shards * rows, n_pick))
+    kept = tied & (rank_in.reshape(shards, rows, n_pick) <= quota[..., None])
+    slot = jnp.arange(n_pick, dtype=jnp.int32)
+    last = jnp.max(jnp.where(kept, slot, -1), axis=2)  # [shards, rows]
+    return jnp.stack([jnp.broadcast_to(cut, last.shape), last], axis=-1)
+
+
+def kpool_cut_pools(
+    picked: jax.Array,  # i32[T, n_pick]; this rank's local pools, then -1
+    scores: jax.Array,  # i32[T, n_pick]; their f32 score bits
+    cuts: jax.Array,  # i32[>= T, 2]; each row's cut for this rank (kpool_slice_cuts)
+    *,
+    shards: int,
+    role: int,
+    own_pools: int,  # this rank's pools per page
+) -> jax.Array:
+    """This rank's global top pools of each row, ``i32[T, n_pick]`` global pool
+    ids in local order, -1 elsewhere: the set ``kpool_merge_rows`` keeps."""
+    num_tokens, n_pick = picked.shape
+    cut, last = cuts[:num_tokens, 0:1], cuts[:num_tokens, 1:2]
+    key = _score_key(scores)
+    slot = jnp.arange(n_pick, dtype=jnp.int32)[None, :]
+    keep = (picked >= 0) & ((key > cut) | ((key == cut) & (slot <= last)))
+    return jnp.where(keep, cp_local_to_global(picked, role, shards, own_pools), -1)
+
+
+def kpool_cut_rows(
+    picked: jax.Array,
+    scores: jax.Array,
+    cuts: jax.Array,
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    shards: int,
+    role: int,
+    own_pools: int,
+    topk: int,
+    kpool: int,
+    out_width: int = 0,
+) -> jax.Array:
+    """``kpool_merge_rows`` from the row slices' cuts: this rank's token rows,
+    expanded like ``expand_picked``."""
+    pools = kpool_cut_pools(
+        picked, scores, cuts, shards=shards, role=role, own_pools=own_pools
+    )
+    _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, picked.shape[0])
     return expand_picked(pools, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
 
 
