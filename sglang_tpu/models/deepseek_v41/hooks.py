@@ -478,16 +478,24 @@ def skip_tpu_noop_pad(original, forward_batch, tensor, size, *, value=0):
 
 
 def drop_tpu_dsv41_folded_rows(original, *, logits_output, folded, tail_lens=None):
-    """AROUND encoder_swa_replay.drop_folded_rows: keep the hidden's row count."""
+    """AROUND encoder_swa_replay.drop_folded_rows: keep the hidden's row count.
+
+    Decoder-SWA tail rows (``tail_lens``, passed by cores with decoder replay)
+    take the original path; the argument is only forwarded when given."""
     hidden = logits_output.hidden_states
     keep_rows = folded.keep_rows
     if (
         hidden is None
+        or tail_lens is not None
         or logits_output.hidden_states_token_indices is not None
         or keep_rows.device.type != "cpu"
         or hidden.shape[0] < folded.num_rows
     ):
-        return original(logits_output=logits_output, folded=folded, tail_lens=tail_lens)
+        if tail_lens is not None:
+            return original(
+                logits_output=logits_output, folded=folded, tail_lens=tail_lens
+            )
+        return original(logits_output=logits_output, folded=folded)
     rows = hidden.shape[0]
     # The tail repeats the last row: those rows are past the live tokens, whose
     # draft KV rows the spec workers send to slot 0.
@@ -495,8 +503,11 @@ def drop_tpu_dsv41_folded_rows(original, *, logits_output, folded, tail_lens=Non
     index[: keep_rows.shape[0]] = keep_rows
     index = index.to(hidden.device, non_blocking=True)
     logits_output.hidden_states = hidden[index]
+    # Core drops the same rows from last_hidden_states (aux hidden capture).
+    # It may still be bucket-padded when the hidden was trimmed to the live
+    # folded rows; the index only reads rows both hold.
     last = getattr(logits_output, "last_hidden_states", None)
-    if last is not None and last.shape[0] == rows:
+    if last is not None and last.shape[0] >= rows:
         logits_output.last_hidden_states = last[index]
 
 

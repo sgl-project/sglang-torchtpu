@@ -442,6 +442,9 @@ class TpuEnvs:
     # DeepSeek-V4.1 attention metadata: also read the device positions / request
     # rows the host mirrors replace and raise if they differ (debug; adds the reads back).
     SGLANG_TPU_DSV41_CHECK_HOST_METADATA = EnvBool(False)
+    # Debug: also read DSV4.1 extend positions back from the device and raise if
+    # the host-built positions differ.
+    SGLANG_TPU_DSV41_CHECK_HOST_POSITIONS = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

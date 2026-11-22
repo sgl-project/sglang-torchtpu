@@ -263,6 +263,56 @@ def _host_int64(values: torch.Tensor) -> torch.Tensor:
     return values.detach().to("cpu").to(torch.int64)
 
 
+def _host_extend_positions(
+    forward_batch: ForwardBatch, num_tokens: int
+) -> Optional[torch.Tensor]:
+    """[num_tokens] int64 positions of a pure extend, from its host extend lists.
+
+    Core computes them on the device at the live token count, so reading them
+    back (an int64 copy to the host) is a program per prompt length under
+    decoder replay. They are prefix + arange(extend) per request, then zeros in
+    the padding rows. None when the host lists cannot reproduce them.
+    """
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
+        return None
+    # Explicit positions (spec inputs) are not prefix + arange.
+    if (
+        getattr(getattr(forward_batch, "spec_info", None), "positions", None)
+        is not None
+    ):
+        return None
+    prefix = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    extend = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if prefix is None or extend is None or len(prefix) != len(extend):
+        return None
+    if sum(int(n) for n in extend) > num_tokens:
+        return None
+    positions = torch.zeros(num_tokens, dtype=torch.int64)
+    offset = 0
+    for start, count in zip(prefix, extend):
+        start, count = int(start), int(count)
+        positions[offset : offset + count] = torch.arange(start, start + count)
+        offset += count
+    return positions
+
+
+def _extend_positions(forward_batch: ForwardBatch, num_tokens: int) -> torch.Tensor:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    positions = _host_extend_positions(forward_batch, num_tokens)
+    if positions is None:
+        # Other modes: the compile policy's host mirror, else the device read.
+        return _host_or_read(forward_batch, "positions", num_tokens)
+    if tpu_envs.SGLANG_TPU_DSV41_CHECK_HOST_POSITIONS.get():
+        read = _as_cpu_int64(forward_batch.positions, num_tokens)
+        if not torch.equal(read, positions):
+            raise AssertionError(
+                "DSV4.1 host extend positions differ from the device: "
+                f"host={positions.tolist()} device={read.tolist()}"
+            )
+    return positions
+
+
 def _as_cpu_int64(values, length: int) -> torch.Tensor:
     if isinstance(values, torch.Tensor):
         out = _host_int64(values)
@@ -459,7 +509,7 @@ def build_forward_metadata(
     ``decoder_replay``: also build the decoder rows' metadata (``tail``)."""
     bs = int(forward_batch.batch_size)
     num_tokens = forward_batch.positions.shape[0]
-    positions = _host_or_read(forward_batch, "positions", num_tokens)
+    positions = _extend_positions(forward_batch, num_tokens)
     out_cache_loc = _host_or_read(forward_batch, "out_cache_loc", num_tokens)
 
     counts = _request_token_counts(forward_batch, bs)
