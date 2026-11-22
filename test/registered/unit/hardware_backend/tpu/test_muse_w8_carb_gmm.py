@@ -573,3 +573,160 @@ def test_flq_zero_rmw_and_gmm1_rowmax_fusion_interpret_parity():
     y_opt = _run_pair("2")
     assert np.all(np.isfinite(y_opt))
     np.testing.assert_array_equal(y_opt, y_base)
+
+
+def test_c24k_smem_window_no_spill_and_mosaic_lowering():
+    """Verify M=196608 (T=24k) stays < 512 KiB SMEM without u16x2 and lowers cleanly to Mosaic."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        fused_rs_smem_rows,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    smem_rows = fused_rs_smem_rows(196_608, 8, False)
+    assert smem_rows == 98_304
+    num_slots = 34 + (smem_rows + 255) // 256 - 1
+    smem_bytes = (
+        smem_rows * 4  # plain int32 primary_idx_ref (no u16x2 overhead)
+        + (num_slots + 1) * 26 * 4  # flattened 1D block_scatter secondary_idx_ref
+        + (2 * num_slots + 1) * 4  # metadata_ref
+        + (5 + 2 * num_slots) * 4  # group_start
+    )
+    assert smem_bytes < 512 * 1024, f"M=196608 SMEM exceeded 512 KiB: {smem_bytes}"
+
+    if len(jax.devices()) < 8:
+        pytest.skip("Requires >=8 virtual/physical JAX devices")
+
+    mesh = Mesh(np.array(jax.devices()[:8]), ("model",))
+    env_dict = {
+        "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_LAYOUT_DEQUANT": "1",
+        "SGLANG_TPU_MUSE_KERNEL_B2_PACK_BF16_SCALE": "1",
+        "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+        "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "0",
+        "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+        "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+        "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "4.0",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+        "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+        "SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL": "4096",
+        "SGLANG_TPU_MUSE_KERNEL_D_T64_C16": "1",
+        "SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP": "1",
+    }
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        patch("jax.default_backend", return_value="tpu"),
+        tpu_info_for_cpu_export(),
+        patch.dict(os.environ, env_dict),
+    ):
+        jax.clear_caches()
+
+        def _wrap(
+            a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus,
+            npnw, naa, nba, npfw, vt,
+        ):
+            return jax.shard_map(
+                lambda *xs: fused_moe_full_bridge_and_ffn(
+                    *xs[:-1],
+                    mesh=mesh,
+                    router_mode="bf16_hilo",
+                    b2_layout="nstream",
+                    b2_two_half=True,
+                    b2_deq0_first=True,
+                    hoist_routing=True,
+                    d_layout="4slab",
+                    d_tok_tile=64,
+                    d_fp8_unpool=True,
+                    in_shard_map=True,
+                    b2_deq0_new_buffer=True,
+                    valid_tokens=xs[-1],
+                    next_in_gather_rows=512,
+                    next_in_gather_static_fp8=True,
+                ),
+                mesh=mesh,
+                in_specs=(
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec("model", None, None),
+                    jax.sharding.PartitionSpec("model", None, None),
+                    jax.sharding.PartitionSpec("model", None, None),
+                    jax.sharding.PartitionSpec("model", None, None),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec("model"),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                ),
+                out_specs=(
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec("model", None),
+                    jax.sharding.PartitionSpec("model", None, None),
+                ),
+                check_vma=False,
+            )(
+                a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus,
+                npnw, naa, nba, npfw, vt,
+            )
+
+        sd = jax.ShapeDtypeStruct
+        hlo = (
+            jax.jit(_wrap)
+            .trace(
+                sd((24576, 8192), jnp.bfloat16),
+                sd((24576, 8192), jnp.float32),
+                sd((8192,), jnp.float32),
+                sd((8192,), jnp.float32),
+                sd((8192,), jnp.bfloat16),
+                sd((8192, 256), jnp.float32),
+                sd((256,), jnp.float32),
+                sd((8192, 4096), jnp.float8_e4m3fn),
+                sd((4096,), jnp.float32),
+                sd((4096,), jnp.bfloat16),
+                sd((256, 4096, 8192), jnp.float4_e2m1fn),
+                sd((256, 4096, 4096), jnp.float4_e2m1fn),
+                sd((256, 8, 8192), jnp.bfloat16),
+                sd((256, 8, 4096), jnp.bfloat16),
+                sd((4096,), jnp.bfloat16),
+                sd((8,), jnp.int32),
+                sd((4096, 8192), jnp.float8_e4m3fn),
+                sd((8192,), jnp.float32),
+                sd((8192,), jnp.bfloat16),
+                sd((8192,), jnp.float32),
+                sd((8192,), jnp.float32),
+                sd((8192,), jnp.bfloat16),
+                sd((1,), jnp.int32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "E_34-M_196608" in hlo
+        assert "-fbs-" in hlo
+        assert "-u16w-" not in hlo

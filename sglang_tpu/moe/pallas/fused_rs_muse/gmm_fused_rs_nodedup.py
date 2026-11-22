@@ -71,8 +71,8 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
         ) * _LOCAL_ROWS_ALIGN
         return min(size_m, aligned)
     force_u16 = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0) >= 1
-    if ep_size >= 4 and (size_m >= 262_144 or (force_u16 and size_m > 120_000)):
-        floor_rows = 131_072 if size_m >= 262_144 else 65_536
+    if ep_size >= 4 and (size_m > 131_072 or (force_u16 and size_m > 120_000)):
+        floor_rows = 131_072 if size_m >= 262_144 else (98_304 if not force_u16 else 65_536)
         target = max(floor_rows, (size_m // ep_size) * 3)
         aligned = (
             (target + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
@@ -4739,7 +4739,7 @@ def gmm_v2_fused_rs(
 
     force_u16_lhs = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0) >= 1
     flatten_bs_meta = bool(envs.SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META.get()) or (
-        block_scatter and (size_m >= 262_144 or force_u16_lhs)
+        block_scatter and (size_m > 131_072 or force_u16_lhs)
     )
     skip_pack_for_bs = block_scatter and (
         flatten_bs_meta
