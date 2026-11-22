@@ -450,6 +450,14 @@ class TpuEnvs:
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
+    # Decoder SWA bounded replay row rule (models/deepseek_v41/decoder_replay.py):
+    # "chunk" (default: each extend's last window, core late_layer_tail_layout,
+    # as GPU SGLang) or "prompt" (each prompt's last window; vLLM-TorchTPU CED).
+    SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS = EnvStr("chunk")
+    # Decoder SWA bounded replay: bring the decoder rows back to the full layout
+    # by a gather over a host-built inverse map (default) rather than a scatter.
+    # 0 keeps the scatter (for A/B only).
+    SGLANG_TPU_DSV41_TAIL_GATHER_SCATTER = EnvBool(True)
     # Cut the eager input-logprob chunks of a forward holding one request at every
     # multiple of this many rows from the request's first row (hooks/logprob_grid.py),
     # so a prefill chunk larger than the grid hands the epilogue the same row sets as

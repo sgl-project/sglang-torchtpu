@@ -134,7 +134,19 @@ def extend_window_pages(
         capacity_pages=capacity_pages,
     )
     lane = torch.arange(WINDOW_TOKENS, dtype=torch.int64)[None, :]
-    live = (counts > 0)[:, None]
+    # A slot's ring belongs to one request per forward: the padding slot 0
+    # (idle and bucket-padding rows) owns none, and a slot repeated across
+    # requests (dummy and warmup batches) moves rows for its first request only.
+    # Otherwise the SWA publish gets duplicate write records, which
+    # write_swa_pages does not allow.
+    first_of_slot = torch.ones_like(slots, dtype=torch.bool)
+    if slots.numel() > 1:
+        order = torch.argsort(slots, stable=True)
+        sorted_slots = slots[order]
+        repeat = torch.zeros_like(first_of_slot)
+        repeat[1:] = sorted_slots[1:] == sorted_slots[:-1]
+        first_of_slot[order] = ~repeat
+    live = ((counts > 0) & (slots != 0) & first_of_slot)[:, None]
     slot = slots[:, None]
 
     history = first[:, None] - WINDOW_TOKENS + lane

@@ -1596,8 +1596,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         compile_items = [
-            (num_tokens, bs, mode, "plain", logits_output_mode)
+            (num_tokens, bs, mode, variant, logits_output_mode)
             for num_tokens, bs, mode in compile_cases
+            # Every serving input signature ("plain" unless a model adds some).
+            for variant in self._extend_serving_variants()
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         cp_items = self._extend_cp_compile_items()

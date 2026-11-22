@@ -209,6 +209,34 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
             forward_batch.tpu_engram_staged = saved_staged
 
 
+def _local_decoder_rows(forward_batch: ForwardBatch) -> int:
+    """Decoder rows of this rank's (folded) extend, as the backend will plan
+    them (without DP there is no MLP-sync count)."""
+    from sglang_tpu.models.deepseek_v41.decoder_replay import (
+        fill_lens_or_ends,
+        plan_decoder_rows,
+    )
+
+    starts = list(forward_batch.extend_prefix_lens_cpu)
+    ext = list(forward_batch.extend_seq_lens_cpu)
+    row_floor = forward_batch.encoder_swa_row_floor
+    floors = [0] * len(starts)
+    if row_floor is not None:
+        first = 0
+        for b, n in enumerate(ext):
+            if n:
+                floors[b] = int(row_floor[first])
+            first += n
+    return plan_decoder_rows(
+        starts=starts,
+        extend_lens=ext,
+        fill_lens=fill_lens_or_ends(
+            getattr(forward_batch, "decoder_fill_lens", None), starts, ext
+        ),
+        floors=floors,
+    ).num_rows
+
+
 def is_deepseek_v41(model_runner) -> bool:
     config = getattr(model_runner.model_config, "hf_config", None)
     return getattr(config, "model_type", None) == "deepseek_v41"
@@ -297,8 +325,86 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             )
             forward_batch.input_embeds = self._embed(safe_ids)
 
+    # ------------------------------------------------------------------ #
+    # Decoder SWA bounded replay: one shared decoder row bucket per forward
+    # ------------------------------------------------------------------ #
+
+    def _decoder_replay_on(self) -> bool:
+        backend = self.model_runner.attn_backend
+        return bool(getattr(backend, "decoder_replay", False))
+
+    def _pick_decoder_rows_bucket(self, forward_batch: ForwardBatch) -> None:
+        """Every DP rank runs the decoder layers on the same row bucket: the
+        smallest holding the busiest rank's decoder rows (MLP-sync counts)."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            decoder_rows_bucket,
+        )
+
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or getattr(forward_batch, "decoder_rows_bucket", None) is not None
+            or not self._decoder_replay_on()
+        ):
+            return
+        token_bucket = int(forward_batch.input_ids.shape[0])
+        rows = getattr(forward_batch, "global_decoder_rows", None)
+        if not rows:
+            if get_parallel().attn_dp_size > 1:
+                # No MLP-sync counts (a dummy or warmup extend): the token bucket
+                # holds any rank's rows and is the same on every rank.
+                forward_batch.decoder_rows_bucket = token_bucket
+                return
+            rows = [_local_decoder_rows(forward_batch)]
+        forward_batch.decoder_rows_bucket = decoder_rows_bucket(max(rows), token_bucket)
+
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        variants = super()._extend_serving_variants()
+        if not self._decoder_replay_on():
+            return variants
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            DECODER_ROW_BUCKETS,
+        )
+
+        # Every pure extend runs one decoder bucket; "plain" has no replay.
+        decoder = ("dec0", *(f"dec{b}" for b in DECODER_ROW_BUCKETS), "decT")
+        return tuple(
+            v
+            for variant in variants
+            for v in (decoder if variant == "plain" else (variant,))
+        )
+
+    def _make_warmup_inputs(self, *, num_tokens: int, variant: str = "plain", **kwargs):
+        if not variant.startswith("dec"):
+            return super()._make_warmup_inputs(
+                num_tokens=num_tokens, variant=variant, **kwargs
+            )
+        args, kw = super()._make_warmup_inputs(
+            num_tokens=num_tokens, variant="plain", **kwargs
+        )
+        forward_batch = kw["forward_batch"] if "forward_batch" in kw else args[2]
+        bucket = variant[len("dec") :]
+        forward_batch.decoder_rows_bucket = (
+            num_tokens if bucket == "T" else min(int(bucket), num_tokens)
+        )
+        # The dummy's rows fill the bucket at most (compile shape only).
+        forward_batch.decoder_replay_warmup = True
+        return args, kw
+
+    def _direct_compile_specialization_key(
+        self, attention_metadata: Any, *args: Any, **kwargs: Any
+    ) -> tuple[Any, ...]:
+        key = super()._direct_compile_specialization_key(
+            attention_metadata, *args, **kwargs
+        )
+        if not self._decoder_replay_on():
+            return key
+        # The decoder row bucket (None: no decoder replay in this forward).
+        return (*key, getattr(attention_metadata, "tail_rows", None))
+
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         super().prepare_forward_batch(forward_batch)
+        self._pick_decoder_rows_bucket(forward_batch)
         # Enqueue outside-graph embedding on TPU before attention planning and
         # host Engram staging so the TPU gather overlaps with overlap-token
         # resolution and NumPy row packing.

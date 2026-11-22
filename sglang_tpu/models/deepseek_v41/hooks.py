@@ -147,6 +147,45 @@ drop_tpu_dsv41_folded_rows
   Upstream PR or issue: not filed (V4.1 TPU bring-up).
   Remove when: drop_folded_rows keeps the hidden's row count.
 
+check_tpu_dsv41_decoder_replay (in allow_tpu_dsv41_encoder_replay)
+  Why: validate_deepseek_v41_features rejects --enable-decoder-swa-bounded-replay
+       under attention DP (input_ids_global is a DP-wide gather), but the TPU
+       backend gives every DP rank the same padded decoder row bucket and
+       re-gathers the decoder rows' DP-wide ids (decoder_replay.py); TPU plans
+       pure extends only and needs encoder SWA replay under the radix cache.
+  How: the validator wrapper runs the TPU rules (prefill graphs, mixed chunk,
+       radix cache), then the original with a resolving view that reports the
+       flag off, so every other check still applies.
+  Upstream PR or issue: not filed (decoder CED prefill on TPU).
+  Remove when: the core validator asks the platform about DP decoder tails.
+
+decoder_replay_sync.hook_specs (decoder SWA bounded replay scheduler state)
+  Why: the TPU backend needs each extend request's full fill length (the
+       "prompt" row rule) and every DP rank's decoder row count (the shared
+       decoder row bucket); core's ScheduleBatch, ForwardBatch and MLP sync
+       carry neither.
+  How: AFTER prepare_for_extend / convert_decode_to_extend / copy keep
+       ScheduleBatch.decoder_fill_lens; AFTER ForwardBatch.init_new copies it
+       and global_decoder_rows, and AFTER EagerRunner.load_batch carries them
+       to the ForwardBatch it rebuilds from dataclass fields; while prepare_mlp_sync_batch_raw runs with a
+       decoder-replay backend, the MLP-sync info tensors carry one more column
+       (this rank's rows; idle slots 0), read back after all_gather /
+       finalize_local and set on the synced batch by _update_gather_batch.
+       AROUND DeepseekV4Model._forward_layers_hc_pre_from_prev stops the
+       layer loop at the first decoder layer when no DP rank keeps a decoder
+       row (bucket 0; every row is mid-prompt and unread), on every rank
+       together, with zero DSpark aux rows for skipped capture layers.
+       AROUND DeepseekV4Model.forward puts the DSpark capture (hidden,
+       pre-head, aux rows; core leaves them in the tail layout) back in the
+       full layout, and the causal-LM head of that forward reads an identity
+       tail (AROUND DeepseekV4ForCausalLM.forward clears it).
+       AROUND deepseek_v4._scatter_tail_rows zero-initializes the full layout
+       for the TPU tail (core leaves rows outside the tail unset, but under the
+       "prompt" rule the logits processor reads the last row of a chunk that
+       kept no decoder rows); other tails go to core unchanged.
+  Upstream PR or issue: not filed (decoder CED prefill on TPU).
+  Remove when: core carries per-rank decoder rows in the MLP sync.
+
 init_tpu_dsv41_pool_configurator
   Why: DSV4PoolConfigurator.__init__ counts the DSpark draft layers kept in a
        per-request SWA ring as a local; get_tpu_dsv41_swa_fixed_bytes prices those
@@ -277,6 +316,7 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
 
 
 def allow_tpu_dsv41_encoder_replay(original, server_args):
+    import contextlib
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -288,19 +328,75 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     if (
         not get_platform().is_tpu
         or validator.model_config_of(server_args).hf_config.model_type != "deepseek_v41"
-        or not cfg.enable_encoder_swa_bounded_replay
     ):
         return original(server_args)
     if cfg.enable_decoder_swa_bounded_replay is None:
-        # The validator defaults decoder replay on for CUDA; TPU attention has none.
+        # Under the CUDA spoof below the validator defaults decoder replay on;
+        # TPU serves it only when asked for.
         declare_resolution(
             server_args,
             "allow_tpu_dsv41_encoder_replay",
             enable_decoder_swa_bounded_replay=False,
         )
-    cuda = SimpleNamespace(is_cuda=True, is_hip=False)
-    with patch.object(validator, "get_platform", lambda: cuda):
+    with contextlib.ExitStack() as stack:
+        if cfg.enable_decoder_swa_bounded_replay:
+            check_tpu_dsv41_decoder_replay(cfg)
+            # Core's decoder-replay checks (DP attention, prefill graphs) are
+            # replaced by the TPU rules above.
+            view = validator.resolving_view
+            stack.enter_context(
+                patch.object(
+                    validator,
+                    "resolving_view",
+                    lambda args: _WithoutDecoderReplay(view(args)),
+                )
+            )
+        if cfg.enable_encoder_swa_bounded_replay:
+            cuda = SimpleNamespace(is_cuda=True, is_hip=False)
+            stack.enter_context(patch.object(validator, "get_platform", lambda: cuda))
         return original(server_args)
+
+
+class _WithoutDecoderReplay:
+    """A resolving view that reports --enable-decoder-swa-bounded-replay off."""
+
+    def __init__(self, cfg):
+        object.__setattr__(self, "_cfg", cfg)
+
+    def __getattr__(self, name):
+        if name == "enable_decoder_swa_bounded_replay":
+            return False
+        return getattr(object.__getattribute__(self, "_cfg"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_cfg"), name, value)
+
+
+def check_tpu_dsv41_decoder_replay(cfg) -> None:
+    """TPU rules of --enable-decoder-swa-bounded-replay beyond core's.
+
+    The backend plans decoder rows for pure extends only, so MIXED batches are
+    out. The radix cache would hand a hit decoder SWA rows that were never
+    computed (only each earlier request's tail ran the decoder), so it needs
+    encoder SWA replay, which keeps no SWA in the cache and rebuilds the window.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        raise ValueError(
+            "--enable-decoder-swa-bounded-replay cannot be combined with the "
+            "prefill CUDA graph"
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-decoder-swa-bounded-replay on TPU cannot be combined with "
+            "--enable-mixed-chunk"
+        )
+    if not cfg.disable_radix_cache and not cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError(
+            "--enable-decoder-swa-bounded-replay with the radix cache requires "
+            "--enable-encoder-swa-bounded-replay on TPU"
+        )
 
 
 class _SlotsOnDevice:
@@ -801,6 +897,7 @@ def hook_specs():
 
     # Declares the ForwardBatch fields the Engram hooks read.
     from sglang_tpu.models.deepseek_v41 import engram_host  # noqa: F401
+    from sglang_tpu.models.deepseek_v41 import decoder_replay_sync
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
@@ -949,4 +1046,5 @@ def hook_specs():
             tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
         ),
+        *decoder_replay_sync.hook_specs(),
     ]

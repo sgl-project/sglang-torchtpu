@@ -200,42 +200,6 @@ def _attend_swa_non_causal(
     )
 
 
-def _attend_main(
-    q: jax.Array,
-    words: jax.Array,
-    scales: jax.Array,
-    selected: jax.Array,
-    main_pages: jax.Array,
-    swa: jax.Array,
-    starts: jax.Array,
-    positions: jax.Array,
-    sink: jax.Array,
-    cos_sin: jax.Array,
-    metadata: jax.Array,
-    main_page_records: int,
-    compress_ratio: int,
-    scale: float,
-) -> jax.Array:
-    """SWA window plus the selected compressed records of each token."""
-    output, _, _, _ = _gather_attend_main(
-        q,
-        words,
-        scales,
-        selected,
-        main_pages,
-        swa,
-        starts,
-        positions,
-        sink,
-        cos_sin,
-        metadata,
-        main_page_records,
-        compress_ratio,
-        scale,
-    )
-    return output
-
-
 def _gather_attend_main(
     q: jax.Array,
     words: jax.Array,
@@ -251,8 +215,14 @@ def _gather_attend_main(
     main_page_records: int,
     compress_ratio: int,
     scale: float,
+    extend_tiling: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """``_attend_main`` that also returns the gathered (words, scales, counts)."""
+    """``_attend_main`` that also returns the gathered (words, scales, counts).
+
+    ``extend_tiling``: the extend configuration (query block 16, one SparseCore
+    gather chunk up to 512 rows) at any row count. Decoder-replay tails (128 /
+    256 rows) take it: the verify-tuned configuration below 385 rows (query
+    block 6, 96-row gather chunks) halted the chip under prefill tails."""
     # As the epic caller: ids at or past the token's compressed length are
     # invalid. Selections must still form a valid prefix per row.
     lengths = (positions + 1) // compress_ratio
@@ -277,8 +247,12 @@ def _gather_attend_main(
         metadata,
         None,
         counts,
-        chunk_size=csa2_gather_chunk_size(q.shape[0]),
-        bq=_bq(q.shape[0]),
+        chunk_size=(
+            q.shape[0]
+            if extend_tiling and q.shape[0] <= 512
+            else csa2_gather_chunk_size(q.shape[0])
+        ),
+        bq=16 if extend_tiling else _bq(q.shape[0]),
         scale=scale,
         compress_ratio=compress_ratio,
         deep_gather=True,
@@ -316,6 +290,77 @@ def _attend_gathered(
         compress_ratio=compress_ratio,
         bq=_bq(q.shape[0]),
     )
+
+
+def _attend_main(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    selected: jax.Array,
+    main_pages: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    main_page_records: int,
+    compress_ratio: int,
+    scale: float,
+) -> jax.Array:
+    """SWA window plus the selected compressed records of each token."""
+    return _gather_attend_main(
+        q,
+        words,
+        scales,
+        selected,
+        main_pages,
+        swa,
+        starts,
+        positions,
+        sink,
+        cos_sin,
+        metadata,
+        main_page_records,
+        compress_ratio,
+        scale,
+    )[0]
+
+
+def _attend_main_extend(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    selected: jax.Array,
+    main_pages: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    main_page_records: int,
+    compress_ratio: int,
+    scale: float,
+) -> jax.Array:
+    """``_attend_main`` with the extend tiling (decoder-replay tails)."""
+    return _gather_attend_main(
+        q,
+        words,
+        scales,
+        selected,
+        main_pages,
+        swa,
+        starts,
+        positions,
+        sink,
+        cos_sin,
+        metadata,
+        main_page_records,
+        compress_ratio,
+        scale,
+        extend_tiling=True,
+    )[0]
 
 
 # =============================================================================
@@ -373,6 +418,7 @@ _DEFINITIONS = {
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_swa_non_causal": (_attend_swa_non_causal, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
+    "attend_main_extend": (_attend_main_extend, _fake_attend, ()),
     "gather_attend_main": (_gather_attend_main, _fake_gather_attend, ()),
     "attend_gathered": (_attend_gathered, _fake_attend, ()),
 }
@@ -486,6 +532,7 @@ def attention(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None
     ) = None,
     keep_gathered: bool = False,
+    extend_tiling: bool = False,
 ):
     """CSA2 attention; returns ``[T, H, 512]`` BF16 with inverse RoPE applied.
 
@@ -505,6 +552,9 @@ def attention(
 
     ``keep_gathered`` (with ``main``) returns ``(out, (words, scales, counts))``,
     the gathered main KV that ``attention_gathered`` reuses.
+
+    ``extend_tiling`` (with ``main``) runs the extend tiling at any row count
+    (decoder-replay tails); see ``_gather_attend_main``.
     """
     if not q.shape[0]:
         return torch.empty_like(q)
@@ -517,6 +567,8 @@ def attention(
         raise ValueError("non-causal SWA bounds serve ratio-0 layers without main KV")
     if keep_gathered and main is None:
         raise ValueError("keep_gathered needs main KV")
+    if keep_gathered and extend_tiling:
+        raise ValueError("keep_gathered runs the default tiling only")
     cos_sin = cos_sin.float()
     common = (_i32(query_start_loc), _i32(positions), sink.float(), cos_sin)
     if swa_bounds is not None:
@@ -544,7 +596,7 @@ def attention(
         float(scale),
     )
     if not keep_gathered:
-        return _op("attend_main")(*args)
+        return _op("attend_main_extend" if extend_tiling else "attend_main")(*args)
     out, gathered_words, gathered_scales, counts = _op("gather_attend_main")(*args)
     return out, (gathered_words, gathered_scales, counts)
 

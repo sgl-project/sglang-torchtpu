@@ -55,8 +55,54 @@ class TestDSV41MetadataPytree(CustomTestCase):
             and f.default_factory is dataclasses.MISSING
         ]
         self.assertEqual(
-            list(_METADATA_INPUT_FIELDS), [*required, "engram", "swa_window_plan"]
+            list(_METADATA_INPUT_FIELDS),
+            [
+                *required,
+                "engram",
+                "swa_window_plan",
+                "tail",
+                "tail_gather",
+                "tail_inverse",
+            ],
         )
+
+    def test_decoder_tail_is_a_nested_input(self):
+        """The decoder rows' metadata rides inside the full metadata; its key
+        paths resolve like the outer ones and its scratch starts empty."""
+        metadata = _metadata()
+        metadata.tail = _metadata()
+        metadata.tail_gather = torch.zeros(4, dtype=torch.int32)
+        metadata.tail_inverse = torch.zeros(6, dtype=torch.int32)
+        metadata.tail.selected[1] = torch.ones(3)
+        metadata.tail_rows = 4
+        leaves, treedef = tree_util.tree_flatten(metadata)
+        rebuilt = tree_util.tree_unflatten(treedef, leaves)
+        # The bucket is static structure: two buckets trace apart.
+        self.assertEqual(rebuilt.tail_rows, 4)
+        other = _metadata()
+        other.tail = _metadata()
+        other.tail_gather = torch.zeros(8, dtype=torch.int32)
+        other.tail_rows = 8
+        self.assertNotEqual(
+            tree_util.tree_structure(other), tree_util.tree_structure(metadata)
+        )
+        self.assertEqual(rebuilt.tail.selected, {})
+        self.assertIs(rebuilt.tail.positions, metadata.tail.positions)
+        self.assertIs(rebuilt.tail_gather, metadata.tail_gather)
+        self.assertIs(rebuilt.tail_inverse, metadata.tail_inverse)
+        self.assertNotEqual(
+            tree_util.tree_structure(metadata), tree_util.tree_structure(_metadata())
+        )
+        for path, leaf in tree_util.tree_flatten_with_path(metadata)[0]:
+            value = metadata
+            for key in path:
+                if isinstance(key, tree_util.GetAttrKey):
+                    value = getattr(value, key.name)
+                elif isinstance(key, tree_util.DictKey):
+                    value = value[key.key]
+                else:
+                    value = value[key.idx]
+            self.assertIs(value, leaf)
 
     def test_scratch_does_not_change_the_structure(self):
         clean = _metadata()

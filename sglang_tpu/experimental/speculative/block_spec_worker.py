@@ -334,7 +334,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 assert not self.ships_pd_hidden, "PD does not serve a draft SWA ring"
                 cache_loc_cpu = _extend_ring_rows(
                     ring_pool=ring_pool, batch=batch, positions=positions_cpu
-                ).to(cache_loc_cpu.dtype)
+                )
+                cache_loc_cpu = self._skip_rows_below_decoder_replay(
+                    batch, positions_cpu, cache_loc_cpu
+                ).to(batch.out_cache_loc.dtype)
             elif full_to_swa is not None and not self.ships_pd_hidden:
                 cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
@@ -368,6 +371,27 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         next_draft_input.kv_fence_tail = kv_fence_tail
         result.next_draft_input = next_draft_input
         return result
+
+    def _skip_rows_below_decoder_replay(
+        self, batch: ScheduleBatch, positions: torch.Tensor, ring_rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Under decoder SWA bounded replay the aux rows below each request's
+        replay start hold no values (the target decoder skipped them); they are
+        never in a draft window, and are not written to the ring either."""
+        backend = self.target_worker.model_runner.attn_backend
+        if not getattr(backend, "decoder_replay", False):
+            return ring_rows
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            scheduled_decoder_plan,
+        )
+
+        # The plan of the unfolded batch: its rows are the ones the draft sees.
+        plan = scheduled_decoder_plan(batch, folds=False)
+        starts = torch.repeat_interleave(
+            torch.tensor(plan.replay_starts, dtype=torch.int64),
+            torch.tensor(batch.extend_lens, dtype=torch.int64),
+        )
+        return torch.where(positions >= starts, ring_rows, -1)
 
     def verify_top_k_width(self) -> int | None:
         # Negotiates on every TP rank here, at init, never inside a compiled verify.

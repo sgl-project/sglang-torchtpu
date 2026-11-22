@@ -43,10 +43,16 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation import host_input_mirror
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
+from sglang_tpu.models.deepseek_v41.decoder_replay import (
+    DecoderTail,
+    TailView,
+    tail_gather_scatter_enabled,
+    tail_inverse_rows,
+)
 
 # The pool owns the page layout the kernels read; the backend only indexes it.
 from sglang_tpu.models.deepseek_v41.memory_pool import (
@@ -170,6 +176,18 @@ class DSV41TPUForwardMetadata:
     engram: Optional[tuple] = None
     # Request-window row moves of an extend forward (history in, window out).
     swa_window_plan: Optional[WindowPlan] = None
+    # Decoder SWA bounded replay (decoder_replay.py): the decoder rows' own
+    # metadata, and [D] int32 full-batch rows to gather them from (padding rows:
+    # a row the decoder does not keep). None outside a decoder-replay extend.
+    tail: Optional["DSV41TPUForwardMetadata"] = None
+    tail_gather: Optional[torch.Tensor] = None
+    # [T] int32: the decoder row each full-batch row comes back from, or -1 (a row
+    # the decoder skipped), so the decoder rows come back by a gather instead of
+    # a scatter. None with SGLANG_TPU_DSV41_TAIL_GATHER_SCATTER=0.
+    tail_inverse: Optional[torch.Tensor] = None
+    # The decoder row bucket. Static pytree aux data, so the traced structure
+    # carries it.
+    tail_rows: Optional[int] = None
 
     # Filled lazily during the forward.
     swa_meta: Optional[torch.Tensor] = None
@@ -205,6 +223,9 @@ _METADATA_INPUT_FIELDS = (
     "low_ratio",
     "engram",
     "swa_window_plan",
+    "tail",
+    "tail_gather",
+    "tail_inverse",
 )
 
 
@@ -221,10 +242,10 @@ def _register_metadata_pytree() -> None:
             tuple(
                 (tree_util.GetAttrKey(f), getattr(m, f)) for f in _METADATA_INPUT_FIELDS
             ),
-            None,
+            m.tail_rows,
         ),
-        lambda _, children: DSV41TPUForwardMetadata(
-            **dict(zip(_METADATA_INPUT_FIELDS, children))
+        lambda tail_rows, children: DSV41TPUForwardMetadata(
+            **dict(zip(_METADATA_INPUT_FIELDS, children)), tail_rows=tail_rows
         ),
     )
 
@@ -430,8 +451,12 @@ def build_forward_metadata(
     max_context_len: int,
     low_ratios: Sequence[int],
     device: torch.device,
+    decoder_replay: bool = False,
+    decoder_low_ratios: Sequence[int] = (),
 ) -> DSV41TPUForwardMetadata:
-    """Host-side metadata from the sglang batch, moved to ``device`` once."""
+    """Host-side metadata from the sglang batch, moved to ``device`` once.
+
+    ``decoder_replay``: also build the decoder rows' metadata (``tail``)."""
     bs = int(forward_batch.batch_size)
     num_tokens = forward_batch.positions.shape[0]
     positions = _host_or_read(forward_batch, "positions", num_tokens)
@@ -441,13 +466,11 @@ def build_forward_metadata(
     query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
     real_tokens = int(query_start_loc[-1])
     assert real_tokens <= num_tokens, f"{real_tokens=} > {num_tokens=}"
-    token_rows = torch.full((num_tokens,), -1, dtype=torch.int64)
-    token_rows[:real_tokens] = torch.repeat_interleave(torch.arange(bs), counts)
-    valid = (token_rows >= 0) & (out_cache_loc > 0)
-    token_rows = token_rows.masked_fill(~valid, -1)
     req_pool_indices = _host_or_read(forward_batch, "req_pool_indices", bs)
     host_input_mirror.release(forward_batch)
-    token_req_pool = req_pool_indices[token_rows.clamp_min(0)].masked_fill(~valid, 0)
+    token_rows, valid, token_req_pool = _token_rows(
+        counts, out_cache_loc, req_pool_indices, num_tokens
+    )
 
     swa_minimum, compress_valid = _fold_masks(
         forward_batch,
@@ -458,6 +481,126 @@ def build_forward_metadata(
 
     columns = max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
     full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
+
+    def put(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device=device, non_blocking=True)
+
+    full_pages_device = put(full_pages.to(torch.int32))
+    metadata = _assemble_metadata(
+        forward_batch=forward_batch,
+        positions=positions,
+        query_start_loc=query_start_loc,
+        token_rows=token_rows,
+        token_req_pool=token_req_pool,
+        valid=valid,
+        compress_valid=compress_valid,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=req_pool_indices,
+        swa_minimum=swa_minimum,
+        full_pages=full_pages,
+        full_pages_device=full_pages_device,
+        request_window=request_window,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        swa_ring_valid_from=swa_ring_valid_from,
+        columns=columns,
+        low_ratios=low_ratios,
+        put=put,
+    )
+    if not decoder_replay:
+        return metadata
+
+    from sglang_tpu.models.deepseek_v41.decoder_replay import plan_tail_rows
+
+    if getattr(forward_batch, "decoder_rows_bucket", None) == 0:
+        # No rank keeps a decoder row: the model skips the decoder layers.
+        metadata.tail_rows = 0
+        return metadata
+    plan = plan_tail_rows(
+        fill_lens=getattr(forward_batch, "decoder_fill_lens", None),
+        query_start_loc=query_start_loc,
+        positions=positions,
+        valid=valid,
+        floors=swa_minimum,
+        bucket=getattr(forward_batch, "decoder_rows_bucket", None),
+        warmup=getattr(forward_batch, "decoder_replay_warmup", False),
+    )
+    tail_positions = positions[plan.gather]
+    tail_qsl = F.pad(torch.cumsum(plan.counts, 0), (1, 0))
+    real = torch.arange(plan.gather.shape[0]) < plan.num_real
+    tail_loc = torch.where(real, out_cache_loc[plan.gather], 0)
+    tail_token_rows, tail_valid, tail_req_pool = _token_rows(
+        plan.counts, tail_loc, req_pool_indices, plan.gather.shape[0]
+    )
+    metadata.tail_rows = int(plan.gather.shape[0])
+    metadata.tail = _assemble_metadata(
+        forward_batch=forward_batch,
+        positions=torch.where(real, tail_positions, 0),
+        query_start_loc=tail_qsl,
+        token_rows=tail_token_rows,
+        token_req_pool=tail_req_pool,
+        valid=tail_valid,
+        # The decoder layers own no compressor.
+        compress_valid=torch.zeros_like(tail_valid),
+        out_cache_loc=tail_loc,
+        req_pool_indices=req_pool_indices,
+        swa_minimum=plan.replay_starts,
+        full_pages=full_pages,
+        full_pages_device=full_pages_device,
+        request_window=request_window,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        swa_ring_valid_from=None,
+        columns=columns,
+        low_ratios=decoder_low_ratios,
+        put=put,
+    )
+    metadata.tail_gather = put(plan.gather.to(torch.int32))
+    if tail_gather_scatter_enabled():
+        metadata.tail_inverse = put(
+            tail_inverse_rows(plan.gather, plan.num_real, int(positions.shape[0]))
+        )
+    return metadata
+
+
+def _token_rows(
+    counts: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    num_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """([T] batch row or -1, [T] valid, [T] req_pool_idx or 0) of request-
+    contiguous rows; rows past the counts and rows without a slot are invalid."""
+    bs = counts.shape[0]
+    real_tokens = int(counts.sum())
+    token_rows = torch.full((num_tokens,), -1, dtype=torch.int64)
+    token_rows[:real_tokens] = torch.repeat_interleave(torch.arange(bs), counts)
+    valid = (token_rows >= 0) & (out_cache_loc > 0)
+    token_rows = token_rows.masked_fill(~valid, -1)
+    token_req_pool = req_pool_indices[token_rows.clamp_min(0)].masked_fill(~valid, 0)
+    return token_rows, valid, token_req_pool
+
+
+def _assemble_metadata(
+    *,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    token_rows: torch.Tensor,
+    token_req_pool: torch.Tensor,
+    valid: torch.Tensor,
+    compress_valid: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    swa_minimum: torch.Tensor,
+    full_pages: torch.Tensor,
+    full_pages_device: torch.Tensor,
+    request_window: Optional[DSV41TPURequestWindow],
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    swa_ring_valid_from: Optional[torch.Tensor],
+    columns: int,
+    low_ratios: Sequence[int],
+    put,
+) -> DSV41TPUForwardMetadata:
+    """SWA table, request-window moves and low-ratio tables of one row set."""
     window_plan = None
     if swa_ring_valid_from is not None:
         # DSpark draft ring: every logical page is the slot's ring; rows before
@@ -489,10 +632,6 @@ def build_forward_metadata(
         )
         for ratio in low_ratios
     }
-
-    def put(t: torch.Tensor) -> torch.Tensor:
-        return t.to(device=device, non_blocking=True)
-
     return DSV41TPUForwardMetadata(
         positions=put(positions.to(torch.int32)),
         query_start_loc=put(query_start_loc.to(torch.int32)),
@@ -501,7 +640,7 @@ def build_forward_metadata(
         valid=put(valid),
         compress_valid=put(compress_valid),
         out_cache_loc=put(out_cache_loc.to(torch.int32)),
-        full_pages=put(full_pages.to(torch.int32)),
+        full_pages=full_pages_device,
         swa_pages=put(swa_pages.to(torch.int32)),
         swa_minimum=put(swa_minimum.to(torch.int32)),
         low_ratio={
@@ -547,9 +686,7 @@ def _check_supported(config) -> None:
             f"the {_MAX_BLOCK_ROWS} non-causal CSA2 queries"
         )
     if get_exec().features.enable_decoder_swa_bounded_replay:
-        raise NotImplementedError(
-            "DeepSeek-V4.1 TPU attention has no decoder SWA bounded replay"
-        )
+        _check_decoder_replay(config)
     if set(config.compress_ratios) - {0, *LOW_RATIOS}:
         raise ValueError(
             "DeepSeek-V4.1 TPU attention serves ratios 0/1/2, got "
@@ -558,6 +695,30 @@ def _check_supported(config) -> None:
     if int(config.sliding_window) != 128 or int(config.head_dim) != 512:
         raise ValueError("CSA2 requires sliding_window 128 and head_dim 512")
     _check_index_sources(config)
+
+
+def _check_decoder_replay(config) -> None:
+    """The decoder layers (past the last kv_source layer) may own no compressor,
+    index keys or Engram: the decoder rows read only the sources' records."""
+    late = max(config.kv_source_layer_ids) + 1
+    owners = [
+        layer_id
+        for layer_id in (
+            *config.kv_source_layer_ids,
+            *(getattr(config, "engram_layer_ids", None) or ()),
+        )
+        if layer_id >= late
+    ]
+    if owners or set(config.compress_ratios[late : config.num_hidden_layers]) - {0, 1}:
+        raise ValueError(
+            "decoder SWA bounded replay needs stateless decoder layers; "
+            f"layers {owners} past {late - 1} own state"
+        )
+    candidate = getattr(config, "candidate_source_layer_id", -1)
+    if candidate >= late:
+        raise ValueError(
+            f"the candidate source layer {candidate} is a decoder layer (>= {late})"
+        )
 
 
 def _check_index_sources(config) -> None:
@@ -609,9 +770,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     # Encoder replay rows run inside the extend forward (see the module docstring).
     folds_encoder_swa_replay: bool = True
-    # TpModelWorker reads it after an encoder-replay fold to drop the decoder
-    # late-layer tail's rows; this backend runs no decoder tail.
-    tail_forward_metadata = None
+    # Set by decoder_replay.clear_full_layout_head around the model forward.
+    in_model_forward: bool = False
 
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__()
@@ -660,6 +820,27 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 ],
             )
         )
+        from sglang.srt.runtime_context import get_exec
+
+        # Decoder SWA bounded replay (decoder_replay.py): target extends only.
+        self.decoder_replay = (
+            get_exec().features.enable_decoder_swa_bounded_replay
+            and not self.is_dspark_draft
+        )
+        late = max(config.kv_source_layer_ids or (0,)) + 1
+        self.decoder_low_ratios = tuple(
+            r
+            for r in self.low_ratios
+            if r in config.compress_ratios[late : config.num_hidden_layers]
+        )
+        if self.decoder_replay:
+            # Decoder-replay tails gather per layer (_attend_main), so no gather
+            # group may carry an encoder layer's gather into the decoder layers.
+            self.gather_groups = {
+                layer_id: (first, min(last, late - 1))
+                for layer_id, (first, last) in self.gather_groups.items()
+                if layer_id < late
+            }
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         # Attention layer id -> the module owning that layer's freqs_cis buffer.
         # The table is read through the owner at call time, so the direct tracer
@@ -750,7 +931,156 @@ class DSV41TPUAttnBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,
+            decoder_replay=self._uses_decoder_replay(forward_batch),
+            decoder_low_ratios=self.decoder_low_ratios,
         )
+
+    def scheduled_decoder_rows(self, batch, *, folds: bool) -> int:
+        """This rank's MLP-sync decoder row count (core dp_attn asks a backend
+        with ``decoder_replay``)."""
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            scheduled_decoder_rows,
+        )
+
+        return scheduled_decoder_rows(batch, folds=folds)
+
+    def _uses_decoder_replay(self, forward_batch: ForwardBatch) -> bool:
+        # MIXED (prefill + decode rows) is not served (validated at startup).
+        return (
+            self.decoder_replay
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and not getattr(forward_batch, "encoder_swa_replay", False)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Decoder SWA bounded replay (core late-layer tail interface)
+    # ------------------------------------------------------------------ #
+
+    # Set by decoder_replay.scatter_dspark_capture for the causal-LM head of the
+    # same forward: the rows are back in the full layout.
+    head_full_layout: Optional[ForwardBatch] = None
+
+    # The forward whose decoder rows the model is on (DecoderTail.rows re-gathers
+    # the DP-wide ids of those rows with it).
+    tail_forward_batch: Optional[ForwardBatch] = None
+    # The decoder rows' metadata while the model is on them.
+    _decoder_tail: Optional[DSV41TPUForwardMetadata] = None
+
+    @property
+    def skips_decoder(self) -> bool:
+        """No DP rank keeps a decoder row in this forward (bucket 0)."""
+        metadata = self.forward_metadata
+        return metadata is not None and metadata.tail_rows == 0
+
+    @property
+    def tail_forward_metadata(self) -> Optional[TailView]:
+        """Core's model reads ``.late_layer_tail`` during the forward. After it,
+        TpModelWorker's encoder-replay fold drop reads ``None`` as no compact
+        tail: every row is back in the full layout before the head."""
+        if not self.in_model_forward:
+            return None
+        if self.head_full_layout is not None:
+            from sglang_tpu.models.deepseek_v41.decoder_replay import FullLayoutTail
+
+            return TailView(late_layer_tail=FullLayoutTail(self.head_full_layout))
+        metadata = self.forward_metadata
+        if metadata is None or metadata.tail is None:
+            return TailView(late_layer_tail=None)
+        return TailView(
+            late_layer_tail=DecoderTail(
+                gather=metadata.tail_gather,
+                positions=metadata.tail.positions,
+                num_tokens=metadata.positions.shape[0],
+                backend=self,
+                inverse=metadata.tail_inverse,
+            )
+        )
+
+    def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
+        """Switch the decoder layers onto the decoder rows' metadata, carrying the
+        candidate source's selection and candidates to those rows."""
+        from sglang.srt.layers import dp_attention
+        from sglang.srt.layers.dp_attention import (
+            get_dp_global_num_tokens,
+            get_global_dp_buffer_len,
+            get_local_dp_buffer_len,
+            is_dp_attention_enabled,
+            set_dp_buffer_len,
+        )
+
+        full = self.forward_metadata
+        tail = full.tail
+        saved = (full, None)
+        self.tail_forward_batch = forward_batch
+        gather = full.tail_gather.to(torch.int64)
+        keep = tail.valid[:, None]
+        for ratio, selected in full.selected.items():
+            if ratio in self.decoder_low_ratios:
+                tail.selected[ratio] = torch.where(
+                    keep, selected.index_select(0, gather), -1
+                )
+        if full.candidates is not None:
+            tail.candidates = torch.where(
+                keep, full.candidates.index_select(0, gather), -1
+            )
+        self.forward_metadata = tail
+        self._decoder_tail = tail
+        if is_dp_attention_enabled():
+            rows = int(gather.shape[0])
+            from sglang.srt.runtime_context import get_parallel
+
+            dp_size = get_parallel().attn_dp_size
+            saved = (
+                full,
+                (
+                    # The DP gather sizes as published for the whole forward,
+                    # restored exactly on exit (padded counts, padding mode and
+                    # the device counts included).
+                    (
+                        get_global_dp_buffer_len(),
+                        get_local_dp_buffer_len(),
+                        dp_attention.is_dp_max_padding(),
+                        get_dp_global_num_tokens(),
+                        dp_attention._DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu(),
+                    ),
+                    forward_batch.global_num_tokens_cpu,
+                    forward_batch.global_num_tokens_gpu,
+                    forward_batch.global_dp_buffer_len,
+                ),
+            )
+            counts = [rows] * dp_size
+            forward_batch.global_num_tokens_cpu = counts
+            forward_batch.global_num_tokens_gpu = torch.full(
+                (dp_size,), rows, dtype=torch.int64, device=gather.device
+            )
+            forward_batch.global_dp_buffer_len = rows * dp_size
+            forward_batch.dp_local_start_pos = None
+            forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                rows * dp_size,
+                rows,
+                True,
+                counts,
+                forward_batch.global_num_tokens_gpu,
+            )
+        return saved
+
+    def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.layers.dp_attention import set_dp_buffer_len
+
+        full, dp = saved
+        self.forward_metadata = full
+        self._decoder_tail = None
+        self.tail_forward_batch = None
+        if dp is None:
+            return
+        published, counts, counts_gpu, buffer_len = dp
+        forward_batch.global_num_tokens_cpu = counts
+        forward_batch.global_num_tokens_gpu = counts_gpu
+        forward_batch.global_dp_buffer_len = buffer_len
+        forward_batch.dp_local_start_pos = None
+        forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(*published)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -1163,6 +1493,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
         records and keeps them for the group's later layers."""
         layer_id = layer.layer_id
         first, last = self.gather_groups.get(layer_id, (layer_id, layer_id))
+        # Decoder-replay tails take the extend tiling (ops.csa2.attention), which
+        # keeps no gathered KV, so each tail layer gathers its own records.
+        extend_tiling = metadata is self._decoder_tail
+        if extend_tiling:
+            first = last = layer_id
         common = dict(
             swa_pages=swa,
             swa_meta=metadata.swa_meta,
@@ -1214,6 +1549,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             common["scale"],
             main=main,
             keep_gathered=keep,
+            extend_tiling=extend_tiling,
         )
         if not keep:
             return result
