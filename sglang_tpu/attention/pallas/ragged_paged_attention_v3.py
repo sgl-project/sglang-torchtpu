@@ -381,6 +381,7 @@ def _stationary_q_v2_process(
     tq_sz = 256
     use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
     use_fp8_qk_dyn = "fp8_qk_dyn" in prefill_opts
+    use_fp8_qkpv_fast = "fp8_qkpv_fast" in prefill_opts
     use_fp8_qkpv_dyn = "fp8_qkpv_dyn" in prefill_opts
     use_fp8_qkpv_norm = "fp8_qkpv_norm" in prefill_opts
     use_fp8_qkpv = (
@@ -395,20 +396,35 @@ def _stationary_q_v2_process(
         else (1.5 if "fp8_qkpv_s1" in prefill_opts else 2.0)
     )
     use_fp8_qk = (
-        use_fp8_qkpv_dyn
+        use_fp8_qkpv_fast
+        or use_fp8_qkpv_dyn
         or use_fp8_qkpv
         or use_fp8_qk_dyn
         or ("fp8_qk" in prefill_opts)
     )
     use_fp8_kv = use_fp8_qk or ("fp8_kv" in prefill_opts)
-    use_vt_fp8 = use_fp8_qkpv_dyn or use_fp8_qkpv or ("fp8_kv" in prefill_opts)
+    use_vt_fp8 = (
+        use_fp8_qkpv_fast
+        or use_fp8_qkpv_dyn
+        or use_fp8_qkpv
+        or ("fp8_kv" in prefill_opts)
+    )
     use_gqa4_vreg = "gqa4_vreg" in prefill_opts
     use_gqa2_vreg = ("gqa2_vreg" in prefill_opts) and not use_gqa4_vreg
-    use_vreg_acc = ("vreg_acc" in prefill_opts) and not (
+    use_vreg_acc1 = ("vreg_acc1" in prefill_opts) and not (
         use_gqa2_vreg or use_gqa4_vreg
     )
+    use_vreg_acc = (
+        ("vreg_acc" in prefill_opts)
+        and not use_vreg_acc1
+        and not (use_gqa2_vreg or use_gqa4_vreg)
+    )
     use_sw_short_fuse = "sw_short_fuse" in prefill_opts
-    mrb_depth = 4 if "mrb4" in prefill_opts else (3 if "mrb3" in prefill_opts else 2)
+    mrb_depth = (
+        1
+        if "mrb1" in prefill_opts
+        else (4 if "mrb4" in prefill_opts else (3 if "mrb3" in prefill_opts else 2))
+    )
     use_f32_exp = (
         use_fp8_qkpv_dyn
         or use_fp8_qk_dyn
@@ -604,6 +620,18 @@ def _stationary_q_v2_process(
                     else jnp.concatenate([bias_spec] * n_rep, axis=2)
                 )
                 qk = jnp.where(bs, qk, -jnp.inf)
+            if use_fp8_qkpv_fast:
+                m16 = jnp.max(qk.reshape(1, 16, 16, w_cols), axis=1)
+                m_col = jnp.max(m16, axis=1, keepdims=True)
+                m_safe = jnp.maximum(m_col, jnp.bfloat16(-110.0))
+                m_bias = m_safe - jnp.bfloat16(8.75)
+                p_bf = jnp.exp2(qk - m_bias)
+                p_f8 = jnp.minimum(p_bf, jnp.bfloat16(448.0)).astype(jnp.float8_e4m3fn)
+                p_scale_8 = jnp.broadcast_to(
+                    jnp.exp2(m_bias.astype(jnp.float32)), (1, 8, w_cols)
+                )
+                ps = _psum_w(p_f8.astype(jnp.bfloat16), w_cols) * p_scale_8
+                return p_f8, ps, p_scale_8
             p = jnp.exp2(qk)
             if use_fp8_qkpv:
                 p_f8 = jnp.minimum(p, jnp.bfloat16(448.0)).astype(jnp.float8_e4m3fn)
@@ -953,7 +981,7 @@ def _stationary_q_v2_process(
                             if rdy_g is not None:
                                 _fl_grp()
                             mrb_g.append((qk_g, loc_s, vts))
-                            if len(mrb_g) >= 2:
+                            if len(mrb_g) >= mrb_depth:
                                 _adv_grp()
                         while mrb_g:
                             if rdy_g is not None:
@@ -982,6 +1010,71 @@ def _stationary_q_v2_process(
                                     a_add,
                                     acc_ref[g : g + 1, :, t_sl] + a_add,
                                 )
+                return
+
+            if use_vreg_acc1 and n_slices >= 4:
+                for kv_h in range(2):
+                    for g_off in range(8):
+                        g = kv_h * 8 + g_off
+                        qt_1 = q_t_ref[g : g + 1, :, t_sl]
+                        qsc_1 = (
+                            jnp.tile(q_sc_ref[g : g + 1, :, t_sl], (1, 32, 1))
+                            if use_fp8_qk_dyn
+                            else None
+                        )
+                        l_1 = jnp.zeros((1, 8, tq_sz), jnp.float32)
+                        acc_1 = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                        mrb_1 = []
+                        rdy_1 = None
+
+                        def _adv_1():
+                            nonlocal rdy_1, l_1
+                            qk_1, loc_s, vt_s, qs_1 = mrb_1.pop(0)
+                            p_1, ps_1, psc_1 = _sm_eval(qk_1, bias_specs[loc_s], qs_1)
+                            l_1 = l_1 + ps_1
+                            rdy_1 = (p_1, vt_s, psc_1)
+
+                        def _fl_1():
+                            nonlocal rdy_1, acc_1
+                            p_1, vt_s, psc_1 = rdy_1
+                            acc_1 = acc_1 + _vp_scaled(vt_s, p_1, psc_1)
+                            rdy_1 = None
+
+                        for loc_s in range(n_slices):
+                            s_ring = (
+                                (s_start + loc_s) & ring_s_mask
+                                if ring_covers_all
+                                else (s_start + loc_s)
+                            )
+                            ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                            vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                            qk_1 = _kq_dot(ks, qt_1)
+                            if rdy_1 is not None:
+                                _fl_1()
+                            mrb_1.append((qk_1, loc_s, vts, qsc_1))
+                            if len(mrb_1) >= mrb_depth:
+                                _adv_1()
+                        while mrb_1:
+                            if rdy_1 is not None:
+                                _fl_1()
+                            _adv_1()
+                        if rdy_1 is not None:
+                            _fl_1()
+
+                        if static_first:
+                            l_ref[g : g + 1, :, t_sl] = l_1
+                            acc_ref[g : g + 1, :, t_sl] = acc_1
+                        else:
+                            l_ref[g : g + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                l_1,
+                                l_ref[g : g + 1, :, t_sl] + l_1,
+                            )
+                            acc_ref[g : g + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                acc_1,
+                                acc_ref[g : g + 1, :, t_sl] + acc_1,
+                            )
                 return
 
             if use_vreg_acc and n_slices >= 4:
@@ -5987,9 +6080,12 @@ def ragged_paged_attention(
                 "gqa2_vreg",
                 "gqa4_vreg",
                 "vreg_acc",
+                "vreg_acc1",
                 "sw_short_fuse",
+                "mrb1",
                 "mrb3",
                 "mrb4",
+                "fp8_qkpv_fast",
                 "f32_exp",
                 "prefix_fast",
                 "staged_qo",
@@ -6074,7 +6170,9 @@ def ragged_paged_attention(
                 ring_blks_v2 = 1
             ring_slices_v2 = ring_blks_v2 * num_s_v2
             use_fp8_qk_dyn_v2 = "fp8_qk_dyn" in prefill_opts
-            use_fp8_qkpv_dyn_v2 = "fp8_qkpv_dyn" in prefill_opts
+            use_fp8_qkpv_dyn_v2 = (
+                "fp8_qkpv_dyn" in prefill_opts or "fp8_qkpv_fast" in prefill_opts
+            )
             use_fp8_qkpv_v2 = (
                 ("fp8_qkpv" in prefill_opts)
                 or ("fp8_qkpv_s1" in prefill_opts)

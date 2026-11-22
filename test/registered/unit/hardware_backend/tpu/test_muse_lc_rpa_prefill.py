@@ -311,6 +311,38 @@ class TestMuseLcRpaPrefill(unittest.TestCase):
             )
         self.assertIn("fp8_qkpv_dyn", captured["_prefill_opts"])
 
+        with patch.dict(
+            os.environ,
+            {
+                **env_8k,
+                "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq4096,s2,prefix_fast,staged_qo,fp8_qkpv_fast,vreg_acc1,mrb1",
+            },
+            clear=False,
+        ):
+            _invoke_v3_kernel(
+                _fake_rpa,
+                queries=_FakeArr((1, 8192, 8, 2, 128), "bfloat16"),
+                keys=_FakeArr((8192, 1, 4, 128), "float8_e4m3fn"),
+                values=None,
+                kv_cache_fused=_FakeArr((1000, 256, 1, 4, 128), "float8_e4m3fn"),
+                kv_lens=_FakeArr((8,), "int32"),
+                page_indices=_FakeArr((8 * 1089,), "int32"),
+                cu_q_lens=_FakeArr((9,), "int32"),
+                cu_kv_lens=_FakeArr((9,), "int32"),
+                distribution=_FakeArr((3,), "int32"),
+                attention_sink=None,
+                sm_scale=0.125,
+                sliding_window=None,
+                soft_cap=None,
+                k_scale=1.0,
+                v_scale=1.0,
+                prepared_inputs=True,
+                skip_decode=True,
+                a3_out_layout=True,
+            )
+        for tok in ("fp8_qkpv_fast", "vreg_acc1", "mrb1"):
+            self.assertIn(tok, captured["_prefill_opts"])
+
     def test_fp8_qkpv_dyn_math_parity(self):
         rng = np.random.default_rng(1337)
         w_cols = 256
@@ -370,6 +402,40 @@ class TestMuseLcRpaPrefill(unittest.TestCase):
         cos = float(np.sum(got * ref) / (np.linalg.norm(got) * np.linalg.norm(ref)))
         self.assertGreater(cos, 0.999)
         np.testing.assert_allclose(got, ref, rtol=3e-2, atol=3e-2)
+
+        # Verify fp8_qkpv_fast (exp_scale folded into Q, bf16 max/sub/exp2/psum).
+        q_scaled_f8 = jnp.asarray(
+            jnp.clip(q_mat * float(exp_scale), -448.0, 448.0),
+            dtype=jnp.float8_e4m3fn,
+        )
+        acc_f = jnp.zeros((64, w_cols), dtype=jnp.float32)
+        l_f = jnp.zeros((w_cols,), dtype=jnp.float32)
+        for s_idx in range(n_slices):
+            qk_bf = (
+                jnp.asarray(k_f8[s_idx], dtype=jnp.float32)
+                @ jnp.asarray(q_scaled_f8, dtype=jnp.float32).T
+            ).astype(jnp.bfloat16)
+            if s_idx == 0:
+                qk_bf = qk_bf.at[:, 64:128].set(jnp.bfloat16(-jnp.inf))
+            if s_idx == 3:
+                qk_bf = qk_bf.at[128:, :].set(jnp.bfloat16(-jnp.inf))
+            if s_idx < 3:
+                qk_bf = qk_bf.at[:, 32:48].set(jnp.bfloat16(-80.0 * float(np.log2(np.e))))
+                qk_bf = qk_bf.at[:, 48:64].set(jnp.bfloat16(-150.0 * float(np.log2(np.e))))
+            m_col_bf = jnp.max(qk_bf, axis=0, keepdims=True)
+            m_safe_bf = jnp.maximum(m_col_bf, jnp.bfloat16(-110.0))
+            m_bias_bf = m_safe_bf - jnp.bfloat16(8.75)
+            p_f8_fast = jnp.minimum(
+                jnp.exp2(qk_bf - m_bias_bf), jnp.bfloat16(448.0)
+            ).astype(jnp.float8_e4m3fn)
+            p_scale_f = jnp.exp2(m_bias_bf.astype(jnp.float32))[0]
+            l_f = l_f + jnp.sum(p_f8_fast.astype(jnp.bfloat16), axis=0).astype(jnp.float32) * p_scale_f
+            vp_f = jnp.asarray(v_f8[s_idx], dtype=jnp.float32).T @ p_f8_fast.astype(jnp.float32)
+            acc_f = acc_f + vp_f * p_scale_f[None, :]
+        got_fast = np.asarray((acc_f / l_f[None, :]).T)
+        self.assertFalse(np.isnan(got_fast).any())
+        cos_fast = float(np.sum(got_fast * ref) / (np.linalg.norm(got_fast) * np.linalg.norm(ref)))
+        self.assertGreater(cos_fast, 0.997)
 
     def test_streaming_prefix_fast_and_gqa4_tpu(self):
         if jax.devices()[0].platform != "tpu":
@@ -577,6 +643,9 @@ class TestMuseLcRpaPrefill(unittest.TestCase):
             ("lc_bq4096_bkv4k_staged_gqa1_fp8qkpvdyn_p256_d2", 8192, 256, 1089, (4096, 4096, 256, 256), base_fl | {"staged_qo", "fp8_qkpv_dyn"}, True, True),
             ("lc_bq4096_bkv4k_staged_vregacc_fp8qkpvdyn_p256_d2", 8192, 256, 1089, (4096, 4096, 256, 256), base_fl | {"staged_qo", "vreg_acc", "fp8_qkpv_dyn"}, True, True),
             ("lc_bq2048_bkv4k_gqa2_fp8qkpvdyn_p256_d2", 8192, 256, 1089, (2048, 4096, 256, 256), base_fl | {"gqa2_vreg", "fp8_qkpv_dyn"}, True, True),
+            ("lc_bq4096_bkv4k_vregacc_fp8qkpvfast_p256_d2", 8192, 256, 1089, (4096, 4096, 256, 256), base_fl | {"staged_qo", "vreg_acc", "fp8_qkpv_fast"}, True, True),
+            ("lc_bq8192_bkv4k_vregacc1_mrb1_fp8qkpvfast_p256_d2", 8192, 256, 1089, (8192, 4096, 256, 256), base_fl | {"staged_qo", "vreg_acc1", "mrb1", "fp8_qkpv_fast"}, True, True),
+            ("lc_bq4096_bkv8k_vregacc1_mrb1_fp8qk_p256_d2", 8192, 256, 1089, (4096, 8192, 256, 256), base_fl | {"staged_qo", "vreg_acc1", "mrb1", "fp8_qk"}, True, True),
         )
         with (
             patch(
