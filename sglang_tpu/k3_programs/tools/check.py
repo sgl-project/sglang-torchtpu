@@ -2,7 +2,7 @@
 # Source: tools/megakernel/check.py
 # SPDX-License-Identifier: Apache-2.0
 """Numerics checks of the K3 programs (``check spec`` / ``check handoff`` /
-``check packing`` / ``check greedy``).
+``check packing`` / ``check greedy``; ``check moe``: check_moe).
 
 **spec** drives the decoder (``KimiDecoder``) as the runner does, over stand-in
 unified pools, and checks greedy DSpark against plain greedy decode (the streams
@@ -106,6 +106,11 @@ def add_arguments(parser) -> None:
     )
 
     add_mla_arguments(sub)
+    from sglang_tpu.k3_programs.tools.check_moe import (
+        add_arguments as add_moe_arguments,
+    )
+
+    add_moe_arguments(sub)
     greedy = sub.add_parser(
         "greedy", help="real prompts replayed on the decoder, then greedy tokens"
     )
@@ -137,6 +142,10 @@ def run(args, records: harness.Records) -> None:
         from sglang_tpu.k3_programs.tools.check_mla import run_mladraft
 
         return run_mladraft(args, records)
+    if args.check == "moe":
+        from sglang_tpu.k3_programs.tools.check_moe import run_moe
+
+        return run_moe(args, records)
     {
         "spec": run_spec,
         "handoff": run_handoff,

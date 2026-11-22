@@ -609,6 +609,15 @@ class KernelConfig:
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
+    # With prefill_expert_parallel=8 (and moe_reduce_dtype float32): the fused
+    # MoE on the EP8/TP4 experts (112 a rank, a quarter of each intermediate;
+    # expert_steal's group order when it is on), which colocated programs share
+    # with the decode program in place, instead of the unfused SparseCore path.
+    # The same products and roundings; each token's local experts add in expert
+    # order (not top-k order) and the reduce-scatter ring runs another schedule,
+    # so FP32 sums run in another order, and the router's sigmoid is the fused
+    # kernel's (as at EP16).
+    prefill_fused_moe_ep8: bool = False
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
     # Weight loading.

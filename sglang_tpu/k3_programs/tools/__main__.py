@@ -16,6 +16,7 @@ Commands (Kimi-K3; see each module's docstring):
     check handoff               prefill -> pools -> decode against a decode-only replay
     check greedy --output FILE  prompts replayed on the decoder, then greedy tokens
     check masked                grammar-masked (structured outputs) vs unmasked decode
+    check moe                   the fused EP8 prefill MoE against the unfused EP8 path
     profile decode|prefill ...  the bench's cases with an xprof trace (--trace) and,
                                 with --llo DIR, the compiled LLO of every op (fresh
                                 compile caches, so nothing is skipped)

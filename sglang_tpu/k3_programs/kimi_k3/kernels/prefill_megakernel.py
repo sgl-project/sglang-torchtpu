@@ -6072,6 +6072,15 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             # Preserve the supported per-hop BF16 reduction implementation.
             from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
+    if (
+        cfg.prefill_fused_moe
+        and cfg.prefill_fused_moe_ep8
+        and cfg.prefill_expert_parallel == 8
+        and cfg.moe_reduce_dtype == "float32"
+    ):
+        from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
+
+        return make_packed_moe(mesh, seq_len=seq_len, expert_parallel=8)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 
 
