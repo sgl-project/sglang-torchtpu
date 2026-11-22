@@ -877,10 +877,18 @@ def _register_attention_backends() -> None:
 
 def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
+    from sglang.srt.environ import envs as srt_envs
     from sglang.srt.models.registry import ModelRegistry
 
-    # Preserve the external-model fast path without importing unused catalogs.
-    ModelRegistry.register_lazy("sglang_tpu.models")
+    if srt_envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get() == "sglang_tpu.models":
+        return
+    if ModelRegistry._default_models_loaded:
+        # Upstream sglang.srt.models may already define architectures that TPU
+        # overrides (e.g. MuseSparkForConditionalGeneration); replace them eagerly.
+        ModelRegistry.register("sglang_tpu.models", overwrite=True)
+    else:
+        # Preserve the external-model fast path while letting TPU override defaults.
+        ModelRegistry.register_lazy("sglang_tpu.models", overwrite=True)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:

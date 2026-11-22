@@ -1098,7 +1098,7 @@ class MuseSpark1xModel(nn.Module):
         # Safe to share: each MoE joins its side work before returning.
         # torch.cuda.Stream() raises outright in a CPU-only build, so the CPU
         # path never builds one; _forward_experts skips the overlap there.
-        side_stream = None if _is_cpu else torch.cuda.Stream()
+        side_stream = torch.cuda.Stream() if is_cuda() else None
         for layer_idx in range(config.num_hidden_layers):
             layer_prefix = add_prefix(f"layers.{layer_idx}", prefix)
             layer = MuseSpark1xDecoderLayer(

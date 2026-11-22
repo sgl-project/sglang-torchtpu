@@ -21,7 +21,7 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
     _default_models_loaded: bool = True
-    _pending_packages: List[Tuple[str, bool]] = field(default_factory=list)
+    _pending_packages: List[Tuple[str, bool, bool]] = field(default_factory=list)
 
     def _load_models(self):
         if not self._default_models_loaded:
@@ -29,13 +29,18 @@ class _ModelRegistry:
             self._default_models_loaded = True
 
         while self._pending_packages:
-            package_name, strict = self._pending_packages[0]
-            self._register_classes(import_model_classes(package_name, strict=strict))
+            package_name, strict, overwrite = self._pending_packages[0]
+            self._register_classes(
+                import_model_classes(package_name, strict=strict),
+                overwrite=overwrite,
+            )
             self._pending_packages.pop(0)
 
-    def register_lazy(self, package_name: str, strict: bool = False):
+    def register_lazy(
+        self, package_name: str, strict: bool = False, overwrite: bool = False
+    ):
         """Defer package imports and duplicate checks until catalog loading."""
-        self._pending_packages.append((package_name, strict))
+        self._pending_packages.append((package_name, strict, overwrite))
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
@@ -104,7 +109,7 @@ class _ModelRegistry:
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
         # Fast startup path: resolve registered models without importing defaults.
-        if architectures:
+        if architectures and not any(ow for _, _, ow in self._pending_packages):
             first_arch = (
                 architectures if isinstance(architectures, str) else architectures[0]
             )
