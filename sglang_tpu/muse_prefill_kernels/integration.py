@@ -28,6 +28,7 @@ import threading
 import time
 from typing import NamedTuple, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
