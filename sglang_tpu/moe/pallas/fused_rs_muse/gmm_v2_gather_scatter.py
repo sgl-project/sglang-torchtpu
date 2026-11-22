@@ -792,9 +792,9 @@ def inner_kernel(
                                     _amax_m * (1.0 / _dt_max),
                                 )
                                 _q_pair.append(
-                                    (
-                                        _blk.reshape(16, cfgs.tiles.tile_k) * _inv_m
-                                    ).astype(_qdt)
+                                    (_blk * _inv_m[:, None, :])
+                                    .astype(_qdt)
+                                    .reshape(16, cfgs.tiles.tile_k)
                                 )
                                 _sc_pair.append(
                                     jnp.broadcast_to(

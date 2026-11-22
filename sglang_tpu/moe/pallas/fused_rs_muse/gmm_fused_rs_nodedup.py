@@ -1151,7 +1151,11 @@ def kernel_main_fused_rs(
     # no remote write lands in an out_buf that is still being zeroed.
     # Every (local_row, topk_slot) in out_buf_ref is overwritten via direct DMA;
     # keep entry sync_barrier() (~2 us) and skip 67.1 MB zero_out_start_3d.
-    sync_barrier()
+    _split_entry_barrier = gather_2ahead_mode in (4, 5)
+    if _split_entry_barrier:
+        sync_barrier_signal()
+    else:
+        sync_barrier()
 
     # Build metadata.
     meta_dims = Dimensions(
@@ -2797,8 +2801,18 @@ def kernel_main_fused_rs(
             if fp8_direct_write:
                 pl.semaphore_wait(scale_send_sems_ref.at[t_stg], send_sz)
 
-    _early_rs = gather_2ahead_mode in (1, 2)
-    _two_ahead_gather = gather_2ahead_mode in (1, 3)
+    _early_rs = gather_2ahead_mode in (1, 2, 4)
+    _two_ahead_gather = gather_2ahead_mode in (1, 3, 4, 5)
+    _gather_during_gmm1 = (
+        gather_2ahead_mode in (4, 5)
+        and use_lhs_fp8_vmem
+        and not use_lhs_2d_cache
+        and not has_ext_pq_lhs
+        and num_k1 == 1
+        and not k256_tiles
+        and not eo_pair_enabled
+        and not hot_interleave
+    )
     _gather_divisor_top = top_k if pack_indices else 1
     _w_base_idx = 17 + 2 * ep_size
     _la_started_idx = 18 + 2 * ep_size
@@ -2835,6 +2849,9 @@ def kernel_main_fused_rs(
                 divisor=_gather_divisor_top,
                 packed_u16=packed_u16_lhs,
             )
+
+    if _split_entry_barrier:
+        sync_barrier_wait()
 
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, skip_cur):
@@ -3599,6 +3616,20 @@ def kernel_main_fused_rs(
                     _emit_prev_reshape()
 
                 _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
+                if _gather_during_gmm1 and step == 0:
+                    @jax.named_scope("dma_gather_prefetch_2ahead_gmm1")
+                    @pl.when(gm_id + 2 < local_num_gm)
+                    def _():
+                        dma_gather_gm_start(
+                            hidden_states_ref,
+                            gathered_lhs_2x_ref.at[sem_id],
+                            lhs_indices_ref,
+                            gather_sem_ref.at[sem_id],
+                            gm_id + 2,
+                            metadata_ref,
+                            divisor=_gather_divisor,
+                            packed_u16=packed_u16_lhs,
+                        )
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
 
@@ -3643,16 +3674,17 @@ def kernel_main_fused_rs(
                 @jax.named_scope("dma_gather_prefetch_2ahead")
                 @pl.when(gm_id + 2 < local_num_gm)
                 def _():
-                    dma_gather_gm_start(
-                        hidden_states_ref,
-                        gathered_lhs_2x_ref.at[sem_id],
-                        lhs_indices_ref,
-                        gather_sem_ref.at[sem_id],
-                        gm_id + 2,
-                        metadata_ref,
-                        divisor=_gather_divisor,
-                        packed_u16=packed_u16_lhs,
-                    )
+                    if not _gather_during_gmm1:
+                        dma_gather_gm_start(
+                            hidden_states_ref,
+                            gathered_lhs_2x_ref.at[sem_id],
+                            lhs_indices_ref,
+                            gather_sem_ref.at[sem_id],
+                            gm_id + 2,
+                            metadata_ref,
+                            divisor=_gather_divisor,
+                            packed_u16=packed_u16_lhs,
+                        )
             else:
 
                 @jax.named_scope("dma_gather_prefetch")

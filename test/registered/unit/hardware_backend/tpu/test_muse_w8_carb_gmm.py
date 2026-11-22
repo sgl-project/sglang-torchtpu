@@ -730,3 +730,198 @@ def test_c24k_smem_window_no_spill_and_mosaic_lowering():
         assert "E_34-M_196608" in hlo
         assert "-fbs-" in hlo
         assert "-u16w-" not in hlo
+
+
+def test_rb4_and_flq2_fp8_first_0ulp_interpret_parity():
+    """Verify rb4 (128-row bucket inside 256-row VMEM) and flq2_fp8_first are 0-ULP vs 256-row."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import (
+        Dimensions,
+        GmmConfigs,
+        InputConfigs,
+        MetadataRef,
+        TileSizes,
+        WeightsRef,
+        inner_kernel,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    rng = np.random.default_rng(20261122)
+    tile_m, k1, n1_half, k2, n2, valid_rows = 256, 512, 256, 256, 256, 96
+    lhs_3d = jax.device_put(
+        jnp.asarray(rng.standard_normal((tile_m, k1 // 128, 128)).astype(np.float32), jnp.bfloat16)
+    )
+    w1_u32 = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k1 // 8, n1_half * 2), dtype=np.uint32))
+    s1_bf16 = jnp.asarray(np.exp(rng.normal(-2.0, 0.2, size=(k1 // 256, n1_half * 2))).astype(np.float32), jnp.bfloat16)
+    w2_u32 = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k2 // 8, n2), dtype=np.uint32))
+    s2_bf16 = jnp.asarray(np.exp(rng.normal(-2.0, 0.2, size=(k2 // 256, n2))).astype(np.float32), jnp.bfloat16)
+
+    def _run_bucket(m_rows: int, flq_val: str) -> np.ndarray:
+        cfgs1 = GmmConfigs(
+            dims=Dimensions(size_m=16384, size_k=k1, size_n=n1_half * 2, size_group=1, size_lhs_group=1, size_lhs_sublane=8),
+            tiles=TileSizes(tile_m=m_rows, tile_k=k1, tile_n=n1_half * 2),
+            lhs_cfgs=InputConfigs(quant_dtype=jnp.float8_e4m3fn.dtype, quant_block_size=k1, dtype=jnp.bfloat16),
+            rhs_cfgs=InputConfigs(quant_dtype=jnp.float4_e2m1fn.dtype, quant_block_size=256, dtype=jnp.float4_e2m1fn, has_bias=False, has_scale=True, packing=8, num_quant_blocks=k1 // 256),
+            out_dtype=jnp.bfloat16, acc_dtype=jnp.float32, zero_init=False, fuse_act="silu",
+        )
+        cfgs2 = GmmConfigs(
+            dims=Dimensions(size_m=16384, size_k=k2, size_n=n2, size_group=1, size_lhs_group=1, size_lhs_sublane=8),
+            tiles=TileSizes(tile_m=m_rows, tile_k=k2, tile_n=n2),
+            lhs_cfgs=InputConfigs(quant_dtype=jnp.float8_e4m3fn.dtype, quant_block_size=k2, dtype=jnp.bfloat16),
+            rhs_cfgs=InputConfigs(quant_dtype=jnp.float4_e2m1fn.dtype, quant_block_size=256, dtype=jnp.float4_e2m1fn, has_bias=False, has_scale=True, packing=8, num_quant_blocks=k2 // 256),
+            out_dtype=jnp.bfloat16, acc_dtype=jnp.float32, zero_init=False, fuse_act=None,
+        )
+
+        def _ker(x3d_r, w1_r, s1_r, w2_r, s2_r, out_r, g1_r, pq_fp8_r, pq_sc_r, p1_r, acc_r, m_gid, m_off):
+            m_gid[0] = jnp.int32(0)
+            m_off[0] = jnp.int32(0)
+            m_off[1] = jnp.int32(valid_rows)
+            meta = MetadataRef(gm_id_to_group_id=m_gid, gm_id_to_m_offset=m_off)
+            inner_kernel(
+                None, WeightsRef(weight=w1_r, scale=s1_r, bias=None),
+                g1_r.at[pl.ds(0, m_rows), :], p1_r, acc_r.at[pl.ds(0, m_rows), :], meta,
+                cfgs=cfgs1, scatter_mode=True, _k_id=0, _num_k=1, _gm_id=0, _n_id=0, _num_n=1,
+                fused_g2_amax_slot=1, prequant_lhs_fp8_ref=pq_fp8_r.at[pl.ds(0, m_rows), :],
+                prequant_lhs_scale_ref=pq_sc_r.at[:, pl.ds(0, m_rows), :],
+                skip_row_mask=True, lhs_3d_vmem_ref=x3d_r.at[pl.ds(0, m_rows), :, :],
+            )
+            inner_kernel(
+                None, WeightsRef(weight=w2_r, scale=s2_r, bias=None),
+                out_r.at[pl.ds(0, m_rows), :], p1_r, acc_r.at[pl.ds(0, m_rows), :], meta,
+                cfgs=cfgs2, scatter_mode=True, _k_id=0, _num_k=1, _gm_id=0, _n_id=0, _num_n=1,
+                fused_g2_amax_slot=1, prequant_lhs_fp8_ref=pq_fp8_r.at[pl.ds(0, m_rows), :k2],
+                prequant_lhs_scale_ref=pq_sc_r.at[:, pl.ds(0, m_rows), :],
+                skip_row_mask=True, lhs_2d_vmem_ref=g1_r.at[pl.ds(0, m_rows), :],
+            )
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.dict(os.environ, {
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": flq_val,
+            }),
+        ):
+            call = pl.pallas_call(
+                _ker,
+                out_shape=jax.ShapeDtypeStruct((tile_m, n2), jnp.bfloat16),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 5,
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[
+                    pltpu.VMEM((tile_m, n1_half), jnp.bfloat16),
+                    pltpu.VMEM((tile_m, k1), jnp.float8_e4m3fn),
+                    pltpu.VMEM((2, tile_m, 128), jnp.float32),
+                    pltpu.VMEM((8, n1_half * 2), jnp.float32),
+                    pltpu.VMEM((tile_m, n1_half * 2), jnp.float32),
+                    pltpu.SMEM((1,), jnp.int32),
+                    pltpu.SMEM((2,), jnp.int32),
+                ],
+                interpret=True,
+            )
+            return np.asarray(call(lhs_3d, w1_u32, s1_bf16, w2_u32, s2_bf16), dtype=np.float32)[:valid_rows]
+
+    y_256 = _run_bucket(256, "2")
+    y_128 = _run_bucket(128, "2")
+    y_ref = _run_bucket(256, "0")
+    assert np.all(np.isfinite(y_128))
+    np.testing.assert_array_equal(y_256, y_ref)
+    np.testing.assert_array_equal(y_128, y_256)
+
+
+def test_rb4_and_g2a4_g2a5_mosaic_lowering():
+    """Verify PREFILL_ROW_BUCKETS=4 and GMM_GATHER_2AHEAD=4/5 lower cleanly at T=24k and T=16k."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh
+
+    import sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline  # noqa: F401
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_moe import moe_gmm_local_rs_nodedup
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    if len(jax.devices()) < 8:
+        pytest.skip("Requires >=8 virtual/physical JAX devices")
+
+    mesh = Mesh(np.array(jax.devices()[:8]), ("model",))
+    base_env = {
+        "SGLANG_TPU_MUSE_KERNEL_GMM_LAYOUT_DEQUANT": "1",
+        "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+        "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+        "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+        "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+        "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+        "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "2",
+        "SGLANG_TPU_MUSE_KERNEL_VECTORIZED_DEQUANT": "1",
+    }
+
+    in_specs = (
+        jax.sharding.PartitionSpec(),
+        jax.sharding.PartitionSpec("model"),
+        jax.sharding.PartitionSpec("model"),
+        jax.sharding.PartitionSpec("model"),
+        jax.sharding.PartitionSpec("model"),
+        jax.sharding.PartitionSpec("model"),
+        jax.sharding.PartitionSpec("model", None),
+        jax.sharding.PartitionSpec(),
+        jax.sharding.PartitionSpec(),
+    )
+
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        patch("jax.default_backend", return_value="tpu"),
+        tpu_info_for_cpu_export(),
+    ):
+        try:
+            for g2a_mode in ("4", "5"):
+                for T in (24576, 16384):
+                    with patch.dict(os.environ, {**base_env, "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": g2a_mode}):
+                        jax.clear_caches()
+                        sd = jax.ShapeDtypeStruct
+                        hlo = (
+                            jax.jit(
+                                lambda *xs: jax.shard_map(
+                                    lambda hs, w1, w1s, w2, w2s, go, wts, ids, pnw: moe_gmm_local_rs_nodedup(
+                                        hs, w1, w1s, None, w2, w2s, None, None, None, go, wts, ids, pnw,
+                                        activation="silu", topk=8, ep_size=8, ep_axis_name="model",
+                                        has_post_norm=True, sp_enabled=True, fp8_direct_write=False,
+                                        expert_tp=False, fp4_w4a16=False, block_scatter=True, return_raw_out_buf=True,
+                                    ),
+                                    mesh=mesh, in_specs=in_specs,
+                                    out_specs=jax.sharding.PartitionSpec("model", None, None),
+                                    check_vma=False,
+                                )(*xs)
+                            )
+                            .trace(
+                                sd((T, 4096), jnp.bfloat16),
+                                sd((256, 4096, 8192), jnp.float4_e2m1fn),
+                                sd((256, 8, 8192), jnp.bfloat16),
+                                sd((256, 4096, 4096), jnp.float4_e2m1fn),
+                                sd((256, 8, 4096), jnp.bfloat16),
+                                sd((8,), jnp.int32),
+                                sd((T, 8), jnp.float32),
+                                sd((T, 8), jnp.int32),
+                                sd((4096,), jnp.bfloat16),
+                            )
+                            .lower(lowering_platforms=("tpu",))
+                            .as_text("stablehlo")
+                        )
+                        assert "-rb4-" in hlo
+                        assert f"-g2a{g2a_mode}-" in hlo
+        finally:
+            jax.clear_caches()
