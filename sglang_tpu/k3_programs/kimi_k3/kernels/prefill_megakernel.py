@@ -804,12 +804,21 @@ def ragged_gather_reduce(
 
     # A stable boolean partition keeps routes for each destination adjacent
     # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
+    # One stable sort carries the routes' fields with the key, so no gather
+    # follows it (XLA's TensorCore gather moves one element at a time).
     weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
+    invalid, route_indices, route_destinations, route_weights = lax.sort(
+        (
+            (~valid_blocks).astype(jnp.int32),
+            indices_blocks,
+            destination_blocks,
+            weights_blocks,
+        ),
+        dimension=1,
+        is_stable=True,
+        num_keys=1,
+    )
+    compact_valid = invalid == 0
     route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
     route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
         jnp.int32
@@ -5581,8 +5590,9 @@ def routed_experts(
     # Sorting one packed integer gives both an expert-major order and its
     # source token without gathering a second large permutation vector.
     packed = (keys << token_bits) | token_id
-    order = jnp.argsort(packed, stable=False)
-    sorted_tokens = token_id[order]
+    # The keys are distinct, so the sorted keys' low bits are the sources in
+    # expert-major order (no gather by the sort permutation).
+    sorted_tokens = jnp.sort(packed) & ((1 << token_bits) - 1)
     inverse, all_counts = _counting_sort_positions(keys, local_experts + 1)
     counts = all_counts[:local_experts]
     x = ragged_gather_v2(
