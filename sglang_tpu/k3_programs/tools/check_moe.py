@@ -105,10 +105,11 @@ def run_moe(args, records: harness.Records) -> None:
                     torch.tensor([length], dtype=torch.int32).to("tpu"),
                     torch.tensor([slot], dtype=torch.int32).to("tpu"),
                 )
-                out = {
-                    tag: op(hidden, prefix, *scalars, *families).float()
-                    for tag, op in ops.items()
-                }
+                out = {}
+                for tag, op in ops.items():
+                    # A registered op returns its outputs as a tuple.
+                    (result,) = op(hidden, prefix, *scalars, *families)
+                    out[tag] = result.float()
                 base = prefix.float()
                 ref, new = out["unfused"] - base, out["fused"] - base
                 diff = new - ref
