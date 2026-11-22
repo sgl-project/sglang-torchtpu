@@ -1081,6 +1081,7 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
                 )
             ]
             assert not bad, f"{name}: {bad[:2]}"
+        return asms[0]
 
     H_FULL, HP_FULL, E_FULL = 8192, 4096, 256
     for B in (16, 32, 64, 128, 384):
@@ -1103,8 +1104,28 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
                 ((HP_FULL,), jnp.float32),
             ],
         )
+        if B in (32, 64):
+            _check_mlir(
+                f"b1b_{B}_rov",
+                lambda *a: attn_to_moe_bridge_jax(*a, world_size=8, router_d2d_overlap=True),
+                (P(),) * 11,
+                (P(), P(), P()),
+                [
+                    ((B, H_FULL), jnp.float32),
+                    ((B, 1024), jnp.bfloat16),
+                    ((1024, H_FULL), jnp.float8_e4m3fn),
+                    ((H_FULL,), jnp.float32),
+                    ((H_FULL,), jnp.float32),
+                    ((H_FULL,), jnp.float32),
+                    ((H_FULL,), jnp.float32),
+                    ((H_FULL, 512), jnp.float8_e4m3fn),
+                    ((512,), jnp.float32),
+                    ((H_FULL, E_FULL), jnp.bfloat16),
+                    ((HP_FULL,), jnp.float32),
+                ],
+            )
         sh = B >= 64
-        _check_mlir(
+        asm2 = _check_mlir(
             f"b2b_{B}",
             lambda *a, _sh=sh: moe_to_attn_bridge_jax(*a, world_size=8, sharded_moe_in=_sh),
             (P(), P("model", None) if sh else P()) + (P(),) * 10,
@@ -1124,6 +1145,16 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
                 ((1024,), jnp.float32),
             ],
         )
+
+        if B == 64:
+            # Single-pass W_post (4) + W_qkv (5) + W_gate (4) = exact 13-matmul floor.
+            assert asm2.count("tpu.matmul") == 13, asm2.count("tpu.matmul")
+        elif B == 16:
+            # Adaptive max_tn=1024 cuts W_post (1) + W_qkv (2) + W_gate (1) = 4 matmuls.
+            assert asm2.count("tpu.matmul") == 4, asm2.count("tpu.matmul")
+        elif B == 32:
+            # Adaptive max_tn=512 cuts W_post (2) + W_qkv (3) + W_gate (2) = 7 matmuls.
+            assert asm2.count("tpu.matmul") == 7, asm2.count("tpu.matmul")
 
     _check_mlir(
         "l0_dqkv_80",
@@ -1173,9 +1204,8 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
             y = y * w[None, :]
         return y
 
-    H_T, HP_T = 4096, 2048
     rng = np.random.default_rng(77)
-    for b_t in (16, 32, 64):
+    for b_t, H_T, HP_T, rov in ((32, 2048, 2048, False), (16, 4096, 2048, False), (32, 4096, 2048, True), (64, 4096, 2048, True)):
         st = rng.standard_normal((b_t, H_T)).astype(np.float32)
         ga_bf = jnp.asarray(rng.standard_normal((b_t, 8 * 256)), dtype=jnp.bfloat16)
         ga_np = np.asarray(ga_bf, dtype=np.float32)
@@ -1191,11 +1221,11 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
 
         fn1 = jax.jit(
             jax.shard_map(
-                lambda s, g, w, ws, a, b, pf, wp, wps, wr, pe: attn_to_moe_bridge_jax(
+                lambda s, g, w, ws, a, b, pf, wp, wps, wr, pe, _rov=rov: attn_to_moe_bridge_jax(
                     s, g, w, ws, a, b, pf, wp, wps, wr, pe,
                     world_size=8, pa_eps=1e-5, pre_ff_eps=1e-5, pre_ff_scale_input=False,
                     router_multiplier=0.5, pre_exp_eps=1e-5, pre_exp_scale_input=False,
-                    interpret=True,
+                    router_d2d_overlap=_rov, interpret=True,
                 ),
                 mesh=mesh,
                 in_specs=(
@@ -1223,7 +1253,8 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
         assert float(np.dot(np.asarray(rlog_out).ravel(), rlog_ref.ravel()) / (np.linalg.norm(rlog_out) * np.linalg.norm(rlog_ref))) > 0.9999
         assert float(np.dot(np.asarray(ein_out, dtype=np.float32).ravel(), ein_ref.ravel()) / (np.linalg.norm(ein_out) * np.linalg.norm(ein_ref))) > 0.9995
 
-    for b_t, sh in ((32, False), (64, True)):
+    H_T = 4096
+    for b_t, sh in ((16, False), (32, False), (64, True)):
         st = rng.standard_normal((b_t, H_T)).astype(np.float32)
         moe_full = jnp.asarray(rng.standard_normal((b_t, 512)) * 0.2, dtype=jnp.bfloat16)
         moe_in = jax.device_put(moe_full, NamedSharding(mesh, P("model", None))) if sh else moe_full

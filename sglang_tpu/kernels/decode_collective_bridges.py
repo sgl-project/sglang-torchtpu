@@ -33,6 +33,7 @@ directly underneath TPU7x ``XOR=1`` chip-hierarchical ICI collectives:
 # PEP 563 must stay off so cpu_export_jax_op sees real jax.Array annotations.
 
 import functools
+import os
 from collections.abc import Callable
 from threading import Lock
 
@@ -59,7 +60,7 @@ FP8_MASK_ALL = (
 )
 
 _OPS_LOCK = Lock()
-_ATTN_TO_MOE_OPS: dict[tuple[int, bool], Callable] = {}
+_ATTN_TO_MOE_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _POST_ATTN_TO_MOE_OPS: dict[tuple[int, bool], Callable] = {}
 _ATTN_OPROJ_AR_RN_OPS: dict[int, Callable] = {}
 _MOE_TO_ATTN_QKVG_OPS: dict[tuple[int, bool], Callable] = {}
@@ -132,6 +133,11 @@ def _pick_strip(n_rows: int, cap: int = 32) -> int:
     return bm
 
 
+def _use_dual_tree_xy(world_size: int, rows: int, hidden: int) -> bool:
+    """Dual-Tree 2D-XY Butterfly needs 8 ranks, >=32 rows, and >=2 col strips per chip."""
+    return world_size == 8 and rows >= 32 and (hidden // world_size) >= 2 * _COL_STRIP
+
+
 def _fori_strips(n: int, step: int, body_fn) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -170,37 +176,55 @@ def _dot_fp8_scaled_to_ref(
     from jax.experimental import pallas as pl
 
     bm = _pick_strip(rows, 64)
+    # Use tn=1024 (bm<=16) / tn=512 (bm==32) so B<=32 LC decodes cut x_ref VMEM re-reads 2-4x
+    # while still keeping <= 16 f32 accumulator VREGs (0/0 LLO spills); bm==64 keeps _DOT_TN=256.
+    max_tn = min(1024, max(_DOT_TN, (16 // max(bm // 8, 1)) * 128))
+    tiles: list[tuple[int, int]] = []
+    if max_tn > _DOT_TN and n_cols <= 2048:
+        cn = 0
+        while cn < n_cols:
+            rem = n_cols - cn
+            tn = max_tn
+            while tn > _DOT_TN and rem < tn:
+                tn //= 2
+            tiles.append((cn, tn))
+            cn += tn
 
     def _m_body(r0):
         rs = pl.ds(r0, bm)
         row_s = w8a8_scale_ref[rs, :] if w8a8_scale_ref is not None else None
 
-        def _dot_one(cn):
+        def _dot_tile(cn, tn: int):
             acc = jnp.dot(
                 x_ref[rs, :],
-                w_buf[:, pl.ds(cn, _DOT_TN)],
+                w_buf[:, pl.ds(cn, tn)],
                 preferred_element_type=jnp.float32,
             )
-            sc = scale_ref[0:1, pl.ds(scale_c0 + cn, _DOT_TN)]
+            sc = scale_ref[0:1, pl.ds(scale_c0 + cn, tn)]
             out = acc * sc
             if row_s is not None:
                 out = out * row_s
-            dst_ref[rs, pl.ds(dst_c0 + cn, _DOT_TN)] = out.astype(dst_ref.dtype)
+            dst_ref[rs, pl.ds(dst_c0 + cn, tn)] = out.astype(dst_ref.dtype)
 
         # Unroll up to 5 tiles (QKV=1280, Gate=1024, Post=1024, Pre=512) or 4-way inside
         # fori_loop (Wo half=4096 -> only 4 loop trips!) so Mosaic LLO back-to-back pipelines
         # MXU dots with VPU scale+bf16 pack while keeping <= 16 live f32 VREGs (0/0 spills!).
-        if n_cols <= 5 * _DOT_TN:
+        if tiles:
+            for cn, tn in tiles:
+                _dot_tile(cn, tn)
+        elif max_tn > _DOT_TN and n_cols % max_tn == 0:
+            _fori_strips(n_cols, max_tn, lambda cn: _dot_tile(cn, max_tn))
+        elif n_cols <= 5 * _DOT_TN:
             for cn in range(0, n_cols, _DOT_TN):
-                _dot_one(cn)
+                _dot_tile(cn, _DOT_TN)
         elif n_cols % (4 * _DOT_TN) == 0:
             def _n_quad(c4):
                 for sub in range(0, 4 * _DOT_TN, _DOT_TN):
-                    _dot_one(c4 + sub)
+                    _dot_tile(c4 + sub, _DOT_TN)
 
             _fori_strips(n_cols, 4 * _DOT_TN, _n_quad)
         else:
-            _fori_strips(n_cols, _DOT_TN, _dot_one)
+            _fori_strips(n_cols, _DOT_TN, lambda cn: _dot_tile(cn, _DOT_TN))
 
     _fori_strips(rows, bm, _m_body)
 
@@ -531,6 +555,7 @@ def _run_oproj_ar_and_post_attn_norm(
     chunk = hidden // world_size  # 1024 (TP8) or 512 (TP16)
     n_chips = world_size // 2
     bm = _pick_strip(rows, 32)
+    bm64 = _pick_strip(rows, 64)
     half_strips = half // _COL_STRIP
     chunk_strips = chunk // _COL_STRIP
 
@@ -592,7 +617,7 @@ def _run_oproj_ar_and_post_attn_norm(
     c1a.wait()
 
     def _sum_s1(r0):
-        rs = pl.ds(r0, bm)
+        rs = pl.ds(r0, bm64)
 
         def _col_step(c_sl):
             v = own_half[rs, c_sl].astype(jnp.float32) + mate_recv[rs, c_sl].astype(jnp.float32)
@@ -600,10 +625,10 @@ def _run_oproj_ar_and_post_attn_norm(
 
         _fori_col_blocks(half, _col_step)
 
-    _fori_strips(rows, bm, _sum_s1)
+    _fori_strips(rows, bm64, _sum_s1)
 
     # Phase 1b + 2a: Inter-chip reduce-scatter + all-gather across n_chips.
-    use_xy = world_size == 8 and rows >= 32
+    use_xy = _use_dual_tree_xy(world_size, rows, hidden)
     if use_xy:
         # Dual-Tree Bidirectional 2D-XY Butterfly on 2x2 torus (zero 2-hop diagonals, zero
         # 3-to-1 DMA incast, simultaneous X + Y link saturation on every step!):
@@ -637,7 +662,7 @@ def _run_oproj_ar_and_post_attn_norm(
         rs1_b.wait()
 
         def _sum_xy1(r0):
-            rs = pl.ds(r0, bm)
+            rs = pl.ds(r0, bm64)
             for s in range(chunk_strips):
                 off = s * _COL_STRIP
                 c_l = pl.ds(off, _COL_STRIP)
@@ -648,7 +673,7 @@ def _run_oproj_ar_and_post_attn_norm(
                 own_half[rs, ca] = va.astype(own_half.dtype)
                 own_half[rs, cb] = vb.astype(own_half.dtype)
 
-        _fori_strips(rows, bm, _sum_xy1)
+        _fori_strips(rows, bm64, _sum_xy1)
 
         a_send2 = pl.multiple_of(a_keep1 + (jnp.int32(1) - cy) * e_cols, 128)
         a_keep2 = pl.multiple_of(a_keep1 + cy * e_cols, 128)
@@ -671,7 +696,7 @@ def _run_oproj_ar_and_post_attn_norm(
         rs2_b.wait()
 
         def _sum_xy2(r0):
-            rs = pl.ds(r0, bm)
+            rs = pl.ds(r0, bm64)
             for s in range(e_strips):
                 off = s * _COL_STRIP
                 c_l = pl.ds(off, _COL_STRIP)
@@ -682,7 +707,7 @@ def _run_oproj_ar_and_post_attn_norm(
                 own_half[rs, ca] = va.astype(own_half.dtype)
                 own_half[rs, cb] = vb.astype(own_half.dtype)
 
-        _fori_strips(rows, bm, _sum_xy2)
+        _fori_strips(rows, bm64, _sum_xy2)
 
         # Dual-Tree AG-1 overlapped with s_buf *= pa_alpha (0-ULP bit-identical)!
         ag1_a = pltpu.make_async_remote_copy(
@@ -698,7 +723,7 @@ def _run_oproj_ar_and_post_attn_norm(
         ag1_a.start()
         ag1_b.start()
         _dma_wait(s_buf, s_in_sem.at[0])
-        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm)
+        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
         ag1_a.wait()
         ag1_b.wait()
 
@@ -720,8 +745,8 @@ def _run_oproj_ar_and_post_attn_norm(
         ag2_b.start()
 
         def _own_pa_sq_keep1(r0):
-            rs = pl.ds(r0, bm)
-            acc = jnp.zeros((bm, 128), dtype=jnp.float32)
+            rs = pl.ds(r0, bm64)
+            acc = jnp.zeros((bm64, 128), dtype=jnp.float32)
             for s in range(chunk_strips):
                 off = s * _COL_STRIP
                 ca = pl.ds(pl.multiple_of(a_keep1 + off, _COL_STRIP), _COL_STRIP)
@@ -732,7 +757,7 @@ def _run_oproj_ar_and_post_attn_norm(
                 acc = acc + (sq[:, 0:128] + sq[:, 128:256])
             sq_buf[rs, :] = acc
 
-        _fori_strips(rows, bm, _own_pa_sq_keep1)
+        _fori_strips(rows, bm64, _own_pa_sq_keep1)
         ag2_a.wait()
         ag2_b.wait()
     else:
@@ -755,7 +780,7 @@ def _run_oproj_ar_and_post_attn_norm(
             op.wait()
 
         def _sum_s2(r0):
-            rs = pl.ds(r0, bm)
+            rs = pl.ds(r0, bm64)
             for s in range(chunk_strips):
                 off = s * _COL_STRIP
                 c_l = pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP)
@@ -767,7 +792,7 @@ def _run_oproj_ar_and_post_attn_norm(
                 own_chunk[rs, c_l] = vb
                 own_half[rs, c_h] = vb
 
-        _fori_strips(rows, bm, _sum_s2)
+        _fori_strips(rows, bm64, _sum_s2)
 
         c2a = []
         for d in range(1, n_chips):
@@ -783,7 +808,7 @@ def _run_oproj_ar_and_post_attn_norm(
             op.start()
             c2a.append(op)
         _dma_wait(s_buf, s_in_sem.at[0])
-        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm)
+        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
         for op in c2a:
             op.wait()
 
@@ -800,7 +825,7 @@ def _run_oproj_ar_and_post_attn_norm(
 
     if use_xy:
         def _own_pa_sq_rest(r0):
-            rs = pl.ds(r0, bm)
+            rs = pl.ds(r0, bm64)
             acc = sq_buf[rs, :]
             for s in range(chunk_strips):
                 off = s * _COL_STRIP
@@ -812,10 +837,10 @@ def _run_oproj_ar_and_post_attn_norm(
                 acc = acc + (sq[:, 0:128] + sq[:, 128:256])
             sq_buf[rs, :] = acc
 
-        _fori_strips(rows, bm, _own_pa_sq_rest)
+        _fori_strips(rows, bm64, _own_pa_sq_rest)
     else:
         def _own_pa_sq(r0):
-            rs = pl.ds(r0, bm)
+            rs = pl.ds(r0, bm64)
 
             def _col(c_sl, acc):
                 bf = own_half[rs, c_sl].astype(jnp.float32)
@@ -823,10 +848,10 @@ def _run_oproj_ar_and_post_attn_norm(
                 return acc + (sq[:, 0:128] + sq[:, 128:256])
 
             sq_buf[rs, :] = _reduce_col_blocks(
-                half, _col, jnp.zeros((bm, 128), dtype=jnp.float32)
+                half, _col, jnp.zeros((bm64, 128), dtype=jnp.float32)
             )
 
-        _fori_strips(rows, bm, _own_pa_sq)
+        _fori_strips(rows, bm64, _own_pa_sq)
     c2b.wait()
 
     # Finish other-half post_attn_ln variance + gated residual + pre_feedforward_ln in VMEM!
@@ -980,7 +1005,7 @@ def attn_oproj_ar_res_norm_jax(
     half = hidden // 2
     chunk = hidden // world_size
     n_chips = world_size // 2
-    use_xy = world_size == 8 and rows >= 32
+    use_xy = _use_dual_tree_xy(world_size, rows, hidden)
     n_ar_sems = 4 if use_xy else (n_chips - 1)
     n_sc_slots = 2 if use_xy else (n_chips - 1)
 
@@ -1153,6 +1178,7 @@ def _attn_to_moe_bridge_kernel(
     pre_exp_eps: float,
     pre_exp_scale_input: bool,
     use_w8a8: bool,
+    router_d2d_overlap: bool = False,
 ) -> None:
     """10-op zero-spill megabridge from ``RPAd_fast(onorm+gate)`` straight into ``muse_sparse``!"""
     import jax.numpy as jnp
@@ -1255,6 +1281,13 @@ def _attn_to_moe_bridge_kernel(
 
     # Note: no second barrier needed! Every rank already synchronized at Phase 2b c2b.wait()
     # and all ranks enter Stage 1 with pre_half_a live from kernel start!
+    overlap_router_d2d = bool(router_d2d_overlap) and use_halfrow and not tile_r32
+
+    def _my_half_b1(src_buf, row_base, n_r):
+        if overlap_router_d2d:
+            _compute_router_under_ici()
+        _norm_pre_slice(src_buf, row_base, n_r)
+
     _gather_shard_xor1(
         pre_shard,
         eff_pre_a,
@@ -1268,8 +1301,8 @@ def _attn_to_moe_bridge_kernel(
         me=me,
         world_size=world_size,
         use_halfrow=use_halfrow,
-        during_ici_fn=_compute_router_under_ici,
-        my_half_epilogue_fn=_norm_pre_slice,
+        during_ici_fn=None if overlap_router_d2d else _compute_router_under_ici,
+        my_half_epilogue_fn=_my_half_b1,
         mate_half_epilogue_fn=_norm_pre_slice,
     )
     _dma_wait(out_stream_hbm, s_out_sem.at[0])
@@ -1296,6 +1329,7 @@ def attn_to_moe_bridge_jax(
     pre_exp_eps: float = 1e-5,
     pre_exp_scale_input: bool = False,
     use_w8a8: bool = False,
+    router_d2d_overlap: bool | None = None,
     interpret: bool = False,
     collective_id: int = _DEFAULT_CID + 1,
 ):
@@ -1329,7 +1363,7 @@ def attn_to_moe_bridge_jax(
     half = hidden // 2
     chunk = hidden // world_size
     n_chips = world_size // 2
-    use_xy = world_size == 8 and rows >= 32
+    use_xy = _use_dual_tree_xy(world_size, rows, hidden)
     n_ar_sems = 4 if use_xy else (n_chips - 1)
     n_sc_slots = 2 if use_xy else (n_chips - 1)
     is_r16 = w_router_km.dtype == jnp.bfloat16
@@ -1356,6 +1390,11 @@ def attn_to_moe_bridge_jax(
             pre_exp_eps=float(pre_exp_eps),
             pre_exp_scale_input=bool(pre_exp_scale_input),
             use_w8a8=bool(use_w8a8),
+            router_d2d_overlap=(
+                (os.environ.get("SGLANG_TPU_MUSE_BRIDGE1_ROUTER_D2D_OVERLAP", "0") == "1")
+                if router_d2d_overlap is None
+                else bool(router_d2d_overlap)
+            ),
         ),
         interpret=interpret,
         out_shape=(
@@ -1915,22 +1954,24 @@ def _gather_token_shard_xor1_and_dot_post(
         op.start()
         ts2.append(op)
 
-    # Overlap W_post HBM wait + own-chip 2*r_per rows of post_expert_proj underneath Stage-2 ICI!
-    _dma_wait(w_post_buf, w_post_sem.at[0])
-    _dot_fp8_row_block_to_ref(
-        moe_full_buf, chip_r0, w_post_buf, s_post_ref, post_shard,
-        n_r=pair_r, n_cols=post_cols, align=16,
-    )
-    for op in ts2:
-        op.wait()
-
     if n_chips == 4 and rows <= 128:
-        # 1 full-batch (B, 4096) @ (4096, 1024) MXU pass stages w_post once (4 MiB vs 12 MiB)!
+        for op in ts2:
+            op.wait()
+        _dma_wait(w_post_buf, w_post_sem.at[0])
+        # Single full-batch (B, 4096) @ (4096, 1024) MXU pass stages w_post exactly once (4 MiB).
         _dot_fp8_scaled_to_ref(
             moe_full_buf, w_post_buf, s_post_ref, 0, post_shard, 0,
             rows=rows, n_cols=post_cols,
         )
     else:
+        # Overlap W_post HBM wait + own-chip 2*r_per rows of post_expert_proj underneath Stage-2 ICI!
+        _dma_wait(w_post_buf, w_post_sem.at[0])
+        _dot_fp8_row_block_to_ref(
+            moe_full_buf, chip_r0, w_post_buf, s_post_ref, post_shard,
+            n_r=pair_r, n_cols=post_cols, align=16,
+        )
+        for op in ts2:
+            op.wait()
         for d in range(1, n_chips):
             p_r0 = (chip ^ jnp.int32(d)) * pair_r
             _dot_fp8_row_block_to_ref(
@@ -2009,7 +2050,7 @@ def _moe_post_ag_epilogue_kernel(
         )
         _wait_barrier(world_size)
 
-    bm_p = _pick_strip(rows, 32)
+    bm_p = _pick_strip(rows, 64)
 
     def _wait_and_prescale_stream():
         _dma_wait(s_buf, s_in_sem.at[0])
@@ -2101,7 +2142,7 @@ def _moe_post_ag_res_only_kernel(
         )
         _wait_barrier(world_size)
 
-    bm_p = _pick_strip(rows, 32)
+    bm_p = _pick_strip(rows, 64)
 
     def _wait_and_prescale_stream():
         _dma_wait(s_buf, s_in_sem.at[0])
@@ -2216,7 +2257,7 @@ def _moe_to_attn_qkvg_bridge_kernel(
         )
         _wait_barrier(world_size)
 
-    bm_p = _pick_strip(rows, 32)
+    bm_p = _pick_strip(rows, 64)
     half = rows // 2
     parity = me & jnp.int32(1)
     my_r0 = pl.multiple_of(parity * half, 16)
@@ -2730,11 +2771,21 @@ def get_attn_oproj_ar_res_norm_op(world_size: int) -> Callable:
     return op
 
 
-def get_attn_to_moe_bridge_op(world_size: int, *, bf16_router: bool = True) -> Callable:
+def get_attn_to_moe_bridge_op(
+    world_size: int,
+    *,
+    bf16_router: bool = True,
+    router_d2d_overlap: bool | None = None,
+) -> Callable:
     """Register Full Bridge 1b (`gated_attn -> (new_stream, scaled_router_logits, expert_in)`)."""
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Unsupported world_size={world_size}")
-    key = (int(world_size), bool(bf16_router))
+    r_d2d_ovl = (
+        (os.environ.get("SGLANG_TPU_MUSE_BRIDGE1_ROUTER_D2D_OVERLAP", "0") == "1")
+        if router_d2d_overlap is None
+        else bool(router_d2d_overlap)
+    )
+    key = (int(world_size), bool(bf16_router), r_d2d_ovl)
     op = _ATTN_TO_MOE_OPS.get(key)
     if op is not None:
         return op
@@ -2792,6 +2843,7 @@ def get_attn_to_moe_bridge_op(world_size: int, *, bf16_router: bool = True) -> C
                         router_multiplier=float(router_multiplier),
                         pre_exp_eps=float(pre_exp_eps),
                         pre_exp_scale_input=bool(pre_exp_scale_input),
+                        router_d2d_overlap=r_d2d_ovl,
                     )
 
                 return jax.shard_map(
@@ -2802,8 +2854,9 @@ def get_attn_to_moe_bridge_op(world_size: int, *, bf16_router: bool = True) -> C
                 )
 
             tag = "r16" if bf16_router else "r32"
+            ovl_tag = "_rov" if r_d2d_ovl else ""
             op = cpu_export_jax_op(
-                f"sglang_tpu_pallas::muse_w7_attn_to_moe_{tag}_tp{world_size}",
+                f"sglang_tpu_pallas::muse_w7_attn_to_moe_{tag}_tp{world_size}{ovl_tag}",
                 _wrapped,
                 mesh=mesh,
                 input_partition_specs=in_specs,
