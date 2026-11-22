@@ -187,6 +187,12 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # (NS x [M, 128]) and 2 accumulators; 1 one row sum (tree-summed per chunk) and one
     # accumulator; 2 one row sum and 2 accumulators
     attn_carry: int = 0
+    # stack2 pipelined step (<= 64 attention rows): PV and QK interleaved per chunk pair, P
+    # single-buffered, so a pair's exp tail overlaps the next pair's PV pushes
+    attn_interleave: bool = False
+    # stack2 pipelined step: global-layer loops run per layer (no pool dispatch tree) and a
+    # pair's KV refill is issued inside the step's compute, right after its slots are read
+    attn_refill_inline: bool = False
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True

@@ -785,6 +785,11 @@ class TpuEnvs:
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Rows up to which global-layer chunk loops are hoisted per global layer (0: shared loop).
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
+    # Decode megakernel global-layer pipelined step at <= 64 attention rows per request
+    # (MKConfig.attn_interleave / attn_refill_inline): PV and QK interleaved per chunk pair;
+    # KV refill DMAs issued inside the step's compute from per-layer loops.
+    SGLANG_TPU_MUSE_MK_ATTN_INTERLEAVE = EnvBool(True)
+    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

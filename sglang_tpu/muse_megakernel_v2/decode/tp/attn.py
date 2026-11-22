@@ -1312,63 +1312,10 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     sum(accs[1:], accs[0]),
                 ), init
 
-            ls0, ls1 = zl, zl
-            for u in range(NS // 2):
-                pa, pb, psc_ab, ls0, ls1 = qk_pair(2 * u, 2 * u + 1, ls0, ls1)
-                p_put(0, 2 * u, pa)
-                p_put(0, 2 * u + 1, pb)
-                if use_fp8_p:
-                    psc_put(0, 2 * u, psc_ab)
+            il = c.attn_interleave
+            inline = c.attn_refill_inline
 
-            def step_body(k, carry, ref=None):
-                ls0, ls1, ac0, ac1 = carry
-                i0 = NS * k
-                par, npar = k % 2, (k + 1) % 2
-                with _scope("kv_wait"):
-                    for t in range(NS):
-                        wait_chunk(geo, (i0 + NS + t) % KR_g)
-                for u in range(NS // 2):
-                    dpv = pv_pair(
-                        i0 + 2 * u,
-                        i0 + 2 * u + 1,
-                        p_get(par, 2 * u),
-                        p_get(par, 2 * u + 1),
-                    )
-                    if use_fp8_p:
-                        dpv = _scale_pv(dpv, psc_get(par, 2 * u))
-                    if u % 2 == 0:
-                        ac0 = ac0 + dpv
-                    else:
-                        ac1 = ac1 + dpv
-                for u in range(NS // 2):
-                    pa, pb, psc_ab, ls0, ls1 = qk_pair(
-                        i0 + NS + 2 * u, i0 + NS + 2 * u + 1, ls0, ls1
-                    )
-                    p_put(npar, 2 * u, pa)
-                    p_put(npar, 2 * u + 1, pb)
-                    if use_fp8_p:
-                        psc_put(npar, 2 * u, psc_ab)
-                if ref is not None:
-                    for t in range(NS):
-                        refill_slot(ref, i0 + KR_g + t)
-                else:
-                    refill_global(i0 + KR_g)
-                return ls0, ls1, ac0, ac1
-
-            k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
-            init4 = (ls0, ls1, za, za)
-            if isinstance(l, int):
-                carry4 = jax.lax.fori_loop(
-                    0, k_full, functools.partial(step_body, ref=KV[l]), init4
-                )
-            elif hoist_rows is None or hoist_kv:
-                carry4, k_full = hoisted(step_body, k_full, init4)
-            else:
-                carry4, k_full = init4, 0
-            ls0, ls1, ac0, ac1 = jax.lax.fori_loop(k_full, n_it - 1, step_body, carry4)
-            i0 = NS * (n_it - 1)
-            par = (n_it - 1) % 2
-            for u in range(NS // 2):
+            def pv_u(i0, par, u, ac0, ac1):
                 dpv = pv_pair(
                     i0 + 2 * u,
                     i0 + 2 * u + 1,
@@ -1378,9 +1325,79 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 if use_fp8_p:
                     dpv = _scale_pv(dpv, psc_get(par, 2 * u))
                 if u % 2 == 0:
-                    ac0 = ac0 + dpv
+                    return ac0 + dpv, ac1
+                return ac0, ac1 + dpv
+
+            def qk_u(i0, par, u, ls0, ls1, refill=None):
+                pa, pb, psc_ab, ls0, ls1 = qk_pair(i0 + 2 * u, i0 + 2 * u + 1, ls0, ls1)
+                if refill is not None:
+                    # DMA starts order against vector loads and stores only: after the K
+                    # loads, before the P stores, the issue overlaps the pops and exp2
+                    refill()
+                p_put(par, 2 * u, pa)
+                p_put(par, 2 * u + 1, pb)
+                if use_fp8_p:
+                    psc_put(par, 2 * u, psc_ab)
+                return ls0, ls1
+
+            ls0, ls1 = zl, zl
+            for u in range(NS // 2):
+                ls0, ls1 = qk_u(0, 0, u, ls0, ls1)
+
+            def step_body(k, carry, ref=None):
+                ls0, ls1, ac0, ac1 = carry
+                i0 = NS * k
+                # interleaved: one P buffer at static offsets; pair u's P is read by its PV
+                # before its QK overwrites it, so QK(u)'s exp tail overlaps PV(u + 1)
+                par, npar = (0, 0) if il else (k % 2, (k + 1) % 2)
+                refill_here = inline and ref is not None
+                with _scope("kv_wait"):
+                    for t in range(NS):
+                        wait_chunk(geo, (i0 + NS + t) % KR_g)
+
+                def refill_pair(u):
+                    if not refill_here:
+                        return None
+
+                    def issue():
+                        for t in range(2):
+                            refill_slot(ref, i0 + KR_g + 2 * u + t)
+
+                    return issue
+
+                if il:
+                    for u in range(NS // 2):
+                        ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
+                        # pair u's slots were read by its PV just above
+                        ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
                 else:
-                    ac1 = ac1 + dpv
+                    for u in range(NS // 2):
+                        ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
+                    for u in range(NS // 2):
+                        ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
+                if ref is None:
+                    refill_global(i0 + KR_g)
+                elif not inline:
+                    for t in range(NS):
+                        refill_slot(ref, i0 + KR_g + t)
+                return ls0, ls1, ac0, ac1
+
+            k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+            init4 = (ls0, ls1, za, za)
+            if isinstance(l, int):
+                carry4 = jax.lax.fori_loop(
+                    0, k_full, functools.partial(step_body, ref=KV[l]), init4
+                )
+            elif inline or hoist_rows is None or hoist_kv:
+                # inline refill needs the layer's pool without a branch: a loop per layer
+                carry4, k_full = hoisted(step_body, k_full, init4)
+            else:
+                carry4, k_full = init4, 0
+            ls0, ls1, ac0, ac1 = jax.lax.fori_loop(k_full, n_it - 1, step_body, carry4)
+            i0 = NS * (n_it - 1)
+            par = 0 if il else (n_it - 1) % 2
+            for u in range(NS // 2):
+                ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
             refill_global(i0 + KR_g)
             return (init[0], ls0 + ls1, ac0 + ac1), init
 
