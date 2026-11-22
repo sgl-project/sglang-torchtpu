@@ -1002,18 +1002,9 @@ def _ccs_wo_uses_kdeep_nvfp4() -> bool:
 def _a3_supports(variant: str, rows_per_rank: int) -> bool:
     if variant != "v16":
         return True
-    if (
-        int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0) >= 1
-        or (
-            int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0) > 0
-            and _ccs_wo_uses_kdeep_nvfp4()
-        )
-    ):
-        return rows_per_rank <= 4096
-    # v16 fits up to num_t_half=3 (rows_per_rank=3072, T=24k: 24+32+4 = 60 MiB < 64 MiB) at bn=1024.
-    if rows_per_rank == 3072 and not tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_BN2048.get():
+    if rows_per_rank <= 1024:
         return True
-    return rows_per_rank <= 1024 or rows_per_rank == 2048
+    return rows_per_rank <= 4096 and rows_per_rank % 512 == 0
 
 
 @functools.cache
@@ -1627,7 +1618,8 @@ def _ops(
             "a3_v16_wo"
             + ("_opt" if a3_opt else "")
             + ("_sk" if a3_skip else "")
-            + (f"_ss{a3_stage_sends}" if a3_stage_sends else ""),
+            + (f"_ss{a3_stage_sends}" if a3_stage_sends else "")
+            + ("_bn2k" if _env_bool("SGLANG_TPU_MUSE_KERNEL_A3_BN2048") else ""),
             a3_wo_only,
             a3_wo_n_in,
             1,

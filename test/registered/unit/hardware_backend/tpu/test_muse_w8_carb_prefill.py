@@ -64,14 +64,17 @@ def test_w8_carb_prefill_flags_default_off_and_ast_get_hygiene():
 
 
 def test_a3_supports_long_prefill_buckets():
-    """Verify _a3_supports unlocks T=24k (3072) on v16 and T=20k..32k on A3_KDEEP_WO / W4_WO."""
+    """Verify _a3_supports unlocks T=20k..32k across stock v16, A3_BN2048, A3_KDEEP_WO, and W4_WO."""
+    from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import resolve_causal_chunks
     from sglang_tpu.muse_prefill_kernels.integration import _a3_supports
 
-    assert _a3_supports("v16", 1024) is True
-    assert _a3_supports("v16", 2048) is True
-    assert _a3_supports("v16", 3072) is True
-    assert _a3_supports("v16", 2560) is False
-    assert _a3_supports("v16", 3584) is False
+    for rpr in (512, 1024, 1536, 2048, 2560, 3072, 3584, 4096):
+        assert _a3_supports("v16", rpr) is True
+    assert _a3_supports("v16", 4608) is False
+
+    with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1"}):
+        assert _a3_supports("v16", 3072) is True
+        assert _a3_supports("v16", 4096) is True
 
     with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO": "2"}):
         for rpr in (512, 2048, 2560, 3072, 3584, 4096):
@@ -80,6 +83,11 @@ def test_a3_supports_long_prefill_buckets():
 
     with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_W4_WO": "256"}):
         assert _a3_supports("v16", 3584) is True
+
+    assert resolve_causal_chunks(3072) == (512, 1280, 1280)
+    assert all(c % 256 == 0 for c in resolve_causal_chunks(3072))
+    assert resolve_causal_chunks(4096) == (1024, 1536, 1536)
+    assert all(c % 256 == 0 for c in resolve_causal_chunks(4096))
 
 
 def test_a1_fast_6roll_dual_head_rmsnorm_numerical_parity():
@@ -370,19 +378,31 @@ def test_w8_carb_prefill_mosaic_tpu7x_hlo_lowering_all_kernels():
             )
             assert "pallas_embed_rmsnorm_bf16" in hlo_ent
 
-        # 3. A3_BN2048=1 at T=16384 (t_shard=2048)
-        with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1"}):
-            hlo_bn2k = _lower_sm(
-                lambda q, w, ws: kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
-                    q, w, ws, tp_axis="model", opt_wo=True
-                ),
-                [
-                    jax.ShapeDtypeStruct((64, 2048, 1024), jnp.float8_e4m3fn),
-                    jax.ShapeDtypeStruct((64, 1024, 8192), jnp.float8_e4m3fn),
-                    jax.ShapeDtypeStruct((8, 8192), jnp.float32),
-                ],
-            )
-            assert "pallas_a3_wo_v16_opt_bn2048" in hlo_bn2k
+        # 3. A3_BN2048=1 at T=16k (2048), T=24k (3072), and T=32k (4096) + stock bn=1024 at T=32k
+        for t_sh_a3 in (2048, 3072, 4096):
+            with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1"}):
+                hlo_bn2k = _lower_sm(
+                    lambda q, w, ws: kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+                        q, w, ws, tp_axis="model", opt_wo=True
+                    ),
+                    [
+                        jax.ShapeDtypeStruct((64, t_sh_a3, 1024), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((64, 1024, 8192), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+                    ],
+                )
+                assert "pallas_a3_wo_v16_opt_bn2048" in hlo_bn2k
+        hlo_32k_bn1k = _lower_sm(
+            lambda q, w, ws: kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+                q, w, ws, tp_axis="model", opt_wo=True
+            ),
+            [
+                jax.ShapeDtypeStruct((64, 4096, 1024), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64, 1024, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            ],
+        )
+        assert "pallas_a3_wo_v16_opt_bn1024" in hlo_32k_bn1k
 
         # 4. A3_KDEEP_WO=1 at T=28672 (t_shard=3584) + W4_WO=256 + CCS Mode-2
         hlo_kd28k = _lower_sm(

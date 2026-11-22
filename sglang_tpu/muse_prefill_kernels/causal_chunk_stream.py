@@ -32,6 +32,8 @@ def resolve_causal_chunks(t_shard: int, spec: str = "") -> tuple[int, ...]:
             scaled = tuple(c * scale for c in raw)
             if all(c >= 64 and c % 64 == 0 for c in scaled):
                 return scaled
+    if t_shard == 3072:
+        return (512, 1280, 1280)
     if t_shard == 2048:
         return (512, 768, 768)
     if t_shard == 1024:

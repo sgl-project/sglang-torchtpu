@@ -2363,8 +2363,6 @@ def pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
 
     tp_deg, t_shard, k_local = q_local_3d.shape
     _, _, n_dim = wo_fp8_xor_3d.shape
-    tm_half = min(1024, t_shard)
-    num_t_half = t_shard // tm_half  # 1 at 8K, 2 at 16K
     ss_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS", None)
     eff_stage_mode = (
         int(stage_sends_mode)
@@ -2375,19 +2373,36 @@ def pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
         d_order is None and tp_deg == 8 and eff_stage_mode in (1, 2)
     )
     bn2048_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A3_BN2048", None)
-    allow_bn2048_16k = bool(
-        bn2048_env is not None and bn2048_env.get() and num_t_half <= 2
+    allow_bn2048 = bool(
+        bn2048_env is not None
+        and bn2048_env.get()
+        and t_shard <= 4096
+        and (t_shard <= 2048 or t_shard % 512 == 0)
     )
     bn_eff = (
         2048
         if (
             opt_wo
             and not stage_sends
-            and (num_t_half == 1 or allow_bn2048_16k)
+            and (t_shard <= 1024 or allow_bn2048)
             and n_dim % 2048 == 0
         )
         else bn
     )
+    max_tm_half = (
+        1024
+        if (t_shard <= 2048 or (t_shard == 3072 and bn_eff == 1024))
+        else 512
+    )
+    tm_half = next(
+        (
+            t
+            for t in (1024, 512, 256, 128)
+            if t <= max_tm_half and t <= t_shard and t_shard % t == 0
+        ),
+        t_shard,
+    )
+    num_t_half = t_shard // tm_half  # 1 at 8K, 2 at 16K, 3-8 at 24K/32K
     num_j = n_dim // bn_eff  # 8 for bn=1024, 4 for bn=2048
     step_xors = tuple(range(tp_deg)) if d_order is None else tuple(d_order)
     src_4d = q_local_3d.reshape(tp_deg, num_t_half, tm_half, k_local)
