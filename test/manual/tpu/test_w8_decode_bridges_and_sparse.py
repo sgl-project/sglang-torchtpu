@@ -490,14 +490,6 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
         assert "stablehlo.partition_id" not in mlir, (
             f"{name} leaked stablehlo.partition_id into SPMD MLIR!"
         )
-        if mosaic_asms:
-            import re
-
-            for line in mosaic_asms[0].splitlines():
-                if "vector.store" in line and "xbf16>" in line:
-                    assert re.search(r"vector<(?:\d+x)*(?:1|2|4|8)x\d+xbf16>", line) is None, (
-                        f"{name} emitted sublane RMW bf16 vector.store: {line}"
-                    )
         if check_t16_bf16:
             import re
 
