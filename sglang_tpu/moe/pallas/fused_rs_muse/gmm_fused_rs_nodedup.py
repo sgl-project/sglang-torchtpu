@@ -72,7 +72,9 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
         return min(size_m, aligned)
     force_u16 = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0) >= 1
     if ep_size >= 4 and (size_m > 131_072 or (force_u16 and size_m > 120_000)):
-        floor_rows = 131_072 if size_m >= 262_144 else (98_304 if not force_u16 else 65_536)
+        floor_rows = (
+            131_072 if size_m >= 262_144 else (98_304 if not force_u16 else 65_536)
+        )
         target = max(floor_rows, (size_m // ep_size) * 3)
         aligned = (
             (target + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
@@ -135,14 +137,18 @@ def _fp4_k256_gmm(
                 w.astype(jnp.float8_e4m3fn),
                 preferred_element_type=jnp.float32,
             )
-            s = scale_ref[pl.ds(c0 // scale_block, 1), pl.ds(n0, nc)].astype(jnp.float32)
+            s = scale_ref[pl.ds(c0 // scale_block, 1), pl.ds(n0, nc)].astype(
+                jnp.float32
+            )
             res = res * s
         elif block256 and lhs_fp8_mode == kc:
             x_q, x_s = _quant_lhs_fp8_block(x_ref[:, c0 : c0 + kc].astype(jnp.bfloat16))
             res = jnp.dot(
                 x_q, w.astype(jnp.float8_e4m3fn), preferred_element_type=jnp.float32
             )
-            s = scale_ref[pl.ds(c0 // scale_block, 1), pl.ds(n0, nc)].astype(jnp.float32)
+            s = scale_ref[pl.ds(c0 // scale_block, 1), pl.ds(n0, nc)].astype(
+                jnp.float32
+            )
             res = (res * x_s) * s
         else:
             x = x_ref[:, c0 : c0 + kc].astype(jnp.bfloat16)
@@ -298,7 +304,6 @@ def _pad_rows_to(x, rows):
     return jnp.concatenate(
         [x, jnp.zeros((rows - x.shape[0], x.shape[1]), x.dtype)], axis=0
     )
-
 
 
 # =============================================================================
@@ -610,6 +615,8 @@ def _select_fused_rs_block_sizes(
         and jax.dtypes.itemsize_bits(w1_dtype) in (4, 32)
         and (size_k1, aligned_n1, padded_k2, aligned_n2) == (4096, 8192, 4096, 4096)
         and (tile_k1, tile_n1, tile_k2, tile_n2) == (4096, 2048, 4096, 2048)
+        and (-(-tile_k1 // (quant_block_size or size_k1))) % 16 == 0
+        and (-(-tile_k2 // (quant_block_size or padded_k2))) % 16 == 0
     ):
         num_w1_bufs, num_w2_bufs = 3, 3
     # --- Step 4a': decode tile override (env, FP4 experts, decode M) ---
@@ -798,7 +805,9 @@ def _precompute_fused_rs_metadata(
         my_id = go // size_group
         is_local = jnp.logical_and(rows >= local_start, rows < local_end)
         total_recv = jnp.sum(
-            jnp.logical_and(lhs_indices // chunk_size == my_id, jnp.logical_not(is_local))
+            jnp.logical_and(
+                lhs_indices // chunk_size == my_id, jnp.logical_not(is_local)
+            )
         )
     if perm_gm is not None:
         m_end_each = jnp.where(
@@ -893,7 +902,9 @@ def _precompute_block_scatter_meta_closed_form(
     trailer = jnp.concatenate(
         [extra_delta, jnp.zeros((1, 2 * ep_size + 2), dtype=jnp.int32)], axis=1
     )
-    body = jnp.concatenate([src_off, dst_off, len_c, send_blks_gm, local_blks_gm], axis=1)
+    body = jnp.concatenate(
+        [src_off, dst_off, len_c, send_blks_gm, local_blks_gm], axis=1
+    )
     if perm_gm is not None:
         body = body[perm_gm]
     return jnp.concatenate([body, trailer], axis=0).astype(jnp.int32)
@@ -941,7 +952,9 @@ def _precompute_block_scatter_meta(
     trailer = jnp.concatenate(
         [extra_delta, jnp.zeros((1, 2 * ep_size + 2), dtype=jnp.int32)], axis=1
     )
-    body = jnp.concatenate([src_off, dst_off, len_c, send_blks_gm, local_blks_gm], axis=1)
+    body = jnp.concatenate(
+        [src_off, dst_off, len_c, send_blks_gm, local_blks_gm], axis=1
+    )
     return jnp.concatenate([body, trailer], axis=0).astype(jnp.int32)
 
 
@@ -1190,7 +1203,9 @@ def kernel_main_fused_rs(
             eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = None
             eo_pair_enabled = False
     else:
-        eo_w_strip_fp8_ref = eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = None
+        eo_w_strip_fp8_ref = eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = (
+            None
+        )
         eo_pair_enabled = False
     if hot_interleave:
         (
@@ -1211,9 +1226,7 @@ def kernel_main_fused_rs(
 
             def _copy_hi(gm, carry):
                 metadata_ref.gm_id_to_group_id[gm] = group_start_ref[5 + gm]
-                metadata_ref.gm_id_to_m_offset[gm] = group_start_ref[
-                    5 + num_slots + gm
-                ]
+                metadata_ref.gm_id_to_m_offset[gm] = group_start_ref[5 + num_slots + gm]
                 metadata_ref.gm_id_to_m_offset[num_slots + gm] = group_start_ref[
                     5 + 2 * num_slots + gm
                 ]
@@ -1340,7 +1353,7 @@ def kernel_main_fused_rs(
             cm_awaited_ref[eff_cm_slots] = jnp.int32(0)
         _cm_slot_xors = (
             (1, 2, 4)
-            if (eff_cm_slots == 3 and ep_size == 8)
+            if (eff_cm_slots == 3 and ep_size >= 8 and (ep_size & (ep_size - 1)) == 0)
             else tuple([chipmate_xor] * max(1, eff_cm_slots))
         )
 
@@ -1401,6 +1414,7 @@ def kernel_main_fused_rs(
 
         def _maybe_start_deferred_cm_wt_send():
             if cm_defer_send:
+
                 @pl.when(cm_awaited_ref[eff_cm_slots] == 0)
                 def _do_def_send():
                     _issue_all_cm_wt_sends()
@@ -1799,7 +1813,9 @@ def kernel_main_fused_rs(
         dims.size_k2 // cfgs2.lhs_cfgs.quant_block_size,
     )
     _g2_amax_slot = (
-        _req_b_pq if (use_lhs_fp8_vmem and partial_out2_ref.shape[0] > _req_b_pq) else None
+        _req_b_pq
+        if (use_lhs_fp8_vmem and partial_out2_ref.shape[0] > _req_b_pq)
+        else None
     )
 
     @jax.named_scope("blockdiag_gmm1_tile")
@@ -2088,9 +2104,12 @@ def kernel_main_fused_rs(
                 sem_id, pl.ds(0, m_rows), pl.ds(k_offset, k_cols), :
             ].reshape(-1, dims.size_lhs_sublane, tile_k1)
         )
+
         def _run_inner1(w1_tile_sel, w1_sc_sel):
             w1_bias_tile = w1_bias_buf_ref if has_bias else None
-            w1_weights = WeightsRef(weight=w1_tile_sel, scale=w1_sc_sel, bias=w1_bias_tile)
+            w1_weights = WeightsRef(
+                weight=w1_tile_sel, scale=w1_sc_sel, bias=w1_bias_tile
+            )
             _acc1_slice = (
                 shared_acc_ref
                 if num_k1 == 1
@@ -2114,9 +2133,7 @@ def kernel_main_fused_rs(
                 _gm_id=0,
                 _n_id=n_id,
                 _num_n=num_n1,
-                fused_g2_amax_slot=(
-                    _g2_amax_slot if not has_ext_pq_lhs else None
-                ),
+                fused_g2_amax_slot=(_g2_amax_slot if not has_ext_pq_lhs else None),
                 prequant_lhs_fp8_ref=(
                     partial_out1_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_k1)]
                     if (use_lhs_fp8_vmem and not has_ext_pq_lhs)
@@ -2129,7 +2146,9 @@ def kernel_main_fused_rs(
                 ),
                 skip_row_mask=True,
                 lhs_2d_vmem_ref=(
-                    partial_out1_ref.at[pl.ds(0, m_rows), :] if use_lhs_2d_cache else None
+                    partial_out1_ref.at[pl.ds(0, m_rows), :]
+                    if use_lhs_2d_cache
+                    else None
                 ),
                 lhs_3d_vmem_ref=(
                     gathered_lhs_2x_ref.at[
@@ -2209,7 +2228,9 @@ def kernel_main_fused_rs(
             lhs_data = None
         else:
             lhs_data = intermediate_ref[
-                pl.ds(0, m_rows // dims.size_lhs_sublane), :, pl.ds(k_id * tile_k2, tile_k2)
+                pl.ds(0, m_rows // dims.size_lhs_sublane),
+                :,
+                pl.ds(k_id * tile_k2, tile_k2),
             ]
         w2_tile = w2_buf_ref.at[buf_id]
         w2_sc = w2_scale_buf_ref.at[buf_id] if has_scale else None
@@ -2241,7 +2262,9 @@ def kernel_main_fused_rs(
             _num_n=num_n2,
             fused_g2_amax_slot=_g2_amax_slot,
             prequant_rhs_fp8_ref=partial_out1_ref.at[buf_id] if use_w2_cache else None,
-            prequant_rhs_scale_ref=partial_out2_ref.at[buf_id] if use_w2_cache else None,
+            prequant_rhs_scale_ref=partial_out2_ref.at[buf_id]
+            if use_w2_cache
+            else None,
             prequant_lhs_fp8_ref=(
                 partial_out1_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_k2)]
                 if use_lhs_fp8_vmem
@@ -2260,7 +2283,13 @@ def kernel_main_fused_rs(
                 else None
             ),
             w2_fp8_cache_ref=(
-                w2_fp8_cache_ref.at[buf_id] if w2_fp8_cache_ref is not None else None
+                w2_fp8_cache_ref.at[buf_id]
+                if (
+                    w2_fp8_cache_ref is not None
+                    and not use_weight_lookahead
+                    and n_id < w2_fp8_cache_ref.shape[0]
+                )
+                else None
             ),
             rhs_fp8_strip_ref=rhs_fp8_strip_ref,
             vectorized_dequant=vectorized_dequant,
@@ -2458,7 +2487,9 @@ def kernel_main_fused_rs(
                 _bs_base = t_gm * _bs_stride
                 s8 = [topk_indices_ref[_bs_base + c] for c in range(ep_size)]
                 d8 = [topk_indices_ref[_bs_base + ep_size + c] for c in range(ep_size)]
-                l8 = [topk_indices_ref[_bs_base + 2 * ep_size + c] for c in range(ep_size)]
+                l8 = [
+                    topk_indices_ref[_bs_base + 2 * ep_size + c] for c in range(ep_size)
+                ]
                 send_blks = topk_indices_ref[_bs_base + 3 * ep_size]
                 local_blks = topk_indices_ref[_bs_base + 3 * ep_size + 1]
             else:
@@ -2471,9 +2502,7 @@ def kernel_main_fused_rs(
             gm_id_ref[9 + t_stg] = gm_id_ref[9 + t_stg] + local_blks
             if rotate_rs_mode >= 1 and (ep_size & (ep_size - 1)) == 0:
                 _xor_steps = (
-                    (2, 4, 6, 3, 5, 7, 1)
-                    if ep_size == 8
-                    else tuple(range(1, ep_size))
+                    (2, 4, 6, 3, 5, 7, 1) if ep_size == 8 else tuple(range(1, ep_size))
                 )
                 for _st in _xor_steps:
                     _tgt = lax.bitwise_xor(my_id, jnp.int32(_st))
@@ -2517,6 +2546,7 @@ def kernel_main_fused_rs(
                         dst_ref=out_buf_ref.at[pl.ds(_dst, _len), :, :],
                         sem=local_write_sems_ref.at[t_stg],
                     ).start()
+
                 return
             for c in range(ep_size):
                 has_c = l8[c] > 0
@@ -2544,6 +2574,7 @@ def kernel_main_fused_rs(
                         dst_ref=out_buf_ref.at[pl.ds(_dst, _len), :, :],
                         sem=local_write_sems_ref.at[t_stg],
                     ).start()
+
             return
         _ml = jnp.int32(0)
         _n_slots_dw = metadata_ref.gm_id_to_group_id.shape[0]
@@ -2578,9 +2609,7 @@ def kernel_main_fused_rs(
                     + jnp.arange(row_f32.shape[1])[None, :]
                     < dims.original_n2
                 )
-                fp8_max = jnp.array(
-                    jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32
-                )
+                fp8_max = jnp.array(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
                 row_scale = (
                     jnp.maximum(
                         jnp.max(jnp.where(valid_n2, jnp.abs(row_f32), 0.0)),
@@ -2588,8 +2617,8 @@ def kernel_main_fused_rs(
                     )
                     / fp8_max
                 )
-                scatter_scale_3x_ref[t_stg, row_idx, :] = (
-                    row_scale + jnp.zeros((128,), dtype=jnp.float32)
+                scatter_scale_3x_ref[t_stg, row_idx, :] = row_scale + jnp.zeros(
+                    (128,), dtype=jnp.float32
                 )
                 scatter_fp8_staging_3x_ref[t_stg, row_idx, :, :] = jnp.where(
                     valid_n2,
@@ -2672,6 +2701,7 @@ def kernel_main_fused_rs(
             )
 
         if (not fp8_direct_write) and (not pack_indices):
+
             def _emit_one_write_local_only(r_idx, p_val):
                 dc = lax.shift_right_logical(p_val, 16)
                 wp = p_val & jnp.int32(0xFFFF)
@@ -2705,11 +2735,15 @@ def kernel_main_fused_rs(
                     off = sub * 8
                     p8 = [topk_indices_ref[base + off + k] for k in range(8)]
                     for k in range(8):
-                        l_sz = l_sz + _emit_one_write_local_only(_ml + i0 + off + k, p8[k])
+                        l_sz = l_sz + _emit_one_write_local_only(
+                            _ml + i0 + off + k, p8[k]
+                        )
                 return l_sz
 
             def _write_tail_single(i, l_sz):
-                return l_sz + _emit_one_write_local_only(_ml + i, topk_indices_ref[t_m_st + i])
+                return l_sz + _emit_one_write_local_only(
+                    _ml + i, topk_indices_ref[t_m_st + i]
+                )
 
             num_16_w = t_num_valid >> 4
             l0 = lax.fori_loop(0, num_16_w, _write_16_spillfree, jnp.int32(0))
@@ -2737,9 +2771,7 @@ def kernel_main_fused_rs(
         def _():
             pl.semaphore_wait(local_write_sems_ref.at[t_stg], local_sz)
             if fp8_direct_write:
-                pl.semaphore_wait(
-                    scale_local_write_sems_ref.at[t_stg], local_sz
-                )
+                pl.semaphore_wait(scale_local_write_sems_ref.at[t_stg], local_sz)
 
         @pl.when(jnp.logical_and(send_sz > 0, not defer_writes))
         def _():
@@ -2758,6 +2790,7 @@ def kernel_main_fused_rs(
         gm_id_ref[_la_started_idx] = jnp.int32(0)
 
     if _two_ahead_gather:
+
         @jax.named_scope("dma_gather_prologue_2ahead")
         @pl.when(local_num_gm > 0)
         def _():
@@ -2904,6 +2937,7 @@ def kernel_main_fused_rs(
                     )
 
                 if defer_writes:
+
                     @pl.when(gm_id > 0)
                     def _():
                         wait_staging_slot_writes(stg_prev)
@@ -2925,6 +2959,7 @@ def kernel_main_fused_rs(
                 eo_strip_w = eo_w_strip_fp8_ref.shape[1]
 
                 for _n1 in range(num_n1):
+
                     @pl.when(jnp.logical_not(is_same_w1_p))
                     def _(_b=_n1):
                         wait_w1_dma(_b)
@@ -2958,6 +2993,7 @@ def kernel_main_fused_rs(
                     _do_direct_write(gm_id - 1, stg_prev)
 
                 if enable_chipmate and cm_defer_send:
+
                     @pl.when(gm_id == 0)
                     def _():
                         _maybe_start_deferred_cm_wt_send()
@@ -2980,6 +3016,7 @@ def kernel_main_fused_rs(
                     else jnp.float32(1.0)
                 )
                 for _n2 in range(num_n2):
+
                     @pl.when(jnp.logical_not(is_same_w2_p))
                     def _(_b=_n2):
                         wait_w2_dma(_b)
@@ -3013,7 +3050,9 @@ def kernel_main_fused_rs(
                 _reshape_gmm2_output(sem0, stg0)
                 _do_direct_write(gm_id, stg0)
 
-            should_run_single = jnp.logical_and(should_run, jnp.logical_not(can_pair_eo))
+            should_run_single = jnp.logical_and(
+                should_run, jnp.logical_not(can_pair_eo)
+            )
         else:
             should_run_single = should_run
 
@@ -3052,6 +3091,7 @@ def kernel_main_fused_rs(
             _gather_divisor = top_k if pack_indices else 1
 
             if not _two_ahead_gather:
+
                 @jax.named_scope("dma_gather_start")
                 @pl.when(gm_id == 0)
                 def _():
@@ -3106,6 +3146,7 @@ def kernel_main_fused_rs(
                     start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
 
             if use_weight_lookahead:
+
                 @pl.when(jnp.logical_and(gm_id > 0, is_new_expert))
                 def _advance_w_ring():
                     gm_id_ref[_w_base_idx] = (
@@ -3121,9 +3162,7 @@ def kernel_main_fused_rs(
                 )
 
                 @pl.when(
-                    jnp.logical_and(
-                        _e_after_cur >= 0, gm_id_ref[_la_started_idx] == 0
-                    )
+                    jnp.logical_and(_e_after_cur >= 0, gm_id_ref[_la_started_idx] == 0)
                 )
                 def _start_la_step0():
                     start_w1_dma(_slot_la, _e_after_cur, 0, 0)
@@ -3162,7 +3201,9 @@ def kernel_main_fused_rs(
                                 lambda: lax.cond(
                                     _p_val <= 64,
                                     lambda: (
-                                        _reshape_gmm2_output_rows(_prev_sem, _prev_stg, 64),
+                                        _reshape_gmm2_output_rows(
+                                            _prev_sem, _prev_stg, 64
+                                        ),
                                         jnp.int32(0),
                                     )[1],
                                     lambda: (
@@ -3248,10 +3289,13 @@ def kernel_main_fused_rs(
 
             if _early_rs:
                 if defer_writes:
+
                     @pl.when(gm_id > 0)
                     def _():
                         wait_staging_slot_writes(_prev_stg)
+
                 _emit_prev_reshape()
+
                 @pl.when(gm_id > 0)
                 def _():
                     _do_direct_write(gm_id - 1, _prev_stg)
@@ -3265,6 +3309,7 @@ def kernel_main_fused_rs(
             )
 
             if has_ext_pq_lhs:
+
                 def _fill_pq_lhs_scales_8(q, _):
                     i0 = q * 8
                     max_r = jnp.maximum(m_en - 1, m_st)
@@ -3277,9 +3322,8 @@ def kernel_main_fused_rs(
                                 lax.shift_right_logical(rk, jnp.int32(1))
                             ]
                             sh_u = lax.shift_left(rk & jnp.int32(1), jnp.int32(4))
-                            tok_k = (
-                                lax.shift_right_logical(w_u, sh_u)
-                                & jnp.int32(0xFFFF)
+                            tok_k = lax.shift_right_logical(w_u, sh_u) & jnp.int32(
+                                0xFFFF
                             )
                         else:
                             tok_k = lhs_indices_ref[rk]
@@ -3322,8 +3366,7 @@ def kernel_main_fused_rs(
                         )
                         for r in blockdiag_rows
                     ] + [
-                        (lambda b=b: (fn(*args, b), jnp.int32(0))[1])
-                        for b in M_BUCKETS
+                        (lambda b=b: (fn(*args, b), jnp.int32(0))[1]) for b in M_BUCKETS
                     ]
                     lax.switch(idx, branches)
                 elif _USE_BUCKETS:
@@ -3370,7 +3413,12 @@ def kernel_main_fused_rs(
                                 :,
                             ].reshape(32, 1024)
 
-            if decode_dual_k256 >= 4 and use_lhs_2d_cache and k256_tiles and tile_m > 32:
+            if (
+                decode_dual_k256 >= 4
+                and use_lhs_2d_cache
+                and k256_tiles
+                and tile_m > 32
+            ):
                 lax.cond(
                     _tile_real <= 16,
                     lambda: (_copy_lhs_2d_cache_rows(16), jnp.int32(0))[1],
@@ -3384,7 +3432,12 @@ def kernel_main_fused_rs(
                         ),
                     ),
                 )
-            elif decode_dual_k256 == 3 and use_lhs_2d_cache and k256_tiles and tile_m > 32:
+            elif (
+                decode_dual_k256 == 3
+                and use_lhs_2d_cache
+                and k256_tiles
+                and tile_m > 32
+            ):
                 lax.cond(
                     _tile_real <= 32,
                     lambda: (_copy_lhs_2d_cache_rows(32), jnp.int32(0))[1],
@@ -3397,6 +3450,7 @@ def kernel_main_fused_rs(
                 _copy_lhs_2d_cache()
 
             if defer_writes and not _early_rs:
+
                 @pl.when(gm_id > 0)
                 def _():
                     wait_staging_slot_writes(_prev_stg)
@@ -3431,7 +3485,9 @@ def kernel_main_fused_rs(
                         start_w1_dma(
                             _ns % num_w1_bufs, expert_id, _ns // num_k1, _ns % num_k1
                         )
+
                 if step == 0 and use_weight_lookahead:
+
                     @pl.when(jnp.logical_and(_is_last_tile_of_e, _e_after_cur >= 0))
                     def _():
                         start_w1_dma(_w_base, _e_after_cur, 1 // num_k1, 1 % num_k1)
@@ -3449,16 +3505,19 @@ def kernel_main_fused_rs(
                         start_w1_dma(0, next_e, 0, 0)
 
             if not _early_rs:
+
                 @pl.when(gm_id > 0)
                 def _():
                     _do_direct_write(gm_id - 1, _prev_stg)
 
             if enable_chipmate and cm_defer_send:
+
                 @pl.when(gm_id == 0)
                 def _():
                     _maybe_start_deferred_cm_wt_send()
 
             if _two_ahead_gather:
+
                 @jax.named_scope("dma_gather_prefetch_2ahead")
                 @pl.when(gm_id + 2 < local_num_gm)
                 def _():
@@ -3473,6 +3532,7 @@ def kernel_main_fused_rs(
                         packed_u16=packed_u16_lhs,
                     )
             else:
+
                 @jax.named_scope("dma_gather_prefetch")
                 @pl.when(has_next)
                 def _():
@@ -3488,6 +3548,7 @@ def kernel_main_fused_rs(
                     )
 
             if not use_weight_lookahead:
+
                 @pl.when(has_next)
                 def _():
                     next_same = jnp.logical_and(
@@ -3507,6 +3568,7 @@ def kernel_main_fused_rs(
 
             if dims.size_k2 != gmm1_out_ref.shape[1]:
                 with jax.named_scope("interlude"):
+
                     def _interlude(m_rows):
                         gmm1_result = gmm1_out_ref[pl.ds(0, m_rows)]
                         k2_pad = dims.size_k2 - gmm1_result.shape[1]
@@ -3514,7 +3576,9 @@ def kernel_main_fused_rs(
                             gmm1_result = jnp.concatenate(
                                 [
                                     gmm1_result,
-                                    jnp.zeros((m_rows, k2_pad), dtype=gmm1_result.dtype),
+                                    jnp.zeros(
+                                        (m_rows, k2_pad), dtype=gmm1_result.dtype
+                                    ),
                                 ],
                                 axis=1,
                             )
@@ -3547,18 +3611,31 @@ def kernel_main_fused_rs(
                             partial_out2_ref.at[_b2],
                             cfgs=cfgs2,
                         )
-                    elif w2_fp8_cache_ref is not None:
-                        _pk2_ch = 1024 // cfgs2.rhs_cfgs.packing
-                        for _ck in range(0, tile_k2, 1024):
-                            _ck_end = min(tile_k2, _ck + 1024)
-                            _raw_c = w2_buf_ref[
-                                _b2,
-                                _ck // cfgs2.rhs_cfgs.packing : _ck_end // cfgs2.rhs_cfgs.packing,
-                                :,
-                            ]
-                            w2_fp8_cache_ref[_b2, _ck:_ck_end, :] = pltpu.bitcast(
-                                _raw_c, cfgs2.rhs_cfgs.quant_dtype
-                            ).astype(jnp.float8_e4m3fn)
+                    elif (
+                        w2_fp8_cache_ref is not None
+                        and not use_weight_lookahead
+                        and _n2 < w2_fp8_cache_ref.shape[0]
+                    ):
+                        _w2c_lim = w2_fp8_cache_ref.shape[-1]
+                        _k_w2c = 256 if tile_k2 % 256 == 0 else min(tile_k2, 1024)
+                        _n_w2c = 512 if _w2c_lim % 512 == 0 else min(_w2c_lim, 256)
+                        for _ck in range(0, tile_k2, _k_w2c):
+                            _ck_len = min(_k_w2c, tile_k2 - _ck)
+                            for _cn in range(0, _w2c_lim, _n_w2c):
+                                _cn_len = min(_n_w2c, _w2c_lim - _cn)
+                                _raw_c = w2_buf_ref[
+                                    _b2,
+                                    pl.ds(
+                                        _ck // cfgs2.rhs_cfgs.packing,
+                                        _ck_len // cfgs2.rhs_cfgs.packing,
+                                    ),
+                                    pl.ds(_cn, _cn_len),
+                                ]
+                                w2_fp8_cache_ref[
+                                    _b2, pl.ds(_ck, _ck_len), pl.ds(_cn, _cn_len)
+                                ] = pltpu.bitcast(
+                                    _raw_c, cfgs2.rhs_cfgs.quant_dtype
+                                ).astype(jnp.float8_e4m3fn)
 
                 # See GMM1 loop: consume the slot before refilling it (WAR).
                 _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
@@ -3566,20 +3643,25 @@ def kernel_main_fused_rs(
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
                 if step == 0 and use_weight_lookahead:
+
                     @pl.when(jnp.logical_and(_is_last_tile_of_e, _e_after_cur >= 0))
                     def _():
                         start_w2_dma(_w_base, _e_after_cur, 1 // num_k2, 1 % num_k2)
                 elif step == 0 and can_cache_w2:
+
                     @pl.when(jnp.logical_and(has_next, next_e != expert_id))
                     def _():
                         start_w2_dma(0, next_e, 0, 0)
 
             if not use_weight_lookahead:
+
                 @pl.when(
                     jnp.logical_and(
                         has_next,
                         jnp.logical_not(
-                            jnp.logical_and(next_e == expert_id, jnp.bool_(can_cache_w2))
+                            jnp.logical_and(
+                                next_e == expert_id, jnp.bool_(can_cache_w2)
+                            )
                         ),
                     )
                 )
@@ -3612,14 +3694,26 @@ def kernel_main_fused_rs(
             )
             lax.cond(
                 last_val <= 16,
-                lambda: (_reshape_gmm2_output_rows(last_sem, last_stg, 16), jnp.int32(0))[1],
+                lambda: (
+                    _reshape_gmm2_output_rows(last_sem, last_stg, 16),
+                    jnp.int32(0),
+                )[1],
                 lambda: lax.cond(
                     last_val <= 32,
-                    lambda: (_reshape_gmm2_output_rows(last_sem, last_stg, 32), jnp.int32(0))[1],
+                    lambda: (
+                        _reshape_gmm2_output_rows(last_sem, last_stg, 32),
+                        jnp.int32(0),
+                    )[1],
                     lambda: lax.cond(
                         last_val <= 64,
-                        lambda: (_reshape_gmm2_output_rows(last_sem, last_stg, 64), jnp.int32(0))[1],
-                        lambda: (_reshape_gmm2_output(last_sem, last_stg), jnp.int32(0))[1],
+                        lambda: (
+                            _reshape_gmm2_output_rows(last_sem, last_stg, 64),
+                            jnp.int32(0),
+                        )[1],
+                        lambda: (
+                            _reshape_gmm2_output(last_sem, last_stg),
+                            jnp.int32(0),
+                        )[1],
                     ),
                 ),
             )
@@ -3633,10 +3727,16 @@ def kernel_main_fused_rs(
             last_val = _last_en - metadata_ref.gm_id_to_m_offset[last_gm]
             lax.cond(
                 last_val <= 32,
-                lambda: (_reshape_gmm2_output_rows(last_sem, last_stg, 32), jnp.int32(0))[1],
+                lambda: (
+                    _reshape_gmm2_output_rows(last_sem, last_stg, 32),
+                    jnp.int32(0),
+                )[1],
                 lambda: lax.cond(
                     last_val <= 64,
-                    lambda: (_reshape_gmm2_output_rows(last_sem, last_stg, 64), jnp.int32(0))[1],
+                    lambda: (
+                        _reshape_gmm2_output_rows(last_sem, last_stg, 64),
+                        jnp.int32(0),
+                    )[1],
                     lambda: (
                         lax.cond(
                             last_val <= 128,
@@ -3644,7 +3744,10 @@ def kernel_main_fused_rs(
                                 _reshape_gmm2_output_rows(last_sem, last_stg, 128),
                                 jnp.int32(0),
                             )[1],
-                            lambda: (_reshape_gmm2_output(last_sem, last_stg), jnp.int32(0))[1],
+                            lambda: (
+                                _reshape_gmm2_output(last_sem, last_stg),
+                                jnp.int32(0),
+                            )[1],
                         )
                         if tile_m > 128
                         else (_reshape_gmm2_output(last_sem, last_stg), jnp.int32(0))[1]
@@ -4018,12 +4121,8 @@ def gmm_v2_fused_rs(
             ):
                 st1 = target_qbs // cur_qbs1
                 st2 = target_qbs // cur_qbs2
-                w1_scale = (
-                    w1_scale[:, :, ::st1] if stacked else w1_scale[:, ::st1]
-                )
-                w2_scale = (
-                    w2_scale[:, :, ::st2] if stacked else w2_scale[:, ::st2]
-                )
+                w1_scale = w1_scale[:, :, ::st1] if stacked else w1_scale[:, ::st1]
+                w2_scale = w2_scale[:, :, ::st2] if stacked else w2_scale[:, ::st2]
         w1s_shape = w1_scale.shape[1:] if stacked else w1_scale.shape
         w2s_shape = w2_scale.shape[1:] if stacked else w2_scale.shape
         rhs1_quant_block_size = recover_quant_block_size(size_k1, w1s_shape[1])
@@ -4080,9 +4179,7 @@ def gmm_v2_fused_rs(
     has_ext_lhs_scales = (
         hidden_states_scale is not None and lhs_in_dtype == jnp.float8_e4m3fn
     )
-    out_dtype = (
-        jnp.dtype(jnp.bfloat16) if has_ext_lhs_scales else lhs_in_dtype
-    )
+    out_dtype = jnp.dtype(jnp.bfloat16) if has_ext_lhs_scales else lhs_in_dtype
     sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
     intermediate_size = size_n1 // 2
 
@@ -4420,7 +4517,8 @@ def gmm_v2_fused_rs(
         and size_m >= _PREFILL_TILES_MIN_SIZE_M
         and num_w1_bufs == 3
         and num_w2_bufs == 3
-        and (size_k1 // tile_k1) * ((size_n1 // 2 if act_fn else size_n1) // tile_n1) == 2
+        and (size_k1 // tile_k1) * ((size_n1 // 2 if act_fn else size_n1) // tile_n1)
+        == 2
         and (size_k2 // tile_k2) * (size_n2 // tile_n2) == 2
         and (-(-tile_k1 // rhs1_quant_block_size)) % 16 == 0
         and (-(-tile_k2 // rhs2_quant_block_size)) % 16 == 0
@@ -4442,7 +4540,18 @@ def gmm_v2_fused_rs(
         and jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
         and rhs2_quant_block_size >= 256
         and cfgs2.lhs_cfgs.quant_dtype is not None
-        and tile_m <= 128
+        and (
+            tile_m <= 128
+            or (
+                tile_m == 256
+                and num_w1_bufs <= 2
+                and num_w2_bufs <= 2
+                and not eff_hot_interleave
+                and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
+                == 0
+                and int(envs.SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_POW2.get() or 0) == 0
+            )
+        )
     )
     use_lhs_fp8_cache = (
         is_quantized
@@ -4501,9 +4610,7 @@ def gmm_v2_fused_rs(
         int(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N.get() or num_lanes),
     )
     use_rhs_fp8_strip_buf = (
-        _tlp_val >= 1
-        and not fp8_direct_write
-        and _tlp_kstep >= 2048
+        _tlp_val >= 1 and not fp8_direct_write and _tlp_kstep >= 2048
     )
     use_in_kernel_pn = (
         (post_expert_norm_weight is not None) and (not expert_tp) and (not has_bias)
@@ -4535,7 +4642,11 @@ def gmm_v2_fused_rs(
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm_static,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM(
-                (2 * max_num_gm_static if eff_hot_interleave else max_num_gm_static + 1,),
+                (
+                    2 * max_num_gm_static
+                    if eff_hot_interleave
+                    else max_num_gm_static + 1,
+                ),
                 jnp.int32,
             ),
         ),
@@ -4588,6 +4699,10 @@ def gmm_v2_fused_rs(
                                 envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0
                             )
                             >= 2
+                            and int(
+                                envs.SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU.get() or 0
+                            )
+                            == 0
                         )
                         else 0
                     ),
@@ -4613,9 +4728,7 @@ def gmm_v2_fused_rs(
         # zero_sem_ref
         pltpu.SemaphoreType.DMA((1,)),
         # gm_id_ref: [0]=gm_id, [1..8]=send counts, [9..16]=local counts (+2 for w_ring)
-        pltpu.SMEM(
-            ((19 if eff_weight_lookahead else 17) + 2 * ep_size,), jnp.int32
-        ),
+        pltpu.SMEM(((19 if eff_weight_lookahead else 17) + 2 * ep_size,), jnp.int32),
         # w1_buf_ref
         pltpu.VMEM(
             (
@@ -4695,7 +4808,9 @@ def gmm_v2_fused_rs(
     if use_in_kernel_pn:
         pnw_1d = post_expert_norm_weight.astype(jnp.float32) + 1.0
         if aligned_n2 > in_kernel_pn_size:
-            pnw_1d = jnp.concatenate([pnw_1d, jnp.zeros(aligned_n2 - in_kernel_pn_size, dtype=jnp.float32)])
+            pnw_1d = jnp.concatenate(
+                [pnw_1d, jnp.zeros(aligned_n2 - in_kernel_pn_size, dtype=jnp.float32)]
+            )
         w2_bias_input = jnp.broadcast_to(pnw_1d[None, :], (8, aligned_n2))
     else:
         w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
@@ -4876,8 +4991,7 @@ def gmm_v2_fused_rs(
     if pack_u16_lhs:
         _u_pairs = window_lhs.astype(jnp.uint32).reshape(smem_rows // 2, 2)
         _packed_u16 = (
-            (_u_pairs[:, 0] & jnp.uint32(0xFFFF))
-            | (_u_pairs[:, 1] << jnp.uint32(16))
+            (_u_pairs[:, 0] & jnp.uint32(0xFFFF)) | (_u_pairs[:, 1] << jnp.uint32(16))
         ).astype(jnp.int32)
         primary_idx_ref = jnp.pad(_packed_u16, (0, 1))
     elif pack_indices:
@@ -4892,7 +5006,9 @@ def gmm_v2_fused_rs(
         primary_idx_ref = window_lhs
         _oi_i32 = window_lhs.astype(jnp.int32)
         _dest_chip_vec = _oi_i32 // chunk_size
-        _write_pos_vec = window_tk.astype(jnp.int32) * chunk_size + (_oi_i32 % chunk_size)
+        _write_pos_vec = window_tk.astype(jnp.int32) * chunk_size + (
+            _oi_i32 % chunk_size
+        )
         secondary_idx_ref = lax.shift_left(_dest_chip_vec, 16) | (
             _write_pos_vec & jnp.int32(0xFFFF)
         )
@@ -4967,7 +5083,9 @@ def gmm_v2_fused_rs(
             blockdiag_rows = _BLOCKDIAG_ROWS
     else:
         # Prefill keeps the W4A16 strips unless K256_PREFILL_TILES is set.
-        k256_tiles = is_fp4_k256 and envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
+        k256_tiles = (
+            is_fp4_k256 and envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
+        )
         block256_scales = (
             envs.SGLANG_TPU_MUSE_KERNEL_BLOCK256_SCALES.get()
             and is_fp4_k256
@@ -5041,10 +5159,9 @@ def gmm_v2_fused_rs(
         else 0
     )
     _out_n1_full = size_n1 // 2 if act_fn else size_n1
-    _can_cache_full_expert = (
-        num_w1_bufs >= (_out_n1_full // tile_n1)
-        and num_w2_bufs >= (size_n2 // tile_n2)
-    )
+    _can_cache_full_expert = num_w1_bufs >= (
+        _out_n1_full // tile_n1
+    ) and num_w2_bufs >= (size_n2 // tile_n2)
     eff_eo_mode = 0
     if (
         _eo_raw >= 1
@@ -5059,7 +5176,16 @@ def gmm_v2_fused_rs(
         and cfgs1.lhs_cfgs.quant_block_size == tile_k1
         and cfgs2.lhs_cfgs.quant_block_size == tile_k2
     ):
-        eff_eo_mode = 2 if (_eo_raw >= 2 and _can_cache_full_expert and act_fn == "silu" and not has_bias) else 1
+        eff_eo_mode = (
+            2
+            if (
+                _eo_raw >= 2
+                and _can_cache_full_expert
+                and act_fn == "silu"
+                and not has_bias
+            )
+            else 1
+        )
     _eo_strip_w = min(_sn_val if _sn_val > 0 else num_lanes, tile_n1, tile_n2)
     if _eo_strip_w % num_lanes != 0:
         _eo_strip_w = num_lanes
@@ -5146,7 +5272,9 @@ def gmm_v2_fused_rs(
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1_scale
         pl.BlockSpec(memory_space=pltpu.HBM),  # w2_scale
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1_bias
-        pl.BlockSpec(memory_space=pltpu.VMEM if use_in_kernel_pn else pltpu.HBM),  # w2_bias or pnw_8
+        pl.BlockSpec(
+            memory_space=pltpu.VMEM if use_in_kernel_pn else pltpu.HBM
+        ),  # w2_bias or pnw_8
     ]
 
     if fp8_direct_write:
@@ -5189,9 +5317,7 @@ def gmm_v2_fused_rs(
                 [
                     pltpu.SemaphoreType.DMA((4 * num_cm_slots,)),
                     pltpu.SemaphoreType.DMA((4 * num_cm_slots,)),
-                    pltpu.SMEM(
-                        (num_cm_slots + (1 if eff_cm_defer else 0),), jnp.int32
-                    ),
+                    pltpu.SMEM((num_cm_slots + (1 if eff_cm_defer else 0),), jnp.int32),
                 ]
             )
         if eff_hot_interleave:
@@ -5215,7 +5341,11 @@ def gmm_v2_fused_rs(
                     pltpu.VMEM(
                         (
                             _num_n1_hi,
-                            (-(-tile_k1 // rhs1_quant_block_size) if is_quantized else 1),
+                            (
+                                -(-tile_k1 // rhs1_quant_block_size)
+                                if is_quantized
+                                else 1
+                            ),
                             *((1,) if scale_has_unit_dim else ()),
                             _w1_dma_n_hi,
                         ),
@@ -5226,8 +5356,28 @@ def gmm_v2_fused_rs(
                 ]
             )
         if use_dedicated_w2_fp8_cache:
+            _w1_vmem_b = (
+                num_w1_bufs
+                * tile_k1
+                * (tile_n1 * 2 if act_fn else tile_n1)
+                * jax.dtypes.itemsize_bits(w1.dtype)
+                // 8
+            )
+            if tile_m <= 128 and _w1_vmem_b <= 16 * 1024 * 1024:
+                _n_w2c_slots = num_w2_bufs
+                _w2c_cols = tile_n2
+            else:
+                _n_w2c_slots = 1
+                # Leave >= 1.9 MiB TPU7x VMEM safety margin under 63.94 MiB usable cap:
+                # base VMEM at (K1=4096, N1=8192, K2=4096, N2=4096) is ~50 MiB at m=128
+                # and ~56 MiB at m=256 -> budget 12 MiB (3072 cols) at m<=128, 6 MiB (1536 cols) at m>=256.
+                _w2c_budget_b = (8 if tile_m <= 128 else 3) * 1024 * 1024
+                if tile_k2 * tile_n2 <= _w2c_budget_b:
+                    _w2c_cols = tile_n2
+                else:
+                    _w2c_cols = max(256, ((_w2c_budget_b // tile_k2) // 256) * 256)
             ext_scratch.append(
-                pltpu.VMEM((num_w2_bufs, tile_k2, tile_n2), jnp.float8_e4m3fn)
+                pltpu.VMEM((_n_w2c_slots, tile_k2, _w2c_cols), jnp.float8_e4m3fn)
             )
         if use_rhs_fp8_strip_buf:
             _max_strip_w = min(
@@ -5246,9 +5396,7 @@ def gmm_v2_fused_rs(
         elif eff_eo_mode >= 2:
             ext_scratch.extend(
                 [
-                    pltpu.VMEM(
-                        (max(tile_k1, tile_k2), _eo_strip_w), jnp.float8_e4m3fn
-                    ),
+                    pltpu.VMEM((max(tile_k1, tile_k2), _eo_strip_w), jnp.float8_e4m3fn),
                     pltpu.VMEM((2, tile_m, max_k_pq), jnp.float8_e4m3fn),
                     pltpu.VMEM((2, tile_m, num_lanes), jnp.float32),
                     pltpu.VMEM((2, tile_m, _out_n1_full), out_dtype),
@@ -5291,7 +5439,9 @@ def gmm_v2_fused_rs(
                 cm_w2_init,
                 cm_s2_init,
             )
-            ext_out_specs = tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(5))
+            ext_out_specs = tuple(
+                pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(5)
+            )
         else:
             ext_out_shape = out_buf_init
             ext_out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -5301,11 +5451,7 @@ def gmm_v2_fused_rs(
             if enable_chipmate
             else ""
         )
-        ext_name = (
-            f"{pallas_name}"
-            f"{_cm_sfx}"
-            f"{'-hi' if eff_hot_interleave else ''}"
-        )
+        ext_name = f"{pallas_name}{_cm_sfx}{'-hi' if eff_hot_interleave else ''}"
 
         def _ext_kernel_entry(*all_refs):
             if has_ext_lhs_scales:
@@ -5346,9 +5492,7 @@ def gmm_v2_fused_rs(
                 cur += 1
             else:
                 rhs_strip_r = None
-            w8_bundle = (
-                (lhs_row_sc_r, w2_fp8_r, rhs_strip_r) if has_w8_ext else None
-            )
+            w8_bundle = (lhs_row_sc_r, w2_fp8_r, rhs_strip_r) if has_w8_ext else None
             if n_eo_scratch > 0:
                 eo_bundle = all_refs[cur : cur + n_eo_scratch]
                 cur += n_eo_scratch

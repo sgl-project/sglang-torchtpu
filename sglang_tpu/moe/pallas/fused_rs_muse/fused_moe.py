@@ -419,7 +419,13 @@ def moe_gmm_local_rs_nodedup(
         )
         _n_cm_slots = (
             3
-            if (use_prefill_cm and not use_prefill_rep and _req_cm_slots >= 3 and ep_size == 8)
+            if (
+                use_prefill_cm
+                and not use_prefill_rep
+                and _req_cm_slots >= 3
+                and ep_size >= 8
+                and (ep_size & (ep_size - 1)) == 0
+            )
             else (
                 2
                 if (use_prefill_cm and not use_prefill_rep and _req_cm_slots >= 2)
@@ -495,14 +501,20 @@ def moe_gmm_local_rs_nodedup(
             if _n_cm_slots >= 2:
                 _plan_entries = []
                 for _ci in range(_n_cm_slots):
-                    _plan_entries.extend([_cm_all[my_id, 3 * _ci + 0], _cm_all[my_id, 3 * _ci + 1]])
+                    _plan_entries.extend(
+                        [_cm_all[my_id, 3 * _ci + 0], _cm_all[my_id, 3 * _ci + 1]]
+                    )
                 my_cm_plan = jnp.stack(_plan_entries)
-                _xors_cm = (1, 2, 4) if _n_cm_slots == 3 else (chipmate_xor, chipmate_xor)
+                _xors_cm = (
+                    (1, 2, 4) if _n_cm_slots == 3 else (chipmate_xor, chipmate_xor)
+                )
                 if w1_global_scale is not None:
                     _cat1 = [w1_global_scale]
                     for _ci, _rx in enumerate(_xors_cm):
                         _pgs1 = jax.lax.ppermute(
-                            w1_global_scale, ep_axis_name, [(r, r ^ _rx) for r in range(ep_size)]
+                            w1_global_scale,
+                            ep_axis_name,
+                            [(r, r ^ _rx) for r in range(ep_size)],
                         )
                         _sr = _cm_all[my_id, 3 * _ci + 2]
                         _cat1.append(_pgs1[_sr : _sr + 1])
@@ -511,7 +523,9 @@ def moe_gmm_local_rs_nodedup(
                     _cat2 = [w2_global_scale]
                     for _ci, _rx in enumerate(_xors_cm):
                         _pgs2 = jax.lax.ppermute(
-                            w2_global_scale, ep_axis_name, [(r, r ^ _rx) for r in range(ep_size)]
+                            w2_global_scale,
+                            ep_axis_name,
+                            [(r, r ^ _rx) for r in range(ep_size)],
                         )
                         _sr = _cm_all[my_id, 3 * _ci + 2]
                         _cat2.append(_pgs2[_sr : _sr + 1])
@@ -559,9 +573,7 @@ def moe_gmm_local_rs_nodedup(
             _tok_f = _flat_iota // topk
             _slot_f = _flat_iota % topk
             _chip_rot = jnp.mod(_tok_f // chunk_size + ep_size - 1 - my_id, ep_size)
-            _rot_key = (
-                topk_indices_flat.astype(jnp.int32) * ep_size + _chip_rot
-            )
+            _rot_key = topk_indices_flat.astype(jnp.int32) * ep_size + _chip_rot
             topk_argsort_indices = _expert_order(_rot_key, num_experts * ep_size)
             lhs_indices = topk_argsort_indices // topk
         else:
@@ -640,9 +652,9 @@ def moe_gmm_local_rs_nodedup(
                         ),
                     ).astype(jnp.int32)
                 )
-            group_start_arg = jnp.stack(
-                [local_start, local_end, recv_cnt]
-            ).astype(jnp.int32)
+            group_start_arg = jnp.stack([local_start, local_end, recv_cnt]).astype(
+                jnp.int32
+            )
         else:
             group_start_arg = (
                 jnp.array([local_start], dtype=jnp.int32)
@@ -736,9 +748,7 @@ def moe_gmm_local_rs_nodedup(
         if expert_tp
         else (_smem_rows if _smem_rows < size_m else size_m)
     )
-    max_groups = (
-        min(num_local_experts, max_rows) if expert_tp else num_local_experts
-    )
+    max_groups = min(num_local_experts, max_rows) if expert_tp else num_local_experts
     max_num_gm = jnp.array(
         max_groups + (max_rows + tile_m - 1) // tile_m - 1,
         dtype=jnp.int32,

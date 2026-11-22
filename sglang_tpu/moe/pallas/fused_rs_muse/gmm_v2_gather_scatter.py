@@ -710,9 +710,12 @@ def inner_kernel(
                 else:
                     gs_gate_val = jnp.float32(1.0)
                     gs_up_val = jnp.float32(1.0)
+                _compact_fori = scoped_w4a8_mode >= 6 or (
+                    scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256
+                )
                 pnw_full_bf16 = (
                     pnw_ref[...].astype(tiled_out_ref.dtype)
-                    if pnw_ref is not None
+                    if (pnw_ref is not None and not _compact_fori)
                     else None
                 )
                 n_tile_offset = (0 if _n_id is None else _n_id) * cfgs.tiles.tile_n
@@ -739,7 +742,11 @@ def inner_kernel(
                 )
                 if lhs_3d_vmem_ref is not None:
                     if (
-                        (scoped_w4a8_mode >= 3 or eo_fp8_mode >= 1)
+                        (
+                            scoped_w4a8_mode >= 3
+                            or eo_fp8_mode >= 1
+                            or _flq_zero_rmw >= 3
+                        )
                         and _qdt == jnp.float8_e4m3fn
                         and cfgs.tiles.tile_m % 32 == 0
                         and cfgs.tiles.tile_k % 128 == 0
@@ -770,7 +777,9 @@ def inner_kernel(
                                     pl.ds(_m0 + _sub, 16), :, :
                                 ].astype(jnp.bfloat16)
                                 _amax_m = jnp.max(
-                                    jnp.max(jnp.abs(_blk), axis=1), axis=1, keepdims=True
+                                    jnp.max(jnp.abs(_blk), axis=1),
+                                    axis=1,
+                                    keepdims=True,
                                 ).astype(jnp.float32)
                                 _inv_m = jnp.where(
                                     _amax_m == 0,
@@ -950,9 +959,7 @@ def inner_kernel(
                 if _two_level_pow2 >= 2:
                     log_r = jnp.clip(
                         jnp.rint(
-                            jnp.log2(
-                                jnp.maximum(s_f32 / s_safe, jnp.float32(2.0**-11))
-                            )
+                            jnp.log2(jnp.maximum(s_f32 / s_safe, jnp.float32(2.0**-11)))
                         ),
                         -11.0,
                         0.0,
@@ -967,9 +974,18 @@ def inner_kernel(
                 return p_bf16, s_max * jnp.float32(1.0 / 64.0)
 
             def _compute_strip_acc(
-                start_n: int, end_n: int, *, quant_otf: bool = False
+                start_n: int,
+                end_n: int,
+                *,
+                quant_otf: bool = False,
+                col_size_override: int | None = None,
+                allow_w_fp8_cache: bool = True,
             ) -> jax.Array:
-                col_size = end_n - start_n
+                col_size = (
+                    (end_n - start_n)
+                    if col_size_override is None
+                    else col_size_override
+                )
                 if use_eo_strip_fp8 and not (eo_fp8_mode >= 2 and use_scoped_w4a8_refs):
                     from .prefill_gmm_opts import (
                         dot_lhs_fp8_with_scaled_fp8_strip,
@@ -1062,6 +1078,12 @@ def inner_kernel(
                         zero_spill_sub_m=(scoped_w4a8_mode >= 2)
                         or (use_eo_strip_fp8 and eo_fp8_mode >= 2),
                         mh_outer=_use_mh_outer,
+                        col_size=col_size,
+                        hoist_rhs_scale=(scoped_w4a8_mode >= 4),
+                        w_fp8_cache_ref=(
+                            w2_fp8_cache_ref if allow_w_fp8_cache else None
+                        ),
+                        prequant_lhs_scale_ref=prequant_lhs_scale_ref,
                     )
                 if use_scoped_w4a8_refs:
                     if _two_level_pow2 >= 1:
@@ -1094,9 +1116,9 @@ def inner_kernel(
                                             prequant_lhs_fp8_ref[:, rk0:rk1] = lq_b
                                         rhs_parts.append(
                                             (
-                                                tiled_rhs[rk0:rk1, start_n:end_n].astype(
-                                                    jnp.bfloat16
-                                                )
+                                                tiled_rhs[
+                                                    rk0:rk1, start_n:end_n
+                                                ].astype(jnp.bfloat16)
                                                 * pow2_bf16[r_bid : r_bid + 1, :]
                                             ).astype(jnp.float8_e4m3fn)
                                         )
@@ -1133,9 +1155,9 @@ def inner_kernel(
                                             lhs_parts.append(lq_b)
                                         rhs_parts.append(
                                             (
-                                                tiled_rhs[rk0:rk1, start_n:end_n].astype(
-                                                    jnp.bfloat16
-                                                )
+                                                tiled_rhs[
+                                                    rk0:rk1, start_n:end_n
+                                                ].astype(jnp.bfloat16)
                                                 * pow2_bf16[r_bid : r_bid + 1, :]
                                             ).astype(jnp.float8_e4m3fn)
                                         )
@@ -1203,9 +1225,9 @@ def inner_kernel(
                             if use_bf16_inner:
                                 scaled_pop = pop.astype(jnp.bfloat16) * rhs_s_bf16
                             else:
-                                scaled_pop = pop.astype(acc_ref.dtype) * rhs_s_bf16.astype(
+                                scaled_pop = pop.astype(
                                     acc_ref.dtype
-                                )
+                                ) * rhs_s_bf16.astype(acc_ref.dtype)
                             sub_acc = (
                                 scaled_pop if sub_acc is None else sub_acc + scaled_pop
                             )
@@ -1362,7 +1384,9 @@ def inner_kernel(
                                 ]
                                 rhs_online_scale = None
                             if has_prequant_lhs:
-                                block_lhs_for_matmul = _read_pq_lhs_slice(start_k, end_k)
+                                block_lhs_for_matmul = _read_pq_lhs_slice(
+                                    start_k, end_k
+                                )
                                 s128 = prequant_lhs_scale_ref[b_id_pq, :, :]
                                 if (
                                     col_size > s128.shape[1]
@@ -1429,7 +1453,11 @@ def inner_kernel(
             ) -> tuple[jax.Array, jax.Array]:
                 if _two_level_pow2 >= 1 and not use_eo_strip_fp8:
                     return _compute_strip_acc(g_s, g_e), _compute_strip_acc(u_s, u_e)
-                if use_scoped_w4a8_refs and scoped_w4a8_mode >= 1 and not use_eo_strip_fp8:
+                if (
+                    use_scoped_w4a8_refs
+                    and scoped_w4a8_mode >= 1
+                    and not use_eo_strip_fp8
+                ):
                     from .prefill_gmm_opts import scoped_w4a8_dual_strip_acc
 
                     return scoped_w4a8_dual_strip_acc(
@@ -1454,6 +1482,7 @@ def inner_kernel(
                         load_lhs_scale_strip_fn=_load_lhs_scale_strip,
                         zero_spill_sub_m=scoped_w4a8_mode >= 2,
                         mh_outer=scoped_w4a8_mode >= 3,
+                        hoist_rhs_scale=scoped_w4a8_mode >= 4,
                     )
                 col_size = g_e - g_s
                 use_bf16_inner = fp4_acc_mode == 3
@@ -1635,6 +1664,128 @@ def inner_kernel(
                                 tiled_out_ref[:, s_n:e_n] = (gate_act * up_acc).astype(
                                     tiled_out_ref.dtype
                                 )
+                    elif (
+                        (
+                            scoped_w4a8_mode >= 6
+                            or (scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256)
+                        )
+                        and skip_row_mask
+                        and use_scoped_w4a8_refs
+                        and not use_eo_strip_fp8
+                        and _two_level_pow2 == 0
+                        and q_block_size == cfgs.tiles.tile_k
+                        and half_tile_n % strip_step == 0
+                        and (has_prequant_lhs or use_fast_lhs_q)
+                    ):
+                        _n_strips_g1 = half_tile_n // strip_step
+
+                        def _g1_gate_fori(si, _):
+                            _sn = si * strip_step
+                            gate_acc = _compute_strip_acc(
+                                _sn,
+                                _sn + strip_step,
+                                col_size_override=strip_step,
+                            )
+                            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                                gate_acc = gate_acc * gs_gate_val
+                            tiled_out_ref[:, pl.ds(_sn, strip_step)] = jax.nn.silu(
+                                gate_acc
+                            ).astype(tiled_out_ref.dtype)
+                            return _
+
+                        lax.fori_loop(0, _n_strips_g1, _g1_gate_fori, jnp.int32(0))
+                        _fuse_g2_amax = (
+                            _flq_zero_rmw >= 2
+                            and fused_g2_amax_slot is not None
+                            and prequant_lhs_scale_ref is not None
+                            and use_fast_lhs_q
+                            and _num_n is not None
+                            and _n_id is not None
+                        )
+                        if _fuse_g2_amax:
+                            _lanes_w = prequant_lhs_scale_ref.shape[-1]
+                            _init_m128 = (
+                                prequant_lhs_scale_ref[fused_g2_amax_slot, :, :].astype(
+                                    jnp.bfloat16
+                                )
+                                if _n_id > 0
+                                else jnp.zeros(
+                                    (cfgs.tiles.tile_m, _lanes_w),
+                                    dtype=jnp.bfloat16,
+                                )
+                            )
+
+                            def _g1_up_fori_amax(si, cur_m128):
+                                _sn = si * strip_step
+                                _un = half_tile_n + _sn
+                                up_acc = _compute_strip_acc(
+                                    _un,
+                                    _un + strip_step,
+                                    col_size_override=strip_step,
+                                )
+                                if cfgs.rhs_cfgs.has_scale and gs_up_ref is not None:
+                                    up_acc = up_acc * gs_up_val
+                                _col_ds = pl.ds(_sn, strip_step)
+                                prod_out = (
+                                    tiled_out_ref[:, _col_ds].astype(jnp.float32)
+                                    * up_acc
+                                ).astype(tiled_out_ref.dtype)
+                                tiled_out_ref[:, _col_ds] = prod_out
+                                _p_bf16 = prod_out.astype(jnp.bfloat16)
+                                if strip_step % _lanes_w == 0:
+                                    for _c0 in range(0, strip_step, _lanes_w):
+                                        cur_m128 = jnp.maximum(
+                                            cur_m128,
+                                            jnp.abs(_p_bf16[:, _c0 : _c0 + _lanes_w]),
+                                        )
+                                else:
+                                    _amax_c = jnp.max(
+                                        jnp.abs(_p_bf16), axis=1, keepdims=True
+                                    )
+                                    cur_m128 = jnp.maximum(
+                                        cur_m128,
+                                        jnp.broadcast_to(
+                                            _amax_c, (cfgs.tiles.tile_m, _lanes_w)
+                                        ),
+                                    )
+                                return cur_m128
+
+                            _fin_m128 = lax.fori_loop(
+                                0, _n_strips_g1, _g1_up_fori_amax, _init_m128
+                            )
+                            if _n_id == _num_n - 1:
+                                _final_amax = jnp.max(
+                                    _fin_m128, axis=1, keepdims=True
+                                ).astype(jnp.float32)
+                                prequant_lhs_scale_ref[fused_g2_amax_slot, :, :] = (
+                                    jnp.broadcast_to(
+                                        _final_amax, (cfgs.tiles.tile_m, _lanes_w)
+                                    )
+                                )
+                            else:
+                                prequant_lhs_scale_ref[fused_g2_amax_slot, :, :] = (
+                                    _fin_m128.astype(jnp.float32)
+                                )
+                        else:
+
+                            def _g1_up_fori(si, _):
+                                _sn = si * strip_step
+                                _un = half_tile_n + _sn
+                                up_acc = _compute_strip_acc(
+                                    _un,
+                                    _un + strip_step,
+                                    col_size_override=strip_step,
+                                )
+                                if cfgs.rhs_cfgs.has_scale and gs_up_ref is not None:
+                                    up_acc = up_acc * gs_up_val
+                                _col_ds = pl.ds(_sn, strip_step)
+                                tiled_out_ref[:, _col_ds] = (
+                                    tiled_out_ref[:, _col_ds].astype(jnp.float32)
+                                    * up_acc
+                                ).astype(tiled_out_ref.dtype)
+                                return _
+
+                            lax.fori_loop(0, _n_strips_g1, _g1_up_fori, jnp.int32(0))
                     else:
                         for s_n in range(0, half_tile_n, strip_step):
                             e_n = min(half_tile_n, s_n + strip_step)
@@ -1683,7 +1834,9 @@ def inner_kernel(
                                 _lanes_w = prequant_lhs_scale_ref.shape[-1]
                                 if _w_cols % _lanes_w == 0:
                                     for _c0 in range(0, _w_cols, _lanes_w):
-                                        _abs_c = jnp.abs(_p_bf16[:, _c0 : _c0 + _lanes_w])
+                                        _abs_c = jnp.abs(
+                                            _p_bf16[:, _c0 : _c0 + _lanes_w]
+                                        )
                                         _g1_m128_bf16 = (
                                             _abs_c
                                             if _g1_m128_bf16 is None
@@ -1721,7 +1874,87 @@ def inner_kernel(
                                 prequant_lhs_scale_ref[fused_g2_amax_slot, :, :] = (
                                     _g1_m128_bf16.astype(jnp.float32)
                                 )
+                elif (
+                    (
+                        scoped_w4a8_mode >= 6
+                        or (scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256)
+                    )
+                    and skip_row_mask
+                    and use_scoped_w4a8_refs
+                    and not use_eo_strip_fp8
+                    and _two_level_pow2 == 0
+                    and q_block_size == cfgs.tiles.tile_k
+                    and rhs_tile_n % strip_step == 0
+                    and (has_prequant_lhs or use_fast_lhs_q)
+                ):
+                    if _otf_inv_scale_bf16 is not None:
+                        _qk_step = (
+                            256 if cfgs.tiles.tile_k >= 256 else cfgs.tiles.tile_k
+                        )
+                        for _qk0 in range(0, cfgs.tiles.tile_k, _qk_step):
+                            _qk_len = min(_qk_step, cfgs.tiles.tile_k - _qk0)
+                            prequant_lhs_fp8_ref[:, pl.ds(_qk0, _qk_len)] = (
+                                lhs_2d_vmem_ref[:, pl.ds(_qk0, _qk_len)].astype(
+                                    jnp.bfloat16
+                                )
+                                * _otf_inv_scale_bf16
+                            ).astype(cfgs.lhs_cfgs.quant_dtype)
+                        _otf_inv_scale_bf16 = None
+                    _n_strips_g2 = rhs_tile_n // strip_step
+
+                    def _make_g2_fori(_allow_w2c: bool):
+                        def _g2_fori(si, _):
+                            _sn = si * strip_step
+                            acc_n = _compute_strip_acc(
+                                _sn,
+                                _sn + strip_step,
+                                quant_otf=False,
+                                col_size_override=strip_step,
+                                allow_w_fp8_cache=_allow_w2c,
+                            )
+                            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                                acc_n = acc_n * gs_gate_val
+                            out_bf16 = acc_n.astype(tiled_out_ref.dtype)
+                            if pnw_ref is not None:
+                                pnw_s = pnw_ref[
+                                    :, pl.ds(n_tile_offset + _sn, strip_step)
+                                ].astype(tiled_out_ref.dtype)
+                                out_bf16 = (
+                                    out_bf16.reshape(
+                                        cfgs.tiles.tile_m // 8, 8, strip_step
+                                    )
+                                    * pnw_s[None, :, :]
+                                ).reshape(cfgs.tiles.tile_m, strip_step)
+                            tiled_out_ref[:, pl.ds(_sn, strip_step)] = out_bf16
+                            return _
+
+                        return _g2_fori
+
+                    if (
+                        w2_fp8_cache_ref is not None
+                        and 0 < w2_fp8_cache_ref.shape[-1] < rhs_tile_n
+                        and w2_fp8_cache_ref.shape[-1] % strip_step == 0
+                    ):
+                        _n_w2c_strips = w2_fp8_cache_ref.shape[-1] // strip_step
+                        lax.fori_loop(
+                            0, _n_w2c_strips, _make_g2_fori(True), jnp.int32(0)
+                        )
+                        lax.fori_loop(
+                            _n_w2c_strips,
+                            _n_strips_g2,
+                            _make_g2_fori(False),
+                            jnp.int32(0),
+                        )
+                    else:
+                        lax.fori_loop(
+                            0,
+                            _n_strips_g2,
+                            _make_g2_fori(w2_fp8_cache_ref is not None),
+                            jnp.int32(0),
+                        )
                 else:
+                    if pnw_full_bf16 is None and pnw_ref is not None:
+                        pnw_full_bf16 = pnw_ref[...].astype(tiled_out_ref.dtype)
                     for s_n in range(0, rhs_tile_n, strip_step):
                         e_n = min(rhs_tile_n, s_n + strip_step)
                         col_size = e_n - s_n

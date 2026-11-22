@@ -26,7 +26,6 @@ from typing import Any
 
 import numpy as np
 
-
 _FP4_PACK = 8
 _FP4_MAX = 6.0
 _FP8_E4M3_MAX = 448.0
@@ -106,7 +105,9 @@ def scaled_fp8_1pop_strip_numpy_ref(
     assert w_scale_blocks.shape[0] * rhs_qbs == k_dim
     col_max = np.max(np.abs(w_scale_blocks), axis=0, keepdims=True)
     col_c = col_max * (_FP4_MAX / _FP8_E4M3_MAX)
-    rel_s = np.where(col_c == 0.0, 0.0, w_scale_blocks / np.where(col_c == 0.0, 1.0, col_c))
+    rel_s = np.where(
+        col_c == 0.0, 0.0, w_scale_blocks / np.where(col_c == 0.0, 1.0, col_c)
+    )
     w_scaled_fp8 = simulate_e4m3fn_numpy(w_fp4_vals * np.repeat(rel_s, rhs_qbs, axis=0))
     pop = lhs_fp8.astype(np.float32) @ w_scaled_fp8.astype(np.float32)
     return pop * (lhs_scale.astype(np.float32) * col_c.astype(np.float32))
@@ -135,7 +136,9 @@ def plan_prefill_chipmate_2slot_numpy_ref(
     if mode_norm not in ("whole", "split"):
         raise ValueError(f"Unsupported prefill chipmate mode={mode!r}")
 
-    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    eff_slot_xors = (
+        tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    )
     n_cm = len(eff_slot_xors)
     ids = np.asarray(topk_indices, dtype=np.int32)
     e_loc = num_local_experts
@@ -143,15 +146,21 @@ def plan_prefill_chipmate_2slot_numpy_ref(
     num_in = ep_size * e_loc
 
     valid_mask = (ids >= 0) & (ids < num_in)
-    counts_flat = np.bincount(ids[valid_mask], minlength=num_in).astype(np.int32)[:num_in]
+    counts_flat = np.bincount(ids[valid_mask], minlength=num_in).astype(np.int32)[
+        :num_in
+    ]
     counts_rs = counts_flat.reshape(ep_size, e_loc).copy()
-    tiles_rs = np.where(counts_rs > 0, (counts_rs + tile_m - 1) // tile_m, 0).astype(np.int32)
+    tiles_rs = np.where(counts_rs > 0, (counts_rs + tile_m - 1) // tile_m, 0).astype(
+        np.int32
+    )
     cost_rs = np.where(counts_rs > 0, tiles_rs + weight_load_tiles, 0).astype(np.int32)
     loads = np.sum(cost_rs, axis=1).astype(np.int32)
 
     own = ids // e_loc
     sl = ids % e_loc
-    base_v = np.where(ids >= num_in, ep_size * e_virt, own * e_virt + sl).astype(np.int32)
+    base_v = np.where(ids >= num_in, ep_size * e_virt, own * e_virt + sl).astype(
+        np.int32
+    )
 
     total_elems = ids.size
     n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
@@ -336,7 +345,9 @@ def scoped_two_level_pow2_strip_acc(
         for qk0 in range(0, tile_k, 256):
             qk_len = min(256, tile_k - qk0)
             prequant_lhs_fp8_ref[pl.ds(0, tile_m), pl.ds(qk0, qk_len)] = (
-                lhs_2d_vmem_ref[pl.ds(0, tile_m), pl.ds(qk0, qk_len)].astype(jnp.bfloat16)
+                lhs_2d_vmem_ref[pl.ds(0, tile_m), pl.ds(qk0, qk_len)].astype(
+                    jnp.bfloat16
+                )
                 * otf_inv_scale_bf16
             ).astype(lhs_quant_dtype)
 
@@ -362,8 +373,8 @@ def scoped_two_level_pow2_strip_acc(
     )
     if use_vmem_strip:
         for rk0 in range(0, tile_k, 256):
-            rhs_fp8_strip_ref[pl.ds(rk0, 256), pl.ds(0, col_size)] = _unpack_256_pow2_fp8(
-                rk0
+            rhs_fp8_strip_ref[pl.ds(rk0, 256), pl.ds(0, col_size)] = (
+                _unpack_256_pow2_fp8(rk0)
             )
 
     if not mh_outer and not use_vmem_strip and num_m_halves > 1:
@@ -414,7 +425,9 @@ def scoped_two_level_pow2_strip_acc(
                     lhs_s_full[m0:m1, :] * col_sc_f32.astype(acc_dtype)
                 )
                 acc_halves_reuse[mh] = (
-                    term if acc_halves_reuse[mh] is None else acc_halves_reuse[mh] + term
+                    term
+                    if acc_halves_reuse[mh] is None
+                    else acc_halves_reuse[mh] + term
                 )
         return jnp.concatenate(acc_halves_reuse, axis=0)
 
@@ -439,12 +452,14 @@ def scoped_two_level_pow2_strip_acc(
                             512,
                         )
                         if (has_prequant_lhs or quant_otf)
-                        else hoisted_lq_blocks[l_bid][m0:m1, rk0 - l_k0 : rk0 + 512 - l_k0]
+                        else hoisted_lq_blocks[l_bid][
+                            m0:m1, rk0 - l_k0 : rk0 + 512 - l_k0
+                        ]
                     )
                     w_sub = rhs_fp8_strip_ref[pl.ds(rk0, 512), pl.ds(0, col_size)]
-                    p = jnp.matmul(x_sub, w_sub, preferred_element_type=jnp.float32).astype(
-                        jnp.bfloat16
-                    )
+                    p = jnp.matmul(
+                        x_sub, w_sub, preferred_element_type=jnp.float32
+                    ).astype(jnp.bfloat16)
                     sub_bf16 = p if sub_bf16 is None else sub_bf16 + p
                 sub_f32 = sub_bf16.astype(jnp.float32)
             elif use_vmem_strip:
@@ -460,7 +475,9 @@ def scoped_two_level_pow2_strip_acc(
                             256,
                         )
                         if (has_prequant_lhs or quant_otf)
-                        else hoisted_lq_blocks[l_bid][m0:m1, rk0 - l_k0 : rk0 + 256 - l_k0]
+                        else hoisted_lq_blocks[l_bid][
+                            m0:m1, rk0 - l_k0 : rk0 + 256 - l_k0
+                        ]
                     )
                     w_sub = rhs_fp8_strip_ref[pl.ds(rk0, 256), pl.ds(0, col_size)]
                     p = jnp.matmul(x_sub, w_sub, preferred_element_type=jnp.float32)
@@ -482,11 +499,13 @@ def scoped_two_level_pow2_strip_acc(
                             512,
                         )
                         if (has_prequant_lhs or quant_otf)
-                        else hoisted_lq_blocks[l_bid][m0:m1, rk0 - l_k0 : rk0 + 512 - l_k0]
+                        else hoisted_lq_blocks[l_bid][
+                            m0:m1, rk0 - l_k0 : rk0 + 512 - l_k0
+                        ]
                     )
-                    p = jnp.matmul(x_512, w_512, preferred_element_type=jnp.float32).astype(
-                        jnp.bfloat16
-                    )
+                    p = jnp.matmul(
+                        x_512, w_512, preferred_element_type=jnp.float32
+                    ).astype(jnp.bfloat16)
                     sub_bf16 = p if sub_bf16 is None else sub_bf16 + p
                 sub_f32 = sub_bf16.astype(jnp.float32)
             else:
@@ -503,7 +522,9 @@ def scoped_two_level_pow2_strip_acc(
                             256,
                         )
                         if (has_prequant_lhs or quant_otf)
-                        else hoisted_lq_blocks[l_bid][m0:m1, rk0 - l_k0 : rk0 + 256 - l_k0]
+                        else hoisted_lq_blocks[l_bid][
+                            m0:m1, rk0 - l_k0 : rk0 + 256 - l_k0
+                        ]
                     )
                     p = jnp.matmul(x_256, w_256, preferred_element_type=jnp.float32)
                     sub_f32 = p if sub_f32 is None else sub_f32 + p
@@ -543,6 +564,10 @@ def scoped_w4a8_strip_acc(
     zero_spill_sub_m: bool = False,
     mh_outer: bool = False,
     prequant_lhs_3d_fp8_ref: Any = None,
+    col_size: int | None = None,
+    hoist_rhs_scale: bool = False,
+    w_fp8_cache_ref: Any = None,
+    prequant_lhs_scale_ref: Any = None,
 ):
     """Scoped VMEM W4A8 strip matmul (`GMM_SCOPED_W4A8` modes 1, 2, 3).
 
@@ -558,18 +583,48 @@ def scoped_w4a8_strip_acc(
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
 
-    col_size = end_n - start_n
+    eff_col_size = (end_n - start_n) if col_size is None else col_size
+    col_size = eff_col_size
     scale_is_2d = len(w_scale_ref.shape) == 2
     use_sub_m = zero_spill_sub_m and tile_m >= 256 and (tile_m % 128 == 0)
     eff_mh_outer = mh_outer or (rhs_qbs > 512 and use_sub_m)
     m_step = (
         64
-        if (eff_mh_outer and use_sub_m and 512 < rhs_qbs < q_block_size and tile_m % 64 == 0)
+        if (
+            eff_mh_outer
+            and use_sub_m
+            and 512 < rhs_qbs < q_block_size
+            and tile_m % 64 == 0
+        )
         else (128 if use_sub_m else tile_m)
     )
     num_m_halves = tile_m // m_step
+    num_r_blocks = tile_k // rhs_qbs
+    can_hoist_rs = (
+        hoist_rhs_scale
+        and (tile_k % rhs_qbs == 0)
+        and (num_r_blocks >= 8)
+        and (num_r_blocks % 8 == 0)
+        and (w_scale_ref.shape[0] == num_r_blocks)
+    )
+    if can_hoist_rs:
+        hoisted_rhs_s_bf16 = (
+            w_scale_ref[:, pl.ds(start_n, col_size)].astype(jnp.bfloat16)
+            if scale_is_2d
+            else w_scale_ref[:, :, pl.ds(start_n, col_size)]
+            .reshape(num_r_blocks, col_size)
+            .astype(jnp.bfloat16)
+        )
+    else:
+        hoisted_rhs_s_bf16 = None
+
+    _use_w_cache = w_fp8_cache_ref is not None and (
+        not isinstance(start_n, int) or start_n + col_size <= w_fp8_cache_ref.shape[-1]
+    )
 
     def _load_w_slice_fp8(k0: int, k_len: int):
+        if _use_w_cache:
+            return w_fp8_cache_ref[pl.ds(k0, k_len), pl.ds(start_n, col_size)]
         raw_w = w_weight_ref[
             pl.ds(k0 // packing, k_len // packing),
             pl.ds(start_n, col_size),
@@ -578,6 +633,8 @@ def scoped_w4a8_strip_acc(
         return w_fp4.astype(jnp.float8_e4m3fn)
 
     def _load_rhs_scale(r_bid: int):
+        if hoisted_rhs_s_bf16 is not None:
+            return hoisted_rhs_s_bf16[r_bid : r_bid + 1, :]
         if scale_is_2d:
             return w_scale_ref[pl.ds(r_bid, 1), pl.ds(start_n, col_size)].astype(
                 jnp.bfloat16
@@ -629,7 +686,9 @@ def scoped_w4a8_strip_acc(
                             lhs_sub = hoisted_lq_blocks[l_bid][
                                 m0:m1, ks0 - l_k0 : ks0 + ks_step - l_k0
                             ]
-                        p_k = jnp.matmul(lhs_sub, w_fp8, preferred_element_type=jnp.float32)
+                        p_k = jnp.matmul(
+                            lhs_sub, w_fp8, preferred_element_type=jnp.float32
+                        )
                         pop = p_k if pop is None else pop + p_k
                     if use_bf16_inner:
                         sp = pop.astype(jnp.bfloat16) * rhs_s_bf16
@@ -640,7 +699,9 @@ def scoped_w4a8_strip_acc(
                 term = sub_h.astype(acc_dtype) * lhs_s_full[m0:m1, :]
                 acc_h = term if acc_h is None else acc_h + term
             acc_halves.append(acc_h)
-        return acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
+        return (
+            acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
+        )
 
     acc_halves = [None] * num_m_halves
     for l_k0 in range(0, tile_k, q_block_size):
@@ -658,7 +719,8 @@ def scoped_w4a8_strip_acc(
 
             if quant_otf:
                 lhs_full_blk = (
-                    lhs_2d_vmem_ref[:, rk0:rk1].astype(jnp.bfloat16) * otf_inv_scale_bf16
+                    lhs_2d_vmem_ref[:, rk0:rk1].astype(jnp.bfloat16)
+                    * otf_inv_scale_bf16
                 ).astype(lhs_quant_dtype)
                 prequant_lhs_fp8_ref[:, rk0:rk1] = lhs_full_blk
             else:
@@ -724,14 +786,15 @@ def scoped_w4a8_dual_strip_acc(
     load_lhs_scale_strip_fn: Any,
     zero_spill_sub_m: bool = False,
     mh_outer: bool = False,
+    hoist_rhs_scale: bool = False,
     prequant_lhs_3d_fp8_ref: Any = None,
 ):
-    """Scoped VMEM dual gate+up strip matmul (`GMM_SCOPED_W4A8` modes 1, 2, 3)."""
+    """Scoped VMEM dual gate+up strip matmul (`GMM_SCOPED_W4A8` modes 1..5)."""
     import jax.experimental.pallas as pl
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
 
-    if rhs_qbs >= 512 and zero_spill_sub_m and tile_m >= 256:
+    if rhs_qbs >= 512 and (hoist_rhs_scale or (zero_spill_sub_m and tile_m >= 256)):
         _dual_mh_outer = mh_outer or (rhs_qbs > 512)
         acc_g = scoped_w4a8_strip_acc(
             w_weight_ref=w_weight_ref,
@@ -757,6 +820,7 @@ def scoped_w4a8_dual_strip_acc(
             load_lhs_scale_strip_fn=load_lhs_scale_strip_fn,
             zero_spill_sub_m=zero_spill_sub_m,
             mh_outer=_dual_mh_outer,
+            hoist_rhs_scale=hoist_rhs_scale,
         )
         acc_u = scoped_w4a8_strip_acc(
             w_weight_ref=w_weight_ref,
@@ -782,6 +846,7 @@ def scoped_w4a8_dual_strip_acc(
             load_lhs_scale_strip_fn=load_lhs_scale_strip_fn,
             zero_spill_sub_m=zero_spill_sub_m,
             mh_outer=_dual_mh_outer,
+            hoist_rhs_scale=hoist_rhs_scale,
         )
         return acc_g, acc_u
 
@@ -855,9 +920,15 @@ def scoped_w4a8_dual_strip_acc(
                             k_len,
                         )
                     else:
-                        lhs_sub = hoisted_lq_blocks[l_bid][m0:m1, rk0 - l_k0 : rk1 - l_k0]
-                    pop_g = jnp.matmul(lhs_sub, wg_fp8, preferred_element_type=jnp.float32)
-                    pop_u = jnp.matmul(lhs_sub, wu_fp8, preferred_element_type=jnp.float32)
+                        lhs_sub = hoisted_lq_blocks[l_bid][
+                            m0:m1, rk0 - l_k0 : rk1 - l_k0
+                        ]
+                    pop_g = jnp.matmul(
+                        lhs_sub, wg_fp8, preferred_element_type=jnp.float32
+                    )
+                    pop_u = jnp.matmul(
+                        lhs_sub, wu_fp8, preferred_element_type=jnp.float32
+                    )
                     if use_bf16_inner:
                         sp_g = pop_g.astype(jnp.bfloat16) * sg_bf16
                         sp_u = pop_u.astype(jnp.bfloat16) * su_bf16
@@ -971,9 +1042,7 @@ def expand_fp4_strip_to_scaled_fp8(
 
     col_max = jnp.max(jnp.abs(s_all), axis=0, keepdims=True)
     col_c = col_max * jnp.float32(_FP4_MAX / _FP8_E4M3_MAX)
-    inv_col_c = jnp.where(
-        col_c == 0.0, jnp.zeros_like(col_c), jnp.float32(1.0) / col_c
-    )
+    inv_col_c = jnp.where(col_c == 0.0, jnp.zeros_like(col_c), jnp.float32(1.0) / col_c)
     rel_s_bf16 = (s_all * inv_col_c).astype(jnp.bfloat16)
 
     k_chunk = 256 if rhs_qbs >= 256 else 64
@@ -1063,49 +1132,53 @@ def quantize_3d_lhs_tile_to_fp8(
         else:
             dst_scale_ref[pl.ds(m0, m_ch), :] = sc_bcast
 
-    if tile_m % 32 == 0 and tile_k % 2048 == 0 and tile_k > 2048:
+    if tile_m % 32 == 0 and tile_k % 2048 == 0 and tile_k >= 2048:
+        # Sublane-native 1-pass (32, 16, 128) -> (32, 2048) xpose + 2D 128-lane tree-max:
+        # cuts TPU7x LLO quantizer bundles 3,278 -> 1,678 (-48.8%), vld 2,048 -> 1,024,
+        # and cvt 804 -> 36 (-95.5%) with 0-ULP bit-exact parity.
         n_kh = tile_k // 2048
-        k_sub = 2048
-        n_blk_sub = k_sub // 128
         for m0 in range(0, tile_m, 32):
-            amax_bf16 = None
-            last_blk = None
+            h_list = []
+            lmax_128 = None
             for kh in range(n_kh):
-                blk = lhs_3d_ref[pl.ds(m0, 32), pl.ds(kh * n_blk_sub, n_blk_sub), :].astype(
-                    jnp.bfloat16
+                h2d = (
+                    lhs_3d_ref[pl.ds(m0, 32), pl.ds(kh * 16, 16), :]
+                    .reshape(32, 2048)
+                    .astype(jnp.bfloat16)
                 )
-                kh_max = jnp.max(jnp.max(jnp.abs(blk), axis=1), axis=1, keepdims=True)
-                amax_bf16 = kh_max if amax_bf16 is None else jnp.maximum(amax_bf16, kh_max)
-                if kh == n_kh - 1:
-                    last_blk = blk
-            amax_m = amax_bf16.astype(jnp.float32)
+                h_list.append(h2d)
+                for b0 in range(0, 2048, 256):
+                    mb = jnp.maximum(
+                        jnp.abs(h2d[:, b0 : b0 + 128]),
+                        jnp.abs(h2d[:, b0 + 128 : b0 + 256]),
+                    )
+                    lmax_128 = mb if lmax_128 is None else jnp.maximum(lmax_128, mb)
+            amax_m = jnp.max(lmax_128, axis=1, keepdims=True).astype(jnp.float32)
             inv_m = jnp.where(
-                amax_m == 0.0, jnp.zeros_like(amax_m), jnp.float32(_FP8_E4M3_MAX) / amax_m
+                amax_m == 0.0,
+                jnp.zeros_like(amax_m),
+                jnp.float32(_FP8_E4M3_MAX) / amax_m,
             ).astype(jnp.bfloat16)
             sc_m = jnp.where(
                 amax_m == 0.0,
                 jnp.zeros_like(amax_m),
                 amax_m * jnp.float32(1.0 / _FP8_E4M3_MAX),
             )
-            dst_fp8_ref[pl.ds(m0, 32), pl.ds((n_kh - 1) * k_sub, k_sub)] = (
-                last_blk.reshape(32, k_sub) * inv_m
-            ).astype(jnp.float8_e4m3fn)
-            for kh in range(n_kh - 1):
-                blk = lhs_3d_ref[pl.ds(m0, 32), pl.ds(kh * n_blk_sub, n_blk_sub), :].astype(
-                    jnp.bfloat16
-                )
-                dst_fp8_ref[pl.ds(m0, 32), pl.ds(kh * k_sub, k_sub)] = (
-                    blk.reshape(32, k_sub) * inv_m
+            for kh in range(n_kh):
+                dst_fp8_ref[pl.ds(m0, 32), pl.ds(kh * 2048, 2048)] = (
+                    h_list[kh] * inv_m
                 ).astype(jnp.float8_e4m3fn)
             _write_scale(m0, 32, sc_m)
         return
 
-    m_ch = 32 if (tile_m % 32 == 0 and tile_k <= 2048) else (16 if tile_m % 16 == 0 else 8)
+    m_ch = (
+        32 if (tile_m % 32 == 0 and tile_k <= 2048) else (16 if tile_m % 16 == 0 else 8)
+    )
     for m0 in range(0, tile_m, m_ch):
         blk = lhs_3d_ref[pl.ds(m0, m_ch), :, :].astype(jnp.bfloat16)
-        amax_m = jnp.max(
-            jnp.max(jnp.abs(blk), axis=1), axis=1, keepdims=True
-        ).astype(jnp.float32)
+        amax_m = jnp.max(jnp.max(jnp.abs(blk), axis=1), axis=1, keepdims=True).astype(
+            jnp.float32
+        )
         inv_m = jnp.where(
             amax_m == 0.0, jnp.zeros_like(amax_m), jnp.float32(_FP8_E4M3_MAX) / amax_m
         ).astype(jnp.bfloat16)
@@ -1332,7 +1405,6 @@ def plan_prefill_chipmate_2slot_jax(
         v_ids: int32[T, topk] remapped virtual expert IDs over `ep_size * (num_local_experts + n_cm)`.
         cm_plan: int32[ep_size, 3 * n_cm] per-rank `[send_0, recv_0, src_0, ...]`.
     """
-    import jax
     import jax.numpy as jnp
     from jax import lax
 
@@ -1347,7 +1419,9 @@ def plan_prefill_chipmate_2slot_jax(
         raise ValueError(
             f"Unsupported prefill chipmate mode={mode!r}; expected 'whole' or 'split'"
         )
-    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    eff_slot_xors = (
+        tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    )
     total_elems_in = int(topk_indices.shape[0] * topk_indices.shape[1])
     if _can_use_tpu_pallas_prefill_router(total_elems_in, use_pallas):
         return _pallas_prefill_chipmate_2slot_route(
@@ -1451,15 +1525,29 @@ def plan_prefill_chipmate_2slot_jax(
             loads = loads.at[lo].set(l_lo + delta_lo)
             new_t_hi = jnp.where(
                 do_any,
-                jnp.where(use_whole, jnp.int32(0), jnp.maximum(0, tiles_rs[hi, chosen_s] - split_t)),
+                jnp.where(
+                    use_whole,
+                    jnp.int32(0),
+                    jnp.maximum(0, tiles_rs[hi, chosen_s] - split_t),
+                ),
                 tiles_rs[hi, chosen_s],
             )
             tiles_rs = tiles_rs.at[hi, chosen_s].set(new_t_hi)
             used_mask = used_mask.at[hi, chosen_s].set(used_mask[hi, chosen_s] | do_any)
 
-            send_cols[rnd] = send_cols[rnd].at[hi].set(jnp.where(do_any, chosen_s, send_cols[rnd][hi]))
-            recv_cols[rnd] = recv_cols[rnd].at[lo].set(jnp.where(do_any, jnp.int32(1), recv_cols[rnd][lo]))
-            src_cols[rnd] = src_cols[rnd].at[lo].set(jnp.where(do_any, chosen_s, src_cols[rnd][lo]))
+            send_cols[rnd] = (
+                send_cols[rnd]
+                .at[hi]
+                .set(jnp.where(do_any, chosen_s, send_cols[rnd][hi]))
+            )
+            recv_cols[rnd] = (
+                recv_cols[rnd]
+                .at[lo]
+                .set(jnp.where(do_any, jnp.int32(1), recv_cols[rnd][lo]))
+            )
+            src_cols[rnd] = (
+                src_cols[rnd].at[lo].set(jnp.where(do_any, chosen_s, src_cols[rnd][lo]))
+            )
 
     cols = []
     for rnd in range(n_cm):
@@ -1491,7 +1579,9 @@ def _pallas_prefill_chipmate_2slot_route(
         _jax_bincount_2d_topk,
     )
 
-    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    eff_slot_xors = (
+        tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    )
     e_in = num_local_experts
     n_cm = len(eff_slot_xors)
     e_final = e_in + n_cm
@@ -1543,9 +1633,7 @@ def _pallas_prefill_chipmate_2slot_route(
                 (c + jnp.int32(tile_m - 1)) // jnp.int32(tile_m),
                 jnp.int32(0),
             )
-            cost = jnp.where(
-                c > 0, t + jnp.int32(weight_load_tiles), jnp.int32(0)
-            )
+            cost = jnp.where(c > 0, t + jnp.int32(weight_load_tiles), jnp.int32(0))
             own = (
                 lax.shift_right_logical(e, jnp.int32(e_in_shift))
                 if e_in_pow2
@@ -1602,7 +1690,9 @@ def _pallas_prefill_chipmate_2slot_route(
                     split_t = jnp.int32(0)
                     keep_rows = jnp.int32(0)
                 else:
-                    split_raw = (l_hi - (l_lo + jnp.int32(weight_load_tiles))) // jnp.int32(2)
+                    split_raw = (
+                        l_hi - (l_lo + jnp.int32(weight_load_tiles))
+                    ) // jnp.int32(2)
                     split_t = jnp.minimum(
                         jnp.maximum(jnp.int32(0), split_raw),
                         jnp.maximum(jnp.int32(0), t_max - jnp.int32(1)),
@@ -1704,6 +1794,7 @@ def _pallas_prefill_chipmate_2slot_route(
                         v_out_ref[r_sl, c_sl] = jnp.where(cur == src_vid, dst_vid, cur)
 
             if chipmate_mode == "split":
+
                 @pl.when(~is_whole)
                 def _apply_split():
                     @pl.loop(0, n_blocks // 8)
