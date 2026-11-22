@@ -150,10 +150,12 @@ def buffered_handoff_reserve_bytes(
     model_dtype: torch.dtype,
     server_args: Any,
     spec_aux_config: Any,
+    pp_rank: int,
 ) -> int:
-    """The buffered hand-off's worst-case device memory (hbm_reserve_bytes),
-    from what the KV budget knows before the compile policy and the hand-off
-    exist; the hand-off checks the same bound at start-up (check_hbm)."""
+    """The buffered hand-off's worst-case device memory (hbm_reserve_bytes) on
+    stage ``pp_rank``, from what the KV budget knows before the compile policy
+    and the hand-off exist; the hand-off checks the same bound at start-up
+    (check_hbm)."""
     from sglang_tpu.compilation.decoder_compile_policy import forward_bucketers
 
     t_bucketer, b_bucketer = forward_bucketers(
@@ -167,6 +169,7 @@ def buffered_handoff_reserve_bytes(
         aux_dtype=model_dtype,
         depth=tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.get(),
         zero_residual_rows=_zero_residual_rows(t_bucketer, b_bucketer),
+        receives=pp_rank > 0,
     )
 
 

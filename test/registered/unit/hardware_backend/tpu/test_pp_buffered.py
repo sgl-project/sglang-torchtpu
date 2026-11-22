@@ -2,9 +2,11 @@
 in-process transport."""
 
 import contextlib
+import gc
 import threading
 import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,7 +36,9 @@ from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
 )
 from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
 from sglang_tpu.hooks.pp_buffered_kv_budget import (  # noqa: E402
+    pp_stage_kv_budget,
     reserve_pp_buffered_handoff,
+    size_pp_stage_on_its_own_memory,
 )
 from sglang_tpu.pp_buffered import (  # noqa: E402
     _MAX_RECEIVES,
@@ -339,6 +343,33 @@ class TestPPBufferedHandoffBounds(unittest.TestCase):
         handoff.close()
         self.assertEqual(handoff.sent, 3)
 
+    def test_sent_transfer_is_freed_while_the_send_thread_waits(self):
+        # The outgoing bound counts the queued transfers and the one being built;
+        # a sent one the send thread still holds would be one more.
+        net = FakeNet()
+        handoff = make_handoff(0, 2, net, depth=2)
+        FakeTransport(net, 11).recv_list([torch.empty((8, HIDDEN))], src=10, tag=1)
+        sent_refs = []
+        send_list = handoff._transport.send_list
+
+        def recording_send_list(tensors, dst, tag):
+            sent_refs.extend(weakref.ref(t) for t in tensors)
+            return send_list(tensors, dst, tag)
+
+        handoff._transport.send_list = recording_send_list
+        handoff.begin_iteration(True)
+        handoff.receive(8)
+        handoff.end_iteration(outgoing(0, 0, 8, 0))
+        deadline = time.monotonic() + 10
+        while handoff.sent < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.1)  # the send thread is back waiting for the next send
+        gc.collect()
+        self.assertEqual(handoff.sent, 1)
+        self.assertTrue(sent_refs)
+        self.assertEqual([r() for r in sent_refs], [None] * len(sent_refs))
+        handoff.close()
+
     def test_aux_of_another_dtype_is_refused(self):
         handoff = make_handoff(0, 2, FakeNet(), num_aux=1, aux_dtype=torch.bfloat16)
         with self.assertRaises(ValueError):
@@ -466,7 +497,7 @@ class TestWarmup(unittest.TestCase):
 
 class TestHbmReserve(unittest.TestCase):
     def test_worst_case_counts_receives_sends_and_zero_residuals(self):
-        # GPT-OSS-120B PP8 at 16384 rows: 7 receives + 3 sends of 94 MiB, plus
+        # GPT-OSS-120B PP8 at 16384 rows: 7 receives + 4 sends of 94 MiB, plus
         # one zero residual per bucket (512..16384 tokens, 8..64 requests).
         transfer = 16384 * 2880 * 2
         zero_rows = 512 + 1024 + 2048 + 4096 + 8192 + 16384 + 8 + 16 + 32 + 64
@@ -479,11 +510,11 @@ class TestHbmReserve(unittest.TestCase):
             zero_residual_rows=zero_rows,
         )
         plain = hbm_reserve_bytes(num_aux=0, **args)
-        self.assertEqual(plain, 10 * transfer + zero_rows * 2880 * 2)
-        self.assertAlmostEqual(plain / (1 << 30), 1.05, places=2)
+        self.assertEqual(plain, 11 * transfer + zero_rows * 2880 * 2)
+        self.assertAlmostEqual(plain / (1 << 30), 1.14, places=2)
         # Three Eagle3 aux slots travel in the same transfers.
         self.assertEqual(
-            hbm_reserve_bytes(num_aux=3, **args), 40 * transfer + zero_rows * 2880 * 2
+            hbm_reserve_bytes(num_aux=3, **args), 44 * transfer + zero_rows * 2880 * 2
         )
 
     def test_start_up_check_allocates_the_worst_case(self):
@@ -492,6 +523,22 @@ class TestHbmReserve(unittest.TestCase):
         self.assertEqual(checked, handoff.reserve_bytes(96))
         self.assertEqual(handoff._transport.checked, [checked])
 
+    def test_first_stage_reserves_only_its_sends(self):
+        transfer, zero_rows = 64 * HIDDEN * 4, 96
+        zero = zero_rows * HIDDEN * 4
+        want = {
+            0: 4 * transfer,
+            1: 11 * transfer + zero,
+            2: 11 * transfer + zero,
+        }
+        for rank, nbytes in want.items():
+            handoff = make_handoff(rank, 3, FakeNet(), max_rows=64, depth=2)
+            with self.subTest(rank=rank):
+                self.assertEqual(handoff.reserve_bytes(zero_rows), nbytes)
+                self.assertEqual(
+                    handoff.check_hbm(zero_residual_rows=zero_rows), nbytes
+                )
+
     def test_start_up_check_fails_with_the_size_it_needs(self):
         handoff = make_handoff(1, 2, FakeNet(), max_rows=64)
         handoff._transport.fail_check = True
@@ -499,22 +546,33 @@ class TestHbmReserve(unittest.TestCase):
             handoff.check_hbm(zero_residual_rows=96)
 
 
+def kv_configurator(*, pp_size=8, is_draft_worker=False, mambaish_config=None):
+    return SimpleNamespace(
+        pp_size=pp_size,
+        is_draft_worker=is_draft_worker,
+        mambaish_config=mambaish_config,
+        model=SimpleNamespace(),
+        model_config=SimpleNamespace(context_len=4096, hidden_size=16),
+        model_dtype=torch.bfloat16,
+        server_args=SimpleNamespace(),
+        spec_aux_config=SpecAuxHiddenStateConfig(),
+        device="tpu",
+        gpu_id=0,
+    )
+
+
 class TestKvBudgetReserve(unittest.TestCase):
-    def _kvc(self, *, pp_size=8, is_draft_worker=False):
-        return SimpleNamespace(
-            pp_size=pp_size,
-            is_draft_worker=is_draft_worker,
-            model=SimpleNamespace(),
-            model_config=SimpleNamespace(context_len=4096, hidden_size=16),
-            model_dtype=torch.bfloat16,
-            server_args=SimpleNamespace(),
-            spec_aux_config=SpecAuxHiddenStateConfig(),
-        )
+    def _kvc(self, **kw):
+        return kv_configurator(**kw)
 
     def test_buffered_handoff_takes_its_worst_case_off_the_kv_budget(self):
         original = Mock(return_value=10 << 30)
         with (
             tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(pp_rank=0),
+            ),
             patch.object(
                 pp_scheduler, "buffered_handoff_reserve_bytes", return_value=1 << 30
             ) as reserve,
@@ -522,7 +580,7 @@ class TestKvBudgetReserve(unittest.TestCase):
             self.assertEqual(
                 reserve_pp_buffered_handoff(original, self._kvc()), 9 << 30
             )
-        reserve.assert_called_once()
+        self.assertEqual(reserve.call_args.kwargs["pp_rank"], 0)
 
     def test_budget_is_unchanged_without_the_switch_one_stage_or_for_a_draft(self):
         cases = [
@@ -551,15 +609,91 @@ class TestKvBudgetReserve(unittest.TestCase):
             "sglang_tpu.compilation.decoder_compile_policy.forward_bucketers",
             return_value=buckets,
         ):
-            got = pp_scheduler.buffered_handoff_reserve_bytes(
-                model=kvc.model,
-                model_config=kvc.model_config,
-                model_dtype=kvc.model_dtype,
-                server_args=kvc.server_args,
-                spec_aux_config=kvc.spec_aux_config,
-            )
-        # 256 rows of 16 fp32 columns, 7 receives + 3 sends; zeros for 64+256+1+32 rows.
-        self.assertEqual(got, 10 * 256 * 16 * 4 + (64 + 256 + 1 + 32) * 16 * 4)
+            got = {
+                rank: pp_scheduler.buffered_handoff_reserve_bytes(
+                    model=kvc.model,
+                    model_config=kvc.model_config,
+                    model_dtype=kvc.model_dtype,
+                    server_args=kvc.server_args,
+                    spec_aux_config=kvc.spec_aux_config,
+                    pp_rank=rank,
+                )
+                for rank in (0, 3, 7)
+            }
+        # 256 rows of 16 fp32 columns; zeros for 64+256+1+32 rows. The first
+        # stage receives nothing (4 sends); the last keeps the full bound.
+        transfer, zero = 256 * 16 * 4, (64 + 256 + 1 + 32) * 16 * 4
+        self.assertEqual(
+            got, {0: 4 * transfer, 3: 11 * transfer + zero, 7: 11 * transfer + zero}
+        )
+
+
+class TestStageKvBudget(unittest.TestCase):
+    GIB = 1 << 30
+
+    def _parallel(self):
+        return SimpleNamespace(
+            tp_group=SimpleNamespace(cpu_group="stage"),
+            world_group=SimpleNamespace(cpu_group="world"),
+            pp_rank=5,
+        )
+
+    def _free(self, by_group):
+        return Mock(side_effect=lambda *a, cpu_group, **k: by_group[cpu_group])
+
+    @contextlib.contextmanager
+    def _env(self, free, *, buffered=True):
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(buffered),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=self._parallel(),
+            ),
+            patch("sglang.srt.utils.device.get_available_gpu_memory", free),
+        ):
+            yield
+
+    def test_stage_sizes_on_its_own_free_memory(self):
+        # A middle stage with 67.70 GiB free on a server whose minimum is the
+        # first stage's 49.51 GiB gains the 18.19 GiB difference.
+        free = self._free({"stage": 67.70, "world": 49.51})
+        original = Mock(return_value=24 * self.GIB)
+        with self._env(free):
+            got = size_pp_stage_on_its_own_memory(original, kv_configurator(pp_size=16))
+        self.assertEqual(got, 24 * self.GIB + int((67.70 - 49.51) * self.GIB))
+        # Every rank reduces over its stage, then over the world, in that order.
+        self.assertEqual(
+            [c.kwargs["cpu_group"] for c in free.call_args_list], ["stage", "world"]
+        )
+
+    def test_budget_keeps_the_world_minimum_where_nothing_reserves_for_it(self):
+        cases = [
+            ("lockstep wave", kv_configurator(pp_size=16), False),
+            ("one stage", kv_configurator(pp_size=1), True),
+            ("draft", kv_configurator(pp_size=16, is_draft_worker=True), True),
+            ("mamba", kv_configurator(pp_size=16, mambaish_config=object()), True),
+        ]
+        for name, kvc, buffered in cases:
+            free = Mock()
+            original = Mock(return_value=24 * self.GIB)
+            with self.subTest(name), self._env(free, buffered=buffered):
+                self.assertEqual(
+                    size_pp_stage_on_its_own_memory(original, kvc), 24 * self.GIB
+                )
+                free.assert_not_called()
+
+    def test_registered_hook_adds_the_stage_headroom_and_takes_the_reserve(self):
+        free = self._free({"stage": 53.0, "world": 50.0})
+        original = Mock(return_value=10 * self.GIB)
+        with (
+            self._env(free),
+            patch.object(
+                pp_scheduler, "buffered_handoff_reserve_bytes", return_value=self.GIB
+            ),
+        ):
+            got = pp_stage_kv_budget(original, kv_configurator(pp_size=16))
+        # +3 GiB of stage headroom, -1 GiB of hand-off reserve.
+        self.assertEqual(got, 12 * self.GIB)
 
 
 class TestPPBufferedHandoffProbe(unittest.TestCase):

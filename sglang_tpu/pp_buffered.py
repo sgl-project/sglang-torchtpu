@@ -188,19 +188,23 @@ def hbm_reserve_bytes(
     aux_dtype: torch.dtype,
     depth: int,
     zero_residual_rows: int,
+    receives: bool = True,
 ) -> int:
     """An upper bound on the device memory a stage's buffered hand-off holds
     beyond the model and the KV cache. Landing: up to _MAX_RECEIVES posted
     receives. Outgoing: up to ``depth`` transfers queued for sending plus the
-    one end_iteration builds while it waits for room. Each is one transfer
+    one end_iteration builds while it waits for room, which it holds both as
+    the merged sum and as its wire copy (_to_wire). Each is one transfer
     of every carried tensor at ``max_rows`` rows. Zero residuals: one per
     padded row count, ``zero_residual_rows`` rows in all. The first stage
-    posts no receives and the last sends nothing, so they hold less; the KV
-    capacity is the minimum over stages, so the bound is the same for all."""
+    receives nothing, so it holds neither landing buffers nor zero residuals.
+    The last stage keeps the send allowance although it sends nothing,
+    because no receiving stage's bound counts the layout copies _from_wire
+    makes when the wire shape differs."""
     transfer = max_rows * hidden * (dtype.itemsize + num_aux * aux_dtype.itemsize)
-    landing = _MAX_RECEIVES * transfer
-    outgoing = (depth + 1) * transfer
-    zero = zero_residual_rows * hidden * dtype.itemsize
+    landing = _MAX_RECEIVES * transfer if receives else 0
+    outgoing = (depth + 2) * transfer
+    zero = zero_residual_rows * hidden * dtype.itemsize if receives else 0
     return landing + outgoing + zero
 
 
@@ -718,8 +722,10 @@ class PPBufferedHandoff:
                     self._sends.clear()
                     self._cv.notify_all()
                     return
-                # Releases the tensors: the copies are done.
+                # Releases the tensors: the copies are done. Drop this thread's
+                # reference too, or the buffer outlives the slot it frees.
                 self._sends.popleft()
+                del outgoing
                 self.sent += 1
                 self._cv.notify_all()
 
@@ -752,6 +758,7 @@ class PPBufferedHandoff:
             aux_dtype=self.aux_dtype,
             depth=self.depth,
             zero_residual_rows=zero_residual_rows,
+            receives=self.rank > 0,
         )
 
     def check_hbm(self, zero_residual_rows: int) -> int:
@@ -766,7 +773,8 @@ class PPBufferedHandoff:
             raise RuntimeError(
                 f"buffered hand-off stage {self.rank}: the device cannot hold the "
                 f"hand-off's worst case of {nbytes / (1 << 30):.2f} GiB "
-                f"({_MAX_RECEIVES} receives and {self.depth + 1} sends of "
+                f"({_MAX_RECEIVES if self.rank > 0 else 0} receives and "
+                f"{self.depth + 2} sends of "
                 f"{self.max_rows} rows) next to the KV cache. Lower "
                 "--mem-fraction-static or --max-total-tokens, or "
                 "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH."
