@@ -359,10 +359,49 @@ def test_w8_collective_bridges_8rank() -> None:
         functools.partial(moe_post_tok_sharded_final_norm_jax, world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True, final_eps=1e-5, return_stream_too=False, interpret=True),
         mesh=mesh, in_specs=(P("model", None), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P()), out_specs=P(), check_vma=False,
     )(st1_ref, moe_out_full, wpost_pair_g, spost_pair_g, pff_post_g, pf_a, pf_b, nxt_g)
+    st2_fn_st, hid_w8_st = jax.shard_map(
+        functools.partial(
+            moe_post_tok_sharded_final_norm_jax,
+            world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True, final_eps=1e-5,
+            return_stream_too=True, interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=(P("model", None), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P()),
+        out_specs=(P("model", None), P()),
+        check_vma=False,
+    )(st1_ref, moe_out_full, wpost_full, spost_full, pff_post_g.reshape(-1), pf_a.reshape(-1), pf_b.reshape(-1), nxt_g.reshape(-1))
+    hid_ref_exact_st = ((st2_ref * jax.lax.rsqrt(jnp.mean(st2_ref ** 2, axis=-1, keepdims=True) + 1e-5)) * nxt_g).astype(jnp.bfloat16)
+    assert jnp.allclose(st2_fn_st, st2_ref, rtol=2e-3, atol=2e-3)
+    assert jnp.allclose(hid_w8_st.astype(jnp.float32), hid_ref_exact_st.astype(jnp.float32), rtol=1e-2, atol=2e-2)
     assert jnp.allclose(hid_w7.astype(jnp.float32), hid_ref.astype(jnp.float32), rtol=1e-2, atol=2e-2)
     assert jnp.allclose(hid_w8.astype(jnp.float32), hid_ref.astype(jnp.float32), rtol=1e-2, atol=2e-2)
     assert jnp.allclose(hid_w8_pair.astype(jnp.float32), hid_ref.astype(jnp.float32), rtol=1e-2, atol=2e-2)
-    print("[PASS] 8-rank Token-Sharded Bridge 1b + Bridge 2b + Fused QKV/RoPE Epi + L61 Final Norm + Pallas Embed")
+
+    # 5. Also verify B=128 (r_tok=16, r_pair=32, half=64 multi-strip path) end-to-end across all 8 ranks!
+    st1_128 = jnp.concatenate([st1_ref, st1_ref * 0.85], axis=0)
+    moe_128 = jnp.concatenate([moe_out_full, moe_out_full * -0.7], axis=0)
+    post_128 = (jnp.dot(moe_128, wpost_full, preferred_element_type=jnp.float32) * spost_full).astype(jnp.bfloat16)
+    ps_128 = post_128.astype(jnp.float32) * pff_post_g
+    st2_128_ref = pf_a * st1_128 + pf_b * (ps_128 * jax.lax.rsqrt(jnp.mean(ps_128 ** 2, axis=-1, keepdims=True) + 1e-8))
+    nxt_128_ref = ((st2_128_ref * jax.lax.rsqrt(jnp.mean(st2_128_ref ** 2, axis=-1, keepdims=True) + 1e-5)) * nxt_g).astype(jnp.bfloat16)
+    qkv_128_r0 = (jnp.dot(nxt_128_ref, wq_all[:, :1280], preferred_element_type=jnp.float32) * sq_all[:, :1280]).astype(jnp.bfloat16)
+    q_128_ref, _ = run_decode_qkv_epilogue(
+        qkv_128_r0, None, norm_eps=1e-5, query_scale=5.47, k_scale=1.0, v_scale=1.0, interpret=True
+    )
+    st2_128_out, q5_128_out, _, _ = jax.shard_map(
+        functools.partial(
+            moe_to_attn_tok_sharded_bridge_jax,
+            world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True, next_in_eps=1e-5,
+            fuse_qkv_epi=True, qkv_norm_eps=1e-5, query_scale=5.47, k_scale=1.0, v_scale=1.0, interpret=True,
+        ),
+        mesh=mesh,
+        in_specs=(P("model", None), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model")),
+        out_specs=(P("model", None), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+        check_vma=False,
+    )(st1_128, moe_128, wpost_full, spost_full, pff_post_g.reshape(-1), pf_a.reshape(-1), pf_b.reshape(-1), nxt_g.reshape(-1), wq_all, sq_all, wg_all, sg_all)
+    assert jnp.allclose(st2_128_out, st2_128_ref, rtol=2e-3, atol=2e-3)
+    assert jnp.allclose(q5_128_out[:, :, :8, :, :].astype(jnp.float32), q_128_ref.reshape(1, 128, 8, 2, 128).astype(jnp.float32), rtol=2e-2, atol=8e-2)
+    print("[PASS] 8-rank Token-Sharded Bridge 1b + Zero-Post-Norm-ICI Bridge 2b (B=64/128, RoPE/NoPE) + L61 Final Norm + Pallas Embed")
 
 
 def test_tpu7x_spmd_mlir_export_clean() -> None:
@@ -451,6 +490,14 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
         assert "stablehlo.partition_id" not in mlir, (
             f"{name} leaked stablehlo.partition_id into SPMD MLIR!"
         )
+        if mosaic_asms:
+            import re
+
+            for line in mosaic_asms[0].splitlines():
+                if "vector.store" in line and "xbf16>" in line:
+                    assert re.search(r"vector<(?:\d+x)*(?:1|2|4|8)x\d+xbf16>", line) is None, (
+                        f"{name} emitted sublane RMW bf16 vector.store: {line}"
+                    )
         if check_t16_bf16:
             import re
 
@@ -459,7 +506,7 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
             for line in m_txt.splitlines():
                 if "tpu.concatenate" in line:
                     assert "vector<1x" not in line, f"{name} emitted 1-row tpu.concatenate: {line}"
-                if ("vector.load" in line or "vector_store" in line) and "xbf16>" in line:
+                if ("vector.load" in line or "vector.store" in line) and "xbf16>" in line:
                     assert re.search(r"vector<(?:\d+x)*(?:1|8)x\d+xbf16>", line) is None, (
                         f"{name} emitted non-T(16,128) bf16 vector op (#1531 e2003): {line}"
                     )
