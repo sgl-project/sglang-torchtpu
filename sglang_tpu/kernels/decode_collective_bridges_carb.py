@@ -1695,7 +1695,7 @@ def get_attn_to_moe_bridge_router_topk_op(
                 P(),
                 P(),
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),
@@ -1782,15 +1782,15 @@ def get_moe_to_attn_overlap_bridge_op(
                 P(),
                 moe_sp,
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),
                 P(),
                 P(None, "model"),
+                P("model"),
                 P(None, "model"),
-                P(None, "model"),
-                P(None, "model"),
+                P("model"),
             )
             in_specs = (*t_specs, None, None, None, None)
             out_specs = (P(), P(None, "model"), P(None, "model"))
@@ -1874,15 +1874,15 @@ def get_moe_to_attn_direct_qkv_epi_bridge_op(
                 P(),
                 moe_sp,
                 P(None, "model"),
-                P(None, "model"),
+                P("model"),
                 P(),
                 P(),
                 P(),
                 P(),
                 P(None, "model"),
+                P("model"),
                 P(None, "model"),
-                P(None, "model"),
-                P(None, "model"),
+                P("model"),
             )
             sfx = f"{'_rope' if has_rope else '_nope'}{'_sh' if sharded_moe_in else ''}{'_ovl' if overlap_mate_epi else ''}"
             if has_rope:

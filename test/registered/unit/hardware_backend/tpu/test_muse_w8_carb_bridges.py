@@ -1292,3 +1292,152 @@ def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
         assert float(np.dot(np.asarray(st2_out).ravel(), st2_ref.ravel()) / (np.linalg.norm(st2_out) * np.linalg.norm(st2_ref))) > 0.9999
         assert float(np.dot(np.asarray(qkv_out, dtype=np.float32).ravel(), qkv_ref.ravel()) / (np.linalg.norm(qkv_out) * np.linalg.norm(qkv_ref))) > 0.9995
         assert float(np.dot(np.asarray(gate_out, dtype=np.float32).ravel(), gate_ref.ravel()) / (np.linalg.norm(gate_out) * np.linalg.norm(gate_ref))) > 0.9995
+
+
+
+
+def test_tp16_bridge2b_norm_before_s3_parity_and_export() -> None:
+    """Verify Bridge 2b Normalize-Before-s3, qkv=640 128-tail, & 1D P('model') scales across TP=8/16."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax import export as jexp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from sglang_tpu.kernels.decode_collective_bridges import (
+        fp8_dual_qkv_gate_jax,
+        moe_to_attn_bridge_jax,
+        quantize_weight_fp8_k_major,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    devs = jax.devices()
+    if len(devs) < 16:
+        pytest.skip(f"Need >= 16 CPU devices, got {len(devs)}")
+
+    def _rms(x, w, eps, scale_in):
+        xf = x.astype(np.float32)
+        if w is not None and scale_in:
+            xf = xf * w[None, :]
+        inv = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + eps)
+        y = xf * inv
+        if w is not None and not scale_in:
+            y = y * w[None, :]
+        return y
+
+    # 1. Verify allow_128_tail=True + fp8_dual_qkv_gate_jax at qkv=640 (TP=16 SWA/Full col shape)
+    w_qkv_t = torch.randn(640, 512, dtype=torch.bfloat16)
+    wq_k, sq_k = quantize_weight_fp8_k_major(w_qkv_t, allow_128_tail=True)
+    assert tuple(wq_k.shape) == (512, 640) and tuple(sq_k.shape) == (1, 640)
+
+    rng = np.random.default_rng(119)
+    H_T = 4096  # post_cols=256 per TP16 rank, K_moe=512
+    mesh16 = Mesh(np.array(devs[:16]), ("model",))
+    for b_t, sh, qkv_c in ((32, False, 640), (64, False, 640), (128, True, 640)):
+        st = rng.standard_normal((b_t, H_T)).astype(np.float32)
+        moe_full = jnp.asarray(rng.standard_normal((b_t, 512)) * 0.2, dtype=jnp.bfloat16)
+        moe_in = jax.device_put(moe_full, NamedSharding(mesh16, P("model", None))) if sh else moe_full
+        wp = jnp.asarray(rng.standard_normal((512, H_T)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sp = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pfg = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pf_a = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pf_b = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        nig = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        wq = jnp.asarray(rng.standard_normal((H_T, qkv_c)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sq = rng.uniform(0.5, 1.5, (qkv_c,)).astype(np.float32)
+        wg = jnp.asarray(rng.standard_normal((H_T, 512)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sg = rng.uniform(0.5, 1.5, (512,)).astype(np.float32)
+        in_sp = (
+            (P(), P("model", None) if sh else P(), P(None, "model"), P("model"))
+            + (P(),) * 8
+        )
+
+        outs = []
+        for nbs3 in (True, False):
+            fn = jax.jit(
+                jax.shard_map(
+                    lambda *x, _sh=sh, _nbs3=nbs3: moe_to_attn_bridge_jax(
+                        *x, world_size=16, post_ff_eps=1e-5, post_ff_scale_input=True,
+                        next_in_eps=1e-5, next_in_scale_input=False, sharded_moe_in=_sh,
+                        norm_before_s3=_nbs3, interpret=True,
+                    ),
+                    mesh=mesh16, in_specs=in_sp, out_specs=(P(), P(), P()), check_vma=False,
+                )
+            )
+            outs.append(
+                fn(
+                    jnp.asarray(st), moe_in, jax.device_put(wp, NamedSharding(mesh16, P(None, "model"))),
+                    jax.device_put(jnp.asarray(sp), NamedSharding(mesh16, P("model"))),
+                    jnp.asarray(pfg), jnp.asarray(pf_a), jnp.asarray(pf_b), jnp.asarray(nig),
+                    wq, jnp.asarray(sq), wg, jnp.asarray(sg),
+                )
+            )
+
+        (st_n, qkv_n, g_n), (st_l, qkv_l, g_l) = outs
+        np.testing.assert_allclose(np.asarray(st_n), np.asarray(st_l), rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.asarray(qkv_n, dtype=np.float32), np.asarray(qkv_l, dtype=np.float32), rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(np.asarray(g_n, dtype=np.float32), np.asarray(g_l, dtype=np.float32), rtol=1e-3, atol=1e-3)
+
+        post_np = np.asarray(jnp.asarray((np.asarray(moe_full, dtype=np.float32) @ np.asarray(wp, dtype=np.float32)) * sp[None, :], dtype=jnp.bfloat16), dtype=np.float32)
+        st_ref = pf_a[None, :] * st + pf_b[None, :] * _rms(post_np, pfg, 1e-5, True)
+        nin_ref = np.asarray(jnp.asarray(_rms(st_ref, nig, 1e-5, False), dtype=jnp.bfloat16), dtype=np.float32)
+        qkv_ref = (nin_ref @ np.asarray(wq, dtype=np.float32)) * sq[None, :]
+        gate_ref = (nin_ref @ np.asarray(wg, dtype=np.float32)) * sg[None, :]
+        assert float(np.dot(np.asarray(st_n).ravel(), st_ref.ravel()) / (np.linalg.norm(st_n) * np.linalg.norm(st_ref))) > 0.9999
+        assert float(np.dot(np.asarray(qkv_n, dtype=np.float32).ravel(), qkv_ref.ravel()) / (np.linalg.norm(qkv_n) * np.linalg.norm(qkv_ref))) > 0.9995
+        assert float(np.dot(np.asarray(g_n, dtype=np.float32).ravel(), gate_ref.ravel()) / (np.linalg.norm(g_n) * np.linalg.norm(gate_ref))) > 0.9995
+
+    sd = jax.ShapeDtypeStruct
+    H_FULL = 8192
+    with tpu_info_for_cpu_export():
+        # L0 dual_qkvg at TP=16 (640 cols)
+        for B in (16, 32, 64):
+            jexp.export(
+                jax.jit(lambda ai, wq, sq, wg, sg: fp8_dual_qkv_gate_jax(ai, wq, sq, wg, sg)),
+                platforms=("tpu",),
+            )(
+                sd((B, H_FULL), jnp.bfloat16),
+                sd((H_FULL, 640), jnp.float8_e4m3fn),
+                sd((640,), jnp.float32),
+                sd((H_FULL, 512), jnp.float8_e4m3fn),
+                sd((512,), jnp.float32),
+            )
+        # Bridge 2b at TP=16 with both 1D (N_local,) and 2D (1, N_local) P("model") scales + qkv=640
+        for B in (32, 64, 128):
+            sh_ok = B >= 128
+            for sc_1d in (True, False):
+                s_h = (H_FULL,) if sc_1d else (16, H_FULL // 16)
+                s_q = (640 * 16,) if sc_1d else (16, 640)
+                s_g = (512 * 16,) if sc_1d else (16, 512)
+                jexp.export(
+                    jax.jit(
+                        jax.shard_map(
+                            lambda st, mo, wp, sp, bg, a, b, ng, wq, sq, wg, sg, _sh=sh_ok: moe_to_attn_bridge_jax(
+                                st, mo, wp, sp, bg, a, b, ng, wq, sq, wg, sg,
+                                world_size=16, sharded_moe_in=_sh, norm_before_s3=True,
+                            ),
+                            mesh=mesh16,
+                            in_specs=(
+                                P(), P("model", None) if sh_ok else P(),
+                                P(None, "model"), P("model"),
+                                P(), P(), P(), P(),
+                                P(None, "model"), P("model"),
+                                P(None, "model"), P("model"),
+                            ),
+                            out_specs=(P(), P(None, "model"), P(None, "model")),
+                            check_vma=False,
+                        )
+                    ),
+                    platforms=("tpu",),
+                )(
+                    sd((B, H_FULL), jnp.float32),
+                    sd((B, 4096), jnp.bfloat16),
+                    sd((4096, H_FULL), jnp.float8_e4m3fn),
+                    sd(s_h, jnp.float32),
+                    sd((H_FULL,), jnp.float32),
+                    sd((H_FULL,), jnp.float32),
+                    sd((H_FULL,), jnp.float32),
+                    sd((H_FULL,), jnp.float32),
+                    sd((H_FULL, 640 * 16), jnp.float8_e4m3fn),
+                    sd(s_q, jnp.float32),
+                    sd((H_FULL, 512 * 16), jnp.float8_e4m3fn),
+                    sd(s_g, jnp.float32),
+                )
