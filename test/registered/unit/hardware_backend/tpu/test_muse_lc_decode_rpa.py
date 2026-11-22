@@ -390,6 +390,8 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             ("sh16_shfp8pv", 16, 15, 256, "w8,c1024,shared16,shsplit,shfp8pv", 16, 0.9985),
             ("sh32_c8_tile_skip", 32, 8, 256, "w8,c1024,shared32,shsplit,shfp8", 32, 0.998),
             ("sh8_c8_shfp8", 8, 8, 256, "w8,c1024,shared8,shsplit,shfp8", 8, 0.998),
+            ("sh16_q128_c8_tile_skip", 16, 8, 256, "w8,c1024,shared16,q128,shsplit,pbf16", 16, 0.999),
+            ("sh16_q128_c16", 16, 16, 256, "w8,c1024,shared16,q128,shsplit,pbf16", 16, 0.999),
         ):
             with self.subTest(case=tag):
                 shared_pgs = 2048 // page_size  # 8 full shared pages -> full block
@@ -642,6 +644,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 ("shared64_272k_ps256_shsplit_d2", 1089, 256, True, "w8,c4096,shared64,q512,shsplit,pbf16", 1, "shsplit"),
                 ("shared64_272k_ps256_shsplit_shfp8_d2", 1089, 256, True, "w8,c4096,shared64,q512,shsplit,shfp8", 1, "shfp8"),
                 ("shared64_272k_ps256_c2048_shfp8_d2", 1089, 256, True, "w8,c2048,shared64,q256,shsplit,shfp8", 1, "shfp8"),
+                ("shared64_272k_ps256_q128_shsplit_d2", 1089, 256, True, "w8,c4096,shared64,q128,shsplit,pbf16", 1, "q128"),
             ):
                 with self.subTest(export=tag):
                     bs = 64
@@ -695,6 +698,8 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 ("nod2_11k_swa_w8", 8, 2048, False, "w8,c1024", "swabatch"),
                 ("nod2_11k_full_batchfull", 8, None, False, "w8,c1024,batchfull", "batchfull"),
                 ("nod2_8k1k_swa_w8", 70, 2048, False, "w8,c1024", "swabatch"),
+                ("nod2_8k1k_full_dyn2k", 136, None, False, "w8,c1024,batchfull,dyn2k", "c2048-streamdyn"),
+                ("nod2_8k1k_full_dyn4k", 136, None, False, "w8,c1024,batchfull,dyn4k", "c4096-streamdyn"),
             ):
                 with self.subTest(export=tag):
                     bs = 64
@@ -741,6 +746,119 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     ).mlir_module()
                     self.assertIn("RPAd_fast", hlo)
                     self.assertIn(exp_sub, hlo)
+
+
+    def test_8k1k_dyn2k_dyn4k_full_attn_parity_interpret(self):
+        """Verify 8k/1k Full-Attn dyn2k/dyn4k routing and 0x7F-poisoned parity across boundary lengths."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            parse_decode_fast_config,
+            run_decode_fast_rpa,
+        )
+
+        # Config routing assertions: c1024 must not clobber dyn2k/dyn4k on 8k/1k (pps=70..136).
+        for pps in (70, 136):
+            cfg2k = parse_decode_fast_config(
+                "w8,c1024,batchfull,dyn2k",
+                sliding_window=None,
+                pages_per_seq=pps,
+                page_size=128,
+            )
+            self.assertEqual(cfg2k.loop_kind, "streamdyn")
+            self.assertEqual(cfg2k.chunk_sz, 2048)
+            cfg4k = parse_decode_fast_config(
+                "w8,c1024,batchfull,dyn4k",
+                sliding_window=None,
+                pages_per_seq=pps,
+                page_size=128,
+            )
+            self.assertEqual(cfg4k.loop_kind, "streamdyn")
+            self.assertEqual(cfg4k.chunk_sz, 4096)
+            # SWA remains swabatch/c1024 even when dyn2k is in the mode string.
+            cfg_swa = parse_decode_fast_config(
+                "w8,c1024,batchfull,dyn2k",
+                sliding_window=2048,
+                pages_per_seq=pps,
+                page_size=128,
+            )
+            self.assertEqual(cfg_swa.loop_kind, "swabatch")
+            self.assertEqual(cfg_swa.chunk_sz, 1024)
+        # 1/1k (pps <= 32) Full-Attn remains swabatch/c1024 when batchfull is set.
+        cfg_11k = parse_decode_fast_config(
+            "w8,c1024,batchfull,dyn2k",
+            sliding_window=None,
+            pages_per_seq=8,
+            page_size=128,
+        )
+        self.assertEqual(cfg_11k.loop_kind, "swabatch")
+        self.assertEqual(cfg_11k.chunk_sz, 1024)
+
+        rng = np.random.default_rng(1947)
+        sm_scale = 0.125
+        bs, n_act, page_size, pps = 16, 14, 128, 70
+        n_phys_pages = bs * pps + 4
+        stock_cache_u8 = np.full(
+            (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+        )
+        stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(
+            rng, (n_phys_pages, page_size, 2, 128)
+        )
+        page_indices = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
+        kv_lens = np.array(
+            [1, 97, 128, 129, 513, 2047, 2048, 2049, 4096, 8191, 8192, 8193, 8450, 8831, 0, 0],
+            dtype=np.int32,
+        )
+        q_bf16 = jnp.asarray(
+            rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16
+        )
+        k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+        v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+        ref = _exact_decode_ref(
+            np.asarray(q_bf16),
+            k_new_u8,
+            v_new_u8,
+            stock_cache_u8,
+            kv_lens,
+            page_indices.ravel(),
+            n_act,
+            page_size,
+            sm_scale,
+            pps,
+        )
+
+        with jax.default_device(jax.devices("cpu")[0]):
+            for tag, use_d2, mode in (
+                ("nod2_dyn2k", False, "w8,c1024,batchfull,dyn2k"),
+                ("d2_dyn4k", True, "w8,c1024,batchfull,dyn4k"),
+            ):
+                with self.subTest(case=tag):
+                    cache_u8 = (
+                        _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+                        if use_d2
+                        else stock_cache_u8
+                    )
+                    out_j, _ = run_decode_fast_rpa(
+                        q_bf16,
+                        _u8_to_fp8(k_new_u8)[:, None, :],
+                        _u8_to_fp8(v_new_u8)[:, None, :],
+                        _u8_to_fp8(cache_u8),
+                        jnp.asarray(kv_lens, dtype=jnp.int32),
+                        jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                        jnp.arange(bs + 1, dtype=jnp.int32),
+                        jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size),
+                        jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32),
+                        sm_scale=sm_scale,
+                        sliding_window=None,
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        mode_str=mode,
+                        decode_query_size=1,
+                        fused_out_pack=1,
+                        kv_pack_dense2=use_d2,
+                        interpret=True,
+                    )
+                    out_np = np.asarray(out_j, dtype=np.float32)
+                    self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+                    self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
 
 
 if __name__ == "__main__":

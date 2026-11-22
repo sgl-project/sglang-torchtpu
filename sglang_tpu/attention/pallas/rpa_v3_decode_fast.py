@@ -263,10 +263,11 @@ def parse_decode_fast_config(
     explicit_ring8k = "ring8k" in toks_cfg
     explicit_ring4k = "ring4k" in toks_cfg or explicit_ring8k
     explicit_multiq = "multiq" in toks_cfg
+    explicit_dyn_chunk = 2048 if "dyn2k" in toks_cfg else (4096 if "dyn4k" in toks_cfg else 0)
     max_full_pps = (
         4096
         if (explicit_ring4k or use_w7 or shared_group > 0)
-        else (144 if explicit_streamdyn else 128)
+        else (160 if explicit_dyn_chunk else (144 if explicit_streamdyn else 128))
     )
     coalesce_dma = False
     in_vmem_pack2 = use_v2
@@ -275,7 +276,11 @@ def parse_decode_fast_config(
     page_reduce = "pgred" in toks_cfg
     fp8_dots = "fp8dp" in toks_cfg
     hoist_new_kv = decode_query_size == 1 and ("hoistkv" in toks_cfg)
-    shared_q_tile = 1024 if "q1024" in toks_cfg else (512 if "q512" in toks_cfg else 256)
+    shared_q_tile = (
+        128
+        if "q128" in toks_cfg
+        else (1024 if "q1024" in toks_cfg else (512 if "q512" in toks_cfg else 256))
+    )
     shared_split_dense2 = "shsplit" in toks_cfg
     shared_fp8_qkpv = "shfp8" in toks_cfg
     shared_fp8_pv_only = "shfp8pv" in toks_cfg
@@ -329,6 +334,9 @@ def parse_decode_fast_config(
             chunk_sz = 8192 if explicit_ring8k else 4096
             if use_w7 or explicit_ring4k or raw == "shared16_host":
                 coalesce_dma = True
+        elif explicit_dyn_chunk and decode_query_size == 1 and 32 < pages_per_seq <= 160:
+            loop_kind = "streamdyn"
+            chunk_sz = explicit_dyn_chunk
         elif use_w7 and decode_query_size == 1 and pages_per_seq <= 160 and not explicit_streamdyn:
             loop_kind = "w7auto"
             chunk_sz = 5120 if pages_per_seq > 64 else 4096
@@ -363,6 +371,9 @@ def parse_decode_fast_config(
                 "shsplit",
                 "shfp8",
                 "shfp8pv",
+                "q128",
+                "dyn2k",
+                "dyn4k",
                 "batchfull",
                 "ring8k",
             ):
@@ -371,9 +382,9 @@ def parse_decode_fast_config(
                 num_slots = int(tok[1:])
             elif tok in ("c128", "c256", "c512", "c1024", "c2048", "c4096", "c5120", "c8192"):
                 parsed_c = int(tok[1:])
-                # Keep ring4k/ring8k/shared* chunk sizes intact when paired with "w8,c1024".
+                # Keep ring4k/ring8k/shared*/dyn* chunk sizes intact when paired with "w8,c1024".
                 if (
-                    loop_kind == "ring4k"
+                    (loop_kind == "ring4k" or (loop_kind == "streamdyn" and explicit_dyn_chunk > 0))
                     and parsed_c == 1024
                     and ("w8" in toks_cfg or "w7" in toks_cfg)
                 ) or (
@@ -560,6 +571,36 @@ def _load_bkv_fp8_split(
         _u8_to_fp8(even_u8, interpret_mode=False),
         _u8_to_fp8(odd_u8, interpret_mode=False),
     )
+
+
+def _load_bkv_fp8_split_half(
+    bkv_vmem_ref,
+    slot,
+    row_start: int,
+    chunk_sz: int,
+    *,
+    kind: str,
+    odd: bool,
+    page_size: int = 128,
+    interpret_mode: bool = False,
+) -> jax.Array:
+    """Return even or odd ``[chunk_sz//2, 128]`` rows from a dense2 buffer."""
+    phys_rows = page_size // 2
+    half_sz = chunk_sz // 2
+    idx = (0 if kind == "k" else 1) + (2 if odd else 0)
+    if interpret_mode:
+        pg_start = row_start // page_size
+        n_pg = chunk_sz // page_size
+        blk = bkv_vmem_ref[slot, pl.ds(pg_start, n_pg)].reshape(half_sz, 4, 128)
+        return blk[:, idx, :]
+    max_phys_rows = bkv_vmem_ref.shape[1] * phys_rows
+    u32_ref = bkv_vmem_ref.bitcast(jnp.uint32).at[slot].reshape(max_phys_rows, 128)
+    pair_u32 = u32_ref[pl.ds(pl.multiple_of(row_start // 2, phys_rows), half_sz)]
+    shift = idx * 8
+    raw_u8 = (
+        pair_u32 if shift == 0 else lax.shift_right_logical(pair_u32, jnp.uint32(shift))
+    ).astype(jnp.uint8)
+    return _u8_to_fp8(raw_u8, interpret_mode=False)
 
 
 def _load_bkv_fp8_chunk(
@@ -1639,8 +1680,11 @@ def _decode_fast_kernel(
 
         @pl.when(target_pages > 0)
         def _clean_bounds():
-            pg0 = _get_page_u32(slot, 0)
-            _set_page_u32(slot, 0, _mask_page_u32(pg0, rel_first, rel_end))
+            # Full-attn always starts at rel_first=0: single-page is covered by
+            # last_p==0 below and >=2-page sequences keep full Page 0.
+            if sliding_window is not None:
+                pg0 = _get_page_u32(slot, 0)
+                _set_page_u32(slot, 0, _mask_page_u32(pg0, rel_first, rel_end))
             last_p = jnp.clip(n_pages - 1, 0, jnp.maximum(target_pages - 1, 0))
             pgl = _get_page_u32(slot, last_p)
             last_lo = jnp.where(last_p == 0, rel_first, 0)
@@ -2099,22 +2143,31 @@ def _decode_fast_kernel(
 
                 if use_split:
                     width_s = max_ring_rows // 2
-                    k_e, k_o = _load_bkv_fp8_split(
+                    k_e = _load_bkv_fp8_split_half(
                         bkv_vmem_ref,
                         slot,
                         0,
                         max_ring_rows,
                         kind="k",
+                        odd=False,
                         page_size=page_size,
                         interpret_mode=interpret_mode,
                     )
-                    s_tup = (
-                        jnp.matmul(q_s, k_e.T, preferred_element_type=jnp.float32),
-                        jnp.matmul(q_s, k_o.T, preferred_element_type=jnp.float32),
+                    s_e = jnp.matmul(q_s, k_e.T, preferred_element_type=jnp.float32)
+                    k_o = _load_bkv_fp8_split_half(
+                        bkv_vmem_ref,
+                        slot,
+                        0,
+                        max_ring_rows,
+                        kind="k",
+                        odd=True,
+                        page_size=page_size,
+                        interpret_mode=interpret_mode,
                     )
+                    s_o = jnp.matmul(q_s, k_o.T, preferred_element_type=jnp.float32)
                     blk_max = jnp.maximum(
-                        jnp.max(s_tup[0], axis=1, keepdims=True),
-                        jnp.max(s_tup[1], axis=1, keepdims=True),
+                        jnp.max(s_e, axis=1, keepdims=True),
+                        jnp.max(s_o, axis=1, keepdims=True),
                     )
                 else:
                     width_s = max_ring_rows
@@ -2125,7 +2178,6 @@ def _decode_fast_kernel(
                     if mask_valid:
                         valid_col = _col_iota(0, max_ring_rows, q_w) < valid
                         scores = jnp.where(valid_col, scores, _MASK_LOGIT)
-                    s_tup = (scores,)
                     blk_max = jnp.max(scores, axis=1, keepdims=True)
 
                 blk_m_128 = _broadcast_minor_128(blk_max)
@@ -2150,46 +2202,57 @@ def _decode_fast_kernel(
                     pv_scale = jnp.float32(v_scale_val)
 
                 ref_m_w = _broadcast_minor_128_any(ref_m_128, width_s)
-                p_tup = tuple(jnp.exp2((s_x - ref_m_w) * eff_sc_w) for s_x in s_tup)
-                p_sum_src = p_tup[0] + p_tup[1] if use_split else p_tup[0]
-                l_add = (
-                    jnp.sum(p_sum_src.reshape(q_w, width_s // 128, 128), axis=1)
-                    * l_scale
-                )
+
+                def _pv_half(s_x: jax.Array, v_x: jax.Array) -> tuple[jax.Array, jax.Array]:
+                    p_x = jnp.exp2((s_x - ref_m_w) * eff_sc_w)
+                    l_x = jnp.sum(p_x.reshape(q_w, width_s // 128, 128), axis=1)
+                    if use_fp8_pv:
+                        p_dot = (p_x * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                    elif cfg.pv_bf16:
+                        p_dot = p_x.astype(jnp.bfloat16)
+                    else:
+                        p_dot = p_x
+                    return l_x, jnp.matmul(
+                        p_dot, v_x, preferred_element_type=jnp.float32
+                    )
 
                 if use_split:
-                    v_tup = _load_bkv_fp8_split(
-                        bkv_vmem_ref,
-                        slot,
-                        0,
-                        max_ring_rows,
-                        kind="v",
-                        page_size=page_size,
-                        interpret_mode=interpret_mode,
-                    )
-                else:
-                    v_tup = (
-                        _bkv_fp8_chunk(
-                            slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
+                    # Evaluate even then odd halves sequentially so only one [q_w, width_s]
+                    # probability tensor and one V half are live at once (-50% VREG/VMEM peak).
+                    l_e, pv_e = _pv_half(
+                        s_e,
+                        _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot,
+                            0,
+                            max_ring_rows,
+                            kind="v",
+                            odd=False,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
                         ),
                     )
-                if use_fp8_pv:
-                    p_dots = tuple(
-                        (p_x * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
-                        for p_x in p_tup
+                    l_o, pv_o = _pv_half(
+                        s_o,
+                        _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot,
+                            0,
+                            max_ring_rows,
+                            kind="v",
+                            odd=True,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                        ),
                     )
-                elif cfg.pv_bf16:
-                    p_dots = tuple(p_x.astype(jnp.bfloat16) for p_x in p_tup)
+                    l_add = (l_e + l_o) * l_scale
+                    pv = pv_e + pv_o
                 else:
-                    p_dots = p_tup
-
-                pv = jnp.matmul(
-                    p_dots[0], v_tup[0], preferred_element_type=jnp.float32
-                )
-                if use_split:
-                    pv = pv + jnp.matmul(
-                        p_dots[1], v_tup[1], preferred_element_type=jnp.float32
+                    v_full = _bkv_fp8_chunk(
+                        slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
                     )
+                    l_sum, pv = _pv_half(scores, v_full)
+                    l_add = l_sum * l_scale
                 state_vmem_ref[0, lanes, :] = m
                 state_vmem_ref[1, lanes, :] = (
                     state_vmem_ref[1, lanes, :] * alpha + l_add
