@@ -1028,7 +1028,7 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def _w9_interpret_context():
+def _w9_interpret_context(eager: bool = False):
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -1040,7 +1040,11 @@ def _w9_interpret_context():
     _orig_wait = pl.semaphore_wait
 
     def _interp_pallas_call(*args, **kwargs):
-        kwargs["interpret"] = True
+        kwargs["interpret"] = (
+            pltpu.InterpretParams(dma_execution_mode="eager", detect_races=True)
+            if eager
+            else True
+        )
         return _orig_pallas_call(*args, **kwargs)
 
     def _interp_marc(*args, **kwargs):
@@ -1355,44 +1359,62 @@ def test_gate_static_fp8_quant_xor_a2a_parity():
                     parity_stagger=use_ps,
                 )
 
-            if not use_ps:
-                fused_exp = jax.jit(
-                    jax.shard_map(
-                        _fused_body,
-                        mesh=mesh,
-                        in_specs=(a_spec, P(None, "model")),
-                        out_specs=P(None, None, "model"),
-                        check_vma=False,
-                    )
+            fused_exp = jax.jit(
+                jax.shard_map(
+                    _fused_body,
+                    mesh=mesh,
+                    in_specs=(a_spec, P(None, "model")),
+                    out_specs=P(None, None, "model"),
+                    check_vma=False,
                 )
-                exp = export.export(fused_exp, platforms=("tpu",))(
+            )
+            exp = export.export(fused_exp, platforms=("tpu",))(
+                jax.ShapeDtypeStruct(in_a.shape, in_a.dtype),
+                jax.ShapeDtypeStruct(gate.shape, gate.dtype),
+            )
+            mlir_txt = exp.mlir_module()
+            assert "pallas_a3_pro_xor_a2a" in mlir_txt
+            assert "partition_id" not in mlir_txt
+
+            # Verify SPMD StableHLO lowering emits 0 partition_id ops (both export & lower).
+            hlo_spmd = (
+                fused_exp.trace(
                     jax.ShapeDtypeStruct(in_a.shape, in_a.dtype),
                     jax.ShapeDtypeStruct(gate.shape, gate.dtype),
                 )
-                assert "pallas_a3_pro_xor_a2a" in exp.mlir_module()
-
-            with _w9_interpret_context():
-                ref_sm = jax.jit(
-                    jax.shard_map(
-                        _ref_body,
-                        mesh=mesh,
-                        in_specs=(a_spec, P(None, "model")),
-                        out_specs=P(None, None, "model"),
-                        check_vma=False,
-                    )
-                )
-                fused_sm = jax.jit(
-                    jax.shard_map(
-                        _fused_body,
-                        mesh=mesh,
-                        in_specs=(a_spec, P(None, "model")),
-                        out_specs=P(None, None, "model"),
-                        check_vma=False,
-                    )
-                )
-                ref_out = ref_sm(in_a, gate)
-                fused_out = fused_sm(in_a, gate)
-            diff = float(
-                jnp.max(jnp.abs(ref_out.astype(jnp.float32) - fused_out.astype(jnp.float32)))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
             )
-            assert diff == 0.0, (use_rpa, use_ps, diff)
+            assert "partition_id" not in hlo_spmd
+            assert "pallas_a3_pro_xor_a2a" in hlo_spmd
+
+            if not use_rpa:
+                # Note: JAX 0.11.2 Mosaic interpret eager mode lacks BitcastTransform.indices
+                # support for rpa_packed_out=True even on stock pallas_gate_static_fp8_quant.
+                with _w9_interpret_context(eager=True):
+                    ref_sm = jax.jit(
+                        jax.shard_map(
+                            _ref_body,
+                            mesh=mesh,
+                            in_specs=(a_spec, P(None, "model")),
+                            out_specs=P(None, None, "model"),
+                            check_vma=False,
+                        )
+                    )
+                    fused_sm = jax.jit(
+                        jax.shard_map(
+                            _fused_body,
+                            mesh=mesh,
+                            in_specs=(a_spec, P(None, "model")),
+                            out_specs=P(None, None, "model"),
+                            check_vma=False,
+                        )
+                    )
+                    ref_out = ref_sm(in_a, gate)
+                    fused_out = fused_sm(in_a, gate)
+                diff = float(
+                    jnp.max(
+                        jnp.abs(ref_out.astype(jnp.float32) - fused_out.astype(jnp.float32))
+                    )
+                )
+                assert diff == 0.0, (use_rpa, use_ps, diff)

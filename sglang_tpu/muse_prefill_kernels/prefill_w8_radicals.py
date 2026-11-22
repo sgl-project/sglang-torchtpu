@@ -219,6 +219,32 @@ def pallas_async_a2a_xor_3d(
     )(src_3d)
 
 
+def _d_from_peer_jax(
+    me: jax.Array, peer: jax.Array, tp_deg: int, *, parity_stagger: bool
+) -> jax.Array:
+    """Inverse of `_kdeep_step_peer_jax` (symmetric involution: `d(me, peer) == d(peer, me)`)."""
+    xv = lax.bitwise_xor(me, peer)
+    if not parity_stagger or tp_deg != 8:
+        return xv
+    is_even = lax.bitwise_and(me, jnp.int32(1)) == jnp.int32(0)
+    pop1 = lax.bitwise_xor(me, lax.shift_right_logical(me, jnp.int32(1)))
+    pop2 = lax.bitwise_xor(pop1, lax.shift_right_logical(me, jnp.int32(2)))
+    pop_odd = lax.bitwise_and(pop2, jnp.int32(1)) != jnp.int32(0)
+    d_val = jnp.where(
+        xv == jnp.int32(2), jnp.where(is_even, jnp.int32(2), jnp.int32(3)), xv
+    )
+    d_val = jnp.where(
+        xv == jnp.int32(4), jnp.where(is_even, jnp.int32(3), jnp.int32(2)), d_val
+    )
+    d_val = jnp.where(
+        xv == jnp.int32(5), jnp.where(pop_odd, jnp.int32(4), jnp.int32(5)), d_val
+    )
+    d_val = jnp.where(
+        xv == jnp.int32(3), jnp.where(pop_odd, jnp.int32(5), jnp.int32(4)), d_val
+    )
+    return d_val
+
+
 def pallas_gate_static_fp8_quant_xor_a2a(
     normed_attn_out: jax.Array,
     gate: jax.Array,
@@ -235,9 +261,9 @@ def pallas_gate_static_fp8_quant_xor_a2a(
     """Fused prologue + direct VMEM->peer-HBM XOR push All-to-All (`A3_KDEEP_WO=3`).
 
     Computes `clip(sigmoid(gate) * rmsnorm(attn) * 32.0, -448, 448) -> fp8_e4m3fn` directly
-    into a double-buffered `(2, tm_c, k_local)` VMEM tile in peer-push order (`d = 1..tp-1, 0`)
-    and pushes each tile straight to peer `dst_hbm[d]` via `make_async_remote_copy`, removing
-    both the intermediate `q_loc` HBM write+read round-trip and the standalone A2A launch.
+    into a double-buffered `(2, tm_c, k_local)` VMEM tile in sequential peer order (`0..tp-1`)
+    and pushes each tile straight to peer `dst_hbm[d_val]` via `make_async_remote_copy` using
+    Mosaic-internal `lax.axis_index(tp_axis)` (zero outer `stablehlo.partition_id` in SPMD).
     """
     t_len, k_local = gate.shape
     assert t_len % tp_deg == 0, (t_len, tp_deg)
@@ -253,42 +279,30 @@ def pallas_gate_static_fp8_quant_xor_a2a(
     total_steps = tp_deg * n_tiles_c
     is_rpa_packed = bool(rpa_packed_out and normed_attn_out.size != t_len * k_local)
 
-    me_out = lax.axis_index(tp_axis)
-    if tp_deg > 1:
-        peers = jnp.stack(
-            [
-                _kdeep_step_peer_jax(me_out, d, tp_deg, parity_stagger=use_ps)
-                for d in range(1, tp_deg)
-            ]
-            + [me_out]
-        ).astype(jnp.int32)
-    else:
-        peers = jnp.zeros((1,), dtype=jnp.int32)
-
     if is_rpa_packed:
         num_q_slices = k_local // 128
         attn_arg = normed_attn_out.reshape(1, t_len, num_q_slices, 2, 128)
         attn_spec = pl.BlockSpec(
             (1, tm_c, num_q_slices, 2, 128),
-            lambda d_i, t_i, p_ref: (0, p_ref[d_i] * n_tiles_c + t_i, 0, 0, 0),
+            lambda p_i, t_i: (0, p_i * n_tiles_c + t_i, 0, 0, 0),
         )
     else:
         num_q_slices = 0
         attn_arg = normed_attn_out.reshape(t_len, k_local)
         attn_spec = pl.BlockSpec(
             (tm_c, k_local),
-            lambda d_i, t_i, p_ref: (p_ref[d_i] * n_tiles_c + t_i, 0),
+            lambda p_i, t_i: (p_i * n_tiles_c + t_i, 0),
         )
     gate_spec = pl.BlockSpec(
         (tm_c, k_local),
-        lambda d_i, t_i, p_ref: (p_ref[d_i] * n_tiles_c + t_i, 0),
+        lambda p_i, t_i: (p_i * n_tiles_c + t_i, 0),
     )
 
-    def _quant_push_kernel(peers_ref, attn_ref, gate_ref, dst_ref, q_vmem, tile_sems, rsems):
+    def _quant_push_kernel(attn_ref, gate_ref, dst_ref, q_vmem, tile_sems, rsems):
         me = lax.axis_index(tp_axis)
-        d_idx = pl.program_id(0)
+        p_idx = pl.program_id(0)
         t_idx = pl.program_id(1)
-        step = d_idx * n_tiles_c + t_idx
+        step = p_idx * n_tiles_c + t_idx
         slot = lax.rem(step, 2)
 
         if tp_deg > 1:
@@ -370,19 +384,18 @@ def pallas_gate_static_fp8_quant_xor_a2a(
 
         if tp_deg > 1:
 
-            @pl.when(d_idx < tp_deg - 1)
+            @pl.when(p_idx != me)
             def _push_remote():
-                d_val = d_idx + 1
-                peer = peers_ref[d_idx]
+                d_val = _d_from_peer_jax(me, p_idx, tp_deg, parity_stagger=use_ps)
                 pltpu.make_async_remote_copy(
                     src_ref=q_vmem.at[pl.ds(slot, 1)],
                     dst_ref=dst_ref.at[pl.ds(d_val, 1), pl.ds(t_idx * tm_c, tm_c), :],
                     send_sem=tile_sems.at[slot],
                     recv_sem=rsems.at[d_val],
-                    device_id={tp_axis: peer},
+                    device_id={tp_axis: p_idx},
                 ).start()
 
-        @pl.when(d_idx == tp_deg - 1)
+        @pl.when(p_idx == me)
         def _copy_local():
             pltpu.make_async_copy(
                 src_ref=q_vmem.at[pl.ds(slot, 1)],
@@ -415,24 +428,21 @@ def pallas_gate_static_fp8_quant_xor_a2a(
     return pl.pallas_call(
         _quant_push_kernel,
         out_shape=jax.ShapeDtypeStruct((tp_deg, c_rows, k_local), jnp.float8_e4m3fn),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(tp_deg, n_tiles_c),
-            in_specs=[attn_spec, gate_spec],
-            out_specs=any_spec,
-            scratch_shapes=[
-                pltpu.VMEM((2, tm_c, k_local), jnp.float8_e4m3fn),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((tp_deg,)),
-            ],
-        ),
+        grid=(tp_deg, n_tiles_c),
+        in_specs=[attn_spec, gate_spec],
+        out_specs=any_spec,
+        scratch_shapes=[
+            pltpu.VMEM((2, tm_c, k_local), jnp.float8_e4m3fn),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((tp_deg,)),
+        ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", "arbitrary"),
             collective_id=collective_id if tp_deg > 1 else None,
             vmem_limit_bytes=vmem_limit_mb * (1 << 20),
         ),
         name=tag,
-    )(peers, attn_arg, gate)
+    )(attn_arg, gate)
 
 
 def _kdeep_dot_tile(
