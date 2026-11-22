@@ -21,7 +21,7 @@ SUPPORTED_FULL_MOE_MODES = ("full", "stage_a", "stage_b")
 SUPPORTED_FUSE_ALL_BATCHES = (16, 32, 64, 128, 256)
 SUPPORTED_FUSE_ALL_BATCHES_B384 = (16, 32, 64, 128, 256, 384)
 SUPPORTED_FUSE_ALL_FP8_BATCHES = (16, 32, 64, 128)
-SUPPORTED_FUSE_ALL_BLOCKS = (16, 256)
+SUPPORTED_FUSE_ALL_BLOCKS = (16, 256, 512)
 SUPPORTED_REPLICA_SLOTS = (0, 1, 2, 4, 6, 8)
 SUPPORTED_REPLICA_COST_MODES = ("active", "tiles", "weighted")
 
@@ -109,9 +109,12 @@ def muse_fuse_all_decode_op_name(
             f"return_sharded=True requires mode in {SUPPORTED_SHARDED_FUSE_ALL_MODES}, "
             f"got {mode!r}"
         )
-    if block not in SUPPORTED_FUSE_ALL_BLOCKS:
+    if block not in SUPPORTED_FUSE_ALL_BLOCKS or (
+        block == 512 and mode in ("ep_tp2", "chipmate")
+    ):
         raise ValueError(
-            f"Unsupported FP4 scale block {block}; expected one of {SUPPORTED_FUSE_ALL_BLOCKS}"
+            f"Unsupported FP4 scale block {block} for mode={mode!r}; "
+            f"expected one of {SUPPORTED_FUSE_ALL_BLOCKS}"
         )
     if num_replicas not in SUPPORTED_REPLICA_SLOTS:
         raise ValueError(
@@ -700,7 +703,7 @@ def get_muse_ep_tp2_fallback_op(
     chipmate_xor: int | None = None,
 ):
     """Return cached TorchTPU jax_op for mixed-mode EPxTP2 prefill/fallback."""
-    if ep not in (4, 8) or tp != 2 or block not in SUPPORTED_FUSE_ALL_BLOCKS:
+    if ep not in (4, 8) or tp != 2 or block not in (16, 256):
         raise ValueError(
             f"Unsupported EPxTP2 fallback config: ep={ep}, tp={tp}, block={block}"
         )

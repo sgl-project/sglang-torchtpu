@@ -149,7 +149,9 @@ def _apply_v2_env_overrides(
                 f"expected one of {_VALID_RING_MODES}"
             )
         ring_mode = ov.ring_mode
-        if ring_mode.endswith("_khalf") and contig_mode == 0:
+        if ring_mode.endswith("_khalf") and scale_block > 256:
+            ring_mode = ring_mode.replace("_khalf", "_proj")
+        elif ring_mode.endswith("_khalf") and contig_mode == 0:
             contig_mode = 1
 
     unpack_mode = base.fp4_unpack_mode
@@ -201,7 +203,7 @@ def _apply_v2_env_overrides(
         ov.rs_bridge64 and ep == 8 and batch_size == 64
     )
     spec_eff = ov.spec_prime_parts if batch_size <= 128 else 0
-    lhs_fp8 = base.lhs_fp8 or (ov.lhs_fp8 and scale_block == 256)
+    lhs_fp8 = base.lhs_fp8 or (ov.lhs_fp8 and scale_block >= 256)
 
     return dataclasses.replace(
         base,
@@ -513,11 +515,12 @@ def _fp4_gmm_chunked_v2(
                     jnp.float4_e2m1fn,
                 ).astype(jnp.float8_e4m3fn)
             res = jnp.dot(x, w_fp8, preferred_element_type=jnp.float32)
+            sb_id = c0 // scale_block
             s = (
-                s_hoisted[b_id : b_id + 1, :]
+                s_hoisted[sb_id : sb_id + 1, :]
                 if s_hoisted is not None
                 else _load_scale_tile(
-                    s_ref, c0 // scale_block, 1, n0, nc, jnp.float32
+                    s_ref, sb_id, 1, n0, nc, jnp.float32
                 )
             )
             if use_w4a8:
@@ -639,11 +642,12 @@ def _fp4_dual_gmm_chunked_v2(
                     jnp.float4_e2m1fn,
                 ).astype(jnp.float8_e4m3fn)
             rg = jnp.dot(x, wg_fp8, preferred_element_type=jnp.float32)
+            sb_id = c0 // scale_block
             sg = (
-                sg_hoisted[b_id : b_id + 1, :]
+                sg_hoisted[sb_id : sb_id + 1, :]
                 if sg_hoisted is not None
                 else _load_scale_tile(
-                    s_ref, c0 // scale_block, 1, n0_g, nc, jnp.float32
+                    s_ref, sb_id, 1, n0_g, nc, jnp.float32
                 )
             )
             if x_sc_col is not None:
@@ -661,10 +665,10 @@ def _fp4_dual_gmm_chunked_v2(
                 ).astype(jnp.float8_e4m3fn)
             ru = jnp.dot(x, wu_fp8, preferred_element_type=jnp.float32)
             su = (
-                su_hoisted[b_id : b_id + 1, :]
+                su_hoisted[sb_id : sb_id + 1, :]
                 if su_hoisted is not None
                 else _load_scale_tile(
-                    s_ref, c0 // scale_block, 1, n0_u, nc, jnp.float32
+                    s_ref, sb_id, 1, n0_u, nc, jnp.float32
                 )
             )
             if x_sc_col is not None:
@@ -818,13 +822,15 @@ def _dot_from_vmem_deq(
     s_k256_ref=None,
     n0_s: jax.Array | int = 0,
     hoist_scales: bool = False,
+    scale_block: int = 256,
 ) -> jax.Array:
     """Compute ``x[r0:r0+m_rows, 0:k_dim] @ w_deq_buf[0:k_dim, 0:nc]`` with zero VPU unpack."""
     kc = 256
     acc = None
+    n_sb = k_dim // scale_block
     s_all = (
-        _load_scale_tile(s_k256_ref, 0, k_dim // 256, n0_s, nc, jnp.float32)
-        if (s_k256_ref is not None and hoist_scales)
+        _load_scale_tile(s_k256_ref, 0, n_sb, n0_s, nc, jnp.float32)
+        if (s_k256_ref is not None and hoist_scales and n_sb >= 8 and n_sb % 8 == 0)
         else None
     )
     for b_id, c0 in enumerate(range(0, k_dim, kc)):
@@ -832,10 +838,11 @@ def _dot_from_vmem_deq(
         w_t = w_deq_buf[pl.ds(c0, kc), pl.ds(0, nc)]
         res = jnp.dot(x, w_t, preferred_element_type=jnp.float32)
         if s_k256_ref is not None:
+            sb_id = c0 // scale_block
             s = (
-                s_all[b_id : b_id + 1, :]
+                s_all[sb_id : sb_id + 1, :]
                 if s_all is not None
-                else _load_scale_tile(s_k256_ref, b_id, 1, n0_s, nc, jnp.float32)
+                else _load_scale_tile(s_k256_ref, sb_id, 1, n0_s, nc, jnp.float32)
             )
             res = res * s
         acc = res if acc is None else acc + res
@@ -1083,7 +1090,7 @@ def _sparse_decode_v2_kernel(
     cfg: SparseDecodeV2Config,
 ):
     has_replicas = num_replicas > 0
-    is_k256 = scale_block == 256
+    is_k256 = scale_block >= 256
     is_dense = cfg.row_mode == "dense"
     is_mxu_sparse = cfg.row_mode == "mxu_sparse"
     is_dense_route = is_dense or is_mxu_sparse
@@ -2329,6 +2336,7 @@ def _sparse_decode_v2_kernel(
                     s_k256_ref=s_slot_ref if is_k256 else None,
                     n0_s=n0,
                     hoist_scales=cfg.hoist_scales,
+                    scale_block=scale_block,
                 )
                 act_2d_buf[pl.ds(r0, 32), col_out] = jax.nn.silu(g).astype(
                     jnp.bfloat16
@@ -2366,6 +2374,7 @@ def _sparse_decode_v2_kernel(
                     s_k256_ref=s_slot_ref if is_k256 else None,
                     n0_s=width + n0,
                     hoist_scales=cfg.hoist_scales,
+                    scale_block=scale_block,
                 )
                 sg = act_2d_buf[pl.ds(r0, 32), col_out].astype(jnp.float32)
                 act_2d_buf[pl.ds(r0, 32), col_out] = (sg * u).astype(jnp.bfloat16)
@@ -2418,6 +2427,7 @@ def _sparse_decode_v2_kernel(
                     s_k256_ref=s_slot_ref if is_k256 else None,
                     n0_s=n0,
                     hoist_scales=cfg.hoist_scales,
+                    scale_block=scale_block,
                 )
                 if not is_up:
                     act_2d_buf[pl.ds(r0, 32), col_out] = jax.nn.silu(res).astype(
@@ -2480,6 +2490,7 @@ def _sparse_decode_v2_kernel(
                     s_k256_ref=s_slot_ref if is_k256 else None,
                     n0_s=n0,
                     hoist_scales=cfg.hoist_scales,
+                    scale_block=scale_block,
                 ).astype(jnp.bfloat16)
                 u = d.astype(jnp.float32) * g_col
                 y_stage_buf[pl.ds(r0, 32), col_out] = u
@@ -4172,7 +4183,7 @@ def fused_decode_sparse_v2_from_logits(
             f"Expected float4_e2m1fn weights, got w1={w1.dtype}, w2={w2.dtype}"
         )
     scale_block = _H // s1.shape[1]
-    if scale_block not in (16, 256):
+    if scale_block not in (16, 256, 512):
         raise ValueError(
             f"Expected K16 or K256 scales, got s1.shape={s1.shape}"
         )
@@ -4189,7 +4200,7 @@ def fused_decode_sparse_v2_from_logits(
         raise ValueError(
             f"Mismatched scale shapes: s1={s1.shape}, s2={s2.shape} for block={scale_block}"
         )
-    if s1.dtype == jnp.float8_e4m3fn and scale_block == 256:
+    if s1.dtype == jnp.float8_e4m3fn and scale_block >= 256:
         raise ValueError(
             "float8_e4m3fn scales require >= 32 scale rows (K16 scale_block=16)"
         )
@@ -4335,9 +4346,9 @@ def fused_decode_sparse_v2_from_logits(
         and (config.multi_m32_mode == "vmem_deq")
         and (tile_m > 32)
     )
-    deq_nc = 1024 if scale_block == 256 else min(config.k16_strip_nc, 512)
-    deq_dtype = jnp.float8_e4m3fn if scale_block == 256 else jnp.bfloat16
-    use_lhs_fp8 = (scale_block == 256) and config.lhs_fp8
+    deq_nc = 1024 if scale_block >= 256 else min(config.k16_strip_nc, 512)
+    deq_dtype = jnp.float8_e4m3fn if scale_block >= 256 else jnp.bfloat16
+    use_lhs_fp8 = (scale_block >= 256) and config.lhs_fp8
     y_dtype = jnp.float32 if config.norm_f32_stage else jnp.bfloat16
     y_stage_rows = max(16, tile_m)
 

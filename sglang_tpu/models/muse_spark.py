@@ -253,7 +253,9 @@ def _format_nvfp4_replica_bank_from_raw(
     raw: dict[str, torch.Tensor],
     *,
     device: torch.device,
-    compact_k256: bool,
+    compact_k256: bool = False,
+    compact_block: Optional[int] = None,
+    two_level_pow2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert raw checkpoint-format replica slices to fused-RS FP4 + bf16 scales."""
     from sglang_tpu.fp4_moe import (
@@ -262,7 +264,21 @@ def _format_nvfp4_replica_bank_from_raw(
         _transpose_packed_fp4,
     )
     from sglang_tpu.fp8_moe import _own_storage
-    from sglang_tpu.moe.nvfp4_requant import compact_nvfp4_blocks
+    from sglang_tpu.moe.nvfp4_requant import (
+        compact_nvfp4_blocks,
+        compact_nvfp4_two_level_pow2,
+    )
+
+    eff_block = (
+        int(compact_block)
+        if compact_block is not None
+        else (256 if compact_k256 else 0)
+    )
+    compact_fn = (
+        compact_nvfp4_two_level_pow2
+        if (two_level_pow2 and eff_block == 256)
+        else compact_nvfp4_blocks
+    )
 
     w13_w = raw["w13_weight"].to(device=device, copy=True)
     w13_s = raw["w13_weight_scale"].to(device=device, dtype=torch.float32, copy=True)
@@ -272,8 +288,8 @@ def _format_nvfp4_replica_bank_from_raw(
         )
     w13_u8 = _transpose_packed_fp4(w13_w)
     w13_scale = _own_storage(w13_s.to(torch.bfloat16).permute(0, 2, 1).contiguous())
-    if compact_k256:
-        w13_u8, w13_scale, _, _ = compact_nvfp4_blocks(w13_u8, w13_scale, 256)
+    if eff_block > 0:
+        w13_u8, w13_scale, _, _ = compact_fn(w13_u8, w13_scale, eff_block)
     rep_w1 = _materialize_packed_fp4(w13_u8)
 
     w2_w = raw["w2_weight"].to(device=device, copy=True)
@@ -287,8 +303,8 @@ def _format_nvfp4_replica_bank_from_raw(
         )
     w2_u8 = _transpose_packed_fp4(w2_w)
     w2_scale = _own_storage(w2_s.to(torch.bfloat16).permute(0, 2, 1).contiguous())
-    if compact_k256:
-        w2_u8, w2_scale, _, _ = compact_nvfp4_blocks(w2_u8, w2_scale, 256)
+    if eff_block > 0:
+        w2_u8, w2_scale, _, _ = compact_fn(w2_u8, w2_scale, eff_block)
     rep_w2 = _materialize_packed_fp4(w2_u8)
     _wait_for(rep_w1, w13_scale, rep_w2, w2_scale)
     return rep_w1, w13_scale, rep_w2, w2_scale
@@ -333,16 +349,28 @@ def _format_fp8_raw_to_nvfp4_replica_bank(
     *,
     device: torch.device,
     block: int,
+    two_level_pow2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize raw BF16 boundary replica slices ``[R, N, K]`` to NVFP4 ``block``."""
     from sglang_tpu.fp4_moe import _materialize_packed_fp4
-    from sglang_tpu.moe.nvfp4_requant import quantize_fp8_to_nvfp4_blocks
+    from sglang_tpu.moe.nvfp4_requant import (
+        _quantize_wb_two_level_pow2,
+        quantize_fp8_to_nvfp4_blocks,
+    )
 
     fp8_w1, fp8_s1, fp8_w2, fp8_s2 = _format_fp8_replica_bank_from_raw(
         raw, device=device, scale_dtype=torch.float32
     )
-    c1, rep_s1, _, _ = quantize_fp8_to_nvfp4_blocks(fp8_w1, fp8_s1, block)
-    c2, rep_s2, _, _ = quantize_fp8_to_nvfp4_blocks(fp8_w2, fp8_s2, block)
+    if two_level_pow2 and block == 256:
+        e1, k1, n1 = fp8_w1.shape
+        wf1 = fp8_w1.float() * fp8_s1.reshape(e1, 1, n1).float()
+        c1, rep_s1, _ = _quantize_wb_two_level_pow2(wf1.reshape(e1, k1 // block, block, n1))
+        e2, k2, n2 = fp8_w2.shape
+        wf2 = fp8_w2.float() * fp8_s2.reshape(e2, 1, n2).float()
+        c2, rep_s2, _ = _quantize_wb_two_level_pow2(wf2.reshape(e2, k2 // block, block, n2))
+    else:
+        c1, rep_s1, _, _ = quantize_fp8_to_nvfp4_blocks(fp8_w1, fp8_s1, block)
+        c2, rep_s2, _, _ = quantize_fp8_to_nvfp4_blocks(fp8_w2, fp8_s2, block)
     rep_w1 = _materialize_packed_fp4(c1)
     rep_w2 = _materialize_packed_fp4(c2)
     _wait_for(rep_w1, rep_s1, rep_w2, rep_s2)
@@ -1929,7 +1957,9 @@ class MuseSparkMoE(nn.Module):
             return
 
         block = 4096 // int(s1_chk.shape[1])
-        if block not in (16, 256):
+        if block not in (16, 256) and not (
+            block == 512 and mode not in ("ep_tp2", "chipmate")
+        ):
             return
 
         if mode == "ep_tp2":
@@ -5495,9 +5525,28 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 "w2_weight",
                 "w2_weight_scale",
             )
+            two_level_pow2 = (
+                int(_env_get("SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_POW2", 0) or 0) == 1
+            )
             if all(key in raw for key in required_fp4):
+                w1_k = int(mlp.experts.w13_weight.shape[1])
+                s1_blocks = int(mlp.experts.w13_weight_scale.shape[1])
+                inferred_block = (
+                    (w1_k // s1_blocks)
+                    if (s1_blocks > 0 and w1_k % s1_blocks == 0)
+                    else 16
+                )
+                compact_block = (
+                    inferred_block
+                    if inferred_block > 16
+                    else (256 if compact_k256 else 0)
+                )
                 rep_w1, rep_s1, rep_w2, rep_s2 = _format_nvfp4_replica_bank_from_raw(
-                    raw, device=device, compact_k256=compact_k256
+                    raw,
+                    device=device,
+                    compact_k256=(compact_block > 0),
+                    compact_block=compact_block,
+                    two_level_pow2=two_level_pow2,
                 )
                 mlp.attach_preloaded_replicas(
                     rep_w1=rep_w1,
@@ -5518,7 +5567,10 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 )
                 block = 4096 // int(s1_ref.shape[1])
                 rep_w1, rep_s1, rep_w2, rep_s2 = _format_fp8_raw_to_nvfp4_replica_bank(
-                    raw, device=device, block=block
+                    raw,
+                    device=device,
+                    block=block,
+                    two_level_pow2=(two_level_pow2 and not has_shadow_fp4),
                 )
                 if has_shadow_fp4:
                     mlp.register_buffer(

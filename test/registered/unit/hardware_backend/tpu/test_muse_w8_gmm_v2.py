@@ -852,3 +852,250 @@ def test_w8_scoped_two_level_pow2_and_qblock_numerical_parity():
         assert rel_l2_w < 1e-5, f"scoped_w4a8 qblock={qbs_w} rel_l2={rel_l2_w}"
 
 
+
+
+def test_w9_replica_bank_and_decode_qblock512(monkeypatch):
+    """Verify QBLOCK=512 / two_level_pow2 replica bank formatting, _finalize_decode_replica_banks,
+    _fp4_gmm_chunked scale_block=512 hoist_scales parity, and TPU lowering for sparse v1/v2 R=6."""
+    from types import SimpleNamespace
+
+    import jax
+    import jax.experimental.pallas as pl
+    import jax.numpy as jnp
+    import torch
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.models.muse_spark import (
+        MuseSparkForConditionalGeneration,
+        MuseSparkMoE,
+        _format_nvfp4_replica_bank_from_raw,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
+        muse_fuse_all_decode_op_name,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        _fp4_gmm_chunked,
+        fused_decode_sparse_from_logits,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse_v2 import (
+        fused_decode_sparse_v2_from_logits,
+    )
+
+    # 1. Replica bank formatting + _finalize_decode_replica_banks + attach_preloaded_replicas at R=6, QBLOCK=512
+    torch.manual_seed(0)
+    num_rep = 6
+    raw_full = {
+        "w13_weight": torch.randint(0, 256, (num_rep, 8192, 2048), dtype=torch.uint8),
+        "w13_weight_scale": torch.rand((num_rep, 8192, 256), dtype=torch.bfloat16) * 0.1
+        + 0.01,
+        "w2_weight": torch.randint(0, 256, (num_rep, 4096, 2048), dtype=torch.uint8),
+        "w2_weight_scale": torch.rand((num_rep, 4096, 256), dtype=torch.bfloat16) * 0.1
+        + 0.01,
+    }
+    rw1_512, rs1_512, rw2_512, rs2_512 = _format_nvfp4_replica_bank_from_raw(
+        raw_full, device=torch.device("cpu"), compact_k256=True, compact_block=512
+    )
+    assert rw1_512.dtype == torch.float4_e2m1fn_x2
+    assert tuple(rw1_512.shape) == (num_rep, 4096, 4096)
+    assert tuple(rs1_512.shape) == (num_rep, 8, 8192)
+    assert tuple(rw2_512.shape) == (num_rep, 4096, 2048)
+    assert tuple(rs2_512.shape) == (num_rep, 8, 4096)
+
+    # Also test two_level_pow2=True on compact_block=256 (small slice for speed)
+    raw_small = {
+        "w13_weight": torch.randint(0, 256, (2, 128, 256), dtype=torch.uint8),
+        "w13_weight_scale": torch.rand((2, 128, 32), dtype=torch.bfloat16) * 0.1 + 0.01,
+        "w2_weight": torch.randint(0, 256, (2, 64, 256), dtype=torch.uint8),
+        "w2_weight_scale": torch.rand((2, 64, 32), dtype=torch.bfloat16) * 0.1 + 0.01,
+    }
+    _, rs1_tlp, _, rs2_tlp = _format_nvfp4_replica_bank_from_raw(
+        raw_small,
+        device=torch.device("cpu"),
+        compact_k256=True,
+        compact_block=256,
+        two_level_pow2=True,
+    )
+    assert tuple(rs1_tlp.shape) == (2, 2, 128)
+    assert tuple(rs2_tlp.shape) == (2, 2, 64)
+
+    # End-to-end _finalize_decode_replica_banks -> attach_preloaded_replicas with QBLOCK=512 experts
+    dummy_mlp = torch.nn.Module()
+    dummy_mlp.tp_size = 8
+    dummy_mlp.__dict__["moe_ep_size"] = 8
+    dummy_mlp.experts = SimpleNamespace(
+        w13_weight=torch.empty((32, 4096, 4096), dtype=torch.float4_e2m1fn_x2),
+        w13_weight_scale=torch.empty((32, 8, 8192), dtype=torch.bfloat16),
+        w2_weight=torch.empty((32, 4096, 2048), dtype=torch.float4_e2m1fn_x2),
+        w2_weight_scale=torch.empty((32, 8, 4096), dtype=torch.bfloat16),
+    )
+    dummy_mlp.attach_preloaded_replicas = (
+        MuseSparkMoE.attach_preloaded_replicas.__get__(dummy_mlp, torch.nn.Module)
+    )
+    dummy_mlp.__dict__["_pending_replica_raw"] = raw_full
+    dummy_host = SimpleNamespace(
+        start_layer=0,
+        end_layer=1,
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=dummy_mlp)]),
+        _decode_replica_plans={
+            0: SimpleNamespace(replica_meta=np.zeros((4, 8 * num_rep), dtype=np.int32))
+        },
+    )
+    MuseSparkForConditionalGeneration._finalize_decode_replica_banks(
+        dummy_host, compact_k256=True
+    )
+    assert tuple(dummy_mlp._buffers["_fused_decode_rep_s1"].shape) == (num_rep, 8, 8192)
+    assert tuple(dummy_mlp._buffers["_fused_decode_rep_s2"].shape) == (num_rep, 8, 4096)
+
+    # 2. _fp4_gmm_chunked hoist_scales=True vs False numerical parity at scale_block=512
+    rng = np.random.default_rng(77)
+    m_rows, k_dim, nc = 32, 4096, 256
+    x_fp8 = jnp.asarray(
+        rng.normal(0.0, 0.5, size=(m_rows, k_dim)), dtype=jnp.float8_e4m3fn
+    )
+    x_sc_16 = rng.uniform(0.01, 0.05, size=(m_rows, 16)).astype(np.float32)
+    x_sc_buf = jnp.asarray(np.repeat(x_sc_16, 128, axis=1), dtype=jnp.float32)
+    w_fp4 = jnp.asarray(
+        np.clip(rng.normal(0.0, 1.5, size=(k_dim, nc)), -6.0, 6.0),
+        dtype=jnp.float4_e2m1fn,
+    )
+    w_u32 = jax.lax.bitcast_convert_type(
+        w_fp4.reshape(k_dim // 8, 8, nc).transpose(0, 2, 1), jnp.uint32
+    )
+    s_512 = jnp.asarray(
+        rng.uniform(0.02, 0.10, size=(k_dim // 512, nc)), dtype=jnp.bfloat16
+    )
+
+    w_f32 = np.asarray(w_fp4.astype(jnp.float32))
+    s_rep = np.repeat(np.asarray(s_512, dtype=np.float32), 512, axis=0)
+    x_f32 = np.asarray(x_fp8, dtype=np.float32) * np.repeat(x_sc_16, 256, axis=1)
+    ref_512 = x_f32 @ (w_f32 * s_rep)
+
+    for hoist in (True, False):
+
+        def _kern_512(xr, xsr, wr, sr, outr):
+            outr[...] = _fp4_gmm_chunked(
+                xr,
+                wr,
+                sr,
+                m_rows,
+                k_dim,
+                0,
+                nc,
+                True,
+                512,
+                lhs_sc_ref=xsr,
+                hoist_scales=hoist,
+            )
+
+        got_512 = np.asarray(
+            pl.pallas_call(
+                _kern_512,
+                out_shape=jax.ShapeDtypeStruct((m_rows, nc), jnp.float32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                ),
+                interpret=True,
+            )(x_fp8, x_sc_buf, w_u32, s_512)
+        )
+        rel = np.linalg.norm(got_512 - ref_512) / np.linalg.norm(ref_512)
+        assert rel < 1e-5, f"_fp4_gmm_chunked scale_block=512 hoist={hoist} rel={rel}"
+
+    # 3. Op naming + TPU StableHLO lowering for sparse (v1) and sparse_v2 at scale_block=512, R=6
+    assert (
+        muse_fuse_all_decode_op_name(
+            mode="sparse", ep=8, tp=1, block=512, num_replicas=6
+        )
+        == "sglang_tpu_pallas::muse_decode_sparse_ep8_k512_r6_tiles"
+    )
+    from jax._src import tpu_info
+
+    dk = next(
+        k
+        for k in ("TPU7x", "TPU v7x", "TPU v6e", "TPU v5p")
+        if k in tpu_info.registry
+        or tpu_info.chip_version_from_device_kind(k) is not None
+    )
+    monkeypatch.setattr(tpu_info, "get_device_kind", lambda: dk)
+    tpu_info.get_tpu_info.cache_clear()
+    devs = jax.devices("cpu")
+    if len(devs) >= 8:
+        mesh = Mesh(np.array(devs[:8]), ("model",))
+        try:
+            for fn in (
+                fused_decode_sparse_from_logits,
+                fused_decode_sparse_v2_from_logits,
+            ):
+
+                def _wrap_dec(
+                    rk, lg, bi, xi, w1, s1, w2, s2, nm, rw1, rs1, rw2, rs2, rm
+                ):
+                    return jax.shard_map(
+                        lambda _rk, _lg, _bi, _xi, _w1, _s1, _w2, _s2, _nm, _rw1, _rs1, _rw2, _rs2, _rm: (
+                            fn(
+                                _rk,
+                                _lg,
+                                _bi,
+                                _xi,
+                                _w1,
+                                _s1,
+                                _w2,
+                                _s2,
+                                _nm,
+                                rep_w1=_rw1,
+                                rep_s1=_rs1,
+                                rep_w2=_rw2,
+                                rep_s2=_rs2,
+                                replica_meta=_rm,
+                                ep=8,
+                                ep_axis_name="model",
+                            )
+                        ),
+                        mesh=mesh,
+                        in_specs=(
+                            P("model"),
+                            P(),
+                            P(),
+                            P(),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P(),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P(),
+                        ),
+                        out_specs=P(),
+                        check_vma=False,
+                    )(rk, lg, bi, xi, w1, s1, w2, s2, nm, rw1, rs1, rw2, rs2, rm)
+
+                hlo_dec = (
+                    jax.jit(_wrap_dec)
+                    .trace(
+                        jax.ShapeDtypeStruct((8,), jnp.int32),
+                        jax.ShapeDtypeStruct((64, 256), jnp.float32),
+                        jax.ShapeDtypeStruct((256,), jnp.float32),
+                        jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((256, 8, 8192), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((256, 8, 4096), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((8 * 6, 4096, 8192), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((8 * 6, 8, 8192), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((8 * 6, 4096, 4096), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((8 * 6, 8, 4096), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((4, 8 * 6), jnp.int32),
+                    )
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text("stablehlo")
+                )
+                assert "k512" in hlo_dec
+        finally:
+            jax.clear_caches()

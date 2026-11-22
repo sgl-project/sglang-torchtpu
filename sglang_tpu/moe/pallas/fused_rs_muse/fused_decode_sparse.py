@@ -224,7 +224,7 @@ def default_sparse_decode_config(
     if batch_size <= 16 or (fast_b64 == 3 and batch_size <= 64):
         return SparseDecodeConfig(
             row_mode="dense",
-            weight_mode="stream3_k2" if contig_parts else "stream3",
+            weight_mode="stream3_k2" if (contig_parts and scale_block <= 256) else "stream3",
             tile_m=batch_size,
             m_buckets=(batch_size,),
             loop32_in_tile=False,
@@ -244,7 +244,7 @@ def default_sparse_decode_config(
         w_m = (
             "w1_2x_w2_1x"
             if fast_b64 == 2
-            else ("stream3_k2" if contig_parts else "stream3")
+            else ("stream3_k2" if (contig_parts and scale_block <= 256) else "stream3")
         )
         m_bkts = (
             (8, 16, 32)
@@ -371,13 +371,16 @@ def _fp4_gmm_chunked(
     use_w4a8 = block256 and (lhs_sc_ref is not None)
     x_read_m = max(32, read_m) if use_w4a8 else read_m
     n_kc = k_dim // _KC
+    n_sb = (k_dim // scale_block) if block256 else 0
     can_hoist_s = (
         block256
         and hoist_scales
+        and n_sb >= 8
+        and (n_sb % 8 == 0)
         and ((m_rows * nc) // 1024 <= 16 or nc <= 1024 or n_kc <= 8)
     )
     s_all = (
-        s_ref[pl.ds(0, n_kc), pl.ds(n0, nc)]
+        s_ref[pl.ds(0, n_sb), pl.ds(n0, nc)]
         if can_hoist_s
         else None
     )
@@ -397,7 +400,8 @@ def _fp4_gmm_chunked(
                 x, w.astype(jnp.float8_e4m3fn), preferred_element_type=jnp.float32
             )
             if s_all is not None:
-                s = s_all[b_id : b_id + 1, :].astype(jnp.float32)
+                sb_id = c0 // scale_block
+                s = s_all[sb_id : sb_id + 1, :].astype(jnp.float32)
             else:
                 s = s_ref[pl.ds(c0 // scale_block, 1), pl.ds(n0, nc)].astype(
                     jnp.float32
@@ -753,9 +757,13 @@ def _sparse_decode_kernel(
     cfg: SparseDecodeConfig,
 ):
     has_replicas = num_replicas > 0
-    is_k256 = scale_block == 256
+    is_k256 = scale_block >= 256
     is_dense = cfg.row_mode == "dense"
-    w_mode = cfg.weight_mode  # "stream3", "w1_2x_w2_1x", "half_n"
+    w_mode = (
+        "stream3"
+        if (cfg.weight_mode == "stream3_k2" and (_H // scale_block) < 16)
+        else cfg.weight_mode
+    )  # "stream3", "w1_2x_w2_1x", "half_n"
     use_bd = (not is_dense) and (not is_k256) and bool(cfg.k16_blockdiag_rows)
     tile_m = cfg.tile_m
     e_local = _E_TOTAL // ep
@@ -3410,9 +3418,9 @@ def fused_decode_sparse_from_logits(
             f"Expected float4_e2m1fn weights, got w1={w1.dtype}, w2={w2.dtype}"
         )
     scale_block = _H // s1.shape[1]
-    if scale_block not in (16, 256):
+    if scale_block not in (16, 256, 512):
         raise ValueError(
-            f"Expected K16 or K256 scales, got s1.shape={s1.shape}"
+            f"Expected K16, K256, or K512 scales, got s1.shape={s1.shape}"
         )
     if s1.shape != (w_groups, _H // scale_block, _N1) or s2.shape != (
         w_groups,
@@ -3487,7 +3495,11 @@ def fused_decode_sparse_from_logits(
             scratch_shapes.append(smem((num_replicas,), jnp.int32))
 
     nqb = _H // scale_block
-    w_mode = config.weight_mode
+    w_mode = (
+        "stream3"
+        if (config.weight_mode == "stream3_k2" and nqb < 16)
+        else config.weight_mode
+    )
     tile_m = config.tile_m
     if w_mode == "stream3":
         w1_buf_shape = vmem((2, _H // _FP4_PACK, _I), jnp.uint32)
@@ -3547,7 +3559,7 @@ def fused_decode_sparse_from_logits(
         and (w_mode != "stream3_k2")
         and bool(config.k16_blockdiag_rows)
     )
-    use_lhs_fp8 = (scale_block == 256) and config.lhs_fp8
+    use_lhs_fp8 = (scale_block >= 256) and config.lhs_fp8
     y_dtype = jnp.float32 if config.norm_f32_stage else jnp.bfloat16
     y_stage_rows = (
         max(16, max(config.m_buckets))

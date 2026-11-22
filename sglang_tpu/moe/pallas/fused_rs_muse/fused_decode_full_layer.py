@@ -452,7 +452,7 @@ def _full_layer_decode_kernel(
     cfg = fcfg.sparse_cfg
     assert cfg is not None
     has_replicas = num_replicas > 0
-    is_k256 = scale_block == 256
+    is_k256 = scale_block >= 256
     is_dense = cfg.row_mode == "dense"
     w_mode = cfg.weight_mode  # "stream3" or "half_n"
     use_bd = (not is_dense) and (not is_k256) and bool(cfg.k16_blockdiag_rows)
@@ -3030,8 +3030,8 @@ def _validate_experts(ep: int, batch_size: int, w1, s1, w2, s2, rep_args):
     ):
         raise ValueError(f"Unexpected FP4 weight shapes: w1={w1.shape}, w2={w2.shape}")
     scale_block = _H // s1.shape[1]
-    if scale_block not in (16, 256):
-        raise ValueError(f"Expected scale_block in (16, 256), got {scale_block}")
+    if scale_block not in (16, 256, 512):
+        raise ValueError(f"Expected scale_block in (16, 256, 512), got {scale_block}")
     has_rep = any(a is not None for a in rep_args)
     if has_rep:
         if any(a is None for a in rep_args):
