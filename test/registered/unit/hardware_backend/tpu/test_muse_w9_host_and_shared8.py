@@ -548,3 +548,25 @@ def test_build_metadata_host_with_shared_decode_repeated_steps():
         pool.write((req_rows, locs), vals, bump_page_table=True, is_decode_step=True)
         m3 = fast_be._build_metadata_host(_fb([129 * page_size + 1] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
         assert m3.full_decode_distribution.tolist() == [bs, bs, bs, 128]
+
+
+def test_async_d2h_non_blocking_when_pin_memory_unavailable():
+    from sglang.srt.utils import device as device_utils
+
+    calls = []
+
+    class _FakeDeviceTensor:
+        device = SimpleNamespace(type="tpu")
+
+        def to(self, target, non_blocking=False):
+            calls.append((target, non_blocking))
+            return ("cpu_copy", target, non_blocking)
+
+    with patch.object(device_utils, "is_pin_memory_available", return_value=False):
+        res = device_utils.async_d2h(_FakeDeviceTensor())
+
+    assert res == ("cpu_copy", "cpu", True)
+    assert calls == [("cpu", True)]
+
+    cpu_t = torch.tensor([1, 2], dtype=torch.int32)
+    assert device_utils.async_d2h(cpu_t) is cpu_t

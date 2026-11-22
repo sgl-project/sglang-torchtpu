@@ -661,7 +661,7 @@ def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type == "cpu":
         return tensor
     if not is_pin_memory_available(tensor.device):
-        return tensor.to("cpu")
+        return tensor.to("cpu", non_blocking=True)
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
     tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
