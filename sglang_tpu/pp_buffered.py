@@ -193,14 +193,16 @@ def hbm_reserve_bytes(
     """An upper bound on the device memory a stage's buffered hand-off holds
     beyond the model and the KV cache. Landing: up to _MAX_RECEIVES posted
     receives. Outgoing: up to ``depth`` transfers queued for sending plus the
-    one end_iteration builds while it waits for room, which it holds both as
-    the merged sum and as its wire copy (_to_wire). Each is one transfer
+    one end_iteration builds, which it holds both as the merged sum and as
+    its wire copy while _to_wire makes the copy. Each is one transfer
     of every carried tensor at ``max_rows`` rows. Zero residuals: one per
     padded row count, ``zero_residual_rows`` rows in all. The first stage
     receives nothing, so it holds neither landing buffers nor zero residuals.
-    The last stage keeps the send allowance although it sends nothing,
-    because no receiving stage's bound counts the layout copies _from_wire
-    makes when the wire shape differs."""
+    The bound leaves out the layout copy _from_wire makes of a forward's
+    input on a receiving stage when the wire shape differs. The last stage
+    keeps the send allowance although it sends nothing, which covers that
+    copy there; on the other receiving stages it comes out of the memory
+    left outside the pool for the forward."""
     transfer = max_rows * hidden * (dtype.itemsize + num_aux * aux_dtype.itemsize)
     landing = _MAX_RECEIVES * transfer if receives else 0
     outgoing = (depth + 2) * transfer

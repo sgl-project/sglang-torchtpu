@@ -363,7 +363,7 @@ class TestPPBufferedHandoffBounds(unittest.TestCase):
         deadline = time.monotonic() + 10
         while handoff.sent < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
-        time.sleep(0.1)  # the send thread is back waiting for the next send
+        # The send thread drops its reference before it counts the send.
         gc.collect()
         self.assertEqual(handoff.sent, 1)
         self.assertTrue(sent_refs)
