@@ -1402,9 +1402,14 @@ class TpuEnvs:
     # Wave-8 prefill chipmate deferred weight send: defer donor TC's 24.4 MiB intra-chip remote
     # weight send until after gm_id==0 cold-start DMAs complete (eliminates 48.8 MiB HBM burst).
     SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND = EnvBool(False)
-    # Wave-8 prefill intra-chip chipmate borrowed expert slots per TC pair (1 = default E_33;
-    # 2 = two-round greedy whole/split rebalance over 2 borrowed slots E_34).
+    # Wave-8 prefill chipmate borrowed expert slots per TC (1 = default intra-chip E_33;
+    # 2 = two-round intra-chip rebalance over E_34; 3 = 3D hypercube butterfly xor=(1,2,4)
+    # over E_35 on EP=8: slot 0 intra-chip xor=1, slot 1 1-hop ICI X xor=2, slot 2 1-hop ICI Y xor=4).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS = EnvInt(1)
+    # Wave-9 prefill gmm_v2 zero-RMW 32-row flq + fused GMM1->GMM2 activation rowmax:
+    # 0 = off; 1 = 32-row concat zero-RMW FP8 store in GMM1 flq (1x gather read, 0 FP8 RMW);
+    # 2 = 1 + fuse GMM2 activation rowmax into GMM1 Up epilogue (eliminates 2 MiB GMM2 read pass).
+    SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW = EnvInt(0)
     # Wave-8 prefill Kernel A1 column-strip sub-tiling (0 = off; 256 or 512 = zero-spill
     # [tm, sub_n] f32 accumulators + progressive Gate/Q/KV 1-way async HBM writes).
     SGLANG_TPU_MUSE_KERNEL_A1_SUB_N = EnvInt(0)

@@ -29,6 +29,7 @@ def test_w8_carb_gmm_flags_default_off():
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS.get() == 0.0
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() == 1
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() == 0
 
 
 def test_no_bare_envfield_bool_evaluation_on_w8_carb_gmm_files():
@@ -48,6 +49,7 @@ def test_no_bare_envfield_bool_evaluation_on_w8_carb_gmm_files():
         "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS",
         "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND",
         "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW",
     }
     for rel in rel_paths:
         tree = ast.parse((repo / rel).read_text())
@@ -266,6 +268,32 @@ def test_w8_carb_gmm_tpu7x_mosaic_hlo_export_at_t16k():
             },
             ("E_34-M_131072", "-eo2", "-sfp8_4", "-cm1s2d", "pallas_prefill_chipmate_2slot_split"),
         ),
+        (
+            {
+                **base_env,
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "2",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "4.0",
+                "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "3",
+            },
+            ("E_35-M_131072", "-sw2", "-sfp8_4", "-cm1s3d", "pallas_prefill_chipmate_3slot_split"),
+        ),
+        (
+            {
+                **base_env,
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_POW2": "2",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_K_STEP": "512",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "2",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "4.0",
+                "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+            },
+            ("E_34-M_131072", "-sw2", "-sfp8_4", "-cm1s2d"),
+        ),
     )
 
     with (
@@ -397,3 +425,151 @@ def test_w8_carb_gmm_tpu7x_mosaic_hlo_export_at_t16k():
             assert len(lowered_512.as_text("stablehlo")) > 0
         finally:
             jax.clear_caches()
+
+
+
+def test_chipmate_3slot_hypercube_reduces_cross_chip_skew_and_matches_jax():
+    """Verify 3-slot hypercube (1,2,4) flattens cross-chip skew and matches JAX 0-ULP."""
+    ep_size = 8
+    e_loc = 32
+    tile_m = 256
+    rng = np.random.default_rng(20261122)
+
+    # Overload an entire 2-TC chip (ranks 0 and 1 equally heavy so xor=1 intra-chip cannot help!)
+    # while ranks 2 and 4 on neighbor chips are light: 3-slot hypercube (1,2,4) must rebalance!
+    ids = (rng.integers(2, ep_size, size=(4096, 8), dtype=np.int32) * e_loc + rng.integers(0, 4, size=(4096, 8), dtype=np.int32))
+    flat = ids.reshape(-1)
+    flat[0:12288] = 5
+    flat[12288:24576] = e_loc + 7
+    ids[-32:, :] = ep_size * e_loc
+
+    v2, cm2 = plan_prefill_chipmate_2slot_numpy_ref(
+        ids, ep_size=ep_size, num_local_experts=e_loc, tile_m=tile_m,
+        mode="split", slot_xors=(1, 1),
+    )
+    v3, cm3 = plan_prefill_chipmate_2slot_numpy_ref(
+        ids, ep_size=ep_size, num_local_experts=e_loc, tile_m=tile_m,
+        mode="split", slot_xors=(1, 2, 4),
+    )
+    assert cm3.shape == (ep_size, 9)
+    # Ranks 0/1 must offload via inter-chip rounds (rnd=1 xor=2 and/or rnd=2 xor=4).
+    assert cm3[2, 4] == 1 or cm3[4, 7] == 1
+    assert int(np.sum(v3 < ep_size * (e_loc + 3))) == int(np.sum(ids < ep_size * e_loc))
+    # Max tiles across 8 ranks strictly lower with 3-slot hypercube vs 2-slot intra-chip.
+    c2 = np.bincount(v2[v2 < ep_size * (e_loc + 2)], minlength=ep_size * (e_loc + 2)).reshape(ep_size, -1)
+    c3 = np.bincount(v3[v3 < ep_size * (e_loc + 3)], minlength=ep_size * (e_loc + 3)).reshape(ep_size, -1)
+    max_t2 = int(np.max(np.sum((c2 + tile_m - 1) // tile_m, axis=1)))
+    max_t3 = int(np.max(np.sum((c3 + tile_m - 1) // tile_m, axis=1)))
+    assert max_t3 < max_t2, f"Expected hypercube max_t3={max_t3} < max_t2={max_t2}"
+
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+        plan_prefill_chipmate_2slot_jax,
+    )
+
+    v3_jax, cm3_jax = plan_prefill_chipmate_2slot_jax(
+        jnp.asarray(ids), ep_size=ep_size, num_local_experts=e_loc,
+        tile_m=tile_m, mode="split", use_pallas=False, slot_xors=(1, 2, 4),
+    )
+    np.testing.assert_array_equal(np.asarray(cm3_jax), cm3)
+    np.testing.assert_array_equal(np.asarray(v3_jax), v3)
+
+
+def test_flq_zero_rmw_and_gmm1_rowmax_fusion_interpret_parity():
+    """Verify GMM_FLQ_ZERO_RMW=2 matches baseline 0-ULP under Pallas interpret=True."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import (
+        GmmConfigs,
+        Dimensions,
+        TileSizes,
+        InputConfigs,
+        MetadataRef,
+        WeightsRef,
+        inner_kernel,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    rng = np.random.default_rng(99)
+    m_rows, k1, n1_half, k2, n2 = 256, 512, 256, 256, 256
+    # Use a 2-strip K=512, N=512 (256 gate + 256 up) GMM1 followed by GMM2 to exercise both
+    # 32-row flq and fused GMM1->GMM2 rowmax reuse.
+    lhs_3d = jax.device_put(
+        jnp.asarray(rng.standard_normal((m_rows, k1 // 128, 128)).astype(np.float32), jnp.bfloat16)
+    )
+    w1_u32 = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k1 // 8, n1_half * 2), dtype=np.uint32))
+    s1_bf16 = jnp.asarray(np.exp(rng.normal(-2.0, 0.2, size=(k1 // 256, n1_half * 2))).astype(np.float32), jnp.bfloat16)
+    w2_u32 = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k2 // 8, n2), dtype=np.uint32))
+    s2_bf16 = jnp.asarray(np.exp(rng.normal(-2.0, 0.2, size=(k2 // 256, n2))).astype(np.float32), jnp.bfloat16)
+
+    cfgs1 = GmmConfigs(
+        dims=Dimensions(size_m=8192, size_k=k1, size_n=n1_half * 2, size_group=1, size_lhs_group=1, size_lhs_sublane=8),
+        tiles=TileSizes(tile_m=m_rows, tile_k=k1, tile_n=n1_half * 2),
+        lhs_cfgs=InputConfigs(quant_dtype=jnp.float8_e4m3fn.dtype, quant_block_size=k1, dtype=jnp.bfloat16),
+        rhs_cfgs=InputConfigs(quant_dtype=jnp.float4_e2m1fn.dtype, quant_block_size=256, dtype=jnp.float4_e2m1fn, has_bias=False, has_scale=True, packing=8, num_quant_blocks=k1 // 256),
+        out_dtype=jnp.bfloat16, acc_dtype=jnp.float32, zero_init=False, fuse_act="silu",
+    )
+    cfgs2 = GmmConfigs(
+        dims=Dimensions(size_m=8192, size_k=k2, size_n=n2, size_group=1, size_lhs_group=1, size_lhs_sublane=8),
+        tiles=TileSizes(tile_m=m_rows, tile_k=k2, tile_n=n2),
+        lhs_cfgs=InputConfigs(quant_dtype=jnp.float8_e4m3fn.dtype, quant_block_size=k2, dtype=jnp.bfloat16),
+        rhs_cfgs=InputConfigs(quant_dtype=jnp.float4_e2m1fn.dtype, quant_block_size=256, dtype=jnp.float4_e2m1fn, has_bias=False, has_scale=True, packing=8, num_quant_blocks=k2 // 256),
+        out_dtype=jnp.bfloat16, acc_dtype=jnp.float32, zero_init=False, fuse_act=None,
+    )
+
+    def _run_pair(flq_zero_rmw_val: str):
+        def _ker(x3d_r, w1_r, s1_r, w2_r, s2_r, out_r, g1_r, pq_fp8_r, pq_sc_r, p1_r, acc_r, m_gid, m_off):
+            m_gid[0] = jnp.int32(0)
+            m_off[0] = jnp.int32(0)
+            m_off[1] = jnp.int32(m_rows)
+            meta = MetadataRef(gm_id_to_group_id=m_gid, gm_id_to_m_offset=m_off)
+            inner_kernel(
+                None, WeightsRef(weight=w1_r, scale=s1_r, bias=None), g1_r, p1_r, acc_r, meta,
+                cfgs=cfgs1, scatter_mode=True, _k_id=0, _num_k=1, _gm_id=0, _n_id=0, _num_n=1,
+                fused_g2_amax_slot=1, prequant_lhs_fp8_ref=pq_fp8_r, prequant_lhs_scale_ref=pq_sc_r,
+                skip_row_mask=True, lhs_3d_vmem_ref=x3d_r,
+            )
+            inner_kernel(
+                None, WeightsRef(weight=w2_r, scale=s2_r, bias=None), out_r, p1_r, acc_r, meta,
+                cfgs=cfgs2, scatter_mode=True, _k_id=0, _num_k=1, _gm_id=0, _n_id=0, _num_n=1,
+                fused_g2_amax_slot=1, prequant_lhs_fp8_ref=pq_fp8_r.at[:, :k2], prequant_lhs_scale_ref=pq_sc_r,
+                skip_row_mask=True, lhs_2d_vmem_ref=g1_r,
+            )
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.dict(os.environ, {
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": flq_zero_rmw_val,
+            }),
+        ):
+            call = pl.pallas_call(
+                _ker,
+                out_shape=jax.ShapeDtypeStruct((m_rows, n2), jnp.bfloat16),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 5,
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[
+                    pltpu.VMEM((m_rows, n1_half), jnp.bfloat16),
+                    pltpu.VMEM((m_rows, k1), jnp.float8_e4m3fn),
+                    pltpu.VMEM((2, m_rows, 128), jnp.float32),
+                    pltpu.VMEM((8, n1_half * 2), jnp.float32),
+                    pltpu.VMEM((m_rows, n1_half * 2), jnp.float32),
+                    pltpu.SMEM((1,), jnp.int32),
+                    pltpu.SMEM((2,), jnp.int32),
+                ],
+                interpret=True,
+            )
+            return np.asarray(call(lhs_3d, w1_u32, s1_bf16, w2_u32, s2_bf16), dtype=np.float32)
+
+    y_base = _run_pair("0")
+    y_opt = _run_pair("2")
+    assert np.all(np.isfinite(y_opt))
+    np.testing.assert_array_equal(y_opt, y_base)

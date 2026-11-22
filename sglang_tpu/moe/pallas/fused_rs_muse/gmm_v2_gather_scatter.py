@@ -340,6 +340,8 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    _num_n: int | None = None,
+    fused_g2_amax_slot: int | None = None,
     prequant_rhs_fp8_ref=None,
     prequant_rhs_scale_ref=None,
     prequant_lhs_fp8_ref=None,
@@ -478,7 +480,7 @@ def inner_kernel(
                 cfgs.dims.size_m > 4096
                 and use_scoped_w4a8_refs
                 and jnp.dtype(cfgs.rhs_cfgs.quant_dtype) == jnp.float4_e2m1fn
-                and cfgs.rhs_cfgs.quant_block_size == 256
+                and cfgs.rhs_cfgs.quant_block_size in (256, 512)
             )
             else 0
         )
@@ -720,6 +722,11 @@ def inner_kernel(
                 and (prequant_lhs_fp8_ref is not None or _has_ext_pq_lhs_3d)
                 and prequant_lhs_scale_ref is not None
             )
+            _flq_zero_rmw = (
+                int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0)
+                if cfgs.dims.size_m > 4096
+                else 0
+            )
             _hoisted_lq_blocks = []
             _hoisted_ls_col = []
             _otf_inv_scale_bf16 = None
@@ -747,6 +754,50 @@ def inner_kernel(
                             tile_k=cfgs.tiles.tile_k,
                             scale_b_id=0,
                         )
+                    elif (
+                        _flq_zero_rmw >= 1
+                        and _qdt == jnp.float8_e4m3fn
+                        and cfgs.tiles.tile_m % 32 == 0
+                    ):
+                        # 1x-read, 0-RMW 32-row concat FP8 quantizer: loads 16 bf16 rows
+                        # at a time, frees bf16 -> keeps 16 fp8 rows, then writes exact
+                        # 32-row FP8 sublane-aligned tiles.
+                        for _m0 in range(0, cfgs.tiles.tile_m, 32):
+                            _q_pair = []
+                            _sc_pair = []
+                            for _sub in (0, 16):
+                                _blk = lhs_3d_vmem_ref[
+                                    pl.ds(_m0 + _sub, 16), :, :
+                                ].astype(jnp.bfloat16)
+                                _amax_m = jnp.max(
+                                    jnp.max(jnp.abs(_blk), axis=1), axis=1, keepdims=True
+                                ).astype(jnp.float32)
+                                _inv_m = jnp.where(
+                                    _amax_m == 0,
+                                    jnp.zeros_like(_amax_m),
+                                    _dt_max / _amax_m,
+                                ).astype(jnp.bfloat16)
+                                _sc_m = jnp.where(
+                                    _amax_m == 0,
+                                    jnp.zeros_like(_amax_m),
+                                    _amax_m * (1.0 / _dt_max),
+                                )
+                                _q_pair.append(
+                                    (
+                                        _blk.reshape(16, cfgs.tiles.tile_k) * _inv_m
+                                    ).astype(_qdt)
+                                )
+                                _sc_pair.append(
+                                    jnp.broadcast_to(
+                                        _sc_m, (16, prequant_lhs_scale_ref.shape[-1])
+                                    )
+                                )
+                            prequant_lhs_fp8_ref[pl.ds(_m0, 32), :] = jnp.concatenate(
+                                _q_pair, axis=0
+                            )
+                            prequant_lhs_scale_ref[0, pl.ds(_m0, 32), :] = (
+                                jnp.concatenate(_sc_pair, axis=0)
+                            )
                     else:
                         # Hot-VREG m-chunked single-pass quant directly from 3D (M, K//128, 128) VMEM:
                         # reads gathered_lhs once in native (8, 128) bursts with zero triple reshape.
@@ -777,24 +828,29 @@ def inner_kernel(
                                 )
                             )
                 else:
-                    # 2D VMEM LHS (GMM2 gmm1_out_ref): chunked 2D tree-max, then
-                    # quantize on-the-fly during Strip 0.
-                    _lmax_bf16 = None
-                    for _k0 in range(0, cfgs.tiles.tile_k, 256):
-                        _b2 = lhs_2d_vmem_ref[:, _k0 : _k0 + 256].astype(
-                            jnp.bfloat16
+                    # 2D VMEM LHS (GMM2 gmm1_out_ref): reuse pre-computed rowmax from GMM1 Up
+                    # epilogue when flq_zero_rmw >= 2, else chunked 2D tree-max.
+                    if _flq_zero_rmw >= 2 and fused_g2_amax_slot is not None:
+                        _amax_f32 = prequant_lhs_scale_ref[
+                            fused_g2_amax_slot, :, :1
+                        ].astype(jnp.float32)
+                    else:
+                        _lmax_bf16 = None
+                        for _k0 in range(0, cfgs.tiles.tile_k, 256):
+                            _b2 = lhs_2d_vmem_ref[:, _k0 : _k0 + 256].astype(
+                                jnp.bfloat16
+                            )
+                            _m128 = jnp.maximum(
+                                jnp.abs(_b2[:, :128]), jnp.abs(_b2[:, 128:])
+                            )
+                            _lmax_bf16 = (
+                                _m128
+                                if _lmax_bf16 is None
+                                else jnp.maximum(_lmax_bf16, _m128)
+                            )
+                        _amax_f32 = jnp.max(_lmax_bf16, axis=1, keepdims=True).astype(
+                            jnp.float32
                         )
-                        _m128 = jnp.maximum(
-                            jnp.abs(_b2[:, :128]), jnp.abs(_b2[:, 128:])
-                        )
-                        _lmax_bf16 = (
-                            _m128
-                            if _lmax_bf16 is None
-                            else jnp.maximum(_lmax_bf16, _m128)
-                        )
-                    _amax_f32 = jnp.max(_lmax_bf16, axis=1, keepdims=True).astype(
-                        jnp.float32
-                    )
                     _otf_inv_scale_bf16 = jnp.where(
                         _amax_f32 == 0,
                         jnp.zeros_like(_amax_f32),
@@ -867,7 +923,7 @@ def inner_kernel(
                     cfgs.dims.size_m > 4096
                     and use_scoped_w4a8_refs
                     and jnp.dtype(cfgs.rhs_cfgs.quant_dtype) == jnp.float4_e2m1fn
-                    and rhs_qbs == 256
+                    and rhs_qbs in (256, 512)
                 )
                 else 0
             )
@@ -1600,6 +1656,15 @@ def inner_kernel(
                             tiled_out_ref[:, s_n:e_n] = gate_act.astype(
                                 tiled_out_ref.dtype
                             )
+                        _fuse_g2_amax = (
+                            _flq_zero_rmw >= 2
+                            and fused_g2_amax_slot is not None
+                            and prequant_lhs_scale_ref is not None
+                            and use_fast_lhs_q
+                            and _num_n is not None
+                            and _n_id is not None
+                        )
+                        _g1_m128_bf16 = None
                         for s_n in range(0, half_tile_n, strip_step):
                             e_n = min(half_tile_n, s_n + strip_step)
                             up_acc = _compute_strip_acc(
@@ -1610,7 +1675,52 @@ def inner_kernel(
                             prod = (
                                 tiled_out_ref[:, s_n:e_n].astype(jnp.float32) * up_acc
                             )
-                            tiled_out_ref[:, s_n:e_n] = prod.astype(tiled_out_ref.dtype)
+                            prod_out = prod.astype(tiled_out_ref.dtype)
+                            tiled_out_ref[:, s_n:e_n] = prod_out
+                            if _fuse_g2_amax:
+                                _p_bf16 = prod_out.astype(jnp.bfloat16)
+                                _w_cols = e_n - s_n
+                                _lanes_w = prequant_lhs_scale_ref.shape[-1]
+                                if _w_cols % _lanes_w == 0:
+                                    for _c0 in range(0, _w_cols, _lanes_w):
+                                        _abs_c = jnp.abs(_p_bf16[:, _c0 : _c0 + _lanes_w])
+                                        _g1_m128_bf16 = (
+                                            _abs_c
+                                            if _g1_m128_bf16 is None
+                                            else jnp.maximum(_g1_m128_bf16, _abs_c)
+                                        )
+                                else:
+                                    _amax_c = jnp.max(
+                                        jnp.abs(_p_bf16), axis=1, keepdims=True
+                                    )
+                                    _abs_b = jnp.broadcast_to(
+                                        _amax_c, (cfgs.tiles.tile_m, _lanes_w)
+                                    )
+                                    _g1_m128_bf16 = (
+                                        _abs_b
+                                        if _g1_m128_bf16 is None
+                                        else jnp.maximum(_g1_m128_bf16, _abs_b)
+                                    )
+                        if _fuse_g2_amax and _g1_m128_bf16 is not None:
+                            _lanes_w = prequant_lhs_scale_ref.shape[-1]
+                            if _n_id > 0:
+                                _prev_m128 = prequant_lhs_scale_ref[
+                                    fused_g2_amax_slot, :, :
+                                ].astype(jnp.bfloat16)
+                                _g1_m128_bf16 = jnp.maximum(_prev_m128, _g1_m128_bf16)
+                            if _n_id == _num_n - 1:
+                                _final_amax = jnp.max(
+                                    _g1_m128_bf16, axis=1, keepdims=True
+                                ).astype(jnp.float32)
+                                prequant_lhs_scale_ref[fused_g2_amax_slot, :, :] = (
+                                    jnp.broadcast_to(
+                                        _final_amax, (cfgs.tiles.tile_m, _lanes_w)
+                                    )
+                                )
+                            else:
+                                prequant_lhs_scale_ref[fused_g2_amax_slot, :, :] = (
+                                    _g1_m128_bf16.astype(jnp.float32)
+                                )
                 else:
                     for s_n in range(0, rhs_tile_n, strip_step):
                         e_n = min(rhs_tile_n, s_n + strip_step)

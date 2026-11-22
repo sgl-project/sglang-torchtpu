@@ -414,17 +414,17 @@ def moe_gmm_local_rs_nodedup(
             route_prefill_imbalance_jax,
         )
 
+        _req_cm_slots = int(
+            envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1
+        )
         _n_cm_slots = (
-            2
-            if (
-                use_prefill_cm
-                and not use_prefill_rep
-                and int(
-                    envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1
-                )
-                >= 2
+            3
+            if (use_prefill_cm and not use_prefill_rep and _req_cm_slots >= 3 and ep_size == 8)
+            else (
+                2
+                if (use_prefill_cm and not use_prefill_rep and _req_cm_slots >= 2)
+                else (1 if use_prefill_cm else 0)
             )
-            else (1 if use_prefill_cm else 0)
         )
         # Invalidate pre-remapped inv_perm_c_pre so _tc_combine_bf16 uses virtual IDs.
         inv_perm_c_pre = None
@@ -461,11 +461,12 @@ def moe_gmm_local_rs_nodedup(
             else num_local_experts
         )
         _n_rep = (num_local_experts - _base_loc) if use_prefill_rep else 0
-        if _n_cm_slots == 2:
+        if _n_cm_slots >= 2:
             from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
                 plan_prefill_chipmate_2slot_jax,
             )
 
+            _slot_xors = (1, 2, 4) if _n_cm_slots == 3 else (chipmate_xor, chipmate_xor)
             topk_indices, _cm_all = plan_prefill_chipmate_2slot_jax(
                 topk_indices,
                 ep_size=ep_size,
@@ -473,6 +474,7 @@ def moe_gmm_local_rs_nodedup(
                 tile_m=_plan_tm,
                 chipmate_xor=chipmate_xor,
                 mode=eff_cm_mode,
+                slot_xors=_slot_xors,
             )
         else:
             topk_indices, _cm_all = route_prefill_imbalance_jax(
@@ -490,37 +492,30 @@ def moe_gmm_local_rs_nodedup(
         local_t_recv = None
         if use_prefill_cm:
             _perm_pairs = [(r, r ^ chipmate_xor) for r in range(ep_size)]
-            if _n_cm_slots == 2:
-                my_cm_plan = jnp.stack(
-                    [
-                        _cm_all[my_id, 0],
-                        _cm_all[my_id, 1],
-                        _cm_all[my_id, 3],
-                        _cm_all[my_id, 4],
-                    ]
-                )
-                _src0 = _cm_all[my_id, 2]
-                _src1 = _cm_all[my_id, 5]
+            if _n_cm_slots >= 2:
+                _plan_entries = []
+                for _ci in range(_n_cm_slots):
+                    _plan_entries.extend([_cm_all[my_id, 3 * _ci + 0], _cm_all[my_id, 3 * _ci + 1]])
+                my_cm_plan = jnp.stack(_plan_entries)
+                _xors_cm = (1, 2, 4) if _n_cm_slots == 3 else (chipmate_xor, chipmate_xor)
                 if w1_global_scale is not None:
-                    _pgs1 = jax.lax.ppermute(w1_global_scale, ep_axis_name, _perm_pairs)
-                    w1_global_scale = jnp.concatenate(
-                        [
-                            w1_global_scale,
-                            _pgs1[_src0 : _src0 + 1],
-                            _pgs1[_src1 : _src1 + 1],
-                        ],
-                        axis=0,
-                    )
+                    _cat1 = [w1_global_scale]
+                    for _ci, _rx in enumerate(_xors_cm):
+                        _pgs1 = jax.lax.ppermute(
+                            w1_global_scale, ep_axis_name, [(r, r ^ _rx) for r in range(ep_size)]
+                        )
+                        _sr = _cm_all[my_id, 3 * _ci + 2]
+                        _cat1.append(_pgs1[_sr : _sr + 1])
+                    w1_global_scale = jnp.concatenate(_cat1, axis=0)
                 if w2_global_scale is not None:
-                    _pgs2 = jax.lax.ppermute(w2_global_scale, ep_axis_name, _perm_pairs)
-                    w2_global_scale = jnp.concatenate(
-                        [
-                            w2_global_scale,
-                            _pgs2[_src0 : _src0 + 1],
-                            _pgs2[_src1 : _src1 + 1],
-                        ],
-                        axis=0,
-                    )
+                    _cat2 = [w2_global_scale]
+                    for _ci, _rx in enumerate(_xors_cm):
+                        _pgs2 = jax.lax.ppermute(
+                            w2_global_scale, ep_axis_name, [(r, r ^ _rx) for r in range(ep_size)]
+                        )
+                        _sr = _cm_all[my_id, 3 * _ci + 2]
+                        _cat2.append(_pgs2[_sr : _sr + 1])
+                    w2_global_scale = jnp.concatenate(_cat2, axis=0)
             else:
                 my_cm_plan = _cm_all[my_id, :2]
                 _recv_src_slot = _cm_all[my_id, 2]

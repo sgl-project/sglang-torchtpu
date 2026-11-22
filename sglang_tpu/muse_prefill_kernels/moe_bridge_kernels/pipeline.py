@@ -1604,15 +1604,18 @@ def fused_moe_full_bridge_and_ffn(
             and (ep_size % 2 == 0)
             and w1_l.ndim == 3
         )
-        eff_cm_slots_pipe = (
-            2
+        _req_cm_slots_pipe = (
+            int(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1)
             if (
                 eff_cm_pipe
-                and int(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1)
-                >= 2
                 and (not eplb_mode or eplb_mode == "off" or num_local_experts <= 32)
             )
-            else (1 if eff_cm_pipe else 0)
+            else 0
+        )
+        eff_cm_slots_pipe = (
+            3
+            if (_req_cm_slots_pipe >= 3 and ep_size == 8)
+            else (2 if _req_cm_slots_pipe >= 2 else (1 if eff_cm_pipe else 0))
         )
         eff_cm_mode_pipe = envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE.get()
 
@@ -1690,11 +1693,12 @@ def fused_moe_full_bridge_and_ffn(
                     raw_local = l_ids = u8_local.astype(jnp.int32)
                     g_ids = u8_global.astype(jnp.int32)
                 if eff_cm_pipe:
-                    if eff_cm_slots_pipe == 2:
+                    if eff_cm_slots_pipe >= 2:
                         from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
                             plan_prefill_chipmate_2slot_jax,
                         )
 
+                        _slot_xors_p = (1, 2, 4) if eff_cm_slots_pipe == 3 else (1, 1)
                         g_ids, _cm_all = plan_prefill_chipmate_2slot_jax(
                             g_ids,
                             ep_size=ep_size,
@@ -1702,15 +1706,12 @@ def fused_moe_full_bridge_and_ffn(
                             tile_m=_query_kernel_tile_m(eff_n_loc),
                             chipmate_xor=1,
                             mode=eff_cm_mode_pipe,
+                            slot_xors=_slot_xors_p,
                         )
-                        cm_plan_local = jnp.stack(
-                            [
-                                _cm_all[my_id, 0],
-                                _cm_all[my_id, 1],
-                                _cm_all[my_id, 3],
-                                _cm_all[my_id, 4],
-                            ]
-                        )
+                        _cm_entries_p = []
+                        for _ci in range(eff_cm_slots_pipe):
+                            _cm_entries_p.extend([_cm_all[my_id, 3 * _ci + 0], _cm_all[my_id, 3 * _ci + 1]])
+                        cm_plan_local = jnp.stack(_cm_entries_p)
                     else:
                         from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
                             plan_prefill_chipmate_jax,
@@ -1778,11 +1779,12 @@ def fused_moe_full_bridge_and_ffn(
                 g_ids = jnp.where(g_active, raw_global, sentinel)
                 l_ids = jnp.where(l_active, raw_local, sentinel)
             if eff_cm_pipe:
-                if eff_cm_slots_pipe == 2:
+                if eff_cm_slots_pipe >= 2:
                     from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
                         plan_prefill_chipmate_2slot_jax,
                     )
 
+                    _slot_xors_p = (1, 2, 4) if eff_cm_slots_pipe == 3 else (1, 1)
                     g_ids, _cm_all = plan_prefill_chipmate_2slot_jax(
                         g_ids,
                         ep_size=ep_size,
@@ -1790,15 +1792,12 @@ def fused_moe_full_bridge_and_ffn(
                         tile_m=_query_kernel_tile_m(eff_n_loc),
                         chipmate_xor=1,
                         mode=eff_cm_mode_pipe,
+                        slot_xors=_slot_xors_p,
                     )
-                    cm_plan_local = jnp.stack(
-                        [
-                            _cm_all[my_id, 0],
-                            _cm_all[my_id, 1],
-                            _cm_all[my_id, 3],
-                            _cm_all[my_id, 4],
-                        ]
-                    )
+                    _cm_entries_p = []
+                    for _ci in range(eff_cm_slots_pipe):
+                        _cm_entries_p.extend([_cm_all[my_id, 3 * _ci + 0], _cm_all[my_id, 3 * _ci + 1]])
+                    cm_plan_local = jnp.stack(_cm_entries_p)
                 else:
                     from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
                         plan_prefill_chipmate_jax,

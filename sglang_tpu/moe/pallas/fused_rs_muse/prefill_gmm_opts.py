@@ -122,21 +122,23 @@ def plan_prefill_chipmate_2slot_numpy_ref(
     min_tile_gap: int = 3,
     mode: str = "split",
     weight_load_tiles: int = 1,
+    slot_xors: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Exact 2-round deterministic NumPy reference for `PREFILL_CHIPMATE_SLOTS=2`.
+    """Exact multi-round deterministic NumPy reference for `PREFILL_CHIPMATE_SLOTS=2/3`.
 
     Returns:
-        v_ids: int32[T, topk] remapped virtual expert IDs over `ep_size * (num_local_experts + 2)`
+        v_ids: int32[T, topk] remapped virtual expert IDs over `ep_size * (num_local_experts + n_cm)`
             (preserving sentinel `>= ep_size * num_local_experts` mapped to `ep_size * e_virt`).
-        cm_plan: int32[ep_size, 6] per-rank `[send_0, recv_0, src_0, send_1, recv_1, src_1]`.
+        cm_plan: int32[ep_size, 3 * n_cm] per-rank `[send_0, recv_0, src_0, ...]`.
     """
     mode_norm = (mode or "whole").strip().lower()
     if mode_norm not in ("whole", "split"):
         raise ValueError(f"Unsupported prefill chipmate mode={mode!r}")
 
+    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
+    n_cm = len(eff_slot_xors)
     ids = np.asarray(topk_indices, dtype=np.int32)
     e_loc = num_local_experts
-    n_cm = 2
     e_virt = e_loc + n_cm
     num_in = ep_size * e_loc
 
@@ -154,30 +156,27 @@ def plan_prefill_chipmate_2slot_numpy_ref(
     total_elems = ids.size
     n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
     blk_elems = total_elems // n_blocks
-    ids_blk = ids.reshape(n_blocks, blk_elems)
     v_blk = base_v.reshape(n_blocks, blk_elems).copy()
 
-    cm_plan = np.zeros((ep_size, 6), dtype=np.int32)
-    cm_plan[:, 0] = -1
-    cm_plan[:, 3] = -1
+    cm_plan = np.zeros((ep_size, 3 * n_cm), dtype=np.int32)
+    for rnd in range(n_cm):
+        cm_plan[:, 3 * rnd] = -1
 
-    pairs = [
-        (r, r ^ chipmate_xor)
-        for r in range(ep_size)
-        if 0 <= (r ^ chipmate_xor) < ep_size and r < (r ^ chipmate_xor)
-    ]
+    used_mask = np.zeros((ep_size, e_loc), dtype=bool)
+    for rnd, r_xor in enumerate(eff_slot_xors):
+        pairs = [
+            (r, r ^ r_xor)
+            for r in range(ep_size)
+            if 0 <= (r ^ r_xor) < ep_size and r < (r ^ r_xor)
+        ]
+        for r0, r1 in pairs:
+            l0, l1 = int(loads[r0]), int(loads[r1])
+            hi = r0 if l0 >= l1 else r1
+            lo = r1 if l0 >= l1 else r0
+            l_hi, l_lo = max(l0, l1), min(l0, l1)
 
-    for r0, r1 in pairs:
-        l0, l1 = int(loads[r0]), int(loads[r1])
-        hi = r0 if l0 >= l1 else r1
-        lo = r1 if l0 >= l1 else r0
-        l_hi = max(l0, l1)
-        l_lo = min(l0, l1)
-        used_mask = np.zeros(e_loc, dtype=bool)
-
-        for rnd in range(n_cm):
-            c_hi = np.where(used_mask, 0, cost_rs[hi])
-            t_hi = np.where(used_mask, 0, tiles_rs[hi])
+            t_hi = np.where(used_mask[hi], 0, tiles_rs[hi])
+            c_hi = np.where(t_hi > 0, t_hi + weight_load_tiles, 0)
             new_peaks = np.where(c_hi > 0, np.maximum(l_hi - c_hi, l_lo + c_hi), l_hi)
             best_s = int(np.argmin(new_peaks))
             whole_gain = l_hi - int(new_peaks[best_s])
@@ -201,27 +200,29 @@ def plan_prefill_chipmate_2slot_numpy_ref(
                 chosen_s = best_s if use_whole else max_s
 
             if not do_any:
-                break
+                continue
 
-            used_mask[chosen_s] = True
-            chosen_eid = hi * e_loc + chosen_s
+            used_mask[hi, chosen_s] = True
+            src_vid = hi * e_virt + chosen_s
             borrowed_vid = lo * e_virt + (e_loc + rnd)
 
             if use_whole:
-                v_blk = np.where(ids_blk == chosen_eid, borrowed_vid, v_blk)
+                v_blk = np.where(v_blk == src_vid, borrowed_vid, v_blk)
                 delta_c = int(c_hi[chosen_s])
-                l_hi -= delta_c
-                l_lo += delta_c
+                loads[hi] -= delta_c
+                loads[lo] += delta_c
+                tiles_rs[hi, chosen_s] = 0
             else:
                 keep_rows = (t_max - split_t) * tile_m
-                hit_blk = ids_blk == chosen_eid
+                hit_blk = v_blk == src_vid
                 blk_cnt = np.sum(hit_blk.astype(np.int32), axis=1)
                 cum_blk = np.cumsum(blk_cnt) - blk_cnt
                 mid_row = cum_blk + (blk_cnt >> 1)
                 to_lo_blk = mid_row >= keep_rows
                 v_blk = np.where(hit_blk & to_lo_blk[:, None], borrowed_vid, v_blk)
-                l_hi -= split_t
-                l_lo += split_t + weight_load_tiles
+                loads[hi] -= split_t
+                loads[lo] += split_t + weight_load_tiles
+                tiles_rs[hi, chosen_s] = max(0, int(tiles_rs[hi, chosen_s]) - split_t)
 
             col_base = 3 * rnd
             cm_plan[hi, col_base + 0] = chosen_s
@@ -1323,12 +1324,13 @@ def plan_prefill_chipmate_2slot_jax(
     mode: str = "split",
     weight_load_tiles: int = 1,
     use_pallas: bool | None = None,
+    slot_xors: tuple[int, ...] | None = None,
 ):
-    """Deterministic 2-round intra-chip chipmate planner borrowing up to 2 experts (`E_34`).
+    """Deterministic multi-round chipmate planner borrowing up to 2/3 experts (`E_34` / `E_35`).
 
     Returns:
-        v_ids: int32[T, topk] remapped virtual expert IDs over `ep_size * (num_local_experts + 2)`.
-        cm_plan: int32[ep_size, 6] per-rank `[send_0, recv_0, src_0, send_1, recv_1, src_1]`.
+        v_ids: int32[T, topk] remapped virtual expert IDs over `ep_size * (num_local_experts + n_cm)`.
+        cm_plan: int32[ep_size, 3 * n_cm] per-rank `[send_0, recv_0, src_0, ...]`.
     """
     import jax
     import jax.numpy as jnp
@@ -1345,6 +1347,7 @@ def plan_prefill_chipmate_2slot_jax(
         raise ValueError(
             f"Unsupported prefill chipmate mode={mode!r}; expected 'whole' or 'split'"
         )
+    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
     total_elems_in = int(topk_indices.shape[0] * topk_indices.shape[1])
     if _can_use_tpu_pallas_prefill_router(total_elems_in, use_pallas):
         return _pallas_prefill_chipmate_2slot_route(
@@ -1356,10 +1359,11 @@ def plan_prefill_chipmate_2slot_jax(
             min_tile_gap=min_tile_gap,
             tile_m=tile_m,
             weight_load_tiles=weight_load_tiles,
+            slot_xors=eff_slot_xors,
         )
 
     e_loc = num_local_experts
-    n_cm = 2
+    n_cm = len(eff_slot_xors)
     e_virt = e_loc + n_cm
     num_in_experts = ep_size * e_loc
 
@@ -1374,36 +1378,29 @@ def plan_prefill_chipmate_2slot_jax(
     total_elems = ids_i32.shape[0] * ids_i32.shape[1]
     n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
     blk_elems = total_elems // n_blocks
-    ids_blk = ids_i32.reshape(n_blocks, blk_elems)
     v_blk = base_v.reshape(n_blocks, blk_elems)
 
-    pairs = [
-        (r, r ^ chipmate_xor)
-        for r in range(ep_size)
-        if 0 <= (r ^ chipmate_xor) < ep_size and r < (r ^ chipmate_xor)
-    ]
+    used_mask = jnp.zeros((ep_size, e_loc), dtype=jnp.bool_)
+    send_cols = [jnp.full((ep_size,), -1, dtype=jnp.int32) for _ in range(n_cm)]
+    recv_cols = [jnp.zeros((ep_size,), dtype=jnp.int32) for _ in range(n_cm)]
+    src_cols = [jnp.zeros((ep_size,), dtype=jnp.int32) for _ in range(n_cm)]
 
-    send_0 = jnp.full((ep_size,), -1, dtype=jnp.int32)
-    recv_0 = jnp.zeros((ep_size,), dtype=jnp.int32)
-    src_0 = jnp.zeros((ep_size,), dtype=jnp.int32)
-    send_1 = jnp.full((ep_size,), -1, dtype=jnp.int32)
-    recv_1 = jnp.zeros((ep_size,), dtype=jnp.int32)
-    src_1 = jnp.zeros((ep_size,), dtype=jnp.int32)
-    slot_iota = jnp.arange(e_loc, dtype=jnp.int32)
+    for rnd, r_xor in enumerate(eff_slot_xors):
+        pairs = [
+            (r, r ^ r_xor)
+            for r in range(ep_size)
+            if 0 <= (r ^ r_xor) < ep_size and r < (r ^ r_xor)
+        ]
+        for r0, r1 in pairs:
+            l0, l1 = loads[r0], loads[r1]
+            r0_heavier = l0 >= l1
+            hi = jnp.where(r0_heavier, jnp.int32(r0), jnp.int32(r1))
+            lo = jnp.where(r0_heavier, jnp.int32(r1), jnp.int32(r0))
+            l_hi = jnp.maximum(l0, l1)
+            l_lo = jnp.minimum(l0, l1)
 
-    for r0, r1 in pairs:
-        l0, l1 = loads[r0], loads[r1]
-        r0_heavier = l0 >= l1
-        hi = jnp.where(r0_heavier, jnp.int32(r0), jnp.int32(r1))
-        lo = jnp.where(r0_heavier, jnp.int32(r1), jnp.int32(r0))
-        l_hi = jnp.maximum(l0, l1)
-        l_lo = jnp.minimum(l0, l1)
-        used_s0 = jnp.int32(-1)
-
-        for rnd in range(n_cm):
-            is_used = slot_iota == used_s0
-            c_hi = jnp.where(is_used, jnp.int32(0), cost_rs[hi])
-            t_hi = jnp.where(is_used, jnp.int32(0), tiles_rs[hi])
+            t_hi = jnp.where(used_mask[hi], jnp.int32(0), tiles_rs[hi])
+            c_hi = jnp.where(t_hi > 0, t_hi + weight_load_tiles, jnp.int32(0))
             new_peaks = jnp.where(c_hi > 0, jnp.maximum(l_hi - c_hi, l_lo + c_hi), l_hi)
             best_s = jnp.argmin(new_peaks).astype(jnp.int32)
             whole_gain = l_hi - new_peaks[best_s]
@@ -1431,11 +1428,11 @@ def plan_prefill_chipmate_2slot_jax(
                 do_any = use_whole | use_split
                 chosen_s = jnp.where(use_whole, best_s, max_s)
 
-            chosen_eid = hi * e_loc + chosen_s
+            src_vid = hi * e_virt + chosen_s
             borrowed_vid = lo * e_virt + (e_loc + rnd)
             keep_rows = jnp.where(use_whole, 0, (t_max - split_t) * tile_m)
 
-            hit_blk = ids_blk == chosen_eid
+            hit_blk = v_blk == src_vid
             blk_cnt = jnp.sum(hit_blk.astype(jnp.int32), axis=1)
             cum_blk = jnp.cumsum(blk_cnt) - blk_cnt
             mid_row = cum_blk + lax.shift_right_logical(blk_cnt, 1)
@@ -1450,24 +1447,24 @@ def plan_prefill_chipmate_2slot_jax(
                 jnp.where(use_whole, c_hi[chosen_s], split_t + weight_load_tiles),
                 0,
             )
-            l_hi = l_hi - delta_hi
-            l_lo = l_lo + delta_lo
+            loads = loads.at[hi].set(l_hi - delta_hi)
+            loads = loads.at[lo].set(l_lo + delta_lo)
+            new_t_hi = jnp.where(
+                do_any,
+                jnp.where(use_whole, jnp.int32(0), jnp.maximum(0, tiles_rs[hi, chosen_s] - split_t)),
+                tiles_rs[hi, chosen_s],
+            )
+            tiles_rs = tiles_rs.at[hi, chosen_s].set(new_t_hi)
+            used_mask = used_mask.at[hi, chosen_s].set(used_mask[hi, chosen_s] | do_any)
 
-            if rnd == 0:
-                used_s0 = jnp.where(do_any, chosen_s, jnp.int32(-1))
-                send_0 = send_0.at[hi].set(jnp.where(do_any, chosen_s, send_0[hi]))
-                recv_0 = recv_0.at[lo].set(
-                    jnp.where(do_any, jnp.int32(1), recv_0[lo])
-                )
-                src_0 = src_0.at[lo].set(jnp.where(do_any, chosen_s, src_0[lo]))
-            else:
-                send_1 = send_1.at[hi].set(jnp.where(do_any, chosen_s, send_1[hi]))
-                recv_1 = recv_1.at[lo].set(
-                    jnp.where(do_any, jnp.int32(1), recv_1[lo])
-                )
-                src_1 = src_1.at[lo].set(jnp.where(do_any, chosen_s, src_1[lo]))
+            send_cols[rnd] = send_cols[rnd].at[hi].set(jnp.where(do_any, chosen_s, send_cols[rnd][hi]))
+            recv_cols[rnd] = recv_cols[rnd].at[lo].set(jnp.where(do_any, jnp.int32(1), recv_cols[rnd][lo]))
+            src_cols[rnd] = src_cols[rnd].at[lo].set(jnp.where(do_any, chosen_s, src_cols[rnd][lo]))
 
-    cm_plan = jnp.stack([send_0, recv_0, src_0, send_1, recv_1, src_1], axis=1)
+    cols = []
+    for rnd in range(n_cm):
+        cols.extend([send_cols[rnd], recv_cols[rnd], src_cols[rnd]])
+    cm_plan = jnp.stack(cols, axis=1)
     return v_blk.reshape(topk_indices.shape), cm_plan
 
 
@@ -1481,8 +1478,9 @@ def _pallas_prefill_chipmate_2slot_route(
     min_tile_gap: int = 3,
     tile_m: int = 256,
     weight_load_tiles: int = 1,
+    slot_xors: tuple[int, ...] | None = None,
 ):
-    """Single-op TPU7x Pallas VMEM+SMEM 2-slot chipmate router (`~30 us`, 0 sorts)."""
+    """Single-op TPU7x Pallas VMEM+SMEM multi-slot chipmate router (`~30 us`, 0 sorts)."""
     import jax
     import jax.experimental.pallas as pl
     import jax.numpy as jnp
@@ -1493,8 +1491,9 @@ def _pallas_prefill_chipmate_2slot_route(
         _jax_bincount_2d_topk,
     )
 
+    eff_slot_xors = tuple(slot_xors) if slot_xors is not None else (chipmate_xor, chipmate_xor)
     e_in = num_local_experts
-    n_cm = 2
+    n_cm = len(eff_slot_xors)
     e_final = e_in + n_cm
     num_in_experts = ep_size * e_in
     e_in_pow2 = (e_in & (e_in - 1)) == 0
@@ -1508,12 +1507,7 @@ def _pallas_prefill_chipmate_2slot_route(
     ids_blk = ids_i32.reshape(n_blocks, blk_elems)
     counts_e = _jax_bincount_2d_topk(ids_i32, num_in_experts)
 
-    pairs = [
-        (r, r ^ chipmate_xor)
-        for r in range(ep_size)
-        if 0 <= (r ^ chipmate_xor) < ep_size and r < (r ^ chipmate_xor)
-    ]
-    max_moves = max(1, ep_size)
+    max_moves = max(1, (ep_size // 2) * n_cm)
 
     def _kernel(*refs):
         it = iter(refs)
@@ -1523,6 +1517,7 @@ def _pallas_prefill_chipmate_2slot_route(
         cm_out_ref = next(it)
         loads_s = next(it)
         tiles_s = next(it)
+        used_s = next(it)
         n_moves_s = next(it)
         m_src_s = next(it)
         m_dst_s = next(it)
@@ -1535,12 +1530,10 @@ def _pallas_prefill_chipmate_2slot_route(
         @pl.loop(0, ep_size)
         def _init_ranks(r):
             loads_s[r] = jnp.int32(0)
-            cm_out_ref[r, 0] = jnp.int32(-1)
-            cm_out_ref[r, 1] = jnp.int32(0)
-            cm_out_ref[r, 2] = jnp.int32(0)
-            cm_out_ref[r, 3] = jnp.int32(-1)
-            cm_out_ref[r, 4] = jnp.int32(0)
-            cm_out_ref[r, 5] = jnp.int32(0)
+            for _rnd in range(n_cm):
+                cm_out_ref[r, 3 * _rnd + 0] = jnp.int32(-1)
+                cm_out_ref[r, 3 * _rnd + 1] = jnp.int32(0)
+                cm_out_ref[r, 3 * _rnd + 2] = jnp.int32(0)
 
         @pl.loop(0, num_in_experts)
         def _init_in(e):
@@ -1559,23 +1552,28 @@ def _pallas_prefill_chipmate_2slot_route(
                 else (e // jnp.int32(e_in))
             )
             tiles_s[e] = t
+            used_s[e] = jnp.int32(0)
             loads_s[own] = loads_s[own] + cost
 
-        for r0, r1 in pairs:
-            l0 = loads_s[r0]
-            l1 = loads_s[r1]
-            r0_heavier = l0 >= l1
-            hi = jnp.where(r0_heavier, jnp.int32(r0), jnp.int32(r1))
-            lo = jnp.where(r0_heavier, jnp.int32(r1), jnp.int32(r0))
-            l_hi = jnp.maximum(l0, l1)
-            l_lo = jnp.minimum(l0, l1)
-            used_s0 = jnp.int32(-1)
+        for rnd, r_xor in enumerate(eff_slot_xors):
+            pairs = [
+                (r, r ^ r_xor)
+                for r in range(ep_size)
+                if 0 <= (r ^ r_xor) < ep_size and r < (r ^ r_xor)
+            ]
+            for r0, r1 in pairs:
+                l0 = loads_s[r0]
+                l1 = loads_s[r1]
+                r0_heavier = l0 >= l1
+                hi = jnp.where(r0_heavier, jnp.int32(r0), jnp.int32(r1))
+                lo = jnp.where(r0_heavier, jnp.int32(r1), jnp.int32(r0))
+                l_hi = jnp.maximum(l0, l1)
+                l_lo = jnp.minimum(l0, l1)
 
-            for rnd in range(n_cm):
-                def _scan_slot(s, carry, _hi=hi, _l_hi=l_hi, _l_lo=l_lo, _u0=used_s0):
+                def _scan_slot(s, carry, _hi=hi, _l_hi=l_hi, _l_lo=l_lo):
                     b_s, b_pk, m_s, m_t = carry
-                    t_raw = tiles_s[_hi * jnp.int32(e_in) + s]
-                    t_s = jnp.where(s == _u0, jnp.int32(0), t_raw)
+                    idx = _hi * jnp.int32(e_in) + s
+                    t_s = jnp.where(used_s[idx] != 0, jnp.int32(0), tiles_s[idx])
                     c_s = jnp.where(
                         t_s > 0, t_s + jnp.int32(weight_load_tiles), jnp.int32(0)
                     )
@@ -1641,6 +1639,10 @@ def _pallas_prefill_chipmate_2slot_route(
                     _lo=lo,
                     _cs=chosen_s,
                     _kr=keep_rows,
+                    _uw=use_whole,
+                    _st=split_t,
+                    _cc=c_chosen,
+                    _traw=c_chosen_raw,
                 ):
                     src_vid = _hi * jnp.int32(e_final) + _cs
                     dst_vid = _lo * jnp.int32(e_final) + jnp.int32(e_in + _rnd)
@@ -1654,21 +1656,15 @@ def _pallas_prefill_chipmate_2slot_route(
                     cm_out_ref[_hi, col_b + 0] = _cs
                     cm_out_ref[_lo, col_b + 1] = jnp.int32(1)
                     cm_out_ref[_lo, col_b + 2] = _cs
-
-                delta_hi = jnp.where(
-                    do_any, jnp.where(use_whole, c_chosen, split_t), jnp.int32(0)
-                )
-                delta_lo = jnp.where(
-                    do_any,
-                    jnp.where(
-                        use_whole, c_chosen, split_t + jnp.int32(weight_load_tiles)
-                    ),
-                    jnp.int32(0),
-                )
-                l_hi = l_hi - delta_hi
-                l_lo = l_lo + delta_lo
-                if rnd == 0:
-                    used_s0 = jnp.where(do_any, chosen_s, jnp.int32(-1))
+                    dh = jnp.where(_uw, _cc, _st)
+                    dl = jnp.where(_uw, _cc, _st + jnp.int32(weight_load_tiles))
+                    loads_s[_hi] = loads_s[_hi] - dh
+                    loads_s[_lo] = loads_s[_lo] + dl
+                    h_idx = _hi * jnp.int32(e_in) + _cs
+                    tiles_s[h_idx] = jnp.where(
+                        _uw, jnp.int32(0), jnp.maximum(jnp.int32(0), _traw - _st)
+                    )
+                    used_s[h_idx] = jnp.int32(1)
 
         @pl.loop(0, n_blocks // 8)
         def _map_base(b8):
@@ -1757,6 +1753,7 @@ def _pallas_prefill_chipmate_2slot_route(
     scratch_shapes = [
         pltpu.SMEM((ep_size,), jnp.int32),
         pltpu.SMEM((num_in_experts,), jnp.int32),
+        pltpu.SMEM((num_in_experts,), jnp.int32),
         pltpu.SMEM((1,), jnp.int32),
         pltpu.SMEM((max_moves,), jnp.int32),
         pltpu.SMEM((max_moves,), jnp.int32),
@@ -1770,7 +1767,7 @@ def _pallas_prefill_chipmate_2slot_route(
         _kernel,
         out_shape=(
             jax.ShapeDtypeStruct((n_blocks, blk_elems), jnp.int32),
-            jax.ShapeDtypeStruct((ep_size, 6), jnp.int32),
+            jax.ShapeDtypeStruct((ep_size, 3 * n_cm), jnp.int32),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -1782,6 +1779,6 @@ def _pallas_prefill_chipmate_2slot_route(
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
-        name=f"pallas_prefill_chipmate_2slot_{chipmate_mode}_m{total_elems}",
+        name=f"pallas_prefill_chipmate_{n_cm}slot_{chipmate_mode}_m{total_elems}",
     )(counts_e, ids_blk)
     return v_blk.reshape(topk_indices.shape), cm_plan

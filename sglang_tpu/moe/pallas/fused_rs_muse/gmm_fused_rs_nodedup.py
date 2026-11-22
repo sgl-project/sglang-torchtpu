@@ -1338,10 +1338,15 @@ def kernel_main_fused_rs(
             cm_awaited_ref[_ci] = jnp.int32(0)
         if cm_defer_send:
             cm_awaited_ref[eff_cm_slots] = jnp.int32(0)
-        cm_partner = lax.bitwise_xor(my_id, jnp.int32(chipmate_xor))
+        _cm_slot_xors = (
+            (1, 2, 4)
+            if (eff_cm_slots == 3 and ep_size == 8)
+            else tuple([chipmate_xor] * max(1, eff_cm_slots))
+        )
 
         def _issue_all_cm_wt_sends():
             for _ci in range(eff_cm_slots):
+                _cm_partner_ci = lax.bitwise_xor(my_id, jnp.int32(_cm_slot_xors[_ci]))
                 _s_slot = max_num_gm_ref[1 + 2 * _ci]
                 _sb = 4 * _ci
                 _w1_dst = _cm_pad_view(cm_w1_pad, _ci)
@@ -1357,13 +1362,14 @@ def kernel_main_fused_rs(
                     _ds1=_s1_dst,
                     _dw2=_w2_dst,
                     _ds2=_s2_dst,
+                    _pt=_cm_partner_ci,
                 ):
                     pltpu.make_async_remote_copy(
                         src_ref=w1_packed.at[_ss],
                         dst_ref=_dw1,
                         send_sem=cm_wt_send_sem_ref.at[_b + 0],
                         recv_sem=cm_wt_recv_sem_ref.at[_b + 0],
-                        device_id={ep_axis_name: cm_partner},
+                        device_id={ep_axis_name: _pt},
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
                     if has_scale:
@@ -1372,7 +1378,7 @@ def kernel_main_fused_rs(
                             dst_ref=_ds1,
                             send_sem=cm_wt_send_sem_ref.at[_b + 1],
                             recv_sem=cm_wt_recv_sem_ref.at[_b + 1],
-                            device_id={ep_axis_name: cm_partner},
+                            device_id={ep_axis_name: _pt},
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
                     pltpu.make_async_remote_copy(
@@ -1380,7 +1386,7 @@ def kernel_main_fused_rs(
                         dst_ref=_dw2,
                         send_sem=cm_wt_send_sem_ref.at[_b + 2],
                         recv_sem=cm_wt_recv_sem_ref.at[_b + 2],
-                        device_id={ep_axis_name: cm_partner},
+                        device_id={ep_axis_name: _pt},
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
                     if has_scale:
@@ -1389,7 +1395,7 @@ def kernel_main_fused_rs(
                             dst_ref=_ds2,
                             send_sem=cm_wt_send_sem_ref.at[_b + 3],
                             recv_sem=cm_wt_recv_sem_ref.at[_b + 3],
-                            device_id={ep_axis_name: cm_partner},
+                            device_id={ep_axis_name: _pt},
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
@@ -1788,6 +1794,13 @@ def kernel_main_fused_rs(
         and partial_out1_ref.dtype != out_dtype
         and partial_out2_ref.ndim == 3
     )
+    _req_b_pq = max(
+        dims.size_k1 // cfgs1.lhs_cfgs.quant_block_size,
+        dims.size_k2 // cfgs2.lhs_cfgs.quant_block_size,
+    )
+    _g2_amax_slot = (
+        _req_b_pq if (use_lhs_fp8_vmem and partial_out2_ref.shape[0] > _req_b_pq) else None
+    )
 
     @jax.named_scope("blockdiag_gmm1_tile")
     def _blockdiag_gmm1_tile(buf_id, n_id, gm_id, rows):
@@ -2100,6 +2113,10 @@ def kernel_main_fused_rs(
                 _num_k=num_k1,
                 _gm_id=0,
                 _n_id=n_id,
+                _num_n=num_n1,
+                fused_g2_amax_slot=(
+                    _g2_amax_slot if not has_ext_pq_lhs else None
+                ),
                 prequant_lhs_fp8_ref=(
                     partial_out1_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_k1)]
                     if (use_lhs_fp8_vmem and not has_ext_pq_lhs)
@@ -2221,6 +2238,8 @@ def kernel_main_fused_rs(
             _num_k=num_k2,
             _gm_id=0,
             _n_id=n_id,
+            _num_n=num_n2,
+            fused_g2_amax_slot=_g2_amax_slot,
             prequant_rhs_fp8_ref=partial_out1_ref.at[buf_id] if use_w2_cache else None,
             prequant_rhs_scale_ref=partial_out2_ref.at[buf_id] if use_w2_cache else None,
             prequant_lhs_fp8_ref=(
@@ -3689,6 +3708,7 @@ def kernel_main_fused_rs(
 
     if enable_chipmate:
         for _ci in range(eff_cm_slots):
+            _cm_partner_d = lax.bitwise_xor(my_id, jnp.int32(_cm_slot_xors[_ci]))
             _s_slot_d = max_num_gm_ref[1 + 2 * _ci]
             _r_flag_d = max_num_gm_ref[2 + 2 * _ci]
             _sb_d = 4 * _ci
@@ -3705,13 +3725,14 @@ def kernel_main_fused_rs(
                 _ds1=_s1_d,
                 _dw2=_w2_d,
                 _ds2=_s2_d,
+                _pt=_cm_partner_d,
             ):
                 pltpu.make_async_remote_copy(
                     src_ref=w1_packed.at[_ss],
                     dst_ref=_dw1,
                     send_sem=cm_wt_send_sem_ref.at[_b + 0],
                     recv_sem=cm_wt_recv_sem_ref.at[_b + 0],
-                    device_id={ep_axis_name: cm_partner},
+                    device_id={ep_axis_name: _pt},
                     device_id_type=pl.DeviceIdType.MESH,
                 ).wait_send()
                 if has_scale:
@@ -3720,7 +3741,7 @@ def kernel_main_fused_rs(
                         dst_ref=_ds1,
                         send_sem=cm_wt_send_sem_ref.at[_b + 1],
                         recv_sem=cm_wt_recv_sem_ref.at[_b + 1],
-                        device_id={ep_axis_name: cm_partner},
+                        device_id={ep_axis_name: _pt},
                         device_id_type=pl.DeviceIdType.MESH,
                     ).wait_send()
                 pltpu.make_async_remote_copy(
@@ -3728,7 +3749,7 @@ def kernel_main_fused_rs(
                     dst_ref=_dw2,
                     send_sem=cm_wt_send_sem_ref.at[_b + 2],
                     recv_sem=cm_wt_recv_sem_ref.at[_b + 2],
-                    device_id={ep_axis_name: cm_partner},
+                    device_id={ep_axis_name: _pt},
                     device_id_type=pl.DeviceIdType.MESH,
                 ).wait_send()
                 if has_scale:
@@ -3737,7 +3758,7 @@ def kernel_main_fused_rs(
                         dst_ref=_ds2,
                         send_sem=cm_wt_send_sem_ref.at[_b + 3],
                         recv_sem=cm_wt_recv_sem_ref.at[_b + 3],
-                        device_id={ep_axis_name: cm_partner},
+                        device_id={ep_axis_name: _pt},
                         device_id_type=pl.DeviceIdType.MESH,
                     ).wait_send()
 
@@ -4470,7 +4491,7 @@ def gmm_v2_fused_rs(
             size_m > _BLOCKDIAG_MAX_SIZE_M
             and is_quantized
             and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn
-            and rhs1_quant_block_size == 256
+            and rhs1_quant_block_size in (256, 512)
         )
         else 0
     )
@@ -4556,7 +4577,25 @@ def gmm_v2_fused_rs(
         )
         if use_w2_prequant_cache
         else (
-            pltpu.VMEM((max_b_pq, tile_m, num_lanes), jnp.float32)
+            pltpu.VMEM(
+                (
+                    max_b_pq
+                    + (
+                        1
+                        if (
+                            size_m > _BLOCKDIAG_MAX_SIZE_M
+                            and int(
+                                envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0
+                            )
+                            >= 2
+                        )
+                        else 0
+                    ),
+                    tile_m,
+                    num_lanes,
+                ),
+                jnp.float32,
+            )
             if use_lhs_fp8_cache
             else pltpu.VMEM((1, num_lanes), jnp.float32)
         ),
