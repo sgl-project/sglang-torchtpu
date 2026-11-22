@@ -149,8 +149,9 @@ def _fori_strips(n: int, step: int, body_fn) -> None:
         body_fn(pl.multiple_of(i * step, step))
         return jnp.int32(0)
 
-    if cnt == 1:
-        _loop(jnp.int32(0), jnp.int32(0))
+    if cnt <= 2:
+        for i in range(cnt):
+            body_fn(pl.multiple_of(i * step, step))
     else:
         lax.fori_loop(0, cnt, _loop, jnp.int32(0))
 
@@ -278,8 +279,13 @@ def _pallas_call_maybe_interpret(kernel_fn, *, interpret: bool, compiler_params,
 
 
 def _fori_col_blocks(n_cols: int, step_fn, *, unroll_k: int = 4) -> None:
-    """Iterate ``0..n_cols`` in ``_COL_STRIP`` steps with ``unroll_k``-way loop unrolling."""
+    """Iterate ``0..n_cols`` in ``_COL_STRIP`` steps with static unrolling up to 8192 cols."""
     from jax.experimental import pallas as pl
+
+    if n_cols <= 8192 and n_cols % _COL_STRIP == 0:
+        for off in range(0, n_cols, _COL_STRIP):
+            step_fn(pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP))
+        return
 
     blk = unroll_k * _COL_STRIP
     if n_cols >= blk and n_cols % blk == 0:
@@ -298,10 +304,16 @@ def _fori_col_blocks(n_cols: int, step_fn, *, unroll_k: int = 4) -> None:
 
 
 def _reduce_col_blocks(n_cols: int, step_fn, init, *, unroll_k: int = 4):
-    """Accumulate across ``0..n_cols`` in ``unroll_k * _COL_STRIP`` loop bodies (0 spills)."""
+    """Accumulate across ``0..n_cols`` with zero-barrier static unrolling up to 8192 cols."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
+
+    if n_cols <= 8192 and n_cols % _COL_STRIP == 0:
+        acc = init
+        for off in range(0, n_cols, _COL_STRIP):
+            acc = step_fn(pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP), acc)
+        return acc
 
     blk = unroll_k * _COL_STRIP
     if n_cols >= blk and n_cols % blk == 0:
@@ -1275,37 +1287,97 @@ def _attn_to_moe_bridge_kernel(
             pre_exp_eps=pre_exp_eps, pre_exp_scale_input=pre_exp_scale_input,
         )
 
-    # Reuse dead send_half / mate_recv VMEM buffers when h_pre == half (saves 3 MiB @ B=384!).
+    # Reuse dead send_half VMEM buffer when h_pre == half (saves 3 MiB @ B=384!).
     eff_pre_a = send_half.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_a
-    eff_pre_b = mate_recv.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
 
     # Note: no second barrier needed! Every rank already synchronized at Phase 2b c2b.wait()
     # and all ranks enter Stage 1 with pre_half_a live from kernel start!
-    overlap_router_d2d = bool(router_d2d_overlap) and use_halfrow and not tile_r32
+    if use_halfrow:
+        half_r = rows // 2
+        bm_s1 = _pick_strip(half_r, 32)
+        parity = me & jnp.int32(1)
+        mate = me ^ jnp.int32(1)
+        chip = me >> jnp.int32(1)
+        n_chips = world_size // 2
+        me_c0 = pl.multiple_of(me * pre_cols, 128)
+        pair_cols = 2 * pre_cols
+        chip_c0 = pl.multiple_of(chip * pair_cols, 128)
+        my_r0 = pl.multiple_of(parity * half_r, 16)
+        mate_r0 = pl.multiple_of((jnp.int32(1) - parity) * half_r, 16)
 
-    def _my_half_b1(src_buf, row_base, n_r):
+        s1 = pltpu.make_async_remote_copy(
+            pre_shard.at[pl.ds(mate_r0, half_r), :],
+            eff_pre_a.at[:, pl.ds(me_c0, pre_cols)],
+            ag_s1_send.at[0],
+            ag_s1_recv.at[0],
+            device_id=(mate,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        s1.start()
+        _fori_strips(
+            half_r,
+            bm_s1,
+            lambda r0: eff_pre_a.__setitem__(
+                (pl.ds(r0, bm_s1), pl.ds(me_c0, pre_cols)), pre_shard[pl.ds(my_r0 + r0, bm_s1), :]
+            ),
+        )
+        s1.wait()
+
+        s2_ops = []
+        for d in range(1, n_chips):
+            peer = me ^ jnp.int32(d << 1)
+            op = pltpu.make_async_remote_copy(
+                eff_pre_a.at[:, pl.ds(chip_c0, pair_cols)],
+                eff_pre_a.at[:, pl.ds(chip_c0, pair_cols)],
+                ag_s2_send.at[d - 1],
+                ag_s2_recv.at[d - 1],
+                device_id=(peer,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op.start()
+            s2_ops.append(op)
+        overlap_router_d2d = bool(router_d2d_overlap) and not tile_r32
+        if not overlap_router_d2d:
+            _compute_router_under_ici()
+        for op in s2_ops:
+            op.wait()
+
+        # Normalize ONLY my_half into out_expert_in_ref[my_r0:my_r0+half_r], then Stage-3 D2D
+        # copies normalized bf16 straight to mate (halves pre_expert_norm VPU rows!).
         if overlap_router_d2d:
             _compute_router_under_ici()
-        _norm_pre_slice(src_buf, row_base, n_r)
-
-    _gather_shard_xor1(
-        pre_shard,
-        eff_pre_a,
-        eff_pre_b,
-        ag_s1_send,
-        ag_s1_recv,
-        ag_s2_send,
-        ag_s2_recv,
-        ag_s3_send,
-        ag_s3_recv,
-        me=me,
-        world_size=world_size,
-        use_halfrow=use_halfrow,
-        during_ici_fn=None if overlap_router_d2d else _compute_router_under_ici,
-        my_half_epilogue_fn=_my_half_b1,
-        mate_half_epilogue_fn=_norm_pre_slice,
-    )
-    _dma_wait(out_stream_hbm, s_out_sem.at[0])
+        _norm_pre_slice(eff_pre_a, my_r0, half_r)
+        s3 = pltpu.make_async_remote_copy(
+            out_expert_in_ref.at[pl.ds(my_r0, half_r), :],
+            out_expert_in_ref.at[pl.ds(my_r0, half_r), :],
+            ag_s3_send.at[0],
+            ag_s3_recv.at[0],
+            device_id=(mate,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        s3.start()
+        _dma_wait(out_stream_hbm, s_out_sem.at[0])
+        s3.wait()
+    else:
+        eff_pre_b = mate_recv.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
+        _gather_shard_xor1(
+            pre_shard,
+            eff_pre_a,
+            eff_pre_b,
+            ag_s1_send,
+            ag_s1_recv,
+            ag_s2_send,
+            ag_s2_recv,
+            ag_s3_send,
+            ag_s3_recv,
+            me=me,
+            world_size=world_size,
+            use_halfrow=False,
+            during_ici_fn=_compute_router_under_ici,
+            my_half_epilogue_fn=_norm_pre_slice,
+            mate_half_epilogue_fn=_norm_pre_slice,
+        )
+        _dma_wait(out_stream_hbm, s_out_sem.at[0])
 
 
 def attn_to_moe_bridge_jax(
@@ -1420,7 +1492,7 @@ def attn_to_moe_bridge_jax(
             vmem((rows, 128), jnp.float32),
             vmem((rows, pre_cols), jnp.bfloat16),
             vmem((8, 128) if reuse_pre_ab else (pre_buf_rows, h_pre), jnp.bfloat16),
-            vmem((8, 128) if reuse_pre_ab else (pre_buf_rows, h_pre), jnp.bfloat16),
+            vmem((8, 128) if (reuse_pre_ab or use_halfrow) else (pre_buf_rows, h_pre), jnp.bfloat16),
             vmem((rows, o_in) if use_w8a8 else (8, 128), jnp.float8_e4m3fn),
             vmem((rows, 1) if use_w8a8 else (8, 1), jnp.float32),
             sem((2,)),
