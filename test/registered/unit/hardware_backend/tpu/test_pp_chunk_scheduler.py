@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import contextlib
+import math
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
@@ -424,7 +425,6 @@ def test_continuation_does_not_count_loaded_host_prefix_twice(monkeypatch):
 
 def test_profile_requires_resolved_compiler_setting(monkeypatch):
     monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "1")
-    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SLACK", "-1")
     with get_context().override_server_args(
         device="tpu",
         pp_size=8,
@@ -434,16 +434,6 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
     ) as raw:
         scheduler = NS(tp_worker=NS(model_runner=NS(server_args=raw)))
         assert not raw.enable_torch_compile
-        with pytest.raises(ValueError, match="SLACK must be nonnegative"):
-            profile_and_install_cost_model(scheduler)
-        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SLACK", "0.1")
-        for spread in ("0.5", "inf", "nan"):
-            monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SPREAD", spread)
-            with pytest.raises(
-                ValueError, match="SPREAD must be finite and at least 1"
-            ):
-                profile_and_install_cost_model(scheduler)
-        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SPREAD", "1")
         get_context().override("test.no_compile", enable_torch_compile=False)
         with pytest.raises(ValueError, match="require --enable-torch-compile"):
             profile_and_install_cost_model(scheduler)
@@ -459,7 +449,7 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
 
     reports = {
-        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None, 1.0)
+        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None, 0.1, 1.0)
         for rank in range(4)
     }
 
@@ -498,9 +488,22 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         models.append(scheduler._tpu_pp_chunk_cost)
         assert scheduler._tpu_pp_chunk_spread == 1.0
     assert all(model == models[0] for model in models)
-    reports[3] = (*reports[3][:2], 2.0)
-    with pytest.raises(ValueError, match="SPREAD must be the same on every rank"):
-        profile_and_install_cost_model(scheduler)
+    # One rank's bad or differing value fails every rank after the gather,
+    # instead of leaving the others waiting in it.
+    agreed = reports[3]
+    for knobs, match in (
+        ((-1.0, 1.0), "SLACK must be finite and nonnegative"),
+        ((math.nan, 1.0), "SLACK must be finite and nonnegative"),
+        ((math.inf, 1.0), "SLACK must be finite and nonnegative"),
+        ((0.1, 0.5), "SPREAD must be finite and at least 1"),
+        ((0.1, math.inf), "SPREAD must be finite and at least 1"),
+        ((0.1, math.nan), "SPREAD must be finite and at least 1"),
+        ((0.2, 1.0), "must be the same on every rank"),
+        ((0.1, 2.0), "must be the same on every rank"),
+    ):
+        reports[3] = (*agreed[:2], *knobs)
+        with pytest.raises(ValueError, match=match):
+            profile_and_install_cost_model(scheduler)
 
 
 if __name__ == "__main__":

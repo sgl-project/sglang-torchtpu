@@ -206,6 +206,24 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
+def _check_chunk_sizing_env(values: list[tuple[float, float]]) -> None:
+    for slack, spread in values:
+        if not 0 <= slack < math.inf:
+            raise ValueError(
+                "SGLANG_TPU_PP_CHUNK_SLACK must be finite and nonnegative."
+            )
+        if not 1 <= spread < math.inf:
+            raise ValueError(
+                "SGLANG_TPU_PP_CHUNK_SPREAD must be finite and at least 1."
+            )
+    if len(set(values)) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_CHUNK_SLACK and SGLANG_TPU_PP_CHUNK_SPREAD must be "
+            "the same on every rank; ranks that size steps differently deadlock "
+            "the pipeline."
+        )
+
+
 def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     """Profile every stage after compilation and share the slowest cost curve."""
     runner = scheduler.tp_worker.model_runner
@@ -213,11 +231,8 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
-        raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
+    slack = envs.SGLANG_TPU_PP_CHUNK_SLACK.get()
     spread = envs.SGLANG_TPU_PP_CHUNK_SPREAD.get()
-    if not 1 <= spread < math.inf:
-        raise ValueError("SGLANG_TPU_PP_CHUNK_SPREAD must be finite and at least 1.")
     policy = runner.compile_policy
     granularity = chunk_granularity(
         scheduler.page_size, scheduler.chunked_prefill_size, True
@@ -254,17 +269,16 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     # let the stage leader decide and broadcast, or check agreement in the stage.
     reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule, spread), group=scheduler.world_group.cpu_group
+        reports,
+        (samples, schedule, slack, spread),
+        group=scheduler.world_group.cpu_group,
     )
-    if len({report[2] for report in reports}) > 1:
-        raise ValueError(
-            "SGLANG_TPU_PP_CHUNK_SPREAD must be the same on every rank; "
-            "ranks that size steps differently deadlock the pipeline."
-        )
+    # Checked on the gathered values, so that every rank raises the same error.
+    _check_chunk_sizing_env([report[2:] for report in reports])
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
         [report[0] for report in reports],
-        envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
+        slack,
         granularity,
         min(schedules) if schedules else None,
     )
