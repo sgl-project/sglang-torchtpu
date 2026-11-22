@@ -343,6 +343,29 @@ class TestWriteBackCopyAhead(CustomTestCase):
         self.assertTrue(_node(cache, c).evicted)
         self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, set())
 
+    def test_eviction_inside_held_checkpoint_frees_frees_at_once(self):
+        # Eviction takes only unlocked nodes, never a transfer's pages: inside a
+        # checkpoint whose frees are held, the copy-ahead eviction still frees.
+        cache, allocator = _build_cache()
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [2] * 8)
+        _insert(cache, allocator, [3] * 8)
+        cache.check_hicache_events()
+        controller.land_all()
+        cache.check_hicache_events()
+        available = allocator.available_size()
+
+        held = []
+        with cache.defer_device_frees(held):
+            result = cache.evict(EvictParams(num_tokens=16))
+            self.assertIs(cache._deferred_free_sink, held)  # the outer hold resumes
+
+        self.assertEqual(result.num_tokens_evicted, 16)
+        self.assertTrue(_node(cache, a).evicted and _node(cache, b).evicted)
+        self.assertEqual(held, [])
+        self.assertEqual(allocator.available_size(), available + 16)
+
     def test_short_eviction_finishes_landed_window_copies_without_a_collective(self):
         """A copy that lands after the step's poll still locks its victim; an
         eviction that needs the victim finishes the landed ack itself, without

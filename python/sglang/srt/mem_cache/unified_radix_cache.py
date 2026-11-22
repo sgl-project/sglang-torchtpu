@@ -1044,11 +1044,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self._deferred_free_sink is not None:
             # Eviction frees only unlocked nodes, never a transfer's pages: apply
             # its frees now, or an allocation that evicts to make room fails.
-            sink, self._deferred_free_sink = self._deferred_free_sink, None
-            try:
+            with self.defer_device_frees(None):
                 return self._evict(params, demand=demand, satisfied=satisfied)
-            finally:
-                self._deferred_free_sink = sink
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
@@ -1960,10 +1957,11 @@ class UnifiedRadixCache(BasePrefixCache):
             actions.reverse()
 
     @contextmanager
-    def defer_device_frees(self, sink: list):
+    def defer_device_frees(self, sink: Optional[list]):
         """Collect device KV and state-slot frees into ``sink`` instead of
         applying them; ``apply_deferred_frees`` applies them once nothing reads
-        those pages (e.g. a PD transfer of the same request has ended)."""
+        those pages (e.g. a PD transfer of the same request has ended). A None
+        sink applies frees at once, as eviction needs inside a deferral."""
         prev, self._deferred_free_sink = self._deferred_free_sink, sink
         try:
             yield sink
