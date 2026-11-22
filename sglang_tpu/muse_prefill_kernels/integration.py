@@ -1636,8 +1636,37 @@ def _ops(
         def a3_pro_chunk(attn_k: jax.Array, gate_k: jax.Array) -> jax.Array:
             return a3_pro_sm(attn_k, gate_k)
 
+        a3_kdeep_ccs_wo1 = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0)
+        w4_wo_ccs_mode = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0)
+        a3_bn2k_ccs = _env_bool("SGLANG_TPU_MUSE_KERNEL_A3_BN2048")
+
         def a3_wo_only_body(q_3d, wo, wo_scale, *opt_valid):
             vtok = opt_valid[0] if (a3_skip and opt_valid) else None
+            if (a3_kdeep_ccs_wo1 == 1 or w4_wo_ccs_mode > 0) and vtok is None:
+                import jax.numpy as jnp
+
+                from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
+                    pallas_a3_wo_kdeep_static_fp8,
+                )
+
+                eff_w4 = (
+                    w4_wo_ccs_mode
+                    if (w4_wo_ccs_mode > 0 and jnp.dtype(wo.dtype) == jnp.float4_e2m1fn)
+                    else 0
+                )
+                eff_sc = (
+                    wo_scale.squeeze(0)
+                    if (eff_w4 > 0 and wo_scale.ndim == 4)
+                    else wo_scale
+                )
+                return pallas_a3_wo_kdeep_static_fp8(
+                    q_3d,
+                    wo,
+                    eff_sc,
+                    tp_axis=_AXIS,
+                    bn=2048 if a3_bn2k_ccs else 1024,
+                    w4_qbs=eff_w4,
+                )
             return kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
                 q_3d,
                 wo,
@@ -1669,7 +1698,9 @@ def _ops(
             + ("_opt" if a3_opt else "")
             + ("_sk" if a3_skip else "")
             + (f"_ss{a3_stage_sends}" if a3_stage_sends else "")
-            + ("_bn2k" if _env_bool("SGLANG_TPU_MUSE_KERNEL_A3_BN2048") else ""),
+            + ("_bn2k" if a3_bn2k_ccs else "")
+            + ("_kd1" if a3_kdeep_ccs_wo1 == 1 else "")
+            + (f"_w4q{w4_wo_ccs_mode}" if w4_wo_ccs_mode > 0 else ""),
             a3_wo_only,
             a3_wo_n_in,
             1,

@@ -1418,3 +1418,121 @@ def test_gate_static_fp8_quant_xor_a2a_parity():
                     )
                 )
                 assert diff == 0.0, (use_rpa, use_ps, diff)
+
+
+def test_ccs_a3_kdeep_wo1_mosaic_and_parity():
+    """Verify CCS A3_KDEEP_WO=1 (pallas_a3_wo_kdeep_static_fp8) lowers for T=16k/24k/32k and matches WO=0."""
+    from types import SimpleNamespace
+
+    import jax
+    import jax.numpy as jnp
+    from jax import export
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+    from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
+        pallas_a3_wo_kdeep_static_fp8,
+    )
+
+    devs = jax.devices()
+    assert len(devs) == 8
+    mesh = jax.sharding.Mesh(np.array(devs), ("model",))
+    tp_deg, k_local, n_dim = 8, 1024, 8192
+
+    # 1. Verify VMEM-safe bn guard + 0 partition_id lowering across T=16k/24k/32k when bn=2048 requested.
+    for t_shard, exp_bn in ((2048, 1024), (3072, 1024), (4096, 512)):
+        fn = jax.jit(
+            jax.shard_map(
+                lambda q, w, ws: pallas_a3_wo_kdeep_static_fp8(
+                    q[0], w[0], ws[0], tp_axis="model", bn=2048
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P("model", None, None, None),
+                    P("model", None, None, None),
+                    P("model", None, None),
+                ),
+                out_specs=P("model", None),
+                check_vma=False,
+            )
+        )
+        exp = export.export(fn, platforms=("tpu",))(
+            jax.ShapeDtypeStruct((tp_deg, tp_deg, t_shard, k_local), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((tp_deg, tp_deg, k_local, n_dim), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((tp_deg, 1, n_dim), jnp.float32),
+        )
+        mlir = exp.mlir_module()
+        assert f"pallas_a3_wo_kdeep_bn{exp_bn}" in mlir
+        assert "partition_id" not in mlir
+
+    # 2. Verify 8-device interpret parity vs WO=0 (pallas_option3d) for both stage_sends=0 and 1.
+    rng = np.random.default_rng(719)
+    t_sh, n_sub = 256, 2048
+    q_3d = jnp.asarray(
+        (rng.standard_normal((tp_deg, tp_deg, t_sh, k_local)) * 0.5).astype(np.float32)
+    ).astype(jnp.float8_e4m3fn)
+    w_by_h = jnp.asarray(
+        (rng.standard_normal((tp_deg, k_local, n_sub)) * 0.25).astype(np.float32)
+    ).astype(jnp.float8_e4m3fn)
+    ws_1 = jnp.asarray(rng.uniform(0.5, 1.5, size=(tp_deg, 1, n_sub)).astype(np.float32))
+    in_sp = (P("model", None, None, None), P("model", None, None, None), P("model", None, None))
+
+    for ss in (0, 1):
+        w_xor = jnp.stack(
+            [
+                jnp.stack(
+                    [
+                        w_by_h[
+                            kernel_a3.a3_v16_step_peer(
+                                r, d, tp_deg, parity_stagger=(ss == 1)
+                            )
+                        ]
+                        for d in range(tp_deg)
+                    ],
+                    axis=0,
+                )
+                for r in range(tp_deg)
+            ],
+            axis=0,
+        )
+        with (
+            _w9_interpret_context(),
+            patch.object(
+                tpu_envs,
+                "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS",
+                SimpleNamespace(get=lambda s=ss: s),
+            ),
+        ):
+            out_wo0 = jax.jit(
+                jax.shard_map(
+                    lambda q, w, ws: kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+                        q[0],
+                        w[0],
+                        ws[0],
+                        tp_axis="model",
+                        bn=1024,
+                        opt_wo=True,
+                        stage_sends_mode=ss,
+                    ),
+                    mesh=mesh,
+                    in_specs=in_sp,
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+            )(q_3d, w_xor, ws_1)
+            out_wo1 = jax.jit(
+                jax.shard_map(
+                    lambda q, w, ws: pallas_a3_wo_kdeep_static_fp8(
+                        q[0], w[0], ws[0], tp_axis="model", bn=2048
+                    ),
+                    mesh=mesh,
+                    in_specs=in_sp,
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+            )(q_3d, w_xor, ws_1)
+        diff = float(
+            jnp.max(jnp.abs(out_wo0.astype(jnp.float32) - out_wo1.astype(jnp.float32)))
+        )
+        assert diff == 0.0, (ss, diff)

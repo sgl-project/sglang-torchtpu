@@ -508,7 +508,10 @@ def pallas_a3_wo_kdeep_static_fp8(
     """
     tp_deg, t_shard, k_local = q_3d.shape
     _, _, n_dim = wo_xor_3d.shape
-    bn = 512 if (bn > 512 and t_shard > 3584 and w4_qbs == 0) else bn
+    if bn > 1024 and (t_shard > 1536 and not (w4_qbs > 0 and t_shard <= 2048)):
+        bn = 1024
+    if bn > 512 and t_shard > 3584 and w4_qbs == 0:
+        bn = 512
     num_j = n_dim // bn
     bm = next(t for t in (256, 128, 64, 32, 8) if t <= t_shard and t_shard % t == 0)
     sub_n = min(256, bn)
