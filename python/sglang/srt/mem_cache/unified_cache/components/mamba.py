@@ -561,7 +561,7 @@ class MambaComponent(TreeComponent):
         if self.state_cost is not None:
             self._cost_begin_walk()
             self._evict_device_cursor = None
-        elif self.tree_core.enable_session_radix_cache:
+        elif self.tree_core.session_orders_device:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
             self._evict_device_cursor = lru.cursor_next()
@@ -591,7 +591,7 @@ class MambaComponent(TreeComponent):
             )
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
-        enabled = self.tree_core.enable_session_radix_cache
+        enabled = self.tree_core.session_orders_device
         if self._evict_device_cursor is not None and not lru.in_list(
             self._evict_device_cursor
         ):
@@ -668,7 +668,7 @@ class MambaComponent(TreeComponent):
         """Clear the device-eviction walk cursor state."""
         if self.state_cost is not None:
             self._cost_heap = []
-        elif self.tree_core.enable_session_radix_cache:
+        elif self.tree_core.session_orders_device:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
 
