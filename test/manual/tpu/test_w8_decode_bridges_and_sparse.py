@@ -688,10 +688,177 @@ def test_tpu7x_spmd_mlir_export_clean() -> None:
     print("[PASS] TPU7x Mosaic T(16,128) + SPMD StableHLO export clean across B=8..384")
 
 
+def test_w10_tok_b2_fast_races_and_llo_invariants() -> None:
+    """Verify 0 DMA races (`detect_races=True`), legacy env fallback, and 13-matmul/0-scf.for MLIR."""
+    import re
+    import jax
+    import jax.numpy as jnp
+    from jax._src import tpu_custom_call
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.pallas_export as pe
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        moe_post_tok_sharded_final_norm_jax,
+        moe_to_attn_qkv_epi_bridge_jax,
+        moe_to_attn_tok_sharded_bridge_jax,
+    )
+
+    mesh = Mesh(jax.devices()[:8], ("model",))
+    W, B, H, H_MOE = 8, 64, 2048, 1024
+    eager_race = pltpu.InterpretParams(dma_execution_mode="eager", detect_races=True)
+
+    def q_fp8(seed: int, k: int, n: int):
+        w = jax.random.normal(jax.random.PRNGKey(seed), (k, n), dtype=jnp.float32) * 0.04
+        sc = jnp.maximum(jnp.max(jnp.abs(w), axis=0, keepdims=True) / 448.0, 1e-12)
+        return (w / sc).astype(jnp.float8_e4m3fn), sc
+
+    st = jax.device_put(jax.random.normal(jax.random.PRNGKey(70), (B, H), dtype=jnp.float32), NamedSharding(mesh, P("model", None)))
+    st_rep = jax.device_put(jax.random.normal(jax.random.PRNGKey(70), (B, H), dtype=jnp.float32), NamedSharding(mesh, P()))
+    mo = jax.device_put(jax.random.normal(jax.random.PRNGKey(71), (B, H_MOE), dtype=jnp.bfloat16), NamedSharding(mesh, P("model", None)))
+    wp, sp = q_fp8(72, H_MOE, H)
+    wp_d = jax.device_put(wp, NamedSharding(mesh, P(None, "model")))
+    sp_d = jax.device_put(sp, NamedSharding(mesh, P(None, "model")))
+    wq, sq = q_fp8(73, H, W * 1280)
+    wg, sg = q_fp8(74, H, W * 1024)
+    wq_d = jax.device_put(wq, NamedSharding(mesh, P(None, "model")))
+    sq_d = jax.device_put(sq, NamedSharding(mesh, P(None, "model")))
+    wg_d = jax.device_put(wg, NamedSharding(mesh, P(None, "model")))
+    sg_d = jax.device_put(sg, NamedSharding(mesh, P(None, "model")))
+    g1 = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 1.05, NamedSharding(mesh, P()))
+    al = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 0.95, NamedSharding(mesh, P()))
+    be = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 0.85, NamedSharding(mesh, P()))
+    g2 = jax.device_put(jnp.ones((H,), dtype=jnp.float32) * 1.10, NamedSharding(mesh, P()))
+    cs = jax.device_put(
+        build_decode_rope_step_tables(
+            jnp.arange(B, dtype=jnp.int32) + 3,
+            jax.random.normal(jax.random.PRNGKey(75), (256, 128), dtype=jnp.float32) * 0.5,
+        ),
+        NamedSharding(mesh, P()),
+    )
+
+    in_sp_b2 = (P("model", None), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P())
+    out_sp_b2 = (P("model", None), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model"))
+
+    def _run_b2(interp_arg):
+        return jax.shard_map(
+            functools.partial(
+                moe_to_attn_tok_sharded_bridge_jax,
+                world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                next_in_eps=1e-5, next_in_scale_input=True,
+                fuse_qkv_epi=True, qkv_norm_eps=1e-5, query_scale=5.47, k_scale=0.9, v_scale=1.1,
+                interpret=interp_arg,
+            ),
+            mesh=mesh, in_specs=in_sp_b2, out_specs=out_sp_b2, check_vma=False,
+        )(st, mo, wp_d, sp_d, g1, al, be, g2, wq_d, sq_d, wg_d, sg_d, cs)
+
+    # 1. Eager DMA race detection on fast tok_b2_p8_epi + fast tok_fnorm_p8 + w7 qkv_epi
+    fast_out = _run_b2(eager_race)
+    jax.block_until_ready(fast_out)
+
+    saved_env = os.environ.get("SGLANG_TPU_MUSE_DECODE_TOK_B2_FAST")
+    try:
+        os.environ["SGLANG_TPU_MUSE_DECODE_TOK_B2_FAST"] = "0"
+        leg_out = _run_b2(True)
+    finally:
+        if saved_env is None:
+            os.environ.pop("SGLANG_TPU_MUSE_DECODE_TOK_B2_FAST", None)
+        else:
+            os.environ["SGLANG_TPU_MUSE_DECODE_TOK_B2_FAST"] = saved_env
+
+    assert jnp.allclose(fast_out[0], leg_out[0], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(fast_out[1].astype(jnp.float32), leg_out[1].astype(jnp.float32), rtol=1e-2, atol=2e-2)
+    assert jnp.array_equal(fast_out[2].view(jnp.uint8), leg_out[2].view(jnp.uint8))
+    assert jnp.allclose(fast_out[3].astype(jnp.float32), leg_out[3].astype(jnp.float32), rtol=1e-2, atol=2e-2)
+
+    for ret_st in (False, True):
+        fn_out = jax.shard_map(
+            functools.partial(
+                moe_post_tok_sharded_final_norm_jax,
+                world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                final_eps=1e-5, final_scale_input=True,
+                return_stream_too=ret_st, interpret=eager_race,
+            ),
+            mesh=mesh,
+            in_specs=(P("model", None), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P()),
+            out_specs=(P("model", None), P()) if ret_st else P(),
+            check_vma=False,
+        )(st, mo, wp_d, sp_d, g1, al, be, g2)
+        jax.block_until_ready(fn_out)
+
+    w7_epi_out = jax.shard_map(
+        functools.partial(
+            moe_to_attn_qkv_epi_bridge_jax,
+            world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+            next_in_eps=1e-5, next_in_scale_input=True, sharded_moe_in=True,
+            qkv_norm_eps=1e-5, query_scale=5.47, k_scale=0.9, v_scale=1.1,
+            interpret=eager_race,
+        ),
+        mesh=mesh,
+        in_specs=(P(), P("model", None), P(None, "model"), P(None, "model"), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(None, "model"), P(None, "model"), P()),
+        out_specs=(P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+        check_vma=False,
+    )(st_rep, mo, wp_d, sp_d, g1, al, be, g2, wq_d, sq_d, wg_d, sg_d, cs)
+    jax.block_until_ready(w7_epi_out)
+
+    # 2. Verify TPU7x B=64 H=8192 Mosaic MLIR hits theoretical floor: 13 tpu.matmul & 0 scf.for!
+    asms: list[str] = []
+    orig_lower = tpu_custom_call._lower_to_custom_call_config
+    orig_kind = pe.get_pallas_tpu_device_kind
+    pe.get_pallas_tpu_device_kind = lambda: "TPU7x"
+    tpu_custom_call._lower_to_custom_call_config = lambda m, **kw: (
+        asms.append(m.operation.get_asm(enable_debug_info=False)),
+        orig_lower(m, **kw),
+    )[1]
+    try:
+        with pe.tpu_info_for_cpu_export():
+            H8, HMOE8 = 8192, 4096
+            sd = lambda s, dt, sp: jax.ShapeDtypeStruct(s, dt, sharding=NamedSharding(mesh, sp))
+            avals = [
+                sd((64, H8), jnp.float32, P("model", None)),
+                sd((64, HMOE8), jnp.bfloat16, P("model", None)),
+                sd((HMOE8, H8), jnp.float8_e4m3fn, P(None, "model")),
+                sd((1, H8), jnp.float32, P(None, "model")),
+                sd((H8,), jnp.float32, P()),
+                sd((H8,), jnp.float32, P()),
+                sd((H8,), jnp.float32, P()),
+                sd((H8,), jnp.float32, P()),
+                sd((H8, W * 1280), jnp.float8_e4m3fn, P(None, "model")),
+                sd((1, W * 1280), jnp.float32, P(None, "model")),
+                sd((H8, W * 1024), jnp.float8_e4m3fn, P(None, "model")),
+                sd((1, W * 1024), jnp.float32, P(None, "model")),
+                sd((64, 2, 128), jnp.float32, P()),
+            ]
+            wrapped = jax.jit(
+                lambda *xs: jax.shard_map(
+                    functools.partial(
+                        moe_to_attn_tok_sharded_bridge_jax,
+                        world_size=W, post_ff_eps=1e-8, post_ff_scale_input=True,
+                        next_in_eps=1e-5, fuse_qkv_epi=True,
+                        qkv_norm_eps=1e-5, query_scale=5.47, k_scale=1.0, v_scale=1.0,
+                    ),
+                    mesh=mesh, in_specs=in_sp_b2, out_specs=out_sp_b2, check_vma=False,
+                )(*xs),
+                out_shardings=tuple(NamedSharding(mesh, sp) for sp in out_sp_b2),
+            )
+            jax.export.export(wrapped, platforms=("tpu",))(*avals)
+    finally:
+        tpu_custom_call._lower_to_custom_call_config = orig_lower
+        pe.get_pallas_tpu_device_kind = orig_kind
+
+    m_txt = asms[0]
+    n_mm = len(re.findall(r"tpu\.matmul", m_txt))
+    n_for = len(re.findall(r"scf\.for", m_txt))
+    assert n_mm == 13, f"Expected 13 tpu.matmul on B=64 tok_b2_p8_epi, got {n_mm}"
+    assert n_for == 0, f"Expected 0 scf.for on B=64 tok_b2_p8_epi, got {n_for}"
+    print("[PASS] Wave-10 tok_b2_p8 eager detect_races=True + legacy fallback + 13-matmul/0-scf.for")
+
+
 if __name__ == "__main__":
     test_syntax_and_annotations()
     _install_lightweight_pkg_stubs()
     test_tpu7x_spmd_mlir_export_clean()
     test_sparse_routing_and_k256_opts()
     test_w8_collective_bridges_8rank()
+    test_w10_tok_b2_fast_races_and_llo_invariants()
     print("ALL WAVE-8 DECODE BRIDGE & SPARSE TESTS PASSED!")
