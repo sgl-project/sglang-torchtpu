@@ -1129,5 +1129,335 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     self.assertIn(exp_sub, hlo)
 
 
+    def test_page_size_512_swa_eviction_and_d2_nod2_nan_poisoned(self):
+        """page_size=512 SWA handles rel_first==0 skip and rel_first>0 eviction with 0x7F poison."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+        rng = np.random.default_rng(1122)
+        bs, n_act, page_size, sw = 16, 14, 512, 2048
+        pps = 6
+        sm_scale = 128 ** -0.5
+        n_phys_pages = bs * pps + 4
+        for tag, use_d2 in (("ps512_nod2_swa", False), ("ps512_d2_swa", True)):
+            with self.subTest(case=tag):
+                stock_cache_u8 = np.full(
+                    (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+                )
+                stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(
+                    rng, (n_phys_pages, page_size, 2, 128)
+                )
+                cache_u8 = (
+                    _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+                    if use_d2
+                    else stock_cache_u8
+                )
+                page_indices = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
+                # Cover <512 (last_p==0), 513..2048 (rel_first==0, last_p>0), and >2049 (rel_first>0).
+                kv_lens = np.zeros((bs,), dtype=np.int32)
+                sample_lens = [17, 511, 512, 513, 1024, 1537, 2048, 2049, 2100, 2500, 2560, 2600, 900, 2200]
+                kv_lens[:n_act] = sample_lens
+                q_bf16 = jnp.asarray(
+                    rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16
+                )
+                k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                out_j, _ = run_decode_fast_rpa(
+                    q_bf16,
+                    _u8_to_fp8(k_new_u8)[:, None, :],
+                    _u8_to_fp8(v_new_u8)[:, None, :],
+                    _u8_to_fp8(cache_u8),
+                    jnp.asarray(kv_lens, dtype=jnp.int32),
+                    jnp.asarray(page_indices.ravel(), dtype=np.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size),
+                    jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32),
+                    sm_scale=sm_scale,
+                    sliding_window=sw,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    mode_str="w8,c1024,batchfull,dyn4k",
+                    decode_query_size=1,
+                    fused_out_pack=1,
+                    kv_pack_dense2=use_d2,
+                    interpret=True,
+                )
+                ref = np.zeros((bs, 16, 128), dtype=np.float32)
+                for s in range(n_act):
+                    kvl = int(kv_lens[s])
+                    first_k = max(0, kvl - sw)
+                    pids = page_indices[s]
+                    k_l = [
+                        _fp8_from_u8(
+                            stock_cache_u8[pids[p // page_size], p % page_size, 0, 0, :]
+                        )
+                        for p in range(first_k, kvl - 1)
+                    ] + [_fp8_from_u8(k_new_u8[s])]
+                    v_l = [
+                        _fp8_from_u8(
+                            stock_cache_u8[pids[p // page_size], p % page_size, 0, 1, :]
+                        )
+                        for p in range(first_k, kvl - 1)
+                    ] + [_fp8_from_u8(v_new_u8[s])]
+                    lg = (
+                        np.asarray(q_bf16[s], dtype=np.float32) @ np.stack(k_l).T
+                    ) * sm_scale
+                    lg -= np.max(lg, axis=1, keepdims=True)
+                    pr = np.exp(lg)
+                    pr /= np.sum(pr, axis=1, keepdims=True)
+                    ref[s] = pr @ np.stack(v_l)
+                out_np = np.asarray(out_j, dtype=np.float32)
+                self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+                self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
+    def test_native_tp16_full_and_swa_nan_poisoned_and_export(self):
+        """TP16 (8, 64) native mode unlocks swabatch, dyn4k, and ring4k across all 62 layers."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import can_use_decode_fast, run_decode_fast_rpa
+        from jax import export as jax_export
+        from unittest.mock import patch
+
+        rng = np.random.default_rng(2026)
+        q_tp16 = jnp.zeros((16, 8, 64), dtype=jnp.bfloat16)
+        q_tp8 = jnp.zeros((16, 16, 128), dtype=jnp.bfloat16)
+        c_512 = jnp.zeros((16, 512, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+        self.assertTrue(
+            can_use_decode_fast(
+                mode_str="tp16",
+                q=q_tp16,
+                kv_cache_fused=c_512,
+                out_dtype=jnp.bfloat16,
+                decode_query_size=1,
+                custom_mask=None,
+                attention_sink=None,
+                soft_cap=None,
+                xai_temperature_len=None,
+                q_scale=None,
+                actual_num_q_heads=8,
+                actual_num_kv_heads=1,
+                actual_head_dim=64,
+                sliding_window=2048,
+                pages_per_seq=6,
+                pure_unpacked_decode=True,
+                kv_pack_dense2=False,
+            )
+        )
+        self.assertFalse(
+            can_use_decode_fast(
+                mode_str="tp16",
+                q=q_tp16,
+                kv_cache_fused=c_512,
+                out_dtype=jnp.bfloat16,
+                decode_query_size=1,
+                custom_mask=None,
+                attention_sink=None,
+                soft_cap=None,
+                xai_temperature_len=None,
+                q_scale=None,
+                actual_num_q_heads=8,
+                actual_num_kv_heads=1,
+                actual_head_dim=64,
+                sliding_window=None,
+                pages_per_seq=6,
+                pure_unpacked_decode=True,
+                kv_pack_dense2=False,
+            )
+        )
+        for sw, pps in ((2048, 6), (None, 19)):
+            self.assertTrue(
+                can_use_decode_fast(
+                    mode_str="tp16,w8,c1024,batchfull,dyn4k",
+                    q=q_tp16,
+                    kv_cache_fused=c_512,
+                    out_dtype=jnp.bfloat16,
+                    decode_query_size=1,
+                    custom_mask=None,
+                    attention_sink=None,
+                    soft_cap=None,
+                    xai_temperature_len=None,
+                    q_scale=None,
+                    actual_num_q_heads=8,
+                    actual_num_kv_heads=1,
+                    actual_head_dim=64,
+                    sliding_window=sw,
+                    pages_per_seq=pps,
+                    pure_unpacked_decode=True,
+                    kv_pack_dense2=False,
+                )
+            )
+        self.assertTrue(
+            can_use_decode_fast(
+                mode_str="tp16,w8,c1024,batchfull,dyn4k",
+                q=q_tp8,
+                kv_cache_fused=c_512,
+                out_dtype=jnp.bfloat16,
+                decode_query_size=1,
+                custom_mask=None,
+                attention_sink=None,
+                soft_cap=None,
+                xai_temperature_len=None,
+                q_scale=None,
+                actual_num_q_heads=16,
+                actual_num_kv_heads=1,
+                actual_head_dim=128,
+                sliding_window=None,
+                pages_per_seq=19,
+                pure_unpacked_decode=False,
+                kv_pack_dense2=False,
+            )
+        )
+
+        # 0x7F NaN-poisoned parity across SWA, Full short swabatch, dyn4k, and ring4k.
+        sm_scale = 64 ** -0.5
+        page_size = 512
+        for tag, sw, pps, mode, lens in (
+            ("tp16_swa_short", 2048, 6, "tp16,w8,c1024,batchfull,dyn4k", [17, 511, 512, 513, 1024, 900, 3, 256, 700, 1023, 64, 512, 999, 1]),
+            ("tp16_swa_evict", 2048, 6, "tp16,w8,c1024,batchfull,dyn4k", [17, 512, 1024, 2048, 2049, 2500, 2600, 513, 2100, 2400, 999, 2055, 2560, 7]),
+            ("tp16_full_11k", None, 3, "tp16,w8,c1024,batchfull,dyn4k", [1, 17, 511, 512, 513, 1024, 1200, 1400, 999, 777, 500, 1500, 1025, 42]),
+            ("tp16_full_dyn4k", None, 10, "tp16,w8,c1024,batchfull,dyn4k", [12, 512, 1025, 2048, 3000, 4096, 4500, 5000, 4900, 2500, 1500, 4100, 5119, 3]),
+            ("tp16_full_ring4k", None, 17, "tp16,w8,c4096,ring4k,batchfull", [19, 1025, 4096, 4097, 5500, 8192, 8193, 8500, 8600, 6000, 3000, 7000, 8400, 5]),
+        ):
+            with self.subTest(case=tag):
+                bs, n_act = 16, 14
+                n_phys_pages = bs * pps + 4
+                cache_u8 = np.full(
+                    (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+                )
+                # Valid rows have head_dim=64 padded with 0.0 in lanes 64:128.
+                cache_u8[:, :, 0, :2, :] = 0
+                cache_u8[:, :, 0, :2, :64] = _rand_fp8_u8(
+                    rng, (n_phys_pages, page_size, 2, 64)
+                )
+                page_indices = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
+                kv_lens = np.zeros((bs,), dtype=np.int32)
+                kv_lens[:n_act] = lens
+                # Re-poison tail rows >= kv_len - 1 in each active sequence's last page to verify sanitizer.
+                for s in range(n_act):
+                    old_l = int(kv_lens[s]) - 1
+                    last_p = old_l // page_size
+                    rem = old_l % page_size
+                    cache_u8[page_indices[s, last_p], rem:, 0, :2, :] = 0x7F
+                    if last_p + 1 < pps:
+                        cache_u8[page_indices[s, last_p + 1 :], :, 0, :2, :] = 0x7F
+
+                q_bf16 = jnp.asarray(
+                    rng.standard_normal((bs, 8, 64)) * 0.35, dtype=jnp.bfloat16
+                )
+                k_new_u8 = _rand_fp8_u8(rng, (bs, 64))
+                v_new_u8 = _rand_fp8_u8(rng, (bs, 64))
+                out_j, _ = run_decode_fast_rpa(
+                    q_bf16,
+                    _u8_to_fp8(k_new_u8)[:, None, :],
+                    _u8_to_fp8(v_new_u8)[:, None, :],
+                    _u8_to_fp8(cache_u8),
+                    jnp.asarray(kv_lens, dtype=jnp.int32),
+                    jnp.asarray(page_indices.ravel(), dtype=np.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size),
+                    jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32),
+                    sm_scale=sm_scale,
+                    sliding_window=sw,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    mode_str=mode,
+                    decode_query_size=1,
+                    fused_out_pack=1,
+                    kv_pack_dense2=False,
+                    interpret=True,
+                )
+                ref = np.zeros((bs, 8, 64), dtype=np.float32)
+                for s in range(n_act):
+                    kvl = int(kv_lens[s])
+                    first_k = 0 if sw is None else max(0, kvl - sw)
+                    pids = page_indices[s]
+                    k_l = [
+                        _fp8_from_u8(
+                            cache_u8[pids[p // page_size], p % page_size, 0, 0, :64]
+                        )
+                        for p in range(first_k, kvl - 1)
+                    ] + [_fp8_from_u8(k_new_u8[s])]
+                    v_l = [
+                        _fp8_from_u8(
+                            cache_u8[pids[p // page_size], p % page_size, 0, 1, :64]
+                        )
+                        for p in range(first_k, kvl - 1)
+                    ] + [_fp8_from_u8(v_new_u8[s])]
+                    lg = (
+                        np.asarray(q_bf16[s], dtype=np.float32) @ np.stack(k_l).T
+                    ) * sm_scale
+                    lg -= np.max(lg, axis=1, keepdims=True)
+                    pr = np.exp(lg)
+                    pr /= np.sum(pr, axis=1, keepdims=True)
+                    ref[s] = pr @ np.stack(v_l)
+                out_np = np.asarray(out_j, dtype=np.float32)
+                self.assertEqual(out_np.shape, (bs, 8, 64))
+                self.assertTrue(np.all(np.isfinite(out_np)))
+                self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+                self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+                return_value="TPU v7",
+            ),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag, pps, sw, exp_sub in (
+                ("tp16_swa", 6, 2048, "swabatch"),
+                ("tp16_full_11k", 3, None, "swabatch"),
+                ("tp16_full_8k1k", 19, None, "c4096-streamdyn"),
+                ("tp16_full_256k", 513, None, "ring4k-mp8"),
+            ):
+                with self.subTest(export=tag):
+                    bs = 64
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q, k, v, c, kl, pi, cq, ckv, d, _sw=sw: ragged_paged_attention(
+                                q,
+                                k,
+                                v,
+                                c,
+                                kl,
+                                pi,
+                                cq,
+                                ckv,
+                                d,
+                                None,
+                                None,
+                                sm_scale=64 ** -0.5,
+                                sliding_window=_sw,
+                                k_scale=1.0,
+                                v_scale=1.0,
+                                decode_query_size=1,
+                                _fused_out_pack=1,
+                                _prepared_inputs=False,
+                                _skip_mixed=True,
+                                _decode_fast="tp16,w8,c1024,batchfull,dyn4k",
+                                _kv_pack_dense2=False,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((bs, 8, 64), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs, 1, 64), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs, 1, 64), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((1024, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs * pps,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("RPAd_fast", hlo)
+                    self.assertIn("-tp16", hlo)
+                    self.assertIn(exp_sub, hlo)
+
+
 if __name__ == "__main__":
     unittest.main()

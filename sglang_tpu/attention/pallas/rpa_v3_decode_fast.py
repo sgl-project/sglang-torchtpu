@@ -196,10 +196,12 @@ def can_use_decode_fast(
     ):
         return False
     native_head = (actual_num_q_heads, actual_head_dim) == (8, 64)
-    if raw == "tp16" or (raw == "shared16_host" and native_head):
+    has_tp16_tok = "tp16" in raw_toks
+    if raw == "tp16" or ((has_tp16_tok or raw == "shared16_host") and native_head):
+        allow_tp16_full = (raw == "shared16_host") or (raw != "tp16")
         if not pure_unpacked_decode or not (
             sliding_window in (2048, 2049)
-            or (raw == "shared16_host" and sliding_window is None)
+            or (allow_tp16_full and sliding_window is None)
         ):
             return False
         head_geometry = (8, 64)
@@ -1197,13 +1199,13 @@ def _decode_fast_kernel(
         )
         u32_ref[pg_idx] = val_u32
 
-    def _mask_page_u32(pg_u32, lo, hi):
-        r_pg = lax.broadcasted_iota(jnp.int32, (phys_page_rows, 128), 0)
+    def _mask_slice_u32(blk_u32, off_r: int, n_rows: int, lo, hi):
+        r_pg = off_r + lax.broadcasted_iota(jnp.int32, (n_rows, 128), 0)
         if not kv_pack_dense2:
             return jnp.where(
                 (r_pg >= lo) & (r_pg < hi),
-                pg_u32,
-                jnp.zeros((phys_page_rows, 128), jnp.uint32),
+                blk_u32,
+                jnp.zeros((n_rows, 128), jnp.uint32),
             )
         e_idx = 2 * r_pg
         o_idx = e_idx + 1
@@ -1213,91 +1215,155 @@ def _decode_fast_kernel(
         o_m = jnp.where(
             (o_idx >= lo) & (o_idx < hi), jnp.uint32(0xFFFF0000), jnp.uint32(0)
         )
-        return pg_u32 & (e_m | o_m)
+        return blk_u32 & (e_m | o_m)
+
+    def _sanitize_page_u32(slot, pg_idx, lo, hi):
+        # Chunk >128-row physical pages (ps=256 nod2, ps=512 d2/nod2) into 128-row
+        # VREG slices so iota/mask temporaries never blow register pressure.
+        if interpret_mode or phys_page_rows <= 128:
+            _set_page_u32(
+                slot,
+                pg_idx,
+                _mask_slice_u32(_get_page_u32(slot, pg_idx), 0, phys_page_rows, lo, hi),
+            )
+            return
+        u32_flat = (
+            bkv_vmem_ref.bitcast(jnp.uint32)
+            .at[slot]
+            .reshape(max_ring_pages * phys_page_rows, 128)
+        )
+        base_r = pg_idx * phys_page_rows
+        n_subs = phys_page_rows // 128
+
+        def _sub_mask(sub_i, _):
+            row_off = sub_i * 128
+            src_off = pl.multiple_of(base_r + row_off, 128)
+            blk = u32_flat[pl.ds(src_off, 128)]
+            u32_flat[pl.ds(src_off, 128)] = _mask_slice_u32(
+                blk, row_off, 128, lo, hi
+            )
+
+        lax.fori_loop(0, n_subs, _sub_mask, None)
+
+    def _zero_pages_u32(slot, start_pg, end_pg):
+        if interpret_mode:
+            z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
+
+            def _z_interp(p_i, _):
+                bkv_vmem_ref[slot, p_i] = z_f8
+
+            lax.fori_loop(start_pg, end_pg, _z_interp, None)
+            return
+        if phys_page_rows <= 128:
+            z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
+            lax.fori_loop(
+                start_pg,
+                end_pg,
+                lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
+                None,
+            )
+            return
+        u32_flat = (
+            bkv_vmem_ref.bitcast(jnp.uint32)
+            .at[slot]
+            .reshape(max_ring_pages * phys_page_rows, 128)
+        )
+        n_subs = phys_page_rows // 128
+        z_128 = jnp.zeros((128, 128), jnp.uint32)
+        lax.fori_loop(
+            start_pg * n_subs,
+            end_pg * n_subs,
+            lambda s_i, _: u32_flat.__setitem__(
+                pl.ds(pl.multiple_of(s_i * 128, 128), 128), z_128
+            ),
+            None,
+        )
 
     def zero_all_slots_once():
         """Zeroes ``bkv_vmem_ref`` once in 8-sublane ``uint32`` before any DMAs start."""
-        z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
         if interpret_mode:
             z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
             for s_i in range(num_slots):
                 for p_i in range(max_ring_pages):
                     bkv_vmem_ref[s_i, p_i] = z_f8
             return
+        if phys_page_rows <= 128:
+            z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
+            flat_u32 = bkv_vmem_ref.bitcast(jnp.uint32).reshape(
+                num_slots * max_ring_pages, phys_page_rows, 128
+            )
+            lax.fori_loop(
+                0,
+                num_slots * max_ring_pages,
+                lambda idx, _: flat_u32.__setitem__(idx, z_pg),
+                None,
+            )
+            return
+        n_subs = phys_page_rows // 128
+        z_128 = jnp.zeros((128, 128), jnp.uint32)
         flat_u32 = bkv_vmem_ref.bitcast(jnp.uint32).reshape(
-            num_slots * max_ring_pages, phys_page_rows, 128
+            num_slots * max_ring_pages * phys_page_rows, 128
         )
         lax.fori_loop(
             0,
-            num_slots * max_ring_pages,
-            lambda idx, _: flat_u32.__setitem__(idx, z_pg),
+            num_slots * max_ring_pages * n_subs,
+            lambda s_i, _: flat_u32.__setitem__(
+                pl.ds(pl.multiple_of(s_i * 128, 128), 128), z_128
+            ),
             None,
         )
 
     def sanitize_slot_boundaries_branchless(
         slot, rel_first, rel_end, active_pages: int
     ):
-        """Zero-branch 2-page VMEM sanitizer (0 ``@pl.when``, 0 ``fori_loop``).
+        """2-page VMEM sanitizer skipping Page 0 when ``rel_first == 0`` (all 1/1k SWA).
 
         With ``zero_all_slots_once()`` run before the loop, every slot starts finite
-        (``0.0``), and every DMA'd sequence sanitizes Page 0 and Page ``n_pg - 1`` in
-        place so no ``0x7F``/``0xFF`` FP8 NaN can ever enter or persist in ``slot``.
+        (``0.0``), and every DMA'd sequence sanitizes Page 0 (only when ``rel_first > 0``
+        and ``last_p > 0``) and Page ``last_p`` in place so no ``0x7F``/``0xFF`` FP8 NaN
+        can ever enter or persist in ``slot``.
         """
-        z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
-        if sliding_window is not None:
-            pg0 = _get_page_u32(slot, 0)
-            _set_page_u32(slot, 0, _mask_page_u32(pg0, rel_first, rel_end))
         n_pg = (rel_end + page_size - 1) // page_size
+        last_p = jnp.clip(n_pg - 1, 0, active_pages - 1)
+        if sliding_window is not None:
+            @pl.when((rel_first > 0) & (last_p > 0))
+            def _clean_pg0_swa():
+                _sanitize_page_u32(slot, 0, rel_first, rel_end)
         if cfg.lazy_slot_zero:
             hwm_b0 = written_cnt_smem_ref[2 + slot]
             start_b0 = jnp.maximum(n_pg, hwm_b0)
 
             @pl.when(start_b0 < active_pages)
             def _lazy_init_b0():
-                lax.fori_loop(
-                    start_b0,
-                    active_pages,
-                    lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
-                    None,
-                )
+                _zero_pages_u32(slot, start_b0, active_pages)
 
             written_cnt_smem_ref[2 + slot] = jnp.maximum(
                 hwm_b0, jnp.maximum(n_pg, active_pages)
             )
 
-        last_p = jnp.clip(n_pg - 1, 0, active_pages - 1)
-        pgl = _get_page_u32(slot, last_p)
         last_lo = jnp.where(last_p == 0, rel_first, 0)
         last_hi = jnp.clip(rel_end - last_p * page_size, 0, page_size)
-        _set_page_u32(slot, last_p, _mask_page_u32(pgl, last_lo, last_hi))
+        _sanitize_page_u32(slot, last_p, last_lo, last_hi)
 
     def sanitize_slot_boundaries(slot, rel_first, rel_end, active_pages: int):
         """Zeroes <=2 boundary pages + any unfetched tail pages in VMEM (0x7F NaN-safe)."""
         if use_branchless_sanitize:
             sanitize_slot_boundaries_branchless(slot, rel_first, rel_end, active_pages)
             return
-        z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
-        pg0 = _get_page_u32(slot, 0)
-        _set_page_u32(slot, 0, _mask_page_u32(pg0, rel_first, rel_end))
+        _sanitize_page_u32(slot, 0, rel_first, rel_end)
         n_pg = (rel_end + page_size - 1) // page_size
         rem_last = rel_end % page_size
 
         @pl.when((n_pg > 1) & (rem_last != 0))
         def _clean_last():
             last_p = jnp.minimum(n_pg - 1, active_pages - 1)
-            pgl = _get_page_u32(slot, last_p)
-            _set_page_u32(slot, last_p, _mask_page_u32(pgl, 0, rem_last))
+            _sanitize_page_u32(slot, last_p, 0, rem_last)
 
         start_zero_pg = jnp.maximum(n_pg, 1)
 
         @pl.when(start_zero_pg < active_pages)
         def _clean_tail_pages():
-            lax.fori_loop(
-                start_zero_pg,
-                active_pages,
-                lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
-                None,
-            )
+            _zero_pages_u32(slot, start_zero_pg, active_pages)
 
     def _bkv_fp8_chunk(
         slot,
@@ -1657,20 +1723,13 @@ def _decode_fast_kernel(
         ``n_pages - 1``, eliminating ``zero_all_slots_once()`` while staying
         100% ``0x7F`` FP8-NaN safe on free, tail, evicted-SWA, and reused slots.
         """
-        z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
-
         if cfg.lazy_slot_zero:
             hwm_v2 = written_cnt_smem_ref[2 + slot]
             start_v2 = jnp.maximum(n_pages, hwm_v2)
 
             @pl.when(start_v2 < target_pages)
             def _zero_unfetched_once():
-                lax.fori_loop(
-                    start_v2,
-                    target_pages,
-                    lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
-                    None,
-                )
+                _zero_pages_u32(slot, start_v2, target_pages)
 
             written_cnt_smem_ref[2 + slot] = jnp.maximum(
                 hwm_v2, jnp.maximum(n_pages, target_pages)
@@ -1679,25 +1738,18 @@ def _decode_fast_kernel(
 
             @pl.when(n_pages < target_pages)
             def _zero_unfetched():
-                lax.fori_loop(
-                    n_pages,
-                    target_pages,
-                    lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
-                    None,
-                )
+                _zero_pages_u32(slot, n_pages, target_pages)
 
         @pl.when(target_pages > 0)
         def _clean_bounds():
-            # Full-attn always starts at rel_first=0: single-page is covered by
-            # last_p==0 below and >=2-page sequences keep full Page 0.
-            if sliding_window is not None:
-                pg0 = _get_page_u32(slot, 0)
-                _set_page_u32(slot, 0, _mask_page_u32(pg0, rel_first, rel_end))
             last_p = jnp.clip(n_pages - 1, 0, jnp.maximum(target_pages - 1, 0))
-            pgl = _get_page_u32(slot, last_p)
+            if sliding_window is not None:
+                @pl.when((rel_first > 0) & (last_p > 0))
+                def _clean_pg0_v2():
+                    _sanitize_page_u32(slot, 0, rel_first, rel_end)
             last_lo = jnp.where(last_p == 0, rel_first, 0)
             last_hi = jnp.clip(rel_end - last_p * page_size, 0, page_size)
-            _set_page_u32(slot, last_p, _mask_page_u32(pgl, last_lo, last_hi))
+            _sanitize_page_u32(slot, last_p, last_lo, last_hi)
 
     def compute_swa_stream2h(slot, q_bf16, q_row, rel_first, rel_end, n_pages):
         """Zero-spill 2-half (1152 + 1024 = 2176 keys) online-softmax SWA engine (dq in {1, 2})."""
@@ -2734,19 +2786,8 @@ def _decode_fast_kernel(
             if probe != "nocompute" and not cfg.lazy_slot_zero:
                 @pl.when(min_pg_b < w_pg)
                 def _zero_active_prefix():
-                    z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
                     for s_z in range(num_slots):
-                        if interpret_mode:
-                            z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
-                            for p_z in range(w_pg):
-                                bkv_vmem_ref[s_z, p_z] = z_f8
-                        else:
-                            lax.fori_loop(
-                                0,
-                                w_pg,
-                                lambda p_z, _, _sz=s_z: _set_page_u32(_sz, p_z, z_pg),
-                                None,
-                            )
+                        _zero_pages_u32(s_z, 0, w_pg)
 
             num_ahead_b = num_slots - 1
             for s_init in range(num_ahead_b):
@@ -3002,8 +3043,10 @@ def run_decode_fast_rpa(
     shared_pages=None,
 ) -> tuple[jax.Array, jax.Array]:
     """Executes the dedicated Ghostfish decode RPA kernel and formats outputs."""
-    native_tp16 = mode_str.strip().lower() == "tp16" or (
-        mode_str.strip().lower() == "shared16_host"
+    raw_mode = mode_str.strip().lower() if mode_str else ""
+    raw_toks = set(raw_mode.replace(",", "_").replace("-", "_").split("_"))
+    native_tp16 = "tp16" in raw_toks or (
+        raw_mode == "shared16_host"
         and not prepared_inputs
         and queries.shape[1:] == (8, 64)
     )
@@ -3034,8 +3077,6 @@ def run_decode_fast_rpa(
     phys_page_rows = kv_cache_fused.shape[1]
     page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
 
-    raw_mode = mode_str.strip().lower() if mode_str else ""
-    raw_toks = set(raw_mode.replace(",", "_").replace("-", "_").split("_"))
     use_w7 = _is_w7_enabled(mode_str)
     use_adaptive_c1024 = (
         decode_query_size == 1
@@ -3043,7 +3084,7 @@ def run_decode_fast_rpa(
         and (1024 % page_size == 0)
         and probe is None
         and shared_pages is None
-        and not native_tp16
+        and raw_mode not in ("tp16", "shared16_host")
         and (sliding_window is None or sliding_window >= 1024)
         and ("adapt" in raw_toks or (use_w7 and "noadapt" not in raw_toks))
     )
