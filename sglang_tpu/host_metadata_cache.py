@@ -34,7 +34,15 @@ class HostMetadataCache:
         self._by_layout[key] = value, resident
         return resident
 
-    def get_by_value(self, name: str, value: torch.Tensor, device) -> torch.Tensor:
+    def get_by_value(
+        self,
+        name: str,
+        value: torch.Tensor,
+        device,
+        *,
+        own_cpu: bool = False,
+        skip_equal: bool = False,
+    ) -> torch.Tensor:
         """Keep the latest upload per name, as with request page tables.
 
         Reuse it only when the device, dtype, shape, and CPU values all match.
@@ -42,7 +50,7 @@ class HostMetadataCache:
         assert value.device.type == "cpu"
         cached = self._by_value.get(name)
         key = str(device)
-        if cached is not None:
+        if not skip_equal and cached is not None:
             previous, device_key, resident = cached
             if (
                 device_key == key
@@ -51,8 +59,8 @@ class HostMetadataCache:
                 and torch.equal(previous, value)
             ):
                 return resident
-        # Keep our own CPU snapshot: callers may subsequently mutate their input.
-        snapshot = value.clone()
+        # Keep our own CPU snapshot unless caller guarantees exclusive ownership.
+        snapshot = value if own_cpu else value.clone()
         resident = snapshot.to(device, non_blocking=True)
         self._by_value[name] = snapshot, key, resident
         return resident

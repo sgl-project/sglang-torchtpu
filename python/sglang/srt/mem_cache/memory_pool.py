@@ -454,8 +454,16 @@ class ReqToTokenPool:
     def _bump_page_table_version(self) -> None:
         r2t = self.req_to_token
         r2t._tpu_page_table_version = getattr(r2t, "_tpu_page_table_version", 0) + 1
+        r2t._tpu_last_decode_patch = None
 
-    def write(self, indices, values, *, bump_page_table: bool = True):
+    def write(
+        self,
+        indices,
+        values,
+        *,
+        bump_page_table: bool = True,
+        is_decode_step: bool = False,
+    ):
         # Host-resident pool: move device index/value tensors to host scatter.
         if self.req_to_token.device.type == "cpu":
             if isinstance(indices, tuple):
@@ -467,6 +475,22 @@ class ReqToTokenPool:
         self.req_to_token[indices] = values
         if bump_page_table:
             self._bump_page_table_version()
+            if (
+                is_decode_step
+                and self.req_to_token.device.type == "cpu"
+                and isinstance(indices, tuple)
+                and len(indices) == 2
+                and torch.is_tensor(indices[0])
+                and torch.is_tensor(indices[1])
+                and torch.is_tensor(values)
+                and values.device.type == "cpu"
+            ):
+                self.req_to_token._tpu_last_decode_patch = (
+                    self.req_to_token._tpu_page_table_version,
+                    indices[0],
+                    indices[1],
+                    values,
+                )
 
     def available_size(self):
         return len(self.free_slots)

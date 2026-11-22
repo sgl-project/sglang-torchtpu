@@ -180,6 +180,9 @@ class TpuEnvs:
     # Reuse uploaded RPA decode/verify page_indices and swa_page_indices in O(1)
     # across target and draft forwards while req_to_token version and batch rows hold.
     SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE = EnvBool(False)
+    # Skip unused eager decode orig_seq_lens+1 updates and fuse global top-k
+    # sampler ops into fused_eager_ops programs on TPU.
+    SGLANG_TPU_DECODE_FAST_HOST = EnvBool(False)
     # Deduplicate aliased accept_lens/block_accept_lens D2H copies and batch result
     # + kv_fence_tail D2H through GIL-releasing torch_tpu batch_transfer_d2h.
     SGLANG_TPU_FAST_RESULT_COPY = EnvBool(False)
@@ -1005,6 +1008,9 @@ class TpuEnvs:
     # Adaptive RPAd_fast dispatch via lax.switch on max(kv_lens) between short <=1024 (c1024, mp=8)
     # and long windows (empty/False = auto under w7/adapt; True/False overrides).
     SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE = EnvBool(False)
+    # Unlock shared-prefix decode batches down to bs=8 (group_size=8 -> 128-row
+    # MXU tile) for Long-Context c=8 workloads.
+    SGLANG_TPU_RPA_SHARED_BS8 = EnvBool(False)
     # Optional RPAd_fast / RPAm diagnostic probe mode ("", "dense_kv", "nodma", "nocompute", "nokvwrite").
     SGLANG_TPU_RPA_V3_DECODE_PROBE = EnvStr("")
     # Wave-7 RPAm Stationary-Q prefill options (comma/underscore tokens: fp8_kv, fp8_qk,

@@ -856,10 +856,15 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         else:
             last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
         seq_lens_next = seq_lens + token_per_req
+        seq_lens_next_cpu = (
+            seq_lens_next
+            if seq_lens is batch.seq_lens_cpu
+            else batch.seq_lens_cpu + token_per_req
+        )
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            seq_lens_cpu=seq_lens_next_cpu,
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
@@ -871,7 +876,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens.to(seq_lens.device) + seq_lens
     else:
-        locs = seq_lens.clone()
+        locs = seq_lens if _is_tpu else seq_lens.clone()
 
     bump_page_table = True
     if _is_tpu:
@@ -886,6 +891,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
             (batch.req_pool_indices_cpu, locs),
             out_cache_loc_host,
             bump_page_table=bump_page_table,
+            is_decode_step=not batch.model_config.is_encoder_decoder,
         )
     elif _is_tpu:
         batch.req_to_token_pool.write(

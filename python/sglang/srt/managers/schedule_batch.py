@@ -3521,7 +3521,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # overlap forward.
         self.seq_lens = self.seq_lens + 1
         self.seq_lens_cpu = self.seq_lens_cpu + 1
-        self.orig_seq_lens = self.orig_seq_lens + 1
+        skip_orig_seq_lens = False
+        if self.device == "tpu":
+            from sglang_tpu.envs import envs as tpu_envs
+
+            skip_orig_seq_lens = tpu_envs.SGLANG_TPU_DECODE_FAST_HOST.get()
+        if not skip_orig_seq_lens:
+            self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 

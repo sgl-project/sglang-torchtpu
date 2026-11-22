@@ -33,7 +33,7 @@ def shared_decode_distribution(
     if (
         live < 8
         or live > rows
-        or group_size < 16
+        or group_size < 8
         or rows % group_size
         or width <= 128
         or page_size not in (128, 256)

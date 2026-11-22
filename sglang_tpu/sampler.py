@@ -408,6 +408,19 @@ def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     return LogitsOutputMode.DISTRIBUTED_TOP_K
 
 
+_TOP_K_POSITIONS_CACHE: dict[tuple[int, torch.dtype, str], torch.Tensor] = {}
+
+
+def _get_top_k_positions(width: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    key = (width, dtype, str(device))
+    cached = _TOP_K_POSITIONS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    pos = torch.arange(width, dtype=dtype, device=device).unsqueeze(0)
+    _TOP_K_POSITIONS_CACHE[key] = pos
+    return pos
+
+
 def sample_from_global_top_k_logits(
     global_top_k_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -416,16 +429,40 @@ def sample_from_global_top_k_logits(
     """Normalize temperature-scaled global TopK logits and sample a position.
     Returned positions index global TopK token IDs, not the full vocabulary."""
 
-    if top_ks is not None:
-        positions = torch.arange(
-            global_top_k_logits.shape[-1],
-            dtype=top_ks.dtype,
-            device=global_top_k_logits.device,
+    fast_host = (
+        global_top_k_logits.device.type == "tpu"
+        and envs.SGLANG_TPU_DECODE_FAST_HOST.get()
+    )
+    if fast_host:
+        positions = (
+            _get_top_k_positions(
+                global_top_k_logits.shape[-1],
+                top_ks.dtype,
+                global_top_k_logits.device,
+            )
+            if top_ks is not None
+            else None
         )
-        global_top_k_logits = global_top_k_logits.masked_fill(
-            positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
-        )
-    global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
+        with fused_eager_ops(True) as fused:
+            if positions is not None:
+                global_top_k_logits = global_top_k_logits.masked_fill(
+                    positions >= top_ks.unsqueeze(1), -torch.inf
+                )
+            scaled_logits = global_top_k_logits / temperatures
+        if fused:
+            submit((scaled_logits,))
+    else:
+        if top_ks is not None:
+            positions = torch.arange(
+                global_top_k_logits.shape[-1],
+                dtype=top_ks.dtype,
+                device=global_top_k_logits.device,
+            )
+            global_top_k_logits = global_top_k_logits.masked_fill(
+                positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
+            )
+        scaled_logits = global_top_k_logits / temperatures
+    global_top_k_probs = torch.softmax(scaled_logits, dim=-1)
     return sampling_from_probs_torch(
         global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
     )
@@ -707,12 +744,18 @@ class TpuSampler(Sampler):
             sampling_info.temperatures,
             sampling_info.top_ks,
         )
-        batch_next_token_ids = torch.gather(
-            logits_output.next_token_global_top_k_token_ids,
-            dim=1,
-            index=sampled_top_k_position.to(torch.int64).view(-1, 1),
-        ).view(-1)
-        batch_next_token_ids = batch_next_token_ids.to(torch.int64)
+        fuse_gather = (
+            sampled_top_k_position.device.type == "tpu"
+            and envs.SGLANG_TPU_DECODE_FAST_HOST.get()
+        )
+        with fused_eager_ops(fuse_gather) as fused:
+            batch_next_token_ids = torch.gather(
+                logits_output.next_token_global_top_k_token_ids,
+                dim=1,
+                index=sampled_top_k_position.to(torch.int64).view(-1, 1),
+            ).view(-1).to(torch.int64)
+        if fused:
+            submit((batch_next_token_ids,))
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         return batch_next_token_ids
 

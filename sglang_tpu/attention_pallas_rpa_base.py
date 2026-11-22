@@ -739,6 +739,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         ] = {}
         # Host req_to_token page-slot columns, built by _host_page_columns.
         self._host_page_cols: torch.Tensor | None = None
+        self._last_query_metadata: tuple | None = None
+        self._cached_full_page_to_swa_page: tuple | None = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -1087,6 +1089,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         """Device offsets for one fixed ``query_width`` or per-row ``query_lens``."""
         assert (query_width is None) != (query_lens is None)
         if query_width is not None:
+            q_key = (bs, kv_stride, non_empty_bs, query_width, str(device))
+            cached_qm = getattr(self, "_last_query_metadata", None)
+            if cached_qm is not None and cached_qm[0] == q_key:
+                return cached_qm[1]
             # Decode uses one token per row; target verify uses query_width.
             # Padded rows have the same width, so (bs, query_width) fixes the offsets.
             cu_q_lens = self._layout_metadata(
@@ -1096,6 +1102,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             active_tokens = non_empty_bs * query_width
         else:
+            q_key = None
             # Extend query lengths can differ across requests, even at the same bs.
             # Include padded rows in the offsets, but exclude them from active_tokens.
             assert len(query_lens) == bs
@@ -1120,7 +1127,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             build=lambda: torch.tensor(active_tokens, dtype=torch.int32),
             device=device,
         )
-        return cu_q_lens, cu_kv_lens, active_num_tokens
+        res = (cu_q_lens, cu_kv_lens, active_num_tokens)
+        if q_key is not None:
+            self._last_query_metadata = (q_key, res)
+        return res
 
     def _build_metadata_host(
         self,
@@ -1263,11 +1273,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             dcp_kv_lens_global = _padded(target_global)
             dcp_cp_rank = self._cp_rank_t
 
-        req_pool_indices = forward_batch.req_pool_indices_cpu
-        assert req_pool_indices is not None
-        assert req_pool_indices.device.type == "cpu"
-        assert req_pool_indices.shape[0] == bs
-        req_pool_indices = req_pool_indices.to(torch.int64)
+        req_pool_indices_raw = forward_batch.req_pool_indices_cpu
+        assert req_pool_indices_raw is not None
+        assert req_pool_indices_raw.device.type == "cpu"
+        assert req_pool_indices_raw.shape[0] == bs
 
         cu_q_lens, cu_kv_lens, active_num_tokens = self._get_query_metadata(
             bs=bs,
@@ -1290,7 +1299,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
         shared_group_sz = self.shared_decode_group_size(bs) if want_shared_decode else 0
 
-        def _build_shared_dist(pages_np, mismatch_cache):
+        def _build_shared_dist(pages_np, mismatch_cache, shared_dist_cache):
             from sglang_tpu.attention_shared_prefix import (
                 compute_shared_mismatch,
                 shared_decode_distribution,
@@ -1313,11 +1322,32 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             if plan is None:
                 return None
-            return self._value_metadata(
+            cached_dist = shared_dist_cache.get(m_key)
+            if cached_dist is not None and np.array_equal(cached_dist[0], plan):
+                return cached_dist[1]
+            dist_t = self._value_metadata(
                 name="full_decode_distribution",
                 value=torch.from_numpy(plan),
                 device=device,
             )
+            shared_dist_cache[m_key] = (plan, dist_t)
+            return dist_t
+
+        def _get_full_page_to_swa_page(swa_ver: int) -> torch.Tensor:
+            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa is not None, (
+                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                "has not been registered yet — did the allocator finish init?"
+            )
+            cached_map = getattr(self, "_cached_full_page_to_swa_page", None)
+            map_key = (id(full_to_swa), swa_ver, self._page_stride)
+            if cached_map is not None and cached_map[0] == map_key:
+                return cached_map[1]
+            page_map = (full_to_swa[0 :: self._page_stride] // self._page_stride).to(
+                torch.int32
+            )
+            self._cached_full_page_to_swa_page = (map_key, page_map)
+            return page_map
 
         page_table_ver = getattr(req_to_token, "_tpu_page_table_version", None)
         can_cache_decode_pages = (
@@ -1329,6 +1359,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 or forward_batch.forward_mode.is_target_verify()
             )
         )
+        swa_map_ver = 0
+        cache_meta = None
         if can_cache_decode_pages:
             swa_map_ver = (
                 getattr(
@@ -1340,44 +1372,151 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 and self.token_to_kv_pool.full_to_swa_index_mapping is not None
                 else 0
             )
-            cache_key = (
+            dev_key = str(device)
+            cache_meta = (
                 page_table_ver,
                 swa_map_ver,
                 pages_per_seq,
                 self._page_stride,
-                str(device),
-                req_pool_indices.numpy().tobytes(),
+                dev_key,
             )
             prev_cached = getattr(self, "_cached_decode_page_tables", None)
-            if prev_cached is not None and prev_cached[0] == cache_key:
-                (
-                    page_indices_dev,
-                    swa_page_indices,
-                    swa_group_page_indices,
-                    page_indices_np,
-                    mismatch_cache,
-                ) = prev_cached[1]
-                full_distribution = (
-                    _build_shared_dist(page_indices_np, mismatch_cache)
-                    if want_shared_decode
-                    else None
+            if prev_cached is not None:
+                prev_meta, prev_req_raw, prev_payload = prev_cached
+                same_rows = (
+                    prev_req_raw.shape == req_pool_indices_raw.shape
+                    and prev_req_raw.dtype == req_pool_indices_raw.dtype
+                    and torch.equal(prev_req_raw, req_pool_indices_raw)
                 )
-                return PallasForwardMetadata(
-                    kv_lens=kv_lens,
-                    cu_q_lens=cu_q_lens,
-                    cu_kv_lens=cu_kv_lens,
-                    page_indices=page_indices_dev,
-                    distribution=distribution,
-                    full_decode_distribution=full_distribution,
-                    active_num_tokens=active_num_tokens,
-                    swa_page_indices=swa_page_indices,
-                    swa_group_page_indices=swa_group_page_indices,
-                    dcp_kv_lens_global=dcp_kv_lens_global,
-                    dcp_cp_rank=dcp_cp_rank,
-                    decode_query_size=decode_query_size,
-                    segments=segments,
-                )
+                if same_rows and prev_meta == cache_meta:
+                    (
+                        page_indices_dev,
+                        swa_page_indices,
+                        swa_group_page_indices,
+                        page_indices_np,
+                        swa_pages_np,
+                        mismatch_cache,
+                        shared_dist_cache,
+                    ) = prev_payload
+                    full_distribution = (
+                        _build_shared_dist(
+                            page_indices_np, mismatch_cache, shared_dist_cache
+                        )
+                        if want_shared_decode
+                        else None
+                    )
+                    return PallasForwardMetadata(
+                        kv_lens=kv_lens,
+                        cu_q_lens=cu_q_lens,
+                        cu_kv_lens=cu_kv_lens,
+                        page_indices=page_indices_dev,
+                        distribution=distribution,
+                        full_decode_distribution=full_distribution,
+                        active_num_tokens=active_num_tokens,
+                        swa_page_indices=swa_page_indices,
+                        swa_group_page_indices=swa_group_page_indices,
+                        dcp_kv_lens_global=dcp_kv_lens_global,
+                        dcp_cp_rank=dcp_cp_rank,
+                        decode_query_size=decode_query_size,
+                        segments=segments,
+                    )
+                if (
+                    same_rows
+                    and prev_meta[0] + 1 == page_table_ver
+                    and prev_meta[1:] == cache_meta[1:]
+                    and prev_payload[2] is None
+                ):
+                    patch = getattr(req_to_token, "_tpu_last_decode_patch", None)
+                    if (
+                        patch is not None
+                        and patch[0] == page_table_ver
+                        and patch[1].shape == req_pool_indices_raw.shape
+                        and torch.equal(patch[1], req_pool_indices_raw)
+                    ):
+                        _, _, p_locs, p_vals = patch
+                        mask = (p_locs >= 0) & (p_locs % self._page_stride == 0)
+                        cols = p_locs[mask] // self._page_stride
+                        if cols.numel() > 0 and bool((cols < pages_per_seq).all()):
+                            row_idx_np = torch.nonzero(mask, as_tuple=True)[0].numpy()
+                            cols_np = cols.numpy()
+                            new_pgs_t = p_vals[mask] // self._page_stride
+                            new_pgs_np = new_pgs_t.to(torch.int32).numpy()
+                            page_indices_np = prev_payload[3].copy()
+                            page_indices_np[row_idx_np, cols_np] = new_pgs_np
+                            page_indices_t = torch.from_numpy(
+                                page_indices_np
+                            ).reshape(bs * pages_per_seq)
+                            page_indices_dev = self._value_metadata_fast(
+                                name="page_indices",
+                                value=page_indices_t,
+                                device=device,
+                                own_cpu=True,
+                                skip_equal=True,
+                            )
+                            swa_page_indices = None
+                            swa_pages_np = None
+                            if self._is_hybrid_swa:
+                                page_map = _get_full_page_to_swa_page(swa_map_ver)
+                                new_swa_np = (
+                                    page_map[new_pgs_t.to(torch.int64)]
+                                    .to(torch.int32)
+                                    .numpy()
+                                )
+                                swa_pages_np = prev_payload[4].copy()
+                                swa_pages_np.reshape(bs, pages_per_seq)[
+                                    row_idx_np, cols_np
+                                ] = new_swa_np
+                                swa_t = torch.from_numpy(swa_pages_np)
+                                swa_page_indices = self._value_metadata_fast(
+                                    name="swa_page_indices",
+                                    value=swa_t,
+                                    device=device,
+                                    own_cpu=True,
+                                    skip_equal=True,
+                                )
+                            mismatch_cache = {}
+                            shared_dist_cache = {}
+                            full_distribution = (
+                                _build_shared_dist(
+                                    page_indices_np, mismatch_cache, shared_dist_cache
+                                )
+                                if want_shared_decode
+                                else None
+                            )
+                            self._cached_decode_page_tables = (
+                                cache_meta,
+                                req_pool_indices_raw.clone(),
+                                (
+                                    page_indices_dev,
+                                    swa_page_indices,
+                                    None,
+                                    page_indices_np,
+                                    swa_pages_np,
+                                    mismatch_cache,
+                                    shared_dist_cache,
+                                ),
+                            )
+                            return PallasForwardMetadata(
+                                kv_lens=kv_lens,
+                                cu_q_lens=cu_q_lens,
+                                cu_kv_lens=cu_kv_lens,
+                                page_indices=page_indices_dev,
+                                distribution=distribution,
+                                full_decode_distribution=full_distribution,
+                                active_num_tokens=active_num_tokens,
+                                swa_page_indices=swa_page_indices,
+                                swa_group_page_indices=None,
+                                dcp_kv_lens_global=dcp_kv_lens_global,
+                                dcp_cp_rank=dcp_cp_rank,
+                                decode_query_size=decode_query_size,
+                                segments=segments,
+                            )
 
+        req_pool_indices = (
+            req_pool_indices_raw
+            if req_pool_indices_raw.dtype == torch.int64
+            else req_pool_indices_raw.to(torch.int64)
+        )
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
         # slot per page), not the full [bs, max_ctx] row.
         page_cols = self._host_page_columns(pages_per_seq, self._page_stride)
@@ -1389,48 +1528,49 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # page indices through the CPU mapping before uploading or reusing them.
         swa_page_indices: torch.Tensor | None = None
         swa_group_page_indices: torch.Tensor | None = None
+        swa_pages_np = None
         if self._is_hybrid_swa:
-            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
-            assert full_to_swa is not None, (
-                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
-                "has not been registered yet — did the allocator finish init?"
-            )
-            # The mapping uses token slots, so look up each page's first token.
-            full_token_starts = page_indices.to(torch.int64) * self._page_stride
-            swa_pages = full_to_swa[full_token_starts] // self._page_stride
-            swa_page_indices = self._value_metadata(
+            page_map = _get_full_page_to_swa_page(swa_map_ver)
+            swa_pages = page_map[page_indices.to(torch.int64)]
+            swa_pages_np = swa_pages.numpy()
+            swa_page_indices = self._value_metadata_fast(
                 name="swa_page_indices",
-                value=swa_pages.to(torch.int32),
+                value=swa_pages,
                 device=device,
+                own_cpu=True,
             )
             if self._swa_group_pages is not None:
                 swa_group_page_indices = self._value_metadata(
                     name="swa_group_page_indices",
-                    value=self._swa_group_pages[:, swa_pages],
+                    value=self._swa_group_pages[:, swa_pages.to(torch.int64)],
                     device=device,
                 )
 
         page_indices_np = page_indices.view(bs, pages_per_seq).numpy()
         mismatch_cache = {}
+        shared_dist_cache = {}
         full_distribution = (
-            _build_shared_dist(page_indices_np, mismatch_cache)
+            _build_shared_dist(page_indices_np, mismatch_cache, shared_dist_cache)
             if want_shared_decode
             else None
         )
 
         # Page tables change with KV growth, so they are value-checked.
-        page_indices_dev = self._value_metadata(
-            name="page_indices", value=page_indices, device=device
+        page_indices_dev = self._value_metadata_fast(
+            name="page_indices", value=page_indices, device=device, own_cpu=True
         )
         if can_cache_decode_pages:
             self._cached_decode_page_tables = (
-                cache_key,
+                cache_meta,
+                req_pool_indices_raw.clone(),
                 (
                     page_indices_dev,
                     swa_page_indices,
                     swa_group_page_indices,
                     page_indices_np,
+                    swa_pages_np,
                     mismatch_cache,
+                    shared_dist_cache,
                 ),
             )
         return PallasForwardMetadata(
@@ -1667,6 +1807,32 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return value.to(device, non_blocking=True)
         return cache.get_by_value(name=name, value=value, device=device)
 
+    def _value_metadata_fast(
+        self,
+        *,
+        name: str,
+        value: torch.Tensor,
+        device,
+        own_cpu: bool = False,
+        skip_equal: bool = False,
+    ) -> torch.Tensor:
+        if (
+            self._value_metadata.__func__ is BaseTpuPallasRpaAttnBackend._value_metadata
+            if hasattr(self._value_metadata, "__func__")
+            else False
+        ):
+            cache = getattr(self, "_host_metadata_cache", None)
+            if cache is None:
+                return value.to(device, non_blocking=True)
+            return cache.get_by_value(
+                name=name,
+                value=value,
+                device=device,
+                own_cpu=own_cpu,
+                skip_equal=skip_equal,
+            )
+        return self._value_metadata(name=name, value=value, device=device)
+
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
@@ -1715,13 +1881,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
         target = get_shared_group_size(envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get())
-        if target <= 0 or bs < 16 or bs % 16 != 0:
+        min_bs = 8 if envs.SGLANG_TPU_RPA_SHARED_BS8.get() else 16
+        if target <= 0 or bs < min_bs or bs % min_bs != 0:
             return 0
         grp = min(target, bs)
-        return grp if bs % grp == 0 else 16
+        while grp > min_bs and (bs % grp != 0 or (grp & (grp - 1)) != 0):
+            grp //= 2
+        if bs % grp == 0 and (grp & (grp - 1)) == 0:
+            return grp
+        return 16 if bs % 16 == 0 else min_bs
 
     def supports_shared_decode_batch(self, bs: int) -> bool:
         """Whether both decode programs can occur at this serving bucket."""
+        min_bs = 8 if envs.SGLANG_TPU_RPA_SHARED_BS8.get() else 16
         return (
             self.shared_decode_group_size(bs) > 0
             and envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED.get()
@@ -1732,8 +1904,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             and get_parallel().attn_dp_size == 1
             and self.page_size in (128, 256)
             and self.max_context_len > 128 * self.page_size
-            and bs >= 16
-            and bs % 16 == 0
+            and bs >= min_bs
+            and bs % min_bs == 0
             and self.req_to_token_pool.req_to_token.device.type == "cpu"
         )
 

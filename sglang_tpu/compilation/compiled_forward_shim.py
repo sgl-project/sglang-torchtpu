@@ -707,31 +707,32 @@ def _pad_batch_fields(
     # under PJRT's 32 executions in flight). Only modes with a fixed token count
     # per request fuse: a fused program is keyed by every field's live shape, and
     # prompt lengths would make one per combination, which warm-up cannot cover.
-    mode = forward_batch.forward_mode
-    fuse = (
-        mode.is_decode()
-        or mode.is_idle()
-        or mode.is_target_verify()
-        or mode.is_draft_extend_v2()
-    )
-    with fused_eager_ops(fuse) as fused:
-        if pad_t is not None:
-            _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
-        for field in _BS_FIELDS:
-            if field in _MAMBA_TRACK_FIELDS:
-                continue
-            val = getattr(forward_batch, field, None)
-            if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
-                setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
-    if fused:
-        spec_info = forward_batch.spec_info
-        submit(
-            (
-                *(getattr(forward_batch, field, None) for field in _TOKEN_FIELDS),
-                *(getattr(forward_batch, field, None) for field in _BS_FIELDS),
-                getattr(spec_info, "hidden_states", None),
-            )
+    if _needs_device_pad(forward_batch, pad_t, pad_b, is_draft_extend_v2):
+        mode = forward_batch.forward_mode
+        fuse = (
+            mode.is_decode()
+            or mode.is_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
         )
+        with fused_eager_ops(fuse) as fused:
+            if pad_t is not None:
+                _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
+            for field in _BS_FIELDS:
+                if field in _MAMBA_TRACK_FIELDS:
+                    continue
+                val = getattr(forward_batch, field, None)
+                if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
+                    setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
+        if fused:
+            spec_info = forward_batch.spec_info
+            submit(
+                (
+                    *(getattr(forward_batch, field, None) for field in _TOKEN_FIELDS),
+                    *(getattr(forward_batch, field, None) for field in _BS_FIELDS),
+                    getattr(spec_info, "hidden_states", None),
+                )
+            )
 
     # Normalize tensor/None values to padded lists so every extend batch
     # presents the same type to the compiled graph (the precompile dummy uses
@@ -767,6 +768,30 @@ def _pad_batch_fields(
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
     forward_batch.batch_size = pad_b
+
+
+def _needs_device_pad(
+    forward_batch: Any, pad_t: int | None, pad_b: int, is_draft_extend_v2: bool
+) -> bool:
+    if pad_t is not None:
+        for field in _TOKEN_FIELDS:
+            val = getattr(forward_batch, field, None)
+            if isinstance(val, torch.Tensor) and val.shape[_TOKEN_FIELD_DIM.get(field, 0)] < pad_t:
+                return True
+        if is_draft_extend_v2 and forward_batch.out_cache_loc.shape[0] < pad_t:
+            return True
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            hs = getattr(spec_info, "hidden_states", None)
+            if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+                return True
+    for field in _BS_FIELDS:
+        if field in _MAMBA_TRACK_FIELDS:
+            continue
+        val = getattr(forward_batch, field, None)
+        if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
+            return True
+    return False
 
 
 def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) -> None:
