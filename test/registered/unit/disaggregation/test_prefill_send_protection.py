@@ -80,7 +80,7 @@ class _Sender:
         self.sends.append(pages)
 
 
-def _scheduler(cache, allocator, pool):
+def _scheduler(cache, allocator, pool, *, base_init=True):
     scheduler = SchedulerDisaggregationPrefillMixin()
     scheduler.tree_cache = cache
     scheduler.token_to_kv_pool_allocator = allocator
@@ -99,7 +99,10 @@ def _scheduler(cache, allocator, pool):
         )
     )
     scheduler.disagg_prefill_pending_chunk_rids = set()
-    scheduler.disagg_prefill_deferred_frees = {}
+    if base_init:
+        # A scheduler that already has its own dict; the first hold creates it
+        # otherwise.
+        scheduler.disagg_prefill_deferred_frees = {}
     return scheduler
 
 
@@ -159,6 +162,7 @@ def _drive(
     unpublished=False,
     skip_insert=False,
     early_final=None,
+    base_init=True,
 ):
     """``early_final`` ("hold" or "skip") sends the last chunk before its result's
     checkpoint, from a sender that exposes pages and holds the checkpoint's frees
@@ -195,7 +199,7 @@ def _drive(
         sender.pages_exposed_before_result = True
     req.pending_bootstrap = unpublished
     req.skip_radix_cache_insert = skip_insert
-    scheduler = _scheduler(cache, allocator, pool)
+    scheduler = _scheduler(cache, allocator, pool, base_init=base_init)
     scheduler.chunked_req = req
     running = SimpleNamespace(batch_is_full=True)
     row = pool.req_to_token[req.kv.req_pool_idx]
@@ -253,7 +257,7 @@ def _drive(
     in_flight = set(sender.in_flight)
     sender.in_flight.clear()
     allocator.freed.clear()
-    sink = scheduler.disagg_prefill_deferred_frees.get(req, [])
+    sink = (scheduler.disagg_prefill_deferred_frees or {}).get(req, [])
     steps[-1].held_units = cache.deferred_free_units(sink)
     available = (allocator.full_available_size(), allocator.swa_available_size())
     scheduler._apply_deferred_frees(req)
@@ -265,7 +269,7 @@ def _drive(
     steps[-1].in_flight = in_flight
     steps[-1].first_tokens = scheduler.first_tokens
     release_kv_cache(req, cache, checkpoint=False)
-    assert req not in scheduler.disagg_prefill_deferred_frees
+    assert req not in (scheduler.disagg_prefill_deferred_frees or {})
     cache.sanity_check()
     return steps
 
@@ -317,6 +321,27 @@ class TestPrefillSendProtection(CustomTestCase):
                 # Without the opt-in the result does not publish and frees nothing.
                 self.assertLess(skip.protected, regular.protected)
                 self.assertFalse(skip.freed or skip.freed_at_end)
+
+    def test_held_frees_without_the_base_init_disaggregation(self):
+        # A scheduler subclass may override init_disaggregation without calling
+        # the base, which leaves the held-frees dict unset.
+        for backend in ("python", "rust"):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(page_size=1),
+            ):
+                based = _drive(backend, (20, 28), sibling=True, early_final="hold")[-1]
+                bare = _drive(
+                    backend,
+                    (20, 28),
+                    sibling=True,
+                    early_final="hold",
+                    base_init=False,
+                )[-1]
+                self.assertFalse(bare.freed_in_flight)
+                self.assertGreater(bare.held_units[0], 0)
+                self.assertEqual(bare.freed_at_end, based.freed_at_end)
+                self.assertEqual(bare.freed_by_pool, based.freed_by_pool)
 
     def test_parked_result_does_not_hold_frees(self):
         # A result still waiting for its bootstrap has sent nothing; it keeps the

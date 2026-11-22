@@ -25,8 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -696,9 +695,10 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
-    # Results' checkpoint device frees held until their transfer ends, by request;
-    # init_disaggregation sets the scheduler's own dict.
-    disagg_prefill_deferred_frees: Mapping[Req, list] = MappingProxyType({})
+    # Results' checkpoint device frees held until their transfer ends, by request.
+    # Created at the first hold rather than in init_disaggregation, which a
+    # scheduler subclass may override without calling the base.
+    disagg_prefill_deferred_frees: Optional[Dict[Req, list]] = None
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -745,12 +745,13 @@ class SchedulerDisaggregationPrefillMixin:
         with self.tree_cache.defer_device_frees(frees):
             checkpoint_kv_cache(req, self.tree_cache)
         if frees:
+            if self.disagg_prefill_deferred_frees is None:
+                self.disagg_prefill_deferred_frees = {}
             self.disagg_prefill_deferred_frees.setdefault(req, []).extend(frees)
 
     def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
-        frees = self.disagg_prefill_deferred_frees.get(req)
+        frees = (self.disagg_prefill_deferred_frees or {}).pop(req, None)
         if frees is not None:
-            del self.disagg_prefill_deferred_frees[req]
             self.tree_cache.apply_deferred_frees(frees)
 
     def release_prefill_sender(
