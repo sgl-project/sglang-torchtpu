@@ -1018,3 +1018,246 @@ def test_mosaic_tpu7x_export_b320_b384_carb_bridges_and_lm_head():
                 exported += 1
 
     assert exported == 48
+
+
+def test_w7_b1b_b2b_interpret_parity_and_b80_direct_qkv_export():
+    """Verify 8-rank interpret=True numerical parity for optimized Bridge 1b/2b and B=80 dqkv."""
+    import re
+    import jax
+    import jax.numpy as jnp
+    from jax import export as jexp
+    from jax._src import tpu_custom_call
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.kernels.decode_collective_bridges import (
+        attn_to_moe_bridge_jax,
+        moe_to_attn_bridge_jax,
+    )
+    from sglang_tpu.kernels.decode_collective_bridges_carb import (
+        fp8_dual_direct_qkv_epi_gate_jax,
+        moe_to_attn_direct_qkv_epi_bridge_jax,
+    )
+
+    all_devs = list(jax.devices())
+    if len(all_devs) < 8:
+        return
+    mesh = Mesh(np.array(all_devs[:8]), ("model",))
+
+    def _check_mlir(name, fn, in_specs, out_specs, shapes_dtypes, *, check_t16: bool = True):
+        asms = []
+        orig = tpu_custom_call._lower_to_custom_call_config
+
+        def _spy(mod, **kw):
+            asms.append(mod.operation.get_asm(enable_debug_info=False))
+            return orig(mod, **kw)
+
+        tpu_custom_call._lower_to_custom_call_config = _spy
+        try:
+            avals = [
+                jax.ShapeDtypeStruct(sh, dt, sharding=NamedSharding(mesh, sp))
+                for (sh, dt), sp in zip(shapes_dtypes, in_specs)
+            ]
+            w = jax.jit(
+                jax.shard_map(
+                    fn, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+                )
+            )
+            with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                exp = jexp.export(w, platforms=("tpu",))(*avals)
+            mlir = exp.mlir_module()
+        finally:
+            tpu_custom_call._lower_to_custom_call_config = orig
+        assert "stablehlo.partition_id" not in mlir
+        if check_t16:
+            bad = [
+                ln
+                for ln in asms[0].splitlines()
+                if ("tpu.concatenate" in ln and "vector<1x" in ln)
+                or (
+                    ("vector.load" in ln or "vector_store" in ln)
+                    and "xbf16>" in ln
+                    and "memref<8x" not in ln
+                    and re.search(r"vector<(?:\d+x)*(?:1|8)x\d+xbf16>", ln)
+                )
+            ]
+            assert not bad, f"{name}: {bad[:2]}"
+
+    H_FULL, HP_FULL, E_FULL = 8192, 4096, 256
+    for B in (16, 32, 64, 128, 384):
+        _check_mlir(
+            f"b1b_{B}",
+            lambda *a: attn_to_moe_bridge_jax(*a, world_size=8),
+            (P(),) * 11,
+            (P(), P(), P()),
+            [
+                ((B, H_FULL), jnp.float32),
+                ((B, 1024), jnp.bfloat16),
+                ((1024, H_FULL), jnp.float8_e4m3fn),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL, 512), jnp.float8_e4m3fn),
+                ((512,), jnp.float32),
+                ((H_FULL, E_FULL), jnp.bfloat16),
+                ((HP_FULL,), jnp.float32),
+            ],
+        )
+        sh = B >= 64
+        _check_mlir(
+            f"b2b_{B}",
+            lambda *a, _sh=sh: moe_to_attn_bridge_jax(*a, world_size=8, sharded_moe_in=_sh),
+            (P(), P("model", None) if sh else P()) + (P(),) * 10,
+            (P(), P(), P()),
+            [
+                ((B, H_FULL), jnp.float32),
+                ((B, 4096), jnp.bfloat16),
+                ((4096, 1024), jnp.float8_e4m3fn),
+                ((1024,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL,), jnp.float32),
+                ((H_FULL, 1280), jnp.float8_e4m3fn),
+                ((1280,), jnp.float32),
+                ((H_FULL, 1024), jnp.float8_e4m3fn),
+                ((1024,), jnp.float32),
+            ],
+        )
+
+    _check_mlir(
+        "l0_dqkv_80",
+        lambda *a: fp8_dual_direct_qkv_epi_gate_jax(*a),
+        (P(),) * 6,
+        (P(), P(), P()),
+        [
+            ((80, H_FULL), jnp.bfloat16),
+            ((H_FULL, 1280), jnp.float8_e4m3fn),
+            ((1280,), jnp.float32),
+            ((H_FULL, 1024), jnp.float8_e4m3fn),
+            ((1024,), jnp.float32),
+            ((80, 2, 128), jnp.float32),
+        ],
+        check_t16=False,
+    )
+    _check_mlir(
+        "b2_dqkv_80",
+        lambda *a: moe_to_attn_direct_qkv_epi_bridge_jax(*a, world_size=8),
+        (P(),) * 13,
+        (P(), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+        [
+            ((80, H_FULL), jnp.float32),
+            ((80, 4096), jnp.bfloat16),
+            ((4096, 1024), jnp.float8_e4m3fn),
+            ((1024,), jnp.float32),
+            ((H_FULL,), jnp.float32),
+            ((H_FULL,), jnp.float32),
+            ((H_FULL,), jnp.float32),
+            ((H_FULL,), jnp.float32),
+            ((H_FULL, 1280), jnp.float8_e4m3fn),
+            ((1280,), jnp.float32),
+            ((H_FULL, 1024), jnp.float8_e4m3fn),
+            ((1024,), jnp.float32),
+            ((80, 2, 128), jnp.float32),
+        ],
+        check_t16=False,
+    )
+
+    def _rms(x, w, eps, scale_in):
+        xf = x.astype(np.float32)
+        if w is not None and scale_in:
+            xf = xf * w[None, :]
+        inv = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + eps)
+        y = xf * inv
+        if w is not None and not scale_in:
+            y = y * w[None, :]
+        return y
+
+    H_T, HP_T = 4096, 2048
+    rng = np.random.default_rng(77)
+    for b_t in (16, 32, 64):
+        st = rng.standard_normal((b_t, H_T)).astype(np.float32)
+        ga_bf = jnp.asarray(rng.standard_normal((b_t, 8 * 256)), dtype=jnp.bfloat16)
+        ga_np = np.asarray(ga_bf, dtype=np.float32)
+        wo = jnp.asarray(rng.standard_normal((8 * 256, H_T)) * 0.1, dtype=jnp.float8_e4m3fn)
+        wos = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pa_a = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pa_b = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pff_g = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        wpre = jnp.asarray(rng.standard_normal((H_T, HP_T)) * 0.1, dtype=jnp.float8_e4m3fn)
+        wpre_s = rng.uniform(0.5, 1.5, (1, HP_T)).astype(np.float32)
+        wrot = jnp.asarray(rng.standard_normal((H_T, 256)) * 0.1, dtype=jnp.bfloat16)
+        peg = rng.uniform(0.5, 1.5, (HP_T,)).astype(np.float32)
+
+        fn1 = jax.jit(
+            jax.shard_map(
+                lambda s, g, w, ws, a, b, pf, wp, wps, wr, pe: attn_to_moe_bridge_jax(
+                    s, g, w, ws, a, b, pf, wp, wps, wr, pe,
+                    world_size=8, pa_eps=1e-5, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+                    router_multiplier=0.5, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+                    interpret=True,
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P(), P(None, "model"), P("model", None), P(), P(), P(), P(),
+                    P(None, "model"), P(None, "model"), P(), P(),
+                ),
+                out_specs=(P(), P(), P()),
+                check_vma=False,
+            )
+        )
+        st_out, rlog_out, ein_out = fn1(
+            jnp.asarray(st), ga_bf, jax.device_put(wo, NamedSharding(mesh, P("model", None))),
+            jnp.asarray(wos), jnp.asarray(pa_a), jnp.asarray(pa_b), jnp.asarray(pff_g),
+            jax.device_put(wpre, NamedSharding(mesh, P(None, "model"))),
+            jax.device_put(jnp.asarray(wpre_s), NamedSharding(mesh, P(None, "model"))),
+            wrot, jnp.asarray(peg),
+        )
+        o_np = (ga_np @ np.asarray(wo, dtype=np.float32)) * wos[None, :]
+        st_ref = pa_a[None, :] * st + pa_b[None, :] * _rms(o_np, None, 1e-5, False)
+        rin_ref = np.asarray(jnp.asarray(_rms(st_ref, pff_g, 1e-5, False), dtype=jnp.bfloat16), dtype=np.float32)
+        rlog_ref = (rin_ref @ np.asarray(wrot, dtype=np.float32)) * 0.5
+        pre_ref = np.asarray(jnp.asarray((rin_ref @ np.asarray(wpre, dtype=np.float32)) * wpre_s, dtype=jnp.bfloat16), dtype=np.float32)
+        ein_ref = _rms(pre_ref, peg, 1e-5, False)
+        assert float(np.dot(np.asarray(st_out).ravel(), st_ref.ravel()) / (np.linalg.norm(st_out) * np.linalg.norm(st_ref))) > 0.9999
+        assert float(np.dot(np.asarray(rlog_out).ravel(), rlog_ref.ravel()) / (np.linalg.norm(rlog_out) * np.linalg.norm(rlog_ref))) > 0.9999
+        assert float(np.dot(np.asarray(ein_out, dtype=np.float32).ravel(), ein_ref.ravel()) / (np.linalg.norm(ein_out) * np.linalg.norm(ein_ref))) > 0.9995
+
+    for b_t, sh in ((32, False), (64, True)):
+        st = rng.standard_normal((b_t, H_T)).astype(np.float32)
+        moe_full = jnp.asarray(rng.standard_normal((b_t, 512)) * 0.2, dtype=jnp.bfloat16)
+        moe_in = jax.device_put(moe_full, NamedSharding(mesh, P("model", None))) if sh else moe_full
+        wp = jnp.asarray(rng.standard_normal((512, H_T)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sp = rng.uniform(0.5, 1.5, (1, H_T)).astype(np.float32)
+        pfg = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pf_a = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        pf_b = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        nig = rng.uniform(0.5, 1.5, (H_T,)).astype(np.float32)
+        wq = jnp.asarray(rng.standard_normal((H_T, 1280)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sq = rng.uniform(0.5, 1.5, (1280,)).astype(np.float32)
+        wg = jnp.asarray(rng.standard_normal((H_T, 1024)) * 0.1, dtype=jnp.float8_e4m3fn)
+        sg = rng.uniform(0.5, 1.5, (1024,)).astype(np.float32)
+        in_sp = ((P(), P("model", None), P(None, "model"), P(None, "model")) if sh else (P(), P(), P(None, "model"), P(None, "model"))) + (P(),) * 8
+        fn2 = jax.jit(
+            jax.shard_map(
+                lambda *x, _sh=sh: moe_to_attn_bridge_jax(
+                    *x, world_size=8, post_ff_eps=1e-5, post_ff_scale_input=True,
+                    next_in_eps=1e-5, next_in_scale_input=False, sharded_moe_in=_sh, interpret=True,
+                ),
+                mesh=mesh, in_specs=in_sp, out_specs=(P(), P(), P()), check_vma=False,
+            )
+        )
+        st2_out, qkv_out, gate_out = fn2(
+            jnp.asarray(st), moe_in, jax.device_put(wp, NamedSharding(mesh, P(None, "model"))),
+            jax.device_put(jnp.asarray(sp), NamedSharding(mesh, P(None, "model"))),
+            jnp.asarray(pfg), jnp.asarray(pf_a), jnp.asarray(pf_b), jnp.asarray(nig),
+            wq, jnp.asarray(sq), wg, jnp.asarray(sg),
+        )
+        post_np = np.asarray(jnp.asarray((np.asarray(moe_full, dtype=np.float32) @ np.asarray(wp, dtype=np.float32)) * sp, dtype=jnp.bfloat16), dtype=np.float32)
+        st2_ref = pf_a[None, :] * st + pf_b[None, :] * _rms(post_np, pfg, 1e-5, True)
+        nin_ref = np.asarray(jnp.asarray(_rms(st2_ref, nig, 1e-5, False), dtype=jnp.bfloat16), dtype=np.float32)
+        qkv_ref = (nin_ref @ np.asarray(wq, dtype=np.float32)) * sq[None, :]
+        gate_ref = (nin_ref @ np.asarray(wg, dtype=np.float32)) * sg[None, :]
+        assert float(np.dot(np.asarray(st2_out).ravel(), st2_ref.ravel()) / (np.linalg.norm(st2_out) * np.linalg.norm(st2_ref))) > 0.9999
+        assert float(np.dot(np.asarray(qkv_out, dtype=np.float32).ravel(), qkv_ref.ravel()) / (np.linalg.norm(qkv_out) * np.linalg.norm(qkv_ref))) > 0.9995
+        assert float(np.dot(np.asarray(gate_out, dtype=np.float32).ravel(), gate_ref.ravel()) / (np.linalg.norm(gate_out) * np.linalg.norm(gate_ref))) > 0.9995

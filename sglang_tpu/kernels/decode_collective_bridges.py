@@ -239,6 +239,89 @@ def _quantize_act_fp8_per_row(x_ref, x_fp8_buf, x_scale_buf) -> None:
     _fori_strips(rows, bm, _row_body)
 
 
+def _pallas_call_maybe_interpret(kernel_fn, *, interpret: bool, compiler_params, **kwargs):
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    if interpret:
+        return pl.pallas_call(
+            kernel_fn,
+            compiler_params=compiler_params,
+            interpret=pltpu.InterpretParams(detect_races=False),
+            **kwargs,
+        )
+    return pl.pallas_call(kernel_fn, compiler_params=compiler_params, **kwargs)
+
+
+def _fori_col_blocks(n_cols: int, step_fn, *, unroll_k: int = 4) -> None:
+    """Iterate ``0..n_cols`` in ``_COL_STRIP`` steps with ``unroll_k``-way loop unrolling."""
+    from jax.experimental import pallas as pl
+
+    blk = unroll_k * _COL_STRIP
+    if n_cols >= blk and n_cols % blk == 0:
+        def _blk(b0):
+            for sub in range(unroll_k):
+                step_fn(pl.ds(pl.multiple_of(b0 + sub * _COL_STRIP, _COL_STRIP), _COL_STRIP))
+
+        _fori_strips(n_cols, blk, _blk)
+        return
+
+    _fori_strips(
+        n_cols,
+        _COL_STRIP,
+        lambda c0: step_fn(pl.ds(c0, _COL_STRIP)),
+    )
+
+
+def _reduce_col_blocks(n_cols: int, step_fn, init, *, unroll_k: int = 4):
+    """Accumulate across ``0..n_cols`` in ``unroll_k * _COL_STRIP`` loop bodies (0 spills)."""
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.experimental import pallas as pl
+
+    blk = unroll_k * _COL_STRIP
+    if n_cols >= blk and n_cols % blk == 0:
+        cnt = n_cols // blk
+
+        def _blk_step(bi, acc):
+            b0 = pl.multiple_of(bi * blk, blk)
+            for sub in range(unroll_k):
+                acc = step_fn(
+                    pl.ds(pl.multiple_of(b0 + sub * _COL_STRIP, _COL_STRIP), _COL_STRIP),
+                    acc,
+                )
+            return acc
+
+        if cnt == 1:
+            return _blk_step(jnp.int32(0), init)
+        return lax.fori_loop(0, cnt, _blk_step, init)
+
+    cnt = n_cols // _COL_STRIP
+
+    def _s_step(si, acc):
+        return step_fn(pl.ds(pl.multiple_of(si * _COL_STRIP, _COL_STRIP), _COL_STRIP), acc)
+
+    if cnt == 1:
+        return _s_step(jnp.int32(0), init)
+    return lax.fori_loop(0, cnt, _s_step, init)
+
+
+def _prescale_s_buf_in_vmem(s_buf, alpha_ref, *, rows: int, hidden: int, bm: int) -> None:
+    """Pre-scale ``s_buf *= alpha_ref`` in-place (overlapped inside ICI wait windows)."""
+    from jax.experimental import pallas as pl
+
+    def _row(r0):
+        rs = pl.ds(r0, bm)
+        _fori_col_blocks(
+            hidden,
+            lambda c_sl: s_buf.__setitem__(
+                (rs, c_sl), alpha_ref[0:1, c_sl] * s_buf[rs, c_sl]
+            ),
+        )
+
+    _fori_strips(rows, bm, _row)
+
+
 def _dma_wait(buf_ref, sem_ref) -> None:
     from jax.experimental.pallas import tpu as pltpu
 
@@ -511,18 +594,17 @@ def _run_oproj_ar_and_post_attn_norm(
     def _sum_s1(r0):
         rs = pl.ds(r0, bm)
 
-        def _col(s, _):
-            c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+        def _col_step(c_sl):
             v = own_half[rs, c_sl].astype(jnp.float32) + mate_recv[rs, c_sl].astype(jnp.float32)
             own_half[rs, c_sl] = v.astype(own_half.dtype)
-            return jnp.int32(0)
 
-        lax.fori_loop(0, half_strips, _col, jnp.int32(0))
+        _fori_col_blocks(half, _col_step)
 
     _fori_strips(rows, bm, _sum_s1)
 
     # Phase 1b + 2a: Inter-chip reduce-scatter + all-gather across n_chips.
-    if world_size == 8 and rows >= 32:
+    use_xy = world_size == 8 and rows >= 32
+    if use_xy:
         # Dual-Tree Bidirectional 2D-XY Butterfly on 2x2 torus (zero 2-hop diagonals, zero
         # 3-to-1 DMA incast, simultaneous X + Y link saturation on every step!):
         #   Tree A [0 : 2048] reduces X (me^2) then Y (me^4);
@@ -602,7 +684,7 @@ def _run_oproj_ar_and_post_attn_norm(
 
         _fori_strips(rows, bm, _sum_xy2)
 
-        # Dual-Tree AG-1 (Y on A, X on B) then AG-2 (X on A, Y on B) straight into own_half!
+        # Dual-Tree AG-1 overlapped with s_buf *= pa_alpha (0-ULP bit-identical)!
         ag1_a = pltpu.make_async_remote_copy(
             own_half.at[:, pl.ds(a_keep2, e_cols)], own_half.at[:, pl.ds(a_keep2, e_cols)],
             ar_s2a_send.at[0], ar_s2a_recv.at[0],
@@ -615,9 +697,15 @@ def _run_oproj_ar_and_post_attn_norm(
         )
         ag1_a.start()
         ag1_b.start()
+        _dma_wait(s_buf, s_in_sem.at[0])
+        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm)
         ag1_a.wait()
         ag1_b.wait()
 
+        # Dual-Tree AG-2 writes (a_other1, b_other1); (a_keep1, b_keep1) are already final,
+        # so overlap the first 50% of _own_pa_sq directly underneath AG-2 ICI!
+        a_other1 = pl.multiple_of((jnp.int32(1) - cx) * chunk, 128)
+        b_other1 = pl.multiple_of(2 * chunk + (jnp.int32(1) - cy) * chunk, 128)
         ag2_a = pltpu.make_async_remote_copy(
             own_half.at[:, pl.ds(a_keep1, chunk)], own_half.at[:, pl.ds(a_keep1, chunk)],
             ar_s2a_send.at[2], ar_s2a_recv.at[2],
@@ -630,6 +718,21 @@ def _run_oproj_ar_and_post_attn_norm(
         )
         ag2_a.start()
         ag2_b.start()
+
+        def _own_pa_sq_keep1(r0):
+            rs = pl.ds(r0, bm)
+            acc = jnp.zeros((bm, 128), dtype=jnp.float32)
+            for s in range(chunk_strips):
+                off = s * _COL_STRIP
+                ca = pl.ds(pl.multiple_of(a_keep1 + off, _COL_STRIP), _COL_STRIP)
+                cb = pl.ds(pl.multiple_of(b_keep1 + off, _COL_STRIP), _COL_STRIP)
+                fa = own_half[rs, ca].astype(jnp.float32)
+                fb = own_half[rs, cb].astype(jnp.float32)
+                sq = fa * fa + fb * fb
+                acc = acc + (sq[:, 0:128] + sq[:, 128:256])
+            sq_buf[rs, :] = acc
+
+        _fori_strips(rows, bm, _own_pa_sq_keep1)
         ag2_a.wait()
         ag2_b.wait()
     else:
@@ -653,19 +756,16 @@ def _run_oproj_ar_and_post_attn_norm(
 
         def _sum_s2(r0):
             rs = pl.ds(r0, bm)
-
-            def _col(s, _):
-                c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-                c_h = pl.ds(pl.multiple_of(chip_c0 + s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            for s in range(chunk_strips):
+                off = s * _COL_STRIP
+                c_l = pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP)
+                c_h = pl.ds(pl.multiple_of(chip_c0 + off, _COL_STRIP), _COL_STRIP)
                 tot = own_half[rs, c_h].astype(jnp.float32)
                 for slot in range(n_chips - 1):
                     tot = tot + scatter_ref[slot, rs, c_l].astype(jnp.float32)
                 vb = tot.astype(own_chunk.dtype)
                 own_chunk[rs, c_l] = vb
                 own_half[rs, c_h] = vb
-                return jnp.int32(0)
-
-            lax.fori_loop(0, chunk_strips, _col, jnp.int32(0))
 
         _fori_strips(rows, bm, _sum_s2)
 
@@ -682,10 +782,12 @@ def _run_oproj_ar_and_post_attn_norm(
             )
             op.start()
             c2a.append(op)
+        _dma_wait(s_buf, s_in_sem.at[0])
+        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm)
         for op in c2a:
             op.wait()
 
-    # Phase 2b: Single [B, H/2] D2D AG into mate_recv OVERLAPPED with own_half sum(b^2)!
+    # Phase 2b: Single [B, H/2] D2D AG into mate_recv OVERLAPPED with remaining own_half sum(b^2)!
     c2b = pltpu.make_async_remote_copy(
         own_half,
         mate_recv,
@@ -696,35 +798,48 @@ def _run_oproj_ar_and_post_attn_norm(
     )
     c2b.start()
 
-    def _own_pa_sq(r0):
-        rs = pl.ds(r0, bm)
+    if use_xy:
+        def _own_pa_sq_rest(r0):
+            rs = pl.ds(r0, bm)
+            acc = sq_buf[rs, :]
+            for s in range(chunk_strips):
+                off = s * _COL_STRIP
+                ca = pl.ds(pl.multiple_of(a_other1 + off, _COL_STRIP), _COL_STRIP)
+                cb = pl.ds(pl.multiple_of(b_other1 + off, _COL_STRIP), _COL_STRIP)
+                fa = own_half[rs, ca].astype(jnp.float32)
+                fb = own_half[rs, cb].astype(jnp.float32)
+                sq = fa * fa + fb * fb
+                acc = acc + (sq[:, 0:128] + sq[:, 128:256])
+            sq_buf[rs, :] = acc
 
-        def _col(s, acc):
-            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            bf = own_half[rs, c_l].astype(jnp.float32)
-            sq = bf * bf
-            return acc + (sq[:, 0:128] + sq[:, 128:256])
+        _fori_strips(rows, bm, _own_pa_sq_rest)
+    else:
+        def _own_pa_sq(r0):
+            rs = pl.ds(r0, bm)
 
-        sq_buf[rs, :] = lax.fori_loop(
-            0, half_strips, _col, jnp.zeros((bm, 128), dtype=jnp.float32)
-        )
+            def _col(c_sl, acc):
+                bf = own_half[rs, c_sl].astype(jnp.float32)
+                sq = bf * bf
+                return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-    _fori_strips(rows, bm, _own_pa_sq)
+            sq_buf[rs, :] = _reduce_col_blocks(
+                half, _col, jnp.zeros((bm, 128), dtype=jnp.float32)
+            )
+
+        _fori_strips(rows, bm, _own_pa_sq)
     c2b.wait()
-    _dma_wait(s_buf, s_in_sem.at[0])
 
     # Finish other-half post_attn_ln variance + gated residual + pre_feedforward_ln in VMEM!
     def _finish_pa_and_pre_ffn(r0):
         rs = pl.ds(r0, bm)
 
-        def _oth_sq(s, acc):
-            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            bf = mate_recv[rs, c_l].astype(jnp.float32)
+        def _oth_sq(c_sl, acc):
+            bf = mate_recv[rs, c_sl].astype(jnp.float32)
             sq = bf * bf
             return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-        oth_sq = lax.fori_loop(
-            0, half_strips, _oth_sq, jnp.zeros((bm, 128), dtype=jnp.float32)
+        oth_sq = _reduce_col_blocks(
+            half, _oth_sq, jnp.zeros((bm, 128), dtype=jnp.float32)
         )
         # IEEE-754 f32 addition is strictly commutative: own_sq + oth_sq == oth_sq + own_sq
         # bit-for-bit across even (side=0) and odd (side=1) chipmate cores!
@@ -734,18 +849,15 @@ def _run_oproj_ar_and_post_attn_norm(
             + jnp.float32(pa_eps)
         )
 
-        def _res_both_halves(s, acc):
-            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            c_own = pl.ds(pl.multiple_of(own_c0 + s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            c_oth = pl.ds(pl.multiple_of(other_c0 + s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+        def _res_both_halves(c_l, acc):
+            c_own = pl.ds(pl.multiple_of(own_c0 + c_l.start, _COL_STRIP), _COL_STRIP)
+            c_oth = pl.ds(pl.multiple_of(other_c0 + c_l.start, _COL_STRIP), _COL_STRIP)
 
-            ns_own = (
-                pa_alpha_ref[0:1, c_own] * s_buf[rs, c_own]
-                + pa_beta_ref[0:1, c_own] * (own_half[rs, c_l].astype(jnp.float32) * inv_pa)
+            ns_own = s_buf[rs, c_own] + pa_beta_ref[0:1, c_own] * (
+                own_half[rs, c_l].astype(jnp.float32) * inv_pa
             )
-            ns_oth = (
-                pa_alpha_ref[0:1, c_oth] * s_buf[rs, c_oth]
-                + pa_beta_ref[0:1, c_oth] * (mate_recv[rs, c_l].astype(jnp.float32) * inv_pa)
+            ns_oth = s_buf[rs, c_oth] + pa_beta_ref[0:1, c_oth] * (
+                mate_recv[rs, c_l].astype(jnp.float32) * inv_pa
             )
             s_buf[rs, c_own] = ns_own
             s_buf[rs, c_oth] = ns_oth
@@ -755,8 +867,8 @@ def _run_oproj_ar_and_post_attn_norm(
             sq = v_own * v_own + v_oth * v_oth
             return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-        pff_sq = lax.fori_loop(
-            0, half_strips, _res_both_halves, jnp.zeros((bm, 128), dtype=jnp.float32)
+        pff_sq = _reduce_col_blocks(
+            half, _res_both_halves, jnp.zeros((bm, 128), dtype=jnp.float32)
         )
         inv_pff = lax.rsqrt(
             jnp.sum(pff_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
@@ -765,17 +877,15 @@ def _run_oproj_ar_and_post_attn_norm(
         if inv_pff_buf is not None:
             inv_pff_buf[rs, :] = inv_pff
 
-        def _pre_ffn_out(s, _):
-            c_g = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+        def _pre_ffn_out(c_g):
             sv = s_buf[rs, c_g]
             gn = pre_ff_gain_ref[0:1, c_g]
             rn = (sv * gn) * inv_pff if pre_ff_scale_input else (sv * inv_pff) * gn
             if r_out_buf is not None:
                 r_out_buf[rs, c_g] = rn
             h_out_buf[rs, c_g] = rn.astype(h_out_buf.dtype)
-            return jnp.int32(0)
 
-        lax.fori_loop(0, hidden // _COL_STRIP, _pre_ffn_out, jnp.int32(0))
+        _fori_col_blocks(hidden, _pre_ffn_out)
 
     _fori_strips(rows, bm, _finish_pa_and_pre_ffn)
     if not defer_stream_store:
@@ -933,6 +1043,55 @@ def attn_oproj_ar_res_norm_jax(
     )
 
 
+def _norm_pre_expert_slice(
+    src_buf,
+    pre_exp_gain_ref,
+    out_expert_in_ref,
+    *,
+    h_pre: int,
+    row_base,
+    n_r: int,
+    align: int,
+    pre_exp_eps: float,
+    pre_exp_scale_input: bool,
+) -> None:
+    """Zero-spill pre_expert RMSNorm using unrolled 1024-col strips."""
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.experimental import pallas as pl
+
+    bm_n = _pick_strip(n_r, 32)
+
+    def _strip(r_loc):
+        rs_l = pl.ds(r_loc, bm_n)
+        rs_g = pl.ds(pl.multiple_of(row_base + r_loc, align), bm_n)
+
+        def _v_step(c_sl, acc):
+            xf = src_buf[rs_l, c_sl].astype(jnp.float32)
+            if pre_exp_scale_input:
+                xf = xf * pre_exp_gain_ref[0:1, c_sl]
+            sq = xf * xf
+            return acc + (sq[:, 0:128] + sq[:, 128:256])
+
+        sq_s = _reduce_col_blocks(
+            h_pre, _v_step, jnp.zeros((bm_n, 128), dtype=jnp.float32)
+        )
+        inv = lax.rsqrt(
+            jnp.sum(sq_s, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
+            + jnp.float32(pre_exp_eps)
+        )
+
+        def _o_step(c_sl):
+            xf = src_buf[rs_l, c_sl].astype(jnp.float32)
+            g = pre_exp_gain_ref[0:1, c_sl]
+            yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
+            out_expert_in_ref[rs_g, c_sl] = yn.astype(out_expert_in_ref.dtype)
+
+        _fori_col_blocks(h_pre, _o_step)
+
+    _fori_strips(n_r, bm_n, _strip)
+
+
 def _attn_to_moe_bridge_kernel(
     stream_hbm,
     gated_ref,
@@ -1081,43 +1240,14 @@ def _attn_to_moe_bridge_kernel(
             pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
 
     # Zero-spill pre_expert_norm overlapped behind Stage-3 D2D!
-    pre_strips = h_pre // _COL_STRIP
+    align = 16 if use_halfrow else 8
 
     def _norm_pre_slice(src_buf, row_base, n_r):
-        bm_n = _pick_strip(n_r, 32)
-        align = 16 if use_halfrow else 8
-
-        def _strip(r_loc):
-            rs_l = pl.ds(r_loc, bm_n)
-            rs_g = pl.ds(pl.multiple_of(row_base + r_loc, align), bm_n)
-
-            def _v_step(s, acc):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-                xf = src_buf[rs_l, c_sl].astype(jnp.float32)
-                if pre_exp_scale_input:
-                    xf = xf * pre_exp_gain_ref[0:1, c_sl]
-                sq = xf * xf
-                return acc + (sq[:, 0:128] + sq[:, 128:256])
-
-            sq_s = lax.fori_loop(
-                0, pre_strips, _v_step, jnp.zeros((bm_n, 128), dtype=jnp.float32)
-            )
-            inv = lax.rsqrt(
-                jnp.sum(sq_s, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
-                + jnp.float32(pre_exp_eps)
-            )
-
-            def _o_step(s, _):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-                xf = src_buf[rs_l, c_sl].astype(jnp.float32)
-                g = pre_exp_gain_ref[0:1, c_sl]
-                yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
-                out_expert_in_ref[rs_g, c_sl] = yn.astype(out_expert_in_ref.dtype)
-                return jnp.int32(0)
-
-            lax.fori_loop(0, pre_strips, _o_step, jnp.int32(0))
-
-        _fori_strips(n_r, bm_n, _strip)
+        _norm_pre_expert_slice(
+            src_buf, pre_exp_gain_ref, out_expert_in_ref,
+            h_pre=h_pre, row_base=row_base, n_r=n_r, align=align,
+            pre_exp_eps=pre_exp_eps, pre_exp_scale_input=pre_exp_scale_input,
+        )
 
     # Reuse dead send_half / mate_recv VMEM buffers when h_pre == half (saves 3 MiB @ B=384!).
     eff_pre_a = send_half.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_a
@@ -1166,6 +1296,7 @@ def attn_to_moe_bridge_jax(
     pre_exp_eps: float = 1e-5,
     pre_exp_scale_input: bool = False,
     use_w8a8: bool = False,
+    interpret: bool = False,
     collective_id: int = _DEFAULT_CID + 1,
 ):
     """Full 10-op Bridge 1b: ``RPAd_fast(onorm+gate) -> (new_stream, router_logits, expert_in)``."""
@@ -1214,7 +1345,7 @@ def attn_to_moe_bridge_jax(
     v_sp = pl.BlockSpec(memory_space=vmem)
     h_sp = pl.BlockSpec(memory_space=hbm)
 
-    return pl.pallas_call(
+    return _pallas_call_maybe_interpret(
         functools.partial(
             _attn_to_moe_bridge_kernel,
             world_size=world_size,
@@ -1226,6 +1357,7 @@ def attn_to_moe_bridge_jax(
             pre_exp_scale_input=bool(pre_exp_scale_input),
             use_w8a8=bool(use_w8a8),
         ),
+        interpret=interpret,
         out_shape=(
             jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
             jax.ShapeDtypeStruct((rows, n_exp), jnp.float32),
@@ -1320,71 +1452,69 @@ def _run_post_ffn_slice_epilogue(
     next_in_eps: float,
     next_in_scale_input: bool,
     with_next_norm: bool,
+    pre_scaled_alpha: bool = False,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
 
     bm = _pick_strip(n_r, 32)
-    n_strips = hidden // _COL_STRIP
 
     def _strip(r_loc):
         rs_l = pl.ds(r_loc, bm)
         rs_g = pl.ds(pl.multiple_of(row_base + r_loc, align), bm)
 
-        def _bvar(s, acc):
-            c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+        def _bvar(c_sl, acc):
             bc = src_buf[rs_l, c_sl].astype(jnp.float32)
             if post_ff_scale_input:
                 bc = bc * post_ff_gain_ref[0:1, c_sl]
             sq = bc * bc
             return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-        b_sq = lax.fori_loop(0, n_strips, _bvar, jnp.zeros((bm, 128), dtype=jnp.float32))
+        b_sq = _reduce_col_blocks(
+            hidden, _bvar, jnp.zeros((bm, 128), dtype=jnp.float32)
+        )
         inv_b = lax.rsqrt(
             jnp.sum(b_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
             + jnp.float32(post_ff_eps)
         )
 
         if with_next_norm:
-            def _res_nvar(s, acc):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            def _res_nvar(c_sl, acc):
                 bc = src_buf[rs_l, c_sl].astype(jnp.float32)
                 bg = post_ff_gain_ref[0:1, c_sl]
                 b_n = (bc * bg) * inv_b if post_ff_scale_input else (bc * inv_b) * bg
-                ns = pf_alpha_ref[0:1, c_sl] * s_in_buf[rs_g, c_sl] + pf_beta_ref[0:1, c_sl] * b_n
+                s_base = s_in_buf[rs_g, c_sl] if pre_scaled_alpha else (pf_alpha_ref[0:1, c_sl] * s_in_buf[rs_g, c_sl])
+                ns = s_base + pf_beta_ref[0:1, c_sl] * b_n
                 s_out_buf[rs_g, c_sl] = ns
                 nv = ns * next_in_gain_ref[0:1, c_sl] if next_in_scale_input else ns
                 sq = nv * nv
                 return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-            n_sq = lax.fori_loop(0, n_strips, _res_nvar, jnp.zeros((bm, 128), dtype=jnp.float32))
+            n_sq = _reduce_col_blocks(
+                hidden, _res_nvar, jnp.zeros((bm, 128), dtype=jnp.float32)
+            )
             inv_n = lax.rsqrt(
                 jnp.sum(n_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
                 + jnp.float32(next_in_eps)
             )
 
-            def _nout(s, _):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            def _nout(c_sl):
                 sv = s_out_buf[rs_g, c_sl]
                 ng = next_in_gain_ref[0:1, c_sl]
                 nn = (sv * ng) * inv_n if next_in_scale_input else (sv * inv_n) * ng
                 next_in_buf[rs_g, c_sl] = nn.astype(next_in_buf.dtype)
-                return jnp.int32(0)
 
-            lax.fori_loop(0, n_strips, _nout, jnp.int32(0))
+            _fori_col_blocks(hidden, _nout)
         else:
-            def _ro(s, _):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            def _ro(c_sl):
                 bc = src_buf[rs_l, c_sl].astype(jnp.float32)
                 bg = post_ff_gain_ref[0:1, c_sl]
                 b_n = (bc * bg) * inv_b if post_ff_scale_input else (bc * inv_b) * bg
-                s_out_buf[rs_g, c_sl] = (
-                    pf_alpha_ref[0:1, c_sl] * s_in_buf[rs_g, c_sl] + pf_beta_ref[0:1, c_sl] * b_n
-                )
-                return jnp.int32(0)
+                s_base = s_in_buf[rs_g, c_sl] if pre_scaled_alpha else (pf_alpha_ref[0:1, c_sl] * s_in_buf[rs_g, c_sl])
+                s_out_buf[rs_g, c_sl] = s_base + pf_beta_ref[0:1, c_sl] * b_n
 
-            lax.fori_loop(0, n_strips, _ro, jnp.int32(0))
+            _fori_col_blocks(hidden, _ro)
 
     _fori_strips(n_r, bm, _strip)
 
@@ -1551,39 +1681,14 @@ def _post_attn_to_moe_bridge_kernel(
         if tile_r32:
             pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
 
+    align = 16 if use_halfrow else 8
+
     def _norm_pre(src_buf, row_base, n_r):
-        bm_n = _pick_strip(n_r, 32)
-        align = 16 if use_halfrow else 8
-
-        def _strip(r_loc):
-            rs_l = pl.ds(r_loc, bm_n)
-            rs_g = pl.ds(pl.multiple_of(row_base + r_loc, align), bm_n)
-
-            def _v(s, acc):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-                xf = src_buf[rs_l, c_sl].astype(jnp.float32)
-                if pre_exp_scale_input:
-                    xf = xf * pre_exp_gain_ref[0:1, c_sl]
-                sq = xf * xf
-                return acc + (sq[:, 0:128] + sq[:, 128:256])
-
-            sq_s = lax.fori_loop(0, pre_strips, _v, jnp.zeros((bm_n, 128), dtype=jnp.float32))
-            inv = lax.rsqrt(
-                jnp.sum(sq_s, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
-                + jnp.float32(pre_exp_eps)
-            )
-
-            def _o(s, _):
-                c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-                xf = src_buf[rs_l, c_sl].astype(jnp.float32)
-                g = pre_exp_gain_ref[0:1, c_sl]
-                yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
-                out_expert_in_ref[rs_g, c_sl] = yn.astype(out_expert_in_ref.dtype)
-                return jnp.int32(0)
-
-            lax.fori_loop(0, pre_strips, _o, jnp.int32(0))
-
-        _fori_strips(n_r, bm_n, _strip)
+        _norm_pre_expert_slice(
+            src_buf, pre_exp_gain_ref, out_expert_in_ref,
+            h_pre=h_pre, row_base=row_base, n_r=n_r, align=align,
+            pre_exp_eps=pre_exp_eps, pre_exp_scale_input=pre_exp_scale_input,
+        )
 
     _gather_shard_xor1(
         pre_shard, pre_half_a, pre_half_b,
@@ -1785,9 +1890,11 @@ def _gather_token_shard_xor1_and_dot_post(
     ts1.start()
     ts1.wait()
 
+    rows = n_chips * pair_r
     is_even = parity == jnp.int32(0)
-    for c0 in range(0, k_in, 512):
-        c_sl = pl.ds(c0, 512)
+    pack_w = 1024 if (k_in % 1024 == 0 and pair_r <= 32) else 512
+    for c0 in range(0, k_in, pack_w):
+        c_sl = pl.ds(c0, pack_w)
         own_v = moe_shard_ref[:, c_sl]
         mate_v = mate_tok_buf[:, c_sl]
         top_v = lax.select(is_even, own_v, mate_v)
@@ -1817,12 +1924,19 @@ def _gather_token_shard_xor1_and_dot_post(
     for op in ts2:
         op.wait()
 
-    for d in range(1, n_chips):
-        p_r0 = (chip ^ jnp.int32(d)) * pair_r
-        _dot_fp8_row_block_to_ref(
-            moe_full_buf, p_r0, w_post_buf, s_post_ref, post_shard,
-            n_r=pair_r, n_cols=post_cols, align=16,
+    if n_chips == 4 and rows <= 128:
+        # 1 full-batch (B, 4096) @ (4096, 1024) MXU pass stages w_post once (4 MiB vs 12 MiB)!
+        _dot_fp8_scaled_to_ref(
+            moe_full_buf, w_post_buf, s_post_ref, 0, post_shard, 0,
+            rows=rows, n_cols=post_cols,
         )
+    else:
+        for d in range(1, n_chips):
+            p_r0 = (chip ^ jnp.int32(d)) * pair_r
+            _dot_fp8_row_block_to_ref(
+                moe_full_buf, p_r0, w_post_buf, s_post_ref, post_shard,
+                n_r=pair_r, n_cols=post_cols, align=16,
+            )
 
 
 def _moe_post_ag_epilogue_kernel(
@@ -1895,8 +2009,11 @@ def _moe_post_ag_epilogue_kernel(
         )
         _wait_barrier(world_size)
 
-    def _wait_stream():
+    bm_p = _pick_strip(rows, 32)
+
+    def _wait_and_prescale_stream():
         _dma_wait(s_buf, s_in_sem.at[0])
+        _prescale_s_buf_in_vmem(s_buf, pf_alpha_ref, rows=rows, hidden=hidden, bm=bm_p)
 
     def _epi(buf, r_base, n_r):
         _run_post_ffn_slice_epilogue(
@@ -1905,14 +2022,14 @@ def _moe_post_ag_epilogue_kernel(
             hidden=hidden, row_base=r_base, n_r=n_r, align=align,
             post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
             next_in_eps=next_in_eps, next_in_scale_input=next_in_scale_input,
-            with_next_norm=True,
+            with_next_norm=True, pre_scaled_alpha=True,
         )
 
     _gather_shard_xor1(
         post_shard, half_a, half_b,
         ag_s1_send, ag_s1_recv, ag_s2_send, ag_s2_recv, ag_s3_send, ag_s3_recv,
         me=me, world_size=world_size, use_halfrow=use_halfrow,
-        during_ici_fn=_wait_stream,
+        during_ici_fn=_wait_and_prescale_stream,
         my_half_epilogue_fn=_epi,
         mate_half_epilogue_fn=_epi,
     )
@@ -1984,20 +2101,27 @@ def _moe_post_ag_res_only_kernel(
         )
         _wait_barrier(world_size)
 
+    bm_p = _pick_strip(rows, 32)
+
+    def _wait_and_prescale_stream():
+        _dma_wait(s_buf, s_in_sem.at[0])
+        _prescale_s_buf_in_vmem(s_buf, pf_alpha_ref, rows=rows, hidden=hidden, bm=bm_p)
+
     def _epi(buf, r_base, n_r):
         _run_post_ffn_slice_epilogue(
             s_buf, buf, post_ff_gain_ref, pf_alpha_ref, pf_beta_ref, None,
             s_buf, None,
             hidden=hidden, row_base=r_base, n_r=n_r, align=align,
             post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
-            next_in_eps=0.0, next_in_scale_input=False, with_next_norm=False,
+            next_in_eps=0.0, next_in_scale_input=False,
+            with_next_norm=False, pre_scaled_alpha=True,
         )
 
     _gather_shard_xor1(
         post_shard, half_a, half_b,
         ag_s1_send, ag_s1_recv, ag_s2_send, ag_s2_recv, ag_s3_send, ag_s3_recv,
         me=me, world_size=world_size, use_halfrow=use_halfrow,
-        during_ici_fn=lambda: _dma_wait(s_buf, s_in_sem.at[0]),
+        during_ici_fn=_wait_and_prescale_stream,
         my_half_epilogue_fn=_epi,
         mate_half_epilogue_fn=_epi,
     )
@@ -2057,6 +2181,7 @@ def _moe_to_attn_qkvg_bridge_kernel(
     """Full 7-op Inter-Layer Bridge 2b: ``moe_out -> (new_stream, next_qkv, next_gate)``!"""
     import jax.numpy as jnp
     from jax import lax
+    from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
     rows = world_size * moe_out_ref.shape[0] if sharded_moe_in else moe_out_ref.shape[0]
@@ -2091,27 +2216,43 @@ def _moe_to_attn_qkvg_bridge_kernel(
         )
         _wait_barrier(world_size)
 
-    def _epi(buf, r_base, n_r):
+    bm_p = _pick_strip(rows, 32)
+    half = rows // 2
+    parity = me & jnp.int32(1)
+    my_r0 = pl.multiple_of(parity * half, 16)
+    mate_r0 = pl.multiple_of((jnp.int32(1) - parity) * half, 16)
+
+    def _wait_and_prescale_stream():
+        _dma_wait(s_buf, s_in_sem.at[0])
+        _prescale_s_buf_in_vmem(s_buf, pf_alpha_ref, rows=rows, hidden=hidden, bm=bm_p)
+
+    def _epi_and_store(buf, r_base, n_r, sem_slot: int):
         _run_post_ffn_slice_epilogue(
             s_buf, buf, post_ff_gain_ref, pf_alpha_ref, pf_beta_ref, next_in_gain_ref,
             s_buf, next_in_vmem,
             hidden=hidden, row_base=r_base, n_r=n_r, align=align,
             post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
             next_in_eps=next_in_eps, next_in_scale_input=next_in_scale_input,
-            with_next_norm=True,
+            with_next_norm=True, pre_scaled_alpha=True,
         )
+        if use_halfrow:
+            pltpu.make_async_copy(
+                s_buf.at[pl.ds(r_base, n_r)],
+                out_stream_hbm.at[pl.ds(r_base, n_r)],
+                s_out_sem.at[sem_slot],
+            ).start()
 
     _gather_shard_xor1(
         post_shard, half_a, half_b,
         ag_s1_send, ag_s1_recv, ag_s2_send, ag_s2_recv, ag_s3_send, ag_s3_recv,
         me=me, world_size=world_size, use_halfrow=use_halfrow,
-        during_ici_fn=lambda: _dma_wait(s_buf, s_in_sem.at[0]),
-        my_half_epilogue_fn=_epi,
-        mate_half_epilogue_fn=_epi,
+        during_ici_fn=_wait_and_prescale_stream,
+        my_half_epilogue_fn=lambda b, r0, nr: _epi_and_store(b, r0, nr, 0),
+        mate_half_epilogue_fn=lambda b, r0, nr: _epi_and_store(b, r0, nr, 1),
     )
 
-    # W_qkv (10 MiB) is ALREADY in VMEM and W_gate (8 MiB) finishes during QKV MXU!
-    pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
+    if not use_halfrow:
+        pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
     _dma_wait(w_qkv_buf, w_qkv_sem.at[0])
     _dot_fp8_scaled_to_ref(
         next_in_vmem, w_qkv_buf, next_s_qkv_ref, 0, out_next_qkv_ref, 0,
@@ -2122,7 +2263,11 @@ def _moe_to_attn_qkvg_bridge_kernel(
         next_in_vmem, w_gate_buf, next_s_gate_ref, 0, out_next_gate_ref, 0,
         rows=rows, n_cols=gate_cols,
     )
-    _dma_wait(out_stream_hbm, s_out_sem.at[0])
+    if use_halfrow:
+        _dma_wait(out_stream_hbm.at[pl.ds(my_r0, half)], s_out_sem.at[0])
+        _dma_wait(out_stream_hbm.at[pl.ds(mate_r0, half)], s_out_sem.at[1])
+    else:
+        _dma_wait(out_stream_hbm, s_out_sem.at[0])
 
 
 def moe_post_ag_res_norm_jax(
@@ -2338,6 +2483,7 @@ def moe_to_attn_bridge_jax(
     next_in_eps: float = 1e-5,
     next_in_scale_input: bool = False,
     sharded_moe_in: bool = False,
+    interpret: bool = False,
     collective_id: int = _DEFAULT_CID + 4,
 ):
     """Full 7-op Bridge 2b: ``moe_out -> (new_stream_f32, next_qkv_bf16, next_gate_bf16)``."""
@@ -2368,12 +2514,13 @@ def moe_to_attn_bridge_jax(
     ):
         raise ValueError("Unsupported moe_to_attn_bridge shapes")
     n_chips = world_size // 2
-    half_rows = rows // 2 if (rows >= 32 and rows % 32 == 0) else rows
+    use_halfrow = rows >= 32 and rows % 32 == 0
+    half_rows = rows // 2 if use_halfrow else rows
 
     vmem, hbm, sem = pltpu.VMEM, pltpu.HBM, pltpu.SemaphoreType.DMA
     v_sp, h_sp = pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=hbm)
 
-    return pl.pallas_call(
+    return _pallas_call_maybe_interpret(
         functools.partial(
             _moe_to_attn_qkvg_bridge_kernel,
             world_size=world_size,
@@ -2383,6 +2530,7 @@ def moe_to_attn_bridge_jax(
             next_in_scale_input=bool(next_in_scale_input),
             sharded_moe_in=bool(sharded_moe_in),
         ),
+        interpret=interpret,
         out_shape=(
             jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
             jax.ShapeDtypeStruct((rows, qkv_cols), jnp.bfloat16),
@@ -2405,7 +2553,7 @@ def moe_to_attn_bridge_jax(
             sem((1,)),
             sem((1,)),
             sem((1,)),
-            sem((1,)),
+            sem((2 if use_halfrow else 1,)),
             sem((1,)),
             sem((1,)),
             sem((n_chips - 1,)),

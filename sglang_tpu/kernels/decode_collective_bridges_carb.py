@@ -1338,13 +1338,14 @@ def _moe_to_attn_direct_qkv_epi_kernel(
             next_in_vmem, w_gate_buf, next_s_gate_ref, 0, out_next_gate_ref, 0,
             rows=rows, n_cols=gate_cols,
         )
-        _in_vmem_qkv_epilogue_tile(
-            qkv_scratch, cos_sin_ref, out_next_q_ref, out_next_kv_ref,
-            b0=jnp.int32(0), tile_r=32,
-            norm_eps=qkv_norm_eps, query_scale=query_scale,
-            k_scale=k_scale, v_scale=v_scale, has_rope=has_rope,
-            interpret_mode=interpret_mode,
-        )
+        for t_i in range(b_pad32 // 32):
+            _in_vmem_qkv_epilogue_tile(
+                qkv_scratch, cos_sin_ref, out_next_q_ref, out_next_kv_ref,
+                b0=t_i * 32, tile_r=32,
+                norm_eps=qkv_norm_eps, query_scale=query_scale,
+                k_scale=k_scale, v_scale=v_scale, has_rope=has_rope,
+                interpret_mode=interpret_mode,
+            )
     _dma_wait(out_stream_hbm, s_out_sem.at[0])
 
 
@@ -1406,8 +1407,12 @@ def moe_to_attn_direct_qkv_epi_bridge_jax(
         raise ValueError("Unsupported moe_to_attn_direct_qkv_epi shapes")
     b_pad32 = _align32(rows)
     has_rope = cos_sin_step is not None
-    if has_rope and cos_sin_step.shape != (b_pad32, 2, 128):
-        raise ValueError(f"Expected cos_sin_step ({b_pad32}, 2, 128), got {cos_sin_step.shape}")
+    cs_in = cos_sin_step
+    if has_rope:
+        if cos_sin_step.shape not in ((rows, 2, 128), (b_pad32, 2, 128)):
+            raise ValueError(f"Expected cos_sin_step ({rows} or {b_pad32}, 2, 128), got {cos_sin_step.shape}")
+        if cos_sin_step.shape[0] < b_pad32:
+            cs_in = jnp.pad(cos_sin_step, ((0, b_pad32 - cos_sin_step.shape[0]), (0, 0), (0, 0)))
     n_chips = world_size // 2
     half_rows = rows // 2 if (rows >= 32 and rows % 32 == 0) else rows
 
@@ -1496,7 +1501,7 @@ def moe_to_attn_direct_qkv_epi_bridge_jax(
         _as_2d_f32_row(next_s_qkv, qkv_cols),
         next_w_gate_w8k,
         _as_2d_f32_row(next_s_gate, gate_cols),
-        cos_sin_step.astype(jnp.float32) if has_rope else None,
+        cs_in.astype(jnp.float32) if has_rope else None,
     )
     q_5d = (q_pad[:rows] if rows < b_pad32 else q_pad).reshape(1, rows, 8, 2, 128)
     kv_m = kv_pad[:rows] if rows < b_pad32 else kv_pad
@@ -1562,13 +1567,14 @@ def _fp8_dual_direct_qkv_epi_gate_kernel(
             attn_in_ref, w_gate_buf, s_gate_ref, 0, out_gate_ref, 0,
             rows=rows, n_cols=gate_cols,
         )
-        _in_vmem_qkv_epilogue_tile(
-            qkv_scratch, cos_sin_ref, out_q_ref, out_kv_ref,
-            b0=jnp.int32(0), tile_r=32,
-            norm_eps=qkv_norm_eps, query_scale=query_scale,
-            k_scale=k_scale, v_scale=v_scale, has_rope=has_rope,
-            interpret_mode=interpret_mode,
-        )
+        for t_i in range(b_pad32 // 32):
+            _in_vmem_qkv_epilogue_tile(
+                qkv_scratch, cos_sin_ref, out_q_ref, out_kv_ref,
+                b0=t_i * 32, tile_r=32,
+                norm_eps=qkv_norm_eps, query_scale=query_scale,
+                k_scale=k_scale, v_scale=v_scale, has_rope=has_rope,
+                interpret_mode=interpret_mode,
+            )
 
 
 def fp8_dual_direct_qkv_epi_gate_jax(
@@ -1606,8 +1612,12 @@ def fp8_dual_direct_qkv_epi_gate_jax(
         raise ValueError("Unsupported fp8_dual_direct_qkv_epi_gate shapes")
     b_pad32 = _align32(rows)
     has_rope = cos_sin_step is not None
-    if has_rope and cos_sin_step.shape != (b_pad32, 2, 128):
-        raise ValueError(f"Expected cos_sin_step ({b_pad32}, 2, 128), got {cos_sin_step.shape}")
+    cs_in = cos_sin_step
+    if has_rope:
+        if cos_sin_step.shape not in ((rows, 2, 128), (b_pad32, 2, 128)):
+            raise ValueError(f"Expected cos_sin_step ({rows} or {b_pad32}, 2, 128), got {cos_sin_step.shape}")
+        if cos_sin_step.shape[0] < b_pad32:
+            cs_in = jnp.pad(cos_sin_step, ((0, b_pad32 - cos_sin_step.shape[0]), (0, 0), (0, 0)))
 
     vmem, hbm, sem = pltpu.VMEM, pltpu.HBM, pltpu.SemaphoreType.DMA
     v_sp, h_sp = pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=hbm)
@@ -1648,7 +1658,7 @@ def fp8_dual_direct_qkv_epi_gate_jax(
         _as_2d_f32_row(s_qkv, qkv_cols),
         w_gate_w8k,
         _as_2d_f32_row(s_gate, gate_cols),
-        cos_sin_step.astype(jnp.float32) if has_rope else None,
+        cs_in.astype(jnp.float32) if has_rope else None,
     )
     q_5d = (q_pad[:rows] if rows < b_pad32 else q_pad).reshape(1, rows, 8, 2, 128)
     kv_m = kv_pad[:rows] if rows < b_pad32 else kv_pad
