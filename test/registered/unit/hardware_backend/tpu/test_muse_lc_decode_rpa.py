@@ -476,11 +476,11 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 if n_act < bs:
                     self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
 
-        # Short-context nod2 regsan + batchfull (0x7F NaN-poisoned, SWA & Full)
+        # Short-context nod2 & d2 batchfull (0x7F NaN-poisoned Full-Attn via swabatch gears)
         for tag, use_d2, sw, pps, mode in (
-            ("nod2_swa_regsan", False, 2048, 8, "w8,c1024,regsan"),
-            ("nod2_full_batchfull_regsan", False, None, 8, "w8,c1024,regsan,batchfull"),
-            ("d2_swa_regsan", True, 2048, 8, "w8,c1024,regsan"),
+            ("nod2_swa_w8", False, 2048, 8, "w8,c1024"),
+            ("nod2_full_batchfull", False, None, 8, "w8,c1024,batchfull"),
+            ("d2_full_batchfull", True, None, 8, "w8,c1024,batchfull"),
         ):
             with self.subTest(case=tag):
                 bs, n_act, page_size = 16, 13, 128
@@ -690,11 +690,11 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     self.assertIn("RPAd_fast", hlo)
                     self.assertIn(exp_sub, hlo)
 
-            # Short-context nod2 regsan + batchfull Mosaic exports (1/1k & 8k/1k)
+            # Short-context nod2 batchfull Mosaic exports (1/1k & 8k/1k)
             for tag, pps, sw, use_d2, mode, exp_sub in (
-                ("nod2_11k_swa_regsan", 8, 2048, False, "w8,c1024,regsan", "regsan"),
-                ("nod2_11k_full_batchfull_regsan", 8, None, False, "w8,c1024,regsan,batchfull", "batchfull"),
-                ("nod2_8k1k_swa_regsan", 70, 2048, False, "w8,c1024,regsan", "regsan"),
+                ("nod2_11k_swa_w8", 8, 2048, False, "w8,c1024", "swabatch"),
+                ("nod2_11k_full_batchfull", 8, None, False, "w8,c1024,batchfull", "batchfull"),
+                ("nod2_8k1k_swa_w8", 70, 2048, False, "w8,c1024", "swabatch"),
             ):
                 with self.subTest(export=tag):
                     bs = 64
