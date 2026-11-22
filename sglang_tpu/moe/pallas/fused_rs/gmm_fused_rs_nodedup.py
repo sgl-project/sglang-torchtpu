@@ -445,8 +445,9 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
     bounds to a 3x-average 128-aligned local window so T=32k/48k/64k fits < 1 MiB SMEM."""
     if expert_tp:
         return size_m // ep_size + _LOCAL_ROWS_ALIGN
-    if ep_size >= 4 and size_m >= 262_144:
-        target = max(131_072, (size_m // ep_size) * 3)
+    if ep_size >= 4 and size_m > 131_072:
+        floor_rows = 131_072 if size_m >= 262_144 else 98_304
+        target = max(floor_rows, (size_m // ep_size) * 3)
         aligned = (
             (target + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
         ) * _LOCAL_ROWS_ALIGN

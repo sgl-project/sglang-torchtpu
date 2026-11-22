@@ -1099,3 +1099,142 @@ def test_w9_replica_bank_and_decode_qblock512(monkeypatch):
                 assert "k512" in hlo_dec
         finally:
             jax.clear_caches()
+
+
+def test_w9_l0_l61_large_m_tuned_blocks_and_fused_rs_smem_window(monkeypatch):
+    """Verify L0/L61 channelwise FP8 (rhs_bs in None/2048/4096) never falls back to default tm=64
+    at M=196608/262144/393216/524288, and fused_rs/gmm_fused_rs_nodedup windows SMEM for M>131072."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.moe.pallas.fused_rs import gmm_fused_rs_nodedup as frs_stock
+    from sglang_tpu.moe.pallas.fused_rs import tuned_block_sizes as tbs_stock
+    from sglang_tpu.moe.pallas.fused_rs_muse import tuned_block_sizes as tbs_muse
+
+    # 1. Verify SMEM windowing at M=196608 (24k) and M=262144 (32k) in stock fused_rs
+    assert frs_stock.fused_rs_smem_rows(131_072, 8, False) == 131_072
+    assert frs_stock.fused_rs_smem_rows(196_608, 8, False) == 98_304
+    assert frs_stock.fused_rs_smem_rows(262_144, 8, False) == 131_072
+
+    # 2. Verify tuned block lookup hits non-default tiles across M=196608..524288
+    monkeypatch.setattr(tbs_stock, "_device_kind", lambda: "TPU7x")
+    monkeypatch.setattr(tbs_muse, "_device_kind", lambda: "TPU7x")
+    sentinel_default = (64, 4096, 2048, 4096, 2048, 1, 1)
+
+    for m_val in (196_608, 262_144, 393_216, 524_288):
+        for rhs_bs in (None, 2048, 4096):
+            res_stock = tbs_stock.get_fused_rs_tuned_block_sizes(
+                m_val,
+                4096,
+                8192,
+                4096,
+                4096,
+                32,
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                rhs_bs,
+                sentinel_default,
+                fuse_act="silu_and_mul_clamp",
+                fp8_direct_write=False,
+            )
+            assert res_stock != sentinel_default and res_stock[0] >= 112, (
+                f"stock miss m={m_val} rhs_bs={rhs_bs}: {res_stock}"
+            )
+            for g in (16, 32, 34, 35):
+                res_muse = tbs_muse.get_fused_rs_tuned_block_sizes(
+                    m_val,
+                    4096,
+                    8192,
+                    4096,
+                    4096,
+                    g,
+                    jnp.bfloat16,
+                    jnp.float8_e4m3fn,
+                    rhs_bs,
+                    sentinel_default,
+                    fuse_act="silu_and_mul_clamp",
+                    fp8_direct_write=False,
+                )
+                assert res_muse != sentinel_default and res_muse[0] >= 112, (
+                    f"muse miss m={m_val} g={g} rhs_bs={rhs_bs}: {res_muse}"
+                )
+
+    # 3. Verify TPU7x StableHLO lowering of L0/L61 stock fused_rs at T=24576 (M=196608) & T=32768 (M=262144)
+    import jax
+    from jax.sharding import Mesh, PartitionSpec as P
+    from jax._src import tpu_info
+    from sglang_tpu.moe.pallas.fused_rs.fused_moe import (
+        moe_gmm_local_rs_nodedup as moe_stock,
+    )
+
+    dk = next(
+        k
+        for k in ("TPU7x", "TPU v7x", "TPU v6e", "TPU v5p")
+        if k in tpu_info.registry or tpu_info.chip_version_from_device_kind(k) is not None
+    )
+    monkeypatch.setattr(tpu_info, "get_device_kind", lambda: dk)
+    tpu_info.get_tpu_info.cache_clear()
+    devs = jax.devices("cpu")
+    if len(devs) >= 8:
+        mesh = Mesh(np.array(devs[:8]), ("model",))
+        try:
+            for t_glob in (24_576, 32_768):
+                t_loc = t_glob // 8
+
+                def _l0_moe(hs, w1, s1, w2, s2, go, tw, ti, pnw):
+                    return jax.shard_map(
+                        lambda _hs, _w1, _s1, _w2, _s2, _go, _tw, _ti, _pnw: moe_stock(
+                            _hs,
+                            _w1,
+                            _s1,
+                            None,
+                            _w2,
+                            _s2,
+                            None,
+                            None,
+                            None,
+                            _go,
+                            _tw,
+                            _ti,
+                            _pnw,
+                            activation="silu",
+                            topk=8,
+                            ep_size=8,
+                            ep_axis_name="model",
+                            has_post_norm=True,
+                            sp_enabled=True,
+                        ),
+                        mesh=mesh,
+                        in_specs=(
+                            P(),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P("model"),
+                            P("model", None),
+                            P(),
+                            P(),
+                        ),
+                        out_specs=P("model", None),
+                        check_vma=False,
+                    )(hs, w1, s1, w2, s2, go, tw, ti, pnw)
+
+                hlo_l0 = (
+                    jax.jit(_l0_moe)
+                    .trace(
+                        jax.ShapeDtypeStruct((t_glob, 4096), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((256, 2, 1, 8192), jnp.float32),
+                        jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((256, 2, 1, 4096), jnp.float32),
+                        jax.ShapeDtypeStruct((8,), jnp.int32),
+                        jax.ShapeDtypeStruct((t_glob, 8), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((t_glob, 8), jnp.int32),
+                        jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    )
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text("stablehlo")
+                )
+                assert f"M_{t_glob * 8}" in hlo_l0 and f"{t_loc}x4096xbf16" in hlo_l0
+        finally:
+            jax.clear_caches()

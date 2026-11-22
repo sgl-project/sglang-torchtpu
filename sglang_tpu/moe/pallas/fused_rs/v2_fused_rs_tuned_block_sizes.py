@@ -195,6 +195,13 @@ _ALL_M_KEYS = [
     "32768_silu",
     "65536_silu",
     "131072_silu",
+    "163840_silu",
+    "196608_silu",
+    "229376_silu",
+    "262144_silu",
+    "327680_silu",
+    "393216_silu",
+    "524288_silu",
 ]
 
 
@@ -394,6 +401,8 @@ def _h4096_i4096_fp8_kblock2_size_dependent():
             out[m_key] = (32, 4096, 4096, 4096, 4096, 1, 1)
         elif m_val <= 2048:
             out[m_key] = _H4096_I4096_FP8_DECODE
+        elif m_val >= 131072:
+            out[m_key] = (256, 4096, 1024, 4096, 1024, 2, 2)
         else:
             out[m_key] = (128, 4096, 2048, 4096, 2048, 2, 2)
     return out
@@ -482,6 +491,15 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             (
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-2048"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-2048"
+            ): _h4096_i4096_fp8_kblock2_size_dependent(),
+            # Channelwise W8A16 FP8 with rhs_bs=None (L0/L61 fallback/direct path).
+            (
+                "k-4096_n-8192_g-16_lhs_quant"
+                "+k-4096_n-4096_g-16_lhs_quant"
+            ): _h4096_i4096_fp8_kblock2_size_dependent(),
+            (
+                "k-4096_n-8192_g-32_lhs_quant"
+                "+k-4096_n-4096_g-32_lhs_quant"
             ): _h4096_i4096_fp8_kblock2_size_dependent(),
             # H4096-I4096 expert TP16 (every expert's intermediate dim split 16
             # ways: w13 N=512, w2 K=256 per device). Muse Spark microbench:
@@ -646,6 +664,22 @@ FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
             (
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-4096"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-4096"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            (
+                "k-4096_n-8192_g-16_lhs_quant_rhs_bs-2048"
+                "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-2048"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            (
+                "k-4096_n-8192_g-32_lhs_quant_rhs_bs-2048"
+                "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-2048"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            (
+                "k-4096_n-8192_g-16_lhs_quant"
+                "+k-4096_n-4096_g-16_lhs_quant"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            (
+                "k-4096_n-8192_g-32_lhs_quant"
+                "+k-4096_n-4096_g-32_lhs_quant"
             ): _h4096_i4096_fp8_fp8comm_size_dependent(),
         },
     },
