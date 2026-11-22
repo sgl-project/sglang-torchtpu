@@ -375,6 +375,177 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 stock_cache_u8[pg, off, 0, 1, :] = v_new_u8[s]
                 d2_cache_u8[pg, off // 2] = upd_u8[pg, off // 2]
 
+    def test_shsplit_shfp8_active_tile_skip_shared8_and_swa_ps256(self):
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            run_decode_fast_rpa,
+        )
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        rng = np.random.default_rng(42)
+        sm_scale = 1.0 / np.sqrt(64.0)
+
+        for tag, bs, n_act, page_size, mode, grp, min_cos in (
+            ("sh16_shsplit", 16, 14, 256, "w8,c1024,shared16,shsplit,pbf16", 16, 0.999),
+            ("sh16_shfp8", 16, 14, 256, "w8,c1024,shared16,shsplit,shfp8", 16, 0.998),
+            ("sh16_shfp8pv", 16, 15, 256, "w8,c1024,shared16,shsplit,shfp8pv", 16, 0.9985),
+            ("sh32_c8_tile_skip", 32, 8, 256, "w8,c1024,shared32,shsplit,shfp8", 32, 0.998),
+            ("sh8_c8_shfp8", 8, 8, 256, "w8,c1024,shared8,shsplit,shfp8", 8, 0.998),
+        ):
+            with self.subTest(case=tag):
+                shared_pgs = 2048 // page_size  # 8 full shared pages -> full block
+                pps = shared_pgs + 4
+                n_phys_pages = 256
+                stock_cache_u8 = np.full(
+                    (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+                )
+                stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(
+                    rng, (n_phys_pages, page_size, 2, 128)
+                )
+                cache_u8 = _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+
+                page_indices = np.zeros((bs, pps), dtype=np.int32)
+                page_indices[:, :shared_pgs] = np.arange(
+                    1, 1 + shared_pgs, dtype=np.int32
+                )
+                nxt = 1 + shared_pgs
+                for s in range(bs):
+                    for p in range(shared_pgs, pps):
+                        page_indices[s, p] = nxt
+                        nxt += 1
+
+                kv_lens = np.zeros((bs,), dtype=np.int32)
+                for s in range(n_act):
+                    kv_lens[s] = shared_pgs * page_size + 7 + (s * 31) % (3 * page_size)
+
+                q_bf16 = jnp.asarray(
+                    rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16
+                )
+                k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                k_new = _u8_to_fp8(k_new_u8)[:, None, :]
+                v_new = _u8_to_fp8(v_new_u8)[:, None, :]
+                cu_q = jnp.arange(bs + 1, dtype=jnp.int32)
+                cu_kv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size)
+                dist = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
+                shared_pages = jnp.full((bs // grp,), shared_pgs, dtype=jnp.int32)
+                if grp >= 16:
+                    pad_w = max(pps, 129)
+                    p_pad = np.zeros((bs, pad_w), dtype=np.int32)
+                    p_pad[:, :pps] = page_indices
+                    plan = shared_decode_distribution(
+                        p_pad, kv_lens, n_act, page_size, group_size=grp
+                    )
+                    self.assertIsNotNone(plan)
+                    shared_pages = jnp.asarray(plan[3:], dtype=jnp.int32)
+
+                out_j, _ = run_decode_fast_rpa(
+                    q_bf16,
+                    k_new,
+                    v_new,
+                    _u8_to_fp8(cache_u8),
+                    jnp.asarray(kv_lens, dtype=jnp.int32),
+                    jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                    cu_q,
+                    cu_kv,
+                    dist,
+                    sm_scale=sm_scale,
+                    sliding_window=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    mode_str=mode,
+                    decode_query_size=1,
+                    fused_out_pack=1,
+                    kv_pack_dense2=True,
+                    shared_pages=shared_pages,
+                    interpret=True,
+                )
+                ref = _exact_decode_ref(
+                    np.asarray(q_bf16),
+                    k_new_u8,
+                    v_new_u8,
+                    stock_cache_u8,
+                    kv_lens,
+                    page_indices.ravel(),
+                    n_act,
+                    page_size,
+                    sm_scale,
+                    pps,
+                )
+                out_np = np.asarray(out_j, dtype=np.float32)
+                self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), min_cos)
+                if n_act < bs:
+                    self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
+        # Page size 256 SWA (w_tot=9*256=2304) zero-concat dense2 path
+        with self.subTest(case="swa_ps256_d2"):
+            bs, n_act, page_size, sw = 16, 14, 256, 2048
+            pps = 12
+            n_phys_pages = 256
+            stock_cache_u8 = np.full(
+                (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+            )
+            stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(
+                rng, (n_phys_pages, page_size, 2, 128)
+            )
+            cache_u8 = _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+            page_indices = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
+            kv_lens = np.zeros((bs,), dtype=np.int32)
+            for s in range(n_act):
+                kv_lens[s] = 2200 + s * 17
+            q_bf16 = jnp.asarray(
+                rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16
+            )
+            k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+            v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+            out_j, _ = run_decode_fast_rpa(
+                q_bf16,
+                _u8_to_fp8(k_new_u8)[:, None, :],
+                _u8_to_fp8(v_new_u8)[:, None, :],
+                _u8_to_fp8(cache_u8),
+                jnp.asarray(kv_lens, dtype=jnp.int32),
+                jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size),
+                jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32),
+                sm_scale=sm_scale,
+                sliding_window=sw,
+                k_scale=1.0,
+                v_scale=1.0,
+                mode_str="w8,c1024,pbf16",
+                decode_query_size=1,
+                fused_out_pack=1,
+                kv_pack_dense2=True,
+                interpret=True,
+            )
+            ref = np.zeros((bs, 16, 128), dtype=np.float32)
+            for s in range(n_act):
+                kvl = int(kv_lens[s])
+                first_k = max(0, kvl - sw)
+                k_list = [
+                    _fp8_from_u8(
+                        stock_cache_u8[
+                            int(page_indices[s, p // page_size]), p % page_size, 0, 0, :
+                        ]
+                    )
+                    for p in range(first_k, kvl - 1)
+                ] + [_fp8_from_u8(k_new_u8[s])]
+                v_list = [
+                    _fp8_from_u8(
+                        stock_cache_u8[
+                            int(page_indices[s, p // page_size]), p % page_size, 0, 1, :
+                        ]
+                    )
+                    for p in range(first_k, kvl - 1)
+                ] + [_fp8_from_u8(v_new_u8[s])]
+                lg = (np.asarray(q_bf16[s], dtype=np.float32) @ np.stack(k_list).T) * sm_scale
+                lg -= np.max(lg, axis=1, keepdims=True)
+                pr = np.exp(lg)
+                pr /= np.sum(pr, axis=1, keepdims=True)
+                ref[s] = pr @ np.stack(v_list)
+            out_np = np.asarray(out_j, dtype=np.float32)
+            self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+            self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
     def test_mosaic_tpu7x_export_long_context_272k(self):
         try:
             from jax._src import tpu_info  # noqa: F401
@@ -403,6 +574,9 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 ("shared64_272k_ps256_d2", 1089, 256, True, "w8,c1024,shared64,pbf16", 1, "shared64-mp8"),
                 ("shared64_272k_ps256_q512_d2", 1089, 256, True, "w8,c1024,shared64,q512", 1, "shared64-mp8"),
                 ("shared64_272k_ps256_c4096_d2", 1089, 256, True, "w8,c4096,shared64", 1, "shared64-mp16"),
+                ("shared64_272k_ps256_shsplit_d2", 1089, 256, True, "w8,c4096,shared64,q512,shsplit,pbf16", 1, "shsplit"),
+                ("shared64_272k_ps256_shsplit_shfp8_d2", 1089, 256, True, "w8,c4096,shared64,q512,shsplit,shfp8", 1, "shfp8"),
+                ("shared64_272k_ps256_c2048_shfp8_d2", 1089, 256, True, "w8,c2048,shared64,q256,shsplit,shfp8", 1, "shfp8"),
             ):
                 with self.subTest(export=tag):
                     bs = 64

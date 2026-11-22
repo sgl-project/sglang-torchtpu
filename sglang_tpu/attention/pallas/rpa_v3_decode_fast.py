@@ -54,6 +54,9 @@ class DecodeFastConfig:
     fine_gears: bool = False
     shared_group_size: int = 0
     shared_q_tile: int = 256
+    shared_split_dense2: bool = False
+    shared_fp8_qkpv: bool = False
+    shared_fp8_pv_only: bool = False
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -69,6 +72,8 @@ def get_shared_group_size(mode_str: str) -> int:
         return 32
     if "shared16" in toks or "shared" in toks:
         return 16
+    if "shared8" in toks:
+        return 8
     return 0
 
 
@@ -270,6 +275,9 @@ def parse_decode_fast_config(
     fp8_dots = "fp8dp" in toks_cfg
     hoist_new_kv = decode_query_size == 1 and ("hoistkv" in toks_cfg)
     shared_q_tile = 1024 if "q1024" in toks_cfg else (512 if "q512" in toks_cfg else 256)
+    shared_split_dense2 = "shsplit" in toks_cfg
+    shared_fp8_qkpv = "shfp8" in toks_cfg
+    shared_fp8_pv_only = "shfp8pv" in toks_cfg
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -345,8 +353,12 @@ def parse_decode_fast_config(
                 "multiq",
                 "shared",
                 "shared16",
+                "shared8",
                 "shared32",
                 "shared64",
+                "shsplit",
+                "shfp8",
+                "shfp8pv",
                 "ring8k",
             ):
                 continue
@@ -484,6 +496,9 @@ def parse_decode_fast_config(
         fine_gears=fine_gears,
         shared_group_size=eff_shared_group,
         shared_q_tile=shared_q_tile,
+        shared_split_dense2=shared_split_dense2,
+        shared_fp8_qkpv=shared_fp8_qkpv,
+        shared_fp8_pv_only=shared_fp8_pv_only,
     )
 
 
@@ -1342,10 +1357,12 @@ def _decode_fast_kernel(
             s_new_eff = s_new
             exp2_sc_eff = exp2_scale
 
-        if kv_pack_dense2 and w_tot >= 512 and (w_tot % 512 == 0):
-            # Zero-concat dense2 path: compute even and odd 256-aligned halves separately,
-            # saving 3x [w_tot, 128] concatenations and halving softmax max/sum width.
+        if kv_pack_dense2 and w_tot >= 512 and (w_tot % 256 == 0):
+            # Zero-concat dense2 path: compute even and odd 128-aligned halves separately,
+            # saving 3x [w_tot, 128] concatenations and halving softmax max/sum width
+            # (also covers page_size=256 SWA w_tot=2304 where half_w=1152=9*128).
             half_w = w_tot // 2
+            n_half_blocks = half_w // 128
             k_e, k_o = _bkv_fp8_split(slot, 0, w_tot, kind="k")
             s_e = jnp.matmul(q_dot, k_e.T, preferred_element_type=jnp.float32)
             s_o = jnp.matmul(q_dot, k_o.T, preferred_element_type=jnp.float32)
@@ -1361,7 +1378,7 @@ def _decode_fast_kernel(
 
             s_eo_max = jnp.maximum(s_e, s_o)
             if cfg.page_reduce:
-                s_pgs = jnp.max(s_eo_max.reshape(16, n_slot_pages // 2, 128), axis=1)
+                s_pgs = jnp.max(s_eo_max.reshape(16, n_half_blocks, 128), axis=1)
                 m = jnp.maximum(
                     s_new_eff, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
                 )
@@ -1375,7 +1392,7 @@ def _decode_fast_kernel(
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
             p_eo_sum = p_e + p_o
             if cfg.page_reduce:
-                p_pgs = jnp.sum(p_eo_sum.reshape(16, n_slot_pages // 2, 128), axis=1)
+                p_pgs = jnp.sum(p_eo_sum.reshape(16, n_half_blocks, 128), axis=1)
                 l_sum = _broadcast_minor_128(jnp.sum(p_pgs, axis=1, keepdims=True)) + p_new
             else:
                 l_sum = _broadcast_minor_128(jnp.sum(p_eo_sum, axis=1, keepdims=True)) + p_new
@@ -2034,45 +2051,158 @@ def _decode_fast_kernel(
         # Unpack K before QK and V after exp2 in 8-bit VREGs (4x smaller than
         # uint32) and slice large shared Q batches (shared32/64) into 256-row
         # chunks without an inner K/state RMW loop.
-        def _accum_shared_or_priv(q, head_offset, slot, mask_valid, valid):
+        def _accum_shared_or_priv(
+            q,
+            head_offset,
+            slot,
+            mask_valid,
+            valid,
+            *,
+            active_heads=None,
+            q_exp2_sc=None,
+        ):
             heads = q.shape[0]
             q_tile = cfg.shared_q_tile if heads > cfg.shared_q_tile else heads
             valid_arg = valid if mask_valid else None
-            for q0 in range(0, heads, q_tile):
+            use_split = (
+                cfg.shared_split_dense2
+                and kv_pack_dense2
+                and (not mask_valid)
+                and (max_ring_rows % 256 == 0)
+            )
+            use_fp8_pv = cfg.shared_fp8_qkpv or cfg.shared_fp8_pv_only
+
+            def _accum_q_tile(q0: int):
                 q_w = min(q_tile, heads - q0)
                 q_s = q if q_w == heads else q[q0 : q0 + q_w]
                 lanes = pl.ds(head_offset + q0, q_w)
-                k = _bkv_fp8_chunk(
-                    slot, 0, max_ring_rows, kind="k", valid_tokens=valid_arg
+                eff_sc = (
+                    (q_exp2_sc if q_w == heads else q_exp2_sc[q0 : q0 + q_w])
+                    if q_exp2_sc is not None
+                    else jnp.float32(exp2_scale)
                 )
-                scores = jnp.matmul(q_s, k.T, preferred_element_type=jnp.float32)
-                if mask_valid:
-                    valid_col = _col_iota(0, max_ring_rows, q_w) < valid
-                    scores = jnp.where(valid_col, scores, _MASK_LOGIT)
+
+                if use_split:
+                    width_s = max_ring_rows // 2
+                    k_e, k_o = _load_bkv_fp8_split(
+                        bkv_vmem_ref,
+                        slot,
+                        0,
+                        max_ring_rows,
+                        kind="k",
+                        page_size=page_size,
+                        interpret_mode=interpret_mode,
+                    )
+                    s_tup = (
+                        jnp.matmul(q_s, k_e.T, preferred_element_type=jnp.float32),
+                        jnp.matmul(q_s, k_o.T, preferred_element_type=jnp.float32),
+                    )
+                    blk_max = jnp.maximum(
+                        jnp.max(s_tup[0], axis=1, keepdims=True),
+                        jnp.max(s_tup[1], axis=1, keepdims=True),
+                    )
+                else:
+                    width_s = max_ring_rows
+                    k = _bkv_fp8_chunk(
+                        slot, 0, max_ring_rows, kind="k", valid_tokens=valid_arg
+                    )
+                    scores = jnp.matmul(q_s, k.T, preferred_element_type=jnp.float32)
+                    if mask_valid:
+                        valid_col = _col_iota(0, max_ring_rows, q_w) < valid
+                        scores = jnp.where(valid_col, scores, _MASK_LOGIT)
+                    s_tup = (scores,)
+                    blk_max = jnp.max(scores, axis=1, keepdims=True)
+
+                blk_m_128 = _broadcast_minor_128(blk_max)
                 old_m = state_vmem_ref[0, lanes, :]
-                m = jnp.maximum(
-                    old_m,
-                    _broadcast_minor_128(jnp.max(scores, axis=1, keepdims=True)),
+                m = jnp.maximum(old_m, blk_m_128)
+                alpha = jnp.exp2((old_m - m) * eff_sc)
+                eff_sc_w = (
+                    _broadcast_minor_128_any(eff_sc, width_s)
+                    if q_exp2_sc is not None
+                    else eff_sc
                 )
-                alpha = jnp.exp2((old_m - m) * exp2_scale)
-                probs = jnp.exp2(
-                    (scores - _broadcast_minor_128_any(m, max_ring_rows)) * exp2_scale
+                if use_fp8_pv:
+                    # Rescale exp2 by local block peak so max(p_local) == 1.0, keeping
+                    # (p_local * 448) across full E4M3 range with zero extra max reduction.
+                    ref_m_128 = blk_m_128
+                    beta = jnp.exp2((blk_m_128 - m) * eff_sc)
+                    l_scale = beta
+                    pv_scale = beta * jnp.float32(v_scale_val / 448.0)
+                else:
+                    ref_m_128 = m
+                    l_scale = jnp.float32(1.0)
+                    pv_scale = jnp.float32(v_scale_val)
+
+                ref_m_w = _broadcast_minor_128_any(ref_m_128, width_s)
+                p_tup = tuple(jnp.exp2((s_x - ref_m_w) * eff_sc_w) for s_x in s_tup)
+                p_sum_src = p_tup[0] + p_tup[1] if use_split else p_tup[0]
+                l_add = (
+                    jnp.sum(p_sum_src.reshape(q_w, width_s // 128, 128), axis=1)
+                    * l_scale
                 )
-                l_add = jnp.sum(probs.reshape(q_w, max_ring_rows // 128, 128), axis=1)
-                p_dot = probs.astype(jnp.bfloat16) if cfg.pv_bf16 else probs
-                v = _bkv_fp8_chunk(
-                    slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
+
+                if use_split:
+                    v_tup = _load_bkv_fp8_split(
+                        bkv_vmem_ref,
+                        slot,
+                        0,
+                        max_ring_rows,
+                        kind="v",
+                        page_size=page_size,
+                        interpret_mode=interpret_mode,
+                    )
+                else:
+                    v_tup = (
+                        _bkv_fp8_chunk(
+                            slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
+                        ),
+                    )
+                if use_fp8_pv:
+                    p_dots = tuple(
+                        (p_x * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                        for p_x in p_tup
+                    )
+                elif cfg.pv_bf16:
+                    p_dots = tuple(p_x.astype(jnp.bfloat16) for p_x in p_tup)
+                else:
+                    p_dots = p_tup
+
+                pv = jnp.matmul(
+                    p_dots[0], v_tup[0], preferred_element_type=jnp.float32
                 )
-                pv = jnp.matmul(p_dot, v, preferred_element_type=jnp.float32)
+                if use_split:
+                    pv = pv + jnp.matmul(
+                        p_dots[1], v_tup[1], preferred_element_type=jnp.float32
+                    )
                 state_vmem_ref[0, lanes, :] = m
                 state_vmem_ref[1, lanes, :] = (
                     state_vmem_ref[1, lanes, :] * alpha + l_add
                 )
                 state_vmem_ref[2, lanes, :] = (
-                    state_vmem_ref[2, lanes, :] * alpha + pv * v_scale_val
+                    state_vmem_ref[2, lanes, :] * alpha + pv * pv_scale
                 )
 
-        def consume(q, head_offset, table_base, first_page, end_token):
+            for q0 in range(0, heads, q_tile):
+                if active_heads is not None and q0 > 0:
+
+                    @pl.when(active_heads > q0)
+                    def _run_active_q_tile(q0=q0):
+                        _accum_q_tile(q0)
+
+                else:
+                    _accum_q_tile(q0)
+
+        def consume(
+            q,
+            head_offset,
+            table_base,
+            first_page,
+            end_token,
+            *,
+            active_heads=None,
+            q_exp2_sc=None,
+        ):
             n_pages = cdiv(end_token, page_size) - first_page
             n_blocks = cdiv(n_pages, max_ring_pages)
 
@@ -2106,11 +2236,27 @@ def _decode_fast_kernel(
 
                 @pl.when(valid >= max_ring_rows)
                 def _full_blk():
-                    _accum_shared_or_priv(q, head_offset, slot, False, valid)
+                    _accum_shared_or_priv(
+                        q,
+                        head_offset,
+                        slot,
+                        False,
+                        valid,
+                        active_heads=active_heads,
+                        q_exp2_sc=q_exp2_sc,
+                    )
 
                 @pl.when(valid < max_ring_rows)
                 def _tail_blk():
-                    _accum_shared_or_priv(q, head_offset, slot, True, valid)
+                    _accum_shared_or_priv(
+                        q,
+                        head_offset,
+                        slot,
+                        True,
+                        valid,
+                        active_heads=active_heads,
+                        q_exp2_sc=q_exp2_sc,
+                    )
 
             last_slot = jnp.maximum(n_blocks - 1, 0) % num_slots
             last_loc = jnp.maximum(end_token - first_page * page_size - 1, 0) % max_ring_rows
@@ -2142,7 +2288,44 @@ def _decode_fast_kernel(
             @pl.when(shared > 0)
             def _common():
                 q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * 16, 128)
-                consume(q, 0, first_base, 0, shared * page_size)
+                active_h = size * 16
+                if cfg.shared_fp8_qkpv:
+                    q_f32 = q.astype(jnp.float32)
+                    q_amax = jnp.max(jnp.abs(q_f32), axis=1, keepdims=True)
+                    q_gain = jnp.where(
+                        q_amax == 0.0,
+                        jnp.float32(1.0),
+                        jnp.float32(448.0) / jnp.maximum(q_amax, jnp.float32(1e-12)),
+                    )
+                    q_deq = jnp.where(
+                        q_amax == 0.0,
+                        jnp.float32(1.0),
+                        q_amax * jnp.float32(1.0 / 448.0),
+                    )
+                    q_gain_128 = _broadcast_minor_128(q_gain)
+                    q_deq_128 = _broadcast_minor_128(q_deq)
+                    q_in = (q_f32 * q_gain_128).astype(jnp.float8_e4m3fn)
+                    q_exp2_sc = q_deq_128 * jnp.float32(exp2_scale)
+                    state_vmem_ref[0] = state_vmem_ref[0] * q_gain_128
+                    consume(
+                        q_in,
+                        0,
+                        first_base,
+                        0,
+                        shared * page_size,
+                        active_heads=active_h,
+                        q_exp2_sc=q_exp2_sc,
+                    )
+                    state_vmem_ref[0] = state_vmem_ref[0] * q_deq_128
+                else:
+                    consume(
+                        q,
+                        0,
+                        first_base,
+                        0,
+                        shared * page_size,
+                        active_heads=active_h,
+                    )
 
             if use_flat_priv:
                 written_cnt_smem_ref[1] = 0
@@ -2827,6 +3010,14 @@ def run_decode_fast_rpa(
             scope_name += "-pgred"
         if run_cfg.fp8_dots:
             scope_name += "-fp8dp"
+        if run_cfg.shared_group_size > 0 and run_cfg.shared_q_tile != 256:
+            scope_name += f"-q{run_cfg.shared_q_tile}"
+        if run_cfg.shared_split_dense2:
+            scope_name += "-shsplit"
+        if run_cfg.shared_fp8_qkpv:
+            scope_name += "-shfp8"
+        elif run_cfg.shared_fp8_pv_only:
+            scope_name += "-shfp8pv"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
