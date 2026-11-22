@@ -2784,20 +2784,33 @@ def prefill_ring_update(
     send = send.reshape(c.layers, rows, RANKS, 2 * hd).transpose(2, 0, 1, 3)
     mine = jax.lax.all_to_all(send, axis, 0, 0)  # [32 sources, layers, rows, 2hd]
     mine = mine.transpose(1, 0, 2, 3).reshape(c.layers, RANKS * rows, 2 * hd)
-    slot = jnp.mod(positions, c.window)
+    return scatter_rings(rings, mine, positions, sequences, ends, stops, c.window)
+
+
+def scatter_rings(rings, rows, positions, sequences, ends, stops, window):
+    """Each sequence's window rows into its ring (``prefill_ring_update``):
+    ``(rings after the window, rings at the checkpoints)``. ``rows``
+    ``[layers, R, d]``, ``positions`` / ``sequences`` ``[R]``, ``rings``
+    ``[slots, layers, window, d]``; a ring keeps a sequence's last ``window``
+    positions at ``position % window``. A ring no row reaches (an unused
+    slot, no checkpoint) is returned as it is, without its scatter."""
+    slot = jnp.mod(positions, window)
 
     def scatter(ring, keep):
-        index = jnp.where(keep, slot, c.window)  # out of range: dropped
-        return ring.at[:, index].set(mine, mode="drop")
+        def write(ring):
+            index = jnp.where(keep, slot, window)  # out of range: dropped
+            return ring.at[:, index].set(rows, mode="drop")
+
+        return jax.lax.cond(jnp.any(keep), write, lambda ring: ring, ring)
 
     after, at = [], []
     for s in range(rings.shape[0]):
         member = sequences == s
-        after.append(scatter(rings[s], member & (positions >= ends[s] - c.window)))
+        after.append(scatter(rings[s], member & (positions >= ends[s] - window)))
         at.append(
             scatter(
                 rings[s],
-                member & (positions < stops[s]) & (positions >= stops[s] - c.window),
+                member & (positions < stops[s]) & (positions >= stops[s] - window),
             )
         )
     return jnp.stack(after), jnp.stack(at)

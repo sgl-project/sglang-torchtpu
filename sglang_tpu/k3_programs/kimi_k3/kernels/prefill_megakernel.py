@@ -4655,8 +4655,14 @@ def prefix_page_order(every, *, count, page_tokens, slots, capacity):
     run = jnp.minimum(
         jnp.sum(arena[:, None] >= ends[None, :], axis=1), sizes.shape[0] - 1
     )
-    within = arena - (ends[run] - sizes[run])
-    source = run_rank[run] * slots + 1 + starts[run] + within
+    # Each arena page's slot is its run's base plus the page, the base picked
+    # by a one-hot select over the runs instead of four gathers by ``run``
+    # (XLA's TensorCore gather moves one element at a time). The same int32
+    # sums, so the same order.
+    base = run_rank * slots + 1 + starts - (ends - sizes)
+    runs = jnp.arange(base.shape[0], dtype=run.dtype)
+    picked = jnp.sum(jnp.where(run[:, None] == runs[None, :], base[None, :], 0), axis=1)
+    source = arena + picked
     total = ends[-1]
     order = jnp.where(arena < total, source, 0).astype(jnp.int32)
     return jnp.concatenate((total[None].astype(jnp.int32), order))
@@ -5676,6 +5682,15 @@ def _moe_latent_all_gather(latent, tables):
     )(jnp.asarray(tables, jnp.int32), latent)
 
 
+def selected_scores(scores, ids):
+    """``take_along_axis(scores, ids, axis=1)`` (``[T, E]`` by ``[T, k]`` in
+    range) as a one-hot select over the ``E`` lanes: XLA's TensorCore gather
+    moves one element at a time. Each output adds one score to zeros, so for
+    scores without -0.0 (the router's sigmoids) the values are the same bits."""
+    lanes = jnp.arange(scores.shape[1], dtype=ids.dtype)
+    return jnp.sum(jnp.where(ids[:, :, None] == lanes, scores[:, None, :], 0.0), axis=2)
+
+
 def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables):
     """This rank's routed-expert partial for every token of the window, and
     its FP32 half of the TP2 shared expert over its chip's rows (reduced
@@ -5707,7 +5722,7 @@ def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables)
     )
     raw = jax.nn.sigmoid(logits)
     _, local_ids = jax.lax.top_k(raw + weights["router_bias"], 16)
-    local_probs = jnp.take_along_axis(raw, local_ids, axis=1)
+    local_probs = selected_scores(raw, local_ids)
     local_probs /= jnp.maximum(local_probs.sum(axis=1, keepdims=True), 1e-30)
     valid_rows = sp_token_index(
         rank, jnp.arange(local_tokens), window_stripe(local_tokens)
