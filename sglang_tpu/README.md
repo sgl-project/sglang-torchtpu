@@ -248,13 +248,15 @@ zero launches.
   queues for sending before it blocks.
 - Needs torch_tpu 0.2.0 and libtpu 0.0.50 or later; a start-up self-test checks
   the routing and the bytes and fails fast otherwise.
-- HBM: with depth `D` = `SGLANG_TPU_PP_BUFFERED_SEND_DEPTH`, a receiving stage
+- HBM: with depth `D` = `SGLANG_TPU_PP_BUFFERED_SEND_DEPTH`, a middle stage
   holds up to `16 + D` hand-off buffers of the largest token bucket x hidden
   size (plus the aux capture slots under Eagle3 or DFlash) in the model dtype,
   about 90 MiB each for GPT-OSS-120B at 16384 rows, and one zero residual per
-  bucket; the first stage holds `D + 2` buffers. Each stage's KV budget reserves
-  its worst case (`hbm_reserve_bytes`), and each stage checks at start-up that
-  it fits next to the KV cache, failing with the size it needs if not.
+  bucket; the first stage, which only sends, holds `D + 2` buffers and the last
+  stage, which only receives, 14 buffers and the zero residuals. Each stage's
+  KV budget reserves its worst case (`hbm_reserve_bytes`), and each stage checks
+  at start-up that it fits next to the KV cache, failing with the size it needs
+  if not.
 - Not supported with DP attention or prefill context parallelism.
 
 ## Fixed-cohort benchmark gate

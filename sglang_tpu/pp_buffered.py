@@ -189,6 +189,7 @@ def hbm_reserve_bytes(
     depth: int,
     zero_residual_rows: int,
     receives: bool = True,
+    sends: bool = True,
 ) -> int:
     """An upper bound on the device memory a stage's buffered hand-off holds
     beyond the model and the KV cache. Each term counts transfers of every
@@ -206,11 +207,11 @@ def hbm_reserve_bytes(
     all.
 
     The first stage receives nothing, so it holds no landing buffers, layout
-    copies or zero residuals. The last stage keeps the send allowance although
-    it sends nothing."""
+    copies or zero residuals. The last stage sends nothing (end_iteration
+    returns before it builds a transfer), so it holds no outgoing buffers."""
     transfer = max_rows * hidden * (dtype.itemsize + num_aux * aux_dtype.itemsize)
     received = 2 * _MAX_RECEIVES * transfer if receives else 0
-    outgoing = (depth + 2) * transfer
+    outgoing = (depth + 2) * transfer if sends else 0
     zero = zero_residual_rows * hidden * dtype.itemsize if receives else 0
     return received + outgoing + zero
 
@@ -772,6 +773,7 @@ class PPBufferedHandoff:
             depth=self.depth,
             zero_residual_rows=zero_residual_rows,
             receives=self.rank > 0,
+            sends=self.rank != self.last,
         )
 
     def check_hbm(self, zero_residual_rows: int) -> int:
@@ -780,18 +782,18 @@ class PPBufferedHandoff:
         shortfall fails here rather than as an out-of-memory error under load.
         Returns the bytes checked."""
         nbytes = self.reserve_bytes(zero_residual_rows)
-        receive_side = (
-            f"{_MAX_RECEIVES} receives and their layout copies, "
-            if self.rank > 0
-            else ""
-        )
+        parts = []
+        if self.rank > 0:
+            parts.append(f"{_MAX_RECEIVES} receives and their layout copies")
+        if self.rank != self.last:
+            parts.append(f"{self.depth + 2} sends")
         try:
             self._transport.check_free(nbytes, self.device)
         except Exception as exc:
             raise RuntimeError(
                 f"buffered hand-off stage {self.rank}: the device cannot hold the "
                 f"hand-off's worst case of {nbytes / (1 << 30):.2f} GiB "
-                f"({receive_side}{self.depth + 2} sends of "
+                f"({' and '.join(parts)} of "
                 f"{self.max_rows} rows) next to the KV cache. Lower "
                 "--mem-fraction-static or --max-total-tokens, or "
                 "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH."

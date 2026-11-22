@@ -561,13 +561,14 @@ class TestHbmReserve(unittest.TestCase):
         self.assertEqual(checked, handoff.reserve_bytes(96))
         self.assertEqual(handoff._transport.checked, [checked])
 
-    def test_first_stage_reserves_only_its_sends(self):
+    def test_each_stage_reserves_only_what_it_allocates(self):
+        # The first stage only sends, the last only receives.
         transfer, zero_rows = 64 * HIDDEN * 4, 96
         zero = zero_rows * HIDDEN * 4
         want = {
             0: 4 * transfer,
             1: 18 * transfer + zero,
-            2: 18 * transfer + zero,
+            2: 14 * transfer + zero,
         }
         for rank, nbytes in want.items():
             handoff = make_handoff(rank, 3, FakeNet(), max_rows=64, depth=2)
@@ -578,10 +579,16 @@ class TestHbmReserve(unittest.TestCase):
                 )
 
     def test_start_up_check_fails_with_the_size_it_needs(self):
-        handoff = make_handoff(1, 2, FakeNet(), max_rows=64)
-        handoff._transport.fail_check = True
-        with self.assertRaisesRegex(RuntimeError, "worst case of .* GiB"):
-            handoff.check_hbm(zero_residual_rows=96)
+        # Each stage names only the buffers it allocates.
+        cases = {
+            0: "of .* GiB \\(4 sends of",
+            1: "of .* GiB \\(7 receives and their layout copies of",
+        }
+        for rank, message in cases.items():
+            handoff = make_handoff(rank, 2, FakeNet(), max_rows=64)
+            handoff._transport.fail_check = True
+            with self.subTest(rank=rank), self.assertRaisesRegex(RuntimeError, message):
+                handoff.check_hbm(zero_residual_rows=96)
 
 
 def kv_configurator(*, pp_size=8, is_draft_worker=False, mambaish_config=None):
@@ -619,6 +626,7 @@ class TestKvBudgetReserve(unittest.TestCase):
                 reserve_pp_buffered_handoff(original, self._kvc()), 9 << 30
             )
         self.assertEqual(reserve.call_args.kwargs["pp_rank"], 0)
+        self.assertEqual(reserve.call_args.kwargs["pp_size"], 8)
 
     def test_budget_is_unchanged_without_the_switch_one_stage_or_for_a_draft(self):
         cases = [
@@ -655,14 +663,15 @@ class TestKvBudgetReserve(unittest.TestCase):
                     server_args=kvc.server_args,
                     spec_aux_config=kvc.spec_aux_config,
                     pp_rank=rank,
+                    pp_size=8,
                 )
                 for rank in (0, 3, 7)
             }
         # 256 rows of 16 fp32 columns; zeros for 64+256+1+32 rows. The first
-        # stage receives nothing (4 sends); the last keeps the full bound.
+        # stage receives nothing (4 sends); the last sends nothing.
         transfer, zero = 256 * 16 * 4, (64 + 256 + 1 + 32) * 16 * 4
         self.assertEqual(
-            got, {0: 4 * transfer, 3: 18 * transfer + zero, 7: 18 * transfer + zero}
+            got, {0: 4 * transfer, 3: 18 * transfer + zero, 7: 14 * transfer + zero}
         )
 
 

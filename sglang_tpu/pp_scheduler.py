@@ -151,6 +151,7 @@ def buffered_handoff_reserve_bytes(
     server_args: Any,
     spec_aux_config: Any,
     pp_rank: int,
+    pp_size: int,
 ) -> int:
     """The buffered hand-off's worst-case device memory (hbm_reserve_bytes) on
     stage ``pp_rank``, from what the KV budget knows before the compile policy
@@ -170,6 +171,7 @@ def buffered_handoff_reserve_bytes(
         depth=tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.get(),
         zero_residual_rows=_zero_residual_rows(t_bucketer, b_bucketer),
         receives=pp_rank > 0,
+        sends=pp_rank < pp_size - 1,
     )
 
 

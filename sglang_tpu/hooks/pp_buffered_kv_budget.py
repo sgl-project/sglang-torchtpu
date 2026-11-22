@@ -25,13 +25,13 @@ reserve_pp_buffered_handoff
        landing buffers for its receives and holds its queued sends while
        serving, after the KV pool is sized: up to 7 receives and their
        layout copies, plus the send depth + 2 transfers at the largest token
-       bucket, and one zero residual per bucket (about 1.76 GiB for
-       GPT-OSS-120B at 16384 rows). Sized from free memory, the pool can leave
-       no room for them, and the stage runs out of memory under load.
+       bucket, and one zero residual per bucket (about 1.76 GiB on a middle
+       stage for GPT-OSS-120B at 16384 rows). Sized from free memory, the pool
+       can leave no room for them, and the stage runs out of memory under load.
   How: AROUND KVCacheConfigurator._profile_available_bytes: with the switch on
        and more than one pipeline stage, subtract this stage's worst case
        (pp_scheduler.buffered_handoff_reserve_bytes: the first stage receives
-       nothing) from the bytes the KV pool may use, as
+       nothing, the last sends nothing) from the bytes the KV pool may use, as
        core does for multimodal runtime memory (mm_runtime_reservation_gb). The
        hand-off checks the same bound when it starts (PPBufferedHandoff.check_hbm),
        which also covers a --max-total-tokens below the profiled capacity.
@@ -117,6 +117,7 @@ def reserve_pp_buffered_handoff(original, kvc, *args, **kwargs) -> int:
         server_args=kvc.server_args,
         spec_aux_config=kvc.spec_aux_config,
         pp_rank=get_parallel().pp_rank,
+        pp_size=kvc.pp_size,
     )
     logger.info(
         "Reserving %.2f GB of the KV budget for the buffered PP hand-off.",
