@@ -59,10 +59,17 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 ATTENTION_DP = int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1"))
 
 
-def size_for_concurrency(config: dict, concurrency: int) -> dict:
+def size_for_concurrency(
+    config: dict,
+    concurrency: int,
+    *,
+    checkpoints: int | None = None,
+    tails: int | None = None,
+) -> dict:
     """``config``'s running requests, KDA state slots and prefix tails for
-    ``concurrency``, this engine's share of the client concurrency (each
-    follows its environment variable when set)."""
+    ``concurrency``, this engine's share of the client concurrency, or the
+    given ``checkpoints`` / ``tails`` (each follows its environment variable
+    when set)."""
     # Decoding requests, up to the 64 rows the programs' plain decode is
     # checked to; the prefill takes its share of the same slots.
     running = min(64, max(4, 2 * concurrency))
@@ -81,19 +88,19 @@ def size_for_concurrency(config: dict, concurrency: int) -> dict:
     # the KV pool sat idle, and 64 checkpoints with 48 tails left too little KV
     # (sessions evicted each other's pages). Eight checkpoints and three tails
     # a session, up to 64 checkpoints.
-    checkpoints = int(
-        os.environ.get(
-            "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(64, max(16, 8 * concurrency)))
-        )
-    )
+    if checkpoints is None:
+        checkpoints = min(64, max(16, 8 * concurrency))
+    checkpoints = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", checkpoints))
     config["server_args"].update(
         max_running_requests=running,
         # sglang caps max_running_requests at a fifth of the slots under
         # overlap scheduling.
         max_mamba_cache_size=max(checkpoints + 2 * running, 5 * running),
     )
+    if tails is None:
+        tails = max(8, 3 * concurrency)
     config["runtime_env"]["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"] = os.environ.get(
-        "K3_PROGRAM_PREFIX_TAILS", str(max(8, 3 * concurrency))
+        "K3_PROGRAM_PREFIX_TAILS", str(tails)
     )
     return config
 

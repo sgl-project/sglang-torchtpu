@@ -220,6 +220,9 @@ def colocated_defaults(config: dict) -> dict:
     for name, default in (
         ("SGLANG_TPU_K3_PROGRAM_OPT_HOST_BOOKKEEPING", "1"),
         ("SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS", "1"),
+        ("SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS_KEEP_EXTENDED", "1"),
+        # A session's next turn encodes only the messages it adds.
+        ("SGLANG_TPU_KIMI_TOKENIZER_SEGMENT_CACHE_TOKENS", "8000000"),
     ):
         env[name] = os.environ.get(name, default)
     env["SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS"] = os.environ.get(

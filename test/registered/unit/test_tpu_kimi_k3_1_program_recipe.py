@@ -65,8 +65,13 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
         config = resolve()
         args, env = config["server_args"], config["runtime_env"]
         self.assertEqual(args["max_running_requests"], 4)
-        self.assertEqual(args["max_mamba_cache_size"], 24)
-        self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"], "8")
+        # 32 KDA checkpoints + two state slots per running request.
+        self.assertEqual(args["max_mamba_cache_size"], 40)
+        self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"], "32")
+        self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS_KEEP_EXTENDED"], "1")
+        self.assertEqual(
+            env["SGLANG_TPU_KIMI_TOKENIZER_SEGMENT_CACHE_TOKENS"], "8000000"
+        )
         self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS"], "150")
         self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_OPT_HOST_BOOKKEEPING"], "1")
         self.assertEqual(env["SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS"], "1")
