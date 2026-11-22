@@ -1095,3 +1095,34 @@ def test_decode_req_to_token_pool_supports_tpu_page_table_versioning():
 
     pool.clear()
     assert pool.req_to_token._tpu_page_table_version == 4
+
+
+def test_prefill_disagg_runs_compact_block256_expert_scales():
+    """1P1D prefill must still compact L1..L60 NVFP4 block-256 scales when COMPACT_K256_SCALES is enabled."""
+    import sglang_tpu.models.muse_spark as muse_spark
+
+    calls = []
+    model = object.__new__(muse_spark.MuseSparkForConditionalGeneration)
+    model._megakernel_enabled = False
+    model.model = SimpleNamespace(start_layer=0, end_layer=0, embed_tokens=SimpleNamespace(weight=None), prefill_kernels=None)
+    model._compact_block256_expert_scales = lambda: calls.append("compact_k256")
+    model._probe_block256_expert_scales = lambda: calls.append("probe_k256")
+    model._convert_boundary_fp8_experts = lambda q: calls.append(("boundary", q))
+    model._finalize_decode_replica_banks = lambda **kw: calls.append(("replica", kw))
+
+    with (
+        patch.object(muse_spark, "get_disagg", return_value=SimpleNamespace(disaggregation_mode="prefill")),
+        patch("sglang_tpu.muse_prefill_kernels.integration.MusePrefillKernels.from_model", return_value="ok"),
+        _temp_env(
+            SGLANG_TPU_MUSE_KERNEL_ENABLED="1",
+            SGLANG_TPU_MUSE_KERNEL_COMPACT_K256_SCALES="1",
+            SGLANG_TPU_MUSE_PROBE_BLOCK256_SCALES="0",
+            SGLANG_TPU_MUSE_QUANT_BOUNDARY_MOE_FP4="-256",
+        ),
+    ):
+        muse_spark.MuseSparkForConditionalGeneration.precompile_kernels_after_loading(model)
+
+    assert "compact_k256" in calls
+    assert ("boundary", -256) in calls
+    assert not any(isinstance(c, tuple) and c[0] == "replica" for c in calls)
+    assert model.model.prefill_kernels == "ok"

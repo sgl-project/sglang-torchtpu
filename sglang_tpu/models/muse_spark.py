@@ -5238,9 +5238,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     "SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB=1 is set"
                 )
         is_non_prefill = get_disagg().disaggregation_mode != "prefill"
-        compact_k256 = bool(
-            tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_K256_SCALES.get() and is_non_prefill
-        )
+        compact_k256 = bool(tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_K256_SCALES.get())
         if (
             decode_ep_tp2
             and tpu_envs.SGLANG_TPU_MUSE_KERNEL_ENABLED.get()
