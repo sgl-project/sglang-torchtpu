@@ -1194,14 +1194,32 @@ def kernel_main_fused_rs(
         cm_w1_pad = cm_s1_pad = cm_w2_pad = cm_s2_pad = None
         cm_wt_send_sem_ref = cm_wt_recv_sem_ref = cm_awaited_ref = None
         borrowed_slot = None
+    eo3_enabled = False
+    eo_w_half_fp8_ref = eo_w_colc_ref = eo_lhs_fp8_4x_ref = eo_lhs_sc_4x_ref = (
+        eo_buf_4x_ref
+    ) = None
     if eo_refs is not None:
-        eo_w_strip_fp8_ref = eo_refs[0]
-        if len(eo_refs) >= 4:
-            eo_lhs_fp8_2x_ref, eo_lhs_sc_2x_ref, eo_gmm1_2x_ref = eo_refs[1:4]
-            eo_pair_enabled = True
-        else:
-            eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = None
+        if len(eo_refs) == 5:
+            (
+                eo_w_half_fp8_ref,
+                eo_w_colc_ref,
+                eo_lhs_fp8_4x_ref,
+                eo_lhs_sc_4x_ref,
+                eo_buf_4x_ref,
+            ) = eo_refs
+            eo3_enabled = True
             eo_pair_enabled = False
+            eo_w_strip_fp8_ref = eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = (
+                eo_gmm1_2x_ref
+            ) = None
+        else:
+            eo_w_strip_fp8_ref = eo_refs[0]
+            if len(eo_refs) >= 4:
+                eo_lhs_fp8_2x_ref, eo_lhs_sc_2x_ref, eo_gmm1_2x_ref = eo_refs[1:4]
+                eo_pair_enabled = True
+            else:
+                eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = None
+                eo_pair_enabled = False
     else:
         eo_w_strip_fp8_ref = eo_lhs_fp8_2x_ref = eo_lhs_sc_2x_ref = eo_gmm1_2x_ref = (
             None
@@ -2821,12 +2839,116 @@ def kernel_main_fused_rs(
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, skip_cur):
         is_active = gm_id < local_num_gm
+        eo_skip_enabled = eo_pair_enabled or eo3_enabled
         should_run = (
-            jnp.logical_and(is_active, skip_cur == 0) if eo_pair_enabled else is_active
+            jnp.logical_and(is_active, skip_cur == 0) if eo_skip_enabled else is_active
         )
         sem_id = gm_id % 2
         stg_id = gm_id % 4
         next_skip_out = jnp.int32(0)
+
+        if eo3_enabled:
+            from .w1_fp8_expert_cache import (
+                compute_eo3_batch_count,
+                run_eo3_expert_batch,
+            )
+
+            batch_n_eo3 = compute_eo3_batch_count(
+                gm_id, local_num_gm, metadata_ref, max_batch=eo_buf_4x_ref.shape[0]
+            )
+            next_skip_out = jnp.where(
+                should_run,
+                batch_n_eo3 - jnp.int32(1),
+                jnp.maximum(skip_cur - jnp.int32(1), jnp.int32(0)),
+            )
+
+            @pl.when(should_run)
+            def _run_eo3():
+                run_eo3_expert_batch(
+                    gm_id=gm_id,
+                    batch_n=batch_n_eo3,
+                    local_num_gm=local_num_gm,
+                    gm_id_ref=gm_id_ref,
+                    metadata_ref=metadata_ref,
+                    fused_metadata_ref=fused_metadata_ref,
+                    hidden_states_ref=hidden_states_ref,
+                    gathered_lhs_2x_ref=gathered_lhs_2x_ref,
+                    lhs_indices_ref=lhs_indices_ref,
+                    gather_sem_ref=gather_sem_ref,
+                    gather_divisor=top_k if pack_indices else 1,
+                    packed_u16_lhs=packed_u16_lhs,
+                    dma_gather_gm_start_fn=dma_gather_gm_start,
+                    dma_gather_gm_wait_fn=dma_gather_gm_wait,
+                    start_w1_dma_fn=start_w1_dma,
+                    wait_w1_dma_fn=wait_w1_dma,
+                    start_w2_dma_fn=start_w2_dma,
+                    wait_w2_dma_fn=wait_w2_dma,
+                    wait_staging_slot_writes_fn=wait_staging_slot_writes,
+                    do_direct_write_fn=_do_direct_write,
+                    maybe_start_deferred_cm_wt_send_fn=(
+                        _maybe_start_deferred_cm_wt_send
+                        if (enable_chipmate and cm_defer_send)
+                        else None
+                    ),
+                    enable_chipmate=enable_chipmate,
+                    cm_defer_send=cm_defer_send,
+                    defer_writes=defer_writes,
+                    w1_buf_ref=w1_buf_ref,
+                    w1_scale_buf_ref=w1_scale_buf_ref,
+                    w2_buf_ref=w2_buf_ref,
+                    w2_scale_buf_ref=w2_scale_buf_ref,
+                    w1_gs_gate_ref=w1_gs_gate_ref,
+                    w1_gs_up_ref=w1_gs_up_ref,
+                    w2_gs_ref=w2_gs_ref,
+                    has_w1_gs=has_w1_gs,
+                    has_w2_gs=has_w2_gs,
+                    pnw_ref=w2_bias_ref if in_kernel_post_norm_size > 0 else None,
+                    in_kernel_post_norm_size=in_kernel_post_norm_size,
+                    static_fp8_rs_scale=static_fp8_rs_scale,
+                    scatter_staging_3x_ref=scatter_staging_3x_ref,
+                    eo_w_half_fp8_ref=eo_w_half_fp8_ref,
+                    eo_w_colc_ref=eo_w_colc_ref,
+                    eo_lhs_fp8_4x_ref=eo_lhs_fp8_4x_ref,
+                    eo_lhs_sc_4x_ref=eo_lhs_sc_4x_ref,
+                    eo_buf_4x_ref=eo_buf_4x_ref,
+                    num_n1=num_n1,
+                    num_n2=num_n2,
+                    tile_m=tile_m,
+                    tile_k1=tile_k1,
+                    tile_n1=tile_n1,
+                    tile_k2=tile_k2,
+                    tile_n2=tile_n2,
+                    strip_step=min(
+                        max(
+                            num_lanes,
+                            int(
+                                envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N.get() or 256
+                            ),
+                        ),
+                        tile_n1,
+                        tile_n2,
+                    ),
+                    rhs1_qbs=cfgs1.rhs_cfgs.quant_block_size,
+                    rhs2_qbs=cfgs2.rhs_cfgs.quant_block_size,
+                    packing1=cfgs1.rhs_cfgs.packing,
+                    packing2=cfgs2.rhs_cfgs.packing,
+                    rhs1_quant_dtype=cfgs1.rhs_cfgs.quant_dtype,
+                    rhs2_quant_dtype=cfgs2.rhs_cfgs.quant_dtype,
+                    out_dtype=out_dtype,
+                    direct_fp8_mode=(
+                        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
+                        >= 4
+                    ),
+                    use_bf16_inner=(
+                        int(envs.SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE.get() or 0)
+                        in (1, 3)
+                    ),
+                    k_chunk=int(
+                        envs.SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_K_STEP.get() or 512
+                    ),
+                )
+
+            return next_skip_out
 
         if eo_pair_enabled:
             _n_slots_eo = metadata_ref.gm_id_to_group_id.shape[0]
@@ -3674,7 +3796,10 @@ def kernel_main_fused_rs(
         return next_skip_out if eo_pair_enabled else skip_cur
 
     lax.fori_loop(
-        0, local_num_gm, gm_loop_body, jnp.int32(0) if eo_pair_enabled else None
+        0,
+        local_num_gm,
+        gm_loop_body,
+        jnp.int32(0) if (eo_pair_enabled or eo3_enabled) else None,
     )
 
     if enable_chipmate and cm_defer_send:
@@ -3682,6 +3807,8 @@ def kernel_main_fused_rs(
 
     @pl.when(local_num_gm > 0)
     def _flush_last_tile():
+        if eo3_enabled:
+            return
         last_gm = local_num_gm - 1
         last_sem = last_gm % 2
         last_stg = last_gm % 4
@@ -5177,14 +5304,23 @@ def gmm_v2_fused_rs(
         and cfgs2.lhs_cfgs.quant_block_size == tile_k2
     ):
         eff_eo_mode = (
-            2
+            min(_eo_raw, 4)
             if (
-                _eo_raw >= 2
+                _eo_raw >= 3
                 and _can_cache_full_expert
                 and act_fn == "silu"
                 and not has_bias
             )
-            else 1
+            else (
+                2
+                if (
+                    _eo_raw >= 2
+                    and _can_cache_full_expert
+                    and act_fn == "silu"
+                    and not has_bias
+                )
+                else 1
+            )
         )
     _eo_strip_w = min(_sn_val if _sn_val > 0 else num_lanes, tile_n1, tile_n2)
     if _eo_strip_w % num_lanes != 0:
@@ -5258,7 +5394,7 @@ def gmm_v2_fused_rs(
         decode_strip_nc=decode_strip_nc,
         decode_dual_k256=decode_dual_k256,
         packed_u16_lhs=pack_u16_lhs,
-        gather_2ahead_mode=_g2a_val,
+        gather_2ahead_mode=(0 if eff_eo_mode >= 3 else _g2a_val),
         use_weight_lookahead=eff_weight_lookahead,
         rotate_rs_mode=_rot_rs_val,
         static_fp8_rs_scale=eff_static_fp8_rs,
@@ -5393,7 +5529,7 @@ def gmm_v2_fused_rs(
                 pltpu.VMEM((max(tile_k1, tile_k2), _eo_strip_w), jnp.float8_e4m3fn)
             )
             n_eo_scratch = 1
-        elif eff_eo_mode >= 2:
+        elif eff_eo_mode == 2:
             ext_scratch.extend(
                 [
                     pltpu.VMEM((max(tile_k1, tile_k2), _eo_strip_w), jnp.float8_e4m3fn),
@@ -5403,6 +5539,35 @@ def gmm_v2_fused_rs(
                 ]
             )
             n_eo_scratch = 4
+        elif eff_eo_mode >= 3:
+            # Shrink unused single-tile VMEM buffers (gmm1_out_ref, tiled_out_2x_ref,
+            # partial_out1_ref, partial_out2_ref) to 8 rows, freeing ~8 MiB VMEM.
+            ext_scratch[3] = pltpu.VMEM((8, _out_n1_full), out_dtype)
+            ext_scratch[5] = pltpu.VMEM((2, 8, aligned_n2), out_dtype)
+            ext_scratch[7] = pltpu.VMEM((8, max_k_pq), cfgs1.lhs_cfgs.quant_dtype)
+            ext_scratch[8] = pltpu.VMEM((1, 8, num_lanes), jnp.float32)
+            _eo3_w_cols = min(2048, max(tile_n1, tile_n2))
+            _w1_eo_b = (
+                num_w1_bufs
+                * tile_k1
+                * (tile_n1 * 2 if act_fn else tile_n1)
+                * jax.dtypes.itemsize_bits(w1.dtype)
+                // 8
+            )
+            _eo3_r = 5 if (tile_m <= 256 and _w1_eo_b <= 16 * 1024 * 1024) else 4
+            ext_scratch.extend(
+                [
+                    pltpu.VMEM((max(tile_k1, tile_k2), _eo3_w_cols), jnp.float8_e4m3fn),
+                    pltpu.VMEM(
+                        (8, num_lanes if eff_eo_mode >= 4 else _eo3_w_cols),
+                        jnp.float32,
+                    ),
+                    pltpu.VMEM((_eo3_r, tile_m, max_k_pq), jnp.float8_e4m3fn),
+                    pltpu.VMEM((_eo3_r, tile_m, num_lanes), jnp.float32),
+                    pltpu.VMEM((_eo3_r, tile_m, _out_n1_full), out_dtype),
+                ]
+            )
+            n_eo_scratch = 5
 
         if enable_chipmate:
             _w1_p_rows = (
