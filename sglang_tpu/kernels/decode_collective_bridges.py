@@ -279,13 +279,8 @@ def _pallas_call_maybe_interpret(kernel_fn, *, interpret: bool, compiler_params,
 
 
 def _fori_col_blocks(n_cols: int, step_fn, *, unroll_k: int = 4) -> None:
-    """Iterate ``0..n_cols`` in ``_COL_STRIP`` steps with static unrolling up to 8192 cols."""
+    """Iterate ``0..n_cols`` in ``_COL_STRIP`` steps with ``unroll_k``-way loop unrolling."""
     from jax.experimental import pallas as pl
-
-    if n_cols <= 8192 and n_cols % _COL_STRIP == 0:
-        for off in range(0, n_cols, _COL_STRIP):
-            step_fn(pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP))
-        return
 
     blk = unroll_k * _COL_STRIP
     if n_cols >= blk and n_cols % blk == 0:
@@ -304,16 +299,10 @@ def _fori_col_blocks(n_cols: int, step_fn, *, unroll_k: int = 4) -> None:
 
 
 def _reduce_col_blocks(n_cols: int, step_fn, init, *, unroll_k: int = 4):
-    """Accumulate across ``0..n_cols`` with zero-barrier static unrolling up to 8192 cols."""
+    """Accumulate across ``0..n_cols`` in ``unroll_k * _COL_STRIP`` loop bodies (0 spills)."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
-
-    if n_cols <= 8192 and n_cols % _COL_STRIP == 0:
-        acc = init
-        for off in range(0, n_cols, _COL_STRIP):
-            acc = step_fn(pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP), acc)
-        return acc
 
     blk = unroll_k * _COL_STRIP
     if n_cols >= blk and n_cols % blk == 0:
