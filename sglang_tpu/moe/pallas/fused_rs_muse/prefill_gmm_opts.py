@@ -568,6 +568,7 @@ def scoped_w4a8_strip_acc(
     hoist_rhs_scale: bool = False,
     w_fp8_cache_ref: Any = None,
     prequant_lhs_scale_ref: Any = None,
+    pair_k512_unpack: bool = False,
 ):
     """Scoped VMEM W4A8 strip matmul (`GMM_SCOPED_W4A8` modes 1, 2, 3).
 
@@ -699,6 +700,75 @@ def scoped_w4a8_strip_acc(
                 term = sub_h.astype(acc_dtype) * lhs_s_full[m0:m1, :]
                 acc_h = term if acc_h is None else acc_h + term
             acc_halves.append(acc_h)
+        return (
+            acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
+        )
+
+    if (
+        pair_k512_unpack
+        and rhs_qbs == 256
+        and packing == 8
+        and not eff_mh_outer
+        and (has_prequant_lhs or quant_otf)
+        and not _use_w_cache
+        and (tile_k % 512 == 0)
+        and (q_block_size % 512 == 0)
+    ):
+        acc_halves = [None] * num_m_halves
+        for l_k0 in range(0, tile_k, q_block_size):
+            l_k1 = min(tile_k, l_k0 + q_block_size)
+            l_bid = l_k0 // q_block_size
+            sub_halves_p: list[Any] = [None] * num_m_halves
+            for ok0 in range(l_k0, l_k1, 512):
+                w_512 = _load_w_slice_fp8(ok0, 512)
+                for ib in range(2):
+                    rk0 = ok0 + ib * 256
+                    rk1 = rk0 + 256
+                    r_bid = rk0 // 256
+                    w_256 = w_512[ib * 256 : (ib + 1) * 256, :]
+                    rhs_s_bf16 = _load_rhs_scale(r_bid)
+                    if quant_otf:
+                        lhs_full_blk = (
+                            lhs_2d_vmem_ref[:, rk0:rk1].astype(jnp.bfloat16)
+                            * otf_inv_scale_bf16
+                        ).astype(lhs_quant_dtype)
+                        prequant_lhs_fp8_ref[:, rk0:rk1] = lhs_full_blk
+                    else:
+                        lhs_full_blk = None
+                    for mh in range(num_m_halves):
+                        m0 = mh * m_step
+                        m1 = m0 + m_step
+                        if lhs_full_blk is not None:
+                            lhs_sub = lhs_full_blk[m0:m1, :]
+                        else:
+                            lhs_sub = _slice_pq_lhs_sub(
+                                prequant_lhs_fp8_ref,
+                                prequant_lhs_3d_fp8_ref,
+                                m0,
+                                m_step,
+                                rk0,
+                                256,
+                            )
+                        pop = jnp.matmul(
+                            lhs_sub,
+                            w_256,
+                            preferred_element_type=jnp.float32,
+                        )
+                        if use_bf16_inner:
+                            sp = pop.astype(jnp.bfloat16) * rhs_s_bf16
+                        else:
+                            sp = pop.astype(acc_dtype) * rhs_s_bf16.astype(acc_dtype)
+                        sub_halves_p[mh] = (
+                            sp if sub_halves_p[mh] is None else sub_halves_p[mh] + sp
+                        )
+            lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+            for mh in range(num_m_halves):
+                m0 = mh * m_step
+                m1 = m0 + m_step
+                term = sub_halves_p[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                acc_halves[mh] = (
+                    term if acc_halves[mh] is None else acc_halves[mh] + term
+                )
         return (
             acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
         )

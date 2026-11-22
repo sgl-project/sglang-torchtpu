@@ -1043,14 +1043,14 @@ def inner_kernel(
                         has_prequant_lhs=has_prequant_lhs,
                         hoisted_lq_blocks=_hoisted_lq_blocks,
                         load_lhs_scale_strip_fn=_load_lhs_scale_strip,
-                        mh_outer=scoped_w4a8_mode >= 3,
+                        mh_outer=scoped_w4a8_mode in (3, 4, 5, 6),
                     )
                 if (use_scoped_w4a8_refs and scoped_w4a8_mode >= 1) or (
                     use_eo_strip_fp8 and eo_fp8_mode >= 2 and use_scoped_w4a8_refs
                 ):
                     from .prefill_gmm_opts import scoped_w4a8_strip_acc
 
-                    _use_mh_outer = (scoped_w4a8_mode >= 3) or (
+                    _use_mh_outer = (scoped_w4a8_mode in (3, 4, 5, 6)) or (
                         use_eo_strip_fp8 and eo_fp8_mode >= 2
                     )
                     return scoped_w4a8_strip_acc(
@@ -1084,6 +1084,7 @@ def inner_kernel(
                             w2_fp8_cache_ref if allow_w_fp8_cache else None
                         ),
                         prequant_lhs_scale_ref=prequant_lhs_scale_ref,
+                        pair_k512_unpack=(scoped_w4a8_mode == 7),
                     )
                 if use_scoped_w4a8_refs:
                     if _two_level_pow2 >= 1:
@@ -1481,7 +1482,7 @@ def inner_kernel(
                         hoisted_lq_blocks=_hoisted_lq_blocks,
                         load_lhs_scale_strip_fn=_load_lhs_scale_strip,
                         zero_spill_sub_m=scoped_w4a8_mode >= 2,
-                        mh_outer=scoped_w4a8_mode >= 3,
+                        mh_outer=scoped_w4a8_mode in (3, 4, 5, 6),
                         hoist_rhs_scale=scoped_w4a8_mode >= 4,
                     )
                 col_size = g_e - g_s
@@ -1666,8 +1667,8 @@ def inner_kernel(
                                 )
                     elif (
                         (
-                            scoped_w4a8_mode >= 6
-                            or (scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256)
+                            scoped_w4a8_mode == 6
+                            or (scoped_w4a8_mode in (5, 7) and cfgs.tiles.tile_m < 256)
                         )
                         and skip_row_mask
                         and use_scoped_w4a8_refs
@@ -1876,8 +1877,8 @@ def inner_kernel(
                                 )
                 elif (
                     (
-                        scoped_w4a8_mode >= 6
-                        or (scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256)
+                        scoped_w4a8_mode == 6
+                        or (scoped_w4a8_mode in (5, 7) and cfgs.tiles.tile_m < 256)
                     )
                     and skip_row_mask
                     and use_scoped_w4a8_refs

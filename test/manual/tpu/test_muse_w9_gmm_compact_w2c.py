@@ -1548,3 +1548,48 @@ def test_eo3_eo4_w1_fp8_expert_cache_parity_and_mosaic_lowering():
             )
             assert expected_tag in hlo
     jax.clear_caches()
+
+
+@pytest.mark.parametrize(
+    ("m_rows", "k_dim", "rhs_qbs"),
+    [
+        (256, 2048, 256),
+        (128, 2048, 256),
+        (256, 2048, 512),
+    ],
+)
+def test_sw7_pair_k512_and_fori_tail_bit_exact_vs_sw2(
+    m_rows: int, k_dim: int, rhs_qbs: int
+) -> None:
+    """GMM_SCOPED_W4A8=7 (mh_outer=False + hoisted scales + 512-K pair unpack + m<256 fori)
+    must be 0.0-ULP bit-exact with sw=2 across full (m=256) and tail (m=128) buckets."""
+    ref_sw2 = _run_two_ntile_gmm1_gmm2_interpret(
+        sw_mode=2,
+        flq_zero_rmw=3,
+        use_w2_cache=False,
+        m_rows=m_rows,
+        k1=k_dim,
+        n1_half=k_dim // 2,
+        k2=k_dim,
+        n2=512,
+        rhs_qbs=rhs_qbs,
+        seed=20261123 + m_rows + rhs_qbs,
+        input_rows=max(256, m_rows),
+    )
+    got_sw7 = _run_two_ntile_gmm1_gmm2_interpret(
+        sw_mode=7,
+        flq_zero_rmw=3,
+        use_w2_cache=False,
+        m_rows=m_rows,
+        k1=k_dim,
+        n1_half=k_dim // 2,
+        k2=k_dim,
+        n2=512,
+        rhs_qbs=rhs_qbs,
+        seed=20261123 + m_rows + rhs_qbs,
+        input_rows=max(256, m_rows),
+    )
+    assert np.array_equal(got_sw7, ref_sw2), (
+        f"sw=7 mismatch vs sw=2 at m_rows={m_rows}, k_dim={k_dim}, rhs_qbs={rhs_qbs}: "
+        f"max_abs={np.max(np.abs(got_sw7.astype(np.float32) - ref_sw2.astype(np.float32)))}"
+    )
