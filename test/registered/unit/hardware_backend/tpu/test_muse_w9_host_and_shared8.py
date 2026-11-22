@@ -9,10 +9,8 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -87,7 +85,10 @@ def test_shared8_gating_and_distribution():
     )
 
     with (
-        patch("sglang_tpu.attention_pallas_rpa_base.get_parallel", return_value=SimpleNamespace(attn_dp_size=1)),
+        patch(
+            "sglang_tpu.attention_pallas_rpa_base.get_parallel",
+            return_value=SimpleNamespace(attn_dp_size=1),
+        ),
         _temp_env(
             SGLANG_TPU_RPA_V3_DECODE_FAST="shared64,c4096",
             SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED="1",
@@ -118,7 +119,9 @@ def test_shared8_interpret_parity_ps128_and_ps256():
         phys_rows = page_size // 2
         n_phys = 128
         d2_cache = jnp.asarray(
-            (rng.standard_normal((n_phys, phys_rows, 1, 4, 128)) * 0.35).astype(np.float32),
+            (rng.standard_normal((n_phys, phys_rows, 1, 4, 128)) * 0.35).astype(
+                np.float32
+            ),
             dtype=jnp.float8_e4m3fn,
         )
         page_indices = np.zeros((bs, pps), dtype=np.int32)
@@ -133,30 +136,69 @@ def test_shared8_interpret_parity_ps128_and_ps256():
         kv_lens[0] += 13
         kv_lens[3] -= 19
         q = jnp.asarray(rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16)
-        k_new = jnp.asarray(rng.standard_normal((bs, 1, 128)) * 0.35, dtype=jnp.float8_e4m3fn)
-        v_new = jnp.asarray(rng.standard_normal((bs, 1, 128)) * 0.35, dtype=jnp.float8_e4m3fn)
+        k_new = jnp.asarray(
+            rng.standard_normal((bs, 1, 128)) * 0.35, dtype=jnp.float8_e4m3fn
+        )
+        v_new = jnp.asarray(
+            rng.standard_normal((bs, 1, 128)) * 0.35, dtype=jnp.float8_e4m3fn
+        )
         gate = jnp.asarray(rng.standard_normal((bs, 1024)) * 0.35, dtype=jnp.bfloat16)
         cu_q = jnp.arange(bs + 1, dtype=jnp.int32)
         cu_kv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size)
         dist = jnp.asarray([bs, bs, bs], dtype=jnp.int32)
 
         out_ref, _ = run_decode_fast_rpa(
-            q, k_new, v_new, d2_cache, jnp.asarray(kv_lens), jnp.asarray(page_indices.ravel()),
-            cu_q, cu_kv, dist, sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
-            mode_str="w8,c4096,pbf16", decode_query_size=1, fused_out_pack=2,
-            gate=gate, out_norm_eps=1e-6, kv_pack_dense2=True, interpret=True, shared_pages=None,
+            q,
+            k_new,
+            v_new,
+            d2_cache,
+            jnp.asarray(kv_lens),
+            jnp.asarray(page_indices.ravel()),
+            cu_q,
+            cu_kv,
+            dist,
+            sm_scale=0.125,
+            sliding_window=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            mode_str="w8,c4096,pbf16",
+            decode_query_size=1,
+            fused_out_pack=2,
+            gate=gate,
+            out_norm_eps=1e-6,
+            kv_pack_dense2=True,
+            interpret=True,
+            shared_pages=None,
         )
         out_sh8, _ = run_decode_fast_rpa(
-            q, k_new, v_new, d2_cache, jnp.asarray(kv_lens), jnp.asarray(page_indices.ravel()),
-            cu_q, cu_kv, dist, sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
-            mode_str="shared64,c4096,pbf16,w8", decode_query_size=1, fused_out_pack=2,
-            gate=gate, out_norm_eps=1e-6, kv_pack_dense2=True, interpret=True,
+            q,
+            k_new,
+            v_new,
+            d2_cache,
+            jnp.asarray(kv_lens),
+            jnp.asarray(page_indices.ravel()),
+            cu_q,
+            cu_kv,
+            dist,
+            sm_scale=0.125,
+            sliding_window=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            mode_str="shared64,c4096,pbf16,w8",
+            decode_query_size=1,
+            fused_out_pack=2,
+            gate=gate,
+            out_norm_eps=1e-6,
+            kv_pack_dense2=True,
+            interpret=True,
             shared_pages=jnp.asarray([shared_pgs], dtype=jnp.int32),
         )
         ref_f = np.asarray(out_ref, dtype=np.float32).ravel()
         sh_f = np.asarray(out_sh8, dtype=np.float32).ravel()
         max_abs = float(np.max(np.abs(ref_f - sh_f)))
-        cos = float(np.dot(ref_f, sh_f) / (np.linalg.norm(ref_f) * np.linalg.norm(sh_f)))
+        cos = float(
+            np.dot(ref_f, sh_f) / (np.linalg.norm(ref_f) * np.linalg.norm(sh_f))
+        )
         assert max_abs < 0.02, f"ps={page_size} max_abs={max_abs}"
         assert cos > 0.9999, f"ps={page_size} cos={cos}"
 
@@ -186,7 +228,9 @@ def test_incremental_decode_page_table_patch_matches_full_gather():
     from sglang_tpu.host_metadata_cache import HostMetadataCache
 
     for is_hybrid in (False, True):
-        pool = ReqToTokenPool(size=8, max_context_len=512, device="tpu", enable_memory_saver=False)
+        pool = ReqToTokenPool(
+            size=8, max_context_len=512, device="tpu", enable_memory_saver=False
+        )
         pool.write((1, slice(0, 128)), torch.arange(128, 256, dtype=torch.int32))
         pool.write((2, slice(0, 128)), torch.arange(256, 384, dtype=torch.int32))
         pool.write((3, slice(0, 256)), torch.arange(384, 640, dtype=torch.int32))
@@ -208,8 +252,12 @@ def test_incremental_decode_page_table_patch_matches_full_gather():
 
         with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="1"):
             # Step 1: cold miss
-            m1 = fast_be._build_metadata_host(_fb([128, 128, 256]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
-            r1 = ref_be._build_metadata_host(_fb([128, 128, 256]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
+            m1 = fast_be._build_metadata_host(
+                _fb([128, 128, 256]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
+            r1 = ref_be._build_metadata_host(
+                _fb([128, 128, 256]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
             assert torch.equal(m1.page_indices, r1.page_indices)
             if is_hybrid:
                 assert torch.equal(m1.swa_page_indices, r1.swa_page_indices)
@@ -217,11 +265,17 @@ def test_incremental_decode_page_table_patch_matches_full_gather():
             # Step 2: decode step crossing page boundary on rows 1 and 3 (locs=128 and 256)
             locs = torch.tensor([128, 64, 256], dtype=torch.int32)
             vals = torch.tensor([1024, 320, 1536], dtype=torch.int32)
-            pool.write((req_rows, locs), vals, bump_page_table=True, is_decode_step=True)
+            pool.write(
+                (req_rows, locs), vals, bump_page_table=True, is_decode_step=True
+            )
             assert pool.req_to_token._tpu_last_decode_patch is not None
 
-            m2 = fast_be._build_metadata_host(_fb([129, 129, 257]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
-            r2 = ref_be._build_metadata_host(_fb([129, 129, 257]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
+            m2 = fast_be._build_metadata_host(
+                _fb([129, 129, 257]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
+            r2 = ref_be._build_metadata_host(
+                _fb([129, 129, 257]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
             assert torch.equal(m2.page_indices, r2.page_indices)
             if is_hybrid:
                 assert torch.equal(m2.swa_page_indices, r2.swa_page_indices)
@@ -233,14 +287,24 @@ def test_incremental_decode_page_table_patch_matches_full_gather():
                 bump_page_table=False,
                 is_decode_step=True,
             )
-            m3 = fast_be._build_metadata_host(_fb([130, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
+            m3 = fast_be._build_metadata_host(
+                _fb([130, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
             assert m3.page_indices is m2.page_indices
 
             # Step 4: non-decode write invalidates _tpu_last_decode_patch -> clean fallback
-            pool.write((1, slice(256, 384)), torch.arange(2048, 2176, dtype=torch.int32), bump_page_table=True)
+            pool.write(
+                (1, slice(256, 384)),
+                torch.arange(2048, 2176, dtype=torch.int32),
+                bump_page_table=True,
+            )
             assert pool.req_to_token._tpu_last_decode_patch is None
-            m4 = fast_be._build_metadata_host(_fb([260, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
-            r4 = ref_be._build_metadata_host(_fb([260, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3)
+            m4 = fast_be._build_metadata_host(
+                _fb([260, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
+            r4 = ref_be._build_metadata_host(
+                _fb([260, 130, 258]), 128, "cpu", 3, pool.req_to_token, 4, dist, 3
+            )
             assert torch.equal(m4.page_indices, r4.page_indices)
             if is_hybrid:
                 assert torch.equal(m4.swa_page_indices, r4.swa_page_indices)
@@ -295,7 +359,10 @@ def test_pad_batch_fields_skips_fused_eager_when_unpadded():
         calls += 1
         yield False
 
-    with patch("sglang_tpu.compilation.compiled_forward_shim.fused_eager_ops", side_effect=_fake_fused):
+    with patch(
+        "sglang_tpu.compilation.compiled_forward_shim.fused_eager_ops",
+        side_effect=_fake_fused,
+    ):
         fb64 = _fb(64)
         rq, rb = _pad_forward_batch_inputs(fb64, t_b, b_b)
         assert calls == 0
@@ -332,12 +399,17 @@ def test_decode_fast_host_prepare_for_decode_and_sampler_parity():
         return sb
 
     with (
-        patch("sglang.srt.managers.schedule_batch.alloc_for_decode", return_value=torch.tensor([1, 2])),
+        patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.tensor([1, 2]),
+        ),
         patch("sglang.srt.managers.schedule_batch.strip_beam_tail"),
         patch("sglang.srt.managers.schedule_batch.append_beam_tail"),
         patch(
             "sglang.srt.managers.schedule_batch.get_exec",
-            return_value=SimpleNamespace(mamba=SimpleNamespace(enable_mamba_extra_buffer=False)),
+            return_value=SimpleNamespace(
+                mamba=SimpleNamespace(enable_mamba_extra_buffer=False)
+            ),
         ),
     ):
         sb0 = _make_sb()
@@ -368,6 +440,7 @@ def test_decode_fast_host_prepare_for_decode_and_sampler_parity():
 def test_piggyback_single_token_prefill_with_real_req():
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
+
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -423,18 +496,25 @@ def test_piggyback_single_token_prefill_with_real_req():
     )
 
     with (
-        patch("sglang.srt.managers.scheduler.current_platform", SimpleNamespace(is_tpu=lambda: True)),
+        patch(
+            "sglang.srt.managers.scheduler.current_platform",
+            SimpleNamespace(is_tpu=lambda: True),
+        ),
         patch(
             "sglang.srt.managers.scheduler.get_parallel",
             return_value=SimpleNamespace(pp_size=1, attn_cp_size=1, attn_dcp_size=1),
         ),
         patch(
             "sglang.srt.managers.scheduler.get_exec",
-            return_value=SimpleNamespace(mamba=SimpleNamespace(enable_mamba_extra_buffer=False)),
+            return_value=SimpleNamespace(
+                mamba=SimpleNamespace(enable_mamba_extra_buffer=False)
+            ),
         ),
         _temp_env(SGLANG_TPU_PIGGYBACK_SINGLE_TOKEN_PREFILL="1"),
     ):
-        nb, rb, piggy = sched._maybe_piggyback_single_token_prefill(new_batch, running_batch)
+        nb, rb, piggy = sched._maybe_piggyback_single_token_prefill(
+            new_batch, running_batch
+        )
     assert nb is None
     assert piggy is rb
     assert rb.forward_mode == ForwardMode.DECODE
@@ -444,6 +524,7 @@ def test_piggyback_single_token_prefill_with_real_req():
 def test_pack_prefill_to_bucket_with_real_req():
     from types import SimpleNamespace
     from unittest.mock import patch
+
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -489,7 +570,10 @@ def test_pack_prefill_to_bucket_with_real_req():
     )
 
     with (
-        patch("sglang.srt.managers.scheduler.current_platform", SimpleNamespace(is_tpu=lambda: True)),
+        patch(
+            "sglang.srt.managers.scheduler.current_platform",
+            SimpleNamespace(is_tpu=lambda: True),
+        ),
         _temp_env(
             SGLANG_TPU_PACK_PREFILL_TO_BUCKET="1",
             SGLANG_TPU_PACK_PREFILL_MAX_DELAY_STEPS="14",
@@ -506,11 +590,19 @@ def test_build_metadata_host_with_shared_decode_repeated_steps():
     from sglang_tpu.host_metadata_cache import HostMetadataCache
 
     bs, page_size, pps = 8, 256, 132
-    pool = ReqToTokenPool(size=16, max_context_len=pps * page_size, device="tpu", enable_memory_saver=False)
+    pool = ReqToTokenPool(
+        size=16,
+        max_context_len=pps * page_size,
+        device="tpu",
+        enable_memory_saver=False,
+    )
     shared_tokens = torch.arange(128 * page_size, dtype=torch.int32) + page_size
     for r in range(bs):
         pool.write((r, slice(0, 128 * page_size)), shared_tokens)
-        pool.write((r, slice(128 * page_size, 129 * page_size)), torch.arange(page_size, dtype=torch.int32) + (200 + r) * page_size)
+        pool.write(
+            (r, slice(128 * page_size, 129 * page_size)),
+            torch.arange(page_size, dtype=torch.int32) + (200 + r) * page_size,
+        )
 
     fast_be = _make_backend(False, HostMetadataCache())
     fast_be._page_stride = page_size
@@ -533,19 +625,48 @@ def test_build_metadata_host_with_shared_decode_repeated_steps():
 
     with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="1"):
         # Step 1: cold miss -> _build_shared_dist populates shared_dist_cache
-        m1 = fast_be._build_metadata_host(_fb([128 * page_size + 10] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        m1 = fast_be._build_metadata_host(
+            _fb([128 * page_size + 10] * bs),
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
+        )
         assert m1.full_decode_distribution is not None
         assert m1.full_decode_distribution.tolist() == [bs, bs, bs, 128]
 
         # Step 2: cache hit -> hits cached_dist is not None and np.array_equal(cached_dist[0], plan)
-        m2 = fast_be._build_metadata_host(_fb([128 * page_size + 11] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        m2 = fast_be._build_metadata_host(
+            _fb([128 * page_size + 11] * bs),
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
+        )
         assert m2.full_decode_distribution is m1.full_decode_distribution
 
         # Step 3: incremental decode patch crossing page boundary
         locs = torch.full((bs,), 129 * page_size, dtype=torch.int32)
-        vals = torch.tensor([(300 + i) * page_size for i in range(bs)], dtype=torch.int32)
+        vals = torch.tensor(
+            [(300 + i) * page_size for i in range(bs)], dtype=torch.int32
+        )
         pool.write((req_rows, locs), vals, bump_page_table=True, is_decode_step=True)
-        m3 = fast_be._build_metadata_host(_fb([129 * page_size + 1] * bs), page_size, "cpu", bs, pool.req_to_token, pps, dist, bs)
+        m3 = fast_be._build_metadata_host(
+            _fb([129 * page_size + 1] * bs),
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
+        )
         assert m3.full_decode_distribution.tolist() == [bs, bs, bs, 128]
 
 
@@ -578,11 +699,17 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
     from sglang_tpu.host_metadata_cache import HostMetadataCache
 
     bs, page_size, pps = 2, 128, 4
-    pool = ReqToTokenPool(size=4, max_context_len=pps * page_size, device="tpu", enable_memory_saver=False)
+    pool = ReqToTokenPool(
+        size=4, max_context_len=pps * page_size, device="tpu", enable_memory_saver=False
+    )
     full_to_swa = torch.zeros(16 * page_size, dtype=torch.int64)
     # Initial mapping: full page 1 -> SWA page 3, full page 2 -> SWA page 4.
-    full_to_swa[1 * page_size : 2 * page_size] = torch.arange(3 * page_size, 4 * page_size)
-    full_to_swa[2 * page_size : 3 * page_size] = torch.arange(4 * page_size, 5 * page_size)
+    full_to_swa[1 * page_size : 2 * page_size] = torch.arange(
+        3 * page_size, 4 * page_size
+    )
+    full_to_swa[2 * page_size : 3 * page_size] = torch.arange(
+        4 * page_size, 5 * page_size
+    )
 
     be = _make_backend(True, HostMetadataCache())
     be._page_stride = page_size
@@ -592,7 +719,10 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
     be.token_to_kv_pool.full_to_swa_index_mapping = full_to_swa
 
     req_rows = torch.tensor([0, 1], dtype=torch.int32)
-    pool.write((req_rows, torch.tensor([0, 0])), torch.tensor([1 * page_size, 2 * page_size], dtype=torch.int32))
+    pool.write(
+        (req_rows, torch.tensor([0, 0])),
+        torch.tensor([1 * page_size, 2 * page_size], dtype=torch.int32),
+    )
     dist = torch.tensor([bs, bs, bs], dtype=torch.int32)
 
     with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="1"):
@@ -606,14 +736,27 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
                 extend_seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
                 req_pool_indices_cpu=req_rows,
             ),
-            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
         )
         assert m_ext1.swa_page_indices.tolist() == [3, 0, 0, 0, 4, 0, 0, 0]
 
         # Step 2 (alloc_extend without bumping _tpu_swa_map_version): full pages 5, 6 -> SWA pages 9, 10
-        full_to_swa[5 * page_size : 6 * page_size] = torch.arange(9 * page_size, 10 * page_size)
-        full_to_swa[6 * page_size : 7 * page_size] = torch.arange(10 * page_size, 11 * page_size)
-        pool.write((req_rows, torch.tensor([0, 0])), torch.tensor([5 * page_size, 6 * page_size], dtype=torch.int32))
+        full_to_swa[5 * page_size : 6 * page_size] = torch.arange(
+            9 * page_size, 10 * page_size
+        )
+        full_to_swa[6 * page_size : 7 * page_size] = torch.arange(
+            10 * page_size, 11 * page_size
+        )
+        pool.write(
+            (req_rows, torch.tensor([0, 0])),
+            torch.tensor([5 * page_size, 6 * page_size], dtype=torch.int32),
+        )
 
         m_ext2 = be._build_metadata_host(
             SimpleNamespace(
@@ -624,7 +767,13 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
                 extend_seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
                 req_pool_indices_cpu=req_rows,
             ),
-            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
         )
         assert m_ext2.swa_page_indices.tolist() == [9, 0, 0, 0, 10, 0, 0, 0]
 
@@ -637,12 +786,22 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
                 seq_lens_cpu=torch.tensor([128, 128], dtype=torch.int32),
                 req_pool_indices_cpu=req_rows,
             ),
-            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
         )
         assert m_dec1.swa_page_indices.tolist() == [9, 0, 0, 0, 10, 0, 0, 0]
 
-        full_to_swa[7 * page_size : 8 * page_size] = torch.arange(11 * page_size, 12 * page_size)
-        full_to_swa[8 * page_size : 9 * page_size] = torch.arange(12 * page_size, 13 * page_size)
+        full_to_swa[7 * page_size : 8 * page_size] = torch.arange(
+            11 * page_size, 12 * page_size
+        )
+        full_to_swa[8 * page_size : 9 * page_size] = torch.arange(
+            12 * page_size, 13 * page_size
+        )
         pool.write(
             (req_rows, torch.tensor([page_size, page_size])),
             torch.tensor([7 * page_size, 8 * page_size], dtype=torch.int32),
@@ -657,10 +816,15 @@ def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
                 seq_lens_cpu=torch.tensor([129, 129], dtype=torch.int32),
                 req_pool_indices_cpu=req_rows,
             ),
-            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+            page_size,
+            "cpu",
+            bs,
+            pool.req_to_token,
+            pps,
+            dist,
+            bs,
         )
         assert m_dec2.swa_page_indices.tolist() == [9, 11, 0, 0, 10, 12, 0, 0]
-
 
 
 def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
@@ -700,7 +864,9 @@ def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
             acc_scaling_penalties=None,
             penalizer_orchestrator=None,
             sampling_params_on_cpu=True,
-            temperatures=torch.full((bs, 1), 0.0 if greedy else 0.8, dtype=torch.float32),
+            temperatures=torch.full(
+                (bs, 1), 0.0 if greedy else 0.8, dtype=torch.float32
+            ),
             device="cpu",
         )
         return SimpleNamespace(
@@ -727,10 +893,20 @@ def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
     )
     pol._distributed_top_k_width = lambda: 64
 
-    with mock.patch("sglang_tpu.sampler.distributed_top_k_candidate_width_for_model", return_value=64):
+    with mock.patch(
+        "sglang_tpu.sampler.distributed_top_k_candidate_width_for_model",
+        return_value=64,
+    ):
         # Default (AUTO=False): bs=16 stays FULL_VOCAB everywhere.
-        with mock.patch("sglang_tpu.sampler.distributed_top_k_min_batch_size", return_value=64):
-            assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.FULL_VOCAB
+        with mock.patch(
+            "sglang_tpu.sampler.distributed_top_k_min_batch_size", return_value=64
+        ):
+            assert (
+                tpu_sampler.select_logits_output_mode(
+                    _make_fb(16, greedy=True, top_k=1), model
+                )
+                is LogitsOutputMode.FULL_VOCAB
+            )
             assert pol._warmup_logits_output_modes(16) == (LogitsOutputMode.FULL_VOCAB,)
 
             # AUTO=True without FUSED_FP8_LM_HEAD_TOPK: unlocks bs>=8 greedy only, not non-greedy TopK.
@@ -739,11 +915,33 @@ def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
                 tpu_envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.override(False),
                 tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.override(False),
             ):
-                assert tpu_sampler.select_logits_output_mode(_make_fb(4, greedy=True, top_k=1), model) is LogitsOutputMode.FULL_VOCAB
-                assert tpu_sampler.select_logits_output_mode(_make_fb(8, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
-                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
-                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=50), model) is LogitsOutputMode.FULL_VOCAB
-                assert pol._warmup_logits_output_modes(4) == (LogitsOutputMode.FULL_VOCAB,)
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(4, greedy=True, top_k=1), model
+                    )
+                    is LogitsOutputMode.FULL_VOCAB
+                )
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(8, greedy=True, top_k=1), model
+                    )
+                    is LogitsOutputMode.DISTRIBUTED_GREEDY
+                )
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(16, greedy=True, top_k=1), model
+                    )
+                    is LogitsOutputMode.DISTRIBUTED_GREEDY
+                )
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(16, greedy=False, top_k=50), model
+                    )
+                    is LogitsOutputMode.FULL_VOCAB
+                )
+                assert pol._warmup_logits_output_modes(4) == (
+                    LogitsOutputMode.FULL_VOCAB,
+                )
                 assert pol._warmup_logits_output_modes(16) == (
                     LogitsOutputMode.DISTRIBUTED_GREEDY,
                     LogitsOutputMode.FULL_VOCAB,
@@ -755,16 +953,30 @@ def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
                 tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.override(True),
                 tpu_envs.SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD.override(True),
             ):
-                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=True, top_k=1), model) is LogitsOutputMode.DISTRIBUTED_GREEDY
-                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=50), model) is LogitsOutputMode.DISTRIBUTED_TOP_K
-                assert tpu_sampler.select_logits_output_mode(_make_fb(16, greedy=False, top_k=None), model) is LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(16, greedy=True, top_k=1), model
+                    )
+                    is LogitsOutputMode.DISTRIBUTED_GREEDY
+                )
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(16, greedy=False, top_k=50), model
+                    )
+                    is LogitsOutputMode.DISTRIBUTED_TOP_K
+                )
+                assert (
+                    tpu_sampler.select_logits_output_mode(
+                        _make_fb(16, greedy=False, top_k=None), model
+                    )
+                    is LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX
+                )
                 assert pol._warmup_logits_output_modes(16) == (
                     LogitsOutputMode.DISTRIBUTED_GREEDY,
                     LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX,
                     LogitsOutputMode.DISTRIBUTED_TOP_K,
                     LogitsOutputMode.FULL_VOCAB,
                 )
-
 
 
 def test_shared_decode_page_size_512_metadata_and_gate():
@@ -780,7 +992,10 @@ def test_shared_decode_page_size_512_metadata_and_gate():
     # Short context (<= 16384 tokens -> width=32 at page_size=512) stays private.
     short_pages = np.broadcast_to(np.arange(32, dtype=np.int32), (16, 32)).copy()
     short_lengths = np.full((16,), 30 * 512 + 1, dtype=np.int32)
-    assert shared_decode_distribution(short_pages, short_lengths, 16, 512, group_size=16) is None
+    assert (
+        shared_decode_distribution(short_pages, short_lengths, 16, 512, group_size=16)
+        is None
+    )
 
     # 64k+ shared prefix (width=160, page_size=512) aligns to block_pages = 2048 // 512 = 4.
     pages = np.broadcast_to(np.arange(160, dtype=np.int32), (16, 160)).copy()
@@ -801,7 +1016,10 @@ def test_shared_decode_page_size_512_metadata_and_gate():
     )
 
     with (
-        patch("sglang_tpu.attention_pallas_rpa_base.get_parallel", return_value=SimpleNamespace(attn_dp_size=1)),
+        patch(
+            "sglang_tpu.attention_pallas_rpa_base.get_parallel",
+            return_value=SimpleNamespace(attn_dp_size=1),
+        ),
         _temp_env(
             SGLANG_TPU_RPA_V3_DECODE_FAST="w8,c4096,shared64,shsplit,batchfull",
             SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED="1",
@@ -810,7 +1028,6 @@ def test_shared_decode_page_size_512_metadata_and_gate():
         assert backend.supports_shared_decode_batch(16) is True
         backend.max_context_len = 16384
         assert backend.supports_shared_decode_batch(16) is False
-
 
 
 def test_tpu_fused_kv_pool_has_kv_cache_layout_attr():
@@ -832,3 +1049,49 @@ def test_tpu_fused_kv_pool_has_kv_cache_layout_attr():
     ):
         assert hasattr(cls, "kv_cache_layout")
         assert cls.kv_cache_layout is None
+
+
+def test_decode_req_to_token_pool_supports_tpu_page_table_versioning():
+    """DecodeReqToTokenPool must match ReqToTokenPool.write(bump_page_table, is_decode_step) and version bumps."""
+    from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+    pool = DecodeReqToTokenPool(
+        size=4,
+        max_context_len=8,
+        device="tpu",
+        enable_memory_saver=False,
+        pre_alloc_size=2,
+    )
+    assert pool.req_to_token.device.type == "cpu"
+    assert pool.req_to_token._tpu_page_table_version == 0
+
+    req = SimpleNamespace(
+        kv=SimpleNamespace(holds_kv=False, kv_allocated_len=0, req_pool_idx=None)
+    )
+    assigned = pool.alloc([req])
+    assert assigned == [1]
+    assert pool.req_to_token._tpu_page_table_version == 1
+
+    rows = torch.tensor([1], dtype=torch.int32)
+    cols = torch.tensor([0], dtype=torch.int32)
+    vals = torch.tensor([42], dtype=torch.int32)
+    pool.write((rows, cols), vals, bump_page_table=False, is_decode_step=True)
+    assert int(pool.req_to_token[1, 0].item()) == 42
+    assert pool.req_to_token._tpu_page_table_version == 1
+    assert getattr(pool.req_to_token, "_tpu_last_decode_patch", None) is None
+
+    cols2 = torch.tensor([1], dtype=torch.int32)
+    vals2 = torch.tensor([43], dtype=torch.int32)
+    pool.write((rows, cols2), vals2, bump_page_table=True, is_decode_step=True)
+    assert int(pool.req_to_token[1, 1].item()) == 43
+    assert pool.req_to_token._tpu_page_table_version == 2
+    patch = pool.req_to_token._tpu_last_decode_patch
+    assert patch is not None and patch[0] == 2 and int(patch[3].item()) == 43
+
+    req.kv.holds_kv = True
+    pool.free(req)
+    assert pool.req_to_token._tpu_page_table_version == 3
+    assert pool.req_to_token._tpu_last_decode_patch is None
+
+    pool.clear()
+    assert pool.req_to_token._tpu_page_table_version == 4

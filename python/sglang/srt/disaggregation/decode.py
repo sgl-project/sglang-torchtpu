@@ -271,6 +271,7 @@ class DecodeReqToTokenPool:
                 dtype=torch.int32,
                 device=r2t_device,
             )
+            self.req_to_token._tpu_page_table_version = 0
 
         self.free_slots = list(range(1, self._alloc_size))
         # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
@@ -279,7 +280,19 @@ class DecodeReqToTokenPool:
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
-    def write(self, indices, values):
+    def _bump_page_table_version(self) -> None:
+        r2t = self.req_to_token
+        r2t._tpu_page_table_version = getattr(r2t, "_tpu_page_table_version", 0) + 1
+        r2t._tpu_last_decode_patch = None
+
+    def write(
+        self,
+        indices,
+        values,
+        *,
+        bump_page_table: bool = True,
+        is_decode_step: bool = False,
+    ):
         # Host-resident pool: move device index/value tensors to host scatter.
         # FIXME: please refactor this inherit from ReqToTokenPool
         if self.req_to_token.device.type == "cpu":
@@ -290,6 +303,24 @@ class DecodeReqToTokenPool:
             if torch.is_tensor(values):
                 values = values.cpu()
         self.req_to_token[indices] = values
+        if bump_page_table:
+            self._bump_page_table_version()
+            if (
+                is_decode_step
+                and self.req_to_token.device.type == "cpu"
+                and isinstance(indices, tuple)
+                and len(indices) == 2
+                and torch.is_tensor(indices[0])
+                and torch.is_tensor(indices[1])
+                and torch.is_tensor(values)
+                and values.device.type == "cpu"
+            ):
+                self.req_to_token._tpu_last_decode_patch = (
+                    self.req_to_token._tpu_page_table_version,
+                    indices[0],
+                    indices[1],
+                    values,
+                )
 
     def available_size(self):
         return len(self.free_slots)
@@ -321,6 +352,8 @@ class DecodeReqToTokenPool:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if select_index:
+            self._bump_page_table_version()
         if self._on_alloc_rows is not None and select_index:
             self._on_alloc_rows(select_index)
         offset = 0
@@ -335,10 +368,12 @@ class DecodeReqToTokenPool:
         assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
+        self._bump_page_table_version()
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         # req_generation must stay monotonic; see ReqToTokenPool.clear().
+        self._bump_page_table_version()
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
@@ -431,6 +466,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self._bump_page_table_version()
         self.state.slots.clear()
 
 
