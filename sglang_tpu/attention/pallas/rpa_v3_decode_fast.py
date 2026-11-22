@@ -57,6 +57,8 @@ class DecodeFastConfig:
     shared_split_dense2: bool = False
     shared_fp8_qkpv: bool = False
     shared_fp8_pv_only: bool = False
+    reg_sanitize: bool = False
+    batch_full: bool = False
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -278,6 +280,8 @@ def parse_decode_fast_config(
     shared_split_dense2 = "shsplit" in toks_cfg
     shared_fp8_qkpv = "shfp8" in toks_cfg
     shared_fp8_pv_only = "shfp8pv" in toks_cfg
+    reg_sanitize = "regsan" in toks_cfg
+    batch_full = "batchfull" in toks_cfg
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -314,7 +318,9 @@ def parse_decode_fast_config(
         win_pages = pages_per_seq
         num_slots = 4 if pages_per_seq <= 84 else 3
         chunk_sz = default_v2_chunk if use_v2 else 256
-        if shared_group > 0 and decode_query_size == 1:
+        if batch_full and shared_group == 0 and decode_query_size == 1 and pages_per_seq <= 32:
+            loop_kind = "swabatch"
+        elif shared_group > 0 and decode_query_size == 1:
             loop_kind = f"shared{shared_group}"
             chunk_sz = 2048
             num_slots = 3 if (shared_group >= 32 or kv_pack_dense2) else 2
@@ -359,6 +365,8 @@ def parse_decode_fast_config(
                 "shsplit",
                 "shfp8",
                 "shfp8pv",
+                "regsan",
+                "batchfull",
                 "ring8k",
             ):
                 continue
@@ -463,7 +471,9 @@ def parse_decode_fast_config(
         else:
             max_ring_pages = align_to(win_pages, 16)
     else:
-        if eff_shared_group > 0:
+        if batch_full and loop_kind == "swabatch":
+            max_ring_pages = win_pages
+        elif eff_shared_group > 0:
             max_ring_pages = max(1, chunk_sz // page_size)
         elif loop_kind == "ring4k":
             max_ring_pages = max(1, chunk_sz // page_size)
@@ -499,6 +509,8 @@ def parse_decode_fast_config(
         shared_split_dense2=shared_split_dense2,
         shared_fp8_qkpv=shared_fp8_qkpv,
         shared_fp8_pv_only=shared_fp8_pv_only,
+        reg_sanitize=reg_sanitize,
+        batch_full=batch_full,
     )
 
 
@@ -529,6 +541,7 @@ def _load_bkv_fp8_split(
     kind: str,
     page_size: int = 128,
     interpret_mode: bool = False,
+    valid_range: tuple | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return ``(even_fp8, odd_fp8)`` ``[chunk_sz//2, 128]`` rows from a dense2 buffer."""
     phys_rows = page_size // 2
@@ -538,19 +551,33 @@ def _load_bkv_fp8_split(
         n_pg = chunk_sz // page_size
         blk = bkv_vmem_ref[slot, pl.ds(pg_start, n_pg)].reshape(half_sz, 4, 128)
         e_idx, o_idx = (0, 2) if kind == "k" else (1, 3)
-        return blk[:, e_idx, :], blk[:, o_idx, :]
-    max_phys_rows = bkv_vmem_ref.shape[1] * phys_rows
-    u32_ref = bkv_vmem_ref.bitcast(jnp.uint32).at[slot].reshape(max_phys_rows, 128)
-    pair_u32 = u32_ref[pl.ds(pl.multiple_of(row_start // 2, phys_rows), half_sz)]
-    if kind == "k":
-        even_u8 = pair_u32.astype(jnp.uint8)
-        odd_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(16)).astype(jnp.uint8)
+        even_f8, odd_f8 = blk[:, e_idx, :], blk[:, o_idx, :]
+        if valid_range is None:
+            return even_f8, odd_f8
+        even_u8 = lax.bitcast_convert_type(even_f8, jnp.uint8)
+        odd_u8 = lax.bitcast_convert_type(odd_f8, jnp.uint8)
     else:
-        even_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(8)).astype(jnp.uint8)
-        odd_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(24)).astype(jnp.uint8)
+        max_phys_rows = bkv_vmem_ref.shape[1] * phys_rows
+        u32_ref = bkv_vmem_ref.bitcast(jnp.uint32).at[slot].reshape(max_phys_rows, 128)
+        pair_u32 = u32_ref[pl.ds(pl.multiple_of(row_start // 2, phys_rows), half_sz)]
+        if kind == "k":
+            even_u8 = pair_u32.astype(jnp.uint8)
+            odd_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(16)).astype(jnp.uint8)
+        else:
+            even_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(8)).astype(jnp.uint8)
+            odd_u8 = lax.shift_right_logical(pair_u32, jnp.uint32(24)).astype(jnp.uint8)
+    if valid_range is not None:
+        rel_first_v, rel_end_v = valid_range
+        e_pos = row_start + 2 * lax.broadcasted_iota(jnp.int32, (half_sz, 128), 0)
+        even_u8 = jnp.where(
+            (e_pos >= rel_first_v) & (e_pos < rel_end_v), even_u8, jnp.uint8(0)
+        )
+        odd_u8 = jnp.where(
+            (e_pos + 1 >= rel_first_v) & (e_pos + 1 < rel_end_v), odd_u8, jnp.uint8(0)
+        )
     return (
-        _u8_to_fp8(even_u8, interpret_mode=False),
-        _u8_to_fp8(odd_u8, interpret_mode=False),
+        _u8_to_fp8(even_u8, interpret_mode=interpret_mode),
+        _u8_to_fp8(odd_u8, interpret_mode=interpret_mode),
     )
 
 
@@ -565,6 +592,7 @@ def _load_bkv_fp8_chunk(
     kv_pack_dense2: bool = False,
     interpret_mode: bool = False,
     valid_tokens: jax.Array | int | None = None,
+    valid_range: tuple | None = None,
 ) -> jax.Array:
     """Load K or V FP8 rows from ``bkv_vmem_ref`` with 8-bit dense2 unpacking.
 
@@ -605,11 +633,15 @@ def _load_bkv_fp8_chunk(
         n_pg = chunk_sz // page_size
         blk = bkv_vmem_ref[slot, pl.ds(pg_start, n_pg)].reshape(chunk_sz, 4, 128)
         col = 0 if kind == "k" else 1
-        if valid_tokens is None:
+        if valid_tokens is None and valid_range is None:
             return blk[:, col, :]
         raw_u8 = lax.bitcast_convert_type(blk[:, col, :], jnp.uint8)
-        pos_row = _bkv_col_iota(row_start, chunk_sz, 1, kv_pack_dense2=False).T
-        raw_u8 = jnp.where(pos_row < valid_tokens, raw_u8, jnp.uint8(0))
+        pos_row = row_start + lax.broadcasted_iota(jnp.int32, (chunk_sz, 128), 0)
+        if valid_tokens is not None:
+            raw_u8 = jnp.where(pos_row < valid_tokens, raw_u8, jnp.uint8(0))
+        if valid_range is not None:
+            rf_v, re_v = valid_range
+            raw_u8 = jnp.where((pos_row >= rf_v) & (pos_row < re_v), raw_u8, jnp.uint8(0))
         return _u8_to_fp8(raw_u8, interpret_mode=True)
     max_rows = bkv_vmem_ref.shape[1] * page_size
     u32_ref = bkv_vmem_ref.bitcast(jnp.uint32).at[slot].reshape(max_rows, 128)
@@ -619,9 +651,13 @@ def _load_bkv_fp8_chunk(
         if kind == "k"
         else lax.shift_right_logical(u32, jnp.uint32(8)).astype(jnp.uint8)
     )
-    if valid_tokens is not None:
-        pos_row = _bkv_col_iota(row_start, chunk_sz, 1, kv_pack_dense2=False).T
-        raw_u8 = jnp.where(pos_row < valid_tokens, raw_u8, jnp.uint8(0))
+    if valid_tokens is not None or valid_range is not None:
+        pos_row = row_start + lax.broadcasted_iota(jnp.int32, (chunk_sz, 128), 0)
+        if valid_tokens is not None:
+            raw_u8 = jnp.where(pos_row < valid_tokens, raw_u8, jnp.uint8(0))
+        if valid_range is not None:
+            rf_v, re_v = valid_range
+            raw_u8 = jnp.where((pos_row >= rf_v) & (pos_row < re_v), raw_u8, jnp.uint8(0))
     return _u8_to_fp8(raw_u8, interpret_mode=interpret_mode)
 
 
@@ -1248,6 +1284,7 @@ def _decode_fast_kernel(
         *,
         kind: str,
         valid_tokens: jax.Array | int | None = None,
+        valid_range: tuple | None = None,
     ) -> jax.Array:
         return _load_bkv_fp8_chunk(
             bkv_vmem_ref,
@@ -1259,11 +1296,17 @@ def _decode_fast_kernel(
             kv_pack_dense2=kv_pack_dense2,
             interpret_mode=interpret_mode,
             valid_tokens=valid_tokens,
+            valid_range=valid_range,
         )
 
     def _bkv_fp8_split(
-        slot, row_start: int, chunk_sz: int, *, kind: str
-    ) -> tuple[jax.Array, jax.Array]:
+        slot,
+        row_start: int,
+        chunk_sz: int,
+        *,
+        kind: str,
+        valid_range: tuple | None = None,
+    ):
         return _load_bkv_fp8_split(
             bkv_vmem_ref,
             slot,
@@ -1272,6 +1315,7 @@ def _decode_fast_kernel(
             kind=kind,
             page_size=page_size,
             interpret_mode=interpret_mode,
+            valid_range=valid_range,
         )
 
     def _col_iota(row_start, width: int, rows: int) -> jax.Array:
@@ -1344,7 +1388,10 @@ def _decode_fast_kernel(
             return acc0.astype(jnp.bfloat16)
 
         w_tot = n_slot_pages * page_size
-        sanitize_slot_boundaries(slot, rel_first, rel_end, n_slot_pages)
+        use_reg_san = cfg.reg_sanitize and cfg.loop_kind == "swabatch"
+        valid_rng = (rel_first, rel_end) if use_reg_san else None
+        if not use_reg_san:
+            sanitize_slot_boundaries(slot, rel_first, rel_end, n_slot_pages)
         if cfg.fp8_dots:
             q_f32_d = q_bf16.astype(jnp.float32)
             q_mx = jnp.maximum(jnp.max(jnp.abs(q_f32_d)), jnp.float32(1e-6))
@@ -1363,7 +1410,7 @@ def _decode_fast_kernel(
             # (also covers page_size=256 SWA w_tot=2304 where half_w=1152=9*128).
             half_w = w_tot // 2
             n_half_blocks = half_w // 128
-            k_e, k_o = _bkv_fp8_split(slot, 0, w_tot, kind="k")
+            k_e, k_o = _bkv_fp8_split(slot, 0, w_tot, kind="k", valid_range=valid_rng)
             s_e = jnp.matmul(q_dot, k_e.T, preferred_element_type=jnp.float32)
             s_o = jnp.matmul(q_dot, k_o.T, preferred_element_type=jnp.float32)
             h_io = lax.broadcasted_iota(jnp.int32, (16, half_w), 1)
@@ -1397,7 +1444,7 @@ def _decode_fast_kernel(
             else:
                 l_sum = _broadcast_minor_128(jnp.sum(p_eo_sum, axis=1, keepdims=True)) + p_new
 
-            v_e, v_o = _bkv_fp8_split(slot, 0, w_tot, kind="v")
+            v_e, v_o = _bkv_fp8_split(slot, 0, w_tot, kind="v", valid_range=valid_rng)
             pe_dot = p_e.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_e
             po_dot = p_o.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_o
             pv = jnp.matmul(pe_dot, v_e, preferred_element_type=jnp.float32) + jnp.matmul(
@@ -1410,9 +1457,15 @@ def _decode_fast_kernel(
                 return (acc / l_sum).astype(jnp.bfloat16)
             return (acc * pltpu.reciprocal(l_sum, approx=True)).astype(jnp.bfloat16)
 
-        k_all = _bkv_fp8_chunk(slot, 0, w_tot, kind="k")
-        if cfg.loop_kind not in ("stream2ld", "stream0b", "swafast", "swafast2"):
-            v_early = _bkv_fp8_chunk(slot, 0, w_tot, kind="v")
+        k_all = _bkv_fp8_chunk(slot, 0, w_tot, kind="k", valid_range=valid_rng)
+        if cfg.loop_kind not in (
+            "stream2ld",
+            "stream0b",
+            "swafast",
+            "swafast2",
+            "swabatch",
+        ):
+            v_early = _bkv_fp8_chunk(slot, 0, w_tot, kind="v", valid_range=valid_rng)
         else:
             v_early = None
         s_all = jnp.matmul(q_dot, k_all.T, preferred_element_type=jnp.float32)
@@ -1440,7 +1493,7 @@ def _decode_fast_kernel(
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
             l_sum = _broadcast_minor_128(jnp.sum(p_all, axis=1, keepdims=True)) + p_new
         if v_early is None:
-            v_all = _bkv_fp8_chunk(slot, 0, w_tot, kind="v")
+            v_all = _bkv_fp8_chunk(slot, 0, w_tot, kind="v", valid_range=valid_rng)
         else:
             v_all = v_early
         p_dot = p_all.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_all
@@ -2645,7 +2698,7 @@ def _decode_fast_kernel(
         )
 
         def _run_swa_fixed_pages(w_pg: int):
-            if probe != "nocompute" and not cfg.lazy_slot_zero:
+            if probe != "nocompute" and not cfg.lazy_slot_zero and not cfg.reg_sanitize:
                 @pl.when(min_pg_b < w_pg)
                 def _zero_active_prefix():
                     z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
@@ -3018,6 +3071,10 @@ def run_decode_fast_rpa(
             scope_name += "-shfp8"
         elif run_cfg.shared_fp8_pv_only:
             scope_name += "-shfp8pv"
+        if run_cfg.reg_sanitize:
+            scope_name += "-regsan"
+        if run_cfg.batch_full:
+            scope_name += "-batchfull"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
@@ -3234,7 +3291,7 @@ def run_decode_fast_rpa(
     ):
         short_loop = (
             "swabatch"
-            if (sliding_window is not None and _is_w8_enabled(mode_str))
+            if ((sliding_window is not None or cfg.batch_full) and _is_w8_enabled(mode_str))
             else (
                 "w7auto"
                 if (sliding_window is None and cfg.fine_gears)
@@ -3254,6 +3311,8 @@ def run_decode_fast_rpa(
             fp8_dots=cfg.fp8_dots,
             hoist_new_kv=cfg.hoist_new_kv,
             fine_gears=cfg.fine_gears,
+            reg_sanitize=cfg.reg_sanitize,
+            batch_full=cfg.batch_full,
         )
         active_mask = jnp.arange(max_num_seqs) < jnp.clip(
             distribution[0], 0, max_num_seqs

@@ -476,6 +476,71 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 if n_act < bs:
                     self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
 
+        # Short-context nod2 regsan + batchfull (0x7F NaN-poisoned, SWA & Full)
+        for tag, use_d2, sw, pps, mode in (
+            ("nod2_swa_regsan", False, 2048, 8, "w8,c1024,regsan"),
+            ("nod2_full_batchfull_regsan", False, None, 8, "w8,c1024,regsan,batchfull"),
+            ("d2_swa_regsan", True, 2048, 8, "w8,c1024,regsan"),
+        ):
+            with self.subTest(case=tag):
+                bs, n_act, page_size = 16, 13, 128
+                n_phys_pages = 256
+                stock_cache_u8 = np.full(
+                    (n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8
+                )
+                stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(
+                    rng, (n_phys_pages, page_size, 2, 128)
+                )
+                cache_u8 = (
+                    _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+                    if use_d2
+                    else stock_cache_u8
+                )
+                page_indices = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
+                kv_lens = np.zeros((bs,), dtype=np.int32)
+                for s in range(n_act):
+                    kv_lens[s] = 180 + (s * 29) % 300
+                q_bf16 = jnp.asarray(
+                    rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16
+                )
+                k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                out_j, _ = run_decode_fast_rpa(
+                    q_bf16,
+                    _u8_to_fp8(k_new_u8)[:, None, :],
+                    _u8_to_fp8(v_new_u8)[:, None, :],
+                    _u8_to_fp8(cache_u8),
+                    jnp.asarray(kv_lens, dtype=jnp.int32),
+                    jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32),
+                    jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size),
+                    jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32),
+                    sm_scale=sm_scale,
+                    sliding_window=sw,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    mode_str=mode,
+                    decode_query_size=1,
+                    fused_out_pack=1,
+                    kv_pack_dense2=use_d2,
+                    interpret=True,
+                )
+                ref = _exact_decode_ref(
+                    np.asarray(q_bf16),
+                    k_new_u8,
+                    v_new_u8,
+                    stock_cache_u8,
+                    kv_lens,
+                    page_indices.ravel(),
+                    n_act,
+                    page_size,
+                    sm_scale,
+                    pps,
+                )
+                out_np = np.asarray(out_j, dtype=np.float32)
+                self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+                self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
         # Page size 256 SWA (w_tot=9*256=2304) zero-concat dense2 path
         with self.subTest(case="swa_ps256_d2"):
             bs, n_act, page_size, sw = 16, 14, 256, 2048
@@ -621,6 +686,58 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
                         jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
                         jax.ShapeDtypeStruct((dist_len,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("RPAd_fast", hlo)
+                    self.assertIn(exp_sub, hlo)
+
+            # Short-context nod2 regsan + batchfull Mosaic exports (1/1k & 8k/1k)
+            for tag, pps, sw, use_d2, mode, exp_sub in (
+                ("nod2_11k_swa_regsan", 8, 2048, False, "w8,c1024,regsan", "regsan"),
+                ("nod2_11k_full_batchfull_regsan", 8, None, False, "w8,c1024,regsan,batchfull", "batchfull"),
+                ("nod2_8k1k_swa_regsan", 70, 2048, False, "w8,c1024,regsan", "regsan"),
+            ):
+                with self.subTest(export=tag):
+                    bs = 64
+                    phys_pg = 64 if use_d2 else 128
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q, kv, g, c, kl, pi, cq, ckv, d, _sw=sw, _m=mode, _d2=use_d2: ragged_paged_attention(
+                                q,
+                                kv,
+                                g,
+                                c,
+                                kl,
+                                pi,
+                                cq,
+                                ckv,
+                                d,
+                                None,
+                                None,
+                                sm_scale=0.125,
+                                sliding_window=_sw,
+                                k_scale=1.0,
+                                v_scale=1.0,
+                                decode_query_size=1,
+                                _fused_out_pack=2,
+                                _prepared_inputs=True,
+                                _skip_mixed=True,
+                                _decode_fast=_m,
+                                _decode_out_norm_eps=1e-5,
+                                _decode_gate_in_values=True,
+                                _kv_pack_dense2=_d2,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, bs, 8, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs, 1024), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((4096, phys_pg, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs * pps,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
                     ).mlir_module()
                     self.assertIn("RPAd_fast", hlo)
                     self.assertIn(exp_sub, hlo)
