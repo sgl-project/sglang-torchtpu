@@ -1387,6 +1387,32 @@ class _OneshotLogitsGatherer(nn.Module):
         )
 
 
+def _gather_token_sharded_chunks(
+    chunks: list[torch.Tensor],
+    chunk_rows: list[tuple[int, int]],
+    tp_size: int,
+) -> torch.Tensor:
+    """All-gather per-chunk token-sharded MoE outputs back into token order.
+
+    Chunk ``i`` contributes ``chunk_rows[i][0]`` rows per rank (rank ``r`` owns
+    chunk rows ``[r * rpr, (r + 1) * rpr)``) and ``chunk_rows[i][1]`` real rows.
+    One all-gather covers every chunk.
+    """
+    local = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    if tp_size == 1:
+        gathered = local
+    else:
+        gathered = tensor_model_parallel_all_gather(local.contiguous(), dim=0)
+    hidden = gathered.shape[-1]
+    per_rank = gathered.view(tp_size, local.shape[0], hidden)
+    parts = []
+    off = 0
+    for rpr, rem in chunk_rows:
+        parts.append(per_rank[:, off : off + rpr].reshape(tp_size * rpr, hidden)[:rem])
+        off += rpr
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+
+
 class MuseSparkMoE(nn.Module):
     def __init__(
         self,
@@ -2111,6 +2137,19 @@ class MuseSparkMoE(nn.Module):
                 self._fused_decode_op = v2_only_op
                 self._fused_decode_v2_op = v2_only_op
                 self._fused_decode_v2_batches = ext_batches
+                if self.__dict__.get("_tpu_v2_extend_fallback", False):
+                    # EXTEND through the token-sharded op (the decode-proven path);
+                    # the replicated B=256 op hit e0200 semaphore halts on hardware.
+                    self._fused_decode_v2_ext_sh_op = get_muse_fuse_all_decode_op(
+                        mode="sparse_v2",
+                        ep=ep_owners,
+                        tp=1,
+                        block=block,
+                        num_replicas=num_replicas,
+                        replica_cost_mode=replica_cost_mode,
+                        return_sharded=True,
+                        has_w3_mask=has_w3_mask,
+                    )
             else:
                 self._fused_decode_op = get_muse_fuse_all_decode_op(
                     mode=mode,
@@ -2946,9 +2985,11 @@ class MuseSparkMoE(nn.Module):
                 if self.__dict__.get("_fused_decode_v2_has_w3", False)
                 else ()
             )
+            ext_sh_op = self.__dict__.get("_fused_decode_v2_ext_sh_op")
             n_tok = expert_input.shape[0]
             step_b = 256
             chunks = []
+            chunk_rows = []
             for s in range(0, n_tok, step_b):
                 lg_c = scaled_ext_logits[s : s + step_b]
                 x_c = expert_input[s : s + step_b]
@@ -2979,7 +3020,7 @@ class MuseSparkMoE(nn.Module):
                         ],
                         dim=0,
                     )
-                out_c = v2_ext_op(
+                out_c = (ext_sh_op or v2_ext_op)(
                     self._fused_decode_rank,
                     lg_c,
                     bias_2d_ext,
@@ -2992,8 +3033,15 @@ class MuseSparkMoE(nn.Module):
                     *rep_tail,
                     *w3_tail,
                 )
-                chunks.append(out_c[:rem])
-            output = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+                if ext_sh_op is None:
+                    chunks.append(out_c[:rem])
+                else:
+                    chunks.append(out_c)
+                    chunk_rows.append((b_pad // self.tp_size, rem))
+            if ext_sh_op is None:
+                output = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+            else:
+                output = _gather_token_sharded_chunks(chunks, chunk_rows, self.tp_size)
         else:
             ep_tp2_fallback = self.__dict__.get("_ep_tp2_fallback_op")
             if self.experts.__dict__.get("_tpu_ep_tp2_packed_fp4", False):
