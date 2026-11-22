@@ -167,6 +167,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # StaticKVStorage reads `.kv_cache_layout` on MHATokenToKVPool subclasses
+    # (SWA view); TpuFusedMHATokenToKVPool bypasses MHATokenToKVPool.__init__.
+    kv_cache_layout: Optional[str] = None
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
     # Whether this layout can pack two consecutive FP8 tokens into one lane row (kv_pack_dense2).

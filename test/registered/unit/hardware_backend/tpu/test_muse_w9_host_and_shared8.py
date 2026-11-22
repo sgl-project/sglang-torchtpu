@@ -810,3 +810,25 @@ def test_shared_decode_page_size_512_metadata_and_gate():
         assert backend.supports_shared_decode_batch(16) is True
         backend.max_context_len = 16384
         assert backend.supports_shared_decode_batch(16) is False
+
+
+
+def test_tpu_fused_kv_pool_has_kv_cache_layout_attr():
+    """TpuFusedMHATokenToKVPool subclasses MHATokenToKVPool and must expose kv_cache_layout."""
+    from sglang_tpu.kv_pool import (
+        TpuBlockMajorMHATokenToKVPool,
+        TpuDraftFusedMHATokenToKVPool,
+        TpuFlywheelKVPool,
+        TpuFusedMHATokenToKVPool,
+        TpuSeqAlongLaneKVPool,
+    )
+
+    for cls in (
+        TpuFusedMHATokenToKVPool,
+        TpuFlywheelKVPool,
+        TpuSeqAlongLaneKVPool,
+        TpuBlockMajorMHATokenToKVPool,
+        TpuDraftFusedMHATokenToKVPool,
+    ):
+        assert hasattr(cls, "kv_cache_layout")
+        assert cls.kv_cache_layout is None
