@@ -54,6 +54,18 @@ Unreachable today: MLA with hybrid SWA or an FP4 KV cache takes the plain OOT
 MLA builder in mode B and the generic builders in mode A; no TPU model uses
 either.
 
+## DeepSeek-V4.1 output projection experiment
+
+`SGLANG_TPU_ENABLE_DSV41_FUSED_OUTPUT_PROJECTION=1` enables the fused
+`wo_a` and `wo_b` kernel in modes A and B on v7 with attention TP1 and
+channelwise FP8 `wo_b`. It handles token counts 1–320 and at least 416.
+Other inputs use the existing projections.
+
+The opt-in packs a second, FP8 copy of `wo_a` and keeps the BF16 weight for
+fallback. A 40-layer model uses about 1.25 GiB of additional device memory per
+rank for these copies. Online weight updates require disabling the opt-in and
+restarting.
+
 ## Layout
 
 ```

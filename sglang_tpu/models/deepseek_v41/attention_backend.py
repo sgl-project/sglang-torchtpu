@@ -758,6 +758,15 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # CSA2 applies the inverse RoPE to its output.
         return o
 
+    def project_mqa_output(self, layer, output, positions, forward_batch):
+        if not hasattr(layer.wo_a, "_dsv41_output_projection_weight"):
+            return None
+        from sglang_tpu.models.deepseek_v41.ops.output_projection import (
+            project_output,
+        )
+
+        return project_output(layer, output)
+
     def forward_low_ratio_sources(
         self,
         *,
