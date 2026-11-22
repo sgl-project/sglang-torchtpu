@@ -66,6 +66,28 @@ def precompile_spec_v2_ops(
                     registered_op.op(*args)
                 else:
                     warmup_compiled_op(registered_op.op, *args)
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get():
+            from sglang_tpu.experimental.speculative.spec_ops import (
+                _accept_step_warmup_args,
+                accept_greedy_top_k_step,
+            )
+
+            for context in warmup_contexts:
+                top1_ids = torch.zeros(
+                    (context.physical_bs * context.num_verify_tokens, 1),
+                    dtype=torch.int32,
+                    device=context.device,
+                )
+                top1_args = (
+                    top1_ids,
+                    *_accept_step_warmup_args(context, sampled=False)[1:],
+                )
+                if queue is None:
+                    accept_greedy_top_k_step(*top1_args)
+                else:
+                    warmup_compiled_op(accept_greedy_top_k_step, *top1_args)
 
     def finish():
         if device.type == "tpu":

@@ -118,10 +118,17 @@ def _build_fused_moe_rs_op():
         return _FUSED_MOE_RS_OP
 
     import jax
+    import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import jax_op
 
+    from sglang_tpu.envs import envs
     from sglang_tpu.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_moe import (
+        fused_moe_func_rs as fused_moe_func_rs_muse,
+    )
+
+    muse_kernels = envs.SGLANG_TPU_MUSE_KERNEL_ENABLED.get()
 
     mesh = _get_mesh()
 
@@ -152,7 +159,13 @@ def _build_fused_moe_rs_op():
         # Run the experts and fuse their model-axis reduce-scatter in one kernel.
         # MoE layers are data-dependent and cannot overlap. Reuse the default
         # collective ID so the exported kernel can be compiled once per shape.
-        result = fused_moe_func_rs(
+        # The Muse GMM assumes NVFP4 block-16 scales (fp4_w4a16 marks block-256
+        # requantized experts instead); FP8 channelwise experts keep the default kernel.
+        nvfp4 = w1.dtype == jnp.float4_e2m1fn and not fp4_w4a16
+        moe_func = (
+            fused_moe_func_rs_muse if muse_kernels and nvfp4 else fused_moe_func_rs
+        )
+        result = moe_func(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,

@@ -219,10 +219,17 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     seq_lens_cpu: torch.Tensor
     host_len_slack: int
     future_indices: torch.Tensor | None
+    packed_addressing: torch.Tensor | None = None
 
     @classmethod
     def from_batch(
-        cls, batch: ScheduleBatch, num_verify_rows: int, padded_bs: int
+        cls,
+        batch: ScheduleBatch,
+        num_verify_rows: int,
+        padded_bs: int,
+        *,
+        pack_addressing: bool = False,
+        swa_mapping: torch.Tensor | None = None,
     ) -> TpuSpecVerifyInput:
         """Convert the algorithm's batch.spec_info; raise for types without a TPU window."""
         draft_input = batch.spec_info
@@ -261,16 +268,30 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # since an adaptive worker may have just switched to a shorter step.
         # The plan stays on host until the forward fixes its bucket;
         # 0 is the reserved row and slot.
+        packed_addressing = None
+        if pack_addressing and draft_input.needs_verify_cache_locs:
+            assert candidates is not None
+            bs_live, cand_cols = candidates.shape
+            total_cols = cand_cols * (2 if swa_mapping is not None else 1) + 1
+            packed_cpu = torch.zeros((padded_bs, total_cols), dtype=torch.int64)
+            packed_cpu[:bs_live, :cand_cols] = candidates
+            if swa_mapping is not None:
+                packed_cpu[:bs_live, cand_cols : 2 * cand_cols] = swa_mapping[
+                    candidates
+                ]
+            packed_cpu[:bs_live, -1] = committed_lens
+            packed_addressing = packed_cpu.to(batch.device, non_blocking=True)
+
         return cls(
             verify_cache_candidates=(
                 padded_h2d(candidates, padded_bs, batch.device)
-                if draft_input.needs_verify_cache_locs
+                if (draft_input.needs_verify_cache_locs and packed_addressing is None)
                 else None
             ),
             verify_cache_candidates_cpu=candidates,
             committed_lens=(
                 padded_h2d(committed_lens, padded_bs, batch.device)
-                if draft_input.needs_verify_cache_locs
+                if (draft_input.needs_verify_cache_locs and packed_addressing is None)
                 else None
             ),
             # The scheduler already owns device pool rows. Only padding needs
@@ -286,6 +307,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 verify_window_rows if draft_input.tpu_host_seq_lens_is_committed else 0
             ),
             future_indices=draft_input.future_indices,
+            packed_addressing=packed_addressing,
         )
 
     @classmethod

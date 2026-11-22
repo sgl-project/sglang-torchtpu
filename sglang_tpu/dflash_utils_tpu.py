@@ -290,9 +290,26 @@ def argmax_draft_tokens_tpu(
         hs = hs.to(lm_head.weight.dtype)
 
     tp_size = _tp_size()
-    # Through the head's own quant method, so a quantized head serves the draft too.
-    local_logits = lm_head.quant_method.apply(lm_head, hs)
     if _uses_pallas_top_k(lm_head, tp_size):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.get():
+            from sglang_tpu.distributed_topk_pallas import (
+                fused_fp8_lm_head_distributed_top_k,
+            )
+
+            fused = fused_fp8_lm_head_distributed_top_k(
+                hs,
+                lm_head,
+                top_k=1,
+                logit_scale=1.0,
+                group=get_parallel().tp_group,
+            )
+            if fused is not None:
+                _, global_token_ids = fused
+                return global_token_ids.squeeze(-1).to(torch.long).view(bs, block_size - 1)
+        # Through the head's own quant method, so a quantized head serves the draft too.
+        local_logits = lm_head.quant_method.apply(lm_head, hs)
         _, global_token_ids = distributed_tpu_top_k(
             local_logits,
             TpuVocabShard.from_lm_head(lm_head),
@@ -301,6 +318,9 @@ def argmax_draft_tokens_tpu(
         )
         tokens = global_token_ids.squeeze(-1).to(torch.long)
         return tokens.view(bs, block_size - 1)
+
+    # Through the head's own quant method, so a quantized head serves the draft too.
+    local_logits = lm_head.quant_method.apply(lm_head, hs)
 
     shard = getattr(lm_head, "shard_indices", None)
     num_org = int(shard.num_org_elements) if shard is not None else 0

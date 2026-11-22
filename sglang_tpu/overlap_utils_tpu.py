@@ -30,6 +30,11 @@ def device_accept_resolved_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
     """True if resolve_seq_lens_cpu already resolved this batch's spec extras
     on device, so _resolve_spec_extras has nothing left to do."""
     draft_input = batch.spec_info
+    if draft_input is not None and getattr(
+        draft_input, "_tpu_direct_handoff_resolved", False
+    ):
+        draft_input._tpu_direct_handoff_resolved = False
+        return True
     return (
         # Only the EAGLE relay (need_topk) has a selected window field.
         future_map.need_topk
@@ -102,29 +107,82 @@ class DirectHandoff(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     payload: Any
     seq_lens: torch.Tensor
+    confidence: Any = None
+    publish_deferred: bool = False
+    is_block_draft: bool = False
 
 
 class PublishedSeqLens(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     seq_lens: torch.Tensor
+    confidence: Any = None
+    deferred: bool = False
 
 
-def publish_tpu(
-    future_map: FutureMap, indices: torch.Tensor, new_seq_lens: torch.Tensor
-) -> None:
-    # The overlap forward publishes, then stashes the same indices object;
-    # stash_tpu pairs the two so the next step can skip the seq_lens gather.
-    future_map.tpu_published_seq_lens = PublishedSeqLens(
-        indices=indices, seq_lens=new_seq_lens
+def _spec_direct_handoff_enabled() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_SPEC_DIRECT_HANDOFF.get()
+
+
+def can_defer_publish_tpu(
+    future_map: FutureMap,
+    indices: torch.Tensor,
+    confidence: Any = None,
+) -> bool:
+    return (
+        _spec_direct_handoff_enabled()
+        and future_map.spec_algo.is_dflash_family()
+        and indices.shape[0] > 0
+        and not (future_map.needs_confidence_relay and confidence is not None)
     )
 
 
+def publish_tpu(
+    future_map: FutureMap,
+    indices: torch.Tensor,
+    new_seq_lens: torch.Tensor,
+    *,
+    confidence: Any = None,
+    deferred: bool = False,
+) -> None:
+    # The overlap forward publishes, then stashes the same indices object;
+    # stash_tpu pairs the two so the next step can skip the seq_lens gather.
+    if deferred and future_map.publish_ready is not None:
+        future_map._publish_fresh = True
+    future_map.tpu_published_seq_lens = PublishedSeqLens(
+        indices=indices,
+        seq_lens=new_seq_lens,
+        confidence=confidence,
+        deferred=deferred,
+    )
+
+
+def _flush_deferred_publish(future_map: FutureMap, pub: PublishedSeqLens) -> None:
+    if not pub.deferred:
+        return
+    orig_publish = getattr(future_map, "_tpu_orig_publish", None)
+    if orig_publish is not None:
+        orig_publish(pub.indices, pub.seq_lens, pub.confidence)
+
+
 def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
-    pending = future_map.tpu_direct_handoff
+    flush_hp = getattr(future_map, "flush_direct_handoff", None)
+    if flush_hp is not None:
+        flush_hp()
+    pub = getattr(future_map, "tpu_published_seq_lens", None)
+    if pub is not None:
+        future_map.tpu_published_seq_lens = None
+        _flush_deferred_publish(future_map, pub)
+    pending = getattr(future_map, "tpu_direct_handoff", None)
     if pending is None:
         return
     # Clear before calling the normal store path, which also checks for a flush.
     future_map.tpu_direct_handoff = None
+    if pending.publish_deferred:
+        orig_publish = getattr(future_map, "_tpu_orig_publish", None)
+        if orig_publish is not None:
+            orig_publish(pending.indices, pending.seq_lens, pending.confidence)
     future_map.stash(pending.indices, pending.payload)
 
 
@@ -132,45 +190,95 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     """Flush any pending handoff, then defer this store when the next step can
     consume the payload directly. Returns True when the store was deferred.
 
-    Only EAGLE3 top-k-1 payloads stashed right after a publish qualify.
+    EAGLE3 top-k-1 payloads always qualify; DFLASH/DSPARK block-draft payloads
+    qualify when SGLANG_TPU_SPEC_DIRECT_HANDOFF=1.
     """
     # Take the publish before flushing: the flush re-enters stash and must fall
     # through to the normal store.
-    published = future_map.tpu_published_seq_lens
+    published = getattr(future_map, "tpu_published_seq_lens", None)
     future_map.tpu_published_seq_lens = None
     # A different batch may still need rows from the previous pending result.
     flush_direct_handoff_tpu(future_map)
+    if published is None or published.indices is not indices or indices.shape[0] == 0:
+        if published is not None:
+            _flush_deferred_publish(future_map, published)
+        return False
+
+    if (
+        _spec_direct_handoff_enabled()
+        and future_map.spec_algo.is_dflash_family()
+        and payload.bonus_tokens is not None
+        and payload.topk_p is None
+        and payload.topk_index is None
+        and payload.hidden_states is None
+        and payload.draft_probs is None
+        and payload.dsa_topk_indices is None
+    ):
+        future_map.tpu_direct_handoff = DirectHandoff(
+            indices=indices,
+            payload=payload,
+            seq_lens=published.seq_lens,
+            confidence=published.confidence,
+            publish_deferred=published.deferred,
+            is_block_draft=True,
+        )
+        return True
+
     # Only gate what the resolve step itself relies on. Anything about the next
     # batch (device acceptance, filtering, merging) is re-checked there, and a
     # mismatch just flushes the pending payload into the normal store.
     if (
-        # No paired publish (prefill seed, beam tail slice): nothing to hand off.
-        published is None
-        or published.indices is not indices
         # Only the EAGLE3 topk-1 decode path keeps acceptance on device.
-        or not future_map.spec_algo.is_eagle3()
+        not future_map.spec_algo.is_eagle3()
         or payload.topk_index is None
         or payload.topk_index.shape[1] != 1
-        # DP idle stub: an empty payload has nothing to relay.
-        or indices.shape[0] == 0
         # Resolve copies these directly. Multi-layer EAGLE3 does not relay
         # hidden states, and draft probabilities are not carried at all.
         or payload.hidden_states is None
         or payload.draft_probs is not None
     ):
+        _flush_deferred_publish(future_map, published)
         return False
     future_map._maybe_init_forward_bufs(payload)
     future_map.tpu_direct_handoff = DirectHandoff(
-        indices=indices, payload=payload, seq_lens=published.seq_lens
+        indices=indices,
+        payload=payload,
+        seq_lens=published.seq_lens,
+        confidence=published.confidence,
+        publish_deferred=published.deferred,
     )
     return True
 
 
 def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
-    pending = future_map.tpu_direct_handoff
+    pending = getattr(future_map, "tpu_direct_handoff", None)
     if pending is None:
         return False
     draft = batch.spec_info
+    if pending.is_block_draft:
+        from sglang_tpu.experimental.speculative.block_info import (
+            HostPaddedBlockDraftInput,
+        )
+
+        if (
+            not isinstance(draft, HostPaddedBlockDraftInput)
+            or batch.forward_mode.is_idle()
+            or batch.forward_mode.is_extend()
+            or getattr(batch, "is_extend_in_batch", False)
+            or not _keeps_committed_host_lens(draft)
+            or draft.future_indices is not pending.indices
+            or draft.bonus_tokens is not pending.payload.bonus_tokens
+            or draft.future_dsa_topk_indices_available
+        ):
+            flush_direct_handoff_tpu(future_map)
+            return False
+        draft.bonus_tokens = pending.payload.bonus_tokens.to(
+            future_map.output_tokens_buf.dtype
+        )
+        batch.seq_lens = pending.seq_lens.to(future_map.new_seq_lens_buf.dtype)
+        draft._tpu_direct_handoff_resolved = True
+        future_map.tpu_direct_handoff = None
+        return True
     # filter_batch and merge_batch rebind future_indices and the draft tensors.
     # Never compare device values on the host; the payload tensors are the
     # draft's own, so identity also pins this generation.

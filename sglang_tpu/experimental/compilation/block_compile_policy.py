@@ -43,6 +43,14 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.
         if self.is_draft_worker or self._distributed_top_k_width() is None:
             return (LogitsOutputMode.FULL_VOCAB,)
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get():
+            return (
+                LogitsOutputMode.FULL_VOCAB,
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+                LogitsOutputMode.DISTRIBUTED_GREEDY,
+            )
         return (LogitsOutputMode.FULL_VOCAB, LogitsOutputMode.DISTRIBUTED_TOP_K)
 
     def precompile_draft(

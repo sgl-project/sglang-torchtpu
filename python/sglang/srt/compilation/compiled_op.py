@@ -43,6 +43,16 @@ def get_compiled_ops() -> tuple[RegisteredCompiledOp, ...]:
 def _canonical_tensor(value):
     if not isinstance(value, torch.Tensor):
         return value
+    ndim = value.ndim
+    if ndim == 1:
+        if value.storage_offset() == 0 and value.stride(0) == 1:
+            return value
+        return value.clone(memory_format=torch.contiguous_format)
+    if ndim == 2:
+        s1 = value.shape[1]
+        if value.storage_offset() == 0 and value.stride() == (s1 if s1 > 1 else 1, 1):
+            return value
+        return value.clone(memory_format=torch.contiguous_format)
     strides, step = [], 1
     for size in reversed(value.shape):
         strides.append(step)
@@ -52,6 +62,57 @@ def _canonical_tensor(value):
     if value.storage_offset() == 0 and value.stride() == tuple(reversed(strides)):
         return value
     return value.clone(memory_format=torch.contiguous_format)
+
+
+def _canonicalize_fast_value(value):
+    if isinstance(value, torch.Tensor):
+        return _canonical_tensor(value)
+    if isinstance(value, tuple):
+        if hasattr(value, "_fields"):
+            changed = False
+            items = []
+            for item in value:
+                canon = _canonicalize_fast_value(item)
+                if canon is not item:
+                    changed = True
+                items.append(canon)
+            return type(value)(*items) if changed else value
+        changed = False
+        items = []
+        for item in value:
+            canon = _canonicalize_fast_value(item)
+            if canon is not item:
+                changed = True
+            items.append(canon)
+        return tuple(items) if changed else value
+    return value
+
+
+def _canonicalize_positional_args_fast(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    changed = False
+    out = []
+    for arg in args:
+        canon = _canonicalize_fast_value(arg)
+        if canon is not arg:
+            changed = True
+        out.append(canon)
+    return tuple(out) if changed else args
+
+
+_fast_compiled_op_stance: Any = None
+
+
+def _get_fast_compiled_op_stance():
+    global _fast_compiled_op_stance
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_FAST_COMPILED_OP.get():
+        return None
+    if _fast_compiled_op_stance is None:
+        from sglang_tpu.compilation.compiled_forward_shim import _SkipGuardStance
+
+        _fast_compiled_op_stance = _SkipGuardStance()
+    return _fast_compiled_op_stance
 
 
 def _specialization_key(spmd_safe, *args, **kwargs):
@@ -109,6 +170,21 @@ def compiled_op(
         )
         specialization_key = functools.partial(_specialization_key, spmd_safe)
 
+        params = list(signature.parameters.values())
+        can_fast_bind = all(
+            p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for p in params
+        )
+        total_positional = len(params)
+        defaults_suffix = tuple(
+            p.default for p in params if p.default is not inspect.Parameter.empty
+        )
+        min_positional = total_positional - len(defaults_suffix)
+
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
             nonlocal compiled_fn, use_direct
@@ -116,6 +192,24 @@ def compiled_op(
                 return fn(*args, **kwargs)
             if not is_tpu() or not envs.SGLANG_ENABLE_TORCH_COMPILE.get():
                 return None if _warmup_async else fn(*args, **kwargs)
+            if (
+                compiled_fn is not None
+                and not _warmup_async
+                and not kwargs
+                and can_fast_bind
+            ):
+                stance = _get_fast_compiled_op_stance()
+                if (
+                    stance is not None
+                    and min_positional <= len(args) <= total_positional
+                ):
+                    if len(args) < total_positional:
+                        args = args + defaults_suffix[len(args) - min_positional :]
+                    args = _canonicalize_positional_args_fast(args)
+                    if not use_direct and stance.armed():
+                        with stance:
+                            return compiled_fn(*args)
+                    return compiled_fn(*args)
             queue = current_warmup_queue() if _warmup_async else None
             if queue is not None and queue.verify and not spmd_safe:
                 return None

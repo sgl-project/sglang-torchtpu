@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import dtypes
 
-from sglang_tpu.pallas_export import get_torch_tpu_device_kind
+from sglang_tpu.pallas_export import get_torch_tpu_device_kind, get_tpu_generation
 
 _FP8_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 _F32 = jnp.finfo(jnp.float32)
@@ -56,6 +56,9 @@ def get_tpu_version() -> int:
             break
 
     if not version_digits:
+        gen = get_tpu_generation()
+        if gen > 0:
+            return gen
         raise ValueError(f"Could not extract TPU version from: {kind}")
 
     return int(version_digits)

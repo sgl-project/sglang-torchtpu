@@ -446,11 +446,16 @@ class ReqToTokenPool:
                 dtype=torch.int32,
                 device=r2t_device,
             )
+            self.req_to_token._tpu_page_table_version = 0
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
 
-    def write(self, indices, values):
+    def _bump_page_table_version(self) -> None:
+        r2t = self.req_to_token
+        r2t._tpu_page_table_version = getattr(r2t, "_tpu_page_table_version", 0) + 1
+
+    def write(self, indices, values, *, bump_page_table: bool = True):
         # Host-resident pool: move device index/value tensors to host scatter.
         if self.req_to_token.device.type == "cpu":
             if isinstance(indices, tuple):
@@ -460,6 +465,8 @@ class ReqToTokenPool:
             if torch.is_tensor(values):
                 values = values.cpu()
         self.req_to_token[indices] = values
+        if bump_page_table:
+            self._bump_page_table_version()
 
     def available_size(self):
         return len(self.free_slots)
@@ -495,6 +502,7 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
+        self._bump_page_table_version()
         if self._on_alloc_rows is not None:
             self._on_alloc_rows(select_index)
         return select_index
@@ -506,6 +514,7 @@ class ReqToTokenPool:
             for index in indices:
                 self._aux_cache.free(index)
         self.free_slots.extend(indices)
+        self._bump_page_table_version()
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
@@ -517,6 +526,7 @@ class ReqToTokenPool:
         # req_generation must stay monotonic: readers detect row reuse by
         # equality with a generation they stored, so zeroing it here can give a
         # row's next request the same generation as its previous one.
+        self._bump_page_table_version()
         if self._aux_cache is not None:
             self._aux_cache.clear()
 

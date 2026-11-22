@@ -1000,9 +1000,15 @@ class CompiledForwardShim:
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         from sglang_tpu.envs import envs as tpu_envs
 
+        self._verify_skip_guard_eval = tpu_envs.SGLANG_TPU_VERIFY_SKIP_GUARD_EVAL.get()
+        self._extend_skip_guard_eval = tpu_envs.SGLANG_TPU_EXTEND_SKIP_GUARD_EVAL.get()
         self._skip_guard_stance = (
             _SkipGuardStance()
-            if tpu_envs.SGLANG_TPU_DECODE_SKIP_GUARD_EVAL.get()
+            if (
+                tpu_envs.SGLANG_TPU_DECODE_SKIP_GUARD_EVAL.get()
+                or self._verify_skip_guard_eval
+                or self._extend_skip_guard_eval
+            )
             else None
         )
         functools.update_wrapper(self, compiled_fn)
@@ -1289,9 +1295,21 @@ class CompiledForwardShim:
                         args=args, input_ids=input_ids, forward_batch=forward_batch
                     )
             skip_guards = self._skip_guard_stance
+            mode = forward_batch.forward_mode
             if (
                 skip_guards is not None
-                and forward_batch.forward_mode.is_decode()
+                and (
+                    mode.is_decode()
+                    or (
+                        self._verify_skip_guard_eval
+                        and (mode.is_target_verify() or mode.is_draft_extend_v2())
+                    )
+                    or (
+                        self._extend_skip_guard_eval
+                        and mode.is_extend()
+                        and getattr(self.policy, "t_bucketer", None) is not None
+                    )
+                )
                 and skip_guards.armed()
             ):
                 with skip_guards:

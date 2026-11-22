@@ -243,6 +243,10 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         self._attn_tp_size = parallel.attn_tp_size
         self._verify_top_k_width = self.verify_top_k_width()
+        self._verify_greedy_topk1 = (
+            self._verify_top_k_width is not None
+            and tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
+        )
         # An idle DP rank mirrors its peers' draft syncs without knowing whether they
         # sample; greedy drafts sync one [pbs, gamma] int64 either way, and sampled
         # requests take the target-only accept, as TPU EAGLE does.
@@ -746,6 +750,10 @@ class TpuSpecWorker(BaseSpecWorker):
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
         if self._verify_top_k_width is None:
             return LogitsOutputMode.FULL_VOCAB
+        if self._verify_greedy_topk1 and (
+            bucket.temperatures is None or bucket.top_ks is None
+        ):
+            return LogitsOutputMode.DISTRIBUTED_GREEDY
         # A simulated accept reads no logits; keep serving's mode so the benchmark
         # pays the same logits traffic as production.
         if bucket.temperatures is None or draft_result.draft_candidates is not None:
@@ -796,8 +804,11 @@ class TpuSpecWorker(BaseSpecWorker):
         if logits_output.has_next_token_global_top_k:
             top_logits = logits_output.next_token_global_top_k_logits
             top_ids = logits_output.next_token_global_top_k_token_ids
-            assert top_ids.shape == (num_rows, TARGET_CANDIDATES), top_ids.shape
             if bucket.temperatures is None or bucket.top_ks is None:
+                assert top_ids.shape in (
+                    (num_rows, TARGET_CANDIDATES),
+                    (num_rows, 1),
+                ), top_ids.shape
                 return accept_greedy_top_k_step(
                     top_ids,
                     draft_tokens,
@@ -805,6 +816,7 @@ class TpuSpecWorker(BaseSpecWorker):
                     state.seq_lens,
                     bucket.live_mask,
                 )
+            assert top_ids.shape == (num_rows, TARGET_CANDIDATES), top_ids.shape
             assert draft_result.draft_candidates is not None
             assert bucket.target_candidates
             draft_ids, draft_logits = draft_result.draft_candidates
@@ -1016,14 +1028,17 @@ class TpuSpecWorker(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         return result
 
+    def _build_spec_verify_input(
+        self, batch: ScheduleBatch, padded_bs: int
+    ) -> TpuSpecVerifyInput:
+        return TpuSpecVerifyInput.from_batch(batch, self.num_verify_rows, padded_bs)
+
     def _forward_decode(
         self, batch: ScheduleBatch, *, grammar_barrier: Callable[[], None] | None = None
     ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
-        verify_input = TpuSpecVerifyInput.from_batch(
-            batch, self.num_verify_rows, padded_bs
-        )
+        verify_input = self._build_spec_verify_input(batch, padded_bs)
         bucket = self._bucket_state(batch, padded_bs, verify_input)
         committed, logits_output, accept = self.step(
             batch, bucket, verify_input, grammar_barrier=grammar_barrier

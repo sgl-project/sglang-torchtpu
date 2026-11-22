@@ -49,6 +49,7 @@ from sglang_tpu.kv_mxint8 import GROUP_SIZE as MXINT8_DEFAULT_GROUP_SIZE
 from sglang_tpu.kv_mxint8 import cache_bytes_per_token as mxint8_cache_bytes_per_token
 from sglang_tpu.kv_pool import (
     GB,
+    TpuDraftFusedMHATokenToKVPool,
     TpuFusedMHATokenToKVPool,
     _cdiv,
 )
@@ -259,6 +260,8 @@ def _resolve_draft_attention_info(kvc, draft_mc):
         or get_exec().kernel.attention_backend
     )
     draft_pool_cls = _mha_kv_pool_cls(draft_attn_backend)
+    if draft_pool_cls is TpuFusedMHATokenToKVPool:
+        draft_pool_cls = TpuDraftFusedMHATokenToKVPool
     model_dtype = getattr(draft_mc, "dtype", None) or getattr(
         kvc, "model_dtype", torch.bfloat16
     )
@@ -316,7 +319,10 @@ def _dflash_unsupported_reason(kvc, draft_mc) -> Optional[str]:
             "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1."
         )
     _, draft_pool_cls, draft_dtype_str, _ = _resolve_draft_attention_info(kvc, draft_mc)
-    if draft_pool_cls is not TpuFusedMHATokenToKVPool or draft_dtype_str == "mxint8":
+    if (
+        draft_pool_cls not in (TpuFusedMHATokenToKVPool, TpuDraftFusedMHATokenToKVPool)
+        or draft_dtype_str == "mxint8"
+    ):
         return (
             f"with {spec_algo.name} requires an unpacked non-MXINT8 "
             "TpuFusedMHATokenToKVPool draft pool."

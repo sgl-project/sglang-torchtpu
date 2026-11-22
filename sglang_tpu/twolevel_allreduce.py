@@ -529,6 +529,14 @@ def _register_twoshot_from_parallel_state() -> None:
         )
         return
     get_twoshot_all_reduce_op(world)
+    if world == 8:
+        from sglang_tpu.twoshot_all_reduce import (
+            bridge_all_reduce_max_bytes,
+            get_bridge_twoshot_all_reduce_op,
+        )
+
+        if bridge_all_reduce_max_bytes() > 0:
+            get_bridge_twoshot_all_reduce_op(world)
     _TWOSHOT_WORLD = world
     logger.info(
         "Two-shot TP all-reduce on: bf16 TP all-reduces up to %d KB per rank.",
@@ -619,10 +627,24 @@ def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
         return original(group, input_)
     if _READY and eligible(input_):
         return _OPS[1](input_)
-    if _TWOSHOT_WORLD and twoshot_eligible(input_, _TWOSHOT_WORLD):
-        from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
+    if _TWOSHOT_WORLD:
+        from sglang_tpu.twoshot_all_reduce import (
+            bridge_all_reduce_max_bytes,
+            get_bridge_twoshot_all_reduce_op,
+            get_twoshot_all_reduce_op,
+        )
 
-        return get_twoshot_all_reduce_op(_TWOSHOT_WORLD)(input_)
+        bridge_max = bridge_all_reduce_max_bytes() if _TWOSHOT_WORLD == 8 else 0
+        if (
+            bridge_max > 0
+            and input_.dim() == 2
+            and input_.dtype == torch.bfloat16
+            and input_.shape[1] % (128 * _TWOSHOT_WORLD) == 0
+            and 0 < input_.numel() * input_.element_size() <= bridge_max
+        ):
+            return get_bridge_twoshot_all_reduce_op(_TWOSHOT_WORLD)(input_)
+        if twoshot_eligible(input_, _TWOSHOT_WORLD):
+            return get_twoshot_all_reduce_op(_TWOSHOT_WORLD)(input_)
     return original(group, input_)
 
 

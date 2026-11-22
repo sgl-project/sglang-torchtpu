@@ -14,13 +14,26 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import dataclasses
+import functools
+import logging
 from typing import Optional
+
+import torch
 
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
+    _build_pallas_kernel_op,
+    _fused_kv_operands,
+    _pool_kv_pack_heads,
+    _unpack_out_heads,
+    _zero_inactive_rpa_rows,
 )
+from sglang_tpu.envs import envs
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PallasForwardMetadata",
@@ -34,6 +47,43 @@ def _import_v3_kernel():
     )
 
     return ragged_paged_attention
+
+
+_STATIONARY_Q_V2_MODES = (
+    "m0_ring",
+    "m0_f32e",
+    "m0_ring_fuse",
+    "m0_f32e_fuse",
+)
+_STATIONARY_Q_M0_MODES = ("m0", *_STATIONARY_Q_V2_MODES)
+_STATIONARY_Q_MODES = (*_STATIONARY_Q_M0_MODES, "pilot")
+
+
+def _env_block_sizes(full_env, sw_env, sliding_window):
+    """The layer kind's "bq,bkv,bq_c,bkv_c" env as an int tuple, None when unset."""
+    value = (sw_env if sliding_window else full_env).get()
+    return tuple(int(x) for x in value.split(",")) if value else None
+
+
+def _pool_kv_pack_dense2(pool) -> bool:
+    """True when the fused pool packs 2 FP8 tokens per 32-bit row (``kv_pack_dense2``)."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    pools = (
+        (pool.full_kv_pool, pool.swa_kv_pool)
+        if isinstance(pool, SWAKVPool)
+        else (pool,)
+    )
+    flags = {
+        bool(getattr(p, "kv_pack_dense2", False))
+        if isinstance(p, TpuFusedMHATokenToKVPool)
+        else False
+        for p in pools
+    }
+    if len(flags) != 1:
+        raise NotImplementedError(f"SWA sub-pools set kv_pack_dense2 differently: {flags}")
+    return flags.pop()
 
 
 def _invoke_v3_kernel(
@@ -56,8 +106,367 @@ def _invoke_v3_kernel(
     v_scale,
     decode_query_size=1,
     use_causal_mask=True,
+    fused_out_pack=1,
+    prepared_inputs=False,
+    skip_decode=False,
+    a3_out_layout=False,
+    skip_mixed=False,
+    decode_out_norm_eps=None,
+    decode_gate_in_values=False,
+    kv_pack_dense2=False,
 ):
-    return jax_rpa(
+    extra = {}
+    long_prefill_tiles = False
+    dense2_env = getattr(envs, "SGLANG_TPU_KV_PACK_DENSE2", None)
+    use_dense2 = bool(
+        kv_pack_dense2
+        or (
+            dense2_env is not None
+            and dense2_env.get()
+            and kv_cache_fused is not None
+            and len(kv_cache_fused.shape) == 5
+            and kv_cache_fused.shape[1] >= 8
+            and kv_cache_fused.shape[2:] == (1, 4, 128)
+        )
+    )
+    logical_page_size = (
+        kv_cache_fused.shape[1] * 2
+        if (use_dense2 and kv_cache_fused is not None)
+        else (kv_cache_fused.shape[1] if kv_cache_fused is not None else 128)
+    )
+    if use_dense2:
+        extra["_kv_pack_dense2"] = True
+    allow_verify_q = decode_query_size == 1 or (
+        decode_query_size > 1
+        and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
+    )
+    if (
+        envs.SGLANG_TPU_MUSE_KERNEL_ENABLED.get()
+        and sliding_window == 2048
+        and allow_verify_q
+    ):
+        # Muse window-2048 decode (DECODE launch only): one 4096-key block instead
+        # of two 2048 ones, measured 57.2->51.9 us at 16 seqs, 172->144 us at 64.
+        extra["d_block_sizes"] = (decode_query_size, 4096, decode_query_size, 4096)
+    decode_blocks = _env_block_sizes(
+        envs.SGLANG_TPU_RPA_V3_DECODE_BLOCK_SIZES,
+        envs.SGLANG_TPU_RPA_V3_DECODE_BLOCK_SIZES_SW,
+        sliding_window,
+    )
+    if (
+        envs.SGLANG_TPU_RPA_V3_DECODE_SW_WINDOW_ALIGNED.get()
+        and sliding_window
+        and allow_verify_q
+    ):
+        page_size = logical_page_size
+        window_bkv = -(-(sliding_window + page_size - 1) // page_size) * page_size
+        extra["d_block_sizes"] = (
+            decode_query_size,
+            window_bkv,
+            decode_query_size,
+            window_bkv,
+        )
+        extra["_decode_window_aligned_kv"] = True
+    if decode_blocks and decode_query_size == 1:
+        extra["d_block_sizes"] = decode_blocks
+    if envs.SGLANG_TPU_RPA_V3_DECODE_ZERO_KV_TAIL.get():
+        extra["_decode_zero_kv_tail"] = True
+    if envs.SGLANG_TPU_RPA_V3_DECODE_RING.get():
+        extra["_decode_ring"] = envs.SGLANG_TPU_RPA_V3_DECODE_RING.get()
+    decode_fast_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST", None)
+    df_verify_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY", None)
+    need_fused_post = decode_out_norm_eps is not None or decode_gate_in_values
+    df_raw = decode_fast_env.get().strip() if decode_fast_env is not None else ""
+    df_raw_toks = (
+        set(df_raw.lower().replace(",", "_").replace("-", "_").split("_"))
+        if df_raw
+        else set()
+    )
+    allow_df_dq = decode_query_size == 1 or (
+        2 <= decode_query_size <= 8
+        and (
+            need_fused_post
+            or (df_verify_env is not None and df_verify_env.get())
+            or bool(df_raw_toks & {"multiq", "verify"})
+        )
+    )
+    if allow_df_dq and (df_raw or need_fused_post):
+        df_val = df_raw or "w7"
+        w7_dec_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_W7", None)
+        if (
+            w7_dec_env is not None
+            and w7_dec_env.get()
+            and df_val.lower() in ("1", "true", "auto", "on", "v2", "2", "streamdyn")
+        ):
+            df_val = "w7"
+        w8_dec_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_W8", None)
+        if (
+            w8_dec_env is not None
+            and w8_dec_env.get()
+            and "w8" not in df_val.lower()
+        ):
+            df_val = f"{df_val}_w8"
+        adapt_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE", None)
+        if (
+            adapt_env is not None
+            and adapt_env.get()
+            and "adapt" not in df_val.lower()
+            and "noadapt" not in df_val.lower()
+        ):
+            df_val = f"{df_val}_adapt"
+        extra["_decode_fast"] = df_val
+    probe_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_PROBE", None)
+    if probe_env is not None and probe_env.get().strip():
+        extra["_decode_probe"] = probe_env.get().strip().lower()
+    mixed_blocks = _env_block_sizes(
+        envs.SGLANG_TPU_RPA_V3_MIXED_BLOCK_SIZES,
+        envs.SGLANG_TPU_RPA_V3_MIXED_BLOCK_SIZES_SW,
+        sliding_window,
+    )
+    prefill_mode = envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.get().strip().lower()
+    is_prepared = prepared_inputs or (
+        queries is not None and getattr(queries, "ndim", 0) == 5
+    )
+    num_q_tokens = (
+        0
+        if queries is None
+        else (queries.shape[1] if is_prepared else queries.shape[0])
+    )
+    use_stationary_q_prefill = (
+        not skip_mixed
+        and prefill_mode in _STATIONARY_Q_MODES
+        and num_q_tokens >= 256
+        and soft_cap is None
+        and attention_sink is None
+    )
+    if use_stationary_q_prefill:
+        sq_blocks_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES", None
+        )
+        sq_blocks_sw_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES_SW", None
+        )
+        stationary_q_blocks = (
+            _env_block_sizes(sq_blocks_env, sq_blocks_sw_env, sliding_window)
+            if (sq_blocks_env is not None and sq_blocks_sw_env is not None)
+            else None
+        )
+        w7_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS", None)
+        w7_prefill_toks = (
+            {
+                t.strip()
+                for t in w7_prefill_env.get().lower().replace(",", " ").split()
+                if t.strip()
+            }
+            if w7_prefill_env is not None and w7_prefill_env.get().strip()
+            else set()
+        )
+        lc_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS", None)
+        lc_prefill_toks = (
+            {
+                t.strip()
+                for t in lc_prefill_env.get().lower().replace(",", " ").split()
+                if t.strip()
+            }
+            if lc_prefill_env is not None and lc_prefill_env.get().strip()
+            else set()
+        )
+        all_prefill_toks = w7_prefill_toks | lc_prefill_toks
+        use_w8_preset = "w8" in all_prefill_toks
+        use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset
+        per_seq_kv_capacity = 0
+        if (
+            page_indices is not None
+            and kv_lens is not None
+            and kv_cache_fused is not None
+            and getattr(kv_lens, "shape", (0,)) > (0,)
+        ):
+            pages_per_seq = page_indices.shape[0] // kv_lens.shape[0]
+            per_seq_kv_capacity = pages_per_seq * logical_page_size
+        is_lc_full = (
+            sliding_window is None
+            and prefill_mode in _STATIONARY_Q_M0_MODES
+            and per_seq_kv_capacity > 32768
+        )
+        if stationary_q_blocks:
+            extra["m_block_sizes"] = stationary_q_blocks
+        else:
+            if prefill_mode in _STATIONARY_Q_V2_MODES:
+                bq_sz = (
+                    512
+                    if (
+                        sliding_window is None
+                        and (
+                            per_seq_kv_capacity > 32768
+                            or "full_bq512" in all_prefill_toks
+                            or use_w7_preset
+                        )
+                        and num_q_tokens >= 512
+                    )
+                    else 256
+                )
+            else:
+                bq_sz = 512 if num_q_tokens >= 512 else 256
+            if is_lc_full:
+                if "bq8192" in lc_prefill_toks and num_q_tokens >= 8192:
+                    bq_sz = 8192
+                elif (
+                    "bq4096" in lc_prefill_toks or "bq8192" in lc_prefill_toks
+                ) and num_q_tokens >= 4096:
+                    bq_sz = 4096
+                elif (
+                    "bq2048" in lc_prefill_toks
+                    or "bq4096" in lc_prefill_toks
+                    or "bq8192" in lc_prefill_toks
+                ) and num_q_tokens >= 2048:
+                    bq_sz = 2048
+                elif (
+                    "bq1024" in lc_prefill_toks
+                    or "bq2048" in lc_prefill_toks
+                    or "bq4096" in lc_prefill_toks
+                    or "bq8192" in lc_prefill_toks
+                ) and num_q_tokens >= 1024:
+                    bq_sz = 1024
+            bkv_sz = (
+                8192
+                if (is_lc_full and "bkv8192" in lc_prefill_toks and num_q_tokens >= 512)
+                else (
+                    4096
+                    if (
+                        sliding_window is None
+                        and prefill_mode in _STATIONARY_Q_M0_MODES
+                        and num_q_tokens >= 512
+                        and (
+                            num_q_tokens >= 16384
+                            or per_seq_kv_capacity > 18432
+                            or "full_bkv4k" in all_prefill_toks
+                            or use_w7_preset
+                        )
+                    )
+                    else 2048
+                )
+            )
+            extra["m_block_sizes"] = (bq_sz, bkv_sz, 256, 256)
+        prefill_opts = {
+            f"stationary_q_{prefill_mode}",
+            "skip_empty_cdma",
+            "mixed_s3",
+        }
+        if is_lc_full and "s2" in lc_prefill_toks:
+            prefill_opts.discard("mixed_s3")
+        if is_lc_full and "prefix_fast" in lc_prefill_toks:
+            prefill_opts.add("prefix_fast")
+        if is_lc_full and (
+            "staged_qo" in lc_prefill_toks
+            or (bq_sz >= 4096 and "nostaged_qo" not in lc_prefill_toks)
+        ):
+            prefill_opts.add("staged_qo")
+        if use_w7_preset and sliding_window is not None:
+            prefill_opts.update(("fp8_qk", "mrb3"))
+        if use_w8_preset and sliding_window is not None:
+            prefill_opts.update(("vreg_acc", "sw_short_fuse"))
+        for w7_opt in (
+            "fp8_kv",
+            "fp8_qk",
+            "fp8_qk_dyn",
+            "fp8_qkpv",
+            "fp8_qkpv_dyn",
+            "fp8_qkpv_s1",
+            "fp8_qkpv_s0",
+            "fp8_qkpv_norm",
+            "gqa2_vreg",
+            "gqa4_vreg",
+            "vreg_acc",
+            "sw_short_fuse",
+            "tq_unroll",
+            "mrb3",
+            "mrb4",
+            "f32_exp",
+        ):
+            if w7_opt in all_prefill_toks:
+                prefill_opts.add(w7_opt)
+            if sliding_window is not None and f"sw_{w7_opt}" in all_prefill_toks:
+                prefill_opts.add(w7_opt)
+            if sliding_window is None and f"full_{w7_opt}" in all_prefill_toks:
+                prefill_opts.add(w7_opt)
+        if (
+            envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()
+            and prefill_mode == "m0_ring_fuse"
+            and not stationary_q_blocks
+            and skip_decode
+            and decode_query_size == 1
+            and not is_prepared
+            and use_causal_mask
+            and queries.shape == (8192, 8, 64)
+            and keys.shape == (8192, 1, 64)
+            and str(queries.dtype) == "bfloat16"
+            and str(kv_cache_fused.dtype) == "float8_e4m3fn"
+            and logical_page_size == 128
+            and sliding_window in (None, 2048, 2049)
+        ):
+            # Preserve 256-key softmax updates and their BF16 rounding boundaries.
+            extra["m_block_sizes"] = (
+                (512, 2048, 512, 256)
+                if sliding_window is None
+                else (256, 1024, 256, 256)
+            )
+            long_prefill_tiles = (
+                sliding_window is None
+                and per_seq_kv_capacity >= 65536 + 6144
+                and attention_sink is None
+                and soft_cap is None
+                and envs.SGLANG_TPU_RPA_V3_TP16_LONG_PREFILL_TILES.get()
+            )
+            prefill_opts.update(("mask_skip", "visible_kv_tile"))
+            if sm_scale == 0.125 and k_scale in (None, 1.0):
+                prefill_opts.add("fold_scale")
+        if sliding_window is None and prefill_mode in _STATIONARY_Q_M0_MODES:
+            prefill_opts.add("bkv_full_unroll")
+        sw2048_fuse_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_SW2048_FUSE", None
+        )
+        if (
+            sliding_window == 2048
+            and sw2048_fuse_env is not None
+            and sw2048_fuse_env.get()
+        ):
+            prefill_opts.add("sw2048_fuse")
+    else:
+        if mixed_blocks:
+            extra["m_block_sizes"] = mixed_blocks
+        prefill_opts = {
+            opt
+            for opt, env in (
+                ("fold_scale", envs.SGLANG_TPU_RPA_V3_PREFILL_FOLD_SCALE),
+                ("mask_skip", envs.SGLANG_TPU_RPA_V3_PREFILL_MASK_SKIP),
+            )
+            if env.get()
+        }
+    if skip_decode or (
+        is_prepared
+        and not skip_mixed
+        and envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get()
+    ):
+        extra["_skip_decode"] = True
+    if skip_mixed:
+        extra["_skip_mixed"] = True
+    if a3_out_layout > 0:
+        if use_stationary_q_prefill and extra.get("_skip_decode", False):
+            extra["_a3_out_layout"] = True
+        else:
+            fused_out_pack = a3_out_layout
+    if prefill_opts:
+        extra["_prefill_opts"] = frozenset(prefill_opts)
+    if fused_out_pack > 1:
+        extra["_fused_out_pack"] = fused_out_pack
+    if prepared_inputs:
+        extra["_prepared_inputs"] = True
+    if decode_out_norm_eps is not None:
+        extra["_decode_out_norm_eps"] = float(decode_out_norm_eps)
+    if decode_gate_in_values:
+        extra["_decode_gate_in_values"] = True
+    run = functools.partial(
+        jax_rpa,
         queries,
         keys,
         values,
@@ -76,7 +485,33 @@ def _invoke_v3_kernel(
         k_scale=k_scale,
         v_scale=v_scale,
         decode_query_size=decode_query_size,
+        **extra,
     )
+
+    if long_prefill_tiles:
+        import jax
+        import jax.numpy as jnp
+
+        # Wider Q tiles amortize the long prefix scan. Keep the 512-row tile for
+        # ragged batches and whenever rounding to 1024 would add padded Q work.
+        live = cu_q_lens[1] - cu_q_lens[0]
+        eligible = (
+            (distribution[0] == 0)
+            & (distribution[2] == 1)
+            & (kv_lens[0] - live >= 65536)
+            & (live >= 6144)
+            & (2 * ((live + 1023) // 1024) == (live + 511) // 512)
+        )
+        tile = jnp.where(eligible, jnp.where(live % 2048 == 0, 2, 1), 0)
+        return jax.lax.switch(
+            tile,
+            (
+                run,
+                functools.partial(run, m_block_sizes=(1024, 4096, 1024, 256)),
+                functools.partial(run, m_block_sizes=(2048, 4096, 2048, 256)),
+            ),
+        )
+    return run()
 
 
 RPA_V3_SPEC = RpaKernelSpec(
@@ -87,6 +522,142 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=True,
     is_batched=False,
     supports_decode_query_size=True,
+    supports_shared_decode=True,
+)
+
+
+def _fused_out_spec(pack: int) -> RpaKernelSpec:
+    """RPA_V3_SPEC returning packed heads' own lanes (SGLANG_TPU_RPA_V3_PREFILL_FUSED_OUT)."""
+    return dataclasses.replace(
+        RPA_V3_SPEC,
+        op_name=f"{RPA_V3_SPEC.op_name}_fused_out{pack}",
+        invoke_kernel=functools.partial(_invoke_v3_kernel, fused_out_pack=pack),
+        out_head_pack=pack,
+    )
+
+
+def _prepared_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
+    """``spec`` taking q / merged kv already in the kernel's layout (SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT)."""
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_prepared",
+        invoke_kernel=functools.partial(spec.invoke_kernel, prepared_inputs=True),
+        prepared_inputs=True,
+    )
+
+
+def _prepared_a3_layout_spec(pack: int) -> RpaKernelSpec:
+    """Prepared Stationary-Q RPA_V3_SPEC writing unpacked bf16[T, Hq * d] directly."""
+    return dataclasses.replace(
+        RPA_V3_SPEC,
+        op_name=f"{RPA_V3_SPEC.op_name}_prepared_a3_layout{pack}",
+        invoke_kernel=functools.partial(
+            _invoke_v3_kernel,
+            prepared_inputs=True,
+            skip_decode=True,
+            a3_out_layout=pack,
+        ),
+        out_head_pack=pack,
+        prepared_inputs=True,
+    )
+
+
+def _skip_decode_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
+    """``spec`` skipping the 0-sequence DECODE sub-launch on pure extend forwards."""
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_skip_decode",
+        invoke_kernel=functools.partial(spec.invoke_kernel, skip_decode=True),
+    )
+
+
+def _skip_mixed_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
+    """``spec`` skipping the 0-sequence MIXED sub-launch on pure decode forwards."""
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_skip_mixed",
+        invoke_kernel=functools.partial(spec.invoke_kernel, skip_mixed=True),
+    )
+
+
+def _decode_gated_spec(spec: RpaKernelSpec, norm_eps: float) -> RpaKernelSpec:
+    """Prepared decode ``spec`` fusing per-head RMSNorm and ``sigmoid(gate) * out``."""
+    eps_tag = f"{norm_eps:.0e}".replace("-", "m").replace("+", "p")
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_onorm_{eps_tag}_gate_v2",
+        invoke_kernel=functools.partial(
+            spec.invoke_kernel,
+            decode_out_norm_eps=float(norm_eps),
+            decode_gate_in_values=True,
+        ),
+        keep_values_when_prepared=True,
+    )
+
+
+def _import_muse_batched_kernel():
+    from sglang_tpu.attention.pallas.batched_rpa_muse.wrapper import (
+        ragged_paged_attention,
+    )
+
+    return ragged_paged_attention
+
+
+def _invoke_muse_batched_prefill_kernel(
+    jax_rpa,
+    *,
+    queries,
+    keys,
+    values,
+    kv_cache_fused,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    cu_kv_lens,
+    distribution,
+    attention_sink,
+    sm_scale,
+    sliding_window,
+    soft_cap,
+    k_scale,
+    v_scale,
+    decode_query_size=1,
+    use_causal_mask=True,
+):
+    """batched_rpa_muse on a v3 extend batch: same token-major KV cache, MIXED launch only."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.attention.pallas.batched_rpa_muse import configs
+
+    # Only causal extend rows reach here (TpuPallasRpaV3AttnBackend._kernel_op).
+    del cu_kv_lens, decode_query_size, use_causal_mask
+    return jax_rpa(
+        queries,
+        keys,
+        values,
+        kv_cache_fused,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        # v3 extend is [0, n, n]; batched lists extend rows first: [n, n, n].
+        jnp.broadcast_to(distribution[2], (3,)),
+        attention_sink=attention_sink,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        rpa_cases=configs.RpaCase.MIXED,
+    )
+
+
+MUSE_BATCHED_PREFILL_SPEC = RpaKernelSpec(
+    op_name="sglang_tpu_pallas::ragged_paged_attention_v3_muse_batched_prefill",
+    import_kernel=_import_muse_batched_kernel,
+    invoke_kernel=_invoke_muse_batched_prefill_kernel,
+    supports_attention_sink=True,
+    uses_cu_kv_lens=False,
 )
 
 
@@ -95,8 +666,542 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
 
     kernel_spec = RPA_V3_SPEC
 
+    def __init__(self, model_runner, speculative_step_id=0):
+        super().__init__(model_runner, speculative_step_id)
+        self._batched_prefill_op = (
+            _build_pallas_kernel_op(MUSE_BATCHED_PREFILL_SPEC)
+            if envs.SGLANG_TPU_MUSE_KERNEL_BATCHED_PREFILL_ATTN.get()
+            else None
+        )
+        pack = _pool_kv_pack_heads(self.token_to_kv_pool)
+        self._kv_pack_dense2 = _pool_kv_pack_dense2(self.token_to_kv_pool)
+        self._fused_out_op = (
+            _build_pallas_kernel_op(_fused_out_spec(pack))
+            if envs.SGLANG_TPU_RPA_V3_PREFILL_FUSED_OUT.get()
+            and pack > 1
+            and self._dcp == 1
+            else None
+        )
+        self._skip_decode_op = (
+            _build_pallas_kernel_op(
+                _skip_decode_spec(
+                    _fused_out_spec(pack)
+                    if self._fused_out_op is not None
+                    else RPA_V3_SPEC
+                )
+            )
+            if envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get() and self._dcp == 1
+            else None
+        )
+        skip_mixed_env = getattr(envs, "SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED", None)
+        decode_fused_out_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FUSED_OUT", None)
+        decode_fast_v2_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_V2", None)
+        want_skip_mixed = bool(skip_mixed_env is not None and skip_mixed_env.get())
+        want_v2 = bool(decode_fast_v2_env is not None and decode_fast_v2_env.get())
+        want_decode_fused_out = bool(
+            pack > 1
+            and (
+                (decode_fused_out_env is not None and decode_fused_out_env.get())
+                or (want_v2 and want_skip_mixed)
+            )
+        )
+        self._want_decode_fast_v2 = want_v2
+        if self._dcp == 1 and (want_skip_mixed or want_decode_fused_out):
+            dec_spec = (
+                _fused_out_spec(pack)
+                if (self._fused_out_op is not None or want_decode_fused_out)
+                else RPA_V3_SPEC
+            )
+            if want_skip_mixed:
+                dec_spec = _skip_mixed_spec(dec_spec)
+            self._decode_op = _build_pallas_kernel_op(dec_spec)
+        else:
+            self._decode_op = None
+        decode_qkv_epi_env = getattr(envs, "SGLANG_TPU_MUSE_DECODE_QKV_EPILOGUE", None)
+        decode_gate_fuse_env = getattr(
+            envs, "SGLANG_TPU_MUSE_DECODE_ATTN_GATE_FUSE", None
+        )
+        if (
+            self._dcp == 1
+            and pack > 1
+            and decode_qkv_epi_env is not None
+            and decode_qkv_epi_env.get()
+        ):
+            dec_prep_spec = (
+                _fused_out_spec(pack)
+                if (self._fused_out_op is not None or want_decode_fused_out)
+                else RPA_V3_SPEC
+            )
+            self._decode_prepared_op = _build_pallas_kernel_op(
+                _prepared_spec(_skip_mixed_spec(dec_prep_spec))
+            )
+            if decode_gate_fuse_env is not None and decode_gate_fuse_env.get():
+                norm_eps = float(
+                    getattr(model_runner.model_config.hf_text_config, "rms_norm_eps", 1e-5)
+                )
+                self._decode_prepared_gated_op = _build_pallas_kernel_op(
+                    _decode_gated_spec(
+                        _prepared_spec(_skip_mixed_spec(_fused_out_spec(pack))),
+                        norm_eps,
+                    )
+                )
+            else:
+                self._decode_prepared_gated_op = None
+        else:
+            self._decode_prepared_op = None
+            self._decode_prepared_gated_op = None
+        a1_rpa_layout_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT", None)
+        a3_rpa_out_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_A3_RPA_OUT", None)
+        rpa_a3_layout_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT", None)
+        prefill_mode = envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.get().strip().lower()
+        use_rpa_a3_layout = (
+            rpa_a3_layout_env is not None
+            and rpa_a3_layout_env.get()
+            and prefill_mode in _STATIONARY_Q_MODES
+            and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
+        )
+        self._prepared_op = (
+            _build_pallas_kernel_op(
+                _prepared_a3_layout_spec(pack)
+                if use_rpa_a3_layout
+                else _prepared_spec(
+                    _fused_out_spec(pack)
+                    if (
+                        self._fused_out_op is not None
+                        and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
+                    )
+                    else RPA_V3_SPEC
+                )
+            )
+            if (a1_rpa_layout_env is not None and a1_rpa_layout_env.get())
+            and pack > 1
+            and self._dcp == 1
+            else None
+        )
+        # Prewarm custom_op outside torch.compile so Dynamo never traces custom_jax_kernel (#1454).
+        try:
+            self._write_kv_only_op = (
+                _get_write_kv_only_op(self._kv_pack_dense2)
+                if self._dcp == 1
+                else None
+            )
+        except ImportError:
+            self._write_kv_only_op = None
+        if prefill_mode in _STATIONARY_Q_MODES or self._skip_decode_op is not None:
+            sq_blk = getattr(envs, "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES", None)
+            sq_blk_sw = getattr(
+                envs, "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES_SW", None
+            )
+            logger.info(
+                "RPA v3 prefill config: mode=%s, skip_empty_decode=%s, "
+                "stationary_q_blocks=%s, stationary_q_blocks_sw=%s",
+                prefill_mode or "stock",
+                envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get(),
+                sq_blk.get() if sq_blk is not None else "",
+                sq_blk_sw.get() if sq_blk_sw is not None else "",
+            )
+
+    def _kernel_op(self, forward_batch, use_causal_mask):
+        md = self.forward_metadata
+        if (
+            self._batched_prefill_op is not None
+            and use_causal_mask
+            # The metadata's distribution is v3's [0, n, n] exactly when it is
+            # not decode-shaped; DCP and prefill CP run other kernels or writes.
+            and forward_batch is not None
+            and not forward_batch.forward_mode.is_decode()
+            and md.decode_query_size == 1
+            and self._dcp == 1
+            and md.cp_write_segments is None
+        ):
+            return self._batched_prefill_op
+        skip_decode_op = getattr(self, "_skip_decode_op", None)
+        if (
+            skip_decode_op is not None
+            and forward_batch is not None
+            and not forward_batch.forward_mode.is_decode()
+            and md.decode_query_size == 1
+            and self._dcp == 1
+            and md.cp_write_segments is None
+        ):
+            return skip_decode_op
+        decode_op = getattr(self, "_decode_op", None)
+        allow_verify = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
+        )
+        if (
+            decode_op is not None
+            and forward_batch is not None
+            and (
+                (forward_batch.forward_mode.is_decode() and md.decode_query_size == 1)
+                or allow_verify
+            )
+            and self._dcp == 1
+            and md.cp_write_segments is None
+        ):
+            return decode_op
+        if self._fused_out_op is not None:
+            return self._fused_out_op
+        return self._op
+
+    def write_kv_only(self, kv, layer, forward_batch, chunk_meta=None):
+        """Write merged fp8 ``kv`` ``[T, 1, 4, 128]`` into ``layer``'s KV pool without attention."""
+        md = chunk_meta if chunk_meta is not None else self.forward_metadata
+        if (
+            self.kv_cache_quant_dtype is None
+            or (chunk_meta is None and md.cp_write_segments is not None)
+            or self._dcp != 1
+            or layer.k_scale_float not in (None, 1.0)
+            or layer.v_scale_float not in (None, 1.0)
+        ):
+            raise NotImplementedError("write_kv_only needs a scale-1 packed fp8 pool")
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            self.token_to_kv_pool, layer.layer_id
+        )
+        sliding_window = layer.sliding_window_size
+        if sliding_window is not None and sliding_window <= 0:
+            sliding_window = None
+        elif sliding_window is not None:
+            sliding_window += 1
+        is_swa = sliding_window is not None
+        if chunk_meta is not None:
+            if is_swa and md.swa_page_indices is not None:
+                group = self._swa_layer_groups.get(layer.layer_id, 0)
+                page_indices = (
+                    md.swa_page_indices
+                    if group == 0 or md.swa_group_page_indices is None
+                    else md.swa_group_page_indices[group - 1]
+                )
+            else:
+                page_indices = md.page_indices
+            kv_lens = md.kv_lens
+        else:
+            page_indices = self._layer_page_indices(
+                layer.layer_id, is_swa_layer=is_swa
+            )
+            kv_lens = self._kv_lens(forward_batch)
+        dense2 = bool(getattr(self, "_kv_pack_dense2", False))
+        op = getattr(self, "_write_kv_only_op", None)
+        if op is None:
+            cached = _WRITE_KV_ONLY_OPS.get(dense2)
+            op = cached if cached is not None else _get_write_kv_only_op(dense2)
+        op(
+            kv,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            kv_layer_idx,
+        )
+
+    def forward_prepared(self, q, kv, layer, forward_batch, chunk_meta=None):
+        """Causal extend on q ``[1, T, Hq / 2, 2, 2 * d]`` and merged fp8 kv ``[T, 1, 4, 2 * d]``
+        (A1's RPA layout, scale-1 fp8); returns ``[T, Hq * d]`` like ``_forward``."""
+        md = chunk_meta if chunk_meta is not None else self.forward_metadata
+        if (
+            self._prepared_op is None
+            or self.kv_cache_quant_dtype is None
+            or (chunk_meta is None and md.cp_write_segments is not None)
+            or layer.k_scale_float not in (None, 1.0)
+            or layer.v_scale_float not in (None, 1.0)
+        ):
+            raise NotImplementedError("prepared RPA inputs need a packed fp8 pool")
+        num_tokens = q.shape[1]
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            self.token_to_kv_pool, layer.layer_id
+        )
+        sliding_window = layer.sliding_window_size
+        if sliding_window is not None and sliding_window <= 0:
+            sliding_window = None
+        elif sliding_window is not None:
+            sliding_window += 1  # RPA counts the current token, SGLang does not.
+        is_swa = sliding_window is not None
+        if chunk_meta is not None:
+            if is_swa and md.swa_page_indices is not None:
+                group = self._swa_layer_groups.get(layer.layer_id, 0)
+                page_indices = (
+                    md.swa_page_indices
+                    if group == 0 or md.swa_group_page_indices is None
+                    else md.swa_group_page_indices[group - 1]
+                )
+            else:
+                page_indices = md.page_indices
+            kv_lens = md.kv_lens
+            decode_query_size = 1
+        else:
+            page_indices = self._layer_page_indices(
+                layer.layer_id, is_swa_layer=is_swa
+            )
+            kv_lens = self._kv_lens(forward_batch)
+            decode_query_size = md.decode_query_size
+        out = self._prepared_op(
+            q,
+            kv,
+            kv,  # unused (values)
+            kv_cache,
+            kv_lens,
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            None,
+            float(layer.scaling),
+            sliding_window,
+            layer.logit_cap if layer.logit_cap else None,
+            1.0,
+            1.0,
+            decode_query_size,
+            use_causal_mask=True,
+            layer_idx=kv_layer_idx,
+        )
+        if out.ndim == 2 and out.shape == (
+            num_tokens,
+            layer.tp_q_head_num * layer.qk_head_dim,
+        ):
+            return out
+        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
+        if out.shape[-1] != layer.qk_head_dim:
+            out = _unpack_out_heads(
+                out, out.shape[-1] // layer.qk_head_dim, layer.qk_head_dim
+            )
+        return out.reshape(num_tokens, layer.tp_q_head_num * layer.qk_head_dim)
+
+    def can_forward_decode_prepared(self, layer, forward_batch) -> bool:
+        """True when decode (or opted-in verify) can consume D4's prepared Q and merged FP8 KV."""
+        md = self.forward_metadata
+        allow_verify = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
+        )
+        return (
+            getattr(self, "_decode_prepared_op", None) is not None
+            and md is not None
+            and forward_batch is not None
+            and (
+                (forward_batch.forward_mode.is_decode() and md.decode_query_size == 1)
+                or allow_verify
+            )
+            and self._dcp == 1
+            and md.cp_write_segments is None
+            and self.kv_cache_quant_dtype == torch.float8_e4m3fn
+            and not getattr(layer, "is_cross_attention", False)
+            and getattr(layer, "tp_q_head_num", 0) == 16
+            and getattr(layer, "tp_k_head_num", 0) == 2
+            and getattr(layer, "qk_head_dim", 0) == 64
+            and getattr(layer, "v_head_dim", 0) == 64
+            and not getattr(layer, "logit_cap", 0)
+        )
+
+    def forward_decode_prepared(self, q, kv, layer, forward_batch):
+        """Single-token decode on D4's prepared ``q`` ``[1, B, 8, 2, 128]`` and merged fp8 ``kv``."""
+        md = self.forward_metadata
+        if not self.can_forward_decode_prepared(layer, forward_batch):
+            raise NotImplementedError(
+                "decode prepared RPA inputs need SGLANG_TPU_MUSE_DECODE_QKV_EPILOGUE=1 "
+                "on a packed fp8 16Q/2KV d=64 decode step"
+            )
+        num_tokens = q.shape[1]
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            self.token_to_kv_pool, layer.layer_id
+        )
+        sliding_window = getattr(layer, "sliding_window_size", None)
+        if sliding_window is not None and sliding_window <= 0:
+            sliding_window = None
+        elif sliding_window is not None:
+            sliding_window += 1
+        page_indices = self._layer_page_indices(
+            layer.layer_id, is_swa_layer=sliding_window is not None
+        )
+        k_scale = float(layer.k_scale_float if layer.k_scale_float is not None else 1.0)
+        v_scale = float(layer.v_scale_float if layer.v_scale_float is not None else 1.0)
+        out = self._decode_prepared_op(
+            q,
+            kv,
+            kv,  # unused (values)
+            kv_cache,
+            self._kv_lens(forward_batch),
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            self._layer_distribution(is_swa_layer=sliding_window is not None),
+            None,
+            float(layer.scaling),
+            sliding_window,
+            None,
+            k_scale,
+            v_scale,
+            md.decode_query_size,
+            use_causal_mask=True,
+            layer_idx=kv_layer_idx,
+        )
+        capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
+        if capture_mode is not None and capture_mode.is_full():
+            out = _zero_inactive_rpa_rows(out, md.active_num_tokens)
+        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
+        if out.shape[-1] != layer.qk_head_dim:
+            out = _unpack_out_heads(
+                out, out.shape[-1] // layer.qk_head_dim, layer.qk_head_dim
+            )
+        return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+    def forward_decode_prepared_gated(self, q, kv, gate, layer, forward_batch):
+        """Single-token decode fusing post-RPA per-head RMSNorm + ``sigmoid(gate) * out``."""
+        gated_op = getattr(self, "_decode_prepared_gated_op", None)
+        if gated_op is None or not self.can_forward_decode_prepared(
+            layer, forward_batch
+        ):
+            return None
+        md = self.forward_metadata
+        num_tokens = q.shape[1]
+        if gate.shape != (num_tokens, layer.tp_q_head_num * layer.v_head_dim):
+            return None
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            self.token_to_kv_pool, layer.layer_id
+        )
+        sliding_window = getattr(layer, "sliding_window_size", None)
+        if sliding_window is not None and sliding_window <= 0:
+            sliding_window = None
+        elif sliding_window is not None:
+            sliding_window += 1
+        page_indices = self._layer_page_indices(
+            layer.layer_id, is_swa_layer=sliding_window is not None
+        )
+        k_scale = float(layer.k_scale_float if layer.k_scale_float is not None else 1.0)
+        v_scale = float(layer.v_scale_float if layer.v_scale_float is not None else 1.0)
+        out = gated_op(
+            q,
+            kv,
+            gate.contiguous(),
+            kv_cache,
+            self._kv_lens(forward_batch),
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            self._layer_distribution(is_swa_layer=sliding_window is not None),
+            None,
+            float(layer.scaling),
+            sliding_window,
+            None,
+            k_scale,
+            v_scale,
+            md.decode_query_size,
+            use_causal_mask=True,
+            layer_idx=kv_layer_idx,
+        )
+        capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
+        if capture_mode is not None and capture_mode.is_full():
+            out = _zero_inactive_rpa_rows(out, md.active_num_tokens)
+        return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int] = None
     ):
         # RPA-v3 rebuilds verify metadata and has no graph-capture buffers.
         pass
+
+
+_WRITE_KV_ONLY_OPS: dict[bool, object] = {}
+
+
+def _get_write_kv_only_op(kv_pack_dense2: bool = False):
+    cached = _WRITE_KV_ONLY_OPS.get(kv_pack_dense2)
+    if cached is not None:
+        return cached
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+        write_kv_only_rpa_v3,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    op_name = (
+        "sglang_tpu_pallas::rpa_v3_write_kv_only_d2"
+        if kv_pack_dense2
+        else "sglang_tpu_pallas::rpa_v3_write_kv_only"
+    )
+
+    def _wrapped(
+        kv_new: jax.Array,
+        kv_cache_fused: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        cu_kv_lens: jax.Array,
+        distribution: jax.Array,
+        layer_idx: jax.Array | None = None,
+    ) -> jax.Array:
+        kv_cache_flat = kv_cache_fused
+        if layer_idx is not None:
+            num_blocks, layer_num = kv_cache_fused.shape[:2]
+            kv_cache_flat = kv_cache_fused.reshape(
+                (num_blocks * layer_num,) + kv_cache_fused.shape[2:]
+            )
+            page_indices = page_indices * layer_num + layer_idx
+        updated = write_kv_only_rpa_v3(
+            kv_new,
+            kv_cache_flat,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            kv_pack_dense2=kv_pack_dense2,
+        )
+        return updated.reshape(kv_cache_fused.shape)
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=(),
+        donate_argnums=(1,),
+        input_output_aliases={1: 0},
+        warn_deprecated=False,
+    )
+
+    def _custom_op_device_types():
+        try:
+            torch._C._dispatch_key_for_device("tpu")
+            return ["tpu"]
+        except RuntimeError:
+            return None
+
+    @torch.library.custom_op(
+        op_name,
+        mutates_args=("kv_cache_fused",),
+        device_types=_custom_op_device_types(),
+    )
+    def write_kv_only_op(
+        kv_new: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        cu_kv_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        layer_idx: torch.Tensor | None = None,
+    ) -> None:
+        with tpu_info_for_cpu_export():
+            jax_kernel(
+                kv_new,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                layer_idx,
+            )
+
+    @write_kv_only_op.register_fake
+    def _(*args, **kwargs) -> None:
+        return None
+
+    _WRITE_KV_ONLY_OPS[kv_pack_dense2] = write_kv_only_op
+    return write_kv_only_op

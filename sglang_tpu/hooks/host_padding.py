@@ -91,15 +91,17 @@ def create_future_map(original, algorithm, device, req_to_token_pool, *args, **k
 def resolve_forward_inputs(original, batch, future_map):
     from sglang_tpu.host_padding_relay import HostPaddingFutureMap
 
-    if (
-        isinstance(future_map, HostPaddingFutureMap)
-        and _can_stage_forward_metadata(batch)
-        and batch.forward_mode.is_decode()
-        and batch.prefill_input_ids_cpu is None
-        and batch.input_ids is None
-        and batch.req_pool_indices.device.type == "cpu"
-    ):
-        batch.input_ids = future_map.gather(batch.req_pool_indices)
+    if isinstance(future_map, HostPaddingFutureMap):
+        if (
+            _can_stage_forward_metadata(batch)
+            and batch.forward_mode.is_decode()
+            and batch.prefill_input_ids_cpu is None
+            and batch.input_ids is None
+            and batch.req_pool_indices.device.type == "cpu"
+        ):
+            batch.input_ids = future_map.gather(batch.req_pool_indices)
+        else:
+            future_map.flush_direct_handoff()
     return original(batch, future_map)
 
 

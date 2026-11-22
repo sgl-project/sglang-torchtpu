@@ -465,6 +465,7 @@ class SchedulerBatchResultProcessor:
                     continue
 
                 if not is_middle_chunk:
+                    req._tpu_piggybacked_prefill = False
                     req.time_stats.set_prefill_finished_time()
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
@@ -616,6 +617,7 @@ class SchedulerBatchResultProcessor:
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
                 if not is_middle_chunk:
+                    req._tpu_piggybacked_prefill = False
                     req.time_stats.set_prefill_finished_time()
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
@@ -1201,7 +1203,12 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            req.time_stats.set_last_decode_finish_time()
+            piggybacked_prefill = getattr(req, "_tpu_piggybacked_prefill", False)
+            if piggybacked_prefill:
+                req._tpu_piggybacked_prefill = False
+                req.time_stats.set_prefill_finished_time()
+            else:
+                req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
             if req.return_sampling_mask:
                 statuses = logits_output.next_token_sampling_mask_status
@@ -1225,6 +1232,8 @@ class SchedulerBatchResultProcessor:
             self._handle_finish_state_updated_req(
                 req, batch, result, i, logits_output, new_accept_len
             )
+            if piggybacked_prefill and not req.finished():
+                checkpoint_kv_cache(req, self.tree_cache)
 
             if req.return_logprob:
                 self._apply_decode_logprobs(

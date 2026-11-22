@@ -26,6 +26,7 @@ sglang-jax specific features:
 import functools
 import inspect as _inspect
 import logging
+import math
 from enum import Enum
 
 import jax
@@ -309,6 +310,2042 @@ def get_kv_cache_shape(
     )
 
 
+_STATIONARY_Q_V2_OPTS = frozenset(
+    {
+        "stationary_q_m0_ring",
+        "stationary_q_m0_f32e",
+        "stationary_q_m0_ring_fuse",
+        "stationary_q_m0_f32e_fuse",
+    }
+)
+
+
+def _stationary_q_v2_process(
+    *,
+    seq_idx,
+    start_seq_idx,
+    end_seq_idx,
+    q_len,
+    kv_len,
+    kv_q_gap,
+    cur_seq_start_bkv_idx,
+    next_seq_start_bkv_idx,
+    actual_bq_sz,
+    num_bq,
+    bq_sz,
+    bkv_sz,
+    bkv_stride,
+    kv_dtype,
+    num_slots,
+    use_causal_mask,
+    sliding_window,
+    sliding_window_chunk_skip,
+    _sw_off,
+    sm_scale,
+    k_scale,
+    v_scale,
+    probe,
+    prefill_opts,
+    sem_ids_ref,
+    bq_x2_ref,
+    bkv_x2_ref,
+    bo_x2_ref,
+    l_ref,
+    acc_ref,
+    q_t_ref,
+    k_sub_ref,
+    vt_sub_ref,
+    mask_lt_ref,
+    mask_ut_ref,
+    cu_q_lens_ref,
+    bo_carry_ref,
+    q_sc_ref=None,
+    kv_pack_dense2: bool = False,
+    get_next_bq_ids,
+    get_next_bkv_ids,
+    start_fetch_bq,
+    wait_fetch_bq,
+    start_fetch_bkv,
+    wait_fetch_bkv,
+    start_update_kv_cache,
+    wait_send_bo,
+    start_send_bo,
+    start_send_bo_a3,
+    start_fetch_bq_stage=None,
+    wait_fetch_bq_stage=None,
+    start_send_bo_staged=None,
+):
+    """Stationary-Q v2 prefill engine: unpacked-KV VMEM ring, exact 256-slice unrolling,
+    precomputed bf16 mask bias tiles, SW-2049 Q-unpack/epilogue fusion, direct 2D A3
+    carry-buffer output, and optional f32 exp2 / Wave-7 FP8 QK(PV) & GQA VREG batching."""
+    tq_sz = 256
+    use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
+    use_fp8_qk_dyn = "fp8_qk_dyn" in prefill_opts
+    use_fp8_qkpv_dyn = "fp8_qkpv_dyn" in prefill_opts
+    use_fp8_qkpv_norm = "fp8_qkpv_norm" in prefill_opts
+    use_fp8_qkpv = (
+        ("fp8_qkpv" in prefill_opts)
+        or ("fp8_qkpv_s1" in prefill_opts)
+        or ("fp8_qkpv_s0" in prefill_opts)
+        or use_fp8_qkpv_norm
+    )
+    qkpv_shift = (
+        0.0
+        if "fp8_qkpv_s0" in prefill_opts
+        else (1.5 if "fp8_qkpv_s1" in prefill_opts else 2.0)
+    )
+    use_fp8_qk = (
+        use_fp8_qkpv_dyn
+        or use_fp8_qkpv
+        or use_fp8_qk_dyn
+        or ("fp8_qk" in prefill_opts)
+    )
+    use_fp8_kv = use_fp8_qk or ("fp8_kv" in prefill_opts)
+    use_vt_fp8 = use_fp8_qkpv_dyn or use_fp8_qkpv or ("fp8_kv" in prefill_opts)
+    use_gqa4_vreg = "gqa4_vreg" in prefill_opts
+    use_gqa2_vreg = ("gqa2_vreg" in prefill_opts) and not use_gqa4_vreg
+    use_vreg_acc = ("vreg_acc" in prefill_opts) and not (
+        use_gqa2_vreg or use_gqa4_vreg
+    )
+    use_sw_short_fuse = "sw_short_fuse" in prefill_opts
+    mrb_depth = 4 if "mrb4" in prefill_opts else (3 if "mrb3" in prefill_opts else 2)
+    use_f32_exp = (
+        use_fp8_qkpv_dyn
+        or use_fp8_qk_dyn
+        or "f32_exp" in prefill_opts
+        or "stationary_q_m0_f32e" in prefill_opts
+        or "stationary_q_m0_f32e_fuse" in prefill_opts
+    )
+    use_fuse_qe = (
+        "stationary_q_m0_ring_fuse" in prefill_opts
+        or "stationary_q_m0_f32e_fuse" in prefill_opts
+    )
+    use_tq_loop = "tq_unroll" not in prefill_opts
+    use_staged_qo = (
+        "staged_qo" in prefill_opts
+        and bq_x2_ref.shape[2] == tq_sz
+        and bq_sz >= 512
+        and bq_sz % tq_sz == 0
+    )
+    num_s = bkv_sz // 256
+    ring_total_slices = k_sub_ref.shape[1]
+    ring_bkv_blocks = ring_total_slices // num_s
+    ring_covers_all = ring_bkv_blocks > 1
+    ring_s_mask = ring_total_slices - 1
+
+    s_scale = sm_scale * (k_scale if k_scale is not None else 1.0)
+    exp_scale = float(s_scale * math.log2(math.e))
+    v_scale_val = float(v_scale) if v_scale is not None else 1.0
+    seq_end_bkv = cdiv(kv_len, bkv_sz)
+
+    @pl.when(seq_idx == start_seq_idx)
+    def _init_static_mask_tiles():
+        q_io = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 2)
+        k_raw = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 1)
+        k_io = (
+            jnp.where(k_raw < 128, 2 * k_raw, 2 * (k_raw - 128) + 1)
+            if kv_pack_dense2
+            else k_raw
+        )
+        if mask_lt_ref is not None:
+            mask_lt_ref[...] = jnp.where(
+                q_io >= k_io, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+            )
+        if mask_ut_ref is not None:
+            ut_cond = (q_io < k_io) if sliding_window == 2048 else (q_io <= k_io)
+            mask_ut_ref[...] = jnp.where(
+                ut_cond, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+            )
+
+    if ring_covers_all:
+        sem_ids_ref[3] = cur_seq_start_bkv_idx
+
+    def _kq_dot(k_3d, q_3d):
+        return lax.dot(
+            k_3d,
+            q_3d,
+            dimension_numbers=(([2], [1]), ([0], [0])),
+            preferred_element_type=jnp.float32,
+        )
+
+    def _vp_dot(vt_3d, p_3d):
+        return lax.dot(
+            vt_3d,
+            p_3d,
+            dimension_numbers=(([2], [1]), ([0], [0])),
+            preferred_element_type=jnp.float32,
+        )
+
+    def _vp_scaled(vt_3d, p_3d, p_sc=None):
+        vp = _vp_dot(vt_3d, p_3d)
+        if p_sc is not None:
+            vp = vp * jnp.tile(p_sc, (1, 8, 1))
+        return vp
+
+    def _psum_w(p, w_cols: int):
+        p_sum16 = jnp.sum(
+            p.reshape(1, 16, 16, w_cols),
+            axis=1,
+            dtype=jnp.bfloat16,
+        )
+        return jnp.broadcast_to(
+            jnp.sum(
+                p_sum16,
+                axis=1,
+                keepdims=True,
+                dtype=jnp.float32,
+            ),
+            (1, 8, w_cols),
+        )
+
+    def _psum(p):
+        return _psum_w(p, tq_sz)
+
+    def _quant_qt_fp8(qt_bf16):
+        """Quantize [64, W] bf16 Q -> (qt_f8 [64, W], q_exp_sc_8 [8, W] f32)."""
+        w_q = qt_bf16.shape[1]
+        qf = qt_bf16.astype(jnp.float32)
+        m8 = jnp.max(jnp.abs(qf).reshape(8, 8, w_q), axis=0)
+        q_amax = jnp.max(m8, axis=0, keepdims=True)
+        q_amax_8 = jnp.broadcast_to(q_amax, (8, w_q))
+        q_inv = jnp.where(
+            q_amax == 0.0,
+            jnp.float32(0.0),
+            jnp.float32(448.0) / jnp.maximum(q_amax, jnp.float32(1e-12)),
+        )
+        qt_f8 = (qf * q_inv).astype(jnp.float8_e4m3fn)
+        q_exp_sc_8 = jnp.where(
+            q_amax_8 == 0.0,
+            jnp.float32(exp_scale),
+            q_amax_8 * jnp.float32(exp_scale / 448.0),
+        )
+        return qt_f8, q_exp_sc_8
+
+    def _sm_eval_w(qk_f32, bias_spec, w_cols: int, q_exp_256=None):
+        n_rep = w_cols // 256
+        if use_f32_exp:
+            qk_sc = (
+                qk_f32 * q_exp_256
+                if q_exp_256 is not None
+                else qk_f32 * exp_scale
+            )
+            if use_fp8_qkpv:
+                qk_sc = qk_sc - jnp.float32(qkpv_shift)
+            if bias_spec == "ut":
+                m_u = mask_ut_ref[...].astype(jnp.float32)
+                qk_sc = qk_sc + (
+                    m_u if n_rep == 1 else jnp.concatenate([m_u] * n_rep, axis=2)
+                )
+            elif bias_spec == "lt":
+                m_l = mask_lt_ref[...].astype(jnp.float32)
+                qk_sc = qk_sc + (
+                    m_l if n_rep == 1 else jnp.concatenate([m_l] * n_rep, axis=2)
+                )
+            elif bias_spec != "none":
+                bs = (
+                    bias_spec
+                    if n_rep == 1
+                    else jnp.concatenate([bias_spec] * n_rep, axis=2)
+                )
+                qk_sc = jnp.where(bs, qk_sc, -jnp.inf)
+            if use_fp8_qkpv_dyn:
+                m16 = jnp.max(qk_sc.reshape(1, 16, 16, w_cols), axis=1)
+                m_col = jnp.max(m16, axis=1, keepdims=True)
+                # Clamp -inf/extreme negative slices >= -110 so m_bias >= -118.75 avoids f32 FTZ.
+                m_safe = jnp.maximum(m_col, jnp.float32(-110.0))
+                m_bias = m_safe - jnp.float32(8.75)
+                p_f32 = jnp.exp2(qk_sc - m_bias)
+                p_f8 = jnp.minimum(p_f32, jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                p_scale_8 = jnp.broadcast_to(jnp.exp2(m_bias), (1, 8, w_cols))
+                p_sum16 = jnp.sum(
+                    p_f8.astype(jnp.float32).reshape(1, 16, 16, w_cols),
+                    axis=1,
+                    dtype=jnp.float32,
+                )
+                ps_unscaled = jnp.broadcast_to(
+                    jnp.sum(p_sum16, axis=1, keepdims=True, dtype=jnp.float32),
+                    (1, 8, w_cols),
+                )
+                return p_f8, ps_unscaled * p_scale_8, p_scale_8
+            if use_fp8_qkpv:
+                p_f32 = jnp.exp2(qk_sc)
+                p_f8 = jnp.minimum(p_f32, jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                p_for_sum = (
+                    p_f8.astype(jnp.float32) if use_fp8_qkpv_norm else p_f32
+                )
+                p_sum16 = jnp.sum(
+                    p_for_sum.reshape(1, 16, 16, w_cols), axis=1, dtype=jnp.float32
+                )
+                ps = jnp.broadcast_to(
+                    jnp.sum(p_sum16, axis=1, keepdims=True, dtype=jnp.float32),
+                    (1, 8, w_cols),
+                )
+                return p_f8, ps, None
+            p = jnp.exp2(qk_sc).astype(jnp.bfloat16)
+        else:
+            if use_fp8_qk and use_fp8_qkpv:
+                qk = (qk_f32 - jnp.float32(qkpv_shift)).astype(jnp.bfloat16)
+            else:
+                qk = qk_f32.astype(jnp.bfloat16)
+            if bias_spec == "ut":
+                m_u = mask_ut_ref[...]
+                qk = qk + (
+                    m_u if n_rep == 1 else jnp.concatenate([m_u] * n_rep, axis=2)
+                )
+            elif bias_spec == "lt":
+                m_l = mask_lt_ref[...]
+                qk = qk + (
+                    m_l if n_rep == 1 else jnp.concatenate([m_l] * n_rep, axis=2)
+                )
+            elif bias_spec != "none":
+                bs = (
+                    bias_spec
+                    if n_rep == 1
+                    else jnp.concatenate([bias_spec] * n_rep, axis=2)
+                )
+                qk = jnp.where(bs, qk, -jnp.inf)
+            p = jnp.exp2(qk)
+            if use_fp8_qkpv:
+                p_f8 = jnp.minimum(p, jnp.bfloat16(448.0)).astype(jnp.float8_e4m3fn)
+                ps = _psum_w(
+                    p_f8.astype(jnp.bfloat16) if use_fp8_qkpv_norm else p, w_cols
+                )
+                return p_f8, ps, None
+        return p, _psum_w(p, w_cols), None
+
+    def _sm_eval(qk_f32, bias_spec, q_exp_256=None):
+        return _sm_eval_w(qk_f32, bias_spec, tq_sz, q_exp_256)
+
+    def _write_unpacked_kv_slice(dst_s, kv_u32):
+        if use_fp8_kv:
+            kv_u32_hi = pltpu.roll(kv_u32, shift=64, axis=1)
+            k_sub_ref[0, dst_s] = pltpu.bitcast(kv_u32.astype(jnp.uint8), kv_dtype)
+            k_sub_ref[1, dst_s] = pltpu.bitcast(kv_u32_hi.astype(jnp.uint8), kv_dtype)
+        else:
+            k_b = pltpu.bitcast(kv_u32.astype(jnp.uint8), kv_dtype).astype(jnp.bfloat16)
+            k_sub_ref[0, dst_s] = k_b
+            k_sub_ref[1, dst_s] = pltpu.roll(k_b, shift=64, axis=1)
+        v_bf16 = pltpu.bitcast(
+            (kv_u32 >> jnp.uint32(8)).astype(jnp.uint8), kv_dtype
+        ).astype(jnp.bfloat16)
+        vt_128 = jnp.swapaxes(v_bf16, 0, 1)
+        if use_vt_fp8:
+            vt_sub_ref[0, dst_s] = vt_128[:64, :].astype(kv_dtype)
+            vt_sub_ref[1, dst_s] = vt_128[64:, :].astype(kv_dtype)
+        else:
+            vt_sub_ref[0, dst_s] = vt_128[:64, :]
+            vt_sub_ref[1, dst_s] = vt_128[64:, :]
+
+    def _unpack_full_bkv_block(bkv_sem_idx, slot_base_s=0):
+        if kv_pack_dense2:
+            kv_u32_all = (
+                bkv_x2_ref.bitcast(jnp.uint32)
+                .at[bkv_sem_idx]
+                .reshape((bkv_sz // 2) * bkv_stride, 128)
+            )
+            for s_loc in range(num_s):
+                pair_u32 = kv_u32_all[
+                    pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
+                ]
+                kv_u32 = jnp.concatenate(
+                    [
+                        pair_u32 & jnp.uint32(0xFFFF),
+                        pair_u32 >> jnp.uint32(16),
+                    ],
+                    axis=0,
+                )
+                _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+            return
+
+        kv_u32_all = (
+            bkv_x2_ref.bitcast(jnp.uint32)
+            .at[bkv_sem_idx]
+            .reshape(bkv_sz * bkv_stride, 128)
+        )
+        for s_loc in range(num_s):
+            kv_u32 = kv_u32_all[pl.ds(s_loc * 256 * bkv_stride, 256, bkv_stride)]
+            _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+
+    def _unpack_bkv_block(bkv_sem_idx, bkv_block_idx, slot_base_s, valid_keys):
+        if kv_pack_dense2:
+            kv_u32_all = (
+                bkv_x2_ref.bitcast(jnp.uint32)
+                .at[bkv_sem_idx]
+                .reshape((bkv_sz // 2) * bkv_stride, 128)
+            )
+
+            @pl.when(valid_keys == bkv_sz)
+            def _up_full_d2():
+                _unpack_full_bkv_block(bkv_sem_idx, slot_base_s)
+
+            @pl.when(valid_keys < bkv_sz)
+            def _up_partial_d2():
+                s_lim = cdiv(valid_keys, 256)
+
+                @pl.loop(0, s_lim, unroll=False)
+                def _up_one_d2(s_loc):
+                    pair_start = s_loc * 128
+                    pair_u32 = kv_u32_all[
+                        pl.ds(pair_start * bkv_stride, 128, bkv_stride)
+                    ]
+                    r_128 = lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+                    tok_even = s_loc * 256 + 2 * r_128
+                    lo_u32 = jnp.where(
+                        tok_even < valid_keys,
+                        pair_u32 & jnp.uint32(0xFFFF),
+                        jnp.uint32(0),
+                    )
+                    hi_u32 = jnp.where(
+                        (tok_even + 1) < valid_keys,
+                        pair_u32 >> jnp.uint32(16),
+                        jnp.uint32(0),
+                    )
+                    kv_u32 = jnp.concatenate([lo_u32, hi_u32], axis=0)
+                    _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+
+            return
+
+        kv_u32_all = (
+            bkv_x2_ref.bitcast(jnp.uint32)
+            .at[bkv_sem_idx]
+            .reshape(bkv_sz * bkv_stride, 128)
+        )
+
+        @pl.when(valid_keys == bkv_sz)
+        def _up_full():
+            _unpack_full_bkv_block(bkv_sem_idx, slot_base_s)
+
+        @pl.when(valid_keys < bkv_sz)
+        def _up_partial():
+            s_lim = cdiv(valid_keys, 256)
+
+            @pl.loop(0, s_lim, unroll=False)
+            def _up_one(s_loc):
+                bkv_start = s_loc * 256
+                kv_u32 = kv_u32_all[pl.ds(bkv_start * bkv_stride, 256, bkv_stride)]
+                k_pos = bkv_start + lax.broadcasted_iota(jnp.int32, (256, 128), 0)
+                kv_u32 = jnp.where(k_pos < valid_keys, kv_u32, jnp.uint32(0))
+                _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+
+    @pl.loop(0, num_bq, unroll=False)
+    def compute_with_bq_v2(bq_idx):
+        bq_sem_idx = sem_ids_ref[0]
+        next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
+            seq_idx, bq_idx, bq_sem_idx
+        )
+        processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
+        start_bkv_idx = jnp.int32(0)
+        if sliding_window is not None:
+            start_bkv_idx = jnp.maximum(processed_q_len - _sw_off, 0) // bkv_sz
+        effective_kv_len = (
+            jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
+            if use_causal_mask
+            else kv_len
+        )
+        end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+        valid_bq_rows = jnp.clip(q_len - bq_idx * actual_bq_sz, 0, actual_bq_sz)
+
+        @pl.when(next_seq_idx < end_seq_idx)
+        def prefetch_next_bq():
+            if not use_staged_qo:
+                sem_ids_ref[0] = next_bq_sem_idx
+                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+
+        def _decode_q_pair(u_s, s, lane_is_lo):
+            if use_fp8_qk and not use_fp8_qk_dyn:
+                q_enc_sc = float(1.0 if use_f32_exp else exp_scale)
+                even_f = pltpu.bitcast(u_s << jnp.uint32(16), jnp.float32) * q_enc_sc
+                odd_f = (
+                    pltpu.bitcast(u_s & jnp.uint32(0xFFFF0000), jnp.float32) * q_enc_sc
+                )
+                if s < 4:
+                    pair_q_f = jnp.where(
+                        lane_is_lo,
+                        even_f,
+                        pltpu.roll(odd_f, shift=64, axis=1),
+                    )
+                else:
+                    pair_q_f = jnp.where(
+                        lane_is_lo,
+                        pltpu.roll(even_f, shift=64, axis=1),
+                        odd_f,
+                    )
+                return jnp.clip(
+                    jnp.swapaxes(pair_q_f, 0, 1), -448.0, 448.0
+                ).astype(jnp.float8_e4m3fn)
+            if use_f32_exp:
+                even_bf16 = pltpu.bitcast(u_s << jnp.uint32(16), jnp.float32).astype(
+                    jnp.bfloat16
+                )
+                odd_bf16 = pltpu.bitcast(
+                    u_s & jnp.uint32(0xFFFF0000), jnp.float32
+                ).astype(jnp.bfloat16)
+            else:
+                even_bf16 = (
+                    pltpu.bitcast(u_s << jnp.uint32(16), jnp.float32) * exp_scale
+                ).astype(jnp.bfloat16)
+                odd_bf16 = (
+                    pltpu.bitcast(u_s & jnp.uint32(0xFFFF0000), jnp.float32) * exp_scale
+                ).astype(jnp.bfloat16)
+            if s < 4:
+                pair_q_bf16 = jnp.where(
+                    lane_is_lo,
+                    even_bf16,
+                    pltpu.roll(odd_bf16, shift=64, axis=1),
+                )
+            else:
+                pair_q_bf16 = jnp.where(
+                    lane_is_lo,
+                    pltpu.roll(even_bf16, shift=64, axis=1),
+                    odd_bf16,
+                )
+            return jnp.swapaxes(pair_q_bf16, 0, 1)
+
+        def _store_qt_pair(pair_q_t, s, t_sl):
+            if use_fp8_qk_dyn:
+                q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                q_t_ref[2 * s, :, t_sl] = q0_f8
+                q_t_ref[2 * s + 1, :, t_sl] = q1_f8
+                q_sc_ref[2 * s, :, t_sl] = q0_sc8
+                q_sc_ref[2 * s + 1, :, t_sl] = q1_sc8
+            else:
+                q_t_ref[2 * s, :, t_sl] = pair_q_t[:64, :]
+                q_t_ref[2 * s + 1, :, t_sl] = pair_q_t[64:, :]
+
+        def _unpack_one_tq_qt_from_ref(q_u32_ref, src_tq_start, dst_tq_start, valid_tq, lane_is_lo):
+            t_sl = pl.ds(dst_tq_start, tq_sz)
+
+            @pl.when(valid_tq == tq_sz)
+            def _up_tq_full():
+                for s in range(8):
+                    u_s = q_u32_ref[pl.ds(src_tq_start * 8 + s, tq_sz, 8)]
+                    pair_q_t = _decode_q_pair(u_s, s, lane_is_lo)
+                    _store_qt_pair(pair_q_t, s, t_sl)
+
+            @pl.when(jnp.logical_and(valid_tq > 0, valid_tq < tq_sz))
+            def _up_tq_partial():
+                q_row_io = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 0)
+                row_ok = q_row_io < valid_tq
+                for s in range(8):
+                    u_s = q_u32_ref[pl.ds(src_tq_start * 8 + s, tq_sz, 8)]
+                    u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
+                    pair_q_t = _decode_q_pair(u_s, s, lane_is_lo)
+                    _store_qt_pair(pair_q_t, s, t_sl)
+
+        def unpack_bq_to_qt_v2(sem_q):
+            q_u32_ref = (
+                bq_x2_ref.bitcast(jnp.uint32).at[sem_q, 0].reshape(bq_sz * 8, 128)
+            )
+            is_lo = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1) < 64
+            for tq_idx in range(bq_sz // tq_sz):
+                tq_start = tq_idx * tq_sz
+                valid_tq = jnp.clip(valid_bq_rows - tq_start, 0, tq_sz)
+                if tq_idx == 0:
+                    _unpack_one_tq_qt_from_ref(
+                        q_u32_ref, tq_start, tq_start, valid_tq, is_lo
+                    )
+                else:
+
+                    @pl.when(tq_start < valid_bq_rows)
+                    def _up_tail_tq(tq_start=tq_start, valid_tq=valid_tq):
+                        _unpack_one_tq_qt_from_ref(
+                            q_u32_ref, tq_start, tq_start, valid_tq, is_lo
+                        )
+
+        def _wait_and_unpack_cur_bq(sem_q):
+            if not use_staged_qo:
+                wait_fetch_bq(seq_idx, bq_idx, sem_q)
+                if probe != "nocompute":
+                    unpack_bq_to_qt_v2(sem_q)
+                return
+            q_row_base = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz
+            n_q_stages = cdiv(valid_bq_rows, tq_sz)
+            is_lo = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1) < 64
+
+            @pl.when(n_q_stages > 0)
+            def _do_staged_q():
+                sz0 = jnp.minimum(tq_sz, valid_bq_rows)
+                start_fetch_bq_stage(q_row_base, sz0, 0)
+
+                @pl.loop(0, n_q_stages, unroll=False)
+                def _q_st(st_idx):
+                    st_slot = st_idx & 1
+                    st_q_start = st_idx * tq_sz
+                    st_sz = jnp.minimum(tq_sz, valid_bq_rows - st_q_start)
+                    next_st = st_idx + 1
+
+                    @pl.when(next_st < n_q_stages)
+                    def _pf_next_q():
+                        nxt_slot = next_st & 1
+                        nxt_q_start = next_st * tq_sz
+                        nxt_sz = jnp.minimum(tq_sz, valid_bq_rows - nxt_q_start)
+                        start_fetch_bq_stage(q_row_base + nxt_q_start, nxt_sz, nxt_slot)
+
+                    wait_fetch_bq_stage(q_row_base + st_q_start, st_sz, st_slot)
+                    if probe != "nocompute":
+                        q_u32_stage = (
+                            bq_x2_ref.bitcast(jnp.uint32)
+                            .at[st_slot, 0]
+                            .reshape(tq_sz * 8, 128)
+                        )
+                        _unpack_one_tq_qt_from_ref(
+                            q_u32_stage, 0, st_q_start, st_sz, is_lo
+                        )
+
+        def _run_ring_chunk(
+            s_start, n_slices, first_vis_cond, bias_specs, t_sl, *, static_first=False
+        ):
+            if use_gqa2_vreg or use_gqa4_vreg:
+                pairs_per_grp = 2 if use_gqa4_vreg else 1
+                n_heads_grp = 2 * pairs_per_grp
+                w_grp = n_heads_grp * tq_sz
+                for kv_h in range(2):
+                    for gp in range(4 // pairs_per_grp):
+                        g_base = kv_h * 8 + n_heads_grp * gp
+                        qt_grp = jnp.concatenate(
+                            [
+                                q_t_ref[g : g + 1, :, t_sl]
+                                for g in range(g_base, g_base + n_heads_grp)
+                            ],
+                            axis=2,
+                        )
+                        if use_fp8_qk_dyn:
+                            qsc_grp_8 = jnp.concatenate(
+                                [
+                                    q_sc_ref[g : g + 1, :, t_sl]
+                                    for g in range(g_base, g_base + n_heads_grp)
+                                ],
+                                axis=2,
+                            )
+                            q_exp_grp = jnp.tile(qsc_grp_8, (1, 32, 1))
+                        else:
+                            q_exp_grp = None
+                        l_grp = jnp.zeros((1, 8, w_grp), jnp.float32)
+                        acc_grp = jnp.zeros((1, 64, w_grp), jnp.float32)
+                        mrb_g = []
+                        rdy_g = None
+
+                        def _adv_grp(q_exp_grp=q_exp_grp):
+                            nonlocal rdy_g, l_grp
+                            qk_g, loc_s, vt_s = mrb_g.pop(0)
+                            p_g, ps_g, p_sc_g = _sm_eval_w(
+                                qk_g, bias_specs[loc_s], w_grp, q_exp_grp
+                            )
+                            l_grp = l_grp + ps_g
+                            rdy_g = (p_g, vt_s, p_sc_g)
+
+                        def _fl_grp():
+                            nonlocal rdy_g, acc_grp
+                            p_g, vt_s, p_sc_g = rdy_g
+                            acc_grp = acc_grp + _vp_scaled(vt_s, p_g, p_sc_g)
+                            rdy_g = None
+
+                        for loc_s in range(n_slices):
+                            s_ring = (
+                                (s_start + loc_s) & ring_s_mask
+                                if ring_covers_all
+                                else (s_start + loc_s)
+                            )
+                            ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                            vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                            qk_g = _kq_dot(ks, qt_grp)
+                            if rdy_g is not None:
+                                _fl_grp()
+                            mrb_g.append((qk_g, loc_s, vts))
+                            if len(mrb_g) >= 2:
+                                _adv_grp()
+                        while mrb_g:
+                            if rdy_g is not None:
+                                _fl_grp()
+                            _adv_grp()
+                        if rdy_g is not None:
+                            _fl_grp()
+
+                        for h_off in range(n_heads_grp):
+                            g = g_base + h_off
+                            c0 = h_off * tq_sz
+                            c1 = c0 + tq_sz
+                            l_add = l_grp[:, :, c0:c1]
+                            a_add = acc_grp[:, :, c0:c1]
+                            if static_first:
+                                l_ref[g : g + 1, :, t_sl] = l_add
+                                acc_ref[g : g + 1, :, t_sl] = a_add
+                            else:
+                                l_ref[g : g + 1, :, t_sl] = jnp.where(
+                                    first_vis_cond,
+                                    l_add,
+                                    l_ref[g : g + 1, :, t_sl] + l_add,
+                                )
+                                acc_ref[g : g + 1, :, t_sl] = jnp.where(
+                                    first_vis_cond,
+                                    a_add,
+                                    acc_ref[g : g + 1, :, t_sl] + a_add,
+                                )
+                return
+
+            if use_vreg_acc and n_slices >= 4:
+                for kv_h in range(2):
+                    for gp in range(4):
+                        g0 = kv_h * 8 + 2 * gp
+                        g1 = g0 + 1
+                        qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                        qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                        qsc0 = (
+                            jnp.tile(q_sc_ref[g0 : g0 + 1, :, t_sl], (1, 32, 1))
+                            if use_fp8_qk_dyn
+                            else None
+                        )
+                        qsc1 = (
+                            jnp.tile(q_sc_ref[g1 : g1 + 1, :, t_sl], (1, 32, 1))
+                            if use_fp8_qk_dyn
+                            else None
+                        )
+                        l0_reg = jnp.zeros((1, 8, tq_sz), jnp.float32)
+                        l1_reg = jnp.zeros((1, 8, tq_sz), jnp.float32)
+                        acc0_reg = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                        acc1_reg = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                        mrb_r = []
+                        rdy_r = None
+
+                        def _adv_r():
+                            nonlocal rdy_r, l0_reg, l1_reg
+                            qk0, qk1, loc_s, vt_s, qs0, qs1 = mrb_r.pop(0)
+                            p0, ps0, psc0 = _sm_eval(qk0, bias_specs[loc_s], qs0)
+                            p1, ps1, psc1 = _sm_eval(qk1, bias_specs[loc_s], qs1)
+                            l0_reg = l0_reg + ps0
+                            l1_reg = l1_reg + ps1
+                            rdy_r = (p0, p1, vt_s, psc0, psc1)
+
+                        def _fl_r():
+                            nonlocal rdy_r, acc0_reg, acc1_reg
+                            p0, p1, vt_s, psc0, psc1 = rdy_r
+                            acc0_reg = acc0_reg + _vp_scaled(vt_s, p0, psc0)
+                            acc1_reg = acc1_reg + _vp_scaled(vt_s, p1, psc1)
+                            rdy_r = None
+
+                        for loc_s in range(n_slices):
+                            s_ring = (
+                                (s_start + loc_s) & ring_s_mask
+                                if ring_covers_all
+                                else (s_start + loc_s)
+                            )
+                            ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                            vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                            qk0 = _kq_dot(ks, qt0)
+                            qk1 = _kq_dot(ks, qt1)
+                            if rdy_r is not None:
+                                _fl_r()
+                            mrb_r.append((qk0, qk1, loc_s, vts, qsc0, qsc1))
+                            if len(mrb_r) >= mrb_depth:
+                                _adv_r()
+                        while mrb_r:
+                            if rdy_r is not None:
+                                _fl_r()
+                            _adv_r()
+                        if rdy_r is not None:
+                            _fl_r()
+
+                        if static_first:
+                            l_ref[g0 : g0 + 1, :, t_sl] = l0_reg
+                            l_ref[g1 : g1 + 1, :, t_sl] = l1_reg
+                            acc_ref[g0 : g0 + 1, :, t_sl] = acc0_reg
+                            acc_ref[g1 : g1 + 1, :, t_sl] = acc1_reg
+                        else:
+                            l_ref[g0 : g0 + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                l0_reg,
+                                l_ref[g0 : g0 + 1, :, t_sl] + l0_reg,
+                            )
+                            l_ref[g1 : g1 + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                l1_reg,
+                                l_ref[g1 : g1 + 1, :, t_sl] + l1_reg,
+                            )
+                            acc_ref[g0 : g0 + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                acc0_reg,
+                                acc_ref[g0 : g0 + 1, :, t_sl] + acc0_reg,
+                            )
+                            acc_ref[g1 : g1 + 1, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                acc1_reg,
+                                acc_ref[g1 : g1 + 1, :, t_sl] + acc1_reg,
+                            )
+                return
+
+            mrb_q = []
+            ready_p = None
+
+            def _adv2():
+                nonlocal ready_p
+                qk0, qk1, g0, g1, loc_s, vt_s, qsc0, qsc1 = mrb_q.pop(0)
+                p0, ps0, psc0 = _sm_eval(qk0, bias_specs[loc_s], qsc0)
+                p1, ps1, psc1 = _sm_eval(qk1, bias_specs[loc_s], qsc1)
+                if loc_s == 0:
+                    l_ref[g0 : g0 + 1, :, t_sl] = (
+                        ps0
+                        if static_first
+                        else jnp.where(
+                            first_vis_cond,
+                            ps0,
+                            l_ref[g0 : g0 + 1, :, t_sl] + ps0,
+                        )
+                    )
+                    l_ref[g1 : g1 + 1, :, t_sl] = (
+                        ps1
+                        if static_first
+                        else jnp.where(
+                            first_vis_cond,
+                            ps1,
+                            l_ref[g1 : g1 + 1, :, t_sl] + ps1,
+                        )
+                    )
+                else:
+                    l_ref[g0 : g0 + 1, :, t_sl] = l_ref[g0 : g0 + 1, :, t_sl] + ps0
+                    l_ref[g1 : g1 + 1, :, t_sl] = l_ref[g1 : g1 + 1, :, t_sl] + ps1
+                ready_p = (p0, p1, g0, g1, loc_s, vt_s, psc0, psc1)
+
+            def _fl2():
+                nonlocal ready_p
+                p0, p1, g0, g1, loc_s, vt_s, psc0, psc1 = ready_p
+                vp0 = _vp_scaled(vt_s, p0, psc0)
+                vp1 = _vp_scaled(vt_s, p1, psc1)
+                if loc_s == 0:
+                    acc_ref[g0 : g0 + 1, :, t_sl] = (
+                        vp0
+                        if static_first
+                        else jnp.where(
+                            first_vis_cond,
+                            vp0,
+                            acc_ref[g0 : g0 + 1, :, t_sl] + vp0,
+                        )
+                    )
+                    acc_ref[g1 : g1 + 1, :, t_sl] = (
+                        vp1
+                        if static_first
+                        else jnp.where(
+                            first_vis_cond,
+                            vp1,
+                            acc_ref[g1 : g1 + 1, :, t_sl] + vp1,
+                        )
+                    )
+                else:
+                    acc_ref[g0 : g0 + 1, :, t_sl] = acc_ref[g0 : g0 + 1, :, t_sl] + vp0
+                    acc_ref[g1 : g1 + 1, :, t_sl] = acc_ref[g1 : g1 + 1, :, t_sl] + vp1
+                ready_p = None
+
+            for kv_h in range(2):
+                for gp in range(4):
+                    g0 = kv_h * 8 + 2 * gp
+                    g1 = g0 + 1
+                    qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                    qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                    qsc0 = (
+                        jnp.tile(q_sc_ref[g0 : g0 + 1, :, t_sl], (1, 32, 1))
+                        if use_fp8_qk_dyn
+                        else None
+                    )
+                    qsc1 = (
+                        jnp.tile(q_sc_ref[g1 : g1 + 1, :, t_sl], (1, 32, 1))
+                        if use_fp8_qk_dyn
+                        else None
+                    )
+                    for loc_s in range(n_slices):
+                        s_ring = (
+                            (s_start + loc_s) & ring_s_mask
+                            if ring_covers_all
+                            else (s_start + loc_s)
+                        )
+                        ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                        vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                        qk0 = _kq_dot(ks, qt0)
+                        qk1 = _kq_dot(ks, qt1)
+                        if ready_p is not None:
+                            _fl2()
+                        mrb_q.append((qk0, qk1, g0, g1, loc_s, vts, qsc0, qsc1))
+                        if len(mrb_q) >= mrb_depth:
+                            _adv2()
+            while mrb_q:
+                if ready_p is not None:
+                    _fl2()
+                _adv2()
+            if ready_p is not None:
+                _fl2()
+
+        def _make_dyn_mask(q_first, key_pos_base, max_valid_kv):
+            q_pos = q_first + lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 2)
+            k_raw = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 1)
+            k_off = (
+                jnp.where(k_raw < 128, 2 * k_raw, 2 * (k_raw - 128) + 1)
+                if kv_pack_dense2
+                else k_raw
+            )
+            kp = key_pos_base + k_off
+            msk = kp < max_valid_kv
+            if use_causal_mask:
+                msk = jnp.logical_and(msk, q_pos >= kp)
+            if sliding_window is not None:
+                msk = jnp.logical_and(msk, q_pos < kp + sliding_window)
+            return msk
+
+        def _run_slice_range(
+            q_first,
+            s_lo,
+            s_hi,
+            s_unm_lo,
+            s_unm_hi,
+            global_first_s,
+            base_kv_pos,
+            max_valid_kv,
+            t_sl,
+        ):
+            @pl.when(s_lo >= s_hi)
+            def _zero_empty():
+                l_ref[:, :, t_sl] = jnp.zeros((16, 8, tq_sz), jnp.float32)
+                acc_ref[:, :, t_sl] = jnp.zeros(
+                    (16, acc_ref.shape[1], tq_sz), jnp.float32
+                )
+
+            # 1. Left-masked boundary slices (SW left edge when not handled by sw9_fast)
+            @pl.loop(s_lo, s_unm_lo, unroll=False)
+            def _left_masked(s_cur):
+                msk = _make_dyn_mask(q_first, base_kv_pos + s_cur * 256, max_valid_kv)
+                _run_ring_chunk(
+                    s_cur,
+                    1,
+                    (base_kv_pos // 256 + s_cur) == global_first_s,
+                    (msk,),
+                    t_sl,
+                )
+
+            # 2. Contiguous unmasked slices [s_unm_lo, s_unm_hi), binary-decomposed (8, 4, 2)
+            #    plus paired (unmasked, causal-lt) when odd unmasked is followed by 1 aligned lt slice.
+            #    For causal SW <= 2049, rem_unm <= 7 mathematically for all q_first, so omit dead _unm8 (-10.9k IMEM bundles!).
+            n_unm = s_unm_lo
+            rem_unm = s_unm_hi - s_unm_lo
+            if (
+                use_causal_mask
+                and sliding_window is not None
+                and sliding_window <= 2049
+                and sliding_window_chunk_skip
+            ):
+                s_after8 = n_unm
+            else:
+                n8 = rem_unm // 8
+
+                @pl.loop(0, n8, unroll=False)
+                def _unm8(i8):
+                    s_cur = s_unm_lo + i8 * 8
+                    _run_ring_chunk(
+                        s_cur,
+                        8,
+                        (base_kv_pos // 256 + s_cur) == global_first_s,
+                        ("none",) * 8,
+                        t_sl,
+                    )
+
+                s_after8 = n_unm + n8 * 8
+            has4 = (rem_unm & 4) != 0
+
+            @pl.when(has4)
+            def _unm4():
+                _run_ring_chunk(
+                    s_after8,
+                    4,
+                    (base_kv_pos // 256 + s_after8) == global_first_s,
+                    ("none",) * 4,
+                    t_sl,
+                )
+
+            s_after4 = s_after8 + jnp.where(has4, jnp.int32(4), jnp.int32(0))
+            has2 = (rem_unm & 2) != 0
+
+            @pl.when(has2)
+            def _unm2():
+                _run_ring_chunk(
+                    s_after4,
+                    2,
+                    (base_kv_pos // 256 + s_after4) == global_first_s,
+                    ("none",) * 2,
+                    t_sl,
+                )
+
+            s_after2 = s_after4 + jnp.where(has2, jnp.int32(2), jnp.int32(0))
+            has1 = (rem_unm & 1) != 0
+            n_right = s_hi - s_unm_hi
+            can_lt_diag = jnp.bool_(False)
+            if use_causal_mask and mask_lt_ref is not None:
+                diag_kp = base_kv_pos + s_unm_hi * 256
+                can_lt_diag = jnp.logical_and(
+                    n_right == 1,
+                    jnp.logical_and(
+                        q_first == diag_kp,
+                        diag_kp + 256 <= max_valid_kv,
+                    ),
+                )
+                if sliding_window is not None:
+                    can_lt_diag = jnp.logical_and(
+                        can_lt_diag, q_first + tq_sz <= diag_kp + sliding_window
+                    )
+
+            pair_odd_lt = jnp.logical_and(has1, can_lt_diag)
+
+            @pl.when(pair_odd_lt)
+            def _run_paired_odd_lt():
+                _run_ring_chunk(
+                    s_after2,
+                    2,
+                    (base_kv_pos // 256 + s_after2) == global_first_s,
+                    ("none", "lt"),
+                    t_sl,
+                )
+
+            @pl.when(jnp.logical_and(has1, jnp.logical_not(pair_odd_lt)))
+            def _unm1():
+                _run_ring_chunk(
+                    s_after2,
+                    1,
+                    (base_kv_pos // 256 + s_after2) == global_first_s,
+                    ("none",),
+                    t_sl,
+                )
+
+            # 3. Right-masked boundary slices (causal diagonal / sequence tail)
+            @pl.when(jnp.logical_and(can_lt_diag, jnp.logical_not(has1)))
+            def _right_lt1():
+                _run_ring_chunk(
+                    s_unm_hi,
+                    1,
+                    (base_kv_pos // 256 + s_unm_hi) == global_first_s,
+                    ("lt",),
+                    t_sl,
+                )
+
+            s_dyn_right_lo = jnp.where(can_lt_diag, s_hi, s_unm_hi)
+
+            @pl.loop(s_dyn_right_lo, s_hi, unroll=False)
+            def _right_dyn(s_cur):
+                msk = _make_dyn_mask(q_first, base_kv_pos + s_cur * 256, max_valid_kv)
+                _run_ring_chunk(
+                    s_cur,
+                    1,
+                    (base_kv_pos // 256 + s_cur) == global_first_s,
+                    (msk,),
+                    t_sl,
+                )
+
+        bo_sem_idx = sem_ids_ref[2]
+        sem_ids_ref[2] = (
+            lax.rem(bo_sem_idx + 1, num_slots)
+            if num_slots > 2
+            else lax.select(bo_sem_idx == 0, 1, 0)
+        )
+        out_u32_ref = (
+            None
+            if (use_a3_out or use_staged_qo)
+            else bo_x2_ref.bitcast(jnp.uint32).at[bo_sem_idx, 0].reshape(bq_sz * 8, 128)
+        )
+        is_lo_ep = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1) < 64
+        mask_lo_u32 = jnp.where(is_lo_ep, jnp.uint32(0xFFFFFFFF), jnp.uint32(0))
+        mask_hi_u32 = jnp.where(is_lo_ep, jnp.uint32(0), jnp.uint32(0xFFFFFFFF))
+
+        def _pair_col_f32(a0, a1, l0, l1):
+            inv_l0 = jnp.where(
+                l0 > 0.0,
+                pltpu.reciprocal(l0, approx=True) * v_scale_val,
+                0.0,
+            )
+            inv_l1 = jnp.where(
+                l1 > 0.0,
+                pltpu.reciprocal(l1, approx=True) * v_scale_val,
+                0.0,
+            )
+            o0_t = (
+                (a0.reshape(8, 8, tq_sz) * inv_l0[None, :, :])
+                .reshape(64, tq_sz)
+                .astype(jnp.bfloat16)
+            )
+            o1_t = (
+                (a1.reshape(8, 8, tq_sz) * inv_l1[None, :, :])
+                .reshape(64, tq_sz)
+                .astype(jnp.bfloat16)
+            )
+            pair_t = jnp.concatenate([o0_t, o1_t], axis=0)
+            return jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32) + 0.0
+
+        def _pack_pair_out(a0, a1, l0, l1, s):
+            inv_l0 = jnp.where(
+                l0 > 0.0,
+                pltpu.reciprocal(l0, approx=True) * v_scale_val,
+                0.0,
+            )
+            inv_l1 = jnp.where(
+                l1 > 0.0,
+                pltpu.reciprocal(l1, approx=True) * v_scale_val,
+                0.0,
+            )
+            o0_t = (
+                (a0.reshape(8, 8, tq_sz) * inv_l0[None, :, :])
+                .reshape(64, tq_sz)
+                .astype(jnp.bfloat16)
+            )
+            o1_t = (
+                (a1.reshape(8, 8, tq_sz) * inv_l1[None, :, :])
+                .reshape(64, tq_sz)
+                .astype(jnp.bfloat16)
+            )
+            pair_t = jnp.concatenate([o0_t, o1_t], axis=0)
+            pair = jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32)
+            rolled = pltpu.roll(pair, shift=64, axis=1)
+            even = jnp.where(is_lo_ep, pair, rolled)
+            odd = jnp.where(is_lo_ep, rolled, pair)
+            lo_u32 = pltpu.bitcast(even, jnp.uint32)
+            hi_u32 = pltpu.bitcast(odd, jnp.uint32)
+            packed_u32 = lax.shift_right_logical(lo_u32, jnp.uint32(16)) | (
+                hi_u32 & jnp.uint32(0xFFFF0000)
+            )
+            return packed_u32 & (mask_lo_u32 if s < 4 else mask_hi_u32)
+
+        def _epilogue_one_tq(tq_start, t_sl):
+            for s in range(8):
+                h0 = 2 * s
+                h1 = 2 * s + 1
+                l0 = l_ref[h0, :, t_sl]
+                l1 = l_ref[h1, :, t_sl]
+                a0 = acc_ref[h0, :, t_sl]
+                a1 = acc_ref[h1, :, t_sl]
+                out_u32_ref[pl.ds(tq_start * 8 + s, tq_sz, 8)] = _pack_pair_out(
+                    a0, a1, l0, l1, s
+                )
+
+        def _emit_unfused_epilogue_and_send():
+            if use_staged_qo:
+                n_o_stages = cdiv(valid_bq_rows, tq_sz)
+                row_iota_st = lax.broadcasted_iota(jnp.int32, (tq_sz + 16, 128), 0)
+                zero_tail_st = jnp.zeros((16, 128), jnp.float32)
+
+                @pl.loop(0, n_o_stages, unroll=False)
+                def _o_st(st_idx):
+                    st_slot = st_idx & 1
+                    wait_send_bo(st_slot)
+                    st_q_start = st_idx * tq_sz
+                    t_sl = pl.ds(st_q_start, tq_sz)
+                    st_valid = jnp.minimum(tq_sz, valid_bq_rows - st_q_start)
+                    if use_a3_out:
+                        g0_st = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz + st_q_start
+                        aligned_g0_st = (g0_st // 16) * 16
+                        lead_st = g0_st - aligned_g0_st
+                        total_rows_st = lead_st + st_valid
+                        full_rows_st = (total_rows_st // 16) * 16
+                        for s in range(8):
+                            h0 = 2 * s
+                            h1 = 2 * s + 1
+                            col_s = jnp.concatenate(
+                                [
+                                    _pair_col_f32(
+                                        acc_ref[h0, :, t_sl],
+                                        acc_ref[h1, :, t_sl],
+                                        l_ref[h0, :, t_sl],
+                                        l_ref[h1, :, t_sl],
+                                    ),
+                                    zero_tail_st,
+                                ],
+                                axis=0,
+                            )
+                            col_s = jnp.where(row_iota_st < st_valid, col_s, 0.0)
+
+                            @pl.when(lead_st == 0)
+                            def _store_al_st(s=s, col_s=col_s):
+                                bo_x2_ref[st_slot, :, s * 128 : (s + 1) * 128] = (
+                                    col_s.astype(jnp.bfloat16)
+                                )
+
+                            @pl.when(lead_st > 0)
+                            def _store_sh_st(s=s, col_s=col_s):
+                                shifted = col_s
+                                for sh in (1, 2, 4, 8):
+                                    shifted = jnp.where(
+                                        (lead_st & sh) != 0,
+                                        pltpu.roll(shifted, shift=sh, axis=0),
+                                        shifted,
+                                    )
+                                carry_s = bo_carry_ref[
+                                    :, s * 128 : (s + 1) * 128
+                                ].astype(jnp.float32)
+                                carry_pad = jnp.concatenate(
+                                    [
+                                        carry_s,
+                                        jnp.zeros((tq_sz, 128), jnp.float32),
+                                    ],
+                                    axis=0,
+                                )
+                                merged = jnp.where(
+                                    row_iota_st < lead_st, carry_pad, shifted
+                                )
+                                bo_x2_ref[st_slot, :, s * 128 : (s + 1) * 128] = (
+                                    merged.astype(jnp.bfloat16)
+                                )
+
+                        bo_carry_ref[...] = bo_x2_ref[
+                            st_slot,
+                            pl.ds(pl.multiple_of((total_rows_st // 16) * 16, 16), 16),
+                            :,
+                        ]
+                        start_send_bo_a3(aligned_g0_st, full_rows_st, st_slot)
+                    else:
+                        out_u32_st = (
+                            bo_x2_ref.bitcast(jnp.uint32)
+                            .at[st_slot, 0]
+                            .reshape(tq_sz * 8, 128)
+                        )
+                        for s in range(8):
+                            h0 = 2 * s
+                            h1 = 2 * s + 1
+                            out_u32_st[pl.ds(s, tq_sz, 8)] = _pack_pair_out(
+                                acc_ref[h0, :, t_sl],
+                                acc_ref[h1, :, t_sl],
+                                l_ref[h0, :, t_sl],
+                                l_ref[h1, :, t_sl],
+                                s,
+                            )
+                        g0_st = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz + st_q_start
+                        start_send_bo_staged(g0_st, st_valid, st_slot)
+                return
+
+            if use_a3_out:
+                g0_ep = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+                valid_ep = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - g0_ep)
+                aligned_g0_ep = (g0_ep // 16) * 16
+                lead_ep = g0_ep - aligned_g0_ep
+                total_rows_ep = lead_ep + valid_ep
+                full_rows_ep = (total_rows_ep // 16) * 16
+                row_iota_ep = lax.broadcasted_iota(jnp.int32, (bq_sz + 16, 128), 0)
+                zero_tail_16 = jnp.zeros((16, 128), jnp.float32)
+
+                for s in range(8):
+                    h0 = 2 * s
+                    h1 = 2 * s + 1
+                    parts_s = []
+                    for tq_idx in range(bq_sz // tq_sz):
+                        tq_start = tq_idx * tq_sz
+                        t_sl = pl.ds(tq_start, tq_sz)
+                        parts_s.append(
+                            _pair_col_f32(
+                                acc_ref[h0, :, t_sl],
+                                acc_ref[h1, :, t_sl],
+                                l_ref[h0, :, t_sl],
+                                l_ref[h1, :, t_sl],
+                            )
+                        )
+                    col_s = jnp.concatenate([*parts_s, zero_tail_16], axis=0)
+                    col_s = jnp.where(row_iota_ep < valid_ep, col_s, 0.0)
+
+                    @pl.when(lead_ep == 0)
+                    def _store_aligned_v2(s=s, col_s=col_s):
+                        bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
+                            col_s.astype(jnp.bfloat16)
+                        )
+
+                    @pl.when(lead_ep > 0)
+                    def _store_shifted_v2(s=s, col_s=col_s):
+                        shifted = col_s
+                        for sh in (1, 2, 4, 8):
+                            shifted = jnp.where(
+                                (lead_ep & sh) != 0,
+                                pltpu.roll(shifted, shift=sh, axis=0),
+                                shifted,
+                            )
+                        carry_s = bo_carry_ref[:, s * 128 : (s + 1) * 128].astype(
+                            jnp.float32
+                        )
+                        carry_pad = jnp.concatenate(
+                            [
+                                carry_s,
+                                jnp.zeros((bq_sz, 128), jnp.float32),
+                            ],
+                            axis=0,
+                        )
+                        merged = jnp.where(row_iota_ep < lead_ep, carry_pad, shifted)
+                        bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
+                            merged.astype(jnp.bfloat16)
+                        )
+
+                bo_carry_ref[...] = bo_x2_ref[
+                    bo_sem_idx,
+                    pl.ds(pl.multiple_of((total_rows_ep // 16) * 16, 16), 16),
+                    :,
+                ]
+                start_send_bo_a3(aligned_g0_ep, full_rows_ep, bo_sem_idx)
+                return
+
+            for tq_idx in range(bq_sz // tq_sz):
+                tq_start = tq_idx * tq_sz
+                t_sl = pl.ds(tq_start, tq_sz)
+                if tq_idx == 0:
+                    _epilogue_one_tq(tq_start, t_sl)
+                else:
+
+                    @pl.when(tq_start < valid_bq_rows)
+                    def _epi_tail_tq(tq_start=tq_start, t_sl=t_sl):
+                        _epilogue_one_tq(tq_start, t_sl)
+
+            start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+
+        allow_sw_fuse = (sliding_window == 2049) or (
+            sliding_window == 2048 and "sw2048_fuse" in prefill_opts
+        )
+        can_fuse_sw9 = (
+            use_fuse_qe
+            and bq_sz == 256
+            and allow_sw_fuse
+            and use_causal_mask
+            and sliding_window_chunk_skip
+            and mask_ut_ref is not None
+            and mask_lt_ref is not None
+            and ring_covers_all
+        )
+
+        def _send_fused_bo():
+            if use_a3_out:
+                g0_f = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+                aligned_g0_f = (g0_f // 16) * 16
+                lead_f = g0_f - aligned_g0_f
+
+                @pl.when(lead_f == 0)
+                def _zero_carry_f():
+                    bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
+
+                @pl.when(lead_f > 0)
+                def _shift_and_merge_carry_f():
+                    row_iota_f = lax.broadcasted_iota(
+                        jnp.int32, (tq_sz + 16, 128), 0
+                    )
+                    zero_tail_f = jnp.zeros((16, 128), jnp.float32)
+                    for s_f in range(8):
+                        c_f = jnp.concatenate(
+                            [
+                                bo_x2_ref[
+                                    bo_sem_idx,
+                                    :tq_sz,
+                                    s_f * 128 : (s_f + 1) * 128,
+                                ].astype(jnp.float32),
+                                zero_tail_f,
+                            ],
+                            axis=0,
+                        )
+                        for sh in (1, 2, 4, 8):
+                            c_f = jnp.where(
+                                (lead_f & sh) != 0,
+                                pltpu.roll(c_f, shift=sh, axis=0),
+                                c_f,
+                            )
+                        carry_f = bo_carry_ref[
+                            :, s_f * 128 : (s_f + 1) * 128
+                        ].astype(jnp.float32)
+                        carry_pad_f = jnp.concatenate(
+                            [
+                                carry_f,
+                                jnp.zeros((tq_sz, 128), jnp.float32),
+                            ],
+                            axis=0,
+                        )
+                        merged_f = jnp.where(
+                            row_iota_f < lead_f, carry_pad_f, c_f
+                        )
+                        bo_x2_ref[
+                            bo_sem_idx, :, s_f * 128 : (s_f + 1) * 128
+                        ] = merged_f.astype(jnp.bfloat16)
+                    bo_carry_ref[...] = bo_x2_ref[
+                        bo_sem_idx, pl.ds(tq_sz, 16), :
+                    ]
+
+                start_send_bo_a3(aligned_g0_f, tq_sz, bo_sem_idx)
+            else:
+                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+
+        def _write_sw9_pair_out(a0, a1, l0, l1, s_pair):
+            if use_a3_out:
+                bo_x2_ref[
+                    bo_sem_idx,
+                    :tq_sz,
+                    s_pair * 128 : (s_pair + 1) * 128,
+                ] = _pair_col_f32(a0, a1, l0, l1).astype(jnp.bfloat16)
+            else:
+                out_u32_ref[pl.ds(s_pair, tq_sz, 8)] = _pack_pair_out(
+                    a0, a1, l0, l1, s_pair
+                )
+
+        def _run_sw9_fused_qe(s_lo):
+            q_u32_ref = (
+                bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx, 0].reshape(256 * 8, 128)
+            )
+            t_sl = pl.ds(0, tq_sz)
+            bias_specs = ("ut",) + ("none",) * 7 + ("lt",)
+
+            if use_gqa2_vreg or use_gqa4_vreg:
+                pairs_per_grp = 2 if use_gqa4_vreg else 1
+                w_grp = 2 * pairs_per_grp * tq_sz
+                for kv_h in range(2):
+                    for grp_i in range(4 // pairs_per_grp):
+                        qt_parts = []
+                        for p_off in range(pairs_per_grp):
+                            sp = kv_h * 4 + grp_i * pairs_per_grp + p_off
+                            u_sp = q_u32_ref[pl.ds(sp, tq_sz, 8)]
+                            pq_t = _decode_q_pair(u_sp, sp, is_lo_ep)
+                            qt_parts.append(pq_t[:64, :])
+                            qt_parts.append(pq_t[64:, :])
+                        qt_cat = jnp.concatenate(qt_parts, axis=1)
+                        if use_fp8_qk_dyn:
+                            qt_f8, qsc_8 = _quant_qt_fp8(qt_cat)
+                            qt_dot = qt_f8[None, :, :]
+                            q_exp_256 = jnp.tile(qsc_8[None, :, :], (1, 32, 1))
+                        else:
+                            qt_dot = qt_cat[None, :, :]
+                            q_exp_256 = None
+
+                        l_grp = jnp.zeros((1, 8, w_grp), jnp.float32)
+                        acc_grp = jnp.zeros((1, 64, w_grp), jnp.float32)
+                        mrb_g = []
+                        rdy_g = None
+
+                        def _adv_g(q_exp_256=q_exp_256):
+                            nonlocal rdy_g, l_grp
+                            qk_g, loc_s, vt_s = mrb_g.pop(0)
+                            p_g, ps_g, p_sc_g = _sm_eval_w(
+                                qk_g, bias_specs[loc_s], w_grp, q_exp_256
+                            )
+                            l_grp = l_grp + ps_g
+                            rdy_g = (p_g, vt_s, p_sc_g)
+
+                        def _fl_g():
+                            nonlocal rdy_g, acc_grp
+                            p_g, vt_s, p_sc_g = rdy_g
+                            acc_grp = acc_grp + _vp_scaled(vt_s, p_g, p_sc_g)
+                            rdy_g = None
+
+                        for loc_s in range(9):
+                            s_ring = (s_lo + loc_s) & ring_s_mask
+                            ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                            vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                            qk_g = _kq_dot(ks, qt_dot)
+                            if rdy_g is not None:
+                                _fl_g()
+                            mrb_g.append((qk_g, loc_s, vts))
+                            if len(mrb_g) >= 2:
+                                _adv_g()
+                        while mrb_g:
+                            if rdy_g is not None:
+                                _fl_g()
+                            _adv_g()
+                        if rdy_g is not None:
+                            _fl_g()
+
+                        for p_off in range(pairs_per_grp):
+                            sp = kv_h * 4 + grp_i * pairs_per_grp + p_off
+                            c0 = (2 * p_off) * tq_sz
+                            c1 = (2 * p_off + 1) * tq_sz
+                            c2 = (2 * p_off + 2) * tq_sz
+                            _write_sw9_pair_out(
+                                acc_grp[0, :, c0:c1],
+                                acc_grp[0, :, c1:c2],
+                                l_grp[0, :, c0:c1],
+                                l_grp[0, :, c1:c2],
+                                sp,
+                            )
+                return
+
+            if use_vreg_acc:
+                for kv_h in range(2):
+                    for gp in range(4):
+                        s_pair = kv_h * 4 + gp
+                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
+                        pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
+                        if use_fp8_qk_dyn:
+                            q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                            q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                            qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                            qsc_pair = (
+                                jnp.tile(q0_sc8[None, :, :], (1, 32, 1)),
+                                jnp.tile(q1_sc8[None, :, :], (1, 32, 1)),
+                            )
+                        else:
+                            qt_pair = (
+                                pair_q_t[:64, :][None, :, :],
+                                pair_q_t[64:, :][None, :, :],
+                            )
+                            qsc_pair = (None, None)
+
+                        acc_out = []
+                        l_out = []
+                        for h_sub in range(2):
+                            qt_1h = qt_pair[h_sub]
+                            qsc_1h = qsc_pair[h_sub]
+                            l_1h = jnp.zeros((1, 8, tq_sz), jnp.float32)
+                            acc_1h = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                            mrb_1 = []
+                            rdy_1 = None
+
+                            def _adv_1h(qsc_1h=qsc_1h):
+                                nonlocal rdy_1, l_1h
+                                qk_1, loc_s, vt_s = mrb_1.pop(0)
+                                p_1, ps_1, psc_1 = _sm_eval(qk_1, bias_specs[loc_s], qsc_1h)
+                                l_1h = l_1h + ps_1
+                                rdy_1 = (p_1, vt_s, psc_1)
+
+                            def _fl_1h():
+                                nonlocal rdy_1, acc_1h
+                                p_1, vt_s, psc_1 = rdy_1
+                                acc_1h = acc_1h + _vp_scaled(vt_s, p_1, psc_1)
+                                rdy_1 = None
+
+                            for loc_s in range(9):
+                                s_ring = (s_lo + loc_s) & ring_s_mask
+                                ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                                vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                                qk_1 = _kq_dot(ks, qt_1h)
+                                if rdy_1 is not None:
+                                    _fl_1h()
+                                mrb_1.append((qk_1, loc_s, vts))
+                                if len(mrb_1) >= 2:
+                                    _adv_1h()
+                            while mrb_1:
+                                if rdy_1 is not None:
+                                    _fl_1h()
+                                _adv_1h()
+                            if rdy_1 is not None:
+                                _fl_1h()
+                            acc_out.append(acc_1h[0])
+                            l_out.append(l_1h[0])
+
+                        _write_sw9_pair_out(
+                            acc_out[0], acc_out[1], l_out[0], l_out[1], s_pair
+                        )
+                return
+
+            mrb_q = []
+            ready_p = None
+
+            def _adv_f():
+                nonlocal ready_p
+                qk0, qk1, s_pair, loc_s, vt_s, qsc0, qsc1 = mrb_q.pop(0)
+                g0 = 2 * s_pair
+                g1 = g0 + 1
+                p0, ps0, psc0 = _sm_eval(qk0, bias_specs[loc_s], qsc0)
+                p1, ps1, psc1 = _sm_eval(qk1, bias_specs[loc_s], qsc1)
+                if loc_s == 0:
+                    l_ref[g0 : g0 + 1, :, t_sl] = ps0
+                    l_ref[g1 : g1 + 1, :, t_sl] = ps1
+                else:
+                    l_ref[g0 : g0 + 1, :, t_sl] = l_ref[g0 : g0 + 1, :, t_sl] + ps0
+                    l_ref[g1 : g1 + 1, :, t_sl] = l_ref[g1 : g1 + 1, :, t_sl] + ps1
+                ready_p = (p0, p1, s_pair, loc_s, vt_s, psc0, psc1)
+
+            def _fl_f():
+                nonlocal ready_p
+                p0, p1, s_pair, loc_s, vt_s, psc0, psc1 = ready_p
+                g0 = 2 * s_pair
+                g1 = g0 + 1
+                vp0 = _vp_scaled(vt_s, p0, psc0)
+                vp1 = _vp_scaled(vt_s, p1, psc1)
+                if loc_s == 0:
+                    acc_ref[g0 : g0 + 1, :, t_sl] = vp0
+                    acc_ref[g1 : g1 + 1, :, t_sl] = vp1
+                elif loc_s < 8:
+                    acc_ref[g0 : g0 + 1, :, t_sl] = acc_ref[g0 : g0 + 1, :, t_sl] + vp0
+                    acc_ref[g1 : g1 + 1, :, t_sl] = acc_ref[g1 : g1 + 1, :, t_sl] + vp1
+                else:
+                    a0 = acc_ref[g0, :, t_sl] + vp0[0]
+                    a1 = acc_ref[g1, :, t_sl] + vp1[0]
+                    l0 = l_ref[g0, :, t_sl]
+                    l1 = l_ref[g1, :, t_sl]
+                    _write_sw9_pair_out(a0, a1, l0, l1, s_pair)
+                ready_p = None
+
+            for kv_h in range(2):
+                for gp in range(4):
+                    s_pair = kv_h * 4 + gp
+                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
+                    pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
+                    if use_fp8_qk_dyn:
+                        q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                        q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                        qt0 = q0_f8[None, :, :]
+                        qt1 = q1_f8[None, :, :]
+                        qsc0 = jnp.tile(q0_sc8[None, :, :], (1, 32, 1))
+                        qsc1 = jnp.tile(q1_sc8[None, :, :], (1, 32, 1))
+                    else:
+                        qt0 = pair_q_t[:64, :][None, :, :]
+                        qt1 = pair_q_t[64:, :][None, :, :]
+                        qsc0 = None
+                        qsc1 = None
+                    for loc_s in range(9):
+                        s_ring = (s_lo + loc_s) & ring_s_mask
+                        ks = k_sub_ref[kv_h, s_ring][:, :64][None, :, :]
+                        vts = vt_sub_ref[kv_h : kv_h + 1, s_ring]
+                        qk0 = _kq_dot(ks, qt0)
+                        qk1 = _kq_dot(ks, qt1)
+                        if ready_p is not None:
+                            _fl_f()
+                        mrb_q.append((qk0, qk1, s_pair, loc_s, vts, qsc0, qsc1))
+                        if len(mrb_q) >= mrb_depth:
+                            _adv_f()
+            while mrb_q:
+                if ready_p is not None:
+                    _fl_f()
+                _adv_f()
+            if ready_p is not None:
+                _fl_f()
+
+        if ring_covers_all:
+            prev_unpacked = sem_ids_ref[3]
+
+            @pl.loop(prev_unpacked, end_bkv_idx, unroll=False)
+            def _fetch_and_unpack_ring(fetch_bkv_idx):
+                bkv_sem_idx = sem_ids_ref[1]
+                is_last_seq_bkv = (fetch_bkv_idx + 1) == seq_end_bkv
+                next_seq_bkv = lax.select(is_last_seq_bkv, seq_idx + 1, seq_idx)
+                next_bkv_to_fetch = lax.select(
+                    is_last_seq_bkv, next_seq_start_bkv_idx, fetch_bkv_idx + 1
+                )
+                next_bkv_sem_idx = (
+                    lax.rem(bkv_sem_idx + 1, num_slots)
+                    if num_slots > 2
+                    else lax.select(bkv_sem_idx == 0, 1, 0)
+                )
+
+                @pl.when(next_seq_bkv < end_seq_idx)
+                def _pf_next_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(next_seq_bkv, next_bkv_to_fetch, next_bkv_sem_idx)
+
+                offset, update_sz = wait_fetch_bkv(seq_idx, fetch_bkv_idx, bkv_sem_idx)
+
+                @pl.when(update_sz > 0)
+                def _upd_cache():
+                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+
+                if probe != "nocompute":
+                    slot_base_s = (fetch_bkv_idx & (ring_bkv_blocks - 1)) * num_s
+                    seq_bkv_valid = jnp.clip(kv_len - fetch_bkv_idx * bkv_sz, 0, bkv_sz)
+                    _unpack_bkv_block(
+                        bkv_sem_idx, fetch_bkv_idx, slot_base_s, seq_bkv_valid
+                    )
+
+            @pl.when(end_bkv_idx > prev_unpacked)
+            def _advance_unpacked_cursor():
+                sem_ids_ref[3] = end_bkv_idx
+
+            _wait_and_unpack_cur_bq(bq_sem_idx)
+
+            if can_fuse_sw9 and probe != "nocompute":
+                wait_send_bo(bo_sem_idx)
+                q_first_0 = processed_q_len
+                is_sw9_fast_0 = jnp.logical_and(
+                    valid_bq_rows == tq_sz,
+                    jnp.logical_and(
+                        (q_first_0 & 255) == 0,
+                        jnp.logical_and(
+                            q_first_0 >= 2048,
+                            q_first_0 + tq_sz <= kv_len,
+                        ),
+                    ),
+                )
+                is_sw_short_0 = (
+                    jnp.logical_and(
+                        valid_bq_rows == tq_sz,
+                        jnp.logical_and(
+                            (q_first_0 & 255) == 0,
+                            jnp.logical_and(
+                                q_first_0 < 2048,
+                                q_first_0 + tq_sz <= kv_len,
+                            ),
+                        ),
+                    )
+                    if use_sw_short_fuse
+                    else jnp.bool_(False)
+                )
+
+                @pl.when(is_sw9_fast_0)
+                def _do_fused_sw9():
+                    s_lo_0 = (q_first_0 - 2048) // 256
+                    _run_sw9_fused_qe(s_lo_0)
+                    _send_fused_bo()
+
+                if use_sw_short_fuse:
+
+                    @pl.when(is_sw_short_0)
+                    def _do_fused_sw_short():
+                        n_unm_0 = q_first_0 // 256
+                        s_lt_ring = n_unm_0 & ring_s_mask
+                        q_u32_ref = (
+                            bq_x2_ref.bitcast(jnp.uint32)
+                            .at[bq_sem_idx, 0]
+                            .reshape(256 * 8, 128)
+                        )
+                        for kv_h in range(2):
+                            ks_lt = k_sub_ref[kv_h, s_lt_ring][:, :64][None, :, :]
+                            vts_lt = vt_sub_ref[kv_h : kv_h + 1, s_lt_ring]
+                            for gp in range(4):
+                                s_pair = kv_h * 4 + gp
+                                u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
+                                pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
+                                if use_fp8_qk_dyn:
+                                    q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                                    q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                                    qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                                    qsc_pair = (
+                                        jnp.tile(q0_sc8[None, :, :], (1, 32, 1)),
+                                        jnp.tile(q1_sc8[None, :, :], (1, 32, 1)),
+                                    )
+                                else:
+                                    qt_pair = (
+                                        pair_q_t[:64, :][None, :, :],
+                                        pair_q_t[64:, :][None, :, :],
+                                    )
+                                    qsc_pair = (None, None)
+
+                                acc_out = []
+                                l_out = []
+                                for h_sub in range(2):
+                                    qt_1h = qt_pair[h_sub]
+                                    qsc_1h = qsc_pair[h_sub]
+                                    z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                                    z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
+
+                                    def _unm_step(
+                                        s_idx,
+                                        carry,
+                                        kv_h=kv_h,
+                                        qt_1h=qt_1h,
+                                        qsc_1h=qsc_1h,
+                                    ):
+                                        acc_c, l_c = carry
+                                        s_r = s_idx & ring_s_mask
+                                        ks_c = k_sub_ref[kv_h, s_r][:, :64][
+                                            None, :, :
+                                        ]
+                                        vts_c = vt_sub_ref[kv_h : kv_h + 1, s_r]
+                                        qk_c = _kq_dot(ks_c, qt_1h)
+                                        p_c, ps_c, psc_c = _sm_eval(qk_c, "none", qsc_1h)
+                                        return acc_c + _vp_scaled(vts_c, p_c, psc_c), l_c + ps_c
+
+                                    acc_1h, l_1h = lax.fori_loop(
+                                        0, n_unm_0, _unm_step, (z_acc, z_l)
+                                    )
+                                    qk_lt = _kq_dot(ks_lt, qt_1h)
+                                    p_lt, ps_lt, psc_lt = _sm_eval(qk_lt, "lt", qsc_1h)
+                                    acc_1h = acc_1h + _vp_scaled(vts_lt, p_lt, psc_lt)
+                                    l_1h = l_1h + ps_lt
+                                    acc_out.append(acc_1h[0])
+                                    l_out.append(l_1h[0])
+
+                                _write_sw9_pair_out(
+                                    acc_out[0], acc_out[1], l_out[0], l_out[1], s_pair
+                                )
+                        _send_fused_bo()
+
+                @pl.when(jnp.logical_not(jnp.logical_or(is_sw9_fast_0, is_sw_short_0)))
+                def _do_unfused_fallback():
+                    unpack_bq_to_qt_v2(bq_sem_idx)
+                    strip_kv_hi = jnp.minimum(kv_len, q_first_0 + tq_sz)
+                    s_hi_0 = cdiv(strip_kv_hi, 256)
+                    s_lo_0 = jnp.minimum(
+                        jnp.maximum(q_first_0 - sliding_window + 1, 0) // 256,
+                        s_hi_0,
+                    )
+                    s_unm_lo_0 = jnp.clip(
+                        cdiv(
+                            jnp.maximum(q_first_0 + tq_sz - sliding_window, 0),
+                            256,
+                        ),
+                        s_lo_0,
+                        s_hi_0,
+                    )
+                    s_unm_hi_0 = jnp.clip(
+                        jnp.minimum(kv_len, q_first_0 + 1) // 256,
+                        s_unm_lo_0,
+                        s_hi_0,
+                    )
+                    _run_slice_range(
+                        q_first_0,
+                        s_lo_0,
+                        s_hi_0,
+                        s_unm_lo_0,
+                        s_unm_hi_0,
+                        s_lo_0,
+                        0,
+                        kv_len,
+                        pl.ds(0, tq_sz),
+                    )
+                    _emit_unfused_epilogue_and_send()
+
+                return
+
+            if not use_staged_qo:
+                if probe != "nocompute":
+                    unpack_bq_to_qt_v2(bq_sem_idx)
+
+                def _exec_tq_ring(tq_idx):
+                    tq_start = tq_idx * tq_sz
+                    t_sl = pl.ds(tq_start, tq_sz)
+
+                    @pl.when(tq_start < valid_bq_rows)
+                    def _do_tq():
+                        q_first = processed_q_len + tq_start
+                        strip_kv_hi = (
+                            jnp.minimum(kv_len, q_first + tq_sz)
+                            if use_causal_mask
+                            else kv_len
+                        )
+                        s_hi = cdiv(strip_kv_hi, 256)
+                        if sliding_window is not None and sliding_window_chunk_skip:
+                            s_lo = jnp.minimum(
+                                jnp.maximum(q_first - sliding_window + 1, 0) // 256,
+                                s_hi,
+                            )
+                            s_unm_lo = jnp.clip(
+                                cdiv(
+                                    jnp.maximum(q_first + tq_sz - sliding_window, 0),
+                                    256,
+                                ),
+                                s_lo,
+                                s_hi,
+                            )
+                        else:
+                            s_lo = jnp.int32(0)
+                            s_unm_lo = jnp.int32(0)
+                        max_unm_end = (
+                            jnp.minimum(kv_len, q_first + 1)
+                            if use_causal_mask
+                            else kv_len
+                        )
+                        s_unm_hi = jnp.clip(max_unm_end // 256, s_unm_lo, s_hi)
+
+                        if (
+                            allow_sw_fuse
+                            and use_causal_mask
+                            and sliding_window_chunk_skip
+                            and mask_ut_ref is not None
+                            and mask_lt_ref is not None
+                        ):
+                            is_sw9_fast = jnp.logical_and(
+                                (q_first & 255) == 0,
+                                jnp.logical_and(
+                                    q_first >= 2048,
+                                    q_first + tq_sz <= kv_len,
+                                ),
+                            )
+
+                            @pl.when(is_sw9_fast)
+                            def _sw9_fast():
+                                _run_ring_chunk(
+                                    s_lo,
+                                    9,
+                                    jnp.bool_(True),
+                                    ("ut",) + ("none",) * 7 + ("lt",),
+                                    t_sl,
+                                    static_first=True,
+                                )
+
+                            @pl.when(jnp.logical_not(is_sw9_fast))
+                            def _sw9_general():
+                                _run_slice_range(
+                                    q_first,
+                                    s_lo,
+                                    s_hi,
+                                    s_unm_lo,
+                                    s_unm_hi,
+                                    s_lo,
+                                    0,
+                                    kv_len,
+                                    t_sl,
+                                )
+                        else:
+                            _run_slice_range(
+                                q_first,
+                                s_lo,
+                                s_hi,
+                                s_unm_lo,
+                                s_unm_hi,
+                                s_lo,
+                                0,
+                                kv_len,
+                                t_sl,
+                            )
+
+                if use_tq_loop and (bq_sz // tq_sz) > 1:
+                    pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_tq_ring)
+                else:
+                    for _tqi in range(bq_sz // tq_sz):
+                        _exec_tq_ring(_tqi)
+
+        else:
+            # Streaming fallback for >32K-context full-attention sequences
+            @pl.when(start_bkv_idx >= end_bkv_idx)
+            def _init_empty_stream():
+                l_ref[...] = jnp.zeros_like(l_ref)
+                acc_ref[...] = jnp.zeros_like(acc_ref)
+
+            use_prefix_fast = (
+                "prefix_fast" in prefill_opts
+                and sliding_window is None
+                and use_causal_mask
+            )
+            tail_bkv_start = (
+                jnp.clip(kv_q_gap // bkv_sz, start_bkv_idx, end_bkv_idx)
+                if use_prefix_fast
+                else start_bkv_idx
+            )
+
+            if use_prefix_fast:
+
+                @pl.loop(start_bkv_idx, tail_bkv_start, unroll=False)
+                def _stream_prefix_bkv(bkv_idx):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    (
+                        next_seq_idx_kv,
+                        _,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                    ) = get_next_bkv_ids(
+                        seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx
+                    )
+
+                    @pl.when(next_seq_idx_kv < end_seq_idx)
+                    def _pf_prefix_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx_kv, next_bkv_idx, next_bkv_sem_idx)
+
+                    @pl.when(bkv_idx == start_bkv_idx)
+                    def _wait_up_bq_prefix():
+                        _wait_and_unpack_cur_bq(bq_sem_idx)
+
+                    wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+
+                    if probe != "nocompute":
+                        _unpack_full_bkv_block(bkv_sem_idx)
+                        is_first_bkv = bkv_idx == start_bkv_idx
+
+                        def _exec_prefix_tq(_tqi):
+                            tq_start = _tqi * tq_sz
+                            t_sl = pl.ds(tq_start, tq_sz)
+
+                            @pl.when(tq_start < valid_bq_rows)
+                            def _do_prefix_tq():
+                                _run_ring_chunk(
+                                    0,
+                                    num_s,
+                                    is_first_bkv,
+                                    ("none",) * num_s,
+                                    t_sl,
+                                )
+
+                        if use_tq_loop and (bq_sz // tq_sz) > 1:
+                            pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_prefix_tq)
+                        else:
+                            for _tqi in range(bq_sz // tq_sz):
+                                _exec_prefix_tq(_tqi)
+
+            @pl.loop(tail_bkv_start, end_bkv_idx, unroll=False)
+            def _stream_bkv(bkv_idx):
+                bkv_sem_idx = sem_ids_ref[1]
+                (
+                    next_seq_idx_kv,
+                    _,
+                    next_bkv_idx,
+                    next_bkv_sem_idx,
+                ) = get_next_bkv_ids(
+                    seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx
+                )
+                processed_kv_len = bkv_idx * bkv_sz
+
+                @pl.when(next_seq_idx_kv < end_seq_idx)
+                def _pf_stream_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(next_seq_idx_kv, next_bkv_idx, next_bkv_sem_idx)
+
+                @pl.when(bkv_idx == start_bkv_idx)
+                def _wait_up_bq_stream():
+                    _wait_and_unpack_cur_bq(bq_sem_idx)
+
+                offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+                is_last_visit = bq_idx == num_bq - 1
+
+                @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
+                def _upd_stream_cache():
+                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+
+                if probe != "nocompute":
+                    effective_bkv_sz = jnp.clip(
+                        effective_kv_len - processed_kv_len, 0, bkv_sz
+                    )
+                    _unpack_bkv_block(bkv_sem_idx, bkv_idx, 0, effective_bkv_sz)
+
+                    def _exec_stream_tq(_tqi):
+                        tq_start = _tqi * tq_sz
+                        t_sl = pl.ds(tq_start, tq_sz)
+
+                        @pl.when(tq_start < valid_bq_rows)
+                        def _do_stream_tq():
+                            q_first = processed_q_len + tq_start
+                            strip_kv_hi = (
+                                jnp.minimum(effective_kv_len, q_first + tq_sz)
+                                if use_causal_mask
+                                else effective_kv_len
+                            )
+                            loc_hi = cdiv(
+                                jnp.clip(strip_kv_hi - processed_kv_len, 0, bkv_sz),
+                                256,
+                            )
+                            max_unm_end = (
+                                jnp.minimum(effective_kv_len, q_first + 1)
+                                if use_causal_mask
+                                else effective_kv_len
+                            )
+                            loc_unm_hi = jnp.clip(
+                                jnp.maximum(max_unm_end - processed_kv_len, 0) // 256,
+                                0,
+                                loc_hi,
+                            )
+                            global_first_s = start_bkv_idx * num_s
+                            bkv_all_unm = loc_unm_hi == num_s
+
+                            @pl.when(bkv_all_unm)
+                            def _full_bkv_fast():
+                                _run_ring_chunk(
+                                    0,
+                                    num_s,
+                                    (bkv_idx * num_s) == global_first_s,
+                                    ("none",) * num_s,
+                                    t_sl,
+                                )
+
+                            @pl.when(jnp.logical_not(bkv_all_unm))
+                            def _partial_bkv():
+                                _run_slice_range(
+                                    q_first,
+                                    jnp.int32(0),
+                                    loc_hi,
+                                    jnp.int32(0),
+                                    loc_unm_hi,
+                                    global_first_s,
+                                    processed_kv_len,
+                                    effective_kv_len,
+                                    t_sl,
+                                )
+
+                    if use_tq_loop and (bq_sz // tq_sz) > 1:
+                        pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_stream_tq)
+                    else:
+                        for _tqi in range(bq_sz // tq_sz):
+                            _exec_stream_tq(_tqi)
+
+        if not use_staged_qo:
+            wait_send_bo(bo_sem_idx)
+        _emit_unfused_epilogue_and_send()
+
+
 def _ragged_paged_attention_kernel(*args, **kwargs):
     # distribution_ref is at index 5 (after kv_lens, page_indices, cu_q_lens,
     # cu_kv_lens, cu_seq_mask_lens).
@@ -322,6 +2359,72 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
             *args,
             **kwargs,
         )
+
+    if (
+        "a3_out_layout" in kwargs.get("prefill_opts", ())
+        and len(args) > 30
+        and args[30] is not None
+        and not kwargs.get("debug_mode", False)
+    ):
+        cu_q_lens_ref = args[2]
+        o_hbm_ref = args[15]
+        bo_x2_ref = args[20]
+        sems = args[21]
+        bo_carry_ref = args[30]
+        max_tok = o_hbm_ref.shape[0]
+        bq_sz_ep = bo_x2_ref.shape[1] - 16
+        total_q = jnp.where(
+            end_seq_idx > start_seq_idx,
+            cu_q_lens_ref[end_seq_idx],
+            jnp.int32(0),
+        )
+        aligned_end = pl.multiple_of((total_q // 16) * 16, 16)
+        rem_end = total_q - aligned_end
+
+        @pl.when(rem_end > 0)
+        def _flush_carry_tail():
+            cp = pltpu.make_async_copy(
+                bo_carry_ref.at[pl.ds(0, 16), :],
+                o_hbm_ref.at[pl.ds(aligned_end, 16), :],
+                sems.at[2, 0],
+            )
+            cp.start()
+            cp.wait()
+
+        zero_start = pl.multiple_of(cdiv(total_q, 16) * 16, 16)
+
+        @pl.when(zero_start < max_tok)
+        def _zero_pad_rows():
+            bo_x2_ref[0, :bq_sz_ep, :] = jnp.zeros(
+                (bq_sz_ep, o_hbm_ref.shape[1]), o_hbm_ref.dtype
+            )
+            rem_total = max_tok - zero_start
+            n_full_z = rem_total // bq_sz_ep
+
+            @pl.loop(0, n_full_z, unroll=False)
+            def _z_blk(i):
+                st_blk = pl.multiple_of(zero_start + i * bq_sz_ep, 16)
+                cp = pltpu.make_async_copy(
+                    bo_x2_ref.at[0, pl.ds(0, bq_sz_ep), :],
+                    o_hbm_ref.at[pl.ds(st_blk, bq_sz_ep), :],
+                    sems.at[2, 0],
+                )
+                cp.start()
+                cp.wait()
+
+            rem_z = rem_total - n_full_z * bq_sz_ep
+
+            @pl.when(rem_z > 0)
+            def _z_rem():
+                st = pl.multiple_of(zero_start + n_full_z * bq_sz_ep, 16)
+                rem_z_al = pl.multiple_of((rem_z // 16) * 16, 16)
+                cp = pltpu.make_async_copy(
+                    bo_x2_ref.at[0, pl.ds(0, rem_z_al), :],
+                    o_hbm_ref.at[pl.ds(st, rem_z_al), :],
+                    sems.at[2, 0],
+                )
+                cp.start()
+                cp.wait()
 
 
 def _ragged_paged_attention_kernel_loop(
@@ -355,6 +2458,14 @@ def _ragged_paged_attention_kernel_loop(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim]
+    q_t_ref=None,  # [16, 64, bq_sz] bf16 when stationary_q is active
+    k_sub_ref=None,  # [2, bkv_sz // 256, 256, 128] bf16 when stationary_q is active
+    vt_sub_ref=None,  # [2, bkv_sz // 256, 64, 256] bf16 when stationary_q is active
+    mask_lt_ref=None,  # [1, 256, 256] bf16 causal diagonal bias for stationary_q v2
+    mask_ut_ref=None,  # [1, 256, 256] bf16 SW-2049 left-edge bias for stationary_q v2
+    bo_carry_ref=None,  # [16, 1024] bf16 when a3_out_layout is active
+    q_sc_ref=None,  # [16, 8, bq_sz] f32 per-Q-token scale when fp8_qk is active
+    bnew_kv_ref=None,  # [num_slots, bkv_sz, 1, 4, 128] fp8 staging when kv_pack_dense2 is active
     *,
     causal: bool = True,
     sm_scale: float,
@@ -373,9 +2484,19 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
     sliding_window_chunk_skip: bool = True,
+    window_aligned_kv: bool = False,
+    zero_kv_tail: bool = False,
+    ring: int = 0,
+    probe: str | None = None,
+    prefill_opts: frozenset = frozenset(),
     debug_mode: bool = False,
+    kv_pack_dense2: bool = False,
 ):
-    assert q_hbm_ref.shape == o_hbm_ref.shape
+    use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
+    if use_a3_out:
+        assert o_hbm_ref.shape == (q_hbm_ref.shape[1], 1024)
+    else:
+        assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
 
     use_causal_mask = causal
@@ -384,7 +2505,7 @@ def _ragged_paged_attention_kernel_loop(
         # (speculative verification) keep the causal mask.
         use_causal_mask = False
 
-    out_dtype = acc_ref.dtype
+    out_dtype = q_hbm_ref.dtype if q_t_ref is not None else acc_ref.dtype
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -394,11 +2515,12 @@ def _ragged_paged_attention_kernel_loop(
     ) = q_hbm_ref.shape
     (
         total_num_pages,
-        page_size,
+        phys_page_size,
         num_kv_heads_x2_per_kv_packing,
         kv_packing,
         _,
     ) = kv_cache_hbm_ref.shape
+    page_size = phys_page_size * 2 if kv_pack_dense2 else phys_page_size
     bkv_stride = bkv_x2_ref.shape[2]
     num_page_indices = page_indices_ref.shape[0]
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
@@ -412,6 +2534,21 @@ def _ragged_paged_attention_kernel_loop(
     assert bkv_sz % bkv_csz == 0, f"bkv_sz={bkv_sz} not divisible by bkv_csz={bkv_csz}"
     bkv_p = bkv_sz // page_size
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
+    # ring > 0: DECODE with one query row and one KV block per sequence keeps
+    # ring - 1 sequences' q and KV fetches in flight, one buffer slot per
+    # sequence; the two-slot pipeline fetches only one sequence ahead.
+    num_slots = (
+        3 if (case != RpaCase.DECODE and "mixed_s3" in prefill_opts) else (ring or 2)
+    )
+    assert (
+        not ring
+        or (case == RpaCase.DECODE and static_q_len == 1)
+        or "mixed_s3" in prefill_opts
+    )
+    assert bkv_x2_ref.shape[0] == num_slots
+
+    def ring_slot(seq):
+        return (seq - start_seq_idx) % num_slots
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
@@ -420,18 +2557,36 @@ def _ragged_paged_attention_kernel_loop(
     kv_q_gap = kv_len - q_len
     cur_seq_start_bkv_idx = 0
     next_seq_start_bkv_idx = 0
+    # window_aligned_kv: a sequence's KV blocks start at the page holding the
+    # first key its first query row sees, not at token 0, so a window-sized
+    # block covers the window (block-aligned blocks straddle it and fetch and
+    # compute up to twice the keys). Block indices are then relative to that
+    # base, and every block index starts at 0.
+    assert not window_aligned_kv or (
+        sliding_window is not None and case == RpaCase.DECODE
+    )
 
-    if sliding_window is not None:
-        cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz
+    def kv_base(seq_idx):
+        if not window_aligned_kv:
+            return 0
+        q_len = cu_q_lens_ref[seq_idx + 1] - cu_q_lens_ref[seq_idx]
+        first_key = jnp.maximum(kv_lens_ref[seq_idx] - q_len - sliding_window + 1, 0)
+        return first_key // page_size * page_size
+
+    _sw_off = (
+        (sliding_window - 1)
+        if (sliding_window is not None and q_t_ref is not None)
+        else sliding_window
+    )
+    if sliding_window is not None and not window_aligned_kv:
+        cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - _sw_off, 0) // bkv_sz
         next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
         next_q_start = cu_q_lens_ref[next_seq_idx]
         next_q_end = cu_q_lens_ref[next_seq_idx + 1]
         next_q_len = next_q_end - next_q_start
         next_kv_len = kv_lens_ref[next_seq_idx]
         next_kv_q_gap = next_kv_len - next_q_len
-        next_seq_start_bkv_idx = (
-            jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
-        )
+        next_seq_start_bkv_idx = jnp.maximum(next_kv_q_gap - _sw_off, 0) // bkv_sz
 
     def debug_print(msg, *args):
         if debug_mode:
@@ -449,6 +2604,7 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         xai_temperature_reg=None,
         custom_mask_data=None,
+        apply_mask=True,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -478,7 +2634,12 @@ def _ragged_paged_attention_kernel_loop(
         if q_scale is not None:
             s_scale *= q_scale
 
-        s *= s_scale
+        # fold_scale: s stays unscaled (m too), the scale rides in exp2's multiplier.
+        fold_scale = "fold_scale" in prefill_opts
+        if fold_scale:
+            exp_scale = s_scale * math.log2(math.e)
+        else:
+            s *= s_scale
 
         # xai temperature scaling
         if xai_temperature_reg is not None:
@@ -497,11 +2658,24 @@ def _ragged_paged_attention_kernel_loop(
         q_span = processed_q_len_int + (
             lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
         ).astype(int_ty)
-        k_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
+        if kv_pack_dense2:
+            half_c = bkv_csz // 2
+            k_raw = lax.broadcasted_iota(int_ty, s.shape, 1)
+            v_raw = lax.broadcasted_iota(int_ty, v.shape, 0)
+            k_span = processed_kv_len_int + jnp.where(
+                k_raw < half_c, 2 * k_raw, 2 * (k_raw - half_c) + 1
+            )
+            v_span = processed_kv_len_int + jnp.where(
+                v_raw < half_c, 2 * v_raw, 2 * (v_raw - half_c) + 1
+            )
+        else:
+            k_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, s.shape, 1)
+            v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
 
         mask = None
-        if use_causal_mask:
+        if not apply_mask:
+            pass
+        elif use_causal_mask:
             assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
         elif custom_mask_data is not None:
@@ -511,11 +2685,12 @@ def _ragged_paged_attention_kernel_loop(
             )
             mask = mask_and(mask, custom_mask_expanded == 1)
 
-        if not skip_kv_mask:
+        if not skip_kv_mask and apply_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            if probe != "novmask" and not zero_kv_tail:
+                v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
-        if sliding_window is not None:
+        if sliding_window is not None and apply_mask:
             mask = mask_and(mask, q_span < k_span + sliding_window)
 
         if mask is not None:
@@ -525,10 +2700,16 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...].astype(jnp.float32)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr.astype(out_dtype)
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        if fold_scale:
+            p = jnp.exp2((s - broadcast_minor(m_curr, s.shape)) * exp_scale)
+        else:
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        if fold_scale:
+            exp_m_diff = jnp.exp2((m_prev - m_curr) * exp_scale)
+        else:
+            exp_m_diff = jnp.exp(m_prev - m_curr)
         l_prev = l_ref[...].astype(jnp.float32)
         l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
 
@@ -609,8 +2790,9 @@ def _ragged_paged_attention_kernel_loop(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
         kv_len = kv_lens_ref[seq_idx]
-        kv_len_start = bkv_idx * bkv_sz
-        kv_p_start = bkv_idx * bkv_p
+        base = kv_base(seq_idx)
+        kv_len_start = base + bkv_idx * bkv_sz
+        kv_p_start = base // page_size + bkv_idx * bkv_p
         q_start = cu_q_lens_ref[seq_idx]
         q_end = cu_q_lens_ref[seq_idx + 1]
         q_len = q_end - q_start
@@ -625,19 +2807,157 @@ def _ragged_paged_attention_kernel_loop(
         start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
         page_indices_offset = start_kv_page_idx + kv_p_start
 
+        if kv_pack_dense2:
+            assert bnew_kv_ref is not None and bkv_stride == 1
+            sem_new = sems.at[5, bkv_sem_idx]
+            if not wait:
+                wait_update_kv_cache(bkv_sem_idx)
+                if probe != "nodma":
+
+                    @pl.when(bkv_sz_frm_cache > 0)
+                    def _do_cache_dmas_d2():
+                        for i in range(bkv_p):
+                            tok_sz = jnp.clip(
+                                kv_left_frm_cache - i * page_size, 0, page_size
+                            )
+                            pair_sz = cdiv(tok_sz, 2)
+                            page_idx = jnp.minimum(
+                                page_indices_offset + i, num_page_indices - 1
+                            )
+                            _async_copy(
+                                cache_hbm_ref.at[
+                                    pl.ds(
+                                        page_indices_ref[page_idx] * phys_page_size,
+                                        pair_sz,
+                                    )
+                                ],
+                                vmem_ref.at[pl.ds(i * phys_page_size, pair_sz)],
+                                sem,
+                                wait=False,
+                            )
+
+                @pl.when(bkv_sz_frm_new > 0)
+                def _do_new_dma_d2():
+                    new_kv_len_start = q_end - kv_left_frm_new
+                    _async_copy(
+                        kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                        bnew_kv_ref.at[
+                            bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
+                        ],
+                        sem_new,
+                        wait=False,
+                    )
+
+            else:
+                if probe != "nodma":
+
+                    @pl.when(bkv_sz_frm_cache > 0)
+                    def _wait_cache_dmas_d2():
+                        cache_pairs = cdiv(bkv_sz_frm_cache, 2)
+                        c_dst = vmem_ref.at[pl.ds(0, cache_pairs)]
+                        _async_copy(
+                            src=c_dst,
+                            dst=c_dst,
+                            sem=sem,
+                            wait=True,
+                        )
+
+                @pl.when(bkv_sz_frm_new > 0)
+                def _wait_and_pack_new_d2():
+                    n_dst = bnew_kv_ref.at[
+                        bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
+                    ]
+                    _async_copy(
+                        src=n_dst,
+                        dst=n_dst,
+                        sem=sem_new,
+                        wait=True,
+                    )
+                    if not debug_mode:
+                        bnew_u32 = (
+                            bnew_kv_ref.bitcast(jnp.uint32)
+                            .at[bkv_sem_idx]
+                            .reshape(bkv_sz, head_dim)
+                        )
+                        dst_u32 = (
+                            bkv_x2_ref.bitcast(jnp.uint32)
+                            .at[bkv_sem_idx, :, :1]
+                            .reshape(bkv_sz // 2, head_dim)
+                        )
+                        total_valid = bkv_sz_frm_cache + bkv_sz_frm_new
+                        pair_chunk = 128 if (bkv_sz // 2) >= 128 else 64
+                        n_pair_chunks = (bkv_sz // 2) // pair_chunk
+                        r_iota = lax.broadcasted_iota(
+                            jnp.int32, (pair_chunk, head_dim), 0
+                        )
+                        for c_idx in range(n_pair_chunks):
+                            tok_base = c_idx * (2 * pair_chunk)
+                            pair_base = c_idx * pair_chunk
+                            t_even = tok_base + 2 * r_iota
+                            t_odd = t_even + 1
+                            old_p = dst_u32[pl.ds(pair_base, pair_chunk)]
+                            new_lo = bnew_u32[
+                                pl.ds(tok_base, pair_chunk, 2)
+                            ] & jnp.uint32(0xFFFF)
+                            new_hi = bnew_u32[
+                                pl.ds(tok_base + 1, pair_chunk, 2)
+                            ] & jnp.uint32(0xFFFF)
+                            lo = jnp.where(
+                                t_even < bkv_sz_frm_cache,
+                                old_p & jnp.uint32(0xFFFF),
+                                jnp.where(
+                                    t_even < total_valid, new_lo, jnp.uint32(0)
+                                ),
+                            )
+                            hi = jnp.where(
+                                t_odd < bkv_sz_frm_cache,
+                                (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
+                                jnp.where(
+                                    t_odd < total_valid, new_hi, jnp.uint32(0)
+                                ),
+                            )
+                            dst_u32[pl.ds(pair_base, pair_chunk)] = lo | (
+                                hi << jnp.uint32(16)
+                            )
+
+            return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
+
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
-            for i in range(bkv_p):
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                _async_copy(
-                    cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
-                    vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
-                    wait=False,
-                )
+            if "skip_empty_cdma" in prefill_opts:
+
+                @pl.when(bkv_sz_frm_cache > 0)
+                def _do_cache_dmas():
+                    for i in range(bkv_p if probe != "nodma" else 0):
+                        sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+                        page_idx = jnp.minimum(
+                            page_indices_offset + i, num_page_indices - 1
+                        )
+                        _async_copy(
+                            cache_hbm_ref.at[
+                                pl.ds(page_indices_ref[page_idx] * page_size, sz)
+                            ],
+                            vmem_ref.at[pl.ds(i * page_size, sz)],
+                            sem,
+                            wait=False,
+                        )
+
+            else:
+                for i in range(bkv_p if probe != "nodma" else 0):
+                    sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+                    page_idx = jnp.minimum(
+                        page_indices_offset + i, num_page_indices - 1
+                    )
+                    _async_copy(
+                        cache_hbm_ref.at[
+                            pl.ds(page_indices_ref[page_idx] * page_size, sz)
+                        ],
+                        vmem_ref.at[pl.ds(i * page_size, sz)],
+                        sem,
+                        wait=False,
+                    )
 
             new_kv_len_start = q_end - kv_left_frm_new
             _async_copy(
@@ -647,7 +2967,14 @@ def _ragged_paged_attention_kernel_loop(
                 wait,
             )
         else:
-            dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
+            dst = vmem_ref.at[
+                pl.ds(
+                    0,
+                    bkv_sz_frm_new
+                    if probe == "nodma"
+                    else bkv_sz_frm_cache + bkv_sz_frm_new,
+                )
+            ]
             _async_copy(
                 src=dst,
                 dst=dst,
@@ -659,11 +2986,12 @@ def _ragged_paged_attention_kernel_loop(
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
-        bkv_id = offset // bkv_sz
+        base = kv_base(seq_idx)
+        bkv_id = (offset - base) // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
         ignore = offset % page_size
-        p_ignore = kv_p_start - bkv_id * bkv_p
+        p_ignore = kv_p_start - base // page_size - bkv_id * bkv_p
         # sglang-jax: use cu_kv_lens for page_indices offset.
         start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
         page_indices_offset = start_kv_page_idx + kv_p_start
@@ -672,6 +3000,46 @@ def _ragged_paged_attention_kernel_loop(
         cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
+
+        if kv_pack_dense2:
+
+            def loop_body_d2(i, states):
+                rem_sz, ign = states
+                sz = jnp.minimum(page_size - ign, rem_sz)
+                pair_lo = ign // 2
+                n_pairs = cdiv(ign + sz, 2) - pair_lo
+                _async_copy(
+                    vmem_ref.at[pl.ds((p_ignore + i) * phys_page_size + pair_lo, n_pairs)],
+                    cache_hbm_ref.at[
+                        pl.ds(
+                            page_indices_ref[page_indices_offset + i] * phys_page_size
+                            + pair_lo,
+                            n_pairs,
+                        )
+                    ],
+                    sem,
+                    wait,
+                )
+                return rem_sz - sz, 0
+
+            if not wait:
+                lax.fori_loop(
+                    0,
+                    kv_p_end - kv_p_start,
+                    loop_body_d2,
+                    (update_sz, ignore),
+                    unroll=False,
+                )
+            else:
+                total_pairs = cdiv(offset + update_sz, 2) - (offset // 2)
+                dst = cache_hbm_ref.at[pl.ds(0, total_pairs)]
+                _async_copy(
+                    src=dst,
+                    dst=dst,
+                    sem=sem,
+                    wait=True,
+                )
+            return
 
         def loop_body(i, states):
             update_sz, ignore = states
@@ -753,14 +3121,99 @@ def _ragged_paged_attention_kernel_loop(
     def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
+    use_staged_qo_loop = bool(
+        q_t_ref is not None
+        and (prefill_opts & _STATIONARY_Q_V2_OPTS)
+        and "staged_qo" in prefill_opts
+        and bq_x2_ref.shape[2] == 256
+        and bq_sz >= 512
+        and bq_sz % 256 == 0
+    )
+
+    def start_fetch_bq_stage(q_row_start, sz, bq_sem_idx):
+        _async_copy(
+            q_hbm_ref.at[:, pl.ds(q_row_start, sz)],
+            bq_x2_ref.at[bq_sem_idx, :, pl.ds(0, sz)],
+            sems.at[1, bq_sem_idx],
+            False,
+        )
+
+    def wait_fetch_bq_stage(q_row_start, sz, bq_sem_idx):
+        _async_copy(
+            q_hbm_ref.at[:, pl.ds(q_row_start, sz)],
+            bq_x2_ref.at[bq_sem_idx, :, pl.ds(0, sz)],
+            sems.at[1, bq_sem_idx],
+            True,
+        )
+
+    def start_send_bo_staged(o_row_start, sz, bo_sem_idx):
+        @pl.when(sz > 0)
+        def _():
+            bo_ids_ref[bo_sem_idx] = o_row_start
+            bo_ids_ref[bo_sem_idx + num_slots] = sz
+            _async_copy(
+                bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, sz)],
+                o_hbm_ref.at[:, pl.ds(o_row_start, sz)],
+                sems.at[2, bo_sem_idx],
+                False,
+            )
+
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
-        bo_ids_ref[bo_sem_idx + 2] = bo_idx
+        bo_ids_ref[bo_sem_idx + num_slots] = bo_idx
         _send_bo(seq_idx, bo_idx, bo_sem_idx)
 
+    def start_send_bo_a3(aligned_g0, full_rows, bo_sem_idx):
+        @pl.when(full_rows > 0)
+        def _():
+            bo_ids_ref[bo_sem_idx] = aligned_g0
+            bo_ids_ref[bo_sem_idx + num_slots] = full_rows
+            al_g0 = pl.multiple_of((aligned_g0 // 16) * 16, 16)
+            al_rows = pl.multiple_of((full_rows // 16) * 16, 16)
+            _async_copy(
+                bo_x2_ref.at[bo_sem_idx, pl.ds(0, al_rows), :],
+                o_hbm_ref.at[pl.ds(al_g0, al_rows), :],
+                sems.at[2, bo_sem_idx],
+                wait=False,
+            )
+
     def wait_send_bo(bo_sem_idx):
+        if use_a3_out:
+            old_rows = bo_ids_ref[bo_sem_idx + num_slots]
+
+            @pl.when(old_rows > 0)
+            def _():
+                old_g0 = bo_ids_ref[bo_sem_idx]
+                bo_ids_ref[bo_sem_idx] = -1
+                bo_ids_ref[bo_sem_idx + num_slots] = 0
+                al_old_g0 = pl.multiple_of((old_g0 // 16) * 16, 16)
+                al_old_rows = pl.multiple_of((old_rows // 16) * 16, 16)
+                _async_copy(
+                    bo_x2_ref.at[bo_sem_idx, pl.ds(0, al_old_rows), :],
+                    o_hbm_ref.at[pl.ds(al_old_g0, al_old_rows), :],
+                    sems.at[2, bo_sem_idx],
+                    wait=True,
+                )
+
+            return
+        if use_staged_qo_loop:
+            old_rows = bo_ids_ref[bo_sem_idx + num_slots]
+
+            @pl.when(old_rows > 0)
+            def _():
+                old_g0 = bo_ids_ref[bo_sem_idx]
+                bo_ids_ref[bo_sem_idx] = -1
+                bo_ids_ref[bo_sem_idx + num_slots] = 0
+                _async_copy(
+                    bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, old_rows)],
+                    o_hbm_ref.at[:, pl.ds(old_g0, old_rows)],
+                    sems.at[2, bo_sem_idx],
+                    wait=True,
+                )
+
+            return
         old_seq_idx = bo_ids_ref[bo_sem_idx]
-        old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
+        old_bo_idx = bo_ids_ref[bo_sem_idx + num_slots]
 
         @pl.when(jnp.logical_and(start_seq_idx <= old_seq_idx, old_seq_idx <= seq_idx))
         def _():
@@ -768,18 +3221,18 @@ def _ragged_paged_attention_kernel_loop(
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
-        bkv_update_ids_ref[bkv_sem_idx + 2] = offset
-        bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
+        bkv_update_ids_ref[bkv_sem_idx + num_slots] = offset
+        bkv_update_ids_ref[bkv_sem_idx + 2 * num_slots] = update_sz
         _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
     def wait_update_kv_cache(bkv_sem_idx):
-        update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
+        update_sz = bkv_update_ids_ref[bkv_sem_idx + 2 * num_slots]
 
         @pl.when(update_sz > 0)
         def _():
             seq_idx = bkv_update_ids_ref[bkv_sem_idx]
-            offset = bkv_update_ids_ref[bkv_sem_idx + 2]
-            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
+            offset = bkv_update_ids_ref[bkv_sem_idx + num_slots]
+            bkv_update_ids_ref[bkv_sem_idx + 2 * num_slots] = 0
             _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, wait=True)
 
     def strided_load(ref, start, sz, step, *, dtype=None):
@@ -827,6 +3280,22 @@ def _ragged_paged_attention_kernel_loop(
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
+        if kv_pack_dense2:
+            assert kv_packing == 4 and kv_head_idx == 0 and bkv_stride == 1
+            kv_ref = (
+                bkv_x2_ref.bitcast(jnp.uint32)
+                .at[bkv_sem_idx]
+                .reshape(bkv_sz // 2, head_dim)
+            )
+            pair = kv_ref[pl.ds(start // 2, sz // 2)]
+            k_lo = pltpu.bitcast(pair.astype(jnp.uint8), kv_dtype)
+            v_lo = pltpu.bitcast((pair >> jnp.uint32(8)).astype(jnp.uint8), kv_dtype)
+            k_hi = pltpu.bitcast((pair >> jnp.uint32(16)).astype(jnp.uint8), kv_dtype)
+            v_hi = pltpu.bitcast((pair >> jnp.uint32(24)).astype(jnp.uint8), kv_dtype)
+            return jnp.concatenate([k_lo, k_hi], axis=0), jnp.concatenate(
+                [v_lo, v_hi], axis=0
+            )
+
         start *= bkv_stride
         sz *= bkv_stride
         step = bkv_stride
@@ -855,6 +3324,76 @@ def _ragged_paged_attention_kernel_loop(
         k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
         return k, v
+
+    def zero_bkv_tail(bkv_sem_idx, valid_sz):
+        # Zero buffer rows [valid_sz, bkv_sz): they hold earlier sequences' KV
+        # or the prologue's zeros, and V must be finite where p is 0. Replaces
+        # the per-chunk V select (measured ~0.6 us per 8k-key decode request).
+        assert bkv_stride == 1 and bkv_sz % 8 == 0
+        group = 8
+        big = 64
+        if kv_pack_dense2:
+            phys_bkv_sz = bkv_sz // 2
+            assert phys_bkv_sz % 8 == 0
+            rows = (
+                bkv_x2_ref.bitcast(jnp.uint32)
+                .at[bkv_sem_idx]
+                .reshape(phys_bkv_sz, head_dim)
+            )
+            valid_pairs = cdiv(valid_sz, 2)
+            first = jnp.minimum(valid_pairs // group * group, phys_bkv_sz - group)
+            head = rows[pl.ds(pl.multiple_of(first, group), group)]
+            pair_id = first + lax.broadcasted_iota(jnp.int32, head.shape, 0)
+            even_ok = (2 * pair_id) < valid_sz
+            odd_ok = (2 * pair_id + 1) < valid_sz
+            rows[pl.ds(pl.multiple_of(first, group), group)] = jnp.where(
+                odd_ok,
+                head,
+                jnp.where(even_ok, head & jnp.uint32(0xFFFF), jnp.uint32(0)),
+            )
+            start = first + group
+            num_big = jnp.maximum(phys_bkv_sz - start, 0) // big
+            big_start = phys_bkv_sz - num_big * big
+
+            def zero_big_d2(i, _):
+                rows[pl.ds(pl.multiple_of(big_start + i * big, group), big)] = (
+                    jnp.zeros((big, head_dim), jnp.uint32)
+                )
+
+            def zero_group_d2(i, _):
+                rows[pl.ds(pl.multiple_of(start + i * group, group), group)] = (
+                    jnp.zeros((group, head_dim), jnp.uint32)
+                )
+
+            lax.fori_loop(0, num_big, zero_big_d2, None)
+            lax.fori_loop(
+                0, jnp.maximum(big_start - start, 0) // group, zero_group_d2, None
+            )
+            return
+
+        rows = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(bkv_sz, head_dim)
+        first = jnp.minimum(valid_sz // group * group, bkv_sz - group)
+        head = rows[pl.ds(pl.multiple_of(first, group), group)]
+        row_id = first + lax.broadcasted_iota(jnp.int32, head.shape, 0)
+        rows[pl.ds(pl.multiple_of(first, group), group)] = jnp.where(
+            row_id < valid_sz, head, jnp.zeros_like(head)
+        )
+        start = first + group
+        num_big = jnp.maximum(bkv_sz - start, 0) // big
+        big_start = bkv_sz - num_big * big
+
+        def zero_big(i, _):
+            rows[pl.ds(pl.multiple_of(big_start + i * big, group), big)] = jnp.zeros(
+                (big, head_dim), jnp.uint32
+            )
+
+        def zero_group(i, _):
+            rows[pl.ds(pl.multiple_of(start + i * group, group), group)] = jnp.zeros(
+                (group, head_dim), jnp.uint32
+            )
+
+        lax.fori_loop(0, num_big, zero_big, None)
+        lax.fori_loop(0, jnp.maximum(big_start - start, 0) // group, zero_group, None)
 
     def broadcast_minor(src, shape):
         if src.shape == shape:
@@ -890,7 +3429,11 @@ def _ragged_paged_attention_kernel_loop(
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+            next_bq_sem_idx = (
+                lax.rem(bq_sem_idx + 1, num_slots)
+                if num_slots > 2
+                else lax.select(bq_sem_idx == 0, 1, 0)
+            )
             return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
         def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *, num_bkv):
@@ -900,19 +3443,1106 @@ def _ragged_paged_attention_kernel_loop(
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-            next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+            next_bkv_sem_idx = (
+                lax.rem(bkv_sem_idx + 1, num_slots)
+                if num_slots > 2
+                else lax.select(bkv_sem_idx == 0, 1, 0)
+            )
 
             next_bq_start_bkv_idx = 0
-            if sliding_window is not None:
+            if sliding_window is not None and not window_aligned_kv:
                 next_bq_start_bkv_idx = (
-                    jnp.maximum(
-                        kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0
-                    )
+                    jnp.maximum(kv_q_gap + (bq_idx + 1) * actual_bq_sz - _sw_off, 0)
                     // bkv_sz
                 )
             next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx)
             next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx, next_bkv_idx)
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
+
+        if q_t_ref is not None and (prefill_opts & _STATIONARY_Q_V2_OPTS):
+            _stationary_q_v2_process(
+                seq_idx=seq_idx,
+                start_seq_idx=start_seq_idx,
+                end_seq_idx=end_seq_idx,
+                q_len=q_len,
+                kv_len=kv_len,
+                kv_q_gap=kv_q_gap,
+                cur_seq_start_bkv_idx=cur_seq_start_bkv_idx,
+                next_seq_start_bkv_idx=next_seq_start_bkv_idx,
+                actual_bq_sz=actual_bq_sz,
+                num_bq=num_bq,
+                bq_sz=bq_sz,
+                bkv_sz=bkv_sz,
+                bkv_stride=bkv_stride,
+                kv_dtype=kv_dtype,
+                num_slots=num_slots,
+                use_causal_mask=use_causal_mask,
+                sliding_window=sliding_window,
+                sliding_window_chunk_skip=sliding_window_chunk_skip,
+                _sw_off=_sw_off,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                probe=probe,
+                prefill_opts=prefill_opts,
+                sem_ids_ref=sem_ids_ref,
+                bq_x2_ref=bq_x2_ref,
+                bkv_x2_ref=bkv_x2_ref,
+                bo_x2_ref=bo_x2_ref,
+                l_ref=l_ref,
+                acc_ref=acc_ref,
+                q_t_ref=q_t_ref,
+                k_sub_ref=k_sub_ref,
+                vt_sub_ref=vt_sub_ref,
+                mask_lt_ref=mask_lt_ref,
+                mask_ut_ref=mask_ut_ref,
+                cu_q_lens_ref=cu_q_lens_ref,
+                bo_carry_ref=bo_carry_ref,
+                q_sc_ref=q_sc_ref,
+                kv_pack_dense2=kv_pack_dense2,
+                get_next_bq_ids=get_next_bq_ids,
+                get_next_bkv_ids=get_next_bkv_ids,
+                start_fetch_bq=start_fetch_bq,
+                wait_fetch_bq=wait_fetch_bq,
+                start_fetch_bkv=start_fetch_bkv,
+                wait_fetch_bkv=wait_fetch_bkv,
+                start_update_kv_cache=start_update_kv_cache,
+                wait_send_bo=wait_send_bo,
+                start_send_bo=start_send_bo,
+                start_send_bo_a3=start_send_bo_a3,
+                start_fetch_bq_stage=start_fetch_bq_stage,
+                wait_fetch_bq_stage=wait_fetch_bq_stage,
+                start_send_bo_staged=start_send_bo_staged,
+            )
+            return
+
+        if q_t_ref is not None:
+            tq_sz = 256
+            use_m0 = "stationary_q_m0" in prefill_opts
+            use_bkvfast = "bkv_full_unroll" in prefill_opts
+            num_s = bkv_sz // 256
+            num_sub_per_bkv = bkv_sz // 512
+            s_scale = sm_scale * (k_scale if k_scale is not None else 1.0)
+            exp_scale = float(s_scale * math.log2(math.e))
+            v_scale_val = float(v_scale) if v_scale is not None else 1.0
+
+            def _kq_dot(k_3d, q_3d):
+                return lax.dot(
+                    k_3d,
+                    q_3d,
+                    dimension_numbers=(([2], [1]), ([0], [0])),
+                    preferred_element_type=jnp.float32,
+                )
+
+            def _vp_dot(vt_3d, p_3d):
+                return lax.dot(
+                    vt_3d,
+                    p_3d,
+                    dimension_numbers=(([2], [1]), ([0], [0])),
+                    preferred_element_type=jnp.float32,
+                )
+
+            @pl.loop(0, num_bq, unroll=False)
+            def compute_with_bq_stationary_q(bq_idx):
+                bq_sem_idx = sem_ids_ref[0]
+                next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
+                    seq_idx, bq_idx, bq_sem_idx
+                )
+                processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
+                start_bkv_idx = jnp.int32(0)
+                base = 0
+                if sliding_window is not None:
+                    start_bkv_idx = jnp.maximum(processed_q_len - _sw_off, 0) // bkv_sz
+                if use_causal_mask:
+                    effective_kv_len = jnp.minimum(
+                        kv_len, processed_q_len + actual_bq_sz
+                    )
+                else:
+                    effective_kv_len = kv_len
+                end_bkv_idx = cdiv(effective_kv_len - base, bkv_sz)
+
+                @pl.when(next_seq_idx < end_seq_idx)
+                def prefetch_next_bq():
+                    sem_ids_ref[0] = next_bq_sem_idx
+                    start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+
+                def unpack_bq_to_qt(sem_q):
+                    q_u32_ref = (
+                        bq_x2_ref.bitcast(jnp.uint32)
+                        .at[sem_q, 0]
+                        .reshape(bq_sz * 8, 128)
+                    )
+                    lane = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1)
+                    is_lo = lane < 64
+                    for tq_idx in range(bq_sz // tq_sz):
+                        tq_start = tq_idx * tq_sz
+                        t_sl = pl.ds(tq_start, tq_sz)
+                        for s in range(8):
+                            u_s = q_u32_ref[pl.ds(tq_start * 8 + s, tq_sz, 8)]
+                            even_bf16 = (
+                                pltpu.bitcast(u_s << jnp.uint32(16), jnp.float32)
+                                * exp_scale
+                            ).astype(jnp.bfloat16)
+                            odd_bf16 = (
+                                pltpu.bitcast(u_s & jnp.uint32(0xFFFF0000), jnp.float32)
+                                * exp_scale
+                            ).astype(jnp.bfloat16)
+                            if s < 4:
+                                pair_q_bf16 = jnp.where(
+                                    is_lo,
+                                    even_bf16,
+                                    pltpu.roll(odd_bf16, shift=64, axis=1),
+                                )
+                            else:
+                                pair_q_bf16 = jnp.where(
+                                    is_lo,
+                                    pltpu.roll(even_bf16, shift=64, axis=1),
+                                    odd_bf16,
+                                )
+                            pair_q_t = jnp.swapaxes(pair_q_bf16, 0, 1)
+                            q_t_ref[2 * s, :, t_sl] = pair_q_t[:64, :]
+                            q_t_ref[2 * s + 1, :, t_sl] = pair_q_t[64:, :]
+
+                @pl.when(start_bkv_idx >= end_bkv_idx)
+                def init_empty_bq():
+                    l_ref[...] = jnp.zeros_like(l_ref)
+                    acc_ref[...] = jnp.zeros_like(acc_ref)
+
+                @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
+                def compute_with_bkv_stationary_q(bkv_idx):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    (
+                        next_seq_idx_kv,
+                        next_bq_idx_kv,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                    ) = get_next_bkv_ids(
+                        seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx
+                    )
+                    processed_kv_len = bkv_idx * bkv_sz
+
+                    @pl.when(next_seq_idx_kv < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx_kv, next_bkv_idx, next_bkv_sem_idx)
+
+                    @pl.when(bkv_idx == start_bkv_idx)
+                    def wait_and_unpack_cur_bq():
+                        wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                        unpack_bq_to_qt(bq_sem_idx)
+
+                    offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+
+                    is_last_visit = bq_idx == num_bq - 1
+                    if sliding_window is not None:
+                        next_bq_start_bkv_idx = (
+                            jnp.maximum(processed_q_len + actual_bq_sz - _sw_off, 0)
+                            // bkv_sz
+                        )
+                        is_last_visit = jnp.logical_or(
+                            is_last_visit, bkv_idx < next_bq_start_bkv_idx
+                        )
+
+                    @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+
+                    effective_bkv_sz = jnp.clip(
+                        effective_kv_len - processed_kv_len, 0, bkv_sz
+                    )
+
+                    if probe != "nocompute":
+                        kv_u32_all = (
+                            bkv_x2_ref.bitcast(jnp.uint32)
+                            .at[bkv_sem_idx]
+                            .reshape(bkv_sz * bkv_stride, 128)
+                        )
+                        full_bkv_valid = effective_bkv_sz == bkv_sz
+                        bkv_s_hi = cdiv(effective_bkv_sz, 512) * 2
+                        if sliding_window is not None and sliding_window_chunk_skip:
+                            win_k0 = jnp.maximum(
+                                processed_q_len - sliding_window + 1 - processed_kv_len,
+                                0,
+                            )
+                            bkv_s_lo = jnp.minimum((win_k0 // 512) * 2, bkv_s_hi)
+                        else:
+                            bkv_s_lo = jnp.int32(0)
+
+                        @pl.when(jnp.logical_and(full_bkv_valid, bkv_s_lo == 0))
+                        def unpack_bkv_full():
+                            for s_idx in range(num_s):
+                                kv_u32 = kv_u32_all[
+                                    pl.ds(s_idx * 256 * bkv_stride, 256, bkv_stride)
+                                ]
+                                k_b = pltpu.bitcast(
+                                    kv_u32.astype(jnp.uint8), kv_dtype
+                                ).astype(jnp.bfloat16)
+                                v_bf16 = pltpu.bitcast(
+                                    (kv_u32 >> jnp.uint32(8)).astype(jnp.uint8),
+                                    kv_dtype,
+                                ).astype(jnp.bfloat16)
+                                k_sub_ref[0, s_idx] = k_b
+                                k_sub_ref[1, s_idx] = pltpu.roll(k_b, shift=64, axis=1)
+                                vt_128 = jnp.swapaxes(v_bf16, 0, 1)
+                                vt_sub_ref[0, s_idx] = vt_128[:64, :]
+                                vt_sub_ref[1, s_idx] = vt_128[64:, :]
+
+                        @pl.when(
+                            jnp.logical_not(
+                                jnp.logical_and(full_bkv_valid, bkv_s_lo == 0)
+                            )
+                        )
+                        def unpack_bkv_partial():
+                            @pl.loop(bkv_s_lo, bkv_s_hi, unroll=False)
+                            def _up_sub(s_idx):
+                                bkv_start = s_idx * 256
+                                kv_u32 = kv_u32_all[
+                                    pl.ds(bkv_start * bkv_stride, 256, bkv_stride)
+                                ]
+                                k_pos = bkv_start + lax.broadcasted_iota(
+                                    jnp.int32, (256, 128), 0
+                                )
+                                kv_u32 = jnp.where(
+                                    k_pos < effective_bkv_sz, kv_u32, jnp.uint32(0)
+                                )
+                                k_b = pltpu.bitcast(
+                                    kv_u32.astype(jnp.uint8), kv_dtype
+                                ).astype(jnp.bfloat16)
+                                v_bf16 = pltpu.bitcast(
+                                    (kv_u32 >> jnp.uint32(8)).astype(jnp.uint8),
+                                    kv_dtype,
+                                ).astype(jnp.bfloat16)
+                                k_sub_ref[0, s_idx] = k_b
+                                k_sub_ref[1, s_idx] = pltpu.roll(k_b, shift=64, axis=1)
+                                vt_128 = jnp.swapaxes(v_bf16, 0, 1)
+                                vt_sub_ref[0, s_idx] = vt_128[:64, :]
+                                vt_sub_ref[1, s_idx] = vt_128[64:, :]
+
+                        def _psum(p):
+                            p_sum16 = jnp.sum(
+                                p.reshape(1, 16, 16, tq_sz),
+                                axis=1,
+                                dtype=jnp.bfloat16,
+                            )
+                            return jnp.broadcast_to(
+                                jnp.sum(
+                                    p_sum16,
+                                    axis=1,
+                                    keepdims=True,
+                                    dtype=jnp.float32,
+                                ),
+                                (1, 8, tq_sz),
+                            )
+
+                        def _sm_m0(qk_f32, mask=None):
+                            qk = qk_f32.astype(jnp.bfloat16)
+                            if mask is not None:
+                                qk = jnp.where(mask, qk, -jnp.inf)
+                            p = jnp.exp2(qk)
+                            return p, _psum(p)
+
+                        def _sm_pilot_accum_f32(qk_f32, m_f32, mask=None):
+                            diff = (
+                                (qk_f32.reshape(1, 32, 8, tq_sz) - m_f32[:, None, :, :])
+                                .reshape(1, 256, tq_sz)
+                                .astype(jnp.bfloat16)
+                            )
+                            if mask is not None:
+                                diff = jnp.where(mask, diff, -jnp.inf)
+                            p = jnp.exp2(diff)
+                            return p, _psum(p)
+
+                        def _sm_pilot_first_f32(qk_f32):
+                            m_f32 = jnp.broadcast_to(
+                                jnp.max(qk_f32[:, :32, :], axis=1, keepdims=True),
+                                (1, 8, tq_sz),
+                            )
+                            diff = (
+                                (qk_f32.reshape(1, 32, 8, tq_sz) - m_f32[:, None, :, :])
+                                .reshape(1, 256, tq_sz)
+                                .astype(jnp.bfloat16)
+                            )
+                            p = jnp.exp2(diff)
+                            return p, m_f32, _psum(p)
+
+                        def _sm_online_masked_f32(qk_f32, m_prev_f32, l_prev, mask):
+                            qk_masked = jnp.where(mask, qk_f32, -jnp.inf)
+                            s_max = jnp.broadcast_to(
+                                jnp.max(qk_masked, axis=1, keepdims=True),
+                                (1, 8, tq_sz),
+                            )
+                            m_new = jnp.maximum(m_prev_f32, s_max)
+                            m_safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+                            alpha = jnp.exp2(m_prev_f32 - m_safe)
+                            diff = (
+                                (
+                                    qk_masked.reshape(1, 32, 8, tq_sz)
+                                    - m_safe[:, None, :, :]
+                                )
+                                .reshape(1, 256, tq_sz)
+                                .astype(jnp.bfloat16)
+                            )
+                            p = jnp.exp2(diff)
+                            return p, m_new, alpha * l_prev + _psum(p), alpha
+
+                        for tq_idx in range(bq_sz // tq_sz):
+                            tq_start = tq_idx * tq_sz
+                            t_sl = pl.ds(tq_start, tq_sz)
+
+                            @pl.when(bq_idx * actual_bq_sz + tq_start < q_len)
+                            def run_tq_stationary_q(tq_start=tq_start, t_sl=t_sl):
+                                q_first = processed_q_len + tq_start
+                                strip_kv_hi = (
+                                    jnp.minimum(effective_kv_len, q_first + tq_sz)
+                                    if use_causal_mask
+                                    else effective_kv_len
+                                )
+                                sub_hi = cdiv(
+                                    jnp.clip(strip_kv_hi - processed_kv_len, 0, bkv_sz),
+                                    512,
+                                )
+                                if (
+                                    sliding_window is not None
+                                    and sliding_window_chunk_skip
+                                ):
+                                    win_fk = jnp.maximum(
+                                        q_first - sliding_window + 1 - processed_kv_len,
+                                        0,
+                                    )
+                                    sub_lo = jnp.minimum(win_fk // 512, sub_hi)
+                                    global_first_sub = (
+                                        jnp.maximum(q_first - sliding_window + 1, 0)
+                                        // 512
+                                    )
+                                else:
+                                    sub_lo = jnp.int32(0)
+                                    global_first_sub = start_bkv_idx * num_sub_per_bkv
+
+                                @pl.when(
+                                    jnp.logical_and(
+                                        bkv_idx == start_bkv_idx, sub_lo >= sub_hi
+                                    )
+                                )
+                                def _zero_strip_if_skipped():
+                                    if not use_m0:
+                                        m_ref[:, :, t_sl] = jnp.full(
+                                            (16, 8, tq_sz), -jnp.inf, jnp.float32
+                                        )
+                                    l_ref[:, :, t_sl] = jnp.zeros(
+                                        (16, 8, tq_sz), jnp.float32
+                                    )
+                                    acc_ref[:, :, t_sl] = jnp.zeros(
+                                        (16, 64, tq_sz), jnp.float32
+                                    )
+
+                                def _run_m0_slices(
+                                    s_start, n_slices, first_vis_cond, masks=None
+                                ):
+                                    mrb_q = []
+                                    ready_p = None
+
+                                    def _adv():
+                                        nonlocal ready_p
+                                        qk0, qk1, g0, g1, loc_s, vt_s = mrb_q.pop(0)
+                                        msk = (
+                                            masks[loc_s] if masks is not None else None
+                                        )
+                                        p0, ps0 = _sm_m0(qk0, msk)
+                                        p1, ps1 = _sm_m0(qk1, msk)
+                                        if loc_s == 0:
+                                            l_ref[g0 : g0 + 1, :, t_sl] = jnp.where(
+                                                first_vis_cond,
+                                                ps0,
+                                                l_ref[g0 : g0 + 1, :, t_sl] + ps0,
+                                            )
+                                            l_ref[g1 : g1 + 1, :, t_sl] = jnp.where(
+                                                first_vis_cond,
+                                                ps1,
+                                                l_ref[g1 : g1 + 1, :, t_sl] + ps1,
+                                            )
+                                        else:
+                                            l_ref[g0 : g0 + 1, :, t_sl] = (
+                                                l_ref[g0 : g0 + 1, :, t_sl] + ps0
+                                            )
+                                            l_ref[g1 : g1 + 1, :, t_sl] = (
+                                                l_ref[g1 : g1 + 1, :, t_sl] + ps1
+                                            )
+                                        ready_p = (p0, p1, g0, g1, loc_s, vt_s)
+
+                                    def _fl():
+                                        nonlocal ready_p
+                                        p0, p1, g0, g1, loc_s, vt_s = ready_p
+                                        vp0 = _vp_dot(vt_s, p0)
+                                        vp1 = _vp_dot(vt_s, p1)
+                                        if loc_s == 0:
+                                            acc_ref[g0 : g0 + 1, :, t_sl] = jnp.where(
+                                                first_vis_cond,
+                                                vp0,
+                                                acc_ref[g0 : g0 + 1, :, t_sl] + vp0,
+                                            )
+                                            acc_ref[g1 : g1 + 1, :, t_sl] = jnp.where(
+                                                first_vis_cond,
+                                                vp1,
+                                                acc_ref[g1 : g1 + 1, :, t_sl] + vp1,
+                                            )
+                                        else:
+                                            acc_ref[g0 : g0 + 1, :, t_sl] = (
+                                                acc_ref[g0 : g0 + 1, :, t_sl] + vp0
+                                            )
+                                            acc_ref[g1 : g1 + 1, :, t_sl] = (
+                                                acc_ref[g1 : g1 + 1, :, t_sl] + vp1
+                                            )
+                                        ready_p = None
+
+                                    for kv_h in range(2):
+                                        for gp in range(4):
+                                            g0 = kv_h * 8 + 2 * gp
+                                            g1 = g0 + 1
+                                            qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                                            qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                                            for loc_s in range(n_slices):
+                                                s_idx = s_start + loc_s
+                                                ks = k_sub_ref[kv_h, s_idx][:, :64][
+                                                    None, :, :
+                                                ]
+                                                vts = vt_sub_ref[kv_h : kv_h + 1, s_idx]
+                                                qk0 = _kq_dot(ks, qt0)
+                                                qk1 = _kq_dot(ks, qt1)
+                                                if ready_p is not None:
+                                                    _fl()
+                                                mrb_q.append(
+                                                    (qk0, qk1, g0, g1, loc_s, vts)
+                                                )
+                                                if len(mrb_q) >= 2:
+                                                    _adv()
+                                    while mrb_q:
+                                        if ready_p is not None:
+                                            _fl()
+                                        _adv()
+                                    if ready_p is not None:
+                                        _fl()
+
+                                if use_bkvfast and use_m0:
+                                    bkv_all_unm = (
+                                        processed_kv_len + bkv_sz <= effective_kv_len
+                                    )
+                                    if use_causal_mask:
+                                        bkv_all_unm = jnp.logical_and(
+                                            bkv_all_unm,
+                                            processed_kv_len + bkv_sz <= q_first + 1,
+                                        )
+                                    if sliding_window is not None:
+                                        bkv_all_unm = jnp.logical_and(
+                                            bkv_all_unm,
+                                            q_first + tq_sz
+                                            <= processed_kv_len + sliding_window,
+                                        )
+                                else:
+                                    bkv_all_unm = jnp.bool_(False)
+
+                                if use_bkvfast and use_m0:
+
+                                    @pl.when(bkv_all_unm)
+                                    def _run_full_bkv_unmasked():
+                                        _run_m0_slices(
+                                            0,
+                                            num_s,
+                                            (bkv_idx * num_sub_per_bkv)
+                                            == global_first_sub,
+                                            None,
+                                        )
+
+                                sub_loop_lo = jnp.where(bkv_all_unm, sub_hi, sub_lo)
+
+                                @pl.loop(sub_loop_lo, sub_hi, unroll=False)
+                                def run_sub512(sub_idx):
+                                    s_base = sub_idx * 2
+                                    sub_kv_len = processed_kv_len + sub_idx * 512
+                                    is_first_vis = (
+                                        bkv_idx * num_sub_per_bkv + sub_idx
+                                    ) == global_first_sub
+                                    sub_unmasked = sub_kv_len + 512 <= effective_kv_len
+                                    if use_causal_mask:
+                                        sub_unmasked = jnp.logical_and(
+                                            sub_unmasked,
+                                            sub_kv_len + 512 <= q_first + 1,
+                                        )
+                                    if sliding_window is not None:
+                                        sw_cond = (
+                                            q_first + tq_sz
+                                            <= sub_kv_len + sliding_window
+                                            if use_m0
+                                            else q_first + tq_sz
+                                            < sub_kv_len + sliding_window
+                                        )
+                                        sub_unmasked = jnp.logical_and(
+                                            sub_unmasked, sw_cond
+                                        )
+
+                                    if use_m0:
+
+                                        @pl.when(sub_unmasked)
+                                        def _m0_unmasked():
+                                            _run_m0_slices(
+                                                s_base, 2, is_first_vis, None
+                                            )
+
+                                        @pl.when(jnp.logical_not(sub_unmasked))
+                                        def _m0_masked():
+                                            q_pos = q_first + lax.broadcasted_iota(
+                                                jnp.int32, (1, 256, tq_sz), 2
+                                            )
+                                            k_iota = lax.broadcasted_iota(
+                                                jnp.int32, (1, 256, tq_sz), 1
+                                            )
+                                            masks = []
+                                            for loc_s in range(2):
+                                                kp = sub_kv_len + loc_s * 256 + k_iota
+                                                msk = kp < effective_kv_len
+                                                if use_causal_mask:
+                                                    msk = jnp.logical_and(
+                                                        msk, q_pos >= kp
+                                                    )
+                                                if sliding_window is not None:
+                                                    msk = jnp.logical_and(
+                                                        msk,
+                                                        q_pos < kp + sliding_window,
+                                                    )
+                                                masks.append(msk)
+                                            _run_m0_slices(
+                                                s_base, 2, is_first_vis, masks
+                                            )
+
+                                    else:
+                                        branch_idx = jnp.where(
+                                            sub_unmasked,
+                                            jnp.where(
+                                                is_first_vis,
+                                                jnp.int32(0),
+                                                jnp.int32(1),
+                                            ),
+                                            jnp.int32(2),
+                                        )
+
+                                        def _p_br0():
+                                            mrb_q = []
+                                            ready_p = None
+
+                                            def _adv():
+                                                nonlocal ready_p
+                                                qk0, qk1, g0, g1, loc_s, vt_s = (
+                                                    mrb_q.pop(0)
+                                                )
+                                                if loc_s == 0:
+                                                    p0, m0_f, l0 = _sm_pilot_first_f32(
+                                                        qk0
+                                                    )
+                                                    p1, m1_f, l1 = _sm_pilot_first_f32(
+                                                        qk1
+                                                    )
+                                                    m_ref[g0 : g0 + 1, :, t_sl] = m0_f
+                                                    m_ref[g1 : g1 + 1, :, t_sl] = m1_f
+                                                    l_ref[g0 : g0 + 1, :, t_sl] = l0
+                                                    l_ref[g1 : g1 + 1, :, t_sl] = l1
+                                                else:
+                                                    m0_f = m_ref[g0 : g0 + 1, :, t_sl]
+                                                    m1_f = m_ref[g1 : g1 + 1, :, t_sl]
+                                                    p0, ps0 = _sm_pilot_accum_f32(
+                                                        qk0, m0_f
+                                                    )
+                                                    p1, ps1 = _sm_pilot_accum_f32(
+                                                        qk1, m1_f
+                                                    )
+                                                    l_ref[g0 : g0 + 1, :, t_sl] = (
+                                                        l_ref[g0 : g0 + 1, :, t_sl]
+                                                        + ps0
+                                                    )
+                                                    l_ref[g1 : g1 + 1, :, t_sl] = (
+                                                        l_ref[g1 : g1 + 1, :, t_sl]
+                                                        + ps1
+                                                    )
+                                                ready_p = (
+                                                    p0,
+                                                    p1,
+                                                    g0,
+                                                    g1,
+                                                    loc_s,
+                                                    vt_s,
+                                                )
+
+                                            def _fl():
+                                                nonlocal ready_p
+                                                p0, p1, g0, g1, loc_s, vt_s = ready_p
+                                                vp0 = _vp_dot(vt_s, p0)
+                                                vp1 = _vp_dot(vt_s, p1)
+                                                if loc_s == 0:
+                                                    acc_ref[g0 : g0 + 1, :, t_sl] = vp0
+                                                    acc_ref[g1 : g1 + 1, :, t_sl] = vp1
+                                                else:
+                                                    acc_ref[g0 : g0 + 1, :, t_sl] = (
+                                                        acc_ref[g0 : g0 + 1, :, t_sl]
+                                                        + vp0
+                                                    )
+                                                    acc_ref[g1 : g1 + 1, :, t_sl] = (
+                                                        acc_ref[g1 : g1 + 1, :, t_sl]
+                                                        + vp1
+                                                    )
+                                                ready_p = None
+
+                                            for kv_h in range(2):
+                                                for gp in range(4):
+                                                    g0 = kv_h * 8 + 2 * gp
+                                                    g1 = g0 + 1
+                                                    qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                                                    qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                                                    for loc_s in range(2):
+                                                        s_idx = s_base + loc_s
+                                                        ks = k_sub_ref[kv_h, s_idx][
+                                                            :, :64
+                                                        ][None, :, :]
+                                                        vts = vt_sub_ref[
+                                                            kv_h : kv_h + 1, s_idx
+                                                        ]
+                                                        qk0 = _kq_dot(ks, qt0)
+                                                        qk1 = _kq_dot(ks, qt1)
+                                                        if ready_p is not None:
+                                                            _fl()
+                                                        mrb_q.append(
+                                                            (
+                                                                qk0,
+                                                                qk1,
+                                                                g0,
+                                                                g1,
+                                                                loc_s,
+                                                                vts,
+                                                            )
+                                                        )
+                                                        if len(mrb_q) >= 2:
+                                                            _adv()
+                                            while mrb_q:
+                                                if ready_p is not None:
+                                                    _fl()
+                                                _adv()
+                                            if ready_p is not None:
+                                                _fl()
+
+                                        def _p_br1():
+                                            mrb_q = []
+                                            ready_p = None
+
+                                            def _adv():
+                                                nonlocal ready_p
+                                                qk0, qk1, g0, g1, vt_s = mrb_q.pop(0)
+                                                m0_f = m_ref[g0 : g0 + 1, :, t_sl]
+                                                m1_f = m_ref[g1 : g1 + 1, :, t_sl]
+                                                p0, ps0 = _sm_pilot_accum_f32(qk0, m0_f)
+                                                p1, ps1 = _sm_pilot_accum_f32(qk1, m1_f)
+                                                l_ref[g0 : g0 + 1, :, t_sl] = (
+                                                    l_ref[g0 : g0 + 1, :, t_sl] + ps0
+                                                )
+                                                l_ref[g1 : g1 + 1, :, t_sl] = (
+                                                    l_ref[g1 : g1 + 1, :, t_sl] + ps1
+                                                )
+                                                ready_p = (p0, p1, g0, g1, vt_s)
+
+                                            def _fl():
+                                                nonlocal ready_p
+                                                p0, p1, g0, g1, vt_s = ready_p
+                                                acc_ref[g0 : g0 + 1, :, t_sl] = acc_ref[
+                                                    g0 : g0 + 1, :, t_sl
+                                                ] + _vp_dot(vt_s, p0)
+                                                acc_ref[g1 : g1 + 1, :, t_sl] = acc_ref[
+                                                    g1 : g1 + 1, :, t_sl
+                                                ] + _vp_dot(vt_s, p1)
+                                                ready_p = None
+
+                                            for kv_h in range(2):
+                                                for gp in range(4):
+                                                    g0 = kv_h * 8 + 2 * gp
+                                                    g1 = g0 + 1
+                                                    qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                                                    qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                                                    for loc_s in range(2):
+                                                        s_idx = s_base + loc_s
+                                                        ks = k_sub_ref[kv_h, s_idx][
+                                                            :, :64
+                                                        ][None, :, :]
+                                                        vts = vt_sub_ref[
+                                                            kv_h : kv_h + 1, s_idx
+                                                        ]
+                                                        qk0 = _kq_dot(ks, qt0)
+                                                        qk1 = _kq_dot(ks, qt1)
+                                                        if ready_p is not None:
+                                                            _fl()
+                                                        mrb_q.append(
+                                                            (
+                                                                qk0,
+                                                                qk1,
+                                                                g0,
+                                                                g1,
+                                                                vts,
+                                                            )
+                                                        )
+                                                        if len(mrb_q) >= 2:
+                                                            _adv()
+                                            while mrb_q:
+                                                if ready_p is not None:
+                                                    _fl()
+                                                _adv()
+                                            if ready_p is not None:
+                                                _fl()
+
+                                        def _p_br2():
+                                            q_pos = q_first + lax.broadcasted_iota(
+                                                jnp.int32, (1, 256, tq_sz), 2
+                                            )
+                                            k_iota = lax.broadcasted_iota(
+                                                jnp.int32, (1, 256, tq_sz), 1
+                                            )
+                                            masks = []
+                                            for loc_s in range(2):
+                                                kp = sub_kv_len + loc_s * 256 + k_iota
+                                                msk = kp < effective_kv_len
+                                                if use_causal_mask:
+                                                    msk = jnp.logical_and(
+                                                        msk, q_pos >= kp
+                                                    )
+                                                if sliding_window is not None:
+                                                    msk = jnp.logical_and(
+                                                        msk,
+                                                        q_pos < kp + sliding_window,
+                                                    )
+                                                masks.append(msk)
+                                            m_neg_f = jnp.full(
+                                                (1, 8, tq_sz), -jnp.inf, jnp.float32
+                                            )
+
+                                            mrb_q = []
+                                            ready_p = None
+
+                                            def _adv():
+                                                nonlocal ready_p
+                                                qk0, qk1, g0, g1, loc_s, vt_s = (
+                                                    mrb_q.pop(0)
+                                                )
+                                                if loc_s == 0:
+                                                    m0_in = jnp.where(
+                                                        is_first_vis,
+                                                        m_neg_f,
+                                                        m_ref[g0 : g0 + 1, :, t_sl],
+                                                    )
+                                                    l0_in = jnp.where(
+                                                        is_first_vis,
+                                                        jnp.zeros(
+                                                            (1, 8, tq_sz),
+                                                            jnp.float32,
+                                                        ),
+                                                        l_ref[g0 : g0 + 1, :, t_sl],
+                                                    )
+                                                    m1_in = jnp.where(
+                                                        is_first_vis,
+                                                        m_neg_f,
+                                                        m_ref[g1 : g1 + 1, :, t_sl],
+                                                    )
+                                                    l1_in = jnp.where(
+                                                        is_first_vis,
+                                                        jnp.zeros(
+                                                            (1, 8, tq_sz),
+                                                            jnp.float32,
+                                                        ),
+                                                        l_ref[g1 : g1 + 1, :, t_sl],
+                                                    )
+                                                else:
+                                                    m0_in = m_ref[g0 : g0 + 1, :, t_sl]
+                                                    l0_in = l_ref[g0 : g0 + 1, :, t_sl]
+                                                    m1_in = m_ref[g1 : g1 + 1, :, t_sl]
+                                                    l1_in = l_ref[g1 : g1 + 1, :, t_sl]
+                                                p0, m0_n, l0_n, al0 = (
+                                                    _sm_online_masked_f32(
+                                                        qk0,
+                                                        m0_in,
+                                                        l0_in,
+                                                        masks[loc_s],
+                                                    )
+                                                )
+                                                p1, m1_n, l1_n, al1 = (
+                                                    _sm_online_masked_f32(
+                                                        qk1,
+                                                        m1_in,
+                                                        l1_in,
+                                                        masks[loc_s],
+                                                    )
+                                                )
+                                                m_ref[g0 : g0 + 1, :, t_sl] = m0_n
+                                                l_ref[g0 : g0 + 1, :, t_sl] = l0_n
+                                                m_ref[g1 : g1 + 1, :, t_sl] = m1_n
+                                                l_ref[g1 : g1 + 1, :, t_sl] = l1_n
+                                                ready_p = (
+                                                    p0,
+                                                    p1,
+                                                    al0,
+                                                    al1,
+                                                    g0,
+                                                    g1,
+                                                    loc_s,
+                                                    vt_s,
+                                                )
+
+                                            def _fl():
+                                                nonlocal ready_p
+                                                (
+                                                    p0,
+                                                    p1,
+                                                    al0,
+                                                    al1,
+                                                    g0,
+                                                    g1,
+                                                    loc_s,
+                                                    vt_s,
+                                                ) = ready_p
+                                                vp0 = _vp_dot(vt_s, p0)
+                                                vp1 = _vp_dot(vt_s, p1)
+                                                if loc_s == 0:
+                                                    a0_in = jnp.where(
+                                                        is_first_vis,
+                                                        jnp.zeros(
+                                                            (1, 64, tq_sz),
+                                                            jnp.float32,
+                                                        ),
+                                                        acc_ref[g0 : g0 + 1, :, t_sl],
+                                                    )
+                                                    a1_in = jnp.where(
+                                                        is_first_vis,
+                                                        jnp.zeros(
+                                                            (1, 64, tq_sz),
+                                                            jnp.float32,
+                                                        ),
+                                                        acc_ref[g1 : g1 + 1, :, t_sl],
+                                                    )
+                                                else:
+                                                    a0_in = acc_ref[
+                                                        g0 : g0 + 1, :, t_sl
+                                                    ]
+                                                    a1_in = acc_ref[
+                                                        g1 : g1 + 1, :, t_sl
+                                                    ]
+                                                acc_ref[g0 : g0 + 1, :, t_sl] = (
+                                                    a0_in.reshape(1, 8, 8, tq_sz)
+                                                    * al0[:, None, :, :]
+                                                ).reshape(1, 64, tq_sz) + vp0
+                                                acc_ref[g1 : g1 + 1, :, t_sl] = (
+                                                    a1_in.reshape(1, 8, 8, tq_sz)
+                                                    * al1[:, None, :, :]
+                                                ).reshape(1, 64, tq_sz) + vp1
+                                                ready_p = None
+
+                                            for kv_h in range(2):
+                                                for gp in range(4):
+                                                    g0 = kv_h * 8 + 2 * gp
+                                                    g1 = g0 + 1
+                                                    qt0 = q_t_ref[g0 : g0 + 1, :, t_sl]
+                                                    qt1 = q_t_ref[g1 : g1 + 1, :, t_sl]
+                                                    for loc_s in range(2):
+                                                        s_idx = s_base + loc_s
+                                                        ks = k_sub_ref[kv_h, s_idx][
+                                                            :, :64
+                                                        ][None, :, :]
+                                                        vts = vt_sub_ref[
+                                                            kv_h : kv_h + 1, s_idx
+                                                        ]
+                                                        qk0 = _kq_dot(ks, qt0)
+                                                        qk1 = _kq_dot(ks, qt1)
+                                                        if ready_p is not None:
+                                                            _fl()
+                                                        mrb_q.append(
+                                                            (
+                                                                qk0,
+                                                                qk1,
+                                                                g0,
+                                                                g1,
+                                                                loc_s,
+                                                                vts,
+                                                            )
+                                                        )
+                                                        if len(mrb_q) >= 2:
+                                                            _adv()
+                                            while mrb_q:
+                                                if ready_p is not None:
+                                                    _fl()
+                                                _adv()
+                                            if ready_p is not None:
+                                                _fl()
+
+                                        lax.switch(
+                                            branch_idx,
+                                            [
+                                                lambda: (_p_br0(), jnp.int32(0))[1],
+                                                lambda: (_p_br1(), jnp.int32(0))[1],
+                                                lambda: (_p_br2(), jnp.int32(0))[1],
+                                            ],
+                                        )
+
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = (
+                    lax.rem(bo_sem_idx + 1, num_slots)
+                    if num_slots > 2
+                    else lax.select(bo_sem_idx == 0, 1, 0)
+                )
+                wait_send_bo(bo_sem_idx)
+
+                if use_a3_out:
+                    g0_ep = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+                    valid_ep = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - g0_ep)
+                    aligned_g0_ep = (g0_ep // 16) * 16
+                    lead_ep = g0_ep - aligned_g0_ep
+                    total_rows_ep = lead_ep + valid_ep
+                    full_rows_ep = (total_rows_ep // 16) * 16
+                    row_iota_ep = lax.broadcasted_iota(jnp.int32, (bq_sz + 16, 128), 0)
+                    zero_tail_16 = jnp.zeros((16, 128), jnp.float32)
+
+                    for s in range(8):
+                        h0 = 2 * s
+                        h1 = 2 * s + 1
+                        parts_s = []
+                        for tq_idx in range(bq_sz // tq_sz):
+                            tq_start = tq_idx * tq_sz
+                            t_sl = pl.ds(tq_start, tq_sz)
+                            l0 = l_ref[h0, :, t_sl]
+                            l1 = l_ref[h1, :, t_sl]
+                            inv_l0 = jnp.where(
+                                l0 > 0.0,
+                                pltpu.reciprocal(l0, approx=True) * v_scale_val,
+                                0.0,
+                            )
+                            inv_l1 = jnp.where(
+                                l1 > 0.0,
+                                pltpu.reciprocal(l1, approx=True) * v_scale_val,
+                                0.0,
+                            )
+                            o0_t = (
+                                (
+                                    acc_ref[h0, :, t_sl].reshape(8, 8, tq_sz)
+                                    * inv_l0[None, :, :]
+                                )
+                                .reshape(64, tq_sz)
+                                .astype(jnp.bfloat16)
+                            )
+                            o1_t = (
+                                (
+                                    acc_ref[h1, :, t_sl].reshape(8, 8, tq_sz)
+                                    * inv_l1[None, :, :]
+                                )
+                                .reshape(64, tq_sz)
+                                .astype(jnp.bfloat16)
+                            )
+                            pair_t = jnp.concatenate([o0_t, o1_t], axis=0)
+                            parts_s.append(
+                                jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32) + 0.0
+                            )
+                        col_s = jnp.concatenate([*parts_s, zero_tail_16], axis=0)
+                        col_s = jnp.where(row_iota_ep < valid_ep, col_s, 0.0)
+
+                        @pl.when(lead_ep == 0)
+                        def _store_aligned(s=s, col_s=col_s):
+                            bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
+                                col_s.astype(jnp.bfloat16)
+                            )
+
+                        @pl.when(lead_ep > 0)
+                        def _store_shifted(s=s, col_s=col_s):
+                            shifted = col_s
+                            for sh in (1, 2, 4, 8):
+                                shifted = jnp.where(
+                                    (lead_ep & sh) != 0,
+                                    pltpu.roll(shifted, shift=sh, axis=0),
+                                    shifted,
+                                )
+                            carry_s = bo_carry_ref[:, s * 128 : (s + 1) * 128].astype(
+                                jnp.float32
+                            )
+                            carry_pad = jnp.concatenate(
+                                [
+                                    carry_s,
+                                    jnp.zeros((bq_sz, 128), jnp.float32),
+                                ],
+                                axis=0,
+                            )
+                            merged = jnp.where(
+                                row_iota_ep < lead_ep, carry_pad, shifted
+                            )
+                            bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
+                                merged.astype(jnp.bfloat16)
+                            )
+
+                    bo_carry_ref[...] = bo_x2_ref[
+                        bo_sem_idx,
+                        pl.ds(pl.multiple_of((total_rows_ep // 16) * 16, 16), 16),
+                        :,
+                    ]
+                    start_send_bo_a3(aligned_g0_ep, full_rows_ep, bo_sem_idx)
+                    return
+
+                out_u32_ref = (
+                    bo_x2_ref.bitcast(jnp.uint32)
+                    .at[bo_sem_idx, 0]
+                    .reshape(bq_sz * 8, 128)
+                )
+                lane_ep = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1)
+                is_lo_ep = lane_ep < 64
+                mask_lo_u32 = jnp.where(is_lo_ep, jnp.uint32(0xFFFFFFFF), jnp.uint32(0))
+                mask_hi_u32 = jnp.where(is_lo_ep, jnp.uint32(0), jnp.uint32(0xFFFFFFFF))
+
+                for tq_idx in range(bq_sz // tq_sz):
+                    tq_start = tq_idx * tq_sz
+                    t_sl = pl.ds(tq_start, tq_sz)
+                    for s in range(8):
+                        h0 = 2 * s
+                        h1 = 2 * s + 1
+                        l0 = l_ref[h0, :, t_sl]
+                        l1 = l_ref[h1, :, t_sl]
+                        inv_l0 = jnp.where(
+                            l0 > 0.0,
+                            pltpu.reciprocal(l0, approx=True) * v_scale_val,
+                            0.0,
+                        )
+                        inv_l1 = jnp.where(
+                            l1 > 0.0,
+                            pltpu.reciprocal(l1, approx=True) * v_scale_val,
+                            0.0,
+                        )
+                        o0_t = (
+                            (
+                                acc_ref[h0, :, t_sl].reshape(8, 8, tq_sz)
+                                * inv_l0[None, :, :]
+                            )
+                            .reshape(64, tq_sz)
+                            .astype(jnp.bfloat16)
+                        )
+                        o1_t = (
+                            (
+                                acc_ref[h1, :, t_sl].reshape(8, 8, tq_sz)
+                                * inv_l1[None, :, :]
+                            )
+                            .reshape(64, tq_sz)
+                            .astype(jnp.bfloat16)
+                        )
+                        pair_t = jnp.concatenate([o0_t, o1_t], axis=0)
+                        pair = jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32)
+                        rolled = pltpu.roll(pair, shift=64, axis=1)
+                        even = jnp.where(is_lo_ep, pair, rolled)
+                        odd = jnp.where(is_lo_ep, rolled, pair)
+                        lo_u32 = pltpu.bitcast(even, jnp.uint32)
+                        hi_u32 = pltpu.bitcast(odd, jnp.uint32)
+                        packed_u32 = lax.shift_right_logical(lo_u32, jnp.uint32(16)) | (
+                            hi_u32 & jnp.uint32(0xFFFF0000)
+                        )
+                        out_u32_ref[pl.ds(tq_start * 8 + s, tq_sz, 8)] = packed_u32 & (
+                            mask_lo_u32 if s < 4 else mask_hi_u32
+                        )
+
+                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+
+            return
 
         @pl.loop(0, num_bq, unroll=False)
         def compute_with_bq(bq_idx):
@@ -938,14 +4568,18 @@ def _ragged_paged_attention_kernel_loop(
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
 
-            bq_sem_idx = sem_ids_ref[0]
+            bq_sem_idx = ring_slot(seq_idx) if ring else sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
                 seq_idx, bq_idx, bq_sem_idx
             )
 
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
             start_bkv_idx = 0
-            if sliding_window is not None:
+            base = kv_base(seq_idx)
+            if window_aligned_kv:
+                # Decode has one query block: no later block revisits any KV block.
+                next_bq_start_bkv_idx = 0
+            elif sliding_window is not None:
                 start_bkv_idx = (
                     jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
                 )
@@ -959,7 +4593,7 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
                 effective_kv_len = kv_len
-            end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+            end_bkv_idx = cdiv(effective_kv_len - base, bkv_sz)
 
             # xai temperature computation
             xai_temperature_reg = None
@@ -980,9 +4614,14 @@ def _ragged_paged_attention_kernel_loop(
                     absolute_q_position > xai_temperature_len, _qtemp, 1.0
                 )
 
+            ring_seq = seq_idx + num_slots - 1
+
             # Prefetch next bq
-            @pl.when(next_seq_idx < end_seq_idx)
+            @pl.when((ring_seq if ring else next_seq_idx) < end_seq_idx)
             def prefetch_next_bq():
+                if ring:
+                    start_fetch_bq(ring_seq, 0, ring_slot(ring_seq))
+                    return
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
@@ -991,17 +4630,20 @@ def _ragged_paged_attention_kernel_loop(
                 assert bkv_sz % kv_packing == 0
 
                 # Get next bkv ids.
-                bkv_sem_idx = sem_ids_ref[1]
+                bkv_sem_idx = ring_slot(seq_idx) if ring else sem_ids_ref[1]
                 next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx = (
                     get_next_bkv_ids(
                         seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx
                     )
                 )
-                processed_kv_len = bkv_idx * bkv_sz
+                processed_kv_len = base + bkv_idx * bkv_sz
 
                 # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
+                @pl.when((ring_seq if ring else next_seq_idx) < end_seq_idx)
                 def prefetch_next_bkv():
+                    if ring:
+                        start_fetch_bkv(ring_seq, 0, ring_slot(ring_seq))
+                        return
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
                     if custom_mask_ref is not None:
@@ -1016,6 +4658,11 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+                if zero_kv_tail:
+                    zero_bkv_tail(
+                        bkv_sem_idx,
+                        jnp.clip(effective_kv_len - processed_kv_len, 0, bkv_sz),
+                    )
 
                 # Wait for custom mask if applicable
                 if custom_mask_ref is not None:
@@ -1048,7 +4695,7 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Flash attention with cur bkv and bq
                 effective_bkv_sz = jnp.minimum(
-                    effective_kv_len - bkv_idx * bkv_sz, bkv_sz
+                    effective_kv_len - processed_kv_len, bkv_sz
                 )
                 effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
 
@@ -1056,8 +4703,7 @@ def _ragged_paged_attention_kernel_loop(
                 # dynamic loop bounds. The @pl.when guard skips invalid iterations.
                 max_num_loops = bkv_sz // bkv_csz
 
-                @pl.loop(0, max_num_loops, unroll=False)
-                def attention_loop(idx):
+                def compute_chunk(idx, *, interior):
                     bkv_start = idx * bkv_csz
                     chunk_has_keys = bkv_start < effective_bkv_sz
                     if sliding_window is not None and sliding_window_chunk_skip:
@@ -1077,66 +4723,120 @@ def _ragged_paged_attention_kernel_loop(
                             chunk_has_keys, chunk_end > window_start
                         )
 
-                    @pl.when(chunk_has_keys)
-                    def _():
+                    if probe == "nocompute":
+                        chunk_has_keys = False
+
+                    def sub_block(bq_start, apply_mask=True):
+                        # Slice custom mask for this compute sub-block
+                        cur_mask_data = None
+                        if custom_mask_data is not None:
+                            cur_mask_data = bkvmask_ref[
+                                bkv_sem_idx,
+                                pl.ds(bq_start, actual_bq_csz),
+                                pl.ds(bkv_start, bkv_csz),
+                                0,
+                            ]
+
+                        # Slice xai temperature for this compute sub-block
+                        cur_xai_temp = None
+                        if xai_temperature_reg is not None:
+                            q_head_start = bq_start * num_q_heads_per_kv_head
+                            q_head_sz = actual_bq_csz * num_q_heads_per_kv_head
+                            cur_xai_temp = xai_temperature_reg[
+                                q_head_start : q_head_start + q_head_sz
+                            ]
+
+                        for kv_head_idx in range(actual_num_kv_heads):
+                            bk_c, bv_c = load_bkv(
+                                bkv_sem_idx,
+                                kv_head_idx,
+                                bkv_start,
+                                bkv_csz,
+                            )
+                            bq_c = load_bq(
+                                bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
+                            )
+
+                            lm_slice_start = bq_start * num_q_heads_per_kv_head
+                            lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
+                            lm_slice = (
+                                kv_head_idx,
+                                pl.ds(lm_slice_start, lm_slice_size),
+                            )
+
+                            cur_p, cur_v, cur_exp_m_diff = (
+                                flash_attention_step1_qk_softmax(
+                                    bq_c,
+                                    bk_c,
+                                    bv_c,
+                                    l_ref.at[lm_slice],
+                                    m_ref.at[lm_slice],
+                                    processed_q_len=processed_q_len + bq_start,
+                                    processed_kv_len=processed_kv_len + bkv_start,
+                                    effective_kv_len=effective_kv_len,
+                                    xai_temperature_reg=cur_xai_temp,
+                                    custom_mask_data=cur_mask_data,
+                                    apply_mask=apply_mask,
+                                )
+                            )
+                            flash_attention_step2_pv(
+                                cur_p,
+                                cur_v,
+                                cur_exp_m_diff,
+                                acc_ref.at[lm_slice],
+                            )
+
+                    def sub_block_maybe_masked(bq_start):
+                        if "mask_skip" not in prefill_opts:
+                            sub_block(bq_start)
+                            return
+                        # Every (row, key) of this sub-block is visible: skip the mask.
+                        q_first = processed_q_len + bq_start
+                        k_first = processed_kv_len + bkv_start
+                        no_mask = k_first + bkv_csz <= effective_kv_len
+                        if use_causal_mask:
+                            no_mask &= k_first + bkv_csz - 1 <= q_first
+                        if sliding_window is not None:
+                            no_mask &= (
+                                q_first + actual_bq_csz - 1 < k_first + sliding_window
+                            )
+                        pl.when(no_mask)(lambda: sub_block(bq_start, apply_mask=False))
+                        pl.when(jnp.logical_not(no_mask))(lambda: sub_block(bq_start))
+
+                    if interior:
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                            # Slice custom mask for this compute sub-block
-                            cur_mask_data = None
-                            if custom_mask_data is not None:
-                                cur_mask_data = bkvmask_ref[
-                                    bkv_sem_idx,
-                                    pl.ds(bq_start, actual_bq_csz),
-                                    pl.ds(bkv_start, bkv_csz),
-                                    0,
-                                ]
+                            sub_block(bq_start, apply_mask=False)
+                    else:
 
-                            # Slice xai temperature for this compute sub-block
-                            cur_xai_temp = None
-                            if xai_temperature_reg is not None:
-                                q_head_start = bq_start * num_q_heads_per_kv_head
-                                q_head_sz = actual_bq_csz * num_q_heads_per_kv_head
-                                cur_xai_temp = xai_temperature_reg[
-                                    q_head_start : q_head_start + q_head_sz
-                                ]
+                        @pl.when(chunk_has_keys)
+                        def _():
+                            for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                                sub_block_maybe_masked(bq_start)
 
-                            for kv_head_idx in range(actual_num_kv_heads):
-                                bk_c, bv_c = load_bkv(
-                                    bkv_sem_idx,
-                                    kv_head_idx,
-                                    bkv_start,
-                                    bkv_csz,
-                                )
-                                bq_c = load_bq(
-                                    bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
-                                )
+                def run_chunks(interior):
+                    unroll = 2 if interior else False
 
-                                lm_slice_start = bq_start * num_q_heads_per_kv_head
-                                lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
-                                lm_slice = (
-                                    kv_head_idx,
-                                    pl.ds(lm_slice_start, lm_slice_size),
-                                )
+                    @pl.loop(0, max_num_loops, unroll=unroll)
+                    def attention_loop(idx):
+                        compute_chunk(idx, interior=interior)
 
-                                cur_p, cur_v, cur_exp_m_diff = (
-                                    flash_attention_step1_qk_softmax(
-                                        bq_c,
-                                        bk_c,
-                                        bv_c,
-                                        l_ref.at[lm_slice],
-                                        m_ref.at[lm_slice],
-                                        processed_q_len=processed_q_len + bq_start,
-                                        processed_kv_len=processed_kv_len + bkv_start,
-                                        effective_kv_len=effective_kv_len,
-                                        xai_temperature_reg=cur_xai_temp,
-                                        custom_mask_data=cur_mask_data,
-                                    )
-                                )
-                                flash_attention_step2_pv(
-                                    cur_p,
-                                    cur_v,
-                                    cur_exp_m_diff,
-                                    acc_ref.at[lm_slice],
-                                )
+                if "visible_kv_tile" in prefill_opts and probe is None:
+                    # Every query sees every key in an interior tile. Prove this once
+                    # for all its compute chunks. Keep the per-chunk BF16 state updates
+                    # in their original order on both sides of the branch.
+                    end = processed_kv_len + bkv_sz
+                    complete = end <= effective_kv_len
+                    if use_causal_mask:
+                        complete &= end - 1 <= processed_q_len
+                    if sliding_window is not None:
+                        complete &= (
+                            processed_q_len + actual_bq_sz - 1
+                            < processed_kv_len + sliding_window
+                        )
+                    pl.when(complete)(lambda: run_chunks(True))
+                    pl.when(jnp.logical_not(complete))(lambda: run_chunks(False))
+                else:
+                    run_chunks(False)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
@@ -1148,8 +4848,11 @@ def _ragged_paged_attention_kernel_loop(
             ).astype(out_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
-            bo_sem_idx = sem_ids_ref[2]
-            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+            if ring:
+                bo_sem_idx = ring_slot(seq_idx)
+            else:
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
@@ -1169,20 +4872,39 @@ def _ragged_paged_attention_kernel_loop(
 
     ### ------- Kernel start ------- ###
 
-    @pl.when(seq_idx == start_seq_idx)
-    def prologue():
-        start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        # Initialize bkv_x2_ref to zeros to avoid NaN issues.
-        # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
+    def ring_prologue():
         bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
         zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
-        bkv_x2_int32_ref[0] = zeros
+        for slot in range(num_slots):
+            bkv_x2_int32_ref[slot] = zeros
+        for slot in range(num_slots - 1):
+
+            @pl.when(start_seq_idx + slot < end_seq_idx)
+            def _():
+                start_fetch_bq(start_seq_idx + slot, 0, slot)
+                start_fetch_bkv(start_seq_idx + slot, 0, slot)
+
+    def prologue():
+        if use_a3_out:
+            bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
+        if not use_staged_qo_loop:
+            start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+        # Initialize bkv_x2_ref to zeros to avoid NaN issues.
+        # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
+        if q_t_ref is None:
+            bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
+            zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
+            bkv_x2_int32_ref[0] = zeros
         start_fetch_bkv(
             seq_idx=start_seq_idx, bkv_idx=cur_seq_start_bkv_idx, bkv_sem_idx=0
         )
-        bkv_x2_int32_ref[1] = zeros
+        if q_t_ref is None:
+            for _sl in range(1, num_slots):
+                bkv_x2_int32_ref[_sl] = zeros
         if custom_mask_ref is not None:
             start_fetch_mask(start_seq_idx, 0, 0, 0)
+
+    pl.when(seq_idx == start_seq_idx)(ring_prologue if ring else prologue)
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
@@ -1190,7 +4912,7 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == end_seq_idx - 1)
     def epilogue():
-        for i in range(2):
+        for i in range(num_slots):
             wait_send_bo(bo_sem_idx=i)
             wait_update_kv_cache(bkv_sem_idx=i)
 
@@ -1320,6 +5042,36 @@ def prepare_outputs(
     )
 
 
+def prepare_head_packed_outputs(
+    out,  # [1, max_num_tokens, num_q_heads // q_packing, q_packing, head_pack * d]
+    head_pack: int,
+    actual_num_q_heads: int,
+    actual_head_dim: int,
+):
+    """-> [max_num_tokens, actual_num_q_heads * d]: q head h keeps the lanes of
+    packed head h // (actual_num_q_heads // head_pack), one slice per packed head."""
+    num_kv_heads, max_num_tokens, rows, q_packing, head_dim = out.shape
+    d = head_dim // head_pack
+    rows_per_head = rows // head_pack
+    if (
+        num_kv_heads != 1
+        or rows * q_packing != actual_num_q_heads
+        or head_dim != actual_head_dim
+        or rows % head_pack
+    ):
+        raise ValueError(f"no head-packed output for {out.shape=}, {head_pack=}")
+    parts = []
+    for g in range(head_pack):
+        rows_g = slice(g * rows_per_head, (g + 1) * rows_per_head)
+        lanes_g = slice(g * d, (g + 1) * d)
+        parts.append(
+            out[0, :, rows_g, :, lanes_g].reshape(
+                max_num_tokens, rows_per_head * q_packing * d
+            )
+        )
+    return jnp.concatenate(parts, axis=-1)
+
+
 def prepare_kv_cache_fused(
     kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
 ):
@@ -1393,6 +5145,7 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
     skip_kv_mask: bool = False,
     attention_sink=None,
+    _kv_pack_dense2: bool = False,
 ):
     """Validate inputs to the RPA kernel statically."""
     q, k, v = queries, keys, values
@@ -1419,7 +5172,8 @@ def static_validate_inputs(
 
     if kv_cache_fused is not None:
         kv_cache_processed = prepare_kv_cache_fused(kv_cache_fused)
-        _, page_size, _, kv_packing, head_dim = kv_cache_processed.shape
+        _, phys_page_size, _, kv_packing, head_dim = kv_cache_processed.shape
+        page_size = phys_page_size * 2 if _kv_pack_dense2 else phys_page_size
 
         if not jnp.issubdtype(kv_cache_fused.dtype, jnp.floating):
             raise ValueError(
@@ -1532,7 +5286,12 @@ def dynamic_validate_inputs(
 
     kv_cache_processed = prepare_kv_cache_fused(kv_cache_fused)
     total_num_pages = kv_cache_processed.shape[0]
-    page_size = kv_cache_processed.shape[1]
+    phys_page_size = kv_cache_processed.shape[1]
+    page_size = (
+        phys_page_size * 2
+        if kwargs.get("_kv_pack_dense2", False)
+        else phys_page_size
+    )
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
     for seq_idx in range(int(k)):
@@ -1791,6 +5550,20 @@ def get_vmem_limit():
         "disable_semaphore_checks",
         "debug_mode",
         "_sliding_window_chunk_skip",
+        "_decode_window_aligned_kv",
+        "_decode_zero_kv_tail",
+        "_decode_ring",
+        "_decode_probe",
+        "_prefill_opts",
+        "_fused_out_pack",
+        "_prepared_inputs",
+        "_skip_decode",
+        "_a3_out_layout",
+        "_skip_mixed",
+        "_decode_fast",
+        "_decode_out_norm_eps",
+        "_decode_gate_in_values",
+        "_kv_pack_dense2",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1830,6 +5603,44 @@ def ragged_paged_attention(
     # The output is identical; it exists only so benchmarks and tests can A/B
     # the skip.
     _sliding_window_chunk_skip: bool = True,
+    # Private: DECODE sliding-window KV blocks start at the window's first page
+    # (see window_aligned_kv in the kernel). Same output; size d_block_sizes'
+    # bkv to cdiv(window + page - 1, page) pages to fetch one block per sequence.
+    _decode_window_aligned_kv: bool = False,
+    # Private: DECODE zeroes the KV buffer rows past each sequence's length once
+    # per block instead of selecting V per compute chunk. Same output.
+    _decode_zero_kv_tail: bool = False,
+    # Private: DECODE keeps this many sequences' q/KV buffers (ring - 1 fetches
+    # ahead) when each sequence is one KV block; 0 keeps the two-slot pipeline.
+    _decode_ring: int = 0,
+    # Private, benchmark removal arms only (wrong output): "nocompute",
+    # "nodma" (no cache page DMAs), "novmask" (no V tail zeroing). DECODE only.
+    _decode_probe: str | None = None,
+    # Private: MIXED/PREFILL launches only, a subset of {"fold_scale" (softmax
+    # scale folded into exp2), "mask_skip" (no mask on fully visible sub-blocks)}.
+    _prefill_opts: frozenset = frozenset(),
+    # Private: >1 means the queries pack this many kv heads into one head
+    # (attention_pallas_rpa_base._pack_qkv_heads); the output is then
+    # [max_num_tokens, actual_num_q_heads * actual_head_dim // _fused_out_pack].
+    _fused_out_pack: int = 1,
+    # Private: queries are already prepare_inputs' [kv_heads, T, Hq / packing,
+    # packing, 128] and keys its merged kv [T, 2 * kv_heads / packing, packing,
+    # 128]; values is None. No attention sink.
+    _prepared_inputs: bool = False,
+    # Private: skip the 0-sequence DECODE sub-launch on pure extend forwards.
+    _skip_decode: bool = False,
+    # Private: Stationary-Q MIXED launch writes unpacked bf16[max_num_tokens, 1024]
+    # directly from its epilogue (requires _skip_decode=True and chunk_prefill_size=None).
+    _a3_out_layout: bool = False,
+    # Private: skip the 0-sequence MIXED sub-launch on pure decode forwards.
+    _skip_mixed: bool = False,
+    # Private: dedicated Ghostfish single-token DECODE fast kernel mode string.
+    _decode_fast: str = "",
+    # Private: optional fused post-RPA per-head RMSNorm eps & gate_in_values for decode.
+    _decode_out_norm_eps: float | None = None,
+    _decode_gate_in_values: bool = False,
+    # Private: dense 2-tokens-per-u32 KV cache packing (phys page rows = page_size // 2).
+    _kv_pack_dense2: bool = False,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -1870,11 +5681,35 @@ def ragged_paged_attention(
     Returns:
       (output, updated_kv_cache_fused)
     """
+    # The full-layer host table carries a proof only on profitable batches.
+    # Its shape selects one of two warmed programs. Counts remain live tensors.
+    shared_pages = None
+    if _decode_fast and distribution.shape != (3,):
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            get_shared_group_size,
+        )
+
+        if get_shared_group_size(_decode_fast) > 0:
+            n_groups = distribution.shape[0] - 3
+            if n_groups <= 0 or kv_lens.shape[0] % n_groups != 0:
+                raise ValueError("unexpected full-attention decode distribution shape")
+            shared_pages = distribution[3:]
+            distribution = distribution[:3]
     q, k, v = queries, keys, values
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = get_vmem_limit()
 
+    if _prepared_inputs:
+        assert (
+            (v is None or _decode_gate_in_values)
+            and attention_sink is None
+            and custom_mask is None
+        )
+        # Validate the shapes prepare_inputs would have been given.
+        num_kv, num_tokens, rows, packing, dim = q.shape
+        k = v = jax.ShapeDtypeStruct((num_tokens, num_kv, dim), k.dtype)
+        q = jax.ShapeDtypeStruct((num_tokens, num_kv * rows * packing, dim), q.dtype)
     static_validate_inputs(
         q,
         k,
@@ -1902,6 +5737,7 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
         skip_kv_mask=skip_kv_mask,
         attention_sink=attention_sink,
+        _kv_pack_dense2=_kv_pack_dense2,
     )
 
     actual_num_q_heads = q.shape[1]
@@ -1909,7 +5745,85 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
+    _eff_out_dtype = (
+        (jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16)
+        if out_dtype is None
+        else out_dtype
+    )
+    _need_fused_post = _decode_out_norm_eps is not None or _decode_gate_in_values
+    _use_decode_fast = False
+    if _decode_fast and not _skip_decode and not debug_mode:
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            can_use_decode_fast,
+            run_decode_fast_rpa,
+        )
+
+        _use_decode_fast = can_use_decode_fast(
+            mode_str=_decode_fast,
+            q=q,
+            kv_cache_fused=kv_cache_fused,
+            out_dtype=_eff_out_dtype,
+            decode_query_size=decode_query_size,
+            custom_mask=custom_mask,
+            attention_sink=attention_sink,
+            soft_cap=soft_cap,
+            xai_temperature_len=xai_temperature_len,
+            q_scale=q_scale,
+            actual_num_q_heads=actual_num_q_heads,
+            actual_num_kv_heads=actual_num_kv_heads,
+            actual_head_dim=actual_head_dim,
+            sliding_window=sliding_window,
+            pages_per_seq=page_indices.shape[0] // max(kv_lens.shape[0], 1),
+            pure_unpacked_decode=(
+                _skip_mixed
+                and chunk_prefill_size is None
+                and not _prepared_inputs
+                and _fused_out_pack == 1
+            ),
+            kv_pack_dense2=_kv_pack_dense2,
+            need_fused_post=_need_fused_post,
+        )
+        if shared_pages is not None and (
+            sliding_window is not None
+            or not _skip_mixed
+            or chunk_prefill_size is not None
+            or kv_lens.shape[0] % 16 != 0
+            or q.shape[0] < kv_lens.shape[0]
+            or kv_lens.shape[0] < 16
+        ):
+            shared_pages = None
+        if _use_decode_fast and _skip_mixed and chunk_prefill_size is None:
+            return run_decode_fast_rpa(
+                queries,
+                keys,
+                values,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                mode_str=_decode_fast,
+                decode_query_size=decode_query_size,
+                fused_out_pack=_fused_out_pack,
+                prepared_inputs=_prepared_inputs,
+                gate=values if _decode_gate_in_values else None,
+                out_norm_eps=_decode_out_norm_eps,
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_semaphore_checks=disable_semaphore_checks,
+                probe=_decode_probe,
+                shared_pages=shared_pages,
+                kv_pack_dense2=_kv_pack_dense2,
+            )
+
+    if _prepared_inputs:
+        q, kv = queries, keys
+    else:
+        q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
 
     (
@@ -1919,7 +5833,8 @@ def ragged_paged_attention(
         q_packing,
         head_dim,
     ) = q.shape
-    page_size = kv_cache_fused_processed.shape[1]
+    phys_page_size = kv_cache_fused_processed.shape[1]
+    page_size = phys_page_size * 2 if _kv_pack_dense2 else phys_page_size
     num_kv_heads_x2_per_kv_packing = kv_cache_fused_processed.shape[2]
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
@@ -1947,8 +5862,6 @@ def ragged_paged_attention(
 
     # Scalar prefetch init values.
     init_sem_ids = jnp.zeros((3,), jnp.int32)
-    init_bo_ids = jnp.full((4,), -1, jnp.int32)
-    init_bkv_update_ids = jnp.full((6,), -1, jnp.int32)
 
     use_causal_mask = causal == 1
     use_custom_mask = custom_mask is not None
@@ -1993,17 +5906,153 @@ def ragged_paged_attention(
         if has_bank_conflicts(bkv_stride):
             bkv_stride += 1
 
+        # The ring needs exactly one KV block per sequence: the whole page table
+        # (full attention) or a window-aligned block covering the window.
+        one_block_per_seq = (
+            bkv_sz >= pages_per_seq * page_size
+            if sliding_window is None
+            else _decode_window_aligned_kv
+            and bkv_sz >= cdiv(sliding_window + page_size - 1, page_size) * page_size
+        )
+        ring = (
+            _decode_ring
+            if case == RpaCase.DECODE
+            and static_q_len == 1
+            and custom_mask is None
+            and one_block_per_seq
+            else 0
+        )
+        prefill_opts = frozenset()
+        if case != RpaCase.DECODE:
+            prefill_opts = frozenset(_prefill_opts)
+            if (
+                soft_cap is not None
+                or xai_temperature_len is not None
+                or attention_sink is not None
+            ):
+                prefill_opts -= {"fold_scale"}
+            if custom_mask is not None:
+                prefill_opts -= {"mask_skip", "visible_kv_tile"}
+
+        use_stationary_q = (
+            case != RpaCase.DECODE
+            and any(
+                o in ("stationary_q_m0", "stationary_q_pilot", *_STATIONARY_Q_V2_OPTS)
+                for o in prefill_opts
+            )
+            and actual_num_kv_heads == 1
+            and num_q_heads_per_kv_head == 16
+            and q_packing == 2
+            and head_dim == 128
+            and q.dtype == jnp.bfloat16
+            and kv_cache.dtype == jnp.float8_e4m3fn
+            and out_dtype == jnp.bfloat16
+            and custom_mask is None
+            and attention_sink is None
+            and soft_cap is None
+            and xai_temperature_len is None
+            and q_scale is None
+            and bkv_sz % 512 == 0
+            and bq_sz % 256 == 0
+        )
+        use_a3_out = (
+            use_stationary_q
+            and _a3_out_layout
+            and _skip_decode
+            and chunk_prefill_size is None
+            and max_num_tokens % 16 == 0
+        )
+        if use_stationary_q:
+            prefill_opts -= {"fold_scale", "mask_skip"}
+            if use_a3_out:
+                prefill_opts = prefill_opts | {"a3_out_layout"}
+            else:
+                prefill_opts -= {"a3_out_layout"}
+        else:
+            prefill_opts -= {
+                "stationary_q_m0",
+                "stationary_q_pilot",
+                "bkv_full_unroll",
+                "a3_out_layout",
+                "tq_loop",
+                "tq_unroll",
+                "sw2048_fuse",
+                "fp8_kv",
+                "fp8_qk",
+                "fp8_qk_dyn",
+                "fp8_qkpv",
+                "fp8_qkpv_s1",
+                "fp8_qkpv_s0",
+                "fp8_qkpv_norm",
+                "gqa2_vreg",
+                "gqa4_vreg",
+                "vreg_acc",
+                "sw_short_fuse",
+                "mrb3",
+                "mrb4",
+                "f32_exp",
+                "prefix_fast",
+                "staged_qo",
+                *_STATIONARY_Q_V2_OPTS,
+            }
+        use_stationary_q_v2 = bool(
+            use_stationary_q and (prefill_opts & _STATIONARY_Q_V2_OPTS)
+        )
+        if _kv_pack_dense2 and use_stationary_q and not use_stationary_q_v2:
+            raise NotImplementedError(
+                "_kv_pack_dense2 requires stationary_q_v2 when stationary_q is enabled."
+            )
+
+        num_slots = (
+            3
+            if (case != RpaCase.DECODE and "mixed_s3" in prefill_opts)
+            else (ring or 2)
+        )
+
+        bkv_phys_rows = bkv_sz // 2 if _kv_pack_dense2 else bkv_sz
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
+            (num_slots, bkv_phys_rows, bkv_stride, *kv_cache.shape[3:]),
             kv_cache.dtype,
         )
 
+        allow_sw_fuse_v2 = (sliding_window == 2049) or (
+            sliding_window == 2048 and "sw2048_fuse" in prefill_opts
+        )
+        use_fuse_qe_v2 = bool(
+            use_stationary_q_v2
+            and allow_sw_fuse_v2
+            and use_causal_mask
+            and bq_sz == 256
+            and (
+                "stationary_q_m0_ring_fuse" in prefill_opts
+                or "stationary_q_m0_f32e_fuse" in prefill_opts
+            )
+        )
+        use_staged_qo = bool(
+            use_stationary_q_v2
+            and "staged_qo" in prefill_opts
+            and not use_fuse_qe_v2
+            and bq_sz >= 512
+            and bq_sz % 256 == 0
+            and not use_custom_mask
+        )
+        qo_stage_sz = 256 if use_staged_qo else bq_sz
         bq_double_buf = pltpu.VMEM(
-            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+            (num_slots, actual_num_kv_heads, qo_stage_sz, *q.shape[2:]),
             q.dtype,
         )
-
-        bo_double_buf = bq_double_buf
+        bo_double_buf = (
+            pltpu.VMEM((num_slots, qo_stage_sz + 16, 1024), q.dtype)
+            if use_a3_out
+            else (
+                pltpu.VMEM(
+                    (num_slots, actual_num_kv_heads, qo_stage_sz, *q.shape[2:]),
+                    q.dtype,
+                )
+                if (use_fuse_qe_v2 or use_staged_qo)
+                else bq_double_buf
+            )
+        )
 
         if not use_custom_mask:
             bkvmask_double_buf = None
@@ -2013,26 +6062,116 @@ def ragged_paged_attention(
                 jnp.int32,
             )
 
-        l_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
-            out_dtype,
-        )
-        m_scratch = l_scratch
+        if use_stationary_q_v2:
+            max_kv_tokens_v2 = pages_per_seq * page_size
+            num_s_v2 = bkv_sz // 256
+            if sliding_window is not None:
+                min_ring_blks = cdiv(bq_sz + sliding_window - 1, bkv_sz) + 1
+                ring_blks_v2 = max(4, next_power_of_2(min_ring_blks))
+            elif max_kv_tokens_v2 <= 32768:
+                ring_blks_v2 = max(2, next_power_of_2(cdiv(max_kv_tokens_v2, bkv_sz)))
+            else:
+                ring_blks_v2 = 1
+            ring_slices_v2 = ring_blks_v2 * num_s_v2
+            use_fp8_qk_dyn_v2 = "fp8_qk_dyn" in prefill_opts
+            use_fp8_qkpv_dyn_v2 = "fp8_qkpv_dyn" in prefill_opts
+            use_fp8_qkpv_v2 = (
+                ("fp8_qkpv" in prefill_opts)
+                or ("fp8_qkpv_s1" in prefill_opts)
+                or ("fp8_qkpv_s0" in prefill_opts)
+                or ("fp8_qkpv_norm" in prefill_opts)
+            )
+            use_fp8_qk_v2 = (
+                use_fp8_qkpv_dyn_v2
+                or use_fp8_qkpv_v2
+                or use_fp8_qk_dyn_v2
+                or ("fp8_qk" in prefill_opts)
+            )
+            use_fp8_kv_v2 = use_fp8_qk_v2 or ("fp8_kv" in prefill_opts)
+            use_vt_fp8_v2 = (
+                use_fp8_qkpv_dyn_v2 or use_fp8_qkpv_v2 or ("fp8_kv" in prefill_opts)
+            )
+            l_scratch = pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+            m_scratch = None
+            acc_scratch = pltpu.VMEM((16, 64, bq_sz), jnp.float32)
+            extra_scratches = [
+                pltpu.VMEM(
+                    (16, 64, bq_sz),
+                    jnp.float8_e4m3fn if use_fp8_qk_v2 else jnp.bfloat16,
+                ),
+                pltpu.VMEM(
+                    (2, ring_slices_v2, 256, 128),
+                    jnp.float8_e4m3fn if use_fp8_kv_v2 else jnp.bfloat16,
+                ),
+                pltpu.VMEM(
+                    (2, ring_slices_v2, 64, 256),
+                    jnp.float8_e4m3fn if use_vt_fp8_v2 else jnp.bfloat16,
+                ),
+                (pltpu.VMEM((1, 256, 256), jnp.bfloat16) if use_causal_mask else None),
+                (
+                    pltpu.VMEM((1, 256, 256), jnp.bfloat16)
+                    if (allow_sw_fuse_v2 and use_causal_mask)
+                    else None
+                ),
+                (pltpu.VMEM((16, 1024), jnp.bfloat16) if use_a3_out else None),
+                (
+                    pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+                    if use_fp8_qk_dyn_v2
+                    else None
+                ),
+            ]
+        elif use_stationary_q:
+            l_scratch = pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+            m_scratch = (
+                None
+                if "stationary_q_m0" in prefill_opts
+                else pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+            )
+            acc_scratch = pltpu.VMEM((16, 64, bq_sz), jnp.float32)
+            extra_scratches = [
+                pltpu.VMEM((16, 64, bq_sz), jnp.bfloat16),
+                pltpu.VMEM((2, bkv_sz // 256, 256, 128), jnp.bfloat16),
+                pltpu.VMEM((2, bkv_sz // 256, 64, 256), jnp.bfloat16),
+                *(
+                    [None, None, pltpu.VMEM((16, 1024), jnp.bfloat16)]
+                    if use_a3_out
+                    else []
+                ),
+            ]
+        else:
+            l_scratch = pltpu.VMEM(
+                (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+                out_dtype,
+            )
+            m_scratch = l_scratch
+            acc_scratch = pltpu.VMEM(
+                (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+                out_dtype,
+            )
+            extra_scratches = []
 
-        acc_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
-            out_dtype,
-        )
+        if _kv_pack_dense2:
+            if len(extra_scratches) < 7:
+                extra_scratches = list(extra_scratches) + [None] * (
+                    7 - len(extra_scratches)
+                )
+            extra_scratches.append(
+                pltpu.VMEM(
+                    (num_slots, bkv_sz, 1, *kv_cache.shape[3:]),
+                    kv_cache.dtype,
+                )
+            )
 
         scratch_shapes = [
             bkvmask_double_buf,
             bkv_double_buf,
             bq_double_buf,
             bo_double_buf,
-            pltpu.SemaphoreType.DMA((5, 2)),
+            pltpu.SemaphoreType.DMA((6 if _kv_pack_dense2 else 5, num_slots)),
             l_scratch,
             m_scratch,
             acc_scratch,
+            *extra_scratches,
         ]
 
         scalar_prefetches = (
@@ -2042,9 +6181,9 @@ def ragged_paged_attention(
             cu_kv_lens,
             cu_seq_mask_lens,
             distribution,
-            init_sem_ids,
-            init_bo_ids,
-            init_bkv_update_ids,
+            jnp.zeros((4,), jnp.int32) if use_stationary_q_v2 else init_sem_ids,
+            jnp.full((2 * num_slots,), -1, jnp.int32),  # bo_ids
+            jnp.full((3 * num_slots,), -1, jnp.int32),  # bkv_update_ids
         )
 
         scope_name = (
@@ -2054,6 +6193,50 @@ def ragged_paged_attention(
             scope_name += f"-sw_{sliding_window}"
             if not _sliding_window_chunk_skip:
                 scope_name += "-noskip"
+        window_aligned_kv = (
+            _decode_window_aligned_kv
+            and sliding_window is not None
+            and case == RpaCase.DECODE
+        )
+        probe = (
+            _decode_probe
+            if (case == RpaCase.DECODE or _decode_probe in ("nocompute", "nodma"))
+            else None
+        )
+        if window_aligned_kv:
+            scope_name += "-wa"
+        zero_kv_tail = (
+            _decode_zero_kv_tail
+            and case == RpaCase.DECODE
+            and bkv_stride == 1
+            and custom_mask is None
+        )
+        if zero_kv_tail:
+            scope_name += "-zt"
+        if ring:
+            scope_name += f"-ring{ring}"
+        if probe:
+            scope_name += f"-probe_{probe}"
+        for opt in sorted(prefill_opts):
+            scope_name += f"-{opt}"
+        if _kv_pack_dense2:
+            scope_name += "-d2"
+
+        extra_compiler_kwargs = (
+            {"flags": {"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True}}
+            if use_stationary_q
+            else {}
+        )
+
+        o_out_shape = (max_num_tokens, 1024) if use_a3_out else q.shape
+        out_aliases = (
+            {11: 1}
+            if use_a3_out
+            else {
+                9: 0,  # q -> output
+                11: 1,  # kv_cache -> updated_kv_cache
+            }
+        )
 
         kernel = pl.pallas_call(
             functools.partial(
@@ -2075,7 +6258,13 @@ def ragged_paged_attention(
                 case=case,
                 skip_kv_mask=skip_kv_mask,
                 sliding_window_chunk_skip=_sliding_window_chunk_skip,
+                window_aligned_kv=window_aligned_kv,
+                zero_kv_tail=zero_kv_tail,
+                ring=ring,
+                probe=probe,
+                prefill_opts=prefill_opts,
                 debug_mode=debug_mode,
+                kv_pack_dense2=_kv_pack_dense2,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -2088,23 +6277,21 @@ def ragged_paged_attention(
                 dimension_semantics=("arbitrary",),
                 vmem_limit_bytes=vmem_limit_bytes,
                 disable_bounds_checks=True,
+                **extra_compiler_kwargs,
                 **(_semaphore_kwargs(disable_semaphore_checks)),
             ),
             out_shape=(
                 [
-                    pltpu.HBM(shape=q.shape, dtype=q.dtype),
+                    pltpu.HBM(shape=o_out_shape, dtype=q.dtype),
                     pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
                 ]
                 if tpu_version >= 7
                 else [
-                    jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                    jax.ShapeDtypeStruct(shape=o_out_shape, dtype=q.dtype),
                     jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
                 ]
             ),
-            input_output_aliases={
-                9: 0,  # q -> output
-                11: 1,  # kv_cache -> updated_kv_cache
-            },
+            input_output_aliases=out_aliases,
             name=scope_name,
         )
 
@@ -2186,13 +6373,48 @@ def ragged_paged_attention(
         distribution = distribution.at[1].set(distribution[0])
 
     # Decode-only
-    q, kv_cache_fused_processed = run_rpa_kernel(
-        q,
-        kv_cache_fused_processed,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
-        static_q_len=decode_query_size,
-        case=RpaCase.DECODE,
-    )
+    if not _skip_decode:
+        if _use_decode_fast:
+            o_dec_3d, kv_cache_fused_processed = run_decode_fast_rpa(
+                queries,
+                keys,
+                values,
+                kv_cache_fused_processed,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                mode_str=_decode_fast,
+                decode_query_size=decode_query_size,
+                fused_out_pack=1,
+                prepared_inputs=_prepared_inputs,
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_semaphore_checks=disable_semaphore_checks,
+                probe=_decode_probe,
+                kv_pack_dense2=_kv_pack_dense2,
+            )
+            o_dec_5d = o_dec_3d.reshape(1, *q.shape[1:])
+            if _skip_mixed and chunk_prefill_size is None:
+                q = o_dec_5d
+            else:
+                dec_tok_end = cu_q_lens[jnp.clip(distribution[0], 0, max_num_seqs)]
+                tok_idx = jnp.arange(max_num_tokens, dtype=jnp.int32)[
+                    None, :, None, None, None
+                ]
+                q = jnp.where(tok_idx < dec_tok_end, o_dec_5d, q)
+        else:
+            q, kv_cache_fused_processed = run_rpa_kernel(
+                q,
+                kv_cache_fused_processed,
+                **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
+                static_q_len=decode_query_size,
+                case=RpaCase.DECODE,
+            )
 
     if chunk_prefill_size is not None:
         # Prefill-only
@@ -2204,17 +6426,496 @@ def ragged_paged_attention(
             case=RpaCase.PREFILL,
         )
     # Mixed
-    q, kv_cache_fused_processed = run_rpa_kernel(
-        q,
-        kv_cache_fused_processed,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
+    if not _skip_mixed:
+        q, kv_cache_fused_processed = run_rpa_kernel(
+            q,
+            kv_cache_fused_processed,
+            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+            static_q_len=None,
+            case=RpaCase.MIXED,
+        )
 
+    out_final = (
+        q
+        if q.ndim == 2
+        else (
+            prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim)
+            if _fused_out_pack == 1
+            else prepare_head_packed_outputs(
+                q, _fused_out_pack, actual_num_q_heads_per_kv_head, actual_head_dim
+            )
+        )
+    )
+    if _decode_out_norm_eps is not None and out_final.ndim == 2:
+        hd = actual_head_dim // max(_fused_out_pack, 1)
+        heads_f = out_final.reshape(out_final.shape[0], -1, hd).astype(jnp.float32)
+        inv_r = lax.rsqrt(
+            jnp.mean(heads_f * heads_f, axis=-1, keepdims=True)
+            + float(_decode_out_norm_eps)
+        )
+        out_final = (heads_f * inv_r).astype(out_final.dtype).reshape(out_final.shape)
+    if _decode_gate_in_values and values is not None and out_final.ndim == 2:
+        sig_g = jax.nn.sigmoid(values.astype(jnp.float32)).astype(out_final.dtype)
+        out_final = sig_g * out_final
     return (
-        prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
+        out_final,
         prepare_updated_kv_cache_fused(
             kv_cache_fused_processed, actual_num_kv_heads, actual_head_dim
         ),
     )
+
+
+def write_kv_only_rpa_v3(
+    kv_new: jax.Array,
+    kv_cache_fused: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    interpret: bool = False,
+    kv_pack_dense2: bool = False,
+) -> jax.Array:
+    """Write ``kv_new`` rows into ``kv_cache_fused`` along RPA v3 page tables without attention.
+
+    ``kv_new`` has shape ``[T, kv_heads_packed, kv_packing, head_dim]`` (matching
+    ``kv_cache_fused.shape[2:]`` and dtype). Used by L61 last-layer pruning to persist all ``T``
+    tokens of K/V while running attention/MoE only on ``last_token_indices``.
+    """
+    if kv_new.shape[1:] != kv_cache_fused.shape[2:]:
+        raise ValueError(
+            f"kv_new trailing shape {kv_new.shape[1:]} != kv_cache trailing shape {kv_cache_fused.shape[2:]}"
+        )
+    if kv_new.dtype != kv_cache_fused.dtype:
+        raise ValueError(
+            f"kv_new dtype {kv_new.dtype} != kv_cache dtype {kv_cache_fused.dtype}"
+        )
+    phys_page_size = kv_cache_fused.shape[1]
+    page_size = phys_page_size * 2 if kv_pack_dense2 else phys_page_size
+    num_page_indices = page_indices.shape[0]
+    flat_cache = kv_cache_fused.reshape(
+        (kv_cache_fused.shape[0] * phys_page_size, *kv_cache_fused.shape[2:])
+    )
+
+    if kv_pack_dense2:
+        if kv_new.shape[1:] != (1, 4, 128) or kv_new.dtype != jnp.float8_e4m3fn:
+            raise ValueError(
+                f"kv_pack_dense2 requires kv_new trailing shape (1, 4, 128) fp8, got {kv_new.shape[1:]} {kv_new.dtype}"
+            )
+
+        def _kv_write_dense2_kernel(
+            kv_lens_ref,
+            page_indices_ref,
+            cu_q_lens_ref,
+            cu_kv_lens_ref,
+            distribution_ref,
+            kv_new_ref,
+            cache_in_ref,
+            cache_out_ref,
+            buf_vmem,
+            pack_vmem,
+            in_sems,
+            cin_sems,
+            out_sems,
+            slot_src_smem,
+            slot_sz_smem,
+            slot_dst_smem,
+            step_smem,
+        ):
+            slot_src_smem[0] = 0
+            slot_src_smem[1] = 0
+            slot_sz_smem[0] = 0
+            slot_sz_smem[1] = 0
+            step_smem[0] = 0
+            n_seqs = jnp.clip(distribution_ref[2], 0, kv_lens_ref.shape[0])
+
+            @pl.loop(0, n_seqs)
+            def _seq_d2(seq_idx):
+                q_start = cu_q_lens_ref[seq_idx]
+                q_end = cu_q_lens_ref[seq_idx + 1]
+                q_len = q_end - q_start
+                kv_len = kv_lens_ref[seq_idx]
+
+                @pl.when((q_len > 0) & (kv_len >= q_len))
+                def _write_seq_d2():
+                    kv_start = kv_len - q_len
+                    p_start = kv_start // page_size
+                    p_end = cdiv(kv_len, page_size)
+                    seq_pg_base = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+
+                    @pl.loop(p_start, p_end)
+                    def _page_d2(p):
+                        step = step_smem[0]
+                        slot = step % 2
+                        other = 1 - slot
+                        step_smem[0] = step + 1
+                        prev_n = slot_sz_smem[slot]
+
+                        @pl.when(prev_n > 0)
+                        def _wait_prev_d2():
+                            prev_src = slot_src_smem[slot]
+                            prev_dst = slot_dst_smem[slot]
+                            pltpu.make_async_copy(
+                                src_ref=pack_vmem.at[slot, pl.ds(prev_src, prev_n)],
+                                dst_ref=cache_out_ref.at[pl.ds(prev_dst, prev_n)],
+                                sem=out_sems.at[slot],
+                            ).wait()
+                            slot_sz_smem[slot] = 0
+
+                        tok_lo = jnp.maximum(kv_start, p * page_size)
+                        tok_hi = jnp.minimum(kv_len, (p + 1) * page_size)
+                        n_tok = tok_hi - tok_lo
+                        off_lo = tok_lo - p * page_size
+                        off_hi = tok_hi - p * page_size
+                        pair_lo = off_lo // 2
+                        pair_hi = cdiv(off_hi, 2)
+                        n_pairs = pair_hi - pair_lo
+                        src_row = q_start + (tok_lo - kv_start)
+                        pg = page_indices_ref[
+                            jnp.minimum(seq_pg_base + p, num_page_indices - 1)
+                        ]
+                        dst_row = pg * phys_page_size + pair_lo
+                        need_cin = (off_lo & 1) != 0
+
+                        @pl.when(need_cin)
+                        def _start_cin():
+                            other_n = slot_sz_smem[other]
+
+                            @pl.when(other_n > 0)
+                            def _drain_other():
+                                o_src = slot_src_smem[other]
+                                o_dst = slot_dst_smem[other]
+                                pltpu.make_async_copy(
+                                    src_ref=pack_vmem.at[other, pl.ds(o_src, other_n)],
+                                    dst_ref=cache_out_ref.at[pl.ds(o_dst, other_n)],
+                                    sem=out_sems.at[other],
+                                ).wait()
+                                slot_sz_smem[other] = 0
+
+                            pltpu.make_async_copy(
+                                src_ref=cache_in_ref.at[pl.ds(dst_row, 1)],
+                                dst_ref=pack_vmem.at[slot, pl.ds(pair_lo, 1)],
+                                sem=cin_sems.at[slot],
+                            ).start()
+
+                        in_cp = pltpu.make_async_copy(
+                            src_ref=kv_new_ref.at[pl.ds(src_row, n_tok)],
+                            dst_ref=buf_vmem.at[slot, pl.ds(off_lo, n_tok)],
+                            sem=in_sems.at[slot],
+                        )
+                        in_cp.start()
+                        in_cp.wait()
+
+                        @pl.when(need_cin)
+                        def _wait_cin():
+                            pltpu.make_async_copy(
+                                src_ref=cache_in_ref.at[pl.ds(dst_row, 1)],
+                                dst_ref=pack_vmem.at[slot, pl.ds(pair_lo, 1)],
+                                sem=cin_sems.at[slot],
+                            ).wait()
+
+                        r_io = lax.broadcasted_iota(
+                            jnp.int32, (phys_page_size, 128), 0
+                        )
+                        t_even = 2 * r_io
+                        t_odd = t_even + 1
+                        if interpret:
+                            b_u8 = lax.bitcast_convert_type(
+                                buf_vmem[slot].reshape(page_size, 4, 128), jnp.uint8
+                            )
+                            new_lo = b_u8[0::2, 0, :].astype(jnp.uint32) | (
+                                b_u8[0::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            new_hi = b_u8[1::2, 0, :].astype(jnp.uint32) | (
+                                b_u8[1::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            p_u8 = lax.bitcast_convert_type(
+                                pack_vmem[slot].reshape(phys_page_size, 4, 128),
+                                jnp.uint8,
+                            )
+                            old_lo = p_u8[:, 0, :].astype(jnp.uint32) | (
+                                p_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            lo = jnp.where(
+                                t_even < off_lo,
+                                old_lo,
+                                jnp.where(t_even < off_hi, new_lo, jnp.uint32(0)),
+                            )
+                            hi = jnp.where(t_odd < off_hi, new_hi, jnp.uint32(0))
+                            out_u8 = jnp.stack(
+                                [
+                                    (lo & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                    ((lo >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                        jnp.uint8
+                                    ),
+                                    (hi & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                    ((hi >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                        jnp.uint8
+                                    ),
+                                ],
+                                axis=1,
+                            )
+                            pack_vmem[slot] = lax.bitcast_convert_type(
+                                out_u8, kv_new.dtype
+                            ).reshape(phys_page_size, 1, 4, 128)
+                        else:
+                            b_u32 = (
+                                buf_vmem.bitcast(jnp.uint32)
+                                .at[slot]
+                                .reshape(page_size, 128)
+                            )
+                            p_u32 = (
+                                pack_vmem.bitcast(jnp.uint32)
+                                .at[slot]
+                                .reshape(phys_page_size, 128)
+                            )
+                            new_lo = b_u32[
+                                pl.ds(0, phys_page_size, 2)
+                            ] & jnp.uint32(0xFFFF)
+                            new_hi = b_u32[
+                                pl.ds(1, phys_page_size, 2)
+                            ] & jnp.uint32(0xFFFF)
+                            old_lo = p_u32[...] & jnp.uint32(0xFFFF)
+                            lo = jnp.where(
+                                t_even < off_lo,
+                                old_lo,
+                                jnp.where(t_even < off_hi, new_lo, jnp.uint32(0)),
+                            )
+                            hi = jnp.where(t_odd < off_hi, new_hi, jnp.uint32(0))
+                            p_u32[...] = lo | (hi << jnp.uint32(16))
+
+                        pltpu.make_async_copy(
+                            src_ref=pack_vmem.at[slot, pl.ds(pair_lo, n_pairs)],
+                            dst_ref=cache_out_ref.at[pl.ds(dst_row, n_pairs)],
+                            sem=out_sems.at[slot],
+                        ).start()
+                        slot_src_smem[slot] = pair_lo
+                        slot_sz_smem[slot] = n_pairs
+                        slot_dst_smem[slot] = dst_row
+
+            for s in (0, 1):
+                rem_n = slot_sz_smem[s]
+
+                @pl.when(rem_n > 0)
+                def _drain_d2(s=s, rem_n=rem_n):
+                    rem_src = slot_src_smem[s]
+                    rem_dst = slot_dst_smem[s]
+                    pltpu.make_async_copy(
+                        src_ref=pack_vmem.at[s, pl.ds(rem_src, rem_n)],
+                        dst_ref=cache_out_ref.at[pl.ds(rem_dst, rem_n)],
+                        sem=out_sems.at[s],
+                    ).wait()
+
+        tpu_version = 0 if interpret else get_tpu_version()
+        out_shape = (
+            pltpu.HBM(shape=flat_cache.shape, dtype=flat_cache.dtype)
+            if tpu_version >= 7
+            else jax.ShapeDtypeStruct(shape=flat_cache.shape, dtype=flat_cache.dtype)
+        )
+        pallas_kwargs_d2 = {
+            "grid_spec": pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=5,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((2, page_size, *kv_new.shape[1:]), kv_new.dtype),
+                    pltpu.VMEM((2, phys_page_size, *kv_new.shape[1:]), kv_new.dtype),
+                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SMEM((2,), jnp.int32),
+                    pltpu.SMEM((2,), jnp.int32),
+                    pltpu.SMEM((2,), jnp.int32),
+                    pltpu.SMEM((1,), jnp.int32),
+                ],
+            ),
+            "out_shape": out_shape,
+            "input_output_aliases": {6: 0},
+            "name": f"RPA_write_kv_only_d2-p_{page_size}",
+        }
+        if interpret:
+            pallas_kwargs_d2["interpret"] = pltpu.InterpretParams(
+                detect_races=True, uninitialized_memory="nan"
+            )
+        else:
+            pallas_kwargs_d2["compiler_params"] = pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+            )
+
+        kernel_d2 = pl.pallas_call(_kv_write_dense2_kernel, **pallas_kwargs_d2)
+        if tpu_version >= 7:
+            updated_d2 = kernel_d2(
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                pltpu.with_memory_space_constraint(kv_new, pltpu.HBM),
+                pltpu.with_memory_space_constraint(flat_cache, pltpu.HBM),
+            )
+        else:
+            updated_d2 = kernel_d2(
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                kv_new,
+                flat_cache,
+            )
+        return updated_d2.reshape(kv_cache_fused.shape)
+
+    def _kv_write_kernel(
+        kv_lens_ref,
+        page_indices_ref,
+        cu_q_lens_ref,
+        cu_kv_lens_ref,
+        distribution_ref,
+        kv_new_ref,
+        cache_in_ref,
+        cache_out_ref,
+        buf_vmem,
+        in_sems,
+        out_sems,
+        slot_sz_smem,
+        slot_dst_smem,
+        step_smem,
+    ):
+        del cache_in_ref
+        slot_sz_smem[0] = 0
+        slot_sz_smem[1] = 0
+        step_smem[0] = 0
+        n_seqs = jnp.clip(distribution_ref[2], 0, kv_lens_ref.shape[0])
+
+        @pl.loop(0, n_seqs)
+        def _seq(seq_idx):
+            q_start = cu_q_lens_ref[seq_idx]
+            q_end = cu_q_lens_ref[seq_idx + 1]
+            q_len = q_end - q_start
+            kv_len = kv_lens_ref[seq_idx]
+
+            @pl.when((q_len > 0) & (kv_len >= q_len))
+            def _write_seq():
+                kv_start = kv_len - q_len
+                p_start = kv_start // page_size
+                p_end = cdiv(kv_len, page_size)
+                seq_pg_base = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+
+                @pl.loop(p_start, p_end)
+                def _page(p):
+                    step = step_smem[0]
+                    slot = step % 2
+                    step_smem[0] = step + 1
+                    prev_n = slot_sz_smem[slot]
+
+                    @pl.when(prev_n > 0)
+                    def _wait_prev():
+                        prev_dst = slot_dst_smem[slot]
+                        pltpu.make_async_copy(
+                            src_ref=buf_vmem.at[slot, pl.ds(0, prev_n)],
+                            dst_ref=cache_out_ref.at[pl.ds(prev_dst, prev_n)],
+                            sem=out_sems.at[slot],
+                        ).wait()
+
+                    tok_lo = jnp.maximum(kv_start, p * page_size)
+                    tok_hi = jnp.minimum(kv_len, (p + 1) * page_size)
+                    n = tok_hi - tok_lo
+                    src_row = q_start + (tok_lo - kv_start)
+                    pg = page_indices_ref[
+                        jnp.minimum(seq_pg_base + p, num_page_indices - 1)
+                    ]
+                    dst_row = pg * page_size + (tok_lo - p * page_size)
+
+                    in_cp = pltpu.make_async_copy(
+                        src_ref=kv_new_ref.at[pl.ds(src_row, n)],
+                        dst_ref=buf_vmem.at[slot, pl.ds(0, n)],
+                        sem=in_sems.at[slot],
+                    )
+                    in_cp.start()
+                    in_cp.wait()
+                    pltpu.make_async_copy(
+                        src_ref=buf_vmem.at[slot, pl.ds(0, n)],
+                        dst_ref=cache_out_ref.at[pl.ds(dst_row, n)],
+                        sem=out_sems.at[slot],
+                    ).start()
+                    slot_sz_smem[slot] = n
+                    slot_dst_smem[slot] = dst_row
+
+        for s in (0, 1):
+            rem_n = slot_sz_smem[s]
+
+            @pl.when(rem_n > 0)
+            def _drain(s=s, rem_n=rem_n):
+                rem_dst = slot_dst_smem[s]
+                pltpu.make_async_copy(
+                    src_ref=buf_vmem.at[s, pl.ds(0, rem_n)],
+                    dst_ref=cache_out_ref.at[pl.ds(rem_dst, rem_n)],
+                    sem=out_sems.at[s],
+                ).wait()
+
+    tpu_version = 0 if interpret else get_tpu_version()
+    out_shape = (
+        pltpu.HBM(shape=flat_cache.shape, dtype=flat_cache.dtype)
+        if tpu_version >= 7
+        else jax.ShapeDtypeStruct(shape=flat_cache.shape, dtype=flat_cache.dtype)
+    )
+    pallas_kwargs = {
+        "grid_spec": pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((2, page_size, *kv_new.shape[1:]), kv_new.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SMEM((2,), jnp.int32),
+                pltpu.SMEM((2,), jnp.int32),
+                pltpu.SMEM((1,), jnp.int32),
+            ],
+        ),
+        "out_shape": out_shape,
+        "input_output_aliases": {6: 0},
+        "name": f"RPA_write_kv_only-p_{page_size}",
+    }
+    if interpret:
+        pallas_kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+    else:
+        pallas_kwargs["compiler_params"] = pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+        )
+
+    kernel = pl.pallas_call(_kv_write_kernel, **pallas_kwargs)
+    if tpu_version >= 7:
+        updated = kernel(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            pltpu.with_memory_space_constraint(kv_new, pltpu.HBM),
+            pltpu.with_memory_space_constraint(flat_cache, pltpu.HBM),
+        )
+    else:
+        updated = kernel(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            kv_new,
+            flat_cache,
+        )
+    return updated.reshape(kv_cache_fused.shape)

@@ -1396,6 +1396,20 @@ class DFlashDraftModel(nn.Module):
             next_draft_tokens, next_draft_lattice = self.sample_draft_tokens_tpu(
                 hidden_states, input_ids
             )
+            from sglang_tpu.envs import envs as tpu_envs
+
+            if (
+                next_draft_tokens is not None
+                and tpu_envs.SGLANG_TPU_DFLASH_FUSE_STEP_OPS.get()
+            ):
+                verify_tokens = torch.cat(
+                    [
+                        input_ids.view(-1, self.block_size)[:, :1],
+                        next_draft_tokens.to(input_ids.dtype),
+                    ],
+                    dim=1,
+                ).reshape(-1)
+                next_draft_lattice = (next_draft_lattice, verify_tokens)
         else:
             next_draft_tokens, next_draft_lattice = None, None
 

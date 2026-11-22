@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import functools
 import itertools
+import logging
+import time
+from collections.abc import Callable
 
 import torch
 
@@ -60,12 +63,14 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    prepare_dflash_block_step,
     select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     CommitResult,
+    DraftBlockInputs,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -126,6 +131,24 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=self._draft_block_width, device=self.device
         )
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self._fuse_step_ops = tpu_envs.SGLANG_TPU_DFLASH_FUSE_STEP_OPS.get()
+        self._step_timers_enabled = tpu_envs.SGLANG_TPU_SPEC_STEP_TIMERS.get()
+        self._step_timer_samples: list[tuple[float, float, float, float, float]] = []
+
+    def _build_spec_verify_input(
+        self, batch: ScheduleBatch, padded_bs: int
+    ) -> TpuSpecVerifyInput:
+        if not self._fuse_step_ops:
+            return super()._build_spec_verify_input(batch, padded_bs)
+        return TpuSpecVerifyInput.from_batch(
+            batch,
+            self.num_verify_rows,
+            padded_bs,
+            pack_addressing=True,
+            swa_mapping=self._block_draft_worker.full_to_swa,
+        )
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -147,6 +170,128 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
+    def step(
+        self,
+        batch: ScheduleBatch,
+        bucket: BucketState,
+        verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
+    ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
+        if verify_input.packed_addressing is None and not self._step_timers_enabled:
+            return super().step(
+                batch, bucket, verify_input, grammar_barrier=grammar_barrier
+            )
+        t0 = time.perf_counter() if self._step_timers_enabled else 0.0
+        state = bucket.state
+        if verify_input.packed_addressing is not None:
+            rows, swa_rows, draft_inputs = prepare_dflash_block_step(
+                verify_input.packed_addressing,
+                state.bonus_tokens,
+                state.seq_lens,
+                bucket.live_mask,
+                self.num_verify_rows,
+                self._mask_token_id,
+                self._draft_block_width,
+                self._block_draft_worker.full_to_swa is not None,
+            )
+            t1 = time.perf_counter() if self._step_timers_enabled else 0.0
+            draft_result = self._draft_from_inputs(
+                bucket=bucket, draft_inputs=draft_inputs, verify_input=verify_input
+            )
+        else:
+            rows = select_verify_rows(
+                verify_input.verify_cache_candidates,
+                verify_input.committed_lens,
+                state.seq_lens,
+                self.num_verify_rows,
+            )
+            swa_rows = None
+            t1 = time.perf_counter() if self._step_timers_enabled else 0.0
+            draft_result = self.draft(batch, bucket, rows, verify_input)
+        t2 = time.perf_counter() if self._step_timers_enabled else 0.0
+        logits_output, accept = self.verify(
+            batch,
+            bucket,
+            rows,
+            draft_result,
+            verify_input,
+            grammar_barrier=grammar_barrier,
+        )
+        t3 = time.perf_counter() if self._step_timers_enabled else 0.0
+        if self._target_has_linear_attn:
+            self._commit_linear_attn_states(
+                batch=batch,
+                accept=accept,
+                pre_verify_lens=state.seq_lens,
+                verify_input=verify_input,
+            )
+        committed = self.commit(
+            batch,
+            state,
+            rows,
+            verify_input,
+            logits_output,
+            accept,
+            swa_rows=swa_rows,
+        )
+        if self._step_timers_enabled:
+            t4 = time.perf_counter()
+            self._record_step_timers(t0, t1, t2, t3, t4)
+        return committed, logits_output, accept
+
+    def _record_step_timers(
+        self, t0: float, t1: float, t2: float, t3: float, t4: float
+    ) -> None:
+        self._step_timer_samples.append(
+            (
+                (t1 - t0) * 1e6,
+                (t2 - t1) * 1e6,
+                (t3 - t2) * 1e6,
+                (t4 - t3) * 1e6,
+                (t4 - t0) * 1e6,
+            )
+        )
+        if len(self._step_timer_samples) >= 32:
+            samples = self._step_timer_samples
+            self._step_timer_samples = []
+            if get_parallel().tp_rank == 0:
+                med = [
+                    sorted(s[i] for s in samples)[len(samples) // 2] for i in range(5)
+                ]
+                logging.getLogger(__name__).info(
+                    "[SPEC_STEP_TIMERS n=%d med_us] prep=%.1f draft=%.1f verify=%.1f commit=%.1f total_step=%.1f",
+                    len(samples),
+                    med[0],
+                    med[1],
+                    med[2],
+                    med[3],
+                    med[4],
+                )
+
+    def _draft_from_inputs(
+        self,
+        *,
+        bucket: BucketState,
+        draft_inputs: DraftBlockInputs,
+        verify_input: TpuSpecVerifyInput,
+    ) -> DraftResult:
+        state = bucket.state
+        bs = state.seq_lens.shape[0]
+        block_hidden, graph_draft_tokens, draft_lattice, graph_verify_tokens = (
+            self._run_draft_block_inputs(
+                state=state, inputs=draft_inputs, verify_input=verify_input
+            )
+        )
+        return self._finish_draft_result(
+            bucket=bucket,
+            bs=bs,
+            block_hidden=block_hidden,
+            graph_draft_tokens=graph_draft_tokens,
+            draft_lattice=draft_lattice,
+            graph_verify_tokens=graph_verify_tokens,
+        )
+
     def draft(
         self,
         batch: ScheduleBatch,
@@ -157,21 +302,48 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         del batch
         state = bucket.state
         bs = state.seq_lens.shape[0]
-        block_hidden, graph_draft_tokens, draft_lattice = self._forward_draft_block(
-            state=state,
-            live_mask=bucket.live_mask,
-            rows=rows,
-            verify_input=verify_input,
+        block_hidden, graph_draft_tokens, draft_lattice, graph_verify_tokens = (
+            self._forward_draft_block_with_verify(
+                state=state,
+                live_mask=bucket.live_mask,
+                rows=rows,
+                verify_input=verify_input,
+            )
         )
+        return self._finish_draft_result(
+            bucket=bucket,
+            bs=bs,
+            block_hidden=block_hidden,
+            graph_draft_tokens=graph_draft_tokens,
+            draft_lattice=draft_lattice,
+            graph_verify_tokens=graph_verify_tokens,
+        )
+
+    def _finish_draft_result(
+        self,
+        *,
+        bucket: BucketState,
+        bs: int,
+        block_hidden: torch.Tensor,
+        graph_draft_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
+        graph_verify_tokens: torch.Tensor | None,
+    ) -> DraftResult:
+        state = bucket.state
         # No confidence budget yet: every bucket verifies all gamma drafts.
         num_verify_drafts = self._all_drafts[bs]
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
         if temperatures is None or top_ks is None or not self._sampled_drafts:
             # The draft graph already drafted greedily (sample_draft_tokens_tpu).
+            synced = self._sync_greedy_drafts(graph_draft_tokens)
+            verify_tokens = (
+                graph_verify_tokens if synced is graph_draft_tokens else None
+            )
             return DraftResult(
-                draft_tokens=self._sync_greedy_drafts(graph_draft_tokens),
+                draft_tokens=synced,
                 draft_logits=None,
                 num_verify_drafts=num_verify_drafts,
+                verify_tokens=verify_tokens,
             )
         sampled = self._sample_draft_block(
             block_hidden,
@@ -228,14 +400,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
+        *,
+        swa_rows: VerifyRows | None = None,
     ) -> CommitResult:
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
-        swa_candidates = self._draft_swa_candidates(verify_input)
-        if swa_candidates is not None:
+        if swa_rows is not None:
+            rows = swa_rows
+        elif (swa_candidates := self._draft_swa_candidates(verify_input)) is not None:
             rows = select_verify_rows(
                 padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
                 verify_input.committed_lens,
@@ -434,25 +609,28 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-    def _forward_draft_block(
+    @staticmethod
+    def _unpack_draft_lattice(
+        raw_lattice: Any,
+    ) -> tuple[DraftLattice | None, torch.Tensor | None]:
+        if (
+            isinstance(raw_lattice, tuple)
+            and len(raw_lattice) == 2
+            and isinstance(raw_lattice[1], torch.Tensor)
+            and raw_lattice[1].ndim == 1
+        ):
+            return raw_lattice[0], raw_lattice[1]
+        return raw_lattice, None
+
+    def _run_draft_block_inputs(
         self,
         *,
         state: SpecState,
-        live_mask: torch.Tensor,
-        rows: VerifyRows,
+        inputs: DraftBlockInputs,
         verify_input: TpuSpecVerifyInput,
-    ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None]:
-        """The block's [pbs, width, H] draft hidden, greedy [pbs, gamma] drafts and lattice."""
+    ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None, torch.Tensor | None]:
         padded_bs = state.seq_lens.shape[0]
         width = self._draft_block_width
-        inputs = build_draft_block_inputs(
-            state.bonus_tokens,
-            rows,
-            state.seq_lens,
-            live_mask,
-            self._mask_token_id,
-            width,
-        )
         # Writes the block's draft KV into the same slots target verify uses next.
         with self._block_draft_worker.draft_context():
             logits_output = forward_draft_rows(
@@ -470,11 +648,50 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         draft_tokens = logits_output.next_draft_tokens
         if hidden is None or draft_tokens is None:
             raise RuntimeError("Draft forward returned no hidden or draft tokens.")
+        draft_lattice, verify_tokens = self._unpack_draft_lattice(
+            logits_output.next_draft_lattice
+        )
         return (
             hidden.view(padded_bs, width, -1),
             draft_tokens,
-            logits_output.next_draft_lattice,
+            draft_lattice,
+            verify_tokens,
         )
+
+    def _forward_draft_block_with_verify(
+        self,
+        *,
+        state: SpecState,
+        live_mask: torch.Tensor,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+    ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None, torch.Tensor | None]:
+        width = self._draft_block_width
+        inputs = build_draft_block_inputs(
+            state.bonus_tokens,
+            rows,
+            state.seq_lens,
+            live_mask,
+            self._mask_token_id,
+            width,
+        )
+        return self._run_draft_block_inputs(
+            state=state, inputs=inputs, verify_input=verify_input
+        )
+
+    def _forward_draft_block(
+        self,
+        *,
+        state: SpecState,
+        live_mask: torch.Tensor,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+    ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None]:
+        """The block's [pbs, width, H] draft hidden, greedy [pbs, gamma] drafts and lattice."""
+        hidden, draft_tokens, draft_lattice, _ = self._forward_draft_block_with_verify(
+            state=state, live_mask=live_mask, rows=rows, verify_input=verify_input
+        )
+        return hidden, draft_tokens, draft_lattice
 
     def _bucket_sizes(self) -> tuple[int, ...]:
         compile_policy = self.target_worker.model_runner.compile_policy
@@ -484,6 +701,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def _warmup_draft_block_inputs(self) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
+        has_swa = self._block_draft_worker.full_to_swa is not None
+        cand_cols = 2 * self.verify_window_rows
+        packed_cols = cand_cols * (2 if has_swa else 1) + 1
         with torch.no_grad():
             for width, padded_bs in itertools.product(
                 self.verify_widths(), self._bucket_sizes()
@@ -515,6 +735,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     self._mask_token_id,
                     self._draft_block_width,
                 )
+                if self._fuse_step_ops:
+                    warmup_compiled_op(
+                        prepare_dflash_block_step,
+                        torch.zeros(
+                            (padded_bs, packed_cols),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (padded_bs,), dtype=torch.int64, device=self.device
+                        ),
+                        torch.zeros(
+                            (padded_bs,), dtype=torch.int64, device=self.device
+                        ),
+                        torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+                        width,
+                        self._mask_token_id,
+                        self._draft_block_width,
+                        has_swa,
+                    )
 
     def _warmup_draft_sampling(self) -> None:
         """The eager sampled-draft chain, plus step's verify-token cat and logits cast."""

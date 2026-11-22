@@ -133,19 +133,35 @@ def _compare_and_swap(
     *,
     descending,
     right_half=None,
+    exact_tie_break: bool = False,
 ):
     import jax.numpy as jnp
 
     if right_half is not None:
         compare_left = jnp.where(right_half, right_values, left_values)
         compare_right = jnp.where(right_half, left_values, right_values)
+        if exact_tie_break:
+            compare_left_idx = jnp.where(right_half, right_indices, left_indices)
+            compare_right_idx = jnp.where(right_half, left_indices, right_indices)
     else:
         compare_left, compare_right = left_values, right_values
+        if exact_tie_break:
+            compare_left_idx, compare_right_idx = left_indices, right_indices
 
     if isinstance(descending, bool) and descending:
-        take_left = compare_left > compare_right
+        if exact_tie_break:
+            take_left = (compare_left > compare_right) | (
+                (compare_left == compare_right) & (compare_left_idx < compare_right_idx)
+            )
+        else:
+            take_left = compare_left > compare_right
     else:
-        take_left = compare_right > compare_left
+        if exact_tie_break:
+            take_left = (compare_right > compare_left) | (
+                (compare_left == compare_right) & (compare_right_idx < compare_left_idx)
+            )
+        else:
+            take_left = compare_right > compare_left
     if not isinstance(descending, bool):
         take_left = take_left ^ descending.astype(bool)
 
@@ -190,6 +206,7 @@ def _bitonic_substage(
     sort_offset: int = 0,
     full_size: int | None = None,
     max_reduce: bool = False,
+    exact_tie_break: bool = False,
 ):
     import jax.numpy as jnp
 
@@ -233,6 +250,7 @@ def _bitonic_substage(
                 permuted_indices,
                 descending=descending,
                 right_half=right_half,
+                exact_tie_break=exact_tie_break,
             )
     else:
         tile_shape = value_tiles[0].shape
@@ -263,6 +281,7 @@ def _bitonic_substage(
                 value_tiles[right],
                 index_tiles[right],
                 descending=descending,
+                exact_tie_break=exact_tie_break,
             )
             output_values[left], output_indices[left] = swapped[:2]
             if not max_reduce:
@@ -298,7 +317,7 @@ def _topk_padded_shape(rows: int, columns: int) -> tuple[int, int]:
     return min(shapes, key=lambda shape: (shape[0] * shape[1], -shape[0]))
 
 
-def _bitonic_top64(values, indices):
+def _bitonic_top64(values, indices, *, exact_tie_break: bool = False):
     """Exact descending Top64 using a TPU compressed-transpose bitonic merge."""
 
     rows, columns = values.shape
@@ -317,7 +336,11 @@ def _bitonic_top64(values, indices):
 
     def substage(value_tiles, index_tiles, **kwargs):
         return _bitonic_substage(
-            value_tiles, index_tiles, batch_size=batch_size, **kwargs
+            value_tiles,
+            index_tiles,
+            batch_size=batch_size,
+            exact_tie_break=exact_tie_break,
+            **kwargs,
         )
 
     def reduce_stage(value_tiles, index_tiles, stage):
@@ -409,6 +432,7 @@ def _distributed_topk_kernel(
     org_vocab_size: int,
     global_vocab_size: int,
     org_vocab_padded_count: int,
+    exact_tie_break: bool = False,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -436,7 +460,9 @@ def _distributed_topk_kernel(
     logits = jnp.where(valid, logits_ref[...], -jnp.inf)
     local_indices = positions
     local_values, local_indices = _bitonic_top64(
-        logits.astype(jnp.float32), local_indices
+        logits.astype(jnp.float32),
+        local_indices,
+        exact_tie_break=exact_tie_break,
     )
     local_values = jnp.pad(
         local_values.astype(logits_ref.dtype),
@@ -580,6 +606,7 @@ def _ring_candidates(
     org_vocab_size: int,
     global_vocab_size: int,
     org_vocab_padded_count: int,
+    exact_tie_break: bool = False,
 ):
     import jax
     import jax.numpy as jnp
@@ -601,6 +628,7 @@ def _ring_candidates(
         org_vocab_size=org_vocab_size,
         global_vocab_size=global_vocab_size,
         org_vocab_padded_count=org_vocab_padded_count,
+        exact_tie_break=exact_tie_break,
     )
     candidate_shape = (world_size, padded_tokens, _DMA_WIDTH)
     output_specs = (
@@ -654,6 +682,9 @@ def distributed_top_k(
     import jax
     import jax.numpy as jnp
 
+    from sglang_tpu.envs import envs
+
+    exact_tie_break = (k == 1) or envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
     tokens, local_width = local_logits.shape
     aligned_width = _ceil_multiple(local_width, _VOCAB_ALIGNMENT)
     candidate_values, candidate_indices = _ring_candidates(
@@ -662,6 +693,7 @@ def distributed_top_k(
         org_vocab_size=org_vocab_size,
         global_vocab_size=global_vocab_size,
         org_vocab_padded_count=org_vocab_padded_count,
+        exact_tie_break=exact_tie_break,
     )
     candidate_values = jnp.transpose(
         candidate_values[:, :tokens, :MAX_DISTRIBUTED_TOP_K], (1, 0, 2)
@@ -670,17 +702,47 @@ def distributed_top_k(
         candidate_indices[:, :tokens, :MAX_DISTRIBUTED_TOP_K], (1, 0, 2)
     ).reshape(tokens, world_size * MAX_DISTRIBUTED_TOP_K)
 
-    values, candidate_positions = jax.lax.top_k(candidate_values, k)
-    packed_ids = jnp.take_along_axis(candidate_indices, candidate_positions, axis=1)
-    source_rank = packed_ids // aligned_width
-    local_position = packed_ids % aligned_width
     added_width = local_width - org_vocab_padded_count
-    token_ids = jnp.where(
-        local_position < org_vocab_padded_count,
-        source_rank * org_vocab_padded_count + local_position,
+    if not exact_tie_break:
+        values, candidate_positions = jax.lax.top_k(candidate_values, k)
+        packed_ids = jnp.take_along_axis(candidate_indices, candidate_positions, axis=1)
+        source_rank = packed_ids // aligned_width
+        local_position = packed_ids % aligned_width
+        token_ids = jnp.where(
+            local_position < org_vocab_padded_count,
+            source_rank * org_vocab_padded_count + local_position,
+            org_vocab_size
+            + source_rank * added_width
+            + local_position
+            - org_vocab_padded_count,
+        )
+        return values, token_ids.astype(jnp.int32)
+
+    cand_source_rank = candidate_indices // aligned_width
+    cand_local_pos = candidate_indices % aligned_width
+    cand_token_ids = jnp.where(
+        cand_local_pos < org_vocab_padded_count,
+        cand_source_rank * org_vocab_padded_count + cand_local_pos,
         org_vocab_size
-        + source_rank * added_width
-        + local_position
+        + cand_source_rank * added_width
+        + cand_local_pos
         - org_vocab_padded_count,
+    ).astype(jnp.int32)
+
+    row_max = jnp.max(candidate_values, axis=1, keepdims=True)
+    min_max_id = jnp.min(
+        jnp.where(candidate_values == row_max, cand_token_ids, jnp.int32(0x7FFFFFFF)),
+        axis=1,
+        keepdims=True,
     )
-    return values, token_ids.astype(jnp.int32)
+    if k == 1:
+        return row_max, min_max_id
+
+    values, candidate_positions = jax.lax.top_k(candidate_values, k)
+    token_ids = jnp.take_along_axis(cand_token_ids, candidate_positions, axis=1)
+    # Guarantee column 0 breaks exact f32 max ties toward the lowest global token ID
+    # even when base and added vocabulary tokens tie across different TP shards.
+    # Swap rather than overwrite so the candidate IDs stay unique.
+    token_ids = jnp.where(token_ids == min_max_id, token_ids[:, :1], token_ids)
+    token_ids = token_ids.at[:, 0:1].set(min_max_id)
+    return values, token_ids

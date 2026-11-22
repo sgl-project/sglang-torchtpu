@@ -59,13 +59,26 @@ def _draft_pool_cls(backend: str | None):
     return _mha_kv_pool_cls(backend)
 
 
-def draft_mha_pool_class(original, configurator):
-    pool_cls = _draft_pool_cls(
-        configurator.speculative_draft_attention_backend
-        if configurator.is_draft_worker
-        else None
+def _as_draft_pool_cls(pool_cls):
+    from sglang_tpu.kv_pool import (
+        TpuDraftFusedMHATokenToKVPool,
+        TpuFusedMHATokenToKVPool,
     )
-    return original(configurator) if pool_cls is None else pool_cls
+
+    return (
+        TpuDraftFusedMHATokenToKVPool
+        if pool_cls is TpuFusedMHATokenToKVPool
+        else pool_cls
+    )
+
+
+def draft_mha_pool_class(original, configurator):
+    is_draft = bool(getattr(configurator, "is_draft_worker", False))
+    pool_cls = _draft_pool_cls(
+        configurator.speculative_draft_attention_backend if is_draft else None
+    )
+    resolved = original(configurator) if pool_cls is None else pool_cls
+    return _as_draft_pool_cls(resolved) if is_draft else resolved
 
 
 def draft_cell_size_per_token(
@@ -85,7 +98,9 @@ def draft_cell_size_per_token(
     from sglang.srt.runtime_context import get_spec
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
-    pool_cls = _draft_pool_cls(get_spec().speculative_draft_attention_backend)
+    pool_cls = _as_draft_pool_cls(
+        _draft_pool_cls(get_spec().speculative_draft_attention_backend)
+    )
     if (
         pool_cls is None
         or not issubclass(pool_cls, TpuFusedMHATokenToKVPool)

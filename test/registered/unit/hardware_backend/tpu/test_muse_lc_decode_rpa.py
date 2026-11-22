@@ -1,0 +1,456 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit, CPU interpret-mode (0x7F NaN & race check), and TPU7x Mosaic export tests for Long-Context Decode RPA."""
+
+from __future__ import annotations
+
+import types
+import unittest
+from unittest.mock import patch
+
+import jax
+from jax import export as jax_export
+import jax.numpy as jnp
+import numpy as np
+import torch
+
+
+def _u8_to_fp8(arr_u8: np.ndarray) -> jax.Array:
+    return jax.lax.bitcast_convert_type(
+        jnp.asarray(arr_u8, dtype=jnp.uint8), jnp.float8_e4m3fn
+    )
+
+
+def _fp8_to_u8(arr_f8: jax.Array) -> np.ndarray:
+    return np.asarray(jax.lax.bitcast_convert_type(arr_f8, jnp.uint8))
+
+
+def _rand_fp8_u8(
+    rng: np.random.Generator, shape: tuple[int, ...], scale: float = 0.35
+) -> np.ndarray:
+    vals = (rng.standard_normal(shape) * scale).astype(np.float32)
+    return _fp8_to_u8(jnp.asarray(vals, dtype=jnp.float8_e4m3fn))
+
+
+def _fp8_from_u8(arr_u8: np.ndarray) -> np.ndarray:
+    return np.asarray(_u8_to_fp8(arr_u8), dtype=np.float32)
+
+
+def _pack_stock_cache_to_dense2_u8(stock_u8: np.ndarray, page_size: int) -> np.ndarray:
+    n_pg = stock_u8.shape[0]
+    phys = page_size // 2
+    d2 = np.full((n_pg, phys, 1, 4, 128), 0x7F, dtype=np.uint8)
+    d2[:, :, 0, 0, :] = stock_u8[:, 0::2, 0, 0, :]
+    d2[:, :, 0, 1, :] = stock_u8[:, 0::2, 0, 1, :]
+    d2[:, :, 0, 2, :] = stock_u8[:, 1::2, 0, 0, :]
+    d2[:, :, 0, 3, :] = stock_u8[:, 1::2, 0, 1, :]
+    return d2
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    af = a.astype(np.float64).ravel()
+    bf = b.astype(np.float64).ravel()
+    denom = np.linalg.norm(af) * np.linalg.norm(bf)
+    return float(np.dot(af, bf) / denom) if denom > 0 else 1.0
+
+
+def _exact_decode_ref(
+    q_bf16: np.ndarray,
+    k_new_u8: np.ndarray,
+    v_new_u8: np.ndarray,
+    cache_u8: np.ndarray,
+    kv_lens: np.ndarray,
+    page_indices: np.ndarray,
+    n_active: int,
+    page_size: int,
+    sm_scale: float,
+    pps: int,
+) -> np.ndarray:
+    out = np.zeros_like(q_bf16, dtype=np.float32)
+    for s in range(n_active):
+        kvl = int(kv_lens[s])
+        if kvl <= 0:
+            continue
+        k_list = []
+        v_list = []
+        for pos in range(kvl - 1):
+            pg = int(page_indices[s * pps + (pos // page_size)])
+            off = pos % page_size
+            k_list.append(_fp8_from_u8(cache_u8[pg, off, 0, 0, :]))
+            v_list.append(_fp8_from_u8(cache_u8[pg, off, 0, 1, :]))
+        k_list.append(_fp8_from_u8(k_new_u8[s]))
+        v_list.append(_fp8_from_u8(v_new_u8[s]))
+        k_mat = np.stack(k_list, axis=0)
+        v_mat = np.stack(v_list, axis=0)
+        q_mat = q_bf16[s].astype(np.float32)
+        logits = (q_mat @ k_mat.T) * sm_scale
+        logits -= np.max(logits, axis=1, keepdims=True)
+        probs = np.exp(logits)
+        probs /= np.sum(probs, axis=1, keepdims=True)
+        out[s] = probs @ v_mat
+    return out
+
+
+class TestMuseLongContextDecodeRpa(unittest.TestCase):
+    def test_long_context_routing_and_page_size_256(self):
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            can_use_decode_fast,
+            get_shared_group_size,
+            parse_decode_fast_config,
+        )
+
+        q_3d = jnp.zeros((64, 16, 128), dtype=jnp.bfloat16)
+        c_128 = jnp.zeros((16, 128, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+        c_d2_256 = jnp.zeros((16, 128, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+        c_d2_128 = jnp.zeros((16, 64, 1, 4, 128), dtype=jnp.float8_e4m3fn)
+
+        # w8 unlocks 64k/128k/256k (pps up to 4096) via ring4k instead of slow fallback
+        for pps in (640, 1152, 2177):
+            for mode in ("w8,c1024", "w8,c1024,ring4k", "w8,c1024,ring8k", "w8,c1024,shared64"):
+                self.assertTrue(
+                    can_use_decode_fast(
+                        mode_str=mode,
+                        q=q_3d,
+                        kv_cache_fused=c_d2_128,
+                        out_dtype=jnp.bfloat16,
+                        decode_query_size=1,
+                        custom_mask=None,
+                        attention_sink=None,
+                        soft_cap=None,
+                        xai_temperature_len=None,
+                        q_scale=None,
+                        actual_num_q_heads=16,
+                        actual_num_kv_heads=1,
+                        actual_head_dim=128,
+                        sliding_window=None,
+                        pages_per_seq=pps,
+                        kv_pack_dense2=True,
+                    ),
+                    f"Expected True for mode={mode}, pps={pps}",
+                )
+
+        self.assertEqual(get_shared_group_size("shared16_host"), 16)
+        self.assertEqual(get_shared_group_size("w8,c1024,shared32"), 32)
+        self.assertEqual(get_shared_group_size("w8,c1024,shared64,pbf16"), 64)
+
+        cfg_ring8k = parse_decode_fast_config(
+            "w8,c1024,ring8k", sliding_window=None, pages_per_seq=2177, page_size=128
+        )
+        self.assertEqual(cfg_ring8k.loop_kind, "ring4k")
+        self.assertEqual(cfg_ring8k.chunk_sz, 8192)
+        self.assertEqual(cfg_ring8k.num_slots, 3)
+        self.assertTrue(cfg_ring8k.coalesce_dma)
+
+        cfg_sh64 = parse_decode_fast_config(
+            "w8,c1024,shared64,pbf16",
+            sliding_window=None,
+            pages_per_seq=1089,
+            page_size=256,
+            shared_group=64,
+            kv_pack_dense2=True,
+        )
+        self.assertEqual(cfg_sh64.loop_kind, "shared64")
+        self.assertEqual(cfg_sh64.shared_group_size, 64)
+        self.assertEqual(cfg_sh64.chunk_sz, 2048)
+        self.assertEqual(cfg_sh64.max_ring_pages, 8)
+        self.assertEqual(cfg_sh64.shared_q_tile, 256)
+        self.assertTrue(cfg_sh64.pv_bf16)
+        self.assertTrue(cfg_sh64.coalesce_dma)
+        self.assertFalse(cfg_sh64.hoist_new_kv)
+
+        cfg_sh64_4k = parse_decode_fast_config(
+            "w8,c4096,shared64,q512",
+            sliding_window=None,
+            pages_per_seq=1089,
+            page_size=256,
+            shared_group=64,
+            kv_pack_dense2=True,
+        )
+        self.assertEqual(cfg_sh64_4k.chunk_sz, 4096)
+        self.assertEqual(cfg_sh64_4k.max_ring_pages, 16)
+        self.assertEqual(cfg_sh64_4k.shared_q_tile, 512)
+        del c_128, c_d2_256
+
+    def test_shared_distribution_group64_and_page_size_256(self):
+        from sglang_tpu.attention_shared_prefix import (
+            compute_shared_mismatch,
+            shared_decode_distribution,
+        )
+
+        pages = np.broadcast_to(np.arange(1100, dtype=np.int32), (64, 1100)).copy()
+        pages[:, 1024:] += np.arange(64, dtype=np.int32)[:, None] * 100
+        lengths = np.full((64,), 1024 * 256 + 100, dtype=np.int32)
+        mm = compute_shared_mismatch(pages, 64, group_size=64)
+        self.assertEqual(mm.tolist(), [1024])
+        plan = shared_decode_distribution(
+            pages, lengths, 64, 256, group_size=64, cached_mismatch=mm
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.tolist(), [64, 64, 64, 1024])
+
+    def test_shared16_and_shared32_and_ring4k_ps256_interpret_parity(self):
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            run_decode_fast_rpa,
+        )
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        rng = np.random.default_rng(7)
+        sm_scale = 1.0 / np.sqrt(64.0)
+
+        for tag, bs, n_act, page_size, use_d2, mode, grp in (
+            ("sh16_ps128_d2", 16, 15, 128, True, "w8,c1024,shared16,pbf16", 16),
+            ("sh32_ps128_d2", 32, 30, 128, True, "w8,c1024,shared32", 32),
+            ("sh16_ps256_d2", 16, 16, 256, True, "w8,c1024,shared16", 16),
+            ("ring4k_ps256_d2", 16, 14, 256, True, "w8,c1024,ring4k", 0),
+        ):
+            with self.subTest(case=tag):
+                shared_pgs = 2048 // page_size  # 16 at ps=128, 8 at ps=256
+                pps = shared_pgs + 4
+                n_phys_pages = 256
+                stock_cache_u8 = np.full((n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+                stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(rng, (n_phys_pages, page_size, 2, 128))
+                if use_d2:
+                    cache_u8 = _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+                else:
+                    cache_u8 = stock_cache_u8
+
+                # Shared prefix on first shared_pgs, unique private pages afterwards
+                page_indices = np.zeros((bs, pps), dtype=np.int32)
+                page_indices[:, :shared_pgs] = np.arange(1, 1 + shared_pgs, dtype=np.int32)
+                nxt = 1 + shared_pgs
+                for s in range(bs):
+                    for p in range(shared_pgs, pps):
+                        page_indices[s, p] = nxt
+                        nxt += 1
+
+                kv_lens = np.zeros((bs,), dtype=np.int32)
+                for s in range(n_act):
+                    kv_lens[s] = shared_pgs * page_size + 5 + (s * 23) % (3 * page_size)
+
+                q_np = (rng.standard_normal((bs, 16, 128)) * 0.35).astype(np.float32)
+                q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
+                k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+                k_new = _u8_to_fp8(k_new_u8)[:, None, :]
+                v_new = _u8_to_fp8(v_new_u8)[:, None, :]
+
+                cu_q = jnp.arange(bs + 1, dtype=jnp.int32)
+                cu_kv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size)
+                dist = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
+                shared_pages = None
+                if grp > 0:
+                    # Make sure shared_decode_distribution triggers: need width > 128 in helper
+                    pad_w = max(pps, 129)
+                    p_pad = np.zeros((bs, pad_w), dtype=np.int32)
+                    p_pad[:, :pps] = page_indices
+                    plan = shared_decode_distribution(p_pad, kv_lens, n_act, page_size, group_size=grp)
+                    self.assertIsNotNone(plan)
+                    shared_pages = jnp.asarray(plan[3:], dtype=jnp.int32)
+
+                out_j, _ = run_decode_fast_rpa(
+                    q_bf16,
+                    k_new,
+                    v_new,
+                    _u8_to_fp8(cache_u8),
+                    jnp.asarray(kv_lens, dtype=jnp.int32),
+                    jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                    cu_q,
+                    cu_kv,
+                    dist,
+                    sm_scale=sm_scale,
+                    sliding_window=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    mode_str=mode,
+                    decode_query_size=1,
+                    fused_out_pack=1,
+                    kv_pack_dense2=use_d2,
+                    shared_pages=shared_pages,
+                    interpret=True,
+                )
+                ref = _exact_decode_ref(
+                    np.asarray(q_bf16),
+                    k_new_u8,
+                    v_new_u8,
+                    stock_cache_u8,
+                    kv_lens,
+                    page_indices.ravel(),
+                    n_act,
+                    page_size,
+                    sm_scale,
+                    pps,
+                )
+                out_np = np.asarray(out_j, dtype=np.float32)
+                self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), 0.999)
+                if n_act < bs:
+                    self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
+
+    def test_shared32_dense2_multistep_odd_kv_write_and_readback(self):
+        """Verify odd/even kv_lens multi-step KV write + readback under shared32 + dense2."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            run_decode_fast_rpa,
+        )
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        rng = np.random.default_rng(19)
+        sm_scale = 1.0 / np.sqrt(64.0)
+        bs, n_act, page_size = 32, 20, 128
+        shared_pgs = 16
+        pps = shared_pgs + 4
+        n_phys_pages = 256
+        stock_cache_u8 = np.full((n_phys_pages, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+        stock_cache_u8[:, :, 0, :2, :] = _rand_fp8_u8(rng, (n_phys_pages, page_size, 2, 128))
+        d2_cache_u8 = _pack_stock_cache_to_dense2_u8(stock_cache_u8, page_size)
+
+        page_indices = np.zeros((bs, pps), dtype=np.int32)
+        page_indices[:, :shared_pgs] = np.arange(1, 1 + shared_pgs, dtype=np.int32)
+        nxt = 1 + shared_pgs
+        for s in range(bs):
+            for p in range(shared_pgs, pps):
+                page_indices[s, p] = nxt
+                nxt += 1
+
+        # Include both even (shared*128 + 128 -> odd cache_kv!) and odd kv_lens across page boundaries
+        kv_lens = np.zeros((bs,), dtype=np.int32)
+        for s in range(n_act):
+            kv_lens[s] = shared_pgs * page_size + 127 + (s % 4)
+
+        cu_q = jnp.arange(bs + 1, dtype=jnp.int32)
+        cu_kv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * page_size)
+        dist = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
+        pad_w = max(pps, 129)
+        p_pad = np.zeros((bs, pad_w), dtype=np.int32)
+        p_pad[:, :pps] = page_indices
+
+        for step in range(3):
+            cur_lens = kv_lens + step
+            plan = shared_decode_distribution(p_pad, cur_lens, n_act, page_size, group_size=32)
+            self.assertIsNotNone(plan)
+            shared_pages = jnp.asarray(plan[3:], dtype=jnp.int32)
+
+            q_bf16 = jnp.asarray(rng.standard_normal((bs, 16, 128)) * 0.35, dtype=jnp.bfloat16)
+            k_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+            v_new_u8 = _rand_fp8_u8(rng, (bs, 128))
+
+            out_j, upd_cache_j = run_decode_fast_rpa(
+                q_bf16,
+                _u8_to_fp8(k_new_u8)[:, None, :],
+                _u8_to_fp8(v_new_u8)[:, None, :],
+                _u8_to_fp8(d2_cache_u8),
+                jnp.asarray(cur_lens, dtype=jnp.int32),
+                jnp.asarray(page_indices.ravel(), dtype=jnp.int32),
+                cu_q,
+                cu_kv,
+                dist,
+                sm_scale=sm_scale,
+                sliding_window=None,
+                k_scale=1.0,
+                v_scale=1.0,
+                mode_str="w8,c1024,shared32,pbf16",
+                decode_query_size=1,
+                fused_out_pack=1,
+                kv_pack_dense2=True,
+                shared_pages=shared_pages,
+                interpret=True,
+            )
+            ref = _exact_decode_ref(
+                np.asarray(q_bf16),
+                k_new_u8,
+                v_new_u8,
+                stock_cache_u8,
+                cur_lens,
+                page_indices.ravel(),
+                n_act,
+                page_size,
+                sm_scale,
+                pps,
+            )
+            self.assertGreater(_cosine(np.asarray(out_j)[:n_act], ref[:n_act]), 0.999)
+            # Apply the written row updates onto both stock_cache_u8 and d2_cache_u8 for next step
+            upd_u8 = _fp8_to_u8(upd_cache_j)
+            for s in range(n_act):
+                pos = int(cur_lens[s]) - 1
+                pg = int(page_indices[s, pos // page_size])
+                off = pos % page_size
+                stock_cache_u8[pg, off, 0, 0, :] = k_new_u8[s]
+                stock_cache_u8[pg, off, 0, 1, :] = v_new_u8[s]
+                d2_cache_u8[pg, off // 2] = upd_u8[pg, off // 2]
+
+    def test_mosaic_tpu7x_export_long_context_272k(self):
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+                return_value="TPU v7",
+            ),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag, pps, ps, use_d2, mode, n_grp, exp_sub in (
+                ("ring4k_272k_ps128_d2", 2177, 128, True, "w8,c1024,ring4k", 0, "ring4k-mp32"),
+                ("ring8k_272k_ps128_d2", 2177, 128, True, "w8,c1024,ring8k", 0, "ring4k-mp64"),
+                ("ring4k_272k_ps256_d2", 1089, 256, True, "w8,c1024,ring4k", 0, "ring4k-mp16"),
+                ("shared16_272k_ps128_d2", 2177, 128, True, "w8,c1024,shared16,pbf16", 4, "shared16-mp16"),
+                ("shared32_272k_ps128_d2", 2177, 128, True, "w8,c1024,shared32,pbf16", 2, "shared32-mp16"),
+                ("shared64_272k_ps128_d2", 2177, 128, True, "w8,c1024,shared64,pbf16", 1, "shared64-mp16"),
+                ("shared64_272k_ps256_d2", 1089, 256, True, "w8,c1024,shared64,pbf16", 1, "shared64-mp8"),
+                ("shared64_272k_ps256_q512_d2", 1089, 256, True, "w8,c1024,shared64,q512", 1, "shared64-mp8"),
+                ("shared64_272k_ps256_c4096_d2", 1089, 256, True, "w8,c4096,shared64", 1, "shared64-mp16"),
+            ):
+                with self.subTest(export=tag):
+                    bs = 64
+                    phys_pg = ps // 2 if use_d2 else ps
+                    dist_len = 3 + n_grp if n_grp > 0 else 3
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q, kv, g, c, kl, pi, cq, ckv, d, _m=mode, _d2=use_d2: ragged_paged_attention(
+                                q,
+                                kv,
+                                g,
+                                c,
+                                kl,
+                                pi,
+                                cq,
+                                ckv,
+                                d,
+                                None,
+                                None,
+                                sm_scale=0.125,
+                                sliding_window=None,
+                                k_scale=1.0,
+                                v_scale=1.0,
+                                decode_query_size=1,
+                                _fused_out_pack=2,
+                                _prepared_inputs=True,
+                                _skip_mixed=True,
+                                _decode_fast=_m,
+                                _decode_out_norm_eps=1e-5,
+                                _decode_gate_in_values=True,
+                                _kv_pack_dense2=_d2,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, bs, 8, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs, 1024), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((4096, phys_pg, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs * pps,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((dist_len,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("RPAd_fast", hlo)
+                    self.assertIn(exp_sub, hlo)
+
+
+if __name__ == "__main__":
+    unittest.main()

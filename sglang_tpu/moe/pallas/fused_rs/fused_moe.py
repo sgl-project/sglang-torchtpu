@@ -364,9 +364,12 @@ def moe_gmm_local_rs_nodedup(
     # Expert TP routes each (token, slot) to exactly one slice per device, so a
     # device holds exactly size_m / ep_size rows, over at most that many of its
     # (many more) virtual experts.
+    smem_rows = fused_rs_smem_rows(size_m, ep_size, expert_tp)
     if expert_tp:
         max_rows = size_m // ep_size
         max_groups = min(num_local_experts, max_rows)
+    elif smem_rows < size_m:
+        max_rows, max_groups = smem_rows, num_local_experts
     else:
         max_rows, max_groups = size_m, num_local_experts
     max_num_gm = jnp.array(

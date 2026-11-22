@@ -263,16 +263,22 @@ def distributed_top_k_for_batch(
         return None
 
     info = forward_batch.sampling_info
-    top_k = info.uniform_top_k
-    if (
-        top_k is None
-        or top_k <= 1
-        or info.is_any_greedy
-        or info.sampling_seed is not None
-        or not info.need_top_k_sampling
-        or info.need_top_p_sampling
-        or info.need_min_p_sampling
-    ):
+    greedy_topk = envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get() and getattr(
+        info, "is_all_greedy", False
+    )
+    if not greedy_topk:
+        top_k = info.uniform_top_k
+        if (
+            top_k is None
+            or top_k <= 1
+            or info.is_any_greedy
+            or info.sampling_seed is not None
+            or not info.need_top_k_sampling
+            or info.need_top_p_sampling
+            or info.need_min_p_sampling
+        ):
+            return None
+    elif getattr(info, "sampling_support_logprobs_capture_indices", None) is not None:
         return None
     if info.has_custom_logit_processor or info.logit_bias is not None:
         return None
@@ -288,7 +294,89 @@ def distributed_top_k_for_batch(
         and info.penalizer_orchestrator.is_required
     ):
         return None
+    if greedy_topk:
+        return 1
     return top_k
+
+
+_GUMBEL_TEMP_CACHE: list[tuple[torch.Tensor, int, torch.Tensor]] = []
+
+
+def _materialize_gumbel_temperatures(
+    info: SamplingBatchInfo, padded_size: int
+) -> torch.Tensor:
+    """Upload/cache ``[padded_size, 1] float32`` temperatures on TPU (0 H2D on steady steps)."""
+    global _GUMBEL_TEMP_CACHE
+    t_src = info.temperatures
+    if not info.sampling_params_on_cpu:
+        t_f = t_src.float().reshape(-1, 1)
+        if t_f.shape[0] < padded_size:
+            t_f = torch.nn.functional.pad(
+                t_f, (0, 0, 0, padded_size - t_f.shape[0]), value=1.0
+            )
+        return t_f[:padded_size]
+    for idx, (cached_host, cached_sz, dev_t) in enumerate(_GUMBEL_TEMP_CACHE):
+        if cached_sz == padded_size and cached_host is t_src:
+            _GUMBEL_TEMP_CACHE.append(_GUMBEL_TEMP_CACHE.pop(idx))
+            return dev_t
+    size = len(info)
+    padded = t_src.new_full((padded_size, 1), 1.0, dtype=torch.float32)
+    padded[:size].copy_(t_src[:size].reshape(size, 1).to(torch.float32))
+    dev_t = padded.to(info.device, non_blocking=True)
+    _GUMBEL_TEMP_CACHE = [*_GUMBEL_TEMP_CACHE, (t_src, padded_size, dev_t)][-2:]
+    return dev_t
+
+
+def _can_use_fused_gumbel_max_for_batch(forward_batch, model) -> bool:
+    """True when unconstrained temperature sampling can execute 1-kernel Gumbel-max LM head."""
+    gumbel_env = getattr(envs, "SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD", None)
+    fused_env = getattr(envs, "SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK", None)
+    if (
+        gumbel_env is None
+        or not gumbel_env.get()
+        or fused_env is None
+        or not fused_env.get()
+        or forward_batch is None
+        or _is_speculative_batch(forward_batch)
+    ):
+        return False
+    info = getattr(forward_batch, "sampling_info", None)
+    batch_size = getattr(forward_batch, "batch_size", 0)
+    if (
+        info is None
+        or getattr(forward_batch, "return_logprob", False)
+        or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+    ):
+        return False
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_extend_without_speculative()):
+        return False
+    if (
+        getattr(info, "temperatures", None) is None
+        or info.sampling_seed is not None
+        or info.need_top_k_sampling
+        or info.need_top_p_sampling
+        or info.need_min_p_sampling
+        or getattr(info, "sampling_support_logprobs_capture_indices", None) is not None
+        or info.has_custom_logit_processor
+        or info.logit_bias is not None
+        or any(info.grammars or ())
+        or info.sampling_mask_batch_indices is not None
+        or info.acc_additive_penalties is not None
+        or info.acc_scaling_penalties is not None
+        or (
+            info.penalizer_orchestrator is not None
+            and info.penalizer_orchestrator.is_required
+        )
+    ):
+        return False
+    output_head = _distributed_top_k_output_head(model)
+    if output_head is None or getattr(output_head, "fp8_w8k", None) is None:
+        return False
+    lp = getattr(model, "logits_processor", None)
+    if getattr(lp, "final_logit_softcapping", None):
+        return False
+    return True
 
 
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
@@ -302,8 +390,21 @@ def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
     requested_top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
-    if requested_top_k is None or requested_top_k > candidate_width:
+    if requested_top_k is None:
+        if _can_use_fused_gumbel_max_for_batch(forward_batch, model):
+            forward_batch.gumbel_temperatures = _materialize_gumbel_temperatures(
+                forward_batch.sampling_info, int(forward_batch.batch_size)
+            )
+            return LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX
         return LogitsOutputMode.FULL_VOCAB
+    if requested_top_k > candidate_width:
+        return LogitsOutputMode.FULL_VOCAB
+    auto_greedy_env = getattr(envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
+    if requested_top_k == 1 and (
+        envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
+        or (auto_greedy_env is not None and auto_greedy_env.get())
+    ):
+        return LogitsOutputMode.DISTRIBUTED_GREEDY
     return LogitsOutputMode.DISTRIBUTED_TOP_K
 
 
@@ -556,11 +657,22 @@ class TpuSampler(Sampler):
             # The producer retains physical logits and forward metadata. Never
             # slice or re-pad them here. Only CPU parameters need materializing
             # at the producer's extent (prefill can use a fixed batch cap).
-            if (
-                sampling_info.is_all_greedy
-                and not logits_output.has_next_token_global_top_k
+            single_col_global = (
+                logits_output.has_next_token_global_top_k
+                and logits_output.next_token_global_top_k_token_ids is not None
+                and logits_output.next_token_global_top_k_token_ids.shape[1] == 1
+            )
+            greedy_global_topk = (
+                envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
+                and getattr(sampling_info, "is_all_greedy", False)
+            )
+            if single_col_global or (
+                getattr(sampling_info, "is_all_greedy", False)
+                and (
+                    not logits_output.has_next_token_global_top_k or greedy_global_topk
+                )
             ):
-                # Greedy argmax reads no sampling parameters.
+                # Greedy argmax and 1-col on-device Gumbel-max read no post-head params.
                 sampling_info = replace(sampling_info, sampling_params_on_cpu=False)
             else:
                 sampling_info = self._device_params.materialize(
@@ -581,6 +693,15 @@ class TpuSampler(Sampler):
 
         if return_logprob:
             raise ValueError("distributed TPU top-k cannot return full logprobs")
+        if logits_output.next_token_global_top_k_token_ids.shape[1] == 1 or (
+            envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
+            and getattr(sampling_info, "is_all_greedy", False)
+        ):
+            batch_next_token_ids = logits_output.next_token_global_top_k_token_ids[
+                :, 0
+            ].to(torch.int64)
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+            return batch_next_token_ids
         sampled_top_k_position = sample_from_global_top_k_logits(
             logits_output.next_token_global_top_k_logits,
             sampling_info.temperatures,

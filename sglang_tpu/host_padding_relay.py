@@ -7,6 +7,8 @@ from sglang.srt.managers.overlap_utils import FutureMap
 
 
 class HostPaddingFutureMap(FutureMap):
+    _is_noop_publish = True
+
     def __init__(self, device, spec_algo, req_to_token_pool, *args, **kwargs):
         super().__init__(device, spec_algo, req_to_token_pool, *args, **kwargs)
         self.bucketer = req_to_token_pool._tpu_relay_bucketer
@@ -18,6 +20,21 @@ class HostPaddingFutureMap(FutureMap):
         if overlap_utils._DEBUG_ASSERT:
             host_tokens[: self.req_pool_size] = -1
         self.output_tokens_buf = host_tokens.to(device)
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self._direct_handoff_enabled = tpu_envs.SGLANG_TPU_SPEC_DIRECT_HANDOFF.get()
+        self._direct_handoff = None
+
+    def flush_direct_handoff(self) -> None:
+        pending = self._direct_handoff
+        if pending is None:
+            return
+        self._direct_handoff = None
+        indices, values = pending
+        padded_indices = self._indices(indices, len(values))
+        self.output_tokens_buf.index_copy_(
+            0, padded_indices, values.to(self.output_tokens_buf.dtype)
+        )
 
     def _indices(self, indices, width):
         if indices.device.type != "cpu":
@@ -31,6 +48,7 @@ class HostPaddingFutureMap(FutureMap):
         return padded.to(self.device, non_blocking=True)
 
     def _store(self, buf, indices, values):
+        self.flush_direct_handoff()
         if buf is not self.output_tokens_buf or indices.device.type != "cpu":
             return super()._store(buf, indices, values)
         if values.device.type == "cpu":
@@ -38,6 +56,14 @@ class HostPaddingFutureMap(FutureMap):
             padded = values.new_zeros(width)
             padded[: len(values)].copy_(values)
             values = padded.to(self.device)
+        if (
+            self._direct_handoff_enabled
+            and not overlap_utils._DEBUG_ASSERT
+            and len(indices) > 0
+            and len(values) == self.bucketer.next_bucket(len(indices))
+        ):
+            self._direct_handoff = (indices, values)
+            return
         # Supported padded sampling supplies a whole bucket. Other sampling
         # modes retain their live-size contract until their outputs are padded.
         padded_indices = self._indices(indices, len(values))
@@ -50,6 +76,19 @@ class HostPaddingFutureMap(FutureMap):
 
     def gather(self, indices):
         width = self.bucketer.next_bucket(len(indices))
+        pending = self._direct_handoff
+        if pending is not None:
+            prev_indices, prev_values = pending
+            if len(prev_values) == width and (
+                prev_indices is indices
+                or (
+                    len(prev_indices) == len(indices)
+                    and torch.equal(prev_indices, indices)
+                )
+            ):
+                self._direct_handoff = None
+                return prev_values.to(self.output_tokens_buf.dtype)
+            self.flush_direct_handoff()
         device_indices = self._indices(indices, width)
         tokens = self.output_tokens_buf[device_indices]
         if overlap_utils._DEBUG_ASSERT:

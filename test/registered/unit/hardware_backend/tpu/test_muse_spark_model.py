@@ -199,6 +199,8 @@ def _build_stub_text_stage(
     hidden, vocab = 16, 32
     stage = torch.nn.Module.__new__(MuseSparkTextModel)
     torch.nn.Module.__init__(stage)
+    stage.prefill_kernels = None
+    stage._decode_norm_layout = 0
     stage.config = SimpleNamespace(
         hidden_size=hidden,
         vocab_size=vocab,

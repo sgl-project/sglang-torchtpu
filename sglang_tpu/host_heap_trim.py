@@ -82,6 +82,20 @@ def _find_releases() -> Tuple[Release, ...]:
             release.argtypes = []
             release.restype = None
             releases.append(("tcmalloc", release))
+        mallctl = _symbol(process, "mallctl")
+        if mallctl is not None:
+            mallctl.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            mallctl.restype = ctypes.c_int
+            # MALLCTL_ARENAS_ALL == 4096 across jemalloc 5.x.
+            releases.append(
+                ("jemalloc", lambda m=mallctl: m(b"arena.4096.purge", None, None, None, 0))
+            )
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
         trim = _symbol(libc, "malloc_trim")

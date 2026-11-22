@@ -522,6 +522,17 @@ class EagerLogitsCase(msgspec.Struct, frozen=True):
     spec_info: SpecInput | None = None
 
 
+def _shared_decode_key(key, attention_metadata):
+    # Hybrid attention passes (full_metadata, linear_metadata). Only the
+    # presence of the optional tensor changes the kernel program; its page
+    # counts are dynamic inputs so different prefix lengths reuse that graph.
+    if isinstance(attention_metadata, tuple) and attention_metadata:
+        attention_metadata = attention_metadata[0]
+    if getattr(attention_metadata, "full_decode_distribution", None) is not None:
+        return (*key, "shared_decode")
+    return key
+
+
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
@@ -1072,7 +1083,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
-        return key
+        return _shared_decode_key(key, attention_metadata)
 
     def _owns_logits_processor(self) -> bool:
         """Whether ``owner`` includes the target logits processor inside its forward."""
@@ -1169,10 +1180,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         if batch_size < distributed_top_k_min_batch_size():
             return (LogitsOutputMode.FULL_VOCAB,)
-        return (
-            LogitsOutputMode.DISTRIBUTED_TOP_K,
-            LogitsOutputMode.FULL_VOCAB,
-        )
+        from sglang_tpu.envs import envs as tpu_envs
+
+        modes: list[LogitsOutputMode] = []
+        auto_greedy_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_GREEDY_TOPK1_AUTO", None)
+        if (
+            tpu_envs.SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1.get()
+            or (auto_greedy_env is not None and auto_greedy_env.get())
+        ) and tpu_envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get():
+            modes.append(LogitsOutputMode.DISTRIBUTED_GREEDY)
+        gumbel_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD", None)
+        if (
+            gumbel_env is not None
+            and gumbel_env.get()
+            and tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.get()
+        ):
+            modes.append(LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX)
+        modes.extend((LogitsOutputMode.DISTRIBUTED_TOP_K, LogitsOutputMode.FULL_VOCAB))
+        return tuple(modes)
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a normal or target forward before attention planning."""
@@ -1650,15 +1675,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 )
         return pending
 
+    def _shared_decode_variants(self, bs: int) -> tuple[bool, ...]:
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            get_shared_group_size,
+        )
+
+        if get_shared_group_size(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()) <= 0:
+            return (False,)
+        backend = self.model_runner.attn_backend
+        backend = getattr(backend, "full_attn_backend", backend)
+        supported = getattr(backend, "supports_shared_decode_batch", None)
+        return (False, True) if supported is not None and supported(bs) else (False,)
+
     def _precompile_decode(self) -> list[PendingCall]:
         """Compile decode mode: vary batch size (tokens == batch size)."""
         assert self.b_bucketer is not None
 
         bs_buckets = list(self.b_bucketer.buckets)
         compile_items = [
-            (bs, logits_output_mode)
+            (bs, logits_output_mode, shared_decode)
             for bs in bs_buckets
             for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for shared_decode in self._shared_decode_variants(bs)
         ]
         logger.info(
             "[decoder compile policy] DECODE: %d graph variants (bs=%s)",
@@ -1675,13 +1713,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else compile_items
         )
         pending = []
-        for bs, logits_output_mode in compile_range:
+        for bs, logits_output_mode, shared_decode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
                 num_tokens=bs,
                 bs=bs,
                 mode=ForwardMode.DECODE,
+                shared_decode=shared_decode,
                 logits_output_mode=logits_output_mode,
             )
             elapsed = time.perf_counter() - start
@@ -1691,6 +1730,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 duration_seconds=elapsed,
                 batch_size=bs,
                 num_tokens=bs,
+                input_variant="shared_decode" if shared_decode else None,
                 logits_output_mode=logits_output_mode.name.lower(),
             )
             if warmup is not None:
@@ -1774,6 +1814,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        shared_decode: bool = False,
         publish_dsa_topk: bool = False,
     ) -> PendingCall | float | None:
         """Run one warmup, defer async execution, or time synchronous profiling.
@@ -1812,6 +1853,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if spec_info is None:
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
                 forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
+            elif logits_output_mode is LogitsOutputMode.DISTRIBUTED_GREEDY:
+                forward_batch.sampling_info = self._make_greedy_warmup_sampling_info(bs)
+            elif logits_output_mode is LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX:
+                forward_batch.sampling_info = (
+                    self._make_full_vocab_warmup_sampling_info(bs)
+                )
+                forward_batch.gumbel_temperatures = torch.ones(
+                    (bs, 1), dtype=torch.float32, device=self.model_runner.device
+                )
             elif logits_output_mode is LogitsOutputMode.FULL_VOCAB:
                 forward_batch.sampling_info = (
                     self._make_full_vocab_warmup_sampling_info(bs)
@@ -1831,6 +1881,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         forward_attn_backend = attn_backend or self.model_runner.attn_backend
         forward_attn_backend.init_forward_metadata(forward_batch)
+        if shared_decode:
+            backend = getattr(
+                forward_attn_backend, "full_attn_backend", forward_attn_backend
+            )
+            md = backend.forward_metadata
+            grp_fn = getattr(backend, "shared_decode_group_size", None)
+            grp = grp_fn(bs) if grp_fn is not None else 16
+            grp = grp if grp > 0 else 16
+            # Trace the shared program safely with the dummy batch's original
+            # lengths/slots. Zero page counts force private reads during warmup.
+            md.full_decode_distribution = torch.cat(
+                (md.distribution, md.distribution.new_zeros(bs // grp))
+            )
 
         # The compiled forward resolves its attention backend and the MoE
         # padded-row bound from the forward context. Serving publishes both in
@@ -2116,6 +2179,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             uniform_top_k=top_k,
         )
 
+    def _make_greedy_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        device = self.model_runner.device
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(getattr(model_config, "vocab_size", 1))
+        return SamplingBatchInfo(
+            temperatures=torch.zeros((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+            top_ks=torch.ones(bs, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=vocab_size,
+            return_sampling_masks=[False] * bs,
+            device=str(device),
+            uniform_top_k=1,
+        )
+
     def _make_full_vocab_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         device = self.model_runner.device
         model_config = getattr(self.model_runner, "model_config", None)
@@ -2346,7 +2429,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
-        return key
+        return _shared_decode_key(key, attention_metadata)
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.
@@ -2551,10 +2634,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else ("text_only", "text_ids")
         )
         compile_items = [
-            (bs, variant, logits_output_mode)
+            (bs, variant, logits_output_mode, shared_decode)
             for bs in bs_buckets
             for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for shared_decode in self._shared_decode_variants(bs)
         ]
         logger.info(
             "[decoder compile policy] VL DECODE: %d graph variants (bs=%s)",
@@ -2571,13 +2655,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else compile_items
         )
         pending = []
-        for bs, variant, logits_output_mode in compile_range:
+        for bs, variant, logits_output_mode, shared_decode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
                 num_tokens=bs,
                 bs=bs,
                 mode=ForwardMode.DECODE,
+                shared_decode=shared_decode,
                 variant=variant,
                 logits_output_mode=logits_output_mode,
             )
@@ -2588,7 +2673,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 duration_seconds=elapsed,
                 batch_size=bs,
                 num_tokens=bs,
-                input_variant=variant,
+                input_variant=f"{variant}_shared_decode" if shared_decode else variant,
                 logits_output_mode=logits_output_mode.name.lower(),
             )
             if warmup is not None:

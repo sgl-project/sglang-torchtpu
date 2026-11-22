@@ -21,9 +21,12 @@ from torch_tpu._internal import pallas
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang_tpu.envs import envs as tpu_envs
 
 # Decode-sized calls only: the kernel holds all rows of x in VMEM.
 _MAX_ROWS = 64
+_DFLASH_MAX_ROWS = 256
+_DFLASH_B384_MAX_ROWS = 384
 # Quantize this many output columns at a time to bound the f32 temporaries.
 _QUANT_COLS = 4096
 _OP = None
@@ -60,7 +63,8 @@ def _fp8_matmul_jax(x: jax.Array, w8k: jax.Array, scale: jax.Array) -> jax.Array
         out_specs=pl.BlockSpec((m, tn), lambda j: (0, j)),
         out_shape=jax.ShapeDtypeStruct((m, np_), jnp.float32),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",), vmem_limit_bytes=32 * 2**20
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=(60 if m > 256 else 32) * 2**20,
         ),
     )(x.astype(jnp.bfloat16), w8k, scale)
 
@@ -119,6 +123,17 @@ class TpuFp8LinearMethod:
         layer.register_buffer("fp8_w8k", w8k, persistent=False)
         layer.register_buffer("fp8_scale", scale, persistent=False)
         self._op = get_fp8_matmul_op()
+        b384_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_B384", None)
+        dflash_cap = (
+            _DFLASH_B384_MAX_ROWS
+            if (b384_env is not None and b384_env.get())
+            else _DFLASH_MAX_ROWS
+        )
+        self._max_rows = (
+            dflash_cap
+            if tpu_envs.SGLANG_TPU_DFLASH_FP8_DRAFT.get()
+            else _MAX_ROWS
+        )
 
     def apply(
         self,
@@ -127,7 +142,7 @@ class TpuFp8LinearMethod:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x2 = x.reshape(-1, x.shape[-1])
-        if x2.shape[0] > _MAX_ROWS:
+        if x2.shape[0] > self._max_rows:
             return F.linear(x, layer.weight, bias)
         out = self._op(x2, layer.fp8_w8k, layer.fp8_scale)[:, : self.out_features]
         out = out.to(x.dtype)

@@ -15,15 +15,18 @@ from sglang_tpu.fp4_moe import (
     mark_qblock_layout,
     qblock_layout,
 )
+from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.moe.nvfp4_requant import (
     NVFP4_SERVED_GROUP,
     QBLOCK_SIZES,
+    probe_nvfp4_blocks,
     requant_nvfp4_blocks,
 )
 
 # Expert-TP slices per compiled call, bounding the f32 temporaries; whole experts
 # (EP) are ep x larger, so a call takes ep x fewer.
 _EXPERT_CHUNK = 32
+_PROBE_EXPERT_CHUNK = 4
 
 _Requant = Callable[
     [torch.Tensor, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]
@@ -36,9 +39,12 @@ def _compiled_requant() -> _Requant:
     return torch.compile(requant_nvfp4_blocks, fullgraph=True, dynamic=False)
 
 
-def _requant_slabs(
-    w: torch.Tensor, s: torch.Tensor, block: int, chunk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+@functools.cache
+def _compiled_probe():
+    return torch.compile(probe_nvfp4_blocks, fullgraph=True, dynamic=False)
+
+
+def _check_slabs(w: torch.Tensor, s: torch.Tensor) -> None:
     if (
         w.dtype != torch.float4_e2m1fn_x2
         or s.dtype != torch.bfloat16
@@ -48,6 +54,12 @@ def _requant_slabs(
             "NVFP4 expert requant takes fp4 experts with bf16 block-16 scales, got "
             f"{w.dtype} {tuple(w.shape)} with {s.dtype} {tuple(s.shape)}"
         )
+
+
+def _requant_slabs(
+    w: torch.Tensor, s: torch.Tensor, block: int, chunk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_slabs(w, s)
     u = w.view(torch.uint8)
     codes, scales = [], []
     for e0 in range(0, w.shape[0], chunk):
@@ -101,3 +113,37 @@ def requant_tpu_nvfp4_experts(
     del w2, s2
     del old
     mark_qblock_layout(layer, block)
+
+
+def probe_tpu_nvfp4_block_scales(layer: torch.nn.Module, block: int) -> list[float]:
+    """SGLANG_TPU_MUSE_PROBE_BLOCK256_SCALES: requantize a fused-RS-prepared layer's fp4
+    experts to one scale per block K rows but keep the block-16 layout, so every kernel
+    serves the lossy weights unchanged. Returns each tensor's relative L2 error."""
+    errs = []
+    for name in ("w13_weight", "w2_weight"):
+        w = getattr(layer, name).data
+        s = getattr(layer, f"{name}_scale").data
+        _check_slabs(w, s)
+        u = w.view(torch.uint8)
+        codes, scales, err2, ref2 = [], [], 0.0, 0.0
+        # 32 experts needed 88 GiB of program memory on TPU7x; 4 fit next to the weights.
+        for e0 in range(0, w.shape[0], _PROBE_EXPERT_CHUNK):
+            c, s16, d2, r2 = _compiled_probe()(
+                u[e0 : e0 + _PROBE_EXPERT_CHUNK].clone(),
+                s[e0 : e0 + _PROBE_EXPERT_CHUNK].clone(),
+                block,
+            )
+            codes.append(c)
+            scales.append(s16)
+            err2 += d2.item()
+            ref2 += r2.item()
+        new_w, new_s = _materialize_packed_fp4(torch.cat(codes)), torch.cat(scales)
+        del codes, scales
+        _wait_for(new_w, new_s)
+        copy_or_rebind_param(layer, name, new_w)
+        copy_or_rebind_param(layer, f"{name}_scale", new_s)
+        _free_replaced_storage(w, getattr(layer, name).data)
+        _free_replaced_storage(s, getattr(layer, f"{name}_scale").data)
+        del w, s, u, new_w, new_s
+        errs.append((err2 / ref2) ** 0.5 if ref2 else 0.0)
+    return errs

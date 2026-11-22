@@ -232,11 +232,24 @@ class GenerationBatchResult:
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
 
+        same_block_accept = False
+        if (
+            self.block_accept_lens is not None
+            and self.block_accept_lens is self.accept_lens
+            and self.accept_lens.device.type == "tpu"
+        ):
+            from sglang_tpu.envs import envs as tpu_envs
+
+            same_block_accept = tpu_envs.SGLANG_TPU_FAST_RESULT_COPY.get()
+
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
 
         if self.block_accept_lens is not None:
-            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+            if same_block_accept:
+                self.block_accept_lens = self.accept_lens
+            else:
+                self.block_accept_lens = _async_d2h(self.block_accept_lens)
 
         if self.cap_lens is not None:
             self.cap_lens = _async_d2h(self.cap_lens)

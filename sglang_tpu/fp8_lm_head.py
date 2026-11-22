@@ -48,7 +48,8 @@ def _build_op():
             out_specs=pl.BlockSpec((m, _TN), lambda j: (0, j)),
             out_shape=jax.ShapeDtypeStruct((m, vp), jnp.float32),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",), vmem_limit_bytes=32 * 2**20
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=(48 if m > 256 else 32) * 2**20,
             ),
         )(x.astype(jnp.bfloat16), w8k, scale)
 
@@ -100,13 +101,29 @@ def _quantize_rows(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 class TpuFp8LmHeadMethod:
     """``lm_head.quant_method``: fp8 e4m3 weights with per-row scales, f32 logits."""
 
-    def __init__(self, layer: torch.nn.Module) -> None:
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        *,
+        use_zsp_kernel: bool = False,
+        tn: int = _TN,
+    ) -> None:
         self.vocab_rows = int(layer.weight.shape[0])
-        w8k, scale = _quantize_rows(layer.weight)
-        # Buffers on the layer so --tpu-compile-tracer direct lifts them as graph inputs.
+        self._use_zsp_kernel = bool(use_zsp_kernel)
+        if self._use_zsp_kernel:
+            from sglang_tpu.kernels.fp8_lm_head_fused import (
+                get_fp8_lm_head_zsp_op,
+                quantize_lm_head_fp8_k_major,
+            )
+
+            w8k, scale = quantize_lm_head_fp8_k_major(layer.weight, tn=tn)
+            self._op = get_fp8_lm_head_zsp_op(out_bf16=False)
+        else:
+            w8k, scale = _quantize_rows(layer.weight)
+            self._op = _get_op()
+        # Buffers on the layer so --tpu-compile-tracer direct/dynamo lifts them as graph inputs.
         layer.register_buffer("fp8_w8k", w8k, persistent=False)
         layer.register_buffer("fp8_scale", scale, persistent=False)
-        self._op = _get_op()
 
     def apply(
         self,
@@ -115,7 +132,12 @@ class TpuFp8LmHeadMethod:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x2 = x.reshape(-1, x.shape[-1])
-        logits = self._op(x2, layer.fp8_w8k, layer.fp8_scale)[:, : self.vocab_rows]
+        if self._use_zsp_kernel:
+            logits = self._op(x2, layer.fp8_w8k, layer.fp8_scale, 1.0)[
+                :, : self.vocab_rows
+            ]
+        else:
+            logits = self._op(x2, layer.fp8_w8k, layer.fp8_scale)[:, : self.vocab_rows]
         if bias is not None:
             logits = logits + bias
         return logits.reshape(*x.shape[:-1], self.vocab_rows)

@@ -873,13 +873,25 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     else:
         locs = seq_lens.clone()
 
+    bump_page_table = True
+    if _is_tpu:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE.get():
+            alloc_ps = _alloc_page_size(batch)
+            bump_page_table = alloc_ps <= 1 or bool((locs % alloc_ps == 0).any())
+
     if out_cache_loc_host is not None:
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices_cpu, locs), out_cache_loc_host
+            (batch.req_pool_indices_cpu, locs),
+            out_cache_loc_host,
+            bump_page_table=bump_page_table,
         )
     elif _is_tpu:
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices_cpu, locs), out_cache_loc.to(torch.int32)
+            (batch.req_pool_indices_cpu, locs),
+            out_cache_loc.to(torch.int32),
+            bump_page_table=bump_page_table,
         )
     else:
         batch.req_to_token_pool.write(

@@ -171,6 +171,35 @@ def build_draft_block_inputs(
 
 
 @compiled_op()
+def prepare_dflash_block_step(
+    packed_addressing: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    num_verify_rows: int,
+    mask_token_id: int,
+    draft_width: int,
+    has_swa: bool,
+) -> tuple[VerifyRows, VerifyRows | None, DraftBlockInputs]:
+    """Unpack [candidates, (swa_candidates), committed_lens] and build both full
+    and SWA VerifyRows plus DraftBlockInputs in one compiled program."""
+    cand_cols = (packed_addressing.shape[1] - 1) // (2 if has_swa else 1)
+    full_cands = packed_addressing[:, :cand_cols]
+    committed_lens = packed_addressing[:, -1]
+    rows = select_verify_rows(full_cands, committed_lens, seq_lens, num_verify_rows)
+    swa_rows = None
+    if has_swa:
+        swa_cands = packed_addressing[:, cand_cols : 2 * cand_cols]
+        swa_rows = select_verify_rows(
+            swa_cands, committed_lens, seq_lens, num_verify_rows
+        )
+    draft_inputs = build_draft_block_inputs(
+        bonus_tokens, rows, seq_lens, live_mask, mask_token_id, draft_width
+    )
+    return rows, swa_rows, draft_inputs
+
+
+@compiled_op()
 def build_chain_block_inputs(
     tokens: torch.Tensor,
     rows: VerifyRows,

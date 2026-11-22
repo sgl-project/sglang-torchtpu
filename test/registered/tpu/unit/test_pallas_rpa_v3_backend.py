@@ -334,6 +334,78 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
         self.assertEqual(meta.distribution.dtype, torch.int32)
 
 
+class TestSharedPrefixDecodeMetadata(CustomTestCase):
+    def test_partial_group_proves_only_active_rows(self):
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        pages = torch.arange(180).expand(16, -1).clone().numpy()
+        lengths = torch.full((16,), 160 * 128 + 1).numpy()
+        pages[15] = 0
+        lengths[15] = 0
+        self.assertEqual(
+            shared_decode_distribution(pages, lengths, 15, 128).tolist(),
+            [15, 15, 15, 160],
+        )
+        lengths[14] = 114 * 128
+        self.assertEqual(shared_decode_distribution(pages, lengths, 15, 128)[3], 112)
+        pages[14, 11] += 1
+        self.assertIsNone(shared_decode_distribution(pages, lengths, 15, 128))
+        self.assertIsNone(shared_decode_distribution(pages, lengths, 7, 128))
+
+    def test_multiple_groups_and_a_short_active_tail(self):
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        page_size = 128
+        page_ids = torch.arange(180).expand(48, -1).clone()
+        lengths = torch.full((48,), 160 * page_size + 1)
+        page_ids[19, 120] += 1
+        plan = shared_decode_distribution(page_ids.numpy(), lengths, 34, page_size)
+        self.assertEqual(plan.tolist(), [34, 34, 34, 160, 112, 0])
+        # Too little physical sharing to amortize grouped private tails.
+        page_ids[3, 0] += 1
+        self.assertIsNone(
+            shared_decode_distribution(page_ids.numpy(), lengths, 34, page_size)
+        )
+
+    def test_full_proof_changes_with_pages_and_never_reaches_swa(self):
+        rows, width, page_size = 16, 130, 128
+        req = torch.arange(width * page_size).expand(rows, -1).clone()
+        backend = _BackendUnderTest(page_size, req)
+        lens = torch.full((rows,), 128 * page_size + 1, dtype=torch.int32)
+        fb = _make_forward_batch(
+            lens, torch.arange(rows), ForwardMode.DECODE, seq_lens_cpu=lens
+        )
+        with (
+            patch(
+                "sglang_tpu.attention_pallas_rpa_base.get_parallel",
+                return_value=types.SimpleNamespace(attn_dp_size=1),
+            ),
+            envs.SGLANG_TPU_RPA_V3_DECODE_FAST.override("shared16_host"),
+            envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED.override(True),
+        ):
+            first = backend.forward_metadata = _build_meta(backend, fb)
+            self.assertEqual(
+                backend._layer_distribution(is_swa_layer=False).tolist(),
+                [16, 16, 16, 128],
+            )
+            self.assertIs(
+                backend._layer_distribution(is_swa_layer=True), first.distribution
+            )
+            # A mismatch in the middle blocks reuse of later equal pages.
+            req[1, 31 * page_size] += page_size
+            second = backend.forward_metadata = _build_meta(backend, fb)
+            self.assertIsNone(second.full_decode_distribution)
+            self.assertIs(
+                backend._layer_distribution(is_swa_layer=False), second.distribution
+            )
+            self.assertEqual(first.full_decode_distribution.tolist(), [16, 16, 16, 128])
+            # A fully shared group can be limited by the shortest live row.
+            req[1, 31 * page_size] -= page_size
+            lens[0] = 91 * page_size + 1
+            third = _build_meta(backend, fb)
+            self.assertEqual(third.full_decode_distribution.tolist(), [16, 16, 16, 80])
+
+
 class TestPallasRpaV3MetadataExtend(CustomTestCase):
     """Extend-mode metadata: cu_q_lens from extend_seq_lens, distribution=[0,bs,bs]."""
 
@@ -962,6 +1034,127 @@ class TestNonEmptyBatchSize(CustomTestCase):
         # than degrading to the padded count.
         fb = self._fb([10, 24, 0, 0], with_cpu=False)
         self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
+
+
+class TestDecodeFastAndSkipMixedRouting(CustomTestCase):
+    """Default-off and opt-in routing for ``DECODE_FAST`` and ``SKIP_EMPTY_MIXED``."""
+
+    def _invoke(self, decode_query_size=1, skip_mixed=False):
+        captured = {}
+
+        def kernel(*_args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        _invoke_v3_kernel(
+            kernel,
+            queries=torch.zeros(4, 16, 128),
+            keys=torch.zeros(4, 1, 128),
+            values=torch.zeros(4, 1, 128),
+            kv_cache_fused=torch.zeros(16, 128, 1, 4, 128),
+            kv_lens=torch.ones(4, dtype=torch.int32),
+            page_indices=torch.zeros(16, dtype=torch.int32),
+            cu_q_lens=torch.arange(5, dtype=torch.int32),
+            cu_kv_lens=torch.arange(5, dtype=torch.int32) * 512,
+            distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+            attention_sink=None,
+            sm_scale=0.125,
+            sliding_window=2049,
+            soft_cap=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            decode_query_size=decode_query_size,
+            skip_mixed=skip_mixed,
+        )
+        return captured["kwargs"]
+
+    def test_default_off_omits_decode_fast_and_skip_mixed(self):
+        with envs.SGLANG_TPU_RPA_V3_DECODE_FAST.override(""):
+            kw = self._invoke()
+            self.assertNotIn("_decode_fast", kw)
+            self.assertNotIn("_skip_mixed", kw)
+
+    def test_decode_fast_forwards_only_for_single_token_decode(self):
+        with envs.SGLANG_TPU_RPA_V3_DECODE_FAST.override("1"):
+            kw_d1 = self._invoke(decode_query_size=1, skip_mixed=True)
+            self.assertEqual(kw_d1["_decode_fast"], "1")
+            self.assertTrue(kw_d1["_skip_mixed"])
+            kw_d4 = self._invoke(decode_query_size=4, skip_mixed=False)
+            self.assertNotIn("_decode_fast", kw_d4)
+
+    def test_decode_prepared_routing_and_epilogue_gate(self):
+        from sglang_tpu.decode_qkv_epilogue_tpu import (
+            can_use_muse_decode_qkv_epilogue,
+            muse_decode_fused_qkv_attn,
+        )
+
+        backend = _BackendUnderTest(
+            16, _build_req_to_token(num_reqs=4, max_context_len=64)
+        )
+        backend.kv_cache_quant_dtype = torch.float8_e4m3fn
+        backend.token_to_kv_pool = types.SimpleNamespace(
+            get_fused_kv_buffer=lambda _lid: torch.zeros(
+                8, 128, 1, 4, 128, dtype=torch.float8_e4m3fn
+            )
+        )
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([12, 20, 31, 40], dtype=torch.int32),
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+        )
+        fb.capture_hidden_mode = None
+        fb.attn_backend = backend
+        backend.forward_metadata = _build_meta(backend, fb)
+        layer = types.SimpleNamespace(
+            tp_q_head_num=16,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=64,
+            v_head_dim=64,
+            layer_id=0,
+            sliding_window_size=2048,
+            logit_cap=0,
+            scaling=0.125,
+            k_scale_float=1.25,
+            v_scale_float=0.75,
+            is_cross_attention=False,
+        )
+        qkv = torch.zeros((4, 1280), dtype=torch.bfloat16)
+        # Default-off: _decode_prepared_op is None -> gate returns False.
+        self.assertFalse(can_use_muse_decode_qkv_epilogue(qkv, None, layer, fb))
+
+        recorded = {}
+
+        def fake_dec_prep_op(q, kv, _v, *_rest, **kw):
+            recorded["q_shape"] = tuple(q.shape)
+            recorded["kv_shape"] = tuple(kv.shape)
+            recorded["window_and_scales"] = (_rest[8], _rest[10], _rest[11])
+            return torch.zeros((4, 16, 128), dtype=torch.bfloat16)
+
+        backend._decode_prepared_op = fake_dec_prep_op
+        backend.kv_cache_quant_dtype = torch.float8_e5m2
+        self.assertFalse(can_use_muse_decode_qkv_epilogue(qkv, None, layer, fb))
+        backend.kv_cache_quant_dtype = torch.float8_e4m3fn
+        self.assertTrue(can_use_muse_decode_qkv_epilogue(qkv, None, layer, fb))
+        with patch(
+            "sglang_tpu.decode_qkv_epilogue_tpu.get_decode_qkv_epilogue_op",
+            return_value=lambda t, *_a: (
+                torch.zeros((1, t.shape[0], 8, 2, 128), dtype=torch.bfloat16),
+                torch.zeros((t.shape[0], 1, 4, 128), dtype=torch.float8_e4m3fn),
+            ),
+        ):
+            out = muse_decode_fused_qkv_attn(
+                torch.arange(4, dtype=torch.int32),
+                qkv,
+                rotary_emb=None,
+                attn_layer=layer,
+                forward_batch=fb,
+                norm_eps=1e-6,
+                query_scale=1.0,
+            )
+        self.assertEqual(tuple(out.shape), (4, 1024))
+        self.assertEqual(recorded["q_shape"], (1, 4, 8, 2, 128))
+        self.assertEqual(recorded["kv_shape"], (4, 1, 4, 128))
+        self.assertEqual(recorded["window_and_scales"], (2049, 1.25, 0.75))
 
 
 if __name__ == "__main__":

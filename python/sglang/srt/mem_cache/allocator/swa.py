@@ -567,9 +567,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_indices = swa_indices.to(mapping.dtype)
             mapping[full_indices] = swa_indices
 
+    def _bump_swa_map_version(self) -> None:
+        m = self.full_to_swa_index_mapping
+        m._tpu_swa_map_version = getattr(m, "_tpu_swa_map_version", 0) + 1
+
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return
+        self._bump_swa_map_version()
         if _is_tpu:
             # TPU mapping is host-resident (see __init__) while the alloc indices
             # are device-resident; align to the mapping's device before clearing.
@@ -604,6 +609,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_indices = mapping[idx]
             swa_indices = swa_indices[swa_indices > 0]
             mapping[idx] = 0
+            self._bump_swa_map_version()
             if self.free_group is not None:
                 # Defer ownership to free_group_end (matches the path below, which
                 # stores resolved swa_indices in swa_free_group).
@@ -820,6 +826,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        self._bump_swa_map_version()
         self.free_group = None
         self.swa_free_group = []
         self.swa_page_ids_group = []

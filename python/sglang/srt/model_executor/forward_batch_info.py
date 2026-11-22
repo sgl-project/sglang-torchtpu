@@ -250,6 +250,8 @@ class LogitsOutputMode(IntEnum):
 
     FULL_VOCAB = auto()
     DISTRIBUTED_TOP_K = auto()
+    DISTRIBUTED_GREEDY = auto()
+    DISTRIBUTED_GUMBEL_MAX = auto()
 
 
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
@@ -504,6 +506,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_prefill_only: bool = False
     # Selected before a TPU model forward; full vocabulary is the safe default.
     logits_output_mode: LogitsOutputMode = LogitsOutputMode.FULL_VOCAB
+    gumbel_temperatures: Optional[torch.Tensor] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

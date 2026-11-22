@@ -1852,6 +1852,64 @@ class TestPrecompileLoops(_PolicyTestCase):
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
+    def test_shared_decode_warmup_and_specialization(self):
+        mr = _model_runner()
+        mr.attn_backend.supports_shared_decode_batch = lambda bs: bs >= 16
+        policies = (
+            _make_policy(mr, bs_buckets=(8, 16)),
+            Qwen3VLDecoderTpuCompilePolicy(
+                model_runner=mr,
+                b_bucketer=Bucketer(name="Bs", buckets=[8, 16]),
+                owner=mr.model,
+            ),
+        )
+        mr.model.decode_embeds_in_language_model = True
+        for policy in policies:
+            with self.subTest(policy=type(policy).__name__):
+                policy._run_one = MagicMock()
+                with (
+                    tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.override("shared16_host"),
+                    get_parallel().override(tp_rank=0),
+                ):
+                    policy._precompile_decode()
+                warmed = sorted(
+                    {
+                        (call.kwargs["bs"], call.kwargs["shared_decode"])
+                        for call in policy._run_one.call_args_list
+                    }
+                )
+                self.assertEqual(warmed, [(8, False), (16, False), (16, True)])
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    batch_size=16,
+                    logits_output_mode=LogitsOutputMode.FULL_VOCAB,
+                )
+                inputs = (torch.arange(16), None, batch)
+                md = SimpleNamespace(full_decode_distribution=None)
+                stock = policy._direct_compile_specialization_key(md, *inputs)
+                md.full_decode_distribution = torch.tensor([16, 16, 16, 0])
+                shared = policy._direct_compile_specialization_key(md, *inputs)
+                self.assertNotEqual(stock, shared)
+                md.full_decode_distribution[-1] = 1024
+                self.assertEqual(
+                    shared, policy._direct_compile_specialization_key(md, *inputs)
+                )
+
+        # Execute the real warmup setup: the shape selects the shared program;
+        # zero counts cause the dummy batch to read exclusively private pages.
+        policy = _make_policy(mr, bs_buckets=(16,))
+        mr.attn_backend.forward_metadata = SimpleNamespace(
+            distribution=torch.full((3,), 16, dtype=torch.int32)
+        )
+        policy._run_one(
+            num_tokens=16, bs=16, mode=ForwardMode.DECODE, shared_decode=True
+        )
+        self.assertEqual(
+            mr.attn_backend.forward_metadata.full_decode_distribution.tolist(),
+            [16, 16, 16, 0],
+        )
+
     def test_compile_timings_include_waits_without_counting_other_queued_work(self):
         for async_warmup in (False, True):
             with self.subTest(async_warmup=async_warmup):

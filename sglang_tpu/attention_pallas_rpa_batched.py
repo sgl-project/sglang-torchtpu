@@ -55,12 +55,32 @@ def kv_layout():
     return configs.KVLayout.HEAD_ALONG_SUBLANE
 
 
+# Fixed per process: the op name below keys the compile cache, so the two
+# kernels must never share it.
+_USE_MUSE_KERNEL = envs.SGLANG_TPU_MUSE_KERNEL_ENABLED.get()
+
+
 def _import_batched_kernel():
+    if _USE_MUSE_KERNEL:
+        from sglang_tpu.attention.pallas.batched_rpa_muse.wrapper import (
+            ragged_paged_attention,
+        )
+
+        return ragged_paged_attention
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
     return ragged_paged_attention
+
+
+def _kernel_kv_layout():
+    """`kv_layout()` as the enum of the package `_import_batched_kernel` picks."""
+    if _USE_MUSE_KERNEL:
+        from sglang_tpu.attention.pallas.batched_rpa_muse import configs
+
+        return configs.KVLayout(kv_layout())
+    return kv_layout()
 
 
 def _invoke_batched_kernel(
@@ -113,7 +133,7 @@ def _invoke_batched_kernel(
         use_causal_mask=True,
         # The kernel owns the KV write; the backend never writes out of band.
         skip_kv_update=False,
-        kv_layout=kv_layout(),
+        kv_layout=_kernel_kv_layout(),
     )
 
 
@@ -124,7 +144,11 @@ def _invoke_batched_kernel(
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    op_name=(
+        "sglang_tpu_pallas::ragged_paged_attention_batched_muse"
+        if _USE_MUSE_KERNEL
+        else "sglang_tpu_pallas::ragged_paged_attention_batched"
+    ),
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,

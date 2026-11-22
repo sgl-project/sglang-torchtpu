@@ -1506,6 +1506,8 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        self._tpu_prefill_delay_steps = 0
+        self._tpu_prefill_drain_grace_steps = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1590,6 +1592,289 @@ class Scheduler(
         PrefillDelayerSinglePassExecutor(
             self.prefill_delayer, token_usage=0.0
         ).finalize(actual_prefill_bs=0)
+
+    def _reset_tpu_prefill_pack_counters(self) -> None:
+        self._tpu_prefill_delay_steps = 0
+        self._tpu_prefill_drain_grace_steps = 0
+
+    def _should_defer_underfilled_prefill(self, running_batch: ScheduleBatch) -> bool:
+        if not current_platform.is_tpu():
+            return False
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if not tpu_envs.SGLANG_TPU_PACK_PREFILL_TO_BUCKET.get():
+            return False
+        if (
+            self.chunked_prefill_size is None
+            or self.chunked_prefill_size <= 0
+            or self.is_mixed_chunk
+            or getattr(self, "disaggregation_mode", DisaggregationMode.NULL)
+            != DisaggregationMode.NULL
+            or getattr(self, "require_mlp_sync", False)
+            or running_batch.is_empty()
+            or running_batch.is_prefill_only
+        ):
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        if any(r.finished() for r in self.waiting_queue):
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        if (
+            self.chunked_req is None
+            and self.waiting_queue
+            and tpu_envs.SGLANG_TPU_PIGGYBACK_SINGLE_TOKEN_PREFILL.get()
+            and all(
+                len(r.origin_input_ids)
+                + len(r.output_ids)
+                - r.num_matched_prefix_tokens
+                <= 1
+                for r in self.waiting_queue
+            )
+        ):
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        chunk_rem = (
+            max(
+                0,
+                len(self.chunked_req.origin_input_ids)
+                + len(self.chunked_req.output_ids)
+                - len(self.chunked_req.prefix_indices),
+            )
+            if self.chunked_req is not None
+            else 0
+        )
+        queue_rem = sum(
+            max(
+                1,
+                len(r.origin_input_ids)
+                + len(r.output_ids)
+                - r.num_matched_prefix_tokens,
+            )
+            for r in self.waiting_queue
+        )
+        pending_tokens = chunk_rem + queue_rem
+        if pending_tokens <= 0:
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        explicit_target = tpu_envs.SGLANG_TPU_PACK_PREFILL_TARGET_TOKENS.get()
+        if explicit_target > 0:
+            target_tokens = explicit_target
+        elif self.chunked_prefill_size >= 16384:
+            # Pair-pack two ~8k prompts (sum in [13.1k..16.4k]) into one T=16384
+            # forward with zero leftover chunked_req fragments.
+            target_tokens = self.chunked_prefill_size // 2 + self.page_size
+        else:
+            target_tokens = max(
+                self.page_size, self.chunked_prefill_size - self.page_size
+            )
+        if pending_tokens >= target_tokens:
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        max_reqs = self.max_running_requests or 0
+        running_bs = len(running_batch.reqs)
+        active_plus_pending = (
+            running_bs
+            + (1 if self.chunked_req is not None else 0)
+            + len(self.waiting_queue)
+        )
+        if (
+            max_reqs <= 2
+            or running_bs < max(1, max_reqs // 2)
+            or active_plus_pending < max_reqs - 1
+        ):
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        if active_plus_pending == max_reqs - 1:
+            self._tpu_prefill_drain_grace_steps = (
+                getattr(self, "_tpu_prefill_drain_grace_steps", 0) + 1
+            )
+            if self._tpu_prefill_drain_grace_steps > 3:
+                self._reset_tpu_prefill_pack_counters()
+                return False
+        else:
+            self._tpu_prefill_drain_grace_steps = 0
+
+        max_delay = max(0, tpu_envs.SGLANG_TPU_PACK_PREFILL_MAX_DELAY_STEPS.get())
+        self._tpu_prefill_delay_steps = getattr(self, "_tpu_prefill_delay_steps", 0) + 1
+        if self._tpu_prefill_delay_steps > max_delay:
+            self._reset_tpu_prefill_pack_counters()
+            return False
+
+        return True
+
+    def _maybe_piggyback_single_token_prefill(
+        self, new_batch: ScheduleBatch, running_batch: ScheduleBatch
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch, Optional[ScheduleBatch]]:
+        if not current_platform.is_tpu():
+            return new_batch, running_batch, None
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if not tpu_envs.SGLANG_TPU_PIGGYBACK_SINGLE_TOKEN_PREFILL.get():
+            return new_batch, running_batch, None
+
+        parallel = get_parallel()
+        is_dflash = self.spec_algorithm.is_dflash()
+        if (
+            not getattr(self, "is_generation", True)
+            or not (
+                self.spec_algorithm.is_none()
+                or (is_dflash and getattr(self, "enable_overlap", False))
+            )
+            or getattr(self, "require_mlp_sync", False)
+            or parallel.pp_size != 1
+            or parallel.attn_cp_size != 1
+            or parallel.attn_dcp_size != 1
+            or getattr(self, "enable_hisparse", False)
+            or getattr(self, "dllm_config", None) is not None
+            or self.chunked_req is not None
+            or new_batch.is_prefill_only
+            or (not running_batch.is_empty() and running_batch.is_prefill_only)
+            or new_batch.return_logprob
+            or running_batch.return_logprob
+            or new_batch.return_hidden_states
+            or running_batch.return_hidden_states
+            or new_batch.has_grammar
+            or running_batch.has_grammar
+            or new_batch.input_embeds is not None
+            or new_batch.replace_embeds is not None
+            or new_batch.prefill_input_ids_cpu is None
+            or any(new_batch.multimodal_inputs or ())
+            or get_exec().mamba.enable_mamba_extra_buffer
+            or any(r.kv.holds_mamba for r in new_batch.reqs)
+            or not all(
+                r.extend_end is not None
+                and r.extend_len == 1
+                and r.inflight_middle_chunks == 0
+                and r.beam_group is None
+                and not r.return_sampling_mask
+                and r.token_indices_to_pool is None
+                for r in new_batch.reqs
+            )
+            or not all(r.beam_group is None for r in running_batch.reqs)
+            or (
+                bool(self.max_running_requests)
+                and sum(1 for r in running_batch.reqs if not r.finished())
+                + len(new_batch.reqs)
+                > self.max_running_requests
+            )
+        ):
+            return new_batch, running_batch, None
+
+        if is_dflash:
+            from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+            from sglang_tpu.experimental.speculative.block_info import (
+                HostPaddedBlockDraftInput,
+            )
+
+            verify_window = int(max_speculative_num_draft_tokens() or 0)
+            if (
+                verify_window <= 0
+                or not getattr(new_batch.req_to_token_pool, "host_resident", False)
+                or (
+                    not running_batch.is_empty()
+                    and not isinstance(
+                        getattr(running_batch, "spec_info", None),
+                        HostPaddedBlockDraftInput,
+                    )
+                )
+                or self.token_to_kv_pool_allocator.available_size()
+                < len(new_batch.reqs) * 2 * verify_window
+            ):
+                return new_batch, running_batch, None
+
+        if not running_batch.is_empty():
+            running_batch = self.update_running_batch(running_batch)
+
+        if is_dflash:
+            for req in new_batch.reqs:
+                req.kv.kv_committed_len = max(0, int(req.kv.kv_committed_len) - 1)
+            seq_lens_before = (new_batch.seq_lens - 1).clamp(min=0)
+            new_batch.seq_lens = seq_lens_before
+            new_batch.orig_seq_lens = seq_lens_before.to(new_batch.orig_seq_lens.dtype)
+            if new_batch.seq_lens_cpu is not None:
+                new_batch.seq_lens_cpu = (new_batch.seq_lens_cpu - 1).clamp(min=0)
+                new_batch.seq_lens_sum = int(new_batch.seq_lens_cpu.sum())
+
+        self.future_map.stash_bonus_tokens(
+            new_batch.req_pool_indices_cpu,
+            new_batch.prefill_input_ids_cpu,
+        )
+        if is_dflash:
+            self.future_map._store(
+                self.future_map.new_seq_lens_buf,
+                new_batch.req_pool_indices_cpu,
+                new_batch.seq_lens,
+            )
+            new_batch.spec_info = HostPaddedBlockDraftInput(
+                bonus_tokens=new_batch.prefill_input_ids_cpu.to(
+                    device=new_batch.device, dtype=torch.int64
+                ),
+                new_seq_lens=new_batch.seq_lens.to(
+                    device=new_batch.device, dtype=torch.int64
+                ),
+                future_indices=new_batch.req_pool_indices,
+                tpu_host_seq_lens_is_committed=True,
+            )
+            new_batch.spec_info.prepare_for_decode(new_batch)
+
+        for req in new_batch.reqs:
+            req._tpu_piggybacked_prefill = True
+
+        new_batch.prefill_input_ids_cpu = None
+        new_batch.input_ids = None
+        new_batch.chunked_req = None
+        new_batch.decoding_reqs = None
+        new_batch.prefill_stats = None
+        new_batch.forward_mode = ForwardMode.DECODE
+
+        if running_batch.is_empty():
+            if not is_dflash and new_batch.out_cache_loc is not None:
+                from sglang_tpu.allocator_tpu import host_return_allocators
+
+                allocs = host_return_allocators(self.token_to_kv_pool_allocator)
+                defer_upload = bool(
+                    allocs and all(a.defer_decode_upload for a in allocs)
+                )
+                loc_dev = "cpu" if defer_upload else new_batch.device
+                new_batch.out_cache_loc = new_batch.out_cache_loc.to(
+                    device=loc_dev, dtype=torch.int32
+                )
+            running_batch = new_batch
+        else:
+            if (
+                running_batch.out_cache_loc is not None
+                and new_batch.out_cache_loc is not None
+            ):
+                merged_out_cache_loc = torch.cat(
+                    [
+                        running_batch.out_cache_loc,
+                        new_batch.out_cache_loc.to(
+                            device=running_batch.out_cache_loc.device,
+                            dtype=running_batch.out_cache_loc.dtype,
+                        ),
+                    ]
+                )
+            else:
+                merged_out_cache_loc = None
+            running_batch.merge_batch(new_batch)
+            running_batch.out_cache_loc = merged_out_cache_loc
+            running_batch.forward_mode = ForwardMode.DECODE
+            if is_dflash:
+                running_batch.spec_info._plan_verify_window(
+                    running_batch,
+                    bs=running_batch.batch_size(),
+                    block_size=verify_window,
+                    committed_lens_cpu=running_batch.seq_lens_cpu,
+                )
+
+        return None, running_batch, running_batch
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
@@ -4718,6 +5003,16 @@ class Scheduler(
                     [req for req in last_batch.reqs if req not in self.running_reqs],
                     self.running_reqs,
                 )
+                if (
+                    current_platform.is_tpu()
+                    and not running_batch.is_empty()
+                    and all(r.finished() for r in running_batch.reqs)
+                ):
+                    from sglang_tpu.envs import envs as tpu_envs
+
+                    if tpu_envs.SGLANG_TPU_FAST_FILTER_FINISHED_BATCH.get():
+                        running_batch.filter_batch()
+                        running_batch.batch_is_full = False
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -4733,7 +5028,9 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
-        elif self._should_defer_prefill(running_batch):
+        elif self._should_defer_prefill(
+            running_batch
+        ) or self._should_defer_underfilled_prefill(running_batch):
             new_batch = None
             self._negotiate_prefill_delayer_while_deferring()
         else:
@@ -4754,7 +5051,15 @@ class Scheduler(
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
-        if new_batch is not None:
+        piggybacked_ret = None
+        if new_batch is not None and not need_mlp_sync:
+            new_batch, running_batch, piggybacked_ret = (
+                self._maybe_piggyback_single_token_prefill(new_batch, running_batch)
+            )
+
+        if piggybacked_ret is not None:
+            ret = piggybacked_ret
+        elif new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -5643,6 +5948,32 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    _SB_ATTR_NAMES: Optional[Tuple[str, ...]] = None
+    _TPU_FAST_ISOLATION_ATTRS: Tuple[str, ...] = (
+        "forward_mode",
+        "input_ids",
+        "seq_lens",
+        "seq_lens_cpu",
+        "seq_lens_sum",
+        "orig_seq_lens",
+        "req_pool_indices",
+        "req_pool_indices_cpu",
+        "out_cache_loc",
+        "spec_info",
+        "sampling_info",
+        "mamba_track_indices",
+        "mamba_track_mask",
+        "mamba_track_seqlens",
+    )
+
+    @classmethod
+    def _schedule_batch_attr_names(cls, batch: ScheduleBatch) -> Tuple[str, ...]:
+        names = cls._SB_ATTR_NAMES
+        if names is None:
+            names = tuple(f.name for f in dataclasses.fields(batch))
+            cls._SB_ATTR_NAMES = names
+        return names
+
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
@@ -5650,9 +5981,8 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_names = self._schedule_batch_attr_names(batch)
+        attr_snapshot = [getattr(batch, name, None) for name in attr_names]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5686,11 +6016,20 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        if snapshot_v2_full:
+            use_fast = False
+            if current_platform.is_tpu() and not batch.forward_mode.is_extend():
+                from sglang_tpu.envs import envs as tpu_envs
+
+                use_fast = tpu_envs.SGLANG_TPU_FAST_FORWARD_ISOLATION.get()
+            snap_names = (
+                self._TPU_FAST_ISOLATION_ATTRS
+                if use_fast
+                else self._schedule_batch_attr_names(batch)
+            )
+            sched_snapshot = {name: getattr(batch, name) for name in snap_names}
+        else:
+            sched_snapshot = None
         sched_sampling_info = batch.sampling_info
 
         # 2. sampling_info substitute
@@ -5837,7 +6176,11 @@ class Scheduler(
                             batch, **fwd_kwargs
                         )
                         # Deferred decode graph I/O owns this step's relay.
-                        if batch.spec_algorithm.is_none() and not input_ids_from_graph:
+                        if (
+                            batch.spec_algorithm.is_none()
+                            and not input_ids_from_graph
+                            and not getattr(self.future_map, "_is_noop_publish", False)
+                        ):
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same

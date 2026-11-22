@@ -102,6 +102,32 @@ def kv_pack_heads(num_kv_heads: int, head_dim: int, align: int) -> int:
     return 1
 
 
+def kv_pack_dense2_enabled(
+    *,
+    packs_heads_cls: bool,
+    num_kv_heads: int,
+    head_dim: int,
+    align: int,
+    store_dtype: torch.dtype,
+    page_size: int = 128,
+) -> bool:
+    """True when 2 consecutive FP8 tokens pack into one 32-bit (1, 4, 128) lane row."""
+    dense2_env = getattr(tpu_envs, "SGLANG_TPU_KV_PACK_DENSE2", None)
+    pack_heads_env = getattr(tpu_envs, "SGLANG_TPU_KV_PACK_HEADS", None)
+    return bool(
+        packs_heads_cls
+        and dense2_env is not None
+        and dense2_env.get()
+        and pack_heads_env is not None
+        and pack_heads_env.get()
+        and num_kv_heads == 1
+        and head_dim == align
+        and _torch_dtype_packing(store_dtype) == 4
+        and page_size >= 16
+        and page_size % 16 == 0
+    )
+
+
 def register_hicache_io_backend_pools(io_backend: str, *pool_classes: type) -> None:
     """Declare that ``io_backend`` can offload each of ``pool_classes`` to host,
     by adding it to their ``kv_offload_io_backends``."""
@@ -143,6 +169,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     HEAD_DIM_ALIGNMENT = 128
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
+    # Whether this layout can pack two consecutive FP8 tokens into one lane row (kv_pack_dense2).
+    PACKS_DENSE2 = True
     # Name of the page's interior arrangement. The torch_tpu host pool folds it
     # into its HiCache storage key; a subclass that changes the arrangement
     # must restate it, or pages it writes would be read back by this layout.
@@ -163,7 +191,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         not spell out: heads stored side by side in one row (``kv_pack_heads``)
         and elements sharing a 32-bit lane (``kv_packing``).
         """
-        return f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
+        tag = f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
+        return f"{tag}-d2" if getattr(self, "kv_pack_dense2", False) else tag
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -177,19 +206,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """Bytes one token occupies in one layer's buffer; must track
         ``_create_buffers``, since the KV budget is spent before the pool exists."""
         del v_head_dim  # V shares K's padded slot; see __init__'s width check.
-        if (
+        packed = (
             cls.PACKS_HEADS
             and kv_pack_heads(num_kv_heads, head_dim, cls.HEAD_DIM_ALIGNMENT) > 1
-        ):
+        )
+        if packed:
             num_kv_heads, head_dim = 1, num_kv_heads * head_dim
         packing = _torch_dtype_packing(store_dtype)
         num_kv_heads_x2 = _cdiv(num_kv_heads * 2, packing) * packing
         padded_head_dim = (
             _cdiv(head_dim, cls.HEAD_DIM_ALIGNMENT) * cls.HEAD_DIM_ALIGNMENT
         )
-        return (
+        per_tok = (
             num_kv_heads_x2 * padded_head_dim * torch._utils._element_size(store_dtype)
         )
+        if kv_pack_dense2_enabled(
+            packs_heads_cls=cls.PACKS_HEADS and cls.PACKS_DENSE2,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            align=cls.HEAD_DIM_ALIGNMENT,
+            store_dtype=store_dtype,
+        ):
+            return per_tok // 2
+        return per_tok
 
     def __init__(
         self,
@@ -286,6 +325,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.num_kv_heads_x2 = (
             _cdiv(self.head_num * 2, self.kv_packing) * self.kv_packing
         )
+        self.kv_pack_dense2 = kv_pack_dense2_enabled(
+            packs_heads_cls=self.PACKS_HEADS and self.PACKS_DENSE2,
+            num_kv_heads=self.head_num,
+            head_dim=self.head_dim,
+            align=self.HEAD_DIM_ALIGNMENT,
+            store_dtype=self.store_dtype,
+            page_size=self.page_size,
+        )
 
         if self.size % self.page_size != 0:
             raise ValueError(
@@ -369,9 +416,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # ------------------------------------------------------------------ #
 
     def _buffer_shape(self) -> tuple[int, ...]:
+        phys_page_rows = (
+            self.page_size // 2
+            if getattr(self, "kv_pack_dense2", False)
+            else self.page_size
+        )
         return (
             self.num_blocks,
-            self.page_size,
+            phys_page_rows,
             self.num_kv_heads_x2 // self.kv_packing,
             self.kv_packing,
             self.padded_head_dim,
@@ -591,8 +643,11 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         out separately. Note the head dim has padding to a multiple of 128.
         """
         buf = self.kv_buffer[layer_id - self.start_layer]
-        n_blocks, page_size, packed, packing, hd = buf.shape
-        return buf.view(n_blocks * page_size, packed * packing, hd)
+        n_blocks, phys_rows, packed, packing, hd = buf.shape
+        if getattr(self, "kv_pack_dense2", False):
+            # Each (1, 4, hd) row packs [K_even, V_even, K_odd, V_odd] -> [2, 2, hd].
+            return buf.reshape(n_blocks * phys_rows * 2, 2, hd)
+        return buf.view(n_blocks * phys_rows, packed * packing, hd)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -1713,8 +1768,22 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self._unsupported("set_mla_kv_buffer")
 
 
+class TpuDraftFusedMHATokenToKVPool(TpuFusedMHATokenToKVPool):
+    """Fused MHA KV pool for speculative draft workers without dense2 packing.
+
+    Draft KV writers (`dflash_write_draft_kv` / `kv_fused_rope_write`) emit one
+    token per physical page row, so draft workers must stay on standard 1-token-per-row
+    storage even when `SGLANG_TPU_KV_PACK_DENSE2=1` is enabled for the target.
+    """
+
+    PACKS_DENSE2 = False
+
+
 # raiden copies whole pages by their dim-0 block id, so it serves any
 # page-major pool exposing page_buffers.
 register_hicache_io_backend_pools(
-    "raiden", TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+    "raiden",
+    TpuFusedMHATokenToKVPool,
+    TpuDraftFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
 )

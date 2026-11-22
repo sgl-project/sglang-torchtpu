@@ -760,18 +760,31 @@ class LogitsProcessor(nn.Module):
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         distributed_top_k = None
+        gumbel_temperatures = None
         token_indices_to_pool = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_output_mode = logits_metadata.logits_output_mode
-            if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
+            if logits_output_mode in (
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+                LogitsOutputMode.DISTRIBUTED_GREEDY,
+            ):
                 from sglang_tpu.sampler import (
                     distributed_top_k_candidate_width,
                 )
 
-                distributed_top_k = distributed_top_k_candidate_width(self, lm_head)
-                if distributed_top_k is None:
+                candidate_width = distributed_top_k_candidate_width(self, lm_head)
+                if candidate_width is None:
                     raise RuntimeError("DISTRIBUTED_TOP_K is unsupported by this model")
+                distributed_top_k = (
+                    1
+                    if logits_output_mode is LogitsOutputMode.DISTRIBUTED_GREEDY
+                    else candidate_width
+                )
+            elif logits_output_mode is LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX:
+                gumbel_temperatures = getattr(
+                    logits_metadata, "gumbel_temperatures", None
+                )
             token_indices_to_pool = logits_metadata.token_indices_to_pool
             verify_vocab_shards = self._batch_vocab_shards(logits_metadata)
             logits_metadata = LogitsMetadata.from_forward_batch(
@@ -857,6 +870,26 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if gumbel_temperatures is not None:
+                if sample_indices is not None:
+                    gumbel_temperatures = gumbel_temperatures[sample_indices]
+                sampled_states = (
+                    pruned_states[sample_indices]
+                    if sample_indices is not None
+                    else pruned_states
+                )
+                g_out = self._get_distributed_gumbel_max(
+                    sampled_states, lm_head, gumbel_temperatures
+                )
+                if g_out is not None:
+                    g_logits, g_ids = g_out
+                    return LogitsProcessorOutput(
+                        next_token_logits=None,
+                        next_token_global_top_k_logits=g_logits,
+                        next_token_global_top_k_token_ids=g_ids,
+                        hidden_states=hidden_states_to_store,
+                        mm_input_embeds=logits_metadata.mm_input_embeds,
+                    )
             if distributed_top_k is not None:
                 global_top_k_logits, global_top_k_token_ids = (
                     self._get_distributed_top_k(
@@ -1255,26 +1288,46 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.top_k import (
             TpuVocabShard,
             distributed_tpu_top_k,
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head)
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-        sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
-
-        # Select k logits per vocabulary shard, then merge them into the exact
-        # global TopK shared by every tensor-parallel rank.
-        global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
-            logits,
-            TpuVocabShard.from_lm_head(lm_head),
-            top_k,
-            group=get_parallel().attn_tp_group
+        group = (
+            get_parallel().attn_tp_group
             if self.use_attn_tp_group
-            else get_parallel().tp_group,
+            else get_parallel().tp_group
         )
+        fused = None
+        if tpu_envs.SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK.get():
+            from sglang_tpu.distributed_topk_pallas import (
+                fused_fp8_lm_head_distributed_top_k,
+            )
+
+            fused = fused_fp8_lm_head_distributed_top_k(
+                hidden_states,
+                lm_head,
+                top_k=top_k,
+                logit_scale=self.logit_scale,
+                group=group,
+            )
+        if fused is not None:
+            global_top_k_logits, global_top_k_token_ids = fused
+        else:
+            logits = self._compute_lm_head(hidden_states, lm_head)
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+            sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
+
+            # Select k logits per vocabulary shard, then merge them into the exact
+            # global TopK shared by every tensor-parallel rank.
+            global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
+                logits,
+                TpuVocabShard.from_lm_head(lm_head),
+                top_k,
+                group=group,
+            )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(
                 global_top_k_logits / self.final_logit_softcapping
@@ -1327,6 +1380,30 @@ class LogitsProcessor(nn.Module):
                 "likely cause."
             )
         self._aux_hidden_states_checked = True
+
+    def _get_distributed_gumbel_max(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        temperatures: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """1-kernel fused FP8 LM head + on-device Gumbel-max categorical sampling."""
+        if self.final_logit_softcapping:
+            return None
+        from sglang_tpu.distributed_topk_pallas import fused_fp8_lm_head_gumbel_max
+
+        group = (
+            get_parallel().attn_tp_group
+            if self.use_attn_tp_group
+            else get_parallel().tp_group
+        )
+        return fused_fp8_lm_head_gumbel_max(
+            hidden_states,
+            lm_head,
+            temperatures,
+            logit_scale=self.logit_scale,
+            group=group,
+        )
 
     def _get_logits(
         self,

@@ -159,6 +159,9 @@ class PallasForwardMetadata:
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
+    # Full-layer-only distribution extended with verified shared decode page
+    # counts. The ordinary distribution remains available to all other paths.
+    full_decode_distribution: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -297,6 +300,15 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
+    # >1: the kernel returns packed queries' output as [T, Hq * d / out_head_pack],
+    # each head's own lanes, instead of [T, Hq, d] (see _unpack_out_heads).
+    out_head_pack: int = 1
+    # Queries and keys come already in the kernel's layout (v3 ``_prepared_inputs``):
+    # q [kv_heads, T, Hq / packing, packing, d], keys the merged kv; values unused
+    # unless ``keep_values_when_prepared`` forwards an auxiliary tensor (e.g. gate).
+    prepared_inputs: bool = False
+    keep_values_when_prepared: bool = False
+    supports_shared_decode: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -399,7 +411,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
     def _wrapped(
         queries: jax.Array,
         keys: jax.Array,
-        values: jax.Array,
+        values: jax.Array | None,
         kv_cache_fused: jax.Array,
         kv_lens: jax.Array,
         page_indices: jax.Array,
@@ -502,7 +514,11 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             output, _updated_kv = jax_kernel(
                 queries,
                 keys,
-                values,
+                (
+                    None
+                    if (spec.prepared_inputs and not spec.keep_values_when_prepared)
+                    else values
+                ),
                 kv_cache_fused,
                 kv_lens,
                 page_indices,
@@ -530,7 +546,13 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         *args,
         **kwargs,
     ):
-        return torch.empty_like(queries)
+        if spec.prepared_inputs:
+            kv_heads, num_tokens, rows, packing, head_dim = queries.shape
+            queries = queries.new_empty(num_tokens, kv_heads * rows * packing, head_dim)
+        if spec.out_head_pack == 1:
+            return torch.empty_like(queries)
+        num_tokens, num_heads, head_dim = queries.shape
+        return queries.new_empty(num_tokens, num_heads * head_dim // spec.out_head_pack)
 
     custom_op.register_fake(_fake_impl)
 
@@ -734,6 +756,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         position — return their own op instead of an ``RpaKernelSpec``-built one.
         """
         return _build_pallas_kernel_op(self.kernel_spec)
+
+    def _kernel_op(self, forward_batch: ForwardBatch, use_causal_mask: bool):
+        """The custom op ``_forward`` runs this layer with; overridable per variant."""
+        return self._op
 
     # ------------------------------------------------------------------ #
     # Metadata
@@ -1252,6 +1278,106 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             query_lens=query_lens,
         )
 
+        from sglang_tpu.envs import envs as tpu_envs
+
+        want_shared_decode = (
+            non_empty_bs >= 8
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+            and seq_lens_cpu is not None
+            and decode_query_size == 1
+            and self.supports_shared_decode_batch(bs)
+        )
+        shared_group_sz = self.shared_decode_group_size(bs) if want_shared_decode else 0
+
+        def _build_shared_dist(pages_np, mismatch_cache):
+            from sglang_tpu.attention_shared_prefix import (
+                compute_shared_mismatch,
+                shared_decode_distribution,
+            )
+
+            m_key = (non_empty_bs, shared_group_sz)
+            mismatch = mismatch_cache.get(m_key)
+            if mismatch is None:
+                mismatch = compute_shared_mismatch(
+                    pages_np, non_empty_bs, shared_group_sz
+                )
+                mismatch_cache[m_key] = mismatch
+            plan = shared_decode_distribution(
+                pages_np,
+                seq_lens_cpu,
+                non_empty_bs,
+                page_size,
+                group_size=shared_group_sz,
+                cached_mismatch=mismatch,
+            )
+            if plan is None:
+                return None
+            return self._value_metadata(
+                name="full_decode_distribution",
+                value=torch.from_numpy(plan),
+                device=device,
+            )
+
+        page_table_ver = getattr(req_to_token, "_tpu_page_table_version", None)
+        can_cache_decode_pages = (
+            page_table_ver is not None
+            and tpu_envs.SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE.get()
+            and not torch.compiler.is_compiling()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        )
+        if can_cache_decode_pages:
+            swa_map_ver = (
+                getattr(
+                    self.token_to_kv_pool.full_to_swa_index_mapping,
+                    "_tpu_swa_map_version",
+                    0,
+                )
+                if self._is_hybrid_swa
+                and self.token_to_kv_pool.full_to_swa_index_mapping is not None
+                else 0
+            )
+            cache_key = (
+                page_table_ver,
+                swa_map_ver,
+                pages_per_seq,
+                self._page_stride,
+                str(device),
+                req_pool_indices.numpy().tobytes(),
+            )
+            prev_cached = getattr(self, "_cached_decode_page_tables", None)
+            if prev_cached is not None and prev_cached[0] == cache_key:
+                (
+                    page_indices_dev,
+                    swa_page_indices,
+                    swa_group_page_indices,
+                    page_indices_np,
+                    mismatch_cache,
+                ) = prev_cached[1]
+                full_distribution = (
+                    _build_shared_dist(page_indices_np, mismatch_cache)
+                    if want_shared_decode
+                    else None
+                )
+                return PallasForwardMetadata(
+                    kv_lens=kv_lens,
+                    cu_q_lens=cu_q_lens,
+                    cu_kv_lens=cu_kv_lens,
+                    page_indices=page_indices_dev,
+                    distribution=distribution,
+                    full_decode_distribution=full_distribution,
+                    active_num_tokens=active_num_tokens,
+                    swa_page_indices=swa_page_indices,
+                    swa_group_page_indices=swa_group_page_indices,
+                    dcp_kv_lens_global=dcp_kv_lens_global,
+                    dcp_cp_rank=dcp_cp_rank,
+                    decode_query_size=decode_query_size,
+                    segments=segments,
+                )
+
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
         # slot per page), not the full [bs, max_ctx] row.
         page_cols = self._host_page_columns(pages_per_seq, self._page_stride)
@@ -1284,15 +1410,36 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     device=device,
                 )
 
+        page_indices_np = page_indices.view(bs, pages_per_seq).numpy()
+        mismatch_cache = {}
+        full_distribution = (
+            _build_shared_dist(page_indices_np, mismatch_cache)
+            if want_shared_decode
+            else None
+        )
+
         # Page tables change with KV growth, so they are value-checked.
+        page_indices_dev = self._value_metadata(
+            name="page_indices", value=page_indices, device=device
+        )
+        if can_cache_decode_pages:
+            self._cached_decode_page_tables = (
+                cache_key,
+                (
+                    page_indices_dev,
+                    swa_page_indices,
+                    swa_group_page_indices,
+                    page_indices_np,
+                    mismatch_cache,
+                ),
+            )
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
-            page_indices=self._value_metadata(
-                name="page_indices", value=page_indices, device=device
-            ),
+            page_indices=page_indices_dev,
             distribution=distribution,
+            full_decode_distribution=full_distribution,
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
             swa_group_page_indices=swa_group_page_indices,
@@ -1561,6 +1708,41 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return draft_kv_lens
         return self.forward_metadata.kv_lens
 
+    def shared_decode_group_size(self, bs: int) -> int:
+        """Query group size for shared-prefix decode at bucket ``bs``, or 0."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            get_shared_group_size,
+        )
+
+        target = get_shared_group_size(envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get())
+        if target <= 0 or bs < 16 or bs % 16 != 0:
+            return 0
+        grp = min(target, bs)
+        return grp if bs % grp == 0 else 16
+
+    def supports_shared_decode_batch(self, bs: int) -> bool:
+        """Whether both decode programs can occur at this serving bucket."""
+        return (
+            self.shared_decode_group_size(bs) > 0
+            and envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED.get()
+            and self.kernel_spec.supports_shared_decode
+            and self._dcp == 1
+            # Ranks with independent attention batches can choose different
+            # model programs, which is unsafe for their shared collectives.
+            and get_parallel().attn_dp_size == 1
+            and self.page_size in (128, 256)
+            and self.max_context_len > 128 * self.page_size
+            and bs >= 16
+            and bs % 16 == 0
+            and self.req_to_token_pool.req_to_token.device.type == "cpu"
+        )
+
+    def _layer_distribution(self, *, is_swa_layer: bool) -> torch.Tensor:
+        md = self.forward_metadata
+        if not is_swa_layer and md.full_decode_distribution is not None:
+            return md.full_decode_distribution
+        return md.distribution
+
     def _layer_page_indices(self, layer_id: int, *, is_swa_layer: bool) -> torch.Tensor:
         """Page table for ``layer_id``."""
         md = self.forward_metadata
@@ -1629,8 +1811,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             self.token_to_kv_pool, layer.layer_id
         )
 
-        op = self._op
-
         sliding_window = getattr(layer, "sliding_window_size", None)
         if sliding_window is not None and sliding_window <= 0:
             sliding_window = None
@@ -1655,6 +1835,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         use_causal_mask = not (
             layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
         )
+        op = self._kernel_op(forward_batch, use_causal_mask)
 
         # fp8 KV cache: quantize new K/V to fp8 here (the kernel writes them to
         # the fp8 cache itself and reads them back for the current tokens), and
@@ -1737,7 +1918,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 page_indices,
                 self.forward_metadata.cu_q_lens,
                 self.forward_metadata.cu_kv_lens,
-                self.forward_metadata.distribution,
+                self._layer_distribution(is_swa_layer=is_swa_layer),
                 sinks,
                 float(layer.scaling),
                 sliding_window,
@@ -1759,7 +1940,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # are dropped here so o_proj receives exactly tp_q_head_num * v_head_dim.
         # When qk == v this view+slice is a no-op reshape.
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
-        if pack > 1:
+        if pack > 1 and out.shape[-1] != layer.qk_head_dim:
             out = _unpack_out_heads(out, pack, layer.qk_head_dim)
         out = out[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)

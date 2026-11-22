@@ -19,7 +19,16 @@ from sglang.srt.runtime_context import get_forward
 from sglang_tpu.kernels.twoshot_all_reduce import TWOSHOT_ALL_REDUCE_MAX_BYTES
 
 _OPS: dict[int, Callable] = {}
+_BRIDGE_OPS: dict[int, Callable] = {}
 _OPS_LOCK = Lock()
+
+
+def bridge_all_reduce_max_bytes() -> int:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    kb_env = getattr(tpu_envs, "SGLANG_TPU_BRIDGE_ALL_REDUCE_MAX_KB", None)
+    kb = int(kb_env.get()) if kb_env is not None else 0
+    return kb * 1024 if kb > 0 else 0
 
 
 @functools.cache
@@ -29,16 +38,20 @@ def _get_mesh(world_size: int):
     return get_pallas_mesh(("model",), (world_size,))
 
 
-def _build_op(world_size: int) -> Callable:
+def _build_op(world_size: int, *, bridge: bool = False) -> Callable:
     import jax
     from jax.sharding import PartitionSpec as P
 
-    from sglang_tpu.kernels.twoshot_all_reduce import twoshot_all_reduce
+    from sglang_tpu.kernels.twoshot_all_reduce import (
+        bridge_twoshot_all_reduce,
+        twoshot_all_reduce,
+    )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     mesh = _get_mesh(world_size)
+    fn = bridge_twoshot_all_reduce if bridge else twoshot_all_reduce
     sharded = jax.shard_map(
-        functools.partial(twoshot_all_reduce, world_size=world_size),
+        functools.partial(fn, world_size=world_size),
         mesh=mesh,
         in_specs=(P("model"),),
         out_specs=P(),
@@ -48,8 +61,9 @@ def _build_op(world_size: int) -> Callable:
     def _wrapped(x: jax.Array) -> jax.Array:
         return sharded(x)
 
+    op_prefix = "bridge_twoshot_all_reduce" if bridge else "twoshot_all_reduce"
     return cpu_export_jax_op(
-        f"sglang_tpu_pallas::twoshot_all_reduce_tp{world_size}",
+        f"sglang_tpu_pallas::{op_prefix}_tp{world_size}",
         _wrapped,
         mesh=mesh,
         input_partition_specs=(P("model"),),
@@ -65,8 +79,21 @@ def get_twoshot_all_reduce_op(world_size: int) -> Callable:
     with _OPS_LOCK:
         op = _OPS.get(world_size)
         if op is None:
-            op = _build_op(world_size)
+            op = _build_op(world_size, bridge=False)
             _OPS[world_size] = op
+    return op
+
+
+def get_bridge_twoshot_all_reduce_op(world_size: int) -> Callable:
+    """Registered 2-stage chipmate-bridge all-reduce op for TP8 on TPU7x."""
+    op = _BRIDGE_OPS.get(world_size)
+    if op is not None:
+        return op
+    with _OPS_LOCK:
+        op = _BRIDGE_OPS.get(world_size)
+        if op is None:
+            op = _build_op(world_size, bridge=True)
+            _BRIDGE_OPS[world_size] = op
     return op
 
 
@@ -78,21 +105,29 @@ class TwoShotAllReduceLinear(torch.nn.Module):
         self.linear = linear
         _, self.world_size = get_group_rank_size(linear.tp_group)
 
-    def _fits(self, x: torch.Tensor) -> bool:
-        """A non-empty 2-D payload under the size cap, outside forwards that
-        reduce-scatter or skip the reduction."""
+    def _fits(self, x: torch.Tensor) -> int:
+        """0 = skip, 1 = flat twoshot, 2 = 2-stage chipmate-bridge twoshot."""
+        if x.dim() != 2 or get_forward().sp_active or should_skip_mlp_all_reduce():
+            return 0
         output_bytes = x.shape[0] * self.linear.output_size * x.element_size()
-        return (
-            x.dim() == 2
-            and 0 < output_bytes <= TWOSHOT_ALL_REDUCE_MAX_BYTES
-            and not get_forward().sp_active
-            and not should_skip_mlp_all_reduce()
-        )
+        if output_bytes <= 0:
+            return 0
+        bridge_max = bridge_all_reduce_max_bytes() if self.world_size == 8 else 0
+        if bridge_max > 0 and output_bytes <= bridge_max:
+            return 2
+        if output_bytes <= TWOSHOT_ALL_REDUCE_MAX_BYTES:
+            return 1
+        return 0
 
     def forward(self, x: torch.Tensor, skip_all_reduce: bool = False, **kwargs):
-        if skip_all_reduce or not self._fits(x):
+        mode = 0 if skip_all_reduce else self._fits(x)
+        if mode == 0:
             return self.linear(x, skip_all_reduce=skip_all_reduce, **kwargs)
         output, output_bias = self.linear(x, skip_all_reduce=True, **kwargs)
+        if mode == 2:
+            return get_bridge_twoshot_all_reduce_op(self.world_size)(
+                output
+            ), output_bias
         return get_twoshot_all_reduce_op(self.world_size)(output), output_bias
 
 

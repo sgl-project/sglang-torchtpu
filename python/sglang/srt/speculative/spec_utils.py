@@ -317,6 +317,9 @@ def allocate_and_assign_decode_cache(
         assign_locs,
         batch_size,
     )
+    req_to_token._tpu_page_table_version = (
+        getattr(req_to_token, "_tpu_page_table_version", 0) + 1
+    )
     return out_cache_loc
 
 

@@ -769,6 +769,7 @@ def _patch_future_map_direct_handoff() -> None:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang_tpu.experimental import is_experimental_chain
     from sglang_tpu.overlap_utils_tpu import (
+        can_defer_publish_tpu,
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
@@ -778,8 +779,10 @@ def _patch_future_map_direct_handoff() -> None:
     orig_publish = FutureMap.publish
     orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
     orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
+    orig_resolve_spec_extras = FutureMap._resolve_spec_extras
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
+    FutureMap._tpu_orig_publish = orig_publish
 
     def stash(self, future_indices, payload):
         if is_experimental_chain(self.spec_algo):
@@ -790,8 +793,19 @@ def _patch_future_map_direct_handoff() -> None:
             orig_stash(self, future_indices, payload)
 
     def publish(self, future_indices, new_seq_lens, confidence=None):
+        if can_defer_publish_tpu(self, future_indices, confidence):
+            flush_direct_handoff_tpu(self)
+            publish_tpu(
+                self,
+                future_indices,
+                new_seq_lens,
+                confidence=confidence,
+                deferred=True,
+            )
+            return
+        flush_direct_handoff_tpu(self)
         orig_publish(self, future_indices, new_seq_lens, confidence)
-        publish_tpu(self, future_indices, new_seq_lens)
+        publish_tpu(self, future_indices, new_seq_lens, confidence=confidence)
 
     # Every other buffer reader or writer must see the pending rows stored first.
     def stash_bonus_tokens(self, indices, bonus_tokens):
@@ -803,10 +817,17 @@ def _patch_future_map_direct_handoff() -> None:
         flush_direct_handoff_tpu(self)
         orig_resolve_mixed_spec_tails(self, batch)
 
+    def _resolve_spec_extras(self, batch):
+        draft_input = getattr(batch, "spec_info", None)
+        if not getattr(draft_input, "_tpu_direct_handoff_resolved", False):
+            flush_direct_handoff_tpu(self)
+        orig_resolve_spec_extras(self, batch)
+
     FutureMap.stash = stash
     FutureMap.publish = publish
     FutureMap.stash_bonus_tokens = stash_bonus_tokens
     FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
+    FutureMap._resolve_spec_extras = _resolve_spec_extras
 
 
 _raiden_is_load_back_event_done_patched = False

@@ -16,6 +16,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
+    _invoke_v3_kernel,
 )
 from sglang_tpu.envs import envs
 
@@ -411,6 +412,341 @@ class TestInactiveRpaRows(unittest.TestCase):
 
         self.assertTrue(torch.isnan(output[0, 0]))
         self.assertTrue(torch.equal(output[2], torch.zeros(4)))
+
+
+class TestStationaryQPrefillEnvPrecedence(unittest.TestCase):
+    def _invoke(
+        self,
+        *,
+        q_shape=(8192, 16, 128),
+        sliding_window=None,
+        prepared_inputs=False,
+        skip_decode=False,
+        a3_out_layout=False,
+        pages_per_seq=128,
+        page_size=128,
+        k_scale=1.0,
+        causal=True,
+        bs=2,
+        soft_cap=None,
+        attention_sink=None,
+    ):
+        calls = []
+        _invoke_v3_kernel(
+            lambda *args, **kwargs: calls.append(kwargs),
+            queries=SimpleNamespace(shape=q_shape, ndim=len(q_shape), dtype="bfloat16"),
+            keys=SimpleNamespace(shape=(q_shape[0], 1, 64)),
+            values=None,
+            kv_cache_fused=SimpleNamespace(
+                shape=(9, page_size, 1, 4, 128), dtype="float8_e4m3fn"
+            ),
+            kv_lens=SimpleNamespace(shape=(bs,)),
+            page_indices=SimpleNamespace(shape=(bs * pages_per_seq,)),
+            cu_q_lens=None,
+            cu_kv_lens=None,
+            distribution=None,
+            attention_sink=attention_sink,
+            sm_scale=0.125,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            use_causal_mask=causal,
+            v_scale=1.0,
+            prepared_inputs=prepared_inputs,
+            skip_decode=skip_decode,
+            a3_out_layout=a3_out_layout,
+        )
+        return calls[0]
+
+    def test_native_tp16_long_prefill_selects_by_live_metadata(self):
+        import jax
+        import jax.numpy as jnp
+
+        def chosen(lens, cu_q, distribution):
+            return _invoke_v3_kernel(
+                lambda *args, **kw: jnp.int32(kw["m_block_sizes"][0]),
+                queries=SimpleNamespace(shape=(8192, 8, 64), ndim=3, dtype="bfloat16"),
+                keys=SimpleNamespace(shape=(8192, 1, 64)),
+                values=None,
+                kv_cache_fused=SimpleNamespace(
+                    shape=(1, 128, 1, 4, 128), dtype="float8_e4m3fn"
+                ),
+                kv_lens=lens,
+                page_indices=SimpleNamespace(shape=(2 * 2128,)),
+                cu_q_lens=cu_q,
+                cu_kv_lens=None,
+                distribution=distribution,
+                attention_sink=None,
+                sm_scale=0.125,
+                sliding_window=None,
+                soft_cap=None,
+                k_scale=None,
+                v_scale=None,
+                skip_decode=True,
+            )
+
+        with (
+            envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override("m0_ring_fuse"),
+            envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.override(True),
+            envs.SGLANG_TPU_RPA_V3_TP16_LONG_PREFILL_TILES.override(True),
+        ):
+            cpu = jax.devices("cpu")[0]
+            with jax.default_device(cpu):
+                inputs = tuple(jnp.zeros(n, jnp.int32) for n in (2, 3, 3))
+                executable = jax.jit(chosen).lower(*inputs).compile()
+                for prefix, live, active, decode, expected in (
+                    (262144, 8192, 1, 0, 2048),
+                    (131072, 6887, 1, 0, 1024),
+                    (131072, 6145, 1, 0, 512),
+                    (65536, 6144, 1, 0, 2048),
+                    (65535, 8192, 1, 0, 512),
+                    (262144, 6000, 1, 0, 512),
+                    (262144, 7168, 2, 0, 512),
+                    (262144, 8192, 1, 1, 512),
+                    (0, 0, 0, 0, 512),
+                ):
+                    args = (
+                        jnp.array([prefix + live, 0], jnp.int32),
+                        jnp.array([0, live, live], jnp.int32),
+                        jnp.array([decode, active, active], jnp.int32),
+                    )
+                    with self.subTest(
+                        prefix=prefix, live=live, active=active, decode=decode
+                    ):
+                        self.assertEqual(int(executable(*args)), expected)
+
+    def test_native_tp16_prefill(self):
+        with (
+            envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override("m0_ring_fuse"),
+            envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.override(True),
+        ):
+            q = {"q_shape": (8192, 8, 64), "skip_decode": True}
+            for window, tiles in (
+                (None, (512, 2048, 512, 256)),
+                (2048, (256, 1024, 256, 256)),
+                (2049, (256, 1024, 256, 256)),
+            ):
+                kw = self._invoke(**q, sliding_window=window)
+                self.assertEqual(kw["m_block_sizes"], tiles)
+                self.assertTrue(
+                    {"mask_skip", "visible_kv_tile", "fold_scale"}
+                    <= kw["_prefill_opts"]
+                )
+            self.assertNotIn(
+                "fold_scale", self._invoke(**q, k_scale=0.75)["_prefill_opts"]
+            )
+            for case in (
+                {},
+                {**q, "q_shape": (4096, 8, 64)},
+                {**q, "skip_decode": False},
+                {**q, "sliding_window": 512},
+                {**q, "causal": False},
+                {**q, "page_size": 64},
+            ):
+                self.assertNotIn(
+                    "visible_kv_tile", self._invoke(**case)["_prefill_opts"]
+                )
+            with envs.SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES.override(
+                "256,4096,256,256"
+            ):
+                kw = self._invoke(**q)
+                self.assertEqual(kw["m_block_sizes"], (256, 4096, 256, 256))
+                self.assertNotIn("visible_kv_tile", kw["_prefill_opts"])
+
+    def test_prefill_mode_overrides_legacy_ma_mixed_envs_and_strips_opts(self):
+        with (
+            envs.SGLANG_TPU_RPA_V3_MIXED_BLOCK_SIZES.override("256,2048,128,512"),
+            envs.SGLANG_TPU_RPA_V3_MIXED_BLOCK_SIZES_SW.override("256,2048,256,256"),
+            envs.SGLANG_TPU_RPA_V3_PREFILL_FOLD_SCALE.override(True),
+            envs.SGLANG_TPU_RPA_V3_PREFILL_MASK_SKIP.override(True),
+        ):
+            # Mode unset -> exact legacy ma behavior preserved.
+            kw_off_full = self._invoke(sliding_window=None)
+            self.assertEqual(kw_off_full["m_block_sizes"], (256, 2048, 128, 512))
+            self.assertEqual(
+                kw_off_full["_prefill_opts"], frozenset({"fold_scale", "mask_skip"})
+            )
+
+            # Mode="m0" -> overrides legacy MIXED_BLOCK_SIZES and strips fold_scale/mask_skip.
+            with envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override("m0"):
+                kw_sw = self._invoke(sliding_window=2049)
+                self.assertEqual(kw_sw["m_block_sizes"], (512, 2048, 256, 256))
+                self.assertEqual(
+                    kw_sw["_prefill_opts"],
+                    frozenset({"stationary_q_m0", "skip_empty_cdma", "mixed_s3"}),
+                )
+
+                kw_full_std = self._invoke(sliding_window=None, pages_per_seq=128)
+                self.assertEqual(kw_full_std["m_block_sizes"], (512, 2048, 256, 256))
+                self.assertEqual(
+                    kw_full_std["_prefill_opts"],
+                    frozenset(
+                        {
+                            "stationary_q_m0",
+                            "bkv_full_unroll",
+                            "skip_empty_cdma",
+                            "mixed_s3",
+                        }
+                    ),
+                )
+
+                # T=256 uses bq=256; T<256 (e.g. decode B=128) stays on legacy path.
+                kw_t256 = self._invoke(q_shape=(256, 16, 128), sliding_window=2049)
+                self.assertEqual(kw_t256["m_block_sizes"], (256, 2048, 256, 256))
+                kw_b128 = self._invoke(q_shape=(128, 16, 128), sliding_window=2049)
+                self.assertEqual(kw_b128["m_block_sizes"], (256, 2048, 256, 256))
+                self.assertEqual(
+                    kw_b128["_prefill_opts"], frozenset({"fold_scale", "mask_skip"})
+                )
+
+    def test_auto_bkv4096_for_long_context_full_and_explicit_override(self):
+        with envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override("m0"):
+            # T=16384 even at standard context -> bkv=4096 on Full, 2048 on SW.
+            self.assertEqual(
+                self._invoke(q_shape=(16384, 16, 128), sliding_window=None)[
+                    "m_block_sizes"
+                ],
+                (512, 4096, 256, 256),
+            )
+            self.assertEqual(
+                self._invoke(q_shape=(16384, 16, 128), sliding_window=2049)[
+                    "m_block_sizes"
+                ],
+                (512, 2048, 256, 256),
+            )
+            # Long-context page table (e.g. 64K / 128K -> pages_per_seq=512, cap=65536 > 18432)
+            # -> auto-selects bkv=4096 at T=8192 and T=2048 on Full!
+            self.assertEqual(
+                self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=None,
+                    prepared_inputs=True,
+                    pages_per_seq=512,
+                )["m_block_sizes"],
+                (512, 4096, 256, 256),
+            )
+            # Explicit STATIONARY_Q_BLOCK_SIZES[_SW] overrides auto selection.
+            with (
+                envs.SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES.override(
+                    "512,2048,256,256"
+                ),
+                envs.SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES_SW.override(
+                    "256,2048,256,256"
+                ),
+            ):
+                self.assertEqual(
+                    self._invoke(sliding_window=None, pages_per_seq=512)[
+                        "m_block_sizes"
+                    ],
+                    (512, 2048, 256, 256),
+                )
+                self.assertEqual(
+                    self._invoke(sliding_window=2049)["m_block_sizes"],
+                    (256, 2048, 256, 256),
+                )
+
+    def test_prepared_skip_empty_decode_and_kernel_op_selection(self):
+        with (
+            envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override("pilot"),
+            envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.override(True),
+        ):
+            kw = self._invoke(
+                q_shape=(1, 8192, 8, 2, 128),
+                sliding_window=2049,
+                prepared_inputs=True,
+            )
+            self.assertTrue(kw["_prepared_inputs"])
+            self.assertTrue(kw["_skip_decode"])
+            self.assertEqual(
+                kw["_prefill_opts"],
+                frozenset({"stationary_q_pilot", "skip_empty_cdma", "mixed_s3"}),
+            )
+
+        backend = object.__new__(TpuPallasRpaV3AttnBackend)
+        backend._op = "v3"
+        backend._batched_prefill_op = None
+        backend._fused_out_op = None
+        backend._skip_decode_op = "skip_dec"
+        backend._dcp = 1
+        backend.forward_metadata = SimpleNamespace(
+            decode_query_size=1, cp_write_segments=None
+        )
+        self.assertEqual(
+            backend._kernel_op(SimpleNamespace(forward_mode=ForwardMode.EXTEND), True),
+            "skip_dec",
+        )
+        self.assertEqual(
+            backend._kernel_op(SimpleNamespace(forward_mode=ForwardMode.DECODE), True),
+            "v3",
+        )
+
+    def test_stationary_q_v2_modes_routing(self):
+        for mode in (
+            "m0_ring",
+            "m0_f32e",
+            "m0_ring_fuse",
+            "m0_f32e_fuse",
+        ):
+            with (
+                envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override(mode),
+                envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.override(True),
+                envs.SGLANG_TPU_RPA_V3_PREFILL_FOLD_SCALE.override(True),
+                envs.SGLANG_TPU_RPA_V3_PREFILL_MASK_SKIP.override(True),
+            ):
+                kw_sw = self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=2049,
+                    prepared_inputs=True,
+                )
+                self.assertEqual(kw_sw["m_block_sizes"], (256, 2048, 256, 256))
+                self.assertEqual(
+                    kw_sw["_prefill_opts"],
+                    frozenset({f"stationary_q_{mode}", "skip_empty_cdma", "mixed_s3"}),
+                )
+                # Standard <=32K capacity Full -> (256, 2048, 256, 256)
+                kw_full_std = self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=None,
+                    prepared_inputs=True,
+                    pages_per_seq=128,
+                )
+                self.assertEqual(kw_full_std["m_block_sizes"], (256, 2048, 256, 256))
+                # >32K capacity Full (pages_per_seq=512 -> 64K) -> streaming (512, 4096, 256, 256)
+                kw_full = self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=None,
+                    prepared_inputs=True,
+                    pages_per_seq=512,
+                )
+                self.assertEqual(kw_full["m_block_sizes"], (512, 4096, 256, 256))
+                self.assertEqual(
+                    kw_full["_prefill_opts"],
+                    frozenset(
+                        {
+                            f"stationary_q_{mode}",
+                            "bkv_full_unroll",
+                            "skip_empty_cdma",
+                            "mixed_s3",
+                        }
+                    ),
+                )
+                # >32K capacity SW still stays (256, 2048, 256, 256)
+                kw_sw_long = self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=2049,
+                    prepared_inputs=True,
+                    pages_per_seq=512,
+                )
+                self.assertEqual(kw_sw_long["m_block_sizes"], (256, 2048, 256, 256))
+                # Direct 2D A3 layout composes with all Stationary-Q v2 modes
+                kw_a3 = self._invoke(
+                    q_shape=(1, 8192, 8, 2, 128),
+                    sliding_window=2049,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=2,
+                )
+                self.assertTrue(kw_a3.get("_a3_out_layout", False))
 
 
 if __name__ == "__main__":

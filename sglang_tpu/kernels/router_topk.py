@@ -17,6 +17,35 @@ import functools
 _RANK_MAX_EXPERTS = 1024
 
 
+def _remap_eplb_topk_ids(
+    ids,
+    *,
+    eplb_replicas: int,
+    ep_size: int,
+    num_base_local: int,
+):
+    """Map global router column IDs into `[ep_size * (num_base_local + R)]` EPLB slot IDs."""
+    import jax
+    import jax.numpy as jnp
+
+    if eplb_replicas <= 0:
+        return ids
+    e_loc = num_base_local + eplb_replicas
+    if (num_base_local & (num_base_local - 1)) == 0:
+        shift = num_base_local.bit_length() - 1
+        base_v = (ids >> shift) * e_loc + (ids & (num_base_local - 1))
+    else:
+        base_v = (ids // num_base_local) * e_loc + (ids % num_base_local)
+    tok_idx = jax.lax.broadcasted_iota(jnp.int32, ids.shape, 0)
+    tok_rank = (
+        (tok_idx & (ep_size - 1))
+        if ep_size > 0 and (ep_size & (ep_size - 1)) == 0
+        else (tok_idx % ep_size)
+    )
+    rep_v = tok_rank * e_loc + (num_base_local + ids)
+    return jnp.where(ids < eplb_replicas, rep_v, base_v)
+
+
 def _topk_kernel(
     logits_ref,
     bias_ref,
@@ -27,6 +56,9 @@ def _topk_kernel(
     renormalize: bool,
     eps: float,
     scale: float,
+    eplb_replicas: int = 0,
+    ep_size: int = 8,
+    num_base_local: int = 32,
 ):
     import jax
     import jax.numpy as jnp
@@ -42,6 +74,9 @@ def _topk_kernel(
             renormalize=renormalize,
             eps=eps,
             scale=scale,
+            eplb_replicas=eplb_replicas,
+            ep_size=ep_size,
+            num_base_local=num_base_local,
         )
     logits = logits_ref[...]
     # sigmoid in f32, rounded to the logits dtype like torch's bf16 sigmoid.
@@ -85,12 +120,30 @@ def _topk_kernel(
     if renormalize:
         weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + eps)
         weights = weights * scale
+    if eplb_replicas > 0:
+        ids = _remap_eplb_topk_ids(
+            ids,
+            eplb_replicas=eplb_replicas,
+            ep_size=ep_size,
+            num_base_local=num_base_local,
+        )
     w_ref[...] = weights
     ids_ref[...] = ids
 
 
 def _topk_kernel_1tok(
-    logits_ref, bias_ref, w_ref, ids_ref, *, k, renormalize, eps, scale
+    logits_ref,
+    bias_ref,
+    w_ref,
+    ids_ref,
+    *,
+    k,
+    renormalize,
+    eps,
+    scale,
+    eplb_replicas: int = 0,
+    ep_size: int = 8,
+    num_base_local: int = 32,
 ):
     """One token: the top-k by rank instead of k rounds of argmax-and-mask.
 
@@ -147,6 +200,13 @@ def _topk_kernel_1tok(
     if renormalize:
         weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + eps)
         weights = weights * scale
+    if eplb_replicas > 0:
+        ids = _remap_eplb_topk_ids(
+            ids,
+            eplb_replicas=eplb_replicas,
+            ep_size=ep_size,
+            num_base_local=num_base_local,
+        )
     w_ref[...] = weights
     ids_ref[...] = ids
 
@@ -159,6 +219,10 @@ def router_topk_jax(
     eps: float,
     scale: float,
     interpret: bool = False,
+    *,
+    eplb_replicas: int = 0,
+    ep_size: int = 8,
+    num_base_local: int = 32,
 ):
     """logits: [T, E]; bias: [E] f32. Returns (f32 weights [T, k], i32 ids [T, k])."""
     import jax
@@ -168,9 +232,19 @@ def router_topk_jax(
 
     tokens, experts = logits.shape
     full = lambda shape: pl.BlockSpec(shape, lambda i: (0,) * len(shape))
+    eplb_tag = (
+        f"_eplb_r{eplb_replicas}_ep{ep_size}" if eplb_replicas > 0 else ""
+    )
     return pl.pallas_call(
         functools.partial(
-            _topk_kernel, k=k, renormalize=renormalize, eps=eps, scale=scale
+            _topk_kernel,
+            k=k,
+            renormalize=renormalize,
+            eps=eps,
+            scale=scale,
+            eplb_replicas=eplb_replicas,
+            ep_size=ep_size,
+            num_base_local=num_base_local,
         ),
         out_shape=(
             jax.ShapeDtypeStruct((tokens, k), jnp.float32),
@@ -186,5 +260,5 @@ def router_topk_jax(
             allow_input_fusion=[True, False],
         ),
         interpret=interpret,
-        name=f"router_topk_{k}_of_{experts}",
+        name=f"router_topk_{k}_of_{experts}{eplb_tag}",
     )(logits, bias.reshape(experts).astype(jnp.float32))

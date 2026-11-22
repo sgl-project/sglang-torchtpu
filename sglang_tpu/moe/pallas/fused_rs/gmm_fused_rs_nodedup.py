@@ -441,22 +441,44 @@ _LOCAL_ROWS_ALIGN = 128
 
 def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
     """Rows of the routing arrays the kernel holds in SMEM: expert TP keeps only this rank's
-    size_m / ep_size routed rows (in a 128-aligned window), the other layouts every row."""
-    return size_m // ep_size + _LOCAL_ROWS_ALIGN if expert_tp else size_m
+    size_m / ep_size routed rows (in a 128-aligned window); large EP>=4 prefill (size_m >= 262144)
+    bounds to a 3x-average 128-aligned local window so T=32k/48k/64k fits < 1 MiB SMEM."""
+    if expert_tp:
+        return size_m // ep_size + _LOCAL_ROWS_ALIGN
+    if ep_size >= 4 and size_m >= 262_144:
+        target = max(131_072, (size_m // ep_size) * 3)
+        aligned = (
+            (target + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
+        ) * _LOCAL_ROWS_ALIGN
+        return min(size_m, aligned)
+    return size_m
 
 
 def _local_expert_tp_rows(
-    meta, lhs_indices, topk_indices, *, ep_size: int, num_slots: int
+    meta,
+    lhs_indices,
+    topk_indices,
+    *,
+    ep_size: int,
+    num_slots: int,
+    expert_tp: bool = True,
 ):
-    """Expert TP routes every (token, slot) to one contiguous block of rows per rank, but the
-    routing arrays cover all ranks' blocks. Keep this rank's window [base, base + n) of them,
-    base the aligned floor of local_start, and rebase meta's row offsets (local_start,
-    local_end, gm_id_to_m_offset) by base; total_recv was counted on the whole arrays."""
-    n = fused_rs_smem_rows(lhs_indices.shape[0], ep_size, True)
-    base = (meta[0] // _LOCAL_ROWS_ALIGN) * _LOCAL_ROWS_ALIGN
+    """Keep this rank's aligned window [base, base + n) of the routing arrays and rebase meta's
+    row offsets (local_start, local_end, gm_id_to_m_offset) by base; total_recv was counted on
+    the whole arrays prior to slicing."""
+    total_m = lhs_indices.shape[0]
+    n = fused_rs_smem_rows(total_m, ep_size, expert_tp)
+    raw_base = (meta[0] // _LOCAL_ROWS_ALIGN) * _LOCAL_ROWS_ALIGN
+    if expert_tp:
+        base = raw_base
 
-    def window(a):
-        return lax.dynamic_slice_in_dim(jnp.pad(a, (0, _LOCAL_ROWS_ALIGN)), base, n)
+        def window(a):
+            return lax.dynamic_slice_in_dim(jnp.pad(a, (0, _LOCAL_ROWS_ALIGN)), base, n)
+    else:
+        base = jnp.minimum(raw_base, jnp.int32(total_m - n))
+
+        def window(a):
+            return lax.dynamic_slice_in_dim(a, base, n)
 
     shift = jnp.zeros_like(meta).at[0:2].set(base).at[4 + num_slots :].set(base)
     return meta - shift, window(lhs_indices), window(topk_indices)
@@ -2410,9 +2432,8 @@ def gmm_v2_fused_rs(
     )
 
     # Scratch shapes.
-    # Expert TP: this device's size_m / ep_size rows, as the caller's max_num_gm.
-    local_rows = size_m // ep_size if expert_tp else size_m
-    max_num_gm_static = size_group + pl.cdiv(local_rows, tile_m) - 1
+    smem_rows = fused_rs_smem_rows(size_m, ep_size, expert_tp)
+    max_num_gm_static = size_group + pl.cdiv(smem_rows, tile_m) - 1
     n2_cols = aligned_n2 // num_lanes
 
     scratch_shapes = [
@@ -2554,7 +2575,7 @@ def gmm_v2_fused_rs(
     # That's size_m > 120K (e.g., prefill_16384 with top_k=8 has size_m=131K).
     # Expert TP builds the routing metadata ahead of the kernel in XLA and
     # leaves each tile's output writes in flight until its staging slot is reused.
-    if expert_tp:
+    if expert_tp or smem_rows < size_m:
         group_start = _precompute_fused_rs_metadata(
             group_sizes,
             group_offset,
@@ -2572,6 +2593,7 @@ def gmm_v2_fused_rs(
             topk_indices,
             ep_size=ep_size,
             num_slots=max_num_gm_static,
+            expert_tp=expert_tp,
         )
 
     pack_indices = lhs_indices.shape[0] > 120_000

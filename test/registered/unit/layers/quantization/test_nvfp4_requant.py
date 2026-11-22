@@ -6,7 +6,11 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.moe.nvfp4_requant import requant_nvfp4_blocks
+from sglang_tpu.moe.nvfp4_requant import (
+    compact_nvfp4_blocks,
+    probe_nvfp4_blocks,
+    requant_nvfp4_blocks,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -74,6 +78,18 @@ class TestNvfp4Requant(CustomTestCase):
         codes, _ = requant_nvfp4_blocks(packed, scale, 256)
         self.assertEqual(int(codes[0, 16, 0]), 0x22)
         self.assertEqual(int(codes[0, 17, 0]), 0x00)
+
+    def test_compact_matches_probe_bit_exact(self):
+        packed, scale = self._random(e=4, k=512, n=256, seed=11)
+        p_codes, p_s16, p_err2, p_ref2 = probe_nvfp4_blocks(packed, scale, 256)
+        c_codes, c_sb, c_err2, c_ref2 = compact_nvfp4_blocks(packed, scale, 256)
+        self.assertEqual(c_sb.shape, (4, 2, 256))
+        self.assertEqual(p_s16.shape, (4, 32, 256))
+        self.assertTrue(torch.equal(c_codes, p_codes))
+        self.assertTrue(torch.equal(c_sb.repeat_interleave(16, dim=1), p_s16))
+        self.assertTrue(torch.equal(_decode(c_codes, c_sb), _decode(p_codes, p_s16)))
+        self.assertAlmostEqual(float(c_err2), float(p_err2), places=4)
+        self.assertAlmostEqual(float(c_ref2), float(p_ref2), places=4)
 
 
 if __name__ == "__main__":
