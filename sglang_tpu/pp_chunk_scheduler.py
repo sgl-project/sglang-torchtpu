@@ -28,8 +28,8 @@ from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_granularity,
     longest_prompt,
+    pipeline_prefill_is_chunked,
     profile_points,
-    uses_dynamic_chunks,
 )
 
 if TYPE_CHECKING:
@@ -206,8 +206,17 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
-def _check_chunk_sizing_env(values: list[tuple[float, float]]) -> None:
-    for slack, spread in values:
+def _check_chunk_env(
+    values: list[tuple[bool, float, float]],
+) -> tuple[float, float] | None:
+    if len({dynamic for dynamic, _, _ in values}) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_DYNAMIC_CHUNKS must be the same on every rank; ranks "
+            "that size steps differently deadlock the pipeline."
+        )
+    if not values[0][0]:
+        return None
+    for _, slack, spread in values:
         if not 0 <= slack < math.inf:
             raise ValueError(
                 "SGLANG_TPU_PP_CHUNK_SLACK must be finite and nonnegative."
@@ -216,23 +225,42 @@ def _check_chunk_sizing_env(values: list[tuple[float, float]]) -> None:
             raise ValueError(
                 "SGLANG_TPU_PP_CHUNK_SPREAD must be finite and at least 1."
             )
-    if len(set(values)) > 1:
+    if len({(slack, spread) for _, slack, spread in values}) > 1:
         raise ValueError(
             "SGLANG_TPU_PP_CHUNK_SLACK and SGLANG_TPU_PP_CHUNK_SPREAD must be "
             "the same on every rank; ranks that size steps differently deadlock "
             "the pipeline."
         )
+    return values[0][1:]
+
+
+def _agreed_chunk_env(world_group: Any) -> tuple[float, float] | None:
+    # Gathered before profiling and checked on the gathered values, so a rank
+    # with a different env fails with its peers instead of leaving them waiting.
+    values = [None] * world_group.world_size
+    torch.distributed.all_gather_object(
+        values,
+        (
+            envs.SGLANG_TPU_PP_DYNAMIC_CHUNKS.get(),
+            envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
+            envs.SGLANG_TPU_PP_CHUNK_SPREAD.get(),
+        ),
+        group=world_group.cpu_group,
+    )
+    return _check_chunk_env(values)
 
 
 def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     """Profile every stage after compilation and share the slowest cost curve."""
     runner = scheduler.tp_worker.model_runner
-    if not uses_dynamic_chunks():
+    if not pipeline_prefill_is_chunked():
+        return
+    agreed = _agreed_chunk_env(scheduler.world_group)
+    if agreed is None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    slack = envs.SGLANG_TPU_PP_CHUNK_SLACK.get()
-    spread = envs.SGLANG_TPU_PP_CHUNK_SPREAD.get()
+    slack, spread = agreed
     policy = runner.compile_policy
     granularity = chunk_granularity(
         scheduler.page_size, scheduler.chunked_prefill_size, True
@@ -270,11 +298,9 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
         reports,
-        (samples, schedule, slack, spread),
+        (samples, schedule),
         group=scheduler.world_group.cpu_group,
     )
-    # Checked on the gathered values, so that every rank raises the same error.
-    _check_chunk_sizing_env([report[2:] for report in reports])
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
         [report[0] for report in reports],

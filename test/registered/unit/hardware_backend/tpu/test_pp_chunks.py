@@ -11,6 +11,7 @@ from sglang_tpu.pp_chunks import (
     chunk_granularity,
     chunk_pairs,
     longest_prompt,
+    pipeline_prefill_is_chunked,
     profile_points,
     uses_dynamic_chunks,
 )
@@ -254,6 +255,9 @@ def test_dynamic_chunks_use_resolved_defaults_and_exclude_decode(monkeypatch):
         assert raw.device is None
         assert raw.chunked_prefill_size is None
         assert uses_dynamic_chunks()
+        monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "0")
+        assert pipeline_prefill_is_chunked() and not uses_dynamic_chunks()
+        monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "1")
         get_context().override("test.decode_role", disaggregation_mode="decode")
         assert not uses_dynamic_chunks()
         get_context().override("test.prefill_role", disaggregation_mode="prefill")

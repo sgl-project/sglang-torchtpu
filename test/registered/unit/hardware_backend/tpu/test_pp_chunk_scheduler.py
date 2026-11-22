@@ -432,7 +432,15 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
         chunked_prefill_size=16384,
         enable_torch_compile=True,
     ) as raw:
-        scheduler = NS(tp_worker=NS(model_runner=NS(server_args=raw)))
+        scheduler = NS(
+            tp_worker=NS(model_runner=NS(server_args=raw)),
+            world_group=NS(world_size=2, cpu_group=(0, 1)),
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda out, obj, group: out.__setitem__(slice(None), [obj] * len(out)),
+        )
         assert not raw.enable_torch_compile
         get_context().override("test.no_compile", enable_torch_compile=False)
         with pytest.raises(ValueError, match="require --enable-torch-compile"):
@@ -448,16 +456,17 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         # Ranks 0, 1 form stage 0 and ranks 2, 3 stage 1; odd ranks time slower.
         return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
 
+    env = {rank: (True, 0.1, 1.0) for rank in range(4)}
     reports = {
-        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None, 0.1, 1.0)
-        for rank in range(4)
+        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None) for rank in range(4)
     }
 
     def all_gather_object(out, obj, group):
-        out[:] = [reports[rank] for rank in group]
+        # Each rank sends its env first, then its profile.
+        out[:] = [(env if len(obj) == 3 else reports)[rank] for rank in group]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
-    monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda: True)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
     monkeypatch.setattr(
         pp_chunk_scheduler, "get_exec", lambda: NS(graph=NS(enable_torch_compile=True))
     )
@@ -490,7 +499,8 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
     assert all(model == models[0] for model in models)
     # One rank's bad or differing value fails every rank after the gather,
     # instead of leaving the others waiting in it.
-    agreed = reports[3]
+    calls = []
+    policy._run_one = lambda **kw: calls.append(kw) or 1.0
     for knobs, match in (
         ((-1.0, 1.0), "SLACK must be finite and nonnegative"),
         ((math.nan, 1.0), "SLACK must be finite and nonnegative"),
@@ -501,9 +511,56 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         ((0.2, 1.0), "must be the same on every rank"),
         ((0.1, 2.0), "must be the same on every rank"),
     ):
-        reports[3] = (*agreed[:2], *knobs)
+        env[3] = (True, *knobs)
         with pytest.raises(ValueError, match=match):
             profile_and_install_cost_model(scheduler)
+    assert not calls
+
+
+@pytest.mark.parametrize("flags", [(True, False), (False, True)])
+def test_dynamic_chunks_mismatch_fails_every_rank_before_profiling(monkeypatch, flags):
+    """A rank with dynamic chunks off must not leave its peers waiting in a
+    collective; every rank fails at startup instead."""
+    sent = []
+
+    def all_gather_object(out, obj, group):
+        sent.append(obj[0])
+        out[:] = [(flag, *obj[1:]) for flag in flags]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
+    for rank, flag in enumerate(flags):
+        monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", str(int(flag)))
+        runner = MagicMock()
+        scheduler = NS(
+            tp_worker=NS(model_runner=runner),
+            world_group=NS(world_size=2, cpu_group=(0, 1)),
+        )
+        with pytest.raises(ValueError, match="DYNAMIC_CHUNKS must be the same"):
+            profile_and_install_cost_model(scheduler)
+        runner.compile_policy._run_one.assert_not_called()
+    assert sent == list(flags)
+
+
+def test_dynamic_chunks_off_on_every_rank_skips_profiling(monkeypatch):
+    monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "0")
+    gathered = []
+
+    def all_gather_object(out, obj, group):
+        gathered.append(obj)
+        out[:] = [obj] * len(out)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
+    runner = MagicMock()
+    scheduler = NS(
+        tp_worker=NS(model_runner=runner),
+        world_group=NS(world_size=2, cpu_group=(0, 1)),
+    )
+    profile_and_install_cost_model(scheduler)
+    assert [dynamic for dynamic, _, _ in gathered] == [False]
+    runner.compile_policy._run_one.assert_not_called()
+    assert "_tpu_pp_chunk_cost" not in vars(scheduler)
 
 
 if __name__ == "__main__":
