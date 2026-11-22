@@ -191,7 +191,7 @@ def _dot_fp8_scaled_to_ref(
     bm = _pick_strip(rows, 64)
     # Use tn=1024 (bm<=16) / tn=512 (bm==32) so B<=32 LC decodes cut x_ref VMEM re-reads 2-4x
     # while still keeping <= 16 f32 accumulator VREGs (0/0 LLO spills); bm==64 keeps _DOT_TN=256.
-    max_tn = min(1024, max(_DOT_TN, (16 // max(bm // 8, 1)) * 128))
+    max_tn = 1024 if bm <= 16 else (512 if bm <= 32 else _DOT_TN)
     tiles: list[tuple[int, int]] = []
     if n_cols <= 2048 and (max_tn > _DOT_TN or n_cols % _DOT_TN != 0):
         cn = 0
@@ -2934,7 +2934,7 @@ def get_attn_oproj_ar_res_norm_op(world_size: int) -> Callable:
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
                 def _local(st, ga, wo, ws, a, b, pg):
                     return attn_oproj_ar_res_norm_jax(
-                        st, ga, wo, ws[0], a, b, pg,
+                        st, ga, wo, ws, a, b, pg,
                         world_size=world_size,
                         pa_eps=float(pa_eps),
                         pre_ff_eps=float(pre_ff_eps),
@@ -3020,7 +3020,7 @@ def get_attn_to_moe_bridge_op(
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
                 def _local(st, ga, wo, ws, a, b, pfg, wp, wps, wr, peg):
                     return attn_to_moe_bridge_jax(
-                        st, ga, wo, ws[0], a, b, pfg, wp, wps, wr, peg,
+                        st, ga, wo, ws, a, b, pfg, wp, wps, wr, peg,
                         world_size=world_size,
                         pa_eps=float(pa_eps),
                         pre_ff_eps=float(pre_ff_eps),

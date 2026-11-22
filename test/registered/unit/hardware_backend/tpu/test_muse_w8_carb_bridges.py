@@ -1441,3 +1441,115 @@ def test_tp16_bridge2b_norm_before_s3_parity_and_export() -> None:
                     sd((H_FULL, 512 * 16), jnp.float8_e4m3fn),
                     sd(s_g, jnp.float32),
                 )
+
+
+
+
+def test_bridge_op_wrappers_accept_1d_and_2d_fp8_scales() -> None:
+    """Verify ALL cpu_export_jax_op get_*_op wrappers trace cleanly with BOTH 1D (N_local,) and 2D (1, N_local) scales."""
+    from unittest import mock
+
+    jax = pytest.importorskip("jax")
+    from jax.sharding import Mesh
+
+    import sglang_tpu.kernels.decode_collective_bridges as dcb
+    import sglang_tpu.kernels.decode_collective_bridges_carb as dcbc
+    import sglang_tpu.pallas_jax_op as pjo
+    from sglang_tpu.kernels.decode_collective_bridges import (
+        get_attn_oproj_ar_res_norm_op,
+        get_attn_to_moe_bridge_op,
+        get_fp8_dual_qkv_gate_op,
+        get_moe_post_ag_res_norm_op,
+        get_moe_post_ag_res_only_op,
+        get_moe_to_attn_bridge_op,
+        get_post_attn_to_moe_bridge_op,
+    )
+    from sglang_tpu.kernels.decode_collective_bridges_carb import (
+        get_attn_to_moe_bridge_router_topk_op,
+        get_moe_to_attn_direct_qkv_epi_bridge_op,
+        get_moe_to_attn_overlap_bridge_op,
+    )
+
+    devs = jax.devices()
+    if len(devs) < 16:
+        pytest.skip(f"Need >= 16 CPU devices, got {len(devs)}")
+
+    def _fake_mesh(world_size: int):
+        return Mesh(np.array(devs[:world_size]), ("model",))
+
+    def _cpu_placeholder(aval, sharding, mesh):
+        from torch_tpu._internal.pallas import pallas as pallas_impl
+
+        dt = pallas_impl.JAX_TO_TORCH_DTYPE_MAP[aval.dtype]
+        spec = getattr(sharding, "spec", None)
+        sh = pjo._convert_partitioned_shape(aval.shape, mesh, spec, lambda s, a: s // a)
+        return torch.empty(sh, dtype=dt, device="cpu")
+
+    # Clear op caches inside this test so _get_tp_mesh mock applies even if earlier tests ran.
+    with (
+        mock.patch.dict(dcb._ATTN_OPROJ_AR_RN_OPS, {}, clear=True),
+        mock.patch.dict(dcb._ATTN_TO_MOE_OPS, {}, clear=True),
+        mock.patch.dict(dcb._MOE_POST_AG_RN_OPS, {}, clear=True),
+        mock.patch.dict(dcb._MOE_POST_AG_RO_OPS, {}, clear=True),
+        mock.patch.dict(dcb._MOE_TO_ATTN_QKVG_OPS, {}, clear=True),
+        mock.patch.dict(dcb._POST_ATTN_TO_MOE_OPS, {}, clear=True),
+        mock.patch.object(dcb, "_DUAL_QKVG_OP", None),
+        mock.patch.dict(dcbc._ATTN_TO_MOE_RTOPK_OPS, {}, clear=True),
+        mock.patch.dict(dcbc._MOE_TO_ATTN_OVERLAP_OPS, {}, clear=True),
+        mock.patch.dict(dcbc._MOE_TO_ATTN_DIRECT_QKV_OPS, {}, clear=True),
+        mock.patch.object(dcb, "_get_tp_mesh", side_effect=_fake_mesh),
+        mock.patch.object(dcbc, "_get_tp_mesh", side_effect=_fake_mesh),
+        mock.patch.object(pjo, "_torch_placeholder", side_effect=_cpu_placeholder),
+    ):
+        B, H = 64, 8192
+        for tp in (8, 16):
+            o_in = H // tp
+            hp = 4096 // tp
+            post_c = H // tp
+            qkv_c = 1280 if tp == 8 else 640
+            g_c = 1024 if tp == 8 else 512
+
+            st = torch.empty((B, H), dtype=torch.float32)
+            ga = torch.empty((B, o_in), dtype=torch.bfloat16)
+            ao = torch.empty((B, H), dtype=torch.bfloat16)
+            wo = torch.empty((o_in, H), dtype=torch.float8_e4m3fn)
+            v_h = torch.empty((H,), dtype=torch.float32)
+            wp = torch.empty((H, hp), dtype=torch.float8_e4m3fn)
+            wr = torch.empty((H, 256), dtype=torch.bfloat16)
+            rb = torch.empty((256,), dtype=torch.float32)
+            v_hp = torch.empty((4096,), dtype=torch.float32)
+            mo = torch.empty((B, 4096), dtype=torch.bfloat16)
+            wpost = torch.empty((4096, post_c), dtype=torch.float8_e4m3fn)
+            wq = torch.empty((H, qkv_c), dtype=torch.float8_e4m3fn)
+            wg = torch.empty((H, g_c), dtype=torch.float8_e4m3fn)
+
+            for sc_1d in (True, False):
+                ws = torch.empty((H,) if sc_1d else (1, H), dtype=torch.float32)
+                wps = torch.empty((hp,) if sc_1d else (1, hp), dtype=torch.float32)
+                spost = torch.empty((post_c,) if sc_1d else (1, post_c), dtype=torch.float32)
+                sq = torch.empty((qkv_c,) if sc_1d else (1, qkv_c), dtype=torch.float32)
+                sg = torch.empty((g_c,) if sc_1d else (1, g_c), dtype=torch.float32)
+
+                assert get_attn_oproj_ar_res_norm_op(tp)._abstract_fn(st, ga, wo, ws, v_h, v_h, v_h, 1e-5, 1e-5, False) is not None
+                assert get_attn_to_moe_bridge_op(tp)._abstract_fn(st, ga, wo, ws, v_h, v_h, v_h, wp, wps, wr, v_hp, 1e-5, 1e-5, False, 1.0, 1e-5, False) is not None
+                assert get_post_attn_to_moe_bridge_op(tp)._abstract_fn(st, ao, v_h, v_h, v_h, wp, wps, wr, v_hp, 1e-5, 1e-5, False, 1.0, 1e-5, False) is not None
+                assert get_moe_post_ag_res_norm_op(tp, sharded_moe_in=False)._abstract_fn(st, mo, wpost, spost, v_h, v_h, v_h, v_h, 1e-5, True, 1e-5, False) is not None
+                assert get_moe_post_ag_res_only_op(tp, sharded_moe_in=False)._abstract_fn(st, mo, wpost, spost, v_h, v_h, v_h, 1e-5, True) is not None
+                assert get_moe_to_attn_bridge_op(tp, sharded_moe_in=False)._abstract_fn(st, mo, wpost, spost, v_h, v_h, v_h, v_h, wq, sq, wg, sg, 1e-5, True, 1e-5, False) is not None
+                assert get_fp8_dual_qkv_gate_op()._abstract_fn(ao, wq, sq, wg, sg) is not None
+                if tp == 8:
+                    assert get_attn_to_moe_bridge_router_topk_op(tp)._abstract_fn(st, ga, wo, ws, v_h, v_h, v_h, wp, wps, wr, rb, v_hp, 1e-5, 1e-5, False, 1.0, 1e-15, 1.0, 1e-5, False) is not None
+                    assert get_moe_to_attn_overlap_bridge_op(tp)._abstract_fn(st, mo, wpost, spost, v_h, v_h, v_h, v_h, wq, sq, wg, sg, 1e-5, True, 1e-5, False) is not None
+                    assert get_moe_to_attn_direct_qkv_epi_bridge_op(tp, has_rope=True)._abstract_fn(st, mo, wpost, spost, v_h, v_h, v_h, v_h, wq, sq, wg, sg, torch.empty((B, 2, 128), dtype=torch.float32), 1e-5, True, 1e-5, False, 1e-5, 1.0, 1.0, 1.0) is not None
+            # Also verify B in (8, 16, 24, 32, 48) non-64 decode batches (guards B=24 max_tn power-of-2 tiling).
+            ws1 = torch.empty((H,), dtype=torch.float32)
+            wps1 = torch.empty((hp,), dtype=torch.float32)
+            spost1 = torch.empty((post_c,), dtype=torch.float32)
+            sq1 = torch.empty((qkv_c,), dtype=torch.float32)
+            sg1 = torch.empty((g_c,), dtype=torch.float32)
+            for b_s in (8, 16, 24, 32, 48):
+                st_s = torch.empty((b_s, H), dtype=torch.float32)
+                ga_s = torch.empty((b_s, o_in), dtype=torch.bfloat16)
+                mo_s = torch.empty((b_s, 4096), dtype=torch.bfloat16)
+                assert get_attn_to_moe_bridge_op(tp)._abstract_fn(st_s, ga_s, wo, ws1, v_h, v_h, v_h, wp, wps1, wr, v_hp, 1e-5, 1e-5, False, 1.0, 1e-5, False) is not None
+                assert get_moe_to_attn_bridge_op(tp, sharded_moe_in=False)._abstract_fn(st_s, mo_s, wpost, spost1, v_h, v_h, v_h, v_h, wq, sq1, wg, sg1, 1e-5, True, 1e-5, False) is not None
