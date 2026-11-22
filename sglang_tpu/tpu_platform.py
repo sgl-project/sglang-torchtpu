@@ -1824,6 +1824,15 @@ class TpuSRTPlatform(SRTPlatform):
             # which calls init_backend again on the OOT path.
             self._backend_initialized = True
             _register_models()
+
+            if self.is_out_of_tree():
+                from sglang.srt.models.deepseek_v4_mhc import (
+                    register_fused_hc_boundary,
+                )
+
+                from sglang_tpu.models.deepseek_v41.ops.mhc import fused_boundary
+
+                register_fused_hc_boundary(self.get_dispatch_key_name(), fused_boundary)
         self._dp_replica_session = None
 
     def on_warmup_complete(self) -> None:

@@ -81,6 +81,30 @@ tpu_dsv4_live_hc_sublayers
   Remove when: the direct tracer swaps tensors inside named tuples, or
        HcSubLayer reads the parameters through the layer.
 
+tpu_dsv41_prepare_shifted_mhc
+  Why: the fused shifted mHC boundary needs a device-resident packed mix weight.
+  How: AFTER DeepseekV4ForCausalLM.post_load_weights, pack the loaded mix
+       weights into nonpersistent buffers while preserving the FP32 parameters.
+       The startup-only post_load_model seam does not cover online model loads.
+  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+  Remove when: the model exposes a backend-specific post-load weight preparation
+       entry point for startup and online loads.
+
+tpu_dsv41_refresh_shifted_mhc_after_direct_update
+  Why: the raw weight-update endpoint bypasses model.post_load_weights.
+  How: AFTER _model_load_weights_direct, refresh any packed mix weight whose
+       FP32 parameter the update wrote.
+  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+  Remove when: raw weight updates notify the same weight preparation entry
+       point as model.post_load_weights.
+
+tpu_dsv41_legacy_shifted_mhc
+  Why: the legacy TPU platform bypasses the OOT boundary registry.
+  How: AROUND _post_fusion, call the plugin's registered implementation for the
+       same supported boundaries in legacy mode.
+  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+  Remove when: the legacy TPU platform identity is retired.
+
 tpu_dsv4_fence_hc_mix_stats
   Why: deepseek_v4_mhc._mix_stats_impl runs the mixing GEMM on the flattened
        hyper-connection state right after the previous sublayer's post-combine;
@@ -521,6 +545,36 @@ def tpu_dsv4_live_hc_sublayers(original, layer, *args, **kwargs):
     return original(layer, *args, **kwargs)
 
 
+def tpu_dsv41_prepare_shifted_mhc(result, model, is_nextn=False, weight_names=None):
+    if not is_nextn:
+        from sglang_tpu.models.deepseek_v41.ops.mhc import prepare_shifted_mhc
+
+        prepare_shifted_mhc(model)
+
+
+def tpu_dsv41_refresh_shifted_mhc_after_direct_update(result, model, named_tensors):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import (
+        refresh_shifted_mhc_after_direct_update,
+    )
+
+    refresh_shifted_mhc_after_direct_update(model, named_tensors)
+
+
+def tpu_dsv41_legacy_shifted_mhc(original, hc, y, residual, coefficients, next):
+    if next is not None and next.norm_fusable and y.device.type == "tpu":
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            from sglang_tpu.models.deepseek_v41.ops.mhc import fused_boundary
+
+            next_hc = next.resolve_hc()
+            if next_hc is not None:
+                state = fused_boundary(hc, y, residual, coefficients, next, next_hc)
+                if state is not None:
+                    return state
+    return original(hc, y, residual, coefficients, next)
+
+
 def tpu_dsv4_fence_hc_mix_stats(original, hc, x):
     """AROUND deepseek_v4_mhc._mix_stats_impl: an optimization barrier on the
     state first, so XLA does not fold its producer into the GEMM operand."""
@@ -840,6 +894,21 @@ def hook_specs():
         (
             "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase.__init__",
             tpu_dsv4_live_hc_sublayers,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.post_load_weights",
+            tpu_dsv41_prepare_shifted_mhc,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct",
+            tpu_dsv41_refresh_shifted_mhc_after_direct_update,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_mhc._post_fusion",
+            tpu_dsv41_legacy_shifted_mhc,
             HookType.AROUND,
         ),
         (
