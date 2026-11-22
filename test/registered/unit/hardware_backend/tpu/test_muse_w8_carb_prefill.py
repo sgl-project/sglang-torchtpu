@@ -1022,3 +1022,377 @@ def test_ccs_w4_wo_guard_when_kdeep_off():
     ):
         assert _ccs_wo_uses_kdeep_nvfp4() is True
 
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _w9_interpret_context():
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    _dummy_barrier = object()
+    _orig_pallas_call = pl.pallas_call
+    _orig_marc = pltpu.make_async_remote_copy
+    _orig_sig = pl.semaphore_signal
+    _orig_wait = pl.semaphore_wait
+
+    def _interp_pallas_call(*args, **kwargs):
+        kwargs["interpret"] = True
+        return _orig_pallas_call(*args, **kwargs)
+
+    def _interp_marc(*args, **kwargs):
+        did = kwargs.get("device_id")
+        if isinstance(did, dict) and len(did) == 1:
+            kwargs = {**kwargs, "device_id": next(iter(did.values()))}
+        return _orig_marc(*args, **kwargs)
+
+    with (
+        patch.object(pl, "pallas_call", _interp_pallas_call),
+        patch.object(pltpu, "make_async_remote_copy", _interp_marc),
+        patch.object(pltpu, "get_barrier_semaphore", lambda *a, **kw: _dummy_barrier),
+        patch.object(
+            pl,
+            "semaphore_signal",
+            lambda sem, *a, **kw: None if sem is _dummy_barrier else _orig_sig(sem, *a, **kw),
+        ),
+        patch.object(
+            pl,
+            "semaphore_wait",
+            lambda sem, *a, **kw: None if sem is _dummy_barrier else _orig_wait(sem, *a, **kw),
+        ),
+        patch.object(pltpu, "roll", lambda x, shift, axis: jnp.roll(x, shift, axis=axis)),
+    ):
+        yield
+
+def test_a3_v16_tm_half_512_parity():
+    """Verify kernel_a3 v16 tm_half=512 (t_shard=1536, bn=2048) matches reference on 8 devices."""
+    from types import SimpleNamespace
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+
+    devs = jax.devices()
+    assert len(devs) == 8
+    mesh = jax.sharding.Mesh(np.array(devs), ("model",))
+    rng = np.random.default_rng(709)
+    tp_deg, t_shard, k_local, n_dim = 8, 1536, 1024, 8192
+
+    q_np = (rng.standard_normal((tp_deg, tp_deg, t_shard, k_local)) * 0.5).astype(np.float32)
+    q_3d = jnp.asarray(q_np).astype(jnp.float8_e4m3fn)
+    wo_np = (rng.standard_normal((tp_deg, tp_deg, k_local, n_dim)) * 0.25).astype(np.float32)
+    wo_xor = jnp.asarray(wo_np).astype(jnp.float8_e4m3fn)
+    wo_sc = jnp.asarray(rng.uniform(0.5, 1.5, size=(tp_deg, 1, n_dim)).astype(np.float32))
+
+    def _ref_wo(q_loc, w_xor, w_sc):
+        me = jax.lax.axis_index("model")
+        acc = jnp.zeros((t_shard, n_dim), dtype=jnp.float32)
+        for d in range(tp_deg):
+            peer = kernel_a3._a3_v16_step_peer_jax(
+                me, d, tp_deg, step_xors=tuple(range(tp_deg)), parity_stagger=True
+            )
+            all_q = jax.lax.all_gather(q_loc[0], axis_name="model")
+            q_d = jax.lax.dynamic_index_in_dim(all_q, peer, axis=0, keepdims=False)
+            q_d_me = jax.lax.dynamic_index_in_dim(q_d, me, axis=0, keepdims=False)
+            acc = acc + jnp.dot(q_d_me, w_xor[0, d], preferred_element_type=jnp.float32)
+        return (acc * (w_sc[0] * jnp.float32(kernel_a3.STATIC_A3_ACT_SCALE))).astype(
+            jnp.bfloat16
+        )
+
+    def _kern_wo(q_loc, w_xor, w_sc):
+        return kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+            q_loc[0],
+            w_xor[0],
+            w_sc[0],
+            tp_axis="model",
+            bn=2048,
+            opt_wo=True,
+            stage_sends_mode=1,
+        )
+
+    in_specs = (P("model", None, None, None), P("model", None, None, None), P("model", None, None))
+    ref = jax.jit(
+        jax.shard_map(_ref_wo, mesh=mesh, in_specs=in_specs, out_specs=P("model", None), check_vma=False)
+    )(q_3d, wo_xor, wo_sc)
+    with (
+        _w9_interpret_context(),
+        patch.object(
+            tpu_envs,
+            "SGLANG_TPU_MUSE_KERNEL_A3_BN2048",
+            SimpleNamespace(get=lambda: True),
+        ),
+    ):
+        got = jax.jit(
+            jax.shard_map(
+                _kern_wo,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=P("model", None),
+                check_vma=False,
+            )
+        )(q_3d, wo_xor, wo_sc)
+    max_diff = float(jnp.max(jnp.abs(ref.astype(jnp.float32) - got.astype(jnp.float32))))
+    assert max_diff < 1e-3, max_diff
+
+
+def test_d_radical_d_opt3_parity():
+    """Verify D_OPT=3 (algebraic d_fuse_p34 + p_step=256) in pallas_d_radical_4slab."""
+    from types import SimpleNamespace
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import PartitionSpec as P
+
+    from jax import export
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import pallas_d_radical_4slab
+
+    devs = jax.devices()
+    assert len(devs) == 8
+    mesh = jax.sharding.Mesh(np.array(devs), ("model",))
+    rng = np.random.default_rng(711)
+    tp_deg, chunk_size, ag_rows, num_toks_routed, n2_cols, lanes, h_dim, topk = (
+        8,
+        128,
+        64,
+        256,
+        32,
+        128,
+        8192,
+        8,
+    )
+    out_buf = jnp.asarray(
+        (rng.standard_normal((tp_deg, num_toks_routed, n2_cols, lanes)) * 0.2).astype(
+            np.float32
+        )
+    ).astype(jnp.bfloat16)
+    inv_perm = jnp.asarray(
+        rng.integers(0, num_toks_routed, size=(tp_deg, chunk_size, topk), dtype=np.int32)
+    )
+    topk_w = jnp.asarray(
+        rng.uniform(0.05, 0.25, size=(tp_deg, chunk_size, topk)).astype(np.float32)
+    )
+    stream_mid = jnp.asarray(
+        (rng.standard_normal((tp_deg, chunk_size, h_dim)) * 0.4).astype(np.float32)
+    ).astype(jnp.bfloat16)
+    wu = jnp.asarray((rng.standard_normal((4096, h_dim)) * 0.2).astype(np.float32)).astype(
+        jnp.float8_e4m3fn
+    )
+    wus = jnp.asarray(rng.uniform(0.5, 1.5, size=(1, h_dim)).astype(np.float32))
+    pnw = jnp.asarray(rng.uniform(0.8, 1.2, size=(1, h_dim)).astype(np.float32))
+    af = jnp.asarray(rng.uniform(0.9, 1.1, size=(1, h_dim)).astype(np.float32))
+    bf = jnp.asarray(rng.uniform(-0.05, 0.05, size=(1, h_dim)).astype(np.float32))
+    nnw = jnp.asarray(rng.uniform(0.8, 1.2, size=(1, h_dim)).astype(np.float32))
+
+    in_specs = (
+        P("model"),
+        P("model"),
+        P("model"),
+        P("model"),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
+    )
+
+    def _run_d(emit_s32: bool, use_ikag: bool, coal: bool):
+        def _fn(ob, ipc, ltw, sm, wu_, wus_, pnw_, af_, bf_, nnw_):
+            return pallas_d_radical_4slab(
+                ob[0],
+                ipc[0],
+                ltw[0],
+                sm[0],
+                wu_,
+                wus_,
+                pnw_,
+                af_,
+                bf_,
+                nnw_,
+                tok_tile=64,
+                coal_gather=coal,
+                emit_static_fp8_attn_in=emit_s32,
+                in_kernel_ag_rows=ag_rows if use_ikag else 0,
+                ag_axis_name="model" if use_ikag else None,
+                ag_part0_static_fp8=(not emit_s32) if use_ikag else False,
+            )
+
+        out_sp = (
+            (P("model"), P("model"), P("model"))
+            if use_ikag
+            else (P("model"), P("model"))
+        )
+        return jax.jit(
+            jax.shard_map(
+                _fn,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_sp,
+                check_vma=False,
+            )
+        )
+
+    # TPU v7x Mosaic HLO check with D_OPT=3 + coal_gather=True (+ _do3 tag)
+    with patch.object(
+        tpu_envs, "SGLANG_TPU_MUSE_KERNEL_D_OPT", SimpleNamespace(get=lambda: 3), create=True
+    ):
+        for emit_s32, use_ikag in ((False, False), (True, False), (True, True), (False, True)):
+            exp = export.export(_run_d(emit_s32, use_ikag, True), platforms=("tpu",))(
+                *[
+                    jax.ShapeDtypeStruct(x.shape, x.dtype)
+                    for x in (out_buf, inv_perm, topk_w, stream_mid, wu, wus, pnw, af, bf, nnw)
+                ]
+            )
+            assert "_do3" in exp.mlir_module()
+
+    for emit_s32, use_ikag in ((False, False), (True, False), (False, True)):
+        with (
+            _w9_interpret_context(),
+            patch.object(
+                tpu_envs,
+                "SGLANG_TPU_MUSE_KERNEL_D_OPT",
+                SimpleNamespace(get=lambda: 0),
+                create=True,
+            ),
+        ):
+            ref = _run_d(emit_s32, use_ikag, False)(
+                out_buf, inv_perm, topk_w, stream_mid, wu, wus, pnw, af, bf, nnw
+            )
+        with (
+            _w9_interpret_context(),
+            patch.object(
+                tpu_envs,
+                "SGLANG_TPU_MUSE_KERNEL_D_OPT",
+                SimpleNamespace(get=lambda: 3),
+                create=True,
+            ),
+        ):
+            got = _run_d(emit_s32, use_ikag, False)(
+                out_buf, inv_perm, topk_w, stream_mid, wu, wus, pnw, af, bf, nnw
+            )
+        if not isinstance(ref, tuple):
+            ref, got = (ref,), (got,)
+        for r_t, g_t in zip(ref, got):
+            assert not bool(jnp.any(jnp.isnan(g_t.astype(jnp.float32))))
+            rf, gf = r_t.astype(jnp.float32).reshape(-1), g_t.astype(jnp.float32).reshape(-1)
+            cos = float(jnp.sum(rf * gf) / (jnp.linalg.norm(rf) * jnp.linalg.norm(gf)))
+            assert cos > 0.9999, (emit_s32, use_ikag, cos)
+
+
+def test_gate_static_fp8_quant_xor_a2a_parity():
+    """Verify A3_KDEEP_WO=3 fused prologue+push-A2A matches quant + pallas_async_a2a_xor_3d."""
+    from jax import export
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+    from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
+        pallas_async_a2a_xor_3d,
+        pallas_gate_static_fp8_quant_xor_a2a,
+    )
+
+    devs = jax.devices()
+    assert len(devs) == 8
+    mesh = jax.sharding.Mesh(np.array(devs), ("model",))
+    rng = np.random.default_rng(713)
+    tp_deg, c_rows, k_local = 8, 128, 1024
+    t_len = tp_deg * c_rows
+
+    gate = jnp.asarray(
+        (rng.standard_normal((t_len, tp_deg * k_local)) * 0.5).astype(np.float32)
+    ).astype(jnp.bfloat16)
+    attn_unpacked = jnp.asarray(
+        (rng.standard_normal((t_len, tp_deg * k_local)) * 0.5).astype(np.float32)
+    ).astype(jnp.bfloat16)
+    num_q_slices = k_local // 128
+    attn_rpa = jnp.asarray(
+        (rng.standard_normal((1, t_len, tp_deg * num_q_slices, 2, 128)) * 0.5).astype(
+            np.float32
+        )
+    ).astype(jnp.bfloat16)
+
+    for use_rpa in (False, True):
+        in_a = attn_rpa if use_rpa else attn_unpacked
+        a_spec = P(None, None, "model", None, None) if use_rpa else P(None, "model")
+        for use_ps in (False, True):
+            def _ref_body(a_c, g_c):
+                q_loc = kernel_a3.pallas_gate_static_fp8_quant(
+                    a_c,
+                    g_c,
+                    tm=128,
+                    head_norm_eps=1e-6,
+                    rpa_packed_out=use_rpa,
+                ).reshape(tp_deg, c_rows, k_local)
+                return pallas_async_a2a_xor_3d(
+                    q_loc, tp_axis="model", parity_stagger=use_ps
+                )
+
+            def _fused_body(a_c, g_c):
+                return pallas_gate_static_fp8_quant_xor_a2a(
+                    a_c,
+                    g_c,
+                    tp_axis="model",
+                    tp_deg=tp_deg,
+                    tm=64,
+                    head_norm_eps=1e-6,
+                    rpa_packed_out=use_rpa,
+                    parity_stagger=use_ps,
+                )
+
+            if not use_ps:
+                fused_exp = jax.jit(
+                    jax.shard_map(
+                        _fused_body,
+                        mesh=mesh,
+                        in_specs=(a_spec, P(None, "model")),
+                        out_specs=P(None, None, "model"),
+                        check_vma=False,
+                    )
+                )
+                exp = export.export(fused_exp, platforms=("tpu",))(
+                    jax.ShapeDtypeStruct(in_a.shape, in_a.dtype),
+                    jax.ShapeDtypeStruct(gate.shape, gate.dtype),
+                )
+                assert "pallas_a3_pro_xor_a2a" in exp.mlir_module()
+
+            with _w9_interpret_context():
+                ref_sm = jax.jit(
+                    jax.shard_map(
+                        _ref_body,
+                        mesh=mesh,
+                        in_specs=(a_spec, P(None, "model")),
+                        out_specs=P(None, None, "model"),
+                        check_vma=False,
+                    )
+                )
+                fused_sm = jax.jit(
+                    jax.shard_map(
+                        _fused_body,
+                        mesh=mesh,
+                        in_specs=(a_spec, P(None, "model")),
+                        out_specs=P(None, None, "model"),
+                        check_vma=False,
+                    )
+                )
+                ref_out = ref_sm(in_a, gate)
+                fused_out = fused_sm(in_a, gate)
+            diff = float(
+                jnp.max(jnp.abs(ref_out.astype(jnp.float32) - fused_out.astype(jnp.float32)))
+            )
+            assert diff == 0.0, (use_rpa, use_ps, diff)

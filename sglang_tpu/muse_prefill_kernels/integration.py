@@ -1684,6 +1684,7 @@ def _ops(
         from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
             pallas_a3_wo_kdeep_ccs_last_a2a,
             pallas_async_a2a_xor_3d,
+            pallas_gate_static_fp8_quant_xor_a2a,
         )
 
         pro_eps = head_norm_eps if (fused_glue or a3_rpa_out) else None
@@ -1704,6 +1705,15 @@ def _ops(
             ).reshape(tp_d_mesh, c_rows, k_loc_c)
 
         def _pro_and_a2a_body(attn_c: jax.Array, gate_c: jax.Array) -> jax.Array:
+            if a3_kdeep_mode >= 3:
+                return pallas_gate_static_fp8_quant_xor_a2a(
+                    attn_c,
+                    gate_c,
+                    tp_axis=_AXIS,
+                    tp_deg=tp_d_mesh,
+                    head_norm_eps=pro_eps,
+                    rpa_packed_out=a3_rpa_out,
+                )
             q_loc = _pro_only_body(attn_c, gate_c)
             return pallas_async_a2a_xor_3d(q_loc, tp_axis=_AXIS)
 
@@ -1758,7 +1768,13 @@ def _ops(
         ps_tag = f"_ss{ss_val}" if ss_val in (1, 2) else ""
         pro_tag = glue + ("_rpao" if a3_rpa_out else "") + ("_zsp" if a3_zsp else "")
         a3_pro_a2a_chunk_op = export(
-            "a3_pro_a2a_chunk" + pro_tag + ps_tag, a3_pro_a2a_chunk, 2, 1
+            "a3_pro_a2a_chunk"
+            + pro_tag
+            + ("_fpro" if a3_kdeep_mode >= 3 else "")
+            + ps_tag,
+            a3_pro_a2a_chunk,
+            2,
+            1,
         )
         a3_pro_last_chunk_op = export(
             "a3_pro_last_chunk" + pro_tag, a3_pro_last_chunk, 2, 1

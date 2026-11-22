@@ -38,7 +38,9 @@ from sglang_tpu.envs import envs
 from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
 from sglang_tpu.muse_prefill_kernels.attn_kernels.kernel_a1 import pallas_axis_index_1d
 from sglang_tpu.muse_prefill_kernels.attn_kernels.kernel_a3 import (
+    STATIC_A3_ACT_MULT,
     STATIC_A3_ACT_SCALE,
+    _dual_head_rmsnorm_128,
     pallas_gate_static_fp8_quant,
 )
 from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b1 import (
@@ -215,6 +217,222 @@ def pallas_async_a2a_xor_3d(
         ),
         name=f"pallas_a3_xor_a2a_r{c_rows}{'_ps' if use_ps else ''}",
     )(src_3d)
+
+
+def pallas_gate_static_fp8_quant_xor_a2a(
+    normed_attn_out: jax.Array,
+    gate: jax.Array,
+    *,
+    tp_axis: str = "model",
+    tp_deg: int = 8,
+    tm: int = 256,
+    vmem_limit_mb: int = 32,
+    head_norm_eps: float | None = None,
+    rpa_packed_out: bool = False,
+    collective_id: int = 35,
+    parity_stagger: bool | None = None,
+) -> jax.Array:
+    """Fused prologue + direct VMEM->peer-HBM XOR push All-to-All (`A3_KDEEP_WO=3`).
+
+    Computes `clip(sigmoid(gate) * rmsnorm(attn) * 32.0, -448, 448) -> fp8_e4m3fn` directly
+    into a double-buffered `(2, tm_c, k_local)` VMEM tile in peer-push order (`d = 1..tp-1, 0`)
+    and pushes each tile straight to peer `dst_hbm[d]` via `make_async_remote_copy`, removing
+    both the intermediate `q_loc` HBM write+read round-trip and the standalone A2A launch.
+    """
+    t_len, k_local = gate.shape
+    assert t_len % tp_deg == 0, (t_len, tp_deg)
+    c_rows = t_len // tp_deg
+    use_ps = _resolve_parity_stagger(parity_stagger, tp_deg)
+    zs_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_A3_ZERO_SPILL_PROLOGUE", None)
+    use_zero_spill = bool(zs_env is not None and zs_env.get())
+    max_tm = min(128 if use_zero_spill else tm, c_rows)
+    tm_c = next(
+        t for t in (512, 256, 128, 64, 32, 16, 8) if t <= max_tm and c_rows % t == 0
+    )
+    n_tiles_c = c_rows // tm_c
+    total_steps = tp_deg * n_tiles_c
+    is_rpa_packed = bool(rpa_packed_out and normed_attn_out.size != t_len * k_local)
+
+    me_out = lax.axis_index(tp_axis)
+    if tp_deg > 1:
+        peers = jnp.stack(
+            [
+                _kdeep_step_peer_jax(me_out, d, tp_deg, parity_stagger=use_ps)
+                for d in range(1, tp_deg)
+            ]
+            + [me_out]
+        ).astype(jnp.int32)
+    else:
+        peers = jnp.zeros((1,), dtype=jnp.int32)
+
+    if is_rpa_packed:
+        num_q_slices = k_local // 128
+        attn_arg = normed_attn_out.reshape(1, t_len, num_q_slices, 2, 128)
+        attn_spec = pl.BlockSpec(
+            (1, tm_c, num_q_slices, 2, 128),
+            lambda d_i, t_i, p_ref: (0, p_ref[d_i] * n_tiles_c + t_i, 0, 0, 0),
+        )
+    else:
+        num_q_slices = 0
+        attn_arg = normed_attn_out.reshape(t_len, k_local)
+        attn_spec = pl.BlockSpec(
+            (tm_c, k_local),
+            lambda d_i, t_i, p_ref: (p_ref[d_i] * n_tiles_c + t_i, 0),
+        )
+    gate_spec = pl.BlockSpec(
+        (tm_c, k_local),
+        lambda d_i, t_i, p_ref: (p_ref[d_i] * n_tiles_c + t_i, 0),
+    )
+
+    def _quant_push_kernel(peers_ref, attn_ref, gate_ref, dst_ref, q_vmem, tile_sems, rsems):
+        me = lax.axis_index(tp_axis)
+        d_idx = pl.program_id(0)
+        t_idx = pl.program_id(1)
+        step = d_idx * n_tiles_c + t_idx
+        slot = lax.rem(step, 2)
+
+        if tp_deg > 1:
+
+            @pl.when(step == 0)
+            def _barrier():
+                bar = pltpu.get_barrier_semaphore()
+                for kk in range(1, tp_deg):
+                    pl.semaphore_signal(bar, device_id={tp_axis: lax.rem(me + kk, tp_deg)})
+                pl.semaphore_wait(bar, tp_deg - 1)
+
+        @pl.when(step >= 2)
+        def _wait_prev_slot():
+            pltpu.make_async_copy(
+                q_vmem.at[pl.ds(slot, 1)],
+                q_vmem.at[pl.ds(slot, 1)],
+                tile_sems.at[slot],
+            ).wait()
+
+        if is_rpa_packed:
+            lane = lax.broadcasted_iota(jnp.int32, (tm_c, 128), 1)
+            is_lo = lane < 64
+            mask_lo = is_lo.astype(jnp.float32)
+            mask_hi = 1.0 - mask_lo
+            attn_words = attn_ref.bitcast(jnp.uint32).at[0].reshape(
+                tm_c * num_q_slices, 128
+            )
+            for s in range(num_q_slices):
+                c0, c1 = s * 128, (s + 1) * 128
+                w = attn_words[pl.ds(s, tm_c, stride=num_q_slices)]
+                even_raw = pltpu.bitcast(lax.shift_left(w, jnp.uint32(16)), jnp.float32)
+                odd_raw = pltpu.bitcast(w & jnp.uint32(0xFFFF0000), jnp.float32)
+                if s < num_q_slices // 2:
+                    pair_f32 = jnp.where(
+                        is_lo, even_raw, pltpu.roll(odd_raw, shift=64, axis=1)
+                    )
+                else:
+                    pair_f32 = jnp.where(
+                        is_lo, pltpu.roll(even_raw, shift=64, axis=1), odd_raw
+                    )
+                pair_f32 = pair_f32 + 0.0
+                if head_norm_eps is not None:
+                    pair_bf16 = _dual_head_rmsnorm_128(
+                        pair_f32, is_lo, mask_lo, mask_hi, 1.0, eps=head_norm_eps
+                    ).astype(jnp.bfloat16)
+                else:
+                    pair_bf16 = pair_f32.astype(jnp.bfloat16)
+                g_sig = jax.nn.sigmoid(gate_ref[:, c0:c1].astype(jnp.float32)).astype(
+                    jnp.bfloat16
+                )
+                gf = (g_sig * pair_bf16).astype(jnp.float32) * STATIC_A3_ACT_MULT
+                q_vmem[slot, :, c0:c1] = jnp.clip(gf, -_FP8_MAX, _FP8_MAX).astype(
+                    jnp.float8_e4m3fn
+                )
+        else:
+            sub_r = min(128, tm_c)
+            lane = lax.broadcasted_iota(jnp.int32, (sub_r, 128), 1)
+            is_lo = lane < 64
+            mask_lo = is_lo.astype(jnp.float32)
+            mask_hi = 1.0 - mask_lo
+            for r0 in range(0, tm_c, sub_r):
+                r1 = r0 + sub_r
+                for c0 in range(0, k_local, 128):
+                    c1 = c0 + 128
+                    a_f32 = attn_ref[r0:r1, c0:c1].astype(jnp.float32)
+                    if head_norm_eps is not None:
+                        a_bf16 = _dual_head_rmsnorm_128(
+                            a_f32, is_lo, mask_lo, mask_hi, 1.0, eps=head_norm_eps
+                        ).astype(jnp.bfloat16)
+                    else:
+                        a_bf16 = a_f32.astype(jnp.bfloat16)
+                    g_sig = jax.nn.sigmoid(
+                        gate_ref[r0:r1, c0:c1].astype(jnp.float32)
+                    ).astype(jnp.bfloat16)
+                    gf = (g_sig * a_bf16).astype(jnp.float32) * STATIC_A3_ACT_MULT
+                    q_vmem[slot, r0:r1, c0:c1] = jnp.clip(
+                        gf, -_FP8_MAX, _FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+
+        if tp_deg > 1:
+
+            @pl.when(d_idx < tp_deg - 1)
+            def _push_remote():
+                d_val = d_idx + 1
+                peer = peers_ref[d_idx]
+                pltpu.make_async_remote_copy(
+                    src_ref=q_vmem.at[pl.ds(slot, 1)],
+                    dst_ref=dst_ref.at[pl.ds(d_val, 1), pl.ds(t_idx * tm_c, tm_c), :],
+                    send_sem=tile_sems.at[slot],
+                    recv_sem=rsems.at[d_val],
+                    device_id={tp_axis: peer},
+                ).start()
+
+        @pl.when(d_idx == tp_deg - 1)
+        def _copy_local():
+            pltpu.make_async_copy(
+                src_ref=q_vmem.at[pl.ds(slot, 1)],
+                dst_ref=dst_ref.at[pl.ds(0, 1), pl.ds(t_idx * tm_c, tm_c), :],
+                sem=tile_sems.at[slot],
+            ).start()
+
+        @pl.when(step == total_steps - 1)
+        def _drain():
+            for ks in range(min(2, total_steps)):
+                pltpu.make_async_copy(
+                    q_vmem.at[pl.ds(ks, 1)],
+                    q_vmem.at[pl.ds(ks, 1)],
+                    tile_sems.at[ks],
+                ).wait()
+            if tp_deg > 1:
+                for dd in range(1, tp_deg):
+                    pltpu.make_async_copy(
+                        dst_ref.at[pl.ds(dd, 1), pl.ds(0, c_rows), :],
+                        dst_ref.at[pl.ds(dd, 1), pl.ds(0, c_rows), :],
+                        rsems.at[dd],
+                    ).wait()
+
+    any_spec = pl.BlockSpec(memory_space=getattr(pltpu, "ANY", pltpu.HBM))
+    tag = (
+        f"pallas_a3_pro_xor_a2a_r{c_rows}_tm{tm_c}"
+        + ("_rpao" if is_rpa_packed else "")
+        + ("_ps" if use_ps else "")
+    )
+    return pl.pallas_call(
+        _quant_push_kernel,
+        out_shape=jax.ShapeDtypeStruct((tp_deg, c_rows, k_local), jnp.float8_e4m3fn),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(tp_deg, n_tiles_c),
+            in_specs=[attn_spec, gate_spec],
+            out_specs=any_spec,
+            scratch_shapes=[
+                pltpu.VMEM((2, tm_c, k_local), jnp.float8_e4m3fn),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((tp_deg,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary", "arbitrary"),
+            collective_id=collective_id if tp_deg > 1 else None,
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=tag,
+    )(peers, attn_arg, gate)
 
 
 def _kdeep_dot_tile(
@@ -889,6 +1107,10 @@ def pallas_d_radical_4slab(
     gathered_dtype = (
         jnp.float8_e4m3fn if ag_part0_is_s32_fp8 else next_in_dtype
     )
+    d_opt_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_D_OPT", None)
+    eff_d_opt = int(d_opt_env.get() or 0) if d_opt_env is not None else 0
+    d_fast_dma = (eff_d_opt & 1) != 0
+    d_fuse_p34 = ((eff_d_opt & 2) != 0) and not emit_fp8_attn_in
     use_salu_overlap = envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP.get()
     eff_salu_ovlp = use_salu_overlap and (tok_tile_eff % num_slabs == 0) and not coal_gather
 
@@ -1101,7 +1323,7 @@ def pallas_d_radical_4slab(
             u_sc = None
 
         # Phase 2: Per-slab waited wunpool dot + post_feedforward_layernorm variance
-        if eff_salu_ovlp:
+        if eff_salu_ovlp and not d_fast_dma:
 
             @pl.when(step == 0)
             def _wait_w_all():
@@ -1115,8 +1337,12 @@ def pallas_d_radical_4slab(
         next_s_k = jnp.minimum(step + 1, num_steps - 1)
         t_per_slab_k = tok_tile_eff // num_slabs
         sq_ffn_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
+        if d_fuse_p34:
+            s_aa_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
+            s_ab_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
+            s_bb_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
         for s in range(num_slabs):
-            if not eff_salu_ovlp:
+            if not eff_salu_ovlp or d_fast_dma:
 
                 @pl.when(step == 0)
                 def _wait_w_slab(s=s):
@@ -1156,6 +1382,12 @@ def pallas_d_radical_4slab(
                 fw_sub = y_sub * vecs_ref[1:2, gn0:gn1]
                 new_stream_out_ref[:, gn0:gn1] = fw_sub
                 sq_ffn_128 = sq_ffn_128 + vpu_tree_sum_128(fw_sub * fw_sub)
+                if d_fuse_p34:
+                    a_smid = vecs_ref[2:3, gn0:gn1] * stream_mid_ref[:, gn0:gn1]
+                    b_fw = vecs_ref[3:4, gn0:gn1] * fw_sub
+                    s_aa_128 = s_aa_128 + vpu_tree_sum_128(a_smid * a_smid)
+                    s_ab_128 = s_ab_128 + vpu_tree_sum_128(a_smid * b_fw)
+                    s_bb_128 = s_bb_128 + vpu_tree_sum_128(b_fw * b_fw)
             if eff_salu_ovlp:
                 _start_step_range(
                     next_s_k,
@@ -1169,29 +1401,44 @@ def pallas_d_radical_4slab(
             + jnp.float32(post_norm_eps)
         )
 
-        # Phase 3: Gated residual + next_layer.input_layernorm variance
-        sq_next_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
-        amax_next_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
-        for s in range(num_slabs):
-            c0, c1 = s * slab_w, (s + 1) * slab_w
-            fw_s = new_stream_out_ref[:, c0:c1]
-            branch_s = (fw_s * inv_rms_ffn).astype(jnp.bfloat16).astype(jnp.float32)
-            new_s = (
-                vecs_ref[2:3, c0:c1] * stream_mid_ref[:, c0:c1]
-                + vecs_ref[3:4, c0:c1] * branch_s
+        # Phase 3: Algebraic residual-norm variance (`D_OPT & 2`) or full Phase 3 pass.
+        if d_fuse_p34:
+            sum_aa = jnp.sum(s_aa_128, axis=1, keepdims=True)
+            sum_ab = jnp.sum(s_ab_128, axis=1, keepdims=True)
+            sum_bb = jnp.sum(s_bb_128, axis=1, keepdims=True)
+            sq_next_row = jnp.maximum(
+                jnp.float32(0.0),
+                sum_aa
+                + jnp.float32(2.0) * inv_rms_ffn * sum_ab
+                + (inv_rms_ffn * inv_rms_ffn) * sum_bb,
             )
-            new_stream_out_ref[:, c0:c1] = new_s
-            sq_next_128 = sq_next_128 + vpu_tree_sum_128(new_s * new_s)
-            if emit_fp8_attn_in:
-                unscaled_next = new_s * vecs_ref[4:5, c0:c1]
-                amax_next_128 = jnp.maximum(
-                    amax_next_128, vpu_tree_max_128(jnp.abs(unscaled_next))
+            inv_rms_next = lax.rsqrt(
+                sq_next_row * jnp.float32(inv_h) + jnp.float32(rms_eps)
+            )
+        else:
+            p_step_3 = 256 if d_fast_dma else slab_w
+            sq_next_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
+            amax_next_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
+            for c0 in range(0, h_dim, p_step_3):
+                c1 = c0 + p_step_3
+                fw_s = new_stream_out_ref[:, c0:c1]
+                branch_s = (fw_s * inv_rms_ffn).astype(jnp.bfloat16).astype(jnp.float32)
+                new_s = (
+                    vecs_ref[2:3, c0:c1] * stream_mid_ref[:, c0:c1]
+                    + vecs_ref[3:4, c0:c1] * branch_s
                 )
+                new_stream_out_ref[:, c0:c1] = new_s
+                sq_next_128 = sq_next_128 + vpu_tree_sum_128(new_s * new_s)
+                if emit_fp8_attn_in:
+                    unscaled_next = new_s * vecs_ref[4:5, c0:c1]
+                    amax_next_128 = jnp.maximum(
+                        amax_next_128, vpu_tree_max_128(jnp.abs(unscaled_next))
+                    )
 
-        inv_rms_next = lax.rsqrt(
-            jnp.sum(sq_next_128, axis=1, keepdims=True) * jnp.float32(inv_h)
-            + jnp.float32(rms_eps)
-        )
+            inv_rms_next = lax.rsqrt(
+                jnp.sum(sq_next_128, axis=1, keepdims=True) * jnp.float32(inv_h)
+                + jnp.float32(rms_eps)
+            )
 
         # If in-kernel push-AG is active, drain previous slot or launch Part-0 remote push at step == steps_ag!
         if use_push_ag:
@@ -1270,7 +1517,27 @@ def pallas_d_radical_4slab(
             else:
                 dst_next_ref[:, c0:c1] = val
 
-        if emit_fp8_attn_in:
+        if d_fuse_p34:
+            inv_rms_next_eff = (
+                inv_rms_next * jnp.float32(32.0)
+                if emit_static_fp8_attn_in
+                else inv_rms_next
+            )
+            out_dt = jnp.float8_e4m3fn if emit_static_fp8_attn_in else jnp.bfloat16
+            for c0 in range(0, h_dim, 256):
+                c1 = c0 + 256
+                fw_s = new_stream_out_ref[:, c0:c1]
+                branch_s = (fw_s * inv_rms_ffn).astype(jnp.bfloat16).astype(jnp.float32)
+                new_s = (
+                    vecs_ref[2:3, c0:c1] * stream_mid_ref[:, c0:c1]
+                    + vecs_ref[3:4, c0:c1] * branch_s
+                )
+                new_stream_out_ref[:, c0:c1] = new_s
+                scaled_next = new_s * inv_rms_next_eff * vecs_ref[4:5, c0:c1]
+                if emit_static_fp8_attn_in:
+                    scaled_next = jnp.clip(scaled_next, -_FP8_MAX, _FP8_MAX)
+                _write_next_slab(c0, c1, scaled_next.astype(out_dt))
+        elif emit_fp8_attn_in:
             row_amax_unscaled = jnp.max(amax_next_128, axis=1, keepdims=True)
             inv_q_sc = jnp.where(
                 row_amax_unscaled == 0,
@@ -1478,6 +1745,7 @@ def pallas_d_radical_4slab(
         + (f"_pag{in_kernel_ag_rows}" if use_push_ag else "")
         + (f"_w4q{w4_unpool_qbs}" if use_w4 else "")
         + (f"_fp8q{eff_fp8_qbs}" if eff_fp8_qbs > 0 and not use_w4 else "")
+        + (f"_do{eff_d_opt}" if eff_d_opt else "")
     )
     cp_kw = dict(
         disable_bounds_checks=True,
