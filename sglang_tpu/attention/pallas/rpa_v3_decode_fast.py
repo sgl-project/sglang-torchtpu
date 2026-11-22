@@ -167,6 +167,7 @@ def can_use_decode_fast(
     use_w7 = _is_w7_enabled(raw)
     raw_toks = set(raw.replace(",", "_").replace("-", "_").split("_"))
     explicit_streamdyn = "streamdyn" in raw_toks
+    explicit_dyn = "dyn2k" in raw_toks or "dyn4k" in raw_toks
     explicit_ring4k = "ring4k" in raw_toks or "ring8k" in raw_toks
     explicit_multiq = "multiq" in raw_toks
     explicit_verify = "verify" in raw_toks
@@ -180,7 +181,7 @@ def can_use_decode_fast(
     max_full_pps = (
         4096
         if (explicit_ring4k or use_w7 or shared_grp > 0)
-        else (144 if explicit_streamdyn else 128)
+        else (160 if explicit_dyn else (144 if explicit_streamdyn else 128))
     )
     if (
         (
@@ -205,7 +206,7 @@ def can_use_decode_fast(
     else:
         head_geometry = (16, 128)
     phys_page_rows = kv_cache_fused.shape[1]
-    expected_phys_rows = (64, 128) if kv_pack_dense2 else (128, 256)
+    expected_phys_rows = (64, 128, 256) if kv_pack_dense2 else (128, 256, 512)
     # Keep dq > 1 routed to VERIFY_RPA_FAST=1 unless multiq, verify, DECODE_FAST_VERIFY=1,
     # or fused post-RPA norm/gate (which requires RPAd_fast across dq in 2..8).
     dq_ok = decode_query_size == 1 or (
@@ -300,11 +301,12 @@ def parse_decode_fast_config(
         default_v2_chunk = 512
     else:
         default_v2_chunk = 256
+    kv_cap_tokens = pages_per_seq * page_size
     if sliding_window is not None:
         win_pages = cdiv(sliding_window + page_size - 1, page_size)
         num_slots = 4
-        chunk_sz = default_v2_chunk if use_v2 else 256
-        if win_pages <= 32:
+        chunk_sz = max(default_v2_chunk if use_v2 else 256, page_size)
+        if win_pages * page_size <= 4096:
             if decode_query_size > 1:
                 loop_kind = (
                     "stream0b"
@@ -319,34 +321,34 @@ def parse_decode_fast_config(
             lazy_slot_zero = False
     else:
         win_pages = pages_per_seq
-        num_slots = 4 if pages_per_seq <= 84 else 3
-        chunk_sz = default_v2_chunk if use_v2 else 256
-        if batch_full and shared_group == 0 and decode_query_size == 1 and pages_per_seq <= 32:
+        num_slots = 4 if kv_cap_tokens <= 10752 else 3
+        chunk_sz = max(default_v2_chunk if use_v2 else 256, page_size)
+        if batch_full and shared_group == 0 and decode_query_size == 1 and kv_cap_tokens <= 4096:
             loop_kind = "swabatch"
         elif shared_group > 0 and decode_query_size == 1:
             loop_kind = f"shared{shared_group}"
             chunk_sz = 2048
             num_slots = 3 if (shared_group >= 32 or kv_pack_dense2) else 2
             coalesce_dma = True
-        elif explicit_ring4k or (raw == "shared16_host" and pages_per_seq > 128) or (use_w7 and pages_per_seq > 160 and decode_query_size == 1):
+        elif explicit_ring4k or (raw == "shared16_host" and kv_cap_tokens > 16384) or (use_w7 and kv_cap_tokens > 20480 and decode_query_size == 1):
             loop_kind = "ring4k"
             num_slots = 3 if explicit_ring8k else 4
             chunk_sz = 8192 if explicit_ring8k else 4096
             if use_w7 or explicit_ring4k or raw == "shared16_host":
                 coalesce_dma = True
-        elif explicit_dyn_chunk and decode_query_size == 1 and 32 < pages_per_seq <= 160:
+        elif explicit_dyn_chunk and decode_query_size == 1 and 4096 < kv_cap_tokens <= 20480:
             loop_kind = "streamdyn"
             chunk_sz = explicit_dyn_chunk
-        elif use_w7 and decode_query_size == 1 and pages_per_seq <= 160 and not explicit_streamdyn:
+        elif use_w7 and decode_query_size == 1 and kv_cap_tokens <= 20480 and not explicit_streamdyn:
             loop_kind = "w7auto"
-            chunk_sz = 5120 if pages_per_seq > 64 else 4096
+            chunk_sz = 5120 if kv_cap_tokens > 8192 else 4096
         elif (
             explicit_streamdyn
-            or (use_w7 and pages_per_seq > 128)
-            or (decode_query_size > 1 and (pages_per_seq > 32 or use_w7 or not explicit_multiq))
+            or (use_w7 and kv_cap_tokens > 16384)
+            or (decode_query_size > 1 and (kv_cap_tokens > 4096 or use_w7 or not explicit_multiq))
         ):
             loop_kind = "streamdyn"
-            if use_w7 and pages_per_seq > 128 and decode_query_size == 1:
+            if use_w7 and kv_cap_tokens > 16384 and decode_query_size == 1:
                 chunk_sz = 4096
         else:
             loop_kind = "stream0b" if pages_per_seq <= max_full_pps else "clean2k"
@@ -459,10 +461,10 @@ def parse_decode_fast_config(
                     if loop_kind == "ring4k" and explicit_chunk_sz is None:
                         chunk_sz = 4096
                     elif loop_kind == "w7auto" and explicit_chunk_sz is None:
-                        chunk_sz = 5120 if pages_per_seq > 64 else 4096
+                        chunk_sz = 5120 if kv_cap_tokens > 8192 else 4096
 
     if sliding_window != 2049 and loop_kind in ("clean1p", "stream2h"):
-        loop_kind = "streamdyn" if use_v2 else ("stream0b" if win_pages <= 32 else "clean2k")
+        loop_kind = "streamdyn" if use_v2 else ("stream0b" if win_pages * page_size <= 4096 else "clean2k")
     if sliding_window is None and pages_per_seq > max_full_pps and loop_kind != "ring4k" and not loop_kind.startswith("shared"):
         num_slots = max(2, min(num_slots, 3))
         loop_kind = "clean2k"
@@ -487,9 +489,15 @@ def parse_decode_fast_config(
             max_ring_pages = max(1, chunk_sz // page_size)
             lazy_slot_zero = True
         elif loop_kind in ("streamdyn", "w7auto"):
+            if loop_kind == "streamdyn" and chunk_sz < page_size:
+                chunk_sz = page_size
             chunk_pages = max(1, chunk_sz // page_size)
-            eff_cap = max(max_full_pps, 144) if use_w7 else max_full_pps
-            min_w7_pgs = (64 if pages_per_seq > 64 else 8) if loop_kind == "w7auto" else 1
+            eff_cap = max(max_full_pps, cdiv(18432, page_size)) if use_w7 else max_full_pps
+            min_w7_pgs = (
+                (max(1, 8192 // page_size) if kv_cap_tokens > 8192 else max(1, 1024 // page_size))
+                if loop_kind == "w7auto"
+                else 1
+            )
             max_ring_pages = min(
                 align_to(max(pages_per_seq, min_w7_pgs), chunk_pages),
                 align_to(eff_cap, chunk_pages),
