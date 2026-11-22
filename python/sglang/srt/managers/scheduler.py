@@ -544,7 +544,11 @@ class Scheduler(
     retraction_draft_kv_pools: tuple = ()
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
-    resolve_forward_inputs = staticmethod(resolve_forward_inputs)
+
+    @staticmethod
+    def resolve_forward_inputs(batch, future_map):
+        return resolve_forward_inputs(batch, future_map)
+
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None

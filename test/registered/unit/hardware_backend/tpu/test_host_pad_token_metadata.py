@@ -1073,6 +1073,85 @@ class TestHostPadFieldSelection(CustomTestCase):
         copy_result_to_cpu(copy, result)
         self.assertEqual(result.next_token_ids.tolist(), [0, 1, 2])
 
+    def test_scheduler_resolve_forward_inputs_uses_host_padding_hook(self):
+        from collections import defaultdict
+
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.managers import scheduler as scheduler_mod
+        from sglang.srt.managers.overlap_utils import RelayPayload
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+        from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks.host_padding import (
+            resolve_forward_inputs as host_padding_resolve,
+        )
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+        saved_hooks = defaultdict(
+            list, {k: list(v) for k, v in HookRegistry._hooks.items()}
+        )
+        saved_patched = set(HookRegistry._patched)
+        saved_overlap_fn = overlap_utils.resolve_forward_inputs
+        saved_sched_fn = scheduler_mod.resolve_forward_inputs
+        try:
+            HookRegistry._hooks.clear()
+            HookRegistry._patched.clear()
+            HookRegistry.register(
+                "sglang.srt.managers.overlap_utils.resolve_forward_inputs",
+                host_padding_resolve,
+                HookType.AROUND,
+            )
+            HookRegistry.apply_hooks()
+
+            pool = SimpleNamespace(
+                req_to_token=torch.zeros((8, 16), dtype=torch.int32),
+                _tpu_relay_bucketer=Bucketer("Bs", [4]),
+            )
+            relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+            relay._direct_handoff_enabled = True
+            indices = torch.tensor([2], dtype=torch.int64)
+            with patch.object(overlap_utils, "_DEBUG_ASSERT", False):
+                relay.stash(
+                    indices,
+                    RelayPayload(
+                        bonus_tokens=torch.tensor([328, 0, 0, 0], dtype=torch.int64)
+                    ),
+                )
+                decode_batch = ScheduleBatch(
+                    reqs=[],
+                    device="cpu",
+                    req_pool_indices=indices,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=SimpleNamespace(
+                        is_generation=True,
+                        use_ngram_embedding=False,
+                        use_engram=False,
+                        is_encoder_decoder=False,
+                    ),
+                )
+                with (
+                    patch.object(overlap_utils, "_is_tpu", True),
+                    get_flags().override(
+                        capture=SimpleNamespace(enable_torch_compile=True)
+                    ),
+                    get_parallel().override(
+                        pp_size=1, attn_cp_size=1, attn_dp_size=1, attn_dcp_size=1
+                    ),
+                    get_schedule().override(enable_mixed_chunk=False),
+                ):
+                    scheduler_mod.Scheduler.resolve_forward_inputs(decode_batch, relay)
+            self.assertEqual(decode_batch.input_ids.tolist(), [328, 0, 0, 0])
+            self.assertIsNone(relay._direct_handoff)
+        finally:
+            HookRegistry._hooks.clear()
+            HookRegistry._hooks.update(saved_hooks)
+            HookRegistry._patched.clear()
+            HookRegistry._patched.update(saved_patched)
+            overlap_utils.resolve_forward_inputs = saved_overlap_fn
+            scheduler_mod.resolve_forward_inputs = saved_sched_fn
+
 
 if __name__ == "__main__":
     unittest.main()
