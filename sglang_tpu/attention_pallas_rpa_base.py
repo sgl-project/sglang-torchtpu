@@ -1914,8 +1914,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # Ranks with independent attention batches can choose different
             # model programs, which is unsafe for their shared collectives.
             and get_parallel().attn_dp_size == 1
-            and self.page_size in (128, 256)
-            and self.max_context_len > 128 * self.page_size
+            and self.page_size in (128, 256, 512)
+            and self.max_context_len > 16384
             and bs >= min_bs
             and bs % min_bs == 0
             and self.req_to_token_pool.req_to_token.device.type == "cpu"

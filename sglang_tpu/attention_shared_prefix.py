@@ -35,8 +35,8 @@ def shared_decode_distribution(
         or live > rows
         or group_size < 8
         or rows % group_size
-        or width <= 128
-        or page_size not in (128, 256)
+        or width * page_size <= 16384
+        or page_size not in (128, 256, 512)
     ):
         return None
     if block_pages is None:

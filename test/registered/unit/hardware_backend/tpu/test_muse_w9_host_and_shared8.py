@@ -764,3 +764,49 @@ def test_muse_greedy_topk1_auto_small_batch_cutoff_and_warmup_sync():
                     LogitsOutputMode.DISTRIBUTED_TOP_K,
                     LogitsOutputMode.FULL_VOCAB,
                 )
+
+
+
+def test_shared_decode_page_size_512_metadata_and_gate():
+    """page_size=512 is supported for Unified LC shared64 while preserving >16384 token gating."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import numpy as np
+
+    from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+    from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+    # Short context (<= 16384 tokens -> width=32 at page_size=512) stays private.
+    short_pages = np.broadcast_to(np.arange(32, dtype=np.int32), (16, 32)).copy()
+    short_lengths = np.full((16,), 30 * 512 + 1, dtype=np.int32)
+    assert shared_decode_distribution(short_pages, short_lengths, 16, 512, group_size=16) is None
+
+    # 64k+ shared prefix (width=160, page_size=512) aligns to block_pages = 2048 // 512 = 4.
+    pages = np.broadcast_to(np.arange(160, dtype=np.int32), (16, 160)).copy()
+    pages[:, 131:] += np.arange(16, dtype=np.int32)[:, None] * 1000
+    lengths = np.full((16,), 140 * 512 + 17, dtype=np.int32)
+    plan = shared_decode_distribution(pages, lengths, 16, 512, group_size=16)
+    assert plan is not None
+    # mismatch at page 131 -> aligned down to multiple of 4 -> 128 pages (64k tokens).
+    assert plan.tolist() == [16, 16, 16, 128]
+
+    backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+    backend._dcp = 1
+    backend.page_size = 512
+    backend.max_context_len = 81920
+    backend.kernel_spec = SimpleNamespace(supports_shared_decode=True)
+    backend.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros((1,), device="cpu")
+    )
+
+    with (
+        patch("sglang_tpu.attention_pallas_rpa_base.get_parallel", return_value=SimpleNamespace(attn_dp_size=1)),
+        _temp_env(
+            SGLANG_TPU_RPA_V3_DECODE_FAST="w8,c4096,shared64,shsplit,batchfull",
+            SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED="1",
+        ),
+    ):
+        assert backend.supports_shared_decode_batch(16) is True
+        backend.max_context_len = 16384
+        assert backend.supports_shared_decode_batch(16) is False
