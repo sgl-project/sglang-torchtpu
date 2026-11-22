@@ -741,7 +741,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Host req_to_token page-slot columns, built by _host_page_columns.
         self._host_page_cols: torch.Tensor | None = None
         self._last_query_metadata: tuple | None = None
-        self._cached_full_page_to_swa_page: tuple | None = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -1334,21 +1333,38 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             shared_dist_cache[m_key] = (plan, dist_t)
             return dist_t
 
-        def _get_full_page_to_swa_page(swa_ver: int) -> torch.Tensor:
+        def _translate_full_pages_to_swa(
+            page_indices_t: torch.Tensor,
+            page_indices_np: np.ndarray | None = None,
+        ) -> tuple[torch.Tensor, np.ndarray]:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
             )
-            cached_map = getattr(self, "_cached_full_page_to_swa_page", None)
-            map_key = (id(full_to_swa), swa_ver, self._page_stride)
-            if cached_map is not None and cached_map[0] == map_key:
-                return cached_map[1]
-            page_map = (full_to_swa[0 :: self._page_stride] // self._page_stride).to(
+            stride = self._page_stride
+            if full_to_swa.device.type == "cpu" and (
+                page_indices_np is not None or page_indices_t.device.type == "cpu"
+            ):
+                idx_np = (
+                    page_indices_np
+                    if page_indices_np is not None
+                    else page_indices_t.numpy()
+                )
+                # Read live full_to_swa memory (alloc_extend/alloc_decode mutate it
+                # without bumping _tpu_swa_map_version); strided NumPy view is O(1).
+                full_np = full_to_swa.numpy()[::stride]
+                if stride > 0 and (stride & (stride - 1)) == 0:
+                    swa_np = (full_np[idx_np] >> (stride.bit_length() - 1)).astype(
+                        np.int32
+                    )
+                else:
+                    swa_np = np.floor_divide(full_np[idx_np], stride).astype(np.int32)
+                return torch.from_numpy(swa_np), swa_np
+            swa_t = (full_to_swa[page_indices_t.to(torch.int64) * stride] // stride).to(
                 torch.int32
             )
-            self._cached_full_page_to_swa_page = (map_key, page_map)
-            return page_map
+            return swa_t, swa_t.numpy()
 
         page_table_ver = getattr(req_to_token, "_tpu_page_table_version", None)
         can_cache_decode_pages = (
@@ -1457,12 +1473,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                             swa_page_indices = None
                             swa_pages_np = None
                             if self._is_hybrid_swa:
-                                page_map = _get_full_page_to_swa_page(swa_map_ver)
-                                new_swa_np = (
-                                    page_map[new_pgs_t.to(torch.int64)]
-                                    .to(torch.int32)
-                                    .numpy()
-                                )
+                                _, new_swa_np = _translate_full_pages_to_swa(new_pgs_t)
                                 swa_pages_np = prev_payload[4].copy()
                                 swa_pages_np.reshape(bs, pages_per_seq)[
                                     row_idx_np, cols_np
@@ -1531,9 +1542,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         swa_group_page_indices: torch.Tensor | None = None
         swa_pages_np = None
         if self._is_hybrid_swa:
-            page_map = _get_full_page_to_swa_page(swa_map_ver)
-            swa_pages = page_map[page_indices.to(torch.int64)]
-            swa_pages_np = swa_pages.numpy()
+            swa_pages, swa_pages_np = _translate_full_pages_to_swa(
+                page_indices, page_indices.numpy()
+            )
             swa_page_indices = self._value_metadata_fast(
                 name="swa_page_indices",
                 value=swa_pages,

@@ -172,7 +172,6 @@ def _make_backend(is_hybrid_swa: bool, cache):
     backend._swa_group_pages = None
     backend._host_metadata_cache = cache
     backend._last_query_metadata = None
-    backend._cached_full_page_to_swa_page = None
     backend._is_extend_including_draft = lambda mode: False
     backend.supports_shared_decode_batch = lambda bs: False
     backend.token_to_kv_pool = SimpleNamespace(
@@ -570,3 +569,94 @@ def test_async_d2h_non_blocking_when_pin_memory_unavailable():
 
     cpu_t = torch.tensor([1, 2], dtype=torch.int32)
     assert device_utils.async_d2h(cpu_t) is cpu_t
+
+
+def test_hybrid_swa_live_mapping_reflects_alloc_without_version_bump():
+    """Verify full_to_swa_index_mapping writes in alloc_extend/alloc_decode (which do not bump
+    _tpu_swa_map_version) are immediately visible to both EXTEND and incremental DECODE metadata.
+    """
+    from sglang_tpu.host_metadata_cache import HostMetadataCache
+
+    bs, page_size, pps = 2, 128, 4
+    pool = ReqToTokenPool(size=4, max_context_len=pps * page_size, device="tpu", enable_memory_saver=False)
+    full_to_swa = torch.zeros(16 * page_size, dtype=torch.int64)
+    # Initial mapping: full page 1 -> SWA page 3, full page 2 -> SWA page 4.
+    full_to_swa[1 * page_size : 2 * page_size] = torch.arange(3 * page_size, 4 * page_size)
+    full_to_swa[2 * page_size : 3 * page_size] = torch.arange(4 * page_size, 5 * page_size)
+
+    be = _make_backend(True, HostMetadataCache())
+    be._page_stride = page_size
+    be.page_size = page_size
+    be.max_context_len = pps * page_size
+    be._swa_group_pages = None
+    be.token_to_kv_pool.full_to_swa_index_mapping = full_to_swa
+
+    req_rows = torch.tensor([0, 1], dtype=torch.int32)
+    pool.write((req_rows, torch.tensor([0, 0])), torch.tensor([1 * page_size, 2 * page_size], dtype=torch.int32))
+    dist = torch.tensor([bs, bs, bs], dtype=torch.int32)
+
+    with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="1"):
+        # Step 1 (EXTEND): populates any caches at _tpu_swa_map_version == 0
+        m_ext1 = be._build_metadata_host(
+            SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                spec_info=None,
+                seq_lens=torch.tensor([10, 10], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
+                req_pool_indices_cpu=req_rows,
+            ),
+            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+        )
+        assert m_ext1.swa_page_indices.tolist() == [3, 0, 0, 0, 4, 0, 0, 0]
+
+        # Step 2 (alloc_extend without bumping _tpu_swa_map_version): full pages 5, 6 -> SWA pages 9, 10
+        full_to_swa[5 * page_size : 6 * page_size] = torch.arange(9 * page_size, 10 * page_size)
+        full_to_swa[6 * page_size : 7 * page_size] = torch.arange(10 * page_size, 11 * page_size)
+        pool.write((req_rows, torch.tensor([0, 0])), torch.tensor([5 * page_size, 6 * page_size], dtype=torch.int32))
+
+        m_ext2 = be._build_metadata_host(
+            SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                spec_info=None,
+                seq_lens=torch.tensor([10, 10], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([10, 10], dtype=torch.int32),
+                req_pool_indices_cpu=req_rows,
+            ),
+            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+        )
+        assert m_ext2.swa_page_indices.tolist() == [9, 0, 0, 0, 10, 0, 0, 0]
+
+        # Step 3 (DECODE priming + incremental decode page boundary alloc without _tpu_swa_map_version bump)
+        m_dec1 = be._build_metadata_host(
+            SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens=torch.tensor([128, 128], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([128, 128], dtype=torch.int32),
+                req_pool_indices_cpu=req_rows,
+            ),
+            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+        )
+        assert m_dec1.swa_page_indices.tolist() == [9, 0, 0, 0, 10, 0, 0, 0]
+
+        full_to_swa[7 * page_size : 8 * page_size] = torch.arange(11 * page_size, 12 * page_size)
+        full_to_swa[8 * page_size : 9 * page_size] = torch.arange(12 * page_size, 13 * page_size)
+        pool.write(
+            (req_rows, torch.tensor([page_size, page_size])),
+            torch.tensor([7 * page_size, 8 * page_size], dtype=torch.int32),
+            bump_page_table=True,
+            is_decode_step=True,
+        )
+        m_dec2 = be._build_metadata_host(
+            SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens=torch.tensor([129, 129], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([129, 129], dtype=torch.int32),
+                req_pool_indices_cpu=req_rows,
+            ),
+            page_size, "cpu", bs, pool.req_to_token, pps, dist, bs,
+        )
+        assert m_dec2.swa_page_indices.tolist() == [9, 11, 0, 0, 10, 12, 0, 0]
