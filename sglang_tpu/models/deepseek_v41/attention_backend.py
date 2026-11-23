@@ -1172,11 +1172,24 @@ class DSV41TPUAttnBackend(AttentionBackend):
             self.init_forward_metadata(forward_batch)
         return self.forward_metadata
 
-    def prepare_slot_tables(self, req_pool_indices: torch.Tensor) -> None:
-        """Build the next forward's slot tables now, ahead of its rows."""
+    def prepare_slot_tables(
+        self, req_pool_indices: torch.Tensor, *, reuse: bool = False
+    ) -> None:
+        """Build the next forward's slot tables now, ahead of its rows.
+
+        ``reuse``: keep tables already held for the same slots (built earlier in
+        the same step); the page table may have grown since an older build."""
+        req_pool_indices = req_pool_indices.to(torch.int64)
+        held = self._slot_tables
+        if (
+            reuse
+            and held is not None
+            and torch.equal(held.req_pool_indices, req_pool_indices)
+        ):
+            return
         self._slot_tables = build_slot_tables(
             req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices.to(torch.int64),
+            req_pool_indices=req_pool_indices,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
             request_window=self.request_window,
             swa_ring_valid_from=self.token_to_kv_pool.swa_valid_from,

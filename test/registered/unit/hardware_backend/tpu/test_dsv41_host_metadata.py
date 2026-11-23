@@ -209,6 +209,37 @@ def test_prebuilt_slot_tables_are_used_only_for_the_forward_slots():
     _assert_same(built, reference)
 
 
+def test_slot_tables_are_reused_only_when_asked():
+    """A later prepare in the same step (reuse) keeps the tables built before the
+    length read; a plain prepare always rebuilds, as the page table may have grown."""
+    builds = []
+
+    def build(**kw):
+        builds.append(kw["req_pool_indices"])
+        return SimpleNamespace(req_pool_indices=kw["req_pool_indices"])
+
+    backend = SimpleNamespace(
+        _slot_tables=None,
+        req_to_token=None,
+        token_to_kv_pool=SimpleNamespace(
+            full_to_swa_index_mapping=None, swa_valid_from=None
+        ),
+        request_window=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    prepare = ab.DSV41TPUAttnBackend.prepare_slot_tables
+    slots = torch.tensor([3, 1])
+    with patch.object(ab, "build_slot_tables", side_effect=build):
+        prepare(backend, slots)
+        prepare(backend, slots, reuse=True)
+        assert len(builds) == 1
+        prepare(backend, torch.tensor([3, 2]), reuse=True)
+        prepare(backend, torch.tensor([3, 2]))
+    assert len(builds) == 3
+
+
 def test_device_values_are_not_read():
     fb = BATCHES["multi"]()
     _upload(fb)

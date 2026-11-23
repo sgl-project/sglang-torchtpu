@@ -702,10 +702,12 @@ class TpuSpecWorker(BaseSpecWorker):
         next_token_logits is p (or its distributed top-k when the accept reads only
         that), hidden_states is the target feature phi.
         """
-        # Ahead of the verify's first read of the draft, which waits for the draft.
+        # Ahead of the verify's first read of the draft, which waits for the draft;
+        # a draft worker may have built them already, before its length read.
         slot_metadata.prepare(
             self.target_worker.model_runner.attn_backend,
             verify_input.req_pool_indices_cpu,
+            reuse=True,
         )
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:

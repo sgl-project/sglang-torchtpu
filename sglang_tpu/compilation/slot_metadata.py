@@ -12,17 +12,20 @@ from typing import Any, Callable, Dict
 
 import torch
 
-_PREPARERS: Dict[type, Callable[[Any, torch.Tensor], None]] = {}
+_PREPARERS: Dict[type, Callable[..., None]] = {}
 
 
-def register(backend_cls: type, prepare: Callable[[Any, torch.Tensor], None]) -> None:
+def register(backend_cls: type, prepare: Callable[..., None]) -> None:
     _PREPARERS[backend_cls] = prepare
 
 
-def prepare(attn_backend: Any, req_pool_indices_cpu: torch.Tensor) -> None:
+def prepare(
+    attn_backend: Any, req_pool_indices_cpu: torch.Tensor, *, reuse: bool = False
+) -> None:
     """Let ``attn_backend`` build its next forward's slot tables for these host slots.
 
     The backend's next metadata build consumes them, or rebuilds if its slots differ.
+    ``reuse``: keep tables built earlier in the same step for the same slots.
     No-op unless SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA and the backend registered.
     """
     from sglang_tpu.envs import envs as tpu_envs
@@ -32,5 +35,5 @@ def prepare(attn_backend: Any, req_pool_indices_cpu: torch.Tensor) -> None:
     for cls in type(attn_backend).__mro__:
         preparer = _PREPARERS.get(cls)
         if preparer is not None:
-            preparer(attn_backend, req_pool_indices_cpu)
+            preparer(attn_backend, req_pool_indices_cpu, reuse=reuse)
             return

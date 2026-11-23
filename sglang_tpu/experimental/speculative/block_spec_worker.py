@@ -481,10 +481,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._mask_token_id,
             width,
         )
-        # Before the read below: the slot tables need no device value.
-        slot_metadata.prepare(
-            self._draft_runner.attn_backend, verify_input.req_pool_indices_cpu
-        )
+        # Before the read below, which waits for the whole previous verify: the
+        # slot tables of this step's draft and verify need no device value.
+        for runner in (self._draft_runner, self.target_worker.model_runner):
+            slot_metadata.prepare(
+                runner.attn_backend, verify_input.req_pool_indices_cpu
+            )
         # Read here, after the inputs are queued: the read waits for the previous verify.
         host_rows = (
             None
