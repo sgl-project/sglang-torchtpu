@@ -35,7 +35,8 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_TARGET = 16
 
     # -- TpuSpecWorker: shared by every algorithm --
-    SPEC_ACCEPT_GREEDY = 17
+    # 17 belongs to DSPARK_DRAFT; a repeated number would make this its alias.
+    SPEC_ACCEPT_GREEDY = 22
     SPEC_ACCEPT_SAMPLE = 18
     SPEC_DRAFT_GREEDY = 19
     SPEC_DRAFT_SAMPLE = 20
