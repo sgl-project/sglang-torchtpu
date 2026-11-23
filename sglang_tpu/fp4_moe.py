@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang_tpu.expert_loading import _wait_for
+from sglang_tpu.expert_loading import _wait_for, take_weights_prepared_early
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
     _free_replaced_storage,
@@ -242,6 +242,8 @@ def prepare_tpu_nvfp4_moe_weights(
 
     The fused-RS kernel takes the scales without the unit dim, (E, K/G, N).
     """
+    if take_weights_prepared_early(layer):
+        return
     if group_size not in TPU_NVFP4_SUPPORTED_GROUP_SIZES:
         raise NotImplementedError(
             "TPU NVFP4 MoE requires group_size in "
