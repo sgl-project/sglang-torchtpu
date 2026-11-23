@@ -8,6 +8,10 @@ from the ``SGLANG_TPU_MOE_FUSED_EP_PUSH_*`` envs. Unset, nothing here runs and
 every layer keeps its ``--moe-runner-backend``. The envs are read here only,
 never inside the kernel package.
 
+``push`` also requires two XLA flags in ``LIBTPU_INIT_ARGS`` at libtpu start:
+``--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0`` and
+``--xla_mosaic_unsafe_allow_multicore_remote_dma=true`` (see push_fused_moe).
+
 A provider is a module in ``_PROVIDERS`` with
 ``prepare_model_for_fused_ep(model, *, impl) -> int``: it finds its own MoE
 layers, converts their experts, sets ``DP_LOCAL_FORWARD_ATTR`` on each, and

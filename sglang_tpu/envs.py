@@ -664,7 +664,10 @@ class TpuEnvs:
     # model provider admits (attention DP == EP == world): unset keeps every layer
     # on its --moe-runner-backend; v2 runs fused_ep_moe_v2 with all-gather
     # dispatch; push runs it with dispatch="push". Needs SGLANG_SHARED_EXPERT_TP1=1
-    # (checked at startup). Read when the plugin hooks are built.
+    # (checked at startup). push also needs two XLA flags in LIBTPU_INIT_ARGS:
+    # --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 and
+    # --xla_mosaic_unsafe_allow_multicore_remote_dma=true (push_fused_moe).
+    # Read when the plugin hooks are built.
     SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL = EnvStr(None)
     # Push-dispatch knobs (fused_ep.PUSH_OPTIONS), forwarded only under
     # SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=push. Unset keeps the kernel default

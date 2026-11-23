@@ -61,6 +61,15 @@ function's defaults, not vLLM's environment defaults. In particular, enabling
 the options explicitly after measuring its shapes. No environment variables
 are read by this package.
 
+**Push requires two XLA flags.** Its SparseCore pre-push and in-kernel remote
+DMAs need both of these in `LIBTPU_INIT_ARGS` when libtpu starts, before the
+JAX client is created (`test_fused_ep_moe_push.py` sets the same):
+
+```
+--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0
+--xla_mosaic_unsafe_allow_multicore_remote_dma=true
+```
+
 `shared_expert=(w13, s13, w2, s2)` with `shared_limit` is push-only and requires
 replicated per-channel FP8 weights. It returns the shared result separately:
 `(routed, shared)` or `(routed, next_load, shared)`. The model combines the
