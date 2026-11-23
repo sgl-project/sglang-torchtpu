@@ -684,10 +684,12 @@ def _device_row_metadata(
         host["live"] = device_rows.window_live(req_pool_indices, counts)
         host["first_row"] = query_start_loc[:-1].clamp(max=max(num_tokens - 1, 0))
     host_input_mirror.release(forward_batch)
-    dev = _upload_metadata(host, device=device)
+    dev = _upload_metadata(host, device=device, pack=False)
 
-    positions = forward_batch.positions.to(torch.int32)
-    out_cache_loc = forward_batch.out_cache_loc.to(torch.int32)
+    # Copies: the host build's fields are graph inputs of their own, not the
+    # batch's positions / cache slots.
+    positions = forward_batch.positions.to(torch.int32, copy=True)
+    out_cache_loc = forward_batch.out_cache_loc.to(torch.int32, copy=True)
     token_rows, valid, token_req_pool = device_rows.token_rows(
         host_rows=dev["host_rows"],
         out_cache_loc=out_cache_loc,
@@ -722,8 +724,9 @@ def _device_row_metadata(
         token_rows=token_rows,
         token_req_pool=token_req_pool,
         valid=valid,
-        # No fold in a spec forward: every valid row compresses.
-        compress_valid=valid,
+        # No fold in a spec forward: every valid row compresses. A copy, as the
+        # host build's two masks are two graph inputs.
+        compress_valid=valid.clone(),
         out_cache_loc=out_cache_loc,
         full_pages=tables.full_pages_device,
         swa_pages=swa_pages.to(torch.int32),
@@ -1070,7 +1073,7 @@ def _assemble_metadata(
         )
         host[f"low_ratio.{ratio}.out_loc"] = out_loc
         host[f"low_ratio.{ratio}.lengths"] = lengths
-    dev = _upload_metadata(host, device=device)
+    dev = _upload_metadata(host, device=device, pack=_packs_rows(forward_batch))
     return DSV41TPUForwardMetadata(
         positions=dev["positions"],
         query_start_loc=dev["query_start_loc"],
@@ -1106,18 +1109,33 @@ def _upload_window_plan(plan: WindowPlan, device: torch.device) -> WindowPlan:
     return WindowPlan(*(t.to(device=device, non_blocking=True) for t in plan))
 
 
+def _packs_rows(forward_batch: ForwardBatch) -> bool:
+    """Whether a forward's row fields may be views of one packed upload.
+
+    Not a spec forward under SGLANG_TPU_SPEC_DEVICE_ROWS: the device-built rows
+    are separate tensors, and TorchTPU compiles a view input as its whole base
+    buffer, so an idle rank's host-built rows must be separate tensors too."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return not (
+        tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get()
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
+
 def _upload_metadata(
-    host: Dict[str, torch.Tensor], *, device: torch.device
+    host: Dict[str, torch.Tensor], *, device: torch.device, pack: bool = True
 ) -> Dict[str, torch.Tensor]:
     """Host metadata fields on ``device``: bool fields stay bool, the rest int32.
 
-    SGLANG_TPU_DSV41_PACKED_METADATA: one upload per dtype, fields as views."""
+    SGLANG_TPU_DSV41_PACKED_METADATA (and ``pack``): one upload per dtype, fields
+    as views."""
     from sglang_tpu.envs import envs as tpu_envs
 
     host = {
         k: t if t.dtype == torch.bool else t.to(torch.int32) for k, t in host.items()
     }
-    if not tpu_envs.SGLANG_TPU_DSV41_PACKED_METADATA.get():
+    if not pack or not tpu_envs.SGLANG_TPU_DSV41_PACKED_METADATA.get():
         return {k: t.to(device=device, non_blocking=True) for k, t in host.items()}
     return dict(zip(host, pack_upload(list(host.values()), device=device)))
 

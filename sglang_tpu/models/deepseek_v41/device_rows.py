@@ -108,11 +108,13 @@ def window_pages(
 
     # All int32: casting to int64 on the device does not lower on TPU, so with
     # device rows the host plan is uploaded as int32 too (window_plan_upload).
+    # Fresh 1-D tensors, not views of the [B, 128] results: TorchTPU compiles a
+    # view input as its base buffer, unlike the host plan's uploads.
     plan = WindowPlan(
-        history_src=history_src.reshape(-1).to(torch.int32),
-        history_dst=history_dst.reshape(-1).to(torch.int32),
-        commit_token=commit_token.reshape(-1).to(torch.int32),
-        commit_dst=commit_dst.reshape(-1).to(torch.int32),
+        *(
+            t.to(torch.int32).reshape(-1).clone()
+            for t in (history_src, history_dst, commit_token, commit_dst)
+        )
     )
     return pages, plan
 

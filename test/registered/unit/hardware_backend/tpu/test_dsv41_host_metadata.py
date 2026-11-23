@@ -326,6 +326,52 @@ def test_device_rows_compute_no_int64_on_the_device(layout):
     assert mode.ops == []
 
 
+def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows():
+    """Active ranks build a spec forward's rows on the device, idle ranks on the
+    host, and both run the same compiled forward. TorchTPU compiles a view input
+    as its whole base buffer, so a packed host field or an aliased one failed
+    the idle rank's verify (RuntimeProgramInputMismatch): with device rows, every
+    row field must be its own tensor in both builds."""
+    slot_fields = {"full_pages", "swa_pages"}
+    seq_lens, slots = [4096, 98310, 17], [1, 2, 3]
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        ),
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    device_fb = _verify_batch(seq_lens, slots)
+    device_fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+    with (
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
+        patch.object(tpu_envs, "SGLANG_TPU_DSV41_PACKED_METADATA", on),
+    ):
+        builds = {"host": _verify_batch(seq_lens, slots), "device": device_fb}
+        for name, fb in builds.items():
+            md = ab.build_forward_metadata(fb, **kw)
+            rows = {
+                k: t
+                for k, t in _flatten(md).items()
+                if k not in slot_fields
+                and "index_pages" not in k
+                and not k.endswith(".2")  # LowRatioMetadata.index_pages
+            }
+            batch_ptrs = {fb.positions.data_ptr(), fb.out_cache_loc.data_ptr()}
+            ptrs = [t.untyped_storage().data_ptr() for t in rows.values()]
+            assert all(t._base is None for t in rows.values()), name
+            if name == "device":
+                # Host uploads are separate device buffers on TPU; on CPU,
+                # .to("cpu") hands back the host tensor itself.
+                assert len(set(ptrs)) == len(ptrs)
+                assert not set(ptrs) & batch_ptrs
+
+
 def test_device_rows_check_mode_catches_a_wrong_field():
     """SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK passes matching device rows and raises,
     naming the field, when a device-built field differs from the host build."""
