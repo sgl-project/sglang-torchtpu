@@ -101,15 +101,17 @@ def window_pages(
 
     kept = (first + counts)[:, None] - WINDOW_TOKENS + lane
     kept_ok = live & (kept >= first[:, None])
-    row_start = (torch.cumsum(counts, 0) - counts)[:, None]
+    # cumsum would promote int32 to int64, which the TPU vector units do not lower.
+    row_start = (torch.cumsum(counts, 0, dtype=counts.dtype) - counts)[:, None]
     commit_token = torch.where(kept_ok, row_start + kept - first[:, None], 0)
     commit_dst = torch.where(kept_ok, ring_rows(slot, kept.clamp(min=0)), -1)
 
-    # The host plan's dtypes: int64 source rows, int32 destination rows.
+    # All int32: casting to int64 on the device does not lower on TPU, so with
+    # device rows the host plan is uploaded as int32 too (window_plan_upload).
     plan = WindowPlan(
-        history_src=history_src.reshape(-1).to(torch.int64),
+        history_src=history_src.reshape(-1).to(torch.int32),
         history_dst=history_dst.reshape(-1).to(torch.int32),
-        commit_token=commit_token.reshape(-1).to(torch.int64),
+        commit_token=commit_token.reshape(-1).to(torch.int32),
         commit_dst=commit_dst.reshape(-1).to(torch.int32),
     )
     return pages, plan
@@ -124,7 +126,7 @@ def _workspace_pages(
     low = (first - WINDOW_TOKENS).clamp(min=0) // SWA_PAGE_TOKENS
     high = (first + counts - 1) // SWA_PAGE_TOKENS
     width = torch.where(has_rows, high - low + 1, 0)
-    offset = torch.cumsum(width, 0) - width
+    offset = torch.cumsum(width, 0, dtype=width.dtype) - width
     col = torch.arange(columns, dtype=first.dtype, device=first.device)[None, :]
     inside = has_rows[:, None] & (col >= low[:, None]) & (col <= high[:, None])
     return torch.where(inside, base_page + offset[:, None] + col - low[:, None], 0)

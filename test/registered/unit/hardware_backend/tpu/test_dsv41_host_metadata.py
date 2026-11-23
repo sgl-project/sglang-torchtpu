@@ -266,15 +266,64 @@ def test_device_rows_match_the_host_rows(layout):
         kw["request_window"] = SimpleNamespace(
             workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
         )
-    reference = ab.build_forward_metadata(batch(), **kw)
-    with (
-        patch.object(
-            tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", SimpleNamespace(get=lambda: True)
-        ),
-        patch.object(ab, "_as_cpu_int64", side_effect=AssertionError("read back")),
-    ):
-        built = ab.build_forward_metadata(batch(), **kw)
+    on = SimpleNamespace(get=lambda: True)
+    with patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on):
+        # Without host slots the forward takes the host path (same plan dtypes).
+        reference = ab.build_forward_metadata(_verify_batch(seq_lens, slots), **kw)
+        with patch.object(ab, "_as_cpu_int64", side_effect=AssertionError("read")):
+            built = ab.build_forward_metadata(batch(), **kw)
     _assert_same(built, reference)
+
+
+@pytest.mark.parametrize("layout", ["draft_ring", "request_window"])
+def test_device_rows_compute_no_int64_on_the_device(layout):
+    """TPU vector units do not lower 64-bit integers: an int64 op in the device-built
+    rows (an implicit cumsum promotion, an int64 cast) aborted the server at the
+    verify warmup. No op on the device may produce an int64 tensor."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Int64OnDevice(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for t in out if isinstance(out, (tuple, list)) else (out,):
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.device.type == "meta"
+                    and t.dtype == torch.int64
+                ):
+                    self.ops.append(str(func))
+            return out
+
+    meta = torch.device("meta")
+    fb = _verify_batch([4096, 98310, 17], [1, 2, 3])
+    fb.req_pool_indices_cpu = torch.tensor([1, 2, 3], dtype=torch.int64)
+    fb.positions = fb.positions.to(device=meta, dtype=torch.int32)
+    fb.out_cache_loc = fb.out_cache_loc.to(meta)
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=None,
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=meta,
+    )
+    if layout == "draft_ring":
+        kw["swa_ring_valid_from"] = torch.zeros(SLOTS, dtype=torch.int64)
+    else:
+        kw["request_window"] = SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        )
+    on = SimpleNamespace(get=lambda: True)
+    with patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on):
+        with Int64OnDevice() as mode:
+            md = ab.build_forward_metadata(fb, **kw)
+    assert md.positions.device == meta
+    assert mode.ops == []
 
 
 def test_device_rows_check_mode_catches_a_wrong_field():
@@ -341,7 +390,8 @@ def test_device_window_pages_match_the_host_loop():
         )
         assert torch.equal(got_pages, pages)
         for got, want in zip(got_plan, plan):
-            assert got.dtype == want.dtype and torch.equal(got, want)
+            assert got.dtype == torch.int32
+            assert torch.equal(got, want.to(torch.int32))
 
 
 def test_device_values_are_not_read():

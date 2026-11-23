@@ -1090,15 +1090,20 @@ def _assemble_metadata(
             )
             for ratio, index_pages in tables.index_pages.items()
         },
-        # int64 row ids (extend only), so not packed.
         swa_window_plan=(
-            None
-            if window_plan is None
-            else WindowPlan(
-                *(t.to(device=device, non_blocking=True) for t in window_plan)
-            )
+            None if window_plan is None else _upload_window_plan(window_plan, device)
         ),
     )
+
+
+def _upload_window_plan(plan: WindowPlan, device: torch.device) -> WindowPlan:
+    """The host plan on ``device``: as built (int64 source rows), or all int32 with
+    SGLANG_TPU_SPEC_DEVICE_ROWS, matching the device-built plan's graph inputs."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get():
+        plan = WindowPlan(*(t.to(torch.int32) for t in plan))
+    return WindowPlan(*(t.to(device=device, non_blocking=True) for t in plan))
 
 
 def _upload_metadata(
