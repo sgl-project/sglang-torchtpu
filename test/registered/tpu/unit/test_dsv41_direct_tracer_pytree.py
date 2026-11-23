@@ -26,7 +26,10 @@ from sglang_tpu.models.deepseek_v41.attention_backend import (
     LowRatioMetadata,
     build_forward_metadata,
 )
-from sglang_tpu.models.deepseek_v41.decoder_replay import plan_decoder_replay
+from sglang_tpu.models.deepseek_v41.decoder_replay import (
+    decoder_prompt_bounds,
+    plan_decoder_replay,
+)
 from sglang_tpu.models.deepseek_v41.request_window import RESERVED_PAGES, WINDOW_TOKENS
 
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
@@ -149,6 +152,26 @@ class TestDSV41MetadataPytree(CustomTestCase):
 
 
 class TestDecoderReplayMetadata(CustomTestCase):
+    def test_only_prompt_logprobs_require_full_decoder_history(self):
+        prompt = range(4096)
+        generated_only = SimpleNamespace(
+            full_untruncated_fill_ids=range(4100),
+            origin_input_ids=prompt,
+            extend_end=2048,
+            return_logprob=True,
+            logprob_start_len=len(prompt),
+            return_hidden_states_mode=SimpleNamespace(is_full=lambda: False),
+        )
+        prompt_logprobs = SimpleNamespace(**vars(generated_only))
+        prompt_logprobs.logprob_start_len = len(prompt) - 2
+        for req, whole in ((generated_only, False), (prompt_logprobs, True)):
+            with self.subTest(logprob_start_len=req.logprob_start_len):
+                batch = SimpleNamespace(reqs=[req], chunked_req=req)
+                self.assertEqual(
+                    decoder_prompt_bounds(batch, keep_hidden=False),
+                    ((4100,), (whole,)),
+                )
+
     def test_middle_and_crossing_chunks_use_same_prompt_window(self):
         plan = plan_decoder_replay(
             prefix_lengths=(98304 - 128, 2048, 2048, 2048),

@@ -56,7 +56,12 @@ def decoder_prompt_bounds(
             for req in batch.reqs
         ),
         tuple(
-            keep_hidden or req.return_logprob or req.return_hidden_states_mode.is_full()
+            keep_hidden
+            or req.return_hidden_states_mode.is_full()
+            or (
+                req.return_logprob
+                and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+            )
             for req in batch.reqs
         ),
     )
