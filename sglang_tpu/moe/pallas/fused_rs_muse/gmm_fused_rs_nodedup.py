@@ -73,9 +73,10 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
     u16_env = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0)
     force_u16 = u16_env >= 1
     pq_lhs_on = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0) >= 1
-    auto_ep16 = (ep_size >= 16 or (u16_env >= 0 and pq_lhs_on)) and size_m >= 131_072
+    auto_ep16 = ep_size >= 16 and size_m >= 131_072
+    auto_pq_win = (u16_env >= 0) and pq_lhs_on and size_m >= 131_072
     if ep_size >= 4 and (
-        size_m > 131_072 or auto_ep16 or (force_u16 and size_m > 120_000)
+        size_m > 131_072 or auto_ep16 or auto_pq_win or (force_u16 and size_m > 120_000)
     ):
         floor_rows = (
             131_072
@@ -3063,6 +3064,9 @@ def kernel_main_fused_rs(
                     k_chunk=int(
                         envs.SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_K_STEP.get() or 512
                     ),
+                    has_ext_pq_lhs=has_ext_pq_lhs,
+                    lhs_row_scales_ref=lhs_row_scales_ref,
+                    pq_lhs_mode=pq_lhs_mode,
                 )
 
             return next_skip_out
@@ -5115,9 +5119,7 @@ def gmm_v2_fused_rs(
 
     u16_lhs_env = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0)
     force_u16_lhs = u16_lhs_env >= 1
-    auto_ep16_u16 = (u16_lhs_env >= 0) and (
-        (ep_size >= 16 or has_ext_lhs_scales) and size_m >= 131_072
-    )
+    auto_ep16_u16 = (u16_lhs_env >= 0) and (ep_size >= 16 and size_m >= 131_072)
     flatten_bs_meta = bool(envs.SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META.get()) or (
         block_scatter and (size_m > 131_072 or force_u16_lhs or auto_ep16_u16)
     )

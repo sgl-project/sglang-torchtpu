@@ -319,6 +319,9 @@ def run_eo3_expert_batch(
     direct_fp8_mode: bool = False,
     use_bf16_inner: bool = False,
     k_chunk: int = 512,
+    has_ext_pq_lhs: bool = False,
+    lhs_row_scales_ref: Any = None,
+    pq_lhs_mode: int = 0,
 ) -> None:
     """Execute `batch_n` (`1..R`) consecutive tiles of `expert_id[gm_id]` in N-outer/M-inner order."""
     import jax
@@ -326,8 +329,10 @@ def run_eo3_expert_batch(
     import jax.numpy as jnp
 
     from .prefill_gmm_opts import (
+        fill_pq_lhs_scales_tree,
         quantize_2d_lhs_tile_to_fp8,
         quantize_3d_lhs_tile_to_fp8,
+        unpack_3d_pq_lhs_to_2d_fp8,
     )
 
     gm_id_ref[0] = gm_id
@@ -380,13 +385,36 @@ def run_eo3_expert_batch(
             cur_g,
             metadata_ref,
         )
-        quantize_3d_lhs_tile_to_fp8(
-            gathered_lhs_2x_ref.at[cur_sem],
-            eo_lhs_fp8_4x_ref.at[t],
-            eo_lhs_sc_4x_ref.at[t],
-            tile_m=tile_m,
-            tile_k=tile_k1,
-        )
+        if has_ext_pq_lhs:
+            m_st_t = metadata_ref.gm_id_to_m_offset[cur_g]
+            m_en_t = metadata_ref.gm_id_to_m_offset[cur_g + 1]
+            unpack_3d_pq_lhs_to_2d_fp8(
+                gathered_lhs_2x_ref.at[cur_sem],
+                eo_lhs_fp8_4x_ref.at[t],
+                tile_m=tile_m,
+                tile_k=tile_k1,
+            )
+            fill_pq_lhs_scales_tree(
+                eo_lhs_sc_4x_ref,
+                lhs_row_scales_ref,
+                lhs_indices_ref,
+                m_st=m_st_t,
+                m_en=m_en_t,
+                num_valid=m_en_t - m_st_t,
+                num_lanes=eo_lhs_sc_4x_ref.shape[-1],
+                packed_u16_lhs=packed_u16_lhs,
+                gather_divisor=gather_divisor,
+                scale_b_id=t,
+                unroll_m_rows=(tile_m if pq_lhs_mode >= 3 else None),
+            )
+        else:
+            quantize_3d_lhs_tile_to_fp8(
+                gathered_lhs_2x_ref.at[cur_sem],
+                eo_lhs_fp8_4x_ref.at[t],
+                eo_lhs_sc_4x_ref.at[t],
+                tile_m=tile_m,
+                tile_k=tile_k1,
+            )
 
     gm_after = gm_id + batch_n
     has_after = gm_after < local_num_gm

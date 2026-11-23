@@ -2667,4 +2667,340 @@ def test_w9_pql4_pql5_zero_deq_pipeline_lowering(ep_size: int, num_tok: int, pq_
         assert "pallas_deq_single_fp8_gmm" not in hlo
         assert "pallas_deq_both_gmm" not in hlo
         assert "pallas_deq_single_gmm" not in hlo
+        if ep_size == 8:
+            assert "-u16w" not in hlo
         jax.clear_caches()
+
+
+def test_w9_cand4_eo3_eo4_with_pql4_interpret_zero_ulp_and_lowering():
+    """Verify run_eo3_expert_batch + has_ext_pq_lhs (pql4) matches eo4 at 0.0-ULP on log-normal scales and lowers cleanly."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        fused_rs_smem_rows,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import MetadataRef
+    from sglang_tpu.moe.pallas.fused_rs_muse.w1_fp8_expert_cache import (
+        compute_eo3_batch_count,
+        run_eo3_expert_batch,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    # 1. Verify i32w98k SMEM windowing at M=131,072 under PREQUANT_LHS_FP8>=1:
+    with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4"}):
+        assert fused_rs_smem_rows(131_072, 8, False) == 98_304
+    with patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "0"}):
+        assert fused_rs_smem_rows(131_072, 8, False) == 131_072
+
+    # 2. CPU interpret=True: eo4+pql4 must match eo4+bf16 at 0.0-ULP when fed identical quantized FP8 LHS!
+    rng = np.random.default_rng(20261125)
+    num_gm = 4
+    e_ids = np.array([0, 1, 1, 1, 0], dtype=np.int32)
+    tile_m, k1, n1_half, k2, n2, rhs_qbs = 256, 2048, 512, 1024, 512, 256
+    m_offs = np.arange(num_gm + 1, dtype=np.int32) * tile_m
+    num_e = 2
+    n_tok = num_gm * tile_m
+    lhs_idx = np.arange(n_tok, dtype=np.int32)
+
+    x_bf16 = jnp.asarray(
+        rng.standard_normal((n_tok, k1 // 128, 128)).astype(np.float32) * 0.4,
+        jnp.bfloat16,
+    )
+    x_2d = x_bf16.reshape(n_tok, k1)
+    amax = jnp.max(jnp.abs(x_2d), axis=1, keepdims=True).astype(jnp.float32)
+    inv_s = jnp.where(amax == 0.0, 0.0, jnp.float32(448.0) / amax).astype(jnp.bfloat16)
+    row_sc = jnp.where(amax == 0.0, 0.0, amax * jnp.float32(1.0 / 448.0)).reshape(-1)
+    x_fp8 = (x_2d * inv_s).astype(jnp.float8_e4m3fn).reshape(n_tok, k1 // 128, 128)
+
+    w1_u32 = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(num_e, 2, k1 // 8, n1_half * 2), dtype=np.uint32)
+    )
+    s1_bf16 = jnp.asarray(
+        np.exp(rng.normal(-2.0, 0.35, size=(num_e, 2, k1 // rhs_qbs, 1, n1_half * 2))).astype(np.float32),
+        jnp.bfloat16,
+    )
+    w2_u32 = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(num_e, 2, k2 // 8, n2), dtype=np.uint32)
+    )
+    s2_bf16 = jnp.asarray(
+        np.exp(rng.normal(-2.0, 0.35, size=(num_e, 2, k2 // rhs_qbs, 1, n2))).astype(np.float32),
+        jnp.bfloat16,
+    )
+    pnw_8 = jnp.broadcast_to(
+        jnp.asarray(1.0 + 0.08 * rng.standard_normal((n2 * 2,), np.float32), jnp.bfloat16)[None, :],
+        (8, n2 * 2),
+    )
+    gs_g = jnp.asarray([0.9, 1.1], dtype=jnp.float32)
+    gs_u = jnp.asarray([1.05, 0.95], dtype=jnp.float32)
+    gs_w2 = jnp.asarray([0.97, 1.03], dtype=jnp.float32)
+
+    def _run_eo_interp(*, use_ext_pq: bool, direct_fp8: bool) -> np.ndarray:
+        x_in = x_fp8.reshape(num_gm, tile_m, k1 // 128, 128) if use_ext_pq else x_bf16.reshape(num_gm, tile_m, k1 // 128, 128)
+
+        def _ker(
+            x_r, sc_r, idx_r, w1_r, s1_r, w2_r, s2_r, pnw_r, eid_r, moff_r, gsg_r, gsu_r, gsw2_r,
+            out_r, g_lhs_2x, w1_b, s1_b, w2_b, s2_b, stg_4x, wh_r, wc_r, lfp8_5x, lsc_5x, buf_5x,
+            gmid_r, fg_r, fm_r, gsem_r,
+        ):
+            meta = MetadataRef(gm_id_to_group_id=eid_r, gm_id_to_m_offset=moff_r)
+            fmeta = MetadataRef(gm_id_to_group_id=fg_r, gm_id_to_m_offset=fm_r)
+
+            def _g_start(hs, dst, idx, sem, gm, mref, divisor=1, packed_u16=False):
+                dst[...] = x_r[gm]
+
+            def _noop(*_a, **_kw):
+                pass
+
+            def _w1_start(slot, eid, nid, kid):
+                w1_b[slot] = w1_r[eid, nid]
+                s1_b[slot] = s1_r[eid, nid]
+
+            def _w2_start(slot, eid, nid, kid):
+                w2_b[slot] = w2_r[eid, nid]
+                s2_b[slot] = s2_r[eid, nid]
+
+            def _direct_w(gm, slot):
+                out_r[gm] = stg_4x[slot].reshape(tile_m, n2 * 2).astype(jnp.bfloat16)
+
+            def _body(gm_id, skip_cur):
+                should_run = skip_cur == 0
+                bn = compute_eo3_batch_count(gm_id, jnp.int32(num_gm), meta, max_batch=5)
+                nxt_skip = jnp.where(should_run, bn - 1, jnp.maximum(skip_cur - 1, 0))
+
+                @pl.when(should_run)
+                def _():
+                    run_eo3_expert_batch(
+                        gm_id=gm_id,
+                        batch_n=bn,
+                        local_num_gm=jnp.int32(num_gm),
+                        gm_id_ref=gmid_r,
+                        metadata_ref=meta,
+                        fused_metadata_ref=fmeta,
+                        hidden_states_ref=x_r,
+                        gathered_lhs_2x_ref=g_lhs_2x,
+                        lhs_indices_ref=idx_r,
+                        gather_sem_ref=gsem_r,
+                        gather_divisor=1,
+                        packed_u16_lhs=False,
+                        dma_gather_gm_start_fn=_g_start,
+                        dma_gather_gm_wait_fn=_noop,
+                        start_w1_dma_fn=_w1_start,
+                        wait_w1_dma_fn=_noop,
+                        start_w2_dma_fn=_w2_start,
+                        wait_w2_dma_fn=_noop,
+                        wait_staging_slot_writes_fn=_noop,
+                        do_direct_write_fn=_direct_w,
+                        maybe_start_deferred_cm_wt_send_fn=None,
+                        enable_chipmate=False,
+                        cm_defer_send=False,
+                        defer_writes=True,
+                        w1_buf_ref=w1_b,
+                        w1_scale_buf_ref=s1_b,
+                        w2_buf_ref=w2_b,
+                        w2_scale_buf_ref=s2_b,
+                        w1_gs_gate_ref=gsg_r,
+                        w1_gs_up_ref=gsu_r,
+                        w2_gs_ref=gsw2_r,
+                        has_w1_gs=True,
+                        has_w2_gs=True,
+                        pnw_ref=pnw_r,
+                        in_kernel_post_norm_size=n2 * 2,
+                        static_fp8_rs_scale=0.0,
+                        scatter_staging_3x_ref=stg_4x,
+                        eo_w_half_fp8_ref=wh_r,
+                        eo_w_colc_ref=wc_r,
+                        eo_lhs_fp8_4x_ref=lfp8_5x,
+                        eo_lhs_sc_4x_ref=lsc_5x,
+                        eo_buf_4x_ref=buf_5x,
+                        num_n1=2,
+                        num_n2=2,
+                        tile_m=tile_m,
+                        tile_k1=k1,
+                        tile_n1=n1_half,
+                        tile_k2=k2,
+                        tile_n2=n2,
+                        strip_step=256,
+                        rhs1_qbs=rhs_qbs,
+                        rhs2_qbs=rhs_qbs,
+                        packing1=8,
+                        packing2=8,
+                        rhs1_quant_dtype=jnp.float4_e2m1fn.dtype,
+                        rhs2_quant_dtype=jnp.float4_e2m1fn.dtype,
+                        out_dtype=jnp.bfloat16,
+                        direct_fp8_mode=direct_fp8,
+                        use_bf16_inner=True,
+                        k_chunk=256,
+                        has_ext_pq_lhs=use_ext_pq,
+                        lhs_row_scales_ref=sc_r,
+                        pq_lhs_mode=(4 if use_ext_pq else 0),
+                    )
+
+                return nxt_skip
+
+            jax.lax.fori_loop(0, num_gm, _body, jnp.int32(0))
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            return np.asarray(
+                pl.pallas_call(
+                    _ker,
+                    out_shape=jax.ShapeDtypeStruct((num_gm, tile_m, n2 * 2), jnp.bfloat16),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)]
+                        + [pl.BlockSpec(memory_space=pltpu.SMEM)] * 2
+                        + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 5
+                        + [pl.BlockSpec(memory_space=pltpu.SMEM)] * 5,
+                        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                        scratch_shapes=[
+                            pltpu.VMEM((2, tile_m, k1 // 128, 128), x_in.dtype),
+                            pltpu.VMEM((2, k1 // 8, n1_half * 2), jnp.uint32),
+                            pltpu.VMEM((2, k1 // rhs_qbs, 1, n1_half * 2), jnp.bfloat16),
+                            pltpu.VMEM((2, k2 // 8, n2), jnp.uint32),
+                            pltpu.VMEM((2, k2 // rhs_qbs, 1, n2), jnp.bfloat16),
+                            pltpu.VMEM((4, tile_m, (n2 * 2) // 128, 128), jnp.bfloat16),
+                            pltpu.VMEM((max(k1, k2), max(n1_half, n2)), jnp.float8_e4m3fn),
+                            pltpu.VMEM((8, 128 if direct_fp8 else max(n1_half, n2)), jnp.float32),
+                            pltpu.VMEM((5, tile_m, max(k1, k2)), jnp.float8_e4m3fn),
+                            pltpu.VMEM((5, tile_m, 128), jnp.float32),
+                            pltpu.VMEM((5, tile_m, n1_half * 2), jnp.bfloat16),
+                            pltpu.SMEM((1,), jnp.int32),
+                            pltpu.SMEM((1,), jnp.int32),
+                            pltpu.SMEM((2,), jnp.int32),
+                            pltpu.SemaphoreType.DMA((2,)),
+                        ],
+                    ),
+                    interpret=True,
+                )(
+                    x_in, row_sc, jnp.asarray(lhs_idx), w1_u32, s1_bf16, w2_u32, s2_bf16,
+                    pnw_8, jnp.asarray(e_ids), jnp.asarray(m_offs), gs_g, gs_u, gs_w2,
+                ),
+                dtype=np.float32,
+            )
+
+    out_eo4_bf16 = _run_eo_interp(use_ext_pq=False, direct_fp8=True)
+    out_eo4_pql4 = _run_eo_interp(use_ext_pq=True, direct_fp8=True)
+    out_eo3_bf16 = _run_eo_interp(use_ext_pq=False, direct_fp8=False)
+    out_eo3_pql4 = _run_eo_interp(use_ext_pq=True, direct_fp8=False)
+
+    # 0.0-ULP bit-exact match between prequantized FP8 LHS (pql4) and in-kernel FP8 LHS!
+    np.testing.assert_array_equal(out_eo4_pql4, out_eo4_bf16)
+    np.testing.assert_array_equal(out_eo3_pql4, out_eo3_bf16)
+
+    # Verify eo3 vs eo4 cosine > 0.999 on log-normal scales
+    cos_eo3 = float(
+        np.dot(out_eo3_pql4.ravel(), out_eo4_pql4.ravel())
+        / (np.linalg.norm(out_eo3_pql4) * np.linalg.norm(out_eo4_pql4) + 1e-30)
+    )
+    assert cos_eo3 > 0.997, f"Expected cos > 0.997 between eo3+pql4 and eo4+pql4, got {cos_eo3}"
+
+    if len(jax.devices()) < 8:
+        pytest.skip("8-device lowering check needs XLA_FLAGS=--xla_force_host_platform_device_count=8")
+
+    mesh = Mesh(np.array(jax.devices()[:8]), ("model",))
+    for eo_mode in ("3", "4"):
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+                    "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": eo_mode,
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+                    "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                },
+            ),
+        ):
+            jax.clear_caches()
+
+            def _wrap(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus):
+                return jax.shard_map(
+                    lambda *xs: fused_moe_full_bridge_and_ffn(
+                        *xs,
+                        mesh=mesh,
+                        router_mode="bf16_hilo",
+                        b2_layout="nstream",
+                        b2_two_half=True,
+                        b2_deq0_first=True,
+                        hoist_routing=True,
+                        d_layout="4slab",
+                        d_tok_tile=64,
+                        d_fp8_unpool=True,
+                        in_shard_map=True,
+                        b2_deq0_new_buffer=True,
+                        next_in_gather_rows=0,
+                        next_in_gather_static_fp8=False,
+                    ),
+                    mesh=mesh,
+                    in_specs=(
+                        P("model", None), P("model", None), P(), P(), P(), P(), P(), P(), P(), P(),
+                        P("model"), P("model"), P("model"), P("model"), P(), P("model"),
+                        P(), P(), P(), P(), P(), P(),
+                    ),
+                    out_specs=(P("model", None), P("model", None), P("model", None), P("model", None)),
+                    check_vma=False,
+                )(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus, pfw, aa, ba, pfw)
+
+            hlo = (
+                jax.jit(_wrap)
+                .trace(
+                    jax.ShapeDtypeStruct((16384, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16384, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8192, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((256,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((4096,), jnp.float32),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((256, 8, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256, 8, 4096), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8,), jnp.int32),
+                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                )
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+            assert f"-pql4" in hlo and f"-eo{eo_mode}" in hlo
+            assert "-u16w" not in hlo
+            assert "_outfp8" in hlo and "xor1_xytorus_ag" in hlo
+            assert "pallas_deq_both" not in hlo
+            jax.clear_caches()
