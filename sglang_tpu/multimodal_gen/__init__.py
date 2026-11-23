@@ -13,7 +13,7 @@ def activate() -> str | None:
     import torch
 
     # torch_tpu autoloads with torch and registers torch.tpu only when it finds
-    # hardware; the built-in TPU detection checks the same.
+    # hardware; an installed wheel alone must not select this platform.
     if getattr(torch, "tpu", None) is None:
         return None
     return PLATFORM_CLASS_PATH
