@@ -7,11 +7,15 @@ import torch
 
 from sglang.srt.configs.model_config import get_hybrid_layer_ids
 from sglang.srt.configs.muse_spark import MuseSparkConfig
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptQuantConfig,
+    TpuModelOptCompatibleFp4Config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.models.muse_spark import (
+    MuseSparkForConditionalGeneration,
     MuseSparkInterleavedRope,
     MuseSparkMoE,
     MuseSparkRMSNorm,
@@ -19,6 +23,7 @@ from sglang_tpu.models.muse_spark import (
     _HostQuantizedFp8Config,
     _param_name,
     _to_interleaved_rope,
+    _uses_quantized_experts,
 )
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -59,6 +64,31 @@ class TestMuseSparkExpertQuantConfig(CustomTestCase):
             with tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.override(True):
                 with self.assertRaisesRegex(ValueError, "MUSE_MEGAKERNEL"):
                     _experts_quant_config(nvfp4, first)
+
+    def test_checkpoint_module_paths_keep_first_and_last_experts_unquantized(self):
+        """The released NVFP4 config lists the BF16 experts as checkpoint module
+        paths too, and ModelOpt reads those; layers 0 and 61 must stay unquantized."""
+        nvfp4 = TpuModelOptCompatibleFp4Config.from_config(
+            {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "exclude_modules": ["layers.0.", "layers.61.", "self_attn", "lm_head"],
+                "modules_to_not_convert": [
+                    "lm_head",
+                    "model.language_model.layers.0.mlp.experts",
+                    "model.language_model.layers.1.mlp.pre_expert_proj",
+                    "model.language_model.layers.61.mlp.experts",
+                ],
+            }
+        )
+        # What the model loader does with the entry class's mapper.
+        nvfp4.apply_weight_name_mapper(
+            MuseSparkForConditionalGeneration.hf_to_sglang_mapper
+        )
+        for layer, quantized in ((0, False), (1, True), (6, True), (61, False)):
+            experts = f"model.layers.{layer}.mlp.experts"
+            with self.subTest(experts=experts):
+                self.assertEqual(_uses_quantized_experts(nvfp4, experts), quantized)
 
 
 class TestMuseSparkSlotCombine(CustomTestCase):
