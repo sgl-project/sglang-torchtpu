@@ -11,6 +11,11 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    PerTensorScaleParameter,
+)
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
@@ -154,6 +159,122 @@ def _requantize_tpu_block_fp8_to_channelwise(
     layer.weight_block_size = None
 
 
+class _TpuFp8LinearReloadSpec(NamedTuple):
+    weight_shape: tuple[int, int]
+    weight_dtype: torch.dtype
+    has_weight_scale: bool
+    weight_scale_shape: tuple[int, ...] | None
+    weight_scale_loader: Callable | None
+    has_weight_scale_inv: bool
+    weight_scale_inv_shape: tuple[int, ...] | None
+    weight_scale_inv_dtype: torch.dtype | None
+    weight_scale_inv_loader: Callable | None
+    weight_scale_inv_ue8m0: bool
+
+
+def record_tpu_fp8_linear_reload_state(layer: Module) -> None:
+    """Record pre-postprocess weight/scale layout so RL weight updates can restore it."""
+    if getattr(layer, "_tpu_fp8_linear_reload_spec", None) is not None:
+        return
+    weight = getattr(layer, "weight", None)
+    if not isinstance(weight, Parameter) or weight.dim() != 2:
+        return
+    weight_scale = getattr(layer, "weight_scale", None)
+    has_weight_scale = isinstance(weight_scale, Parameter)
+    weight_scale_inv = getattr(layer, "weight_scale_inv", None)
+    has_weight_scale_inv = isinstance(weight_scale_inv, Parameter)
+    layer._tpu_fp8_linear_reload_spec = _TpuFp8LinearReloadSpec(
+        weight_shape=(int(weight.shape[0]), int(weight.shape[1])),
+        weight_dtype=weight.dtype,
+        has_weight_scale=has_weight_scale,
+        weight_scale_shape=tuple(weight_scale.shape) if has_weight_scale else None,
+        weight_scale_loader=(
+            getattr(weight_scale, "weight_loader", None) if has_weight_scale else None
+        ),
+        has_weight_scale_inv=has_weight_scale_inv,
+        weight_scale_inv_shape=(
+            tuple(weight_scale_inv.shape) if has_weight_scale_inv else None
+        ),
+        weight_scale_inv_dtype=(
+            weight_scale_inv.dtype if has_weight_scale_inv else None
+        ),
+        weight_scale_inv_loader=(
+            getattr(weight_scale_inv, "weight_loader", None)
+            if has_weight_scale_inv
+            else None
+        ),
+        weight_scale_inv_ue8m0=(
+            bool(getattr(weight_scale_inv, "format_ue8m0", False))
+            if has_weight_scale_inv
+            else False
+        ),
+    )
+
+
+def restore_tpu_fp8_linear_weights_before_loading(layer: Module) -> None:
+    """Restore canonical [N, K] parameter shapes before an online RL weight reload."""
+    if isinstance(getattr(layer, "weight", None), StaticFp8Weight):
+        raise RuntimeError(
+            "StaticFp8Weight does not support online weight reload; "
+            "disable SGLANG_TPU_K3_STATIC_FP8 for RL rollout engines."
+        )
+    spec: _TpuFp8LinearReloadSpec | None = getattr(
+        layer, "_tpu_fp8_linear_reload_spec", None
+    )
+    if spec is None:
+        return
+    device = layer.weight.device
+    if (
+        tuple(layer.weight.shape) != spec.weight_shape
+        or layer.weight.dtype != spec.weight_dtype
+    ):
+        # Keep the ModelWeightParameter instance stable for weight_loader and direct_compile.
+        copy_or_rebind_param(
+            layer,
+            "weight",
+            torch.empty(spec.weight_shape, dtype=spec.weight_dtype, device=device),
+        )
+    if spec.has_weight_scale and spec.weight_scale_shape is not None:
+        scale_buf = torch.full(
+            spec.weight_scale_shape,
+            torch.finfo(torch.float32).min,
+            dtype=torch.float32,
+            device=device,
+        )
+        if isinstance(getattr(layer, "weight_scale", None), Parameter):
+            copy_or_rebind_param(layer, "weight_scale", scale_buf)
+        else:
+            layer.register_parameter(
+                "weight_scale",
+                PerTensorScaleParameter(
+                    data=scale_buf, weight_loader=spec.weight_scale_loader
+                ),
+            )
+    if spec.has_weight_scale_inv and spec.weight_scale_inv_shape is not None:
+        assert spec.weight_scale_inv_dtype is not None
+        scale_inv_init = (
+            torch.zeros
+            if spec.weight_scale_inv_dtype == torch.uint8
+            else lambda *s, **kw: torch.full(*s, torch.finfo(torch.float32).min, **kw)
+        )
+        scale_inv_buf = scale_inv_init(
+            spec.weight_scale_inv_shape,
+            dtype=spec.weight_scale_inv_dtype,
+            device=device,
+        )
+        if isinstance(getattr(layer, "weight_scale_inv", None), Parameter):
+            copy_or_rebind_param(layer, "weight_scale_inv", scale_inv_buf)
+        else:
+            scale_inv_param = BlockQuantScaleParameter(
+                data=scale_inv_buf,
+                input_dim=1,
+                output_dim=0,
+                weight_loader=spec.weight_scale_inv_loader,
+            )
+            scale_inv_param.format_ue8m0 = spec.weight_scale_inv_ue8m0
+            layer.register_parameter("weight_scale_inv", scale_inv_param)
+
+
 def _set_channelwise_fp8_weight(
     layer: Module, weight: torch.Tensor, dtype: torch.dtype
 ) -> None:
@@ -177,8 +298,8 @@ def _set_channelwise_fp8_weight(
         max=dtype_max,
     ).to(dtype)
 
-    layer.weight = Parameter(qweight.t().contiguous(), requires_grad=False)
-    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+    copy_or_rebind_param(layer, "weight", qweight.t().contiguous())
+    copy_or_rebind_param(layer, "weight_scale", weight_scale)
     layer.input_scale = None
 
 
@@ -188,6 +309,7 @@ def prepare_tpu_fp8_linear_weights(
     weight_block_size: list[int] | tuple[int, int],
 ) -> None:
     """Post-load preparation for TPU block-FP8 dense linear layers."""
+    record_tpu_fp8_linear_reload_state(layer)
     block_n, block_k = weight_block_size
     out_size, in_size = layer.weight.shape
     logical_widths = getattr(layer, "logical_widths", None) or [out_size]
@@ -225,6 +347,7 @@ def prepare_tpu_online_fp8_linear_weights(
     per-row scales instead of one per-tensor scale over the rank's shard, so
     TP-replicated kv heads stay byte-identical across ranks (#1767).
     """
+    record_tpu_fp8_linear_reload_state(layer)
     _set_channelwise_fp8_weight(layer, layer.weight.data, dtype)
 
 

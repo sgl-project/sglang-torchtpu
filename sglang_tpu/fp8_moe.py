@@ -12,6 +12,9 @@ native torch here without touching the generic FP8 quantization method.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -263,6 +266,171 @@ def _to_tpu_fp8_moe_block_scale_layout(
     return _own_storage(scale[:, :, None, :].contiguous())
 
 
+@dataclass(frozen=True)
+class _MoeParamReloadSpec:
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    attrs: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _TpuFp8MoeReloadSpec:
+    w13_weight: _MoeParamReloadSpec
+    w2_weight: _MoeParamReloadSpec
+    w13_weight_scale: _MoeParamReloadSpec | None
+    w2_weight_scale: _MoeParamReloadSpec | None
+    w13_weight_scale_inv: _MoeParamReloadSpec | None
+    w2_weight_scale_inv: _MoeParamReloadSpec | None
+
+
+def _snapshot_moe_param(
+    layer: torch.nn.Module, name: str
+) -> _MoeParamReloadSpec | None:
+    param = getattr(layer, name, None)
+    if not isinstance(param, Parameter):
+        return None
+    return _MoeParamReloadSpec(
+        shape=tuple(param.shape),
+        dtype=param.dtype,
+        attrs={
+            k: v for k, v in param.__dict__.items() if not isinstance(v, torch.Tensor)
+        },
+    )
+
+
+def record_tpu_fp8_moe_reload_state(layer: torch.nn.Module) -> None:
+    """Record canonical [E, N, K] shapes and scale metadata before TPU layout conversion."""
+    if getattr(layer, "_tpu_fp8_moe_reload_spec", None) is not None:
+        return
+    w13 = _snapshot_moe_param(layer, "w13_weight")
+    w2 = _snapshot_moe_param(layer, "w2_weight")
+    if w13 is None or w2 is None:
+        return
+    layer._tpu_fp8_moe_reload_spec = _TpuFp8MoeReloadSpec(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_weight_scale=_snapshot_moe_param(layer, "w13_weight_scale"),
+        w2_weight_scale=_snapshot_moe_param(layer, "w2_weight_scale"),
+        w13_weight_scale_inv=_snapshot_moe_param(layer, "w13_weight_scale_inv"),
+        w2_weight_scale_inv=_snapshot_moe_param(layer, "w2_weight_scale_inv"),
+    )
+
+
+def _restore_moe_param(
+    layer: torch.nn.Module,
+    name: str,
+    spec: _MoeParamReloadSpec | None,
+    *,
+    device: torch.device,
+    fill_ones: bool,
+) -> None:
+    if spec is None:
+        return
+    init_fn = (
+        torch.zeros
+        if spec.dtype == torch.uint8
+        else (torch.ones if fill_ones else torch.empty)
+    )
+    existing = getattr(layer, name, None)
+    if isinstance(existing, Parameter):
+        if tuple(existing.shape) != spec.shape or existing.dtype != spec.dtype:
+            copy_or_rebind_param(
+                layer, name, init_fn(spec.shape, dtype=spec.dtype, device=device)
+            )
+        elif fill_ones:
+            existing.data.fill_(0 if spec.dtype == torch.uint8 else 1)
+        param = getattr(layer, name)
+    else:
+        param = Parameter(
+            init_fn(spec.shape, dtype=spec.dtype, device=device),
+            requires_grad=False,
+        )
+        layer.register_parameter(name, param)
+    for attr_key, attr_val in spec.attrs.items():
+        setattr(param, attr_key, attr_val)
+
+
+def restore_tpu_fp8_moe_weights_before_loading(layer: torch.nn.Module) -> None:
+    """Restore canonical [E, N, K] shapes and scale buffers before an online RL reload."""
+    spec: _TpuFp8MoeReloadSpec | None = getattr(layer, "_tpu_fp8_moe_reload_spec", None)
+    if spec is None:
+        return
+    device = layer.w13_weight.device
+    _restore_moe_param(
+        layer, "w13_weight", spec.w13_weight, device=device, fill_ones=False
+    )
+    _restore_moe_param(
+        layer, "w2_weight", spec.w2_weight, device=device, fill_ones=False
+    )
+    _restore_moe_param(
+        layer, "w13_weight_scale", spec.w13_weight_scale, device=device, fill_ones=True
+    )
+    _restore_moe_param(
+        layer, "w2_weight_scale", spec.w2_weight_scale, device=device, fill_ones=True
+    )
+    _restore_moe_param(
+        layer,
+        "w13_weight_scale_inv",
+        spec.w13_weight_scale_inv,
+        device=device,
+        fill_ones=True,
+    )
+    _restore_moe_param(
+        layer,
+        "w2_weight_scale_inv",
+        spec.w2_weight_scale_inv,
+        device=device,
+        fill_ones=True,
+    )
+
+
+def _transient_chunk_budget_bytes(device: torch.device) -> int:
+    if device.type == "cpu":
+        return 256 * 1024**2
+    try:
+        free_bytes = current_platform.get_available_memory()[0]
+    except Exception:
+        free_bytes = 1024**3
+    return int(min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4)))
+
+
+def prepare_tpu_online_fp8_moe_weights(
+    layer: torch.nn.Module,
+    *,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> None:
+    """Quantize unquantized MoE weights (``--quantization fp8``) to channelwise FP8 on TPU."""
+    record_tpu_fp8_moe_reload_state(layer)
+    device = layer.w13_weight.device
+    target_transient_bytes = _transient_chunk_budget_bytes(device)
+    for w_name in ("w13_weight", "w2_weight"):
+        w_param = getattr(layer, w_name)
+        num_experts, n, k = w_param.shape
+        chunk = max(1, target_transient_bytes // max(1, n * k * 4))
+        q_weight = torch.empty((num_experts, n, k), dtype=dtype, device=device)
+        scales = []
+        for c0 in range(0, num_experts, chunk):
+            c1 = min(c0 + chunk, num_experts)
+            q_chunk, s_chunk = _quantize_moe_weight_channelwise(
+                w_param.data[c0:c1].to(torch.float32), dtype
+            )
+            q_weight[c0:c1].copy_(q_chunk)
+            del q_chunk
+            scales.append(s_chunk)
+            if device.type != "cpu":
+                torch.accelerator.synchronize()
+        copy_or_rebind_param(layer, w_name, q_weight)
+        copy_or_rebind_param(layer, f"{w_name}_scale", torch.cat(scales, dim=0))
+
+    prepare_tpu_fp8_moe_weights(
+        layer,
+        block_quant=False,
+        weight_block_size=None,
+        use_mxfp8=False,
+        is_fp4_expert=False,
+    )
+
+
 def prepare_tpu_fp8_moe_weights(
     layer: torch.nn.Module,
     *,
@@ -272,6 +440,8 @@ def prepare_tpu_fp8_moe_weights(
     is_fp4_expert: bool,
 ) -> None:
     """Format FP8 or MXFP4 MoE weights/scales for the TPU Pallas gmm_v2 backend."""
+    if not is_fp4_expert and not use_mxfp8:
+        record_tpu_fp8_moe_reload_state(layer)
     if use_mxfp8:
         raise NotImplementedError(
             "TPU FP8 MoE currently does not support MXFP8 experts."

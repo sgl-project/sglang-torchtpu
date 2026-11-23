@@ -35,9 +35,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
-from sglang_tpu.hooks.dsv4 import (
-    register_tpu_dsv4_resolution_hooks,
-)
+from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -45,6 +43,7 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
+from sglang_tpu.hooks.fp8_reload import hook_specs as fp8_reload_hooks
 from sglang_tpu.hooks.glm5_next_vision import (
     attach_glm5_next_nextn_multimodal_forward,
     attach_glm5_next_vision_runner,
@@ -483,6 +482,7 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+HOOKS.extend(fp8_reload_hooks())
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
 
