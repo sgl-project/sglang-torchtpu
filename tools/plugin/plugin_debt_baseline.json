@@ -1,0 +1,256 @@
+{
+  "hooks": {
+    "sglang.kernels.ops.activation.silu_and_mul_clamp": 1,
+    "sglang.kernels.ops.layernorm.mhc": 2,
+    "sglang.srt.arg_groups.deepseek_v4_hook": 1,
+    "sglang.srt.arg_groups.kimi_k3_hook": 1,
+    "sglang.srt.arg_groups.validation_hook": 1,
+    "sglang.srt.configs.model_config": 1,
+    "sglang.srt.disaggregation.decode": 1,
+    "sglang.srt.disaggregation.encoder.runtime": 1,
+    "sglang.srt.disaggregation.encoder.server": 4,
+    "sglang.srt.distributed.parallel_state": 1,
+    "sglang.srt.environ": 1,
+    "sglang.srt.layers.attention.dsv4.compressor": 2,
+    "sglang.srt.layers.engram": 5,
+    "sglang.srt.layers.layer_boundary.adapters.attention": 1,
+    "sglang.srt.layers.layer_boundary.residual.mhc": 1,
+    "sglang.srt.layers.linear": 1,
+    "sglang.srt.layers.logits_processor": 3,
+    "sglang.srt.layers.moe.hash_topk": 2,
+    "sglang.srt.layers.moe.topk": 3,
+    "sglang.srt.managers.mm_schedule": 1,
+    "sglang.srt.managers.overlap_utils": 2,
+    "sglang.srt.managers.row_select": 2,
+    "sglang.srt.managers.schedule_batch": 8,
+    "sglang.srt.managers.schedule_policy": 3,
+    "sglang.srt.managers.scheduler": 4,
+    "sglang.srt.managers.scheduler_components.metrics_reporter": 3,
+    "sglang.srt.managers.tp_worker": 1,
+    "sglang.srt.managers.utils": 1,
+    "sglang.srt.mem_cache.allocation": 2,
+    "sglang.srt.mem_cache.hicache_auto_size": 1,
+    "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler": 1,
+    "sglang.srt.mem_cache.kv_cache_configurator": 9,
+    "sglang.srt.mem_cache.unified_radix_cache": 1,
+    "sglang.srt.model_executor.encoder_swa_replay": 1,
+    "sglang.srt.model_executor.forward_batch_info": 3,
+    "sglang.srt.model_executor.model_runner": 2,
+    "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager": 2,
+    "sglang.srt.model_executor.pool_configurator": 10,
+    "sglang.srt.model_loader.loader": 2,
+    "sglang.srt.models.deepseek_nextn": 1,
+    "sglang.srt.models.deepseek_v2": 1,
+    "sglang.srt.models.deepseek_v4": 4,
+    "sglang.srt.models.deepseek_v4_dspark": 4,
+    "sglang.srt.models.deepseek_v4_mhc": 1,
+    "sglang.srt.models.deepseek_v4_nextn": 1,
+    "sglang.srt.models.dflash": 2,
+    "sglang.srt.models.dspark": 2,
+    "sglang.srt.models.glm4_moe_lite_nextn": 1,
+    "sglang.srt.models.glm4_moe_nextn": 1,
+    "sglang.srt.models.glm5_next": 11,
+    "sglang.srt.models.glm5_next_nextn": 1,
+    "sglang.srt.models.kimi_k3": 12,
+    "sglang.srt.models.kimi_k3_vl": 3,
+    "sglang.srt.observability.metrics_collector": 2,
+    "sglang.srt.runtime_context": 1,
+    "sglang.srt.sampling.penaltylib.repetition_penalty": 1,
+    "sglang.srt.sampling.sampling_batch_info": 4,
+    "sglang.srt.speculative.base_spec_worker": 1,
+    "sglang.srt.speculative.dflash_disaggregation": 1,
+    "sglang.srt.speculative.dflash_utils": 1,
+    "sglang.srt.speculative.dspark_disaggregation": 1,
+    "sglang.srt.speculative.eagle_disaggregation": 1,
+    "sglang.srt.speculative.spec_info": 7,
+    "sglang.srt.speculative.spec_tp_sync": 1,
+    "sglang.srt.speculative.spec_utils": 2,
+    "sglang.srt.utils.process": 1,
+    "sglang_tpu.graph_runner.tpu_graph_runner": 1
+  },
+  "patches": {
+    "_configure_eager_mode": [
+      "torch_tpu._internal.execution_mode.eager_mode"
+    ],
+    "_install_hybrid_linear_hicache": [],
+    "_patch_compute_position_torch": [
+      "sglang.srt.model_executor.forward_batch_info.compute_position_torch"
+    ],
+    "_patch_future_map_direct_handoff": [
+      "sglang.srt.managers.overlap_utils.FutureMap.publish",
+      "sglang.srt.managers.overlap_utils.FutureMap.resolve_mixed_spec_tails",
+      "sglang.srt.managers.overlap_utils.FutureMap.stash",
+      "sglang.srt.managers.overlap_utils.FutureMap.stash_bonus_tokens",
+      "sglang.srt.managers.overlap_utils.FutureMap.tpu_direct_handoff",
+      "sglang.srt.managers.overlap_utils.FutureMap.tpu_published_seq_lens"
+    ],
+    "_patch_hicache_async_ready_counts": [
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._sync_hicache_ready_counts",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reset"
+    ],
+    "_patch_hicache_write_back_copy_ahead": [
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._evict",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._finish_write_through_ack",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._write_back_copy_ahead",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.backup_node_for_write_back",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.check_hicache_events",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.init_hicache",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.writing_check"
+    ],
+    "_patch_host_heap_trim": [
+      "sglang.srt.managers.scheduler.Scheduler.get_init_info",
+      "sglang.srt.managers.scheduler.Scheduler.handle_freeze_gc",
+      "sglang.srt.managers.scheduler.Scheduler.init_all_cuda_graphs",
+      "sglang.srt.managers.scheduler.Scheduler.init_model_worker"
+    ],
+    "_patch_pd_decode_async_prefill_info": [
+      "sglang.srt.disaggregation.decode.DecodePreallocQueue._ensure_prefill_info"
+    ],
+    "_patch_pd_decode_swa_hicache": [
+      "sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock",
+      "sglang.srt.disaggregation.decode_hicache_mixin.DecodeHiCacheTransferMixin._commit_hicache_local_restore_to_req",
+      "sglang.srt.disaggregation.decode_hicache_mixin.DecodeHiCacheTransferMixin._process_hicache_local_restores",
+      "sglang.srt.mem_cache.kv_cache_builder.build_kv_cache",
+      "sglang.srt.mem_cache.kv_cache_builder.create_tree_cache",
+      "sglang.srt.mem_cache.unified_cache.components.swa.SWAComponent._collect_unbacked_swa_nodes",
+      "sglang.srt.mem_cache.unified_cache.components.swa.SWAComponent.build_hicache_transfers",
+      "sglang.srt.mem_cache.unified_cache.components.swa.SWAComponent.create_match_validator",
+      "sglang.srt.mem_cache.unified_cache.components.swa.SWAComponent.finalize_match_result_in_tree_core",
+      "sglang_tpu.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController.load"
+    ],
+    "_patch_prefill_kv_offload_to_decode_dram": [
+      "sglang.srt.disaggregation.decode.DecodePreallocQueue._init_kv_manager",
+      "sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata",
+      "sglang.srt.disaggregation.decode.DecodePreallocQueue.add",
+      "sglang.srt.disaggregation.decode.DecodeTransferQueue.has_pending_deferred_releases",
+      "sglang.srt.disaggregation.decode.DecodeTransferQueue.move_transferred_with_outcomes",
+      "sglang.srt.disaggregation.decode.DecodeTransferQueue.resolve_deferred_releases",
+      "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager",
+      "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.move_bootstrapped",
+      "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue.release_memory_occupation",
+      "sglang.srt.managers.scheduler.Scheduler._record_scheduler_state_for_paused_engine",
+      "sglang.srt.managers.scheduler.Scheduler.is_fully_idle",
+      "sglang.srt.managers.scheduler_components.weight_updater.SchedulerWeightUpdaterManager.release_memory_occupation",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._evict_device_leaf",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reset"
+    ],
+    "_patch_prefill_transfer_finish_from_raiden": [
+      "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue",
+      "sglang.srt.observability.req_time_stats.SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time"
+    ],
+    "_patch_profile_auto": [
+      "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager.__post_init__",
+      "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile_batch_predicate",
+      "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._stop_profile"
+    ],
+    "_patch_raiden_is_load_back_event_done": [
+      "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.is_load_back_event_done"
+    ],
+    "_patch_scheduler_reject_unservable_requests": [
+      "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue"
+    ],
+    "_patch_set_device_tolerate_mismatch": [
+      "torch_tpu._internal.device._device_module._DeviceModule.set_device"
+    ],
+    "_patch_support_triton_for_tpu": [
+      "sglang.srt.utils.triton_utils.support_triton"
+    ],
+    "_patch_torch_native_attn_backend": [
+      "sglang.srt.layers.attention.torch_native_backend.TorchNativeAttnBackend._run_sdpa_forward_decode",
+      "sglang.srt.layers.attention.torch_native_backend.TorchNativeAttnBackend._run_sdpa_forward_extend"
+    ],
+    "_patch_tpu_torch_pallas_register_positional": [
+      "torch_tpu._internal.pallas.tpu_torch_pallas.call_custom_kernel",
+      "torch_tpu._internal.pallas.tpu_torch_pallas.register_custom_kernel"
+    ],
+    "_register_aten_fallbacks": [],
+    "_register_tpu_compile_backend": [],
+    "_register_tpu_sampler_backend": [],
+    "_unwrap_dynamic_compile_fns": [
+      "sglang.srt.layers.rotary_embedding.utils.apply_rotary_pos_emb_native",
+      "sglang.srt.layers.vocab_parallel_embedding.get_masked_input_and_mask",
+      "sglang.srt.sampling.penaltylib.repetition_penalty.apply_scaling_penalties",
+      "sglang.srt.sampling.sampling_batch_info.apply_scaling_penalties"
+    ]
+  },
+  "upstream": "f6de13a0c26697382a1bb7969e24ea59f089365e",
+  "fork_only": {
+    "modules": [
+      "sglang.multimodal_gen.runtime.platforms.tpu",
+      "sglang.srt.compilation.compiled_op",
+      "sglang.srt.compilation.support_torch_compile",
+      "sglang.srt.compilation.torch_compile_bundle",
+      "sglang.srt.layers.moe.tpu_moe_utils",
+      "sglang.srt.layers.quantization.mxfp4_tpu_util",
+      "sglang.srt.observability.compile_timing",
+      "sglang.test.tpu.evals.model_config",
+      "sglang.test.tpu.utils.pd_singlehost_base"
+    ],
+    "symbols": [
+      "sglang.srt.arg_groups.platform_hook:torch_compile_bundle_dirs",
+      "sglang.srt.environ:EnvFloatWithAlias",
+      "sglang.srt.layers.attention.attention_registry:register_draft_attention_backend",
+      "sglang.srt.layers.attention.vision:VisionTpuAttention",
+      "sglang.srt.layers.attn_residual:register_aggregate_impl",
+      "sglang.srt.layers.aux_hidden_states:AUX_HIDDEN_STATES_PROXY_KEY",
+      "sglang.srt.layers.dp_attention:_rank_tensor",
+      "sglang.srt.layers.dp_attention:attn_rank0_scale",
+      "sglang.srt.layers.moe.utils:local_routed_expert_range",
+      "sglang.srt.layers.quantization.modelopt_quant:TpuModelOptCompatibleFp4Config",
+      "sglang.srt.layers.quantization.modelopt_quant:TpuModelOptMixedPrecisionConfig",
+      "sglang.srt.managers.cache_controller:BatchDoneCounter",
+      "sglang.srt.managers.schedule_policy:matched_prefix_len",
+      "sglang.srt.mem_cache.hicache_auto_size:register_sizeable_pool",
+      "sglang.srt.mem_cache.utils:last_hash_value",
+      "sglang.srt.mem_cache.utils:prefix_hash_values",
+      "sglang.srt.model_executor.forward_batch_info:LogitsOutputMode",
+      "sglang.srt.models.deepseek_v4:_hc_split_sinkhorn_torch",
+      "sglang.srt.models.kimi_k25:RealRoPE",
+      "sglang.srt.models.kimi_k25:_bicubic_interp_axis",
+      "sglang.srt.platforms.interface:WeightUpdateReceiver",
+      "sglang.srt.speculative.spec_info:SpecPaddingState",
+      "sglang.srt.speculative.spec_utils:allocate_and_assign_decode_cache",
+      "sglang.srt.speculative.spec_utils:gather_spec_extras_func",
+      "sglang.srt.utils.patch_torch:initialize_torch_tpu_worker",
+      "sglang.srt.utils:is_tpu"
+    ],
+    "platform_methods": [
+      "DeviceMixin.supports_overlap_streams",
+      "DeviceMixin.weight_loading_context",
+      "SRTPlatform.build_swa_kv_pool",
+      "SRTPlatform.build_swa_kv_pool_allocator",
+      "SRTPlatform.create_memory_pool_configurator",
+      "SRTPlatform.create_weight_update_receiver",
+      "SRTPlatform.dcp_replicates_q_heads",
+      "SRTPlatform.dcp_shards_every_kv_pool",
+      "SRTPlatform.get_batch_input_device",
+      "SRTPlatform.get_compilation_cache_misses",
+      "SRTPlatform.get_device_pool_kv_host_cls",
+      "SRTPlatform.get_group_coordinator_cls",
+      "SRTPlatform.get_hicache_explicit_size_context",
+      "SRTPlatform.get_hybrid_cache_controller_cls",
+      "SRTPlatform.get_mamba_pool_cls",
+      "SRTPlatform.get_mha_kv_bytes_per_token",
+      "SRTPlatform.get_mha_kv_pool_host_cls",
+      "SRTPlatform.get_recompilation_counters",
+      "SRTPlatform.get_traced_rank",
+      "SRTPlatform.get_zigzag_cp_strategy_cls",
+      "SRTPlatform.keeps_swa_index_mapping_on_host",
+      "SRTPlatform.narrows_padded_extend_attention",
+      "SRTPlatform.on_warmup_complete",
+      "SRTPlatform.prepare_model_parallel_groups",
+      "SRTPlatform.prepare_worker",
+      "SRTPlatform.process_model_after_loading",
+      "SRTPlatform.runs_eager_extend_cp",
+      "SRTPlatform.slice_tensor_for_rank",
+      "SRTPlatform.supports_decode_context_parallel",
+      "SRTPlatform.supports_mamba_prefix_cache",
+      "SRTPlatform.supports_moe_dp_pipeline_stages",
+      "SRTPlatform.supports_speculative_dp_attention",
+      "SRTPlatform.supports_torch_compile",
+      "SRTPlatform.unified_kv_pool_enabled",
+      "SRTPlatform.validate_mamba_prefix_cache"
+    ]
+  }
+}
