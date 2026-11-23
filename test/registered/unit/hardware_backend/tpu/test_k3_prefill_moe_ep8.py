@@ -8,10 +8,17 @@ import unittest
 
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=300, suite="base-a-test-cpu")
+# Needs jax, which the CPU runners do not install; the TPU unit stage's time
+# budget is spent, so test_k3_programs_nightly.py runs it in the TPU nightly.
+register_tpu_ci(
+    est_time=300,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    disabled="runs in the TPU nightly through test_k3_programs_nightly.py",
+)
 
 EXPERTS, TOPK = 896, 16
 
