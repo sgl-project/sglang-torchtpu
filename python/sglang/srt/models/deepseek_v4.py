@@ -4226,13 +4226,18 @@ class DeepseekV4Model(nn.Module):
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
-        if (
-            self.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
+        backend_manages_late_layout = False
+        if self.late_layer_start is not None:
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            backend_manages_late_layout = getattr(
+                attn_backend, "manages_late_layer_layout", False
+            )
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                tail_metadata = attn_backend.tail_forward_metadata
+                if tail_metadata is not None:
+                    tail = tail_metadata.late_layer_tail
+                    if not backend_manages_late_layout:
+                        self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -4243,6 +4248,7 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
+            and not backend_manages_late_layout
             # The prefill graph's capture batch leaves is_extend_in_batch unset.
             and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
@@ -4264,6 +4270,7 @@ class DeepseekV4Model(nn.Module):
                 tail_in_graph=tail_in_graph,
             )
         saved_full = None
+        skip_decoder = getattr(tail, "skip_decoder", False)
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
@@ -4314,6 +4321,10 @@ class DeepseekV4Model(nn.Module):
                             positions=positions,
                             forward_batch=forward_batch,
                         )
+                if skip_decoder:
+                    if _is_cuda:
+                        residual_batch.clear(forward_batch)
+                    return state.residual, None, tail
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
@@ -4412,7 +4423,11 @@ class DeepseekV4Model(nn.Module):
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-            if capture_dspark and i in self.dspark_layers_to_capture:
+            if (
+                capture_dspark
+                and not skip_decoder
+                and i in self.dspark_layers_to_capture
+            ):
                 from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
 
                 # The draft head reads the attention input of its target layers.
@@ -4800,6 +4815,21 @@ class DeepseekV4Model(nn.Module):
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
+        if getattr(tail, "skip_decoder", False):
+            # All requests in the step are still ingesting their prompts.
+            # Preserve the output layout for the scheduler and draft worker.
+            rows = hidden_states.shape[0]
+            empty = (
+                hidden_states.new_zeros((rows, self.hidden_size)),
+                hidden_states.new_zeros((rows, self.hc_mult * self.hidden_size)),
+            )
+            if capture_dspark:
+                aux = hidden_states.new_zeros(
+                    (rows, len(self.dspark_layers_to_capture) * self.hidden_size)
+                )
+                return empty, aux
+            return empty
+
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
@@ -4821,23 +4851,29 @@ class DeepseekV4Model(nn.Module):
             tail, forward_batch
         )
         num_tokens = input_ids.shape[0]
-        if tail is not None and (not capture_dspark or cuda_cp_tail):
+        keep_full_layout = getattr(tail, "keep_full_output_layout", False)
+        if tail is not None and (
+            not capture_dspark or cuda_cp_tail or keep_full_layout
+        ):
             # The logits processor indexes rows by the full extend layout.
             hidden_states = _scatter_tail_rows(
                 tail=tail,
                 rows=hidden_states,
                 num_tokens=num_tokens,
-                zero=cuda_cp_tail,
+                zero=cuda_cp_tail or keep_full_layout,
             )
             pre_hc_head = _scatter_tail_rows(
                 tail=tail,
                 rows=pre_hc_head,
                 num_tokens=num_tokens,
-                zero=cuda_cp_tail,
+                zero=cuda_cp_tail or keep_full_layout,
             )
         if capture_dspark:
             return (hidden_states, pre_hc_head), _finalize_dspark_aux(
-                dspark_aux_hidden_states, tail, num_tokens, cuda_cp_tail
+                dspark_aux_hidden_states,
+                tail,
+                num_tokens,
+                cuda_cp_tail or keep_full_layout,
             )
 
         return hidden_states, pre_hc_head
@@ -5205,7 +5241,11 @@ class DeepseekV4ForCausalLM(
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            metadata = get_attn_backend().tail_forward_metadata
+            if metadata is not None:
+                tail = metadata.late_layer_tail
+                if not getattr(tail, "keep_full_output_layout", False):
+                    return tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):
