@@ -129,6 +129,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     # Set by the non-spec host-padding policy; wrapped allocators retain
     # their existing device-return contract.
     defer_decode_upload: bool = False
+    extend_indices_on_host = True
 
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.

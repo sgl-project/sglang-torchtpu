@@ -3312,7 +3312,9 @@ def alloc_for_decode_prealloc(
         return storage.take_tokens(
             delta_len, make_room=_evicted_by_caller, receive=True
         )
-    device = allocator.device
+    # Host-computing allocators (TPU) read only the CPU lengths and last_loc;
+    # device copies of them would only be read back.
+    device = "cpu" if allocator.extend_indices_on_host else allocator.device
     last_loc = (
         prefix_indices[-1:].to(dtype=torch.int64, device=device)
         if prefix_len > 0
