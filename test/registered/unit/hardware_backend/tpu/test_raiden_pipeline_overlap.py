@@ -207,7 +207,9 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False
     t.client = controller.client(t.unit)
     t.dst_units = [t.unit]
     t.max_blocks = 32
+    t.page_admission = True
     t.admission = StagingAdmission(4 * 32)
+    t.producer_arenas = set()
     t.engine = Engine()
     (controller.producers if t.producer else controller.decodes).append(t)
     return t
@@ -419,9 +421,11 @@ def offer_two_parts(world):
 
 
 def test_each_early_part_holds_its_own_staging(world):
-    """Two parts and the closing transfer need three staging slots; with room
-    for one, each waits until the one before it lands."""
+    """With whole-slot staging (full host mirrors), two parts and the closing
+    transfer need three slots; with room for one, each waits until the one
+    before it lands."""
     d = world.decode
+    d.page_admission = False
     d.admission = StagingAdmission(d.max_blocks)  # one transfer
     started = []
 
@@ -447,6 +451,120 @@ def test_each_early_part_holds_its_own_staging(world):
     poll(d)
     assert str(ROOM) in d.manager._completed_recv
     assert d.admission.pages() == 0
+
+
+def test_early_parts_share_a_slot_by_pages(world):
+    """With bounded leases, a transfer holds only its own pages: two 4-page
+    parts and the 1-page closing transfer fit in one slot and start together."""
+    d = world.decode
+    d.admission = StagingAdmission(d.max_blocks)  # one slot of pages
+    started = []
+
+    def deferred(**kwargs):
+        started.append(kwargs["req_id"])
+        return True  # accepted; landing is reported later
+
+    d.client_type = lambda address: SimpleNamespace(coordinate_transfer=deferred)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    offer_two_parts(world)
+    d.maybe_start_pull(ROOM)
+    assert started == [f"{ROOM}.p0", f"{ROOM}.p1", str(ROOM)]
+    assert d.admission.pages() == 4 + 4 + 1
+    d.engine.received = [f"{ROOM}.p0", f"{ROOM}.p1", str(ROOM)]
+    poll(d)
+    assert str(ROOM) in d.manager._completed_recv
+    assert d.admission.pages() == 0
+
+
+def test_storage_pages_is_the_largest_pool_count():
+    assert pl._storage_pages({"dst_block_counts": [4, 9, 1]}) == 9
+    assert pl._storage_pages({"dst_block_counts": []}) == 0
+    assert pl._storage_pages(None) == 0
+
+
+def start_recorded(d):
+    """Coordinate calls are accepted and recorded; landings come later."""
+    started = []
+
+    def deferred(**kwargs):
+        started.append(kwargs["req_id"])
+        return True
+
+    d.client_type = lambda address: SimpleNamespace(coordinate_transfer=deferred)
+    return started
+
+
+def test_decode_admits_no_more_than_the_producer_arena(world):
+    """A producer's sender leases the same pages per storage as the decode, so
+    a decode with a larger arena admits only the producer's pages."""
+    for s in world.stages:
+        s.admission = StagingAdmission(s.max_blocks)  # one slot of pages
+    d = world.decode  # four slots of pages
+    started = start_recorded(d)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    offer_two_parts(world)
+    assert (d.admission.capacity, d.page_admission) == (d.max_blocks, True)
+    d.admission.admit("other", d.max_blocks - 4)  # staging busy elsewhere
+    d.maybe_start_pull(ROOM)
+    assert started == [f"{ROOM}.p0"]  # part 1 waits for the producer's pages
+
+
+def test_producer_arena_under_one_decode_slot_bounds_admission(world):
+    """A producer with a shorter context holds fewer pages than one decode
+    slot; the decode still admits only what that arena holds."""
+    for s in world.stages:
+        s.admission = StagingAdmission(8)
+    d = world.decode
+    started = start_recorded(d)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    offer_two_parts(world)
+    d.maybe_start_pull(ROOM)
+    assert d.admission.capacity == 8
+    assert started == [f"{ROOM}.p0", f"{ROOM}.p1"]  # 4 + 4; the close waits
+
+
+def test_transfer_over_the_smallest_producer_arena_runs_alone(world):
+    """Capacity is the smallest announced arena; a transfer charged over it
+    (as one from a larger producer would be) waits until nothing else is in
+    flight and then runs alone, instead of failing. The arenas are artificial."""
+    small, large = world.stages
+    small.admission = StagingAdmission(2)
+    large.admission = StagingAdmission(128)
+    d = world.decode
+    started = start_recorded(d)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    offer_two_parts(world)
+    assert d.admission.capacity == 2
+    d.admission.admit("other", 1)  # staging busy elsewhere
+    d.maybe_start_pull(ROOM)
+    assert started == []  # 4 pages over a 2-page capacity wait for all of it
+    d.admission.release("other")
+    d.maybe_start_pull(ROOM)
+    assert started == [f"{ROOM}.p0"] and d.admission.pages() == 2
+    d.engine.received = [f"{ROOM}.p0"]
+    poll(d)
+    d.maybe_start_pull(ROOM)
+    assert started == [f"{ROOM}.p0", f"{ROOM}.p1"]
+
+
+def test_producer_without_an_arena_gets_whole_slot_charging(world):
+    """A producer that announces no arena (whole-slot staging, or an older
+    build) is charged a whole slot per transfer."""
+    for s in world.stages:
+        s.page_admission = False
+    d = world.decode
+    started = start_recorded(d)
+    d.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    offer_two_parts(world)
+    d.maybe_start_pull(ROOM)
+    assert started == [f"{ROOM}.p0", f"{ROOM}.p1", str(ROOM)]
+    assert d.page_admission is False
+    assert d.admission.pages() == 3 * d.max_blocks
 
 
 def test_part_landing_before_this_rank_starts_it_is_kept(world):
@@ -671,9 +789,11 @@ def test_stage_group_moves_its_stages_as_one_transfer(staged):
 
 
 def test_each_group_transfer_holds_its_own_staging(staged):
-    """Two stage groups need two staging slots; with room for one, the second
-    group waits until the first lands instead of over-committing staging."""
+    """With whole-slot staging (full host mirrors), two stage groups need two
+    slots; with room for one, the second group waits until the first lands
+    instead of over-committing staging."""
     w = staged
+    w.decode.page_admission = False
     w.decode.admission = StagingAdmission(w.decode.max_blocks)  # one transfer
     controller = w.controller
     held = []

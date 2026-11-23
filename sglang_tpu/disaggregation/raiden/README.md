@@ -149,9 +149,10 @@ Each rank's budget sizes all of its engines together:
   `slots=[24, 192] layers=[2, 6] of [16, 46]` for Muse Spark at TP16 on two
   hosts with the 64 GiB default budget, 8 layers, and at least 192 requests.
 
-Pipeline and block-major transfers and `SGLANG_TPU_RAIDEN_STAGING_LAYERS=0`
-keep full mirrors under the same 64 GiB default, so they get far fewer slots;
-raise `SGLANG_RAIDEN_HOST_POOL_GB` for more concurrent transfers. Asymmetric TP
+Block-major transfers, `SGLANG_TPU_RAIDEN_STAGING_LAYERS=0`, and pipeline
+transfers on Raiden builds without bounded pool staging keep full mirrors under
+the same 64 GiB default, so they get far fewer slots; raise
+`SGLANG_RAIDEN_HOST_POOL_GB` for more concurrent transfers. Asymmetric TP
 requires dynamic staging and `SGLANG_TPU_RAIDEN_STAGING_LAYERS=0` on prefill and
 decode. The prefill learns the decode's TP only from its first request, so with
 staging layers every such request fails with this instruction.
@@ -279,7 +280,13 @@ peak allocation, including a temporary replacement buffer, against each
 rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`. Over-budget mirrors are rejected;
 reduce `--max-total-tokens` or increase the host budget to fit them. Shared-memory
 mirrors (`RAIDEN_SHM_KEY`) are unsupported. Both modes limit concurrent
-transfers before calling the coordinator.
+transfers before calling the coordinator. With bounded leases, a transfer is
+charged its own pages on each storage, so short requests share a max-length
+slot, and each sliding-window slot is priced with an eighth of a
+full-attention slot, as dynamic staging does. Producers announce their arena
+in their READY metadata, and the decode admits no more pages than the
+smallest one holds. Full mirrors charge a whole slot per transfer, and so does
+a decode once any producer announces no arena.
 A failed or aborted request retains its pages until native transfer completion
 or atomic cancellation of an unclaimed source registration. A transfer the
 controller rejects fails its request only, and the decode keeps that request's
