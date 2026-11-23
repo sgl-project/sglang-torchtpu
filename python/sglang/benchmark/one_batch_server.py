@@ -1238,6 +1238,9 @@ def run_benchmark_internal(
     bench_args: BenchArgs,
     launch_server_func: Callable = launch_server,
 ):
+    # Callers benchmarking an external server may pass a minimal namespace
+    # (host/port/tp_size) instead of ServerArgs; it carries no admin key.
+    admin_api_key = getattr(server_args, "admin_api_key", None)
     # Validate flags that depend only on bench_args before launching a server.
     if bench_args.disable_ignore_eos:
         if bench_args.backend == "vllm":
@@ -1494,7 +1497,7 @@ def run_benchmark_internal(
                 run_name="",
                 result_filename="",
                 tokenizer=tokenizer,
-                admin_api_key=server_args.admin_api_key,
+                admin_api_key=admin_api_key,
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
                 parallel_batch=bench_args.parallel_batch,
@@ -1547,7 +1550,7 @@ def run_benchmark_internal(
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
-                    admin_api_key=server_args.admin_api_key,
+                    admin_api_key=admin_api_key,
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
@@ -1617,7 +1620,7 @@ def run_benchmark_internal(
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
-                            admin_api_key=server_args.admin_api_key,
+                            admin_api_key=admin_api_key,
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
