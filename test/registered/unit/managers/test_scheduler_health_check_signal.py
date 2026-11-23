@@ -27,7 +27,7 @@ from sglang.srt.managers.scheduler_components.health_monitor import (  # noqa: E
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _decode_batch():
