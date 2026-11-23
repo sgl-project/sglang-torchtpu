@@ -13,7 +13,8 @@ Every point runs fp8 weights and KV with 128-token pages and 4096-token prefill
 chunks, MTP (topk 1) at InferenceX's golden acceptance length, the MoE ring kernel
 with decode on the model path (megakernel off), and a raiden host tier that also holds
 KDA states, with a KDA checkpoint at every prefill chunk. c32 and c48 also split the
-index-key cache, with libtpu's SparseCore all-gather offload off (SPARSE_CORE_FIX).
+index-key cache, with libtpu's SparseCore all-gather offload off (SPARSE_CORE_FIX);
+c32 also drops the KDA checkpoints taken during decode.
 """
 
 import argparse
@@ -45,6 +46,7 @@ class Profile(NamedTuple):
     index_split: bool = False  # split the index-key cache too (needs shards=8)
     bf16_merge: bool = False  # the split cache's prefill merge in bf16
     state_ratio: float | None = None  # host KDA states, x KDA slots (None: host_ratio)
+    track_interval: int | None = None  # decode tokens per KDA checkpoint (None: 256)
     compile_bs: tuple[int, ...] | None = None  # decode buckets (None: 1..running)
     spmd_compile: bool = False  # unsplit cache only: compile once, broadcast the result
 
@@ -99,14 +101,16 @@ PROFILES = {
         running=32,
         steps=3,
         pool_tokens=14155776,
-        kda_slots=800,
-        host_ratio=2.37,
+        kda_slots=1200,
+        host_ratio=1.2,
         interval=0,
         mk_rows=64,
         shards=8,
         index_split=True,
         bf16_merge=True,
         state_ratio=2.5,
+        # Decode-time KDA checkpoints off: unused, they forced KDA and KV evictions.
+        track_interval=CONTEXT_LENGTH,
         # Host RAM grows with every decode program: 1..32 does not fit.
         compile_bs=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
     ),
@@ -183,6 +187,8 @@ def config_for(conc, *, simulate_acceptance=True, spmd_compile=True):
             "weight_loader_drop_cache_after_load": True,  # else page cache evicts the pod
         }
     )
+    if p.track_interval is not None:
+        args["mamba_track_interval"] = p.track_interval
     if p.shards == 1:
         # Unsplit cache: scattered prefill input off (SPMD slices rows at a rank offset).
         args["enable_attn_tp_input_scattered"] = False

@@ -13,14 +13,16 @@ the file names below are relative to it.
 
 ## Results
 
-Chart v46 (artifact version `1795421539-7305`), read 2026-11-23.
+Chart v47 (artifact version `1795443917-f7f1`), read 2026-11-23.
 
 Real weights, one 1 h window per point.
 - c1-c16: this branch's integrated tree (`b38e84a11e`, job 36d0): the final curve plus the
   prefill and decode commits and prefill-decode interval 16 (Optimizations).
-- c32/c48: the integrated tree plus the DSA index-key cache split (`f977f22c30`, job 7605),
-  with the freed HBM spent on a larger device KV pool and libtpu's SparseCore all-gather
-  offload off (Accuracy). Both are over the latency limit.
+- c32/c48: the integrated tree plus the DSA index-key cache split (`f977f22c30`; c48 job
+  7605, c32 job f909), with the freed HBM spent on a larger device KV pool and libtpu's
+  SparseCore all-gather offload off (Accuracy). c32 also turns the decode-time KDA
+  checkpoints off, with 1,200 KDA slots and host tier 1.2x (c32 KDA retention below). Both
+  are over the latency limit.
 
 | cc | tok/s/chip | M tokens/$ | 1/ITL p50 / p90 | TTFT p90 s | E2E latency p90 / limit s | prefix hit / ideal % | vs final curve: tok/s / 1/ITL p90 | run JSON |
 |---|---|---|---|---|---|---|---|---|
@@ -28,20 +30,29 @@ Real weights, one 1 h window per point.
 | 4 | 8,876 | 31.0 | 420.0 / 321.5 | 0.79 | 10.1 / 20.4 | 97.67 / 97.88 | +0.2% / +3.0% | [`runs/C4u_c4_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/C4u_c4_real_l3_ring_full.json) |
 | 8 | 14,920 | 52.1 | 327.3 / 208.3 | 0.97 | 10.2 / 19.6 | 97.48 / 97.78 | +0.6% / +11.0% | [`runs/K2ts_c8_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/K2ts_c8_real_l3_ring_full.json) |
 | 16 | 26,360 | 92.1 | 201.5 / 118.5 | 2.40 | 13.9 / 20.3 | 97.23 / 97.60 | +4.1% / +28.0% | [`runs/C16_S2ts_kda1400_bf16_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/C16_S2ts_kda1400_bf16_real_l3_ring_full.json) |
-| 32 | 41,958 | 146.6 | 106.3 / 50.7 | 2.71 | 31.9 / 28.2 **over** | 96.92 / 97.67 | +18.7% / +44.9% | [`runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json) |
+| 32 | 42,923 | 150.0 | 112.6 / 53.2 | 2.24 | 29.6 / 28.2 **over** | 97.11 / 97.69 | +21.5% / +52.0% | [`runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json) |
 | 48 | 46,947 | 164.1 | 62.8 / 32.0 | 3.17 | 49.7 / 37.4 **over** | 96.38 / 97.25 | +25.3% / +38.5% | [`runs/R9_c48_mr48_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R9_c48_mr48_real_l3_ring_full_ixsplit.json) |
 
 - Latency limit: a point's p90 E2E latency may not exceed GB300's p90 at the same concurrency
   plus 10 s. GB300 p90 (InferenceX run 42026173061, the chart's GB300 line): c1 14.0, c4 10.4,
-  c8 9.6, c16 10.3, c32 18.2, c48 27.4 s. c32 and c48 are over it (31.9 vs 28.2 s and 49.7
-  vs 37.4 s; 36.7 and 58.3 s without the split). At interval 0 prefill stalls are 12.3 s of
-  c32's p90-band latency (32.0 s) and 25.8 s of c48's (50.5 s).
+  c8 9.6, c16 10.3, c32 18.2, c48 27.4 s. c32 and c48 are over it (29.6 vs 28.2 s, 1.4 s
+  over, and 49.7 vs 37.4 s; 36.7 and 58.3 s without the split). At interval 0 prefill stalls
+  are 10.4 s of c32's p90-band latency (30.1 s) and 25.8 s of c48's (50.5 s).
 - Index-key cache split (c32/c48), to enable: set `SGLANG_TPU_DSA_MLA_KV_SHARDS=8` (the
   exact prefill exchange needs the latent cache split by 8),
   `SGLANG_TPU_DSA_INDEX_KV_SHARD=1` and the libtpu flag (Accuracy), then resize the pools.
   Spend the freed HBM on device KV tokens (`max_total_tokens`) and set `hicache_ratio` so host
   KV bytes per rank stay at or above the unsplit run's. KV bytes per token per rank: 3,840 at
   latent split 2, 1,536 at split 8, 864 at split 8 with the index split.
+- c32 KDA retention (job f909): `mamba_track_interval` 1,048,576 (no KDA checkpoints during
+  decode; the default takes one every 256 tokens), `max_mamba_cache_size` 800 -> 1,200 and
+  `hicache_ratio` 2.37 -> 1.2, device KV pool unchanged. Against the same config without
+  them (job 7605): 42,923 vs 41,958 tok/s/chip, 1/ITL p90 53.2 vs 50.7, E2E p90 29.6 vs
+  31.9 s. Turning the decode checkpoints off gives most of it alone (29.8 s, +1.6% tok/s):
+  they were not reused, and their KDA evictions took cached KV along (3.35M -> 0.39M tokens
+  per hour); device prefix hit 93.7 -> 96.9%. The host tier trades KV for KDA states: 17.0M
+  KV tokens (14.7 GB per rank, below the unsplit run's 29.0 GB, unlike the rule above) and
+  3,001 KDA states (57.3 GB per rank).
 - c16 stays unsplit. With the split and the flag (job 7605) it measured 26,412 tok/s/chip and
   1/ITL p90 125.2 (unsplit 26,360 and 118.5), but a lower E2E-normalized p90 (60.1 vs 66.0) and
   a higher pod memory peak (985 vs 874 GB). Its JSON is kept as
@@ -164,7 +175,7 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
 | c4 | [`C4u_c4_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/C4u_c4_real_l3_ring_full.json) | 4 | 3 / 3.00 | 4 | 1..4 | 3,407,872 | 384 | none / off | 6.82M / 769 | 676 GB | 966 |
 | c8 | [`K2ts_c8_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/K2ts_c8_real_l3_ring_full.json) | 8 | `1:7,2:3` / 3.93, 3.00 | 8 | 1..8 | 8,604,416 (9,437,184) | 800 | 2 / on | 12.9M / 1,201 | 833 GB | 1,316 |
 | c16 | [`C16_S2ts_kda1400_bf16_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/C16_S2ts_kda1400_bf16_real_l3_ring_full.json) | 16 | 3 / 3.00 | 16 | 1..16 | 5,643,136 (9,437,184) | 1,400 | 2 / on | 9.59M / 2,002 | 874 GB | 1,846 |
-| c32 | [`R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json) | 32 | 3 / 3.00 | 32 | 1, 2, 4, 8, 12..32 by 4 | 14,155,776 | 800 | 8 / on | 33.5M / 2,001 | 966 GB | 1,655 |
+| c32 | [`R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R10_c32_mr32_combo_real_l3_ring_full_ixsplit.json) | 32 | 3 / 3.00 | 32 | 1, 2, 4, 8, 12..32 by 4 | 14,155,776 | 1,200 | 8 / on | 17.0M / 3,001 | 906 GB | 1,456 |
 | c48 | [`R9_c48_mr48_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs/R9_c48_mr48_real_l3_ring_full_ixsplit.json) | 48 | 3 / 3.00 | 48 | 1..16, 20..48 by 4 | 28,400,000 | 800 | 8 / on | 32.0M / 2,001 | 985 GB | 2,008 |
 
 - K = `speculative_num_steps`, giving K + 1 draft tokens and topk 1. `1:7,2:3` = 7 draft
@@ -203,6 +214,7 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
 - c32/c48 also set `SGLANG_TPU_DSA_INDEX_KV_SHARD=1` (index-key cache split, Results) and
   append `--xla_tpu_enable_sparse_core_collective_offload_all_gather=false` to
   `LIBTPU_INIT_ARGS` (Accuracy).
+- c32 also sets `mamba_track_interval` 1,048,576: no KDA checkpoints during decode (Results).
 
 ### Server
 
@@ -312,8 +324,9 @@ python3 $A/summarize.py --md $OUT
     c32/c48 interval 0;
   - `*_real_l3_ring_full_ixsplit.json` (c32/c48, and c16's unused split): the `*_full` JSON
     plus `SGLANG_TPU_DSA_INDEX_KV_SHARD=1`, the libtpu flag and resized pools
-    (`max_total_tokens` / `hicache_ratio`): c32 14,155,776 / 2.37; c48 28,400,000 / 1.127;
-    c16 25,000,000 / 1.71, also `SGLANG_TPU_DSA_MLA_KV_SHARDS` 2 -> 8.
+    (`max_total_tokens` / `hicache_ratio`): c32 14,155,776 / 1.2; c48 28,400,000 / 1.127;
+    c16 25,000,000 / 1.71, also `SGLANG_TPU_DSA_MLA_KV_SHARDS` 2 -> 8. c32 also sets
+    `max_mamba_cache_size` 1,200 and `mamba_track_interval` 1,048,576 (job f909).
 - [`launch_agentx.sh`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh) launches the `agentx.py` profiles. The recipes
   ([`agentx_cc<N>.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx), [`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py)) still build and check
   the previous dummy-weight points' configs.
@@ -336,9 +349,10 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 | index-key cache split | env `SGLANG_TPU_DSA_INDEX_KV_SHARD` plus the libtpu flag (Accuracy) | unset / unset / unset / unset / 1 / 1 | the pooled indexer's key cache split like the latent cache: HBM freed for the KV pool; exact prefill exchange needs split 8 | with the flag and the pools resized: c32 38,539 -> 41,958 tok/s, 1/ITL 42.7 -> 50.7, E2E p90 36.7 -> 31.9 s (c49c, 7605); c48 41,987 -> 46,947, 1/ITL 27.9 -> 32.0, E2E p90 58.3 -> 49.7 s (c49c, 7605); c16 26,360 -> 26,412, 1/ITL 118.5 -> 125.2, E2E-normalized p90 66.0 -> 60.1 (also split 2 -> 8; 36d0, 7605). Without the flag the output was wrong (01cc, 83cb numbers void) |
 | token split | env `SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT` | unset / unset / 1 / 1 / 1 / 1 | each selected cache row gathered by one rank, plus an all-to-all of queries and outputs | c16 split 8: 1/ITL 83.7 -> 93.5, tok/s 23,207 -> 24,407; c8: 1/ITL 175.0 -> 188.1; neutral on the unsplit c1/c4 (fee5) |
 | device KV pool | `max_total_tokens` (cap; HBM may bound it lower), `mem_fraction_static` 0.9 | 3,407,872 / 3,407,872 / 9,437,184 / 9,437,184 / 14,155,776 / 28,400,000 (boot sizes in the per-point table) | HBM for KV tokens vs device KDA slots | c16 (8.64M -> 5.66M tokens, 800 -> 1,400 slots): state evictions 6,399 -> 2,192 per h, tok/s and 1/ITL within noise (8c26). c32/c48 pools sized for the index-key split (Results; 01cc) |
-| device KDA slots | `max_mamba_cache_size` | 74 / 384 / 800 / 1,400 / 800 / 800 | HBM for KDA checkpoints vs KV pool; sized for the conversations AgentX keeps cached, not from max running | c16 1,100: 26,004 / 1/ITL 111.6; 1,400: hit gap 0.36 vs 0.50 pt (8c26). c32 1,600: no gain (98c5) |
+| device KDA slots | `max_mamba_cache_size` | 74 / 384 / 800 / 1,400 / 1,200 / 800 | HBM for KDA checkpoints vs KV pool; sized for the conversations AgentX keeps cached, not from max running | c16 1,100: 26,004 / 1/ITL 111.6; 1,400: hit gap 0.36 vs 0.50 pt (8c26). c32 1,600: no gain (98c5). c32 with decode checkpoints off, 800 -> 1,200 and host tier 2.37 -> 1.2: 42,618 -> 42,923 tok/s, E2E p90 29.8 -> 29.6 s, within noise (f909) |
 | checkpoint level | `hybrid_cache_checkpoints_level` | 3 at every point | KDA checkpoints at every prefill chunk vs only at branch points and request ends (level 2, the default) | real weights, level 2 -> 3: hit gap 1.67-3.80 -> 0.13-1.17 pt, tok/s +3 to +21% (301e) |
-| host KV tier | `hicache_ratio` (x device pool) | 2 / 2 / 1.5 / 1.7 / 2.37 / 1.127 | host-hit reach vs host RAM | c32 at max running 32 fit with 2.0 (R6c, 175a) and 1.33 at split 4 (R7, 3ca4). c32/c48 with the index-key split: host KV bytes per rank kept at or above the unsplit run's (01cc) |
+| decode KDA checkpoints | `mamba_track_interval` (decode tokens per KDA checkpoint; default 256) | unset / unset / unset / unset / 1,048,576 / unset | checkpoints during decode vs KDA slots and the KV evicted with their states | c32 off: 41,958 -> 42,618 tok/s, 1/ITL p90 50.7 -> 51.4, E2E p90 31.9 -> 29.8 s; KV evicted with its state 3.35M -> 0.43M tokens per hour (f909) |
+| host KV tier | `hicache_ratio` (x device pool) | 2 / 2 / 1.5 / 1.7 / 1.2 / 1.127 | host-hit reach vs host RAM | c32 at max running 32 fit with 2.0 (R6c, 175a) and 1.33 at split 4 (R7, 3ca4). c48 with the index-key split: host KV bytes per rank kept at or above the unsplit run's (01cc). c32 at 1.2 with 1,200 KDA slots: 17.0M host KV tokens (14.7 vs 29.0 GB per rank unsplit), host RAM to 3,001 KDA states; host-tier hit 0.27%, total 97.11% (f909) |
 | host KDA states | env `SGLANG_TPU_HICACHE_STATE_RATIO` (x device KDA slots; unset = `hicache_ratio`) | unset / unset / unset / 1.429 / 2.5 / 2.5 | host states (~19.6 MB/rank each) give the host-tier hits after idle gaps vs host RAM | c16 2,001 states reach ~15 min; ratio 1.5 would cut them to 1,201, ~9 min (8c26) |
 | max running | `max_running_requests`, `torch_compile_max_bs` | 2 / 4 / 8 / 16 / 32 / 48 | decode batch vs step time | c32 at 32 vs 16, both with the prefill patches: 40,220 vs 39,770 tok/s, 1/ITL 43.5 vs 59.6 (5196, 15c4); before the patches tok/s flat, 1/ITL -24 to -27% (175a, 3ca4) |
 | decode buckets | `tpu_compile_bs` | 1..max running at c1-c16; c32 10 buckets; c48 24 buckets | unpadded decode steps vs host RAM per program | c32 at max running 32: buckets 1..32 ran out of host RAM at boot, 1..16 + 20..32 was OOM-killed in the window, 10 buckets ran (175a) |
