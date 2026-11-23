@@ -58,8 +58,11 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     device = input_ids.device
     engram_host.move_hasher_to_host(hasher)
     # DSpark verify commits wait here, after the next draft is dispatched; both
-    # paths below read or write hasher.history.
-    engram_host.flush_engram_commits(hasher)
+    # paths below read or write hasher.history. A verify flushes in stage_verify,
+    # where its draft tokens come back in the same read.
+    verify = forward_batch.forward_mode.is_target_verify() and not coordinator.started
+    if not verify:
+        engram_host.flush_engram_commits(hasher)
     staged_result = None
     if coordinator.started:
         staged_result = coordinator.stage_all(

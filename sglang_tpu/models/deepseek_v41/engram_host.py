@@ -46,6 +46,7 @@ import logging
 import sys
 import threading
 import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -1164,7 +1165,8 @@ class HostEngramCoordinator:
         self, input_ids: torch.Tensor, forward_batch
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
-        flush_engram_commits(self._hasher)
+        # The draft tokens come back with the queued commits, in one read.
+        (input_ids_cpu,) = flush_engram_commits(self._hasher, also_read=(input_ids,))
         if not forward_batch.forward_mode.is_target_verify():
             return None
         history = self._hasher.history
@@ -1197,7 +1199,7 @@ class HostEngramCoordinator:
         try:
             inputs = verify_inputs_from_host(
                 history,
-                input_ids,
+                input_ids_cpu,
                 forward_batch.positions,
                 req_slots,
                 block=block,
@@ -1654,16 +1656,46 @@ def flush_all_engram_commits() -> None:
         flush_engram_commits(hasher)
 
 
-def flush_engram_commits(hasher) -> None:
-    """Apply the queued verify commits in order; call before reading or writing history."""
-    if hasher is None or not _PENDING_COMMITS:
-        return
-    for verify_ids_2d, req_pool_indices, commit_lens in _PENDING_COMMITS.pop(
-        hasher, ()
-    ):
+def flush_engram_commits(
+    hasher, *, also_read: Sequence[torch.Tensor] = ()
+) -> list[torch.Tensor]:
+    """Apply the queued verify commits in order; call before reading or writing history.
+
+    Returns host copies of ``also_read``, read back in the same transfer as the
+    commits' device tensors (each separate read waits for the device queue)."""
+    pending = []
+    if hasher is not None and _PENDING_COMMITS:
+        pending = list(_PENDING_COMMITS.pop(hasher, ()))
+    host = _read_to_host([t for commit in pending for t in commit] + list(also_read))
+    for i in range(len(pending)):
+        verify_ids_2d, req_pool_indices, commit_lens = host[3 * i : 3 * i + 3]
         commit_engram_history(
             hasher,
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=req_pool_indices,
             commit_lens=commit_lens,
         )
+    return host[3 * len(pending) :]
+
+
+def _read_to_host(tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """``tensors`` on the host; the int32 device ones in one read (concatenated on
+    the device), others one by one. Only int32 joins the batch: casting a 64-bit
+    integer on the TPU does not lower."""
+    out: list = list(tensors)
+    batch = [
+        i
+        for i, t in enumerate(tensors)
+        if t.device.type != "cpu" and t.dtype == torch.int32
+    ]
+    if len(batch) > 1:
+        flat = torch.cat([tensors[i].reshape(-1) for i in batch]).cpu()
+        offset = 0
+        for i in batch:
+            n = tensors[i].numel()
+            out[i] = flat[offset : offset + n].view(tensors[i].shape)
+            offset += n
+    for i, t in enumerate(out):
+        if t.device.type != "cpu":
+            out[i] = t.cpu()
+    return out
