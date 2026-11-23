@@ -2,13 +2,10 @@
 """Shifted mHC TorchTPU bridge against the unfused DeepSeek-V4.1 computation."""
 
 import importlib.util
-import os
 import sys
 from types import SimpleNamespace
 
-# TorchTPU owns the device; JAX exports the custom op from the CPU.
-os.environ["JAX_PLATFORMS"] = "cpu"
-
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -16,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.envs import envs
 from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as kernel
 from sglang_tpu.models.deepseek_v41.ops import mhc as ops
 from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
@@ -35,7 +33,8 @@ RTOLS = (2**-7, 1e-4, 1e-4, 2**-6, 1e-4)
 def test_weight_packing_matches_source_layout():
     weight = torch.randn(24, M * D, generator=torch.Generator().manual_seed(23))
     packed = ops.pack_mix_weight(weight)
-    jax_packed = kernel.pack_mix_weight(jnp.asarray(weight.numpy()))
+    with jax.default_device(jax.devices("cpu")[0]):
+        jax_packed = kernel.pack_mix_weight(jnp.asarray(weight.numpy()))
     assert packed.shape == (M * D, 128) and packed.is_contiguous()
     assert packed.dtype == torch.bfloat16
     np.testing.assert_array_equal(
@@ -103,21 +102,15 @@ def _unfused(y, residual, pre, post, comb, fn, scale, base, norm):
     )
 
 
-@pytest.mark.parametrize(
-    ("tokens", "check_elements"),
-    [(16, True), (240, True), (64, False), (512, False), (1024, False), (2048, False)],
-)
-def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
-    from sglang.srt.models.deepseek_v4_mhc import HcConfig, HcNextBoundary, HcSubLayer
-
-    rng = torch.Generator().manual_seed(42)
+def _case(tokens, *, noncancelling=False, near_zero=False, seed=42):
+    rng = torch.Generator().manual_seed(seed)
 
     def normal(*shape):
         return torch.randn(shape, generator=rng)
 
     y = (normal(tokens, D) * 0.5).bfloat16()
     residual = (normal(tokens, M, D) * 0.5).bfloat16()
-    if check_elements:
+    if noncancelling:
         # Use noncancelling activations for the per-element rounding budget.
         # The signed cases use the end-to-end relative L2 budget because BF16
         # rounding of the intermediate residual can dominate near-zero values.
@@ -129,40 +122,137 @@ def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
     scale = torch.tensor([0.1, 0.2, 0.3])
     base = normal(M * (M + 2)) * 0.1
     norm = (1 + 0.1 * normal(D)).bfloat16()
-    ref = _unfused(y, residual, pre, post, comb, fn, scale, base, norm)
+    if near_zero:
+        y, residual = y / 512, residual / 512
+    if tokens == 2048:
+        # The real prefill graph can pad a 2044-row workload to this bucket.
+        y[-4:].zero_()
+        residual[-4:].zero_()
+    return y, residual, pre, post, comb, fn, scale, base, norm
+
+
+def _boundary(fn, scale, base, norm, device):
+    from sglang.srt.models.deepseek_v4_mhc import HcConfig, HcNextBoundary, HcSubLayer
 
     norm_module = torch.nn.Module()
-    norm_module.register_parameter("weight", torch.nn.Parameter(norm.to(tpu)))
+    norm_module.register_parameter("weight", torch.nn.Parameter(norm.to(device)))
     norm_module.variance_epsilon = NORM_EPS
     norm_module.register_buffer(
-        "_tpu_shifted_mhc_mix_weight", ops.pack_mix_weight(fn).to(tpu), persistent=False
+        "_tpu_shifted_mhc_mix_weight",
+        ops.pack_mix_weight(fn).to(device),
+        persistent=False,
     )
     cfg = HcConfig(M, SINKHORN_ITERS, HC_EPS, RMS_EPS, D, True, False)
-    next_hc = HcSubLayer(cfg, fn.to(tpu), scale.to(tpu), base.to(tpu), norm_module)
+    next_hc = HcSubLayer(
+        cfg, fn.to(device), scale.to(device), base.to(device), norm_module
+    )
     next_boundary = HcNextBoundary(norm_module, False, True, next_hc)
-    coeffs = tuple(tensor.to(tpu) for tensor in (pre, post, comb))
+    return next_hc, next_boundary
 
-    state = ops.fused_boundary(
-        next_hc, y.to(tpu), residual.to(tpu), coeffs, next_boundary, next_hc
-    )
-    assert state is not None and state.pre is coeffs[0]
+
+def _outputs(state):
     next_pre, next_post, next_comb = state.stats
-    actual = (
-        state.residual,
-        next_post[..., None],
-        next_comb,
-        state.input.rows,
-        next_pre,
-    )
-    for actual_tensor, expected, rtol in zip(actual, ref, RTOLS, strict=True):
+    return state.residual, next_post[..., None], next_comb, state.input.rows, next_pre
+
+
+OUTPUT_NAMES = ("residual", "next_post", "next_comb", "normalized", "next_pre")
+
+
+def _check_outputs(actual, reference, *, check_elements=False):
+    for name, actual_tensor, expected, rtol in zip(
+        OUTPUT_NAMES, actual, reference, RTOLS, strict=True
+    ):
+        assert actual_tensor.shape == expected.shape, name
+        assert actual_tensor.dtype == expected.dtype, name
         got = actual_tensor.cpu().float()
         expected = expected.float()
+        assert got.isfinite().all(), name
         diff = (got - expected).abs()
         if check_elements:
             bound = torch.maximum(got.abs(), expected.abs()) * rtol + 1e-6
-            assert (diff <= bound).all(), (rtol, (diff - bound).amax().item())
-        error = torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected)
-        assert error <= 2e-3, (rtol, error.item())
+            assert (diff <= bound).all(), (name, (diff - bound).amax().item())
+        denom = torch.linalg.vector_norm(expected).clamp_min(1e-12)
+        error = torch.linalg.vector_norm(diff) / denom
+        assert error <= 2e-3, (name, error.item())
+
+
+@pytest.mark.parametrize(
+    ("tokens", "check_elements"),
+    [
+        (16, True),
+        (240, True),
+        (64, False),
+        (288, False),
+        (512, False),
+        (1024, False),
+        (2048, False),
+    ],
+)
+def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
+    y, residual, pre, post, comb, fn, scale, base, norm = _case(
+        tokens, noncancelling=check_elements
+    )
+    ref = _unfused(y, residual, pre, post, comb, fn, scale, base, norm)
+    hc, boundary = _boundary(fn, scale, base, norm, tpu)
+    coeffs = tuple(tensor.to(tpu) for tensor in (pre, post, comb))
+    with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
+        state = ops.fused_boundary(
+            hc, y.to(tpu), residual.to(tpu), coeffs, boundary, hc
+        )
+    assert state is not None and state.pre is coeffs[0]
+    _check_outputs(_outputs(state), ref, check_elements=check_elements)
+
+
+def test_direct_trace_chains_boundaries_and_reuses_updated_packed_buffer(tpu):
+    from sglang_tpu.compilation.direct_compile import direct_compile
+
+    y, residual, pre, post, comb, fn, scale, base, norm = _case(288, near_zero=True)
+    hc, boundary = _boundary(fn, scale, base, norm, tpu)
+    norm_module = hc.norm
+
+    def chain(y, residual, pre, post, comb, scale, base):
+        live_hc = hc._replace(scale=scale, base=base)
+        outputs = []
+        for _ in range(3):
+            state = ops.fused_boundary(
+                live_hc, y, residual, (pre, post, comb), boundary, live_hc
+            )
+            assert state is not None and state.pre is pre
+            outputs.append(_outputs(state))
+            y, residual = state.input.rows, state.residual
+            pre, post, comb = state.stats
+        return tuple(outputs)
+
+    compiled = direct_compile(
+        chain,
+        model=norm_module,
+        specialization_key=lambda *args: args[0].shape,
+        name="test/shifted_mhc_chain",
+        spmd_safe=True,
+    )
+    inputs = tuple(
+        tensor.to(tpu) for tensor in (y, residual, pre, post, comb, scale, base)
+    )
+
+    def check(weight):
+        with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
+            results = compiled(*inputs)
+        ref_args = (y, residual, pre, post, comb)
+        for actual in results:
+            ref = _unfused(*ref_args, weight, scale, base, norm)
+            _check_outputs(actual, ref)
+            streams, next_post, next_comb, normalized, next_pre = ref
+            ref_args = (normalized, streams, next_pre, next_post.squeeze(-1), next_comb)
+        return results
+
+    before = check(fn)
+    retained = norm_module._tpu_shifted_mhc_mix_weight
+    updated_fn = -fn
+    ops._refresh_packed_buffer(hc._replace(fn=updated_fn.to(tpu)))
+    assert norm_module._tpu_shifted_mhc_mix_weight is retained
+    after = check(updated_fn)
+    assert len(compiled.cache) == 1
+    assert not torch.equal(before[0][-1].cpu(), after[0][-1].cpu())
 
 
 @pytest.mark.parametrize("tokens", [0, 15])
@@ -170,7 +260,8 @@ def test_unsupported_token_bucket_falls_back(tpu, tokens):
     cfg = SimpleNamespace(mult=M, hidden=D)
     hc = SimpleNamespace(cfg=cfg)
     y = torch.empty((tokens, D), device=tpu, dtype=torch.bfloat16)
-    assert ops.fused_boundary(hc, y, None, None, None, None) is None
+    with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
+        assert ops.fused_boundary(hc, y, None, None, None, None) is None
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 """The optional shifted-mHC boundary preserves the built-in post fallback."""
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -91,6 +93,79 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
             ):
                 self._assert_post_fallback(self._post(boundary))
         self.fused.assert_not_called()
+
+    def test_draft_consumes_boundary_inputs_and_gates_across_stages(self):
+        from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDSparkMixin
+
+        width = 5120
+        norm = torch.nn.Identity()
+        norm.weight = torch.ones(width, dtype=torch.bfloat16)
+        norm.cast_x_before_out_mul = False
+        norm.variance_size_override = None
+        hc = self.hc._replace(cfg=self.hc.cfg._replace(hidden=width), norm=norm)
+        initial = torch.full((1, 2, width), 2.0, dtype=torch.bfloat16)
+        attn_values = []
+        ffn_values = []
+
+        def attention(positions, rows, batch):
+            attn_values.append(rows[0, 0].item())
+            return rows + 1
+
+        def feed_forward(rows, batch):
+            ffn_values.append(rows[0, 0].item())
+            return rows + 2
+
+        def finish(rows, residual, post, comb):
+            return mhc.post(hc.cfg, rows, residual, post, comb)
+
+        def make_stage():
+            attn = Mock(side_effect=attention)
+            attn.maybe_use_decode_attn_tp.return_value = nullcontext()
+            return SimpleNamespace(
+                attn_hc=hc,
+                ffn_hc=hc,
+                hc_cfg=hc.cfg,
+                self_attn=attn,
+                _run_ffn=feed_forward,
+                hc_post=finish,
+            )
+
+        def complete(prev_hc, rows, residual, coefficients, boundary, next_hc):
+            pre, post, comb = coefficients
+            updated = finish(rows, residual, post, comb)
+            return mhc.HcState(
+                updated, pre, mhc.HcNormed(rows + 10), (pre + 1, post + 1, comb)
+            )
+
+        stage0, stage1 = make_stage(), make_stage()
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: False, is_target_verify=lambda: False
+            )
+        )
+        mhc.register_fused_hc_boundary("test_mhc", complete)
+        run = NonCudaDSparkMixin._forward_hc_pre_from_prev
+        with (
+            patch("sglang.srt.platforms._current_platform", _FakePlatform()),
+            patch.object(mhc, "mix_stats", return_value=self.coefficients) as mix,
+        ):
+            state = run(stage0, None, mhc.HcState(initial), batch, stage1)
+            state = run(stage1, None, state, batch)
+
+        self.assertEqual(attn_values, [2.0, 25.0])
+        self.assertEqual(ffn_values, [13.0, 36.0])
+        self.assertEqual(mix.call_count, 1)
+        self.assertIsNone(state.stats)
+        self.assertIsNone(state.input)
+        pre, post, comb = self.coefficients
+        torch.testing.assert_close(state.pre, pre + 3)
+        expected_residual = initial
+        for value, post_offset in ((3, 0), (15, 1), (26, 2), (38, 3)):
+            rows = torch.full((1, width), value, dtype=torch.bfloat16)
+            expected_residual = finish(
+                rows, expected_residual, post + post_offset, comb
+            )
+        torch.testing.assert_close(state.residual, expected_residual)
 
 
 if __name__ == "__main__":

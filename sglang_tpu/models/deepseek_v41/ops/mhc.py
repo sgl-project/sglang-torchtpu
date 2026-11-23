@@ -4,6 +4,7 @@
 import jax
 import torch
 
+from sglang_tpu.envs import envs
 from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as kernel
 
 _PACKED = "_tpu_shifted_mhc_mix_weight"
@@ -96,12 +97,15 @@ def _refresh_packed_buffer(hc):
         existing.copy_(packed)
 
 
-def prepare_shifted_mhc(model):
-    """Refresh traceable packed buffers after each run of the model's loader."""
+def prepare_shifted_mhc(layers, *, draft=False):
+    """Refresh traceable buffers for destinations of serving boundaries."""
     from sglang.srt.models.deepseek_v4 import DeepseekV4PlatformDecoderLayer
     from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
-    for layer in model.model.layers:
+    if not envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get():
+        return
+
+    for index, layer in enumerate(layers):
         if not isinstance(layer, DeepseekV4PlatformDecoderLayer):
             continue
         cfg = layer.hc_cfg
@@ -116,8 +120,17 @@ def prepare_shifted_mhc(model):
         if get_pallas_tpu_device_kind() != "TPU7x":
             return
         register_shifted_mhc_op()
-        for hc in (layer.attn_hc, layer.ffn_hc):
-            if hc.fn.dtype == torch.float32:
+        # The draft begins with embeddings and has no incoming attention boundary.
+        sublayers = (
+            (layer.ffn_hc,)
+            if draft and index == 0
+            else (
+                layer.attn_hc,
+                layer.ffn_hc,
+            )
+        )
+        for hc in sublayers:
+            if hc.fn.dtype == torch.float32 and hc.fn.shape == (24, 20480):
                 _refresh_packed_buffer(hc)
 
 
@@ -138,11 +151,24 @@ def refresh_shifted_mhc_after_direct_update(model, named_tensors):
 
 def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
     """Return the new residual and the next sublayer's input and triplet."""
-    if y.device.type != "tpu" or y.dtype != torch.bfloat16:
+    if (
+        y.device.type != "tpu"
+        or y.dtype != torch.bfloat16
+        or not envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get()
+    ):
         return None
     if not kernel.is_supported_shape(y.shape[0], hc.cfg.mult, hc.cfg.hidden):
         return None
 
+    if (
+        next_boundary is None
+        or not next_boundary.norm_fusable
+        or residual.dtype != torch.bfloat16
+        or any(gate.dtype != torch.float32 for gate in coefficients)
+        or next_hc.scale.dtype != torch.float32
+        or next_hc.base.dtype != torch.float32
+    ):
+        return None
     packed = getattr(next_hc.norm, _PACKED, None)
     if packed is None:
         return None

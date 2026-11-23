@@ -1825,7 +1825,10 @@ class TpuSRTPlatform(SRTPlatform):
             self._backend_initialized = True
             _register_models()
 
-            if self.is_out_of_tree():
+            if (
+                self.is_out_of_tree()
+                and tpu_envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get()
+            ):
                 from sglang.srt.models.deepseek_v4_mhc import (
                     register_fused_hc_boundary,
                 )

@@ -81,12 +81,13 @@ tpu_dsv4_live_hc_sublayers
   Remove when: the direct tracer swaps tensors inside named tuples, or
        HcSubLayer reads the parameters through the layer.
 
-tpu_dsv41_prepare_shifted_mhc
+tpu_dsv41_prepare_shifted_mhc, tpu_dsv41_prepare_dspark_shifted_mhc
   Why: the fused shifted mHC boundary needs a device-resident packed mix weight.
   How: AFTER DeepseekV4ForCausalLM.post_load_weights, pack the loaded mix
        weights into nonpersistent buffers while preserving the FP32 parameters.
-       The startup-only post_load_model seam does not cover online model loads.
-  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+       Apply the same hook to DeepseekV4ForCausalLMDSpark.post_load_weights
+       for draft stages. The startup-only seam misses online model loads.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
   Remove when: the model exposes a backend-specific post-load weight preparation
        entry point for startup and online loads.
 
@@ -94,15 +95,15 @@ tpu_dsv41_refresh_shifted_mhc_after_direct_update
   Why: the raw weight-update endpoint bypasses model.post_load_weights.
   How: AFTER _model_load_weights_direct, refresh any packed mix weight whose
        FP32 parameter the update wrote.
-  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
   Remove when: raw weight updates notify the same weight preparation entry
        point as model.post_load_weights.
 
 tpu_dsv41_legacy_shifted_mhc
   Why: the legacy TPU platform bypasses the OOT boundary registry.
-  How: AROUND _post_fusion, call the plugin's registered implementation for the
+  How: AROUND try_platform_fused_boundary, call the plugin's registered implementation for the
        same supported boundaries in legacy mode.
-  Upstream PR or issue: DeepSeek-V4.1 shifted mHC boundary seam (PR-B1).
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
   Remove when: the legacy TPU platform identity is retired.
 
 tpu_dsv4_fence_hc_mix_stats
@@ -549,7 +550,15 @@ def tpu_dsv41_prepare_shifted_mhc(result, model, is_nextn=False, weight_names=No
     if not is_nextn:
         from sglang_tpu.models.deepseek_v41.ops.mhc import prepare_shifted_mhc
 
-        prepare_shifted_mhc(model)
+        prepare_shifted_mhc(model.model.layers)
+
+
+def tpu_dsv41_prepare_dspark_shifted_mhc(
+    result, model, is_nextn=False, weight_names=None
+):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import prepare_shifted_mhc
+
+    prepare_shifted_mhc(model.stages, draft=True)
 
 
 def tpu_dsv41_refresh_shifted_mhc_after_direct_update(result, model, named_tensors):
@@ -902,12 +911,17 @@ def hook_specs():
             HookType.AFTER,
         ),
         (
+            f"{dspark}.post_load_weights",
+            tpu_dsv41_prepare_dspark_shifted_mhc,
+            HookType.AFTER,
+        ),
+        (
             "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct",
             tpu_dsv41_refresh_shifted_mhc_after_direct_update,
             HookType.AFTER,
         ),
         (
-            "sglang.srt.models.deepseek_v4_mhc._post_fusion",
+            "sglang.srt.models.deepseek_v4_mhc.try_platform_fused_boundary",
             tpu_dsv41_legacy_shifted_mhc,
             HookType.AROUND,
         ),

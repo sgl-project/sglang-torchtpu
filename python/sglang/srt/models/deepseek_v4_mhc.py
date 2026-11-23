@@ -764,7 +764,9 @@ def try_platform_fused_boundary(
     if fused is None:
         return None
     next_hc = next.resolve_hc()
-    return None if next_hc is None else fused(hc, y, residual, coefficients, next, next_hc)
+    return (
+        None if next_hc is None else fused(hc, y, residual, coefficients, next, next_hc)
+    )
 
 
 def _post_fusion(
