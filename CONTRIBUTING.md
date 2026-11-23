@@ -64,8 +64,8 @@ Labels are required and come from `scripts/ci/tpu/support_matrix_vocab.json`; ad
    Then open the PR against `sgl-project/sglang-torchtpu:main`. One concern per PR.
 2. Run `pre-commit run --all-files`. It runs ruff, isort, codespell, and the TPU debt ratchet (see Architecture below).
 3. Review your own diff against [AGENTS.md](AGENTS.md). It is the checklist maintainers and their coding agents apply, including the plugin-migration rules; pointing your own agent at it before you open the PR catches placement problems earlier than CI does.
-4. Title with an area prefix: `[TPU]` backend code, `[TPU/CI]` CI and tooling, `[Docs]`, `[Upstream]` for a change also open against sgl-project/sglang (link it).
-5. Fill in the PR template. The description becomes the squash-merge commit message, so keep it accurate.
+4. Title as `[Type] [TPU] scope: summary` (or `[Type] scope: summary`), where `Type` is `Feat`, `Fix`, `Refactor`, `Perf`, `Doc`, `Test`, `CI`, `Chore`, or `Misc` — for example `[Perf] [TPU] dsa-kpool: Write prefill raw keys a page at a time` or `[Doc] docs: ...`. Link any matching PR open against sgl-project/sglang in the description.
+5. Fill in the PR template as [AGENTS.md](AGENTS.md#writing-a-pr-description) describes. The description becomes the squash-merge commit message, so keep it accurate.
 6. Lint and CPU tests run automatically on every PR, from forks included, with no secrets involved.
 7. **TPU tests run on request**, because TPU capacity is limited and fork PRs cannot reach the TPU runners on their own. An authorized user adds the `run-ci` label after reading the diff and comments `/tag-and-rerun-ci` on the PR; that runs the TPU suite once for the current commit. A new push needs a new comment. `/rerun-failed-ci` reruns what failed. Only users listed in `.github/CI_PERMISSIONS.json` can run CI commands. A PR author can also rerun failed CI on their own PR with `/rerun-failed-ci`. Ask for the run in a PR comment once the CPU checks are green.
 8. CODEOWNERS assigns reviewers for TPU paths. One approval plus code-owner review, all threads resolved, then a maintainer squash-merges.
@@ -110,7 +110,7 @@ Today the backend still runs on the fork in `python/`, because some TPU behaviou
 What this means for a change:
 
 - **TPU-only code** (kernels, pools, backends, recipes, tests) goes under `sglang_tpu/`. Never under `python/sglang/srt/`, and never into one of the old re-export shim files there.
-- **Generic engine changes** go to upstream first and arrive here through the sync. If you cannot wait, open the upstream PR, then the same change here with the `[Upstream]` prefix.
+- **Generic engine changes** go to upstream first and arrive here through the sync. If you cannot wait, open the upstream PR, then open the matching PR here and link it in the description.
 - **A core change that TPU needs** uses the first of these that fits: an existing `SRTPlatform` method or capability flag; a registry filled from `init_backend()` (`register_attention_backend`, `register_oot_forward`, `get_quantization_config`); subclass-and-override through a factory; a seam PR upstream, carried here as a `sglang_tpu/hooks/` entry until it merges. Seam PRs stay under about 300 lines, carry no TPU code, and ship with a CPU unit test. The hook header links the seam PR, and a cleanup PR deletes the hook after the sync brings the seam in.
 - **The ratchet** (`tools/plugin/check_tpu_branches.py`, run by pre-commit) rejects any PR that raises a per-file count of `is_tpu` branches or `sglang_tpu` imports in core. Raising a baseline needs a linked upstream seam issue or PR and a maintainer's approval. Lowering one is always welcome: run it with `--write-baseline` and commit the JSON.
 
