@@ -27,7 +27,7 @@ def _lp_kernel(
         s_ref[...] = jnp.zeros_like(s_ref)
         pick_ref[...] = jnp.zeros_like(pick_ref)
 
-    col = j * _LP_COLS + jax.lax.broadcasted_iota(jnp.int32, logits_ref.shape, 1)
+    col = j * _LP_COLS + jax.lax.broadcasted_iota(jnp.int32, (1, _LP_COLS), 1)
     x = logits_ref[...].astype(jnp.float32) / temp_ref[...]
     x = jnp.where(col < vocab, x, -jnp.inf)
     m_new = jnp.maximum(m_ref[...], jnp.max(x, axis=1, keepdims=True))

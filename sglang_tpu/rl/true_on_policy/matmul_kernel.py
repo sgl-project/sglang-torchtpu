@@ -43,16 +43,17 @@ def _jax_matmul(x: jax.Array, w: jax.Array) -> jax.Array:
     if k % _MM_BK:
         raise ValueError(f"True on-policy matmul needs K % {_MM_BK} == 0, got K={k}")
     bm = row_block(m, _MM_BM, 128)
+    bn = row_block(n, _MM_BN, 128)
     return pl.pallas_call(
         functools.partial(_mm_kernel, nk=k // _MM_BK),
-        grid=(pl.cdiv(m, bm), pl.cdiv(n, _MM_BN), k // _MM_BK),
+        grid=(pl.cdiv(m, bm), pl.cdiv(n, bn), k // _MM_BK),
         in_specs=[
             pl.BlockSpec((bm, _MM_BK), lambda i, j, kk: (i, kk)),
-            pl.BlockSpec((_MM_BN, _MM_BK), lambda i, j, kk: (j, kk)),
+            pl.BlockSpec((bn, _MM_BK), lambda i, j, kk: (j, kk)),
         ],
-        out_specs=pl.BlockSpec((bm, _MM_BN), lambda i, j, kk: (i, j)),
+        out_specs=pl.BlockSpec((bm, bn), lambda i, j, kk: (i, j)),
         out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
-        scratch_shapes=[pltpu.VMEM((bm, _MM_BN), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((bm, bn), jnp.float32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=_MM_VMEM_BYTES,

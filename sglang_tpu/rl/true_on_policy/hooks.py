@@ -18,6 +18,7 @@ Remove when: core exposes batch-invariant op seams on TPU.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Any
 
@@ -135,9 +136,12 @@ def true_on_policy_gated_rms_norm(original, self, x: torch.Tensor, z=None):
     return out.reshape(x.shape)
 
 
+_gdn_signature = functools.lru_cache(maxsize=4)(inspect.signature)
+
+
 def recurrent_gated_delta_net(original, *args, **kwargs):
     """AROUND fused_conv1d_gdn: every tile runs the per-token recurrence, as a decode step does."""
-    call = inspect.signature(original).bind(*args, **kwargs)
+    call = _gdn_signature(original).bind(*args, **kwargs)
     if call.arguments.get("packed_weights") is not None:
         # KDA's packed operand carries its own A_log and dt_bias, unrounded
         raise ValueError(
@@ -227,18 +231,33 @@ def true_on_policy_input_logprobs(
     **kwargs,
 ):
     """AROUND InputLogprobProcessor.forward: the prompt token log-probs come from the log-prob kernel."""
-    result, sampled_logits = original(
-        self,
-        pruned_states,
-        sample_indices,
-        input_logprob_indices,
-        token_to_seq_idx,
-        lm_head,
-        get_logits_fn,
-        logits_metadata,
-        *args,
-        **kwargs,
-    )
+    from sglang.srt.layers.logprob_processor import LogprobResult
+
+    if (
+        logits_metadata.extend_return_top_logprob
+        or logits_metadata.extend_token_ids_logprob
+        or hasattr(lm_head, "set_lm_head_pass")
+    ):
+        result, sampled_logits = original(
+            self,
+            pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+            lm_head,
+            get_logits_fn,
+            logits_metadata,
+            *args,
+            **kwargs,
+        )
+    else:
+        result = LogprobResult()
+        sampled_logits = get_logits_fn(
+            pruned_states[sample_indices],
+            lm_head,
+            logits_metadata,
+            use_logits_buffer=False,
+        )
     targets = logits_metadata.extend_input_logprob_token_ids_gpu.to(torch.int32)
     token_logprobs = []
     # The chunk only bounds the [rows, vocab] logits.

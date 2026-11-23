@@ -105,13 +105,13 @@ def gated_rms_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: 
 
 
 def _norm_input_grad(s, w, grad_out, eps):
-    """d/ds of s * rsqrt(mean(s^2) + eps) * w, all fp32; returns (grad_s, grad_w)."""
+    """d/ds of s * rsqrt(mean(s^2) + eps) * w, all fp32; returns (grad_s, grad_w, s_hat)."""
     g = grad_out.float()
     rstd = torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + eps)
     s_hat = s * rstd
     gw = g * w.float()
     grad_s = rstd * (gw - s_hat * (gw * s_hat).mean(-1, keepdim=True))
-    return grad_s, (g * s_hat).sum(0)
+    return grad_s, (g * s_hat).sum(0), s_hat
 
 
 def _norm_setup(ctx, inputs, output):
@@ -128,7 +128,7 @@ def _norm_weight(w, gemma):
 def _norm_grad(ctx, grad):
     x, w = ctx.saved_tensors
     eps, gemma = ctx.static
-    grad_s, grad_w = _norm_input_grad(x.float(), _norm_weight(w, gemma), grad, eps)
+    grad_s, grad_w, _ = _norm_input_grad(x.float(), _norm_weight(w, gemma), grad, eps)
     return grad_s.to(x.dtype), grad_w.to(w.dtype), None, None
 
 
@@ -138,7 +138,7 @@ def _norm_residual_grad(ctx, grad_out, grad_residual):
     s = x.float() + r.float()
     if gemma:
         s = s.to(x.dtype).float()
-    grad_s, grad_w = _norm_input_grad(s, _norm_weight(w, gemma), grad_out, eps)
+    grad_s, grad_w, _ = _norm_input_grad(s, _norm_weight(w, gemma), grad_out, eps)
     # The new residual is bf16(s); its gradient passes straight through the rounding.
     grad_s = grad_s + grad_residual.float()
     return grad_s.to(x.dtype), grad_s.to(r.dtype), grad_w.to(w.dtype), None, None
@@ -147,12 +147,11 @@ def _norm_residual_grad(ctx, grad_out, grad_residual):
 def _gated_norm_grad(ctx, grad):
     x, z, w = ctx.saved_tensors
     (eps,) = ctx.static
-    xf, zf, g = x.float(), z.float(), grad.float()
+    xf, zf, wf, g = x.float(), z.float(), w.float(), grad.float()
     sig = torch.sigmoid(zf)
-    grad_x, grad_w = _norm_input_grad(xf, w.float(), g * zf * sig, eps)
-    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
+    grad_x, grad_w, x_hat = _norm_input_grad(xf, wf, g * zf * sig, eps)
     # d silu(z) / dz = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
-    grad_z = g * normed * sig * (1.0 + zf * (1.0 - sig))
+    grad_z = g * (x_hat * wf) * sig * (1.0 + zf * (1.0 - sig))
     return grad_x.to(x.dtype), grad_z.to(z.dtype), grad_w.to(w.dtype), None
 
 

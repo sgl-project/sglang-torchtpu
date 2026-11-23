@@ -127,10 +127,12 @@ class TestTrueOnPolicyKernels(CustomTestCase):
             self.assertTrue(torch.equal(part, full[:m]), f"rows differ at M={m}")
 
     def test_matmul_rows_do_not_depend_on_row_count(self):
-        x, w = _rnd(1024, 1536), _rnd(640, 1536, scale=1536**-0.5, seed=1)
-        self._assert_rows_invariant(self.k.matmul, (x, w))
-        ref = x.float() @ w.float().T
-        self.assertLess((self.k.matmul(x, w).float() - ref).abs().max().item(), 0.05)
+        x = _rnd(1024, 1536)
+        for n in (640, 1):
+            w = _rnd(n, 1536, scale=1536**-0.5, seed=1)
+            self._assert_rows_invariant(self.k.matmul, (x, w))
+            err = (self.k.matmul(x, w).float() - x.float() @ w.float().T).abs().max()
+            self.assertLess(err.item(), 0.05)
 
     def test_matmul_refuses_a_partial_k_step(self):
         with self.assertRaisesRegex(Exception, "K % 512"):
