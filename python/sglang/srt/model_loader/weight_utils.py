@@ -27,6 +27,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Protocol,
     Set,
     Tuple,
     Union,
@@ -84,11 +85,6 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.device import is_cuda_alike
-
-if TYPE_CHECKING:
-    from sglang_tpu.ep_local_expert_reader import (
-        EpLocalExpertReader,
-    )
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -1318,20 +1314,33 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+class LocalExpertReader(Protocol):
+    """Reads safetensors shards without the routed experts outside one EP
+    rank's range; built by ``current_platform.create_local_expert_reader``."""
+
+    def handles(self, st_file: str) -> bool:
+        """Whether ``read`` serves ``st_file``; other files are read whole."""
+        ...
+
+    def read(self, st_file: str) -> Dict[str, torch.Tensor]:
+        """The tensors of ``st_file`` this rank keeps, by name."""
+        ...
+
+    def verify(self) -> None:
+        """Raise unless every local expert tensor the load expects was read."""
+        ...
+
+
 def _ep_local_expert_reader(
     hf_weights_files: List[str],
     disable_mmap: bool,
     local_expert_range: Optional[Tuple[int, int]],
-) -> Optional["EpLocalExpertReader"]:
-    """TPU EP-local expert reader for ``local_expert_range``, or None to read whole
-    shards (no range, mmap on, or no checkpoint index)."""
+) -> Optional[LocalExpertReader]:
+    """The platform's EP-local expert reader for ``local_expert_range``, or None
+    to read whole shards (no range, or the platform reads them whole)."""
     if local_expert_range is None:
         return None
-    from sglang_tpu.ep_local_expert_reader import (
-        EpLocalExpertReader,
-    )
-
-    return EpLocalExpertReader.maybe_create(
+    return current_platform.create_local_expert_reader(
         hf_weights_files, local_expert_range, disable_mmap=disable_mmap
     )
 
@@ -1346,9 +1355,8 @@ def safetensors_weights_iterator(
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
-    With ``disable_mmap`` and ``local_expert_range`` (see
-    ``hardware_backend/tpu/ep_local_expert_reader``), indexed shards are read
-    without the routed experts outside that range.
+    With ``local_expert_range``, shards the platform's ``LocalExpertReader``
+    claims are read without the routed experts outside that range.
     """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

@@ -30,12 +30,15 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.model_loader.weight_utils import LocalExpertReader
 
 
 class PlatformEnum(enum.Enum):
@@ -175,6 +178,13 @@ class DeviceMixin:
         """
         return True
 
+    def supports_async_weight_loading(self) -> bool:
+        """Whether model weight loaders may copy host checkpoint tensors to
+        the device from a thread pool (``model_loader.utils.should_async_load``).
+        False when copies issued from several host threads race the runtime.
+        """
+        return True
+
     # ------------------------------------------------------------------
     # Active methods — core calls these through current_platform.
     # OOT implementations take effect immediately.
@@ -199,6 +209,57 @@ class DeviceMixin:
         graph to bound its materialization peak).
         """
         yield weights
+
+    def after_module_weights_processed(self, module: torch.nn.Module) -> None:
+        """[Active] Called right after each module's
+        ``quant_method.process_weights_after_loading`` in
+        ``DefaultModelLoader.postprocess_weights`` and
+        ``load_model_with_cpu_quantization``.
+
+        Default: no-op. A runtime that defers device copies and frees can
+        flush here, so one module's post-processing transients are released
+        before the next module creates its own.
+        """
+        pass
+
+    def after_model_weights_processed(
+        self, model: torch.nn.Module, target_device: torch.device
+    ) -> None:
+        """[Active] Called at the end of
+        ``DefaultModelLoader.postprocess_weights``, after every module's
+        ``process_weights_after_loading``: on the initial load and again
+        after each weight update, so implementations must be idempotent.
+
+        Default: no-op. Platforms prepare kernel-specific state derived from
+        the processed weights here.
+        """
+        pass
+
+    def get_local_expert_range(
+        self, model: torch.nn.Module
+    ) -> Optional[tuple[int, int]]:
+        """[Active] The routed-expert ids ``[start, end)`` whose weights this
+        rank stores, when its checkpoint reads may skip every other routed
+        expert (``DefaultModelLoader.Source.local_expert_range``).
+
+        Default: None, read every expert.
+        """
+        return None
+
+    def create_local_expert_reader(
+        self,
+        hf_weights_files: list[str],
+        local_expert_range: tuple[int, int],
+        *,
+        disable_mmap: bool,
+    ) -> Optional["LocalExpertReader"]:
+        """[Active] A reader for the safetensors weight iterators that skips
+        the routed experts outside ``local_expert_range`` (from
+        ``get_local_expert_range``), or None to read whole shards.
+
+        Default: None.
+        """
+        return None
 
     def is_pin_memory_available(self, device=None) -> bool:
         """[Active] Whether pinned host memory is available for a target device."""

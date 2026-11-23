@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
@@ -299,22 +300,20 @@ def should_async_load(weight: torch.Tensor) -> bool:
 
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
-    (e.g., GIL contention) without benefit, so we do it synchronously.
-
-    TPU loads must be synchronous: threaded copies race torch_tpu's enqueue path.
+    (e.g., GIL contention) without benefit, so we do it synchronously. A
+    platform whose runtime races threaded copies loads synchronously
+    (``supports_async_weight_loading``).
 
     RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
     must be consumed synchronously before the streamer fills its next batch.
     """
-    from sglang.srt.utils.device import is_tpu
-
     if getattr(weight, "_sglang_runai_streamer_tensor", False):
         return False
 
     device = getattr(weight, "device", None)
     if device is None:
         return False
-    return device.type == "cpu" and not is_tpu()
+    return device.type == "cpu" and current_platform.supports_async_weight_loading()
 
 
 def maybe_executor_submit(
