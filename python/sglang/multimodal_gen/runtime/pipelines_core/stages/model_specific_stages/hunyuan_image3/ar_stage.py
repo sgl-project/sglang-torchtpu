@@ -590,11 +590,13 @@ class HunyuanImage3AR(PipelineStage):
         vit_info.image_tensor = vit_tensor
         return joint_info
 
-    def _vae_encode_cond_image(self, vae_tensor, device):
+    def _vae_encode_cond_image(self, vae_tensor, device, generator=None):
         vae = self._vae
         vae_tensor = self._cond_vae_tensor_5d(vae_tensor).to(device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=True):
-            latents = vae.encode(vae_tensor).latent_dist.sample()
+            # The request's seeded generator, as the reference implementation's
+            # vae_encode samples the posterior.
+            latents = vae.encode(vae_tensor).latent_dist.sample(generator)
             if vae.shift_factor:
                 latents.sub_(vae.shift_factor)
             if vae.scaling_factor:
@@ -620,8 +622,18 @@ class HunyuanImage3AR(PipelineStage):
             per_request_joint_infos.append(joints)
         return per_request_joint_infos
 
-    def _encode_conditions(self, per_request_joint_infos, device):
+    def _encode_conditions(self, per_request_joint_infos, device, generators=None):
         flat_infos = [info for joints in per_request_joint_infos for info in joints]
+        # Each condition image samples with its request's generator.
+        flat_generators = (
+            [
+                g
+                for g, joints in zip(generators, per_request_joint_infos)
+                for _ in joints
+            ]
+            if generators is not None
+            else None
+        )
         request_bounds = []
         offset = 0
         for joints in per_request_joint_infos:
@@ -641,7 +653,9 @@ class HunyuanImage3AR(PipelineStage):
         batched = None
         if envs.SGLANG_HI3_COND_ENCODE_BATCHING:
             try:
-                batched = self._encode_conditions_batched(flat_infos, device)
+                batched = self._encode_conditions_batched(
+                    flat_infos, device, flat_generators
+                )
             except (torch.OutOfMemoryError, RuntimeError) as e:
                 if (
                     isinstance(e, RuntimeError)
@@ -651,7 +665,9 @@ class HunyuanImage3AR(PipelineStage):
                 logger.warning("Batched cond encoding OOM; falling back to sequential")
                 _empty_device_cache()
         if batched is None:
-            batched = self._encode_conditions_sequential(flat_infos, device)
+            batched = self._encode_conditions_sequential(
+                flat_infos, device, flat_generators
+            )
         vae_embeds, t_values, vit_embeds = batched
 
         per_request_vae_embeds: list[list] = []
@@ -673,7 +689,7 @@ class HunyuanImage3AR(PipelineStage):
             tensor = tensor.unsqueeze(2)
         return tensor
 
-    def _encode_conditions_sequential(self, flat_infos, device):
+    def _encode_conditions_sequential(self, flat_infos, device, generators=None):
         vae_embeds: list = []
         t_values: list = []
         vit_embeds: list = []
@@ -683,9 +699,11 @@ class HunyuanImage3AR(PipelineStage):
             dtype=torch.bfloat16,
             enabled=True,
         ):
-            for info in flat_infos:
+            for i, info in enumerate(flat_infos):
                 t_i, latents_i = self._vae_encode_cond_image(
-                    info.vae_image_info.image_tensor, device
+                    info.vae_image_info.image_tensor,
+                    device,
+                    generators[i] if generators is not None else None,
                 )
                 # Keep t 1D: time_embed output feeds the ResBlock scale/shift split.
                 t_i_emb = self.ar_model.time_embed(t_i.to(device))
@@ -747,7 +765,7 @@ class HunyuanImage3AR(PipelineStage):
                 chunk = size // 2
         return results
 
-    def _encode_conditions_batched(self, flat_infos, device):
+    def _encode_conditions_batched(self, flat_infos, device, generators=None):
         # Returns None when the images cannot be stacked (shape mismatch).
         vae_tensors = [
             self._cond_vae_tensor_5d(info.vae_image_info.image_tensor)
@@ -784,7 +802,9 @@ class HunyuanImage3AR(PipelineStage):
                     dim=0,
                 )
                 t_chunk, latents_chunk = self._vae_encode_cond_image(
-                    batched_vae, device
+                    batched_vae,
+                    device,
+                    [generators[i] for i in idxs] if generators is not None else None,
                 )
                 # Keep t 1D: time_embed output feeds the ResBlock scale/shift split.
                 t_emb = self.ar_model.time_embed(t_chunk.to(device))
@@ -1040,6 +1060,20 @@ class HunyuanImage3AR(PipelineStage):
         vae_h, vae_w = _vae_downsample_factors(arch_config)
         return latent_channels, height // vae_h, width // vae_w
 
+    @staticmethod
+    def _request_generators(reqs: list[Req], device: torch.device) -> list:
+        # One generator per request keeps output bit-identical to its
+        # single-request run.
+        generators = []
+        for req in reqs:
+            generator = torch.Generator(device=device)
+            # Seeds arrive normalized to per-output scalars by
+            # _expand_multi_output.
+            if req.seed is not None:
+                generator.manual_seed(req.seed)
+            generators.append(generator)
+        return generators
+
     def _prepare_noise(
         self,
         reqs: list[Req],
@@ -1047,16 +1081,12 @@ class HunyuanImage3AR(PipelineStage):
         latent_h: int,
         latent_w: int,
         device: torch.device,
+        generators: list | None = None,
     ) -> torch.Tensor:
-        # One generator per request keeps output bit-identical to its
-        # single-request run.
+        if generators is None:
+            generators = self._request_generators(reqs, device)
         noise_rows = []
-        for req in reqs:
-            generator = torch.Generator(device=device)
-            # Seeds arrive normalized to per-output scalars by
-            # _expand_multi_output.
-            if req.seed is not None:
-                generator.manual_seed(req.seed)
+        for generator in generators:
             noise_rows.append(
                 torch.randn(
                     1,
@@ -1280,7 +1310,9 @@ class HunyuanImage3AR(PipelineStage):
         timesteps = scheduler.timesteps
 
         latent_channels, latent_h, latent_w = self._latent_dims(height, width)
-        latents = self._prepare_noise(reqs, latent_channels, latent_h, latent_w, device)
+        # As the reference implementation: each request's generator samples its
+        # condition-image latents first, then the starting noise.
+        generators = self._request_generators(reqs, device)
 
         per_request_vae_embeds: list[list] = []
         per_request_t: list = []
@@ -1295,8 +1327,11 @@ class HunyuanImage3AR(PipelineStage):
                 per_request_vae_embeds,
                 per_request_t,
                 per_request_vit_embeds,
-            ) = self._encode_conditions(per_request_joint_infos, device)
+            ) = self._encode_conditions(per_request_joint_infos, device, generators)
             has_cond_encoded = True
+        latents = self._prepare_noise(
+            reqs, latent_channels, latent_h, latent_w, device, generators
+        )
 
         cond_vae_slices_rows = tok["cond_vae_slices_rows"]
         cond_vit_slices_rows = tok["cond_vit_slices_rows"]

@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `hunyuan_image3.sh` | `tencent/HunyuanImage-3.0-Instruct` | 8 | TP 8 |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| HunyuanImage-3.0-Instruct | T2I 1024x1024, 50 steps | 8 | 33.8 s | 0.665 s | 1.5 s | 57.7 GB |
+| HunyuanImage-3.0-Instruct | Edit 1024x1024 (one reference image), 50 steps | 8 | 37.4 s | 0.738 s | 1.5 s | 57.7 GB |
 
 
 ## Example requests
@@ -49,6 +52,16 @@ curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: a
   "prompt": "A cinematic portrait of a red panda astronaut floating in space, highly detailed",
   "size": "1024x1024", "num_inference_steps": 9, "guidance_scale": 0.0, "seed": 42, "response_format": "b64_json"
 }' | python3 -c 'import base64, json, sys; open("out.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+```
+
+HunyuanImage-3.0-Instruct (`hunyuan_image3.sh`) also edits: `/v1/images/edits` takes the reference images as
+`image[]` parts (repeat it for several) and the defaults are 50 steps at guidance 2.5.
+
+```bash
+curl -s http://localhost:30000/v1/images/edits -F model=tencent/HunyuanImage-3.0-Instruct \
+  -F 'prompt=Change the background to a quiet seaside town; preserve the subject.' \
+  -F 'image[]=@reference.png' -F size=1024x1024 -F seed=42 -F response_format=b64_json \
+  | python3 -c 'import base64, json, sys; open("out.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
 ```
 
 `/v1/videos` queues a job and returns its `id`; poll `GET /v1/videos/{id}` until `status` is `completed`, then

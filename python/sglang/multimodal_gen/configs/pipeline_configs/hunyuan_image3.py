@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 @dataclass
 class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
+    # The AR backbone shards with TP (srt parallel linears and FusedMoE).
+    supports_tpu_tensor_parallel = True
+
     vae_precision: str = "fp32"
 
     should_use_guidance: bool = True

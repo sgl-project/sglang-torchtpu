@@ -737,7 +737,21 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_tpu_tensor_parallel()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_tpu_tensor_parallel(self) -> None:
+        if (
+            current_platform.is_tpu()
+            and self.tp_size not in (None, 1)
+            and not type(self.pipeline_config).supports_tpu_tensor_parallel
+        ):
+            raise ValueError(
+                "TPU diffusion has no tensor-parallel path for "
+                f"{type(self.pipeline_config).__name__}; shard with "
+                "--cfg-parallel-size / --sp-degree instead "
+                f"(got --tp-size {self.tp_size})."
+            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -1899,12 +1913,6 @@ class ServerArgs(DisaggServerArgsMixin):
             # Single-host ports are random, so pick them once for workers to inherit.
             _prepare_tpu_env(
                 world_size=self.num_gpus, resolve_single_host_topology=False
-            )
-
-        if self.tp_size not in (None, 1):
-            raise ValueError(
-                "TPU diffusion has no tensor-parallel path yet; shard with "
-                f"--cfg-parallel-size / --sp-degree instead (got --tp-size {self.tp_size})."
             )
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
