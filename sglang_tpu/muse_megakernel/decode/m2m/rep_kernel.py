@@ -669,9 +669,8 @@ def _m2m_rep_kernel(
     out_stream_hbm = body_refs[idx]
     out_router_logits_ref = body_refs[idx + 1]
     out_expert_in_ref = body_refs[idx + 2]
-    out_kvw_rows_hbm = body_refs[idx + 3]
-    out_kvw_dst_hbm = body_refs[idx + 4]
-    idx += 5
+    out_kv_cache_hbm = body_refs[idx + 3]
+    idx += 4
 
     slab_a = body_refs[idx]
     slab_b = body_refs[idx + 1]
@@ -687,27 +686,26 @@ def _m2m_rep_kernel(
     gate_vmem_ref = body_refs[idx + 11]
     gated_vmem_ref = body_refs[idx + 12]
     kvw_rows_vmem = body_refs[idx + 13]
-    kvw_dst_vmem = body_refs[idx + 14]
-    post_shard = body_refs[idx + 15]
-    b2_half_a = body_refs[idx + 16]
-    b2_half_b = body_refs[idx + 17]
-    mate_tok_buf = body_refs[idx + 18]
-    moe_full_buf = body_refs[idx + 19]
-    router_vmem = body_refs[idx + 20]
-    inv_pff_buf = body_refs[idx + 21]
-    send_half = body_refs[idx + 22]
-    mate_recv = body_refs[idx + 23]
-    own_half = body_refs[idx + 24]
-    scatter_ref = body_refs[idx + 25]
-    own_chunk = body_refs[idx + 26]
-    sq_buf = body_refs[idx + 27]
-    pre_shard = body_refs[idx + 28]
-    pre_half_a = body_refs[idx + 29]
-    pre_half_b = body_refs[idx + 30]
-    rpa_smem_ref = body_refs[idx + 31]
-    idx += 32
+    post_shard = body_refs[idx + 14]
+    b2_half_a = body_refs[idx + 15]
+    b2_half_b = body_refs[idx + 16]
+    mate_tok_buf = body_refs[idx + 17]
+    moe_full_buf = body_refs[idx + 18]
+    router_vmem = body_refs[idx + 19]
+    inv_pff_buf = body_refs[idx + 20]
+    send_half = body_refs[idx + 21]
+    mate_recv = body_refs[idx + 22]
+    own_half = body_refs[idx + 23]
+    scatter_ref = body_refs[idx + 24]
+    own_chunk = body_refs[idx + 25]
+    sq_buf = body_refs[idx + 26]
+    pre_shard = body_refs[idx + 27]
+    pre_half_a = body_refs[idx + 28]
+    pre_half_b = body_refs[idx + 29]
+    rpa_smem_ref = body_refs[idx + 30]
+    idx += 31
 
-    # Semaphores (`<= 60` on TP=16, `<= 42` on TP=8 — strictly < 64 hardware limit!):
+    # Semaphores (`<= 59` on TP=16, `<= 41` on TP=8 — strictly < 64 hardware limit!):
     w_post_gate_sem = body_refs[idx]
     w_qkv_pre_sem = body_refs[idx + 1]
     wo_sem = body_refs[idx + 2]
@@ -735,7 +733,9 @@ def _m2m_rep_kernel(
     qkv_cols = next_w_qkv_hbm.shape[1]
     gate_cols = next_w_gate_hbm.shape[1]
     pre_cols = w_pre_hbm.shape[1]
-    phys_page_rows = kv_cache_ro_hbm.shape[1]
+    phys_page_rows = (
+        kv_cache_ro_hbm.shape[2] if kv_cache_ro_hbm.ndim == 6 else kv_cache_ro_hbm.shape[1]
+    )
     page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
     use_halfrow = rows >= 32 and rows % 32 == 0
     align = 16 if use_halfrow else 8
@@ -804,14 +804,8 @@ def _m2m_rep_kernel(
 
     _llo_fence(distribution_ref, _run_b2_post_dot)
 
-    # `w_post_buf` is dead -> reuse `slab_b` (`w_post_gate_sem`) for `W_gate` + stream `Wo`!
+    # `w_post_buf` is dead -> reuse `slab_b` (`w_post_gate_sem`) for `W_gate` (defer `Wo`/`W_pre`/`W_router` past RPAd KV)!
     pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, w_post_gate_sem.at[0]).start()
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
-    ).start()
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
-    ).start()
 
     def _wait_and_prescale_stream():
         _dma_wait(s_buf, s_io_sem.at[0])
@@ -865,10 +859,6 @@ def _m2m_rep_kernel(
         ),
     )
 
-    # `w_qkv_buf` is dead -> reuse `slab_a` (`w_qkv_pre_sem`) for `W_pre` + stream `W_router`!
-    pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
-    pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
-
     _run_in_vmem_qkv_epilogue_any(
         qkv_vmem,
         cos_sin_ref,
@@ -883,6 +873,14 @@ def _m2m_rep_kernel(
         distribution_ref=distribution_ref,
     )
 
+    def _start_wo_rep():
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
+        ).start()
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
+        ).start()
+
     _run_in_vmem_rpad_and_gate(
         kv_lens_ref,
         page_indices_ref,
@@ -892,6 +890,7 @@ def _m2m_rep_kernel(
         q_vmem_ref,
         kv_merged_vmem_ref,
         kv_cache_ro_hbm,
+        out_kv_cache_hbm,
         bkv_vmem_ref,
         o_vmem_ref,
         next_in_vmem,
@@ -901,9 +900,9 @@ def _m2m_rep_kernel(
         gate_vmem_ref,
         gated_vmem_ref,
         kvw_rows_vmem,
-        kvw_dst_vmem,
         rpa_smem_ref,
         bkv_sems,
+        kvw_out_sem,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         k_scale=k_scale,
@@ -914,10 +913,11 @@ def _m2m_rep_kernel(
         layer_offset_in_bundle=layer_offset_in_bundle,
         early_prefetched=True,
         interpret_mode=interpret_mode,
+        on_rpad_kv_done_fn=_start_wo_rep,
     )
 
-    pltpu.make_async_copy(kvw_rows_vmem, out_kvw_rows_hbm, kvw_out_sem.at[0]).start()
-    pltpu.make_async_copy(kvw_dst_vmem, out_kvw_dst_hbm, kvw_out_sem.at[1]).start()
+    pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
+    pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
     # Phase 3: `ici_p1 + d2d_p2` causally closed `d2d_p0, d2d_p1, ici_p0` across all ranks,
     # and `ar_s2a (ici_p2) + ar_s2b (d2d_p1)` causally closes `ici_p1, d2d_p2, d2d_p0` before
@@ -979,8 +979,12 @@ def _m2m_rep_kernel(
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=False,
     )
-    _dma_wait(out_kvw_rows_hbm, kvw_out_sem.at[0])
-    _dma_wait(out_kvw_dst_hbm, kvw_out_sem.at[1])
+    w_tot_cnt = rpa_smem_ref[0]
+
+    @pl.when(w_tot_cnt > 0)
+    def _wait_kv_scatter():
+        src_kv = kvw_rows_vmem.at[pl.ds(0, w_tot_cnt)]
+        pltpu.make_async_copy(src_kv, src_kv, kvw_out_sem.at[0]).wait()
 
 
 def _l0_a2m_rep_kernel(
@@ -1042,9 +1046,8 @@ def _l0_a2m_rep_kernel(
     out_stream_hbm = body_refs[idx]
     out_router_logits_ref = body_refs[idx + 1]
     out_expert_in_ref = body_refs[idx + 2]
-    out_kvw_rows_hbm = body_refs[idx + 3]
-    out_kvw_dst_hbm = body_refs[idx + 4]
-    idx += 5
+    out_kv_cache_hbm = body_refs[idx + 3]
+    idx += 4
 
     slab_a = body_refs[idx]
     w_gate_buf = body_refs[idx + 1]
@@ -1060,20 +1063,19 @@ def _l0_a2m_rep_kernel(
     gate_vmem_ref = body_refs[idx + 11]
     gated_vmem_ref = body_refs[idx + 12]
     kvw_rows_vmem = body_refs[idx + 13]
-    kvw_dst_vmem = body_refs[idx + 14]
-    router_vmem = body_refs[idx + 15]
-    inv_pff_buf = body_refs[idx + 16]
-    send_half = body_refs[idx + 17]
-    mate_recv = body_refs[idx + 18]
-    own_half = body_refs[idx + 19]
-    scatter_ref = body_refs[idx + 20]
-    own_chunk = body_refs[idx + 21]
-    sq_buf = body_refs[idx + 22]
-    pre_shard = body_refs[idx + 23]
-    pre_half_a = body_refs[idx + 24]
-    pre_half_b = body_refs[idx + 25]
-    rpa_smem_ref = body_refs[idx + 26]
-    idx += 27
+    router_vmem = body_refs[idx + 14]
+    inv_pff_buf = body_refs[idx + 15]
+    send_half = body_refs[idx + 16]
+    mate_recv = body_refs[idx + 17]
+    own_half = body_refs[idx + 18]
+    scatter_ref = body_refs[idx + 19]
+    own_chunk = body_refs[idx + 20]
+    sq_buf = body_refs[idx + 21]
+    pre_shard = body_refs[idx + 22]
+    pre_half_a = body_refs[idx + 23]
+    pre_half_b = body_refs[idx + 24]
+    rpa_smem_ref = body_refs[idx + 25]
+    idx += 26
 
     w_qkv_pre_sem = body_refs[idx]
     w_gate_sem = body_refs[idx + 1]
@@ -1103,7 +1105,9 @@ def _l0_a2m_rep_kernel(
     half = hidden // 2
     qkv_cols = w_qkv_hbm.shape[1]
     pre_cols = w_pre_hbm.shape[1]
-    phys_page_rows = kv_cache_ro_hbm.shape[1]
+    phys_page_rows = (
+        kv_cache_ro_hbm.shape[2] if kv_cache_ro_hbm.ndim == 6 else kv_cache_ro_hbm.shape[1]
+    )
     page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
 
     me = lax.axis_index("model").astype(jnp.int32)
@@ -1133,12 +1137,6 @@ def _l0_a2m_rep_kernel(
         page_size=page_size,
         num_slots=bkv_vmem_ref.shape[0],
     )
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
-    ).start()
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
-    ).start()
 
     _dma_wait(w_qkv_buf, w_qkv_pre_sem.at[0])
     _llo_fence(
@@ -1147,9 +1145,6 @@ def _l0_a2m_rep_kernel(
             attn_in_ref, w_qkv_buf, s_qkv_ref, 0, qkv_vmem, 0, rows=rows, n_cols=qkv_cols
         ),
     )
-
-    pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
-    pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
     _run_in_vmem_qkv_epilogue_any(
         qkv_vmem,
@@ -1165,6 +1160,14 @@ def _l0_a2m_rep_kernel(
         distribution_ref=distribution_ref,
     )
 
+    def _start_wo_l0_rep():
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
+        ).start()
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
+        ).start()
+
     _run_in_vmem_rpad_and_gate(
         kv_lens_ref,
         page_indices_ref,
@@ -1174,6 +1177,7 @@ def _l0_a2m_rep_kernel(
         q_vmem_ref,
         kv_merged_vmem_ref,
         kv_cache_ro_hbm,
+        out_kv_cache_hbm,
         bkv_vmem_ref,
         o_vmem_ref,
         attn_in_ref,
@@ -1183,9 +1187,9 @@ def _l0_a2m_rep_kernel(
         gate_vmem_ref,
         gated_vmem_ref,
         kvw_rows_vmem,
-        kvw_dst_vmem,
         rpa_smem_ref,
         bkv_sems,
+        kvw_out_sem,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         k_scale=k_scale,
@@ -1196,10 +1200,12 @@ def _l0_a2m_rep_kernel(
         layer_offset_in_bundle=layer_offset_in_bundle,
         early_prefetched=True,
         interpret_mode=interpret_mode,
+        on_rpad_kv_done_fn=_start_wo_l0_rep,
     )
 
-    pltpu.make_async_copy(kvw_rows_vmem, out_kvw_rows_hbm, kvw_out_sem.at[0]).start()
-    pltpu.make_async_copy(kvw_dst_vmem, out_kvw_dst_hbm, kvw_out_sem.at[1]).start()
+    pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
+    pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
+
     _dma_wait(s_buf, s_in_sem.at[0])
 
     _run_rep_b1_from_vmem_core(
@@ -1257,8 +1263,12 @@ def _l0_a2m_rep_kernel(
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=True,
     )
-    _dma_wait(out_kvw_rows_hbm, kvw_out_sem.at[0])
-    _dma_wait(out_kvw_dst_hbm, kvw_out_sem.at[1])
+    w_tot_cnt = rpa_smem_ref[0]
+
+    @pl.when(w_tot_cnt > 0)
+    def _wait_kv_scatter():
+        src_kv = kvw_rows_vmem.at[pl.ds(0, w_tot_cnt)]
+        pltpu.make_async_copy(src_kv, src_kv, kvw_out_sem.at[0]).wait()
 
 
 def m2m_rep_jax(
@@ -1353,7 +1363,9 @@ def m2m_rep_jax(
     b_pad32 = align_to(rows, 32)
     r_per = rows // world_size if sharded_moe_in else 8
 
-    phys_page_rows = kv_cache_ro.shape[1]
+    phys_page_rows = (
+        kv_cache_ro.shape[2] if kv_cache_ro.ndim == 6 else kv_cache_ro.shape[1]
+    )
     page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
@@ -1371,14 +1383,19 @@ def m2m_rep_jax(
         in_specs.append(v_sp)
     in_specs.extend([h_sp, h_sp, v_sp, v_sp, v_sp, v_sp, h_sp, v_sp, h_sp, v_sp])
 
+    kv_out_sd = (
+        jax.ShapeDtypeStruct(kv_cache_ro.shape, kv_cache_ro.dtype)
+        if interpret
+        else pltpu.HBM(kv_cache_ro.shape, kv_cache_ro.dtype)
+    )
     out_shape = (
         jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
         jax.ShapeDtypeStruct((rows, n_exp), jnp.float32),
         jax.ShapeDtypeStruct((rows, h_pre), jnp.bfloat16),
-        jax.ShapeDtypeStruct((rows, 1, 4, 128), kv_cache_ro.dtype),
-        jax.ShapeDtypeStruct((8, 128), jnp.int32),
+        kv_out_sd,
     )
-    out_specs = (h_sp, v_sp, v_sp, h_sp, h_sp)
+    out_specs = (h_sp, v_sp, v_sp, h_sp)
+    kv_in_idx = 5 + 12 + (1 if has_rope else 0)
 
     scratch_shapes = [
         vmem((hidden, max(qkv_cols, pre_cols)), next_w_qkv_w8k.dtype),  # slab_a
@@ -1395,7 +1412,6 @@ def m2m_rep_jax(
         vmem((rows, gate_cols), jnp.bfloat16),  # gate_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gated_vmem_ref
         vmem((rows, 1, 4, 128), kv_cache_ro.dtype),  # kvw_rows_vmem
-        vmem((8, 128), jnp.int32),  # kvw_dst_vmem
         vmem((rows, post_cols), jnp.bfloat16),  # post_shard
         vmem((buf_rows, hidden), jnp.bfloat16),  # b2_half_a
         vmem((buf_rows, hidden), jnp.bfloat16),  # b2_half_b
@@ -1412,14 +1428,14 @@ def m2m_rep_jax(
         vmem((rows, pre_cols), jnp.bfloat16),  # pre_shard
         vmem((8, 128) if reuse_pre_ab else (buf_rows, h_pre), jnp.bfloat16),
         vmem((8, 128) if (reuse_pre_ab or use_halfrow) else (buf_rows, h_pre), jnp.bfloat16),
-        smem((2 + _NUM_KV_SLOTS,), jnp.int32),  # rpa_smem_ref
+        smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),  # rpa_smem_ref
         sem((1,)),  # w_post_gate_sem
         sem((1,)),  # w_qkv_pre_sem
         sem((2,)),  # wo_sem
         sem((1,)),  # w_router_sem
         sem((1,)),  # s_io_sem
         sem((_NUM_KV_SLOTS,)),  # bkv_sems
-        sem((2,)),  # kvw_out_sem
+        sem((1,)),  # kvw_out_sem
         sem((1,)),  # d2d_p0_send
         sem((1,)),  # d2d_p0_recv
         sem((1,)),  # d2d_p1_send
@@ -1461,7 +1477,7 @@ def m2m_rep_jax(
         f"{'rope' if has_rope else 'nope'}"
     )
 
-    st_out, logits_out, exp_in_out, kvw_rows_out, kvw_dst_out = _pallas_call_maybe_interpret(
+    st_out, logits_out, exp_in_out, kv_cache_out = _pallas_call_maybe_interpret(
         functools.partial(
             _m2m_rep_kernel,
             world_size=world_size,
@@ -1491,6 +1507,7 @@ def m2m_rep_jax(
         interpret=interpret,
         grid_spec=grid_spec,
         out_shape=out_shape,
+        input_output_aliases={kv_in_idx: 3},
         compiler_params=cp,
         name=name,
     )(
@@ -1523,10 +1540,7 @@ def m2m_rep_jax(
         w_router_km,
         _as_2d_f32_row(pre_exp_gain, h_pre),
     )
-    if not interpret:
-        kvw_rows_out = pltpu.with_memory_space_constraint(kvw_rows_out, pltpu.HBM)
-        kvw_dst_out = pltpu.with_memory_space_constraint(kvw_dst_out, pltpu.HBM)
-    return st_out, logits_out, exp_in_out, kvw_rows_out, kvw_dst_out
+    return st_out, logits_out, exp_in_out, kv_cache_out
 
 
 def l0_a2m_rep_jax(
@@ -1605,7 +1619,9 @@ def l0_a2m_rep_jax(
     has_rope = cos_sin is not None
     b_pad32 = align_to(rows, 32)
 
-    phys_page_rows = kv_cache_ro.shape[1]
+    phys_page_rows = (
+        kv_cache_ro.shape[2] if kv_cache_ro.ndim == 6 else kv_cache_ro.shape[1]
+    )
     page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
@@ -1623,14 +1639,19 @@ def l0_a2m_rep_jax(
         in_specs.append(v_sp)
     in_specs.extend([h_sp, h_sp, v_sp, v_sp, v_sp, v_sp, h_sp, v_sp, h_sp, v_sp])
 
+    kv_out_sd = (
+        jax.ShapeDtypeStruct(kv_cache_ro.shape, kv_cache_ro.dtype)
+        if interpret
+        else pltpu.HBM(kv_cache_ro.shape, kv_cache_ro.dtype)
+    )
     out_shape = (
         jax.ShapeDtypeStruct((rows, hidden), jnp.float32),
         jax.ShapeDtypeStruct((rows, n_exp), jnp.float32),
         jax.ShapeDtypeStruct((rows, h_pre), jnp.bfloat16),
-        jax.ShapeDtypeStruct((rows, 1, 4, 128), kv_cache_ro.dtype),
-        jax.ShapeDtypeStruct((8, 128), jnp.int32),
+        kv_out_sd,
     )
-    out_specs = (h_sp, v_sp, v_sp, h_sp, h_sp)
+    out_specs = (h_sp, v_sp, v_sp, h_sp)
+    kv_in_idx = 5 + 6 + (1 if has_rope else 0)
 
     scratch_shapes = [
         vmem((hidden, max(qkv_cols, pre_cols)), w_qkv_w8k.dtype),
@@ -1647,7 +1668,6 @@ def l0_a2m_rep_jax(
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, 1, 4, 128), kv_cache_ro.dtype),
-        vmem((8, 128), jnp.int32),
         vmem((8, 128) if is_r16 else ((bm_g, hidden) if tile_r32 else (rows, hidden)), jnp.float32),
         vmem((rows, 1) if tile_r32 else (8, 1), jnp.float32),
         vmem((rows, half), jnp.bfloat16),
@@ -1659,7 +1679,7 @@ def l0_a2m_rep_jax(
         vmem((rows, pre_cols), jnp.bfloat16),
         vmem((8, 128) if reuse_pre_ab else (buf_rows, h_pre), jnp.bfloat16),
         vmem((8, 128) if (reuse_pre_ab or use_halfrow) else (buf_rows, h_pre), jnp.bfloat16),
-        smem((2 + _NUM_KV_SLOTS,), jnp.int32),
+        smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),
         sem((1,)),
         sem((1,)),
         sem((2,)),
@@ -1667,7 +1687,7 @@ def l0_a2m_rep_jax(
         sem((1,)),
         sem((1,)),
         sem((_NUM_KV_SLOTS,)),
-        sem((2,)),
+        sem((1,)),
         sem((1,)),
         sem((1,)),
         sem((n_ar_sems,)),
@@ -1707,7 +1727,7 @@ def l0_a2m_rep_jax(
     d2_tag = "d2" if kv_pack_dense2 else "nod2"
     name = f"muse_l0_a2m_rep_tp{world_size}_b{rows}_{sw_tag}_{d2_tag}_{'rope' if has_rope else 'nope'}"
 
-    st_out, logits_out, exp_in_out, kvw_rows_out, kvw_dst_out = _pallas_call_maybe_interpret(
+    st_out, logits_out, exp_in_out, kv_cache_out = _pallas_call_maybe_interpret(
         functools.partial(
             _l0_a2m_rep_kernel,
             world_size=world_size,
@@ -1732,6 +1752,7 @@ def l0_a2m_rep_jax(
         interpret=interpret,
         grid_spec=grid_spec,
         out_shape=out_shape,
+        input_output_aliases={kv_in_idx: 3},
         compiler_params=cp,
         name=name,
     )(
@@ -1758,7 +1779,4 @@ def l0_a2m_rep_jax(
         w_router_km,
         _as_2d_f32_row(pre_exp_gain, h_pre),
     )
-    if not interpret:
-        kvw_rows_out = pltpu.with_memory_space_constraint(kvw_rows_out, pltpu.HBM)
-        kvw_dst_out = pltpu.with_memory_space_constraint(kvw_dst_out, pltpu.HBM)
-    return st_out, logits_out, exp_in_out, kvw_rows_out, kvw_dst_out
+    return st_out, logits_out, exp_in_out, kv_cache_out

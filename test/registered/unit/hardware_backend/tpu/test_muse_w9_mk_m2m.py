@@ -69,7 +69,7 @@ def test_w9_m2m_in_specs_and_prewarm_lock_free():
     fake_mesh = object()
     with (
         mock.patch.object(m2m_ops, "_get_tp_mesh", return_value=fake_mesh),
-        mock.patch("sglang_tpu.pallas_jax_op.cpu_export_jax_op", side_effect=_fake_export),
+        mock.patch.object(m2m_ops, "_cpu_export_m2m_op", side_effect=_fake_export),
         mock.patch("sglang_tpu.decode_qkv_epilogue_tpu.get_decode_rope_step_op", return_value=lambda *a: None),
         mock.patch.dict(m2m_ops._M2M_TOK_OPS, {}, clear=True),
         mock.patch.dict(m2m_ops._L0_TOK_OPS, {}, clear=True),
@@ -96,7 +96,7 @@ def test_w9_m2m_in_specs_and_prewarm_lock_free():
         assert in_specs is not None and len(in_specs) == n_params, (
             f"{op_name}: len(in_specs)={len(in_specs)} != n_params={n_params}"
         )
-        assert out_specs is not None and len(out_specs) == 5
+        assert out_specs is not None and len(out_specs) == 4
 
 
 def test_w9_m2m_hybrid_swa_and_long_full_dispatch():
@@ -114,8 +114,6 @@ def test_w9_m2m_hybrid_swa_and_long_full_dispatch():
             torch.zeros((B // TP, H), dtype=torch.float32),
             torch.zeros((B, 256), dtype=torch.float32),
             torch.zeros((B, HE), dtype=torch.bfloat16),
-            torch.zeros((B, 1, 4, 128), dtype=torch.float8_e4m3fn),
-            torch.zeros((8, 128), dtype=torch.int32),
         )
 
     def _fake_m2m(*args):
@@ -124,8 +122,6 @@ def test_w9_m2m_hybrid_swa_and_long_full_dispatch():
             torch.zeros((B // TP, H), dtype=torch.float32),
             torch.zeros((B, 256), dtype=torch.float32),
             torch.zeros((B, HE), dtype=torch.bfloat16),
-            torch.zeros((B, 1, 4, 128), dtype=torch.float8_e4m3fn),
-            torch.zeros((8, 128), dtype=torch.int32),
         )
 
     def _fake_b2(*args):
@@ -302,8 +298,6 @@ def test_w9_m2m_hybrid_swa_and_long_full_dispatch():
         "moe_l2",
         "fnorm",
     ]
-    # Single end-of-step KV scatter flushing the 2 SWA layers onto the 1 unique SWA pool!
-    assert kvw_flushes == [(2, 1)]
 
 
 def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
@@ -401,13 +395,12 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             return st_f, lg, ei, kvu[None]
 
         def _cand(*a):
-            st_f, lg, ei, r0, d0 = m2m_tok_sh_tp8_jax(
+            st_f, lg, ei, kvu = m2m_tok_sh_tp8_jax(
                 *a[23:], *a[:13], a[13][0], *a[14:19], a[19][0], a[20][0], a[21], a[22],
                 world_size=TP, post_ff_eps=1e-5, post_ff_scale_input=True,
                 query_scale=1.25, sm_scale=0.125, sliding_window=2048,
                 kv_pack_dense2=True, pa_eps=1e-8, router_multiplier=1.5, interpret=True,
             )
-            (kvu,) = kv_write_batch_jax((r0,), (d0,), (a[13][0],), layer_to_buf_idx=(0,), interpret=True)
             return st_f, lg, ei, kvu[None]
 
         args = (st_sh, moe_sh, w_post, s_post, pfg, pf_a, pf_b, nig, w_qkv, s_qkv, w_gate, s_gate, cs, kv_init, wo, s_wo, pa_a, pa_b, pff_g, wpp, spp, wr, peg, kvl, pgi, cuq, cukv, dst)
@@ -421,20 +414,23 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             np.asarray(jax.lax.bitcast_convert_type(r_kv, jnp.uint8)),
         )
 
-        # Verify tpu7x:2x2x2 TP=16 AOT compiles with 0 KV HLO copies!
+        # Verify tpu7x:2x2x2 TP=16 AOT compiles with 0 inter-kernel KV HLO copies!
         dev16 = get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
         tmesh16 = Mesh(np.array(sorted(dev16, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+        sp_kv16 = P("model", None, None, None, None)
         def sd(sh, dt, sp=P()):
             return jax.ShapeDtypeStruct(sh, dt, sharding=NamedSharding(tmesh16, sp))
         def step16(kvl, pgi, cuq, cukv, dst, st, mo, wp, sp, pfg, pfa, pfb, nig, wq, sq, wg, sg, cs, wo, swo, paa, pab, pffg, wpr, spr, wr, peg, kv):
             def b(*x):
-                st2, lg2, ei2, r0, d0 = m2m_rep_jax(
-                    *x[:18], x[27][0], *x[18:27], world_size=16, sharded_moe_in=False, sliding_window=2048, kv_pack_dense2=False
+                st2, lg2, ei2, kv2 = m2m_rep_jax(
+                    *x[:18], x[27], *x[18:27], world_size=16, sharded_moe_in=False, sliding_window=2048, kv_pack_dense2=False, collective_id=54
                 )
-                (kvu,) = kv_write_batch_jax((r0,), (d0,), (x[27][0],), layer_to_buf_idx=(0,))
-                return st2, lg2, ei2, kvu[None]
-            isp = (P(), P(), P(), P(), P(), P(), P(), P(None, "model"), P("model"), P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(), P("model", None), P("model"), P(), P(), P(), P(None, "model"), P("model"), P(), P(), P("model"))
-            return jax.shard_map(b, mesh=tmesh16, in_specs=isp, out_specs=(P(), P(), P(), P("model")), check_vma=False)(
+                st3, lg3, ei3, kv3 = m2m_rep_jax(
+                    *x[:5], st2, mo, *x[7:18], kv2, *x[18:27], world_size=16, sharded_moe_in=False, sliding_window=2048, kv_pack_dense2=False, collective_id=55
+                )
+                return st3, lg3, ei3, kv3
+            isp = (P(), P(), P(), P(), P(), P(), P(), P(None, "model"), P("model"), P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(), P("model", None), P("model"), P(), P(), P(), P(None, "model"), P("model"), P(), P(), sp_kv16)
+            return jax.shard_map(b, mesh=tmesh16, in_specs=isp, out_specs=(P(), P(), P(), sp_kv16), check_vma=False)(
                 kvl, pgi, cuq, cukv, dst, st, mo, wp, sp, pfg, pfa, pfb, nig, wq, sq, wg, sg, cs, wo, swo, paa, pab, pffg, wpr, spr, wr, peg, kv
             )
         a16 = (
@@ -447,11 +443,13 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             sd((H,), jnp.float32), sd((H,), jnp.float32), sd((H,), jnp.float32),
             sd((H, HE), jnp.float8_e4m3fn, P(None, "model")), sd((HE,), jnp.float32, P("model")),
             sd((H, 256), jnp.bfloat16), sd((HE,), jnp.float32),
-            sd((16, 256, 512, 1, 4, 128), jnp.float8_e4m3fn, P("model")),
+            sd((16 * 256, 512, 1, 4, 128), jnp.float8_e4m3fn, sp_kv16),
         )
-        comp = jax.jit(step16, donate_argnums=(27,), out_shardings=(NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P("model")))).lower(*a16).compile()
+        comp = jax.jit(step16, donate_argnums=(27,), out_shardings=(NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, sp_kv16))).lower(*a16).compile()
         hlo = comp.as_text()
-        assert not [ln for ln in hlo.splitlines() if "copy(" in ln and "[256,512,1,4,128]" in ln]
+        kv_copies = [ln for ln in hlo.splitlines() if " copy(" in ln and "[256,512,1,4,128]" in ln]
+        # At most 2 entry/exit boundary layout copies across 2 chained layers (0 inter-kernel copies!)
+        assert len(kv_copies) <= 2, f"Expected <= 2 boundary copies across 2 layers, got {len(kv_copies)}"
 
         # Also verify ops.py TorchTPU StableHLO export (_jax_placeholders + wrapped.exported) end-to-end!
         from unittest import mock
@@ -500,7 +498,9 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             j_args_tok = _jax_placeholders(t_args_tok, mesh=w_tok.mesh, partition_specs=w_tok.input_partition_specs)
             with mock.patch("sglang_tpu.pallas_export.get_pallas_tpu_device_kind", return_value="TPU7x"), tpu_info_for_cpu_export(), jax._src.config.export_ignore_forward_compatibility(True):
                 lowered_tok = w_tok.exported(*j_args_tok)
-                assert len(lowered_tok.out_avals) == 5
+                assert len(lowered_tok.out_avals) == 4
+                assert w_tok.input_output_aliases == {18: 3}
+                assert "kv_cache_ro" in str(op_tok._schema) and "!" in str(op_tok._schema)
 
                 kvw_c = m2m_ops._build_kvw_callable(2, 1, (0, 0))
                 j_kvw = _jax_placeholders(

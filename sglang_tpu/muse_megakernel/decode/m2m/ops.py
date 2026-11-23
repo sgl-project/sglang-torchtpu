@@ -56,6 +56,107 @@ def _contig(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _cpu_export_m2m_op(
+    name: str,
+    function: Callable[..., object],
+    *,
+    mesh,
+    input_partition_specs,
+    output_partition_specs,
+):
+    """Export an M2M custom op with zero-copy in-place `kv_cache_ro` aliasing (`#2615`)."""
+    import inspect
+
+    import jax
+    from jax.sharding import NamedSharding
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+    from sglang_tpu.pallas_jax_op import (
+        _CpuExportJaxCallable,
+        _jax_placeholders,
+        _torch_placeholder,
+    )
+
+    class _M2MExportJaxCallable(_CpuExportJaxCallable):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.__signature__ = self.__signature__.replace(
+                return_annotation=tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            )
+
+        def __call__(self, *args, **kwargs):
+            res = super().__call__(*args, **kwargs)
+            return res[:3]
+
+    signature = inspect.signature(function, follow_wrapped=False)
+    pallas_impl._verify_signature(signature)
+    static_argnums = pallas_impl._infer_static_argnums(signature)
+    kv_idx = list(signature.parameters.keys()).index("kv_cache_ro")
+    donate_argnums_tuple = (kv_idx,)
+    aliases = {kv_idx: 3}
+
+    input_partition_specs = tuple(input_partition_specs or ())
+    output_partition_specs = tuple(output_partition_specs or ())
+    output_shardings = tuple(
+        NamedSharding(mesh, spec) for spec in output_partition_specs
+    )
+    jit_function = jax.jit(
+        function,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums_tuple,
+        keep_unused=True,
+        out_shardings=output_shardings,
+    )
+    trace_key = pallas_impl._get_kernel_invocation_key(
+        name,
+        [],
+        {
+            "static_argnums": static_argnums,
+            "donate_argnums": donate_argnums_tuple,
+            "output_partition_specs": tuple(map(str, output_partition_specs)),
+        },
+    )
+    wrapped = _M2MExportJaxCallable(
+        name=name,
+        jit_fn=jit_function,
+        trace_key=trace_key,
+        mesh=mesh,
+        input_partition_specs=input_partition_specs or None,
+        static_argnums=static_argnums,
+        donate_argnums=list(donate_argnums_tuple),
+        input_output_aliases=aliases,
+    )
+    wrapped.sglang_output_shardings = output_shardings
+    custom_op = torch.library.custom_op(
+        name,
+        wrapped,
+        mutates_args=("kv_cache_ro",),
+        device_types=_custom_op_device_types(),
+    )
+
+    def fake_function(*args, **kwargs):
+        jax_args = _jax_placeholders(
+            args,
+            mesh=mesh,
+            partition_specs=tuple(input_partition_specs),
+        )
+        with (
+            tpu_info_for_cpu_export(),
+            jax._src.config.export_ignore_forward_compatibility(True),
+        ):
+            lowered = wrapped.exported(*jax_args, **kwargs)
+        shardings = output_shardings or (None,) * len(lowered.out_avals)
+        unflat = lowered.out_tree.unflatten(
+            _torch_placeholder(aval, sharding, mesh)
+            for aval, sharding in zip(lowered.out_avals, shardings)
+        )
+        return unflat[:3]
+
+    custom_op.register_fake(fake_function)
+    return custom_op
+
+
 def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
     key = (bool(has_rope), bool(bf16_router))
     op = _M2M_TOK_OPS.get(key)
@@ -102,7 +203,7 @@ def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
             P(),
             P(),
         )
-        out_specs = (P("model", None), P(), P(), P("model"), P("model"))
+        out_specs = (P("model", None), P(), P(), P("model"))
         r_tag = "rope" if has_rope else "nope"
         rt_tag = "r16" if bf16_router else "r32"
         n_scalars = 15
@@ -157,7 +258,7 @@ def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
                 fn = functools.partial(
                     m2m_tok_sh_tp8_jax,
@@ -215,7 +316,7 @@ def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
 
             # Note: 17 static scalar args at tail
             in_specs = (*t_specs, *([None] * 17))
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_m2m_tok_{r_tag}_{rt_tag}_tp8",
                 _wrapped_r,
                 mesh=mesh,
@@ -271,7 +372,7 @@ def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
 
                 def _local(*t_args):
@@ -331,7 +432,7 @@ def get_m2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_m2m_tok_{r_tag}_{rt_tag}_tp8",
                 _wrapped_n,
                 mesh=mesh,
@@ -382,7 +483,7 @@ def get_l0_a2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
             P(),
             P(),
         )
-        out_specs = (P("model", None), P(), P(), P("model"), P("model"))
+        out_specs = (P("model", None), P(), P(), P("model"))
         r_tag = "rope" if has_rope else "nope"
         rt_tag = "r16" if bf16_router else "r32"
 
@@ -426,7 +527,7 @@ def get_l0_a2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
                 fn = functools.partial(
                     l0_a2m_tok_sh_tp8_jax,
@@ -472,7 +573,7 @@ def get_l0_a2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_l0_a2m_tok_{r_tag}_{rt_tag}_tp8",
                 _wrapped_r,
                 mesh=mesh,
@@ -518,7 +619,7 @@ def get_l0_a2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
 
                 def _local(*t_args):
@@ -568,7 +669,7 @@ def get_l0_a2m_tok_sh_tp8_op(*, has_rope: bool, bf16_router: bool) -> Callable:
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_l0_a2m_tok_{r_tag}_{rt_tag}_tp8",
                 _wrapped_n,
                 mesh=mesh,
@@ -630,7 +731,7 @@ def get_m2m_rep_op(
             P(),
             P(),
         )
-        out_specs = (P(), P(), P(), P("model"), P("model"))
+        out_specs = (P(), P(), P(), P("model"))
         sh_tag = "sh" if sharded_moe_in else "rep"
         r_tag = "rope" if has_rope else "nope"
         rt_tag = "r16" if bf16_router else "r32"
@@ -685,7 +786,7 @@ def get_m2m_rep_op(
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
                 fn = functools.partial(
                     m2m_rep_jax,
@@ -742,7 +843,7 @@ def get_m2m_rep_op(
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_m2m_{sh_tag}_{r_tag}_{rt_tag}_tp{world_size}",
                 _wrapped_r,
                 mesh=mesh,
@@ -798,7 +899,7 @@ def get_m2m_rep_op(
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
 
                 def _local(*t_args):
@@ -859,7 +960,7 @@ def get_m2m_rep_op(
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_m2m_{sh_tag}_{r_tag}_{rt_tag}_tp{world_size}",
                 _wrapped_n,
                 mesh=mesh,
@@ -912,7 +1013,7 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
             P(),
             P(),
         )
-        out_specs = (P(), P(), P(), P("model"), P("model"))
+        out_specs = (P(), P(), P(), P("model"))
         r_tag = "rope" if has_rope else "nope"
         rt_tag = "r16" if bf16_router else "r32"
 
@@ -956,7 +1057,7 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
                 fn = functools.partial(
                     l0_a2m_rep_jax,
@@ -1002,7 +1103,7 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_l0_a2m_rep_{r_tag}_{rt_tag}_tp{world_size}",
                 _wrapped_r,
                 mesh=mesh,
@@ -1048,7 +1149,7 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
                 router_multiplier: float,
                 pre_exp_eps: float,
                 pre_exp_scale_input: bool,
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
                 sw = sliding_window_val if sliding_window_val > 0 else None
 
                 def _local(*t_args):
@@ -1098,7 +1199,7 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
                     pre_exp_gain,
                 )
 
-            op = cpu_export_jax_op(
+            op = _cpu_export_m2m_op(
                 f"sglang_tpu_pallas::muse_w9_l0_a2m_rep_{r_tag}_{rt_tag}_tp{world_size}",
                 _wrapped_n,
                 mesh=mesh,
@@ -1241,10 +1342,15 @@ def maybe_forward_m2m_decode(
 
     from sglang_tpu.models.muse_spark import _layer_tp_size
 
-    n_tok = positions.shape[0] if tok_sharded_stream else stream.shape[0]
+    n_tok = int(positions.shape[0])
     layer0 = model.layers[model.start_layer]
     tp = _layer_tp_size(layer0.self_attn.o_proj)
-    if tp not in (8, 16) or n_tok not in (16, 32, 64, 128):
+    expected_stream_rows = (n_tok // tp) if tok_sharded_stream else n_tok
+    if (
+        tp not in (8, 16)
+        or n_tok not in (16, 32, 64, 128)
+        or int(stream.shape[0]) != expected_stream_rows
+    ):
         return None
     if tok_sharded_stream and (tp != 8 or n_tok not in (64, 128)):
         return None
@@ -1303,36 +1409,7 @@ def maybe_forward_m2m_decode(
         )
     cs_kw = {"cos_sin_step": cos_sin_step} if cos_sin_step is not None else {}
 
-    staged_rows: list[torch.Tensor] = []
-    staged_dsts: list[torch.Tensor] = []
-    staged_bufs: list[torch.Tensor] = []
-    staged_buf_map: dict[int, int] = {}
-    staged_l2b: list[int] = []
-
-    def _stage_kv(kvw_r: torch.Tensor, kvw_d: torch.Tensor, kv_buf: torch.Tensor) -> None:
-        ptr = int(kv_buf.data_ptr())
-        b_i = staged_buf_map.get(ptr)
-        if b_i is None:
-            b_i = len(staged_bufs)
-            staged_buf_map[ptr] = b_i
-            staged_bufs.append(kv_buf)
-        staged_rows.append(kvw_r)
-        staged_dsts.append(kvw_d)
-        staged_l2b.append(b_i)
-
-    def _flush_kv() -> None:
-        if not staged_rows:
-            return
-        torch.ops.sglang_tpu_pallas.muse_w9_m2m_kv_write(
-            list(staged_rows), list(staged_dsts), list(staged_bufs), list(staged_l2b)
-        )
-        staged_rows.clear()
-        staged_dsts.clear()
-        staged_bufs.clear()
-        staged_buf_map.clear()
-        staged_l2b.clear()
-
-    # Step 1: Layer-0 Attention -> MoE(0) inputs
+    # Step 1: Layer-0 Attention -> MoE(0) inputs (in-place overlapped KV scatter!)
     lyr0, sa0, mlp0, kv0, sw0, pg0, dist0, m2m0 = layer_meta[0]
     if carried_attn_input is not None:
         attn_in0 = _contig(carried_attn_input)
@@ -1354,7 +1431,7 @@ def maybe_forward_m2m_decode(
         if tok_sharded_stream:
             l0_op = get_l0_a2m_tok_sh_tp8_op(has_rope=has_rope0, bf16_router=r16_0)
             cs_t0 = (_contig(cos_sin_step),) if has_rope0 else ()
-            stream, scaled_logits, expert_in, kvw_r0, kvw_d0 = l0_op(
+            stream, scaled_logits, expert_in = l0_op(
                 kv_lens,
                 pg0,
                 cu_q,
@@ -1394,7 +1471,7 @@ def maybe_forward_m2m_decode(
         else:
             l0_op = get_l0_a2m_rep_op(tp, has_rope=has_rope0, bf16_router=r16_0)
             cs_t0 = (_contig(cos_sin_step),) if has_rope0 else ()
-            stream, scaled_logits, expert_in, kvw_r0, kvw_d0 = l0_op(
+            stream, scaled_logits, expert_in = l0_op(
                 kv_lens,
                 pg0,
                 cu_q,
@@ -1431,7 +1508,6 @@ def maybe_forward_m2m_decode(
                 float(mlp0.pre_expert_norm.eps),
                 bool(mlp0.pre_expert_norm.scale_input),
             )
-        _stage_kv(kvw_r0, kvw_d0, kv0)
     else:
         gated0 = sa0(positions, attn_in0, forward_batch, return_gated_attn=True, **cs_kw)
         if tok_sharded_stream:
@@ -1548,7 +1624,6 @@ def maybe_forward_m2m_decode(
                     float(model.norm.eps),
                     bool(model.norm.scale_input),
                 )
-            _flush_kv()
             return final_hidden
 
         n_lyr, n_sa, n_mlp, n_kv, n_sw, n_pg, n_dist, n_m2m = layer_meta[i + 1]
@@ -1567,7 +1642,7 @@ def maybe_forward_m2m_decode(
             cs_tn = (_contig(cos_sin_step),) if n_has_rope else ()
             if tok_sharded_stream:
                 m2m_op = get_m2m_tok_sh_tp8_op(has_rope=n_has_rope, bf16_router=n_r16)
-                stream, scaled_logits, expert_in, kvw_rn, kvw_dn = m2m_op(
+                stream, scaled_logits, expert_in = m2m_op(
                     kv_lens,
                     n_pg,
                     cu_q,
@@ -1618,7 +1693,7 @@ def maybe_forward_m2m_decode(
                 m2m_op = get_m2m_rep_op(
                     tp, sharded_moe_in=sharded_in, has_rope=n_has_rope, bf16_router=n_r16
                 )
-                stream, scaled_logits, expert_in, kvw_rn, kvw_dn = m2m_op(
+                stream, scaled_logits, expert_in = m2m_op(
                     kv_lens,
                     n_pg,
                     cu_q,
@@ -1665,12 +1740,9 @@ def maybe_forward_m2m_decode(
                     float(n_mlp.pre_expert_norm.eps),
                     bool(n_mlp.pre_expert_norm.scale_input),
                 )
-            _stage_kv(kvw_rn, kvw_dn, n_kv)
             continue
 
         # Long-context Full layer (`streamdyn` / `shared16`): run standalone b2 -> RPAd -> b1!
-        if int(n_kv.data_ptr()) in staged_buf_map:
-            _flush_kv()
         if tok_sharded_stream:
             use_epi = bool(lyr.__dict__.get("_w8_bridge_qkv_epi", False)) and n_sa.decode_qkv_epilogue
             if use_epi:
@@ -1850,5 +1922,4 @@ def maybe_forward_m2m_decode(
                 bool(n_mlp.pre_expert_norm.scale_input),
             )
 
-    _flush_kv()
     return model.norm(stream.to(torch.bfloat16))
