@@ -48,6 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation import host_input_mirror, slot_metadata
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.models.deepseek_v41.decoder_replay import (
     DecoderTail,
     TailView,
@@ -693,6 +694,40 @@ def _device_row_metadata(
     host_input_mirror.release(forward_batch)
     dev = _upload_metadata(host, device=device, pack=False)
 
+    # One program, not ~60: past PJRT's 32 in-flight executions each small op
+    # would block dispatch until the running forward ends (fused_eager.py).
+    with fused_eager_ops(forward_batch.positions.device.type == "tpu") as fused:
+        fields = _device_row_fields(
+            forward_batch,
+            dev=dev,
+            tables=tables,
+            window=window,
+            columns=columns if window else 0,
+            base_page=request_window.workspace_first_page if window else 0,
+        )
+    if fused:
+        submit(_metadata_leaves(fields))
+    return DSV41TPUForwardMetadata(
+        query_start_loc=dev["query_start_loc"],
+        full_pages=tables.full_pages_device,
+        swa_minimum=dev["swa_minimum"],
+        **fields,
+    )
+
+
+def _device_row_fields(
+    forward_batch: ForwardBatch,
+    *,
+    dev: Dict[str, torch.Tensor],
+    tables: SlotTables,
+    window: bool,
+    columns: int,
+    base_page: int,
+) -> Dict[str, object]:
+    """The position-dependent metadata fields, as device ops only (no upload,
+    no read), each a tensor of its own like the host build's."""
+    from sglang_tpu.models.deepseek_v41 import device_rows
+
     # Copies: the host build's fields are graph inputs of their own, not the
     # batch's positions / cache slots.
     positions = forward_batch.positions.to(torch.int32, copy=True)
@@ -711,8 +746,9 @@ def _device_row_metadata(
             slots=dev["req_pool_indices"],
             minimum=dev["swa_minimum"],
             columns=columns,
-            base_page=request_window.workspace_first_page,
+            base_page=base_page,
         )
+        swa_pages = swa_pages.to(torch.int32)
     low_ratio = {}
     for ratio, index_pages in tables.index_pages.items():
         out_loc, lengths = device_rows.low_ratio_rows(
@@ -725,9 +761,8 @@ def _device_row_metadata(
         low_ratio[ratio] = LowRatioMetadata(
             out_loc=out_loc, lengths=lengths, index_pages=index_pages
         )
-    return DSV41TPUForwardMetadata(
+    return dict(
         positions=positions,
-        query_start_loc=dev["query_start_loc"],
         token_rows=token_rows,
         token_req_pool=token_req_pool,
         valid=valid,
@@ -735,12 +770,22 @@ def _device_row_metadata(
         # host build's two masks are two graph inputs.
         compress_valid=valid.clone(),
         out_cache_loc=out_cache_loc,
-        full_pages=tables.full_pages_device,
-        swa_pages=swa_pages.to(torch.int32),
-        swa_minimum=dev["swa_minimum"],
+        swa_pages=swa_pages,
         low_ratio=low_ratio,
         swa_window_plan=window_plan,
     )
+
+
+def _metadata_leaves(fields: Dict[str, object]):
+    """Every tensor in ``fields`` (through LowRatioMetadata / WindowPlan)."""
+    for value in fields.values():
+        if isinstance(value, torch.Tensor):
+            yield value
+        elif isinstance(value, dict):
+            for meta in value.values():
+                yield from meta
+        elif isinstance(value, WindowPlan):
+            yield from value
 
 
 def _check_device_rows(
