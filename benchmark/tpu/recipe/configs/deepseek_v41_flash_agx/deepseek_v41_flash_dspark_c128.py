@@ -36,3 +36,9 @@ CONFIG = with_max_running_requests(384)
 # tok/s/chip, prefix hit 0.9421 -> 0.9427. GSM8K 0.904 (j-aa594f84-81e8-4913-8388).
 # Off at c32: TTFT ratio 1.0136 (1.007-1.019), worse.
 CONFIG["runtime_env"]["SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE"] = "131072"
+# Pin each rank's scheduler process to its own CPUs (SGLANG_SET_CPU_AFFINITY): the
+# MLP-sync wait across DP ranks halves, per-op costs unchanged. Paired per-request
+# interactivity: c32 +2.9% (j-fff55c92 vs j-b29f6ac4), c64 canonical +2.3%
+# (j-10b94a15-88dd-40a2-af97 vs j-b598a23c-9c0b-4fef-87d2); neutral at c4
+# (j-6643e364-2d36-454b-ae78 vs j-eecd8be6-a630-4b97-879e), so off at c4/c16.
+CONFIG["runtime_env"]["SGLANG_SET_CPU_AFFINITY"] = "1"

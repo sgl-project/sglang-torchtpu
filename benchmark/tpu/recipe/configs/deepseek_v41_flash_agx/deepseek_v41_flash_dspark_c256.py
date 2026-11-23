@@ -29,3 +29,9 @@ from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash_dspa
 )
 
 CONFIG = with_max_running_requests(512)
+# Pin each rank's scheduler process to its own CPUs (SGLANG_SET_CPU_AFFINITY): the
+# MLP-sync wait across DP ranks halves, per-op costs unchanged. Paired per-request
+# interactivity: c32 +2.9% (j-fff55c92 vs j-b29f6ac4), c64 canonical +2.3%
+# (j-10b94a15-88dd-40a2-af97 vs j-b598a23c-9c0b-4fef-87d2); neutral at c4
+# (j-6643e364-2d36-454b-ae78 vs j-eecd8be6-a630-4b97-879e), so off at c4/c16.
+CONFIG["runtime_env"]["SGLANG_SET_CPU_AFFINITY"] = "1"
