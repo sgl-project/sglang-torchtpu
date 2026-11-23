@@ -929,15 +929,15 @@ class TestPPFenceGate(CustomTestCase):
 
 
 class TestTpuImportOrder(CustomTestCase):
-    def test_swa_allocator_imports_first_on_tpu(self):
-        # On TPU the SWA allocator imports the TPU allocator, which imports the
-        # fence; the fence must not import the unified cache components then.
+    def test_tpu_allocator_import_stays_clear_of_the_unified_cache(self):
+        # The TPU allocator imports the fence at module level; neither may import
+        # the unified cache components, which reach back into the allocators.
         script = textwrap.dedent("""
-            import sglang.srt.utils
-            sglang.srt.utils.is_tpu = lambda: True
-            import sglang.srt.mem_cache.allocator.swa
             import sys
+            import sglang_tpu.allocator_tpu
             assert "sglang_tpu.kv_free_fence" in sys.modules
+            unified = [m for m in sys.modules if m.startswith("sglang.srt.mem_cache.unified")]
+            assert not unified, unified
             """)
         completed = subprocess.run(
             [sys.executable, "-c", script],

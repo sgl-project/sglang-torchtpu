@@ -11,25 +11,19 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_npu, is_tpu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 
 if _is_npu:
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
-    )
-
-if _is_tpu:
-    from sglang_tpu.allocator_tpu import (
-        TpuPagedTokenToKVPoolAllocator,
     )
 
 
@@ -43,9 +37,11 @@ _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
-    # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
-    # subclasses that bypass this __init__ read False.
+    # Class defaults so subclasses that bypass this __init__ read False: the
+    # per-request SWA ring (BaseSWAKVPool.swa_req_ring_size), and a host-resident
+    # full-to-SWA mapping (only this __init__ places the mapping on the host).
     _swa_req_ring = False
+    _mapping_on_host = False
 
     @property
     def has_window_pool(self) -> bool:
@@ -93,8 +89,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 PagedTokenToKVPoolAllocatorClass = platform_allocator_cls
             elif _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
-            elif _is_tpu:
-                PagedTokenToKVPoolAllocatorClass = TpuPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
@@ -115,12 +109,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         # Trailing -1: a last_loc of -1 (no prefix) indexes it, so alloc_extend and
         # alloc_decode see -1 on the SWA side as well.
-        # On TPU the index bookkeeping that drives this mapping (last_loc and
-        # free_index) is host-resident (#29), so keep the mapping on CPU too: the
-        # hot translate / free_swa / attention-metadata-host paths then gather
-        # without a device round-trip. Alloc writes carry device indices and align
-        # to mapping.device explicitly. NPU/CUDA keep it on the accelerator.
-        mapping_device = "cpu" if _is_tpu else device
+        # Where the index bookkeeping that drives this mapping (last_loc and
+        # free_index) is host-resident (TPU, #29), the platform keeps the mapping
+        # on CPU too: the hot translate / free_swa / attention-metadata-host paths
+        # then gather without a device round-trip. Alloc writes carry device
+        # indices and align to mapping.device explicitly. NPU/CUDA keep it on the
+        # accelerator. Read once here: every method below follows this placement.
+        self._mapping_on_host = current_platform.keeps_swa_index_mapping_on_host()
+        mapping_device = "cpu" if self._mapping_on_host else device
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -527,8 +523,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 indices_2d,
                 alloc_swa_indices.to(torch.int64),
             )
-        elif _is_tpu:
-            # TPU mapping is host-resident; align the device alloc indices to it.
+        elif self._mapping_on_host:
+            # Host-resident mapping; align the device alloc indices to it.
             mapping = self.full_to_swa_index_mapping
             mapping[alloc_full_indices.to(mapping.device, torch.int64)] = (
                 alloc_swa_indices.to(mapping.device, torch.int64)
@@ -555,8 +551,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         assert full_indices.numel() == swa_indices.numel()
         mapping = self.full_to_swa_index_mapping
-        if _is_tpu:
-            # TPU mapping is host-resident (see __init__) while alloc indices are
+        if self._mapping_on_host:
+            # Host-resident mapping (see __init__) while alloc indices are
             # device-resident; align both operands to the mapping's device.
             # (TODO Qinghan: int64 is not native on TPU; further optimization needed)
             mapping[full_indices.to(mapping.device, torch.int64)] = swa_indices.to(
@@ -570,9 +566,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return
-        if _is_tpu:
-            # TPU mapping is host-resident (see __init__) while the alloc indices
-            # are device-resident; align to the mapping's device before clearing.
+        if self._mapping_on_host:
+            # Host-resident mapping (see __init__) while the alloc indices are
+            # device-resident; align to the mapping's device before clearing.
             mapping = self.full_to_swa_index_mapping
             mapping[full_indices.to(mapping.device, torch.int64)] = 0
             return
@@ -592,9 +588,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._swa_req_ring or free_index.numel() == 0:
             return
 
-        if _is_tpu:
-            # TPU: mapping is host-resident and the free_index bookkeeping is
-            # host-side (#29/#107). Gather/scatter on the mapping's device using
+        if self._mapping_on_host:
+            # Host-resident mapping, and the free_index bookkeeping is host-side
+            # too (TPU, #29/#107). Gather/scatter on the mapping's device using
             # the raw (non-page-expanded) indices; free() handles placement.
             # Do NOT route through _expand_to_full_pages here — its torch.unique
             # produces a variable output shape and reintroduces the per-page TPU
@@ -641,7 +637,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        if current_platform.keeps_swa_index_mapping_on_host():
+        if self._mapping_on_host:
             # The mapping is host-resident (see __init__), and so are the kv rows
             # segment frees are cut from (the host-resident req_to_token table).
             assert free_index.device.type == "cpu", (
