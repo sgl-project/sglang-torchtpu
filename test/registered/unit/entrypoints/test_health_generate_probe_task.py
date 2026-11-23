@@ -267,7 +267,15 @@ class TestHealthGenerateCompletionAck(CustomTestCase):
                     stream=stream,
                 )
                 request = SimpleNamespace(
-                    headers={}, is_disconnected=AsyncMock(return_value=False)
+                    headers={},
+                    json=AsyncMock(
+                        return_value={
+                            "rid": obj.rid,
+                            "input_ids": [0],
+                            "stream": stream,
+                        }
+                    ),
+                    is_disconnected=AsyncMock(return_value=False),
                 )
 
                 async def drive():

@@ -98,6 +98,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
+from sglang.srt.managers.scheduler_components.health_probe import (
+    ProbeAction,
+    finished_probe_count,
+    probe_action,
+    retire_decode_probe,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
     kv_private_window_tokens,
@@ -4545,12 +4551,9 @@ class SchedulerDisaggregationDecodeMixin:
         # An idle probe can still be decoding when a user's KV transfer
         # finishes. Let its tiny forward finish alone: merging the user into
         # it would change the user's decode batch shape solely for liveness.
-        finished_probes = 0
-        for req in running_batch.reqs:
-            if is_health_check_req(req):
-                if not req.finished():
-                    return None
-                finished_probes += 1
+        finished_probes = finished_probe_count(running_batch.reqs)
+        if finished_probes is None:
+            return None
 
         if self.enable_priority_scheduling:
             self.waiting_queue.reorder(
@@ -4573,7 +4576,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
         has_traffic = not health_check_only and (
             curr_batch_size > 0
             or any(not is_health_check_req(req) for req in self.waiting_queue)
@@ -4581,22 +4583,21 @@ class SchedulerDisaggregationDecodeMixin:
 
         for req in self.waiting_queue:
             if is_health_check_req(req):
-                # Completion counts agree across TP ranks; probe expiry uses
-                # rank-local clocks and must not decide admission or cleanup.
-                assert req.health_check_admission_seq is not None
-                if self.health_monitor.completion_seq > req.health_check_admission_seq:
-                    self._release_aborted_request(req)
-                    if get_disagg().disaggregation_decode_host_receive_threshold > 0:
-                        discard_kv_cache_backup(req, self.tree_cache, "host_pool")
-                    if self.enable_hisparse:
-                        self.hisparse_coordinator.request_finished(req)
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                action = probe_action(
+                    req, self.health_monitor.completion_seq, has_traffic=has_traffic
+                )
+                if action is ProbeAction.RETIRE:
+                    # A previously deferred probe may have a host restore in
+                    # flight. Keep its row until every rank's writer is done.
+                    if req.kv.restore_done_event is not None:
+                        if host_restore and id(req) not in restores_ready:
+                            continue
+                        finish_restore_kv_cache(req, self.tree_cache)
+                    retire_decode_probe(self, req)
                     continue
-                if has_traffic:
-                    waiting_queue.append(req)
+                if action is ProbeAction.DEFER:
                     continue
             elif health_check_only:
-                waiting_queue.append(req)
                 continue
             # A host-restored request joins only after the copy is ready.
             if len(can_run_list) < num_not_used_batch and (

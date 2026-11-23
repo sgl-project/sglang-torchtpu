@@ -65,7 +65,7 @@ from sglang.srt.beam_search.output import (
     try_build_beam_search_out_dict,
 )
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, is_health_check_request
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
@@ -1069,7 +1069,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Only the server's health handler may use the probe namespace. This
         # Python-only argument cannot be set by a generate/OpenAI request body.
         if not is_health_check and any(
-            rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            is_health_check_request(rid)
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         ):
             raise ValueError(
