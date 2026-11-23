@@ -5,6 +5,7 @@ import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from weakref import ref
 
 import torch
 
@@ -52,13 +53,13 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
         original.assert_called_once_with(model, None, self.y, None)
 
     def test_target_reads_live_sublayer_after_hook_binding(self):
-        from weakref import ref
-
         owner = torch.nn.Module()
         owner.ffn_hc = self.hc
         setattr(self.next.norm, tpu_mhc._OWNER, (ref(owner), "ffn_hc"))
         owner.ffn_hc = self.hc._replace(scale=torch.ones(3))
-        device_rows = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+        device_rows = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), shape=(96, 5120)
+        )
         original = Mock()
         with patch.object(
             tpu_mhc, "fused_boundary", side_effect=[None, object()]
@@ -72,6 +73,28 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
             )
             self.assertIs(fused.call_args.args[-1], owner.ffn_hc)
             original.assert_called_once_with(*args)
+
+    def test_serving_skips_small_and_unmeasured_buckets(self):
+        owner = torch.nn.Module()
+        owner.ffn_hc = self.hc
+        setattr(self.next.norm, tpu_mhc._OWNER, (ref(owner), "ffn_hc"))
+        original = Mock()
+        for tokens in (8, 40, 48, 64, 80, 8208):
+            with self.subTest(tokens=tokens):
+                device_rows = SimpleNamespace(
+                    device=SimpleNamespace(type="tpu"), shape=(tokens, 5120)
+                )
+                with patch.object(tpu_mhc, "fused_boundary") as fused:
+                    result = hooks.tpu_dsv41_shifted_mhc(
+                        original,
+                        self.hc,
+                        device_rows,
+                        self.residual,
+                        self.coefficients,
+                        self.next,
+                    )
+                self.assertIs(result, original.return_value)
+                fused.assert_not_called()
 
     def test_draft_consumes_boundary_inputs_and_gates_across_stages(self):
         width = 5120

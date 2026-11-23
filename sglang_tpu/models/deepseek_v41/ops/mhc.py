@@ -3,51 +3,12 @@
 
 from weakref import ref
 
-import jax
 import torch
 
-from sglang_tpu.envs import envs
-from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as kernel
 
 _PACKED = "_tpu_shifted_mhc_mix_weight"
 _shifted_op = None
 _OWNER = "_tpu_shifted_mhc_owner"
-
-
-def _shifted_jax(
-    y: jax.Array,
-    residual: jax.Array,
-    post: jax.Array,
-    comb: jax.Array,
-    packed: jax.Array,
-    scale: jax.Array,
-    base: jax.Array,
-    pre: jax.Array,
-    norm_weight: jax.Array,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    return kernel.shifted_post_pre_rms(
-        y,
-        residual,
-        post,
-        comb,
-        packed,
-        scale,
-        base,
-        pre,
-        norm_weight=norm_weight,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_eps,
-        hc_sinkhorn_eps=hc_eps,
-        sinkhorn_repeat=sinkhorn_iters,
-        norm_eps=norm_eps,
-        gate_input_mode=kernel.GateInputMode.COMPILER,
-        unpadded_gates=True,
-        early_prep=True,
-    )
 
 
 def _fake(y, residual, post, comb, packed, scale, base, pre, norm_weight, *args):
@@ -65,6 +26,9 @@ def register_shifted_mhc_op():
     global _shifted_op
     if _shifted_op is not None:
         return
+    from sglang_tpu.models.deepseek_v41.kernels.mhc.shifted_post_pre_rms import (
+        _shifted_jax,
+    )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     _shifted_op = cpu_export_jax_op(
@@ -104,9 +68,6 @@ def prepare_shifted_mhc(layers, *, draft=False):
     """Refresh traceable buffers for destinations of serving boundaries."""
     from sglang.srt.models.deepseek_v4 import DeepseekV4PlatformDecoderLayer
     from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
-
-    if not envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get():
-        return
 
     for index, layer in enumerate(layers):
         if not isinstance(layer, DeepseekV4PlatformDecoderLayer):
@@ -149,13 +110,13 @@ def refresh_shifted_mhc_after_direct_update(model, named_tensors):
 
 def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
     """Return the new residual and the next sublayer's input and triplet."""
-    if (
-        y.device.type != "tpu"
-        or y.dtype != torch.bfloat16
-        or not envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get()
-    ):
+    if y.device.type != "tpu" or y.dtype != torch.bfloat16:
         return None
-    if not kernel.is_supported_shape(y.shape[0], hc.cfg.mult, hc.cfg.hidden):
+    from sglang_tpu.models.deepseek_v41.kernels.mhc.shifted_post_pre_rms import (
+        is_supported_shape,
+    )
+
+    if not is_supported_shape(y.shape[0], hc.cfg.mult, hc.cfg.hidden):
         return None
 
     if (
@@ -201,8 +162,14 @@ def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
     )
 
 
+def _use_shifted_mhc_for_rows(tokens: int) -> bool:
+    # Small buckets have mixed speedups with the TorchTPU bridge. Serve the
+    # measured range where both attention and FFN boundaries consistently win.
+    return 96 <= tokens <= 8192
+
+
 def fused_target_boundary(hc, y, residual, coefficients, boundary):
-    if boundary is None or y.device.type != "tpu":
+    if boundary is None or not _use_shifted_mhc_for_rows(y.shape[0]):
         return None
     # The cached HcNextBoundary holds an HcSubLayer from its first forward.
     # Resolve the owner each time so direct compile sees the live parameters.
@@ -218,12 +185,18 @@ def fused_target_boundary(hc, y, residual, coefficients, boundary):
 
 
 def can_run_draft(model, x):
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang_tpu.models.deepseek_v41.kernels.mhc.shifted_post_pre_rms import (
+        is_supported_shape,
+    )
+
     return (
         x.device.type == "tpu"
         and model.hc_pre_from_prev_sublayer
-        and envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get()
+        and _use_shifted_mhc_for_rows(x.shape[0])
         and getattr(model.stages[0].ffn_hc.norm, _PACKED, None) is not None
-        and kernel.is_supported_shape(x.shape[0], model.hc_mult, x.shape[-1])
+        and is_supported_shape(x.shape[0], model.hc_mult, x.shape[-1])
+        and not is_batch_invariant_mode_enabled()
     )
 
 

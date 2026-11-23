@@ -579,3 +579,39 @@ def _pre_gates(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)
     return (pre.T, post.T, comb.transpose(2, 0, 1))
+
+
+def _shifted_jax(
+    y: jax.Array,
+    residual: jax.Array,
+    post: jax.Array,
+    comb: jax.Array,
+    packed: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    pre: jax.Array,
+    norm_weight: jax.Array,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    return shifted_post_pre_rms(
+        y,
+        residual,
+        post,
+        comb,
+        packed,
+        scale,
+        base,
+        pre,
+        norm_weight=norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_eps=norm_eps,
+        gate_input_mode=GateInputMode.COMPILER,
+        unpadded_gates=True,
+        early_prep=True,
+    )

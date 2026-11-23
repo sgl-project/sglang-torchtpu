@@ -13,7 +13,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang_tpu.envs import envs
 from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as kernel
 from sglang_tpu.models.deepseek_v41.ops import mhc as ops
 from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
@@ -200,10 +199,7 @@ def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
     ref = _unfused(y, residual, pre, post, comb, fn, scale, base, norm)
     hc, boundary = _boundary(fn, scale, base, norm, tpu)
     coeffs = tuple(tensor.to(tpu) for tensor in (pre, post, comb))
-    with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
-        state = ops.fused_boundary(
-            hc, y.to(tpu), residual.to(tpu), coeffs, boundary, hc
-        )
+    state = ops.fused_boundary(hc, y.to(tpu), residual.to(tpu), coeffs, boundary, hc)
     assert state is not None and state.pre is coeffs[0]
     _check_outputs(_outputs(state), ref, check_elements=check_elements)
 
@@ -240,8 +236,7 @@ def test_direct_trace_chains_boundaries_and_reuses_updated_packed_buffer(tpu):
     )
 
     def check(weight):
-        with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
-            results = compiled(*inputs)
+        results = compiled(*inputs)
         ref_args = (y, residual, pre, post, comb)
         for actual in results:
             ref = _unfused(*ref_args, weight, scale, base, norm)
@@ -265,8 +260,7 @@ def test_unsupported_token_bucket_falls_back(tpu, tokens):
     cfg = SimpleNamespace(mult=M, hidden=D)
     hc = SimpleNamespace(cfg=cfg)
     y = torch.empty((tokens, D), device=tpu, dtype=torch.bfloat16)
-    with envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.override(True):
-        assert ops.fused_boundary(hc, y, None, None, None, None) is None
+    assert ops.fused_boundary(hc, y, None, None, None, None) is None
 
 
 if __name__ == "__main__":
