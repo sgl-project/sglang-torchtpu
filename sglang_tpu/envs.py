@@ -792,9 +792,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_ATTN_INTERLEAVE = EnvBool(True)
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE = EnvBool(True)
     # Global layers given an inline-refill loop copy (MKConfig.attn_refill_inline_layers);
-    # 0: all. Each copy is a whole step; past 4 the program slows unchanged code (SWA
-    # attention +1% at 6, +3-6% at 16, q4 b4-b16).
-    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(4)
+    # 0: all. Each copy is a whole step; all 16 slow SWA attention 4-7% against 4 copies, but
+    # SWA stays ~17% under its pre-copy time and the megakernel is faster from 256k.
+    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(0)
     # Inline refill: each chunk pair's refill DMAs issue one pair later (MKConfig.attn_refill_next_pair).
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR = EnvBool(True)
 
