@@ -11,7 +11,9 @@ host; JAX comes with the TPU stack.
 
 import dataclasses
 import unittest
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 from jax import tree_util
@@ -29,6 +31,10 @@ from sglang_tpu.models.deepseek_v41.attention_backend import (
 from sglang_tpu.models.deepseek_v41.decoder_replay import (
     decoder_prompt_bounds,
     plan_decoder_replay,
+)
+from sglang_tpu.models.deepseek_v41.decoder_replay_forward import (
+    configure_decoder_replay,
+    forward_decoder_replay,
 )
 from sglang_tpu.models.deepseek_v41.request_window import RESERVED_PAGES, WINDOW_TOKENS
 
@@ -227,6 +233,147 @@ class TestDecoderReplayMetadata(CustomTestCase):
         )
         self.assertTrue(torch.all(decoder.swa_window_plan.history_dst == -1))
         self.assertEqual(int(decoder.valid.sum()), 6)
+
+
+class TestDecoderReplayForward(CustomTestCase):
+    def test_decoder_replay_rejects_unshifted_mhc(self):
+        from sglang.srt import runtime_context
+
+        model = SimpleNamespace(late_layer_start=1, hc_pre_from_prev_sublayer=False)
+        config = SimpleNamespace(model_type="deepseek_v41")
+        with patch.object(
+            runtime_context, "get_platform", lambda: SimpleNamespace(is_tpu=True)
+        ):
+            with self.assertRaisesRegex(ValueError, "requires shifted mHC"):
+                configure_decoder_replay(Mock(), model, config)
+
+    def test_hook_keeps_source_write_full_and_restores_output_layout(self):
+        from sglang.kernels.ops.layernorm import mhc as ops
+        from sglang.srt import runtime_context
+        from sglang.srt.eplb import expert_distribution
+        from sglang.srt.layers import moe
+        from sglang.srt.model_executor import forward_context
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        from sglang_tpu.models.deepseek_v41 import decoder_replay_forward
+
+        def forward_layer(*, state, input_ids, input_ids_global, **_):
+            torch.testing.assert_close(input_ids_global, input_ids.repeat(2))
+            return mhc.HcState(
+                state.residual + 1,
+                state.residual.new_full((state.residual.shape[0], 2), 0.5),
+            )
+
+        def record_source(*, x, positions, **_):
+            torch.testing.assert_close(x.squeeze(1), positions.float() + 1)
+
+        before = Mock(side_effect=forward_layer)
+        after = Mock(side_effect=forward_layer)
+        model = SimpleNamespace(
+            late_layer_start=1,
+            hc_pre_from_prev_sublayer=True,
+            dspark_layers_to_capture=(0, 1),
+            pp_group=SimpleNamespace(world_size=1),
+            hidden_size=1,
+            hc_mult=2,
+            start_layer=0,
+            end_layer=2,
+            engram_hasher=None,
+            embed_tokens=lambda ids: ids[:, None].float(),
+            norm=lambda x: x,
+            layers=[
+                SimpleNamespace(engram=None, forward_hc_pre_from_prev=before),
+                SimpleNamespace(
+                    engram=None,
+                    self_attn=object(),
+                    attn_hc=object(),
+                    hc_cfg=None,
+                    forward_hc_pre_from_prev=after,
+                ),
+            ],
+        )
+        backend = SimpleNamespace(
+            decoder_replay_enabled=True,
+            write_tail_source_kv=Mock(side_effect=record_source),
+            enter_late_layer_tail=Mock(),
+            exit_late_layer_tail=Mock(),
+        )
+        original = Mock()
+        ids = torch.arange(4)
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with ExitStack() as stack:
+            patches = [
+                (runtime_context, "get_platform", lambda: SimpleNamespace(is_tpu=True)),
+                (
+                    runtime_context,
+                    "get_parallel",
+                    lambda: SimpleNamespace(attn_dp_size=2),
+                ),
+                (
+                    runtime_context,
+                    "get_forward",
+                    lambda: SimpleNamespace(sp_active=False),
+                ),
+                (forward_context, "get_attn_backend", lambda: backend),
+                (decoder_replay_forward, "_gather_ids", lambda ids, _: ids.repeat(2)),
+                (
+                    moe,
+                    "get_moe_a2a_backend",
+                    lambda: SimpleNamespace(is_none=lambda: True),
+                ),
+                (
+                    expert_distribution,
+                    "get_global_expert_distribution_recorder",
+                    lambda: SimpleNamespace(with_current_layer=lambda _: nullcontext()),
+                ),
+                (mhc, "combine", lambda _, state: state.residual.mean(dim=1)),
+                (ops, "hc_broadcast", lambda x, hc: x[:, None, :].expand(-1, hc, -1)),
+                (ops, "mhc_stream_mean", lambda x, *, out: out.copy_(x.mean(dim=1))),
+                (
+                    ops,
+                    "mhc_combine",
+                    lambda x, pre, hc, _: (x.view(-1, hc, 1) * pre[..., None]).sum(
+                        dim=1
+                    ),
+                ),
+            ]
+            for module, name, fn in patches:
+                stack.enter_context(patch.object(module, name, fn))
+
+            configure_decoder_replay(
+                Mock(), model, SimpleNamespace(model_type="deepseek_v41")
+            )
+            self.assertIsNone(model.late_layer_start)
+            for skip in (True, False):
+                with self.subTest(skip=skip):
+                    tail = DecoderTail(
+                        torch.tensor([2, 0]),
+                        torch.tensor([2, 4]),
+                        torch.tensor([2, 0]),
+                        torch.tensor(0 if skip else 1),
+                        (0 if skip else 1,),
+                        skip,
+                    )
+                    backend.tail_forward_metadata = SimpleNamespace(
+                        late_layer_tail=tail
+                    )
+                    (hidden, pre), aux = forward_decoder_replay(
+                        original, model, ids, ids, batch, None
+                    )
+                    self.assertEqual(hidden[:, 0].tolist(), [0, 0, 0 if skip else 4, 0])
+                    self.assertEqual(pre[:, 0].tolist(), hidden[:, 0].tolist())
+                    self.assertEqual(aux[2].tolist(), [0, 0] if skip else [2, 3])
+                    self.assertEqual(after.call_count, int(not skip))
+                    self.assertEqual(
+                        backend.exit_late_layer_tail.call_count, int(not skip)
+                    )
+            self.assertEqual(before.call_count, 2)
+            self.assertEqual(backend.write_tail_source_kv.call_count, 2)
+            original.assert_not_called()
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+            forward_decoder_replay(original, model, ids, ids, batch, None)
+            original.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -157,6 +157,17 @@ tpu_dsv41_decoder_schedule
   Upstream PR or issue: not filed (prompt-tail decoder replay).
   Remove when: the scheduler carries host prompt bounds into attention planning.
 
+configure_decoder_replay, forward_decoder_replay
+  Why: the upstream V4.1 layer loop uses a GPU decoder layout and compact
+       DSpark outputs. TPU needs a globally agreed skip or static tail
+       bucket and full-layout outputs for its padded logits and draft writer.
+  How: AROUND DeepseekV4Model.__init__ retains upstream's source-layer
+       validation and redirects replay to an AROUND _forward_impl hook.
+       The hook runs the TPU layer path only for a prepared decoder tail.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#2417 (upstream seam not filed).
+  Remove when: the upstream model can delegate decoder replay layout and
+       full-layout output handling to the attention backend.
+
 fold_tpu_dsv41_encoder_replay
   Why: encoder_swa_replay._fold_batch concatenates each hit's replay rows with
        the scheduled rows assuming one device and int64 slots: replay token ids
@@ -296,6 +307,10 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
             raise ValueError("TPU decoder replay requires encoder SWA bounded replay")
         if cfg.disaggregation_mode != "null" or cfg.enable_multimodal is not False:
             raise ValueError("TPU decoder replay requires monolithic text serving")
+        if cfg.enable_return_routed_experts:
+            raise ValueError(
+                "TPU decoder replay does not support routed expert capture"
+            )
         if not cfg.enable_torch_compile or cfg.tpu_compile_tracer != "direct":
             raise ValueError("TPU decoder replay requires the direct TPU compiler")
         if (
@@ -801,9 +816,15 @@ def hook_specs():
     # Declares the ForwardBatch fields the Engram hooks read.
     from sglang_tpu.models.deepseek_v41 import engram_host  # noqa: F401
 
+    from sglang_tpu.models.deepseek_v41.decoder_replay_forward import (
+        configure_decoder_replay,
+        forward_decoder_replay,
+    )
+
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
     dspark = "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark"
+    model = "sglang.srt.models.deepseek_v4.DeepseekV4Model"
     ngram = (
         "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
         ".NgramEmbeddingManager"
@@ -837,6 +858,8 @@ def hook_specs():
             allow_tpu_dsv41_encoder_replay,
             HookType.AROUND,
         ),
+        (f"{model}.__init__", configure_decoder_replay, HookType.AROUND),
+        (f"{model}._forward_impl", forward_decoder_replay, HookType.AROUND),
         (
             "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation",
             tpu_dsv41_decoder_schedule,

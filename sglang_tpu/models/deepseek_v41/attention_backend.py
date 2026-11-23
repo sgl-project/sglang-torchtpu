@@ -155,8 +155,6 @@ class DecoderTail(msgspec.Struct, frozen=True):
     extend_seq_lens_cpu: tuple[int, ...]
     skip_decoder: bool
 
-    keep_full_output_layout = True
-
     def rows(self, value: torch.Tensor) -> torch.Tensor:
         return value.index_select(0, self.token_indices)
 
@@ -617,7 +615,6 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     # Encoder replay rows run inside the extend forward (see the module docstring).
     folds_encoder_swa_replay: bool = True
-    manages_late_layer_layout = True
 
     @property
     def tail_forward_metadata(self):
