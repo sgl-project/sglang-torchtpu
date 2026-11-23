@@ -24,6 +24,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
+from unittest import mock
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -260,11 +261,14 @@ class TestGmm2TileSource(CustomTestCase):
 
     def test_packed_fp4_uses_the_tuned_lookup(self):
         # uint8-packed FP4 is the one case that must not reach calculate_tiling.
-        tiles = self._source(
-            jnp.uint8,
-            w2_packed=True,
-            w2_scale=jnp.ones((16, 8, 8192), dtype=jnp.float32),
-        )
+        # Its lookup reads the VMEM capacity, which a CPU host cannot report.
+        tpu_info = SimpleNamespace(vmem_capacity_bytes=64 * 1024 * 1024)
+        with mock.patch.object(gmm_v2.pltpu, "get_tpu_info", return_value=tpu_info):
+            tiles = self._source(
+                jnp.uint8,
+                w2_packed=True,
+                w2_scale=jnp.ones((16, 8, 8192), dtype=jnp.float32),
+            )
         self.assertIsInstance(tiles, gmm_v2.TileSizes)
 
 
