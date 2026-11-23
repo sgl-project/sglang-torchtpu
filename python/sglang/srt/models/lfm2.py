@@ -49,9 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_tpu, make_layers, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.linear.short_conv_backend import (
@@ -315,7 +314,11 @@ class Lfm2ShortConv(nn.Module):
             self.register_parameter("conv_bias", None)
 
         register_shortconv_verify_buffers(self)
-        self._short_conv_kernel = current_platform.get_short_conv_kernel()
+        self._short_conv_kernel = None
+        if is_tpu():
+            from sglang_tpu.attention_short_conv import short_conv
+
+            self._short_conv_kernel = short_conv
 
     def forward(
         self,

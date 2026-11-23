@@ -136,24 +136,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         """Every factory is inherited, not copied."""
         self.assertTrue(issubclass(self.TpuOOTPlatform, self.TpuSRTPlatform))
 
-    def test_short_conv_factories_resolve_the_backend_and_kernel(self):
-        """The platform gate must resolve importable implementations after moves."""
-        from sglang.srt.layers.attention.linear.short_conv_backend import (
-            ShortConvAttnBackend,
-        )
-        from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend, short_conv
-
-        self.assertIs(
-            self.SRTPlatform().get_short_conv_backend_cls(), ShortConvAttnBackend
-        )
-        self.assertIsNone(self.SRTPlatform().get_short_conv_kernel())
-        for platform in (self.TpuSRTPlatform(), self.platform):
-            with self.subTest(platform=type(platform).__name__):
-                self.assertIs(
-                    platform.get_short_conv_backend_cls(), TpuShortConvAttnBackend
-                )
-                self.assertIs(platform.get_short_conv_kernel(), short_conv)
-
     def test_lfm2_shortconv_claims_no_buffer_prefix_cache_support(self):
         """LFM2 prefix reuse uses the shared TPU state-copy path."""
         from sglang.srt.configs.lfm2 import Lfm2Config
@@ -769,13 +751,15 @@ class TestTpuPatchInventory(CustomTestCase):
 
 
 class TestShortConvPlatformKernel(CustomTestCase):
-    def test_lfm2_uses_the_platform_kernel_between_its_gates(self):
-        """In-tree overrides must reach the same sidecar and kernel as OOT ones."""
-        for out_of_tree in (False, True):
-            with self.subTest(out_of_tree=out_of_tree):
-                self._check_lfm2_platform_kernel(out_of_tree)
+    def test_lfm2_uses_the_tpu_kernel_between_its_gates(self):
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-    def _check_lfm2_platform_kernel(self, out_of_tree):
+        for platform in (TpuSRTPlatform(), TpuOOTPlatform()):
+            with self.subTest(platform=type(platform).__name__):
+                self._check_lfm2_platform_kernel(platform)
+
+    def _check_lfm2_platform_kernel(self, platform):
         import torch
 
         from sglang.srt.configs.lfm2 import Lfm2Config
@@ -783,8 +767,8 @@ class TestShortConvPlatformKernel(CustomTestCase):
         from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.models import lfm2
-        from sglang.srt.platforms.interface import SRTPlatform
         from sglang.srt.runtime_context import get_context
+        from sglang_tpu import attention_short_conv
 
         override = get_context().override_server_args(linear_attn_backend="triton")
         override.install()
@@ -818,16 +802,6 @@ class TestShortConvPlatformKernel(CustomTestCase):
             state.index_copy_(0, slots, window[:, 1:].unsqueeze(2))
             return output
 
-        class Platform(SRTPlatform):
-            def is_out_of_tree(self):
-                return out_of_tree
-
-            def get_short_conv_backend_cls(self):
-                return CpuShortConvBackend
-
-            def get_short_conv_kernel(self):
-                return cpu_short_conv
-
         class Linear(torch.nn.Linear):
             # Replace the distributed projection boundary with a real CPU GEMM.
             def __init__(self, input_size, output_size, **kwargs):
@@ -855,10 +829,13 @@ class TestShortConvPlatformKernel(CustomTestCase):
             use_mla_backend=False,
             is_draft_worker=False,
         )
-        platform = Platform()
         with (
-            patch.object(attention_registry, "current_platform", platform),
-            patch.object(lfm2, "current_platform", platform),
+            patch("sglang.srt.utils.is_tpu", platform.is_tpu),
+            patch.object(lfm2, "is_tpu", platform.is_tpu),
+            patch.object(
+                attention_short_conv, "TpuShortConvAttnBackend", CpuShortConvBackend
+            ),
+            patch.object(attention_short_conv, "short_conv", cpu_short_conv),
             patch.object(lfm2, "get_parallel", return_value=SimpleNamespace(tp_size=1)),
             patch.object(lfm2, "MergedColumnParallelLinear", Linear),
             patch.object(lfm2, "RowParallelLinear", Linear),

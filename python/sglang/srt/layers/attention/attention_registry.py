@@ -18,7 +18,6 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -523,9 +522,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     ShortConvHybridAttnBackend,
                 )
 
-                linear_attn_backend = current_platform.get_short_conv_backend_cls()(
-                    runner
-                )
+                if is_tpu():
+                    from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend
+
+                    linear_attn_backend = TpuShortConvAttnBackend(runner)
+                else:
+                    from sglang.srt.layers.attention.linear.short_conv_backend import (
+                        ShortConvAttnBackend,
+                    )
+
+                    linear_attn_backend = ShortConvAttnBackend(runner)
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
