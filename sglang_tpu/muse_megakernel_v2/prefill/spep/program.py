@@ -28,13 +28,13 @@ import jax.numpy as jnp
 
 from sglang_tpu.muse_megakernel_v2.common import a2a
 from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
-from sglang_tpu.muse_megakernel_v2.common.plan import expert_units, layer_units
 from sglang_tpu.muse_megakernel_v2.common.consts import LANE, small_row
 from sglang_tpu.muse_megakernel_v2.common.numerics import (
     _rms,
     _topk_iter,
     heads_rms_xla,
 )
+from sglang_tpu.muse_megakernel_v2.common.plan import expert_units, layer_units
 from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
 
 # dtype instances: RPA / gmm_v2 configs read .itemsize
