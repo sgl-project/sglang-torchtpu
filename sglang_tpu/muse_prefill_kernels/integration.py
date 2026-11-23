@@ -665,7 +665,6 @@ def _a1_body(
             jnp.empty((tp, n_parts, h_sub, *kv_cols), jnp.float8_e4m3fn),
         )
         kernel_kw = dict(
-            rpa_layout=rpa_layout,
             h_q_local=h_q_local,
             h_kv_local=h_kv_local,
             # The kernels' grid is h_sub // tm: tm must divide h_sub (a multiple of 128).
@@ -1569,16 +1568,22 @@ def _ops(
                 row_off=0,
                 h_q_local=h_q_local,
                 h_kv_local=h_kv_local,
-                rpa_layout=True,
+                rpa_layout=a1_rpa_layout,
                 mode="all",
                 tp_axis=_AXIS,
                 tm=256 if c_k % 256 == 0 else 128,
             )
             c_tok = tp_d * c_k
+            if a1_rpa_layout:
+                return (
+                    q_k.reshape(1, c_tok, h_q_local // 2, 2, 128),
+                    gate_k.reshape(c_tok, h_q_local * 64),
+                    kv_k.reshape(c_tok, 1, 4, 128),
+                )
             return (
-                q_k.reshape(1, c_tok, h_q_local // 2, 2, 128),
+                q_k.reshape(c_tok, h_q_local * 64),
                 gate_k.reshape(c_tok, h_q_local * 64),
-                kv_k.reshape(c_tok, 1, 4, 128),
+                kv_k.reshape(c_tok, h_kv_local * 128),
             )
 
         a1_chunk_sm = shard(a1_chunk_body, 5, 3)
@@ -1597,13 +1602,14 @@ def _ops(
             if xor1_ag_mode > 0
             else ("_xagccs" if use_xor1_ccs_ag else "")
         )
+        rpal_sfx = "_rpal" if a1_rpa_layout else "_unpk"
         ag_chunk_op = export(
             "ag_chunk" + ccs_ag_sfx,
             ag_chunk,
             1,
             1,
         )
-        a1_chunk_op = export("a1_chunk_v6_rpal" + a1_w8_tag, a1_chunk, 5, 3)
+        a1_chunk_op = export("a1_chunk_v6" + rpal_sfx + a1_w8_tag, a1_chunk, 5, 3)
         if ccs_fuse_ag_a1 > 0:
 
             def a1_chunk_agd_body(ag_k, next_slice, wqkvg, wqkvg_scale, cos_k, sin_k):
@@ -1630,7 +1636,7 @@ def _ops(
                 )
 
             a1_chunk_agd_op = export(
-                "a1_chunk_agd_v6_rpal" + a1_w8_tag + ccs_ag_sfx,
+                "a1_chunk_agd_v6" + rpal_sfx + a1_w8_tag + ccs_ag_sfx,
                 a1_chunk_agd,
                 6,
                 4,
@@ -2321,14 +2327,14 @@ class MusePrefillKernels(torch.nn.Module):
         )
         if self.causal_chunk_stream and (
             self.a1_variant != "v6"
-            or not self.a1_rpa_layout
+            or (self.tp_size != 16 and not self.a1_rpa_layout)
             or self.ep_tp2_mode
             or self.tp16_owner_a1
             or self.skip_pad_attn_tokens
         ):
             raise ValueError(
-                "CAUSAL_CHUNK_STREAM requires A1_VARIANT='v6', A1_RPA_LAYOUT=1, "
-                "pure EP, and SKIP_PAD_ATTN_TOKENS=0"
+                "CAUSAL_CHUNK_STREAM requires A1_VARIANT='v6', "
+                "(A1_RPA_LAYOUT=1 or TP=16), pure EP, and SKIP_PAD_ATTN_TOKENS=0"
             )
         self.ops = _ops(
             attn.num_heads,
@@ -2545,7 +2551,7 @@ class MusePrefillKernels(torch.nn.Module):
             16,
         ):
             reason = "native TP16 needs eight query heads and one KV head per rank"
-        elif (native_tp16 or (ep_tp2_prefill and tp == 16)) and (
+        elif (ep_tp2_prefill and tp == 16) and (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() != "v1"
             or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() != "v3"
             or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_AG_UNDER_D.get()
@@ -2554,7 +2560,16 @@ class MusePrefillKernels(torch.nn.Module):
                 and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
             )
         ):
-            reason = "native TP16 needs unpacked A1 v1 and A3 v3"
+            reason = "hybrid EP8xTP2 TP16 needs unpacked A1 v1 and A3 v3"
+        elif native_tp16 and (
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v1", "v6")
+            or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() not in ("v3", "v16")
+            or (
+                tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
+                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
+            )
+        ):
+            reason = "native TP16 needs unpacked A1 v1/v6 and A3 v3/v16"
         elif parallel.attn_dcp_size != 1 or is_dp_attention_enabled():
             reason = "does not support DCP or DP attention"
         elif decoder.pp_group.world_size != 1:
@@ -3271,6 +3286,88 @@ class MusePrefillKernels(torch.nn.Module):
             layer_idx=kv_layer_idx,
         )
 
+    def _forward_rpa_unpacked_fp8(
+        self, q, kv, attn_layer, forward_batch, chunk_meta=None
+    ):
+        """Runs unpacked scale-1 FP8-KV RPA v3 on ``q [T, Hq*d]`` and ``kv [T, 2*Hkv*d]``."""
+        from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
+
+        be = get_attn_backend()
+        md = chunk_meta if chunk_meta is not None else be.forward_metadata
+        if (
+            be.kv_cache_quant_dtype is None
+            or (chunk_meta is None and md.cp_write_segments is not None)
+            or be._dcp != 1
+            or attn_layer.k_scale_float not in (None, 1.0)
+            or attn_layer.v_scale_float not in (None, 1.0)
+        ):
+            raise NotImplementedError(
+                "Unpacked chunked FP8 RPA needs a scale-1 fp8 KV pool with dcp=1"
+            )
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            be.token_to_kv_pool, attn_layer.layer_id
+        )
+        sliding_window = attn_layer.sliding_window_size
+        if sliding_window is not None and sliding_window <= 0:
+            sliding_window = None
+        elif sliding_window is not None:
+            sliding_window += 1
+        is_swa = sliding_window is not None
+        if chunk_meta is not None:
+            if is_swa and md.swa_page_indices is not None:
+                group = be._swa_layer_groups.get(attn_layer.layer_id, 0)
+                page_indices = (
+                    md.swa_page_indices
+                    if group == 0 or md.swa_group_page_indices is None
+                    else md.swa_group_page_indices[group - 1]
+                )
+            else:
+                page_indices = md.page_indices
+            kv_lens = md.kv_lens
+            decode_query_size = 1
+        else:
+            page_indices = be._layer_page_indices(
+                attn_layer.layer_id, is_swa_layer=is_swa
+            )
+            kv_lens = be._kv_lens(forward_batch)
+            decode_query_size = md.decode_query_size
+        num_tokens = q.shape[0]
+        q_3d = q.view(num_tokens, attn_layer.tp_q_head_num, attn_layer.qk_head_dim)
+        k_3d = (
+            kv[:, : self.kv_size]
+            .contiguous()
+            .view(num_tokens, attn_layer.tp_k_head_num, attn_layer.qk_head_dim)
+        )
+        v_3d = (
+            kv[:, self.kv_size :]
+            .contiguous()
+            .view(num_tokens, attn_layer.tp_v_head_num, attn_layer.v_head_dim)
+        )
+        op = be._kernel_op(forward_batch, True)
+        out = op(
+            q_3d,
+            k_3d,
+            v_3d,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            None,
+            float(attn_layer.scaling),
+            sliding_window,
+            attn_layer.logit_cap if attn_layer.logit_cap else None,
+            1.0,
+            1.0,
+            decode_query_size,
+            use_causal_mask=True,
+            layer_idx=kv_layer_idx,
+        )
+        out = out.reshape(num_tokens, attn_layer.tp_q_head_num, -1)
+        out = out[..., : attn_layer.v_head_dim]
+        return out.reshape(num_tokens, attn_layer.tp_q_head_num * attn_layer.v_head_dim)
+
     def _layer(
         self,
         *,
@@ -3369,8 +3466,12 @@ class MusePrefillKernels(torch.nn.Module):
                     out_k = self._forward_rpa_raw_packed(
                         q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
                     )
-                else:
+                elif self.a1_rpa_layout:
                     out_k = be.forward_prepared(
+                        q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
+                    )
+                else:
+                    out_k = self._forward_rpa_unpacked_fp8(
                         q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
                     )
                 out_tok = (
@@ -3552,8 +3653,12 @@ class MusePrefillKernels(torch.nn.Module):
                 out_k = self._forward_rpa_raw_packed(
                     q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
                 )
-            else:
+            elif self.a1_rpa_layout:
                 out_k = be.forward_prepared(
+                    q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
+                )
+            else:
+                out_k = self._forward_rpa_unpacked_fp8(
                     q_k, kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k]
                 )
             out_tok = (

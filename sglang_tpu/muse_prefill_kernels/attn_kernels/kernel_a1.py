@@ -2845,10 +2845,13 @@ def pallas_a1_chunk_1way(
             ).start()
 
             if not q_gate_only:
-                assert h_kv_local == 2
-                acc_kv = _strip_dot_c(2 * q_size, 2 * q_size + 256)
-                k_pair = acc_kv[:, 0:128]
-                v_pair = acc_kv[:, 128:256].astype(jnp.bfloat16)
+                if h_kv_local == 2:
+                    acc_kv = _strip_dot_c(2 * q_size, 2 * q_size + 256)
+                    k_pair = acc_kv[:, 0:128]
+                    v_pair = acc_kv[:, 128:256].astype(jnp.bfloat16)
+                else:
+                    assert h_kv_local == 1 and not rpa_layout
+                    kv_pair = _strip_dot_c(2 * q_size, 2 * q_size + 128)
         else:
             if has_packed_f8_sc:
                 s_hi = x_ref[0, :, k_dim : k_dim + 1].astype(jnp.float32)
@@ -2912,38 +2915,59 @@ def pallas_a1_chunk_1way(
                 q_sems.at[slot],
             ).start()
             if not q_gate_only:
-                assert h_kv_local == 2
-                k_pair = acc[:, 2 * q_size : 2 * q_size + 128]
-                v_pair = acc[:, 2 * q_size + 128 : 2 * q_size + 256].astype(
-                    jnp.bfloat16
-                )
+                if h_kv_local == 2:
+                    k_pair = acc[:, 2 * q_size : 2 * q_size + 128]
+                    v_pair = acc[:, 2 * q_size + 128 : 2 * q_size + 256].astype(
+                        jnp.bfloat16
+                    )
+                else:
+                    assert h_kv_local == 1 and not rpa_layout
+                    kv_pair = acc[:, 2 * q_size : 2 * q_size + 128]
 
         if not q_gate_only:
-            k_norm = _dual_head_rmsnorm_128(
-                k_pair,
-                is_lo,
-                mask_lo,
-                mask_hi,
-                1.0,
-                eps=1e-5,
-                fast_6roll=use_fast_norm,
-            )
-            k_rot = _rope_128_vreg(
-                k_norm, cos_tile, sin_tile, lane, rope_mode=rope_mode
-            )
-            k8 = jnp.clip(
-                k_rot.astype(jnp.float32) * inv_k_scale, -FP8_MAX, FP8_MAX
-            ).astype(jnp.float8_e4m3fn)
-            v8 = jnp.clip(
-                v_pair.astype(jnp.float32) * inv_v_scale, -FP8_MAX, FP8_MAX
-            ).astype(jnp.float8_e4m3fn)
-            if rpa_layout:
-                kv_vmem.bitcast(jnp.uint32).at[slot, 0].reshape(tm_eff, 128)[...] = (
-                    _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
+            if h_kv_local == 2:
+                k_norm = _dual_head_rmsnorm_128(
+                    k_pair,
+                    is_lo,
+                    mask_lo,
+                    mask_hi,
+                    1.0,
+                    eps=1e-5,
+                    fast_6roll=use_fast_norm,
                 )
+                k_rot = _rope_128_vreg(
+                    k_norm, cos_tile, sin_tile, lane, rope_mode=rope_mode
+                )
+                k8 = jnp.clip(
+                    k_rot.astype(jnp.float32) * inv_k_scale, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+                v8 = jnp.clip(
+                    v_pair.astype(jnp.float32) * inv_v_scale, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+                if rpa_layout:
+                    kv_vmem.bitcast(jnp.uint32).at[slot, 0].reshape(tm_eff, 128)[...] = (
+                        _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
+                    )
+                else:
+                    kv_vmem[slot, 0, :, 0:128] = k8
+                    kv_vmem[slot, 0, :, 128:256] = v8
             else:
-                kv_vmem[slot, 0, :, 0:128] = k8
-                kv_vmem[slot, 0, :, 128:256] = v8
+                sq_lo = jnp.sum(kv_pair * kv_pair * mask_lo, axis=1, keepdims=True) * (
+                    1.0 / 64.0
+                )
+                inv_rms_kv = jnp.where(is_lo, lax.rsqrt(sq_lo + 1e-5), 1.0)
+                kv_norm = (
+                    (kv_pair * inv_rms_kv).astype(jnp.bfloat16).astype(jnp.float32)
+                )
+                cos_kv = jnp.where(is_lo, cos_tile, 1.0)
+                sin_kv = jnp.where(is_lo, sin_tile, 0.0)
+                kv_rot = _rope_128_vreg(
+                    kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
+                )
+                kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
+                kv_vmem[slot, 0, :, 0:128] = jnp.clip(
+                    kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
             pltpu.make_async_copy(
                 kv_vmem.at[slot],
                 kv_out_hbm.at[pl.ds(dst_r, 1), pl.ds(row_off + m * tm_eff, tm_eff)],

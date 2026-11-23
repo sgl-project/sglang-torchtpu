@@ -561,3 +561,267 @@ def test_w12b_l61_pruned_per_chunk_gather_bit_exact_fp8_and_bf16():
         assert torch.equal(q_pruned.view(torch.uint16), q_ref.view(torch.uint16))
         assert torch.equal(gate_pruned.view(torch.uint16), gate_ref.view(torch.uint16))
         assert torch.equal(kv_pruned.view(torch.uint8), kv_ref.view(torch.uint8))
+
+
+
+def test_w12c_tp16_a1_chunk_1way_hkv1_bit_exact_and_race_free_16dev():
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices()) < 16:
+        pytest.skip("Requires >=16 host devices")
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+    from sglang_tpu.muse_prefill_kernels.integration import _a1_body
+
+    tp_deg = 16
+    t_shard = 256
+    c_sub = 128
+    h_q_local = 8
+    h_kv_local = 1
+    k_dim = 512
+    n_dim = 2 * h_q_local * 64 + 2 * h_kv_local * 64  # 1024 + 128 = 1152
+
+    rng = np.random.default_rng(20261124)
+    x_sh = jnp.asarray(
+        (rng.standard_normal((tp_deg * t_shard, k_dim)) * 0.25).astype(np.float32),
+        dtype=jnp.bfloat16,
+    )
+    wq = jnp.asarray(
+        (rng.standard_normal((k_dim, n_dim)) * 0.1).astype(np.float32),
+        dtype=jnp.float8_e4m3fn,
+    )
+    wsc = jnp.asarray(
+        (np.abs(rng.standard_normal((1, n_dim))) * 0.02 + 0.005).astype(np.float32),
+        dtype=jnp.float32,
+    )
+    cos = jnp.asarray(
+        rng.uniform(0.5, 1.0, (tp_deg * t_shard, 128)).astype(np.float32),
+        dtype=jnp.float32,
+    )
+    sin = jnp.asarray(
+        rng.uniform(-0.5, 0.5, (tp_deg * t_shard, 128)).astype(np.float32),
+        dtype=jnp.float32,
+    )
+
+    mesh = Mesh(np.array(jax.devices()[:16]), ("model",))
+    with _tpu7x_cpu_context(interpret=True, detect_races=True):
+        x_fp8 = jnp.clip(
+            x_sh.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT, -448.0, 448.0
+        ).astype(jnp.float8_e4m3fn)
+        wsc_eff = wsc * kernel_a1.STATIC_A1_ACT_SCALE
+
+        # Reference: unpacked pallas_qkvg_qk_rope_kv on static-fp8 x
+        q_ref, g_ref, kv_ref = kernel_a1.pallas_qkvg_qk_rope_kv(
+            x_fp8.astype(jnp.bfloat16), wq, wsc_eff, cos, sin, h_q_local=h_q_local, h_kv_local=h_kv_local, tm=128, bk=512
+        )
+
+        # 1. Direct pallas_a1_chunk_1way (h_kv_local=1, rpa_layout=False) with detect_races=True
+        x_3d_0 = x_fp8.reshape(tp_deg, t_shard, k_dim)[:, :c_sub, :]
+        cos_3d_0 = cos.reshape(tp_deg, t_shard, 128)[:, :c_sub, :]
+        sin_3d_0 = sin.reshape(tp_deg, t_shard, 128)[:, :c_sub, :]
+        q_c0, g_c0, kv_c0 = kernel_a1.pallas_a1_chunk_1way(
+            x_3d_0,
+            wq,
+            wsc_eff,
+            cos_3d_0,
+            sin_3d_0,
+            None,
+            t_shard=c_sub,
+            row_off=0,
+            h_q_local=h_q_local,
+            h_kv_local=h_kv_local,
+            rpa_layout=False,
+            mode="all",
+            tp_axis="model",
+            tm=128,
+        )
+        q_ref_3d = np.asarray(q_ref.view(jnp.uint16)).reshape(tp_deg, t_shard, h_q_local * 64)
+        g_ref_3d = np.asarray(g_ref.view(jnp.uint16)).reshape(tp_deg, t_shard, h_q_local * 64)
+        kv_ref_3d = np.asarray(kv_ref.view(jnp.uint8)).reshape(tp_deg, t_shard, h_kv_local * 128)
+        np.testing.assert_array_equal(np.asarray(q_c0.view(jnp.uint16)), q_ref_3d[:, :c_sub, :])
+        np.testing.assert_array_equal(np.asarray(g_c0.view(jnp.uint16)), g_ref_3d[:, :c_sub, :])
+        np.testing.assert_array_equal(np.asarray(kv_c0.view(jnp.uint8)), kv_ref_3d[:, :c_sub, :])
+        with mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_A1_SUB_N": "128"}):
+            q_sn, g_sn, kv_sn = kernel_a1.pallas_a1_chunk_1way(
+                x_3d_0, wq, wsc_eff, cos_3d_0, sin_3d_0, None,
+                t_shard=c_sub, row_off=0, h_q_local=h_q_local, h_kv_local=h_kv_local,
+                rpa_layout=False, mode="all", tp_axis="model", tm=128,
+            )
+        np.testing.assert_array_equal(np.asarray(q_sn.view(jnp.uint16)), q_ref_3d[:, :c_sub, :])
+        np.testing.assert_array_equal(np.asarray(g_sn.view(jnp.uint16)), g_ref_3d[:, :c_sub, :])
+        np.testing.assert_array_equal(np.asarray(kv_sn.view(jnp.uint8)), kv_ref_3d[:, :c_sub, :])
+
+        # 2. _a1_body(v6, ag_under_d=True, a1_1way=True) across 16-rank shard_map with detect_races=True
+        for a1_1way_flag in (True,):
+            body_fn = _a1_body(
+                h_q_local,
+                h_kv_local,
+                "v6",
+                rpa_layout=False,
+                a1_1way=a1_1way_flag,
+                ag_under_d=True,
+            )
+            ag0_sh = jnp.broadcast_to(x_3d_0[None], (tp_deg, tp_deg, c_sub, k_dim))
+            rest_sh = x_fp8.reshape(tp_deg, t_shard, k_dim)[:, c_sub:, :].reshape(tp_deg * (t_shard - c_sub), k_dim)
+
+            def _run_sh(ag0_l, rest_l, wq_l, wsc_l, cos_l, sin_l):
+                return body_fn(ag0_l.squeeze(0), rest_l, wq_l, wsc_l, cos_l, sin_l)
+
+            q_got, g_got, kv_got = jax.shard_map(
+                _run_sh,
+                mesh=mesh,
+                in_specs=(P("model"), P("model", None), P(), P(), P(), P()),
+                out_specs=(P(), P(), P()),
+                check_vma=False,
+            )(ag0_sh, rest_sh, wq, wsc, cos, sin)
+            np.testing.assert_array_equal(
+                np.asarray(q_got.view(jnp.uint16)), np.asarray(q_ref.view(jnp.uint16))
+            )
+            np.testing.assert_array_equal(
+                np.asarray(g_got.view(jnp.uint16)), np.asarray(g_ref.view(jnp.uint16))
+            )
+            np.testing.assert_array_equal(
+                np.asarray(kv_got.view(jnp.uint8)), np.asarray(kv_ref.view(jnp.uint8))
+            )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_LIBTPU_AOT_TEST") != "1",
+    reason="Set RUN_LIBTPU_AOT_TEST=1 to run real libtpu TPU7x=2x2x2 AOT HLO checks",
+)
+def test_real_libtpu_tpu7x_2x2x2_aot_tp16_a1v6_a3v16_agd_and_2chunk():
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1, kernel_a3
+    from sglang_tpu.muse_prefill_kernels.integration import _a1_body, _a3_body
+
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh = Mesh(topo.devices, ("model",))
+    sh = lambda spec: NamedSharding(mesh, spec)
+    tp = 16
+    h_q_local = 8
+    h_kv_local = 1
+    k_loc = h_q_local * 64  # 512
+    h_stream = 8192
+
+    with mock.patch(
+        "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+        return_value="TPU v7",
+    ), tpu_info_for_cpu_export():
+        # Step A: _a1_body(v6, ag_under_d=True, a1_1way in (False, True)) + _a3_body(v16, opt_wo=True) on TP=16
+        a3_fn = _a3_body("v16", tp, 1e-5, rpa_packed_out=False, opt_wo=True)
+        for a1_1way_flag in (False, True):
+            a1_fn = _a1_body(
+                h_q_local, h_kv_local, "v6", rpa_layout=False, a1_1way=a1_1way_flag, ag_under_d=True
+            )
+            t_shard = 512
+            c0 = 256
+
+            def run_step_a(ag0, rest, wq, wqs, cos, sin, attn_out, wo, wsc):
+                def _b(ag0_l, rest_l, wq_l, wqs_l, cos_l, sin_l, ao_l, wo_l, wsc_l):
+                    q, gate, kv = a1_fn(
+                        ag0_l.squeeze(0), rest_l, wq_l.squeeze(0), wqs_l.squeeze(0), cos_l, sin_l
+                    )
+                    o_sh = a3_fn(
+                        ao_l.squeeze(0), gate, wo_l.squeeze(0), wsc_l.squeeze(0)
+                    )
+                    return q[None], kv[None], o_sh
+                return jax.shard_map(
+                    _b,
+                    mesh=mesh,
+                    in_specs=(
+                        P("model"),
+                        P("model", None),
+                        P("model"),
+                        P("model"),
+                        P(),
+                        P(),
+                        P("model"),
+                        P("model"),
+                        P("model"),
+                    ),
+                    out_specs=(P("model"), P("model"), P("model", None)),
+                    check_vma=False,
+                )(ag0, rest, wq, wqs, cos, sin, attn_out, wo, wsc)
+
+            comp_a = (
+                jax.jit(run_step_a)
+                .trace(
+                    jax.ShapeDtypeStruct((tp, tp, c0, h_stream), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                    jax.ShapeDtypeStruct((tp * (t_shard - c0), h_stream), jnp.float8_e4m3fn, sharding=sh(P("model", None))),
+                    jax.ShapeDtypeStruct((tp, h_stream, 1152), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                    jax.ShapeDtypeStruct((tp, 1, 1152), jnp.float32, sharding=sh(P("model"))),
+                    jax.ShapeDtypeStruct((tp * t_shard, 128), jnp.float32, sharding=sh(P())),
+                    jax.ShapeDtypeStruct((tp * t_shard, 128), jnp.float32, sharding=sh(P())),
+                    jax.ShapeDtypeStruct((tp, tp * t_shard, k_loc), jnp.bfloat16, sharding=sh(P("model"))),
+                    jax.ShapeDtypeStruct((tp, tp, k_loc, h_stream), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                    jax.ShapeDtypeStruct((tp, 1, h_stream), jnp.float32, sharding=sh(P("model"))),
+                )
+                .lower()
+                .compile()
+            )
+            hlo_a = comp_a.as_text()
+            assert "all-reduce(" not in hlo_a and "reduce-scatter(" not in hlo_a
+            assert "pallas_a3_wo_v16_opt" in hlo_a
+
+        # Step B: TP=16 2-chunk CCS (384, 640) with unpacked A1 v6 + A3_CCS_2CHUNK
+        c0_b, c1_b = 384, 640
+
+        def run_step_b(ag0, ag1, wq, wqs, cos0, sin0, cos1, sin1, ao0, ao1, wo, wsc):
+            def _b(ag0_l, ag1_l, wq_l, wqs_l, c0_l, s0_l, c1_l, s1_l, ao0_l, ao1_l, wo_l, wsc_l):
+                q0, g0, kv0 = kernel_a1.pallas_a1_chunk_1way(
+                    ag0_l.squeeze(0), wq_l.squeeze(0), wqs_l.squeeze(0), c0_l.squeeze(0), s0_l.squeeze(0), None,
+                    t_shard=c0_b, row_off=0, h_q_local=h_q_local, h_kv_local=h_kv_local, rpa_layout=False,
+                    mode="all", tp_axis="model", tm=128,
+                )
+                q1, g1, kv1 = kernel_a1.pallas_a1_chunk_1way(
+                    ag1_l.squeeze(0), wq_l.squeeze(0), wqs_l.squeeze(0), c1_l.squeeze(0), s1_l.squeeze(0), None,
+                    t_shard=c1_b, row_off=0, h_q_local=h_q_local, h_kv_local=h_kv_local, rpa_layout=False,
+                    mode="all", tp_axis="model", tm=128,
+                )
+                qp0 = kernel_a3.pallas_gate_static_fp8_quant(
+                    ao0_l.squeeze(0), g0.reshape(tp * c0_b, k_loc), head_norm_eps=1e-5, rpa_packed_out=False
+                ).reshape(tp, c0_b, k_loc)
+                qp1 = kernel_a3.pallas_gate_static_fp8_quant(
+                    ao1_l.squeeze(0), g1.reshape(tp * c1_b, k_loc), head_norm_eps=1e-5, rpa_packed_out=False
+                ).reshape(tp, c1_b, k_loc)
+                o_sh = kernel_a3.pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
+                    qp0, qp1, wo_l.squeeze(0), wsc_l.squeeze(0), tp_axis="model", bn=2048
+                )
+                return q0[None], kv0[None], q1[None], kv1[None], o_sh
+            return jax.shard_map(
+                _b,
+                mesh=mesh,
+                in_specs=(P("model"),) * 12,
+                out_specs=(P("model"), P("model"), P("model"), P("model"), P("model", None)),
+                check_vma=False,
+            )(ag0, ag1, wq, wqs, cos0, sin0, cos1, sin1, ao0, ao1, wo, wsc)
+
+        comp_b = (
+            jax.jit(run_step_b)
+            .trace(
+                jax.ShapeDtypeStruct((tp, tp, c0_b, h_stream), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, c1_b, h_stream), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, h_stream, 1152), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, 1, 1152), jnp.float32, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, c0_b, 128), jnp.float32, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, c0_b, 128), jnp.float32, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, c1_b, 128), jnp.float32, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, c1_b, 128), jnp.float32, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp * c0_b, k_loc), jnp.bfloat16, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp * c1_b, k_loc), jnp.bfloat16, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, tp, k_loc, h_stream), jnp.float8_e4m3fn, sharding=sh(P("model"))),
+                jax.ShapeDtypeStruct((tp, 1, h_stream), jnp.float32, sharding=sh(P("model"))),
+            )
+            .lower()
+            .compile()
+        )
+        hlo_b = comp_b.as_text()
+        assert "all-reduce(" not in hlo_b and "reduce-scatter(" not in hlo_b
+        assert "pad_maximum_fusion" not in hlo_b
+        assert f"pallas_a3_wo_2chunk_c{c0_b}_{c1_b}" in hlo_b
