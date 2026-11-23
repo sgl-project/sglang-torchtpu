@@ -2520,14 +2520,16 @@ class MuseSparkMoE(nn.Module):
         router_bf16: bool = True,
         free_bf16: bool = False,
         tok_sharded: bool = False,
+        chip_sharded: bool = False,
     ) -> Tuple[bool, bool]:
-        """Prepare K-major FP8 weights for Wave-7/Wave-8 decode collective bridges 1 & 2."""
+        """Prepare K-major FP8 weights for Wave-7/Wave-8/Wave-9 decode collective bridges 1 & 2."""
         from sglang_tpu.kernels.decode_collective_bridges import (
             quantize_weight_fp8_k_major,
         )
 
         can_pair_ag = (
-            tok_sharded and self.tp_size == 8 and torch.distributed.is_initialized()
+            ((tok_sharded and self.tp_size == 8) or (chip_sharded and self.tp_size in (8, 16)))
+            and torch.distributed.is_initialized()
         )
         side = get_parallel().tp_rank & 1 if can_pair_ag else 0
 
@@ -3520,6 +3522,7 @@ class MuseSparkDecoderLayer(nn.Module):
         is_dec_step: bool,
         next_input_layernorm: Optional[MuseSparkRMSNorm],
         next_layer_attn: Optional[MuseSparkAttention],
+        sharded_stream: bool = False,
     ) -> Tuple[int, int]:
         """Return ``(b1_kind, b2_kind)`` for Wave-7 decode collective bridges.
 
@@ -3570,7 +3573,7 @@ class MuseSparkDecoderLayer(nn.Module):
             # XOR=1 on TP=16) wins across B=8..128 on TP=8 and B=8..64 on TP=16.
             if mode in (5, 6):
                 b1_kind = 1
-            elif tp == 8 or n_tok <= 64 or br_cap > 128:
+            elif sharded_stream or tp == 8 or n_tok <= 64 or br_cap > 128:
                 b1_kind = 2
 
         b2_kind = 0
@@ -3607,6 +3610,7 @@ class MuseSparkDecoderLayer(nn.Module):
         next_layer_attn: Optional[MuseSparkAttention] = None,
         final_layernorm: Optional[MuseSparkRMSNorm] = None,
         tok_sharded_stream: bool = False,
+        chip_sharded_stream: bool = False,
     ) -> (
         torch.Tensor
         | Tuple[torch.Tensor]
@@ -3614,7 +3618,11 @@ class MuseSparkDecoderLayer(nn.Module):
         | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ):
-        n_tok = positions.shape[0] if tok_sharded_stream else stream.shape[0]
+        n_tok = (
+            positions.shape[0]
+            if (tok_sharded_stream or chip_sharded_stream)
+            else stream.shape[0]
+        )
         cs_kw = {"cos_sin_step": cos_sin_step} if cos_sin_step is not None else {}
         is_dec_step = forward_batch.forward_mode.is_decode() or (
             getattr(self, "_decode_fuse_target_verify", False)
@@ -3626,6 +3634,7 @@ class MuseSparkDecoderLayer(nn.Module):
             is_dec_step=is_dec_step,
             next_input_layernorm=next_input_layernorm,
             next_layer_attn=next_layer_attn,
+            sharded_stream=bool(tok_sharded_stream or chip_sharded_stream),
         )
         if b1_kind > 0 or b2_kind > 0:
             from sglang_tpu.kernels.decode_collective_bridges import (
@@ -3677,7 +3686,35 @@ class MuseSparkDecoderLayer(nn.Module):
                         **cs_kw,
                     )
                     w_router_km = self.mlp._buffers["_w7_wrouter_km"]
-                    if tok_sharded_stream and "_w8_wpre_pair_w8k" in self.mlp._buffers:
+                    if chip_sharded_stream and "_w8_wpre_pair_w8k" in self.mlp._buffers:
+                        from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                            get_attn_to_moe_chip_sharded_bridge_op,
+                        )
+
+                        stream, scaled_logits, expert_in = (
+                            get_attn_to_moe_chip_sharded_bridge_op(
+                                tp, bf16_router=(w_router_km.dtype == torch.bfloat16)
+                            )(
+                                stream,
+                                gated,
+                                self.self_attn._o_proj_w8k,
+                                self.self_attn._o_proj_scale,
+                                pa_alpha_arg,
+                                pa_beta_arg,
+                                pre_ff_gain,
+                                self.mlp._buffers["_w8_wpre_pair_w8k"],
+                                self.mlp._buffers["_w8_spre_pair"],
+                                w_router_km,
+                                pre_exp_gain,
+                                float(self.post_attention_layernorm.eps),
+                                float(self.pre_feedforward_layernorm.eps),
+                                bool(self.pre_feedforward_layernorm.scale_input),
+                                float(self.mlp.router_multiplier),
+                                float(self.mlp.pre_expert_norm.eps),
+                                bool(self.mlp.pre_expert_norm.scale_input),
+                            )
+                        )
+                    elif tok_sharded_stream and "_w8_wpre_pair_w8k" in self.mlp._buffers:
                         from sglang_tpu.kernels.decode_collective_bridges_w8 import (
                             get_attn_to_moe_tok_sharded_bridge_op,
                         )
@@ -3881,6 +3918,142 @@ class MuseSparkDecoderLayer(nn.Module):
                         max_tok=384,
                     )
                 )
+                if chip_sharded_stream and "_w7_wpost_w8k" in self.mlp._buffers:
+                    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                        get_moe_post_chip_sharded_final_norm_op,
+                        get_moe_to_attn_chip_sharded_bridge_op,
+                    )
+
+                    w_post_p = self.mlp._buffers["_w7_wpost_w8k"]
+                    s_post_p = self.mlp._buffers["_w7_spost"]
+                    if b2_kind == 3:
+                        assert (
+                            next_input_layernorm is not None
+                            and next_layer_attn is not None
+                        )
+                        next_in_gain = next_input_layernorm.gain()
+                        assert next_in_gain is not None
+                        next_has_rope = next_layer_attn.rotary_emb is not None
+                        if use_qkv_epi:
+                            k_sc = float(
+                                getattr(next_layer_attn.attn, "k_scale_float", None)
+                                or 1.0
+                            )
+                            v_sc = float(
+                                getattr(next_layer_attn.attn, "v_scale_float", None)
+                                or 1.0
+                            )
+                            epi_op = get_moe_to_attn_chip_sharded_bridge_op(
+                                tp,
+                                sharded_moe_in=sharded_in,
+                                fuse_qkv_epi=True,
+                                has_rope=next_has_rope,
+                            )
+                            if next_has_rope:
+                                return epi_op(
+                                    stream,
+                                    moe_out,
+                                    w_post_p,
+                                    s_post_p,
+                                    post_ff_gain,
+                                    pf_alpha_arg,
+                                    pf_beta_arg,
+                                    next_in_gain,
+                                    next_layer_attn._buffers["_w7_wqkv_w8k"],
+                                    next_layer_attn._buffers["_w7_sqkv"],
+                                    next_layer_attn._buffers["_w7_wgate_w8k"],
+                                    next_layer_attn._buffers["_w7_sgate"],
+                                    cos_sin_step,
+                                    float(self.post_feedforward_layernorm.eps),
+                                    bool(self.post_feedforward_layernorm.scale_input),
+                                    float(next_input_layernorm.eps),
+                                    bool(next_input_layernorm.scale_input),
+                                    float(next_layer_attn.norm_eps),
+                                    float(next_layer_attn.query_scale),
+                                    k_sc,
+                                    v_sc,
+                                )
+                            return epi_op(
+                                stream,
+                                moe_out,
+                                w_post_p,
+                                s_post_p,
+                                post_ff_gain,
+                                pf_alpha_arg,
+                                pf_beta_arg,
+                                next_in_gain,
+                                next_layer_attn._buffers["_w7_wqkv_w8k"],
+                                next_layer_attn._buffers["_w7_sqkv"],
+                                next_layer_attn._buffers["_w7_wgate_w8k"],
+                                next_layer_attn._buffers["_w7_sgate"],
+                                float(self.post_feedforward_layernorm.eps),
+                                bool(self.post_feedforward_layernorm.scale_input),
+                                float(next_input_layernorm.eps),
+                                bool(next_input_layernorm.scale_input),
+                                float(next_layer_attn.norm_eps),
+                                float(next_layer_attn.query_scale),
+                                k_sc,
+                                v_sc,
+                            )
+                        return get_moe_to_attn_chip_sharded_bridge_op(
+                            tp, sharded_moe_in=sharded_in, fuse_qkv_epi=False
+                        )(
+                            stream,
+                            moe_out,
+                            w_post_p,
+                            s_post_p,
+                            post_ff_gain,
+                            pf_alpha_arg,
+                            pf_beta_arg,
+                            next_in_gain,
+                            next_layer_attn._buffers["_w7_wqkv_w8k"],
+                            next_layer_attn._buffers["_w7_sqkv"],
+                            next_layer_attn._buffers["_w7_wgate_w8k"],
+                            next_layer_attn._buffers["_w7_sgate"],
+                            float(self.post_feedforward_layernorm.eps),
+                            bool(self.post_feedforward_layernorm.scale_input),
+                            float(next_input_layernorm.eps),
+                            bool(next_input_layernorm.scale_input),
+                        )
+                    if final_layernorm is not None:
+                        fin_gain = final_layernorm.gain()
+                        assert fin_gain is not None
+                        hid_f = get_moe_post_chip_sharded_final_norm_op(
+                            tp, sharded_moe_in=sharded_in, return_stream_too=False
+                        )(
+                            stream,
+                            moe_out,
+                            w_post_p,
+                            s_post_p,
+                            post_ff_gain,
+                            pf_alpha_arg,
+                            pf_beta_arg,
+                            fin_gain,
+                            float(self.post_feedforward_layernorm.eps),
+                            bool(self.post_feedforward_layernorm.scale_input),
+                            float(final_layernorm.eps),
+                            bool(final_layernorm.scale_input),
+                        )
+                        return (hid_f,)
+                    assert next_input_layernorm is not None
+                    next_in_gain = next_input_layernorm.gain()
+                    assert next_in_gain is not None
+                    return get_moe_post_chip_sharded_final_norm_op(
+                        tp, sharded_moe_in=sharded_in, return_stream_too=True
+                    )(
+                        stream,
+                        moe_out,
+                        w_post_p,
+                        s_post_p,
+                        post_ff_gain,
+                        pf_alpha_arg,
+                        pf_beta_arg,
+                        next_in_gain,
+                        float(self.post_feedforward_layernorm.eps),
+                        bool(self.post_feedforward_layernorm.scale_input),
+                        float(next_input_layernorm.eps),
+                        bool(next_input_layernorm.scale_input),
+                    )
                 if tok_sharded_stream and "_w7_wpost_w8k" in self.mlp._buffers:
                     from sglang_tpu.kernels.decode_collective_bridges_w8 import (
                         get_moe_post_tok_sharded_final_norm_op,
@@ -4711,9 +4884,28 @@ class MuseSparkTextModel(nn.Module):
             and is_dec_or_verify
             and (n_tok_in == 8 or (16 <= n_tok_in <= 384 and n_tok_in % 16 == 0))
         )
+        br_max_tok = _decode_bridge_max_tokens()
+        chip_sh_tp = int(self.__dict__.get("_w9_chip_sharded_tp", 8))
+        chip_sh_batches = self.__dict__.get("_w9_chip_sharded_batches", ())
+        use_chip_sharded_relay = (
+            bool(self.__dict__.get("_w9_chip_sharded_bridges", False))
+            and bool(self.__dict__.get("_w9_all_layers_chip_sharded_ready", False))
+            and chip_sh_tp in (8, 16)
+            and self.pp_group.is_first_rank
+            and self.pp_group.is_last_rank
+            and not prefill_handles_in
+            and is_dec_or_verify
+            and isinstance(col_bridges_mode, int)
+            and col_bridges_mode == 3
+            and n_tok_in <= br_max_tok
+            and n_tok_in in chip_sh_batches
+            and (self.end_layer - 1) not in self._capture_slots_by_layer
+            and int(os.environ.get("WORLD_SIZE", str(chip_sh_tp))) == chip_sh_tp
+        )
         tok_sh_batches = self.__dict__.get("_w8_tok_sharded_batches", (64, 128))
         use_tok_sharded_relay = (
-            bool(self.__dict__.get("_w8_tok_sharded_bridges", False))
+            not use_chip_sharded_relay
+            and bool(self.__dict__.get("_w8_tok_sharded_bridges", False))
             and bool(self.__dict__.get("_w8_all_layers_tok_sharded_ready", False))
             and self.pp_group.is_first_rank
             and self.pp_group.is_last_rank
@@ -4721,14 +4913,17 @@ class MuseSparkTextModel(nn.Module):
             and is_dec_or_verify
             and isinstance(col_bridges_mode, int)
             and col_bridges_mode == 3
+            and n_tok_in <= br_max_tok
             and n_tok_in in tok_sh_batches
+            and (self.end_layer - 1) not in self._capture_slots_by_layer
         )
-        if can_pallas_embed or use_tok_sharded_relay:
+        if can_pallas_embed or use_tok_sharded_relay or use_chip_sharded_relay:
             from sglang.srt.runtime_context import get_forward
 
             if getattr(get_forward(), "sp_active", False):
                 can_pallas_embed = False
                 use_tok_sharded_relay = False
+                use_chip_sharded_relay = False
 
         carried_attn_input: Optional[torch.Tensor] = None
         if self.pp_group.is_first_rank:
@@ -4739,6 +4934,50 @@ class MuseSparkTextModel(nn.Module):
                 and prefill_handles_in
             ):
                 stream = self.prefill_kernels.embed_stream(self, input_ids)
+            elif (
+                use_chip_sharded_relay
+                and can_pallas_embed
+                and pallas_emb_tp == 8
+                and chip_sh_tp == 8
+                and n_tok_in >= 32
+            ):
+                from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                    get_decode_vocab_embed_chip_sharded_op,
+                )
+
+                l0_ln = self.layers[self.start_layer].input_layernorm
+                l0_gain = l0_ln.gain()
+                assert l0_gain is not None
+                stream, carried_attn_input = get_decode_vocab_embed_chip_sharded_op(8)(
+                    input_ids.to(torch.int32),
+                    self.embed_tokens.weight,
+                    l0_gain,
+                    float(self.config.rms_norm_eps),
+                    float(l0_ln.eps),
+                    bool(l0_ln.scale_input),
+                )
+            elif use_chip_sharded_relay:
+                from sglang_tpu.rank_local import rank_slice
+
+                if input_embeds is None:
+                    embeds = self.embed_tokens(input_ids)
+                    input_embeds = _rms_normalize(embeds, self.config.rms_norm_eps).to(
+                        embeds.dtype
+                    )
+                full_stream = input_embeds.float()
+                carried_attn_input = (
+                    self.layers[self.start_layer]
+                    .input_layernorm(full_stream)
+                    .to(torch.bfloat16)
+                )
+                n_chips_tp = chip_sh_tp // 2
+                stream = rank_slice(
+                    full_stream,
+                    0,
+                    n_chips_tp,
+                    get_parallel().tp_rank // 2,
+                    rank_stride=2,
+                ).contiguous()
             elif use_tok_sharded_relay and can_pallas_embed and pallas_emb_tp == 8:
                 from sglang_tpu.kernels.decode_collective_bridges_w8 import (
                     get_decode_vocab_embed_tok_sharded_op,
@@ -4835,7 +5074,11 @@ class MuseSparkTextModel(nn.Module):
                 )
                 - 1
             )
-        n_tok_eff = positions.shape[0] if use_tok_sharded_relay else stream.shape[0]
+        n_tok_eff = (
+            positions.shape[0]
+            if (use_tok_sharded_relay or use_chip_sharded_relay)
+            else stream.shape[0]
+        )
         use_cross_layer_norm = (
             self._decode_norm_layout in (3, 5)
             and forward_batch.forward_mode != ForwardMode.EXTEND
@@ -4939,12 +5182,18 @@ class MuseSparkTextModel(nn.Module):
                             layer_idx + 1
                         ].self_attn
                     elif (
-                        (fuse_final_ln or use_tok_sharded_relay)
+                        (
+                            fuse_final_ln
+                            or use_tok_sharded_relay
+                            or use_chip_sharded_relay
+                        )
                         and self.pp_group.is_last_rank
                         and layer_idx not in self._capture_slots_by_layer
                     ):
                         relay_kw["final_layernorm"] = self.norm
-                    if use_tok_sharded_relay:
+                    if use_chip_sharded_relay:
+                        relay_kw["chip_sharded_stream"] = True
+                    elif use_tok_sharded_relay:
                         relay_kw["tok_sharded_stream"] = True
                 layer_out = self.layers[layer_idx](
                     positions,
@@ -4988,7 +5237,16 @@ class MuseSparkTextModel(nn.Module):
             if slots is not None:
                 # Drafts read the operator dtype, not the fp32 residual.
                 snap = stream.to(torch.bfloat16)
-                if use_tok_sharded_relay:
+                if use_chip_sharded_relay:
+                    ag_snap = tensor_model_parallel_all_gather(
+                        snap.contiguous(), dim=0
+                    )
+                    snap = (
+                        ag_snap.view(chip_sh_tp // 2, 2, -1, snap.shape[-1])[:, 0]
+                        .reshape(n_tok_eff, snap.shape[-1])
+                        .contiguous()
+                    )
+                elif use_tok_sharded_relay:
                     snap = tensor_model_parallel_all_gather(snap.contiguous(), dim=0)
                 for slot in slots:
                     captured_by_slot[slot] = snap
@@ -5507,8 +5765,12 @@ class MuseSparkForConditionalGeneration(nn.Module):
 
         router_bf16 = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_ROUTER_BF16", False))
         free_bf16 = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_FREE_BF16", False))
-        tok_sharded = bool(
-            _env_get("SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES", False)
+        chip_sharded = bool(
+            _env_get("SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES", False)
+        )
+        tok_sharded = (
+            bool(_env_get("SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES", False))
+            and not chip_sharded
         )
         bridge_qkv_epi = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI", False))
         fuse_final_norm = bool(
@@ -5516,12 +5778,18 @@ class MuseSparkForConditionalGeneration(nn.Module):
         )
         pallas_embed = bool(_env_get("SGLANG_TPU_MUSE_DECODE_PALLAS_EMBED", False))
 
+        from sglang_tpu.fused_rs_sequence_parallel import (
+            get_fused_moe_sequence_parallel_plan,
+        )
+
+        sp_moe_active = any(get_fused_moe_sequence_parallel_plan())
         do_b1 = mode in (1, 3, 4, 5, 6)
         do_b2 = mode in (2, 3, 4, 5, 6)
         do_qkvg = mode in (2, 3, 5)
         pk = self.model.prefill_kernels
         tp_seen = 0
-        all_tok_sh_ready = mode == 3 and tok_sharded
+        all_tok_sh_ready = mode == 3 and tok_sharded and not sp_moe_active
+        all_chip_sh_ready = mode == 3 and chip_sharded and not sp_moe_active
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.model.layers[layer_idx]
             can_free = free_bf16 and (pk is None or (pk.start <= layer_idx < pk.end))
@@ -5536,9 +5804,11 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     router_bf16=router_bf16,
                     free_bf16=can_free,
                     tok_sharded=tok_sharded,
+                    chip_sharded=chip_sharded,
                 )
             want_ret_sh = bool(
                 tok_sharded
+                or chip_sharded
                 or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_RETURN_SHARDED", False)
                 or os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_RETURN_SHARDED", "")
                 in ("1", "true", "True")
@@ -5557,6 +5827,19 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 has_sh = layer.mlp.__dict__.get("_fused_decode_sharded_op") is not None
                 if not (has_pair_w and has_sh):
                     all_tok_sh_ready = False
+            if all_chip_sh_ready:
+                has_b1_b2_w = (
+                    layer.self_attn._o_proj_w8k is not None
+                    and "_w8_wpre_pair_w8k" in layer.mlp._buffers
+                    and "_w7_wrouter_km" in layer.mlp._buffers
+                    and "_w7_wpost_w8k" in layer.mlp._buffers
+                )
+                has_qkvg_w = layer_idx == self.start_layer or (
+                    "_w7_wqkv_w8k" in layer.self_attn._buffers
+                    and "_w7_wgate_w8k" in layer.self_attn._buffers
+                )
+                if not (has_b1_b2_w and has_qkvg_w):
+                    all_chip_sh_ready = False
             op = getattr(layer.self_attn, "o_proj", None)
             if op is not None and tp_seen == 0:
                 tp_seen = int(getattr(op, "tp_size", 0))
@@ -5599,9 +5882,20 @@ class MuseSparkForConditionalGeneration(nn.Module):
 
         # Eagerly register all custom ops BEFORE torch.compile traces forward() (#1025/#1098/#1454).
         warm_tp = tp_seen if tp_seen in SUPPORTED_WORLD_SIZES else emb_tp
+        if all_chip_sh_ready and (
+            not dist_ok
+            or warm_tp not in SUPPORTED_WORLD_SIZES
+            or torch.distributed.get_world_size() != warm_tp
+        ):
+            all_chip_sh_ready = False
+        # On TP=8, B=32 (r_pair=8) keeps the faster 50.0 us/L W7+W8 path (vs 52.7 us/L 3D bf16 pack),
+        # while B>=64 (r_pair>=16) wins by -3.45 us/L (-0.21 ms/step) on Ghostfish silicon.
+        chip_sh_batches = (64, 128, 256, 384) if warm_tp in SUPPORTED_WORLD_SIZES else ()
         prewarm_ok = warm_tp in SUPPORTED_WORLD_SIZES and dist_ok
         if prewarm_ok:
-            if tok_sharded and all_tok_sh_ready:
+            if (tok_sharded and all_tok_sh_ready) or (
+                chip_sharded and all_chip_sh_ready
+            ):
                 from sglang_tpu.rank_local import _slice_op
 
                 _slice_op(None)
@@ -5614,6 +5908,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 mode,
                 bf16_router=router_bf16,
                 tok_sharded=tok_sharded and all_tok_sh_ready,
+                chip_sharded=chip_sharded and all_chip_sh_ready,
                 bridge_qkv_epi=bridge_qkv_epi,
                 fuse_final_norm=fuse_final_norm,
                 pallas_embed=can_pallas_emb,
@@ -5638,7 +5933,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     overlap_b2_epi=(do_qkvg and ovl_b2),
                 )
 
-        # Gate all Wave-8 runtime dispatch flags on prewarm_ok so forward() can NEVER
+        # Gate all Wave-8 / Wave-9 runtime dispatch flags on prewarm_ok so forward() can NEVER
         # trigger lazy cpu_export_jax_op inside torch.compile (#1454).
         qkv_epi_ready = prewarm_ok and bridge_qkv_epi
         for layer_idx in range(self.start_layer, self.end_layer):
@@ -5652,6 +5947,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.model._w8_all_layers_tok_sharded_ready = prewarm_ok and all_tok_sh_ready
         self.model._w8_tok_sharded_batches = (
             tuple(sorted(tok_sh_common)) if (prewarm_ok and all_tok_sh_ready) else ()
+        )
+        self.model._w9_chip_sharded_bridges = prewarm_ok and chip_sharded
+        self.model._w9_all_layers_chip_sharded_ready = prewarm_ok and all_chip_sh_ready
+        self.model._w9_chip_sharded_batches = (
+            chip_sh_batches if (prewarm_ok and all_chip_sh_ready) else ()
+        )
+        self.model._w9_chip_sharded_tp = (
+            warm_tp if (prewarm_ok and all_chip_sh_ready) else 0
         )
         self.model._w8_pallas_embed_tp = (
             emb_tp if (prewarm_ok and can_pallas_emb) else 0

@@ -1455,6 +1455,10 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL = EnvInt(0)
     # Wave-8 token-sharded stream [B//TP, 8192] + TP_chip=2 W_pre/W_post across Bridge 1b & 2b.
     SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES = EnvBool(False)
+    # Wave-9 chip-granularity stream [B//(TP//2), 8192] across Bridge 1b, Bridge 2b, Final Norm,
+    # and Entry on BOTH TP=8 (B=32..384) and TP=16 (B=64..384), eliminating intra-chip stream
+    # split/re-gather D2D barriers and concat loops.
+    SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-8 fuse final L61 model.norm into Bridge 2a and skip dead final stream HBM store.
