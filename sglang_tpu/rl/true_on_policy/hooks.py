@@ -53,11 +53,17 @@ def true_on_policy_linear(original, self, layer, x: torch.Tensor, bias=None):
 
 
 def true_on_policy_lm_head(
-    original, self, hidden_states: torch.Tensor, lm_head, embedding_bias=None
+    original,
+    self,
+    hidden_states: torch.Tensor,
+    lm_head,
+    embedding_bias=None,
+    *,
+    out=None,
 ):
     """AROUND LogitsProcessor._compute_lm_head_rows: bf16 logits from the fixed-tile matmul."""
     if hidden_states.device.type != "tpu":
-        return original(self, hidden_states, lm_head, embedding_bias)
+        return original(self, hidden_states, lm_head, embedding_bias, out=out)
     if embedding_bias is not None or lm_head.weight.dtype != torch.bfloat16:
         raise ValueError(
             f"TPU true on-policy lm_head needs an unquantized bf16 head without bias, got "
