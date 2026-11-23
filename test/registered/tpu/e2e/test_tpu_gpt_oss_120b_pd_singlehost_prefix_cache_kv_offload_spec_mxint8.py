@@ -56,7 +56,7 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
-    from sglang.test.tpu.utils.kv_offload_probe import (
+    from sglang_tpu.testing.utils.kv_offload_probe import (
         mean_accept_length,
         plan_eviction,
         probe_prompt,
@@ -65,7 +65,7 @@ try:
         synthetic_prompt,
         validate_probe,
     )
-    from sglang.test.tpu.utils.pd_singlehost_base import (
+    from sglang_tpu.testing.utils.pd_singlehost_base import (
         PDSingleHostTestCase,
         peer_hostname,
     )
@@ -1857,7 +1857,7 @@ class TestPdSingleHostMxint8MultiTurnGptOss120bConfiguration(unittest.TestCase):
 
     @unittest.skipIf(SGLANG_IMPORT_ERROR is not None, "needs the sglang test package")
     def test_gates_build(self) -> None:
-        from sglang.test.tpu.evals.model_config import build_gates
+        from sglang_tpu.testing.evals.model_config import build_gates
 
         config = build_model_config(
             "http://prefill:30000", "http://decode:30000", env={}

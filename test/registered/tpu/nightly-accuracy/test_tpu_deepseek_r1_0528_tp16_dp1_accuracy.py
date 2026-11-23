@@ -8,7 +8,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
-from sglang.test.tpu.utils.accuracy_base import (
+from sglang_tpu.testing.utils.accuracy_base import (
     AccuracyTestCase,
     live_server_only,
 )

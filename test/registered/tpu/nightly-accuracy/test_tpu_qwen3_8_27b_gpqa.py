@@ -3,9 +3,12 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import QWEN3_8_27B, make_model_config, make_runner
-from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.evals import QWEN3_8_27B, make_model_config, make_runner
+from sglang_tpu.testing.utils.accuracy_base import (
+    AccuracyTestCase,
+    gate_server_failures,
+)
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=5700,

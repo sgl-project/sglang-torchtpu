@@ -21,13 +21,13 @@ import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import dump_metric
-from sglang.test.tpu import MUSE_SPARK
-from sglang.test.tpu.utils.kv_offload_probe import (
+from sglang_tpu.testing.evals import MUSE_SPARK
+from sglang_tpu.testing.pd_pp_spec_perf import engine_configuration_failures
+from sglang_tpu.testing.utils.kv_offload_probe import (
     generate_with_cache_report,
     kv_offload_runner,
 )
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
-from sglang_tpu.testing.pd_pp_spec_perf import engine_configuration_failures
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
     est_time=7200,

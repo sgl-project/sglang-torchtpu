@@ -6,7 +6,7 @@ import signal
 from pathlib import Path
 from typing import Any, ClassVar
 
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
 
 
 def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
@@ -90,6 +90,6 @@ class PDSingleHostTestCase(TPULauncherTestCase):
             self.assertEqual(code, 0)
             return
 
-        from sglang.test.tpu import run_model_config
+        from sglang_tpu.testing.evals import run_model_config
 
         run_model_config(self.build_model_config(), base_url=self.base_url)

@@ -11,8 +11,8 @@ import sys
 import unittest
 from typing import Any, ClassVar
 
-from sglang.test.tpu.evals.eval_support import wait_for_health
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.evals.eval_support import wait_for_health
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
@@ -124,6 +124,6 @@ class AccuracyTestCase(TPULauncherTestCase):
         super().setUpClass()
 
     def run_evaluations(self) -> None:
-        from sglang.test.tpu import run_model_config
+        from sglang_tpu.testing.evals import run_model_config
 
         run_model_config(self.build_model_config(), base_url=self.base_url)

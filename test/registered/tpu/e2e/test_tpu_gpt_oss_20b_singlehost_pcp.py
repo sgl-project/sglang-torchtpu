@@ -17,9 +17,9 @@ from urllib.parse import urlsplit
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.needle_probe import needle_runner
-from sglang.test.tpu import run_model_config
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.evals import run_model_config
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 # PCP is an attention feature; the checkpoint only has to be good enough for the
 # probe's assertions. test_tpu_qwen3_30b_a3b_singlehost_pcp.py keeps the 30B

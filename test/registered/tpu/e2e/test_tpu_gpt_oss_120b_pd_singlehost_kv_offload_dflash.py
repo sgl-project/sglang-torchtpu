@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.pd_singlehost_base import (
+from sglang_tpu.testing.utils.pd_singlehost_base import (
     PDSingleHostTestCase,
     peer_hostname,
 )

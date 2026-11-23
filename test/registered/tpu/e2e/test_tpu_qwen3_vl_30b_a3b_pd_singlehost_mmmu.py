@@ -20,7 +20,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
+from sglang_tpu.testing.utils.pd_singlehost_base import (
+    PDSingleHostTestCase,
+    peer_hostname,
+)
 
 register_tpu_ci(
     # Both engines start in parallel (the single-host cold start was ~21 min

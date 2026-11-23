@@ -51,7 +51,7 @@ predecessor here, test_tpu_perf_qwen3_30b.py, was retired with it.)
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang_tpu.testing.evals import model_config_main
 
 # One bring-up (weight load + per-shape compile, ~10 min with the single-bucket
 # compile below) plus one sweep leg. Drives the JobSet poll budget, so an

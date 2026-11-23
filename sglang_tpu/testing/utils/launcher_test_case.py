@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar
 
-from sglang.test.tpu.evals.eval_support import RecipeLauncher, wait_for_health
+from sglang_tpu.testing.evals.eval_support import RecipeLauncher, wait_for_health
 
 
 class TPULauncherTestCase(unittest.TestCase):
@@ -19,7 +19,7 @@ class TPULauncherTestCase(unittest.TestCase):
     Set health_generate_timeout to check generation after server configuration
     validation, as P/D tests do once both engines and the router are healthy.
     repo_root defaults to the editable checkout (or Bazel runfiles workspace).
-    Override it when the installed SGLang package is outside that checkout.
+    Override it when the installed sglang-tpu package is outside that checkout.
     Bazel tests depend on //python:tpu_launcher_test_support for the executable.
     """
 
@@ -29,7 +29,7 @@ class TPULauncherTestCase(unittest.TestCase):
     health_timeout: ClassVar[float] = 3600
     health_endpoint: ClassVar[str] = "/health"
     health_generate_timeout: ClassVar[float | None] = None
-    repo_root: ClassVar[Path] = Path(__file__).absolute().parents[5]
+    repo_root: ClassVar[Path] = Path(__file__).absolute().parents[3]
     cwd: ClassVar[str | None] = None
     log_path: ClassVar[str | None] = None
     keep_up: ClassVar[bool] = False

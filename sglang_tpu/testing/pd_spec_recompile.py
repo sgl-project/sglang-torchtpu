@@ -21,7 +21,7 @@ from typing import Any, ClassVar
 
 import requests
 
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 SERVING_EVENT = "at serving time"
 # The gate recipes' max_running_requests: the drain walks every live size below it.

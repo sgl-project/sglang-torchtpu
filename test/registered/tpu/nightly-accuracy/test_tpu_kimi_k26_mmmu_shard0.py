@@ -4,9 +4,9 @@ import unittest
 from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import KIMI_K26
-from sglang.test.tpu.evals.mmmu_full import run_shard
-from sglang.test.tpu.utils.accuracy_base import (
+from sglang_tpu.testing.evals import KIMI_K26
+from sglang_tpu.testing.evals.mmmu_full import run_shard
+from sglang_tpu.testing.utils.accuracy_base import (
     AccuracyTestCase,
     live_server_only,
 )

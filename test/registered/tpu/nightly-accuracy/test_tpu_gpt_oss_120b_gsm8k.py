@@ -3,11 +3,11 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import (
+from sglang_tpu.testing.evals import (
     GPT_OSS_120B,
     make_model_config,
 )
-from sglang.test.tpu.utils.accuracy_base import (
+from sglang_tpu.testing.utils.accuracy_base import (
     AccuracyTestCase,
     gate_server_failures,
 )

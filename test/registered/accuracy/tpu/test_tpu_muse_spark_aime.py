@@ -3,8 +3,8 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import MUSE_SPARK, make_model_config, make_runner
-from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
+from sglang_tpu.testing.evals import MUSE_SPARK, make_model_config, make_runner
+from sglang_tpu.testing.utils.accuracy_base import AccuracyTestCase
 
 register_tpu_ci(
     # Leave queueing time behind the other Muse quality jobs.

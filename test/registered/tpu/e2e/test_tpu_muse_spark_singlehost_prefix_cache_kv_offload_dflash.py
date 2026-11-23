@@ -3,9 +3,9 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import MUSE_SPARK, run_model_config
-from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.evals import MUSE_SPARK, run_model_config
+from sglang_tpu.testing.utils.kv_offload_probe import kv_offload_runner
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     # The external suite's 1 h per file covers it: 2,878 s in-project.

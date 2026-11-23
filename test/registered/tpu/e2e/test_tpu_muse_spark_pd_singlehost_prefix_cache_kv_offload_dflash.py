@@ -9,9 +9,9 @@ import unittest
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import MUSE_SPARK
-from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
+from sglang_tpu.testing.evals import MUSE_SPARK
+from sglang_tpu.testing.utils.kv_offload_probe import kv_offload_runner
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
     est_time=7200,

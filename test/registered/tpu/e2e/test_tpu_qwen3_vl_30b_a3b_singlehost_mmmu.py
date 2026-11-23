@@ -9,7 +9,7 @@ deepstack or expert-routing regression shows up as a score drop.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang_tpu.testing.evals import model_config_main
 
 register_tpu_ci(
     # A cold tpu7x 2x2x1 run measured ~35 min: ~21 min to ready, ~10 min of

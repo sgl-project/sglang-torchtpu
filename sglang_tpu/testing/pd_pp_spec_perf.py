@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from sglang.test.test_utils import dump_metric
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 REPO = Path(__file__).absolute().parents[2]
 BENCH = REPO / "benchmark" / "tpu"
@@ -275,7 +275,7 @@ class PDPipelineSpecConfigurationTestCase(unittest.TestCase):
             self.assertIn(EXPERIMENTAL_SPEC_ENV, plan["runtime_env_keys"])
 
     def test_perf_config_builds_its_sweep_gate(self) -> None:
-        from sglang.test.tpu.evals import model_config
+        from sglang_tpu.testing.evals import model_config
 
         self.assertTrue(model_config.build_gates(self.perf_case.build_model_config()))
 

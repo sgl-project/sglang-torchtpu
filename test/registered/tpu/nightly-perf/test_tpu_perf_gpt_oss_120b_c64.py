@@ -14,7 +14,7 @@ question than the c16 file does, so the trends would not be comparable.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang_tpu.testing.evals import model_config_main
 
 # One bring-up plus one sweep leg. Longer than the c16 file's 1800: a 64-wide
 # decode bucket compiles slower and the KV pool is 4x. Drives the JobSet poll

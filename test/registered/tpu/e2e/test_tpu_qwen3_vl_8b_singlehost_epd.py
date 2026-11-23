@@ -16,7 +16,7 @@ import urllib.request
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.evals.model_config import run_model_config
+from sglang_tpu.testing.evals.model_config import run_model_config
 
 register_tpu_ci(
     est_time=3600,

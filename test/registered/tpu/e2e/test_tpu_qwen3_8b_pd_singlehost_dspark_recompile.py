@@ -8,8 +8,8 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 from sglang_tpu.testing import pd_spec_recompile as base
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=3600,

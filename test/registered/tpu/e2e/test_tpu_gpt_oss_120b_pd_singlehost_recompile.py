@@ -17,7 +17,7 @@ from sglang.test.recompilation_gate import (
     assert_no_serving_recompilation,
     recompilation_gate_runner,
 )
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
     est_time=1800,

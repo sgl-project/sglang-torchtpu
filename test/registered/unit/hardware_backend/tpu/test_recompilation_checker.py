@@ -779,7 +779,7 @@ class TestRecompilationGateHelpers(CustomTestCase):
             )
 
     def test_model_config_builds_fail_on_recompile_gate(self):
-        from sglang.test.tpu.evals.model_config import build_gates
+        from sglang_tpu.testing.evals.model_config import build_gates
 
         gates = build_gates(
             {

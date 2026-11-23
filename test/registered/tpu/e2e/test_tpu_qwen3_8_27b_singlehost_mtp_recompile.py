@@ -13,8 +13,8 @@ from pathlib import Path
 import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=900,
