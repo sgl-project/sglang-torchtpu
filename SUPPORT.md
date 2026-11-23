@@ -38,7 +38,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | Supported |
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
-| Kimi-K3 | bf16 | 1 host (tiny config) | Experimental |
+| Kimi-K3 | bf16 | 1 host (0.40B dummy-weight test) | Experimental |
 | GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
@@ -85,7 +85,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | gpt-oss-120b | MXFP4 | 1 host tp8+ep8; 2 hosts tp16; 2P+2D | **Optimized** | Flagship. Nightly accuracy (gsm8k, gpqa, aime25, mmlu-pro), four perf configs, PD, spec decode, KV offload, resharding. |
 | Qwen3-Coder-480B-A35B | FP8 channelwise | 2 hosts tp16/ep16/dp2; 1 host; 2P+2D | **Optimized** | Flagship. Nightly gsm8k, agentic tool-call workload, PD resharding, benchmark matrix. |
 | Qwen3.5-397B-A17B (text and VL) | FP8 | 1 host | **Optimized** | GDN hybrid linear attention. Nightly MMMU-Pro and perf. |
-| GLM-5.3-Flash | FP8 | 1 host tp8 | **Supported** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. [AIME26 accuracy passed on 2026-10-27 (Taipei)](https://github.com/sgl-project/sglang-torchtpu/actions/runs/40365648339/job/121726633369); the [MTP perf suite](test/registered/perf/tpu/test_tpu_perf_glm_5_3_flash_mtp_mk.py) has no completed run in the [workflow history](https://github.com/sgl-project/sglang-torchtpu/actions/workflows/perf-test-tpu.yml) as of 2026-10-27 (Taipei). |
+| GLM-5.3-Flash | FP8 | 1 host tp8 | **Supported** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. [AIME26 accuracy passed](https://github.com/sgl-project/sglang-torchtpu/actions/runs/40365648339/job/121726633369). |
 | gpt-oss-20b | MXFP4 | 1 host | **Quickstart** | PR gate: spec decode, spec + DP attention, prefix cache + KV offload, PP smoke. Also nightly accuracy and perf. |
 | Qwen3-0.6B | bf16 | 1 chip, 1 host | **Quickstart** | PR gate runs in plugin mode: smoke, prompt logprobs, compile tracer, compile bundles. Single-host only (tp>1 OOMs). |
 | Qwen3-30B-A3B | FP8 | 1 host (PCP) | **Supported** | Nightly e2e for prefill context parallel. Multi-host smoke retired. |
@@ -98,7 +98,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | GLM-5.2 / GLM-5.3 | FP8 | 1 host tp8+ep8 | **Experimental** | DSA sparse-MLA kernels, shared with GLM-5.3-Flash. The `glm_5_3.sh` recipe was removed as an orphan in #1432. No registered test. |
 | DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. The DeepSeek-V4-Flash gsm8k/MGSM single-host test is registered, disabled pending checkpoint staging on the shared CI PVC. FP4 indexer and online compression rejected. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
-| Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a [dummy-weight compile smoke](test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_singlehost_compile.py) runs; no real checkpoint served in CI. |
+| Kimi-K3 / K3-Linear | bf16 | 1 host (0.40B dummy-weight test) | **Experimental** | A [compile smoke](test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_singlehost_compile.py) uses the 0.40B test config with dummy weights, 8 KDA heads, and 128-dimensional attention heads. It compares compiled and eager text/vision serving; no full checkpoint is served in CI. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Supported** | Text and vision. Both variants' [AIME26 and GPQA](https://github.com/sgl-project/sglang-torchtpu/actions/runs/40365648339), [MMMU-Pro](https://github.com/sgl-project/sglang-torchtpu/actions/runs/40428835481), and [perf](https://github.com/sgl-project/sglang-torchtpu/actions/runs/40292708901) jobs passed on 2026-10-26/27 (Taipei). |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
