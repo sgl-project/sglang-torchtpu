@@ -786,30 +786,6 @@ class TpuEnvs:
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Rows up to which global-layer chunk loops are hoisted per global layer (0: shared loop).
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
-    # Decode megakernel global-layer pipelined step at <= 64 attention rows per request
-    # (MKConfig.attn_interleave / attn_refill_inline): PV and QK interleaved per chunk pair;
-    # KV refill DMAs issued inside the step's compute from per-layer loops.
-    SGLANG_TPU_MUSE_MK_ATTN_INTERLEAVE = EnvBool(True)
-    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE = EnvBool(True)
-    # Global layers given an inline-refill loop copy (MKConfig.attn_refill_inline_layers);
-    # 0: all. Each copy is a whole step; all 16 slow SWA attention 4-7% against 4 copies, but
-    # SWA stays ~17% under its pre-copy time and the megakernel is faster from 256k.
-    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(0)
-    # Inline refill: each chunk pair's refill DMAs issue one pair later (MKConfig.attn_refill_next_pair).
-    SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR = EnvBool(True)
-    # Decode megakernel (v2): a request's own new rows attended before its chunk loop and merged
-    # after it (MKConfig.attn_own_rows_first). Off: SWA -1% alone, +0.05% with SWA_PREFETCH.
-    SGLANG_TPU_MUSE_MK_ATTN_OWN_ROWS_FIRST = EnvBool(False)
-    # Decode megakernel (v2): sliding-window requests use disjoint ring slots and the next
-    # request's window is issued before this request's chunk loop (MKConfig.attn_swa_prefetch).
-    SGLANG_TPU_MUSE_MK_ATTN_SWA_PREFETCH = EnvBool(True)
-    # SAL KV ring in its own page-shaped fp8 VMEM (MKConfig.kv_ring_fp8 / _swa / kv_ring_slots).
-    # SWA stays on the w13 view (no gain there); under 32 slots the refill waits (16: +1.3 us/step).
-    SGLANG_TPU_MUSE_MK_KV_RING_FP8 = EnvBool(True)
-    SGLANG_TPU_MUSE_MK_KV_RING_FP8_SWA = EnvBool(False)
-    SGLANG_TPU_MUSE_MK_KV_RING_SLOTS = EnvInt(0)
-    # TP decode megakernel without Pallas bounds checks (MKConfig.no_bounds_checks).
-    SGLANG_TPU_MUSE_MK_NO_BOUNDS_CHECKS = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

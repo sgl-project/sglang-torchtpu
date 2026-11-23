@@ -228,7 +228,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     qg = q * g
     # SWA window prefetch: request j's chunks take ring slots from (j * W) % KR, W slots apart,
     # so request j + 1's window can be in flight during request j's chunk loop
-    swa_pre = c.attn_swa_prefetch and is_global is False
+    swa_pre = is_global is False
     if swa_pre:
         W = (c.window + q + cpt_g - 3) // cpt_g + 1
         assert 2 * W <= KR_g, (W, KR_g)
@@ -452,66 +452,6 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
     # Global-layer chunks before a request's last one lie wholly in the past of every
     # verify row: chunks [0, n_clean) need only the cross-head mask.
-    def own_scores():
-        """The request's own new rows: masked scores [rows, keys] and their V rows."""
-        q8 = -(-q // 8) * 8
-        krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
-        vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
-        if c.packed_attn:
-            zrows = (
-                jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
-            )  # Mosaic has no 0-row vectors
-            kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
-            vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
-            nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
-            head_ok = True
-        else:
-            zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
-            kn = jnp.concatenate(
-                [
-                    x
-                    for h in range(hkv)
-                    for x in [krows[:, h * hd : (h + 1) * hd]]
-                    + ([zrows] if q8 > q else [])
-                ],
-                axis=0,
-            )
-            vn = jnp.concatenate(
-                [
-                    x
-                    for h in range(hkv)
-                    for x in [vrows[:, h * hd : (h + 1) * hd]]
-                    + ([zrows] if q8 > q else [])
-                ],
-                axis=0,
-            )
-            ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
-            nt = ncol % q8
-            head_ok = ncol // q8 == rowhead
-        newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
-        for t in range(q):
-            newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
-        live_new = head_ok & (newpos <= rowpos)
-        in_win = _in_window(is_global, rowpos - newpos < c.window)
-        if in_win is not None:
-            live_new = live_new & in_win
-        s_ = jax.lax.dot_general(
-            q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-        )
-        if sc != 1.0:
-            s_ = s_ * sc
-        return jnp.where(live_new, s_, NEG), vn
-
-    # own rows first: their QK -> exp -> PV latency chain does not wait for the chunk loop;
-    # merged after it in the order online() adds (carry + own)
-    own_first = c.attn_own_rows_first and c.attn_unshifted
-    if own_first:
-        with _scope("own_rows"):
-            s_own, vn_own = own_scores()
-            p_own = jnp.exp2(s_own) if c.attn_exp2 else jnp.exp(s_own)
-            ls_own = jnp.sum(p_own, axis=1, keepdims=True)
-            pv_own = pv(p_own, vn_own, False)
-
     if swa_pre:
 
         @pl.when(j + 1 < n_req_live)
@@ -1370,13 +1310,9 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     sum(accs[1:], accs[0]),
                 ), init
 
-            il = c.attn_interleave
-            inline = c.attn_refill_inline
-            # pair index whose QK issues pair u's refill; always >= u (its PV read the slots)
-            refill_at = [
-                min(u + 1, NS // 2 - 1) if c.attn_refill_next_pair else u
-                for u in range(NS // 2)
-            ]
+            # pair index whose QK issues pair u's refill: one pair later (the last keeps its
+            # own); at its own pair the DMA chain fences the next pair's loads, starving the MXU
+            refill_at = [min(u + 1, NS // 2 - 1) for u in range(NS // 2)]
 
             def pv_u(i0, par, u, ac0, ac1):
                 dpv = pv_pair(
@@ -1410,17 +1346,16 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
             def step_body(k, carry, ref=None):
                 ls0, ls1, ac0, ac1 = carry
                 i0 = NS * k
-                # interleaved: one P buffer at static offsets; pair u's P is read by its PV
-                # before its QK overwrites it, so QK(u)'s exp tail overlaps PV(u + 1)
-                par, npar = (0, 0) if il else (k % 2, (k + 1) % 2)
-                refill_here = inline and ref is not None
+                # one P buffer: pair u's P is read by its PV before its QK overwrites it, so
+                # QK(u)'s exp tail overlaps PV(u + 1)
+                par = npar = 0
                 with _scope("kv_wait"):
                     for t in range(NS):
                         wait_chunk(geo, (i0 + NS + t) % KR_g)
 
                 def refill_pair(u):
                     srcs = [w for w in range(NS // 2) if refill_at[w] == u]
-                    if not refill_here or not srcs:
+                    if ref is None or not srcs:
                         return None
 
                     def issue():
@@ -1431,20 +1366,12 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
                     return issue
 
-                if il:
-                    for u in range(NS // 2):
-                        ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
-                        # pair u's slots were read by its PV just above
-                        ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
-                else:
-                    for u in range(NS // 2):
-                        ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
-                    for u in range(NS // 2):
-                        ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
+                for u in range(NS // 2):
+                    ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
+                    # pair u's slots were read by its PV just above
+                    ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
                 if ref is None:
                     refill_global(i0 + KR_g)
-                elif not inline:
-                    refill_slots(ref, i0 + KR_g)
                 return ls0, ls1, ac0, ac1
 
             k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
@@ -1453,32 +1380,24 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 carry4 = jax.lax.fori_loop(
                     0, k_full, functools.partial(step_body, ref=KV[l]), init4
                 )
-            elif inline:
-                # inline refill needs the layer's pool without a branch: a loop per layer.
-                # Each copy is a whole step and too many slow unchanged code (SWA attention),
-                # so layers past attn_refill_inline_layers keep the tree refill
-                inl = gls[: c.attn_refill_inline_layers or len(gls)]
-
-                def leaf(x):
-                    if x in inl:
-                        return lambda r=KV[x]: (
+            else:
+                # inline refill needs the layer's pool without a branch: a loop per layer
+                carry4, k_full = branch_layers(
+                    gls,
+                    [
+                        lambda r=KV[x]: (
                             jax.lax.fori_loop(
                                 0, k_full, functools.partial(step_body, ref=r), init4
                             ),
                             k_full,
                         )
-                    return lambda: (init4, jnp.int32(0))
-
-                carry4, k_full = branch_layers(gls, [leaf(x) for x in gls])
-            elif hoist_rows is None or hoist_kv:
-                carry4, k_full = hoisted(step_body, k_full, init4)
-            else:
-                carry4, k_full = init4, 0
+                        for x in gls
+                    ],
+                )
             ls0, ls1, ac0, ac1 = jax.lax.fori_loop(k_full, n_it - 1, step_body, carry4)
             i0 = NS * (n_it - 1)
-            par = 0 if il else (n_it - 1) % 2
             for u in range(NS // 2):
-                ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
+                ac0, ac1 = pv_u(i0, 0, u, ac0, ac1)
             refill_global(i0 + KR_g)
             return (init[0], ls0 + ls1, ac0 + ac1), init
 
@@ -1609,15 +1528,53 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows
     # (h, t); packed: the projection rows as they are, heads side by side.
     with _scope("own_rows"):
-        if own_first:
-            assert carry[1].shape[1] == 1, carry[
-                1
-            ].shape  # online() sums own rows per row
-            lsum = carry[1] + ls_own
-            acc = carry[2][:, : pv_own.shape[1]] + pv_own
+        q8 = -(-q // 8) * 8
+        krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
+        vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
+        if c.packed_attn:
+            zrows = (
+                jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
+            )  # Mosaic has no 0-row vectors
+            kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
+            vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
+            nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
+            head_ok = True
         else:
-            s_m, vn = own_scores()
-            _, lsum, acc = online(carry, s_m, vn)
+            zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
+            kn = jnp.concatenate(
+                [
+                    x
+                    for h in range(hkv)
+                    for x in [krows[:, h * hd : (h + 1) * hd]]
+                    + ([zrows] if q8 > q else [])
+                ],
+                axis=0,
+            )
+            vn = jnp.concatenate(
+                [
+                    x
+                    for h in range(hkv)
+                    for x in [vrows[:, h * hd : (h + 1) * hd]]
+                    + ([zrows] if q8 > q else [])
+                ],
+                axis=0,
+            )
+            ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
+            nt = ncol % q8
+            head_ok = ncol // q8 == rowhead
+        newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
+        for t in range(q):
+            newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
+        live_new = head_ok & (newpos <= rowpos)
+        in_win = _in_window(is_global, rowpos - newpos < c.window)
+        if in_win is not None:
+            live_new = live_new & in_win
+        s_ = jax.lax.dot_general(
+            q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        if sc != 1.0:
+            s_ = s_ * sc
+        _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
         res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
         lanes = (
             (lambda h: slice(h * hd, (h + 1) * hd))

@@ -187,32 +187,6 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # (NS x [M, 128]) and 2 accumulators; 1 one row sum (tree-summed per chunk) and one
     # accumulator; 2 one row sum and 2 accumulators
     attn_carry: int = 0
-    # stack2 pipelined step (<= 64 attention rows): PV and QK interleaved per chunk pair, P
-    # single-buffered, so a pair's exp tail overlaps the next pair's PV pushes
-    attn_interleave: bool = False
-    # stack2 pipelined step: global-layer loops run per layer (no pool dispatch tree) and a
-    # pair's KV refill is issued inside the step's compute, right after its slots are read
-    attn_refill_inline: bool = False
-    # with attn_refill_inline: how many global layers (in layer order) get their own inline
-    # loop copy; 0 means all
-    attn_refill_inline_layers: int = 0
-    # unshifted attention: a request's own new rows go through QK -> exp -> PV before its chunk
-    # loop and are added after it, off the loop's critical path
-    attn_own_rows_first: bool = False
-    # sliding-window layers: each request's chunks start at its own ring offset, and the next
-    # request's window is issued before this request's chunk loop rather than after it
-    attn_swa_prefetch: bool = False
-    # inline refill: issue pair u's refill at pair u + 1 (the last pair keeps its own). Issued
-    # at its own pair the DMA chain fences the next pair's loads and the MXU starves mid-step
-    attn_refill_next_pair: bool = False
-    # SAL KV ring in its own VMEM with the pool page's fp8 shape: the page DMA needs no relayout,
-    # so it lowers to a register-strided copy without SMEM descriptors (global layers; _swa: SWA too)
-    kv_ring_fp8: bool = False
-    kv_ring_fp8_swa: bool = False
-    # chunks of that ring (0: as many as the expert w13 slots hold)
-    kv_ring_slots: int = 0
-    # TP megakernel without Pallas bounds checks (they add a checked chain to every DMA issue)
-    no_bounds_checks: bool = False
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True
@@ -300,17 +274,22 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
         )
 
     @property
-    def kv_ring_w13(self):
-        """Chunks the expert w13 slots hold (sal_kv_view)."""
-        return (
-            (self.expert_depth + 1) * (self.expert_hidden // FP4_PACK) // self.sal_words
-        )
+    def kv_ring(self):
+        if self.kv_sal:  # every chunk the expert w13 slots hold (sal_kv_view)
+            return (
+                (self.expert_depth + 1)
+                * (self.expert_hidden // FP4_PACK)
+                // self.sal_words
+            )
+        return 2 * self.kv_group
 
     @property
-    def kv_ring(self):
-        if self.kv_sal:
-            return self.kv_ring_slots or self.kv_ring_w13
-        return 2 * self.kv_group
+    def kv_ring_fp8(self) -> bool:
+        """Global-layer SAL chunks in their own page-shaped fp8 ring (DMAs need no relayout).
+
+        Needs the global geometry split from SWA; SWA stays on the w13 view (no gain there).
+        """
+        return self.kv_sal and self.swa_chunk_pages > 0
 
     @property
     def swa_kv_group(self):
@@ -386,14 +365,6 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
             == 0
         )
         assert self.sal_fp8_dot == 0 or self.kv_sal_fp8
-        assert not self.kv_ring_fp8 or self.kv_sal
-        assert not self.kv_ring_fp8_swa or self.kv_ring_fp8
-        # a traced layer flag picks no ring per layer type; the w13 view holds at most its slots
-        assert not self.kv_ring_fp8 or self.swa_chunk_pages or self.kv_ring_fp8_swa
-        assert not self.kv_ring_slots or (
-            self.kv_ring_slots <= self.kv_ring_w13
-            or (self.kv_ring_fp8 and (self.kv_ring_fp8_swa or not self.swa_chunk_pages))
-        )
         assert not self.swa_chunk_pages or (
             self.kv_sal
             and 0 < self.swa_chunk_pages < self.chunk_pages

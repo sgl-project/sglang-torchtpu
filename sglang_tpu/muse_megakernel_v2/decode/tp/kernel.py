@@ -739,7 +739,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             _dispatch(l, KV, leaf, only)
 
         def ring_fp8(geo):
-            return c.kv_ring_fp8 and (c.kv_ring_fp8_swa or geo.is_global is True)
+            return c.kv_ring_fp8 and geo.is_global is True
 
         def kv_ring_ref(geo):
             """The KV chunk ring.
@@ -749,7 +749,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             sal_words, chunk tokens] u32 in the native tiling: the page DMA relayouts
             the pool's (pk, 128) tiles, so chunk loads are whole vregs.
             """
-            if c.kv_sal and ring_fp8(geo):
+            if ring_fp8(geo):
                 # [chunk, lane tile, word, LANE]: a lane tile's word rows are contiguous
                 return (
                     S["kv_chunk"]
@@ -757,10 +757,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     .reshape(c.kv_ring, c.chunk_pages * ps // LANE, c.sal_words, LANE)
                 )
             if c.kv_sal:
-                w13 = S["w13"].reshape(c.kv_ring_w13, c.sal_words, c.chunk_pages * ps)
-                return (
-                    w13 if c.kv_ring == c.kv_ring_w13 else w13.at[pl.ds(0, c.kv_ring)]
-                )
+                return S["w13"].reshape(c.kv_ring, c.sal_words, c.chunk_pages * ps)
             return S["kv_chunk"]
 
         def ring_words(geo, slot, off=0, n=None):
@@ -1572,10 +1569,9 @@ def megakernel_call(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None
             compiler_params=pltpu.CompilerParams(
                 vmem_limit_bytes=cfg.vmem_limit_bytes,
                 collective_id=_COLLECTIVE_ID if cfg.tp > 1 else None,
-                disable_bounds_checks=(
-                    ep is not None and tpu_envs.SGLANG_TPU_EP_NO_BOUNDS.get()
-                )
-                or (ep is None and cfg.no_bounds_checks),
+                # TP: each checked DMA issue adds ~22 serial bundles (shalt.err chain)
+                disable_bounds_checks=ep is None
+                or tpu_envs.SGLANG_TPU_EP_NO_BOUNDS.get(),
             ),
             name=f"muse_{'ep_' if ep else ''}megakernel_r{cfg.rows}_q{cfg.rows_per_req}",
         )
