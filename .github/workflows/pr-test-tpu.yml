@@ -96,6 +96,7 @@ jobs:
               - 'python/sglang/multimodal_gen/test/unit/test_compile_cache_key.py'
               - 'python/sglang/multimodal_gen/test/unit/test_compile_graph_breaks.py'
               - 'python/sglang/multimodal_gen/test/unit/test_decoding_stage_parallelism.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_ltx2_guider_cfg_off.py'
               - 'python/sglang/multimodal_gen/test/unit/test_ltx2_sp_padding_mask.py'
               - 'python/sglang/multimodal_gen/test/unit/test_server_args.py'
               - 'python/sglang/multimodal_gen/test/unit/test_vae_spatial_parallel_decode.py'

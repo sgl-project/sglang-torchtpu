@@ -11,6 +11,9 @@ register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
+from sglang.multimodal_gen.test.unit.test_ltx2_guider_cfg_off import (  # noqa: F401
+    TestLtx2GuiderWithoutCfg,
+)
 from sglang.multimodal_gen.test.unit.test_ltx2_sp_padding_mask import (  # noqa: F401
     TestLtx2SplitRotaryEmb,
     TestLTX2SPPaddingMask,
