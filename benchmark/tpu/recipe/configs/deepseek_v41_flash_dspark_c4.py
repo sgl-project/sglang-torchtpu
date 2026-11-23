@@ -4,24 +4,24 @@
         --config recipe/configs/deepseek_v41_flash_dspark_c4.py
 
 deepseek_v41_flash_dspark_agentx.py (128 running requests, 16 per rank) with
-prefill_decode_interval_min_bs 8 and compile batch sizes from 2.
+three low-concurrency settings, measured together:
 
-Why: under attention DP, prefill_decode_interval 4 with min_bs 0 makes every rank
-skip prefill for 4 decode rounds after any extend on any rank; at c4 that adds
-~4 x 51 ms per 1024-token chunk. With min_bs 8, ranks with fewer than 8 running
-requests admit prefill every round (the interval stays in effect at high load).
-AgentX canonical c4, same payload, only this setting differs
-(j-912e782e-50ae-434d-b46a vs j-66eb2c72-91fb-418f-8c08): 3,761 -> 3,892
-tok/s/chip, TTFT p50 950 -> 781 ms, p90 4,654 -> 2,290 ms, TPOT p50 14.99 ->
-15.02 ms, p90 interactivity within run noise.
+- prefill_decode_interval_min_bs 8: under attention DP, the 4-round decode
+  interval after any rank's extend made every rank skip prefill (~4 x 51 ms per
+  1024-token chunk at c4). Ranks with fewer than 8 running requests now admit
+  prefill every round; the interval still applies at high load.
+- tpu_compile_bs from 1 (inherited [8, 16, 32, 64]): a rank holds at most ~2
+  requests at c4, so every verify/draft step padded to bs 8 (48 rows per rank).
+  GSM8K-1319 with bs 1 compiled and used: 0.912 (parallel 8) / 0.906 (parallel
+  128), no NaN (j-516f79b6-4fb7-4e75-9ba1).
+- chunked prefill 2048 tokens per rank (16384 global, max_prefill_tokens to
+  match; the 2048 token bucket is already compiled).
 
-tpu_compile_bs from 2 (inherited [8, 16, 32, 64]): at c4 a rank holds at most
-~2 requests, so every verify/draft step padded to bs 8 (48 rows per rank); bs 2
-runs 12. Canonical c4 on the fused-EP tree, only this setting differs
-(j-a9903e34-edd8-494f-b8dc vs j-c5f58a55-08c7-4e1f-85f4): 5,107 -> 5,389
-tok/s/chip, p90 interactivity 89.1 -> 101.2, p90 E2E 38.5 -> 33.3 s. GSM8K-1319
-(real acceptance, parallel 8 so bs 2 runs / parallel 128): 0.912 / 0.907
-(j-db72179e-f648-4514-aa10).
+AgentX canonical c4 on the fused-EP tree, only these settings vs the default
+recipe (j-20e8c9d3-e157-40e8-9a18 vs j-a9903e34-edd8-494f-b8dc): 5,107 -> 5,600
+tok/s/chip, p90 interactivity 89.1 -> 104.4, TTFT p90 1,457 -> 1,171 ms, TPOT
+p50 9.39 -> 7.84 ms; paired per-request interactivity 1.207 (95% CI
+1.195-1.215), TTFT 0.882 (0.864-0.893).
 """
 
 from copy import deepcopy
@@ -31,5 +31,11 @@ from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark_agentx import (
 )
 
 CONFIG = deepcopy(_AGENTX)
-CONFIG["server_args"]["prefill_decode_interval_min_bs"] = 8
-CONFIG["server_args"]["tpu_compile_bs"] = [2, 4, 8, 16, 32, 64]
+CONFIG["server_args"].update(
+    {
+        "prefill_decode_interval_min_bs": 8,
+        "tpu_compile_bs": [1, 2, 4, 8, 16, 32, 64],
+        "chunked_prefill_size": 16384,
+        "max_prefill_tokens": 16384,
+    }
+)
