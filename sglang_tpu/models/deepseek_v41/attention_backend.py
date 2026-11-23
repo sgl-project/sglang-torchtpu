@@ -36,16 +36,28 @@ IMPORTANT: Do NOT add ``from __future__ import annotations``; see
 """
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Sequence, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.dp_attention import set_dp_buffer_len_from_batch
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
+from sglang_tpu.models.deepseek_v41.decoder_replay import (
+    DecoderReplayPlan,
+    decoder_prompt_bounds,
+    plan_decoder_replay,
+)
 
 # The pool owns the page layout the kernels read; the backend only indexes it.
 from sglang_tpu.models.deepseek_v41.memory_pool import (
@@ -55,6 +67,7 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
     SWA_PAGE_TOKENS,
 )
 from sglang_tpu.models.deepseek_v41.request_window import (
+    WINDOW_TOKENS,
     DSV41TPURequestWindow,
     WindowPlan,
     decode_window_pages,
@@ -132,6 +145,22 @@ class LowRatioMetadata(NamedTuple):
     index_pages: torch.Tensor
 
 
+class DecoderTail(msgspec.Struct, frozen=True):
+    """Fixed TPU decoder layout, with valid rows followed by masked padding."""
+
+    token_indices: torch.Tensor
+    scatter_indices: torch.Tensor
+    positions: torch.Tensor
+    num_real_rows: torch.Tensor
+    extend_seq_lens_cpu: tuple[int, ...]
+    skip_decoder: bool
+
+    keep_full_output_layout = True
+
+    def rows(self, value: torch.Tensor) -> torch.Tensor:
+        return value.index_select(0, self.token_indices)
+
+
 # A dataclass like DSV4TPUForwardMetadata: layers set fields on it inside the
 # compiled forward, where msgspec.Struct mutation is untested.
 @dataclass
@@ -165,6 +194,9 @@ class DSV41TPUForwardMetadata:
     engram: Optional[tuple] = None
     # Request-window row moves of an extend forward (history in, window out).
     swa_window_plan: Optional[WindowPlan] = None
+    late_layer_tail: Optional[DecoderTail] = None
+    decoder_metadata: Optional["DSV41TPUForwardMetadata"] = None
+    is_decoder_tail: bool = False
 
     # Filled lazily during the forward.
     swa_meta: Optional[torch.Tensor] = None
@@ -200,6 +232,8 @@ _METADATA_INPUT_FIELDS = (
     "low_ratio",
     "engram",
     "swa_window_plan",
+    "late_layer_tail",
+    "decoder_metadata",
 )
 
 
@@ -208,6 +242,16 @@ def _register_metadata_pytree() -> None:
         from jax import tree_util
     except ModuleNotFoundError:  # CPU unit tests without JAX
         return
+    tail_tensors = ("token_indices", "scatter_indices", "positions", "num_real_rows")
+    tree_util.register_pytree_with_keys(
+        DecoderTail,
+        lambda t: (
+            tuple((tree_util.GetAttrKey(k), getattr(t, k)) for k in tail_tensors),
+            t.skip_decoder,
+        ),
+        # Direct tracing reads only tensors and the globally agreed skip decision.
+        lambda skip, children: DecoderTail(*children, (), skip),
+    )
     # Keyed by attribute: direct_compile resolves every leaf of a deferred call
     # through its key path and accepts only GetAttr / Dict / Sequence keys.
     tree_util.register_pytree_with_keys(
@@ -216,10 +260,10 @@ def _register_metadata_pytree() -> None:
             tuple(
                 (tree_util.GetAttrKey(f), getattr(m, f)) for f in _METADATA_INPUT_FIELDS
             ),
-            None,
+            m.is_decoder_tail,
         ),
-        lambda _, children: DSV41TPUForwardMetadata(
-            **dict(zip(_METADATA_INPUT_FIELDS, children))
+        lambda decoder_tail, children: DSV41TPUForwardMetadata(
+            **dict(zip(_METADATA_INPUT_FIELDS, children)), is_decoder_tail=decoder_tail
         ),
     )
 
@@ -383,6 +427,8 @@ def build_forward_metadata(
     max_context_len: int,
     low_ratios: Sequence[int],
     device: torch.device,
+    decoder_plan: Optional[DecoderReplayPlan] = None,
+    decoder_rows: int = 0,
 ) -> DSV41TPUForwardMetadata:
     """Host-side metadata from the sglang batch, moved to ``device`` once."""
     bs = int(forward_batch.batch_size)
@@ -407,6 +453,19 @@ def build_forward_metadata(
         query_start_loc=query_start_loc,
         valid=valid,
     )
+
+    if decoder_plan is not None:
+        kept = torch.tensor(decoder_plan.row_indices, dtype=torch.int64)
+        pad = decoder_rows - len(decoder_plan.row_indices)
+        positions = F.pad(positions[kept], (0, pad))
+        out_cache_loc = F.pad(out_cache_loc[kept], (0, pad))
+        token_rows = F.pad(token_rows[kept], (0, pad), value=-1)
+        token_req_pool = F.pad(token_req_pool[kept], (0, pad))
+        valid = F.pad(valid[kept], (0, pad))
+        compress_valid = F.pad(compress_valid[kept], (0, pad))
+        counts = torch.tensor(decoder_plan.lengths, dtype=torch.int64)
+        query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
+        swa_minimum = torch.maximum(swa_minimum, torch.tensor(decoder_plan.swa_floors))
 
     columns = max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
     full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
@@ -463,6 +522,7 @@ def build_forward_metadata(
         swa_window_plan=(
             None if window_plan is None else WindowPlan(*(put(t) for t in window_plan))
         ),
+        is_decoder_tail=decoder_plan is not None,
     )
 
 
@@ -475,7 +535,7 @@ _MAX_BLOCK_ROWS = 64
 
 
 def _check_supported(config) -> None:
-    from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+    from sglang.srt.runtime_context import get_parallel, get_spec
 
     parallel = get_parallel()
     for name in ("pp_size", "attn_cp_size", "attn_dcp_size", "attn_tp_size"):
@@ -497,10 +557,6 @@ def _check_supported(config) -> None:
         raise ValueError(
             f"DSpark verify of {rows} rows exceeds "
             f"the {_MAX_BLOCK_ROWS} non-causal CSA2 queries"
-        )
-    if get_exec().features.enable_decoder_swa_bounded_replay:
-        raise NotImplementedError(
-            "DeepSeek-V4.1 TPU attention has no decoder SWA bounded replay"
         )
     if set(config.compress_ratios) - {0, *LOW_RATIOS}:
         raise ValueError(
@@ -561,11 +617,16 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     # Encoder replay rows run inside the extend forward (see the module docstring).
     folds_encoder_swa_replay: bool = True
-    # The decoder SWA bounded-replay tail (the late-layer rows of each extend).
-    # TpModelWorker reads it after a folded encoder replay; there is no decoder
-    # replay here (_check_supported), so it is always None, as on the core
-    # backend with decoder replay off.
-    tail_forward_metadata = None
+    manages_late_layer_layout = True
+
+    @property
+    def tail_forward_metadata(self):
+        metadata = self.forward_metadata
+        return (
+            metadata
+            if metadata is not None and metadata.late_layer_tail is not None
+            else None
+        )
 
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__()
@@ -581,6 +642,19 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
+        from sglang.srt.runtime_context import get_exec
+
+        self.decoder_replay_enabled = (
+            get_exec().features.enable_decoder_swa_bounded_replay
+            and not model_runner.is_draft_worker
+        )
+        if self.decoder_replay_enabled and self.request_window is None:
+            raise ValueError(
+                "TPU decoder replay requires an encoder SWA request window"
+            )
+        self._decoder_prompt_bounds = None
+        self.decoder_warmup_rows = None
+        self._last_kv_source = max(config.kv_source_layer_ids, default=-1)
         # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
         self.is_dspark_draft = (
             model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
@@ -686,8 +760,19 @@ class DSV41TPUAttnBackend(AttentionBackend):
             self.init_forward_metadata(forward_batch)
         return self.forward_metadata
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self.forward_metadata = build_forward_metadata(
+    @contextmanager
+    def decoder_schedule(self, batch):
+        previous = self._decoder_prompt_bounds
+        self._decoder_prompt_bounds = decoder_prompt_bounds(
+            batch, keep_hidden=get_server_return_hidden_states_mode().is_full()
+        )
+        try:
+            yield
+        finally:
+            self._decoder_prompt_bounds = previous
+
+    def _build_metadata(self, forward_batch, **kwargs):
+        return build_forward_metadata(
             forward_batch,
             req_to_token=self.req_to_token,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
@@ -696,7 +781,154 @@ class DSV41TPUAttnBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,
+            **kwargs,
         )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        metadata = self._build_metadata(forward_batch)
+        self.forward_metadata = metadata
+        warmup_rows = self.decoder_warmup_rows
+        if not forward_batch.forward_mode.is_extend_without_speculative() or (
+            self._decoder_prompt_bounds is None and warmup_rows is None
+        ):
+            return
+
+        prefixes = tuple(forward_batch.extend_prefix_lens_cpu or ())
+        counts = tuple(forward_batch.extend_seq_lens_cpu or ())
+        bs = forward_batch.batch_size
+        if warmup_rows is None:
+            prompt_ends, whole_extend = self._decoder_prompt_bounds
+        else:
+            # Every rank compiles the same variant, including when just one rank
+            # traces it for SPMD. No host collective runs during warmup.
+            remaining = warmup_rows
+            ends = []
+            for prefix, count in zip(prefixes, counts, strict=True):
+                keep = min(remaining, count)
+                ends.append(prefix + count - keep + WINDOW_TOKENS)
+                remaining -= keep
+            prompt_ends, whole_extend = tuple(ends), (False,) * len(ends)
+        missing = bs - len(prompt_ends)
+        prefixes = prefixes[: len(prompt_ends)]
+        counts = counts[: len(prompt_ends)]
+        plan = plan_decoder_replay(
+            prefix_lengths=prefixes + (0,) * missing,
+            extend_lengths=counts + (0,) * missing,
+            prompt_ends=prompt_ends + (0,) * missing,
+            whole_extend=whole_extend + (False,) * missing,
+            window=WINDOW_TOKENS,
+        )
+        count = len(plan.row_indices)
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        max_rows = count
+        if warmup_rows is not None:
+            max_rows = warmup_rows
+        elif parallel.attn_dp_size > 1:
+            peer_max = torch.tensor(count, dtype=torch.int32, device="cpu")
+            torch.distributed.all_reduce(
+                peer_max,
+                op=torch.distributed.ReduceOp.MAX,
+                group=parallel.tp_group.cpu_group,
+            )
+            max_rows = int(peer_max)
+        encoder_rows = sum(counts)
+        encoder_bucket = forward_batch.positions.shape[0]
+        if not max_rows:
+            if envs.SGLANG_LOG_FORWARD_ITERS.get():
+                logger.info(
+                    "DSV4.1 CED encoder_rows=%d encoder_bucket=%d decoder_rows=0 decoder_bucket=0",
+                    encoder_rows,
+                    encoder_bucket,
+                )
+            empty = metadata.positions.new_empty((0,))
+            metadata.late_layer_tail = DecoderTail(
+                empty, empty, empty, empty, plan.lengths, True
+            )
+            return
+
+        # Use the primary prefill token grid and the same bucket on all peers.
+        bucketer = self.model_runner.compile_policy.t_bucketer
+        rows = min(bucketer.next_bucket(max_rows), encoder_bucket)
+        if envs.SGLANG_LOG_FORWARD_ITERS.get():
+            logger.info(
+                "DSV4.1 CED encoder_rows=%d encoder_bucket=%d decoder_rows=%d decoder_bucket=%d",
+                encoder_rows,
+                encoder_bucket,
+                count,
+                rows,
+            )
+        metadata.decoder_metadata = tail = self._build_metadata(
+            forward_batch, decoder_plan=plan, decoder_rows=rows
+        )
+        padded = rows - count
+        indices = torch.tensor(plan.row_indices, dtype=torch.int32)
+        metadata.late_layer_tail = DecoderTail(
+            F.pad(indices, (0, padded)).to(self.device, non_blocking=True),
+            F.pad(indices.to(torch.int64), (0, padded), value=encoder_bucket).to(
+                self.device, non_blocking=True
+            ),
+            tail.positions,
+            torch.tensor(count, dtype=torch.int32).to(self.device, non_blocking=True),
+            plan.lengths,
+            False,
+        )
+
+    def write_tail_source_kv(self, *, layer, x, positions, forward_batch):
+        self.forward_low_ratio_sources(
+            layer=layer,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+
+    def enter_late_layer_tail(self, forward_batch):
+        from sglang.srt.runtime_context import get_parallel
+
+        metadata = self.forward_metadata
+        tail = metadata.late_layer_tail
+        self.forward_metadata = metadata.decoder_metadata
+        fb = forward_batch
+        saved = (
+            metadata,
+            fb.global_num_tokens_cpu,
+            fb.global_num_tokens_gpu,
+            fb.global_num_tokens_padded_cpu,
+            fb.global_dp_buffer_len,
+            fb.dp_local_start_pos,
+            fb.dp_local_num_tokens,
+            fb.global_num_token_non_padded,
+            fb.num_token_non_padded,
+        )
+        fb.global_num_token_non_padded = fb.num_token_non_padded = tail.num_real_rows
+        if fb.global_num_tokens_cpu is not None:
+            rows = tail.positions.shape[0]
+            dp = get_parallel().attn_dp_size
+            fb.global_num_tokens_cpu = fb.global_num_tokens_padded_cpu = [rows] * dp
+            fb.global_num_tokens_gpu = torch.full_like(fb.global_num_tokens_gpu, rows)
+            fb.global_dp_buffer_len = rows * dp
+            fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+            set_dp_buffer_len_from_batch(fb)
+        return saved
+
+    def exit_late_layer_tail(self, saved, forward_batch):
+        fb = forward_batch
+        (
+            self.forward_metadata,
+            fb.global_num_tokens_cpu,
+            fb.global_num_tokens_gpu,
+            fb.global_num_tokens_padded_cpu,
+            fb.global_dp_buffer_len,
+            fb.dp_local_start_pos,
+            fb.dp_local_num_tokens,
+            fb.global_num_token_non_padded,
+            fb.num_token_non_padded,
+        ) = saved
+        if fb.global_num_tokens_cpu is not None:
+            set_dp_buffer_len_from_batch(fb)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -776,7 +1008,13 @@ class DSV41TPUAttnBackend(AttentionBackend):
         assert x.shape[0] == metadata.positions.shape[0], (
             f"{x.shape[0]} rows, metadata for {metadata.positions.shape[0]}"
         )
-        if run_compressor and layer.compressor is not None:
+        if (
+            run_compressor
+            and layer.compressor is not None
+            and not (
+                metadata.is_decoder_tail and layer.layer_id == self._last_kv_source
+            )
+        ):
             self._compress_and_publish(layer=layer, x=x, metadata=metadata)
         if run_indexer and layer.indexer is not None:
             self._select(layer=layer, x=x, q_lora=q_lora, metadata=metadata)

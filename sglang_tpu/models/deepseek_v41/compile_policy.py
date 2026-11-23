@@ -319,6 +319,48 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             self.is_v41 and self.model_runner.is_draft_worker
         )
 
+    def _run_one(self, **kwargs):
+        backend = kwargs.get("attn_backend") or self.model_runner.attn_backend
+        if (
+            not getattr(backend, "decoder_replay_enabled", False)
+            or not kwargs["mode"].is_extend_without_speculative()
+            or kwargs.get("profile_prefix") is not None
+        ):
+            return super()._run_one(**kwargs)
+
+        pending = []
+        total = kwargs["num_tokens"]
+        buckets = [0, *(rows for rows in self.t_bucketer.buckets if rows <= total)]
+        try:
+            for rows in buckets:
+                backend.decoder_warmup_rows = rows
+                warmup = super()._run_one(**kwargs)
+                if isinstance(warmup, PendingCall):
+                    pending.append(warmup)
+        finally:
+            backend.decoder_warmup_rows = None
+        if pending:
+
+            def wait_all():
+                for warmup in pending:
+                    warmup.wait()
+
+            return PendingCall(wait_all)
+        return None
+
+    def _direct_compile_specialization_key(
+        self, attention_metadata, input_ids, positions, forward_batch, *args, **kwargs
+    ):
+        key = super()._direct_compile_specialization_key(
+            attention_metadata, input_ids, positions, forward_batch, *args, **kwargs
+        )
+        tail = getattr(attention_metadata, "late_layer_tail", None)
+        if tail is None:
+            return key
+        # All DP peers share the same phase and tail bucket. Individual ranks'
+        # live rows and selectors travel as tensors.
+        return (*key, tail.token_indices.shape[0])
+
     def _direct_compile(self, fn):
         if self.is_v41:
             from sglang_tpu.models.deepseek_v41.direct_tracer import (

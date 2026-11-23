@@ -329,8 +329,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             full_to_swa = self._block_draft_worker.full_to_swa
             if ring_pool is not None:
                 assert not self.ships_pd_hidden, "PD does not serve a draft SWA ring"
+                backend = self.target_worker.model_runner.attn_backend
                 cache_loc_cpu = _extend_ring_rows(
-                    ring_pool=ring_pool, batch=batch, positions=positions_cpu
+                    ring_pool=ring_pool,
+                    batch=batch,
+                    positions=positions_cpu,
+                    decoder_replay=getattr(backend, "decoder_replay_enabled", False),
                 ).to(cache_loc_cpu.dtype)
             elif full_to_swa is not None and not self.ships_pd_hidden:
                 cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
@@ -585,20 +589,49 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         return None
 
 
-def _extend_ring_rows(*, ring_pool, batch: ScheduleBatch, positions: torch.Tensor):
+def _extend_ring_rows(
+    *, ring_pool, batch: ScheduleBatch, positions: torch.Tensor, decoder_replay=False
+):
     """[T] int64 draft ring rows of an extend's tokens. Restarts the ring of each
     newly placed request at its cached prefix: the replayed rows' hidden states
     never reach the draft, so the ring holds nothing below it."""
+    floors = None
+    if decoder_replay:
+        from sglang.srt.model_executor.forward_batch_info import (
+            get_server_return_hidden_states_mode,
+        )
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            decoder_prompt_bounds,
+            decoder_swa_floor,
+        )
+        from sglang_tpu.models.deepseek_v41.request_window import WINDOW_TOKENS
+
+        prompt_ends, whole = decoder_prompt_bounds(
+            batch, keep_hidden=get_server_return_hidden_states_mode().is_full()
+        )
+        floors = torch.tensor(
+            [
+                decoder_swa_floor(end, whole_extend=keep, window=WINDOW_TOKENS)
+                for end, keep in zip(prompt_ends, whole)
+            ],
+            dtype=torch.int64,
+        )
+
     if batch.encoder_swa_reset is not None:
         placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
         if placed:
-            ring_pool.set_swa_valid_from(
-                batch.req_pool_indices_cpu[placed],
-                torch.tensor([batch.prefix_lens[i] for i in placed], dtype=torch.int64),
+            valid_from = torch.tensor(
+                [batch.prefix_lens[i] for i in placed], dtype=torch.int64
             )
+            if floors is not None:
+                valid_from = torch.maximum(valid_from, floors[placed])
+            ring_pool.set_swa_valid_from(batch.req_pool_indices_cpu[placed], valid_from)
     lens = torch.tensor(batch.extend_lens, dtype=torch.int64)
     slots = torch.repeat_interleave(batch.req_pool_indices_cpu.to(torch.int64), lens)
     ends = torch.repeat_interleave(
         torch.tensor(batch.prefix_lens, dtype=torch.int64) + lens, lens
     )
-    return ring_pool.swa_ring_rows(slots=slots, positions=positions, ends=ends)
+    rows = ring_pool.swa_ring_rows(slots=slots, positions=positions, ends=ends)
+    if floors is not None:
+        rows.masked_fill_(positions < torch.repeat_interleave(floors, lens), -1)
+    return rows

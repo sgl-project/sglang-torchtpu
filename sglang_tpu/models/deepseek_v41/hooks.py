@@ -142,12 +142,20 @@ allow_tpu_dsv41_encoder_replay
   How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
        original with the module's get_platform reporting CUDA and not ROCm, the
        only two platform facts the validator reads. Since the validator also
-       turns decoder SWA bounded replay on by default on CUDA, which the TPU
-       attention backend does not serve, an unset
-       --enable-decoder-swa-bounded-replay is declared off first.
+       turns decoder SWA bounded replay on by default on CUDA, an unset
+       --enable-decoder-swa-bounded-replay is declared off first. Explicit TPU
+       decoder replay is validated against the TPU prefill and draft paths.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
   Remove when: the validator asks current_platform whether it folds encoder
        SWA replay.
+
+tpu_dsv41_decoder_schedule
+  Why: decoder replay needs the untruncated prompt end and the request's
+       output requirements. ForwardBatch contains the scheduled chunk extent.
+  How: AROUND TpModelWorker.forward_batch_generation carries the request's
+       host bounds to CSA2 metadata construction, including idle DP peers.
+  Upstream PR or issue: not filed (prompt-tail decoder replay).
+  Remove when: the scheduler carries host prompt bounds into attention planning.
 
 fold_tpu_dsv41_encoder_replay
   Why: encoder_swa_replay._fold_batch concatenates each hit's replay rows with
@@ -279,11 +287,28 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     if (
         not get_platform().is_tpu
         or validator.model_config_of(server_args).hf_config.model_type != "deepseek_v41"
-        or not cfg.enable_encoder_swa_bounded_replay
     ):
         return original(server_args)
+    if cfg.enable_decoder_swa_bounded_replay:
+        from sglang_tpu.envs import envs
+
+        if not cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError("TPU decoder replay requires encoder SWA bounded replay")
+        if cfg.disaggregation_mode != "null" or cfg.enable_multimodal is not False:
+            raise ValueError("TPU decoder replay requires monolithic text serving")
+        if not cfg.enable_torch_compile or cfg.tpu_compile_tracer != "direct":
+            raise ValueError("TPU decoder replay requires the direct TPU compiler")
+        if (
+            cfg.speculative_algorithm is not None
+            and not envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
+        ):
+            raise ValueError(
+                "TPU decoder replay with DSpark requires the TPU spec worker"
+            )
+    if not cfg.enable_encoder_swa_bounded_replay:
+        return original(server_args)
     if cfg.enable_decoder_swa_bounded_replay is None:
-        # The validator's default for CUDA; DSV41TPUAttnBackend has no decoder replay.
+        # Preserve the TPU default when running the validator as CUDA.
         declare_resolution(
             server_args,
             "tpu.allow_tpu_dsv41_encoder_replay",
@@ -292,6 +317,21 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     cuda = SimpleNamespace(is_cuda=True, is_hip=False)
     with patch.object(validator, "get_platform", lambda: cuda):
         return original(server_args)
+
+
+def tpu_dsv41_decoder_schedule(original, worker, batch, *args, **kwargs):
+    backend = worker.model_runner.attn_backend
+    if (
+        batch is not None
+        and getattr(backend, "decoder_replay_enabled", False)
+        and (
+            batch.forward_mode.is_extend_without_speculative()
+            or (batch.forward_mode.is_idle() and batch.is_extend_in_batch)
+        )
+    ):
+        with backend.decoder_schedule(batch):
+            return original(worker, batch, *args, **kwargs)
+    return original(worker, batch, *args, **kwargs)
 
 
 class _SlotsOnDevice:
@@ -795,6 +835,11 @@ def hook_specs():
         (
             "sglang.srt.arg_groups.deepseek_v4_hook.validate_deepseek_v41_features",
             allow_tpu_dsv41_encoder_replay,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation",
+            tpu_dsv41_decoder_schedule,
             HookType.AROUND,
         ),
         (
