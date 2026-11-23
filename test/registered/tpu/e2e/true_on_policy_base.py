@@ -188,6 +188,28 @@ class TrueOnPolicyTestCase(CustomTestCase):
         self.assertEqual(resp.status_code, 400, resp.text)
         self.assertIn("top_p", resp.text)
 
+    def assert_custom_logit_processor_is_refused(self):
+        from sglang.srt.sampling.custom_logit_processor import (
+            DisallowedTokensLogitsProcessor,
+        )
+
+        resp = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": PROMPTS[0],
+                "return_logprob": True,
+                "custom_logit_processor": DisallowedTokensLogitsProcessor.to_str(),
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 4,
+                    "custom_params": {"token_ids": [0]},
+                },
+            },
+            timeout=600,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("refused: a custom logit processor", resp.text)
+
 
 if __name__ == "__main__":
     # Nothing is collected here; the model files subclass TrueOnPolicyTestCase.

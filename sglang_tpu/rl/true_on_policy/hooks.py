@@ -9,7 +9,8 @@ How: AROUND the unquantized linear and the lm_head (matmul), the RMSNorm variant
      fused_conv1d_gdn (per-token recurrence), fused_moe_call (slot-order combine), fused_topk_native (a single
      row runs as two), the Qwen2-MoE shared-expert gate (matmul), Sampler.forward and
      InputLogprobProcessor.forward (log-prob kernel); AFTER batched RPA calculate_block_sizes (KV block = page)
-     and SamplingParams.verify (refuses logit transforms). Not covered: TP above 1, other attention backends,
+     and SamplingParams.verify and TokenizerManager._validate_one_request (refuse logit transforms and custom
+     logit processors). Not covered: TP above 1, other attention backends,
      quantized weights.
 Upstream PR or issue: not filed (prototype).
 Remove when: core exposes batch-invariant op seams on TPU.
@@ -20,12 +21,12 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-import jax.numpy as jnp
 import torch
 
 from sglang_tpu.envs import envs
 from sglang_tpu.rl.true_on_policy import (
     attention_kernel,
+    gated_delta_net_kernel,
     logprob_kernel,
     matmul_kernel,
     moe_kernel,
@@ -137,9 +138,13 @@ def true_on_policy_gated_rms_norm(original, self, x: torch.Tensor, z=None):
 def recurrent_gated_delta_net(original, *args, **kwargs):
     """AROUND fused_conv1d_gdn: every tile runs the per-token recurrence, as a decode step does."""
     call = inspect.signature(original).bind(*args, **kwargs)
-    a_log = call.arguments["a_log"]
-    # A trainer's forward sees A_log in bf16.
-    call.arguments["a_log"] = a_log.astype(jnp.bfloat16).astype(a_log.dtype)
+    if call.arguments.get("packed_weights") is not None:
+        # KDA's packed operand carries its own A_log and dt_bias, unrounded
+        raise ValueError(
+            "TPU true on-policy covers the gated delta net, not KDA's packed weights"
+        )
+    for name in ("a_log", "dt_bias"):
+        call.arguments[name] = gated_delta_net_kernel.bf16_rounded(call.arguments[name])
     return original(*call.args, **{**call.kwargs, "recurrent_scan": True})
 
 
@@ -284,6 +289,18 @@ def refuse_transformed_sampling(result, self, vocab_size) -> Any:
     return result
 
 
+def refuse_custom_logit_processor(result, self, obj, input_ids) -> Any:
+    """AFTER TokenizerManager._validate_one_request: a custom logit processor changes the sampled distribution,
+    which the returned log-prob does not model."""
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    if isinstance(obj, GenerateReqInput) and obj.custom_logit_processor:
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_TRUE_ON_POLICY serves plain temperature sampling; refused: a custom logit processor"
+        )
+    return result
+
+
 def pin_kv_block(result, model_cfgs, serve_cfgs, vmem_limit_bytes) -> Any:
     """AFTER batched RPA calculate_block_sizes: one KV block (the page) for decode and prefill alike."""
     attention_kernel.refuse_rpa_rounding_flags()
@@ -357,6 +374,11 @@ def hook_specs():
         (
             "sglang.srt.sampling.sampling_params.SamplingParams.verify",
             refuse_transformed_sampling,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.managers.tokenizer_manager.TokenizerManager._validate_one_request",
+            refuse_custom_logit_processor,
             HookType.AFTER,
         ),
     ]

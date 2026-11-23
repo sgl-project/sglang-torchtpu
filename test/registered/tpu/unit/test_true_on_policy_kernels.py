@@ -281,6 +281,37 @@ class TestTrueOnPolicyKernels(CustomTestCase):
         decoded = torch.cat(outs).reshape(packed.shape)
         self.assertTrue(torch.equal(decoded, packed))
 
+    def test_packed_gated_delta_net_reads_a_log_and_dt_bias_in_bf16(self):
+        # The engine serves its fp32 A_log rounded to bf16; a trainer passing the fp32 values gets the same bytes.
+        tokens = 64
+        qkv, b, a = _gdn_inputs(tokens)
+        cu = torch.tensor([0, tokens], dtype=torch.int32, device="tpu")
+        conv, a_log, dt_bias = _gdn_weights()
+        fp32 = [
+            w.float() * (1 + 1e-3 * _rnd(_GDN_NV, seed=6 + i).float())
+            for i, w in enumerate((a_log, dt_bias))
+        ]
+
+        def gdn(a_log, dt_bias):
+            args = (
+                qkv,
+                b,
+                a,
+                conv,
+                a_log,
+                dt_bias,
+                cu,
+                _GDN_NKQ,
+                _GDN_NV,
+                _GDN_D,
+                _GDN_D,
+            )
+            return self.k.packed_gated_delta_net(*args).cpu()
+
+        self.assertTrue(
+            torch.equal(gdn(*fp32), gdn(*(w.to(torch.bfloat16) for w in fp32)))
+        )
+
     def test_moe_experts_rows_do_not_depend_on_row_count(self):
         hidden, inter, experts, topk = 512, 256, 16, 4
         x = _rnd(1024, hidden)

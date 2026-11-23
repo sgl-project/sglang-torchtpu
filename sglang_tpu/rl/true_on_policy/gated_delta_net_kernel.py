@@ -12,6 +12,11 @@ from sglang_tpu.rl.true_on_policy.common import register
 GDN_PREFILL_TILE = 16
 
 
+def bf16_rounded(x: jax.Array) -> jax.Array:
+    """A_log or dt_bias as the engine serves it: rounded to bf16, kept in its dtype (Qwen3.5 holds A_log in fp32)."""
+    return x.astype(jnp.bfloat16).astype(x.dtype)
+
+
 def _jax_packed_gated_delta_net(
     qkv: jax.Array,
     b: jax.Array,
@@ -28,7 +33,8 @@ def _jax_packed_gated_delta_net(
     """Gated delta net over packed sequences, each from a zero state.
 
     qkv [T, 2 * n_kq * d_k + n_v * d_v], b and a [T, n_v] bf16; conv_weight [dim, 1, kernel], no bias;
-    cu_seqlens [n + 1] int32 sequence starts (rows past cu_seqlens[-1] are padding). Returns [T, n_v, d_v].
+    a_log and dt_bias [n_v], read as their bf16 rounding; cu_seqlens [n + 1] int32 sequence starts (rows past
+    cu_seqlens[-1] are padding). Returns [T, n_v, d_v].
     """
     from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
@@ -49,8 +55,8 @@ def _jax_packed_gated_delta_net(
             recurrent_state,
             conv_weight,
             None,
-            a_log,
-            dt_bias,
+            bf16_rounded(a_log),
+            bf16_rounded(dt_bias),
             cu_seqlens.astype(jnp.int32),
             slots,
             # No decode sequences: every sequence is a prefill.

@@ -19,6 +19,8 @@ register_tpu_ci(
 )
 class TestTpuQwen306bSinglehostTrueOnPolicy(TrueOnPolicyTestCase):
     model_path = "Qwen/Qwen3-0.6B"
+    # lets a request carry a custom logit processor, which the mode must refuse
+    model_args = ("--enable-custom-logit-processor",)
 
     def test_decode_log_probs_equal_the_prefill_rescore(self):
         self.assert_decode_equals_prefill_rescore(temperature=1.0)
@@ -28,6 +30,9 @@ class TestTpuQwen306bSinglehostTrueOnPolicy(TrueOnPolicyTestCase):
 
     def test_top_p_sampling_is_refused(self):
         self.assert_top_p_sampling_is_refused()
+
+    def test_custom_logit_processor_is_refused(self):
+        self.assert_custom_logit_processor_is_refused()
 
 
 if __name__ == "__main__":
