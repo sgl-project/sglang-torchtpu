@@ -768,7 +768,7 @@ def calculate_block_sizes(
 
 
 # ---------------------------------------------------------------------------
-# Block sizes of the PCP ring / fused-PCP kernels (google3 cl/985434096).
+# Block sizes of the PCP ring / fused-PCP kernels (ported from google3).
 #
 # `calculate_block_sizes` above is SGLang's search and serves every other
 # kernel, including the DCP ones. The classes below are google3's calculators
@@ -1869,7 +1869,7 @@ def ragged_paged_attention(
 
 
 # ---------------------------------------------------------------------------
-# PCP ring attention (google3 cl/985434096): the fused kernel's wrapper.
+# PCP ring attention (ported from google3): the fused kernel's wrapper.
 # ---------------------------------------------------------------------------
 
 

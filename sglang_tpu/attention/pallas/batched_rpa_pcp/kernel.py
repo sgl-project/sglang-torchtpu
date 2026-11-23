@@ -1341,7 +1341,7 @@ def rpa_kernel(
 
 # ----------------------------------------------------------------------------
 # Fused PCP kernel: ring cache phase + new-token phase in one pallas_call
-# (google3 cl/985434096).
+# (ported from google3).
 # ----------------------------------------------------------------------------
 
 

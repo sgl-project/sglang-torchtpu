@@ -146,7 +146,7 @@ def num_lane_folds_in_head_dim(
 ) -> int:
     """Number of lane folds of a K/V head when head_dim is on the lane dim.
 
-    Folding (google3 cl/1018717699) stores an fp8 HEAD_ALONG_SUBLANE head wider
+    Folding (as in google3) stores an fp8 HEAD_ALONG_SUBLANE head wider
     than a lane tile as several 128-lane chunks instead of one padded row. It
     changes the cache layout, and SGLang's token-major pool is shared with code
     that assumes the unfolded rows (the rpa_v3 kernel, the context-parallel KV
@@ -252,7 +252,7 @@ class ServingConfigs:
     skip_kv_write: bool = False
     # Lane-folded fp8 HEAD_ALONG_SUBLANE cache; see `num_lane_folds_in_head_dim`.
     lane_fold_kv_head_dim: bool = False
-    # PCP ring attention (google3 cl/985434096); all off outside the ring /
+    # PCP ring attention (ported from google3); all off outside the ring /
     # fused-PCP kernels.
     # Mesh axis the KV window rotates around (`scheduler_cp.RingAttention`), and
     # the names of every axis of the enclosing `shard_map` mesh, in mesh order
@@ -397,8 +397,8 @@ def is_sfs(tpu_info) -> bool:
 # bkv=2048 at batch_size=4 is 281.2 us and bkv=4096 at 1 is 316.1 us, so the
 # surface has cliffs. Revisit the cap and prefill batch_size together, on
 # multi-sequence prefill and the other models, before moving either; and
-# re-measure when the per-block cost of the kernel changes (b/503493392
-# softmax work).
+# re-measure when the per-block cost of the kernel changes (softmax
+# work).
 SFS_PREFILL_MAX_BQ_SZ = 512
 SFS_PREFILL_MAX_BKV_SZ_8BIT = 1024
 SFS_PREFILL_MAX_BKV_SZ_16BIT = 512
@@ -716,7 +716,7 @@ class RpaConfigs:
         """Whether the KV buffered ref issues the new-K/V fetch / writeback DMAs.
 
         The ring's cache phase has no new K/V and skips them (google3
-        cl/985434096 skips them for every CACHE_ONLY kernel; the other
+        skips them for every CACHE_ONLY kernel; the other
         cache-only kernels here keep issuing their zero-size DMAs, as before).
         """
         return self.serve.has_new_kv or not self.ring_enabled

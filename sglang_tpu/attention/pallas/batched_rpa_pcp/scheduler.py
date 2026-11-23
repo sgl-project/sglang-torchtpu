@@ -55,7 +55,7 @@ class BaseScheduler:
     def get_cp_group_size(self) -> int | None:
         return None
 
-    # PCP ring hooks (google3 cl/985434096); no-ops outside `RingCacheScheduler`.
+    # PCP ring hooks (ported from google3); no-ops outside `RingCacheScheduler`.
     def get_collective_id(self) -> int | None:
         """Pallas collective id of the kernel, for schedulers whose kernel
         synchronizes with other devices."""

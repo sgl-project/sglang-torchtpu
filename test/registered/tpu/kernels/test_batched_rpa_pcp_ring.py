@@ -3,7 +3,7 @@
 (experimental ``sglang_tpu.attention.pallas.batched_rpa_pcp`` package).
 
 Ported from google3 ``correctness_test_cp.RaggedPagedAttentionPCPTest``
-(cl/985434096) and adapted to SGLang's batched RPA conventions (page size 256,
+and adapted to SGLang's batched RPA conventions (page size 256,
 SGLang ``distribution`` order, ``update_kv_cache=False`` by default with a
 companion per-rank stripe write, plus parity checks for ``update_kv_cache=True``
 with ``new_kv_write_rows``).

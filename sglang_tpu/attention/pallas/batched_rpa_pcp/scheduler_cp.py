@@ -80,7 +80,7 @@ class StripedCacheScheduler(CPScheduler):
 
 
 # ---------------------------------------------------------------------------
-# PCP ring attention (google3 cl/985434096).
+# PCP ring attention (ported from google3).
 # ---------------------------------------------------------------------------
 
 
@@ -503,7 +503,7 @@ class StripedNewTokensScheduler(CPScheduler):
     its `q_len` rows of keys/values, and each new K block is written back by
     the first Q block that attends it.
 
-    Paged new K/V (prefill context parallelism, google3 cl/985434096):
+    Paged new K/V (prefill context parallelism, ported from google3):
     `extra_scalars = (cp_rank, new_kv_page_indices[, new_kv_write_rows])`. A
     sequence's `kv_new_len` new tokens are read through its row of
     `new_kv_page_indices` (page `j` of the new tokens is page

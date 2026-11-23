@@ -22,11 +22,11 @@ imports it; every other path, including ring-mode decode and short extends
 (the DCP `STRIPED` path), uses the production kernel in
 `sglang_tpu.attention.pallas.batched_rpa`.
 
-This is a self-contained copy of `batched_rpa` synced to google3's
-`experimental/users/alynie/batched_rpa/kernel` at cl/1018717699 (the tree's
+This is a self-contained copy of `batched_rpa` synced to the google3 batched
+RPA kernel (the tree's
 file split and names, `pipeline`, `scheduler`, `scheduler_cp`, ..., are kept),
 with SGLang behaviour re-applied, plus the fused PCP ring kernel ported from
-google3 cl/985434096 (`scheduler_cp` ring schedulers, a step-time model for the
+google3 (`scheduler_cp` ring schedulers, a step-time model for the
 cache-phase tile, the new-token start-mask skip and a memoized host schedule
 check). Keeping it separate lets the ring kernel evolve without changing the
 production kernel; once the production package is synced to google3 the two
