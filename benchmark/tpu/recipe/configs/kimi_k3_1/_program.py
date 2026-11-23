@@ -130,6 +130,9 @@ DECODE_SETTINGS = (
     "ring_draft_lm_prefetch=true",
     "draft_rope_bf16=true",
     "ring_draft_first_step=true",
+    # The prefill's MoE as one fused kernel on the EP8 experts it shares with
+    # the decode.
+    "prefill_fused_moe_ep8=true",
 )
 # The TensorCore's highest DVFS clock (p-state 7): the MXU, vector and scalar
 # work runs faster; the interconnect is unchanged.

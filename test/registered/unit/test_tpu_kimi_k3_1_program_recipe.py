@@ -133,6 +133,7 @@ class TestKimiK31ColocatedProgramRecipe(unittest.TestCase):
                 "ring_draft_first_step",
             },
         )
+        self.assertEqual(settings["prefill_fused_moe_ep8"], "true")
         self.assertLessEqual(set(settings), set(KernelConfig.__dataclass_fields__))
         # The FP8 weights are opt-in, and K3_PROGRAM_KERNEL_EXTRA comes last.
         for name in FP8_WEIGHTS:

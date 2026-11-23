@@ -8,8 +8,8 @@ Every setting is ``kimi_k3/colocated_program.py``'s, sized for concurrency 1
 by default, with Kimi-K3.1-Pro's model, DSpark draft at a pinned revision
 (the released Inferact/Kimi-K3.1-Pro-DSpark unless K3_PROGRAM_K31_DRAFT=preview)
 and pre-shard (``_program.apply``) and the colocated AgentX settings
-(``_program.colocated_defaults``): the decode's and the ring draft's kernel
-settings, expert parallelism 8 for both programs, host-side bookkeeping,
+(``_program.colocated_defaults``): the decode's, the ring draft's and the
+prefill MoE's kernel settings, expert parallelism 8 for both programs, host-side bookkeeping,
 first-step drafts, a 150-round prefill wait, the TensorCore's highest clock,
 Prometheus metrics and no reasoning or tool-call parser. The decode verifies
 its drafts unless K3_PROGRAM_SIMULATE_ACC_LENGTHS asks for simulated acceptance
