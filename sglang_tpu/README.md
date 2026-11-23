@@ -276,9 +276,10 @@ zero launches.
 
 `multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
 `sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
-whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
-selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
-built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
+whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu_oot`
+names it explicitly. Core has no built-in TPU diffusion platform.
+`TpuOOTPlatform` is a `PlatformEnum.OOT` platform that keeps `is_tpu()` true and
+adds:
 
 - `--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT` backend.
 - torch.compile with the `tpu` backend and static shapes; compile-cache tags for
@@ -292,11 +293,9 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   the Ulysses output all-to-all exchanges heads-major outputs in head slabs.
 - `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its
   default under ring; an automatic selection may give it to any layer that takes
-  `torch_sdpa`. The built-in platform has no ring-capable backend.
+  `torch_sdpa`.
 - Subgroup collectives need every rank (`supports_rank_subset_collectives`), so
-  LTX-2's two-stage refinement runs on every CFG rank. The built-in platform
-  (`SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`) keeps the default and still hangs
-  with CFG-parallel and Ulysses on the two-stage pipeline.
+  LTX-2's two-stage refinement runs on every CFG rank.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
   the debt header: `rope.py` (RoPE without stride-2 lane access) and
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
@@ -305,18 +304,14 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 
-Gates that take the OOT arm, with the same outcome as the built-in platform:
+Gates that take the OOT arm:
 
 - `CustomOp` dispatch: the dispatch key is `tpu`, so ops reach `forward_tpu`
   where they define it and `forward_native` otherwise.
 - `get_torch_library_dispatch_key()`: `PrivateUse1` instead of `CUDA`; its only
   caller registers the CUDA flash-attention op, which TPU never selects.
 - `get_all_to_all_communicator_cls()`: answered explicitly with the base
-  communicator the built-in platform uses.
-
-Gates whose OOT arm differs from the built-in platform:
-
-- `build_torch_compile_kwargs()`: the OOT arm compiles with `get_compile_backend()`
-  (`tpu`) and drops the mode; the built-in arm passes the mode to the default
-  backend (inductor). Worker init turns off dynamo's automatic dynamic shapes,
+  communicator.
+- `build_torch_compile_kwargs()`: compiles with `get_compile_backend()` (`tpu`)
+  and drops the mode. Worker init turns off dynamo's automatic dynamic shapes,
   as `dynamic=False` would.
