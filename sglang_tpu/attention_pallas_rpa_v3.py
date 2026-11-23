@@ -88,6 +88,24 @@ def _pool_kv_pack_dense2(pool) -> bool:
     return flags.pop()
 
 
+def _pool_is_tp16_sq_64(pool) -> bool:
+    """True when the fused pool holds 1 local KV head of dim 64 (Muse TP=16)."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    pools = (
+        (pool.full_kv_pool, pool.swa_kv_pool)
+        if isinstance(pool, SWAKVPool)
+        else (pool,)
+    )
+    return all(
+        isinstance(p, TpuFusedMHATokenToKVPool)
+        and getattr(p, "head_num", 0) == 1
+        and getattr(p, "head_dim", 0) == 64
+        for p in pools
+    )
+
+
 def _invoke_v3_kernel(
     jax_rpa,
     *,
@@ -229,24 +247,87 @@ def _invoke_v3_kernel(
         if queries is None
         else (queries.shape[1] if is_prepared else queries.shape[0])
     )
-    # stationary_q requires actual_num_kv_heads == 1 and num_q_heads_per_kv_head == 16;
-    # avoid forcing its large m_block_sizes (e.g. bq4096/bkv8192) onto TP16 fallback.
-    is_sq_head_shape = False
+    w7_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS", None)
+    w7_prefill_toks = (
+        {
+            t.strip()
+            for t in w7_prefill_env.get().lower().replace(",", " ").split()
+            if t.strip()
+        }
+        if w7_prefill_env is not None and w7_prefill_env.get().strip()
+        else set()
+    )
+    lc_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS", None)
+    lc_prefill_toks = (
+        {
+            t.strip()
+            for t in lc_prefill_env.get().lower().replace(",", " ").split()
+            if t.strip()
+        }
+        if lc_prefill_env is not None and lc_prefill_env.get().strip()
+        else set()
+    )
+    raw_all_toks = w7_prefill_toks | lc_prefill_toks
+    w9_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_W9", None)
+    use_w9_preset = ("w9" in raw_all_toks) or bool(
+        w9_prefill_env is not None and w9_prefill_env.get()
+    )
+    tp16_sq_env = getattr(envs, "SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q", None)
+    a1_rpa_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT", None)
+    allow_tp16_sq = (
+        use_w9_preset
+        or ("tp16_sq" in raw_all_toks)
+        or bool(tp16_sq_env is not None and tp16_sq_env.get())
+        or bool(is_prepared and a1_rpa_env is not None and a1_rpa_env.get())
+    )
+    # stationary_q supports TP8 (16 Q / 2 packed KV) and opt-in TP16 (8 Q / 1 KV, d=64),
+    # plus legacy TP16_NATIVE_PREFILL block-size routing when explicitly requested.
+    is_tp8_sq_shape = False
+    is_tp16_sq_shape = False
+    is_tp16_legacy_native = False
     if queries is not None:
         if is_prepared:
-            is_sq_head_shape = (
+            is_tp8_sq_shape = (
                 queries.ndim == 5
                 and queries.shape[0] == 1
                 and (queries.shape[2] * queries.shape[3]) == 16
             )
+            is_tp16_sq_shape = (
+                queries.ndim == 5
+                and queries.shape[0] == 1
+                and (queries.shape[2] * queries.shape[3]) == 8
+                and queries.shape[4] == 128
+            )
         else:
-            is_sq_head_shape = (
-                queries.ndim == 3
-                and keys is not None
-                and keys.ndim == 3
+            q_ndim = len(queries.shape)
+            k_ndim = len(keys.shape) if keys is not None else 0
+            is_tp8_sq_shape = (
+                q_ndim == 3
+                and k_ndim == 3
                 and keys.shape[1] == 1
                 and queries.shape[1] == 16
             )
+            is_tp16_sq_shape = (
+                q_ndim == 3
+                and k_ndim == 3
+                and keys.shape[1] == 1
+                and queries.shape[1] == 8
+                and queries.shape[2] == 64
+            )
+            is_tp16_legacy_native = (
+                not allow_tp16_sq
+                and envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()
+                and prefill_mode == "m0_ring_fuse"
+                and q_ndim == 3
+                and queries.shape[1:] == (8, 64)
+                and k_ndim == 3
+                and keys.shape[1:] == (1, 64)
+            )
+    is_sq_head_shape = (
+        is_tp8_sq_shape
+        or (allow_tp16_sq and is_tp16_sq_shape)
+        or is_tp16_legacy_native
+    )
     use_stationary_q_prefill = (
         not skip_mixed
         and prefill_mode in _STATIONARY_Q_MODES
@@ -267,29 +348,6 @@ def _invoke_v3_kernel(
             if (sq_blocks_env is not None and sq_blocks_sw_env is not None)
             else None
         )
-        w7_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS", None)
-        w7_prefill_toks = (
-            {
-                t.strip()
-                for t in w7_prefill_env.get().lower().replace(",", " ").split()
-                if t.strip()
-            }
-            if w7_prefill_env is not None and w7_prefill_env.get().strip()
-            else set()
-        )
-        lc_prefill_env = getattr(envs, "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS", None)
-        lc_prefill_toks = (
-            {
-                t.strip()
-                for t in lc_prefill_env.get().lower().replace(",", " ").split()
-                if t.strip()
-            }
-            if lc_prefill_env is not None and lc_prefill_env.get().strip()
-            else set()
-        )
-        all_prefill_toks = w7_prefill_toks | lc_prefill_toks
-        use_w8_preset = "w8" in all_prefill_toks
-        use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset
         per_seq_kv_capacity = 0
         if (
             page_indices is not None
@@ -301,10 +359,31 @@ def _invoke_v3_kernel(
             per_seq_kv_capacity = pages_per_seq * logical_page_size
         is_lc_full = (
             sliding_window is None
+            and not is_tp16_legacy_native
             and prefill_mode in _STATIONARY_Q_M0_MODES
             and per_seq_kv_capacity > 32768
         )
+        # Keep LC_OPTS scoped to Full-Attn >32K (unless explicitly prefixed with sw_ or w7/w8/w9)
+        # so LC mrb1/vreg_acc1 never bleed onto SWA layers.
+        scoped_lc_toks = (
+            lc_prefill_toks
+            if is_lc_full
+            else {
+                t
+                for t in lc_prefill_toks
+                if t.startswith("sw_") or t in ("w7", "w8", "w9", "tp16_sq")
+            }
+        )
+        all_prefill_toks = w7_prefill_toks | scoped_lc_toks
+        use_w8_preset = ("w8" in all_prefill_toks) or use_w9_preset
+        use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset
+        eff_lc_toks = set(lc_prefill_toks)
+        if use_w9_preset and is_lc_full and not (
+            eff_lc_toks & {"bq1024", "bq2048", "bq4096", "bq8192"}
+        ):
+            eff_lc_toks.update(("bq4096", "bkv8192", "s2", "prefix_fast", "staged_qo"))
         if stationary_q_blocks:
+            bq_sz = stationary_q_blocks[0]
             extra["m_block_sizes"] = stationary_q_blocks
         else:
             if prefill_mode in _STATIONARY_Q_V2_MODES:
@@ -324,28 +403,28 @@ def _invoke_v3_kernel(
             else:
                 bq_sz = 512 if num_q_tokens >= 512 else 256
             if is_lc_full:
-                if "bq8192" in lc_prefill_toks and num_q_tokens >= 8192:
+                if "bq8192" in eff_lc_toks and num_q_tokens >= 8192:
                     bq_sz = 8192
                 elif (
-                    "bq4096" in lc_prefill_toks or "bq8192" in lc_prefill_toks
+                    "bq4096" in eff_lc_toks or "bq8192" in eff_lc_toks
                 ) and num_q_tokens >= 4096:
                     bq_sz = 4096
                 elif (
-                    "bq2048" in lc_prefill_toks
-                    or "bq4096" in lc_prefill_toks
-                    or "bq8192" in lc_prefill_toks
+                    "bq2048" in eff_lc_toks
+                    or "bq4096" in eff_lc_toks
+                    or "bq8192" in eff_lc_toks
                 ) and num_q_tokens >= 2048:
                     bq_sz = 2048
                 elif (
-                    "bq1024" in lc_prefill_toks
-                    or "bq2048" in lc_prefill_toks
-                    or "bq4096" in lc_prefill_toks
-                    or "bq8192" in lc_prefill_toks
+                    "bq1024" in eff_lc_toks
+                    or "bq2048" in eff_lc_toks
+                    or "bq4096" in eff_lc_toks
+                    or "bq8192" in eff_lc_toks
                 ) and num_q_tokens >= 1024:
                     bq_sz = 1024
             bkv_sz = (
                 8192
-                if (is_lc_full and "bkv8192" in lc_prefill_toks and num_q_tokens >= 512)
+                if (is_lc_full and "bkv8192" in eff_lc_toks and num_q_tokens >= 512)
                 else (
                     4096
                     if (
@@ -370,19 +449,27 @@ def _invoke_v3_kernel(
             "skip_empty_cdma",
             "mixed_s3",
         }
-        if is_lc_full and "s2" in lc_prefill_toks:
+        if allow_tp16_sq and is_tp16_sq_shape:
+            prefill_opts.add("tp16_sq")
+        if is_lc_full and "s2" in eff_lc_toks:
             prefill_opts.discard("mixed_s3")
-        if is_lc_full and "prefix_fast" in lc_prefill_toks:
+        if is_lc_full and "prefix_fast" in eff_lc_toks:
             prefill_opts.add("prefix_fast")
         if is_lc_full and (
-            "staged_qo" in lc_prefill_toks
-            or (bq_sz >= 4096 and "nostaged_qo" not in lc_prefill_toks)
+            "staged_qo" in eff_lc_toks
+            or (bq_sz >= 4096 and "nostaged_qo" not in eff_lc_toks)
         ):
             prefill_opts.add("staged_qo")
         if use_w7_preset and sliding_window is not None:
             prefill_opts.update(("fp8_qk", "mrb3"))
         if use_w8_preset and sliding_window is not None:
             prefill_opts.update(("vreg_acc", "sw_short_fuse"))
+        if use_w9_preset:
+            prefill_opts.add("fp8_qk")
+            if "nomk128" not in raw_all_toks:
+                prefill_opts.add("mk128")
+            if sliding_window is None and not is_lc_full and "noprefix_fast" not in raw_all_toks:
+                prefill_opts.add("prefix_fast")
         for w7_opt in (
             "fp8_kv",
             "fp8_qk",
@@ -397,6 +484,8 @@ def _invoke_v3_kernel(
             "gqa4_vreg",
             "vreg_acc",
             "vreg_acc1",
+            "mk128",
+            "tp16_sq",
             "sw_short_fuse",
             "tq_unroll",
             "mrb1",
@@ -411,7 +500,8 @@ def _invoke_v3_kernel(
             if sliding_window is None and f"full_{w7_opt}" in all_prefill_toks:
                 prefill_opts.add(w7_opt)
         if (
-            envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()
+            not (allow_tp16_sq and is_tp16_sq_shape)
+            and envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()
             and prefill_mode == "m0_ring_fuse"
             and not stationary_q_blocks
             and skip_decode
@@ -782,6 +872,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             and prefill_mode in _STATIONARY_Q_MODES
             and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
         )
+        is_tp16_sq_pool = _pool_is_tp16_sq_64(self.token_to_kv_pool)
         self._prepared_op = (
             _build_pallas_kernel_op(
                 _prepared_a3_layout_spec(pack)
@@ -796,7 +887,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
                 )
             )
             if (a1_rpa_layout_env is not None and a1_rpa_layout_env.get())
-            and pack > 1
+            and (pack > 1 or is_tp16_sq_pool)
             and self._dcp == 1
             else None
         )
@@ -889,10 +980,13 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         if chunk_meta is not None:
             if is_swa and md.swa_page_indices is not None:
                 group = self._swa_layer_groups.get(layer.layer_id, 0)
+                swa_grp = getattr(md, "swa_group_pages", None)
+                if swa_grp is None:
+                    swa_grp = md.swa_group_page_indices
                 page_indices = (
                     md.swa_page_indices
-                    if group == 0 or md.swa_group_page_indices is None
-                    else md.swa_group_page_indices[group - 1]
+                    if group == 0 or swa_grp is None
+                    else swa_grp[group - 1]
                 )
             else:
                 page_indices = md.page_indices
@@ -941,10 +1035,13 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         if chunk_meta is not None:
             if is_swa and md.swa_page_indices is not None:
                 group = self._swa_layer_groups.get(layer.layer_id, 0)
+                swa_grp = getattr(md, "swa_group_pages", None)
+                if swa_grp is None:
+                    swa_grp = md.swa_group_page_indices
                 page_indices = (
                     md.swa_page_indices
-                    if group == 0 or md.swa_group_page_indices is None
-                    else md.swa_group_page_indices[group - 1]
+                    if group == 0 or swa_grp is None
+                    else swa_grp[group - 1]
                 )
             else:
                 page_indices = md.page_indices

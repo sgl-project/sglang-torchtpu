@@ -1038,6 +1038,10 @@ class TpuEnvs:
     # Native Muse TP16 8k prefill tiles for the m0_ring_fuse recipe.
     SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL = EnvBool(False)
     SGLANG_TPU_RPA_V3_TP16_LONG_PREFILL_TILES = EnvBool(False)
+    # Wave-9 zero-spill M_k=128 Stationary-Q v2 prefill preset (TP8 + TP16).
+    SGLANG_TPU_RPA_V3_PREFILL_W9 = EnvBool(False)
+    # Native Muse TP16 (8 Q / 1 KV head, d=64) Stationary-Q v2 prefill engine.
+    SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q = EnvBool(False)
     # Stationary-Q Dual-MXU prefill engine for packed-KV RPA v3 (16 Q heads on 1
     # 128-wide fp8 KV head): "" = off (stock kernel), "m0" = zero-shift exp2(qk)
     # with full-block unrolling on full-attention layers, "pilot" = scale-invariant

@@ -379,6 +379,10 @@ def _stationary_q_v2_process(
     precomputed bf16 mask bias tiles, SW-2049 Q-unpack/epilogue fusion, direct 2D A3
     carry-buffer output, and optional f32 exp2 / Wave-7 FP8 QK(PV) & GQA VREG batching."""
     tq_sz = 256
+    sq_kv_heads = k_sub_ref.shape[0]
+    sq_pairs = 4 * sq_kv_heads
+    sq_q_heads = 8 * sq_kv_heads
+    use_mk128 = k_sub_ref.shape[2] == 128
     use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
     use_fp8_qk_dyn = "fp8_qk_dyn" in prefill_opts
     use_fp8_qkpv_fast = "fp8_qkpv_fast" in prefill_opts
@@ -409,13 +413,18 @@ def _stationary_q_v2_process(
         or use_fp8_qkpv
         or ("fp8_kv" in prefill_opts)
     )
-    use_gqa4_vreg = "gqa4_vreg" in prefill_opts
-    use_gqa2_vreg = ("gqa2_vreg" in prefill_opts) and not use_gqa4_vreg
-    use_vreg_acc1 = ("vreg_acc1" in prefill_opts) and not (
-        use_gqa2_vreg or use_gqa4_vreg
+    use_gqa4_vreg = ("gqa4_vreg" in prefill_opts) and not use_mk128
+    use_gqa2_vreg = (
+        ("gqa2_vreg" in prefill_opts) and not use_gqa4_vreg and not use_mk128
+    )
+    use_vreg_acc1 = (
+        ("vreg_acc1" in prefill_opts)
+        and not use_mk128
+        and not (use_gqa2_vreg or use_gqa4_vreg)
     )
     use_vreg_acc = (
         ("vreg_acc" in prefill_opts)
+        and not use_mk128
         and not use_vreg_acc1
         and not (use_gqa2_vreg or use_gqa4_vreg)
     )
@@ -444,10 +453,13 @@ def _stationary_q_v2_process(
         and bq_sz % tq_sz == 0
     )
     num_s = bkv_sz // 256
-    ring_total_slices = k_sub_ref.shape[1]
+    ring_total_slices = (
+        (k_sub_ref.shape[1] // 2) if use_mk128 else k_sub_ref.shape[1]
+    )
     ring_bkv_blocks = ring_total_slices // num_s
     ring_covers_all = ring_bkv_blocks > 1
     ring_s_mask = ring_total_slices - 1
+    ring_h_mask = 2 * ring_total_slices - 1
 
     s_scale = sm_scale * (k_scale if k_scale is not None else 1.0)
     exp_scale = float(s_scale * math.log2(math.e))
@@ -456,6 +468,28 @@ def _stationary_q_v2_process(
 
     @pl.when(seq_idx == start_seq_idx)
     def _init_static_mask_tiles():
+        if use_mk128:
+            q_io_h = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 2)
+            k_128 = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 1)
+            k_io_0 = (2 * k_128) if kv_pack_dense2 else k_128
+            k_io_1 = (2 * k_128 + 1) if kv_pack_dense2 else (k_128 + 128)
+            if mask_lt_ref is not None:
+                mask_lt_ref[0:1] = jnp.where(
+                    q_io_h >= k_io_0, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+                )
+                mask_lt_ref[1:2] = jnp.where(
+                    q_io_h >= k_io_1, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+                )
+            if mask_ut_ref is not None:
+                ut0_c = (q_io_h < k_io_0) if sliding_window == 2048 else (q_io_h <= k_io_0)
+                ut1_c = (q_io_h < k_io_1) if sliding_window == 2048 else (q_io_h <= k_io_1)
+                mask_ut_ref[0:1] = jnp.where(
+                    ut0_c, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+                )
+                mask_ut_ref[1:2] = jnp.where(
+                    ut1_c, jnp.bfloat16(0.0), jnp.bfloat16(-jnp.inf)
+                )
+            return
         q_io = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 2)
         k_raw = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 1)
         k_io = (
@@ -499,14 +533,15 @@ def _stationary_q_v2_process(
         return vp
 
     def _psum_w(p, w_cols: int):
-        p_sum16 = jnp.sum(
-            p.reshape(1, 16, 16, w_cols),
+        m_rows = p.shape[1]
+        p_sum_sub = jnp.sum(
+            p.reshape(1, m_rows // 8, 8, w_cols),
             axis=1,
             dtype=jnp.bfloat16,
         )
         return jnp.broadcast_to(
             jnp.sum(
-                p_sum16,
+                p_sum_sub,
                 axis=1,
                 keepdims=True,
                 dtype=jnp.float32,
@@ -539,6 +574,7 @@ def _stationary_q_v2_process(
 
     def _sm_eval_w(qk_f32, bias_spec, w_cols: int, q_exp_256=None):
         n_rep = w_cols // 256
+        m_rows = qk_f32.shape[1]
         if use_f32_exp:
             qk_sc = (
                 qk_f32 * q_exp_256
@@ -547,13 +583,29 @@ def _stationary_q_v2_process(
             )
             if use_fp8_qkpv:
                 qk_sc = qk_sc - jnp.float32(qkpv_shift)
-            if bias_spec == "ut":
-                m_u = mask_ut_ref[...].astype(jnp.float32)
+            if bias_spec in ("ut", "ut0", "ut1"):
+                m_u = (
+                    mask_ut_ref[0:1]
+                    if bias_spec == "ut0"
+                    else (
+                        mask_ut_ref[1:2]
+                        if bias_spec == "ut1"
+                        else mask_ut_ref[...]
+                    )
+                ).astype(jnp.float32)
                 qk_sc = qk_sc + (
                     m_u if n_rep == 1 else jnp.concatenate([m_u] * n_rep, axis=2)
                 )
-            elif bias_spec == "lt":
-                m_l = mask_lt_ref[...].astype(jnp.float32)
+            elif bias_spec in ("lt", "lt0", "lt1"):
+                m_l = (
+                    mask_lt_ref[0:1]
+                    if bias_spec == "lt0"
+                    else (
+                        mask_lt_ref[1:2]
+                        if bias_spec == "lt1"
+                        else mask_lt_ref[...]
+                    )
+                ).astype(jnp.float32)
                 qk_sc = qk_sc + (
                     m_l if n_rep == 1 else jnp.concatenate([m_l] * n_rep, axis=2)
                 )
@@ -565,21 +617,21 @@ def _stationary_q_v2_process(
                 )
                 qk_sc = jnp.where(bs, qk_sc, -jnp.inf)
             if use_fp8_qkpv_dyn:
-                m16 = jnp.max(qk_sc.reshape(1, 16, 16, w_cols), axis=1)
-                m_col = jnp.max(m16, axis=1, keepdims=True)
+                m_sub = jnp.max(qk_sc.reshape(1, m_rows // 8, 8, w_cols), axis=1)
+                m_col = jnp.max(m_sub, axis=1, keepdims=True)
                 # Clamp -inf/extreme negative slices >= -110 so m_bias >= -118.75 avoids f32 FTZ.
                 m_safe = jnp.maximum(m_col, jnp.float32(-110.0))
                 m_bias = m_safe - jnp.float32(8.75)
                 p_f32 = jnp.exp2(qk_sc - m_bias)
                 p_f8 = jnp.minimum(p_f32, jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
                 p_scale_8 = jnp.broadcast_to(jnp.exp2(m_bias), (1, 8, w_cols))
-                p_sum16 = jnp.sum(
-                    p_f8.astype(jnp.float32).reshape(1, 16, 16, w_cols),
+                p_sum_sub = jnp.sum(
+                    p_f8.astype(jnp.float32).reshape(1, m_rows // 8, 8, w_cols),
                     axis=1,
                     dtype=jnp.float32,
                 )
                 ps_unscaled = jnp.broadcast_to(
-                    jnp.sum(p_sum16, axis=1, keepdims=True, dtype=jnp.float32),
+                    jnp.sum(p_sum_sub, axis=1, keepdims=True, dtype=jnp.float32),
                     (1, 8, w_cols),
                 )
                 return p_f8, ps_unscaled * p_scale_8, p_scale_8
@@ -589,11 +641,13 @@ def _stationary_q_v2_process(
                 p_for_sum = (
                     p_f8.astype(jnp.float32) if use_fp8_qkpv_norm else p_f32
                 )
-                p_sum16 = jnp.sum(
-                    p_for_sum.reshape(1, 16, 16, w_cols), axis=1, dtype=jnp.float32
+                p_sum_sub = jnp.sum(
+                    p_for_sum.reshape(1, m_rows // 8, 8, w_cols),
+                    axis=1,
+                    dtype=jnp.float32,
                 )
                 ps = jnp.broadcast_to(
-                    jnp.sum(p_sum16, axis=1, keepdims=True, dtype=jnp.float32),
+                    jnp.sum(p_sum_sub, axis=1, keepdims=True, dtype=jnp.float32),
                     (1, 8, w_cols),
                 )
                 return p_f8, ps, None
@@ -603,13 +657,29 @@ def _stationary_q_v2_process(
                 qk = (qk_f32 - jnp.float32(qkpv_shift)).astype(jnp.bfloat16)
             else:
                 qk = qk_f32.astype(jnp.bfloat16)
-            if bias_spec == "ut":
-                m_u = mask_ut_ref[...]
+            if bias_spec in ("ut", "ut0", "ut1"):
+                m_u = (
+                    mask_ut_ref[0:1]
+                    if bias_spec == "ut0"
+                    else (
+                        mask_ut_ref[1:2]
+                        if bias_spec == "ut1"
+                        else mask_ut_ref[...]
+                    )
+                )
                 qk = qk + (
                     m_u if n_rep == 1 else jnp.concatenate([m_u] * n_rep, axis=2)
                 )
-            elif bias_spec == "lt":
-                m_l = mask_lt_ref[...]
+            elif bias_spec in ("lt", "lt0", "lt1"):
+                m_l = (
+                    mask_lt_ref[0:1]
+                    if bias_spec == "lt0"
+                    else (
+                        mask_lt_ref[1:2]
+                        if bias_spec == "lt1"
+                        else mask_lt_ref[...]
+                    )
+                )
                 qk = qk + (
                     m_l if n_rep == 1 else jnp.concatenate([m_l] * n_rep, axis=2)
                 )
@@ -621,8 +691,8 @@ def _stationary_q_v2_process(
                 )
                 qk = jnp.where(bs, qk, -jnp.inf)
             if use_fp8_qkpv_fast:
-                m16 = jnp.max(qk.reshape(1, 16, 16, w_cols), axis=1)
-                m_col = jnp.max(m16, axis=1, keepdims=True)
+                m_sub = jnp.max(qk.reshape(1, m_rows // 8, 8, w_cols), axis=1)
+                m_col = jnp.max(m_sub, axis=1, keepdims=True)
                 m_safe = jnp.maximum(m_col, jnp.bfloat16(-110.0))
                 m_bias = m_safe - jnp.bfloat16(8.75)
                 p_bf = jnp.exp2(qk - m_bias)
@@ -646,23 +716,29 @@ def _stationary_q_v2_process(
 
     def _write_unpacked_kv_slice(dst_s, kv_u32):
         if use_fp8_kv:
-            kv_u32_hi = pltpu.roll(kv_u32, shift=64, axis=1)
             k_sub_ref[0, dst_s] = pltpu.bitcast(kv_u32.astype(jnp.uint8), kv_dtype)
-            k_sub_ref[1, dst_s] = pltpu.bitcast(kv_u32_hi.astype(jnp.uint8), kv_dtype)
+            if sq_kv_heads > 1:
+                kv_u32_hi = pltpu.roll(kv_u32, shift=64, axis=1)
+                k_sub_ref[1, dst_s] = pltpu.bitcast(
+                    kv_u32_hi.astype(jnp.uint8), kv_dtype
+                )
         else:
             k_b = pltpu.bitcast(kv_u32.astype(jnp.uint8), kv_dtype).astype(jnp.bfloat16)
             k_sub_ref[0, dst_s] = k_b
-            k_sub_ref[1, dst_s] = pltpu.roll(k_b, shift=64, axis=1)
+            if sq_kv_heads > 1:
+                k_sub_ref[1, dst_s] = pltpu.roll(k_b, shift=64, axis=1)
         v_bf16 = pltpu.bitcast(
             (kv_u32 >> jnp.uint32(8)).astype(jnp.uint8), kv_dtype
         ).astype(jnp.bfloat16)
         vt_128 = jnp.swapaxes(v_bf16, 0, 1)
         if use_vt_fp8:
             vt_sub_ref[0, dst_s] = vt_128[:64, :].astype(kv_dtype)
-            vt_sub_ref[1, dst_s] = vt_128[64:, :].astype(kv_dtype)
+            if sq_kv_heads > 1:
+                vt_sub_ref[1, dst_s] = vt_128[64:, :].astype(kv_dtype)
         else:
             vt_sub_ref[0, dst_s] = vt_128[:64, :]
-            vt_sub_ref[1, dst_s] = vt_128[64:, :]
+            if sq_kv_heads > 1:
+                vt_sub_ref[1, dst_s] = vt_128[64:, :]
 
     def _unpack_full_bkv_block(bkv_sem_idx, slot_base_s=0):
         if kv_pack_dense2:
@@ -671,7 +747,26 @@ def _stationary_q_v2_process(
                 .at[bkv_sem_idx]
                 .reshape((bkv_sz // 2) * bkv_stride, 128)
             )
-            for s_loc in range(num_s):
+            if use_mk128:
+
+                @pl.loop(0, num_s, unroll=False)
+                def _up_mk_d2(s_loc):
+                    pair_u32 = kv_u32_all[
+                        pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
+                    ]
+                    _write_unpacked_kv_slice(
+                        2 * (slot_base_s + s_loc),
+                        pair_u32 & jnp.uint32(0xFFFF),
+                    )
+                    _write_unpacked_kv_slice(
+                        2 * (slot_base_s + s_loc) + 1,
+                        pair_u32 >> jnp.uint32(16),
+                    )
+
+                return
+
+            @pl.loop(0, num_s, unroll=False)
+            def _up_256_d2(s_loc):
                 pair_u32 = kv_u32_all[
                     pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
                 ]
@@ -683,6 +778,7 @@ def _stationary_q_v2_process(
                     axis=0,
                 )
                 _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+
             return
 
         kv_u32_all = (
@@ -690,7 +786,19 @@ def _stationary_q_v2_process(
             .at[bkv_sem_idx]
             .reshape(bkv_sz * bkv_stride, 128)
         )
-        for s_loc in range(num_s):
+        if use_mk128:
+
+            @pl.loop(0, 2 * num_s, unroll=False)
+            def _up_mk_nod2(h_loc):
+                kv_u32_h = kv_u32_all[
+                    pl.ds(h_loc * 128 * bkv_stride, 128, bkv_stride)
+                ]
+                _write_unpacked_kv_slice(2 * slot_base_s + h_loc, kv_u32_h)
+
+            return
+
+        @pl.loop(0, num_s, unroll=False)
+        def _up_256_nod2(s_loc):
             kv_u32 = kv_u32_all[pl.ds(s_loc * 256 * bkv_stride, 256, bkv_stride)]
             _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
 
@@ -728,8 +836,16 @@ def _stationary_q_v2_process(
                         pair_u32 >> jnp.uint32(16),
                         jnp.uint32(0),
                     )
-                    kv_u32 = jnp.concatenate([lo_u32, hi_u32], axis=0)
-                    _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
+                    if use_mk128:
+                        _write_unpacked_kv_slice(
+                            2 * (slot_base_s + s_loc), lo_u32
+                        )
+                        _write_unpacked_kv_slice(
+                            2 * (slot_base_s + s_loc) + 1, hi_u32
+                        )
+                    else:
+                        kv_u32 = jnp.concatenate([lo_u32, hi_u32], axis=0)
+                        _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
 
             return
 
@@ -745,6 +861,24 @@ def _stationary_q_v2_process(
 
         @pl.when(valid_keys < bkv_sz)
         def _up_partial():
+            if use_mk128:
+                h_lim = cdiv(valid_keys, 128)
+
+                @pl.loop(0, h_lim, unroll=False)
+                def _up_one_mk(h_loc):
+                    bkv_start = h_loc * 128
+                    kv_u32_h = kv_u32_all[
+                        pl.ds(bkv_start * bkv_stride, 128, bkv_stride)
+                    ]
+                    k_pos = bkv_start + lax.broadcasted_iota(
+                        jnp.int32, (128, 128), 0
+                    )
+                    kv_u32_h = jnp.where(
+                        k_pos < valid_keys, kv_u32_h, jnp.uint32(0)
+                    )
+                    _write_unpacked_kv_slice(2 * slot_base_s + h_loc, kv_u32_h)
+
+                return
             s_lim = cdiv(valid_keys, 256)
 
             @pl.loop(0, s_lim, unroll=False)
@@ -846,24 +980,38 @@ def _stationary_q_v2_process(
 
             @pl.when(valid_tq == tq_sz)
             def _up_tq_full():
-                for s in range(8):
-                    u_s = q_u32_ref[pl.ds(src_tq_start * 8 + s, tq_sz, 8)]
-                    pair_q_t = _decode_q_pair(u_s, s, lane_is_lo)
-                    _store_qt_pair(pair_q_t, s, t_sl)
+                for kv_h_u in range(sq_kv_heads):
+
+                    @pl.loop(0, 4, unroll=False)
+                    def _up_gp_full(gp_u, kv_h_u=kv_h_u):
+                        s = kv_h_u * 4 + gp_u
+                        u_s = q_u32_ref[
+                            pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                        ]
+                        pair_q_t = _decode_q_pair(u_s, kv_h_u * 4, lane_is_lo)
+                        _store_qt_pair(pair_q_t, s, t_sl)
 
             @pl.when(jnp.logical_and(valid_tq > 0, valid_tq < tq_sz))
             def _up_tq_partial():
                 q_row_io = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 0)
                 row_ok = q_row_io < valid_tq
-                for s in range(8):
-                    u_s = q_u32_ref[pl.ds(src_tq_start * 8 + s, tq_sz, 8)]
-                    u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
-                    pair_q_t = _decode_q_pair(u_s, s, lane_is_lo)
-                    _store_qt_pair(pair_q_t, s, t_sl)
+                for kv_h_u in range(sq_kv_heads):
+
+                    @pl.loop(0, 4, unroll=False)
+                    def _up_gp_part(gp_u, kv_h_u=kv_h_u):
+                        s = kv_h_u * 4 + gp_u
+                        u_s = q_u32_ref[
+                            pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                        ]
+                        u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
+                        pair_q_t = _decode_q_pair(u_s, kv_h_u * 4, lane_is_lo)
+                        _store_qt_pair(pair_q_t, s, t_sl)
 
         def unpack_bq_to_qt_v2(sem_q):
             q_u32_ref = (
-                bq_x2_ref.bitcast(jnp.uint32).at[sem_q, 0].reshape(bq_sz * 8, 128)
+                bq_x2_ref.bitcast(jnp.uint32)
+                .at[sem_q, 0]
+                .reshape(bq_sz * sq_pairs, 128)
             )
             is_lo = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1) < 64
             for tq_idx in range(bq_sz // tq_sz):
@@ -915,20 +1063,169 @@ def _stationary_q_v2_process(
                         q_u32_stage = (
                             bq_x2_ref.bitcast(jnp.uint32)
                             .at[st_slot, 0]
-                            .reshape(tq_sz * 8, 128)
+                            .reshape(tq_sz * sq_pairs, 128)
                         )
                         _unpack_one_tq_qt_from_ref(
                             q_u32_stage, 0, st_q_start, st_sz, is_lo
                         )
 
+        def _expand_mk128_specs(bias_specs):
+            out_sp = []
+            for bs in bias_specs:
+                if bs == "none":
+                    out_sp.extend(("none", "none"))
+                elif bs == "lt":
+                    out_sp.extend(("lt0", "lt1"))
+                elif bs == "ut":
+                    out_sp.extend(("ut0", "ut1"))
+                elif isinstance(bs, tuple):
+                    out_sp.extend(bs)
+                else:
+                    out_sp.extend((bs[:, :128, :], bs[:, 128:, :]))
+            return tuple(out_sp)
+
+        def _eval_mk128_head(kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs):
+            n_h = 2 * n_slices
+            z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
+            z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
+
+            def _h_ring(h_idx):
+                return (h_idx & ring_h_mask) if ring_covers_all else h_idx
+
+            if bias_specs == ("none",) * n_slices and n_h >= 4:
+                h_r0 = _h_ring(h_base)
+                ks_0 = k_sub_ref[kv_h, h_r0][:, :64][None, :, :]
+                qk_0 = _kq_dot(ks_0, qt_1)
+                p_0, ps_0, psc_0 = _sm_eval(qk_0, "none", qsc_1)
+
+                def _pipe_step(h_off, carry):
+                    acc_c, l_c, p_prev, psc_prev = carry
+                    h_cur = _h_ring(h_base + h_off)
+                    h_prev = _h_ring(h_base + h_off - 1)
+                    ks_cur = k_sub_ref[kv_h, h_cur][:, :64][None, :, :]
+                    qk_cur = _kq_dot(ks_cur, qt_1)
+                    vts_prev = vt_sub_ref[kv_h : kv_h + 1, h_prev]
+                    acc_nxt = acc_c + _vp_scaled(vts_prev, p_prev, psc_prev)
+                    p_cur, ps_cur, psc_cur = _sm_eval(qk_cur, "none", qsc_1)
+                    return acc_nxt, l_c + ps_cur, p_cur, psc_cur
+
+                acc_f, l_f, p_last, psc_last = lax.fori_loop(
+                    1, n_h, _pipe_step, (z_acc, ps_0, p_0, psc_0)
+                )
+                h_rlast = _h_ring(h_base + n_h - 1)
+                vts_last = vt_sub_ref[kv_h : kv_h + 1, h_rlast]
+                return acc_f + _vp_scaled(vts_last, p_last, psc_last), l_f
+
+            if (
+                n_slices == 9
+                and bias_specs == ("ut",) + ("none",) * 7 + ("lt",)
+            ):
+                h_r0 = _h_ring(h_base)
+                qk_0 = _kq_dot(k_sub_ref[kv_h, h_r0][:, :64][None, :, :], qt_1)
+                p_prev, l_cur, psc_prev = _sm_eval(qk_0, "ut0", qsc_1)
+                h_r1 = _h_ring(h_base + 1)
+                qk_1 = _kq_dot(k_sub_ref[kv_h, h_r1][:, :64][None, :, :], qt_1)
+                acc_cur = z_acc + _vp_scaled(
+                    vt_sub_ref[kv_h : kv_h + 1, h_r0], p_prev, psc_prev
+                )
+                p_prev, ps_1, psc_prev = _sm_eval(qk_1, "ut1", qsc_1)
+                l_cur = l_cur + ps_1
+
+                def _sw_mid(h_off, carry):
+                    acc_c, l_c, p_p, psc_p = carry
+                    h_cur = _h_ring(h_base + h_off)
+                    h_prv = _h_ring(h_base + h_off - 1)
+                    qk_c = _kq_dot(
+                        k_sub_ref[kv_h, h_cur][:, :64][None, :, :], qt_1
+                    )
+                    acc_n = acc_c + _vp_scaled(
+                        vt_sub_ref[kv_h : kv_h + 1, h_prv], p_p, psc_p
+                    )
+                    p_c, ps_c, psc_c = _sm_eval(qk_c, "none", qsc_1)
+                    return acc_n, l_c + ps_c, p_c, psc_c
+
+                acc_cur, l_cur, p_prev, psc_prev = lax.fori_loop(
+                    2, 16, _sw_mid, (acc_cur, l_cur, p_prev, psc_prev)
+                )
+                for h_tail, b_tail in ((16, "lt0"), (17, "lt1")):
+                    h_ct = _h_ring(h_base + h_tail)
+                    h_pt = _h_ring(h_base + h_tail - 1)
+                    qk_t = _kq_dot(
+                        k_sub_ref[kv_h, h_ct][:, :64][None, :, :], qt_1
+                    )
+                    acc_cur = acc_cur + _vp_scaled(
+                        vt_sub_ref[kv_h : kv_h + 1, h_pt], p_prev, psc_prev
+                    )
+                    p_prev, ps_t, psc_prev = _sm_eval(qk_t, b_tail, qsc_1)
+                    l_cur = l_cur + ps_t
+                h_r17 = _h_ring(h_base + 17)
+                acc_cur = acc_cur + _vp_scaled(
+                    vt_sub_ref[kv_h : kv_h + 1, h_r17], p_prev, psc_prev
+                )
+                return acc_cur, l_cur
+
+            h_specs = _expand_mk128_specs(bias_specs)
+            h_r0 = _h_ring(h_base)
+            qk_0 = _kq_dot(k_sub_ref[kv_h, h_r0][:, :64][None, :, :], qt_1)
+            p_prev, l_cur, psc_prev = _sm_eval(qk_0, h_specs[0], qsc_1)
+            acc_cur = z_acc
+            for h_off in range(1, n_h):
+                h_c = _h_ring(h_base + h_off)
+                h_p = _h_ring(h_base + h_off - 1)
+                qk_c = _kq_dot(k_sub_ref[kv_h, h_c][:, :64][None, :, :], qt_1)
+                acc_cur = acc_cur + _vp_scaled(
+                    vt_sub_ref[kv_h : kv_h + 1, h_p], p_prev, psc_prev
+                )
+                p_prev, ps_c, psc_prev = _sm_eval(qk_c, h_specs[h_off], qsc_1)
+                l_cur = l_cur + ps_c
+            h_rl = _h_ring(h_base + n_h - 1)
+            acc_cur = acc_cur + _vp_scaled(
+                vt_sub_ref[kv_h : kv_h + 1, h_rl], p_prev, psc_prev
+            )
+            return acc_cur, l_cur
+
         def _run_ring_chunk(
             s_start, n_slices, first_vis_cond, bias_specs, t_sl, *, static_first=False
         ):
+            if use_mk128:
+                h_base = 2 * s_start
+                for kv_h in range(sq_kv_heads):
+
+                    @pl.loop(0, 8, unroll=False)
+                    def _mk_head_loop(g_off, kv_h=kv_h):
+                        g = kv_h * 8 + g_off
+                        g_sl = pl.ds(g, 1)
+                        qt_1 = q_t_ref[g_sl, :, t_sl]
+                        qsc_1 = (
+                            jnp.tile(q_sc_ref[g_sl, :, t_sl], (1, 16, 1))
+                            if use_fp8_qk_dyn
+                            else None
+                        )
+                        acc_1, l_1 = _eval_mk128_head(
+                            kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs
+                        )
+                        if static_first:
+                            l_ref[g_sl, :, t_sl] = l_1
+                            acc_ref[g_sl, :, t_sl] = acc_1
+                        else:
+                            l_ref[g_sl, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                l_1,
+                                l_ref[g_sl, :, t_sl] + l_1,
+                            )
+                            acc_ref[g_sl, :, t_sl] = jnp.where(
+                                first_vis_cond,
+                                acc_1,
+                                acc_ref[g_sl, :, t_sl] + acc_1,
+                            )
+
+                return
+
             if use_gqa2_vreg or use_gqa4_vreg:
                 pairs_per_grp = 2 if use_gqa4_vreg else 1
                 n_heads_grp = 2 * pairs_per_grp
                 w_grp = n_heads_grp * tq_sz
-                for kv_h in range(2):
+                for kv_h in range(sq_kv_heads):
                     for gp in range(4 // pairs_per_grp):
                         g_base = kv_h * 8 + n_heads_grp * gp
                         qt_grp = jnp.concatenate(
@@ -1013,7 +1310,7 @@ def _stationary_q_v2_process(
                 return
 
             if use_vreg_acc1 and n_slices >= 4:
-                for kv_h in range(2):
+                for kv_h in range(sq_kv_heads):
                     for g_off in range(8):
                         g = kv_h * 8 + g_off
                         qt_1 = q_t_ref[g : g + 1, :, t_sl]
@@ -1078,7 +1375,7 @@ def _stationary_q_v2_process(
                 return
 
             if use_vreg_acc and n_slices >= 4:
-                for kv_h in range(2):
+                for kv_h in range(sq_kv_heads):
                     for gp in range(4):
                         g0 = kv_h * 8 + 2 * gp
                         g1 = g0 + 1
@@ -1228,7 +1525,7 @@ def _stationary_q_v2_process(
                     acc_ref[g1 : g1 + 1, :, t_sl] = acc_ref[g1 : g1 + 1, :, t_sl] + vp1
                 ready_p = None
 
-            for kv_h in range(2):
+            for kv_h in range(sq_kv_heads):
                 for gp in range(4):
                     g0 = kv_h * 8 + 2 * gp
                     g1 = g0 + 1
@@ -1267,6 +1564,24 @@ def _stationary_q_v2_process(
                 _fl2()
 
         def _make_dyn_mask(q_first, key_pos_base, max_valid_kv):
+            if use_mk128:
+                q_pos_h = q_first + lax.broadcasted_iota(
+                    jnp.int32, (1, 128, tq_sz), 2
+                )
+                k_128 = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 1)
+                kp0 = key_pos_base + ((2 * k_128) if kv_pack_dense2 else k_128)
+                kp1 = key_pos_base + (
+                    (2 * k_128 + 1) if kv_pack_dense2 else (k_128 + 128)
+                )
+                m0 = kp0 < max_valid_kv
+                m1 = kp1 < max_valid_kv
+                if use_causal_mask:
+                    m0 = jnp.logical_and(m0, q_pos_h >= kp0)
+                    m1 = jnp.logical_and(m1, q_pos_h >= kp1)
+                if sliding_window is not None:
+                    m0 = jnp.logical_and(m0, q_pos_h < kp0 + sliding_window)
+                    m1 = jnp.logical_and(m1, q_pos_h < kp1 + sliding_window)
+                return (m0, m1)
             q_pos = q_first + lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 2)
             k_raw = lax.broadcasted_iota(jnp.int32, (1, 256, tq_sz), 1)
             k_off = (
@@ -1295,9 +1610,9 @@ def _stationary_q_v2_process(
         ):
             @pl.when(s_lo >= s_hi)
             def _zero_empty():
-                l_ref[:, :, t_sl] = jnp.zeros((16, 8, tq_sz), jnp.float32)
+                l_ref[:, :, t_sl] = jnp.zeros((sq_q_heads, 8, tq_sz), jnp.float32)
                 acc_ref[:, :, t_sl] = jnp.zeros(
-                    (16, acc_ref.shape[1], tq_sz), jnp.float32
+                    (sq_q_heads, acc_ref.shape[1], tq_sz), jnp.float32
                 )
 
             # 1. Left-masked boundary slices (SW left edge when not handled by sw9_fast)
@@ -1437,7 +1752,9 @@ def _stationary_q_v2_process(
         out_u32_ref = (
             None
             if (use_a3_out or use_staged_qo)
-            else bo_x2_ref.bitcast(jnp.uint32).at[bo_sem_idx, 0].reshape(bq_sz * 8, 128)
+            else bo_x2_ref.bitcast(jnp.uint32)
+            .at[bo_sem_idx, 0]
+            .reshape(bq_sz * sq_pairs, 128)
         )
         is_lo_ep = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 1) < 64
         mask_lo_u32 = jnp.where(is_lo_ep, jnp.uint32(0xFFFFFFFF), jnp.uint32(0))
@@ -1501,16 +1818,20 @@ def _stationary_q_v2_process(
             return packed_u32 & (mask_lo_u32 if s < 4 else mask_hi_u32)
 
         def _epilogue_one_tq(tq_start, t_sl):
-            for s in range(8):
-                h0 = 2 * s
-                h1 = 2 * s + 1
-                l0 = l_ref[h0, :, t_sl]
-                l1 = l_ref[h1, :, t_sl]
-                a0 = acc_ref[h0, :, t_sl]
-                a1 = acc_ref[h1, :, t_sl]
-                out_u32_ref[pl.ds(tq_start * 8 + s, tq_sz, 8)] = _pack_pair_out(
-                    a0, a1, l0, l1, s
-                )
+            for kv_h_e in range(sq_kv_heads):
+
+                @pl.loop(0, 4, unroll=False)
+                def _ep_gp(gp_e, kv_h_e=kv_h_e):
+                    s = kv_h_e * 4 + gp_e
+                    h0 = 2 * s
+                    h1 = 2 * s + 1
+                    l0 = l_ref[h0, :, t_sl]
+                    l1 = l_ref[h1, :, t_sl]
+                    a0 = acc_ref[h0, :, t_sl]
+                    a1 = acc_ref[h1, :, t_sl]
+                    out_u32_ref[
+                        pl.ds(tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                    ] = _pack_pair_out(a0, a1, l0, l1, kv_h_e * 4)
 
         def _emit_unfused_epilogue_and_send():
             if use_staged_qo:
@@ -1531,9 +1852,12 @@ def _stationary_q_v2_process(
                         lead_st = g0_st - aligned_g0_st
                         total_rows_st = lead_st + st_valid
                         full_rows_st = (total_rows_st // 16) * 16
-                        for s in range(8):
+
+                        @pl.loop(0, sq_pairs, unroll=False)
+                        def _st_a3_pair(s):
                             h0 = 2 * s
                             h1 = 2 * s + 1
+                            c_sl = pl.ds(pl.multiple_of(s * 128, 128), 128)
                             col_s = jnp.concatenate(
                                 [
                                     _pair_col_f32(
@@ -1549,13 +1873,13 @@ def _stationary_q_v2_process(
                             col_s = jnp.where(row_iota_st < st_valid, col_s, 0.0)
 
                             @pl.when(lead_st == 0)
-                            def _store_al_st(s=s, col_s=col_s):
-                                bo_x2_ref[st_slot, :, s * 128 : (s + 1) * 128] = (
-                                    col_s.astype(jnp.bfloat16)
+                            def _store_al_st():
+                                bo_x2_ref[st_slot, :, c_sl] = col_s.astype(
+                                    jnp.bfloat16
                                 )
 
                             @pl.when(lead_st > 0)
-                            def _store_sh_st(s=s, col_s=col_s):
+                            def _store_sh_st():
                                 shifted = col_s
                                 for sh in (1, 2, 4, 8):
                                     shifted = jnp.where(
@@ -1563,9 +1887,7 @@ def _stationary_q_v2_process(
                                         pltpu.roll(shifted, shift=sh, axis=0),
                                         shifted,
                                     )
-                                carry_s = bo_carry_ref[
-                                    :, s * 128 : (s + 1) * 128
-                                ].astype(jnp.float32)
+                                carry_s = bo_carry_ref[:, c_sl].astype(jnp.float32)
                                 carry_pad = jnp.concatenate(
                                     [
                                         carry_s,
@@ -1576,8 +1898,8 @@ def _stationary_q_v2_process(
                                 merged = jnp.where(
                                     row_iota_st < lead_st, carry_pad, shifted
                                 )
-                                bo_x2_ref[st_slot, :, s * 128 : (s + 1) * 128] = (
-                                    merged.astype(jnp.bfloat16)
+                                bo_x2_ref[st_slot, :, c_sl] = merged.astype(
+                                    jnp.bfloat16
                                 )
 
                         bo_carry_ref[...] = bo_x2_ref[
@@ -1590,18 +1912,25 @@ def _stationary_q_v2_process(
                         out_u32_st = (
                             bo_x2_ref.bitcast(jnp.uint32)
                             .at[st_slot, 0]
-                            .reshape(tq_sz * 8, 128)
+                            .reshape(tq_sz * sq_pairs, 128)
                         )
-                        for s in range(8):
-                            h0 = 2 * s
-                            h1 = 2 * s + 1
-                            out_u32_st[pl.ds(s, tq_sz, 8)] = _pack_pair_out(
-                                acc_ref[h0, :, t_sl],
-                                acc_ref[h1, :, t_sl],
-                                l_ref[h0, :, t_sl],
-                                l_ref[h1, :, t_sl],
-                                s,
-                            )
+                        for kv_h_st in range(sq_kv_heads):
+
+                            @pl.loop(0, 4, unroll=False)
+                            def _st_u32_gp(gp_st, kv_h_st=kv_h_st):
+                                s = kv_h_st * 4 + gp_st
+                                h0 = 2 * s
+                                h1 = 2 * s + 1
+                                out_u32_st[pl.ds(s, tq_sz, sq_pairs)] = (
+                                    _pack_pair_out(
+                                        acc_ref[h0, :, t_sl],
+                                        acc_ref[h1, :, t_sl],
+                                        l_ref[h0, :, t_sl],
+                                        l_ref[h1, :, t_sl],
+                                        kv_h_st * 4,
+                                    )
+                                )
+
                         g0_st = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz + st_q_start
                         start_send_bo_staged(g0_st, st_valid, st_slot)
                 return
@@ -1616,9 +1945,11 @@ def _stationary_q_v2_process(
                 row_iota_ep = lax.broadcasted_iota(jnp.int32, (bq_sz + 16, 128), 0)
                 zero_tail_16 = jnp.zeros((16, 128), jnp.float32)
 
-                for s in range(8):
+                @pl.loop(0, sq_pairs, unroll=False)
+                def _ep_a3_pair(s):
                     h0 = 2 * s
                     h1 = 2 * s + 1
+                    c_sl = pl.ds(pl.multiple_of(s * 128, 128), 128)
                     parts_s = []
                     for tq_idx in range(bq_sz // tq_sz):
                         tq_start = tq_idx * tq_sz
@@ -1635,13 +1966,13 @@ def _stationary_q_v2_process(
                     col_s = jnp.where(row_iota_ep < valid_ep, col_s, 0.0)
 
                     @pl.when(lead_ep == 0)
-                    def _store_aligned_v2(s=s, col_s=col_s):
-                        bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
-                            col_s.astype(jnp.bfloat16)
+                    def _store_aligned_v2():
+                        bo_x2_ref[bo_sem_idx, :, c_sl] = col_s.astype(
+                            jnp.bfloat16
                         )
 
                     @pl.when(lead_ep > 0)
-                    def _store_shifted_v2(s=s, col_s=col_s):
+                    def _store_shifted_v2():
                         shifted = col_s
                         for sh in (1, 2, 4, 8):
                             shifted = jnp.where(
@@ -1649,9 +1980,7 @@ def _stationary_q_v2_process(
                                 pltpu.roll(shifted, shift=sh, axis=0),
                                 shifted,
                             )
-                        carry_s = bo_carry_ref[:, s * 128 : (s + 1) * 128].astype(
-                            jnp.float32
-                        )
+                        carry_s = bo_carry_ref[:, c_sl].astype(jnp.float32)
                         carry_pad = jnp.concatenate(
                             [
                                 carry_s,
@@ -1659,9 +1988,11 @@ def _stationary_q_v2_process(
                             ],
                             axis=0,
                         )
-                        merged = jnp.where(row_iota_ep < lead_ep, carry_pad, shifted)
-                        bo_x2_ref[bo_sem_idx, :, s * 128 : (s + 1) * 128] = (
-                            merged.astype(jnp.bfloat16)
+                        merged = jnp.where(
+                            row_iota_ep < lead_ep, carry_pad, shifted
+                        )
+                        bo_x2_ref[bo_sem_idx, :, c_sl] = merged.astype(
+                            jnp.bfloat16
                         )
 
                 bo_carry_ref[...] = bo_x2_ref[
@@ -1715,13 +2046,16 @@ def _stationary_q_v2_process(
                         jnp.int32, (tq_sz + 16, 128), 0
                     )
                     zero_tail_f = jnp.zeros((16, 128), jnp.float32)
-                    for s_f in range(8):
+
+                    @pl.loop(0, sq_pairs, unroll=False)
+                    def _sh_f_pair(s_f):
+                        c_sl_f = pl.ds(pl.multiple_of(s_f * 128, 128), 128)
                         c_f = jnp.concatenate(
                             [
                                 bo_x2_ref[
                                     bo_sem_idx,
                                     :tq_sz,
-                                    s_f * 128 : (s_f + 1) * 128,
+                                    c_sl_f,
                                 ].astype(jnp.float32),
                                 zero_tail_f,
                             ],
@@ -1733,9 +2067,7 @@ def _stationary_q_v2_process(
                                 pltpu.roll(c_f, shift=sh, axis=0),
                                 c_f,
                             )
-                        carry_f = bo_carry_ref[
-                            :, s_f * 128 : (s_f + 1) * 128
-                        ].astype(jnp.float32)
+                        carry_f = bo_carry_ref[:, c_sl_f].astype(jnp.float32)
                         carry_pad_f = jnp.concatenate(
                             [
                                 carry_f,
@@ -1746,9 +2078,10 @@ def _stationary_q_v2_process(
                         merged_f = jnp.where(
                             row_iota_f < lead_f, carry_pad_f, c_f
                         )
-                        bo_x2_ref[
-                            bo_sem_idx, :, s_f * 128 : (s_f + 1) * 128
-                        ] = merged_f.astype(jnp.bfloat16)
+                        bo_x2_ref[bo_sem_idx, :, c_sl_f] = merged_f.astype(
+                            jnp.bfloat16
+                        )
+
                     bo_carry_ref[...] = bo_x2_ref[
                         bo_sem_idx, pl.ds(tq_sz, 16), :
                     ]
@@ -1757,35 +2090,73 @@ def _stationary_q_v2_process(
             else:
                 start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
-        def _write_sw9_pair_out(a0, a1, l0, l1, s_pair):
+        def _write_sw9_pair_out(a0, a1, l0, l1, s_pair, kv_h_tag=0):
             if use_a3_out:
+                c_sl_sw = pl.ds(pl.multiple_of(s_pair * 128, 128), 128)
                 bo_x2_ref[
                     bo_sem_idx,
                     :tq_sz,
-                    s_pair * 128 : (s_pair + 1) * 128,
+                    c_sl_sw,
                 ] = _pair_col_f32(a0, a1, l0, l1).astype(jnp.bfloat16)
             else:
-                out_u32_ref[pl.ds(s_pair, tq_sz, 8)] = _pack_pair_out(
-                    a0, a1, l0, l1, s_pair
+                out_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)] = _pack_pair_out(
+                    a0, a1, l0, l1, kv_h_tag * 4
                 )
 
         def _run_sw9_fused_qe(s_lo):
             q_u32_ref = (
-                bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx, 0].reshape(256 * 8, 128)
+                bq_x2_ref.bitcast(jnp.uint32)
+                .at[bq_sem_idx, 0]
+                .reshape(256 * sq_pairs, 128)
             )
             t_sl = pl.ds(0, tq_sz)
             bias_specs = ("ut",) + ("none",) * 7 + ("lt",)
 
+            if use_mk128:
+                h_base_sw = 2 * s_lo
+                for kv_h in range(sq_kv_heads):
+
+                    @pl.loop(0, 4, unroll=False)
+                    def _sw9_mk_gp(gp, kv_h=kv_h):
+                        s_pair = kv_h * 4 + gp
+                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                        pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
+                        if use_fp8_qk_dyn:
+                            q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                            q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                            qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                            qsc_pair = (
+                                jnp.tile(q0_sc8[None, :, :], (1, 16, 1)),
+                                jnp.tile(q1_sc8[None, :, :], (1, 16, 1)),
+                            )
+                        else:
+                            qt_pair = (
+                                pair_q_t[:64, :][None, :, :],
+                                pair_q_t[64:, :][None, :, :],
+                            )
+                            qsc_pair = (None, None)
+                        acc0, l0 = _eval_mk128_head(
+                            kv_h, qt_pair[0], qsc_pair[0], h_base_sw, 9, bias_specs
+                        )
+                        acc1, l1 = _eval_mk128_head(
+                            kv_h, qt_pair[1], qsc_pair[1], h_base_sw, 9, bias_specs
+                        )
+                        _write_sw9_pair_out(
+                            acc0[0], acc1[0], l0[0], l1[0], s_pair, kv_h
+                        )
+
+                return
+
             if use_gqa2_vreg or use_gqa4_vreg:
                 pairs_per_grp = 2 if use_gqa4_vreg else 1
                 w_grp = 2 * pairs_per_grp * tq_sz
-                for kv_h in range(2):
+                for kv_h in range(sq_kv_heads):
                     for grp_i in range(4 // pairs_per_grp):
                         qt_parts = []
                         for p_off in range(pairs_per_grp):
                             sp = kv_h * 4 + grp_i * pairs_per_grp + p_off
-                            u_sp = q_u32_ref[pl.ds(sp, tq_sz, 8)]
-                            pq_t = _decode_q_pair(u_sp, sp, is_lo_ep)
+                            u_sp = q_u32_ref[pl.ds(sp, tq_sz, sq_pairs)]
+                            pq_t = _decode_q_pair(u_sp, kv_h * 4, is_lo_ep)
                             qt_parts.append(pq_t[:64, :])
                             qt_parts.append(pq_t[64:, :])
                         qt_cat = jnp.concatenate(qt_parts, axis=1)
@@ -1845,15 +2216,17 @@ def _stationary_q_v2_process(
                                 l_grp[0, :, c0:c1],
                                 l_grp[0, :, c1:c2],
                                 sp,
+                                kv_h,
                             )
                 return
 
-            if use_vreg_acc:
-                for kv_h in range(2):
+            if use_vreg_acc or use_vreg_acc1:
+                sw_mrb = 1 if use_vreg_acc1 and mrb_depth == 1 else 2
+                for kv_h in range(sq_kv_heads):
                     for gp in range(4):
                         s_pair = kv_h * 4 + gp
-                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
-                        pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
+                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                        pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                         if use_fp8_qk_dyn:
                             q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
                             q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
@@ -1900,7 +2273,7 @@ def _stationary_q_v2_process(
                                 if rdy_1 is not None:
                                     _fl_1h()
                                 mrb_1.append((qk_1, loc_s, vts))
-                                if len(mrb_1) >= 2:
+                                if len(mrb_1) >= sw_mrb:
                                     _adv_1h()
                             while mrb_1:
                                 if rdy_1 is not None:
@@ -1912,7 +2285,7 @@ def _stationary_q_v2_process(
                             l_out.append(l_1h[0])
 
                         _write_sw9_pair_out(
-                            acc_out[0], acc_out[1], l_out[0], l_out[1], s_pair
+                            acc_out[0], acc_out[1], l_out[0], l_out[1], s_pair, kv_h
                         )
                 return
 
@@ -1921,7 +2294,7 @@ def _stationary_q_v2_process(
 
             def _adv_f():
                 nonlocal ready_p
-                qk0, qk1, s_pair, loc_s, vt_s, qsc0, qsc1 = mrb_q.pop(0)
+                qk0, qk1, s_pair, kv_h_tag, loc_s, vt_s, qsc0, qsc1 = mrb_q.pop(0)
                 g0 = 2 * s_pair
                 g1 = g0 + 1
                 p0, ps0, psc0 = _sm_eval(qk0, bias_specs[loc_s], qsc0)
@@ -1932,11 +2305,11 @@ def _stationary_q_v2_process(
                 else:
                     l_ref[g0 : g0 + 1, :, t_sl] = l_ref[g0 : g0 + 1, :, t_sl] + ps0
                     l_ref[g1 : g1 + 1, :, t_sl] = l_ref[g1 : g1 + 1, :, t_sl] + ps1
-                ready_p = (p0, p1, s_pair, loc_s, vt_s, psc0, psc1)
+                ready_p = (p0, p1, s_pair, kv_h_tag, loc_s, vt_s, psc0, psc1)
 
             def _fl_f():
                 nonlocal ready_p
-                p0, p1, s_pair, loc_s, vt_s, psc0, psc1 = ready_p
+                p0, p1, s_pair, kv_h_tag, loc_s, vt_s, psc0, psc1 = ready_p
                 g0 = 2 * s_pair
                 g1 = g0 + 1
                 vp0 = _vp_scaled(vt_s, p0, psc0)
@@ -1952,14 +2325,14 @@ def _stationary_q_v2_process(
                     a1 = acc_ref[g1, :, t_sl] + vp1[0]
                     l0 = l_ref[g0, :, t_sl]
                     l1 = l_ref[g1, :, t_sl]
-                    _write_sw9_pair_out(a0, a1, l0, l1, s_pair)
+                    _write_sw9_pair_out(a0, a1, l0, l1, s_pair, kv_h_tag)
                 ready_p = None
 
-            for kv_h in range(2):
+            for kv_h in range(sq_kv_heads):
                 for gp in range(4):
                     s_pair = kv_h * 4 + gp
-                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
-                    pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
+                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                    pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                     if use_fp8_qk_dyn:
                         q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
                         q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
@@ -1980,7 +2353,7 @@ def _stationary_q_v2_process(
                         qk1 = _kq_dot(ks, qt1)
                         if ready_p is not None:
                             _fl_f()
-                        mrb_q.append((qk0, qk1, s_pair, loc_s, vts, qsc0, qsc1))
+                        mrb_q.append((qk0, qk1, s_pair, kv_h, loc_s, vts, qsc0, qsc1))
                         if len(mrb_q) >= mrb_depth:
                             _adv_f()
             while mrb_q:
@@ -2029,9 +2402,8 @@ def _stationary_q_v2_process(
             def _advance_unpacked_cursor():
                 sem_ids_ref[3] = end_bkv_idx
 
-            _wait_and_unpack_cur_bq(bq_sem_idx)
-
             if can_fuse_sw9 and probe != "nocompute":
+                wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
                 wait_send_bo(bo_sem_idx)
                 q_first_0 = processed_q_len
                 is_sw9_fast_0 = jnp.logical_and(
@@ -2070,73 +2442,179 @@ def _stationary_q_v2_process(
                     @pl.when(is_sw_short_0)
                     def _do_fused_sw_short():
                         n_unm_0 = q_first_0 // 256
-                        s_lt_ring = n_unm_0 & ring_s_mask
                         q_u32_ref = (
                             bq_x2_ref.bitcast(jnp.uint32)
                             .at[bq_sem_idx, 0]
-                            .reshape(256 * 8, 128)
+                            .reshape(256 * sq_pairs, 128)
                         )
-                        for kv_h in range(2):
-                            ks_lt = k_sub_ref[kv_h, s_lt_ring][:, :64][None, :, :]
-                            vts_lt = vt_sub_ref[kv_h : kv_h + 1, s_lt_ring]
-                            for gp in range(4):
-                                s_pair = kv_h * 4 + gp
-                                u_s = q_u32_ref[pl.ds(s_pair, tq_sz, 8)]
-                                pair_q_t = _decode_q_pair(u_s, s_pair, is_lo_ep)
-                                if use_fp8_qk_dyn:
-                                    q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
-                                    q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
-                                    qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
-                                    qsc_pair = (
-                                        jnp.tile(q0_sc8[None, :, :], (1, 32, 1)),
-                                        jnp.tile(q1_sc8[None, :, :], (1, 32, 1)),
+                        if use_mk128:
+                            n_unm_h = 2 * n_unm_0
+                            h_lt0 = (2 * n_unm_0) & ring_h_mask
+                            h_lt1 = (2 * n_unm_0 + 1) & ring_h_mask
+                            for kv_h in range(sq_kv_heads):
+
+                                @pl.loop(0, 4, unroll=False)
+                                def _sws_mk_gp(gp, kv_h=kv_h):
+                                    s_pair = kv_h * 4 + gp
+                                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                                    pair_q_t = _decode_q_pair(
+                                        u_s, kv_h * 4, is_lo_ep
                                     )
-                                else:
-                                    qt_pair = (
-                                        pair_q_t[:64, :][None, :, :],
-                                        pair_q_t[64:, :][None, :, :],
+                                    if use_fp8_qk_dyn:
+                                        q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                                        q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                                        qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                                        qsc_pair = (
+                                            jnp.tile(q0_sc8[None, :, :], (1, 16, 1)),
+                                            jnp.tile(q1_sc8[None, :, :], (1, 16, 1)),
+                                        )
+                                    else:
+                                        qt_pair = (
+                                            pair_q_t[:64, :][None, :, :],
+                                            pair_q_t[64:, :][None, :, :],
+                                        )
+                                        qsc_pair = (None, None)
+                                    acc_out = []
+                                    l_out = []
+                                    for h_sub in range(2):
+                                        qt_1h = qt_pair[h_sub]
+                                        qsc_1h = qsc_pair[h_sub]
+                                        z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                                        z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
+
+                                        def _unm_h_step(
+                                            h_idx,
+                                            carry,
+                                            kv_h=kv_h,
+                                            qt_1h=qt_1h,
+                                            qsc_1h=qsc_1h,
+                                        ):
+                                            acc_c, l_c = carry
+                                            h_r = h_idx & ring_h_mask
+                                            ks_c = k_sub_ref[kv_h, h_r][:, :64][
+                                                None, :, :
+                                            ]
+                                            vts_c = vt_sub_ref[kv_h : kv_h + 1, h_r]
+                                            qk_c = _kq_dot(ks_c, qt_1h)
+                                            p_c, ps_c, psc_c = _sm_eval(
+                                                qk_c, "none", qsc_1h
+                                            )
+                                            return (
+                                                acc_c + _vp_scaled(vts_c, p_c, psc_c),
+                                                l_c + ps_c,
+                                            )
+
+                                        acc_1h, l_1h = lax.fori_loop(
+                                            0, n_unm_h, _unm_h_step, (z_acc, z_l)
+                                        )
+                                        for h_lt, b_lt in (
+                                            (h_lt0, "lt0"),
+                                            (h_lt1, "lt1"),
+                                        ):
+                                            qk_lt = _kq_dot(
+                                                k_sub_ref[kv_h, h_lt][:, :64][
+                                                    None, :, :
+                                                ],
+                                                qt_1h,
+                                            )
+                                            p_lt, ps_lt, psc_lt = _sm_eval(
+                                                qk_lt, b_lt, qsc_1h
+                                            )
+                                            acc_1h = acc_1h + _vp_scaled(
+                                                vt_sub_ref[kv_h : kv_h + 1, h_lt],
+                                                p_lt,
+                                                psc_lt,
+                                            )
+                                            l_1h = l_1h + ps_lt
+                                        acc_out.append(acc_1h[0])
+                                        l_out.append(l_1h[0])
+                                    _write_sw9_pair_out(
+                                        acc_out[0],
+                                        acc_out[1],
+                                        l_out[0],
+                                        l_out[1],
+                                        s_pair,
+                                        kv_h,
                                     )
-                                    qsc_pair = (None, None)
 
-                                acc_out = []
-                                l_out = []
-                                for h_sub in range(2):
-                                    qt_1h = qt_pair[h_sub]
-                                    qsc_1h = qsc_pair[h_sub]
-                                    z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
-                                    z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
+                            _send_fused_bo()
+                        else:
+                            s_lt_ring = n_unm_0 & ring_s_mask
+                            for kv_h in range(sq_kv_heads):
+                                ks_lt = k_sub_ref[kv_h, s_lt_ring][:, :64][None, :, :]
+                                vts_lt = vt_sub_ref[kv_h : kv_h + 1, s_lt_ring]
+                                for gp in range(4):
+                                    s_pair = kv_h * 4 + gp
+                                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                                    pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
+                                    if use_fp8_qk_dyn:
+                                        q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                                        q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                                        qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                                        qsc_pair = (
+                                            jnp.tile(q0_sc8[None, :, :], (1, 32, 1)),
+                                            jnp.tile(q1_sc8[None, :, :], (1, 32, 1)),
+                                        )
+                                    else:
+                                        qt_pair = (
+                                            pair_q_t[:64, :][None, :, :],
+                                            pair_q_t[64:, :][None, :, :],
+                                        )
+                                        qsc_pair = (None, None)
 
-                                    def _unm_step(
-                                        s_idx,
-                                        carry,
-                                        kv_h=kv_h,
-                                        qt_1h=qt_1h,
-                                        qsc_1h=qsc_1h,
-                                    ):
-                                        acc_c, l_c = carry
-                                        s_r = s_idx & ring_s_mask
-                                        ks_c = k_sub_ref[kv_h, s_r][:, :64][
-                                            None, :, :
-                                        ]
-                                        vts_c = vt_sub_ref[kv_h : kv_h + 1, s_r]
-                                        qk_c = _kq_dot(ks_c, qt_1h)
-                                        p_c, ps_c, psc_c = _sm_eval(qk_c, "none", qsc_1h)
-                                        return acc_c + _vp_scaled(vts_c, p_c, psc_c), l_c + ps_c
+                                    acc_out = []
+                                    l_out = []
+                                    for h_sub in range(2):
+                                        qt_1h = qt_pair[h_sub]
+                                        qsc_1h = qsc_pair[h_sub]
+                                        z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
+                                        z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
 
-                                    acc_1h, l_1h = lax.fori_loop(
-                                        0, n_unm_0, _unm_step, (z_acc, z_l)
+                                        def _unm_step(
+                                            s_idx,
+                                            carry,
+                                            kv_h=kv_h,
+                                            qt_1h=qt_1h,
+                                            qsc_1h=qsc_1h,
+                                        ):
+                                            acc_c, l_c = carry
+                                            s_r = s_idx & ring_s_mask
+                                            ks_c = k_sub_ref[kv_h, s_r][:, :64][
+                                                None, :, :
+                                            ]
+                                            vts_c = vt_sub_ref[kv_h : kv_h + 1, s_r]
+                                            qk_c = _kq_dot(ks_c, qt_1h)
+                                            p_c, ps_c, psc_c = _sm_eval(
+                                                qk_c, "none", qsc_1h
+                                            )
+                                            return (
+                                                acc_c + _vp_scaled(vts_c, p_c, psc_c),
+                                                l_c + ps_c,
+                                            )
+
+                                        acc_1h, l_1h = lax.fori_loop(
+                                            0, n_unm_0, _unm_step, (z_acc, z_l)
+                                        )
+                                        qk_lt = _kq_dot(ks_lt, qt_1h)
+                                        p_lt, ps_lt, psc_lt = _sm_eval(
+                                            qk_lt, "lt", qsc_1h
+                                        )
+                                        acc_1h = acc_1h + _vp_scaled(
+                                            vts_lt, p_lt, psc_lt
+                                        )
+                                        l_1h = l_1h + ps_lt
+                                        acc_out.append(acc_1h[0])
+                                        l_out.append(l_1h[0])
+
+                                    _write_sw9_pair_out(
+                                        acc_out[0],
+                                        acc_out[1],
+                                        l_out[0],
+                                        l_out[1],
+                                        s_pair,
+                                        kv_h,
                                     )
-                                    qk_lt = _kq_dot(ks_lt, qt_1h)
-                                    p_lt, ps_lt, psc_lt = _sm_eval(qk_lt, "lt", qsc_1h)
-                                    acc_1h = acc_1h + _vp_scaled(vts_lt, p_lt, psc_lt)
-                                    l_1h = l_1h + ps_lt
-                                    acc_out.append(acc_1h[0])
-                                    l_out.append(l_1h[0])
-
-                                _write_sw9_pair_out(
-                                    acc_out[0], acc_out[1], l_out[0], l_out[1], s_pair
-                                )
-                        _send_fused_bo()
+                            _send_fused_bo()
 
                 @pl.when(jnp.logical_not(jnp.logical_or(is_sw9_fast_0, is_sw_short_0)))
                 def _do_unfused_fallback():
@@ -2175,9 +2653,12 @@ def _stationary_q_v2_process(
 
                 return
 
-            if not use_staged_qo:
-                if probe != "nocompute":
-                    unpack_bq_to_qt_v2(bq_sem_idx)
+            if can_fuse_sw9:
+                wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+            else:
+                _wait_and_unpack_cur_bq(bq_sem_idx)
+
+            if probe != "nocompute":
 
                 def _exec_tq_ring(tq_idx):
                     tq_start = tq_idx * tq_sz
@@ -2587,7 +3068,7 @@ def _ragged_paged_attention_kernel_loop(
 ):
     use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
     if use_a3_out:
-        assert o_hbm_ref.shape == (q_hbm_ref.shape[1], 1024)
+        assert o_hbm_ref.shape == (q_hbm_ref.shape[1], 128 * q_hbm_ref.shape[2])
     else:
         assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -6027,6 +6508,14 @@ def ragged_paged_attention(
             if custom_mask is not None:
                 prefill_opts -= {"mask_skip", "visible_kv_tile"}
 
+        is_tp16_sq = (
+            actual_num_kv_heads == 1
+            and num_q_heads_per_kv_head == 8
+            and q_packing == 2
+            and head_dim == 128
+            and bool(prefill_opts & _STATIONARY_Q_V2_OPTS)
+            and ("tp16_sq" in prefill_opts or "w9" in prefill_opts)
+        )
         use_stationary_q = (
             case != RpaCase.DECODE
             and any(
@@ -6034,7 +6523,7 @@ def ragged_paged_attention(
                 for o in prefill_opts
             )
             and actual_num_kv_heads == 1
-            and num_q_heads_per_kv_head == 16
+            and (num_q_heads_per_kv_head == 16 or is_tp16_sq)
             and q_packing == 2
             and head_dim == 128
             and q.dtype == jnp.bfloat16
@@ -6048,6 +6537,9 @@ def ragged_paged_attention(
             and bkv_sz % 512 == 0
             and bq_sz % 256 == 0
         )
+        sq_kv_heads = 1 if is_tp16_sq else 2
+        sq_q_heads = 8 * sq_kv_heads
+        a3_out_cols = 512 * sq_kv_heads
         use_a3_out = (
             use_stationary_q
             and _a3_out_layout
@@ -6081,6 +6573,9 @@ def ragged_paged_attention(
                 "gqa4_vreg",
                 "vreg_acc",
                 "vreg_acc1",
+                "mk128",
+                "tp16_sq",
+                "w9",
                 "sw_short_fuse",
                 "mrb1",
                 "mrb3",
@@ -6138,7 +6633,7 @@ def ragged_paged_attention(
             q.dtype,
         )
         bo_double_buf = (
-            pltpu.VMEM((num_slots, qo_stage_sz + 16, 1024), q.dtype)
+            pltpu.VMEM((num_slots, qo_stage_sz + 16, a3_out_cols), q.dtype)
             if use_a3_out
             else (
                 pltpu.VMEM(
@@ -6169,6 +6664,7 @@ def ragged_paged_attention(
             else:
                 ring_blks_v2 = 1
             ring_slices_v2 = ring_blks_v2 * num_s_v2
+            use_mk128_v2 = "mk128" in prefill_opts
             use_fp8_qk_dyn_v2 = "fp8_qk_dyn" in prefill_opts
             use_fp8_qkpv_dyn_v2 = (
                 "fp8_qkpv_dyn" in prefill_opts or "fp8_qkpv_fast" in prefill_opts
@@ -6189,31 +6685,40 @@ def ragged_paged_attention(
             use_vt_fp8_v2 = (
                 use_fp8_qkpv_dyn_v2 or use_fp8_qkpv_v2 or ("fp8_kv" in prefill_opts)
             )
-            l_scratch = pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+            l_scratch = pltpu.VMEM((sq_q_heads, 8, bq_sz), jnp.float32)
             m_scratch = None
-            acc_scratch = pltpu.VMEM((16, 64, bq_sz), jnp.float32)
+            acc_scratch = pltpu.VMEM((sq_q_heads, 64, bq_sz), jnp.float32)
+            mask_shape_v2 = (2, 128, 256) if use_mk128_v2 else (1, 256, 256)
             extra_scratches = [
                 pltpu.VMEM(
-                    (16, 64, bq_sz),
+                    (sq_q_heads, 64, bq_sz),
                     jnp.float8_e4m3fn if use_fp8_qk_v2 else jnp.bfloat16,
                 ),
                 pltpu.VMEM(
-                    (2, ring_slices_v2, 256, 128),
+                    (sq_kv_heads, 2 * ring_slices_v2, 128, 128)
+                    if use_mk128_v2
+                    else (sq_kv_heads, ring_slices_v2, 256, 128),
                     jnp.float8_e4m3fn if use_fp8_kv_v2 else jnp.bfloat16,
                 ),
                 pltpu.VMEM(
-                    (2, ring_slices_v2, 64, 256),
+                    (sq_kv_heads, 2 * ring_slices_v2, 64, 128)
+                    if use_mk128_v2
+                    else (sq_kv_heads, ring_slices_v2, 64, 256),
                     jnp.float8_e4m3fn if use_vt_fp8_v2 else jnp.bfloat16,
                 ),
-                (pltpu.VMEM((1, 256, 256), jnp.bfloat16) if use_causal_mask else None),
+                (pltpu.VMEM(mask_shape_v2, jnp.bfloat16) if use_causal_mask else None),
                 (
-                    pltpu.VMEM((1, 256, 256), jnp.bfloat16)
+                    pltpu.VMEM(mask_shape_v2, jnp.bfloat16)
                     if (allow_sw_fuse_v2 and use_causal_mask)
                     else None
                 ),
-                (pltpu.VMEM((16, 1024), jnp.bfloat16) if use_a3_out else None),
                 (
-                    pltpu.VMEM((16, 8, bq_sz), jnp.float32)
+                    pltpu.VMEM((16, a3_out_cols), jnp.bfloat16)
+                    if use_a3_out
+                    else None
+                ),
+                (
+                    pltpu.VMEM((sq_q_heads, 8, bq_sz), jnp.float32)
                     if use_fp8_qk_dyn_v2
                     else None
                 ),
@@ -6326,7 +6831,7 @@ def ragged_paged_attention(
             else {}
         )
 
-        o_out_shape = (max_num_tokens, 1024) if use_a3_out else q.shape
+        o_out_shape = (max_num_tokens, a3_out_cols) if use_a3_out else q.shape
         out_aliases = (
             {11: 1}
             if use_a3_out
