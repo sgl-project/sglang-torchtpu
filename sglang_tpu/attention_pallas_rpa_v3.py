@@ -486,16 +486,34 @@ def _invoke_v3_kernel(
                 or "nofull_fp8_qk" not in raw_all_toks
             ):
                 prefill_opts.add("fp8_qk")
+            if "nobf16_pop" not in raw_all_toks:
+                prefill_opts.add("bf16_pop")
+            if "nosub8_l" not in raw_all_toks:
+                prefill_opts.add("sub8_l")
             if sliding_window is not None:
                 if sliding_window == 2048 and "nosw2048_fuse" not in raw_all_toks:
                     prefill_opts.add("sw2048_fuse")
-                if "sw_mk128" in raw_all_toks:
+                if sliding_window == 2048 and "nosw_short_v2" not in raw_all_toks:
+                    prefill_opts.add("sw_short_v2")
+                if (
+                    "sw_mk128" in raw_all_toks
+                    or (
+                        not (allow_tp16_sq and is_tp16_sq_shape)
+                        and "nosw_mk128" not in raw_all_toks
+                        and "nomk128" not in raw_all_toks
+                    )
+                ):
                     prefill_opts.add("mk128")
             else:
                 if "nomk128" not in raw_all_toks:
                     prefill_opts.add("mk128")
                 if not is_lc_full and "noprefix_fast" not in raw_all_toks:
                     prefill_opts.add("prefix_fast")
+            if "mk128" in prefill_opts:
+                if "nola2" not in raw_all_toks:
+                    prefill_opts.add("la2")
+                if "nounroll_up" not in raw_all_toks:
+                    prefill_opts.add("unroll_up")
         for w7_opt in (
             "fp8_kv",
             "fp8_qk",
@@ -512,6 +530,11 @@ def _invoke_v3_kernel(
             "vreg_acc1",
             "mk128",
             "gqa8",
+            "sub8_l",
+            "bf16_pop",
+            "la2",
+            "unroll_up",
+            "sw_short_v2",
             "tp16_sq",
             "sw_short_fuse",
             "tq_unroll",

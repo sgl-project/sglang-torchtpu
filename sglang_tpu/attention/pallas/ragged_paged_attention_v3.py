@@ -428,7 +428,13 @@ def _stationary_q_v2_process(
         and not use_vreg_acc1
         and not (use_gqa2_vreg or use_gqa4_vreg)
     )
-    use_sw_short_fuse = "sw_short_fuse" in prefill_opts
+    use_sw_short_v2 = "sw_short_v2" in prefill_opts
+    use_sw_short_fuse = ("sw_short_fuse" in prefill_opts) or use_sw_short_v2
+    use_sub8_l = "sub8_l" in prefill_opts
+    use_la2 = "la2" in prefill_opts
+    use_unroll_up = ("unroll_up" in prefill_opts) and not (
+        "gqa8" in prefill_opts and kv_pack_dense2
+    )
     mrb_depth = (
         1
         if "mrb1" in prefill_opts
@@ -510,13 +516,20 @@ def _stationary_q_v2_process(
     if ring_covers_all:
         sem_ids_ref[3] = cur_seq_start_bkv_idx
 
+    use_bf16_pop = (
+        ("bf16_pop" in prefill_opts)
+        and not use_f32_exp
+        and not (use_fp8_qk and use_fp8_qkpv)
+    )
+
     def _kq_dot(k_3d, q_3d):
-        return lax.dot(
+        qk_f = lax.dot(
             k_3d,
             q_3d,
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
+        return qk_f.astype(jnp.bfloat16) if use_bf16_pop else qk_f
 
     def _vp_dot(vt_3d, p_3d):
         return lax.dot(
@@ -533,6 +546,12 @@ def _stationary_q_v2_process(
         return vp
 
     def _psum_w(p, w_cols: int):
+        if use_sub8_l:
+            return jnp.sum(
+                p.reshape((1, p.shape[1] // 8, 8, w_cols)),
+                axis=1,
+                dtype=jnp.bfloat16,
+            ).astype(jnp.float32)
         sub_shape = (
             (1, 16, 8, w_cols) if p.shape[1] == 128 else (1, 16, 16, w_cols)
         )
@@ -750,6 +769,20 @@ def _stationary_q_v2_process(
                 .reshape((bkv_sz // 2) * bkv_stride, 128)
             )
             if use_mk128:
+                if use_unroll_up:
+                    for s_loc in range(num_s):
+                        pair_u32 = kv_u32_all[
+                            pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
+                        ]
+                        _write_unpacked_kv_slice(
+                            2 * (slot_base_s + s_loc),
+                            pair_u32 & jnp.uint32(0xFFFF),
+                        )
+                        _write_unpacked_kv_slice(
+                            2 * (slot_base_s + s_loc) + 1,
+                            pair_u32 >> jnp.uint32(16),
+                        )
+                    return
 
                 @pl.loop(0, num_s, unroll=False)
                 def _up_mk_d2(s_loc):
@@ -788,6 +821,13 @@ def _stationary_q_v2_process(
             .reshape(bkv_sz * bkv_stride, 128)
         )
         if use_mk128:
+            if use_unroll_up:
+                for h_loc in range(2 * num_s):
+                    kv_u32_h = kv_u32_all[
+                        pl.ds(h_loc * 128 * bkv_stride, 128, bkv_stride)
+                    ]
+                    _write_unpacked_kv_slice(2 * slot_base_s + h_loc, kv_u32_h)
+                return
 
             @pl.loop(0, 2 * num_s, unroll=False)
             def _up_mk_nod2(h_loc):
@@ -1089,6 +1129,41 @@ def _stationary_q_v2_process(
                 return (h_idx & ring_h_mask) if ring_covers_all else h_idx
 
             h_specs = _expand_mk128_specs(bias_specs)
+            if use_la2 and n_h >= 2:
+                h_r0 = _h_ring(h_base)
+                h_r1 = _h_ring(h_base + 1)
+                qk_0 = _kq_dot(k_sub_ref[kv_h, h_r0][:, :64][None, :, :], qt_1)
+                qk_cur = _kq_dot(k_sub_ref[kv_h, h_r1][:, :64][None, :, :], qt_1)
+                p_prev, l_cur, psc_prev = _sm_eval(qk_0, h_specs[0], qsc_1)
+                acc_cur = z_acc
+                for h_off in range(2, n_h):
+                    h_next = _h_ring(h_base + h_off)
+                    h_vp = _h_ring(h_base + h_off - 2)
+                    qk_next = _kq_dot(
+                        k_sub_ref[kv_h, h_next][:, :64][None, :, :], qt_1
+                    )
+                    acc_cur = acc_cur + _vp_scaled(
+                        vt_sub_ref[kv_sl, h_vp], p_prev, psc_prev
+                    )
+                    p_prev, ps_c, psc_prev = _sm_eval(
+                        qk_cur, h_specs[h_off - 1], qsc_1
+                    )
+                    l_cur = l_cur + ps_c
+                    qk_cur = qk_next
+                h_vp_penult = _h_ring(h_base + n_h - 2)
+                h_vp_last = _h_ring(h_base + n_h - 1)
+                acc_cur = acc_cur + _vp_scaled(
+                    vt_sub_ref[kv_sl, h_vp_penult], p_prev, psc_prev
+                )
+                p_last, ps_last, psc_last = _sm_eval(
+                    qk_cur, h_specs[n_h - 1], qsc_1
+                )
+                l_cur = l_cur + ps_last
+                acc_cur = acc_cur + _vp_scaled(
+                    vt_sub_ref[kv_sl, h_vp_last], p_last, psc_last
+                )
+                return acc_cur, l_cur
+
             h_r0 = _h_ring(h_base)
             qk_0 = _kq_dot(k_sub_ref[kv_h, h_r0][:, :64][None, :, :], qt_1)
             p_prev, l_cur, psc_prev = _sm_eval(qk_0, h_specs[0], qsc_1)
@@ -1695,6 +1770,9 @@ def _stationary_q_v2_process(
         mask_hi_u32 = jnp.where(is_lo_ep, jnp.uint32(0), jnp.uint32(0xFFFFFFFF))
 
         def _pair_col_f32(a0, a1, l0, l1):
+            if use_sub8_l:
+                l0 = jnp.broadcast_to(jnp.sum(l0, axis=0, keepdims=True), (8, tq_sz))
+                l1 = jnp.broadcast_to(jnp.sum(l1, axis=0, keepdims=True), (8, tq_sz))
             inv_l0 = jnp.where(
                 l0 > 0.0,
                 pltpu.reciprocal(l0, approx=True) * v_scale_val,
@@ -1719,6 +1797,9 @@ def _stationary_q_v2_process(
             return jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32) + 0.0
 
         def _pack_pair_out(a0, a1, l0, l1, s):
+            if use_sub8_l:
+                l0 = jnp.broadcast_to(jnp.sum(l0, axis=0, keepdims=True), (8, tq_sz))
+                l1 = jnp.broadcast_to(jnp.sum(l1, axis=0, keepdims=True), (8, tq_sz))
             inv_l0 = jnp.where(
                 l0 > 0.0,
                 pltpu.reciprocal(l0, approx=True) * v_scale_val,
@@ -2364,6 +2445,59 @@ def _stationary_q_v2_process(
                     @pl.when(is_sw_short_0)
                     def _do_fused_sw_short():
                         n_unm_0 = q_first_0 // 256
+                        if use_sw_short_v2:
+                            t_sl0 = pl.ds(0, tq_sz)
+                            unpack_bq_to_qt_v2(bq_sem_idx)
+                            has4_s = (n_unm_0 & 4) != 0
+                            has2_s = (n_unm_0 & 2) != 0
+                            has1_s = (n_unm_0 & 1) != 0
+
+                            @pl.when(has4_s)
+                            def _sws_4():
+                                _run_ring_chunk(
+                                    0,
+                                    4,
+                                    jnp.bool_(True),
+                                    ("none",) * 4,
+                                    t_sl0,
+                                    static_first=True,
+                                )
+
+                            s_a4 = jnp.where(has4_s, jnp.int32(4), jnp.int32(0))
+
+                            @pl.when(has2_s)
+                            def _sws_2():
+                                _run_ring_chunk(
+                                    s_a4, 2, s_a4 == 0, ("none",) * 2, t_sl0
+                                )
+
+                            s_a2 = s_a4 + jnp.where(has2_s, jnp.int32(2), jnp.int32(0))
+
+                            @pl.when(has1_s)
+                            def _sws_1():
+                                _run_ring_chunk(
+                                    s_a2, 2, s_a2 == 0, ("none", "lt"), t_sl0
+                                )
+
+                            @pl.when(jnp.logical_not(has1_s))
+                            def _sws_lt_even():
+                                _run_ring_chunk(
+                                    n_unm_0, 1, n_unm_0 == 0, ("lt",), t_sl0
+                                )
+
+                            for s_p in range(sq_pairs):
+                                h0_p = 2 * s_p
+                                h1_p = h0_p + 1
+                                _write_sw9_pair_out(
+                                    acc_ref[h0_p, :, t_sl0],
+                                    acc_ref[h1_p, :, t_sl0],
+                                    l_ref[h0_p, :, t_sl0],
+                                    l_ref[h1_p, :, t_sl0],
+                                    s_p,
+                                    s_p // 4,
+                                )
+                            _send_fused_bo()
+                            return
                         q_u32_ref = (
                             bq_x2_ref.bitcast(jnp.uint32)
                             .at[bq_sem_idx, 0]
@@ -6572,6 +6706,12 @@ def ragged_paged_attention(
                 "vreg_acc",
                 "vreg_acc1",
                 "mk128",
+                "gqa8",
+                "sub8_l",
+                "bf16_pop",
+                "la2",
+                "unroll_up",
+                "sw_short_v2",
                 "tp16_sq",
                 "w9",
                 "sw_short_fuse",
