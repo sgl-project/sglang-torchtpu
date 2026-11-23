@@ -738,6 +738,45 @@ class TestPcpRingOpExport(CustomTestCase):
             ),
         )
 
+    def test_ring_schedule_chunk_holds_whole_slot_rotations(self):
+        """The ring's slot rotation restarts at every schedule chunk while its
+        credits carry over, so the ring phase's ``max_steps_ub`` must be a
+        multiple of the 3 input slots (and stays a multiple of the lanes)."""
+        import jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu import pallas_export
+        from sglang_tpu.attention.pallas.batched_rpa_pcp import configs, wrapper
+
+        for cp in (2, 4, 8):
+            with (
+                self.subTest(cp=cp),
+                patch.object(
+                    pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+                ),
+                pallas_export.tpu_info_for_cpu_export(),
+            ):
+                fused = wrapper.pcp_fused_configs(
+                    num_q_heads=4,
+                    num_kv_heads=1,
+                    head_dim=128,
+                    dtype_q=jnp.bfloat16,
+                    dtype_kv=jnp.float8_e4m3fn,
+                    page_size=256,
+                    cp_group_size=cp,
+                    total_q_tokens=4096,
+                    num_cache_rows=8,
+                    cache_pages_per_row=64,
+                    num_new_rows=16,
+                    new_pages_per_row=64,
+                    cache_lens_cp_page_aligned=True,
+                )
+                ring = fused.cfgs_cache
+                self.assertTrue(ring.ring_enabled)
+                align = configs.NUM_INPUT_SLOTS * pltpu.get_tpu_info().num_lanes
+                self.assertEqual(ring.max_steps_ub % align, 0)
+                self.assertEqual(ring.max_steps_ub % cp, 0)
+
     def test_each_rank_passes_and_gets_its_own_shard(self):
         """PCP4 on a 1-D mesh and PCP4 x attention TP 2 on a ``(pcp, model)``
         mesh ringing along ``pcp``; nothing is donated or aliased (a remote-DMA

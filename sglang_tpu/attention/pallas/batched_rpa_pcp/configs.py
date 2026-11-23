@@ -506,7 +506,10 @@ class RpaConfigs:
         max_steps_ub = available_bytes // bytes_per_step
 
         num_lanes = pltpu.get_tpu_info().num_lanes
-        max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
+        align = num_lanes
+        if self.ring_enabled:
+            align *= NUM_INPUT_SLOTS
+        max_steps_ub = max(1, max_steps_ub // align) * align
         return int(max_steps_ub)
 
     @property
