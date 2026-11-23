@@ -58,6 +58,30 @@ def n_expert_refs(c: PFConfig) -> int:
     return 4 * len(expert_units(c))
 
 
+def _stacked_group_sizes(group_sizes, *, in_group, n_experts: int, n_rhs: int):
+    """gmm_v2 group sizes for one layer's expert FFN.
+
+    gmm_v2 runs lhs group g on rhs[g - group_offset] (offset 1: group 0 is the padding
+    group). A layer at index in_group of a stacked group runs on the group's flattened
+    [n * n_experts, ...] refs, so k * n_experts empty groups go right after the padding
+    group; rows keep their layout. Zero groups pad to n_rhs + 1, as gmm_v2 needs a size
+    per rhs expert (also for EP replica slots past the received experts)."""
+    if in_group is not None:
+        group_sizes = jnp.concatenate(
+            [
+                group_sizes[:1],
+                jnp.zeros((in_group * n_experts,), group_sizes.dtype),
+                group_sizes[1:],
+            ]
+        )
+    short = n_rhs + 1 - group_sizes.shape[0]
+    if short > 0:
+        group_sizes = jnp.concatenate(
+            [group_sizes, jnp.zeros((short,), group_sizes.dtype)]
+        )
+    return group_sizes
+
+
 def _counts(dest, n: int):
     """[n] int32: how many of dest's entries equal each of 0..n-1."""
     return jax.nn.one_hot(dest, n, dtype=jnp.int32).sum(axis=0)
@@ -157,27 +181,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
         """silu(x @ gate) * (x @ up) @ w2 over rows grouped by local expert -> bf16 [cap, He].
         gmm_v2 quantizes x and h to e4m3 (W4A8 / W8A8) and accumulates in f32.
 
-        in_group: the layer's index in its stacked expert group (refs [n, E, ...]), or None.
-        gmm_v2 runs lhs group g on rhs[g - group_offset] (group 0 is the padding group, so
-        offset 1); a stacked layer k runs on the flattened [n * E, ...] refs with k * E empty
-        groups after the padding group, which leaves the row layout as is."""
+        in_group: the layer's index in its stacked expert group (refs [n, E, ...]), or None;
+        a stacked layer runs on the group's refs flattened to [n * E, ...]."""
         q_dtype = jnp.float4_e2m1fn if kind == "fp4" else jnp.float8_e4m3fn
+        n_e = w13.shape[1] if in_group is not None else 0
         if in_group is not None:
-            n_e = w13.shape[1]
             w13, s13, w2, s2 = (t.reshape(-1, *t.shape[2:]) for t in (w13, s13, w2, s2))
-            group_sizes = jnp.concatenate(
-                [
-                    group_sizes[:1],
-                    jnp.zeros((in_group * n_e,), group_sizes.dtype),
-                    group_sizes[1:],
-                ]
-            )
-        # gmm_v2 needs at least as many lhs groups as rhs groups (+ the padding group)
-        short = w13.shape[0] + 1 - group_sizes.shape[0]
-        if short > 0:
-            group_sizes = jnp.concatenate(
-                [group_sizes, jnp.zeros((short,), group_sizes.dtype)]
-            )
+        group_sizes = _stacked_group_sizes(
+            group_sizes, in_group=in_group, n_experts=n_e, n_rhs=w13.shape[0]
+        )
         group_offset = jnp.ones((1,), jnp.int32)
 
         def gmm(lhs, rhs, scale, fuse_act=None):
