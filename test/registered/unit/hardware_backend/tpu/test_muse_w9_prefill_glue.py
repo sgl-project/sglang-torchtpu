@@ -161,6 +161,7 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
     assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[0] == "xyz"
     assert xor1_ag_schedule_spec(8, 512, 1, xy_torus=True)[0] == "xy"
     assert xor1_ag_schedule_spec(16, 64, 1, xy_torus=True)[0] == "flat"
+    assert xor1_ag_schedule_spec(16, 100, 1, xy_torus=True)[0] == "flat"
 
     devs = jax.devices()
     if len(devs) < 8:
@@ -724,5 +725,89 @@ def test_build_chunk_rpa_metas_torch_preunbinds_swa_group_pages():
         assert m.swa_group_pages is not None and len(m.swa_group_pages) == 3
         for g in range(3):
             torch.testing.assert_close(m.swa_group_pages[g], m.swa_group_page_indices[g])
+
+
+def test_extend_full_vocab_logits_mode_gating_and_hygiene():
+    """Verify SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS defaults off, uses .get(), and pins EXTEND to FULL_VOCAB."""
+    import types
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
+    from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
+    from sglang_tpu.sampler import (
+        _can_use_fused_gumbel_max_for_batch,
+        distributed_top_k_for_batch,
+    )
+
+    assert tpu_envs.SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS.get() is False
+    repo = pathlib.Path(__file__).resolve().parents[5]
+    for rel in (
+        "sglang_tpu/sampler.py",
+        "sglang_tpu/compilation/decoder_compile_policy.py",
+    ):
+        tree = ast.parse((repo / rel).read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS"
+            ):
+                found_get = any(
+                    isinstance(c, ast.Call)
+                    and isinstance(c.func, ast.Attribute)
+                    and c.func.attr == "get"
+                    and c.func.value is node
+                    for c in ast.walk(tree)
+                )
+                assert found_get, f"{rel}:{node.lineno} missing .get()"
+
+    info = types.SimpleNamespace(
+        is_all_greedy=False,
+        uniform_top_k=50,
+        is_any_greedy=False,
+        sampling_seed=None,
+        need_top_k_sampling=True,
+        need_top_p_sampling=False,
+        need_min_p_sampling=False,
+        has_custom_logit_processor=False,
+        logit_bias=None,
+        grammars=(),
+        sampling_mask_batch_indices=None,
+        acc_additive_penalties=None,
+        acc_scaling_penalties=None,
+        penalizer_orchestrator=None,
+        temperatures=[1.0],
+    )
+    ext_batch = types.SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=64,
+        return_logprob=False,
+        sampling_info=info,
+        spec_info=None,
+    )
+    dec_batch = types.SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=64,
+        return_logprob=False,
+        sampling_info=info,
+        spec_info=None,
+    )
+    with mock.patch.dict(os.environ, {"SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS": "1"}):
+        assert distributed_top_k_for_batch(ext_batch, sampling_backend="tpu") is None
+        assert distributed_top_k_for_batch(dec_batch, sampling_backend="tpu") == 50
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_FUSED_GUMBEL_MAX_LM_HEAD": "1",
+                "SGLANG_TPU_MUSE_FUSED_FP8_LM_HEAD_TOPK": "1",
+            },
+        ):
+            assert _can_use_fused_gumbel_max_for_batch(ext_batch, None) is False
+
+    pol = DecoderTpuCompilePolicy.__new__(DecoderTpuCompilePolicy)
+    pol.model_runner = types.SimpleNamespace(spec_algorithm=None, model=object())
+    pol._distributed_top_k_width = lambda: 64
+    with mock.patch.dict(os.environ, {"SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS": "1"}):
+        assert pol._extend_logits_output_modes(64) == (LogitsOutputMode.FULL_VOCAB,)
+        assert LogitsOutputMode.DISTRIBUTED_TOP_K in pol._warmup_logits_output_modes(64)
+
 
 

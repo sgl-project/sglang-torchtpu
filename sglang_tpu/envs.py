@@ -39,6 +39,9 @@ class TpuEnvs:
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
+    # Opt-in warmup & runtime optimization: pin EXTEND/MIXED forwards to LogitsOutputMode.FULL_VOCAB
+    # so distributed TopK / greedy / Gumbel-Max variants are only compiled for DECODE buckets.
+    SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS = EnvBool(False)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
     # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static

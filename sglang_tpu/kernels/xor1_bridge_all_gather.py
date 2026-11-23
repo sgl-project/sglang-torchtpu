@@ -76,7 +76,12 @@ def xor1_ag_schedule_spec(
         and (rows % (2 * min_row_align) == 0)
     ):
         return "xy", (rows // 2, rows // 2), (1, 6, 6, 7, 7)
-    if xy_torus and tp_size == 16 and rows >= 3 * min_row_align:
+    if (
+        xy_torus
+        and tp_size == 16
+        and rows >= 3 * min_row_align
+        and (rows % min_row_align == 0)
+    ):
         return "xyz", _xyz_row_splits(rows, min_row_align), (1, 21, 21, 22, 22)
     num_chips = tp_size // 2
     num_inter = num_chips - 1

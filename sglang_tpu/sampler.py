@@ -277,7 +277,13 @@ def distributed_top_k_for_batch(
         return None
 
     mode = forward_batch.forward_mode
-    if not (mode.is_decode() or mode.is_extend_without_speculative()):
+    if not (
+        mode.is_decode()
+        or (
+            mode.is_extend_without_speculative()
+            and not envs.SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS.get()
+        )
+    ):
         return None
 
     info = forward_batch.sampling_info
@@ -370,7 +376,13 @@ def _can_use_fused_gumbel_max_for_batch(forward_batch, model) -> bool:
     ):
         return False
     mode = forward_batch.forward_mode
-    if not (mode.is_decode() or mode.is_extend_without_speculative()):
+    if not (
+        mode.is_decode()
+        or (
+            mode.is_extend_without_speculative()
+            and not envs.SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS.get()
+        )
+    ):
         return False
     if (
         getattr(info, "temperatures", None) is None

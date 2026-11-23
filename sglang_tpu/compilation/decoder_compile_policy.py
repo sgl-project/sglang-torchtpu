@@ -1213,6 +1213,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         modes.append(LogitsOutputMode.FULL_VOCAB)
         return tuple(modes)
 
+    def _extend_logits_output_modes(
+        self, batch_size: int = 0
+    ) -> tuple[LogitsOutputMode, ...]:
+        """Return logits modes reachable during EXTEND/MIXED warmup."""
+        if tpu_envs.SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS.get():
+            return (LogitsOutputMode.FULL_VOCAB,)
+        return self._warmup_logits_output_modes(batch_size)
+
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a normal or target forward before attention planning."""
         assert self.t_bucketer is not None
@@ -1605,7 +1613,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return [
             (num_tokens, bs, ForwardMode.EXTEND, "cp", logits_output_mode)
             for num_tokens, bs in self._extend_cp_compile_cases()
-            for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for logits_output_mode in self._extend_logits_output_modes(bs)
         ]
 
     def _precompile_extend(self) -> list[PendingCall]:
@@ -1624,7 +1632,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         compile_items = [
             (num_tokens, bs, mode, "plain", logits_output_mode)
             for num_tokens, bs, mode in compile_cases
-            for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for logits_output_mode in self._extend_logits_output_modes(bs)
         ]
         cp_items = self._extend_cp_compile_items()
         compile_items += cp_items
@@ -2539,7 +2547,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             (num_tokens, bs, mode, variant, logits_output_mode)
             for num_tokens, bs, mode in compile_cases
             for variant in variants
-            for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for logits_output_mode in self._extend_logits_output_modes(bs)
         ]
         logger.info(
             "[decoder compile policy] VL EXTEND: %d graph variants "
@@ -2935,7 +2943,9 @@ class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
             spec_info=spec_info,
         )
 
-    def _extend_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+    def _extend_logits_output_modes(
+        self, batch_size: int = 0
+    ) -> tuple[LogitsOutputMode, ...]:
         """Pin EXTEND to FULL_VOCAB to avoid duplicating 45-layer prefill graphs.
 
         Next-token logits on EXTEND gather at most ``extend_bs`` rows (<0.01% of
