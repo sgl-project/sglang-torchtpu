@@ -1,25 +1,18 @@
 #!/bin/bash
-# Launch one GLM-5.3-Flash AgentX point on one tpu7x 2x2x1 host (tp8) from its run JSON, as jobs
-# 36d0 (c1-c8) and 01cc (c16, c32, c48) ran them. Ready when the log prints "The server is fired
-# up and ready to roll".
+# Boot one GLM-5.3-Flash AgentX point of glm_5_3_flash/agentx.py on one tpu7x 2x2x1 host (tp8),
+# with its caches on a PVC, as jobs 36d0 (c1-c8) and 01cc (c16, c32, c48) ran them. Ready when
+# the log prints "The server is fired up and ready to roll".
 # usage: launch_agentx.sh <1|4|8|16|32|48> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)
 #   AGENTX_DEPS=<dir>    pip --target dir: transformers 5.19.0, blake3, timm 1.0.25 (default $CACHE_ROOT/pydeps)
 #   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as every point ran
-#   AGENTX_NO_SPMD=1     c1 only: use_spmd_compile false (torch_tpu 0.2.0), as c1 ran; writes the JSON to the cache dir
+#   AGENTX_NO_SPMD=1     c1 only: agentx.py --no-spmd-compile (torch_tpu 0.2.0), as c1 ran; writes the JSON to the cache dir
 #   --dry-run            print the resolved env, command and server args; start nothing
-# Removed: point 16-kda1400 and AGENTX_DUMMY, which launched the dummy-weight agentx_cc<N>.py recipes.
 set -euo pipefail
 case "${1:-}" in
-  1) RUN=R1b_c1_real_l3_ring_full ;;
-  4) RUN=C4u_c4_real_l3_ring_full ;;
-  8) RUN=K2ts_c8_real_l3_ring_full ;;
-  16) RUN=C16_S2ts_kda1400_bf16_real_l3_ring_full_ixsplit ;;
-  32) RUN=R10_c32_mr32_combo_real_l3_ring_full_ixsplit ;;
-  48) RUN=R9_c48_mr48_real_l3_ring_full_ixsplit ;;
-  *) echo "usage: $0 <1|4|8|16|32|48> [--dry-run]" >&2; exit 2 ;;
+  '' | *[!0-9]*) echo "usage: $0 <1|4|8|16|32|48> [--dry-run]" >&2; exit 2 ;;
 esac
-POINT=$1
+POINT=$1 # agentx.py rejects a concurrency it has no profile for
 case "${2:-}" in
   "") DRY_RUN= ;;
   --dry-run) DRY_RUN=1 ;;
@@ -29,15 +22,15 @@ esac
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../../../../../.." && pwd)
-CFG=$HERE/runs/$RUN.json
 CR=${CACHE_ROOT:-/cache/agentx}/c$POINT
 DEPS=${AGENTX_DEPS:-${CACHE_ROOT:-/cache/agentx}/pydeps}
+CONFIG=(--config recipe/configs/glm_5_3_flash/agentx.py --concurrency "$POINT")
 if [ "${AGENTX_NO_SPMD:-0}" = 1 ]; then
   [ "$POINT" = 1 ] || { echo "AGENTX_NO_SPMD=1 applies to c1 only" >&2; exit 2; }
   mkdir -p "$CR"
-  python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); d["server_args"]["use_spmd_compile"] = False; open(sys.argv[2], "w").write(json.dumps(d, indent=2) + "\n")' \
-    "$CFG" "$CR/${RUN}_nospmd.json"
-  CFG=$CR/${RUN}_nospmd.json
+  PYTHONPATH=$ROOT python3 -m benchmark.tpu.recipe.configs.glm_5_3_flash.agentx --conc 1 \
+    --no-spmd-compile > "$CR/agentx_c1_nospmd.json"
+  CONFIG=(--config "@$CR/agentx_c1_nospmd.json")
 fi
 [ -d "$DEPS" ] || echo "[launch_agentx] warning: no $DEPS; the images lack transformers 5.19.0, blake3, timm 1.0.25" >&2
 unset ENABLE_PROFILER_ENDPOINT SGLANG_TORCH_PROFILER_DIR # no profiler, as measured
@@ -63,7 +56,7 @@ if [ -z "$DRY_RUN" ]; then
   ln -sfn "$SGLANG_CACHE_DIR" "$HOME/.cache/sglang"
 fi
 cd "$ROOT"
-CMD=(python3 -u -m benchmark.tpu.launch_server --config "@$CFG")
+CMD=(python3 -u -m benchmark.tpu.launch_server "${CONFIG[@]}")
 if [ -n "$DRY_RUN" ]; then CMD+=(--dry-run); fi
 env | grep -E '^(PYTHON|HF_HUB_OFFLINE|TMPDIR|PROMETHEUS|SGLANG_CACHE|TORCH|FORCE_SINGLE|TPU_|HOST_BOUNDS|CHIPS_PER)' |
   sort | sed 's/^/[launch_agentx] env /' >&2

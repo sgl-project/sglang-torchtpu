@@ -3,8 +3,10 @@
 usage, from the repo root:
     python3 benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py
 
-AGENTX_DUMMY=1 must render the run JSON exactly. The submission render (real weights)
-may differ only by SUBMISSION_ONLY. Exits 1 on any other difference.
+glm_5_3_flash/agentx.py: each profile must render its MEASURED run JSON exactly.
+agentx_cc<N>.py (the earlier dummy-weight points): AGENTX_DUMMY=1 must render the run
+JSON exactly, and the submission render (real weights) may differ only by
+SUBMISSION_ONLY. Exits 1 on any other difference.
 """
 
 import importlib
@@ -86,15 +88,47 @@ def check(recipe: str, run_name: str) -> tuple[list[str], bool]:
     return lines, ok
 
 
+def _as_json(config: dict) -> dict:
+    """Values as JSON text: 2 and 2.0, or True and 1, launch different flags."""
+    return {s: {k: json.dumps(v) for k, v in d.items()} for s, d in config.items()}
+
+
+def check_profile(conc: int) -> tuple[list[str], bool]:
+    """agentx.py --conc <conc> against the run JSON it was measured with."""
+    from benchmark.tpu.recipe.configs.glm_5_3_flash.agentx import MEASURED, config_for
+
+    run_name = MEASURED[conc]
+    run = json.loads((HERE / "runs" / f"{run_name}.json").read_text())
+    rendered = config_for(conc)
+    found = diff(_as_json(run), _as_json(rendered))
+    sizes = f"{len(rendered['server_args'])} server args, {len(rendered['runtime_env'])} env"
+    lines = [
+        f"agentx.py --conc {conc} vs runs/{run_name}.json: "
+        + ("identical" if not found else f"{len(found)} differences")
+        + f" ({sizes})"
+    ]
+    for (section, key), (a, b) in found.items():
+        lines.append(f"    {section}.{key}: run {a!r} -> agentx.py {b!r} [UNEXPECTED]")
+    return lines, not found
+
+
 def main() -> int:
     sys.path.insert(0, str(HERE.parents[6]))
+    from benchmark.tpu.recipe.configs.glm_5_3_flash.agentx import MEASURED
+
     failed = []
+    for conc in MEASURED:
+        lines, ok = check_profile(conc)
+        print("\n".join(lines))
+        if not ok:
+            failed.append(f"agentx.py --conc {conc}")
     for recipe, run_name in POINTS.items():
         lines, ok = check(recipe, run_name)
         print("\n".join(lines))
         if not ok:
             failed.append(recipe)
-    print(f"FAIL: {', '.join(failed)}" if failed else f"OK: {len(POINTS)} recipes")
+    total = len(MEASURED) + len(POINTS)
+    print(f"FAIL: {', '.join(failed)}" if failed else f"OK: {total} configs")
     return 1 if failed else 0
 
 

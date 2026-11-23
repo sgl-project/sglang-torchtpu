@@ -5,7 +5,9 @@ Benchmark: AgentX (`agentx-harness==1.0.14`, SemiAnalysis cc traces, 1 h window 
 concurrency). MTP verify at InferenceX's golden acceptance: K=3 steps -> AL 3.00, K=7 ->
 AL 3.93. One run JSON in [`runs/`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs) per point.
 
-The AgentX files live in
+[`agentx.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/agentx.py) holds the server config of every point, one profile per concurrency
+(`--conc <cc>` prints it); each profile renders its point's run JSON exactly. The other
+AgentX files live in
 [`benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx);
 the file names below are relative to it.
 
@@ -173,29 +175,33 @@ Run one fresh server per point. Stop it (SIGTERM) before the next point.
 
 ### Server
 
-[`launch_agentx.sh <1|4|8|16|32|48>`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh) runs the steps below on the point's run JSON
-(`--dry-run` prints the env, command and server args; the usage text lists its knobs):
+[`launch_agentx.sh <1|4|8|16|32|48>`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh) runs the steps below on the point's
+[`agentx.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/agentx.py) profile (`--dry-run` prints the env, command and server args; the usage
+text lists its knobs):
 
 ```bash
 CACHE_ROOT=/cache/agentx AGENTX_HALF_SLICE=1 \
   benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh 16
 ```
 
-By hand, from the repo root, with the run JSON from the table:
+By hand, from the repo root, with `CC` from the table:
 
 ```bash
-A=benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx
-CFG=$A/runs/C16_S2ts_kda1400_bf16_real_l3_ring_full_ixsplit.json
-CR=/cache/agentx/c16                     # on a PVC
+CC=16
+CR=/cache/agentx/c$CC                    # on a PVC
 DEPS=/cache/agentx/pydeps                # transformers 5.19.0, blake3, timm 1.0.25
 export PYTHONSAFEPATH=1 PYTHONPATH=$DEPS:$PWD/python:$PWD PYTHONFAULTHANDLER=1 HF_HUB_OFFLINE=1 \
   TMPDIR=$CR/tmp PROMETHEUS_MULTIPROC_DIR=$CR/prom SGLANG_CACHE_DIR=$CR/sglang \
-  TORCHINDUCTOR_CACHE_DIR=$CR/inductor TORCH_TPU_TIER3_ROOT=$CR/tier3 TORCH_TPU_TIER2_NAME=agentx_c16
+  TORCHINDUCTOR_CACHE_DIR=$CR/inductor TORCH_TPU_TIER3_ROOT=$CR/tier3 TORCH_TPU_TIER2_NAME=agentx_c$CC
 mkdir -p $TMPDIR $PROMETHEUS_MULTIPROC_DIR $SGLANG_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $TORCH_TPU_TIER3_ROOT ~/.cache
 ln -sfn $SGLANG_CACHE_DIR ~/.cache/sglang
 ulimit -c 0
-python3 -u -m benchmark.tpu.launch_server --config @$CFG    # --dry-run prints the command only
+python3 -u -m benchmark.tpu.launch_server \
+  --config recipe/configs/glm_5_3_flash/agentx.py --concurrency $CC   # --dry-run prints the command only
 ```
+
+`python3 -m benchmark.tpu.recipe.configs.glm_5_3_flash.agentx --conc $CC` prints the config
+(`launch_server --config @<file>` takes it); `--eval` drops the simulated acceptance.
 
 - One host of a 2x2x2 slice run alone, as the dev-pod points ran: export this first
   (launcher: `AGENTX_HALF_SLICE=1`).
@@ -206,12 +212,11 @@ python3 -u -m benchmark.tpu.launch_server --config @$CFG    # --dry-run prints t
     TPU_WORKER_ID=0 TPU_PROCESS_ADDRESSES=localhost:8471 TPU_ACCELERATOR_TYPE=tpu7x-8
   ```
 
-- c1 on torch_tpu 0.2.0, as measured (launcher: `AGENTX_NO_SPMD=1`):
+- c1 on torch_tpu 0.2.0, as measured (launcher: `AGENTX_NO_SPMD=1`): launch with
+  `--config @$CR/c1.json` after
 
   ```bash
-  python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); d["server_args"]["use_spmd_compile"] = False; json.dump(d, open(sys.argv[2], "w"), indent=2)' \
-    $A/runs/R1b_c1_real_l3_ring_full.json $CR/c1.json
-  CFG=$CR/c1.json
+  python3 -m benchmark.tpu.recipe.configs.glm_5_3_flash.agentx --conc 1 --no-spmd-compile > $CR/c1.json
   ```
 
 - The server is ready when the log prints `The server is fired up and ready to roll`.
@@ -261,8 +266,9 @@ python3 $A/summarize.py --md $OUT
 
 ### Submission vs measured
 
-- The submission is the run JSONs in the table, as measured, except c1's `use_spmd_compile`
-  (see Per point).
+- The submission is [`agentx.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/agentx.py)'s profiles: each renders its run JSON in the table
+  exactly ([`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py) diffs them). The measured runs
+  launched those JSONs as they are, except c1's `use_spmd_compile` (see Per point).
 - Each run JSON is built in steps:
   - `*_real.json`: the point's dummy-weight config with real weights (no `load_format`,
     checkpoint prefetch, page cache dropped after load, 2400 s unbalanced-load timeout),
@@ -275,8 +281,9 @@ python3 $A/summarize.py --md $OUT
     `SGLANG_TPU_DSA_INDEX_KV_SHARD=1` and resized pools (`max_total_tokens` /
     `hicache_ratio`): c16 25,000,000 / 1.71, also `SGLANG_TPU_DSA_MLA_KV_SHARDS` 2 -> 8; c32
     14,155,776 / 2.37; c48 28,400,000 / 1.127.
-- [`launch_agentx.sh`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh) launches these JSONs. The recipes ([`agentx_cc<N>.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx),
-  [`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py)) still build and check the previous dummy-weight points' configs.
+- [`launch_agentx.sh`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh) launches the `agentx.py` profiles. The recipes
+  ([`agentx_cc<N>.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx), [`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py)) still build and check
+  the previous dummy-weight points' configs.
 
 ## Pending
 
@@ -330,14 +337,18 @@ Evidence is a job ID; 1/ITL numbers are p90. Evidence before job 301e is on dumm
 
 ## Files
 
+- [`agentx.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/agentx.py): the server config of every Results point, one profile per
+  concurrency on top of `mtp.py` (`--conc <cc>` prints it; `get_config(cc)` serves
+  `launch_server --concurrency`), the same interface as Muse Spark's AgentX recipe
+  (`muse_spark_ax/agentx.py`).
 - [`runs/*_real_l3_ring_full.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs) (c1-c8) and [`runs/*_real_l3_ring_full_ixsplit.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs)
   (c16/c32/c48): the launch JSONs of the Results points.
 - [`runs/*.json`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/runs): the launch JSONs of all measured runs, which are the measurement record.
 - [`summarize.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/summarize.py): computes the metrics of one client output dir.
-- [`launch_agentx.sh`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh): launches one Results point from its run JSON, as jobs 36d0 (c1-c8) and 01cc
-  (c16/c32/c48) ran them (Replicate, Server).
+- [`launch_agentx.sh`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/launch_agentx.sh): launches one Results point's `agentx.py` profile with the
+  caches and env of jobs 36d0 (c1-c8) and 01cc (c16/c32/c48) (Replicate, Server).
 - [`_base.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/_base.py), [`agentx_cc<N>.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx), [`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py): build and check the previous
-  dummy-weight points' configs. [`benchmark/tpu/test_launch_server.py`](benchmark/tpu/test_launch_server.py) also runs
-  [`check_recipes.py`](benchmark/tpu/recipe/configs/glm_5_3_flash/experimental/agentx/check_recipes.py).
+  dummy-weight points' configs; `check_recipes.py` also diffs each `agentx.py` profile against its
+  run JSON. [`benchmark/tpu/test_launch_server.py`](benchmark/tpu/test_launch_server.py) runs its dummy-weight checks.
 
 Chart: [GLM Flash AgentX Curves](https://claude.ai/artifact/JnGfziw2GBSqDx5LCZArVf)
