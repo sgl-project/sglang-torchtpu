@@ -660,13 +660,34 @@ class TpuEnvs:
     # per global layer. 0 (default): one shared loop with tree-walk KV refill, which keeps
     # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
-    # DeepSeek-V4.1 Flash (text, attention DP == EP == world, FP4 experts): run
-    # the routed experts of every top-k MoE layer through fused_ep_moe_v2 on
-    # this rank's own rows, without the DP gather/scatter and post-experts
-    # all-reduce (models/deepseek_v41/fused_ep_op.py). Needs
-    # SGLANG_SHARED_EXPERT_TP1=1 (checked at startup). Read when the plugin
-    # hooks are built; False registers nothing.
-    SGLANG_TPU_DSV41_FUSED_EP = EnvBool(False)
+    # Fused expert-parallel MoE (sglang_tpu/moe/fused_ep.py) for the MoE layers a
+    # model provider admits (attention DP == EP == world): unset keeps every layer
+    # on its --moe-runner-backend; v2 runs fused_ep_moe_v2 with all-gather
+    # dispatch; push runs it with dispatch="push". Needs SGLANG_SHARED_EXPERT_TP1=1
+    # (checked at startup). Read when the plugin hooks are built.
+    SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL = EnvStr(None)
+    # Push-dispatch knobs, one per push_fused_moe.PUSH_OPTIONS entry, forwarded
+    # only under SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=push. Unset keeps the
+    # kernel's default (fused_ep_moe_push's signature).
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_SC_PREPUSH = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_TC_EXCHANGE = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_HEIGHT_RUNGS_OVERRIDE = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_TAIL_BARRIER = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_ONEHOT_SLOTS = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_HBM_STAGING = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_DISPATCH_AHEAD = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_TABLE_KERNEL = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_EXCHANGE_TABLES = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_LIGHT_PREPUSH = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_SINGLE_BARRIER = EnvBool(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_FUSE_METADATA = EnvBool(None)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU checks for the DeepSeek-V4.1 fused EP wiring (SGLANG_TPU_DSV41_FUSED_EP).
+"""CPU checks for the DeepSeek-V4.1 fused EP provider (sglang_tpu.moe.fused_ep,
+SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL).
 
 sglang_tpu/models/deepseek_v41/fused_ep_op.py converts the FP4 experts in the
 gmm layout (see fused_ep.py) into fused_ep_moe_v2 operands at load and sets
@@ -59,7 +60,7 @@ from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from sglang_tpu.models.deepseek_v41 import fused_ep as fe  # noqa: E402
 from sglang_tpu.models.deepseek_v41 import fused_ep_op as op_mod  # noqa: E402
-from sglang_tpu.models.deepseek_v41 import hooks as dsv41_hooks  # noqa: E402
+from sglang_tpu.moe import fused_ep as fused_ep_mod  # noqa: E402
 
 FP4_X2 = torch.float4_e2m1fn_x2
 IMAGE_TOKEN_ID = 7
@@ -68,6 +69,11 @@ IMAGE_TOKEN_ID = 7
 E, H, I, TOPK, SCALE = 4, 512, 384, 2, 1.5
 IP = 512
 SHARED_I = 64
+V2 = fused_ep_mod.FusedEpImpl(name="v2", dispatch="all_gather")
+PUSH = fused_ep_mod.FusedEpImpl(
+    name="push", dispatch="push", push_options=(("sc_prepush", 1),)
+)
+IMPL_ENV = fused_ep_mod.IMPL_ENV
 
 
 # --------------------------------------------------------------------------- #
@@ -401,44 +407,53 @@ def _rel_rows(got, want):
 _LOADER = "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights"
 
 
+def _hook_mod():
+    # Imported here: the hooks package imports every TPU hook module.
+    from sglang_tpu.hooks import moe_fused_ep
+
+    return moe_fused_ep
+
+
 def test_switch_off_registers_no_hook(monkeypatch):
     from sglang.srt.plugins.hook_registry import HookType
 
-    monkeypatch.delenv("SGLANG_TPU_DSV41_FUSED_EP", raising=False)
-    assert dsv41_hooks.fused_ep_hook_specs() == []
-    off = dsv41_hooks.hook_specs()
-    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "0")
-    assert dsv41_hooks.hook_specs() == off
+    hooks = _hook_mod()
+    monkeypatch.delenv(IMPL_ENV, raising=False)
+    assert hooks.hook_specs() == []
+    monkeypatch.setenv(IMPL_ENV, "")
+    assert hooks.hook_specs() == []
+    for impl in ("v2", "push"):
+        monkeypatch.setenv(IMPL_ENV, impl)
+        assert hooks.hook_specs() == [
+            (_LOADER, hooks.prepare_tpu_moe_fused_ep, HookType.AFTER)
+        ]
+    # Building the specs never raises (load_plugins would drop every TPU hook);
+    # startup rejects the value instead.
+    monkeypatch.setenv(IMPL_ENV, "v3")
+    assert hooks.hook_specs()
 
-    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
-    monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "1")
-    on = dsv41_hooks.hook_specs()
-    assert on[: len(off)] == off, "the default hooks keep their order"
-    assert [(t, h, ht) for t, h, ht in on[len(off) :]] == [
-        (_LOADER, dsv41_hooks.prepare_tpu_dsv41_fused_ep, HookType.AFTER),
-    ]
 
-
-def test_missing_shared_expert_tp1_fails_at_startup(monkeypatch):
-    """The switch without SGLANG_SHARED_EXPERT_TP1=1 fails while the server args
-    resolve, not after the weights load; building the hook specs must not raise,
-    since load_plugins would only log it and drop every TPU hook."""
+def test_bad_selection_fails_at_startup(monkeypatch):
+    """A missing SGLANG_SHARED_EXPERT_TP1 or an unknown impl fails while the
+    server args resolve, not after the weights load."""
     from sglang_tpu.tpu_platform import TpuSRTPlatform
 
     # Its DSV4 resolution-hook registration imports every TPU hook module.
     dsv4_hooks = types.ModuleType("sglang_tpu.hooks.dsv4")
     dsv4_hooks.register_tpu_dsv4_resolution_hooks = lambda: None
     monkeypatch.setitem(sys.modules, dsv4_hooks.__name__, dsv4_hooks)
-    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    monkeypatch.setenv(IMPL_ENV, "push")
     monkeypatch.delenv("SGLANG_SHARED_EXPERT_TP1", raising=False)
-    assert dsv41_hooks.fused_ep_hook_specs()
     with pytest.raises(ValueError, match="needs SGLANG_SHARED_EXPERT_TP1=1"):
         TpuSRTPlatform().apply_server_args_defaults(SimpleNamespace())
     monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "1")
-    op_mod.check_dsv41_fused_ep_env()
-    monkeypatch.delenv("SGLANG_TPU_DSV41_FUSED_EP")
+    fused_ep_mod.check_fused_ep_env()
+    monkeypatch.setenv(IMPL_ENV, "v3")
+    with pytest.raises(ValueError, match="expected one of"):
+        fused_ep_mod.check_fused_ep_env()
+    monkeypatch.delenv(IMPL_ENV)
     monkeypatch.delenv("SGLANG_SHARED_EXPERT_TP1")
-    op_mod.check_dsv41_fused_ep_env()
+    fused_ep_mod.check_fused_ep_env()
 
 
 def test_hook_target_and_seam_exist():
@@ -475,7 +490,8 @@ def test_hook_applies_like_the_registry_does(monkeypatch):
     """AFTER on a staticmethod, through HookRegistry itself, on a stand-in."""
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    mod = types.ModuleType("_fake_dsv41_targets")
+    hooks = _hook_mod()
+    mod = types.ModuleType("_fake_fused_ep_targets")
 
     class Loader:
         @staticmethod
@@ -486,7 +502,7 @@ def test_hook_applies_like_the_registry_does(monkeypatch):
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
     prepared = []
     monkeypatch.setattr(
-        op_mod, "prepare_model_for_dsv41_fused_ep", lambda m: prepared.append(m)
+        fused_ep_mod, "prepare_model_for_fused_ep", lambda m: prepared.append(m)
     )
     saved_hooks = {k: list(v) for k, v in HookRegistry._hooks.items()}
     saved_patched = set(HookRegistry._patched)
@@ -494,7 +510,7 @@ def test_hook_applies_like_the_registry_does(monkeypatch):
         HookRegistry.reset()
         HookRegistry.register(
             f"{mod.__name__}.Loader.postprocess_weights",
-            dsv41_hooks.prepare_tpu_dsv41_fused_ep,
+            hooks.prepare_tpu_moe_fused_ep,
             HookType.AFTER,
         )
         HookRegistry.apply_hooks()
@@ -513,26 +529,44 @@ def test_hook_applies_like_the_registry_does(monkeypatch):
     # A refusal (unmet requirement) leaves the hooked loader step, so it fails
     # model loading and with it server start; the AFTER wrapper swallows nothing.
     def refuse(m):
-        raise ValueError("SGLANG_TPU_DSV41_FUSED_EP=1 needs X")
+        raise ValueError(f"{IMPL_ENV}=v2 needs X")
 
-    monkeypatch.setattr(op_mod, "prepare_model_for_dsv41_fused_ep", refuse)
-    with pytest.raises(ValueError, match="SGLANG_TPU_DSV41_FUSED_EP=1 needs X"):
+    monkeypatch.setattr(fused_ep_mod, "prepare_model_for_fused_ep", refuse)
+    with pytest.raises(ValueError, match=f"{IMPL_ENV}=v2 needs X"):
         Loader.postprocess_weights(model, SimpleNamespace(type="tpu"))
 
 
 def test_switch_off_prepares_nothing(monkeypatch):
-    monkeypatch.delenv("SGLANG_TPU_DSV41_FUSED_EP", raising=False)
+    monkeypatch.delenv(IMPL_ENV, raising=False)
+    monkeypatch.setattr(
+        op_mod, "prepare_model_for_fused_ep", lambda *a, **k: pytest.fail("called")
+    )
     gate, shared = _parts(torch.bfloat16)
     moe = _moe(_gmm_prepared(E, H, I), gate, shared)
     before = {
         n: (p.data_ptr(), p.shape, p.dtype) for n, p in moe.experts.named_parameters()
     }
     model = torch.nn.ModuleDict({"mlp": moe})
-    assert op_mod.prepare_model_for_dsv41_fused_ep(model) == 0
+    assert fused_ep_mod.prepare_model_for_fused_ep(model) == 0
     assert not getattr(moe, op_mod.READY_ATTR, False)
     for name, param in moe.experts.named_parameters():
         assert (param.data_ptr(), param.shape, param.dtype) == before[name]
     assert not dict(moe.experts.named_buffers())
+
+
+def test_provider_gets_the_resolved_impl(monkeypatch):
+    seen = []
+
+    def provider(model, *, impl):
+        seen.append((model, impl))
+        return 3
+
+    monkeypatch.setattr(op_mod, "prepare_model_for_fused_ep", provider)
+    monkeypatch.setenv(IMPL_ENV, "push")
+    monkeypatch.setenv(fused_ep_mod.push_option_env("sc_prepush"), "1")
+    model = object()
+    assert fused_ep_mod.prepare_model_for_fused_ep(model) == 3
+    assert seen == [(model, PUSH)]
 
 
 # --------------------------------------------------------------------------- #
@@ -598,12 +632,12 @@ def test_prepared_layer_dequantizes_like_gmm_layout(monkeypatch, geometry):
     monkeypatch.setattr(op_mod, "materialize_float4_x2", spy)
     with op_mod.kernel_override(None):
         assert op_mod.prepare_moe_layer_for_fused_ep(
-            moe, ep=2, ep_rank=1, multimodal_enabled=False
+            moe, ep=2, ep_rank=1, multimodal_enabled=False, impl=V2
         )
-        assert built == [(2, TOPK, True, SCALE, inter, "ep")]
+        assert built == [(2, TOPK, True, SCALE, inter, "ep", "all_gather", ())]
         # Idempotent.
         assert op_mod.prepare_moe_layer_for_fused_ep(
-            moe, ep=2, ep_rank=1, multimodal_enabled=False
+            moe, ep=2, ep_rank=1, multimodal_enabled=False, impl=V2
         )
         assert len(built) == 1
     assert seen[0][:2] == (0, gmm["w2_weight"].size) and seen[1][:2] == (0, 0)
@@ -695,7 +729,7 @@ A2A_NONE = SimpleNamespace(is_none=lambda: True)
 
 
 def test_global_requirements():
-    check = op_mod.unmet_global_requirements
+    check = fused_ep_mod.unmet_global_requirements
     assert check(_parallel(), _exec(), A2A_NONE) == []
     assert check(_parallel(attn_tp_size=2, attn_dp_size=4), _exec(), A2A_NONE) == [
         "attention TP size 1",
@@ -771,7 +805,7 @@ def test_layer_requirements_and_skips():
         moe = _moe(gmm, gate, shared)
         setattr(moe, attr, True)
         assert not op_mod.prepare_moe_layer_for_fused_ep(
-            moe, ep=1, ep_rank=0, multimodal_enabled=False
+            moe, ep=1, ep_rank=0, multimodal_enabled=False, impl=V2
         )
         assert moe.experts.w13_weight.numel() > 0
         assert moe.dp_local_forward is None
@@ -781,6 +815,7 @@ def test_layer_requirements_and_skips():
             ep=1,
             ep_rank=0,
             multimodal_enabled=False,
+            impl=V2,
         )
 
 
@@ -788,7 +823,6 @@ def test_prepare_model_checks_and_counts(monkeypatch):
     import sglang.srt.layers.moe as moe_pkg
     import sglang.srt.runtime_context as rc
 
-    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
     monkeypatch.setattr(op_mod, "_build_op", lambda *key: "op")
     monkeypatch.setattr(op_mod, "_multimodal_enabled", lambda: False)
     monkeypatch.setattr(rc, "get_exec", lambda: _exec())
@@ -807,7 +841,7 @@ def test_prepare_model_checks_and_counts(monkeypatch):
 
     monkeypatch.setattr(rc, "get_parallel", lambda: _parallel(attn_tp_size=2))
     with pytest.raises(ValueError, match="attention TP size 1"):
-        op_mod.prepare_model_for_dsv41_fused_ep(model)
+        op_mod.prepare_model_for_fused_ep(model, impl=V2)
     assert not any(getattr(m, op_mod.READY_ATTR, False) for m in layers)
 
     parallel = _parallel(
@@ -820,15 +854,13 @@ def test_prepare_model_checks_and_counts(monkeypatch):
     monkeypatch.setattr(
         rc, "get_exec", lambda: _exec(enable_return_routed_experts=True)
     )
-    with pytest.raises(
-        ValueError, match="SGLANG_TPU_DSV41_FUSED_EP=1 needs --enable-return-routed"
-    ):
-        op_mod.prepare_model_for_dsv41_fused_ep(model)
+    with pytest.raises(ValueError, match=f"{IMPL_ENV}=v2 needs --enable-return-routed"):
+        op_mod.prepare_model_for_fused_ep(model, impl=V2)
     assert not any(getattr(m, op_mod.READY_ATTR, False) for m in layers)
 
     monkeypatch.setattr(rc, "get_exec", lambda: _exec())
     with op_mod.kernel_override(None):
-        assert op_mod.prepare_model_for_dsv41_fused_ep(model) == 2
+        assert op_mod.prepare_model_for_fused_ep(model, impl=V2) == 2
     assert [getattr(m, op_mod.READY_ATTR, False) for m in layers] == [
         False,
         True,
@@ -844,7 +876,7 @@ def test_prepare_model_checks_and_counts(monkeypatch):
         assert m.dp_local_forward.func is op_mod.forward_fused_ep_moe
         assert m.dp_local_forward.args == (m,)
     # A model without V4.1 MoE layers (e.g. a draft) is left alone.
-    assert op_mod.prepare_model_for_dsv41_fused_ep(torch.nn.Linear(2, 2)) == 0
+    assert op_mod.prepare_model_for_fused_ep(torch.nn.Linear(2, 2), impl=V2) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -917,13 +949,18 @@ def test_op_names_are_unique_and_cached(monkeypatch):
         (8, 6, True, 2.5, 2304),
         (8, 6, True, 1.5, 2048),
         (8, 6, True, 1.5, 2304, "model"),
+        (8, 6, True, 1.5, 2304, "ep", "push", ()),
+        (8, 6, True, 1.5, 2304, "ep", "push", (("sc_prepush", 1),)),
+        (8, 6, True, 1.5, 2304, "ep", "push", (("sc_prepush", 2),)),
     ]
     names = [op_mod._op_name(*k) for k in keys]
     assert len(set(names)) == len(names)
+    # All-gather names are unchanged; push appends its dispatch and options.
     assert (
         names[0]
         == "sglang_tpu_pallas::dsv41_fused_ep_ep8_k6_r1_s1_5_i2304_c128_q512_ep"
     )
+    assert names[7] == names[0] + "_push"
     for name in names:
         assert re.fullmatch(r"sglang_tpu_pallas::[A-Za-z0-9_]+", name)
 
@@ -934,8 +971,15 @@ def test_op_names_are_unique_and_cached(monkeypatch):
         assert op_mod._get_op(8, 6, True, 1.5, 2304) is a
         assert op_mod._get_op(8.0, 6, 1, 1.5, 2304) is a  # normalized key
         assert op_mod._get_op(8, 6, True, 2.5, 2304) is not a
-        assert built == [(8, 6, True, 1.5, 2304, "ep"), (8, 6, True, 2.5, 2304, "ep")]
-    assert (8, 6, True, 1.5, 2304, "ep") not in op_mod._OPS  # override restored
+        p = op_mod._get_op(8, 6, True, 1.5, 2304, "ep", "push", (("sc_prepush", 1),))
+        assert p is not a
+        base = ("ep", "all_gather", ())
+        assert built == [
+            (8, 6, True, 1.5, 2304, *base),
+            (8, 6, True, 2.5, 2304, *base),
+            (8, 6, True, 1.5, 2304, "ep", "push", (("sc_prepush", 1),)),
+        ]
+    assert (8, 6, True, 1.5, 2304, *base) not in op_mod._OPS  # override restored
 
 
 def test_build_op_specs_and_signature(cpu_op):
@@ -968,8 +1012,9 @@ def test_build_op_specs_and_signature(cpu_op):
 # --------------------------------------------------------------------------- #
 # The fused forward against today's semantics.
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("impl", [V2, PUSH], ids=["v2", "push"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
-def test_fused_forward_matches_current_path(cpu_op, dtype):
+def test_fused_forward_matches_current_path(cpu_op, dtype, impl):
     gmm = _gmm_prepared(E, H, I)
     gate, shared = _parts(dtype, seed=2)
     moe = _moe(gmm, gate, shared)
@@ -984,7 +1029,7 @@ def test_fused_forward_matches_current_path(cpu_op, dtype):
     )
     with op_mod.kernel_override(kernel):
         assert op_mod.prepare_moe_layer_for_fused_ep(
-            moe, ep=1, ep_rank=0, multimodal_enabled=False
+            moe, ep=1, ep_rank=0, multimodal_enabled=False, impl=impl
         )
         # As NonCudaDecoderMixin._run_moe_ffn_dp_sync calls it.
         got = moe.dp_local_forward(x, fb, input_ids=ids)
@@ -1002,7 +1047,8 @@ def test_fused_forward_matches_current_path(cpu_op, dtype):
     assert call["topk"] == TOPK and call["renormalize"] is True
     assert call["routed_scaling_factor"] == SCALE
     assert call["logical_intermediate_size"] == I
-    assert call["mesh_ep_ranks"] == (0,) and call["dispatch"] == "all_gather"
+    assert call["mesh_ep_ranks"] == (0,) and call["dispatch"] == impl.dispatch
+    assert call["push_options"] == (dict(impl.push_options) or None)
     np.testing.assert_array_equal(np.asarray(call["rank"]), [[0]])
     np.testing.assert_array_equal(
         np.asarray(call["score_bias"]), gate.e_score_correction_bias.numpy()
@@ -1030,7 +1076,7 @@ def test_two_ranks_against_gathered_current_path(cpu_op):
         for rank in range(2):
             moe = _moe(gmm, gate, shared, first=2 * rank, count=2)
             assert op_mod.prepare_moe_layer_for_fused_ep(
-                moe, ep=2, ep_rank=rank, multimodal_enabled=False
+                moe, ep=2, ep_rank=rank, multimodal_enabled=False, impl=V2
             )
             fb = SimpleNamespace(
                 num_token_non_padded=torch.tensor(real[rank], dtype=torch.int32),

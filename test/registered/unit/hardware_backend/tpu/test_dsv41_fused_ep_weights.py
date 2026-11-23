@@ -473,6 +473,7 @@ def test_make_fused_ep_moe_passes_production_settings():
         logical_intermediate_size=2304,
         preprocess_topology=None,
         dispatch="all_gather",
+        push_options=None,
     )
     # Every keyword exists on the real entry point.
     inspect.signature(package.fused_ep_moe_v2).bind(

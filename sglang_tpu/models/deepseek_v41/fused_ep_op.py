@@ -5,9 +5,10 @@
 # `param.annotation is jax.Array`.
 """DeepSeek-V4.1 Flash routed experts on ``fused_ep_moe_v2`` inside SGLang.
 
-Opt-in with ``SGLANG_TPU_DSV41_FUSED_EP=1`` (``sglang_tpu.envs``). Off, nothing in
-this module runs: the plugin hook that calls it
-(``sglang_tpu/models/deepseek_v41/hooks.py``) is not registered.
+The V4.1 provider of ``sglang_tpu.moe.fused_ep``: opt-in with
+``SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=v2|push``. Unset, nothing in this module
+runs: the plugin hook that calls it (``sglang_tpu/hooks/moe_fused_ep.py``) is
+not registered.
 
 With the switch off, every V4.1 MoE layer under attention DP8 + EP8 gathers
 all ranks' hidden states (``dp_gather_replicate``), runs gate, top-k and
@@ -78,12 +79,18 @@ rows.
 import contextlib
 import functools
 import logging
+import zlib
 from threading import Lock
 from typing import Callable, Optional
 
 import torch
 
 from sglang_tpu.models.deepseek_v41 import fused_ep as fe
+from sglang_tpu.moe.fused_ep import (
+    IMPL_ENV,
+    FusedEpImpl,
+    unmet_global_requirements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,25 +120,6 @@ _KERNEL_FN: Optional[Callable] = None
 _TRACED_RANK: Optional[Callable] = None
 
 
-def is_dsv41_fused_ep_enabled() -> bool:
-    from sglang_tpu.envs import envs as tpu_envs
-
-    return bool(tpu_envs.SGLANG_TPU_DSV41_FUSED_EP.get())
-
-
-def check_dsv41_fused_ep_env() -> None:
-    """Refuse the switch without its prerequisite at startup; the per-layer check
-    would refuse every V4.1 MoE layer only once the weights have loaded."""
-    from sglang.srt.environ import envs
-
-    if is_dsv41_fused_ep_enabled() and not envs.SGLANG_SHARED_EXPERT_TP1.get():
-        raise ValueError(
-            "SGLANG_TPU_DSV41_FUSED_EP=1 needs SGLANG_SHARED_EXPERT_TP1=1 (the "
-            "fused EP layers add a replicated shared expert on each rank's own "
-            "rows). Set SGLANG_SHARED_EXPERT_TP1=1."
-        )
-
-
 # --------------------------------------------------------------------------- #
 # The custom op.
 # --------------------------------------------------------------------------- #
@@ -158,6 +146,15 @@ def _tag(value: float) -> str:
     return f"{value:.6g}".replace(".", "_").replace("-", "m").replace("+", "p")
 
 
+def _dispatch_tag(dispatch: str, push_options: tuple) -> str:
+    if dispatch == fe.DISPATCH:
+        return ""
+    tag = f"_{dispatch}"
+    if push_options:
+        tag += f"_o{zlib.crc32(repr(push_options).encode()):08x}"
+    return tag
+
+
 def _op_name(
     ep: int,
     topk: int,
@@ -165,6 +162,8 @@ def _op_name(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    dispatch: str = fe.DISPATCH,
+    push_options: tuple = (),
 ) -> str:
     """One torch custom-op name per closure configuration (the kernel's other
     settings are module constants of fused_ep and part of the name too)."""
@@ -172,6 +171,7 @@ def _op_name(
         f"sglang_tpu_pallas::dsv41_fused_ep_ep{ep}_k{topk}_r{int(renormalize)}"
         f"_s{_tag(routed_scaling_factor)}_i{logical_intermediate_size}"
         f"_c{fe.CAPACITY}_q{fe.RHS_QB}_{axis_name}"
+        f"{_dispatch_tag(dispatch, push_options)}"
     )
 
 
@@ -183,6 +183,8 @@ def _make_jax_fn(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str,
+    dispatch: str = fe.DISPATCH,
+    push_options: tuple = (),
 ):
     """The exported JAX body, its input and its output partition specs.
 
@@ -201,6 +203,8 @@ def _make_jax_fn(
         renormalize=renormalize,
         routed_scaling_factor=routed_scaling_factor,
         logical_intermediate_size=logical_intermediate_size,
+        dispatch=dispatch,
+        push_options=dict(push_options) or None,
         kernel_fn=_KERNEL_FN,
         jit=False,
     )
@@ -236,6 +240,8 @@ def _build_op(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    dispatch: str = fe.DISPATCH,
+    push_options: tuple = (),
 ) -> Callable:
     mesh = _get_mesh(ep, axis_name)
     fn, in_specs, out_specs = _make_jax_fn(
@@ -246,6 +252,8 @@ def _build_op(
         routed_scaling_factor,
         logical_intermediate_size,
         axis_name,
+        dispatch,
+        push_options,
     )
     op = _export_op(
         _op_name(
@@ -255,6 +263,8 @@ def _build_op(
             routed_scaling_factor,
             logical_intermediate_size,
             axis_name,
+            dispatch,
+            push_options,
         ),
         fn,
         mesh=mesh,
@@ -273,6 +283,8 @@ def _get_op(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    dispatch: str = fe.DISPATCH,
+    push_options: tuple = (),
 ) -> Callable:
     key = (
         int(ep),
@@ -281,6 +293,8 @@ def _get_op(
         float(routed_scaling_factor),
         int(logical_intermediate_size),
         str(axis_name),
+        str(dispatch),
+        tuple(push_options),
     )
     op = _OPS.get(key)
     if op is not None:
@@ -435,52 +449,6 @@ def layer_skip_reason(moe: torch.nn.Module) -> Optional[str]:
     return None
 
 
-def unmet_global_requirements(parallel, exec_ctx, a2a_backend) -> list[str]:
-    """Process-wide conditions the fused path relies on (empty when all hold)."""
-    world = int(parallel.world_group.world_size)
-    ep = int(parallel.moe_ep_size)
-    moe_args = exec_ctx.moe
-    features = exec_ctx.features
-    requirements = (
-        ("attention TP size 1", int(parallel.attn_tp_size) == 1),
-        (f"MoE EP size == world size ({ep} vs {world})", ep == world),
-        (
-            f"attention DP size == EP size ({parallel.attn_dp_size} vs {ep})",
-            int(parallel.attn_dp_size) == ep,
-        ),
-        ("pipeline parallel size 1", int(parallel.pp_size) == 1),
-        ("attention context parallel size 1", int(parallel.attn_cp_size) == 1),
-        ("no MoE all-to-all backend", a2a_backend.is_none()),
-        (
-            "EPLB and redundant experts off",
-            not moe_args.enable_eplb and not moe_args.ep_num_redundant_experts,
-        ),
-        # A fused layer never runs the layer's TopK, so its routing reaches
-        # neither the routed-experts capture nor the expert distribution
-        # recorder: refuse both rather than return data without these layers.
-        (
-            "--enable-return-routed-experts off (fused layers capture no routing)",
-            not features.enable_return_routed_experts,
-        ),
-        (
-            "--expert-distribution-recorder-mode unset (fused layers record no "
-            "routing)",
-            moe_args.expert_distribution_recorder_mode is None,
-        ),
-        # The relayout and the in-kernel gating take physical expert e as
-        # logical expert e.
-        (
-            "--init-expert-location trivial (experts in logical order)",
-            moe_args.init_expert_location == "trivial",
-        ),
-        (
-            "decoder SWA bounded replay off (it drops rows per layer)",
-            not features.enable_decoder_swa_bounded_replay,
-        ),
-    )
-    return [name for name, met in requirements if not met]
-
-
 def _gmm_fp4_layout(experts, hidden: int, logical: int) -> bool:
     """The gmm layout's FP4-expert tensors with the model's geometry."""
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
@@ -586,6 +554,7 @@ def prepare_moe_layer_for_fused_ep(
     ep: int,
     ep_rank: int,
     multimodal_enabled: Optional[bool],
+    impl: FusedEpImpl,
 ) -> bool:
     """Replace one layer's gmm-layout expert tensors by the kernel operands,
     build its op and set ``moe.dp_local_forward``. Returns False for a layer
@@ -595,7 +564,9 @@ def prepare_moe_layer_for_fused_ep(
     reason = layer_skip_reason(moe)
     if reason is not None:
         logger.info(
-            "SGLANG_TPU_DSV41_FUSED_EP: layer %s keeps gmm_v2 (%s).",
+            "%s=%s: layer %s keeps gmm_v2 (%s).",
+            IMPL_ENV,
+            impl.name,
             getattr(moe, "layer_id", "?"),
             reason,
         )
@@ -603,7 +574,7 @@ def prepare_moe_layer_for_fused_ep(
     unmet = unmet_layer_requirements(moe, ep=ep, multimodal_enabled=multimodal_enabled)
     if unmet:
         raise ValueError(
-            "SGLANG_TPU_DSV41_FUSED_EP=1, but MoE layer "
+            f"{IMPL_ENV}={impl.name}, but MoE layer "
             f"{getattr(moe, 'layer_id', '?')} cannot run fused EP: needs "
             + "; ".join(unmet)
         )
@@ -616,6 +587,8 @@ def prepare_moe_layer_for_fused_ep(
         float(moe.routed_scaling_factor),
         int(config.moe_intermediate_size),
         _DEFAULT_MESH_AXIS,
+        impl.dispatch,
+        impl.push_options,
     )
     # Build the op first (outside Dynamo): a failure leaves the gmm-layout weights.
     _get_op(*key)
@@ -642,15 +615,16 @@ def prepare_moe_layer_for_fused_ep(
     return True
 
 
-def prepare_model_for_dsv41_fused_ep(model: torch.nn.Module) -> int:
-    """Prepare every eligible V4.1 MoE layer of ``model``; returns the count."""
+def prepare_model_for_fused_ep(model: torch.nn.Module, *, impl: FusedEpImpl) -> int:
+    """Prepare every eligible V4.1 MoE layer of ``model`` for ``impl``; returns
+    the count (the provider entry point of ``sglang_tpu.moe.fused_ep``)."""
     global _TRACED_RANK
-    if not is_dsv41_fused_ep_enabled():
-        return 0
     layers = [m for m in model.modules() if is_dsv41_moe(m)]
     if not layers:
         logger.info(
-            "SGLANG_TPU_DSV41_FUSED_EP: %s has no DeepSeek-V4.1 MoE layer.",
+            "%s=%s: %s has no DeepSeek-V4.1 MoE layer.",
+            IMPL_ENV,
+            impl.name,
             type(model).__name__,
         )
         return 0
@@ -661,7 +635,7 @@ def prepare_model_for_dsv41_fused_ep(model: torch.nn.Module) -> int:
     parallel = get_parallel()
     unmet = unmet_global_requirements(parallel, get_exec(), get_moe_a2a_backend())
     if unmet:
-        raise ValueError("SGLANG_TPU_DSV41_FUSED_EP=1 needs " + "; ".join(unmet))
+        raise ValueError(f"{IMPL_ENV}={impl.name} needs " + "; ".join(unmet))
     ep = int(parallel.moe_ep_size)
     ep_rank = int(parallel.moe_ep_rank)
     _TRACED_RANK = _resolve_traced_rank()
@@ -671,16 +645,19 @@ def prepare_model_for_dsv41_fused_ep(model: torch.nn.Module) -> int:
         m
         for m in layers
         if prepare_moe_layer_for_fused_ep(
-            m, ep=ep, ep_rank=ep_rank, multimodal_enabled=multimodal
+            m, ep=ep, ep_rank=ep_rank, multimodal_enabled=multimodal, impl=impl
         )
     ]
     if prepared:
         key = getattr(prepared[0], _KEY_ATTR)
         logger.info(
-            "SGLANG_TPU_DSV41_FUSED_EP: %d of %d MoE layers run fused_ep_moe_v2 "
-            "(op %s, ep rank %d); %d keep gmm_v2.",
+            "%s=%s: %d of %d MoE layers run fused_ep_moe_v2 (dispatch %s, op %s, "
+            "ep rank %d); %d keep gmm_v2.",
+            IMPL_ENV,
+            impl.name,
             len(prepared),
             len(layers),
+            impl.dispatch,
             _op_name(*key),
             ep_rank,
             len(layers) - len(prepared),

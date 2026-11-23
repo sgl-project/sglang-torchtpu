@@ -137,6 +137,8 @@ def make_fused_ep_moe(
     act_fn: str = ACT_FN,
     scoring_fn: str = SCORING_FN,
     sharded_plan: bool = True,
+    dispatch: str = DISPATCH,
+    push_options: dict | None = None,
     kernel_fn=None,
     jit: bool = True,
 ):
@@ -152,7 +154,8 @@ def make_fused_ep_moe(
     Settings mirror vLLM epic/dsv41's V4.1 layer except
     ``preprocess_topology`` (None here; vLLM passes
     ``prepare_moe_preprocessing(mesh)``). Tokens are exchanged with
-    :data:`DISPATCH`. ``rank`` is optional: left out (None), the kernel layer
+    ``dispatch``: :data:`DISPATCH` by default, or ``"push"`` with the push
+    kernel's ``push_options``. ``rank`` is optional: left out (None), the kernel layer
     builds the rank operand itself under a plain ``jax.jit``; a torch_tpu
     export must pass it as an int32 ``[ep, 1]`` operand sharded on the mesh
     axis (see fused_ep_op.py). ``kernel_fn`` replaces ``fused_ep_moe_v2``
@@ -197,7 +200,8 @@ def make_fused_ep_moe(
             routed_scaling_factor=routed_scaling_factor,
             logical_intermediate_size=logical_intermediate_size,
             preprocess_topology=None,
-            dispatch=DISPATCH,
+            dispatch=dispatch,
+            push_options=push_options,
         )
 
     return jax.jit(moe) if jit else moe
