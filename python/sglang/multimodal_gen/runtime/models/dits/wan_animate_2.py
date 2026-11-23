@@ -40,6 +40,14 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformer3DM
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
+def _own_shard(hidden_states: torch.Tensor) -> torch.Tensor:
+    """This rank's sequence shard at storage offset 0: a shard view starts at a
+    rank-dependent offset, which some compiled backends key executables on, and
+    the spmd-safe block regions need the same program on every rank."""
+    hidden_states, _ = shard_seq(hidden_states, dim=1)
+    return hidden_states.clone(memory_format=torch.contiguous_format)
+
+
 class WanAnimate2Transformer3DModel(WanTransformer3DModel):
     """Wan-Animate-2 DiT (in-context variant) on the Wan2.2-I2V-14B backbone.
 
@@ -302,7 +310,7 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         reference_video_key_mask = None
         sp_size = get_sp_world_size()
         if sp_size > 1:
-            hidden_states, _ = shard_seq(hidden_states, dim=1)
+            hidden_states = _own_shard(hidden_states)
             gathered_seq_len = hidden_states.shape[1] * sp_size
             if gathered_seq_len != reference_video_num_tokens:
                 reference_video_key_mask = _reference_video_key_mask(
@@ -405,7 +413,7 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         # sequence, so shard tail padding lands at the global tail where forward_gen
         # expects it.
         if sp_size > 1:
-            hidden_states, _ = shard_seq(hidden_states, dim=1)
+            hidden_states = _own_shard(hidden_states)
         hidden_states = self._run_generation_blocks(
             hidden_states,
             encoder_hidden_states=generation_encoder_hidden_states,

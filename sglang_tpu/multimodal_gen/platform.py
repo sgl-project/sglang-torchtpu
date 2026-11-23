@@ -147,6 +147,11 @@ class TpuOOTPlatform(TpuPlatform):
         return spmd_safe
 
     def apply_server_args_defaults(self, server_args) -> None:
+        # Pipeline configs validate the parallel layout here, in the launcher,
+        # before any worker installs its runtime patches.
+        from sglang_tpu.multimodal_gen import wan_animate_2
+
+        wan_animate_2.install_config()
         # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
         if (
             server_args.is_arg_explicitly_set("offload_during_compile")
