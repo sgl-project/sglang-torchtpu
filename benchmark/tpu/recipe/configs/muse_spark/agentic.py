@@ -83,18 +83,12 @@ _BASE["runtime_env"].update(
         "SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE": "1",
         "SGLANG_TPU_MUSE_MK_ATTN_COL_MASK": "1",
         "SGLANG_TPU_MK_FOLD_ATTN_SCALE": "1",
-        # Megakernel MoE: overlap the reduce-scatter sends with the remaining experts.
-        "SGLANG_TPU_MK_Y_EARLY": "1",
-        "SGLANG_TPU_MK_Y_BLOCK_SEND": "1",
         # DFlash2 draft: TP-sharded context projection, matmul conv, fp8 weight-only linears.
         "SGLANG_DFLASH_ROW_PARALLEL_FC": "1",
         "SGLANG_DFLASH_CONV_MATMUL_EXPAND": "1",
         "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
-        # HiCache transfers: one segment per run of contiguous pages.
-        "SGLANG_TPU_RAIDEN_COALESCE_PAGES": "1",
-        # Scheduling: short prefills ride along a long one; no idle deferral when nothing decodes.
+        # Scheduling: short prefills ride along a long one.
         "SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS": "1024",
-        "SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE": "1",
         # Checkpoint a long prefill into the radix tree every 128K tokens, not every chunk.
         "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         # Reserve each request's full max_new_tokens at admission: queue, never retract.
