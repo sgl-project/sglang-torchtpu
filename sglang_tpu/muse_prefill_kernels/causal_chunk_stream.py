@@ -24,14 +24,41 @@ def resolve_causal_chunks(t_shard: int, spec: str = "") -> tuple[int, ...]:
     """Return per-rank chunk row counts summing to ``t_shard`` (all >=64 & 64-aligned)."""
     spec_s = spec.strip()
     if spec_s:
-        raw = tuple(int(x) for x in spec_s.split(",") if x.strip())
-        if len(raw) >= 2 and sum(raw) == t_shard and all(c >= 64 and c % 64 == 0 for c in raw):
-            return raw
-        if len(raw) >= 2 and t_shard > sum(raw) and t_shard % sum(raw) == 0:
-            scale = t_shard // sum(raw)
-            scaled = tuple(c * scale for c in raw)
-            if all(c >= 64 and c % 64 == 0 for c in scaled):
-                return scaled
+        default_raw: tuple[int, ...] | None = None
+        for clause in spec_s.split(";"):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if ":" in clause:
+                bkt_s, nums_s = clause.split(":", 1)
+                if int(bkt_s.strip()) == t_shard:
+                    nums = tuple(int(x) for x in nums_s.split(",") if x.strip())
+                    if (
+                        len(nums) >= 2
+                        and sum(nums) == t_shard
+                        and all(c >= 64 and c % 64 == 0 for c in nums)
+                    ):
+                        return nums
+            else:
+                default_raw = tuple(int(x) for x in clause.split(",") if x.strip())
+        if default_raw is not None and len(default_raw) >= 2:
+            raw = default_raw
+            sum_r = sum(raw)
+            if sum_r == t_shard and all(c >= 64 and c % 64 == 0 for c in raw):
+                return raw
+            if t_shard > sum_r and t_shard % sum_r == 0:
+                scale = t_shard // sum_r
+                scaled = tuple(c * scale for c in raw)
+                if all(c >= 64 and c % 64 == 0 for c in scaled):
+                    return scaled
+            if len(raw) == 2 and sum_r > 0 and t_shard >= 128 and t_shard % 64 == 0:
+                step = 128 if (t_shard >= 256 and t_shard % 128 == 0) else 64
+                n_units = t_shard // step
+                denom = sum_r * step
+                u0 = (t_shard * raw[0] + denom // 2) // denom
+                u0 = max(1, min(n_units - 1, u0))
+                c0 = u0 * step
+                return (c0, t_shard - c0)
     if t_shard == 3072:
         return (512, 1280, 1280)
     if t_shard == 2048:

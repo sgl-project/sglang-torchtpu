@@ -411,3 +411,153 @@ def test_real_libtpu_tpu7x_aot_hlo_and_llo_zero_concat_and_chipmate():
         assert "pallas_prefill_chipmate_2slot_split_m196608" in hlo_cm
         n_fusions = len(re.findall(r"= .*fusion\(", hlo_cm))
         assert n_fusions <= 4, f"Expected <=4 fusions with Pallas chipmate router, got {n_fusions}"
+
+
+
+def test_w12b_resolve_causal_chunks_2chunk_downscale_and_per_bucket_spec():
+    from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import (
+        from_chunk_major_perm,
+        resolve_causal_chunks,
+        to_chunk_major_perm,
+    )
+
+    # Empty spec preserves legacy 3-chunk defaults verbatim.
+    assert resolve_causal_chunks(3072, "") == (512, 1280, 1280)
+    assert resolve_causal_chunks(2048, "") == (512, 768, 768)
+    assert resolve_causal_chunks(1024, "") == (256, 384, 384)
+    assert resolve_causal_chunks(512, "") == (128, 192, 192)
+
+    # 2-chunk specs stay 2-chunk & 128-aligned across sub-16k buckets (>=256).
+    assert resolve_causal_chunks(2048, "640,1408") == (640, 1408)
+    assert resolve_causal_chunks(1024, "640,1408") == (384, 640)
+    assert resolve_causal_chunks(512, "640,1408") == (128, 384)
+    assert resolve_causal_chunks(256, "640,1408") == (128, 128)
+    assert resolve_causal_chunks(128, "640,1408") == (64, 64)
+
+    assert resolve_causal_chunks(2048, "768,1280") == (768, 1280)
+    assert resolve_causal_chunks(1024, "768,1280") == (384, 640)
+    assert resolve_causal_chunks(512, "768,1280") == (256, 256)
+    assert resolve_causal_chunks(256, "768,1280") == (128, 128)
+
+    assert resolve_causal_chunks(3072, "1024,2048") == (1024, 2048)
+    assert resolve_causal_chunks(2048, "1024,2048") == (640, 1408)
+    assert resolve_causal_chunks(1024, "1024,2048") == (384, 640)
+    assert resolve_causal_chunks(512, "1024,2048") == (128, 384)
+
+    # Integer upscale continues to work cleanly.
+    assert resolve_causal_chunks(2048, "384,640") == (768, 1280)
+    assert resolve_causal_chunks(1024, "384,640") == (384, 640)
+
+    # Explicit per-bucket overrides (';' / ':') take precedence over default scaling.
+    spec_multi = "2048:640,1408;1024:256,768;512:192,320;640,1408"
+    assert resolve_causal_chunks(2048, spec_multi) == (640, 1408)
+    assert resolve_causal_chunks(1024, spec_multi) == (256, 768)
+    assert resolve_causal_chunks(512, spec_multi) == (192, 320)
+    assert resolve_causal_chunks(256, spec_multi) == (128, 128)
+
+    for ts in (128, 256, 384, 512, 1024, 2048, 3072):
+        ch = resolve_causal_chunks(ts, "640,1408")
+        assert len(ch) == 2 and sum(ch) == ts
+        if ts >= 256:
+            assert all(c % 128 == 0 for c in ch)
+        p = to_chunk_major_perm(8, ch)
+        inv = from_chunk_major_perm(8, ch)
+        assert [p[inv[i]] for i in range(8 * ts)] == list(range(8 * ts))
+
+
+def test_w12b_l61_pruned_per_chunk_gather_bit_exact_fp8_and_bf16():
+    import torch
+
+    int_src = (
+        pathlib.Path(__file__).resolve().parents[5]
+        / "sglang_tpu"
+        / "muse_prefill_kernels"
+        / "integration.py"
+    ).read_text()
+    tree = ast.parse(int_src)
+    fn_nodes = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_layer_l61_pruned"
+    ]
+    assert len(fn_nodes) == 1
+    l61_segment = ast.get_source_segment(int_src, fn_nodes[0]) or ""
+    assert "torch.cat(q_parts" not in l61_segment
+    assert "torch.cat(gate_parts" not in l61_segment
+    assert "torch.cat(kv_parts" not in l61_segment
+
+    g = torch.Generator().manual_seed(20261123)
+    tp_size = 8
+    q_size = 1024
+    for chunks in ((384, 640), (640, 1408), (256, 384, 384)):
+        t_total = tp_size * sum(chunks)
+        bs = 64
+        # Include exact chunk boundaries, interior indices, and inactive (ext_lens=0) rows.
+        c0_tok = tp_size * chunks[0]
+        raw_idx = torch.randint(0, t_total, (bs,), generator=g, dtype=torch.int64)
+        raw_idx[0] = 0
+        raw_idx[1] = c0_tok - 1
+        raw_idx[2] = c0_tok
+        raw_idx[3] = t_total - 1
+        ext_lens = torch.randint(0, 4, (bs,), generator=g, dtype=torch.int32)
+        active = ext_lens > 0
+        eff_idx = torch.where(active, raw_idx, 0).clamp(0, t_total - 1)
+        idx_128 = torch.nn.functional.pad(eff_idx.long(), (0, 128 - bs))
+
+        q_parts = []
+        gate_parts = []
+        kv_parts = []
+        for c_k in chunks:
+            c_tok = tp_size * c_k
+            q_parts.append(
+                torch.randn((1, c_tok, 8, 2, 128), generator=g).to(torch.bfloat16)
+            )
+            gate_parts.append(
+                torch.randn((c_tok, q_size), generator=g).to(torch.bfloat16)
+            )
+            kv_u8 = torch.randint(
+                0, 256, (c_tok, 1, 4, 128), generator=g, dtype=torch.uint8
+            )
+            kv_parts.append(kv_u8.view(torch.float8_e4m3fn))
+
+        # Reference: full concat + index_select
+        q_ref = torch.cat(q_parts, dim=1).index_select(1, idx_128)
+        gate_ref = torch.cat(gate_parts, dim=0).index_select(0, idx_128)
+        kv_ref = (
+            torch.cat([x.view(torch.uint8) for x in kv_parts], dim=0)
+            .index_select(0, idx_128)
+            .view(torch.float8_e4m3fn)
+        )
+
+        # Optimized per-chunk 128-row gather (zero full-T concat)
+        q_pruned = None
+        gate_pruned = None
+        kv_pruned_u8 = None
+        kv_dtype = None
+        c_off = 0
+        for k, (c_k, q_k, gate_k, kv_k) in enumerate(
+            zip(chunks, q_parts, gate_parts, kv_parts)
+        ):
+            c_tok = tp_size * c_k
+            loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
+            q_sel = q_k.index_select(1, loc_idx)
+            gate_sel = gate_k.reshape(-1, q_size).index_select(0, loc_idx)
+            kv_dtype = kv_k.dtype
+            kv_sel_u8 = kv_k.view(torch.uint8).index_select(0, loc_idx)
+            if k == 0:
+                q_pruned = q_sel
+                gate_pruned = gate_sel
+                kv_pruned_u8 = kv_sel_u8
+            else:
+                in_c = (idx_128 >= c_off) & (idx_128 < c_off + c_tok)
+                in_q = in_c.view(1, -1, *([1] * (q_sel.ndim - 2)))
+                in_kv = in_c.view(-1, *([1] * (kv_sel_u8.ndim - 1)))
+                q_pruned = torch.where(in_q, q_sel, q_pruned)
+                gate_pruned = torch.where(in_c[:, None], gate_sel, gate_pruned)
+                kv_pruned_u8 = torch.where(in_kv, kv_sel_u8, kv_pruned_u8)
+            c_off += c_tok
+        kv_pruned = kv_pruned_u8.view(kv_dtype)
+
+        assert torch.equal(q_pruned.view(torch.uint16), q_ref.view(torch.uint16))
+        assert torch.equal(gate_pruned.view(torch.uint16), gate_ref.view(torch.uint16))
+        assert torch.equal(kv_pruned.view(torch.uint8), kv_ref.view(torch.uint8))

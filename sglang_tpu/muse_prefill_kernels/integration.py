@@ -1115,7 +1115,12 @@ def _ops(
 
     ccs_tag = (
         "_ccs"
-        + ("_" + causal_chunk_spec.replace(",", "_") if causal_chunk_spec else "")
+        + (
+            "_"
+            + causal_chunk_spec.replace(";", "__").replace(":", "_").replace(",", "_")
+            if causal_chunk_spec
+            else ""
+        )
         if causal_chunk_stream
         else ""
     )
@@ -2939,6 +2944,11 @@ class MusePrefillKernels(torch.nn.Module):
         wqkvg_scale = weights.wqkvg_scale[None]
         a1_extra = (valid_tokens,) if self._a1_skip else ()
         q_size = attn.num_heads * 64
+        bs = exit_last_index.shape[0]
+        ext_lens = forward_batch.extend_seq_lens
+        active = ext_lens > 0
+        eff_idx = torch.where(active, exit_last_index, 0).clamp(0, t_total - 1)
+        idx_128 = torch.nn.functional.pad(eff_idx.long(), (0, 128 - bs))
         if chunk_metas is not None and chunks is not None and rope_chunks is not None:
             if isinstance(attn_in, tuple):
                 ag_cur, rest_in = attn_in
@@ -2947,7 +2957,11 @@ class MusePrefillKernels(torch.nn.Module):
                 ag_cur = self.ops.ag_chunk(attn_in[: chunks[0]])
                 rest_in = attn_in
                 rest_off = chunks[0]
-            q_parts, gate_parts, kv_parts = [], [], []
+            q_pruned = None
+            gate_pruned = None
+            kv_pruned_u8 = None
+            kv_dtype = None
+            c_off = 0
             for k, c_k in enumerate(chunks):
                 has_next_c = k + 1 < len(chunks)
                 if has_next_c and self.ops.a1_chunk_agd is not None:
@@ -2976,14 +2990,28 @@ class MusePrefillKernels(torch.nn.Module):
                         rope_chunks[k][1],
                     )
                 be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k])
-                q_parts.append(q_k)
-                gate_parts.append(gate_k.reshape(-1, q_size))
-                kv_parts.append(kv_k)
+                c_tok = self.tp_size * c_k
+                loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
+                q_sel = q_k.index_select(1, loc_idx)
+                gate_sel = gate_k.reshape(-1, q_size).index_select(0, loc_idx)
+                kv_dtype = kv_k.dtype
+                kv_sel_u8 = kv_k.view(torch.uint8).index_select(0, loc_idx)
+                if k == 0:
+                    q_pruned = q_sel
+                    gate_pruned = gate_sel
+                    kv_pruned_u8 = kv_sel_u8
+                else:
+                    in_c = (idx_128 >= c_off) & (idx_128 < c_off + c_tok)
+                    in_q = in_c.view(1, -1, *([1] * (q_sel.ndim - 2)))
+                    in_kv = in_c.view(-1, *([1] * (kv_sel_u8.ndim - 1)))
+                    q_pruned = torch.where(in_q, q_sel, q_pruned)
+                    gate_pruned = torch.where(in_c[:, None], gate_sel, gate_pruned)
+                    kv_pruned_u8 = torch.where(in_kv, kv_sel_u8, kv_pruned_u8)
+                c_off += c_tok
                 if k + 1 < len(chunks):
                     ag_cur = ag_next
-            q_all = torch.cat(q_parts, dim=1)
-            gate_all = torch.cat(gate_parts, dim=0)
-            kv_all = torch.cat(kv_parts, dim=0)
+            assert q_pruned is not None and gate_pruned is not None and kv_pruned_u8 is not None
+            kv_pruned = kv_pruned_u8.view(kv_dtype)
         else:
             if self.a1_variant in _HYBRID_A1_VARIANTS:
                 q_all, gate_all, kv_all = self.ops.a1(
@@ -3021,15 +3049,9 @@ class MusePrefillKernels(torch.nn.Module):
                     attn_in, wqkvg, wqkvg_scale, rope[0], rope[1], *a1_extra
                 )
             be.write_kv_only(kv_all, attn.attn, forward_batch)
-
-        bs = exit_last_index.shape[0]
-        ext_lens = forward_batch.extend_seq_lens
-        active = ext_lens > 0
-        eff_idx = torch.where(active, exit_last_index, 0).clamp(0, t_total - 1)
-        idx_128 = torch.nn.functional.pad(eff_idx.long(), (0, 128 - bs))
-        q_pruned = q_all.index_select(1, idx_128)
-        gate_pruned = gate_all.index_select(0, idx_128)
-        kv_pruned = kv_all.index_select(0, idx_128)
+            q_pruned = q_all.index_select(1, idx_128)
+            gate_pruned = gate_all.index_select(0, idx_128)
+            kv_pruned = kv_all.index_select(0, idx_128)
 
         cm_idx = (
             inv_cm_perm.index_select(0, eff_idx.long())
@@ -3831,7 +3853,10 @@ class MusePrefillKernels(torch.nn.Module):
                     ts, self.causal_chunk_spec
                 )[0]
                 ccs_eplb_tag = "_ccs" + (
-                    "_" + self.causal_chunk_spec.replace(",", "_")
+                    "_"
+                    + self.causal_chunk_spec.replace(";", "__")
+                    .replace(":", "_")
+                    .replace(",", "_")
                     if self.causal_chunk_spec
                     else ""
                 )
