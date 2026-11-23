@@ -57,7 +57,10 @@ class DecodeFastConfig:
     shared_split_dense2: bool = False
     shared_fp8_qkpv: bool = False
     shared_fp8_pv_only: bool = False
+    shared_sub_k: int = 0
+    shared_1x_kv: bool = False
     batch_full: bool = False
+    pipe_2seq: bool = False
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -280,14 +283,29 @@ def parse_decode_fast_config(
     fp8_dots = "fp8dp" in toks_cfg
     hoist_new_kv = decode_query_size == 1 and ("hoistkv" in toks_cfg)
     shared_q_tile = (
-        128
-        if "q128" in toks_cfg
-        else (1024 if "q1024" in toks_cfg else (512 if "q512" in toks_cfg else 256))
+        32
+        if "q32" in toks_cfg
+        else (
+            64
+            if "q64" in toks_cfg
+            else (
+                128
+                if "q128" in toks_cfg
+                else (1024 if "q1024" in toks_cfg else (512 if "q512" in toks_cfg else 256))
+            )
+        )
     )
-    shared_split_dense2 = "shsplit" in toks_cfg
+    shared_1x_kv = "sh1x" in toks_cfg
+    shared_split_dense2 = "shsplit" in toks_cfg or shared_1x_kv
     shared_fp8_qkpv = "shfp8" in toks_cfg
     shared_fp8_pv_only = "shfp8pv" in toks_cfg
+    shared_sub_k = (
+        512
+        if "shsub512" in toks_cfg
+        else (1024 if "shsub1024" in toks_cfg else (2048 if "shsub2048" in toks_cfg else 0))
+    )
     batch_full = "batchfull" in toks_cfg
+    pipe_2seq = "swapipe" in toks_cfg
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -375,10 +393,17 @@ def parse_decode_fast_config(
                 "shsplit",
                 "shfp8",
                 "shfp8pv",
+                "q32",
+                "q64",
                 "q128",
+                "shsub512",
+                "shsub1024",
+                "shsub2048",
+                "sh1x",
                 "dyn2k",
                 "dyn4k",
                 "batchfull",
+                "swapipe",
                 "ring8k",
             ):
                 continue
@@ -527,7 +552,10 @@ def parse_decode_fast_config(
         shared_split_dense2=shared_split_dense2,
         shared_fp8_qkpv=shared_fp8_qkpv,
         shared_fp8_pv_only=shared_fp8_pv_only,
+        shared_sub_k=shared_sub_k,
+        shared_1x_kv=shared_1x_kv,
         batch_full=batch_full,
+        pipe_2seq=pipe_2seq,
     )
 
 
@@ -593,6 +621,7 @@ def _load_bkv_fp8_split_half(
     odd: bool,
     page_size: int = 128,
     interpret_mode: bool = False,
+    pair_start=None,
 ) -> jax.Array:
     """Return even or odd ``[chunk_sz//2, 128]`` rows from a dense2 buffer."""
     phys_rows = page_size // 2
@@ -605,7 +634,8 @@ def _load_bkv_fp8_split_half(
         return blk[:, idx, :]
     max_phys_rows = bkv_vmem_ref.shape[1] * phys_rows
     u32_ref = bkv_vmem_ref.bitcast(jnp.uint32).at[slot].reshape(max_phys_rows, 128)
-    pair_u32 = u32_ref[pl.ds(pl.multiple_of(row_start // 2, phys_rows), half_sz)]
+    p0 = row_start // 2 if pair_start is None else pair_start
+    pair_u32 = u32_ref[pl.ds(pl.multiple_of(p0, phys_rows), half_sz)]
     shift = idx * 8
     raw_u8 = (
         pair_u32 if shift == 0 else lax.shift_right_logical(pair_u32, jnp.uint32(shift))
@@ -726,19 +756,19 @@ def _load_new_kv_1row_f32(
     *,
     interpret_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    aligned32 = (q_row // 32) * 32
-    sub32 = q_row - aligned32
+    aligned8 = (q_row // 8) * 8
+    sub8 = q_row - aligned8
     if interpret_mode:
-        blk = kv_merged_vmem_ref[pl.ds(aligned32, 32)].reshape(32, 4, 128)
+        blk = kv_merged_vmem_ref[pl.ds(aligned8, 8)].reshape(8, 4, 128)
         u8 = lax.bitcast_convert_type(blk, jnp.uint8)
         u32 = u8[:, 0, :].astype(jnp.uint32) | (u8[:, 1, :].astype(jnp.uint32) << 8)
     else:
         u32_ref = kv_merged_vmem_ref.bitcast(jnp.uint32).reshape(
             kv_merged_vmem_ref.shape[0], 128
         )
-        u32 = u32_ref[pl.ds(pl.multiple_of(aligned32, 32), 32)]
-    row_iota = lax.broadcasted_iota(jnp.int32, (32, 128), 0)
-    u32_m = jnp.where(row_iota == sub32, u32, jnp.uint32(0))
+        u32 = u32_ref[pl.ds(pl.multiple_of(aligned8, 8), 8)]
+    row_iota = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
+    u32_m = jnp.where(row_iota == sub8, u32, jnp.uint32(0))
     k_f8 = _u8_to_fp8(u32_m.astype(jnp.uint8), interpret_mode=interpret_mode)
     v_f8 = _u8_to_fp8((u32_m >> 8).astype(jnp.uint8), interpret_mode=interpret_mode)
     return (
@@ -1245,7 +1275,7 @@ def _decode_fast_kernel(
 
     def _zero_pages_u32(slot, start_pg, end_pg):
         if interpret_mode:
-            z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
+            z_f8 = jnp.zeros(bkv_vmem_ref.shape[2:], bkv_vmem_ref.dtype)
 
             def _z_interp(p_i, _):
                 bkv_vmem_ref[slot, p_i] = z_f8
@@ -1280,7 +1310,7 @@ def _decode_fast_kernel(
     def zero_all_slots_once():
         """Zeroes ``bkv_vmem_ref`` once in 8-sublane ``uint32`` before any DMAs start."""
         if interpret_mode:
-            z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
+            z_f8 = jnp.zeros(bkv_vmem_ref.shape[2:], bkv_vmem_ref.dtype)
             for s_i in range(num_slots):
                 for p_i in range(max_ring_pages):
                     bkv_vmem_ref[s_i, p_i] = z_f8
@@ -1399,6 +1429,86 @@ def _decode_fast_kernel(
             row_start, width, rows, kv_pack_dense2=kv_pack_dense2
         )
 
+    def _dense2_subblock_step(
+        slot,
+        q_dot,
+        sub_r0,
+        pair_r0,
+        sub_w: int,
+        carry,
+        *,
+        q_rows_n: int,
+        exp2_sc,
+        pv_bf16: bool,
+        do_mask: bool = True,
+        rel_end=None,
+        rf_rows=None,
+    ):
+        """Online-softmax attention over one zero-concat even/odd dense2 sub-block."""
+        m_prev, l_prev, acc_prev = carry
+        half_sub = sub_w // 2
+        n_half_blk = half_sub // 128
+
+        def _qk_half(odd: bool) -> jax.Array:
+            k_h = _load_bkv_fp8_split_half(
+                bkv_vmem_ref,
+                slot,
+                sub_r0,
+                sub_w,
+                kind="k",
+                odd=odd,
+                page_size=page_size,
+                interpret_mode=interpret_mode,
+                pair_start=pair_r0,
+            )
+            s_h = jnp.matmul(q_dot, k_h.T, preferred_element_type=jnp.float32)
+            if not do_mask:
+                return s_h
+            c_h = (
+                sub_r0
+                + 2 * lax.broadcasted_iota(jnp.int32, (q_rows_n, half_sub), 1)
+                + (1 if odd else 0)
+            )
+            if rf_rows is not None:
+                return jnp.where((c_h >= rf_rows) & (c_h < rel_end), s_h, _MASK_LOGIT)
+            return jnp.where(c_h < rel_end, s_h, _MASK_LOGIT)
+
+        s_e = _qk_half(False)
+        s_o = _qk_half(True)
+        s_pages = jnp.max(
+            jnp.maximum(s_e, s_o).reshape(q_rows_n, n_half_blk, 128), axis=1
+        )
+        m_new = jnp.maximum(
+            m_prev,
+            _broadcast_minor_128(jnp.max(s_pages, axis=1, keepdims=True)),
+        )
+        alpha = jnp.exp2((m_prev - m_new) * exp2_sc)
+        m_hw = _broadcast_minor_128_any(m_new, half_sub)
+
+        def _pv_half(s_h: jax.Array, odd: bool) -> tuple[jax.Array, jax.Array]:
+            p_h = jnp.exp2((s_h - m_hw) * exp2_sc)
+            l_h = jnp.sum(p_h.reshape(q_rows_n, n_half_blk, 128), axis=1)
+            v_h = _load_bkv_fp8_split_half(
+                bkv_vmem_ref,
+                slot,
+                sub_r0,
+                sub_w,
+                kind="v",
+                odd=odd,
+                page_size=page_size,
+                interpret_mode=interpret_mode,
+                pair_start=pair_r0,
+            )
+            p_dot_h = p_h.astype(jnp.bfloat16) if pv_bf16 else p_h
+            return l_h, jnp.matmul(p_dot_h, v_h, preferred_element_type=jnp.float32)
+
+        l_e, pv_e = _pv_half(s_e, False)
+        l_o, pv_o = _pv_half(s_o, True)
+        pv = pv_e + pv_o
+        if v_scale is not None and v_scale_val != 1.0:
+            pv = pv * v_scale_val
+        return (m_new, l_prev * alpha + l_e + l_o, acc_prev * alpha + pv)
+
     def compute_swa_clean1p_2176(slot, q_bf16, q_row, rel_first, rel_end):
         """Zero-spill 1-shot SWA softmax over 17x128 (or 8x256 + 1x128) K/V chunks."""
         s_new, _, acc0 = init_new_token_state(q_bf16, q_row)
@@ -1478,24 +1588,30 @@ def _decode_fast_kernel(
             exp2_sc_eff = exp2_scale
 
         if kv_pack_dense2 and w_tot >= 512 and (w_tot % 256 == 0):
-            # Zero-concat dense2 path: compute even and odd 128-aligned halves separately,
-            # saving 3x [w_tot, 128] concatenations and halving softmax max/sum width
-            # (also covers page_size=256 SWA w_tot=2304 where half_w=1152=9*128).
+            # Zero-concat dense2 path: compute even and odd 128-aligned halves sequentially
+            # so K, V, P, and column-index VREGs never coexist across halves.
             half_w = w_tot // 2
             n_half_blocks = half_w // 128
-            k_e, k_o = _bkv_fp8_split(slot, 0, w_tot, kind="k")
-            s_e = jnp.matmul(q_dot, k_e.T, preferred_element_type=jnp.float32)
-            s_o = jnp.matmul(q_dot, k_o.T, preferred_element_type=jnp.float32)
-            h_io = lax.broadcasted_iota(jnp.int32, (16, half_w), 1)
-            c_e = 2 * h_io
-            c_o = c_e + 1
-            if sliding_window is not None:
-                s_e = jnp.where((c_e >= rel_first) & (c_e < rel_end), s_e, _MASK_LOGIT)
-                s_o = jnp.where((c_o >= rel_first) & (c_o < rel_end), s_o, _MASK_LOGIT)
-            else:
-                s_e = jnp.where(c_e < rel_end, s_e, _MASK_LOGIT)
-                s_o = jnp.where(c_o < rel_end, s_o, _MASK_LOGIT)
 
+            def _qk_half(odd: bool) -> jax.Array:
+                k_h = _load_bkv_fp8_split_half(
+                    bkv_vmem_ref,
+                    slot,
+                    0,
+                    w_tot,
+                    kind="k",
+                    odd=odd,
+                    page_size=page_size,
+                    interpret_mode=interpret_mode,
+                )
+                s_h = jnp.matmul(q_dot, k_h.T, preferred_element_type=jnp.float32)
+                c_h = 2 * lax.broadcasted_iota(jnp.int32, (16, half_w), 1) + (1 if odd else 0)
+                if sliding_window is not None:
+                    return jnp.where((c_h >= rel_first) & (c_h < rel_end), s_h, _MASK_LOGIT)
+                return jnp.where(c_h < rel_end, s_h, _MASK_LOGIT)
+
+            s_e = _qk_half(False)
+            s_o = _qk_half(True)
             s_eo_max = jnp.maximum(s_e, s_o)
             if cfg.page_reduce:
                 s_pgs = jnp.max(s_eo_max.reshape(16, n_half_blocks, 128), axis=1)
@@ -1507,22 +1623,34 @@ def _decode_fast_kernel(
                     s_new_eff, _broadcast_minor_128(jnp.max(s_eo_max, axis=1, keepdims=True))
                 )
             m_hw = _broadcast_minor_128_any(m, half_w)
-            p_e = jnp.exp2((s_e - m_hw) * exp2_sc_eff)
-            p_o = jnp.exp2((s_o - m_hw) * exp2_sc_eff)
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
-            p_eo_sum = p_e + p_o
-            if cfg.page_reduce:
-                p_pgs = jnp.sum(p_eo_sum.reshape(16, n_half_blocks, 128), axis=1)
-                l_sum = _broadcast_minor_128(jnp.sum(p_pgs, axis=1, keepdims=True)) + p_new
-            else:
-                l_sum = _broadcast_minor_128(jnp.sum(p_eo_sum, axis=1, keepdims=True)) + p_new
 
-            v_e, v_o = _bkv_fp8_split(slot, 0, w_tot, kind="v")
-            pe_dot = p_e.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_e
-            po_dot = p_o.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_o
-            pv = jnp.matmul(pe_dot, v_e, preferred_element_type=jnp.float32) + jnp.matmul(
-                po_dot, v_o, preferred_element_type=jnp.float32
-            )
+            def _pv_half_s1p(s_h: jax.Array, odd: bool) -> tuple[jax.Array, jax.Array]:
+                p_h = jnp.exp2((s_h - m_hw) * exp2_sc_eff)
+                if cfg.page_reduce:
+                    l_h = jnp.sum(p_h.reshape(16, n_half_blocks, 128), axis=1)
+                else:
+                    l_h = _broadcast_minor_128(jnp.sum(p_h, axis=1, keepdims=True))
+                v_h = _load_bkv_fp8_split_half(
+                    bkv_vmem_ref,
+                    slot,
+                    0,
+                    w_tot,
+                    kind="v",
+                    odd=odd,
+                    page_size=page_size,
+                    interpret_mode=interpret_mode,
+                )
+                p_dot_h = p_h.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_h
+                return l_h, jnp.matmul(p_dot_h, v_h, preferred_element_type=jnp.float32)
+
+            l_e, pv_e = _pv_half_s1p(s_e, False)
+            l_o, pv_o = _pv_half_s1p(s_o, True)
+            if cfg.page_reduce:
+                l_sum = _broadcast_minor_128(jnp.sum(l_e + l_o, axis=1, keepdims=True)) + p_new
+            else:
+                l_sum = l_e + l_o + p_new
+            pv = pv_e + pv_o
             if v_scale is not None and v_scale_val != 1.0:
                 pv = pv * v_scale_val
             acc = pv + p_new * acc0
@@ -1845,6 +1973,57 @@ def _decode_fast_kernel(
         else:
             q_dot_dyn = q_bf16
             exp2_sc_dyn = exp2_scale
+
+        if kv_pack_dense2 and chunk_sz >= 512 and (chunk_sz % 256 == 0) and (chunk_sz % page_size == 0):
+            sub_w = 1024 if (chunk_sz % 1024 == 0 and dq == 1) else chunk_sz
+            n_sub = chunk_sz // sub_w
+            half_sub = sub_w // 2
+            rf_arg = rf_rows if sliding_window is not None else None
+            pv_bf16_dyn = cfg.pv_bf16 or cfg.fp8_dots
+
+            def _dyn_chunk_split(c_idx, carry):
+                if n_sub >= 2:
+                    return lax.fori_loop(
+                        0,
+                        n_sub,
+                        lambda s_i, cy: _dense2_subblock_step(
+                            slot,
+                            q_dot_dyn,
+                            c_idx * chunk_sz + s_i * sub_w,
+                            c_idx * (chunk_sz // 2) + s_i * half_sub,
+                            sub_w,
+                            cy,
+                            q_rows_n=q_rows,
+                            exp2_sc=exp2_sc_dyn,
+                            pv_bf16=pv_bf16_dyn,
+                            do_mask=True,
+                            rel_end=rel_end,
+                            rf_rows=rf_arg,
+                        ),
+                        carry,
+                    )
+                return _dense2_subblock_step(
+                    slot,
+                    q_dot_dyn,
+                    c_idx * chunk_sz,
+                    c_idx * (chunk_sz // 2),
+                    sub_w,
+                    carry,
+                    q_rows_n=q_rows,
+                    exp2_sc=exp2_sc_dyn,
+                    pv_bf16=pv_bf16_dyn,
+                    do_mask=True,
+                    rel_end=rel_end,
+                    rf_rows=rf_arg,
+                )
+
+            _, l_fin, acc_fin = lax.fori_loop(
+                0,
+                n_chunks,
+                _dyn_chunk_split,
+                (m0, l0, a0),
+            )
+            return finalize_out(l_fin, acc_fin)
 
         def _dyn_chunk(c_idx, carry):
             m_prev, l_prev, acc_prev = carry
@@ -2175,8 +2354,10 @@ def _decode_fast_kernel(
             *,
             active_heads=None,
             q_exp2_sc=None,
+            q_row_base=None,
+            heads_override=None,
         ):
-            heads = q.shape[0]
+            heads = heads_override if heads_override is not None else q.shape[0]
             q_tile = cfg.shared_q_tile if heads > cfg.shared_q_tile else heads
             valid_arg = valid if mask_valid else None
             use_split = (
@@ -2187,9 +2368,159 @@ def _decode_fast_kernel(
             )
             use_fp8_pv = cfg.shared_fp8_qkpv or cfg.shared_fp8_pv_only
 
+            if (
+                cfg.shared_split_dense2
+                and kv_pack_dense2
+                and cfg.shared_1x_kv
+                and heads > 64
+                and max_ring_rows >= max(512, page_size)
+                and max_ring_rows % max(512, page_size) == 0
+            ):
+                # 1x K/V unpack across all Q tiles for both full and partial blocks:
+                # unpack each [half_sub, 128] K/V half once inside lax.fori_loop.
+                sub_k_1x = (
+                    min(max_ring_rows, max(cfg.shared_sub_k, page_size))
+                    if cfg.shared_sub_k > 0
+                    else max(512, page_size)
+                )
+                n_sub_1x = max_ring_rows // sub_k_1x
+                half_sub_1x = sub_k_1x // 2
+                n_half_1x = half_sub_1x // 128
+                q_tile_1x = cfg.shared_q_tile if cfg.shared_q_tile in (32, 64) else 64
+                if mask_valid:
+                    @pl.when(valid > 0)
+                    def _san_sh_tail():
+                        n_vpg = cdiv(valid, page_size)
+                        target_pgs_1x = cdiv(valid, sub_k_1x) * (sub_k_1x // page_size)
+                        sanitize_slot_v2(slot, 0, valid, n_vpg, target_pgs_1x)
+
+                def _sub_1x_step(sub_i, _):
+                    sub_off = sub_i * sub_k_1x
+                    pair_off = sub_i * half_sub_1x
+                    for is_odd in (False, True):
+                        k_h = _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot,
+                            sub_off,
+                            sub_k_1x,
+                            kind="k",
+                            odd=is_odd,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                            pair_start=pair_off,
+                        )
+                        v_h = _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot,
+                            sub_off,
+                            sub_k_1x,
+                            kind="v",
+                            odd=is_odd,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                            pair_start=pair_off,
+                        )
+                        for q0 in range(0, heads, q_tile_1x):
+                            q_w = min(q_tile_1x, heads - q0)
+                            lanes = pl.ds(head_offset + q0, q_w)
+                            eff_sc = (
+                                q_exp2_sc[q0 : q0 + q_w]
+                                if q_exp2_sc is not None
+                                else jnp.float32(exp2_scale)
+                            )
+                            eff_sc_sub = (
+                                _broadcast_minor_128_any(eff_sc, half_sub_1x)
+                                if q_exp2_sc is not None
+                                else eff_sc
+                            )
+
+                            def _step_q_1x(
+                                q0=q0,
+                                lanes=lanes,
+                                eff_sc=eff_sc,
+                                eff_sc_sub=eff_sc_sub,
+                                q_w=q_w,
+                                odd_h=is_odd,
+                            ):
+                                if q_row_base is not None and q_exp2_sc is None and q_w % 16 == 0:
+                                    q_s = q_vmem_ref[
+                                        pl.ds(q_row_base + q0 // 16, q_w // 16), :, :
+                                    ].reshape(q_w, 128)
+                                else:
+                                    q_s = q[q0 : q0 + q_w]
+                                s_h = jnp.matmul(
+                                    q_s, k_h.T, preferred_element_type=jnp.float32
+                                )
+                                if mask_valid:
+                                    c_h = (
+                                        sub_off
+                                        + 2 * lax.broadcasted_iota(jnp.int32, (q_w, half_sub_1x), 1)
+                                        + (1 if odd_h else 0)
+                                    )
+                                    s_h = jnp.where(c_h < valid, s_h, _MASK_LOGIT)
+                                blk_m = _broadcast_minor_128(
+                                    jnp.max(s_h, axis=1, keepdims=True)
+                                )
+                                m_cur = state_vmem_ref[0, lanes, :]
+                                m_new = jnp.maximum(m_cur, blk_m)
+                                alpha_h = jnp.exp2((m_cur - m_new) * eff_sc)
+                                if use_fp8_pv:
+                                    ref_m = blk_m
+                                    beta_h = jnp.exp2((blk_m - m_new) * eff_sc)
+                                    l_sc = beta_h
+                                    pv_sc = beta_h * jnp.float32(v_scale_val / 448.0)
+                                else:
+                                    ref_m = m_new
+                                    l_sc = jnp.float32(1.0)
+                                    pv_sc = jnp.float32(v_scale_val)
+                                p_h = jnp.exp2(
+                                    (s_h - _broadcast_minor_128_any(ref_m, half_sub_1x))
+                                    * eff_sc_sub
+                                )
+                                l_h = jnp.sum(
+                                    p_h.reshape(q_w, n_half_1x, 128), axis=1
+                                )
+                                if use_fp8_pv:
+                                    p_dot = (p_h * jnp.float32(448.0)).astype(
+                                        jnp.float8_e4m3fn
+                                    )
+                                elif cfg.pv_bf16:
+                                    p_dot = p_h.astype(jnp.bfloat16)
+                                else:
+                                    p_dot = p_h
+                                pv_h = jnp.matmul(
+                                    p_dot, v_h, preferred_element_type=jnp.float32
+                                )
+                                state_vmem_ref[0, lanes, :] = m_new
+                                state_vmem_ref[1, lanes, :] = (
+                                    state_vmem_ref[1, lanes, :] * alpha_h + l_h * l_sc
+                                )
+                                state_vmem_ref[2, lanes, :] = (
+                                    state_vmem_ref[2, lanes, :] * alpha_h + pv_h * pv_sc
+                                )
+
+                            if active_heads is not None and q0 > 0:
+                                @pl.when(active_heads > q0)
+                                def _run_1x(fn=_step_q_1x):
+                                    fn()
+                            else:
+                                _step_q_1x()
+
+                n_iters_1x = cdiv(valid, sub_k_1x) if mask_valid else n_sub_1x
+                if mask_valid or n_sub_1x >= 2:
+                    lax.fori_loop(0, n_iters_1x, _sub_1x_step, None)
+                else:
+                    _sub_1x_step(0, None)
+                return
+
             def _accum_q_tile(q0: int):
                 q_w = min(q_tile, heads - q0)
-                q_s = q if q_w == heads else q[q0 : q0 + q_w]
+                if q is None and q_row_base is not None and q_w % 16 == 0:
+                    q_s = q_vmem_ref[
+                        pl.ds(q_row_base + q0 // 16, q_w // 16), :, :
+                    ].reshape(q_w, 128)
+                else:
+                    q_s = q if q_w == heads else q[q0 : q0 + q_w]
                 lanes = pl.ds(head_offset + q0, q_w)
                 eff_sc = (
                     (q_exp2_sc if q_w == heads else q_exp2_sc[q0 : q0 + q_w])
@@ -2198,6 +2529,95 @@ def _decode_fast_kernel(
                 )
 
                 if use_split:
+                    sub_k = (
+                        min(max_ring_rows, max(cfg.shared_sub_k, page_size))
+                        if cfg.shared_sub_k > 0
+                        else (
+                            max(512, page_size)
+                            if (
+                                q_w * (max_ring_rows // 2) >= 64 * 512
+                                and max_ring_rows >= 2 * max(512, page_size)
+                                and max_ring_rows % max(512, page_size) == 0
+                            )
+                            else max_ring_rows
+                        )
+                    )
+                    if sub_k < max_ring_rows:
+                        half_sub = sub_k // 2
+                        n_half_sub = half_sub // 128
+                        eff_sc_sub = (
+                            _broadcast_minor_128_any(eff_sc, half_sub)
+                            if q_exp2_sc is not None
+                            else eff_sc
+                        )
+                        m_cur = state_vmem_ref[0, lanes, :]
+                        l_cur = state_vmem_ref[1, lanes, :]
+                        acc_cur = state_vmem_ref[2, lanes, :]
+                        for sub_off in range(0, max_ring_rows, sub_k):
+                            for is_odd in (False, True):
+                                k_h = _load_bkv_fp8_split_half(
+                                    bkv_vmem_ref,
+                                    slot,
+                                    sub_off,
+                                    sub_k,
+                                    kind="k",
+                                    odd=is_odd,
+                                    page_size=page_size,
+                                    interpret_mode=interpret_mode,
+                                )
+                                s_h = jnp.matmul(
+                                    q_s, k_h.T, preferred_element_type=jnp.float32
+                                )
+                                blk_m = _broadcast_minor_128(
+                                    jnp.max(s_h, axis=1, keepdims=True)
+                                )
+                                m_new = jnp.maximum(m_cur, blk_m)
+                                alpha_h = jnp.exp2((m_cur - m_new) * eff_sc)
+                                if use_fp8_pv:
+                                    ref_m = blk_m
+                                    beta_h = jnp.exp2((blk_m - m_new) * eff_sc)
+                                    l_sc = beta_h
+                                    pv_sc = beta_h * jnp.float32(v_scale_val / 448.0)
+                                else:
+                                    ref_m = m_new
+                                    l_sc = jnp.float32(1.0)
+                                    pv_sc = jnp.float32(v_scale_val)
+                                p_h = jnp.exp2(
+                                    (s_h - _broadcast_minor_128_any(ref_m, half_sub))
+                                    * eff_sc_sub
+                                )
+                                l_h = jnp.sum(
+                                    p_h.reshape(q_w, n_half_sub, 128), axis=1
+                                )
+                                v_h = _load_bkv_fp8_split_half(
+                                    bkv_vmem_ref,
+                                    slot,
+                                    sub_off,
+                                    sub_k,
+                                    kind="v",
+                                    odd=is_odd,
+                                    page_size=page_size,
+                                    interpret_mode=interpret_mode,
+                                )
+                                if use_fp8_pv:
+                                    p_dot = (p_h * jnp.float32(448.0)).astype(
+                                        jnp.float8_e4m3fn
+                                    )
+                                elif cfg.pv_bf16:
+                                    p_dot = p_h.astype(jnp.bfloat16)
+                                else:
+                                    p_dot = p_h
+                                pv_h = jnp.matmul(
+                                    p_dot, v_h, preferred_element_type=jnp.float32
+                                )
+                                m_cur = m_new
+                                l_cur = l_cur * alpha_h + l_h * l_sc
+                                acc_cur = acc_cur * alpha_h + pv_h * pv_sc
+                        state_vmem_ref[0, lanes, :] = m_cur
+                        state_vmem_ref[1, lanes, :] = l_cur
+                        state_vmem_ref[2, lanes, :] = acc_cur
+                        return
+
                     width_s = max_ring_rows // 2
                     k_e = _load_bkv_fp8_split_half(
                         bkv_vmem_ref,
@@ -2336,6 +2756,8 @@ def _decode_fast_kernel(
             *,
             active_heads=None,
             q_exp2_sc=None,
+            q_row_base=None,
+            heads_override=None,
         ):
             n_pages = cdiv(end_token, page_size) - first_page
             n_blocks = cdiv(n_pages, max_ring_pages)
@@ -2378,6 +2800,8 @@ def _decode_fast_kernel(
                         valid,
                         active_heads=active_heads,
                         q_exp2_sc=q_exp2_sc,
+                        q_row_base=q_row_base,
+                        heads_override=heads_override,
                     )
 
                 @pl.when(valid < max_ring_rows)
@@ -2390,6 +2814,8 @@ def _decode_fast_kernel(
                         valid,
                         active_heads=active_heads,
                         q_exp2_sc=q_exp2_sc,
+                        q_row_base=q_row_base,
+                        heads_override=heads_override,
                     )
 
             last_slot = jnp.maximum(n_blocks - 1, 0) % num_slots
@@ -2421,9 +2847,9 @@ def _decode_fast_kernel(
 
             @pl.when(shared > 0)
             def _common():
-                q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * 16, 128)
                 active_h = size * 16
                 if cfg.shared_fp8_qkpv:
+                    q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * 16, 128)
                     q_f32 = q.astype(jnp.float32)
                     q_amax = jnp.max(jnp.abs(q_f32), axis=1, keepdims=True)
                     q_gain = jnp.where(
@@ -2451,7 +2877,23 @@ def _decode_fast_kernel(
                         q_exp2_sc=q_exp2_sc,
                     )
                     state_vmem_ref[0] = state_vmem_ref[0] * q_deq_128
+                elif (
+                    cfg.shared_1x_kv
+                    and cfg.shared_split_dense2
+                    and kv_pack_dense2
+                ):
+                    consume(
+                        None,
+                        0,
+                        first_base,
+                        0,
+                        shared * page_size,
+                        active_heads=active_h,
+                        q_row_base=first_row,
+                        heads_override=group * 16,
+                    )
                 else:
+                    q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * 16, 128)
                     consume(
                         q,
                         0,
@@ -2554,13 +2996,50 @@ def _decode_fast_kernel(
                     wait_fetch_pages(cur_pg, slot)
                     q_bf16 = q_vmem_ref[q_r]
 
-                    @pl.when(loc_end >= max_ring_rows)
-                    def _full_priv_blk():
-                        _accum_shared_or_priv(q_bf16, head_off, slot, False, loc_end)
+                    if kv_pack_dense2 and max_ring_rows >= 512 and page_size <= 512 and (max_ring_rows % 512 == 0):
+                        sub_w_p = 512
+                        half_sub_p = sub_w_p // 2
 
-                    @pl.when(loc_end < max_ring_rows)
-                    def _tail_priv_blk():
-                        _accum_shared_or_priv(q_bf16, head_off, slot, True, loc_end)
+                        @pl.when((loc_end > 0) & (loc_end < max_ring_rows))
+                        def _sanitize_priv_tail():
+                            target_pgs_p = cdiv(loc_end, sub_w_p) * (sub_w_p // page_size)
+                            sanitize_slot_v2(
+                                slot, 0, loc_end, cur_pg, target_pgs_p
+                            )
+
+                        m_p, l_p, a_p = lax.fori_loop(
+                            0,
+                            cdiv(loc_end, sub_w_p),
+                            lambda sub_i, cy: _dense2_subblock_step(
+                                slot,
+                                q_bf16,
+                                sub_i * sub_w_p,
+                                sub_i * half_sub_p,
+                                sub_w_p,
+                                cy,
+                                q_rows_n=16,
+                                exp2_sc=exp2_scale,
+                                pv_bf16=cfg.pv_bf16,
+                                do_mask=True,
+                                rel_end=loc_end,
+                            ),
+                            (
+                                state_vmem_ref[0, lanes, :],
+                                state_vmem_ref[1, lanes, :],
+                                state_vmem_ref[2, lanes, :],
+                            ),
+                        )
+                        state_vmem_ref[0, lanes, :] = m_p
+                        state_vmem_ref[1, lanes, :] = l_p
+                        state_vmem_ref[2, lanes, :] = a_p
+                    else:
+                        @pl.when(loc_end >= max_ring_rows)
+                        def _full_priv_blk():
+                            _accum_shared_or_priv(q_bf16, head_off, slot, False, loc_end)
+
+                        @pl.when(loc_end < max_ring_rows)
+                        def _tail_priv_blk():
+                            _accum_shared_or_priv(q_bf16, head_off, slot, True, loc_end)
 
                     @pl.when(is_last)
                     def _fin_priv():
@@ -2688,10 +3167,54 @@ def _decode_fast_kernel(
                 state_vmem_ref[2] = a0
 
             if probe != "nocompute":
+                def _ring4k_dense2_block(slot, q_bf16, loc_end, *, do_mask: bool):
+                    sub_w = 1024 if (max_ring_rows % 1024 == 0) else max_ring_rows
+                    half_sub = sub_w // 2
+                    n_sub_r = max_ring_rows // sub_w
+                    init_cy = (state_vmem_ref[0], state_vmem_ref[1], state_vmem_ref[2])
+                    if n_sub_r >= 2:
+                        m_f, l_f, a_f = lax.fori_loop(
+                            0,
+                            n_sub_r,
+                            lambda s_i, cy: _dense2_subblock_step(
+                                slot,
+                                q_bf16,
+                                s_i * sub_w,
+                                s_i * half_sub,
+                                sub_w,
+                                cy,
+                                q_rows_n=16,
+                                exp2_sc=exp2_scale,
+                                pv_bf16=cfg.pv_bf16,
+                                do_mask=do_mask,
+                                rel_end=loc_end,
+                            ),
+                            init_cy,
+                        )
+                    else:
+                        m_f, l_f, a_f = _dense2_subblock_step(
+                            slot,
+                            q_bf16,
+                            0,
+                            0,
+                            sub_w,
+                            init_cy,
+                            q_rows_n=16,
+                            exp2_sc=exp2_scale,
+                            pv_bf16=cfg.pv_bf16,
+                            do_mask=do_mask,
+                            rel_end=loc_end,
+                        )
+                    state_vmem_ref[0] = m_f
+                    state_vmem_ref[1] = l_f
+                    state_vmem_ref[2] = a_f
 
                 @pl.when(loc_end == max_ring_rows)
                 def _full_4k():
                     written_cnt_smem_ref[2 + slot] = max_ring_pages
+                    if kv_pack_dense2 and max_ring_rows >= 512 and (max_ring_rows % 256 == 0):
+                        _ring4k_dense2_block(slot, q_bf16, loc_end, do_mask=False)
+                        return
                     k_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="k")
                     s_blk = jnp.matmul(
                         q_bf16, k_blk.T, preferred_element_type=jnp.float32
@@ -2726,6 +3249,9 @@ def _decode_fast_kernel(
                 @pl.when(loc_end < max_ring_rows)
                 def _tail_4k():
                     sanitize_slot_v2(slot, 0, loc_end, cur_pg, max_ring_pages)
+                    if kv_pack_dense2 and max_ring_rows >= 512 and (max_ring_rows % 256 == 0):
+                        _ring4k_dense2_block(slot, q_bf16, loc_end, do_mask=True)
+                        return
                     k_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="k")
                     s_blk = jnp.matmul(
                         q_bf16, k_blk.T, preferred_element_type=jnp.float32
@@ -2795,6 +3321,162 @@ def _decode_fast_kernel(
             if use_hoist_kv:
                 precompute_hoisted_new_kv()
 
+            if (
+                cfg.pipe_2seq
+                and probe is None
+                and num_slots >= 4
+                and kv_pack_dense2
+                and (w_pg * page_size) in (512, 1024, 1536)
+                and not cfg.fp8_dots
+            ):
+                w_tot = w_pg * page_size
+                half_w = w_tot // 2
+                n_half_b = half_w // 128
+                n_pairs = n_active // 2
+
+                def _prep_qk_seq(slot_s, q_r_s, rf_s, re_s):
+                    q_bf = q_vmem_ref[q_r_s]
+                    s_new, _, acc0 = init_new_token_state(q_bf, q_r_s)
+                    sanitize_slot_boundaries(slot_s, rf_s, re_s, w_pg)
+
+                    def _qk_h(odd: bool) -> jax.Array:
+                        k_h = _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot_s,
+                            0,
+                            w_tot,
+                            kind="k",
+                            odd=odd,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                        )
+                        s_h = jnp.matmul(q_bf, k_h.T, preferred_element_type=jnp.float32)
+                        c_h = 2 * lax.broadcasted_iota(jnp.int32, (16, half_w), 1) + (
+                            1 if odd else 0
+                        )
+                        if sliding_window is not None:
+                            return jnp.where((c_h >= rf_s) & (c_h < re_s), s_h, _MASK_LOGIT)
+                        return jnp.where(c_h < re_s, s_h, _MASK_LOGIT)
+
+                    return s_new, acc0, _qk_h(False), _qk_h(True)
+
+                def _finish_pv_seq(slot_s, q_r_s, s_new, acc0, s_e, s_o):
+                    s_eo_max = jnp.maximum(s_e, s_o)
+                    if cfg.page_reduce:
+                        s_pgs = jnp.max(s_eo_max.reshape(16, n_half_b, 128), axis=1)
+                        m = jnp.maximum(
+                            s_new, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
+                        )
+                    else:
+                        m = jnp.maximum(
+                            s_new, _broadcast_minor_128(jnp.max(s_eo_max, axis=1, keepdims=True))
+                        )
+                    m_hw = _broadcast_minor_128_any(m, half_w)
+                    p_new = jnp.exp2((s_new - m) * exp2_scale)
+
+                    def _pv_h(s_h: jax.Array, odd: bool) -> tuple[jax.Array, jax.Array]:
+                        p_h = jnp.exp2((s_h - m_hw) * exp2_scale)
+                        if cfg.page_reduce:
+                            l_h = jnp.sum(p_h.reshape(16, n_half_b, 128), axis=1)
+                        else:
+                            l_h = _broadcast_minor_128(jnp.sum(p_h, axis=1, keepdims=True))
+                        v_h = _load_bkv_fp8_split_half(
+                            bkv_vmem_ref,
+                            slot_s,
+                            0,
+                            w_tot,
+                            kind="v",
+                            odd=odd,
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                        )
+                        p_dot = p_h.astype(jnp.bfloat16) if cfg.pv_bf16 else p_h
+                        return l_h, jnp.matmul(p_dot, v_h, preferred_element_type=jnp.float32)
+
+                    l_e, pv_e = _pv_h(s_e, False)
+                    l_o, pv_o = _pv_h(s_o, True)
+                    if cfg.page_reduce:
+                        l_sum = _broadcast_minor_128(jnp.sum(l_e + l_o, axis=1, keepdims=True)) + p_new
+                    else:
+                        l_sum = l_e + l_o + p_new
+                    pv = pv_e + pv_o
+                    if v_scale is not None and v_scale_val != 1.0:
+                        pv = pv * v_scale_val
+                    acc = pv + p_new * acc0
+                    if interpret_mode:
+                        o_vmem_ref[q_r_s] = (acc / l_sum).astype(jnp.bfloat16)
+                    else:
+                        o_vmem_ref[q_r_s] = (acc * pltpu.reciprocal(l_sum, approx=True)).astype(
+                            jnp.bfloat16
+                        )
+
+                @pl.loop(0, n_pairs)
+                def _seq_pair_b(pair_idx):
+                    seq0 = 2 * pair_idx
+                    seq1 = seq0 + 1
+                    slot0 = seq0 % num_slots
+                    slot1 = seq1 % num_slots
+                    fut0 = seq0 + num_ahead_b
+                    fut_slot0 = (slot0 + num_ahead_b) % num_slots
+                    fut1 = seq1 + num_ahead_b
+                    fut_slot1 = (slot1 + num_ahead_b) % num_slots
+
+                    q_r0, act0, kvl0, rf0, re0, n_pg0, _ = seq_info(seq0)
+                    q_r1, act1, kvl1, rf1, re1, n_pg1, _ = seq_info(seq1)
+
+                    @pl.when(fut0 < n_active)
+                    def _pf0():
+                        _, _, _, _, _, n_pg_f0, pg_base_f0 = seq_info(fut0)
+                        start_fetch_pages(pg_base_f0, n_pg_f0, fut_slot0)
+
+                    wait_fetch_pages(n_pg0, slot0)
+                    enqueue_kv_write(seq0, q_r0, act0, kvl0, slot0, re0 - 1)
+                    sn0, a0, se0, so0 = _prep_qk_seq(slot0, q_r0, rf0, re0)
+
+                    wait_fetch_pages(n_pg1, slot1)
+                    enqueue_kv_write(seq1, q_r1, act1, kvl1, slot1, re1 - 1)
+                    sn1, a1, se1, so1 = _prep_qk_seq(slot1, q_r1, rf1, re1)
+
+                    @pl.when(act0)
+                    def _fin0():
+                        _finish_pv_seq(slot0, q_r0, sn0, a0, se0, so0)
+
+                    @pl.when(~act0)
+                    def _z0():
+                        o_vmem_ref[q_r0] = jnp.zeros((16, 128), jnp.bfloat16)
+
+                    @pl.when(fut1 < n_active)
+                    def _pf1():
+                        _, _, _, _, _, n_pg_f1, pg_base_f1 = seq_info(fut1)
+                        start_fetch_pages(pg_base_f1, n_pg_f1, fut_slot1)
+
+                    @pl.when(act1)
+                    def _fin1():
+                        _finish_pv_seq(slot1, q_r1, sn1, a1, se1, so1)
+
+                    @pl.when(~act1)
+                    def _z1():
+                        o_vmem_ref[q_r1] = jnp.zeros((16, 128), jnp.bfloat16)
+
+                @pl.when((n_active & 1) == 1)
+                def _seq_tail_b():
+                    seq = n_active - 1
+                    slot = seq % num_slots
+                    q_r, act, kvl, rf, re, n_pg, _ = seq_info(seq)
+                    wait_fetch_pages(n_pg, slot)
+                    enqueue_kv_write(seq, q_r, act, kvl, slot, re - 1)
+
+                    @pl.when(act)
+                    def _():
+                        o_vmem_ref[q_r] = compute_stream1p(
+                            slot, q_vmem_ref[q_r], q_r, rf, re, w_pg
+                        )
+
+                    @pl.when(~act)
+                    def _():
+                        o_vmem_ref[q_r] = jnp.zeros((16, 128), jnp.bfloat16)
+                return
+
             @pl.loop(0, n_active)
             def _seq_step_b(seq):
                 slot = seq % num_slots
@@ -2820,30 +3502,67 @@ def _decode_fast_kernel(
                 def _():
                     o_vmem_ref[q_r] = jnp.zeros((16, 128), jnp.bfloat16)
 
-        if max_ring_pages > cdiv(1024, page_size):
+        p_512 = cdiv(512, page_size)
+        p_1024 = cdiv(1024, page_size)
+        p_1536 = cdiv(1536, page_size)
+        p_2048 = cdiv(2048, page_size)
+        if page_size >= 512 and max_ring_pages > p_1024:
+            @pl.when(max_re_b <= 512)
+            def _b_512_p():
+                _run_swa_fixed_pages(p_512)
+
+            @pl.when((max_re_b > 512) & (max_re_b <= 1024))
+            def _b_1024_p():
+                _run_swa_fixed_pages(p_1024)
+
+            if max_ring_pages > p_2048:
+                @pl.when((max_re_b > 1024) & (max_re_b <= 1536))
+                def _b_1536_p():
+                    _run_swa_fixed_pages(p_1536)
+
+                @pl.when((max_re_b > 1536) & (max_re_b <= 2048))
+                def _b_2048_p():
+                    _run_swa_fixed_pages(p_2048)
+
+                @pl.when(max_re_b > 2048)
+                def _b_full_p():
+                    _run_swa_fixed_pages(max_ring_pages)
+            elif max_ring_pages > p_1536:
+                @pl.when((max_re_b > 1024) & (max_re_b <= 1536))
+                def _b_1536_p4():
+                    _run_swa_fixed_pages(p_1536)
+
+                @pl.when(max_re_b > 1536)
+                def _b_full_p4():
+                    _run_swa_fixed_pages(max_ring_pages)
+            else:
+                @pl.when(max_re_b > 1024)
+                def _b_full_p3():
+                    _run_swa_fixed_pages(max_ring_pages)
+        elif max_ring_pages > p_1024:
             @pl.when(max_re_b <= 256)
             def _b_256():
                 _run_swa_fixed_pages(cdiv(256, page_size))
 
             @pl.when((max_re_b > 256) & (max_re_b <= 512))
             def _b_512():
-                _run_swa_fixed_pages(cdiv(512, page_size))
+                _run_swa_fixed_pages(p_512)
 
             @pl.when((max_re_b > 512) & (max_re_b <= 1024))
             def _b_1024():
-                _run_swa_fixed_pages(cdiv(1024, page_size))
+                _run_swa_fixed_pages(p_1024)
 
             @pl.when(max_re_b > 1024)
             def _b_full():
                 _run_swa_fixed_pages(max_ring_pages)
-        elif max_ring_pages > cdiv(512, page_size):
+        elif max_ring_pages > p_512:
             @pl.when(max_re_b <= 256)
             def _b_s256():
                 _run_swa_fixed_pages(cdiv(256, page_size))
 
             @pl.when((max_re_b > 256) & (max_re_b <= 512))
             def _b_s512():
-                _run_swa_fixed_pages(cdiv(512, page_size))
+                _run_swa_fixed_pages(p_512)
 
             @pl.when(max_re_b > 512)
             def _b_sfull():
@@ -2935,13 +3654,13 @@ def _decode_fast_kernel(
 
     if in_kernel_pack2:
         tile_r = max_num_tokens
-        for cand_r in (64, 32, 16, 8):
+        for cand_r in (16, 8):
             if max_num_tokens >= cand_r and max_num_tokens % cand_r == 0:
                 tile_r = cand_r
                 break
         lane_lt_64 = lax.broadcasted_iota(jnp.int32, (tile_r, 128), 1) < 64
 
-        def _finish_pair_tile(pair_bf16, row_sl, col_off: int):
+        def _finish_pair_tile(pair_bf16, r_base, col_off: int):
             out_p = pair_bf16
             if out_norm_eps is not None:
                 pf = out_p.astype(jnp.float32)
@@ -2960,42 +3679,54 @@ def _decode_fast_kernel(
             if has_gate:
                 g_p = (
                     gate_vmem_ref[:, pl.ds(col_off, 128)]
-                    if row_sl is None
-                    else gate_vmem_ref[row_sl, pl.ds(col_off, 128)]
+                    if r_base is None
+                    else gate_vmem_ref[pl.ds(r_base, tile_r), pl.ds(col_off, 128)]
                 )
                 sig_g = jax.nn.sigmoid(g_p.astype(jnp.float32)).astype(jnp.bfloat16)
                 out_p = sig_g * out_p
-            if row_sl is None:
+            if r_base is None:
                 o_out_vmem_ref[:, pl.ds(col_off, 128)] = out_p
             else:
-                o_out_vmem_ref[row_sl, pl.ds(col_off, 128)] = out_p
+                o_out_vmem_ref[pl.ds(r_base, tile_r), pl.ds(col_off, 128)] = out_p
 
-        use_full_axis = tile_r == max_num_tokens
-        for r0 in range(0, max_num_tokens, tile_r):
-            r_sl = None if use_full_axis else pl.ds(r0, tile_r)
+        def _run_pack2_tile(r_base):
             for p in range(4):
-                if r_sl is None:
+                if r_base is None:
                     e_lo = o_vmem_ref[:, 2 * p, :]
                     d_lo = o_vmem_ref[:, 2 * p + 1, :]
-                    e_hi = o_vmem_ref[:, 8 + 2 * p, :]
-                    d_hi = o_vmem_ref[:, 8 + 2 * p + 1, :]
                 else:
+                    r_sl = pl.ds(r_base, tile_r)
                     e_lo = o_vmem_ref[r_sl, 2 * p, :]
                     d_lo = o_vmem_ref[r_sl, 2 * p + 1, :]
-                    e_hi = o_vmem_ref[r_sl, 8 + 2 * p, :]
-                    d_hi = o_vmem_ref[r_sl, 8 + 2 * p + 1, :]
                 pair_lo = jnp.where(
                     lane_lt_64,
                     e_lo,
                     _roll_lanes_fast(d_lo, 64, interpret_mode=interpret_mode),
                 )
+                _finish_pair_tile(pair_lo, r_base, p * 128)
+                if r_base is None:
+                    e_hi = o_vmem_ref[:, 8 + 2 * p, :]
+                    d_hi = o_vmem_ref[:, 8 + 2 * p + 1, :]
+                else:
+                    r_sl = pl.ds(r_base, tile_r)
+                    e_hi = o_vmem_ref[r_sl, 8 + 2 * p, :]
+                    d_hi = o_vmem_ref[r_sl, 8 + 2 * p + 1, :]
                 pair_hi = jnp.where(
                     lane_lt_64,
                     _roll_lanes_fast(e_hi, 64, interpret_mode=interpret_mode),
                     d_hi,
                 )
-                _finish_pair_tile(pair_lo, r_sl, p * 128)
-                _finish_pair_tile(pair_hi, r_sl, 512 + p * 128)
+                _finish_pair_tile(pair_hi, r_base, 512 + p * 128)
+
+        if tile_r == max_num_tokens:
+            _run_pack2_tile(None)
+        else:
+            lax.fori_loop(
+                0,
+                max_num_tokens // tile_r,
+                lambda r_i, _: _run_pack2_tile(pl.multiple_of(r_i * tile_r, tile_r)),
+                None,
+            )
 
     if probe != "nokvwrite":
         w_cnt = written_cnt_smem_ref[0]
@@ -3137,12 +3868,18 @@ def run_decode_fast_rpa(
             scope_name += f"-q{run_cfg.shared_q_tile}"
         if run_cfg.shared_split_dense2:
             scope_name += "-shsplit"
+        if run_cfg.shared_sub_k > 0:
+            scope_name += f"-shsub{run_cfg.shared_sub_k}"
+        if run_cfg.shared_1x_kv:
+            scope_name += "-sh1x"
         if run_cfg.shared_fp8_qkpv:
             scope_name += "-shfp8"
         elif run_cfg.shared_fp8_pv_only:
             scope_name += "-shfp8pv"
         if run_cfg.batch_full:
             scope_name += "-batchfull"
+        if run_cfg.pipe_2seq:
+            scope_name += "-swapipe"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
@@ -3380,6 +4117,7 @@ def run_decode_fast_rpa(
             hoist_new_kv=cfg.hoist_new_kv,
             fine_gears=cfg.fine_gears,
             batch_full=cfg.batch_full,
+            pipe_2seq=cfg.pipe_2seq,
         )
         active_mask = jnp.arange(max_num_seqs) < jnp.clip(
             distribution[0], 0, max_num_seqs
