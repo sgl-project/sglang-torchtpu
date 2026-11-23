@@ -153,6 +153,19 @@ class NomasDoubleStreamBlock(nn.Module):
     def forward(
         self, img, txt, vec, rope, layer_cache, valid_length, attention, collect_cache
     ):
+        img_qkv, txt_qkv, mods = self.attention_inputs(img, txt, vec, rope)
+        txt_qkv = self.select_text_heads(txt_qkv)
+        q, k, v = [torch.cat(pair, 1) for pair in zip(img_qkv, txt_qkv)]
+        entry = {"k": k, "v": v} if collect_cache else None
+        attn = attention(q, k, v, layer_cache, valid_length)
+        return *self.attention_outputs(img, txt, attn, mods), entry
+
+    def attention_inputs(self, img, txt, vec, rope):
+        """Modulations and per-stream Q/K/V ahead of the segment attention.
+
+        Video Q/K/V come back with all tokens and this rank's heads (Ulysses);
+        text Q/K/V keep every TP-local head, see ``select_text_heads``.
+        """
         qkv, mods = [], []
         for stream, x in (("img", img), ("txt", txt)):
             mod = getattr(self, f"{stream}_mod")(vec).chunk(6, -1)
@@ -176,16 +189,18 @@ class NomasDoubleStreamBlock(nn.Module):
                 q, k, v = (ulysses_all_to_all(x, self.info, 2, 1) for x in (q, k, v))
             else:
                 q, k = q_norm(q).to(v), k_norm(k).to(v)
-                # Text is replicated; keep this rank's head slice.
-                lo = self.info.sp_rank * self.attn_heads
-                q, k, v = (x[:, :, lo : lo + self.attn_heads] for x in (q, k, v))
             qkv.append((q, k, v))
-        q, k, v = [torch.cat((qkv[0][i], qkv[1][i]), 1) for i in range(3)]
-        entry = {"k": k, "v": v} if collect_cache else None
-        video_tokens = q.shape[1] - txt.shape[1]
-        img_attn, txt_attn = attention(q, k, v, layer_cache, valid_length).split(
-            (video_tokens, txt.shape[1]), 1
-        )
+        return qkv[0], qkv[1], mods
+
+    def select_text_heads(self, txt_qkv):
+        # Text is replicated; keep this rank's head slice.
+        lo = self.info.sp_rank * self.attn_heads
+        return tuple(x[:, :, lo : lo + self.attn_heads] for x in txt_qkv)
+
+    def attention_outputs(self, img, txt, attn, mods):
+        """Output projections, MLPs and gated residuals after the segment attention."""
+        video_tokens = attn.shape[1] - txt.shape[1]
+        img_attn, txt_attn = attn.split((video_tokens, txt.shape[1]), 1)
         img_attn = ulysses_all_to_all(img_attn, self.info, 1, 2)
         txt_attn = sp_all_gather(txt_attn, self.info, 2)
         outputs = []
@@ -205,7 +220,7 @@ class NomasDoubleStreamBlock(nn.Module):
                 mod[5],
             )
             outputs.append(x)
-        return *outputs, entry
+        return tuple(outputs)
 
 
 class NomasCameraAttention(nn.Module):
