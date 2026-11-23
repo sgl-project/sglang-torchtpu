@@ -14,7 +14,7 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 # Expected runtime includes model load, compilation, and the eviction probe.
 register_tpu_ci(
-    est_time=280,
+    est_time=190,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "gpt-oss-20b", "prefix-cache", "kv-offload"],

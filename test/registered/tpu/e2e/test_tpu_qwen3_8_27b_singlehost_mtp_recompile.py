@@ -17,7 +17,7 @@ from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
-    est_time=900,
+    est_time=340,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "qwen3.8-27b", "spec", "compile"],

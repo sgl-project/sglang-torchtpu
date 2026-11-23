@@ -39,7 +39,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 # Unmeasured estimate for the eight-device sweep at the served dims; the
 # weekly est-time job refreshes it. Nightly, like the v2 numerical sweep.
 register_tpu_ci(
-    est_time=1800,
+    est_time=1470,
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=4,

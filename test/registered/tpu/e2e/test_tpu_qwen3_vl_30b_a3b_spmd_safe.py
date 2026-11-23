@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.testing.spmd_safe import run_recipes, verify_startup
 
 register_tpu_ci(
-    est_time=600,
+    est_time=870,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=[

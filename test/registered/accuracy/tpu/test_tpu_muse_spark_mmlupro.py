@@ -7,7 +7,7 @@ from sglang.test.tpu import MUSE_SPARK, make_model_config
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
 
 register_tpu_ci(
-    est_time=10800,
+    est_time=5800,
     suite="nightly-tpu-accuracy-muse-spark-mmlupro",
     nightly=True,
     labels=["singlehost", "muse-spark-open-816b-a42b", "accuracy"],
