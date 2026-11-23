@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash + DSpark for AgentX at concurrency 64 (one tpu7x-8 host).
 
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/deepseek_v41_flash_dspark_c64.py
+        --config recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash_dspark_c64.py
 
 deepseek_v41_flash_dspark_agentx.py with max_running_requests 256 (32 per rank).
 
@@ -23,7 +23,7 @@ Capacity, computed (the boot log and smoke run check it on hardware):
   programs compiled. Headroom at 32 per rank is not measured yet.
 """
 
-from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark_agentx import (
+from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash_dspark_agentx import (
     with_max_running_requests,
 )
 

@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash + its bundled DSpark draft on one tpu7x-8 host.
 
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/deepseek_v41_flash_dspark.py
+        --config recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash_dspark.py
 
 The deepseek_v41_flash.py deployment with DSpark on the
 experimental TPU spec worker: the target and draft graphs are traced by the
@@ -26,7 +26,9 @@ tok/s/chip.
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.deepseek_v41_flash import CONFIG as BASE_CONFIG
+from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash import (
+    CONFIG as BASE_CONFIG,
+)
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(

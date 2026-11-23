@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash + DSpark served for AgentX on one tpu7x-8 host (DP8/EP8).
 
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/deepseek_v41_flash_dspark_c32.py
+        --config recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash_dspark_c32.py
 
 The AgentX sizing the canonical harness has applied on top of
 deepseek_v41_flash_dspark.py (combined-1 canonical: c8 7,314 tok/s/chip @ p90
@@ -14,7 +14,7 @@ Global values are divided by attn_dp_size (8) per rank.
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark import (
+from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash_dspark import (
     CONFIG as DSPARK_CONFIG,
 )
 

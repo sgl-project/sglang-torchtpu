@@ -8,7 +8,7 @@ graph: VERIFY_SPMD_SAFE=1 compares them without executing.
 
 Sample usage (from the repo root):
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/deepseek_v41_flash.py
+        --config recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash.py
 """
 
 import os

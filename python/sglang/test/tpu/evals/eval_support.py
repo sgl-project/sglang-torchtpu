@@ -813,7 +813,7 @@ DEEPSEEK_V41_FLASH = {
     "served_model_name": "deepseek-ai/DeepSeek-V4.1-Flash",
     "display_name": "DeepSeek-V4.1-Flash",
     "variant": "DPA8+EP8",
-    "config_module": "recipe/configs/deepseek_v41_flash.py",
+    "config_module": "recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash.py",
 }
 
 

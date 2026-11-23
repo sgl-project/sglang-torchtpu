@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash + DSpark for AgentX at concurrency 4 (one tpu7x-8 host).
 
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/deepseek_v41_flash_dspark_c4.py
+        --config recipe/configs/deepseek_v41_flash_agx/deepseek_v41_flash_dspark_c4.py
 
 deepseek_v41_flash_dspark_agentx.py (128 running requests, 16 per rank) with
 three low-concurrency settings, measured together:
@@ -26,7 +26,7 @@ p50 9.39 -> 7.84 ms; paired per-request interactivity 1.207 (95% CI
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark_agentx import (
+from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash_dspark_agentx import (
     CONFIG as _AGENTX,
 )
 
