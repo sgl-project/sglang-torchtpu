@@ -1007,6 +1007,22 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 (7, 1),
             )
 
+            # Verify Wave-9 zero-spill adaptive strip default & EP=16 paired RS/AG defaults.
+            self.assertEqual(c16.k256_strip_mode, "adaptive")
+            self.assertEqual(c64.k256_strip_mode, "adaptive")
+            self.assertTrue(c32.pair_rs and c32.bridge_ag)
+            self.assertTrue(c64.pair_rs and c64.bridge_ag)
+            self.assertTrue(fp8_64.pair_rs and fp8_64.bridge_ag)
+            self.assertFalse(fp8_64.static_holder_mask)
+            self.assertTrue(v2_64.pair_rs and v2_64.pair_ag_relay)
+
+            c64_ep8 = v1_mod.default_sparse_decode_config(64, 8, 512)
+            self.assertFalse(c64_ep8.pair_rs)
+            with mock.patch.dict(
+                os.environ, {"SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "1"}, clear=False
+            ):
+                self.assertTrue(v1_mod.default_sparse_decode_config(64, 8, 512).pair_rs)
+
 
 if __name__ == "__main__":
     unittest.main()

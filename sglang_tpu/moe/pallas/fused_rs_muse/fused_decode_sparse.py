@@ -77,10 +77,11 @@ class SparseDecodeConfig:
     k16_bd_fp8: bool = False  # True: per-(tok,16-grp) FP8 masked_x -> 4,614 TFLOP/s MXU!
     k16_dequant_mode: str = "repeat"  # "repeat" or "reshape3d"
     k16_strip_nc: int = 512
-    k256_strip_mode: str = "wide"  # "wide" (2048/1024), "adaptive", "fixed512", "fixed1024", "fixed2048"
+    k256_strip_mode: str = "adaptive"  # "adaptive" (1024 at m<=16, 512 at m>=32: 0 expert spills!), "wide", "fixed512"
     k256_dual_mode: str = "hybrid"  # "vstage", "dual", "hybrid" (dual at m<=16, vstage at m>=32)
     lhs_fp8: bool = False  # W4A8: online K256 FP8 activation quant
     rs_wire_bf16: bool = False
+    pair_rs: bool = False  # 2-stage intra-chip XOR=1 paired Reduce-Scatter (halves off-chip ICI!)
     bridge_ag: bool = False  # 2-stage chipmate-bridge All-Gather (halves ICI fan-out bytes!)
     norm_f32_stage: bool = True
     route_chunk_rows: int = 32
@@ -107,7 +108,7 @@ def _env_bool_fallback(name: str, default: bool) -> bool:
 
 
 def _read_sparse_env_overrides() -> (
-    tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int]
+    tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int, int, str]
 ):
     import os
 
@@ -116,6 +117,9 @@ def _read_sparse_env_overrides() -> (
     contig_p = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_CONTIG_PARTS", False)
     min_p = float(os.environ.get("SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK", "0.0") or 0.0)
     free_spec = os.environ.get("SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS", "")
+    pair_rs_raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS")
+    pair_rs = int(pair_rs_raw) if (pair_rs_raw is not None and pair_rs_raw.strip() != "") else -1
+    strip_mode = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_STRIP_MODE", "").strip()
     try:
         from sglang_tpu.envs import envs
 
@@ -126,6 +130,7 @@ def _read_sparse_env_overrides() -> (
         contig_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_CONTIG_PARTS", None)
         minp_env = getattr(envs, "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK", None)
         free_env = getattr(envs, "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS", None)
+        pair_rs_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS", None)
         if m8_env is not None:
             decode_m8 = bool(m8_env.get())
         if hoist_env is not None:
@@ -136,6 +141,8 @@ def _read_sparse_env_overrides() -> (
             min_p = float(minp_env.get())
         if free_env is not None:
             free_spec = str(free_env.get())
+        if pair_rs_raw is None and pair_rs_env is not None:
+            pair_rs = int(pair_rs_env.get())
         f_rows, f_max_w, f_min_s = parse_free_expert_rows_spec(free_spec)
         return (
             bool(envs.SGLANG_TPU_MUSE_KERNEL_DECODE_STATIC_HOLDER_MASK.get()),
@@ -150,6 +157,8 @@ def _read_sparse_env_overrides() -> (
             f_rows,
             f_max_w,
             f_min_s,
+            pair_rs,
+            strip_mode,
         )
     except Exception:
         f_rows, f_max_w, f_min_s = parse_free_expert_rows_spec(free_spec)
@@ -166,6 +175,8 @@ def _read_sparse_env_overrides() -> (
             f_rows,
             f_max_w,
             f_min_s,
+            pair_rs,
+            strip_mode,
         )
 
 
@@ -186,9 +197,17 @@ def default_sparse_decode_config(
         free_rows,
         free_max_w,
         free_min_slot,
+        pair_rs_ov,
+        strip_mode_ov,
     ) = _read_sparse_env_overrides()
     spec_eff = spec_parts if batch_size <= 128 else 0
-    use_br64 = bridge64 and (ep == 8) and (batch_size == 64)
+    use_br64 = bridge64 and (ep in (8, 16)) and (batch_size == 64)
+    use_pair_rs = (
+        (pair_rs_ov > 0 and ep in (8, 16))
+        if pair_rs_ov >= 0
+        else (ep == 16 and batch_size >= 32)
+    )
+    eff_strip = strip_mode_ov if strip_mode_ov else "adaptive"
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
@@ -216,7 +235,8 @@ def default_sparse_decode_config(
             k16_bd_fp8=(fast_b64 >= 1 and batch_size <= 64),
             k16_strip_nc=512,
             rs_wire_bf16=(batch_size >= 128) or use_br64,
-            bridge_ag=(ep == 8 and batch_size >= 128) or use_br64,
+            pair_rs=use_pair_rs,
+            bridge_ag=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 128) or use_br64,
             norm_f32_stage=True,
             route_chunk_rows=batch_size if (fast_b64 >= 1 and batch_size <= 64) else min(batch_size, 32),
             static_holder_mask=static_mask,
@@ -225,7 +245,7 @@ def default_sparse_decode_config(
             **route_kw,
         )
 
-    # Compact K256: dense fast-path at B=16 (or B<=64 when fast_b64==3), 2/3-bucket sparse at B in (32, 64),
+    # Compact K256/K512: dense fast-path at B=16 (or B<=64 when fast_b64==3), 2/3-bucket sparse at B in (32, 64),
     # 3-bucket (16, 32, 64) unlooped sparse + BF16 RS wire at B >= 128 (~38 MiB VMEM).
     if batch_size <= 16 or (fast_b64 == 3 and batch_size <= 64):
         return SparseDecodeConfig(
@@ -235,10 +255,11 @@ def default_sparse_decode_config(
             m_buckets=(batch_size,),
             loop32_in_tile=False,
             k16_blockdiag_rows=(),
-            k256_strip_mode="wide",
+            k256_strip_mode=eff_strip,
             k256_dual_mode="vstage",
             rs_wire_bf16=use_br64 if batch_size == 64 else False,
-            bridge_ag=use_br64 if batch_size == 64 else False,
+            pair_rs=use_pair_rs,
+            bridge_ag=(ep == 16 and batch_size >= 32) or (use_br64 if batch_size == 64 else False),
             norm_f32_stage=True,
             route_chunk_rows=batch_size,
             static_holder_mask=static_mask,
@@ -264,10 +285,11 @@ def default_sparse_decode_config(
             m_buckets=m_bkts,
             loop32_in_tile=False,
             k16_blockdiag_rows=(),
-            k256_strip_mode="wide",
+            k256_strip_mode=eff_strip,
             k256_dual_mode="dual" if fast_b64 == 2 else "hybrid",
             rs_wire_bf16=use_br64,
-            bridge_ag=use_br64,
+            pair_rs=use_pair_rs,
+            bridge_ag=(ep == 16) or use_br64,
             norm_f32_stage=True,
             route_chunk_rows=batch_size if fast_b64 >= 1 else 32,
             static_holder_mask=static_mask,
@@ -282,10 +304,11 @@ def default_sparse_decode_config(
         m_buckets=(16, 32, 64),
         loop32_in_tile=False,
         k16_blockdiag_rows=(),
-        k256_strip_mode="wide",
+        k256_strip_mode=eff_strip,
         k256_dual_mode="hybrid",
         rs_wire_bf16=True,
-        bridge_ag=(ep == 8),
+        pair_rs=use_pair_rs,
+        bridge_ag=(ep in (8, 16)),
         norm_f32_stage=True,
         route_chunk_rows=32,
         static_holder_mask=static_mask,
@@ -375,6 +398,64 @@ def _fp4_gmm_chunked(
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
+    if block256 and not use_w4a8:
+        # Sub-tile N to <= 512 cols (<= 32 VREGs for [256, 512] fp8 weight -> 0 expert spills!)
+        # and chain MXU FP32 accumulation across all K256 chunks sharing a scale_block (2x fewer
+        # MXU pops & VPU scale muls at scale_block=512; 0.0-ULP bit-identical at scale_block=256).
+        n_sb = k_dim // scale_block
+        sub_nc = min(nc, 512)
+        n_sub = nc // sub_nc
+        can_hoist_s = hoist_scales and n_sb >= 8 and (n_sb % 8 == 0)
+        s_subs = [
+            s_ref[pl.ds(0, n_sb), pl.ds(n0 + si * sub_nc, sub_nc)]
+            if can_hoist_s
+            else None
+            for si in range(n_sub)
+        ]
+        accs = [
+            (
+                init_acc[:, si * sub_nc : (si + 1) * sub_nc]
+                if init_acc is not None
+                else None
+            )
+            for si in range(n_sub)
+        ]
+        chunks_per_sb = scale_block // _KC
+        for sb_id in range(n_sb):
+            c_base = sb_id * scale_block
+            blk_accs: list[jax.Array | None] = [None] * n_sub
+            for ci in range(chunks_per_sb):
+                c0 = c_base + ci * _KC
+                x = x_2d_ref[pl.ds(0, read_m), pl.ds(k_offset + c0, _KC)]
+                if read_m != m_rows:
+                    x = x[:m_rows, :]
+                for si in range(n_sub):
+                    col0 = n0 + si * sub_nc
+                    w_fp8 = pltpu.bitcast(
+                        w_ref[
+                            pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
+                            pl.ds(col0, sub_nc),
+                        ],
+                        jnp.float4_e2m1fn,
+                    ).astype(jnp.float8_e4m3fn)
+                    part = jnp.dot(
+                        x, w_fp8, preferred_element_type=jnp.float32
+                    )
+                    blk_accs[si] = (
+                        part if blk_accs[si] is None else blk_accs[si] + part
+                    )
+            for si in range(n_sub):
+                col0 = n0 + si * sub_nc
+                if s_subs[si] is not None:
+                    s = s_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
+                else:
+                    s = s_ref[pl.ds(sb_id, 1), pl.ds(col0, sub_nc)].astype(
+                        jnp.float32
+                    )
+                scaled = blk_accs[si] * s
+                accs[si] = scaled if accs[si] is None else accs[si] + scaled
+        return accs[0] if n_sub == 1 else jnp.concatenate(accs, axis=1)
+
     x_read_m = max(32, read_m) if use_w4a8 else read_m
     n_kc = k_dim // _KC
     n_sb = (k_dim // scale_block) if block256 else 0
@@ -456,6 +537,84 @@ def _fp4_dual_gmm_chunked(
     """Interleaved gate + up K256 matmul reading ``x`` once per K256 chunk."""
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
+    if block256:
+        n_sb = k_dim // scale_block
+        sub_nc = min(nc, 512)
+        n_sub = nc // sub_nc
+        can_hoist = n_sb >= 8 and (n_sb % 8 == 0)
+        sg_subs = [
+            s_ref[pl.ds(0, n_sb), pl.ds(n0_g + si * sub_nc, sub_nc)]
+            if can_hoist
+            else None
+            for si in range(n_sub)
+        ]
+        su_subs = [
+            s_ref[pl.ds(0, n_sb), pl.ds(n0_u + si * sub_nc, sub_nc)]
+            if can_hoist
+            else None
+            for si in range(n_sub)
+        ]
+        accs_g: list[jax.Array | None] = [None] * n_sub
+        accs_u: list[jax.Array | None] = [None] * n_sub
+        chunks_per_sb = scale_block // _KC
+        for sb_id in range(n_sb):
+            c_base = sb_id * scale_block
+            bg_list: list[jax.Array | None] = [None] * n_sub
+            bu_list: list[jax.Array | None] = [None] * n_sub
+            for ci in range(chunks_per_sb):
+                c0 = c_base + ci * _KC
+                x = x_2d_ref[pl.ds(0, read_m), pl.ds(c0, _KC)]
+                if m_rows == 8:
+                    x = x[:8, :]
+                for si in range(n_sub):
+                    cg = n0_g + si * sub_nc
+                    cu = n0_u + si * sub_nc
+                    wg_fp8 = pltpu.bitcast(
+                        w_ref[
+                            pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
+                            pl.ds(cg, sub_nc),
+                        ],
+                        jnp.float4_e2m1fn,
+                    ).astype(jnp.float8_e4m3fn)
+                    rg = jnp.dot(
+                        x, wg_fp8, preferred_element_type=jnp.float32
+                    )
+                    bg_list[si] = rg if bg_list[si] is None else bg_list[si] + rg
+                    wu_fp8 = pltpu.bitcast(
+                        w_ref[
+                            pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
+                            pl.ds(cu, sub_nc),
+                        ],
+                        jnp.float4_e2m1fn,
+                    ).astype(jnp.float8_e4m3fn)
+                    ru = jnp.dot(
+                        x, wu_fp8, preferred_element_type=jnp.float32
+                    )
+                    bu_list[si] = ru if bu_list[si] is None else bu_list[si] + ru
+            for si in range(n_sub):
+                cg = n0_g + si * sub_nc
+                cu = n0_u + si * sub_nc
+                sg = (
+                    sg_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
+                    if sg_subs[si] is not None
+                    else s_ref[pl.ds(sb_id, 1), pl.ds(cg, sub_nc)].astype(
+                        jnp.float32
+                    )
+                )
+                su = (
+                    su_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
+                    if su_subs[si] is not None
+                    else s_ref[pl.ds(sb_id, 1), pl.ds(cu, sub_nc)].astype(
+                        jnp.float32
+                    )
+                )
+                gs_v = bg_list[si] * sg
+                us_v = bu_list[si] * su
+                accs_g[si] = gs_v if accs_g[si] is None else accs_g[si] + gs_v
+                accs_u[si] = us_v if accs_u[si] is None else accs_u[si] + us_v
+        out_g = accs_g[0] if n_sub == 1 else jnp.concatenate(accs_g, axis=1)
+        out_u = accs_u[0] if n_sub == 1 else jnp.concatenate(accs_u, axis=1)
+        return out_g, out_u
     acc_g = None
     acc_u = None
     for c0 in range(0, k_dim, _KC):
@@ -854,10 +1013,23 @@ def _sparse_decode_kernel(
         accum_2d = None
         fan_3d_buf = x_3d_buf if not return_sharded else None
 
+    use_pair_rs = cfg.pair_rs and (ep in (8, 16))
     rs_send_bf16 = next(it) if cfg.rs_wire_bf16 else None
-    rs_recv_3d = next(it)
-    rs_send_sem = next(it)
-    rs_recv_sem = next(it)
+    if use_pair_rs:
+        rs_pair_recv = next(it)
+        rs_chip_send = next(it)
+        rs_chip_recv = next(it)
+        rs_pair_ssem = next(it)
+        rs_pair_rsem = next(it)
+        rs_chip_ssem = next(it)
+        rs_chip_rsem = next(it)
+        rs_recv_3d = rs_send_sem = rs_recv_sem = None
+    else:
+        rs_recv_3d = next(it)
+        rs_send_sem = next(it)
+        rs_recv_sem = next(it)
+        rs_pair_recv = rs_chip_send = rs_chip_recv = None
+        rs_pair_ssem = rs_pair_rsem = rs_chip_ssem = rs_chip_rsem = None
     owner_3d = next(it)
     if not return_sharded:
         fan_send_sem = next(it)
@@ -3176,53 +3348,144 @@ def _sparse_decode_kernel(
 
     pl.semaphore_wait(barrier_sem, ep)
 
-    rs_copies = []
-    for d in range(ep):
-        dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
-        copy_op = pltpu.make_async_remote_copy(
-            rs_src_ref.at[pl.ds(d * rows_per_rank, rows_per_rank), :, :],
-            rs_recv_3d.at[dst_slot],
-            rs_send_sem.at[d],
-            rs_recv_sem,
-            device_id={ep_axis_name: jnp.int32(d)},
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        rs_copies.append((d, copy_op))
+    if use_pair_rs:
+        # 2-stage intra-chip XOR=1 paired Reduce-Scatter: exchanges partner blocks over
+        # the 733 GB/s die-to-die link first, cutting off-chip/inter-host ICI sends by >50%!
+        num_chips_rs = ep // 2
+        core_rs = me & jnp.int32(1)
+        chip_rs = me >> 1
+        partner_rs = jnp.bitwise_xor(me, jnp.int32(1))
 
-        @pl.when(me != d)
-        def _start_rs(_op=copy_op):
-            _op.start()
+        p1_ops = []
+        for c in range(num_chips_rs):
+            dest_for_partner = jnp.int32(2 * c) + (jnp.int32(1) - core_rs)
+            op_p = pltpu.make_async_remote_copy(
+                rs_src_ref.at[
+                    pl.ds(dest_for_partner * rows_per_rank, rows_per_rank), :, :
+                ],
+                rs_pair_recv.at[c],
+                rs_pair_ssem.at[c],
+                rs_pair_rsem.at[c],
+                device_id={ep_axis_name: partner_rs},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op_p.start()
+            p1_ops.append(op_p)
 
-    pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
+        chip_ops = []
+        for c in range(num_chips_rs):
+            pltpu.make_async_copy(
+                rs_pair_recv.at[c], rs_pair_recv.at[c], rs_pair_rsem.at[c]
+            ).wait()
+            target_rank = jnp.int32(2 * c) + core_rs
 
-    if cfg.fast_b64_epi_pro and rows_per_rank in (2, 4, 8):
-        acc = accum_3d[pl.ds(me * rows_per_rank, rows_per_rank), :, :]
-        for src in range(ep - 1):
-            acc = acc + rs_recv_3d[src, :, :, :].astype(jnp.float32)
-        owner_3d[...] = acc.astype(jnp.bfloat16)
-    else:
+            @pl.when(c != chip_rs)
+            def _sum_and_send_chip(c=c, target_rank=target_rank):
+                r_off = target_rank * rows_per_rank
+                pair_f32 = accum_3d[
+                    pl.ds(r_off, rows_per_rank), :, :
+                ] + rs_pair_recv[c].astype(jnp.float32)
+                rs_chip_send[c] = pair_f32.astype(rs_chip_send.dtype)
+
+            op_c = pltpu.make_async_remote_copy(
+                rs_chip_send.at[c],
+                rs_chip_recv.at[chip_rs],
+                rs_chip_ssem.at[c],
+                rs_chip_rsem,
+                device_id={ep_axis_name: target_rank},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            chip_ops.append((c, op_c))
+
+            @pl.when(c != chip_rs)
+            def _start_chip_rs(_op=op_c):
+                _op.start()
+
+        pltpu.make_async_copy(
+            rs_chip_recv.at[pl.ds(0, num_chips_rs - 1)],
+            rs_chip_recv.at[pl.ds(0, num_chips_rs - 1)],
+            rs_chip_rsem,
+        ).wait()
+
         red_rc = min(rows_per_rank, 4)
 
-        def _reduce_owner_chunk(ci, _):
+        def _reduce_owner_paired(ci, _):
             r0 = ci * red_rc
             acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
-            for src in range(ep - 1):
-                acc = acc + rs_recv_3d[src, pl.ds(r0, red_rc), :, :].astype(
-                    jnp.float32
+            for c in range(num_chips_rs):
+                part_c = jnp.where(
+                    c == chip_rs,
+                    rs_pair_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
+                    rs_chip_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
                 )
+                acc = acc + part_c
             owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
             return _
 
         lax.fori_loop(
-            0, rows_per_rank // red_rc, _reduce_owner_chunk, jnp.int32(0)
+            0, rows_per_rank // red_rc, _reduce_owner_paired, jnp.int32(0)
         )
 
-    if stop_stage == "rs":
-        for d, copy_op in rs_copies:
+        def _finish_rs_sends():
+            for op_p in p1_ops:
+                op_p.wait_send()
+            for c, op_c in chip_ops:
+
+                @pl.when(c != chip_rs)
+                def _wc(_op=op_c):
+                    _op.wait_send()
+
+    else:
+        rs_copies = []
+        for d in range(ep):
+            dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
+            copy_op = pltpu.make_async_remote_copy(
+                rs_src_ref.at[pl.ds(d * rows_per_rank, rows_per_rank), :, :],
+                rs_recv_3d.at[dst_slot],
+                rs_send_sem.at[d],
+                rs_recv_sem,
+                device_id={ep_axis_name: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            rs_copies.append((d, copy_op))
 
             @pl.when(me != d)
-            def _wait_rs_early(_op=copy_op):
-                _op.wait_send()
+            def _start_rs(_op=copy_op):
+                _op.start()
+
+        pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
+
+        if cfg.fast_b64_epi_pro and rows_per_rank in (2, 4, 8):
+            acc = accum_3d[pl.ds(me * rows_per_rank, rows_per_rank), :, :]
+            for src in range(ep - 1):
+                acc = acc + rs_recv_3d[src, :, :, :].astype(jnp.float32)
+            owner_3d[...] = acc.astype(jnp.bfloat16)
+        else:
+            red_rc = min(rows_per_rank, 4)
+
+            def _reduce_owner_chunk(ci, _):
+                r0 = ci * red_rc
+                acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
+                for src in range(ep - 1):
+                    acc = acc + rs_recv_3d[src, pl.ds(r0, red_rc), :, :].astype(
+                        jnp.float32
+                    )
+                owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
+                return _
+
+            lax.fori_loop(
+                0, rows_per_rank // red_rc, _reduce_owner_chunk, jnp.int32(0)
+            )
+
+        def _finish_rs_sends():
+            for d, copy_op in rs_copies:
+
+                @pl.when(me != d)
+                def _wait_rs(_op=copy_op):
+                    _op.wait_send()
+
+    if stop_stage == "rs":
+        _finish_rs_sends()
 
         if return_sharded:
             z_rows = min(rows_per_rank, 16)
@@ -3366,11 +3629,7 @@ def _sparse_decode_kernel(
             def _wait_fan(_op=fan_op):
                 _op.wait_send()
 
-    for d, copy_op in rs_copies:
-
-        @pl.when(me != d)
-        def _wait_rs(_op=copy_op):
-            _op.wait_send()
+    _finish_rs_sends()
 
 
 def fused_decode_sparse_from_logits(
@@ -3632,17 +3891,33 @@ def fused_decode_sparse_from_logits(
         )
 
     rows_per_rank = batch_size // ep
+    use_pair_rs = config.pair_rs and (ep in (8, 16))
     rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
     if config.rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
-    scratch_shapes.extend(
-        [
-            vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
-            sem((ep,)),
-            sem,
-            vmem((rows_per_rank, 32, 128), jnp.bfloat16),
-        ]
-    )
+    if use_pair_rs:
+        num_chips_rs = ep // 2
+        scratch_shapes.extend(
+            [
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
+    else:
+        scratch_shapes.extend(
+            [
+                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((ep,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
     if not return_sharded:
         if config.bridge_ag:
             num_chips = ep // 2
@@ -3734,6 +4009,7 @@ class Fp8SparseDecodeConfig:
     fp8_dual_mode: str = "hybrid"  # "vstage", "dual", "hybrid" (dual at m<=16 w/ stream3_half)
     lhs_fp8: bool = False  # W8A8: per-row FP8 LHS quantization for 2x MXU
     rs_wire_bf16: bool = True
+    pair_rs: bool = False
     bridge_ag: bool = True
     norm_f32_stage: bool = True
     route_chunk_rows: int = 32
@@ -3765,10 +4041,15 @@ def default_fp8_sparse_decode_config(
         free_rows,
         free_max_w,
         free_min_slot,
+        _,
+        _,
     ) = _read_sparse_env_overrides()
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
+    fp8_static_mask = ep <= 8
+    fp8_pair_rs = ep == 16 and batch_size >= 32
+    fp8_bridge_ag = (ep == 8) or (ep == 16 and batch_size >= 32)
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
@@ -3777,6 +4058,7 @@ def default_fp8_sparse_decode_config(
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
         free_min_slot=free_min_slot_eff,
+        pair_rs=fp8_pair_rs,
     )
     if batch_size <= 16 or use_dense_k2:
         return Fp8SparseDecodeConfig(
@@ -3789,10 +4071,10 @@ def default_fp8_sparse_decode_config(
             fp8_dual_mode="hybrid",
             lhs_fp8=use_w8a8,
             rs_wire_bf16=(ep == 8),
-            bridge_ag=(ep == 8),
+            bridge_ag=fp8_bridge_ag,
             norm_f32_stage=True,
             route_chunk_rows=batch_size,
-            static_holder_mask=True,
+            static_holder_mask=fp8_static_mask,
             spec_prime_parts=spec_parts,
             fast_b64_epi_pro=(fast_b64 >= 1 or use_k2),
             **route_kw,
@@ -3813,10 +4095,10 @@ def default_fp8_sparse_decode_config(
             fp8_dual_mode="hybrid",
             lhs_fp8=use_w8a8,
             rs_wire_bf16=(ep == 8),
-            bridge_ag=(ep == 8),
+            bridge_ag=fp8_bridge_ag,
             norm_f32_stage=True,
             route_chunk_rows=batch_size if (fast_b64 >= 1 or use_k2) else 32,
-            static_holder_mask=True,
+            static_holder_mask=fp8_static_mask,
             spec_prime_parts=spec_parts,
             fast_b64_epi_pro=(fast_b64 >= 1 or use_k2),
             **route_kw,
@@ -3832,10 +4114,10 @@ def default_fp8_sparse_decode_config(
             fp8_dual_mode="hybrid",
             lhs_fp8=use_w8a8,
             rs_wire_bf16=True,
-            bridge_ag=(ep == 8),
+            bridge_ag=fp8_bridge_ag,
             norm_f32_stage=True,
             route_chunk_rows=32,
-            static_holder_mask=True,
+            static_holder_mask=fp8_static_mask,
             spec_prime_parts=spec_parts,
             **route_kw,
         )
@@ -3848,10 +4130,10 @@ def default_fp8_sparse_decode_config(
         fp8_strip_mode="wide",
         fp8_dual_mode="vstage",
         rs_wire_bf16=True,
-        bridge_ag=(ep == 8),
+        bridge_ag=fp8_bridge_ag,
         norm_f32_stage=True,
         route_chunk_rows=32,
-        static_holder_mask=True,
+        static_holder_mask=fp8_static_mask,
         spec_prime_parts=0,
         **route_kw,
     )
@@ -4037,10 +4319,23 @@ def _sparse_fp8_decode_kernel(
         accum_2d = None
         fan_3d_buf = x_3d_buf if not return_sharded else None
 
+    use_pair_rs = cfg.pair_rs and (ep in (8, 16))
     rs_send_bf16 = next(it) if cfg.rs_wire_bf16 else None
-    rs_recv_3d = next(it)
-    rs_send_sem = next(it)
-    rs_recv_sem = next(it)
+    if use_pair_rs:
+        rs_pair_recv = next(it)
+        rs_chip_send = next(it)
+        rs_chip_recv = next(it)
+        rs_pair_ssem = next(it)
+        rs_pair_rsem = next(it)
+        rs_chip_ssem = next(it)
+        rs_chip_rsem = next(it)
+        rs_recv_3d = rs_send_sem = rs_recv_sem = None
+    else:
+        rs_recv_3d = next(it)
+        rs_send_sem = next(it)
+        rs_recv_sem = next(it)
+        rs_pair_recv = rs_chip_send = rs_chip_recv = None
+        rs_pair_ssem = rs_pair_rsem = rs_chip_ssem = rs_chip_rsem = None
     owner_3d = next(it)
     if not return_sharded:
         fan_send_sem = next(it)
@@ -5487,7 +5782,7 @@ def _sparse_fp8_decode_kernel(
 
             lax.fori_loop(0, num_exec, _s3h_expert_body, jnp.int32(0))
 
-    # 7. Contiguous EP-1 Reduce-Scatter + Bridge/Flat All-Gather.
+    # 7. Contiguous EP-1 / 2-Stage Paired Reduce-Scatter + Bridge/Flat All-Gather.
     if cfg.rs_wire_bf16:
         cast_rc = min(batch_size, 8)
 
@@ -5505,40 +5800,133 @@ def _sparse_fp8_decode_kernel(
 
     pl.semaphore_wait(barrier_sem, ep)
 
-    rs_copies = []
-    for d in range(ep):
-        dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
-        copy_op = pltpu.make_async_remote_copy(
-            rs_src_ref.at[pl.ds(d * rows_per_rank, rows_per_rank), :, :],
-            rs_recv_3d.at[dst_slot],
-            rs_send_sem.at[d],
-            rs_recv_sem,
-            device_id={ep_axis_name: jnp.int32(d)},
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        rs_copies.append((d, copy_op))
+    if use_pair_rs:
+        num_chips_rs = ep // 2
+        core_rs = me & jnp.int32(1)
+        chip_rs = me >> 1
+        partner_rs = jnp.bitwise_xor(me, jnp.int32(1))
 
-        @pl.when(me != d)
-        def _start_rs(_op=copy_op):
-            _op.start()
-
-    pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
-
-    red_rc = min(rows_per_rank, 4)
-
-    def _reduce_owner_chunk(ci, _):
-        r0 = ci * red_rc
-        acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
-        for src in range(ep - 1):
-            acc = acc + rs_recv_3d[src, pl.ds(r0, red_rc), :, :].astype(
-                jnp.float32
+        p1_ops = []
+        for c in range(num_chips_rs):
+            dest_for_partner = jnp.int32(2 * c) + (jnp.int32(1) - core_rs)
+            op_p = pltpu.make_async_remote_copy(
+                rs_src_ref.at[
+                    pl.ds(dest_for_partner * rows_per_rank, rows_per_rank), :, :
+                ],
+                rs_pair_recv.at[c],
+                rs_pair_ssem.at[c],
+                rs_pair_rsem.at[c],
+                device_id={ep_axis_name: partner_rs},
+                device_id_type=pl.DeviceIdType.MESH,
             )
-        owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
-        return _
+            op_p.start()
+            p1_ops.append(op_p)
 
-    lax.fori_loop(
-        0, rows_per_rank // red_rc, _reduce_owner_chunk, jnp.int32(0)
-    )
+        chip_ops = []
+        for c in range(num_chips_rs):
+            pltpu.make_async_copy(
+                rs_pair_recv.at[c], rs_pair_recv.at[c], rs_pair_rsem.at[c]
+            ).wait()
+            target_rank = jnp.int32(2 * c) + core_rs
+
+            @pl.when(c != chip_rs)
+            def _sum_and_send_chip_fp8(c=c, target_rank=target_rank):
+                r_off = target_rank * rows_per_rank
+                pair_f32 = accum_3d[
+                    pl.ds(r_off, rows_per_rank), :, :
+                ] + rs_pair_recv[c].astype(jnp.float32)
+                rs_chip_send[c] = pair_f32.astype(rs_chip_send.dtype)
+
+            op_c = pltpu.make_async_remote_copy(
+                rs_chip_send.at[c],
+                rs_chip_recv.at[chip_rs],
+                rs_chip_ssem.at[c],
+                rs_chip_rsem,
+                device_id={ep_axis_name: target_rank},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            chip_ops.append((c, op_c))
+
+            @pl.when(c != chip_rs)
+            def _start_chip_rs_fp8(_op=op_c):
+                _op.start()
+
+        pltpu.make_async_copy(
+            rs_chip_recv.at[pl.ds(0, num_chips_rs - 1)],
+            rs_chip_recv.at[pl.ds(0, num_chips_rs - 1)],
+            rs_chip_rsem,
+        ).wait()
+
+        red_rc = min(rows_per_rank, 4)
+
+        def _reduce_owner_paired_fp8(ci, _):
+            r0 = ci * red_rc
+            acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
+            for c in range(num_chips_rs):
+                part_c = jnp.where(
+                    c == chip_rs,
+                    rs_pair_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
+                    rs_chip_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
+                )
+                acc = acc + part_c
+            owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
+            return _
+
+        lax.fori_loop(
+            0, rows_per_rank // red_rc, _reduce_owner_paired_fp8, jnp.int32(0)
+        )
+
+        def _finish_rs_sends():
+            for op_p in p1_ops:
+                op_p.wait_send()
+            for c, op_c in chip_ops:
+
+                @pl.when(c != chip_rs)
+                def _wc_fp8(_op=op_c):
+                    _op.wait_send()
+
+    else:
+        rs_copies = []
+        for d in range(ep):
+            dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
+            copy_op = pltpu.make_async_remote_copy(
+                rs_src_ref.at[pl.ds(d * rows_per_rank, rows_per_rank), :, :],
+                rs_recv_3d.at[dst_slot],
+                rs_send_sem.at[d],
+                rs_recv_sem,
+                device_id={ep_axis_name: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            rs_copies.append((d, copy_op))
+
+            @pl.when(me != d)
+            def _start_rs(_op=copy_op):
+                _op.start()
+
+        pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
+
+        red_rc = min(rows_per_rank, 4)
+
+        def _reduce_owner_chunk(ci, _):
+            r0 = ci * red_rc
+            acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
+            for src in range(ep - 1):
+                acc = acc + rs_recv_3d[src, pl.ds(r0, red_rc), :, :].astype(
+                    jnp.float32
+                )
+            owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
+            return _
+
+        lax.fori_loop(
+            0, rows_per_rank // red_rc, _reduce_owner_chunk, jnp.int32(0)
+        )
+
+        def _finish_rs_sends():
+            for d, copy_op in rs_copies:
+
+                @pl.when(me != d)
+                def _wait_rs(_op=copy_op):
+                    _op.wait_send()
 
     if return_sharded:
         if rows_per_rank >= 16:
@@ -5669,11 +6057,7 @@ def _sparse_fp8_decode_kernel(
             def _wait_fan(_op=fan_op):
                 _op.wait_send()
 
-    for d, copy_op in rs_copies:
-
-        @pl.when(me != d)
-        def _wait_rs(_op=copy_op):
-            _op.wait_send()
+    _finish_rs_sends()
 
 
 def fused_decode_sparse_fp8_from_logits(
@@ -5863,17 +6247,33 @@ def fused_decode_sparse_fp8_from_logits(
         )
 
     rows_per_rank = batch_size // ep
+    use_pair_rs = config.pair_rs and (ep in (8, 16))
     rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
     if config.rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
-    scratch_shapes.extend(
-        [
-            vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
-            sem((ep,)),
-            sem,
-            vmem((rows_per_rank, 32, 128), jnp.bfloat16),
-        ]
-    )
+    if use_pair_rs:
+        num_chips_rs = ep // 2
+        scratch_shapes.extend(
+            [
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
+    else:
+        scratch_shapes.extend(
+            [
+                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((ep,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
     if not return_sharded:
         if config.bridge_ag:
             num_chips = ep // 2

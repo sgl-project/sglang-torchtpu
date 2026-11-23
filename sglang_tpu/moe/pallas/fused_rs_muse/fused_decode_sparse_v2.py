@@ -107,7 +107,7 @@ class SparseDecodeV2Config:
     lhs_fp8: bool = False  # True: online K256 W4A8/W3A8 FP8 activation quant (2x MXU)
     k16_strip_nc: int = 512
     k16_dual_mode: str = "hybrid"  # "dual", "vstage", "hybrid" (dual at m<=32, vstage at m>=64)
-    k256_strip_mode: str = "wide"  # "wide" (2048 at m<=16, 1024 at m<=64, 512 above)
+    k256_strip_mode: str = "adaptive"  # "adaptive" (1024 at m<=16, 512 at m>=32: 0 expert spills!), "wide"
     k256_dual_mode: str = "hybrid"  # "dual", "vstage", "hybrid" (dual at m<=16, vstage at m>=32)
     async_gather: bool = True  # double-buffered async DMA token gather overlapped w/ W2
     fused_norm_scatter: bool = True  # single-pass y_stage -> inv_rms -> accum_3d scatter
@@ -191,7 +191,7 @@ def _apply_v2_env_overrides(
             if 32 not in m_buckets:
                 m_buckets = tuple(sorted(set(m_buckets) | {32}))
 
-    pair_rs = base.pair_rs if ov.pair_rs < 0 else (bool(ov.pair_rs) and ep == 8)
+    pair_rs = base.pair_rs if ov.pair_rs < 0 else (bool(ov.pair_rs) and ep in (8, 16))
     async_gather = (
         base.async_gather if ov.async_gather < 0 else bool(ov.async_gather)
     )
@@ -201,7 +201,7 @@ def _apply_v2_env_overrides(
         else bool(ov.fused_norm_scatter)
     )
     rs_bf16 = base.rs_wire_bf16 or (
-        ov.rs_bridge64 and ep == 8 and batch_size == 64
+        ov.rs_bridge64 and ep in (8, 16) and batch_size == 64
     )
     spec_eff = ov.spec_prime_parts if batch_size <= 128 else 0
     lhs_fp8 = base.lhs_fp8 or (ov.lhs_fp8 and scale_block >= 256)
@@ -241,6 +241,7 @@ def default_sparse_decode_v2_config(
     batch_size: int, ep: int, scale_block: int
 ) -> SparseDecodeV2Config:
     """Return the tuned default v2 configuration for ``(batch_size, ep, scale_block)``."""
+    use_paired_ep = ep in (8, 16)
     if scale_block == 16:
         if batch_size <= 64:
             base = SparseDecodeV2Config(
@@ -257,8 +258,8 @@ def default_sparse_decode_v2_config(
                 async_gather=False,
                 fused_norm_scatter=True,
                 rs_wire_bf16=(batch_size >= 64),
-                pair_rs=(ep == 8 and batch_size >= 32),
-                pair_ag_relay=(ep == 8 and batch_size >= 32),
+                pair_rs=(use_paired_ep and batch_size >= 32),
+                pair_ag_relay=(use_paired_ep and batch_size >= 32),
                 route_chunk_rows=min(batch_size, 32),
             )
             return _apply_v2_env_overrides(base, batch_size, ep, scale_block)
@@ -277,13 +278,13 @@ def default_sparse_decode_v2_config(
             async_gather=False,
             fused_norm_scatter=True,
             rs_wire_bf16=True,
-            pair_rs=(ep == 8),
-            pair_ag_relay=(ep == 8),
+            pair_rs=use_paired_ep,
+            pair_ag_relay=use_paired_ep,
             route_chunk_rows=32,
         )
         return _apply_v2_env_overrides(base, batch_size, ep, scale_block)
 
-    # Compact K256
+    # Compact K256 / K512
     if batch_size <= 16:
         base = SparseDecodeV2Config(
             row_mode="dense",
@@ -294,7 +295,7 @@ def default_sparse_decode_v2_config(
             k16_blockdiag_rows=(),
             fp4_unpack_mode="via_fp8",
             kc_step=256,
-            k256_strip_mode="wide",
+            k256_strip_mode="adaptive",
             k256_dual_mode="vstage",
             async_gather=False,
             fused_norm_scatter=True,
@@ -314,13 +315,13 @@ def default_sparse_decode_v2_config(
             k16_blockdiag_rows=(),
             fp4_unpack_mode="via_fp8",
             kc_step=256,
-            k256_strip_mode="wide",
+            k256_strip_mode="adaptive",
             k256_dual_mode="hybrid",
             async_gather=False,
             fused_norm_scatter=True,
             rs_wire_bf16=(batch_size >= 64),
-            pair_rs=(ep == 8 and batch_size >= 64),
-            pair_ag_relay=(ep == 8 and batch_size >= 64),
+            pair_rs=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 64),
+            pair_ag_relay=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 64),
             route_chunk_rows=32,
         )
         return _apply_v2_env_overrides(base, batch_size, ep, scale_block)
@@ -333,13 +334,13 @@ def default_sparse_decode_v2_config(
         k16_blockdiag_rows=(),
         fp4_unpack_mode="via_fp8",
         kc_step=256,
-        k256_strip_mode="wide",
+        k256_strip_mode="adaptive",
         k256_dual_mode="hybrid",
         async_gather=False,
         fused_norm_scatter=True,
         rs_wire_bf16=True,
-        pair_rs=(ep == 8),
-        pair_ag_relay=(ep == 8),
+        pair_rs=use_paired_ep,
+        pair_ag_relay=use_paired_ep,
         route_chunk_rows=32,
     )
     return _apply_v2_env_overrides(base, batch_size, ep, scale_block)
@@ -502,6 +503,64 @@ def _fp4_gmm_chunked_v2(
     eff_kc = 256 if (block256 or kperm_order or is_w3) else kc_step
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
+    if block256 and not use_w4a8:
+        n_k_blocks = k_dim // scale_block
+        sub_nc = min(nc, 512)
+        n_sub = nc // sub_nc
+        can_hoist = hoist_scales and n_k_blocks >= 8 and n_k_blocks % 8 == 0
+        s_subs = [
+            _load_scale_tile(
+                s_ref, 0, n_k_blocks, n0 + si * sub_nc, sub_nc, jnp.float32
+            )
+            if can_hoist
+            else None
+            for si in range(n_sub)
+        ]
+        accs: list[jax.Array | None] = [None] * n_sub
+        chunks_per_sb = scale_block // eff_kc
+        for sb_id in range(n_k_blocks):
+            c_base = sb_id * scale_block
+            blk_accs: list[jax.Array | None] = [None] * n_sub
+            for ci in range(chunks_per_sb):
+                c0 = c_base + ci * eff_kc
+                x = x_2d_ref[pl.ds(0, read_m), pl.ds(x_col_base + c0, eff_kc)]
+                if read_m != m_rows:
+                    x = x[:m_rows, :]
+                for si in range(n_sub):
+                    col0 = n0 + si * sub_nc
+                    if is_w3:
+                        w_fp8 = unpack_w3_u32_chunk_pallas(
+                            w_ref, c0, col0, sub_nc
+                        ).astype(jnp.float8_e4m3fn)
+                    else:
+                        w_fp8 = pltpu.bitcast(
+                            w_ref[
+                                pl.ds(c0 // _FP4_PACK, eff_kc // _FP4_PACK),
+                                pl.ds(col0, sub_nc),
+                            ],
+                            jnp.float4_e2m1fn,
+                        ).astype(jnp.float8_e4m3fn)
+                    part = jnp.dot(
+                        x, w_fp8, preferred_element_type=jnp.float32
+                    )
+                    blk_accs[si] = (
+                        part if blk_accs[si] is None else blk_accs[si] + part
+                    )
+            for si in range(n_sub):
+                col0 = n0 + si * sub_nc
+                s = (
+                    s_subs[si][sb_id : sb_id + 1, :]
+                    if s_subs[si] is not None
+                    else _load_scale_tile(
+                        s_ref, sb_id, 1, col0, sub_nc, jnp.float32
+                    )
+                )
+                scaled = blk_accs[si] * s
+                accs[si] = scaled if accs[si] is None else accs[si] + scaled
+        acc = accs[0] if n_sub == 1 else jnp.concatenate(accs, axis=1)
+        if gs_scale is not None:
+            acc = acc * gs_scale
+        return acc
     x_read_m = max(32, read_m) if use_w4a8 else read_m
     acc = None
     s_blk32 = None
@@ -612,6 +671,102 @@ def _fp4_dual_gmm_chunked_v2(
     eff_kc = 256 if (block256 or kperm_order or is_w3) else kc_step
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
+    if block256 and not use_w4a8:
+        n_k_blocks = k_dim // scale_block
+        sub_nc = min(nc, 512)
+        n_sub = nc // sub_nc
+        can_hoist = hoist_scales and n_k_blocks >= 8 and n_k_blocks % 8 == 0
+        sg_subs = [
+            _load_scale_tile(
+                s_ref, 0, n_k_blocks, n0_g + si * sub_nc, sub_nc, jnp.float32
+            )
+            if can_hoist
+            else None
+            for si in range(n_sub)
+        ]
+        su_subs = [
+            _load_scale_tile(
+                s_ref, 0, n_k_blocks, n0_u + si * sub_nc, sub_nc, jnp.float32
+            )
+            if can_hoist
+            else None
+            for si in range(n_sub)
+        ]
+        accs_g: list[jax.Array | None] = [None] * n_sub
+        accs_u: list[jax.Array | None] = [None] * n_sub
+        chunks_per_sb = scale_block // eff_kc
+        for sb_id in range(n_k_blocks):
+            c_base = sb_id * scale_block
+            bg_list: list[jax.Array | None] = [None] * n_sub
+            bu_list: list[jax.Array | None] = [None] * n_sub
+            for ci in range(chunks_per_sb):
+                c0 = c_base + ci * eff_kc
+                x = x_2d_ref[pl.ds(0, read_m), pl.ds(x_col_base + c0, eff_kc)]
+                if read_m != m_rows:
+                    x = x[:m_rows, :]
+                for si in range(n_sub):
+                    cg = n0_g + si * sub_nc
+                    cu = n0_u + si * sub_nc
+                    if is_w3:
+                        wg_fp8 = unpack_w3_u32_chunk_pallas(
+                            w_ref, c0, cg, sub_nc
+                        ).astype(jnp.float8_e4m3fn)
+                    else:
+                        wg_fp8 = pltpu.bitcast(
+                            w_ref[
+                                pl.ds(c0 // _FP4_PACK, eff_kc // _FP4_PACK),
+                                pl.ds(cg, sub_nc),
+                            ],
+                            jnp.float4_e2m1fn,
+                        ).astype(jnp.float8_e4m3fn)
+                    rg = jnp.dot(
+                        x, wg_fp8, preferred_element_type=jnp.float32
+                    )
+                    bg_list[si] = rg if bg_list[si] is None else bg_list[si] + rg
+                    if is_w3:
+                        wu_fp8 = unpack_w3_u32_chunk_pallas(
+                            w_ref, c0, cu, sub_nc
+                        ).astype(jnp.float8_e4m3fn)
+                    else:
+                        wu_fp8 = pltpu.bitcast(
+                            w_ref[
+                                pl.ds(c0 // _FP4_PACK, eff_kc // _FP4_PACK),
+                                pl.ds(cu, sub_nc),
+                            ],
+                            jnp.float4_e2m1fn,
+                        ).astype(jnp.float8_e4m3fn)
+                    ru = jnp.dot(
+                        x, wu_fp8, preferred_element_type=jnp.float32
+                    )
+                    bu_list[si] = ru if bu_list[si] is None else bu_list[si] + ru
+            for si in range(n_sub):
+                cg = n0_g + si * sub_nc
+                cu = n0_u + si * sub_nc
+                sg = (
+                    sg_subs[si][sb_id : sb_id + 1, :]
+                    if sg_subs[si] is not None
+                    else _load_scale_tile(
+                        s_ref, sb_id, 1, cg, sub_nc, jnp.float32
+                    )
+                )
+                su = (
+                    su_subs[si][sb_id : sb_id + 1, :]
+                    if su_subs[si] is not None
+                    else _load_scale_tile(
+                        s_ref, sb_id, 1, cu, sub_nc, jnp.float32
+                    )
+                )
+                gs_v = bg_list[si] * sg
+                us_v = bu_list[si] * su
+                accs_g[si] = gs_v if accs_g[si] is None else accs_g[si] + gs_v
+                accs_u[si] = us_v if accs_u[si] is None else accs_u[si] + us_v
+        acc_g = accs_g[0] if n_sub == 1 else jnp.concatenate(accs_g, axis=1)
+        acc_u = accs_u[0] if n_sub == 1 else jnp.concatenate(accs_u, axis=1)
+        if gs_g is not None:
+            acc_g = acc_g * gs_g
+        if gs_u is not None:
+            acc_u = acc_u * gs_u
+        return acc_g, acc_u
     x_read_m = max(32, read_m) if use_w4a8 else read_m
     acc_g = None
     acc_u = None
@@ -1261,7 +1416,7 @@ def _sparse_decode_v2_kernel(
         accum_2d = sq_dense_buf = None
         fan_3d_buf = x_3d_buf if not return_sharded else None
 
-    if cfg.pair_rs and ep == 8:
+    if cfg.pair_rs and ep in (8, 16):
         rs_send_bf16 = next(it) if cfg.rs_wire_bf16 else None
         rs_pair_recv = next(it)
         rs_chip_send = next(it)
@@ -1281,7 +1436,7 @@ def _sparse_decode_v2_kernel(
 
     owner_3d = next(it)
     if not return_sharded:
-        if cfg.pair_ag_relay and ep == 8:
+        if cfg.pair_ag_relay and ep in (8, 16):
             ag_ssem = next(it)
             ag_psem = next(it)
             fan_send_sem = fan_recv_sem = None
@@ -3875,9 +4030,10 @@ def _sparse_decode_v2_kernel(
     # =========================================================================
     pl.semaphore_wait(barrier_sem, ep)
 
-    if cfg.pair_rs and ep == 8:
+    if cfg.pair_rs and ep in (8, 16):
         # Ported from muse_megakernel/decode/spep/gather.py (_u_reduce_pair):
         # Halves off-chip ICI Reduce-Scatter traffic via 733 GB/s intra-chip pair sum!
+        num_chips = ep // 2
         if cfg.rs_wire_bf16:
             cast_rc = min(batch_size, 8)
 
@@ -3897,9 +4053,9 @@ def _sparse_decode_v2_kernel(
         chip = me >> 1
         partner = jnp.bitwise_xor(me, jnp.int32(1))
 
-        # Stage 1: Exchange partner's 4 blocks across 733 GB/s intra-chip link.
+        # Stage 1: Exchange partner's blocks across 733 GB/s intra-chip link.
         p1_ops = []
-        for c in range(4):
+        for c in range(num_chips):
             dest_for_partner = jnp.int32(2 * c) + (jnp.int32(1) - core)
             op_p = pltpu.make_async_remote_copy(
                 pair_src.at[
@@ -3914,9 +4070,9 @@ def _sparse_decode_v2_kernel(
             op_p.start()
             p1_ops.append(op_p)
 
-        # Stage 2: As each partner block arrives, sum in FP32 and send ONLY 3 blocks off-chip!
+        # Stage 2: As each partner block arrives, sum in FP32 and send ONLY (num_chips - 1) blocks off-chip!
         chip_ops = []
-        for c in range(4):
+        for c in range(num_chips):
             pltpu.make_async_copy(
                 rs_pair_recv.at[c], rs_pair_recv.at[c], rs_pair_rsem.at[c]
             ).wait()
@@ -3944,10 +4100,10 @@ def _sparse_decode_v2_kernel(
             def _start_chip_rs(_op=op_c):
                 _op.start()
 
-        # Wait for the 3 remote same-parity chips' summed blocks.
+        # Wait for the (num_chips - 1) remote same-parity chips' summed blocks.
         pltpu.make_async_copy(
-            rs_chip_recv.at[pl.ds(0, 3)],
-            rs_chip_recv.at[pl.ds(0, 3)],
+            rs_chip_recv.at[pl.ds(0, num_chips - 1)],
+            rs_chip_recv.at[pl.ds(0, num_chips - 1)],
             rs_chip_rsem,
         ).wait()
 
@@ -3956,7 +4112,7 @@ def _sparse_decode_v2_kernel(
         def _reduce_owner_paired(ci, _):
             r0 = ci * red_rc
             acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
-            for c in range(4):
+            for c in range(num_chips):
                 part_c = jnp.where(
                     c == chip,
                     rs_pair_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
@@ -4047,10 +4203,10 @@ def _sparse_decode_v2_kernel(
                 ].reshape(16, _H)
         else:
             output_ref[...] = owner_3d[...].reshape(rows_per_rank, _H)
-    elif cfg.pair_ag_relay and ep == 8:
+    elif cfg.pair_ag_relay and ep in (8, 16):
         # Ported from muse_megakernel/common/coll.py (pair_all_gather_start):
-        # Relays 1-hop chips (d=1, 2) over 733 GB/s partner bridge immediately upon arrival
-        # while 2-hop diagonal chip (d=3) is still in flight!
+        # Relays remote chips over 733 GB/s partner bridge immediately upon arrival!
+        num_chips = ep // 2
         core = me & jnp.int32(1)
         chip = me >> 1
         partner = jnp.bitwise_xor(me, jnp.int32(1))
@@ -4077,16 +4233,16 @@ def _sparse_decode_v2_kernel(
 
         far_ranks = [
             jnp.int32(2) * jnp.bitwise_xor(chip, jnp.int32(d)) + core
-            for d in (1, 2, 3)
+            for d in range(1, num_chips)
         ]
         ag_ops = [_ag_send_slot(me, partner, 0)]
         for idx_f, fk in enumerate(far_ranks):
             ag_ops.append(_ag_send_slot(me, fk, 1 + idx_f))
 
-        # Relay 1-hop blocks (d=1, d=2) immediately on arrival, then d=3!
+        # Relay blocks immediately on arrival!
         for idx_f, fk in enumerate(far_ranks):
             _ag_wait_arrived(fk)
-            ag_ops.append(_ag_send_slot(fk, partner, 4 + idx_f))
+            ag_ops.append(_ag_send_slot(fk, partner, num_chips + idx_f))
 
         _ag_wait_arrived(partner)
         for fk in far_ranks:
@@ -4459,15 +4615,16 @@ def fused_decode_sparse_v2_from_logits(
     if config.rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
 
-    if config.pair_rs and ep == 8:
+    if config.pair_rs and ep in (8, 16):
+        num_chips_rs = ep // 2
         scratch_shapes.extend(
             [
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_pair_recv
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_chip_send
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_chip_recv
-                sem((4,)),  # rs_pair_ssem
-                sem((4,)),  # rs_pair_rsem
-                sem((4,)),  # rs_chip_ssem
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_pair_recv
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_chip_send
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),  # rs_chip_recv
+                sem((num_chips_rs,)),  # rs_pair_ssem
+                sem((num_chips_rs,)),  # rs_pair_rsem
+                sem((num_chips_rs,)),  # rs_chip_ssem
                 sem,  # rs_chip_rsem
             ]
         )
@@ -4482,8 +4639,9 @@ def fused_decode_sparse_v2_from_logits(
     scratch_shapes.append(vmem((rows_per_rank, 32, 128), jnp.bfloat16))  # owner_3d
 
     if not return_sharded:
-        if config.pair_ag_relay and ep == 8:
-            scratch_shapes.extend([sem((7,)), sem((8,))])  # ag_ssem, ag_psem
+        if config.pair_ag_relay and ep in (8, 16):
+            num_chips_ag = ep // 2
+            scratch_shapes.extend([sem((2 * num_chips_ag - 1,)), sem((ep,))])  # ag_ssem, ag_psem
         else:
             scratch_shapes.extend([sem((ep,)), sem])
 
@@ -4653,7 +4811,7 @@ def _sparse_decode_fp8_v2_kernel(
     accum_3d = next(it)  # [B, 32, 128] f32
     rs_send_bf16 = next(it) if rs_wire_bf16 else None
 
-    if pair_rs and ep == 8:
+    if pair_rs and ep in (8, 16):
         rs_pair_recv = next(it)
         rs_chip_send = next(it)
         rs_chip_recv = next(it)
@@ -4673,7 +4831,7 @@ def _sparse_decode_fp8_v2_kernel(
     fan_3d_buf = x_3d_buf
 
     if not return_sharded:
-        if pair_ag_relay and ep == 8:
+        if pair_ag_relay and ep in (8, 16):
             ag_ssem = next(it)
             ag_psem = next(it)
             fan_send_sem = fan_recv_sem = None
@@ -5077,7 +5235,8 @@ def _sparse_decode_fp8_v2_kernel(
     # 6. Reduce-Scatter + optional All-Gather (identical to _sparse_decode_v2_kernel).
     pl.semaphore_wait(barrier_sem, ep)
 
-    if pair_rs and ep == 8:
+    if pair_rs and ep in (8, 16):
+        num_chips = ep // 2
         if rs_wire_bf16:
             cast_rc = min(batch_size, 8)
 
@@ -5098,7 +5257,7 @@ def _sparse_decode_fp8_v2_kernel(
         partner = jnp.bitwise_xor(me, jnp.int32(1))
 
         p1_ops = []
-        for c in range(4):
+        for c in range(num_chips):
             dest_for_partner = jnp.int32(2 * c) + (jnp.int32(1) - core)
             op_p = pltpu.make_async_remote_copy(
                 pair_src.at[
@@ -5114,7 +5273,7 @@ def _sparse_decode_fp8_v2_kernel(
             p1_ops.append(op_p)
 
         chip_ops = []
-        for c in range(4):
+        for c in range(num_chips):
             pltpu.make_async_copy(
                 rs_pair_recv.at[c], rs_pair_recv.at[c], rs_pair_rsem.at[c]
             ).wait()
@@ -5143,8 +5302,8 @@ def _sparse_decode_fp8_v2_kernel(
                 _op.start()
 
         pltpu.make_async_copy(
-            rs_chip_recv.at[pl.ds(0, 3)],
-            rs_chip_recv.at[pl.ds(0, 3)],
+            rs_chip_recv.at[pl.ds(0, num_chips - 1)],
+            rs_chip_recv.at[pl.ds(0, num_chips - 1)],
             rs_chip_rsem,
         ).wait()
 
@@ -5153,7 +5312,7 @@ def _sparse_decode_fp8_v2_kernel(
         def _red_own_fp8(ci, c_r):
             r0 = ci * red_rc
             acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
-            for c in range(4):
+            for c in range(num_chips):
                 part_c = jnp.where(
                     c == chip,
                     rs_pair_recv[c, pl.ds(r0, red_rc), :, :].astype(jnp.float32),
@@ -5234,7 +5393,8 @@ def _sparse_decode_fp8_v2_kernel(
                 ].reshape(16, _H)
         else:
             output_ref[...] = owner_3d[...].reshape(rows_per_rank, _H)
-    elif pair_ag_relay and ep == 8:
+    elif pair_ag_relay and ep in (8, 16):
+        num_chips = ep // 2
         core = me & jnp.int32(1)
         chip = me >> 1
         partner = jnp.bitwise_xor(me, jnp.int32(1))
@@ -5261,14 +5421,14 @@ def _sparse_decode_fp8_v2_kernel(
 
         far_ranks = [
             jnp.int32(2) * jnp.bitwise_xor(chip, jnp.int32(d)) + core
-            for d in (1, 2, 3)
+            for d in range(1, num_chips)
         ]
         ag_ops = [_ag_send_fp8(me, partner, 0)]
         for idx_f, fk in enumerate(far_ranks):
             ag_ops.append(_ag_send_fp8(me, fk, 1 + idx_f))
         for idx_f, fk in enumerate(far_ranks):
             _ag_wait_fp8(fk)
-            ag_ops.append(_ag_send_fp8(fk, partner, 4 + idx_f))
+            ag_ops.append(_ag_send_fp8(fk, partner, num_chips + idx_f))
         _ag_wait_fp8(partner)
         for fk in far_ranks:
             _ag_wait_fp8(jnp.bitwise_xor(fk, jnp.int32(1)))
@@ -5438,15 +5598,16 @@ def fused_decode_sparse_fp8_from_logits(
     )
     if rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
-    if pair_rs and ep == 8:
+    if pair_rs and ep in (8, 16):
+        num_chips_rs = ep // 2
         scratch_shapes.extend(
             [
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((4, rows_per_rank, 32, 128), rs_wire_dtype),
-                sem((4,)),
-                sem((4,)),
-                sem((4,)),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
                 sem,
             ]
         )
@@ -5460,8 +5621,9 @@ def fused_decode_sparse_fp8_from_logits(
         )
     scratch_shapes.append(vmem((rows_per_rank, 32, 128), jnp.bfloat16))
     if not return_sharded:
-        if pair_ag_relay and ep == 8:
-            scratch_shapes.extend([sem((7,)), sem((8,))])
+        if pair_ag_relay and ep in (8, 16):
+            num_chips_ag = ep // 2
+            scratch_shapes.extend([sem((2 * num_chips_ag - 1,)), sem((ep,))])
         else:
             scratch_shapes.extend([sem((ep,)), sem])
 

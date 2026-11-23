@@ -642,10 +642,9 @@ def route_topk_and_counts_in_kernel(
         )
         return
     batch_size, num_experts = logits_ref.shape
+    has_dyn_prune = (min_p_topk > 0.0) or (free_max_rows > 0)
     eff_chunk = (
-        max(route_chunk_rows, min(batch_size, 64))
-        if (free_max_rows > 0 and batch_size <= 64)
-        else route_chunk_rows
+        min(route_chunk_rows, 16) if has_dyn_prune else route_chunk_rows
     )
     rb = min(batch_size, eff_chunk)
     if batch_size % rb != 0:
@@ -661,61 +660,176 @@ def route_topk_and_counts_in_kernel(
     counts_init = jnp.zeros((1, num_experts), jnp.int32)
     neg_inf = jnp.float32(-jnp.inf)
 
-    if min_p_topk > 0.0 or free_max_rows > 0:
+    if free_max_rows > 0:
+        # 2-pass VMEM-staged routing over spill-free <=16-row chunks:
+        # Pass 1 evaluates sigmoid + Top-8 ONCE per chunk into scratch.route_pack_vmem;
+        # Pass 2 masks freed experts and normalizes weights without re-reading logits!
         n_chunks = batch_size // rb
-        eff_min_s = max(1, int(free_min_slot))
         first_v = jnp.broadcast_to(first, (rb, 1))
         last_excl_v = jnp.broadcast_to(last_excl, (rb, 1))
         rep_vecs = tuple(
             jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (rb, 1))
             for eid in holder_cand_eids
         )
-        free_mask_global = None
-        if free_max_rows > 0 and n_chunks > 1:
 
-            def _scan_free_sparse(ci, carry):
-                tot_c, drp_c = carry
-                r0 = pl.multiple_of(ci * rb, rb)
-                sb, sw, kf = _select_and_filter_chunk_vpu(
-                    logits_ref[pl.ds(r0, rb), :].astype(jnp.float32),
-                    bias_row,
-                    e_iota,
-                    num_experts,
-                    topk=topk,
-                    route_eps=route_eps,
-                    min_p_topk=min_p_topk,
+        def _stage_free_chunk(r0, carry):
+            tot_c, drp_c = carry
+            row_s = pl.ds(r0, rb)
+            sb, sw, kf = _select_and_filter_chunk_vpu(
+                logits_ref[row_s, :].astype(jnp.float32),
+                bias_row,
+                e_iota,
+                num_experts,
+                topk=topk,
+                route_eps=route_eps,
+                min_p_topk=min_p_topk,
+            )
+            df = _droppable_flags_for_chunk(
+                sw,
+                kf,
+                route_eps=route_eps,
+                free_max_w=free_max_w,
+                free_min_slot=free_min_slot,
+            )
+            stage_meta = jnp.zeros((rb, 128), dtype=jnp.int32)
+            stage_w = jnp.zeros((rb, 128), dtype=jnp.float32)
+            for s, (b_s, w_s, k_s, d_s) in enumerate(zip(sb, sw, kf, df)):
+                pk = e_iota == b_s
+                tot_c = tot_c + jnp.sum(
+                    jnp.logical_and(pk, k_s).astype(jnp.int32),
+                    axis=0,
+                    keepdims=True,
                 )
-                df = _droppable_flags_for_chunk(
-                    sw,
-                    kf,
-                    route_eps=route_eps,
-                    free_max_w=free_max_w,
-                    free_min_slot=free_min_slot,
+                drp_c = drp_c + jnp.sum(
+                    jnp.logical_and(pk, d_s).astype(jnp.int32),
+                    axis=0,
+                    keepdims=True,
                 )
-                for b_s, k_s, d_s in zip(sb, kf, df):
-                    pk = e_iota == b_s
-                    tot_c = tot_c + jnp.sum(
-                        jnp.logical_and(pk, k_s).astype(jnp.int32),
-                        axis=0,
-                        keepdims=True,
-                    )
-                    drp_c = drp_c + jnp.sum(
-                        jnp.logical_and(pk, d_s).astype(jnp.int32),
-                        axis=0,
-                        keepdims=True,
-                    )
-                return tot_c, drp_c
+                eid_store = jnp.where(k_s, b_s, jnp.int32(-1))
+                drp_store = d_s.astype(jnp.int32)
+                w_store = jnp.where(k_s, w_s, jnp.float32(0.0))
+                stage_meta = jnp.where(col128 == s, eid_store, stage_meta)
+                stage_meta = jnp.where(
+                    col128 == (8 + s), drp_store, stage_meta
+                )
+                stage_w = jnp.where(col128 == (16 + s), w_store, stage_w)
+            w_bits = lax.bitcast_convert_type(stage_w, jnp.int32)
+            scratch.route_pack_vmem[row_s, :] = jnp.where(
+                col128 < 16, stage_meta, w_bits
+            )
+            return tot_c, drp_c
 
+        if n_chunks == 1:
+            tot_all, drp_all = _stage_free_chunk(0, (counts_init, counts_init))
+        else:
             tot_all, drp_all = lax.fori_loop(
-                0, n_chunks, _scan_free_sparse, (counts_init, counts_init)
-            )
-            free_mask_global = (
-                (tot_all > 0)
-                & (tot_all <= free_max_rows)
-                & (drp_all == tot_all)
+                0,
+                n_chunks,
+                lambda ci, acc: _stage_free_chunk(
+                    pl.multiple_of(ci * rb, rb), acc
+                ),
+                (counts_init, counts_init),
             )
 
-        def _route_chunk_sparse_dyn(r0, counts_acc):
+        fmask = (
+            (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+        )
+        counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
+        fmask_bcast = jnp.broadcast_to(fmask, (rb, num_experts))
+
+        def _pack_free_chunk(r0, _):
+            row_s = pl.ds(r0, rb)
+            staged = scratch.route_pack_vmem[row_s, :]
+            staged_f = lax.bitcast_convert_type(staged, jnp.float32)
+
+            pack_ids = jnp.zeros((rb, 128), dtype=jnp.int32)
+            w_loc_raw = jnp.zeros((rb, 128), dtype=jnp.float32)
+            loc_cnt = jnp.zeros((rb, 1), dtype=jnp.int32)
+            w_sum = jnp.zeros((rb, 1), dtype=jnp.float32)
+
+            for s in range(topk):
+                best = jnp.sum(
+                    jnp.where(col128 == s, staged, jnp.int32(0)),
+                    axis=1,
+                    keepdims=True,
+                )
+                drop_s = (
+                    jnp.sum(
+                        jnp.where(col128 == (8 + s), staged, jnp.int32(0)),
+                        axis=1,
+                        keepdims=True,
+                    )
+                    != 0
+                )
+                w_slot = jnp.sum(
+                    jnp.where(col128 == (16 + s), staged_f, jnp.float32(0.0)),
+                    axis=1,
+                    keepdims=True,
+                )
+                was_kept = best >= 0
+                freed_e = jnp.any(
+                    (e_iota == best) & fmask_bcast, axis=1, keepdims=True
+                )
+                keep_s = was_kept & (~(drop_s & freed_e))
+                w_sum = w_sum + jnp.where(keep_s, w_slot, 0.0)
+
+                cand_slot = jnp.where(
+                    (best >= first_v) & (best < last_excl_v),
+                    best - first_v,
+                    jnp.int32(-1),
+                )
+                for r_slot, rep_v in enumerate(rep_vecs):
+                    cand_slot = jnp.where(
+                        best == rep_v,
+                        jnp.int32(e_per_owner + r_slot),
+                        cand_slot,
+                    )
+                is_cand = keep_s & (cand_slot >= 0)
+                id_col = jnp.int32(1) + loc_cnt
+                w_col = jnp.int32(16) + loc_cnt
+                pack_ids = jnp.where(
+                    jnp.logical_and(is_cand, col128 == id_col),
+                    cand_slot,
+                    pack_ids,
+                )
+                w_loc_raw = jnp.where(
+                    jnp.logical_and(is_cand, col128 == w_col),
+                    w_slot,
+                    w_loc_raw,
+                )
+                loc_cnt = loc_cnt + is_cand.astype(jnp.int32)
+
+            pack_ids = jnp.where(col128 == 0, loc_cnt, pack_ids)
+            w_loc_norm = w_loc_raw / (w_sum + route_eps)
+            if route_scale != 1.0:
+                w_loc_norm = w_loc_norm * route_scale
+            w_bits = lax.bitcast_convert_type(w_loc_norm, jnp.int32)
+            scratch.route_pack_vmem[row_s, :] = jnp.where(
+                col128 < 16, pack_ids, w_bits
+            )
+            return _
+
+        if n_chunks == 1:
+            _pack_free_chunk(0, jnp.int32(0))
+        else:
+            lax.fori_loop(
+                0,
+                n_chunks,
+                lambda ci, c: _pack_free_chunk(
+                    pl.multiple_of(ci * rb, rb), c
+                ),
+                jnp.int32(0),
+            )
+    elif min_p_topk > 0.0:
+        n_chunks = batch_size // rb
+        first_v = jnp.broadcast_to(first, (rb, 1))
+        last_excl_v = jnp.broadcast_to(last_excl, (rb, 1))
+        rep_vecs = tuple(
+            jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (rb, 1))
+            for eid in holder_cand_eids
+        )
+
+        def _route_chunk_minp_only(r0, counts_acc):
             row_s = pl.ds(r0, rb)
             slot_bests, slot_ws, keep_flags = _select_and_filter_chunk_vpu(
                 logits_ref[row_s, :].astype(jnp.float32),
@@ -726,42 +840,6 @@ def route_topk_and_counts_in_kernel(
                 route_eps=route_eps,
                 min_p_topk=min_p_topk,
             )
-            if free_max_rows > 0:
-                drop_flags = _droppable_flags_for_chunk(
-                    slot_ws,
-                    keep_flags,
-                    route_eps=route_eps,
-                    free_max_w=free_max_w,
-                    free_min_slot=free_min_slot,
-                )
-                if free_mask_global is None:
-                    tot_c = counts_init
-                    drp_c = counts_init
-                    for b_s, k_s, d_s in zip(slot_bests, keep_flags, drop_flags):
-                        pk = e_iota == b_s
-                        tot_c = tot_c + jnp.sum(
-                            jnp.logical_and(pk, k_s).astype(jnp.int32),
-                            axis=0,
-                            keepdims=True,
-                        )
-                        drp_c = drp_c + jnp.sum(
-                            jnp.logical_and(pk, d_s).astype(jnp.int32),
-                            axis=0,
-                            keepdims=True,
-                        )
-                    fmask = (
-                        (tot_c > 0)
-                        & (tot_c <= free_max_rows)
-                        & (drp_c == tot_c)
-                    )
-                else:
-                    fmask = free_mask_global
-                for s in range(eff_min_s, topk):
-                    freed_e = jnp.any(
-                        (e_iota == slot_bests[s]) & fmask, axis=1, keepdims=True
-                    )
-                    keep_flags[s] = keep_flags[s] & (~(drop_flags[s] & freed_e))
-
             pack_ids = jnp.zeros((rb, 128), dtype=jnp.int32)
             w_loc_raw = jnp.zeros((rb, 128), dtype=jnp.float32)
             loc_cnt = jnp.zeros((rb, 1), dtype=jnp.int32)
@@ -812,16 +890,12 @@ def route_topk_and_counts_in_kernel(
             )
 
         if n_chunks == 1:
-            counts_acc = _route_chunk_sparse_dyn(0, counts_init)
-        elif n_chunks <= 4 and hoist_holder_vecs:
-            counts_acc = counts_init
-            for ci in range(n_chunks):
-                counts_acc = _route_chunk_sparse_dyn(ci * rb, counts_acc)
+            counts_acc = _route_chunk_minp_only(0, counts_init)
         else:
             counts_acc = lax.fori_loop(
                 0,
                 n_chunks,
-                lambda ci, acc: _route_chunk_sparse_dyn(
+                lambda ci, acc: _route_chunk_minp_only(
                     pl.multiple_of(ci * rb, rb), acc
                 ),
                 counts_init,
