@@ -252,7 +252,7 @@ class TestLaunchTimeOutputCopy(_StreamPatchedTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _launched(self):
+    def _launched(self, *, skip=False):
         scheduler = _single_queue_scheduler(is_last_rank=True)
         scheduler.device = "tpu"
         scheduler._pp_output_send_deferred = lambda: True
@@ -261,15 +261,21 @@ class TestLaunchTimeOutputCopy(_StreamPatchedTestCase):
             "next_token_ids": tokens
         }
         queue = deque()
-        pp_output_copy.copy_outputs_at_launch(
-            SchedulerPPMixin._pp_launch_batch,
-            scheduler,
-            0,
-            SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE),
-            None,
-            [None],
-            queue,
-        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+            return_value=skip,
+        ):
+            pp_output_copy.copy_outputs_at_launch(
+                SchedulerPPMixin._pp_launch_batch,
+                scheduler,
+                0,
+                SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE),
+                None,
+                [None],
+                queue,
+            )
+        if skip:
+            return scheduler, queue, None
         [(source, landed)] = self.worker.copies
         self.assertIs(source, tokens)
         return scheduler, queue, landed
@@ -300,9 +306,11 @@ class TestLaunchTimeOutputCopy(_StreamPatchedTestCase):
         sent = scheduler._pp_send_dict_to_next_stage.call_args.args[0]
         self.assertIs(sent["next_token_ids"], host)
 
-    def test_skipped_send_keeps_the_device_outputs(self):
-        scheduler, queue, landed = self._launched()
-        landed.set_result(torch.tensor([5]))
+    def test_skipped_send_starts_no_copy(self):
+        """A pure-chunk send is skipped; a copy started for it would make that send
+        wait for the forward to end, which the stock send never does."""
+        scheduler, queue, _ = self._launched(skip=True)
+        self.assertEqual(self.worker.copies, [])
         outputs = queue[0][1]
         device_tokens = outputs.tensors["next_token_ids"]
         self.assertEqual(self._send(scheduler, queue, skip=True), [])

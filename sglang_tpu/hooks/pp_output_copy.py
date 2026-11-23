@@ -9,7 +9,8 @@ How: AROUND Scheduler._pp_launch_batch starts the copy of the queued outputs'
      device tensors on a TPUAsyncCopyWorker. AROUND
      Scheduler._pp_send_output_to_next_stage and
      Scheduler._pp_pd_send_deferred_output put the host copies in place of the
-     outputs the send pops; a skipped send waits for them and drops them.
+     outputs the send pops. A send skipped as a pure chunk starts no copy; one
+     skipped for a prebuilt batch waits for its copies and drops them.
 Upstream PR or issue: not filed; the wave and its deferred send are TPU only.
 Remove when: the deferred send moves into sglang_tpu with the wave.
 """
@@ -99,7 +100,12 @@ def copy_outputs_at_launch(
         scheduler, mb_id, cur_batch, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
     )
     copies = _active_copies(scheduler)
-    if copies is not None and len(last_rank_comm_queue) > queued:
+    # A pure-chunk send is skipped, so its outputs need no copy and nothing waits.
+    if (
+        copies is not None
+        and len(last_rank_comm_queue) > queued
+        and not scheduler_pp_mixin._pp_can_skip_output_comm(cur_batch)
+    ):
         copies.start(last_rank_comm_queue[-1][1])
     return launched
 

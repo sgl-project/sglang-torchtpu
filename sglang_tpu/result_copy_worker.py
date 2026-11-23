@@ -8,6 +8,7 @@ import torch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.hooks.cpu_pinning import keep_off_main_core
 
 
 class TpuAsyncCopyEvent:
@@ -71,7 +72,10 @@ class TPUAsyncCopyWorker:
         # unrelated work submitted by the scheduler.
         self.stream = self.device_module.Stream(device=self.device_index)
         self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="result-copy"
+            max_workers=1,
+            thread_name_prefix="result-copy",
+            # The thread starts at the first submit, in the pinned event loop.
+            initializer=keep_off_main_core,
         )
 
     def submit(
