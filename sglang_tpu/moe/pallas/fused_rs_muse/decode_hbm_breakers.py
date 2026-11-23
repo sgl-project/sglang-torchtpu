@@ -204,8 +204,8 @@ def read_decode_routing_prune_config() -> DecodeRoutingPruneConfig:
 
 
 def read_free_expert_scale_mode() -> str:
-    """Read ``SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE`` (defaults to ``'b64'``)."""
-    return str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", "b64")).strip()
+    """Read ``SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE`` (defaults to ``'b64_ms16'``)."""
+    return str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", "b64_ms16")).strip()
 
 
 def scale_free_expert_for_batch(
@@ -219,7 +219,8 @@ def scale_free_expert_for_batch(
     Calibrates ``free_rows`` tuned at steady-state ``B=64`` down to ``B=16, 32``
     so tail decode steps (e.g. ``<=7`` real tokens padded to ``B=16`` or ``c=16``
     shared-prefix decode) never collapse real tokens to ``top-1``, while leaving
-    ``B >= 64`` 100% unchanged under default ``mode='b64'``.
+    ``free_min_slot`` intact at ``B >= 32`` under default ``mode='b64_ms16'``
+    (and ``B >= 64`` 100% unchanged).
     """
     if free_rows <= 0:
         return 0, free_min_slot
@@ -229,7 +230,7 @@ def scale_free_expert_for_batch(
     if eff_mode in ("0", "false", "no", "off", "none"):
         return free_rows, free_min_slot
     if not eff_mode:
-        eff_mode = "b64"
+        eff_mode = "b64_ms16"
     if eff_mode == "ge32":
         if batch_size < 32:
             return 0, free_min_slot

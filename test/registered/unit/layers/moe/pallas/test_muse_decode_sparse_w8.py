@@ -936,6 +936,13 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
         self.assertEqual(scale_free_expert_for_batch(7, 1, 32, mode="ge32"), (4, 2))
         self.assertEqual(scale_free_expert_for_batch(7, 1, 16, mode="off"), (7, 1))
         self.assertEqual(scale_free_expert_for_batch(0, 1, 16, mode="b64"), (0, 1))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", None)
+            self.assertEqual( _BREAKERS_MOD.read_free_expert_scale_mode(), "b64_ms16")
+            self.assertEqual(scale_free_expert_for_batch(7, 1, 16), (2, 2))
+            self.assertEqual(scale_free_expert_for_batch(7, 1, 32), (4, 1))
+            self.assertEqual(scale_free_expert_for_batch(7, 1, 64), (7, 1))
+            self.assertEqual(scale_free_expert_for_batch(6, 2, 32), (3, 2))
 
         # Verify tail-batch protection (5 real tokens + 11 identical dummy rows at B=16):
         # unscaled f7 (7:0.20:1) collapses real tokens to top-1, whereas b64-scaled (2:0.20:2)
@@ -1034,6 +1041,30 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 self.assertTrue(fp8_64_on.pair_rs and fp8_64_on.bridge_ag)
                 self.assertTrue(v2_64_on.pair_rs and v2_64_on.pair_ag_relay)
                 self.assertTrue(v1_mod.default_sparse_decode_config(64, 8, 512).pair_rs)
+
+        # Verify default (unset env) uses b64_ms16 across v1, FP8, and v2 (#2552).
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS": "7:0.20:1",
+                "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK": "0.80",
+            },
+            clear=False,
+        ):
+            os.environ.pop("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", None)
+            d16 = v1_mod.default_sparse_decode_config(16, 16, 512)
+            d32 = v1_mod.default_sparse_decode_config(32, 16, 512)
+            d64 = v1_mod.default_sparse_decode_config(64, 16, 512)
+            self.assertEqual((d16.free_max_rows, d16.free_min_slot), (2, 2))
+            self.assertEqual((d32.free_max_rows, d32.free_min_slot), (4, 1))
+            self.assertEqual((d64.free_max_rows, d64.free_min_slot), (7, 1))
+            dfp8_32 = v1_mod.default_fp8_sparse_decode_config(32, 16)
+            self.assertEqual((dfp8_32.free_max_rows, dfp8_32.free_min_slot), (4, 1))
+            dv2_32 = v2_mod.default_sparse_decode_v2_config(32, 16, 512)
+            self.assertEqual(
+                (dv2_32.routing_prune.free_expert_rows, dv2_32.routing_prune.free_min_rank),
+                (4, 1),
+            )
 
     def test_w9_routing_rb16_two_pass_bit_exact_vs_legacy_rb64(self):
         """Bit-exact selection-mask, weight-bits, counts_smem & freed-expert parity vs legacy rb=64."""

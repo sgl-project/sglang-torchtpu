@@ -566,10 +566,10 @@ class TpuEnvs:
     # e.g. "2:0.06:5" drops trailing hits only when doing so frees all rows of that expert; "" = off).
     SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS = EnvStr("")
     # Muse Wave-9 (#2407): bucket-scaled FREE pruning for tail decode buckets (B < 64):
-    # "b64" = max(1, round(free_rows * B / 64)) + min_slot >= 2 at B <= 32 (B >= 64 unchanged);
-    # "b64_ms16" = same row scaling, min_slot >= 2 only at B <= 16;
+    # "b64_ms16" (default) = max(1, round(free_rows * B / 64)) + min_slot >= 2 at B <= 16 (keeps min_slot at B >= 32);
+    # "b64" = same row scaling, min_slot >= 2 at B <= 32;
     # "ge32" = disable FREE at B < 32, b64 scaling + min_slot >= 2 at B == 32; "off" = unscaled.
-    SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE = EnvStr("b64")
+    SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE = EnvStr("b64_ms16")
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)
