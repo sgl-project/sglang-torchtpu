@@ -85,7 +85,9 @@ def attach_dram_offload_extension(
     """Extend ``cache``'s L2 controller to the peer role's DRAM, reached over
     the raiden ``channel``. A decode passes its transfer queue."""
     host_pool, swa_pool = anchor_host_pool(cache), swa_host_pool(cache)
-    channel.bind_host_pools(host_pool, swa_pool)
+    channel.bind_host_pools(
+        host_pool, swa_pool, retain_metadata=decode_queue is not None
+    )
     page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
     ctx = DramOffloadWorkerContext(
         cache=cache,

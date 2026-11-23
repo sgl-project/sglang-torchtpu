@@ -125,6 +125,8 @@ def _rpa_kernel_spec(backend: str | None):
         from sglang_tpu.attention_pallas_rpa_batched import RPA_BATCHED_SPEC as spec
     elif backend == "pallas_tpu_rpa_v3":
         from sglang_tpu.attention_pallas_rpa_v3 import RPA_V3_SPEC as spec
+    elif backend == "flywheel":
+        from sglang_tpu.attention_flywheel import FLYWHEEL_SPEC as spec
     else:
         return None
     return spec
@@ -379,12 +381,14 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
 
         return TpuSeqAlongLaneKVPool
 
+    if backend == "flywheel":
+        from sglang_tpu.kv_pool import TpuFlywheelKVPool
+
+        return TpuFlywheelKVPool
+
     # RPA v3 and batched use the fused 5D KV layout; pallas_tpu_flash and
     # torch_native read the generic MHA pool.
-    if backend in (
-        "pallas_tpu_rpa_v3",
-        "pallas_tpu_rpa_batched",
-    ):
+    if backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool
@@ -855,6 +859,12 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
+    @register_attention_backend("flywheel")
+    def create_flywheel_backend(runner):
+        from sglang_tpu.attention_flywheel import TpuFlywheelAttnBackend
+
+        return TpuFlywheelAttnBackend(runner)
+
     # Vision: opt in to block-skipping splash for the "tpu" backend.
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -1272,6 +1282,12 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        if cfg.attention_backend == "flywheel":
+            from sglang_tpu.attention_flywheel import validate_flywheel_server_args
+
+            validate_flywheel_server_args(cfg)
+            # The host plans each step's KV writes from the page table.
+            _pin_req_to_token_on_host("--attention-backend flywheel")
         if _uses_block_major_kv():
             _check_block_major_supported(server_args)
         _resolve_unified_kv_pool(server_args)

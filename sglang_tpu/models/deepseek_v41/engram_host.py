@@ -1547,15 +1547,22 @@ def _padded_history(history, req_pool_indices):
 
 @contextlib.contextmanager
 def without_cuda_host_register():
-    """_HostTable pins its mapping with cudaHostRegister for GPU reads; the TPU
-    lookup gathers on the host, so the pin is a no-op here."""
+    """_HostTable pins its mapping with cudaHostRegister for GPU reads, and
+    EngramEmbedding asks the current GPU whether to read rows in address order
+    (sglang#45879); the TPU lookup gathers on the host, so neither applies here."""
+    from sglang.srt.layers import engram
+
     stub = SimpleNamespace(cudaHostRegister=lambda *args: 0)
-    original = torch.cuda.cudart
+    original = (torch.cuda.cudart, torch.cuda.current_device, engram._sorted_host_reads)
     torch.cuda.cudart = lambda: stub
+    torch.cuda.current_device = lambda: 0
+    engram._sorted_host_reads = lambda device: False
     try:
         yield
     finally:
-        torch.cuda.cudart = original
+        torch.cuda.cudart, torch.cuda.current_device, engram._sorted_host_reads = (
+            original
+        )
 
 
 # hasher -> verify commits not yet applied to its host history, oldest first.
