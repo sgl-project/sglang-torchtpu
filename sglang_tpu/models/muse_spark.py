@@ -1820,7 +1820,7 @@ class MuseSparkMoE(nn.Module):
             get_fused_decode_op,
         )
 
-        self.register_buffer("_fused_decode_norm", norm, persistent=False)
+        self._register_fused_decode_vecs(norm)
         self.register_buffer(
             "_fused_decode_rank",
             ex._tpu_fused_rs_group_offset // local,
@@ -1976,7 +1976,7 @@ class MuseSparkMoE(nn.Module):
                         return
                 self.register_buffer("_fused_decode_fp8_s1", s1_2d, persistent=False)
                 self.register_buffer("_fused_decode_fp8_s2", s2_2d, persistent=False)
-                self.register_buffer("_fused_decode_norm", norm, persistent=False)
+                self._register_fused_decode_vecs(norm)
                 self.register_buffer(
                     "_fused_decode_rank",
                     ex._tpu_fused_rs_group_offset // w_groups,
@@ -2140,17 +2140,20 @@ class MuseSparkMoE(nn.Module):
             ):
                 return
 
+        from sglang_tpu.fp8_moe import _own_storage
         from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
             SUPPORTED_FUSE_ALL_BATCHES,
             get_muse_ep_tp2_fallback_op,
             get_muse_fuse_all_decode_op,
         )
 
-        self.register_buffer("_fused_decode_norm", norm, persistent=False)
+        self._register_fused_decode_vecs(norm)
         self.register_buffer("_fused_decode_rank", rank_t, persistent=False)
         if pre_gain is not None:
             self.register_buffer(
-                "_fused_decode_pre_gain", pre_gain.unsqueeze(0), persistent=False
+                "_fused_decode_pre_gain",
+                _own_storage(pre_gain.detach().reshape(1, -1).contiguous()),
+                persistent=False,
             )
         ext_batches = (
             (*SUPPORTED_FUSE_ALL_BATCHES, 384)
@@ -2369,7 +2372,7 @@ class MuseSparkMoE(nn.Module):
             get_muse_fuse_all_decode_op,
         )
 
-        self.register_buffer("_fused_decode_norm", norm, persistent=False)
+        self._register_fused_decode_vecs(norm)
         self.register_buffer(
             "_fused_decode_rank",
             ex._tpu_fused_rs_group_offset // w_groups,
@@ -2609,11 +2612,71 @@ class MuseSparkMoE(nn.Module):
                 post_ok = True
         return pre_ok, post_ok
 
+    def _register_fused_decode_vecs(self, norm: torch.Tensor) -> None:
+        """Register storage-owned 1D and 2D router-bias / post-expert-norm buffers.
+
+        Eliminates 124 per-step ``.unsqueeze(0)`` ``execute_as_strided`` ops across 62 layers
+        and allows ``sparse`` / ``sparse_v2`` / ``fp8_sparse`` / ``sparse_fp8`` decode ops to
+        consume 1D ``{0:T(1024)}`` vectors directly without ``{1,0:T(8,128)}`` HLO copies.
+        """
+        from sglang_tpu.fp8_moe import _own_storage
+
+        bias_d = self.e_score_correction_bias.data
+        if (
+            bias_d.device.type != "cpu"
+            or bias_d._base is not None
+            or bias_d.storage_offset() != 0
+            or bias_d.untyped_storage().nbytes()
+            != bias_d.numel() * bias_d.element_size()
+        ):
+            fresh_b = bias_d.detach().reshape(-1).contiguous()
+            self.e_score_correction_bias.data = (
+                fresh_b.clone()
+                if fresh_b.device.type == "cpu"
+                else _own_storage(fresh_b)
+            )
+        fresh_n1 = norm.detach().reshape(-1).contiguous()
+        norm_1d = (
+            fresh_n1.clone()
+            if fresh_n1.device.type == "cpu"
+            else _own_storage(fresh_n1)
+        )
+        fresh_b2 = self.e_score_correction_bias.detach().reshape(1, -1).contiguous()
+        bias_2d = (
+            fresh_b2.clone()
+            if fresh_b2.device.type == "cpu"
+            else _own_storage(fresh_b2)
+        )
+        fresh_n2 = norm.detach().reshape(1, -1).contiguous()
+        norm_2d = (
+            fresh_n2.clone()
+            if fresh_n2.device.type == "cpu"
+            else _own_storage(fresh_n2)
+        )
+        self.register_buffer("_fused_decode_norm", norm_1d, persistent=False)
+        self.register_buffer("_fused_decode_bias_2d", bias_2d, persistent=False)
+        self.register_buffer("_fused_decode_norm_2d", norm_2d, persistent=False)
+
     def _bias_2d(self) -> torch.Tensor:
+        buf = self._buffers.get("_fused_decode_bias_2d")
+        if buf is not None:
+            return buf
         return self.e_score_correction_bias.unsqueeze(0)
 
     def _norm_2d(self) -> torch.Tensor:
+        buf = self._buffers.get("_fused_decode_norm_2d")
+        if buf is not None:
+            return buf
         return self._fused_decode_norm.unsqueeze(0)
+
+    def _use_1d_decode_vecs(self, fmode: str) -> bool:
+        if fmode not in ("sparse", "sparse_v2", "fp8_sparse", "sparse_fp8"):
+            return False
+        return os.environ.get("SGLANG_TPU_MUSE_DECODE_1D_MOE_VECS", "1").strip() not in (
+            "0",
+            "false",
+            "False",
+        )
 
     def fuses_pre_gather(self, n_tok: int, *, decode: bool) -> bool:
         """Return True when ``forward`` fuses ``gate + pre_expert_proj + AG`` in-kernel."""
@@ -3012,16 +3075,17 @@ class MuseSparkMoE(nn.Module):
                 packed_lg[0, 128:256] = cnts[:128]
                 packed_lg[1, 128:256] = cnts[128:256]
                 scaled_router_logits = packed_lg
+            use_1d_vecs = self._use_1d_decode_vecs(fmode)
             base_args = (
                 self._fused_decode_rank,
                 scaled_router_logits,
-                self._bias_2d(),
+                self.e_score_correction_bias if use_1d_vecs else self._bias_2d(),
                 expert_input,
                 w1_arg,
                 s1_arg,
                 w2_arg,
                 s2_arg,
-                self._norm_2d(),
+                self._fused_decode_norm if use_1d_vecs else self._norm_2d(),
             )
             use_v2_b = n_tok_in in self.__dict__.get("_fused_decode_v2_batches", ())
             v2_sh_op = self.__dict__.get("_fused_decode_v2_sharded_op")
@@ -3078,8 +3142,13 @@ class MuseSparkMoE(nn.Module):
                 if precomputed_moe_inputs is not None
                 else (topk_output.router_logits.float() * self.router_multiplier)
             )
-            bias_2d_ext = self.e_score_correction_bias.reshape(1, -1)
-            norm_2d_ext = self._fused_decode_norm.reshape(1, -1)
+            use_1d_ext = self._use_1d_decode_vecs("sparse_v2")
+            bias_2d_ext = (
+                self.e_score_correction_bias if use_1d_ext else self._bias_2d()
+            )
+            norm_2d_ext = (
+                self._fused_decode_norm if use_1d_ext else self._norm_2d()
+            )
             rep_tail = (
                 (
                     self._fused_decode_rep_w1,

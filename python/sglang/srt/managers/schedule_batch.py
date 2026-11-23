@@ -175,6 +175,8 @@ logger = logging.getLogger(__name__)
 # SGLANG_DETERMINISTIC_PENALTY_TOKENS: decode steps whose penalty token was not
 # on the host yet (logged, rate-limited).
 _DET_PENALTY_MISSING = [0]
+# Out-of-vocab / 0x7FFFFFFF NaN token occurrences in _check_vocab_boundary_finish (rate-limited).
+_VOCAB_BOUNDARY_NAN_COUNT = [0]
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -1426,6 +1428,20 @@ class Req(ReqDllmMixin):
                 self.vocab_size is not None and token_id >= self.vocab_size
             ):
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
+                _VOCAB_BOUNDARY_NAN_COUNT[0] += 1
+                cnt = _VOCAB_BOUNDARY_NAN_COUNT[0]
+                if cnt <= 8 or (cnt & (cnt - 1)) == 0:
+                    logger.warning(
+                        "Out-of-vocab / NaN token_id=%d (0x%X, vocab_size=%s) on req rid=%s "
+                        "prompt_len=%d output_offset=%d (occurrence #%d); finishing request early.",
+                        token_id,
+                        token_id & 0xFFFFFFFF,
+                        self.vocab_size,
+                        getattr(self, "rid", None),
+                        len(getattr(self, "origin_input_ids", ()) or ()),
+                        offset,
+                        cnt,
+                    )
                 if self.sampling_params.stop_token_ids:
                     self.output_ids[offset] = next(
                         iter(self.sampling_params.stop_token_ids)

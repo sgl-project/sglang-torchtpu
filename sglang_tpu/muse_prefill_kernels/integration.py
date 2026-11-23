@@ -3170,16 +3170,26 @@ class MusePrefillKernels(torch.nn.Module):
                     res_pad = res_pad.index_select(0, perm_128)
             attn_shard_61 = rank_slice(attn_pad, 0, self.tp_size, self.tp_rank)
             res_shard_61 = rank_slice(res_pad, 0, self.tp_size, self.tp_rank)
+            lw_bufs = getattr(weights, "_buffers", {})
+            b1_alpha_arg = lw_bufs.get("b1_vecs")
+            if b1_alpha_arg is None:
+                b1_alpha_arg = layer.post_attention_residual_gate.alpha
+            b1_bias_arg = lw_bufs.get("b1_bias_t")
+            if b1_bias_arg is None:
+                b1_bias_arg = moe.e_score_correction_bias
+            b2_wpsc_arg = lw_bufs.get("b2_vecs")
+            if b2_wpsc_arg is None:
+                b2_wpsc_arg = weights.wpool_scale
             moe_args_61 = (
                 attn_shard_61,
                 res_shard_61,
-                layer.post_attention_residual_gate.alpha,
+                b1_alpha_arg,
                 layer.post_attention_residual_gate.beta,
                 layer.pre_feedforward_layernorm.weight,
                 weights.wrouter,
-                moe.e_score_correction_bias,
+                b1_bias_arg,
                 weights.wpool,
-                weights.wpool_scale,
+                b2_wpsc_arg,
                 moe.pre_expert_norm.weight,
                 experts.w13_weight,
                 experts.w2_weight,
@@ -4034,10 +4044,10 @@ class MusePrefillKernels(torch.nn.Module):
         init_perms: list[np.ndarray] | None = None
         dual_decode = _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_ALLOW_PREFILL_EPLB")
         dec_counts_map: dict[int, np.ndarray] | None = None
+        num_e = int(getattr(decoder.config, "num_local_experts", 256))
         try:
             from sglang_tpu.models.muse_spark import _placed_expert_order
 
-            num_e = self.tp_size * 32
             layer_perms = []
             any_placed = False
             for l_idx in range(self.start, self.end):
@@ -4064,7 +4074,7 @@ class MusePrefillKernels(torch.nn.Module):
             dec_counts_map = load_calibration_counts(
                 dec_stats_path,
                 num_layers=len(decoder.layers),
-                num_experts=self.tp_size * 32,
+                num_experts=num_e,
             )
         self.eplb_manager = PrefillEplbManager(
             decoder=decoder,

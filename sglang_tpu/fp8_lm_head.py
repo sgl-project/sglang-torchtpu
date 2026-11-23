@@ -93,8 +93,10 @@ def _quantize_rows(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             torch.zeros(h, vp - v, dtype=torch.float8_e4m3fn, device=weight.device)
         )
         scales.append(torch.zeros(vp - v, dtype=torch.float32, device=weight.device))
+    from sglang_tpu.fp8_moe import _own_storage
+
     w8k = torch.cat(cols, dim=1).clone()
-    scale = torch.cat([s.reshape(1, -1) for s in scales], dim=1)
+    scale = _own_storage(torch.cat([s.reshape(1, -1) for s in scales], dim=1).contiguous())
     return w8k, scale
 
 

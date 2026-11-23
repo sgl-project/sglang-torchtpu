@@ -1483,6 +1483,10 @@ class PrefillEplbManager:
         if gate_km is not None:
             gate_km.copy_(moe.gate.weight.data.detach().t().contiguous())
             _wait_for(gate_km)
+        bias_2d = moe_bufs.get("_fused_decode_bias_2d")
+        if bias_2d is not None:
+            bias_2d.copy_(moe.e_score_correction_bias.data.detach().reshape(1, -1))
+            _wait_for(bias_2d)
 
         if moe_bufs.get("_decode_fp4_w1") is not None:
             base_slot_idx = rel_slot_idx[: self.num_base_local]

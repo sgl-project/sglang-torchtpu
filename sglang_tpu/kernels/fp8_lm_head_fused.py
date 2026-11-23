@@ -2435,8 +2435,10 @@ def quantize_lm_head_fp8_k_major(
     if vp > v:
         cols.append(torch.zeros(h, vp - v, dtype=torch.float8_e4m3fn, device=weight_vh.device))
         scales.append(torch.zeros(1, vp - v, dtype=torch.float32, device=weight_vh.device))
+    from sglang_tpu.fp8_moe import _own_storage
+
     w8k = torch.cat(cols, dim=1).contiguous()
-    scale = torch.cat(scales, dim=1).contiguous()
+    scale = _own_storage(torch.cat(scales, dim=1).contiguous())
     return w8k, scale
 
 
