@@ -523,6 +523,23 @@ class EagerLogitsCase(msgspec.Struct, frozen=True):
     spec_info: SpecInput | None = None
 
 
+def _record_device_slots(forward_batch: ForwardBatch) -> None:
+    """Record ``req_pool_indices_cpu`` as the host copy of slots already on the device."""
+    device_value = forward_batch.req_pool_indices
+    host = forward_batch.req_pool_indices_cpu
+    if (
+        isinstance(device_value, torch.Tensor)
+        and device_value.device.type != "cpu"
+        and isinstance(host, torch.Tensor)
+        and host.device.type == "cpu"
+        and host.shape == device_value.shape
+        and host_input_mirror.host_copy(forward_batch, "req_pool_indices") is None
+    ):
+        host_input_mirror.record_upload(
+            forward_batch, "req_pool_indices", host, device_value
+        )
+
+
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
@@ -1269,6 +1286,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             value = getattr(forward_batch, name, None)
             if isinstance(value, torch.Tensor) and value.device.type == "cpu":
                 self._upload_field(forward_batch, name, value)
+        _record_device_slots(forward_batch)
 
     def _upload_field(
         self, forward_batch: ForwardBatch, name: str, value: torch.Tensor
