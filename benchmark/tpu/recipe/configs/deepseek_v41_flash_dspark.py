@@ -73,5 +73,9 @@ CONFIG["runtime_env"].update(
         # affinity hint (new prompts may move, continuations follow their cache).
         "SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN": "0.25",
         "SGLANG_TPU_DP_PROMPT_BACKLOG_ROUTED": "1",
+        # Routed experts on fused EP MoE v2 (#2267): local routing, no DP gather
+        # or all-reduce of the padded batch. It needs the shared expert on TP1.
+        "SGLANG_TPU_DSV41_FUSED_EP": "1",
+        "SGLANG_SHARED_EXPERT_TP1": "1",
     }
 )
