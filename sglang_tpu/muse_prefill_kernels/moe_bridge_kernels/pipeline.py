@@ -1633,7 +1633,7 @@ def _allow_pallas_sortfree_routing(
     eff_hoist_routing: bool,
     eff_cm_pipe: bool,
 ) -> bool:
-    """Gate PALLAS_SORTFREE_ROUTING; disabled on ep_size==16 padded EXTEND due to TPU7x halt."""
+    """Gate PALLAS_SORTFREE_ROUTING; disabled on ep_size==16 until bounds-checked silicon repro passes."""
     return (
         pallas_sf_rt >= 1
         and sortfree_prefill
@@ -1642,7 +1642,7 @@ def _allow_pallas_sortfree_routing(
         and (t_local % 128 == 0)
         and ((t_local * topk) % 128 == 0)
         and (n_loc_eff <= 120)
-        and not (ep_size == 16 and has_pad_sentinel)
+        and ep_size != 16
         and (eff_hoist_routing or has_pad_sentinel or eff_cm_pipe)
     )
 
