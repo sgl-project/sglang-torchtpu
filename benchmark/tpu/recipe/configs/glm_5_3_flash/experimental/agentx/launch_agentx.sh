@@ -1,11 +1,12 @@
 #!/bin/bash
 # Boot one GLM-5.3-Flash AgentX point of glm_5_3_flash/agentx.py on one tpu7x 2x2x1 host (tp8),
-# with its caches on a PVC, as jobs 36d0 (c1-c16) and 7605 (c32) ran them. Ready when
+# with its caches on a PVC, as the README's Results points ran. Ready when
 # the log prints "The server is fired up and ready to roll".
 # usage: launch_agentx.sh <1|4|8|16|32> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)
 #   AGENTX_DEPS=<dir>    pip --target dir: transformers 5.19.0, blake3, timm 1.0.25 (default $CACHE_ROOT/pydeps)
-#   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as every point ran
+#   AGENTX_HALF_SLICE=1  single-host 2x2x1 env for one host of a 2x2x2 slice run alone, as c1-c16 ran;
+#                        c32 ran on a 2x2x1 tpuq host, also with this env
 #   AGENTX_NO_SPMD=1     c1 only: agentx.py --no-spmd-compile (torch_tpu 0.2.0), as c1 ran; writes the JSON to the cache dir
 #   --dry-run            print the resolved env, command and server args; start nothing
 set -euo pipefail
