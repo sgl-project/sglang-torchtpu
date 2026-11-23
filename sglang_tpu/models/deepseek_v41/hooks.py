@@ -273,6 +273,17 @@ tpu_dsv41_carry_mirrored_padding
   Remove when: the padding returns a field unchanged when it has nothing to
        append, and records follow the fields they describe.
 
+tpu_dsv41_carry_mirror_to_loaded_batch
+  Why: host_input_mirror ties its records to the ForwardBatch object, and on
+       TPU EagerRunner.load_batch hands the forward a dataclasses.replace copy;
+       build_forward_metadata then finds no record and reads positions,
+       out_cache_loc and req_pool_indices back from the device, blocking on
+       the previous forward (three reads before every draft and verify).
+  How: AROUND EagerRunner.load_batch moves the record to the returned copy
+       (host_input_mirror.carry_batch); the copy holds the same tensors.
+  Upstream PR or issue: not filed (V4.1 TPU serving).
+  Remove when: records follow the fields they describe across batch copies.
+
 tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
   Why: the target's Engram history lives on the host (engram_host), so
        committing a verify reads its outputs back and blocks the host for the
@@ -886,6 +897,17 @@ def tpu_dsv41_carry_mirrored_padding(original, forward_batch, *args, **kwargs):
     return result
 
 
+def tpu_dsv41_carry_mirror_to_loaded_batch(
+    original, runner, forward_batch, *args, **kwargs
+):
+    """AROUND EagerRunner.load_batch: keep host_input_mirror records on the copy."""
+    from sglang_tpu.compilation import host_input_mirror
+
+    loaded = original(runner, forward_batch, *args, **kwargs)
+    host_input_mirror.carry_batch(forward_batch, loaded)
+    return loaded
+
+
 def tpu_dsv41_defer_engram_commit(
     original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
 ):
@@ -1095,6 +1117,11 @@ def hook_specs():
         (
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch._pad_inputs_to_size",
             tpu_dsv41_carry_mirrored_padding,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.runner.eager_runner.EagerRunner.load_batch",
+            tpu_dsv41_carry_mirror_to_loaded_batch,
             HookType.AROUND,
         ),
         (

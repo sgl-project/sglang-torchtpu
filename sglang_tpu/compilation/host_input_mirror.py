@@ -70,6 +70,23 @@ def clear() -> None:
     _record = None
 
 
+def carry_batch(old_batch: Any, new_batch: Any) -> None:
+    """Move ``old_batch``'s record to ``new_batch``, a shallow copy of it.
+
+    Each field's record still needs ``new_batch`` to hold the exact device
+    tensor it describes, so a field the copy rebound falls back to the device.
+    """
+    global _record
+    if new_batch is old_batch or _record is None or _record[0]() is not old_batch:
+        return
+    try:
+        ref = weakref.ref(new_batch)
+    except TypeError:
+        _record = None
+        return
+    _record = (ref, _record[1])
+
+
 def carry_padding(forward_batch: Any, name: str, old: torch.Tensor) -> None:
     """Move ``name``'s record from ``old`` to the zero-padded tensor that replaced it.
 

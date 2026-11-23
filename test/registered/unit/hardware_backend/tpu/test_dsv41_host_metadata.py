@@ -9,10 +9,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    compute_position_torch,
-)
+from sglang.srt.model_executor.forward_batch_info import compute_position_torch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.compilation import host_input_mirror
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
@@ -155,6 +153,25 @@ def test_metadata_from_uploaded_host_copies_is_bit_identical(name):
     fb = BATCHES[name]()
     _upload(fb)  # fields now on "meta": a device read would raise
     _assert_same(_metadata(fb), reference)
+
+
+@pytest.mark.parametrize("name", ["multi", "verify"])
+def test_runner_batch_copy_keeps_the_host_copies(name):
+    """The runner builds metadata from a shallow copy of the uploaded batch
+    (EagerRunner.load_batch); that copy must not read the uploads back."""
+    import copy
+
+    from sglang_tpu.models.deepseek_v41.hooks import (
+        tpu_dsv41_carry_mirror_to_loaded_batch,
+    )
+
+    reference = _metadata(BATCHES[name]())
+    fb = BATCHES[name]()
+    _upload(fb)  # fields now on "meta": a device read would raise
+    loaded = tpu_dsv41_carry_mirror_to_loaded_batch(
+        lambda runner, batch: copy.copy(batch), None, fb
+    )
+    _assert_same(_metadata(loaded), reference)
 
 
 def test_device_values_are_not_read():
