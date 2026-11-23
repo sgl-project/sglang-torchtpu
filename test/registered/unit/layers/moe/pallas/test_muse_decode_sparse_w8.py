@@ -1025,7 +1025,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertFalse(c32.pair_rs or c32.bridge_ag)
             self.assertFalse(c64.pair_rs or c64.bridge_ag)
             self.assertFalse(fp8_64.pair_rs or fp8_64.bridge_ag)
-            self.assertFalse(fp8_64.static_holder_mask)
+            self.assertTrue(fp8_64.static_holder_mask)
             self.assertFalse(v2_32.pair_rs or v2_32.pair_ag_relay)
             self.assertFalse(v2_64.pair_rs or v2_64.pair_ag_relay)
 

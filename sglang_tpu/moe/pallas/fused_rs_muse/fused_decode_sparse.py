@@ -4102,7 +4102,13 @@ def default_fp8_sparse_decode_config(
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
-    fp8_static_mask = ep <= 8
+    fp8_static_mask = (
+        (ep <= 8)
+        if _env_bool_fallback(
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_FP8_NO_EP16_STATIC_MASK", False
+        )
+        else True
+    )
     fp8_pair_rs = (
         (pair_rs_ov > 0)
         and (ep in (8, 16))
