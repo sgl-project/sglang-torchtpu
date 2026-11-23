@@ -52,7 +52,7 @@ class TestNvfp4ExpertTpFusedRs(CustomTestCase):
 
     def test_matches_reference(self):
         """Also feeds expert ids outside [0, 256): they must count as weight 0, not halt or
-        hang the kernel (they dropped out of the routed counts but kept their rows)."""
+        hang the kernel."""
         self._run({}, "--invalid-ids")
 
     def test_bf16_weights_match_reference(self):
@@ -62,9 +62,9 @@ class TestNvfp4ExpertTpFusedRs(CustomTestCase):
 
     def test_twolevel_rs_matches_reference(self):
         """4096 tokens reach the two-level reduce-scatter (on-chip chip sums, one more
-        bf16 rounding) and its VMEM scatter combine; 4100 pad to 4104 rows per rank, which
-        the 256-row matmul-combine blocks must not drop the tail of. Out-of-range expert
-        ids halted the two-level kernel."""
+        bf16 rounding) and its VMEM scatter combine; 4100 pad to a 513-token chunk, whose
+        last row step and token store overlap the ones before and must not add a row twice
+        or drop one. Out-of-range expert ids halted the two-level kernel."""
         self._run(
             {"SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL": "1"},
             "--tokens 64,4096,4100 --invalid-ids",
