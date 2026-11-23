@@ -478,12 +478,6 @@ def _invoke_v3_kernel(
             else:
                 if "nomk128" not in raw_all_toks:
                     prefill_opts.add("mk128")
-                    if (
-                        is_lc_full
-                        and not (allow_tp16_sq and is_tp16_sq_shape)
-                        and "nogqa8" not in raw_all_toks
-                    ):
-                        prefill_opts.add("gqa8")
                 if not is_lc_full and "noprefix_fast" not in raw_all_toks:
                     prefill_opts.add("prefix_fast")
         for w7_opt in (

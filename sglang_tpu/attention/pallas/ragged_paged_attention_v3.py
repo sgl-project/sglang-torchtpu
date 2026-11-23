@@ -1079,6 +1079,11 @@ def _stationary_q_v2_process(
         def _eval_mk128_head(kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs):
             n_h = 2 * n_slices
             z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
+            kv_sl = (
+                pl.ds(kv_h, 1)
+                if not isinstance(kv_h, int)
+                else slice(kv_h, kv_h + 1)
+            )
 
             def _h_ring(h_idx):
                 return (h_idx & ring_h_mask) if ring_covers_all else h_idx
@@ -1093,13 +1098,13 @@ def _stationary_q_v2_process(
                 h_p = _h_ring(h_base + h_off - 1)
                 qk_c = _kq_dot(k_sub_ref[kv_h, h_c][:, :64][None, :, :], qt_1)
                 acc_cur = acc_cur + _vp_scaled(
-                    vt_sub_ref[kv_h : kv_h + 1, h_p], p_prev, psc_prev
+                    vt_sub_ref[kv_sl, h_p], p_prev, psc_prev
                 )
                 p_prev, ps_c, psc_prev = _sm_eval(qk_c, h_specs[h_off], qsc_1)
                 l_cur = l_cur + ps_c
             h_rl = _h_ring(h_base + n_h - 1)
             acc_cur = acc_cur + _vp_scaled(
-                vt_sub_ref[kv_h : kv_h + 1, h_rl], p_prev, psc_prev
+                vt_sub_ref[kv_sl, h_rl], p_prev, psc_prev
             )
             return acc_cur, l_cur
 
@@ -2727,16 +2732,14 @@ def _stationary_q_v2_process(
                                 sl128 = pl.ds(q128_start, 128)
                                 for kv_h in range(sq_kv_heads):
                                     h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
+                                    q_h8 = q_t_ref[h_sl, :, sl128]
                                     acc_subs = []
                                     l_subs = []
                                     for sub_c in range(4):
                                         c0 = sub_c * 32
                                         c1 = c0 + 32
                                         qt_8h = jnp.concatenate(
-                                            [
-                                                q_t_ref[kv_h * 8 + g_i, :, sl128][:, c0:c1]
-                                                for g_i in range(8)
-                                            ],
+                                            [q_h8[g_i, :, c0:c1] for g_i in range(8)],
                                             axis=1,
                                         )[None, :, :]
                                         acc_8h, l_8h = _eval_mk128_head(
@@ -2854,20 +2857,7 @@ def _stationary_q_v2_process(
                                 loc_hi,
                             )
                             global_first_s = start_bkv_idx * num_s
-                            bkv_all_unm = loc_unm_hi == num_s
-
-                            @pl.when(bkv_all_unm)
-                            def _full_bkv_fast():
-                                _run_ring_chunk(
-                                    0,
-                                    num_s,
-                                    (bkv_idx * num_s) == global_first_s,
-                                    ("none",) * num_s,
-                                    t_sl,
-                                )
-
-                            @pl.when(jnp.logical_not(bkv_all_unm))
-                            def _partial_bkv():
+                            if use_prefix_fast:
                                 _run_slice_range(
                                     q_first,
                                     jnp.int32(0),
@@ -2879,6 +2869,32 @@ def _stationary_q_v2_process(
                                     effective_kv_len,
                                     t_sl,
                                 )
+                            else:
+                                bkv_all_unm = loc_unm_hi == num_s
+
+                                @pl.when(bkv_all_unm)
+                                def _full_bkv_fast():
+                                    _run_ring_chunk(
+                                        0,
+                                        num_s,
+                                        (bkv_idx * num_s) == global_first_s,
+                                        ("none",) * num_s,
+                                        t_sl,
+                                    )
+
+                                @pl.when(jnp.logical_not(bkv_all_unm))
+                                def _partial_bkv():
+                                    _run_slice_range(
+                                        q_first,
+                                        jnp.int32(0),
+                                        loc_hi,
+                                        jnp.int32(0),
+                                        loc_unm_hi,
+                                        global_first_s,
+                                        processed_kv_len,
+                                        effective_kv_len,
+                                        t_sl,
+                                    )
 
                     if use_tq_loop and (bq_sz // tq_sz) > 1:
                         pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_stream_tq)

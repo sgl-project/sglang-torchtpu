@@ -519,13 +519,29 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             kw = _call_invoke(q_tp8_4k, k_tp8, None, c_d2, kl, pi_lc, sw=None, prepared=True, d2=True, a3_out=2)
             lc_opts = kw["_prefill_opts"]
             self.assertIn("mk128", lc_opts)
-            self.assertIn("gqa8", lc_opts)
+            self.assertNotIn("gqa8", lc_opts)
             self.assertIn("fp8_qk", lc_opts)
             self.assertIn("staged_qo", lc_opts)
             self.assertIn("prefix_fast", lc_opts)
             self.assertNotIn("vreg_acc1", lc_opts)
             self.assertNotIn("mrb1", lc_opts)
             self.assertEqual(kw["m_block_sizes"][:2], (4096, 8192))
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_KV_PACK_DENSE2": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": "sw_w8,sw_fp8_qk,gqa8",
+                "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq4096,bkv8192,s2,prefix_fast,staged_qo,fp8_qk,vreg_acc1,mrb1",
+            },
+            clear=False,
+        ):
+            q_tp8_4k = SimpleNamespace(ndim=5, shape=(1, 4096, 8, 2, 128), dtype="bfloat16")
+            kw_g8 = _call_invoke(q_tp8_4k, k_tp8, None, c_d2, kl, pi_lc, sw=None, prepared=True, d2=True, a3_out=2)
+            self.assertIn("gqa8", kw_g8["_prefill_opts"])
 
         # 3. Verify `TP=16` (`q=(1, T, 4, 2, 128)`) prepared Stationary-Q v2 + `[T, 512]` `a3_out_layout`.
         q_tp16_prep = SimpleNamespace(ndim=5, shape=(1, 8192, 4, 2, 128), dtype="bfloat16")
