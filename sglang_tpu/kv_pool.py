@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool import (
+    BLOCK_MAJOR,
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
@@ -898,6 +899,9 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
     # raiden moves a bundle row by its dim-0 block id; torch_tpu's host pool
     # reads the pool layer by layer, which the bundle does not offer.
     kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
+
+    def kv_pool_layout(self) -> str:
+        return BLOCK_MAJOR
 
     def _create_buffers(self):
         kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
