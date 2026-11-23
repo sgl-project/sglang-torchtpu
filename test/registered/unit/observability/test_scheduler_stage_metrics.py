@@ -8,10 +8,13 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_NONE,
     FORWARD_OVERLAP_PARTIAL,
     SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
     SCHEDULER_STAGE_PROCESS_QUEUE,
     SCHEDULER_STAGE_PROCESS_REQUESTS,
+    SCHEDULER_STAGE_RESULT_WAIT,
     SCHEDULER_STAGE_RUN_BATCH,
     SchedulerStageMetricsRecorder,
+    format_stage_wall_ns_per_iteration,
     scheduler_stage_method,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
@@ -220,3 +223,84 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSchedulerStageLogFragment(CustomTestCase):
+    def test_means_per_iteration_in_category_order_skipping_idle_stages(self):
+        fragment = format_stage_wall_ns_per_iteration(
+            {
+                SCHEDULER_STAGE_RESULT_WAIT: 400_000,
+                SCHEDULER_STAGE_RUN_BATCH: 96_000_000,
+                SCHEDULER_STAGE_PROCESS_BATCH_RESULT: 12_000_000,
+                SCHEDULER_STAGE_GET_NEXT_BATCH: 0,
+            },
+            iterations=40,
+        )
+
+        self.assertEqual(
+            fragment,
+            "scheduler ms/iter: total 2.710 (40 iters) | "
+            "run_batch 2.400 process_batch_result 0.300 result_wait 0.010",
+        )
+
+    def test_a_window_without_iterations_does_not_divide(self):
+        self.assertEqual(
+            format_stage_wall_ns_per_iteration({SCHEDULER_STAGE_RUN_BATCH: 5}, 0),
+            "scheduler ms/iter: n/a (0 iters)",
+        )
+
+
+class TestResultWaitStage(CustomTestCase):
+    def test_wait_copy_done_is_recorded_inside_process_batch_result(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        recorder = SchedulerStageMetricsRecorder(enabled=True)
+        recorder.start(wall_ns=0)
+        processor = SimpleNamespace(
+            metrics_reporter=SimpleNamespace(scheduler_stage_metrics=recorder)
+        )
+        copy_done = Mock()
+
+        with patch(
+            "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+            side_effect=[10, 20, 50, 70],
+        ):
+            outer = recorder.enter(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+            SchedulerBatchResultProcessor.wait_copy_done(
+                processor, SimpleNamespace(copy_done=copy_done)
+            )
+            recorder.exit(outer)
+
+        copy_done.synchronize.assert_called_once_with()
+        self.assertEqual(
+            recorder.drain(wall_ns=100),
+            {
+                ("other", FORWARD_OVERLAP_NONE): 40,
+                ("process_batch_result", FORWARD_OVERLAP_NONE): 30,
+                ("result_wait", FORWARD_OVERLAP_NONE): 30,
+            },
+        )
+
+    def test_a_disabled_recorder_still_waits(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        recorder = SchedulerStageMetricsRecorder(enabled=False)
+        processor = SimpleNamespace(
+            metrics_reporter=SimpleNamespace(scheduler_stage_metrics=recorder)
+        )
+        copy_done = Mock()
+
+        SchedulerBatchResultProcessor.wait_copy_done(
+            processor, SimpleNamespace(copy_done=copy_done)
+        )
+
+        copy_done.synchronize.assert_called_once_with()
+        self.assertEqual(recorder.drain(wall_ns=100), {})

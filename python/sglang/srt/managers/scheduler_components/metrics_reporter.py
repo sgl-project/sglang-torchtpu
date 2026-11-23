@@ -34,6 +34,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
+    format_stage_wall_ns_per_iteration,
 )
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
@@ -342,6 +343,9 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
+        # Per-stage wall time between decode logs, for the decode log line.
+        self._stage_log_window_ns: dict[str, int] = defaultdict(int)
+        self._stage_log_window_iterations = 0
         self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
             enabled=self.enable_metrics,
             query_forward_active=(
@@ -1062,6 +1066,8 @@ class SchedulerMetricsReporter:
             # Poll completed forward events before formatting, without synchronizing.
             self.forward_pass_device_timer._report()
             msg += ", " + self.forward_occupancy_log_string()
+        if self.enable_metrics:
+            msg += ", " + self.scheduler_stage_log_string()
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -1455,13 +1461,35 @@ class SchedulerMetricsReporter:
         self.metrics_collector.increment_scheduler_process_cpu_seconds(
             elapsed_process_cpu_ns / 1e9
         )
+        self._drain_scheduler_stages(now_wall_ns)
+        accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
+
+    def _drain_scheduler_stages(self, now_wall_ns: int) -> None:
+        """Move the recorder's stage totals to Prometheus and the decode log window."""
         for (stage, overlap), elapsed_wall_ns in self.scheduler_stage_metrics.drain(
             now_wall_ns
         ).items():
             self.metrics_collector.increment_scheduler_stage_seconds(
                 stage=stage, seconds=elapsed_wall_ns / 1e9, forward_overlap=overlap
             )
-        accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
+            self._stage_log_window_ns[stage] += elapsed_wall_ns
+
+    def increment_scheduler_iterations(self) -> None:
+        self.metrics_collector.increment_scheduler_iterations()
+        self._stage_log_window_iterations += 1
+
+    def scheduler_stage_log_string(self) -> str:
+        """Mean exclusive wall time per scheduler iteration of each stage since
+        the previous decode log, then start a new window. Steady decode gives
+        one iteration per decode batch, so the means are per decode step; the
+        iteration count shows when prefill or idle iterations are mixed in."""
+        self._drain_scheduler_stages(time.monotonic_ns())
+        fragment = format_stage_wall_ns_per_iteration(
+            self._stage_log_window_ns, self._stage_log_window_iterations
+        )
+        self._stage_log_window_ns = defaultdict(int)
+        self._stage_log_window_iterations = 0
+        return fragment
 
     def _reset_device_timer_window(self):
         """Exclude idle time and invalidate the last forward-occupancy sample."""

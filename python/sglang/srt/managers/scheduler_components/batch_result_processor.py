@@ -39,6 +39,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_RESULT_WAIT,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -160,6 +163,17 @@ class SchedulerBatchResultProcessor:
     # staging.
     prefill_launched_reqs: ReqList
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+
+    def wait_copy_done(self, result: GenerationBatchResult) -> None:
+        """Block until the step's device-to-host copy has landed, as the
+        result_wait stage: time here is the device still running the step, not
+        host-side result processing."""
+        recorder = self.metrics_reporter.scheduler_stage_metrics
+        previous_stage = recorder.enter(SCHEDULER_STAGE_RESULT_WAIT)
+        try:
+            result.copy_done.synchronize()
+        finally:
+            recorder.exit(previous_stage)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -372,7 +386,7 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 MM_FEATURE_RELEASER.drain_before_wait(result.copy_done)
-                result.copy_done.synchronize()
+                self.wait_copy_done(result)
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -584,7 +598,7 @@ class SchedulerBatchResultProcessor:
 
         else:  # embedding or reward model
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                self.wait_copy_done(result)
 
             embeddings = self._convert_embeddings(
                 result=result, batch=batch, still_in_batch_rows=still_in_batch_rows
@@ -1072,7 +1086,7 @@ class SchedulerBatchResultProcessor:
             return
         still_in_batch_rows = self._rows_still_in_batch(batch)
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self.wait_copy_done(result)
         next_token_ids = result.next_token_ids.tolist()
 
         if not is_decode:
@@ -1114,7 +1128,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self.wait_copy_done(result)
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -1127,7 +1141,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             MM_FEATURE_RELEASER.drain_before_wait(result.copy_done)
-            result.copy_done.synchronize()
+            self.wait_copy_done(result)
         still_in_batch_rows = self._rows_still_in_batch(batch)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output

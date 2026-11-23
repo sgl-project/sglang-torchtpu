@@ -35,6 +35,11 @@ SCHEDULER_STAGE_GET_NEXT_BATCH = "get_next_batch_to_run"
 SCHEDULER_STAGE_PROCESS_QUEUE = "process_queue"
 SCHEDULER_STAGE_RUN_BATCH = "run_batch"
 SCHEDULER_STAGE_PROCESS_BATCH_RESULT = "process_batch_result"
+# Nested in process_batch_result: the wait for the step's device-to-host copy.
+# It separates "the device was still busy" from host-side result processing.
+SCHEDULER_STAGE_RESULT_WAIT = "result_wait"
+# The delayed sampler launch of the overlap loop (launch_batch_sample_if_needed).
+SCHEDULER_STAGE_LAUNCH_SAMPLE = "launch_batch_sample"
 SCHEDULER_STAGE_SANITY_CHECK_CACHE = "sanity_check_cache"
 SCHEDULER_STAGE_IDLE = "idle"
 
@@ -46,6 +51,8 @@ SCHEDULER_STAGE_CATEGORIES = (
     SCHEDULER_STAGE_PROCESS_QUEUE,
     SCHEDULER_STAGE_RUN_BATCH,
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
+    SCHEDULER_STAGE_RESULT_WAIT,
+    SCHEDULER_STAGE_LAUNCH_SAMPLE,
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SCHEDULER_STAGE_IDLE,
 )
@@ -161,6 +168,26 @@ class SchedulerStageMetricsRecorder:
             self._wall_ns[self._current_stage, overlap] += wall_ns - self._last_wall_ns
         self._last_wall_ns = wall_ns
         self._last_forward_active = forward_active
+
+
+def format_stage_wall_ns_per_iteration(
+    wall_ns_by_stage: dict[str, int], iterations: int
+) -> str:
+    """One log fragment with the mean exclusive wall time per scheduler
+    iteration of each stage that saw time, in the fixed category order."""
+    if iterations <= 0:
+        return "scheduler ms/iter: n/a (0 iters)"
+    ms_per_iter = 1e-6 / iterations
+    total_ms = sum(wall_ns_by_stage.values()) * ms_per_iter
+    parts = [
+        f"{stage} {wall_ns_by_stage[stage] * ms_per_iter:.3f}"
+        for stage in SCHEDULER_STAGE_CATEGORIES
+        if wall_ns_by_stage.get(stage, 0) > 0
+    ]
+    return (
+        f"scheduler ms/iter: total {total_ms:.3f} ({iterations} iters) | "
+        + " ".join(parts)
+    )
 
 
 _F = TypeVar("_F", bound=Callable)
