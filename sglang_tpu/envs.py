@@ -1318,6 +1318,11 @@ class TpuEnvs:
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Wave-9 Per-Layer MoE-to-MoE (M2M) Decode Megakernel: fuses Bridge-2b(l-1) + QKV/RoPE
+    # epilogue + RPAd(l) + post-RPA head-RMSNorm/gate + Bridge-1b(l) into one zero-spill
+    # collective Pallas kernel across TP=8 (2x2x1) and TP=16 (2x2x2) with 0 extra weight HBM.
+    SGLANG_TPU_MUSE_MK_M2M = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_M2M_MAX_FULL_CTX = EnvInt(4096)
     # Batched RPA prefill tiles (P/D prefill; the Muse Spark recipe sets all four).
     # Softmax exp2 with log2e folded into the q scale, one VALU op per score fewer.
     # Off with an attention sink or an LSE output, which would see base-2 m and l;

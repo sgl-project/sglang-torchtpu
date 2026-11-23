@@ -5134,6 +5134,26 @@ class MuseSparkTextModel(nn.Module):
                 )
         cs_layer_kw = {"cos_sin_step": cos_sin_step} if cos_sin_step is not None else {}
         fuse_final_ln = bool(self.__dict__.get("_w8_fuse_final_norm", False))
+        if (
+            kernels is None
+            and is_dec_or_verify
+            and bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False))
+        ):
+            from sglang_tpu.muse_megakernel.decode.m2m.ops import (
+                maybe_forward_m2m_decode,
+            )
+
+            m2m_hidden = maybe_forward_m2m_decode(
+                self,
+                positions=positions,
+                stream=stream,
+                carried_attn_input=carried_attn_input,
+                cos_sin_step=cos_sin_step,
+                forward_batch=forward_batch,
+                tok_sharded_stream=use_tok_sharded_relay,
+            )
+            if m2m_hidden is not None:
+                return m2m_hidden
         layer_idx = self.start_layer
         while layer_idx < self.end_layer:
             if kernels is not None and layer_idx == kernels.start:
@@ -5919,6 +5939,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 fuse_final_norm=fuse_final_norm,
                 pallas_embed=can_pallas_emb,
             )
+            if bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False)):
+                from sglang_tpu.muse_megakernel.decode.m2m.ops import (
+                    prewarm_m2m_decode_ops,
+                )
+
+                prewarm_m2m_decode_ops(
+                    warm_tp, tok_sharded=tok_sharded and all_tok_sh_ready
+                )
             fuse_b1_tk = bool(
                 _env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE1_FUSE_TOPK", False)
             )
