@@ -1475,6 +1475,19 @@ class TpuSRTPlatform(SRTPlatform):
             return host_cls
         return None
 
+    def get_hicache_controller_cls(self, io_backend: str) -> Optional[type]:
+        # torch_tpu and the TPU DMA backends have no per-layer device streams;
+        # their controllers gate the whole forward on one reload event.
+        if io_backend == "torch_tpu":
+            from sglang_tpu.tpu_cache_controller import TpuHiCacheController
+
+            return TpuHiCacheController
+        if is_tpu_dma_hicache_backend(io_backend):
+            from sglang_tpu.tpu_dma_cache_controller import TpuDMAHiCacheController
+
+            return TpuDMAHiCacheController
+        return None
+
     def get_hybrid_cache_controller_cls(self, io_backend: str) -> Optional[type]:
         # A TPU DMA backend has no device streams and drives per-pool
         # all-layer DMAs, so it needs its own hybrid controller.

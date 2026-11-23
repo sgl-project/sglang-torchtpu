@@ -959,9 +959,12 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
 
 class TestDispatch(CustomTestCase):
     def test_raiden_io_backend_selects_tpu_hybrid_controller(self):
-        with patch.object(
-            TpuDMAHybridCacheController, "__init__", return_value=None
-        ) as init:
+        with (
+            patch("sglang.srt.platforms.current_platform", TpuSRTPlatform()),
+            patch.object(
+                TpuDMAHybridCacheController, "__init__", return_value=None
+            ) as init,
+        ):
             ctrl = HybridCacheController.create_for_backend(io_backend="raiden")
         self.assertIsInstance(ctrl, TpuDMAHybridCacheController)
         init.assert_called_once()

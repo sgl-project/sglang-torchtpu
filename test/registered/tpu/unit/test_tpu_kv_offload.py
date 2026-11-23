@@ -129,11 +129,9 @@ def _make_controller(target_dev, target_host):
     """Minimal TpuHiCacheController carrying only the data-plane state the
     write/load rounds touch (the full __init__ wires storage/prefetch threads
     irrelevant to these tests)."""
-    from sglang.srt.managers.cache_controller import (
-        BatchDoneCounter,
-        TpuHiCacheController,
-    )
+    from sglang.srt.managers.cache_controller import BatchDoneCounter
     from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
+    from sglang_tpu.tpu_cache_controller import TpuHiCacheController
 
     controller = TpuHiCacheController.__new__(TpuHiCacheController)
     controller.io_backend = "torch_tpu"

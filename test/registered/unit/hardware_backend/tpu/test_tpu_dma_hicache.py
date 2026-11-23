@@ -23,11 +23,15 @@ from sglang_tpu.kv_pool_host import (
     TpuDMAUnifiedHostKVPool,
     tpu_dma_host_kv_pool_cls,
 )
+from sglang_tpu.tpu_cache_controller import TpuHiCacheController
+from sglang_tpu.tpu_dma_cache_controller import TpuDMAHiCacheController
 from sglang_tpu.tpu_dma_hicache import (
     NOOP_EVENT,
     is_tpu_dma_hicache_backend,
     register_tpu_dma_hicache_backend,
 )
+from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -161,6 +165,7 @@ class TestTpuDMAKVTransfer(CustomTestCase):
 
     def test_engines_select_the_tpu_controllers(self):
         with (
+            patch("sglang.srt.platforms.current_platform", TpuSRTPlatform()),
             patch(
                 "sglang_tpu.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController"
             ) as hybrid,
@@ -172,6 +177,22 @@ class TestTpuDMAKVTransfer(CustomTestCase):
             HiCacheController.create_for_backend(io_backend=ENGINE)
         hybrid.assert_called_once_with(io_backend=ENGINE)
         single.assert_called_once_with(io_backend=ENGINE)
+
+    def test_tpu_platform_controller_classes(self):
+        platform = TpuSRTPlatform()
+        for io_backend, single, hybrid in (
+            ("torch_tpu", TpuHiCacheController, None),
+            ("raiden", TpuDMAHiCacheController, TpuDMAHybridCacheController),
+            (ENGINE, TpuDMAHiCacheController, TpuDMAHybridCacheController),
+            ("kernel", None, None),
+            ("direct", None, None),
+            ("", None, None),
+        ):
+            with self.subTest(io_backend=io_backend):
+                self.assertIs(platform.get_hicache_controller_cls(io_backend), single)
+                self.assertIs(
+                    platform.get_hybrid_cache_controller_cls(io_backend), hybrid
+                )
 
     def test_host_pool_copies_whole_pages_through_its_engine(self):
         device_pool = SimpleNamespace(
