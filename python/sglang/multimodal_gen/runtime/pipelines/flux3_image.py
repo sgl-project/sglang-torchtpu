@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ImageDenoiseStage,
     Flux3ImageTextEncodeStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
@@ -102,9 +103,14 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 vae = Flux3ImageVAE(Flux3ImageVAEConfig()).to(
                     dtype=precision_to_dtype(package.config.vae.dtype)
                 )
-            load_model_state_dict(
-                vae, load_file(str(package.vae), device=str(vae_device)), assign=True
+            # A device safetensors cannot address (tpu:N) is read on the host.
+            on_host = not current_platform.supports_safetensors_device_load()
+            state = load_file(
+                str(package.vae), device="cpu" if on_host else str(vae_device)
             )
+            if on_host:
+                state = {name: tensor.to(vae_device) for name, tensor in state.items()}
+            load_model_state_dict(vae, state, assign=True)
             modules["vae"] = vae
         if role.includes_stage(RoleType.PROMPT_ENCODER):
             modules["text_encoder"] = self._load_text_encoder(

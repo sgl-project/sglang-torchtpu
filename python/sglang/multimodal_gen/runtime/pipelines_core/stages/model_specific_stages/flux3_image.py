@@ -953,6 +953,9 @@ class Flux3ImageDecodeStage(PipelineStage):
             ),
             use_vae_fast_path(self.vae, batches[0].quality != "exact"),
             exact_vae_convolutions(batches[0].quality == "exact"),
+            # As forward: a spatial-parallel decoder's cached halo buffers are
+            # inference tensors.
+            torch.inference_mode(),
         ):
             for group in groups.values():
                 decoded = vae_decode(
