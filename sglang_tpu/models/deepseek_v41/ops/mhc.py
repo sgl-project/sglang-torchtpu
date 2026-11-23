@@ -5,7 +5,6 @@ from weakref import ref
 
 import torch
 
-
 _PACKED = "_tpu_shifted_mhc_mix_weight"
 _shifted_op = None
 _OWNER = "_tpu_shifted_mhc_owner"
