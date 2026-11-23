@@ -1068,3 +1068,63 @@ def test_two_ranks_against_gathered_current_path(cpu_op):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- #
+# TARGET_VERIFY: only the live requests' verify rows are real.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
+def test_live_count_keeps_real_rows_bit_identical(cpu_op, dtype):
+    """Masking the padding rows changes nothing on the live rows: the fused
+    forward with count = live rows equals the one counting every row, bitwise,
+    on the live rows; the padding rows then carry the shared expert only."""
+    gmm = _gmm_prepared(E, H, I)
+    gate, shared = _parts(dtype, seed=3)
+    moe = _moe(gmm, gate, shared)
+    g = torch.Generator().manual_seed(11)
+    x = torch.randn(8, H, generator=g).to(dtype)
+    ids = torch.randint(10, 100, (8,), generator=g)
+
+    def run(count):
+        fb = SimpleNamespace(
+            num_token_non_padded=torch.tensor(count, dtype=torch.int32),
+            global_num_tokens_cpu=None,
+            dp_padding_mode=None,
+        )
+        return moe.dp_local_forward(x, fb, input_ids=ids)
+
+    with op_mod.kernel_override(ReferenceKernel()):
+        assert op_mod.prepare_moe_layer_for_fused_ep(
+            moe, ep=1, ep_rank=0, multimodal_enabled=False
+        )
+        all_rows = run(8)
+        live = run(6)
+    np.testing.assert_array_equal(
+        _bits(live[:6].float().numpy()), _bits(all_rows[:6].float().numpy())
+    )
+    np.testing.assert_array_equal(
+        _bits(live[6:].float().numpy()), _bits(shared(x)[6:].float().numpy())
+    )
+
+
+def test_set_live_verify_rows(monkeypatch):
+    fb = SimpleNamespace(
+        num_token_non_padded=torch.tensor(48, dtype=torch.int32),
+        global_num_token_non_padded=torch.tensor(48, dtype=torch.int32),
+        global_num_token_non_padded_cpu=48,
+    )
+    monkeypatch.setattr(op_mod, "is_dsv41_fused_ep_enabled", lambda: False)
+    op_mod.set_live_verify_rows(fb, 6)
+    assert int(fb.num_token_non_padded) == 48
+    monkeypatch.setattr(op_mod, "is_dsv41_fused_ep_enabled", lambda: True)
+    op_mod.set_live_verify_rows(fb, 6)  # one live request x 6 verify rows
+    assert int(fb.num_token_non_padded) == 6
+    assert fb.num_token_non_padded.dtype == torch.int32
+    assert fb.num_token_non_padded.shape == torch.Size([])
+    assert int(fb.global_num_token_non_padded) == 6
+    assert fb.global_num_token_non_padded_cpu == 6
+    op_mod.set_live_verify_rows(fb, 0)  # idle DP rank: in lockstep, routes none
+    assert int(fb.num_token_non_padded) == 0
+    none = SimpleNamespace(num_token_non_padded=None)
+    op_mod.set_live_verify_rows(none, 6)
+    assert none.num_token_non_padded is None

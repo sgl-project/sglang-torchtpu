@@ -1754,7 +1754,20 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input=verify_input,
             host_kv_rows=self.num_verify_rows,
         ) as view:
-            return self._prepare_verify_forward_batch(view, spec_info)
+            forward_batch = self._prepare_verify_forward_batch(view, spec_info)
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_idle():
+            from sglang_tpu.models.deepseek_v41.fused_ep_op import (
+                set_live_verify_rows,
+            )
+
+            # Fused EP routes only the live requests' verify rows; an idle DP
+            # rank still runs the bucket in lockstep but routes none.
+            set_live_verify_rows(
+                forward_batch,
+                verify_input.seq_lens_cpu.shape[0] * self.num_verify_rows,
+            )
+        return forward_batch
 
     def _prepare_verify_forward_batch(
         self, batch: ScheduleBatch, spec_info: SpecInput

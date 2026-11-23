@@ -732,6 +732,33 @@ def real_row_count(forward_batch) -> Optional[torch.Tensor]:
     return forward_batch.num_token_non_padded
 
 
+def set_live_verify_rows(forward_batch, live_tokens: int) -> None:
+    """TARGET_VERIFY: the real rows are the live requests' verify rows.
+
+    The verify batch is built at the padded batch bucket, so init_new counts every
+    row as real; fused EP then routes the padding rows (and every row of an idle DP
+    rank) to experts. Live requests come first, so their rows are the prefix
+    [0, live_tokens). The DP row counts stay physical: every rank still runs the
+    same bucket, only the routing mask changes. A no-op unless fused EP is on and
+    the batch carries the count (attention TP 1, so local == global).
+    """
+    if not is_dsv41_fused_ep_enabled():
+        return
+    if getattr(forward_batch, "num_token_non_padded", None) is None:
+        return
+    from sglang_tpu.host_upload import device_scalar
+
+    count = device_scalar(
+        int(live_tokens),
+        forward_batch.num_token_non_padded.dtype,
+        forward_batch.num_token_non_padded.device,
+    ).reshape(forward_batch.num_token_non_padded.shape)
+    forward_batch.num_token_non_padded = count
+    if getattr(forward_batch, "global_num_token_non_padded", None) is not None:
+        forward_batch.global_num_token_non_padded = count
+        forward_batch.global_num_token_non_padded_cpu = int(live_tokens)
+
+
 def local_gating_logits(
     moe: torch.nn.Module,
     hidden_states: torch.Tensor,
