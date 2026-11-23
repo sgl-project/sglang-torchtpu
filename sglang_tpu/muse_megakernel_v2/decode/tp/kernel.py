@@ -799,10 +799,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
         k.wait_chunk = wait_chunk
 
-        def kv_prologue(geo, l, j):
-            # the request's first geo.kr chunks
+        def kv_prologue(geo, l, j, slot0=0):
+            # the request's first geo.kr chunks, into ring slots from slot0
             _, first_ch, n_ch = req_geom(geo, j)
-            issue_range(geo, l, j, first_ch, 0, jnp.minimum(n_ch, geo.kr))
+            issue_range(geo, l, j, first_ch, slot0, jnp.minimum(n_ch, geo.kr))
 
         k.kv_prologue = kv_prologue
 

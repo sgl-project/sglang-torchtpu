@@ -797,6 +797,12 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(0)
     # Inline refill: each chunk pair's refill DMAs issue one pair later (MKConfig.attn_refill_next_pair).
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR = EnvBool(True)
+    # Decode megakernel (v2): a request's own new rows attended before its chunk loop and merged
+    # after it (MKConfig.attn_own_rows_first). Off: SWA -1% alone, +0.05% with SWA_PREFETCH.
+    SGLANG_TPU_MUSE_MK_ATTN_OWN_ROWS_FIRST = EnvBool(False)
+    # Decode megakernel (v2): sliding-window requests use disjoint ring slots and the next
+    # request's window is issued before this request's chunk loop (MKConfig.attn_swa_prefetch).
+    SGLANG_TPU_MUSE_MK_ATTN_SWA_PREFETCH = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

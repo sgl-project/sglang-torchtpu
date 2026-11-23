@@ -227,6 +227,17 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     is_global, KR_g, cpt_g = geo.is_global, geo.kr, geo.cp * ps
     r0 = pl.multiple_of(j * q, q)
     qg = q * g
+    # SWA window prefetch: request j's chunks take ring slots from (j * W) % KR, W slots apart,
+    # so request j + 1's window can be in flight during request j's chunk loop
+    swa_pre = c.attn_swa_prefetch and is_global is False
+    if swa_pre:
+        W = (c.window + q + cpt_g - 3) // cpt_g + 1
+        assert 2 * W <= KR_g, (W, KR_g)
+        sbase = (j * W) % KR_g
+
+    def ring_slot(i):
+        return (i + sbase) % KR_g if swa_pre else i % KR_g
+
     p_lo, first_ch, n_ch = req_geom(geo, j)
     qrows = rows_at(S["qn_s"], r0, q)  # [q, q_dim]
 
@@ -379,7 +390,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
         every row and skip the position and window masks.
         """
-        slot = i % KR_g
+        slot = ring_slot(i)
         ci = first_ch + i
         kk, vk = chunk_kv(slot)
         live = None if c.packed_attn else colhead == rowhead
@@ -425,11 +436,11 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         i0, i1 = 2 * k, 2 * k + 1
         valid_b = i1 < n_ch
         with _scope("kv_wait"):
-            wait_chunk(geo, i0 % KR_g)
+            wait_chunk(geo, ring_slot(i0))
 
             @pl.when(valid_b)  # an odd tail re-reads chunk i0, already waited for
             def _():
-                wait_chunk(geo, i1 % KR_g)
+                wait_chunk(geo, ring_slot(i1))
 
         s_a, v_a = chunk_scores(i0, True, clean)
         # stream b is always computed (masked past n_ch): a cond around it splits the body
@@ -448,6 +459,73 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
     # Global-layer chunks before a request's last one lie wholly in the past of every
     # verify row: chunks [0, n_clean) need only the cross-head mask.
+    def own_scores():
+        """The request's own new rows: masked scores [rows, keys] and their V rows."""
+        q8 = -(-q // 8) * 8
+        krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
+        vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
+        if c.packed_attn:
+            zrows = (
+                jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
+            )  # Mosaic has no 0-row vectors
+            kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
+            vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
+            nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
+            head_ok = True
+        else:
+            zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
+            kn = jnp.concatenate(
+                [
+                    x
+                    for h in range(hkv)
+                    for x in [krows[:, h * hd : (h + 1) * hd]]
+                    + ([zrows] if q8 > q else [])
+                ],
+                axis=0,
+            )
+            vn = jnp.concatenate(
+                [
+                    x
+                    for h in range(hkv)
+                    for x in [vrows[:, h * hd : (h + 1) * hd]]
+                    + ([zrows] if q8 > q else [])
+                ],
+                axis=0,
+            )
+            ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
+            nt = ncol % q8
+            head_ok = ncol // q8 == rowhead
+        newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
+        for t in range(q):
+            newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
+        live_new = head_ok & (newpos <= rowpos)
+        in_win = _in_window(is_global, rowpos - newpos < c.window)
+        if in_win is not None:
+            live_new = live_new & in_win
+        s_ = jax.lax.dot_general(
+            q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        if sc != 1.0:
+            s_ = s_ * sc
+        return jnp.where(live_new, s_, NEG), vn
+
+    # own rows first: their QK -> exp -> PV latency chain does not wait for the chunk loop;
+    # merged after it in the order online() adds (carry + own)
+    own_first = c.attn_own_rows_first and c.attn_unshifted
+    if own_first:
+        with _scope("own_rows"):
+            s_own, vn_own = own_scores()
+            p_own = jnp.exp2(s_own) if c.attn_exp2 else jnp.exp(s_own)
+            ls_own = jnp.sum(p_own, axis=1, keepdims=True)
+            pv_own = pv(p_own, vn_own, False)
+
+    if swa_pre:
+
+        @pl.when(j + 1 < n_req_live)
+        def _():
+            with _scope("kv_prologue"):
+                kv_prologue(geo, l, j + 1, ((j + 1) * W) % KR_g)
+
     n_clean = _sel(is_global, jnp.maximum(n_ch - 1, 0), 0)
     NS = c.attn_streams
     gls = sorted(c.global_layers)
@@ -1539,62 +1617,26 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     # every ring slot is read and every copy waited for: the next request's first
     # chunks fly during this request's own-row attention (request 0's were requested
     # before the qkv matvec)
-    @pl.when(j + 1 < n_req_live)
-    def _():
-        with _scope("kv_prologue"):
-            kv_prologue(geo, l, j + 1)
+    if not swa_pre:
+
+        @pl.when(j + 1 < n_req_live)
+        def _():
+            with _scope("kv_prologue"):
+                kv_prologue(geo, l, j + 1)
 
     # the request's own new rows (causal within a verify block), padded to a sublane
     # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows
     # (h, t); packed: the projection rows as they are, heads side by side.
     with _scope("own_rows"):
-        q8 = -(-q // 8) * 8
-        krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
-        vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
-        if c.packed_attn:
-            zrows = (
-                jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
-            )  # Mosaic has no 0-row vectors
-            kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
-            vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
-            nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
-            head_ok = True
+        if own_first:
+            assert carry[1].shape[1] == 1, carry[
+                1
+            ].shape  # online() sums own rows per row
+            lsum = carry[1] + ls_own
+            acc = carry[2][:, : pv_own.shape[1]] + pv_own
         else:
-            zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
-            kn = jnp.concatenate(
-                [
-                    x
-                    for h in range(hkv)
-                    for x in [krows[:, h * hd : (h + 1) * hd]]
-                    + ([zrows] if q8 > q else [])
-                ],
-                axis=0,
-            )
-            vn = jnp.concatenate(
-                [
-                    x
-                    for h in range(hkv)
-                    for x in [vrows[:, h * hd : (h + 1) * hd]]
-                    + ([zrows] if q8 > q else [])
-                ],
-                axis=0,
-            )
-            ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
-            nt = ncol % q8
-            head_ok = ncol // q8 == rowhead
-        newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
-        for t in range(q):
-            newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
-        live_new = head_ok & (newpos <= rowpos)
-        in_win = _in_window(is_global, rowpos - newpos < c.window)
-        if in_win is not None:
-            live_new = live_new & in_win
-        s_ = jax.lax.dot_general(
-            q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-        )
-        if sc != 1.0:
-            s_ = s_ * sc
-        _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
+            s_m, vn = own_scores()
+            _, lsum, acc = online(carry, s_m, vn)
         res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
         lanes = (
             (lambda h: slice(h * hd, (h + 1) * hd))
