@@ -23,6 +23,7 @@ from sglang_tpu.fp8_moe import (
     record_tpu_fp8_moe_reload_state,
     restore_tpu_fp8_moe_weights_before_loading,
 )
+from sglang_tpu.rl.fp8_reload import hook_specs
 
 _FP8 = torch.float8_e4m3fn
 
@@ -166,6 +167,10 @@ class TestTpuFp8Reload(unittest.TestCase):
             dequant_w13 - fresh_w13.float()
         ).abs().max() / fresh_w13.float().abs().max()
         self.assertLess(rel_err.item(), 0.08)
+
+    def test_rl_fp8_reload_hook_specs(self):
+        specs = hook_specs()
+        self.assertEqual(len(specs), 5)
 
 
 if __name__ == "__main__":

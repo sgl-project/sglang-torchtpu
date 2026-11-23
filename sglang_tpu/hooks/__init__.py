@@ -43,7 +43,6 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
-from sglang_tpu.hooks.fp8_reload import hook_specs as fp8_reload_hooks
 from sglang_tpu.hooks.glm5_next_vision import (
     attach_glm5_next_nextn_multimodal_forward,
     attach_glm5_next_vision_runner,
@@ -112,6 +111,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 )
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
+from sglang_tpu.rl.fp8_reload import hook_specs as fp8_reload_hooks
 
 logger = logging.getLogger(__name__)
 
