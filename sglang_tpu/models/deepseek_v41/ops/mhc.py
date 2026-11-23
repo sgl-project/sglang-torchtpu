@@ -184,18 +184,23 @@ def fused_target_boundary(hc, y, residual, coefficients, boundary):
     )
 
 
-def can_run_draft(model, x):
+def can_run_draft(model, rows, *, has_input_embeds):
+    if not model.hc_pre_from_prev_sublayer or not _use_shifted_mhc_for_rows(
+        rows.shape[0]
+    ):
+        return False
+    ffn = model.stages[0].ffn_hc
+    if ffn is None or getattr(ffn.norm, _PACKED, None) is None:
+        return False
+
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang_tpu.models.deepseek_v41.kernels.mhc.shifted_post_pre_rms import (
         is_supported_shape,
     )
 
+    hidden_size = rows.shape[-1] if has_input_embeds else ffn.cfg.hidden
     return (
-        x.device.type == "tpu"
-        and model.hc_pre_from_prev_sublayer
-        and _use_shifted_mhc_for_rows(x.shape[0])
-        and getattr(model.stages[0].ffn_hc.norm, _PACKED, None) is not None
-        and is_supported_shape(x.shape[0], model.hc_mult, x.shape[-1])
+        is_supported_shape(rows.shape[0], model.hc_mult, hidden_size)
         and not is_batch_invariant_mode_enabled()
     )
 

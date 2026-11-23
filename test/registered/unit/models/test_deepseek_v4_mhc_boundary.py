@@ -49,8 +49,8 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
         )
         original.reset_mock()
         model = object()
-        hooks.tpu_dsv41_shifted_draft_stages(original, model, None, self.y, None)
-        original.assert_called_once_with(model, None, self.y, None)
+        hooks.tpu_dsv41_shifted_draft_forward(original, model, self.y, None, None, None)
+        original.assert_called_once_with(model, self.y, None, None, None)
 
     def test_target_reads_live_sublayer_after_hook_binding(self):
         owner = torch.nn.Module()
@@ -95,6 +95,84 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
                     )
                 self.assertIs(result, original.return_value)
                 fused.assert_not_called()
+
+    def test_draft_small_bucket_calls_original_before_embedding(self):
+        model = SimpleNamespace(
+            hc_pre_from_prev_sublayer=True, forward_embed=Mock(), _expand_hc=Mock()
+        )
+        ids = SimpleNamespace(device=SimpleNamespace(type="tpu"), shape=(40,))
+        original = Mock()
+        result = hooks.tpu_dsv41_shifted_draft_forward(
+            original, model, ids, None, None, None
+        )
+        original.assert_called_once_with(model, ids, None, None, None)
+        self.assertIs(result, original.return_value)
+        model.forward_embed.assert_not_called()
+        model._expand_hc.assert_not_called()
+
+    def test_draft_forward_hook_uses_embedding_and_head_contract(self):
+        input_ids = SimpleNamespace(device=SimpleNamespace(type="tpu"), shape=(240,))
+        flat_embeds = SimpleNamespace(
+            device=input_ids.device, shape=(240, 5120), dim=lambda: 2
+        )
+        expanded_embeds = SimpleNamespace(
+            device=input_ids.device, shape=(240, 4, 5120), dim=lambda: 3
+        )
+        model = SimpleNamespace(
+            stages=object(),
+            hc_mult=2,
+            forward_embed=Mock(return_value=self.residual),
+            _expand_hc=Mock(return_value=self.residual),
+        )
+        original = Mock()
+        recorder = Mock()
+        recorder.disable_this_region.side_effect = nullcontext
+        for embeds in (None, flat_embeds, expanded_embeds):
+            with self.subTest(embeds=embeds):
+                model.forward_embed.reset_mock()
+                model._expand_hc.reset_mock()
+                with (
+                    patch.object(
+                        tpu_mhc, "can_run_draft", return_value=True
+                    ) as can_run,
+                    patch.object(
+                        tpu_mhc,
+                        "run_draft_stages",
+                        return_value=(self.residual, self.coefficients[0]),
+                    ) as run_stages,
+                    patch(
+                        "sglang.srt.eplb.expert_distribution.get_global_expert_distribution_recorder",
+                        return_value=recorder,
+                    ),
+                    patch(
+                        "sglang.kernels.ops.layernorm.mhc.mhc_combine",
+                        return_value=self.y,
+                    ) as combine,
+                ):
+                    out = hooks.tpu_dsv41_shifted_draft_forward(
+                        original, model, input_ids, None, None, embeds
+                    )
+                rows = input_ids if embeds is None else embeds
+                can_run.assert_called_once_with(
+                    model, rows, has_input_embeds=embeds is not None
+                )
+                stage_input = (
+                    expanded_embeds if embeds is expanded_embeds else self.residual
+                )
+                self.assertIs(run_stages.call_args.args[2], stage_input)
+                self.assertIs(out.hidden_states, self.y)
+                self.assertIsNone(out.next_token_logits)
+                torch.testing.assert_close(
+                    combine.call_args.args[0], self.residual.flatten(1)
+                )
+                self.assertIs(combine.call_args.args[1], self.coefficients[0])
+                self.assertEqual(combine.call_args.args[2:], (2, torch.bfloat16))
+                self.assertEqual(model.forward_embed.call_count, int(embeds is None))
+                self.assertEqual(
+                    model._expand_hc.call_count, int(embeds is flat_embeds)
+                )
+        original.assert_not_called()
+        self.assertEqual(recorder.disable_this_region.call_count, 3)
 
     def test_draft_consumes_boundary_inputs_and_gates_across_stages(self):
         width = 5120

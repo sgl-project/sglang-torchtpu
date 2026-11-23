@@ -934,11 +934,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         elif input_embeds.dim() == 2:
             input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
+        pre = None
         if _is_cuda:
             residual_batch.start(forward_batch)
         # Draft stages do not have recorder layer indices.
         with get_global_expert_distribution_recorder().disable_this_region():
-            x, pre = self._run_stages(positions, x, forward_batch)
+            for stage in self.stages:
+                if _is_cuda:
+                    x = stage(positions, x, forward_batch)
+                else:
+                    x, pre = stage(positions, x, forward_batch, pre)
         if _is_cuda:
             x = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
@@ -951,15 +956,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             # The kernel widens each element to fp32 as it loads it.
             x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
-
-    def _run_stages(self, positions, x, forward_batch):
-        pre = None
-        for stage in self.stages:
-            if _is_cuda:
-                x = stage(positions, x, forward_batch)
-            else:
-                x, pre = stage(positions, x, forward_batch, pre)
-        return x, pre
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
         if self.hc_pre_from_prev_sublayer:

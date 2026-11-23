@@ -99,12 +99,13 @@ tpu_dsv41_refresh_shifted_mhc_after_direct_update
   Remove when: raw weight updates notify the same weight preparation entry
        point as model.post_load_weights.
 
-tpu_dsv41_shifted_mhc, tpu_dsv41_shifted_draft_stages
+tpu_dsv41_shifted_mhc, tpu_dsv41_shifted_draft_forward
   Why: the TPU kernel completes both sides of an mHC boundary and carries
        the next sublayer's gates and normalized input in HcState.
   How: AROUND deepseek_v4_mhc._post_fusion for target and
-       DeepseekV4ForCausalLMDSpark._run_stages for draft. Unsupported sites
-       use the original path. Draft embedding and head stay in the core.
+       DeepseekV4ForCausalLMDSpark._forward_impl for draft. The TPU draft
+       path reuses the model's embedding methods and the existing mHC head
+       operation. Unsupported shapes and configurations call original.
   Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2411
   Remove when: the target boundary and draft stage runner dispatch through
        upstream platform interfaces.
@@ -582,16 +583,20 @@ def tpu_dsv41_shifted_mhc(original, hc, y, residual, coefficients, next):
     return original(hc, y, residual, coefficients, next)
 
 
-def tpu_dsv41_shifted_draft_stages(original, model, positions, x, forward_batch):
-    if x.device.type == "tpu":
-        from sglang_tpu.models.deepseek_v41.ops.mhc import (
-            can_run_draft,
-            run_draft_stages,
-        )
+def tpu_dsv41_shifted_draft_forward(
+    original, model, input_ids, positions, forward_batch, input_embeds
+):
+    rows = input_ids if input_embeds is None else input_embeds
+    if rows.device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.ops.mhc import can_run_draft
 
-        if can_run_draft(model, x):
-            return run_draft_stages(model.stages, positions, x, forward_batch)
-    return original(model, positions, x, forward_batch)
+        if can_run_draft(model, rows, has_input_embeds=input_embeds is not None):
+            from sglang_tpu.models.deepseek_v41.dspark import shifted_draft_forward
+
+            return shifted_draft_forward(
+                model, input_ids, positions, forward_batch, input_embeds
+            )
+    return original(model, input_ids, positions, forward_batch, input_embeds)
 
 
 def tpu_dsv4_fence_hc_mix_stats(original, hc, x):
@@ -936,8 +941,8 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            f"{dspark}._run_stages",
-            tpu_dsv41_shifted_draft_stages,
+            f"{dspark}._forward_impl",
+            tpu_dsv41_shifted_draft_forward,
             HookType.AROUND,
         ),
         (
