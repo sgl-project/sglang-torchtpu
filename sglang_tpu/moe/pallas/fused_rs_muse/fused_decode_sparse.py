@@ -113,7 +113,7 @@ def _env_bool_fallback(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int, bool, bool]:
+def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int, bool, int]:
     import os
 
     nc_split = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512", False)
@@ -4105,6 +4105,8 @@ class Fp8SparseDecodeConfig:
     free_max_w: float = 0.06
     free_min_slot: int = 5
     route_rb16_mode: int = 0
+    route_fast: bool = False
+    fast_plan: int = 0
 
 
 def default_fp8_sparse_decode_config(
@@ -4127,7 +4129,7 @@ def default_fp8_sparse_decode_config(
         pair_rs_ov,
         _,
     ) = _read_sparse_env_overrides()
-    _, _, _, route_rb16_mode = _read_sparse_w9_sub_knobs()
+    _, _, _, route_rb16_mode, route_fast, fast_plan = _read_sparse_w9_sub_knobs()
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
@@ -4153,6 +4155,8 @@ def default_fp8_sparse_decode_config(
         free_max_w=free_max_w,
         free_min_slot=free_min_slot_eff,
         route_rb16_mode=route_rb16_mode,
+        route_fast=route_fast,
+        fast_plan=fast_plan,
         pair_rs=fp8_pair_rs,
     )
     if batch_size <= 16 or use_dense_k2:
@@ -4722,6 +4726,7 @@ def _sparse_fp8_decode_kernel(
             free_max_w=cfg.free_max_w,
             free_min_slot=cfg.free_min_slot,
             route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
+            route_fast=getattr(cfg, "route_fast", None),
         )
         counts_smem = r_scratch.counts_smem
 
@@ -4741,6 +4746,7 @@ def _sparse_fp8_decode_kernel(
             tile_m=tile_m,
             moved_flag_smem=moved_flag_smem,
             vpu_precomputed_loads=(not is_dense and cfg.static_holder_mask),
+            fast_plan=getattr(cfg, "fast_plan", 0),
         )
         if is_dense:
             num_exec = build_dense_exec_plan_smem(
@@ -4761,6 +4767,7 @@ def _sparse_fp8_decode_kernel(
                 holder_slot_expert_smem,
                 r_scratch,
                 spec_slot=spec_slot,
+                fast_plan=bool(getattr(cfg, "fast_plan", 0)),
             )
     else:
         if is_dense:
