@@ -8,6 +8,7 @@ wrappers register when this module is imported; `tpu_platform` imports it.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
@@ -48,11 +49,13 @@ def _check_kda_speculative_decoding(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not get_platform().is_tpu or cfg.speculative_algorithm is None:
         return
-    # The experimental worker verifies these on the TPU KDA checkpoint path
-    # (sglang_tpu.hooks.experimental_spec.kimi_spec_defaults).
+    # The experimental worker verifies these on the TPU KDA checkpoint path,
+    # once load_plugins() has installed the registry hook that skips the GPU
+    # verify pins (sglang_tpu.hooks.experimental_spec.kimi_spec_defaults).
     if (
         cfg.speculative_algorithm in ("DSPARK", "DFLASH")
         and experimental_spec_enabled()
+        and _spec_defaults_are_hooked()
     ):
         return
     # The step builds no model config for an instance connector.
@@ -66,3 +69,12 @@ def _check_kda_speculative_decoding(server_args: Any) -> None:
         "Speculative decoding is not supported for Kimi hybrid (KDA) models "
         "on TPU yet; drop --speculative-algorithm."
     )
+
+
+def _spec_defaults_are_hooked() -> bool:
+    # Entry points that resolve before load_plugins() (bench_offline_throughput,
+    # bench_one_batch) run the unhooked step, which would pin GPU backends.
+    from sglang.srt.arg_groups import kimi_k3_hook
+
+    step = kimi_k3_hook.apply_kimi_k3_spec_backend_defaults
+    return inspect.unwrap(step) is not step

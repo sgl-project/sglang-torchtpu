@@ -5,6 +5,8 @@ and check what the core `arg_groups` handlers resolved before these decisions
 moved into `sglang_tpu.server_args_resolution`.
 """
 
+import contextlib
+import functools
 import json
 import os
 import shutil
@@ -22,6 +24,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.hooks.experimental_spec import kimi_spec_defaults
+from sglang_tpu.platform import TpuOOTPlatform
 from sglang_tpu.server_args_resolution import _reject_kda_speculative_decoding
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -88,6 +91,18 @@ _KIMI_LINEAR = {
 
 _KDA_REJECTION = r"not supported for Kimi hybrid \(KDA\) models on TPU"
 
+# Mode A (in-tree platform) and mode C (out-of-tree platform).
+_TPU_PLATFORMS = (TpuSRTPlatform, TpuOOTPlatform)
+
+
+def _hooked_spec_defaults(original):
+    # The AROUND wrapper load_plugins() installs on a TPU host (HookRegistry).
+    @functools.wraps(original)
+    def wrapper(server_args):
+        return kimi_spec_defaults(original, server_args)
+
+    return wrapper
+
 
 class _TpuResolveCase(CustomTestCase):
     def setUp(self):
@@ -100,34 +115,42 @@ class _TpuResolveCase(CustomTestCase):
 
         self.addCleanup(restore)
 
-    def resolve(self, config, **fields):
+    def resolve(
+        self, config, *, platform=TpuSRTPlatform, plugins_loaded=True, **fields
+    ):
         path = tempfile.mkdtemp(prefix="tpu_server_args_")
         self.addCleanup(shutil.rmtree, path, ignore_errors=True)
         with open(os.path.join(path, "config.json"), "w") as handle:
             json.dump(config, handle)
         if fields.get("speculative_algorithm") is not None:
             fields.setdefault("speculative_draft_model_path", path)
-        original = kimi_k3_hook.apply_kimi_k3_spec_backend_defaults
-        with (
-            override_platform(
-                is_tpu=True,
-                is_cuda=False,
-                is_hip=False,
-                is_musa=False,
-                is_npu=False,
-                is_xpu=False,
-                is_sm100=False,
-            ),
-            patch.object(platforms, "_current_platform", TpuSRTPlatform()),
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                override_platform(
+                    is_tpu=True,
+                    is_cuda=False,
+                    is_hip=False,
+                    is_musa=False,
+                    is_npu=False,
+                    is_xpu=False,
+                    is_sm100=False,
+                )
+            )
+            stack.enter_context(
+                patch.object(platforms, "_current_platform", platform())
+            )
             # Builds the slice environment of a real TPU worker.
-            patch("sglang_tpu.patches._prepare_tpu_env"),
-            # The registry hook sglang_tpu.hooks.register() installs on a TPU host.
-            patch.object(
-                kimi_k3_hook,
-                "apply_kimi_k3_spec_backend_defaults",
-                lambda server_args: kimi_spec_defaults(original, server_args),
-            ),
-        ):
+            stack.enter_context(patch("sglang_tpu.patches._prepare_tpu_env"))
+            if plugins_loaded:
+                stack.enter_context(
+                    patch.object(
+                        kimi_k3_hook,
+                        "apply_kimi_k3_spec_backend_defaults",
+                        _hooked_spec_defaults(
+                            kimi_k3_hook.apply_kimi_k3_spec_backend_defaults
+                        ),
+                    )
+                )
             server_args = ServerArgs(
                 model_path=path, device="tpu", random_seed=42, **fields
             )
@@ -137,10 +160,15 @@ class _TpuResolveCase(CustomTestCase):
 
 class TestKimiHybridSpeculativeDecoding(_TpuResolveCase):
     def test_rejected_without_a_tpu_kda_verify_path(self):
-        for algorithm in ("EAGLE", "NEXTN"):
-            with self.subTest(algorithm=algorithm):
-                with self.assertRaisesRegex(ValueError, _KDA_REJECTION):
-                    self.resolve(_KIMI_LINEAR, speculative_algorithm=algorithm)
+        for platform in _TPU_PLATFORMS:
+            for algorithm in ("EAGLE", "NEXTN"):
+                with self.subTest(platform=platform.__name__, algorithm=algorithm):
+                    with self.assertRaisesRegex(ValueError, _KDA_REJECTION):
+                        self.resolve(
+                            _KIMI_LINEAR,
+                            platform=platform,
+                            speculative_algorithm=algorithm,
+                        )
 
     def test_rejected_dflash_without_the_experimental_worker(self):
         with (
@@ -151,14 +179,30 @@ class TestKimiHybridSpeculativeDecoding(_TpuResolveCase):
                 self.resolve(_KIMI_LINEAR, speculative_algorithm="DFLASH")
 
     def test_experimental_worker_algorithms_resolve_without_gpu_pins(self):
-        for algorithm in ("DSPARK", "DFLASH"):
-            with self.subTest(algorithm=algorithm):
-                server_args = self.resolve(
-                    _KIMI_LINEAR, speculative_algorithm=algorithm
-                )
-                self.assertIsNone(
-                    resolution_result(server_args, "linear_attn_verify_backend")
-                )
+        for platform in _TPU_PLATFORMS:
+            for algorithm in ("DSPARK", "DFLASH"):
+                with self.subTest(platform=platform.__name__, algorithm=algorithm):
+                    server_args = self.resolve(
+                        _KIMI_LINEAR, platform=platform, speculative_algorithm=algorithm
+                    )
+                    self.assertIsNone(
+                        resolution_result(server_args, "linear_attn_verify_backend")
+                    )
+
+    def test_experimental_algorithms_rejected_before_load_plugins(self):
+        """bench_offline_throughput and bench_one_batch resolve before
+        load_plugins() installs the hook that skips the GPU verify pins; there
+        DSPARK and DFLASH are refused, not resolved with a CUDA verify backend."""
+        for platform in _TPU_PLATFORMS:
+            for algorithm in ("DSPARK", "DFLASH"):
+                with self.subTest(platform=platform.__name__, algorithm=algorithm):
+                    with self.assertRaisesRegex(ValueError, _KDA_REJECTION):
+                        self.resolve(
+                            _KIMI_LINEAR,
+                            platform=platform,
+                            plugins_loaded=False,
+                            speculative_algorithm=algorithm,
+                        )
 
     def test_without_speculative_decoding(self):
         server_args = self.resolve(_KIMI_LINEAR)
