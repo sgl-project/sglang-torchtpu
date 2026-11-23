@@ -14,7 +14,11 @@ from typing import Any, Callable, List, Optional, Sequence
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from sglang.srt.mem_cache.memory_pool import (
+    BLOCK_MAJOR,
+    HybridLinearKVPool,
+    KVCache,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.pool_spans import _BLOCK_MAJOR_KV_RANK
@@ -32,7 +36,6 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4SWAKVPool,
 )
 from sglang_tpu.kv_pool import (
-    TpuBlockMajorMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
     TpuSplitMLATokenToKVPool,
 )
@@ -144,22 +147,34 @@ def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
     return PER_LAYER_KV_LAYOUT
 
 
+def _is_block_major(pool) -> bool:
+    # Duck-typed test doubles, which are not KVCaches, are layer-major.
+    return isinstance(pool, KVCache) and pool.kv_pool_layout() == BLOCK_MAJOR
+
+
 def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
     """One bundle per page namespace for a block-major pool, else None.
 
     The bundle row holds every layer of a page, so it is registered whole; its
-    strided per-layer ``kv_buffer`` views are never registered.
+    strided per-layer ``kv_buffer`` views are never registered. An SWA pool is
+    block-major when both its sub-pools are; one block-major sub-pool next to a
+    layer-major one is refused.
     """
-    if isinstance(pool, TpuBlockMajorMHATokenToKVPool):
+    if isinstance(pool, SWAKVPool) and _is_block_major(
+        pool.full_kv_pool
+    ) != _is_block_major(pool.swa_kv_pool):
+        raise ValueError(
+            "an SWA pool's full and SWA sub-pools must both be block-major or "
+            "both layer-major"
+        )
+    if _is_block_major(pool):
         has_layers = pool.layer_num > 0
         groups = RaidenKVCacheGroups(
             full=pool.page_buffers() if has_layers else [],
             swa=[],
             full_layer_ids=[pool.start_layer] if has_layers else [],
         )
-    elif isinstance(pool, SWAKVPool) and isinstance(
-        pool.full_kv_pool, TpuBlockMajorMHATokenToKVPool
-    ):
+    elif isinstance(pool, SWAKVPool) and _is_block_major(pool.full_kv_pool):
         mapping = pool.layers_mapping
         full_ids = sorted(layer for layer, (_, swa) in mapping.items() if not swa)
         swa_ids = sorted(layer for layer, (_, swa) in mapping.items() if swa)
