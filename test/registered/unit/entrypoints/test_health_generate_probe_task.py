@@ -18,7 +18,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import HealthCheckOutput
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager

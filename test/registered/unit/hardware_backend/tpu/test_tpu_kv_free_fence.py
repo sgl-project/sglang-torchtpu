@@ -42,6 +42,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
@@ -141,6 +142,8 @@ class TestKVFreeFence(CustomTestCase):
 
         tree_cache = SimpleNamespace(
             token_to_kv_pool_allocator=self.allocator,
+            # No request rows: these allocations take token slots only.
+            req_to_token_pool=None,
             supports_prefix_sharing=lambda: False,
         )
         alloc_token_slots(tree_cache, num_tokens=PAGE)
@@ -379,7 +382,7 @@ class TestOverlapLoopWiring(CustomTestCase):
         ]
         scheduler = Mock(
             gracefully_exit=False,
-            _engine_paused=False,
+            pause_state=SimpleNamespace(paused=False, may_launch=lambda: True),
             enable_unified_memory=False,
             is_generation=True,
             running_batch=None,
@@ -399,7 +402,8 @@ class TestOverlapLoopWiring(CustomTestCase):
             "get_next_disagg_decode_batch_to_run",
         ):
             getattr(scheduler, name).side_effect = list(plans)
-        scheduler.is_disable_overlap_for_batch.side_effect = [
+        # disable_overlap: batch A's result is processed before B launches.
+        scheduler.should_process_last_batch_early.side_effect = [
             False,
             disable_overlap,
             False,
@@ -416,7 +420,9 @@ class TestOverlapLoopWiring(CustomTestCase):
         scheduler.launch_batch_sample_if_needed.side_effect = [None, None, _StopLoop]
         with self.assertRaises(_StopLoop):
             loop(scheduler)
-        self.assertEqual(held_at_processing, [0, 2])
+        # Processed early, A's result frees its pages before B forms, so B
+        # cannot write them and nothing is held; otherwise they wait for B.
+        self.assertEqual(held_at_processing, [0, 0] if disable_overlap else [0, 2])
         self.assertEqual(allocator.held_pages.num_pages, 0)
         self.assertEqual(log, ["copy_done", "copy_done"])
 
@@ -470,7 +476,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=PAGE,
                 eviction_policy="lru",
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 # The fence's release stamps live in the Python core, which a TPU
                 # allocator always resolves to; this CPU one would pick Rust.
                 tree_core_backend="python",
@@ -686,7 +692,7 @@ class TestPPLoopWiring(CustomTestCase):
                 )
             return SimpleNamespace(running_batch=None, batch_to_run=batch)
 
-        def intake():
+        def intake(**_):
             issued_at_intake.append(list(issued))
             if len(issued_at_intake) > 3:
                 raise _StopLoop
@@ -702,6 +708,9 @@ class TestPPLoopWiring(CustomTestCase):
             scheduler.launch_event = None
 
         scheduler = Scheduler.__new__(Scheduler)
+        Scheduler.init_pause_state(scheduler)
+        scheduler._war_barrier_enabled = False
+        scheduler.invariant_checker = Mock()
         scheduler.pp_kv_free_fence = fence
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.init_pp_loop_state = init_loop_state
@@ -718,6 +727,7 @@ class TestPPLoopWiring(CustomTestCase):
             "_pp_process_batch_result",
             "_pp_send_proxy",
             "on_idle",
+            "increment_scheduler_iterations",
         ):
             setattr(scheduler, name, Mock())
 
@@ -768,6 +778,9 @@ class TestPPLoopWiring(CustomTestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.pp_kv_free_fence = fence
+        Scheduler.init_pause_state(scheduler)
+        scheduler._war_barrier_enabled = False
+        scheduler.invariant_checker = Mock()
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.enable_staging = False
         scheduler.disagg_prefill_inflight_queue = []
@@ -798,7 +811,9 @@ class TestPPLoopWiring(CustomTestCase):
             "_pp_process_batch_result",
             "_pp_send_proxy",
             "_pp_process_freeze_gc",
+            "process_bootstrapped_queue",
             "on_idle",
+            "increment_scheduler_iterations",
         ):
             setattr(scheduler, name, Mock())
 
@@ -817,7 +832,7 @@ class TestPPFenceGate(CustomTestCase):
     it, with a TPU DMA HiCache backend; every other server keeps none."""
 
     def _scheduler(self, *, device="tpu", mode="prefill", dma=True):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.device = device

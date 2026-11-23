@@ -25,33 +25,49 @@ class TestRetractionDefersOnlyNewAdmissions(CustomTestCase):
                 retracted = SimpleNamespace(rid="retracted")
                 prealloc_queue = SimpleNamespace(
                     retracted_queue=[retracted],
-                    resume_retracted_reqs=lambda: [],
-                    pop_preallocated=Mock(return_value=([], [])),
+                    move_resumed=lambda dst: [],
+                    move_preallocated=Mock(return_value=([], [])),
+                    publish_pending_destinations=Mock(),
                 )
+                arrivals = [[transferred], []]
+
+                def move_transferred(dst):
+                    reqs = arrivals.pop(0)
+                    dst.extend(reqs)
+                    return reqs
+
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.scheduler_stage_metrics = None
                 scheduler.enable_decode_hicache = False
                 scheduler.enable_hisparse = False
+                scheduler.tree_cache = SimpleNamespace(linker=None)
                 scheduler.waiting_queue = []
                 scheduler.disagg_decode_prealloc_queue = prealloc_queue
-                scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+                transfer_queue = SimpleNamespace(
+                    queue=[],
                     resolve_deferred_releases=Mock(),
-                    pop_transferred=Mock(side_effect=[[transferred], []]),
-                    extend=Mock(),
+                    publish_pending_metadata=Mock(),
+                    move_transferred=move_transferred,
                 )
+                scheduler.disagg_decode_transfer_queue = transfer_queue
 
                 scheduler.process_decode_queue()
                 self.assertEqual(scheduler.waiting_queue, [transferred])
-                prealloc_queue.pop_preallocated.assert_not_called()
+                prealloc_queue.move_preallocated.assert_not_called()
 
                 # The retracted request now fits. Resume drains retracted_queue
                 # inside the call, so admissions reopen in this same iteration.
-                prealloc_queue.resume_retracted_reqs = lambda: [
-                    prealloc_queue.retracted_queue.pop()
-                ]
+                def move_resumed(dst):
+                    resumed = [prealloc_queue.retracted_queue.pop()]
+                    dst.extend(resumed)
+                    return resumed
+
+                prealloc_queue.move_resumed = move_resumed
                 scheduler.process_decode_queue()
                 self.assertEqual(scheduler.waiting_queue, [transferred, retracted])
-                prealloc_queue.pop_preallocated.assert_called_once_with()
+                prealloc_queue.move_preallocated.assert_called_once_with(
+                    transfer_queue.queue
+                )
 
 
 if __name__ == "__main__":

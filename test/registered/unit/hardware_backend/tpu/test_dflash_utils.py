@@ -15,6 +15,7 @@ import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
 import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
@@ -284,7 +285,7 @@ def test_resolve_seq_lens_cpu_still_syncs_without_the_committed_flag():
 def _prepare_batch(req_to_token: torch.Tensor):
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=64, kv_committed_len=committed),
+            kv=ReqKvInfo(kv_allocated_len=64, kv_committed_len=committed),
             sampling_params=SimpleNamespace(top_k=1),
             decode_batch_idx=0,
             lora_id=None,

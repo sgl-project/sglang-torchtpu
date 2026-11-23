@@ -506,6 +506,61 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                 )
 
+    def test_repeated_decode_keeps_cached_keys(self):
+        """Decoding one step again and again, over a batch that needs more kernel
+        tiles than KV buffers, leaves every cached key and value as it was."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+            ragged_paged_attention,
+        )
+
+        kv_layout = configs.KVLayout.SEQ_ALONG_LANE
+        num_q_heads, num_kv_heads, head_dim = 16, 8, 128
+        # 44 one-page KV blocks, 11 tiles of 4: rows on their first or second page.
+        kv_lens = (211,) * 4 + (354,) * 4 + (258,) * 4 + (279, 279, 279, 247, 279)
+        kv_lens += (247,) * 3 + (236,) * 4 + (246,) * 4 + (247,) * 4
+        num_seqs, pages_per_seq = len(kv_lens), 2
+        # Page 0 stays unused, as in the engine's pool.
+        num_pages = 1 + num_seqs * pages_per_seq
+        page_indices = np.arange(1, num_pages, dtype=np.int32)
+        page_indices = page_indices.reshape(num_seqs, pages_per_seq)
+        rng = np.random.default_rng(0)
+
+        def _values(*shape):
+            values = rng.standard_normal(shape, dtype=np.float32)
+            return _round_through(values, jnp.bfloat16)
+
+        fused = _values(num_pages, self.PAGE_SIZE, 2 * num_kv_heads, head_dim)
+        q = _values(num_seqs, num_q_heads, head_dim)
+        new_k = jnp.asarray(_values(num_seqs, num_kv_heads, head_dim), jnp.bfloat16)
+        new_v = jnp.asarray(_values(num_seqs, num_kv_heads, head_dim), jnp.bfloat16)
+        cache = _kv_cache_to_kernel(fused, jnp.bfloat16, kv_layout)
+        # A bad buffer order tears a page on about 1 call in 400 (measured on v7x);
+        # a torn page stays torn, so one check after 2000 calls sees it.
+        for _ in range(2000):
+            _, cache = ragged_paged_attention(
+                jnp.asarray(q, dtype=jnp.bfloat16),
+                new_k,
+                new_v,
+                cache,
+                jnp.asarray(kv_lens, dtype=jnp.int32),
+                jnp.asarray(page_indices.reshape(-1)),
+                jnp.arange(num_seqs + 1, dtype=jnp.int32),
+                jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
+                sm_scale=1.0 / math.sqrt(head_dim),
+                kv_layout=kv_layout,
+            )
+
+        updated = _kv_cache_from_kernel(cache, 2 * num_kv_heads, head_dim, kv_layout)
+        cached = np.zeros((num_pages, self.PAGE_SIZE), dtype=bool)
+        for row_pages, kv_len in zip(page_indices, kv_lens):
+            positions = np.arange(kv_len - 1)
+            pages = row_pages[positions // self.PAGE_SIZE]
+            cached[pages, positions % self.PAGE_SIZE] = True
+        np.testing.assert_array_equal(updated[cached], fused[cached])
+
     def test_seq_along_lane_packed_extend(self):
         for use_sink, sliding_window in ((False, None), (True, 128)):
             with self.subTest(use_sink=use_sink, sliding_window=sliding_window):
@@ -548,15 +603,20 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                 )
 
     def _check_prefill_tiles(self, variants):
-        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows) variant."""
+        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows,
+        (k_scale, v_scale)) variant."""
         import jax
 
         from sglang_tpu.envs import envs as tpu_envs
 
-        for env, windows in variants:
+        for env, windows, (k_scale, v_scale) in variants:
             for sliding_window in windows:
                 with (
-                    self.subTest(env=env, sliding_window=sliding_window),
+                    self.subTest(
+                        env=env,
+                        sliding_window=sliding_window,
+                        kv_scales=(k_scale, v_scale),
+                    ),
                     unittest.mock.patch.dict(os.environ, env),
                 ):
                     # The wrapper reads the flags while tracing; drop cached traces.
@@ -566,38 +626,43 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                         seqs=self.EXTEND_SEQS,
                         padded_tokens=self.EXTEND_TOKENS,
                         kv_dtype_name="float8_e4m3fn",
-                        k_scale=1.0,
-                        v_scale=1.0,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
                         sliding_window=sliding_window,
                         seq_along_lane=True,
                     )
         jax.clear_caches()
 
     def test_seq_along_lane_softmax_variants(self):
-        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone."""
+        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone.
+
+        Ones-in-V also runs with a v scale other than 1, which must scale the output
+        but not the row sums riding in the accumulator."""
         # Each variant recompiles; the combination is covered by the transposed test.
         self._check_prefill_tiles(
             (
-                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,)),
-                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,)),
-                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,)),
+                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (1.0, 1.0)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,), (0.5, 0.25)),
+                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,), (1.0, 1.0)),
             )
         )
 
     def test_seq_along_lane_transposed(self):
-        """The transposed prefill tile (scores^T, split fp8 q), alone and with every other tile."""
+        """The transposed prefill tile (scores^T, split fp8 q), alone, with every other
+        tile, and with KV scales other than 1, which it must apply. The sequences end in
+        partial q blocks, whose padded compute blocks the tile skips."""
+        all_tiles = {
+            "SGLANG_TPU_RPA_TRANSPOSED": "1",
+            "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+            "SGLANG_TPU_RPA_ONES_V": "1",
+        }
         self._check_prefill_tiles(
             (
-                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,)),
-                (
-                    {
-                        "SGLANG_TPU_RPA_TRANSPOSED": "1",
-                        "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
-                        "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
-                        "SGLANG_TPU_RPA_ONES_V": "1",
-                    },
-                    (None, 128),
-                ),
+                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,), (1.0, 1.0)),
+                (all_tiles, (None, 128), (1.0, 1.0)),
+                (all_tiles, (None,), (0.5, 0.25)),
             )
         )
 

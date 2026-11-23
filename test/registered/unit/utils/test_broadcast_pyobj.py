@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.utils.common import (
+from sglang.srt.utils.process_group import (
     _PYOBJ_TENSOR_BUFFER_MIN_BYTES,
     _dumps_with_tensor_buffers,
     _loads_with_tensor_buffers,

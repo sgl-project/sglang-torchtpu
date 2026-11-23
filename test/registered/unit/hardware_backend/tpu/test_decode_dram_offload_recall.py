@@ -30,6 +30,9 @@ from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks import (
     DecodeDramOffloadExtension,
     PrefillDramOffloadExtension,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    register_host_page_metadata,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller import (
     PrefillDramPrefixPuller,
 )
@@ -76,6 +79,21 @@ class TestRecallLifecycle(
     """The scheduler-step lifecycle of one recall on the prefill: offer, plan,
     allocate at READY, read, agree, insert, and the host pin that keeps the
     recalled pages until admission has taken the request."""
+
+    def test_missing_metadata_discards_the_recall_without_leaking_host_pages(self):
+        mgr = self._scripted()
+        cache, _, puller = self._build(host_capacity=32, mgr=mgr)
+        req = self._req()
+        self._advance_to_pulling(puller, mgr, req)
+        mgr.read_done = True
+        puller.advance([req], waiting_reqs=[])
+        mgr.restore_host_metadata.side_effect = RuntimeError("missing page tags")
+        self.assertFalse(puller.insert_recalled_host_prefix(req))
+        puller.free_settled_host_landings()
+        self.assertEqual(cache.cache_controller.host.available_size(), 32)
+        self.assertEqual(host_hit(cache, list(req.origin_input_ids)), 0)
+        self.assertFalse(puller.holds_host_landing_pages())
+        self.assertEqual(puller.stats["failed"], 1)
 
     def test_recall_runs_from_offer_to_a_pinned_host_node(self):
         mgr = self._scripted()
@@ -387,7 +405,9 @@ class TestEnginesAreValidatedAtStart(CustomTestCase):
         }
         self.assertIn(("PrefillBootstrapQueue", "_init_kv_manager"), installed)
         self.assertIn(("DecodePreallocQueue", "_init_kv_manager"), installed)
-        self.assertIn(("DecodeTransferQueue", "pop_transferred"), installed)
+        self.assertIn(
+            ("DecodeTransferQueue", "move_transferred_with_outcomes"), installed
+        )
         self.assertIn(
             ("SchedulerWeightUpdaterManager", "release_memory_occupation"), installed
         )
@@ -585,6 +605,50 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
         decode.source.settle_offers()
         decode.landing.advance()
 
+    def test_export_failure_releases_prefill_bootstrap_without_a_timeout(self):
+        p, d = self._engine(prefill_manager()), self._engine(decode_manager())
+        prefill = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(p.ctx), push=PrefillDramVictimPusher(p.ctx)
+        )
+        register_host_page_metadata(
+            d.host,
+            export=MagicMock(side_effect=RuntimeError("unsealed source")),
+            restore=MagicMock(),
+        )
+        req = pushed_req(room=ROOM, tokens=[1, 2, 3, 4, 5])
+        sender = sender_on(p.mgr)
+        d.mgr.dram_offload_channel.offer_resident_prefix(ROOM, [3, 4])
+        d.mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+        with SWITCH.override(True):
+            self._deliver(d, p)
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+        self._prefill_step(prefill, [req])
+        with self.assertLogs("sglang_tpu.disaggregation.raiden", level="ERROR"):
+            self._deliver(p, d)
+        self._deliver(d, p)
+        self._prefill_step(prefill, [req])
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(p.host.used, 0)
+        self.assertFalse(d.mgr.room_has_active_io(ROOM))
+        self.assertFalse(p.mgr.is_failed(ROOM))
+
+    def test_host_eviction_and_local_backup_do_not_forward_old_page_tags(self):
+        d = self._engine(decode_manager())
+        old_tokens, new_tokens = list(range(8)), list(range(100, 108))
+        indices = d.host.alloc(8)
+        radix_host_ops.insert_host_prefix(
+            d.cache, RadixKey(array("q", old_tokens)), indices, 1
+        )
+        d.mgr.dram_offload_channel.restore_host_metadata(list(range(8)), [b"old"] * 8)
+        d.cache.evict_host(8, FULL)
+        self.assertEqual(d.host.used, 0)
+        insert_tokens(d.cache, d.allocator, new_tokens)
+        d.cache.evict(EvictParams(num_tokens=8))
+        self.assertEqual(host_hit(d.cache, new_tokens), 8)
+        self.assertEqual(
+            d.mgr.dram_offload_channel.export_host_metadata(list(range(8))), []
+        )
+
     def test_cold_branch_is_pushed_to_the_decode_and_recalled_when_it_returns(self):
         p, d = self._engine(prefill_manager()), self._engine(decode_manager())
         prefill = PrefillDramOffloadExtension(
@@ -702,6 +766,15 @@ class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
             source=DecodeDramPrefixOfferer(d.ctx, queue),
         )
         session = list(range(4 * page))
+        full_tags = {i: b"full" + bytes([i]) for i in range(4)}
+        swa_tags = {i: b"window" + bytes([i]) for i in range(2)}
+        expected_full, expected_swa = full_tags.copy(), swa_tags.copy()
+        for pool, tags in ((p.host, full_tags), (p.swa_host, swa_tags)):
+            register_host_page_metadata(
+                pool,
+                export=lambda pages, tags=tags: [tags[i] for i in pages],
+                restore=lambda pages, rows, tags=tags: tags.update(zip(pages, rows)),
+            )
 
         # The prefill holds the session and its last window in host RAM only.
         radix_host_ops.insert_host_prefix(
@@ -719,6 +792,8 @@ class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
         self._deliver(p, d)
         (push,) = d.mgr.dram_offload_channel.received_pushes().values()
         self.assertEqual((len(push.blocks), len(push.swa_blocks)), (4, 2))
+        self.assertEqual(push.page_metadata, list(expected_full.values()))
+        self.assertEqual(push.swa_page_metadata, list(expected_swa.values()))
         for _ in range(decode_dram_victim_receiver._CADENCE):
             self._decode_step(decode)
         self.assertEqual((d.host.used, d.swa_host.used), (len(session), window))
@@ -736,6 +811,8 @@ class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
         self.assertEqual(prefill.push.stats["stored"], 1)
         p.cache.evict_host(len(session), FULL)
         self.assertEqual(p.host.used, 0)
+        full_tags.update({i: b"stale" for i in full_tags})
+        swa_tags.update({i: b"stale" for i in swa_tags})
 
         # The session returns one page longer: the decode offers its four
         # pages with the window that ends there, and the prefill takes both.
@@ -765,6 +842,8 @@ class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
         self._commit(prefill, req)
         self.assertEqual(prefill.recall.stats["pulled_tokens"], len(session))
         self.assertEqual((p.host.used, p.swa_host.used), (len(session), window))
+        self.assertEqual(full_tags, expected_full)
+        self.assertEqual(swa_tags, expected_swa)
 
 
 class TestReceivedPagesBackUpDeviceOnlyNodes(CustomTestCase):
@@ -952,7 +1031,9 @@ class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
                 queue, _ = self._queue(*rids)
                 calls = []
                 upstream = MagicMock(
-                    side_effect=lambda q, r: calls.append("pop") or ["transferred"]
+                    side_effect=lambda q, d, r: (
+                        calls.append("pop") or (["transferred"], {})
+                    )
                 )
                 offload = SimpleNamespace(source=MagicMock())
                 offload.source.close_departed_offers.side_effect = lambda: calls.append(
@@ -961,11 +1042,13 @@ class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
                 with patch.object(
                     dram_offload_hooks, "_extension", return_value=offload
                 ):
-                    result = dram_offload_hooks._pop_transferred(upstream, queue, ["b"])
-                self.assertEqual(result, ["transferred"])
+                    result = dram_offload_hooks._move_transferred_with_outcomes(
+                        upstream, queue, "dst", {"b": False}
+                    )
+                self.assertEqual(result, (["transferred"], {}))
                 # A request can leave by abort while the queue is empty of work.
                 self.assertEqual(calls, ["pop", "release"])
-                upstream.assert_called_once_with(queue, ["b"])
+                upstream.assert_called_once_with(queue, "dst", {"b": False})
 
 
 if __name__ == "__main__":

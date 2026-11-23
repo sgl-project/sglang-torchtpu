@@ -251,7 +251,10 @@ def test_tp4_ep2_initialization_stays_inside_replica(monkeypatch, rank):
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     monkeypatch.setattr(dist, "get_world_size", lambda: 8)
-    create_group = Mock(side_effect=lambda *args, **kwargs: object())
+    # CPU groups: teardown releases symmetric workspaces by group name.
+    create_group = Mock(
+        side_effect=lambda ranks, **kwargs: SimpleNamespace(group_name=f"cpu{ranks}")
+    )
     destroy_group = Mock()
     monkeypatch.setattr(dist, "new_group", create_group)
     monkeypatch.setattr(dist, "destroy_process_group", destroy_group)

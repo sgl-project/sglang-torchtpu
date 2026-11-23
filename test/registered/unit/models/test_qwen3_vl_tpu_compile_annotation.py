@@ -73,17 +73,23 @@ def _stub_tpu_modules():
 class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
     def test_qwen3_vl_decoder_policy_is_attached_to_class_forward(self):
         import sglang.srt.platforms as platforms
-        import sglang.srt.utils.common as common
+        import sglang.srt.utils.device as device_utils
 
         module_name = "sglang.srt.models.qwen3_vl"
+        # Import qwen3_vl's dependencies on the real platform first, so only
+        # qwen3_vl itself is evaluated under the fake TPU platform.
+        importlib.import_module("sglang.srt.layers.attention.vision")
         old_module = sys.modules.pop(module_name, None)
-        common.is_cpu.cache_clear()
-        common.is_npu.cache_clear()
-        common.is_tpu.cache_clear()
+        device_utils.is_cpu.cache_clear()
+        device_utils.is_npu.cache_clear()
+        device_utils.is_tpu.cache_clear()
 
         try:
+            fake_platform = FakeTpuPlatform()
             with (
-                patch.object(platforms, "_current_platform", FakeTpuPlatform()),
+                patch.object(platforms, "_current_platform", fake_platform),
+                # device.is_tpu() reads the platform bound at its import.
+                patch.object(device_utils, "current_platform", fake_platform),
                 patch.dict(sys.modules, _stub_tpu_modules()),
             ):
                 qwen3_vl = importlib.import_module(module_name)
@@ -129,9 +135,9 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
             sys.modules.pop(module_name, None)
             if old_module is not None:
                 sys.modules[module_name] = old_module
-            common.is_cpu.cache_clear()
-            common.is_npu.cache_clear()
-            common.is_tpu.cache_clear()
+            device_utils.is_cpu.cache_clear()
+            device_utils.is_npu.cache_clear()
+            device_utils.is_tpu.cache_clear()
 
 
 if __name__ == "__main__":

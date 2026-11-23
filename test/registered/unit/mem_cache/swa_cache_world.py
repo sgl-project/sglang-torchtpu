@@ -13,15 +13,18 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=0, suite="base-a-test-cpu", disabled="SWA cache test helper")
 
@@ -29,6 +32,7 @@ register_cpu_ci(est_time=0, suite="base-a-test-cpu", disabled="SWA cache test he
 # four 16-token pages and reads [seqlen - 64, seqlen).
 PAGE, WINDOW = 16, 63
 SWA = ComponentType.SWA
+SWA_POOL = BaseSWAKVPool.WINDOW_SUB_POOL
 POISON = 30000.0  # large finite poison (a NaN would hide in comparisons)
 
 
@@ -102,6 +106,10 @@ class KVWorld:
             kvcache=self.kv_pool,
             need_sort=False,
         )
+        # As the cache builder does: the storage owns the window's kept tail.
+        kv_storage_of(self.req_to_token_pool, self.allocator).bind_window_retention(
+            WINDOW, None
+        )
         # The helpers read tree nodes (tree_core.node_by_id), which only the
         # Python TreeCore exposes; TPU always uses it. pin_python=False leaves
         # the backend to the deployment's selection.
@@ -117,7 +125,9 @@ class KVWorld:
                     page_size=PAGE,
                     disable=False,
                     sliding_window_size=WINDOW,
-                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.SWA), window=WINDOW
+                    ),
                     eviction_policy="lru",
                 )
             )
@@ -188,7 +198,16 @@ class KVWorld:
         req.decode_batch_idx = getattr(req, "decode_batch_idx", 0) + 1
 
     def evict(self, swa_tokens: int, full_tokens: int = 0) -> None:
-        self.cache.evict(EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens))
+        self.cache.evict(
+            EvictParams(
+                num_tokens=full_tokens, window_num_tokens={SWA_POOL: swa_tokens}
+            )
+        )
+
+    def device_indices(self, match) -> torch.Tensor:
+        """The KV slots of a match's device prefix."""
+        path = self.cache.path_device_indices(match.last_device_node)
+        return path[: match.device_prefix_len]
 
     def match(self, tokens: list[int]):
         return self.cache.match_prefix(

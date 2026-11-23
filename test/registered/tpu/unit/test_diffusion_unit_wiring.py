@@ -40,6 +40,8 @@ _PARTLY_WIRED = {
     "test_platform_detection": "the rest are upstream CUDA detection",
     "test_minimax_h3_encoder_device": "the rest check the encoder device under "
     "CPU offload on a mocked CUDA device",
+    "test_wan_temb_table_slices": "the rest build Wan/LongLive2 DiTs under the unit "
+    "package's conftest model-parallel fixture, which the TPU wrappers do not load",
 }
 
 # Core test files the TPU path filter matches that no TPU wrapper runs, with why.

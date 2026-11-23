@@ -25,6 +25,7 @@ with a closed-pools-only causal mask.
 """
 
 import logging
+import math
 from typing import Any
 
 import jax
@@ -137,6 +138,142 @@ def _raw_page_slot(
     return page, pos % loc["page_size"]
 
 
+def _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs):
+    """``raw_cache.at[page, slot].set(raw, mode="drop")`` a page at a time.
+
+    A request fills consecutive slots of pages no other request writes, so a
+    step is one run of rows per (request, page), each on its own page. The
+    runs' pages are read into a small buffer, the rows scattered there (far
+    cheaper on a small table than on the cache), and written back by one scatter.
+    """
+    num_raw = raw_cache.shape[0]
+    tok = jnp.arange(raw.shape[0], dtype=jnp.int32)
+    first = valid & ((tok == 0) | (req != jnp.roll(req, 1)) | (slot == 0))
+    run = jnp.where(valid, jnp.cumsum(first) - 1, max_runs)
+    run_page = jnp.full((max_runs,), num_raw, page.dtype)
+    run_page = run_page.at[run].set(page, mode="drop")
+    pages = raw_cache[jnp.minimum(run_page, num_raw - 1)]
+    pages = pages.at[run, slot].set(raw, mode="drop")
+    return raw_cache.at[run_page].set(pages, mode="drop")
+
+
+def _should_use_page_write(
+    num_tokens: int, num_seqs: int, num_raw: int, page_size: int, raw_dim: int
+) -> bool:
+    """Picks ``_write_raw_pages`` when its worst-case TPU7x cycle estimate beats row scatter.
+
+    Models XLA's three scatter lowerings (in-VMEM, sort+stream, per-row RMW) at
+    trace time using worst-case active runs ``R = T // page_size + 2 * S``
+    (validated on Ghostfish TPU7x in cl/1027000430).
+
+    Args:
+        num_tokens: Padded token count in the step.
+        num_seqs: Static max concurrent sequence slots.
+        num_raw: Total pages in ``raw_cache``.
+        page_size: Slots per page.
+        raw_dim: Row width in bf16 elements (``2 * head_dim``).
+    """
+    if num_tokens <= 16 or num_seqs <= 0 or num_raw <= 0:
+        return False
+    # TPU7x DMA latency (cycles) / bandwidth (B/cycle) and VMEM budgets.
+    dma_in, dma_out, dma_smem, bw, bw_smem = 692.0, 594.0, 722.0, 1688.0, 32.0
+    vmem_window_staging = 32 * 1024 * 1024 * 39 // 40  # 32 MiB, leaving 1/40 headroom
+    vmem_staging_bytes = 32704 * 1024  # ~31.9 MiB before staging spills to HBM
+    old_sort, new_sort = 9000.0, 15000.0  # one-time sort+stream index sort
+    old_fmt, new_fmt = 55.0, 125.0  # VMEM bf16 <-> f32 unpack/repack per page
+    old_row, new_row = 10.4, 9.5  # in-VMEM row update cycles
+    rw_passes, rand_cyc = 2.0, 38.0  # HBM read+write passes, non-contiguous penalty
+    row_b, page_b = float(raw_dim * 2), float(page_size * raw_dim * 2)
+    tile_b = 8.0 * row_b  # default T(8,128)(2,1) copies an 8-row tile per RMW
+    n_win = max(
+        1,
+        (vmem_window_staging - 2 * min(512, num_tokens) * raw_dim * 4)
+        // (page_size * raw_dim * 4),
+    )
+    log2_t = max(1, math.ceil(math.log2(max(2, num_tokens))))
+    t, r = num_tokens, num_tokens // page_size + 2 * num_seqs
+    fits = r * page_b + t * row_b <= vmem_staging_bytes
+
+    def branch(n_pages: int) -> str:
+        if t < 1024:
+            return "per-row"
+        if n_pages <= n_win:
+            return "in-vmem"
+        sort_cost = 11 * t + page_size * n_pages + int(0.01 * t * log2_t * log2_t)
+        return "sort+stream" if sort_cost < 80 * t else "per-row"
+
+    old_br, new_br = branch(num_raw), branch(r)
+    if old_br == "in-vmem" or (new_br == "per-row" and not fits):
+        return False
+
+    # Old path: raw_cache.at[page, slot].set(raw).
+    if old_br == "sort+stream":
+        old_cyc = (
+            old_sort
+            + math.ceil(num_raw / n_win) * (dma_in + dma_out)
+            + rw_passes * num_raw * page_b / bw
+            + old_fmt * num_raw
+            + old_row * t
+        )
+    else:
+        iters = math.ceil(t / 16.0)
+        uniq = min(t, math.ceil(t / 8.0) + 1) if t < 256 else t
+        smem = math.ceil(t / 256) * (dma_smem + 1024.0 / bw_smem)
+        dma = (
+            iters * (dma_in + dma_out)
+            + (t * (tile_b + row_b) + uniq * tile_b) / bw
+            + ((t + uniq) * rand_cyc if uniq > 16 else uniq * 15.0)
+        )
+        tc = iters * (1860.0 if uniq > 16 else 650.0)
+        old_cyc = max(6500.0, smem + dma + tc - (8000.0 if t >= 256 else 0.0))
+
+    # Step 1: run-id cumsum and run_page scatter.
+    s1 = dma_smem + 4.0 * t / bw_smem + 1.5 * t + 6.0 * r
+    # Step 2: gather R pages HBM -> VMEM (plus HBM spill if > VMEM).
+    s2_dma = (
+        math.ceil(r / 16.0) * dma_in
+        + r * page_b / bw
+        + r * (rand_cyc if t >= 1024 else 12.0)
+    )
+    if not fits:
+        s2_dma += math.ceil(r / 16.0) * dma_out + r * page_b / bw
+    s2 = dma_smem + 4.0 * r / bw_smem + max(s2_dma, 24.0 * r)
+    # Step 3: row scatter into the [R, page_size, raw_dim] staging buffer.
+    if new_br == "in-vmem":
+        s3 = 5000.0 + dma_in + t * row_b / bw + new_fmt * r + new_row * t
+    elif new_br == "sort+stream":
+        nw = math.ceil(r / n_win)
+        if fits:
+            s3 = (
+                new_sort
+                + nw * 2500.0
+                + dma_in
+                + t * row_b / bw
+                + 155.0 * r
+                + new_row * t
+            )
+        else:
+            s3 = (
+                new_sort
+                + nw * (dma_in + dma_out)
+                + rw_passes * r * page_b / bw
+                + 65.0 * r
+                + new_row * t
+            )
+    else:
+        s3 = dma_smem + math.ceil(t / 16.0) * 1560.0
+    # Step 4: scatter R updated pages VMEM -> HBM (worst case R_act = R).
+    scan = 95.0 if (t >= 1024 or not fits) else 45.0
+    s4 = (
+        dma_smem
+        + 4.0 * r / bw_smem
+        + (scan + 85.0) * r
+        + math.ceil(r / 16.0) * dma_out
+        + r * page_b / bw
+    )
+    return s1 + s2 + s3 + s4 < old_cyc
+
+
 def _align(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
@@ -173,11 +310,9 @@ def _round_bf16(x: jax.Array) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=8, mantissa_bits=7)
 
 
-def kpool_indexer_step(
-    query: jax.Array,  # bf16[num_tokens, n_heads, d]; wq_b(q_lora), not rotated
+def store_pooled_keys(
     key: jax.Array,  # bf16[num_tokens, d]; k_norm(wk(x)), not rotated
     gate: jax.Array,  # bf16[num_tokens, d]; compress_gate(x)
-    head_weights: jax.Array,  # f32[num_tokens, n_heads]; weights_proj(x)
     ape: jax.Array,  # f32[kpool, d]
     raw_cache: jax.Array,  # bf16[num_pages, page_size, 2 * d]: key | gate
     pooled_cache: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
@@ -186,31 +321,18 @@ def kpool_indexer_step(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]; [2] is the number of real requests
     *,
-    weight_scale: float,
-    topk: int,
     kpool: int,
-    out_width: int = 0,
-    decode_query_size: int = 1,
     max_query_length: int | None = None,
-    row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
-    row_count: int = 0,
     raw_page_base: jax.Array | None = None,  # i32[max_num_seqs]; raw ring only
     raw_ring_pages_cnt: int = 0,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
-    raw_cache, pooled_cache). Rows list sequence-relative token positions: the
-    selected pools' tokens, then the tail, then -1.
+) -> tuple[jax.Array, jax.Array]:
+    """Store this step's raw key | gate records and compress the pools it
+    closes; return ``(raw_cache, pooled_cache)``.
 
-    ``row_count`` > 0 (with ``row_start``) is the DSA indexer token split
-    (attention_pallas_mla_sparse.py): every token's raw key is stored and
-    every closing pool compressed, as without it, but only query rows
-    ``[row_start, row_start + row_count)`` are scored, and the first output is
-    those rows' picked pools, ``i32[row_count, topk // kpool]`` (chosen pools
-    first, then -1; rows past the batch are all -1), not token rows. The caller
-    puts the ranks' slices together and expands them with
-    ``kpool_expand_rows``; each row then equals the same row of an unsplit call.
+    The store half of ``kpool_indexer_step``: any other writer of these caches
+    must call it to leave the indexer step's bytes.
     """
-    num_tokens, n_heads, d = query.shape
+    num_tokens, d = key.shape
     num_raw, page_size, _ = raw_cache.shape
     num_pages = pooled_cache.shape[0]
     _, tokens_per_row, record_bytes = pooled_cache.shape[1:]
@@ -226,10 +348,8 @@ def kpool_indexer_step(
             f"pooled cache has shape {pooled_cache.shape}; the index-key layout "
             f"is {expected}"
         )
-    if topk % kpool != 0 or page_size % (kpool * _TOKENS_PER_ROW) != 0:
-        raise ValueError(
-            f"topk must be a multiple of kpool and page_size of {kpool * _TOKENS_PER_ROW}"
-        )
+    if page_size % (kpool * _TOKENS_PER_ROW) != 0:
+        raise ValueError(f"page_size must be a multiple of {kpool * _TOKENS_PER_ROW}")
 
     req, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
     loc = dict(
@@ -248,7 +368,14 @@ def kpool_indexer_step(
     # 1. Raw key | gate records of this step's tokens.
     page, slot = _raw_page_slot(req, pos, valid=valid, **raw_loc)
     raw = jnp.concatenate([key, gate], axis=-1).astype(raw_cache.dtype)
-    raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
+    # Runs: a page per page_size tokens and two partial pages per request.
+    max_runs = num_tokens // page_size + 2 * num_seqs
+    if _should_use_page_write(
+        num_tokens, num_seqs, num_raw, page_size, raw_cache.shape[2]
+    ):
+        raw_cache = _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs)
+    else:
+        raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
     # 2. Compress the pools this step closes, reading the cache just written.
     fused = (
@@ -301,6 +428,68 @@ def kpool_indexer_step(
         pooled_cache = pooled_cache.at[
             p_page, record // tokens_per_row, record % tokens_per_row
         ].set(records, mode="drop")
+
+    return raw_cache, pooled_cache
+
+
+def kpool_indexer_step(
+    query: jax.Array,  # bf16[num_tokens, n_heads, d]; wq_b(q_lora), not rotated
+    key: jax.Array,  # bf16[num_tokens, d]; k_norm(wk(x)), not rotated
+    gate: jax.Array,  # bf16[num_tokens, d]; compress_gate(x)
+    head_weights: jax.Array,  # f32[num_tokens, n_heads]; weights_proj(x)
+    ape: jax.Array,  # f32[kpool, d]
+    raw_cache: jax.Array,  # bf16[num_pages, page_size, 2 * d]: key | gate
+    pooled_cache: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    *,
+    weight_scale: float,
+    topk: int,
+    kpool: int,
+    out_width: int = 0,
+    decode_query_size: int = 1,
+    max_query_length: int | None = None,
+    row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
+    row_count: int = 0,
+    raw_page_base: jax.Array | None = None,  # i32[max_num_seqs]; raw ring only
+    raw_ring_pages_cnt: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
+    raw_cache, pooled_cache). Rows list sequence-relative token positions: the
+    selected pools' tokens, then the tail, then -1.
+
+    ``row_count`` > 0 (with ``row_start``) is the DSA indexer token split
+    (attention_pallas_mla_sparse.py): every token's raw key is stored and
+    every closing pool compressed, as without it, but only query rows
+    ``[row_start, row_start + row_count)`` are scored, and the first output is
+    those rows' picked pools, ``i32[row_count, topk // kpool]`` (chosen pools
+    first, then -1; rows past the batch are all -1), not token rows. The caller
+    puts the ranks' slices together and expands them with
+    ``kpool_expand_rows``; each row then equals the same row of an unsplit call.
+    """
+    num_tokens = query.shape[0]
+    page_size = raw_cache.shape[1]
+    num_seqs = kv_lens.shape[0]
+    if topk % kpool != 0:
+        raise ValueError(f"topk ({topk}) must be a multiple of kpool ({kpool})")
+    raw_cache, pooled_cache = store_pooled_keys(
+        key,
+        gate,
+        ape,
+        raw_cache,
+        pooled_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        kpool=kpool,
+        max_query_length=max_query_length,
+        raw_page_base=raw_page_base,
+        raw_ring_pages_cnt=raw_ring_pages_cnt,
+    )
+    _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
 
     # 3. Score each query against its request's closed pools and keep the best
     # topk // kpool. The pooled cache is paged like the raw cache with

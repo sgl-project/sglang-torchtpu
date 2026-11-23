@@ -519,7 +519,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # int64 for the verify commit's index_copy_ (the table itself is int32).
         if slots.dtype != torch.int64:
             slots = slots.long()
-        if pool.mamba_v2p_table is None:
+        if self._state_ids.read_v2p is None:
             self._slot_memo = (
                 weakref.ref(req_pool_indices),
                 req_pool_indices._version,
@@ -641,10 +641,26 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             # tensor signature as live requests to precompile the cache path.
             self._track_indices = torch.zeros_like(self._state_indices)
             self._track_end = torch.full_like(self._state_indices, -1)
+        metadata_track = self._track_indices
+        if is_verify and metadata_track is None:
+            # The kernel takes no snapshot during verify, but the commit after
+            # acceptance reads its checkpoint slots from this metadata
+            # (forward_state_slots), as upstream's metadata always carries them.
+            # Keep the scheduler's live-length host ids: commit_verified_states
+            # pads them on the host and uploads at the bucket, as warmup does. A
+            # TPU-side op on the uploaded copy would be an eager program per
+            # bucket that no warmup compiles.
+            host_tracking = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+            verify_track = (host_tracking or {}).get(
+                "mamba_track_indices",
+                getattr(forward_batch, "mamba_track_indices", None),
+            )
+            if verify_track is not None:
+                metadata_track = self._translate_mamba_indices(verify_track)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self._query_start_loc,
             mamba_cache_indices=self._state_indices,
-            mamba_track_indices=self._track_indices,
+            mamba_track_indices=metadata_track,
         )
         self._init_spec_metadata(forward_batch)
 

@@ -119,6 +119,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | --- | --- | --- | --- | --- |
 | Ragged paged attention v3 (`pallas_tpu_rpa_v3`, default) | CI | Nightly | **Optimized** | Fused 5-D KV pool, fp8 KV by default, attention sinks. |
 | Batched RPA (`pallas_tpu_rpa_batched`) | CI (unit, PCP e2e) | — | **Experimental** | Required backend for prefill and decode context parallel. No sinks, no spec decode. |
+| FlyWheel (`flywheel`) | CI (unit, Qwen3-0.6B e2e) | — | **Experimental** | flywheel-tpu kernels on the RPA fused pool, bf16 or fp8 KV. No sinks, sliding window, spec decode, MLA or hybrid models. |
 | Paged MLA (`pallas_tpu_mla`) | CI (unit) | Nightly (DeepSeek) | **Supported** | Absorbed path. fp8 KV opt-in until accuracy is validated. |
 | GDN / hybrid linear attention | Nightly (Qwen3.5) | — | **Supported** | Mamba-style state pool; no host offload of GDN state. |
 | KDA (Kimi-K3) | CI (unit) | — | **Experimental** | Kernel tested; no real-weight e2e. |

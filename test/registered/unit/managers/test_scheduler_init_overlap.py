@@ -22,6 +22,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -41,6 +42,8 @@ def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     s.draft_worker = None
     s.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(attn_backend=object()))
     s.req_to_token_pool = object()
+    # Read by _gpu_work_on_forward_stream on the multi-stream path.
+    s.model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=None))
     # Passed to decide_needs_cpu_seq_lens (patched in the runner) and to
     # decide_needs_confidence_relay, which reads speculative_algorithm.
     s.server_args = SimpleNamespace(speculative_algorithm=None)
@@ -104,7 +107,9 @@ class TestInitOverlapStreamGating(CustomTestCase):
 
         self.assertTrue(s.use_overlap_streams)
         dm.stream.assert_any_call(s.forward_stream)
-        dm.Stream.assert_called_once_with()
+        dm.Stream.assert_called_once_with(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
         self.assertIs(s.copy_stream, dm.Stream.return_value)
         self.assertIs(s.forward_stream_ctx, dm.stream(s.forward_stream))
         self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
@@ -163,6 +168,7 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s.use_overlap_streams = use_overlap_streams
         s.forward_stream_ctx = nullcontext()
         s.copy_stream_ctx = nullcontext()
+        s.enable_async_d2h_copy = False
         # The relay itself (FutureMap stash vs ngram skip) is covered elsewhere;
         # here we only assert it is invoked with this iter's payload.
         s._relay_forward_payload = MagicMock()

@@ -25,12 +25,28 @@ from sglang_tpu.attention.pallas.batched_rpa import configs, schedule
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class _BypassRef(pltpu.BufferedRef):
-    """Helper class to safely bypass buffer_count checks during creation."""
+    """KV ref with more than two buffers; it waits for its own write-backs."""
 
     def __post_init__(self):
         # pallas doesn't allow you to set n_buffer > 2 for output refs, so
         # we override to bypass this check.
         pass
+
+    def _wait_copy_out(self, schedule_ref: schedule.RpaSchedule, block_idx):
+        # The pipeline starts the lookahead fetch into this slot at the next step,
+        # before its wait_out for this step. Wait here, or that fetch overwrites
+        # the buffer while the write-back is still reading it.
+        slot = self.current_copy_out_slot
+        wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
+        flat_src = self.window_ref.at[slot].bitcast(jnp.uint32).reshape((-1, 128))
+        pltpu.make_async_copy(
+            flat_src.at[pl.ds(0, wait_lanes), :],
+            flat_src.at[pl.ds(0, wait_lanes), :],
+            self.sem_sends.at[slot],
+        ).wait()
+
+    def wait_out(self, dst_ref, grid_indices):
+        """copy_out already waited for the write-back."""
 
 
 @jax.tree_util.register_dataclass
@@ -142,6 +158,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                     kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
                     sem,
                 ).start()
+        self._wait_copy_out(schedule_ref, block_idx)
 
     def wait_in(
         self,
@@ -161,26 +178,6 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         pltpu.make_async_copy(
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
-            sem,
-        ).wait()
-
-    def wait_out(
-        self,
-        dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
-        grid_indices: tuple[int | jax.Array, ...],
-    ):
-        _, _, schedule_ref, _ = dst_ref
-        slot = self.current_wait_out_slot
-        sem = self.sem_sends.at[slot]
-        block_idx = grid_indices[0]
-        wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
-
-        vmem_src = self.window_ref.at[slot]
-        vmem_u32 = vmem_src.bitcast(jnp.uint32)
-        flat_src = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
-            flat_src.at[pl.ds(0, wait_lanes), :],
-            flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
 
@@ -303,6 +300,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                     kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
                     sem,
                 ).start()
+        self._wait_copy_out(schedule_ref, block_idx)
 
     def wait_in(
         self,
@@ -321,26 +319,6 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         pltpu.make_async_copy(
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
-            sem,
-        ).wait()
-
-    def wait_out(
-        self,
-        dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
-        grid_indices: tuple[int | jax.Array, ...],
-    ):
-        _, _, schedule_ref, _ = dst_ref
-        slot = self.current_wait_out_slot
-        sem = self.sem_sends.at[slot]
-        block_idx = grid_indices[0]
-        wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
-
-        vmem_src = self.window_ref.at[slot]
-        vmem_u32 = vmem_src.bitcast(jnp.uint32)
-        flat_src = vmem_u32.reshape((-1, 128))
-        pltpu.make_async_copy(
-            flat_src.at[pl.ds(0, wait_lanes), :],
-            flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
 

@@ -150,6 +150,12 @@ class RaidenReceiverMixin:
             self._decode.remote_draft_swa_blocks[room] = list(req.draft_swa_blocks)
             self._decode.remote_state_rows[room] = list(req.state_blocks)
             self._decode.remote_state_endpoint[room] = req.state_endpoint
+            if req.page_tags or req.swa_page_tags:
+                self._decode.page_tags[room] = (
+                    req.page_tags,
+                    req.swa_page_tags,
+                    req.swa_page_tags_first,
+                )
             self._record_announcement_locked(room, str(room))
             aux_index = self._decode.decode_aux_index.get(room)
             # Written under the lock: a room failing concurrently frees its
@@ -1627,6 +1633,25 @@ class RaidenKVReceiver(CommonKVReceiver):
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+
+    def _register_kv_args(self) -> bool:
+        # Raiden peers exchange KV layouts through their raiden handshake, not
+        # through a per-receiver registration message on the bootstrap socket.
+        return True
+
+    def carries_page_tags(self) -> bool:
+        """Whether this room's prefill answers with BLOCKS, the message that
+        carries page tags: the resharding push (several prefill sources, a
+        decode attention TP smaller than the prefill's) and the pipeline path
+        send none."""
+        return self.kv_mgr._pipeline is None and len(self.bootstrap_infos or ()) == 1
+
+    def page_tags(self) -> tuple[bytes, bytes, int]:
+        """The per-page tags the prefill's BLOCKS carried (full pages', SWA
+        window pages', the window's first page index); empty without a page tag
+        source on the prefill."""
+        with self.kv_mgr._state_lock:
+            return self.kv_mgr._decode.page_tags.get(self.bootstrap_room, (b"", b"", 0))
 
     def send_metadata(
         self,

@@ -6,11 +6,12 @@ import torch
 
 from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.model_executor import forward_batch_info as fbi
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NUM_TOKENS_PER_REQ = 4
 
@@ -42,6 +43,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
     )
     model_runner = MagicMock(is_draft_worker=False, compile_policy=NoopCompilePolicy())
     model_runner.attn_tp_sequence_sharded.return_value = False
+    model_runner.attn_backend.late_layer_num_tokens.return_value = None
     no_prefill_graph = SimpleNamespace(
         graph=SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[]))

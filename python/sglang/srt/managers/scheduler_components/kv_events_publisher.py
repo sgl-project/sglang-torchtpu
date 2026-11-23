@@ -104,6 +104,12 @@ class SchedulerKvEventsPublisher:
                     )
                     self.metrics_drop_warned = True
 
+    def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
+        if self.kv_event_publisher is None:
+            return []
+        source = self.kv_event_publisher.describe_local_source(block_size)
+        return [source] if source is not None else []
+
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:
             return

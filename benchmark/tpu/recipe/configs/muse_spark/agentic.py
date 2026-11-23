@@ -86,12 +86,6 @@ _BASE["runtime_env"].update(
         # Megakernel MoE: overlap the reduce-scatter sends with the remaining experts.
         "SGLANG_TPU_MK_Y_EARLY": "1",
         "SGLANG_TPU_MK_Y_BLOCK_SEND": "1",
-        # Fused reduce-scatter expert TP (prefill MoE).
-        "SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS": "1",
-        "SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE": "1",
-        "SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO": "1",
-        "SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE": "1",
-        "SGLANG_TPU_FUSED_RS_STAGING_SLOTS": "8",
         # DFlash2 draft: TP-sharded context projection, matmul conv, fp8 weight-only linears.
         "SGLANG_DFLASH_ROW_PARALLEL_FC": "1",
         "SGLANG_DFLASH_CONV_MATMUL_EXPAND": "1",
