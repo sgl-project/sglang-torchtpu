@@ -1,6 +1,6 @@
 """GLM-5.3-Flash AgentX on one tpu7x host (tp8, 4 chips) at the model's 1M context.
 
-The server configs of the AgentX points at concurrency 1, 4, 8, 16, 32 and 48, as one
+The server configs of the AgentX points at concurrency 1, 4, 8, 16 and 32, as one
 profile table on top of mtp.py. Each profile renders the launch JSON its point was
 measured with (MEASURED, in experimental/agentx/runs/; check_recipes.py there diffs
 them). experimental/agentx/launch_agentx.sh boots one point with its caches on a PVC.
@@ -12,9 +12,9 @@ them). experimental/agentx/launch_agentx.sh boots one point with its caches on a
 Every point runs fp8 weights and KV with 128-token pages and 4096-token prefill
 chunks, MTP (topk 1) at InferenceX's golden acceptance length, the MoE ring kernel
 with decode on the model path (megakernel off), and a raiden host tier that also holds
-KDA states, with a KDA checkpoint at every prefill chunk. c32 and c48 also split the
-index-key cache, with libtpu's SparseCore all-gather offload off (SPARSE_CORE_FIX);
-c32 also drops the KDA checkpoints taken during decode.
+KDA states, with a KDA checkpoint at every prefill chunk. c32 also splits the
+index-key cache, with libtpu's SparseCore all-gather offload off (SPARSE_CORE_FIX),
+and drops the KDA checkpoints taken during decode.
 """
 
 import argparse
@@ -114,20 +114,6 @@ PROFILES = {
         # Host RAM grows with every decode program: 1..32 does not fit.
         compile_bs=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
     ),
-    48: Profile(
-        running=48,
-        steps=3,
-        pool_tokens=28400000,
-        kda_slots=800,
-        host_ratio=1.127,
-        interval=0,
-        mk_rows=64,
-        shards=8,
-        index_split=True,
-        bf16_merge=True,
-        state_ratio=2.5,
-        compile_bs=(*range(1, 17), *range(20, 49, 4)),
-    ),
 }
 
 # The launch JSON each point was measured with, in experimental/agentx/runs/.
@@ -137,7 +123,6 @@ MEASURED = {
     8: "K2ts_c8_real_l3_ring_full",
     16: "C16_S2ts_kda1400_bf16_real_l3_ring_full",
     32: "R10_c32_mr32_combo_real_l3_ring_full_ixsplit",
-    48: "R9_c48_mr48_real_l3_ring_full_ixsplit",
 }
 
 

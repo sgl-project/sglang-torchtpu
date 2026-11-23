@@ -1,8 +1,8 @@
 #!/bin/bash
 # Boot one GLM-5.3-Flash AgentX point of glm_5_3_flash/agentx.py on one tpu7x 2x2x1 host (tp8),
-# with its caches on a PVC, as jobs 36d0 (c1-c16) and 7605 (c32, c48) ran them. Ready when
+# with its caches on a PVC, as jobs 36d0 (c1-c16) and 7605 (c32) ran them. Ready when
 # the log prints "The server is fired up and ready to roll".
-# usage: launch_agentx.sh <1|4|8|16|32|48> [--dry-run]
+# usage: launch_agentx.sh <1|4|8|16|32> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)
 #   AGENTX_DEPS=<dir>    pip --target dir: transformers 5.19.0, blake3, timm 1.0.25 (default $CACHE_ROOT/pydeps)
 #   AGENTX_HALF_SLICE=1  one host of a 2x2x2 slice run alone, as every point ran
@@ -10,7 +10,7 @@
 #   --dry-run            print the resolved env, command and server args; start nothing
 set -euo pipefail
 case "${1:-}" in
-  '' | *[!0-9]*) echo "usage: $0 <1|4|8|16|32|48> [--dry-run]" >&2; exit 2 ;;
+  '' | *[!0-9]*) echo "usage: $0 <1|4|8|16|32> [--dry-run]" >&2; exit 2 ;;
 esac
 POINT=$1 # agentx.py rejects a concurrency it has no profile for
 case "${2:-}" in
