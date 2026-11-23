@@ -273,6 +273,17 @@ tpu_dsv41_carry_mirrored_padding
   Remove when: the padding returns a field unchanged when it has nothing to
        append, and records follow the fields they describe.
 
+tpu_dsv41_flush_engram_at_length_read
+  (registered only with SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ=1)
+  Why: the queued Engram verify commits read the previous verify's outputs back.
+       Flushed at the next verify's staging, they are the first device read
+       after the draft launch; there the host has to wait for the draft.
+  How: AFTER StepHostRows._build reads the step's sequence lengths (which
+       already waited for the previous verify), apply the queue then; the
+       verify staging finds it empty. Commit order is unchanged.
+  Upstream PR or issue: not filed (V4.1 TPU serving).
+  Remove when: the Engram history lives on the device and commits in-graph.
+
 tpu_dsv41_carry_mirror_to_loaded_batch
   Why: host_input_mirror ties its records to the ForwardBatch object, and on
        TPU EagerRunner.load_batch hands the forward a dataclasses.replace copy;
@@ -908,6 +919,18 @@ def tpu_dsv41_carry_mirror_to_loaded_batch(
     return loaded
 
 
+def tpu_dsv41_flush_engram_at_length_read(original, step_rows, *args, **kwargs):
+    """AROUND StepHostRows._build: flush the Engram commits after the length read."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    # Idle DP ranks pass host lengths and read nothing; a flush there would add a wait.
+    synced = step_rows._seq_lens_cpu is None
+    rows = original(step_rows, *args, **kwargs)
+    if synced and rows is not None:
+        engram_host.flush_all_engram_commits()
+    return rows
+
+
 def tpu_dsv41_defer_engram_commit(
     original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
 ):
@@ -971,6 +994,22 @@ def fused_ep_hook_specs():
             "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights",
             prepare_tpu_dsv41_fused_ep,
             HookType.AFTER,
+        ),
+    ]
+
+
+def engram_flush_hook_specs():
+    """The early Engram commit flush, only with SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ=1."""
+    from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ.get():
+        return []
+    return [
+        (
+            "sglang_tpu.experimental.speculative.host_verify_rows.StepHostRows._build",
+            tpu_dsv41_flush_engram_at_length_read,
+            HookType.AROUND,
         ),
     ]
 
@@ -1135,4 +1174,5 @@ def hook_specs():
             HookType.AROUND,
         ),
         *decoder_replay_sync.hook_specs(),
+        *engram_flush_hook_specs(),
     ] + fused_ep_hook_specs()

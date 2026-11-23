@@ -499,6 +499,25 @@ def test_records_survive_the_dp_padding(extra_rows):
     _assert_same(_metadata(fb), _metadata(reference_fb))
 
 
+def test_engram_commits_flush_only_where_the_length_read_synced():
+    """The early Engram flush may run only after a real length read: on an idle DP
+    rank (host lengths, no read) it would add a blocking device read."""
+    from unittest.mock import MagicMock
+
+    from sglang_tpu.models.deepseek_v41 import engram_host
+    from sglang_tpu.models.deepseek_v41.hooks import (
+        tpu_dsv41_flush_engram_at_length_read,
+    )
+
+    rows = object()
+    for seq_lens_cpu, flushed in ((None, True), (torch.zeros(2), False)):
+        step = SimpleNamespace(_seq_lens_cpu=seq_lens_cpu)
+        with patch.object(engram_host, "flush_all_engram_commits", MagicMock()) as f:
+            out = tpu_dsv41_flush_engram_at_length_read(lambda s: rows, step)
+        assert out is rows
+        assert f.called == flushed
+
+
 def test_spec_worker_builds_host_rows_only_for_a_consumer():
     from sglang_tpu.experimental.speculative.block_spec_worker import (
         TpuBlockSpecWorker,

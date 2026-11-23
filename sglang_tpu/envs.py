@@ -451,6 +451,9 @@ class TpuEnvs:
     # Spec step: build the slot-only attention metadata of the draft and verify
     # forwards before the blocking length read / draft-token read (slot_metadata.py).
     SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)
+    # DSpark: apply the queued Engram verify commits right after the spec step's
+    # sequence-length read, when the host has already waited for the previous verify.
+    SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

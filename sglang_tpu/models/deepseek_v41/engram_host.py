@@ -1644,6 +1644,12 @@ def has_pending_engram_commits(hasher) -> bool:
     )
 
 
+def flush_all_engram_commits() -> None:
+    """Apply every hasher's queued verify commits (flush_engram_commits for each)."""
+    for hasher in list(_PENDING_COMMITS.keys()):
+        flush_engram_commits(hasher)
+
+
 def flush_engram_commits(hasher) -> None:
     """Apply the queued verify commits in order; call before reading or writing history."""
     if hasher is None or not _PENDING_COMMITS:
