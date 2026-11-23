@@ -267,6 +267,116 @@ def _slice_pq_lhs_sub(
     return prequant_lhs_fp8_ref[pl.ds(m0, m_rows_sub), pl.ds(rk0, k_len)]
 
 
+def unpack_3d_pq_lhs_to_2d_fp8(
+    lhs_3d_fp8_ref: Any,
+    dst_fp8_ref: Any,
+    *,
+    tile_m: int,
+    tile_k: int,
+    via_bf16_xpose: bool = False,
+):
+    """Unpack 3D `(M, K//128, 128) fp8` gather buffer -> 2D `(M, K) fp8` VMEM cache once per tile.
+
+    Slices full `(32, 32, 128)` FP8 sublane tiles (or `(32, 16, 128)` BF16 XLU tiles when
+    `via_bf16_xpose=True`) so TPU7x uses hardware XLU transpose instead of emitting
+    `106k` VALU `vrot.slane` instructions inside the strip loop.
+    """
+    import jax.experimental.pallas as pl
+    import jax.numpy as jnp
+
+    if via_bf16_xpose and tile_m % 32 == 0 and tile_k % 2048 == 0 and tile_k >= 2048:
+        n_kh = tile_k // 2048
+        for m0 in range(0, tile_m, 32):
+            for kh in range(n_kh):
+                dst_fp8_ref[pl.ds(m0, 32), pl.ds(kh * 2048, 2048)] = (
+                    lhs_3d_fp8_ref[pl.ds(m0, 32), pl.ds(kh * 16, 16), :]
+                    .astype(jnp.bfloat16)
+                    .reshape(32, 2048)
+                    .astype(jnp.float8_e4m3fn)
+                )
+        return
+
+    if tile_m % 32 == 0 and tile_k % 4096 == 0 and tile_k >= 4096:
+        n_kh = tile_k // 4096
+        for m0 in range(0, tile_m, 32):
+            for kh in range(n_kh):
+                dst_fp8_ref[pl.ds(m0, 32), pl.ds(kh * 4096, 4096)] = lhs_3d_fp8_ref[
+                    pl.ds(m0, 32), pl.ds(kh * 32, 32), :
+                ].reshape(32, 4096)
+        return
+
+    m_ch = 32 if (tile_m >= 32 and tile_m % 32 == 0) else tile_m
+    n_lanes = lhs_3d_fp8_ref.shape[-1]
+    for m0 in range(0, tile_m, m_ch):
+        dst_fp8_ref[pl.ds(m0, m_ch), pl.ds(0, tile_k)] = lhs_3d_fp8_ref[
+            pl.ds(m0, m_ch), pl.ds(0, tile_k // n_lanes), :
+        ].reshape(m_ch, tile_k)
+
+
+def fill_pq_lhs_scales_tree(
+    dst_scale_ref: Any,
+    lhs_row_scales_ref: Any,
+    lhs_indices_ref: Any,
+    *,
+    m_st: Any,
+    m_en: Any,
+    num_valid: Any,
+    num_lanes: int,
+    packed_u16_lhs: bool,
+    gather_divisor: int,
+    scale_b_id: int = 0,
+):
+    """Populate `dst_scale_ref[scale_b_id, 0:num_valid, :]` using a 3-level binary `vselect` tree."""
+    import jax.experimental.pallas as pl
+    import jax.numpy as jnp
+    from jax import lax
+
+    max_r = jnp.maximum(m_en - 1, m_st)
+    row_q = lax.broadcasted_iota(jnp.int32, (8, num_lanes), 0)
+    b0 = (row_q & jnp.int32(1)) != 0
+    b1 = (row_q & jnp.int32(2)) != 0
+    b2 = (row_q & jnp.int32(4)) != 0
+
+    def _load_sc(rk):
+        if packed_u16_lhs:
+            w_u = lhs_indices_ref[lax.shift_right_logical(rk, jnp.int32(1))]
+            sh_u = lax.shift_left(rk & jnp.int32(1), jnp.int32(4))
+            tok_k = lax.shift_right_logical(w_u, sh_u) & jnp.int32(0xFFFF)
+        else:
+            tok_k = lhs_indices_ref[rk]
+            if gather_divisor != 1:
+                tok_k = tok_k // gather_divisor
+        return lhs_row_scales_ref[tok_k].astype(jnp.float32)
+
+    def _pack_8(i0):
+        s = [_load_sc(jnp.minimum(m_st + i0 + k, max_r)) for k in range(8)]
+        p01 = jnp.where(b0, s[1], s[0])
+        p23 = jnp.where(b0, s[3], s[2])
+        p45 = jnp.where(b0, s[5], s[4])
+        p67 = jnp.where(b0, s[7], s[6])
+        q03 = jnp.where(b1, p23, p01)
+        q47 = jnp.where(b1, p67, p45)
+        dst_scale_ref[scale_b_id, pl.ds(i0, 8), :] = jnp.where(b2, q47, q03)
+
+    tile_m_cap = dst_scale_ref.shape[1]
+    if tile_m_cap >= 32 and tile_m_cap % 32 == 0:
+
+        def _fill_32(q32, _):
+            base_i = q32 * 32
+            for sub in range(4):
+                _pack_8(base_i + sub * 8)
+            return _
+
+        lax.fori_loop(0, (num_valid + 31) >> 5, _fill_32, jnp.int32(0))
+    else:
+
+        def _fill_8(q8, _):
+            _pack_8(q8 * 8)
+            return _
+
+        lax.fori_loop(0, (num_valid + 7) >> 3, _fill_8, jnp.int32(0))
+
+
 def scoped_two_level_pow2_strip_acc(
     *,
     w_weight_ref: Any,

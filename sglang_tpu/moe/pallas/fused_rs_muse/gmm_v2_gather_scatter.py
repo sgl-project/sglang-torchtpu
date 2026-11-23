@@ -355,6 +355,7 @@ def inner_kernel(
     rhs_fp8_strip_ref=None,
     vectorized_dequant: bool = False,
     w_strip_fp8_ref=None,
+    prequant_lhs_ready: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -456,6 +457,7 @@ def inner_kernel(
             fast_lhs_quant >= 1
             and (use_scoped_w4a8_refs or use_eo_strip_fp8)
             and not _has_ext_pq_lhs_3d
+            and not prequant_lhs_ready
             and prequant_lhs_fp8_ref is not None
             and prequant_lhs_scale_ref is not None
             and not has_prequant_rhs
@@ -465,14 +467,18 @@ def inner_kernel(
             and (cfgs.tiles.tile_k % cfgs.rhs_cfgs.quant_block_size == 0)
             and (lhs_3d_vmem_ref is not None or lhs_2d_vmem_ref is not None)
         )
-        _reuse_pq_lhs = _has_ext_pq_lhs_3d or (
-            cfgs.lhs_cfgs.quant_dtype is not None
-            and prequant_lhs_fp8_ref is not None
-            and prequant_lhs_scale_ref is not None
-            and not has_prequant_rhs
-            and is_first_k_step
-            and is_last_k_step
-            and (_n_id or 0) > 0
+        _reuse_pq_lhs = (
+            prequant_lhs_ready
+            or _has_ext_pq_lhs_3d
+            or (
+                cfgs.lhs_cfgs.quant_dtype is not None
+                and prequant_lhs_fp8_ref is not None
+                and prequant_lhs_scale_ref is not None
+                and not has_prequant_rhs
+                and is_first_k_step
+                and is_last_k_step
+                and (_n_id or 0) > 0
+            )
         )
         _tlp_raw_early = (
             int(envs.SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_POW2.get() or 0)
@@ -710,8 +716,8 @@ def inner_kernel(
                 else:
                     gs_gate_val = jnp.float32(1.0)
                     gs_up_val = jnp.float32(1.0)
-                _compact_fori = scoped_w4a8_mode >= 6 or (
-                    scoped_w4a8_mode == 5 and cfgs.tiles.tile_m < 256
+                _compact_fori = scoped_w4a8_mode == 6 or (
+                    scoped_w4a8_mode in (5, 7) and cfgs.tiles.tile_m < 256
                 )
                 pnw_full_bf16 = (
                     pnw_ref[...].astype(tiled_out_ref.dtype)
@@ -1699,7 +1705,11 @@ def inner_kernel(
                             _flq_zero_rmw >= 2
                             and fused_g2_amax_slot is not None
                             and prequant_lhs_scale_ref is not None
-                            and use_fast_lhs_q
+                            and (
+                                use_fast_lhs_q
+                                or _has_ext_pq_lhs_3d
+                                or prequant_lhs_ready
+                            )
                             and _num_n is not None
                             and _n_id is not None
                         )
@@ -1812,7 +1822,11 @@ def inner_kernel(
                             _flq_zero_rmw >= 2
                             and fused_g2_amax_slot is not None
                             and prequant_lhs_scale_ref is not None
-                            and use_fast_lhs_q
+                            and (
+                                use_fast_lhs_q
+                                or _has_ext_pq_lhs_3d
+                                or prequant_lhs_ready
+                            )
                             and _num_n is not None
                             and _n_id is not None
                         )

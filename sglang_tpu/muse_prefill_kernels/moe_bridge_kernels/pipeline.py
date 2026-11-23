@@ -178,7 +178,7 @@ register_ep16_tuned_block_sizes()
 def _convert_both_halves_fp8_gmm_layout(
     ag_i8_0: jax.Array,
     ag_sc_0: jax.Array | None,
-    ag_i8_1: jax.Array,
+    ag_i8_1: jax.Array | None,
     ag_sc_1: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-pass Pallas VMEM i8 -> (fp8[T_global, H//128, 128], fp8_scale[T_global]) converter."""
@@ -186,20 +186,29 @@ def _convert_both_halves_fp8_gmm_layout(
     from jax.experimental.pallas import tpu as pltpu
 
     ep_sz, half_tok, raw_cols = ag_i8_0.shape
+    n_halves = 1 if ag_i8_1 is None else 2
     packed_sc = ag_sc_0 is None
     lane_w = 128
     hidden_sz = (raw_cols - lane_w) if packed_sc else raw_cols
 
     def _k_fp8(*refs):
         if packed_sc:
-            i8_0_ref, i8_1_ref, fp8_out_ref, sc_out_ref = refs
-            pairs = ((i8_0_ref, None), (i8_1_ref, None))
+            if n_halves == 1:
+                i8_0_ref, fp8_out_ref, sc_out_ref = refs
+                pairs = ((i8_0_ref, None),)
+            else:
+                i8_0_ref, i8_1_ref, fp8_out_ref, sc_out_ref = refs
+                pairs = ((i8_0_ref, None), (i8_1_ref, None))
             mask_r = None
         else:
-            i8_0_ref, sc_0_ref, i8_1_ref, sc_1_ref, fp8_out_ref, sc_out_ref = refs
             r = pl.program_id(0)
             mask_r = jax.lax.broadcasted_iota(jnp.int32, (ep_sz, lane_w), 0) == r
-            pairs = ((i8_0_ref, sc_0_ref), (i8_1_ref, sc_1_ref))
+            if n_halves == 1:
+                i8_0_ref, sc_0_ref, fp8_out_ref, sc_out_ref = refs
+                pairs = ((i8_0_ref, sc_0_ref),)
+            else:
+                i8_0_ref, sc_0_ref, i8_1_ref, sc_1_ref, fp8_out_ref, sc_out_ref = refs
+                pairs = ((i8_0_ref, sc_0_ref), (i8_1_ref, sc_1_ref))
         for half_idx, (i8_ref, sc_ref) in enumerate(pairs):
             for t_blk in range(half_tok // lane_w):
                 r0, r1 = t_blk * lane_w, (t_blk + 1) * lane_w
@@ -252,30 +261,37 @@ def _convert_both_halves_fp8_gmm_layout(
                     )
 
     if packed_sc:
-        in_specs = [
-            pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-            pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-        ]
-        args: tuple[jax.Array, ...] = (ag_i8_0, ag_i8_1)
+        in_specs = [pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0))] * n_halves
+        args: tuple[jax.Array, ...] = (
+            (ag_i8_0,) if n_halves == 1 else (ag_i8_0, ag_i8_1)
+        )
     else:
-        assert ag_sc_0 is not None and ag_sc_1 is not None
-        in_specs = [
-            pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-            pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
-            pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-            pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
-        ]
-        args = (ag_i8_0, ag_sc_0, ag_i8_1, ag_sc_1)
+        assert ag_sc_0 is not None
+        if n_halves == 1:
+            in_specs = [
+                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
+                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
+            ]
+            args = (ag_i8_0, ag_sc_0)
+        else:
+            assert ag_sc_1 is not None
+            in_specs = [
+                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
+                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
+                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
+                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
+            ]
+            args = (ag_i8_0, ag_sc_0, ag_i8_1, ag_sc_1)
 
     vmem_cap = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.94)
     fp8_5d, sc_4d = pl.pallas_call(
         _k_fp8,
         out_shape=(
             jax.ShapeDtypeStruct(
-                (ep_sz, 2, half_tok, hidden_sz // lane_w, lane_w),
+                (ep_sz, n_halves, half_tok, hidden_sz // lane_w, lane_w),
                 jnp.float8_e4m3fn,
             ),
-            jax.ShapeDtypeStruct((ep_sz, 2, half_tok, lane_w), jnp.float32),
+            jax.ShapeDtypeStruct((ep_sz, n_halves, half_tok, lane_w), jnp.float32),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -283,10 +299,10 @@ def _convert_both_halves_fp8_gmm_layout(
             in_specs=in_specs,
             out_specs=[
                 pl.BlockSpec(
-                    (1, 2, half_tok, hidden_sz // lane_w, lane_w),
+                    (1, n_halves, half_tok, hidden_sz // lane_w, lane_w),
                     lambda r: (r, 0, 0, 0, 0),
                 ),
-                pl.BlockSpec((1, 2, half_tok, lane_w), lambda r: (r, 0, 0, 0)),
+                pl.BlockSpec((1, n_halves, half_tok, lane_w), lambda r: (r, 0, 0, 0)),
             ],
             scratch_shapes=[],
         ),
@@ -294,10 +310,10 @@ def _convert_both_halves_fp8_gmm_layout(
             disable_bounds_checks=True,
             vmem_limit_bytes=vmem_cap,
         ),
-        name=f"pallas_deq_both_fp8_gmm_ep{ep_sz}_ht{half_tok}",
+        name=f"pallas_deq_{'single' if n_halves == 1 else 'both'}_fp8_gmm_ep{ep_sz}_ht{half_tok}",
     )(*args)
     return (
-        fp8_5d.reshape(ep_sz * 2 * half_tok, hidden_sz // lane_w, lane_w),
+        fp8_5d.reshape(ep_sz * n_halves * half_tok, hidden_sz // lane_w, lane_w),
         sc_4d[:, :, :, 0].reshape(-1),
     )
 
@@ -2166,8 +2182,13 @@ def fused_moe_full_bridge_and_ffn(
                         (inv_perm_c, local_t_recv)
                     )
                     precomputed_routing = None
-                hs_4d = dequant_single_gmm_layout(ag_i8)
-                hidden_states = hs_4d.reshape(ep_size * t_local, he_dim // 128, 128)
+                if _use_pq_lhs_fp8:
+                    hidden_states, hidden_states_scale = (
+                        _convert_both_halves_fp8_gmm_layout(ag_i8, None, None, None)
+                    )
+                else:
+                    hs_4d = dequant_single_gmm_layout(ag_i8)
+                    hidden_states = hs_4d.reshape(ep_size * t_local, he_dim // 128, 128)
             elif fused_b1_b2_mode in (3, 4) and (t_local % 256 == 0):
                 half_tok = t_local // 2
                 fp8_wp = fused_b1_b2_mode == 4

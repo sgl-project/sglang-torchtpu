@@ -1709,3 +1709,737 @@ def test_compute_block_scatter_routing_rotate_rs2_with_pallas_sf0_bit_exact(
                 cur_m += take
                 rem -= take
                 gm_slot += 1
+
+
+@pytest.mark.parametrize("m_rows", [256, 128])
+def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
+    """Verify 1x-per-tile FP8 unpack (pql1/pql2), 3-level binary-tree scale fill,
+    and fused_g2_amax_slot=1 (with NaN-poisoned slot 1) match pq0+sw2 at 0.0-ULP."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import (
+        Dimensions,
+        GmmConfigs,
+        InputConfigs,
+        MetadataRef,
+        TileSizes,
+        WeightsRef,
+        inner_kernel,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+        fill_pq_lhs_scales_tree,
+        unpack_3d_pq_lhs_to_2d_fp8,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    k1, n1_half, k2, n2, rhs_qbs = 2048, 512, 1024, 512, 512
+    rng = np.random.default_rng(20261124 + m_rows)
+    lhs_3d_bf16 = jnp.asarray(
+        rng.standard_normal((m_rows, k1 // 128, 128)).astype(np.float32) * 0.5,
+        jnp.bfloat16,
+    )
+    x_bf16_2d = lhs_3d_bf16.reshape(m_rows, k1)
+    amax = jnp.max(jnp.abs(x_bf16_2d), axis=1, keepdims=True).astype(jnp.float32)
+    inv_m = jnp.where(amax == 0, 0.0, jnp.float32(448.0) / amax).astype(jnp.bfloat16)
+    row_sc = jnp.where(amax == 0, 0.0, amax * jnp.float32(1.0 / 448.0)).reshape(-1)
+    lhs_3d_fp8 = (
+        (x_bf16_2d * inv_m).astype(jnp.float8_e4m3fn).reshape(m_rows, k1 // 128, 128)
+    )
+    perm = rng.permutation(m_rows).astype(np.int32)
+    inv_perm = np.argsort(perm).astype(np.int32)
+    hs_sc_perm = jnp.asarray(np.asarray(row_sc)[inv_perm], jnp.float32)
+    lhs_idx_perm = jnp.asarray(perm, jnp.int32)
+    u16_words = (perm[0::2].astype(np.uint32) & 0xFFFF) | (
+        (perm[1::2].astype(np.uint32) & 0xFFFF) << 16
+    )
+    lhs_idx_u16 = jnp.asarray(u16_words.view(np.int32), jnp.int32)
+
+    w1_a = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(k1 // 8, n1_half * 2), dtype=np.uint32)
+    )
+    w1_b = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(k1 // 8, n1_half * 2), dtype=np.uint32)
+    )
+    s1_a = jnp.asarray(
+        np.exp(rng.normal(-2.5, 0.2, size=(k1 // rhs_qbs, 1, n1_half * 2))).astype(
+            np.float32
+        ),
+        jnp.bfloat16,
+    )
+    s1_b = jnp.asarray(
+        np.exp(rng.normal(-2.5, 0.2, size=(k1 // rhs_qbs, 1, n1_half * 2))).astype(
+            np.float32
+        ),
+        jnp.bfloat16,
+    )
+    w2_a = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k2 // 8, n2), dtype=np.uint32))
+    w2_b = jnp.asarray(rng.integers(0, 2**31 - 1, size=(k2 // 8, n2), dtype=np.uint32))
+    s2_a = jnp.asarray(
+        np.exp(rng.normal(-2.5, 0.2, size=(k2 // rhs_qbs, 1, n2))).astype(np.float32),
+        jnp.bfloat16,
+    )
+    s2_b = jnp.asarray(
+        np.exp(rng.normal(-2.5, 0.2, size=(k2 // rhs_qbs, 1, n2))).astype(np.float32),
+        jnp.bfloat16,
+    )
+    pnw_8 = jnp.broadcast_to(
+        jnp.asarray(
+            1.0 + 0.1 * rng.standard_normal((n2 * 2,)).astype(np.float32), jnp.bfloat16
+        )[None, :],
+        (8, n2 * 2),
+    )
+    gs_gate = jnp.asarray([0.85], dtype=jnp.float32)
+    gs_up = jnp.asarray([1.15], dtype=jnp.float32)
+    gs_w2 = jnp.asarray([0.92], dtype=jnp.float32)
+
+    cfgs1 = GmmConfigs(
+        dims=Dimensions(
+            size_m=131072,
+            size_k=k1,
+            size_n=n1_half * 2,
+            size_group=1,
+            size_lhs_group=1,
+            size_lhs_sublane=8,
+        ),
+        tiles=TileSizes(tile_m=m_rows, tile_k=k1, tile_n=n1_half),
+        lhs_cfgs=InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn.dtype,
+            quant_block_size=k1,
+            dtype=jnp.bfloat16,
+        ),
+        rhs_cfgs=InputConfigs(
+            quant_dtype=jnp.float4_e2m1fn.dtype,
+            quant_block_size=rhs_qbs,
+            dtype=jnp.float4_e2m1fn,
+            has_bias=False,
+            has_scale=True,
+            packing=8,
+            num_quant_blocks=k1 // rhs_qbs,
+        ),
+        out_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        zero_init=False,
+        fuse_act="silu",
+    )
+    cfgs2 = GmmConfigs(
+        dims=Dimensions(
+            size_m=131072,
+            size_k=k2,
+            size_n=n2 * 2,
+            size_group=1,
+            size_lhs_group=1,
+            size_lhs_sublane=8,
+        ),
+        tiles=TileSizes(tile_m=m_rows, tile_k=k2, tile_n=n2),
+        lhs_cfgs=InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn.dtype,
+            quant_block_size=k2,
+            dtype=jnp.bfloat16,
+        ),
+        rhs_cfgs=InputConfigs(
+            quant_dtype=jnp.float4_e2m1fn.dtype,
+            quant_block_size=rhs_qbs,
+            dtype=jnp.float4_e2m1fn,
+            has_bias=False,
+            has_scale=True,
+            packing=8,
+            num_quant_blocks=k2 // rhs_qbs,
+        ),
+        out_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        zero_init=False,
+        fuse_act=None,
+    )
+
+    def _run(sw_mode: int, pq_mode: int, packed_u16: bool = False) -> np.ndarray:
+        idx_arg = lhs_idx_u16 if packed_u16 else lhs_idx_perm
+
+        def _ker(
+            sc_smem_r,
+            idx_smem_r,
+            x_bf16_r,
+            x_fp8_r,
+            w1a_r,
+            s1a_r,
+            w1b_r,
+            s1b_r,
+            w2a_r,
+            s2a_r,
+            w2b_r,
+            s2b_r,
+            pnw_r,
+            gsg_r,
+            gsu_r,
+            gsw2_r,
+            out_r,
+            g1_r,
+            pq_fp8_r,
+            pq_sc_r,
+            p1_r,
+            acc_r,
+            m_gid,
+            m_off,
+        ):
+            pq_sc_r[1, :, :] = jnp.full((m_rows, 128), jnp.nan, dtype=jnp.float32)
+            m_gid[0] = jnp.int32(0)
+            m_off[0] = jnp.int32(0)
+            m_off[1] = jnp.int32(m_rows)
+            meta = MetadataRef(gm_id_to_group_id=m_gid, gm_id_to_m_offset=m_off)
+            if pq_mode >= 1:
+                fill_pq_lhs_scales_tree(
+                    pq_sc_r,
+                    sc_smem_r,
+                    idx_smem_r,
+                    m_st=jnp.int32(0),
+                    m_en=jnp.int32(m_rows),
+                    num_valid=jnp.int32(m_rows),
+                    num_lanes=128,
+                    packed_u16_lhs=packed_u16,
+                    gather_divisor=1,
+                    scale_b_id=0,
+                )
+                unpack_3d_pq_lhs_to_2d_fp8(
+                    x_fp8_r,
+                    pq_fp8_r,
+                    tile_m=m_rows,
+                    tile_k=k1,
+                    via_bf16_xpose=(pq_mode == 2),
+                )
+            for nid, (wr, sr) in enumerate([(w1a_r, s1a_r), (w1b_r, s1b_r)]):
+                inner_kernel(
+                    None,
+                    WeightsRef(weight=wr, scale=sr, bias=None),
+                    g1_r.at[:, pl.ds(nid * n1_half, n1_half)],
+                    p1_r,
+                    acc_r,
+                    meta,
+                    cfgs=cfgs1,
+                    gs_gate_ref=gsg_r,
+                    gs_up_ref=gsu_r,
+                    scatter_mode=True,
+                    _k_id=0,
+                    _num_k=1,
+                    _gm_id=0,
+                    _n_id=nid,
+                    _num_n=2,
+                    fused_g2_amax_slot=1,
+                    prequant_lhs_fp8_ref=pq_fp8_r,
+                    prequant_lhs_scale_ref=pq_sc_r,
+                    skip_row_mask=True,
+                    lhs_3d_vmem_ref=(None if pq_mode >= 1 else x_bf16_r),
+                    prequant_lhs_ready=(pq_mode >= 1),
+                )
+            for nid, (wr, sr) in enumerate([(w2a_r, s2a_r), (w2b_r, s2b_r)]):
+                inner_kernel(
+                    None,
+                    WeightsRef(weight=wr, scale=sr, bias=None),
+                    out_r.at[:, pl.ds(nid * n2, n2)],
+                    p1_r,
+                    acc_r,
+                    meta,
+                    cfgs=cfgs2,
+                    gs_gate_ref=gsw2_r,
+                    gs_up_ref=gsw2_r,
+                    scatter_mode=True,
+                    _k_id=0,
+                    _num_k=1,
+                    _gm_id=0,
+                    _n_id=nid,
+                    _num_n=2,
+                    fused_g2_amax_slot=1,
+                    prequant_lhs_fp8_ref=pq_fp8_r.at[:, :k2],
+                    prequant_lhs_scale_ref=pq_sc_r,
+                    pnw_ref=pnw_r,
+                    skip_row_mask=True,
+                    lhs_2d_vmem_ref=g1_r,
+                )
+
+        with (
+            patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+                return_value="TPU v7",
+            ),
+            tpu_info_for_cpu_export(),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": str(sw_mode),
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": str(k1),
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                },
+            ),
+        ):
+            res = pl.pallas_call(
+                _ker,
+                out_shape=jax.ShapeDtypeStruct((m_rows, n2 * 2), jnp.bfloat16),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=2,
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 14,
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                    scratch_shapes=[
+                        pltpu.VMEM((m_rows, k2), jnp.bfloat16),
+                        pltpu.VMEM((m_rows, k1), jnp.float8_e4m3fn),
+                        pltpu.VMEM((2, m_rows, 128), jnp.float32),
+                        pltpu.VMEM((1, 128), jnp.bfloat16),
+                        pltpu.VMEM((1, 128), jnp.float32),
+                        pltpu.SMEM((1,), jnp.int32),
+                        pltpu.SMEM((2,), jnp.int32),
+                    ],
+                ),
+                interpret=True,
+            )(
+                hs_sc_perm,
+                idx_arg,
+                lhs_3d_bf16,
+                lhs_3d_fp8,
+                w1_a,
+                s1_a,
+                w1_b,
+                s1_b,
+                w2_a,
+                s2_a,
+                w2_b,
+                s2_b,
+                pnw_8,
+                gs_gate,
+                gs_up,
+                gs_w2,
+            )
+            return np.asarray(res, dtype=np.float32)
+
+    ref = _run(sw_mode=2, pq_mode=0)
+    assert np.isfinite(ref).all() and np.linalg.norm(ref) > 0
+    for got in (
+        _run(sw_mode=8, pq_mode=0),
+        _run(sw_mode=2, pq_mode=1, packed_u16=False),
+        _run(sw_mode=2, pq_mode=1, packed_u16=True),
+        _run(sw_mode=2, pq_mode=2, packed_u16=False),
+        _run(sw_mode=8, pq_mode=1, packed_u16=True),
+    ):
+        assert np.isfinite(got).all()
+        np.testing.assert_array_equal(got, ref)
+
+
+@pytest.mark.parametrize("borrowed_at_gm0", [False, True])
+def test_w9_g2a6_prologue_w_dma_and_split_chipmate_interpret_zero_ulp(
+    borrowed_at_gm0: bool,
+) -> None:
+    """Verify 2-device g2a6 prologue cold-start W1/W2 DMA + split chipmate W1/W2 remote wait
+    with InterpretParams(detect_races=True): 0 races, 0 leaked semaphores, 0.0-ULP vs g2a4."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices()) < 2:
+        pytest.skip("Requires >=2 virtual/physical JAX devices")
+
+    rng = np.random.default_rng(77 + int(borrowed_at_gm0))
+    w1_data = jnp.asarray(
+        rng.standard_normal((2, 3, 16, 128), dtype=np.float32), jnp.bfloat16
+    )
+    w2_data = jnp.asarray(
+        rng.standard_normal((2, 3, 16, 128), dtype=np.float32), jnp.bfloat16
+    )
+    x_data = jnp.asarray(
+        rng.standard_normal((2, 2, 16, 128), dtype=np.float32), jnp.bfloat16
+    )
+    mesh = Mesh(np.array(jax.devices()[:2]), ("ep",))
+
+    def _run(split_mode: bool) -> np.ndarray:
+        cm_flag_len = 5 if split_mode else 3
+
+        def _ker(
+            x_hbm,
+            w1_hbm,
+            w2_hbm,
+            out_hbm,
+            cm_w1_pad,
+            cm_w2_pad,
+            x_vmem,
+            w1_buf,
+            w2_buf,
+            g_sem,
+            w1_sem,
+            w2_sem,
+            cm_send_sem,
+            cm_recv_sem,
+            cm_awaited,
+            bar_sem,
+        ):
+            my_id = jax.lax.axis_index("ep")
+            partner = jax.lax.bitwise_xor(my_id, jnp.int32(1))
+            borrowed_slot = jnp.int32(3)
+            e0 = jnp.int32(3 if borrowed_at_gm0 else 0)
+            e1 = jnp.int32(4)
+
+            for i in range(cm_flag_len):
+                cm_awaited[i] = jnp.int32(0)
+
+            pl.semaphore_signal(
+                bar_sem.at[0],
+                1,
+                device_id={"ep": partner},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+            pltpu.make_async_copy(
+                src_ref=x_hbm.at[0], dst_ref=x_vmem.at[0], sem=g_sem.at[0]
+            ).start()
+            if split_mode:
+
+                @pl.when(e0 < borrowed_slot)
+                def _pro_home():
+                    pltpu.make_async_copy(
+                        src_ref=w1_hbm.at[e0], dst_ref=w1_buf.at[0], sem=w1_sem.at[0]
+                    ).start()
+                    pltpu.make_async_copy(
+                        src_ref=w2_hbm.at[e0], dst_ref=w2_buf.at[0], sem=w2_sem.at[0]
+                    ).start()
+
+            pltpu.make_async_copy(
+                src_ref=x_hbm.at[1], dst_ref=x_vmem.at[1], sem=g_sem.at[1]
+            ).start()
+            pl.semaphore_wait(bar_sem.at[0], 1)
+
+            def _issue_def_send():
+                flag_idx = 4 if split_mode else 2
+
+                @pl.when(cm_awaited[flag_idx] == 0)
+                def _do():
+                    for ci in range(2):
+                        pltpu.make_async_remote_copy(
+                            src_ref=w1_hbm.at[ci],
+                            dst_ref=cm_w1_pad.at[ci],
+                            send_sem=cm_send_sem.at[2 * ci + 0],
+                            recv_sem=cm_recv_sem.at[2 * ci + 0],
+                            device_id={"ep": partner},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+                        pltpu.make_async_remote_copy(
+                            src_ref=w2_hbm.at[ci],
+                            dst_ref=cm_w2_pad.at[ci],
+                            send_sem=cm_send_sem.at[2 * ci + 1],
+                            recv_sem=cm_recv_sem.at[2 * ci + 1],
+                            device_id={"ep": partner},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+                    cm_awaited[flag_idx] = jnp.int32(1)
+
+            def _wait_cm_w1(ci: int):
+                @pl.when(cm_awaited[ci] == 0)
+                def _w1():
+                    pltpu.make_async_copy(
+                        src_ref=cm_w1_pad.at[ci],
+                        dst_ref=cm_w1_pad.at[ci],
+                        sem=cm_recv_sem.at[2 * ci + 0],
+                    ).wait()
+                    if not split_mode:
+                        pltpu.make_async_copy(
+                            src_ref=cm_w2_pad.at[ci],
+                            dst_ref=cm_w2_pad.at[ci],
+                            sem=cm_recv_sem.at[2 * ci + 1],
+                        ).wait()
+                    cm_awaited[ci] = jnp.int32(1)
+
+            def _wait_cm_w2(ci: int):
+                if not split_mode:
+                    return _wait_cm_w1(ci)
+
+                @pl.when(cm_awaited[2 + ci] == 0)
+                def _w2():
+                    pltpu.make_async_copy(
+                        src_ref=cm_w2_pad.at[ci],
+                        dst_ref=cm_w2_pad.at[ci],
+                        sem=cm_recv_sem.at[2 * ci + 1],
+                    ).wait()
+                    cm_awaited[2 + ci] = jnp.int32(1)
+
+            # If gm0 is borrowed, donor must have sent first; issue send before gm0 when borrowed_at_gm0
+            if borrowed_at_gm0:
+                _issue_def_send()
+
+            def _start_w(slot_b: int, eid):
+                for ci in range(2):
+
+                    @pl.when(eid == borrowed_slot + ci)
+                    def _from_cm(_c=ci):
+                        _wait_cm_w1(_c)
+                        pltpu.make_async_copy(
+                            src_ref=cm_w1_pad.at[_c],
+                            dst_ref=w1_buf.at[slot_b],
+                            sem=w1_sem.at[slot_b],
+                        ).start()
+                        _wait_cm_w2(_c)
+                        pltpu.make_async_copy(
+                            src_ref=cm_w2_pad.at[_c],
+                            dst_ref=w2_buf.at[slot_b],
+                            sem=w2_sem.at[slot_b],
+                        ).start()
+
+                @pl.when(eid < borrowed_slot)
+                def _from_home():
+                    pltpu.make_async_copy(
+                        src_ref=w1_hbm.at[eid],
+                        dst_ref=w1_buf.at[slot_b],
+                        sem=w1_sem.at[slot_b],
+                    ).start()
+                    pltpu.make_async_copy(
+                        src_ref=w2_hbm.at[eid],
+                        dst_ref=w2_buf.at[slot_b],
+                        sem=w2_sem.at[slot_b],
+                    ).start()
+
+            if split_mode:
+
+                @pl.when(e0 >= borrowed_slot)
+                def _gm0_borrowed():
+                    _start_w(0, e0)
+            else:
+                _start_w(0, e0)
+
+            for gm, eid in ((0, e0), (1, e1)):
+                pltpu.make_async_copy(
+                    src_ref=x_vmem.at[gm], dst_ref=x_vmem.at[gm], sem=g_sem.at[gm]
+                ).wait()
+                pltpu.make_async_copy(
+                    src_ref=w1_buf.at[gm], dst_ref=w1_buf.at[gm], sem=w1_sem.at[gm]
+                ).wait()
+                y1 = x_vmem[gm] + w1_buf[gm]
+                if gm == 0:
+                    _issue_def_send()
+                    _start_w(1, e1)
+                pltpu.make_async_copy(
+                    src_ref=w2_buf.at[gm], dst_ref=w2_buf.at[gm], sem=w2_sem.at[gm]
+                ).wait()
+                out_hbm[gm] = y1 + w2_buf[gm]
+
+            for ci in range(2):
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[ci],
+                    dst_ref=cm_w1_pad.at[ci],
+                    send_sem=cm_send_sem.at[2 * ci + 0],
+                    recv_sem=cm_recv_sem.at[2 * ci + 0],
+                    device_id={"ep": partner},
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[ci],
+                    dst_ref=cm_w2_pad.at[ci],
+                    send_sem=cm_send_sem.at[2 * ci + 1],
+                    recv_sem=cm_recv_sem.at[2 * ci + 1],
+                    device_id={"ep": partner},
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                _wait_cm_w1(ci)
+                _wait_cm_w2(ci)
+
+            pl.semaphore_signal(
+                bar_sem.at[0],
+                1,
+                device_id={"ep": partner},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            pl.semaphore_wait(bar_sem.at[0], 1)
+
+        def _shard(x_s, w1_s, w2_s):
+            out, _, _ = pl.pallas_call(
+                _ker,
+                out_shape=(
+                    jax.ShapeDtypeStruct((2, 16, 128), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((2, 16, 128), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((2, 16, 128), jnp.bfloat16),
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
+                    out_specs=(
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                    ),
+                    scratch_shapes=[
+                        pltpu.VMEM((2, 16, 128), jnp.bfloat16),
+                        pltpu.VMEM((2, 16, 128), jnp.bfloat16),
+                        pltpu.VMEM((2, 16, 128), jnp.bfloat16),
+                        pltpu.SemaphoreType.DMA((2,)),
+                        pltpu.SemaphoreType.DMA((2,)),
+                        pltpu.SemaphoreType.DMA((2,)),
+                        pltpu.SemaphoreType.DMA((4,)),
+                        pltpu.SemaphoreType.DMA((4,)),
+                        pltpu.SMEM((cm_flag_len,), jnp.int32),
+                        pltpu.SemaphoreType.REGULAR((1,)),
+                    ],
+                ),
+                interpret=pltpu.InterpretParams(detect_races=True),
+            )(x_s[0], w1_s[0], w2_s[0])
+            return out[None, ...]
+
+        res = jax.jit(
+            jax.shard_map(
+                _shard,
+                mesh=mesh,
+                in_specs=(P("ep"), P("ep"), P("ep")),
+                out_specs=P("ep"),
+                check_vma=False,
+            )
+        )(x_data, w1_data, w2_data)
+        return np.asarray(res, dtype=np.float32)
+
+    ref_g2a4 = _run(split_mode=False)
+    got_g2a6 = _run(split_mode=True)
+    assert np.isfinite(got_g2a6).all()
+    np.testing.assert_array_equal(got_g2a6, ref_g2a4)
+
+
+@pytest.mark.parametrize(
+    "ep_size,num_tok,expect_single_deq",
+    [(8, 16384, False), (16, 16384, False), (16, 2048, True)],
+)
+def test_w9_pql1_g2a6_2x2x1_and_2x2x2_mosaic_lowering(
+    ep_size: int, num_tok: int, expect_single_deq: bool
+) -> None:
+    """Verify TPU7x Mosaic lowering for pql1 + g2a6 + cm1s2d across EP=8 and EP=16 (1-half & 2-half)."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices()) < ep_size:
+        pytest.skip(f"Requires >={ep_size} virtual/physical JAX devices")
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    mesh = Mesh(np.array(jax.devices()[:ep_size]), ("model",))
+    e_loc = 256 // ep_size + 2
+    with (
+        patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+                "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "2",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                "SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+                "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_PREFILL_ROW_BUCKETS": "4",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+            },
+        ),
+    ):
+        jax.clear_caches()
+
+        def _wrap(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus):
+            return jax.shard_map(
+                lambda *xs: fused_moe_full_bridge_and_ffn(
+                    *xs,
+                    mesh=mesh,
+                    router_mode="bf16_hilo",
+                    b2_layout="nstream",
+                    b2_two_half=True,
+                    b2_deq0_first=True,
+                    hoist_routing=True,
+                    d_layout="4slab",
+                    d_tok_tile=64,
+                    d_fp8_unpool=True,
+                    in_shard_map=True,
+                    b2_deq0_new_buffer=True,
+                    next_in_gather_rows=min(512, num_tok // ep_size),
+                    next_in_gather_static_fp8=True,
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P("model", None),
+                    P("model", None),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P("model"),
+                    P("model"),
+                    P("model"),
+                    P("model"),
+                    P(),
+                    P("model"),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                ),
+                out_specs=(
+                    P("model", None),
+                    P("model", None),
+                    P("model", None),
+                    P("model", None),
+                    P("model", None, None),
+                ),
+                check_vma=False,
+            )(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus, pfw, aa, ba, pfw)
+
+        hlo = (
+            jax.jit(_wrap)
+            .trace(
+                jax.ShapeDtypeStruct((num_tok, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((num_tok, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8192, 256), jnp.float32),
+                jax.ShapeDtypeStruct((256,), jnp.float32),
+                jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((4096,), jnp.float32),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((256, 8, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((256, 8, 4096), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((ep_size,), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert f"gmm_v2_fused_rs-E_{e_loc}-M_{num_tok * 8}" in hlo
+        assert "-g2a6" in hlo and "-pql1" in hlo and "-cm1s2d" in hlo
+        expected_deq = (
+            "pallas_deq_single_fp8_gmm"
+            if expect_single_deq
+            else "pallas_deq_both_fp8_gmm"
+        )
+        assert expected_deq in hlo
+        jax.clear_caches()
