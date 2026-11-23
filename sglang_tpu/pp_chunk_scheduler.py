@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
@@ -27,9 +28,9 @@ from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_granularity,
     longest_prompt,
+    pipeline_prefill_is_chunked,
     profile_points,
     stage_min_samples,
-    uses_dynamic_chunks,
 )
 
 if TYPE_CHECKING:
@@ -48,8 +49,11 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     every chunk, so a costly chunk already in the pipeline lengthens the
     pipeline's fill and drain; under the lockstep wave the slowest forward of
     each wave also holds back the other stages.
+    Below a full step per stage, the work is split over ``spread`` times as
+    many steps; at or above it, every step takes the largest bucket.
     """
     cost = scheduler._tpu_pp_chunk_cost
+    pp_size, top = get_parallel().pp_size, cost.buckets[-1]
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
@@ -76,7 +80,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
             cached = matched_prefix_len(scheduler.tree_cache, req)
             cached_prefix[req.rid] = cached
         pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
-        if pending >= get_parallel().pp_size * cost.buckets[-1]:
+        if pending >= pp_size * top:
             # The limit saturates at a full step; the rest need no match.
             break
     # A micro-batch slot holds its batch until the result is processed, when
@@ -84,9 +88,11 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
+    if pending >= pp_size * top:
+        return top
     granule = cost.granularity
-    share = -(-pending // get_parallel().pp_size)
-    return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
+    granules = math.ceil(pending / (pp_size * scheduler._tpu_pp_chunk_spread * granule))
+    return min(top, max(granule, granules * granule))
 
 
 def _prefill_tokens(batch: ScheduleBatch) -> int:
@@ -203,15 +209,61 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
+def _check_chunk_env(
+    values: list[tuple[bool, float, float]],
+) -> tuple[float, float] | None:
+    if len({dynamic for dynamic, _, _ in values}) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_DYNAMIC_CHUNKS must be the same on every rank; ranks "
+            "that size steps differently deadlock the pipeline."
+        )
+    if not values[0][0]:
+        return None
+    for _, slack, spread in values:
+        if not 0 <= slack < math.inf:
+            raise ValueError(
+                "SGLANG_TPU_PP_CHUNK_SLACK must be finite and nonnegative."
+            )
+        if not 1 <= spread < math.inf:
+            raise ValueError(
+                "SGLANG_TPU_PP_CHUNK_SPREAD must be finite and at least 1."
+            )
+    if len({(slack, spread) for _, slack, spread in values}) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_CHUNK_SLACK and SGLANG_TPU_PP_CHUNK_SPREAD must be "
+            "the same on every rank; ranks that size steps differently deadlock "
+            "the pipeline."
+        )
+    return values[0][1:]
+
+
+def _agreed_chunk_env(world_group: Any) -> tuple[float, float] | None:
+    # Gathered before profiling and checked on the gathered values, so a rank
+    # with a different env fails with its peers instead of leaving them waiting.
+    values = [None] * world_group.world_size
+    torch.distributed.all_gather_object(
+        values,
+        (
+            envs.SGLANG_TPU_PP_DYNAMIC_CHUNKS.get(),
+            envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
+            envs.SGLANG_TPU_PP_CHUNK_SPREAD.get(),
+        ),
+        group=world_group.cpu_group,
+    )
+    return _check_chunk_env(values)
+
+
 def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     """Profile every stage after compilation and share the slowest cost curve."""
     runner = scheduler.tp_worker.model_runner
-    if not uses_dynamic_chunks():
+    if not pipeline_prefill_is_chunked():
+        return
+    agreed = _agreed_chunk_env(scheduler.world_group)
+    if agreed is None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
-        raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
+    slack, spread = agreed
     policy = runner.compile_policy
     granularity = chunk_granularity(
         scheduler.page_size, scheduler.chunked_prefill_size, True
@@ -257,7 +309,7 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     stage_samples = stage_min_samples([(stage, timed) for stage, timed, _ in reports])
     cost = StepCostModel.fit(
         stage_samples,
-        envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
+        slack,
         granularity,
         min(schedules) if schedules else None,
     )
@@ -273,12 +325,16 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
                 f"lower --context-length from {context_len} to {longest}."
             )
     scheduler._tpu_pp_chunk_cost = cost
+    scheduler._tpu_pp_chunk_spread = spread
     # Cached prefix tokens of each waiting request, matched once.
     scheduler._tpu_pp_cached_prefix = {}
     if get_parallel().pp_rank == 0 and get_parallel().tp_rank == 0:
         # Every rank installs the same model.
         logger.info(
-            "TPU pipeline chunks: %s; stage samples %s", cost.describe(), stage_samples
+            "TPU pipeline chunks: %s; spread %s; stage samples %s",
+            cost.describe(),
+            spread,
+            stage_samples,
         )
         logger.debug(
             "TPU pipeline chunks: (stage, samples, schedule) per rank %s", reports

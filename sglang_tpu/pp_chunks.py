@@ -261,15 +261,15 @@ class StepCostModel:
         return text
 
 
-def uses_dynamic_chunks() -> bool:
-    """Whether this TPU pipeline uses profiled prefill step budgets."""
+def pipeline_prefill_is_chunked() -> bool:
+    """Whether this server chunks prefill on a TPU pipeline; set by server
+    arguments alone, so it is the same on every rank."""
     from sglang.srt.runtime_context import (
         get_device,
         get_disagg,
         get_parallel,
         get_schedule,
     )
-    from sglang_tpu.envs import envs
 
     return (
         get_device().device == "tpu"
@@ -277,5 +277,11 @@ def uses_dynamic_chunks() -> bool:
         and get_disagg().disaggregation_mode != "decode"
         and get_schedule().chunked_prefill_size is not None
         and get_schedule().chunked_prefill_size > 0
-        and envs.SGLANG_TPU_PP_DYNAMIC_CHUNKS.get()
     )
+
+
+def uses_dynamic_chunks() -> bool:
+    """Whether this TPU pipeline uses profiled prefill step budgets."""
+    from sglang_tpu.envs import envs
+
+    return pipeline_prefill_is_chunked() and envs.SGLANG_TPU_PP_DYNAMIC_CHUNKS.get()
