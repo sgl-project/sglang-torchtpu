@@ -4,9 +4,11 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.utils.network import (
+    _ephemeral_port_low,
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
+    get_free_port_below_ephemeral,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -152,6 +154,34 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+class TestGetFreePortBelowEphemeral(CustomTestCase):
+    def test_draws_below_the_ephemeral_range(self):
+        port = get_free_port_below_ephemeral()
+        self.assertGreaterEqual(port, 22000)
+        self.assertLess(port, _ephemeral_port_low())
+
+    def test_returns_the_preferred_port_when_free(self):
+        preferred = get_free_port_below_ephemeral()
+        self.assertEqual(get_free_port_below_ephemeral(preferred=preferred), preferred)
+
+    def test_draws_when_the_preferred_port_is_taken(self):
+        preferred = get_free_port_below_ephemeral()
+        sock = bind_port(preferred)
+        try:
+            port = get_free_port_below_ephemeral(preferred=preferred)
+        finally:
+            sock.close()
+        self.assertNotEqual(port, preferred)
+        self.assertGreaterEqual(port, 22000)
+        self.assertLess(port, _ephemeral_port_low())
+
+    def test_draws_when_the_preferred_port_is_ephemeral(self):
+        preferred = _ephemeral_port_low() + 1000
+        port = get_free_port_below_ephemeral(preferred=preferred)
+        self.assertNotEqual(port, preferred)
+        self.assertLess(port, _ephemeral_port_low())
 
 
 class TestReservePort(CustomTestCase):

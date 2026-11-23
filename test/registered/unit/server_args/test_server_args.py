@@ -131,7 +131,14 @@ from sglang.srt.runtime_context import (
     get_serving,
     override_platform,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    NCCL_PORT_DELTA,
+    PortArgs,
+    ServerArgs,
+    default_nccl_port,
+    prepare_server_args,
+)
+from sglang.srt.utils.network import bind_port, get_free_port_below_ephemeral
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -2760,6 +2767,54 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.scheduler_input_ipc_name.startswith("ipc://"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_derives_the_default_nccl_port_from_the_server_port(
+        self, mock_temp_file
+    ):
+        # Servers that share a host have distinct --port, so they must never
+        # draw the same rendezvous port; the derived port is stable across calls.
+        mock_temp_file.return_value.name = "temp_file"
+        free_port = get_free_port_below_ephemeral()
+        nccl_ports = []
+        for port in (free_port - NCCL_PORT_DELTA, free_port - NCCL_PORT_DELTA + 1):
+            server_args = ServerArgs(model_path="dummy")
+            server_args.port = port
+            server_args.nccl_port = None
+            self.assertEqual(
+                PortArgs.init_new(server_args).nccl_port, port + NCCL_PORT_DELTA
+            )
+            self.assertEqual(
+                PortArgs.init_new(server_args).nccl_port, port + NCCL_PORT_DELTA
+            )
+            nccl_ports.append(default_nccl_port(port))
+        self.assertEqual(len(set(nccl_ports)), 2)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_draws_a_random_nccl_port_when_the_derived_one_is_taken(
+        self, mock_temp_file
+    ):
+        # launch_dp_schedulers holds each rank's nccl_port and calls init_new
+        # again for the next rank, which must get a different port.
+        mock_temp_file.return_value.name = "temp_file"
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = get_free_port_below_ephemeral() - NCCL_PORT_DELTA
+        server_args.nccl_port = None
+
+        first = PortArgs.init_new(server_args).nccl_port
+        sock = bind_port(first)
+        try:
+            second = PortArgs.init_new(server_args).nccl_port
+        finally:
+            sock.close()
+
+        self.assertEqual(first, default_nccl_port(server_args.port))
+        self.assertNotEqual(second, first)
+        self.assertIsInstance(second, int)
+
+    def test_default_nccl_port_stays_below_65536(self):
+        self.assertEqual(default_nccl_port(30000), 30000 + NCCL_PORT_DELTA)
+        self.assertEqual(default_nccl_port(65535), 65535 - NCCL_PORT_DELTA)
 
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_builds_decoupled_spec_ipc_config(self, mock_temp_file):

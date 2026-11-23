@@ -202,25 +202,45 @@ def get_free_port():
     return port
 
 
-def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
-    """Free port under the kernel ephemeral range (32768+ by default), for a
-    port that a child process binds only later."""
+def _ephemeral_port_low() -> int:
+    """First port of the kernel's ephemeral range (32768 by default)."""
     try:
         with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
-            ephemeral_low = int(f.read().split()[0])
+            return int(f.read().split()[0])
     except (OSError, ValueError, IndexError):
-        ephemeral_low = 32768
+        return 32768
+
+
+def _is_free_ipv4_port(port: int) -> bool:
+    try:
+        # IPv4 explicitly: the TCPStore binds the IPv4 side of this port.
+        try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+    except OSError:
+        return False
+    return True
+
+
+def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64, preferred=None):
+    """Free port under the kernel ephemeral range (32768+ by default), for a
+    port that a child process binds only later.
+
+    `preferred` is returned when it is free and under the ephemeral range, so
+    a caller that derives it from its configuration gets the same port on every
+    start; the random draw is the fallback."""
+    ephemeral_low = _ephemeral_port_low()
+    if (
+        preferred is not None
+        and 0 < preferred < ephemeral_low
+        and _is_free_ipv4_port(preferred)
+    ):
+        return preferred
     # bind(0) and connect() only hand out ports from ephemeral_low up.
     high = min(high, ephemeral_low - 1)
     if high - low + 1 < attempts:
         return get_free_port()
     for port in random.sample(range(low, high + 1), attempts):
-        try:
-            # IPv4 explicitly: the TCPStore binds the IPv4 side of this port.
-            try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+        if _is_free_ipv4_port(port):
             return port
-        except OSError:
-            continue
     return get_free_port()
 
 
