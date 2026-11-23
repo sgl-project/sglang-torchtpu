@@ -445,6 +445,9 @@ class TpuEnvs:
     # Debug: also read DSV4.1 extend positions back from the device and raise if
     # the host-built positions differ.
     SGLANG_TPU_DSV41_CHECK_HOST_POSITIONS = EnvBool(False)
+    # Upload the DSV4.1 per-forward attention metadata as one buffer per dtype
+    # (fields become device views) instead of one copy per field.
+    SGLANG_TPU_DSV41_PACKED_METADATA = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

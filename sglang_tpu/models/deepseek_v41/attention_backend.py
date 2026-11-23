@@ -61,6 +61,7 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
     PAGE_RECORDS,
     SWA_PAGE_TOKENS,
 )
+from sglang_tpu.models.deepseek_v41.metadata_pack import pack_upload
 from sglang_tpu.models.deepseek_v41.request_window import (
     DSV41TPURequestWindow,
     WindowPlan,
@@ -545,7 +546,6 @@ def build_forward_metadata(
     def put(t: torch.Tensor) -> torch.Tensor:
         return t.to(device=device, non_blocking=True)
 
-    full_pages_device = put(full_pages.to(torch.int32))
     metadata = _assemble_metadata(
         forward_batch=forward_batch,
         positions=positions,
@@ -558,13 +558,13 @@ def build_forward_metadata(
         req_pool_indices=req_pool_indices,
         swa_minimum=swa_minimum,
         full_pages=full_pages,
-        full_pages_device=full_pages_device,
+        full_pages_device=None,
         request_window=request_window,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         swa_ring_valid_from=swa_ring_valid_from,
         columns=columns,
         low_ratios=low_ratios,
-        put=put,
+        device=device,
     )
     if not decoder_replay:
         return metadata
@@ -605,13 +605,13 @@ def build_forward_metadata(
         req_pool_indices=req_pool_indices,
         swa_minimum=plan.replay_starts,
         full_pages=full_pages,
-        full_pages_device=full_pages_device,
+        full_pages_device=metadata.full_pages,
         request_window=request_window,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         swa_ring_valid_from=None,
         columns=columns,
         low_ratios=decoder_low_ratios,
-        put=put,
+        device=device,
     )
     metadata.tail_gather = put(plan.gather.to(torch.int32))
     if tail_gather_scatter_enabled():
@@ -652,15 +652,18 @@ def _assemble_metadata(
     req_pool_indices: torch.Tensor,
     swa_minimum: torch.Tensor,
     full_pages: torch.Tensor,
-    full_pages_device: torch.Tensor,
+    full_pages_device: Optional[torch.Tensor],
     request_window: Optional[DSV41TPURequestWindow],
     full_to_swa_index_mapping: Optional[torch.Tensor],
     swa_ring_valid_from: Optional[torch.Tensor],
     columns: int,
     low_ratios: Sequence[int],
-    put,
+    device: torch.device,
 ) -> DSV41TPUForwardMetadata:
-    """SWA table, request-window moves and low-ratio tables of one row set."""
+    """SWA table, request-window moves and low-ratio tables of one row set.
+
+    ``full_pages_device``: the uploaded page table to share, or None to upload
+    ``full_pages`` with this row set."""
     window_plan = None
     if swa_ring_valid_from is not None:
         # DSpark draft ring: every logical page is the slot's ring; rows before
@@ -692,25 +695,63 @@ def _assemble_metadata(
         )
         for ratio in low_ratios
     }
+    host = {
+        "positions": positions,
+        "query_start_loc": query_start_loc,
+        "token_rows": token_rows,
+        "token_req_pool": token_req_pool,
+        "valid": valid,
+        "compress_valid": compress_valid,
+        "out_cache_loc": out_cache_loc,
+        "swa_pages": swa_pages,
+        "swa_minimum": swa_minimum,
+    }
+    if full_pages_device is None:
+        host["full_pages"] = full_pages
+    for ratio, meta in low_ratio.items():
+        for name, t in zip(LowRatioMetadata._fields, meta):
+            host[f"low_ratio.{ratio}.{name}"] = t
+    dev = _upload_metadata(host, device=device)
     return DSV41TPUForwardMetadata(
-        positions=put(positions.to(torch.int32)),
-        query_start_loc=put(query_start_loc.to(torch.int32)),
-        token_rows=put(token_rows.to(torch.int32)),
-        token_req_pool=put(token_req_pool.to(torch.int32)),
-        valid=put(valid),
-        compress_valid=put(compress_valid),
-        out_cache_loc=put(out_cache_loc.to(torch.int32)),
-        full_pages=full_pages_device,
-        swa_pages=put(swa_pages.to(torch.int32)),
-        swa_minimum=put(swa_minimum.to(torch.int32)),
+        positions=dev["positions"],
+        query_start_loc=dev["query_start_loc"],
+        token_rows=dev["token_rows"],
+        token_req_pool=dev["token_req_pool"],
+        valid=dev["valid"],
+        compress_valid=dev["compress_valid"],
+        out_cache_loc=dev["out_cache_loc"],
+        full_pages=dev.get("full_pages", full_pages_device),
+        swa_pages=dev["swa_pages"],
+        swa_minimum=dev["swa_minimum"],
         low_ratio={
-            ratio: LowRatioMetadata(*(put(t) for t in meta))
-            for ratio, meta in low_ratio.items()
+            ratio: LowRatioMetadata(
+                *(dev[f"low_ratio.{ratio}.{n}"] for n in LowRatioMetadata._fields)
+            )
+            for ratio in low_ratio
         },
+        # int64 row ids (extend only), so not packed.
         swa_window_plan=(
-            None if window_plan is None else WindowPlan(*(put(t) for t in window_plan))
+            None
+            if window_plan is None
+            else WindowPlan(
+                *(t.to(device=device, non_blocking=True) for t in window_plan)
+            )
         ),
     )
+
+
+def _upload_metadata(
+    host: Dict[str, torch.Tensor], *, device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """Host metadata fields on ``device``: bool fields stay bool, the rest int32."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    host = {
+        k: t if t.dtype == torch.bool else t.to(torch.int32) for k, t in host.items()
+    }
+    if not tpu_envs.SGLANG_TPU_DSV41_PACKED_METADATA.get():
+        return {k: t.to(device=device, non_blocking=True) for k, t in host.items()}
+    return dict(zip(host, pack_upload(list(host.values()), device=device)))
 
 
 # =============================================================================

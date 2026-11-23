@@ -155,6 +155,19 @@ def test_metadata_from_uploaded_host_copies_is_bit_identical(name):
     _assert_same(_metadata(fb), reference)
 
 
+@pytest.mark.parametrize("name", list(BATCHES))
+def test_packed_upload_gives_the_same_fields(name):
+    """One upload per dtype: every field is a view at its own offset and shape."""
+    reference = _metadata(BATCHES[name]())
+    with patch.object(
+        tpu_envs, "SGLANG_TPU_DSV41_PACKED_METADATA", SimpleNamespace(get=lambda: True)
+    ):
+        packed = _metadata(BATCHES[name]())
+    _assert_same(packed, reference)
+    bases = {t.untyped_storage().data_ptr() for t in _flatten(packed).values()}
+    assert len(bases) == 2  # one int32 and one bool buffer
+
+
 @pytest.mark.parametrize("name", ["multi", "verify"])
 def test_runner_batch_copy_keeps_the_host_copies(name):
     """The runner builds metadata from a shallow copy of the uploaded batch
