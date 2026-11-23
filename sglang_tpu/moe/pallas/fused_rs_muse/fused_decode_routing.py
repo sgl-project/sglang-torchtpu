@@ -268,11 +268,11 @@ def routing_scratch_shapes(
         counts_smem=pltpu.SMEM((8, num_experts), jnp.int32),
         route_pack_vmem=pltpu.VMEM((pack_rows, 128), jnp.int32),
         route_pack_smem=pltpu.SMEM((pack_rows, 128), jnp.int32),
-        exec_expert_id=pltpu.SMEM((max_exec_experts,), jnp.int32),
-        exec_weight_src=pltpu.SMEM((max_exec_experts,), jnp.int32),
-        exec_weight_slot=pltpu.SMEM((max_exec_experts,), jnp.int32),
+        exec_expert_id=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
+        exec_weight_src=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
+        exec_weight_slot=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
         exec_start=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
-        exec_write_ptr=pltpu.SMEM((max_exec_experts,), jnp.int32),
+        exec_write_ptr=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
         cand_exec_idx=pltpu.SMEM((max_exec_experts,), jnp.int32),
         packed_tok_ids=pltpu.SMEM((max_packed,), jnp.int32),
         packed_tok_w=pltpu.SMEM((max_packed,), jnp.float32),
@@ -620,6 +620,350 @@ def _read_route_rb16_mode() -> int:
     return 0
 
 
+def _read_route_fast_flag() -> bool:
+    import os
+
+    raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST")
+    if raw is not None and raw.strip() != "":
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        from sglang_tpu.envs import envs
+
+        env_v = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST", None)
+        if env_v is not None:
+            return bool(env_v.get())
+    except Exception:
+        pass
+    return False
+
+
+def _route_vertical_lane_parallel(
+    logits_ref,
+    bias_ref,
+    scratch: RoutingScratch,
+    dma_sem,
+    *,
+    my_owner: jax.Array,
+    e_per_owner: int,
+    holder_cand_eids: tuple = (),
+    precompute_owner_loads: bool = False,
+    replica_cost_mode: str = "active",
+    replica_tile_m: int = 32,
+    topk: int = 8,
+    route_eps: float = 1e-15,
+    route_scale: float = 1.0,
+    min_p_topk: float = 0.0,
+    free_max_rows: int = 0,
+    free_max_w: float = 0.06,
+    free_min_slot: int = 5,
+) -> None:
+    """Zero-cross-lane-butterfly, 0.0-ULP bit-exact VPU router for B <= 128, E == 256.
+
+    Transposes ``[B, 256]`` -> ``[256, 128]`` via square ``128x128`` XLU hardware
+    ``vxpose`` so tokens ``0..B-1`` sit in independent lanes ``0..B-1`` and all
+    ``32`` per-token reductions execute as pure vertical ``axis=0`` elementwise
+    ``vmax``/``vmin``/``vadd`` with zero cross-lane swizzles and zero ``fori_loop``
+    ``sbr`` drains.
+    """
+    batch_size, num_experts = logits_ref.shape
+    first = my_owner * e_per_owner
+    last_excl = first + e_per_owner
+    bias_row = bias_ref[...].reshape(1, num_experts).astype(jnp.float32)
+    neg_inf = jnp.float32(-jnp.inf)
+
+    def _load_256x128(add_bias: bool) -> tuple[jax.Array, jax.Array]:
+        pad_v = neg_inf if add_bias else jnp.float32(0.0)
+        if batch_size <= 64:
+            lg_r = logits_ref[:, :].astype(jnp.float32)
+            lg_c = jnp.where(jnp.isnan(lg_r), neg_inf, lg_r)
+            val = 1.0 / (1.0 + jnp.exp(-lg_c))
+            if add_bias:
+                val = val + bias_row
+            if batch_size < 128:
+                val = jnp.concatenate(
+                    [
+                        val,
+                        jnp.full(
+                            (128 - batch_size, num_experts), pad_v, jnp.float32
+                        ),
+                    ],
+                    axis=0,
+                )
+        else:
+            lg0 = logits_ref[pl.ds(0, 64), :].astype(jnp.float32)
+            v0 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg0), neg_inf, lg0)))
+            lg1 = logits_ref[pl.ds(64, 64), :].astype(jnp.float32)
+            v1 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg1), neg_inf, lg1)))
+            if add_bias:
+                v0 = v0 + bias_row
+                v1 = v1 + bias_row
+            val = jnp.concatenate([v0, v1], axis=0)
+        return jnp.transpose(val[:, :128]), jnp.transpose(val[:, 128:])
+
+    ct_lo, ct_hi = _load_256x128(True)
+    c0, c1 = ct_lo[:64, :], ct_lo[64:, :]
+    c2, c3 = ct_hi[:64, :], ct_hi[64:, :]
+    del ct_lo, ct_hi
+    e_base = lax.broadcasted_iota(jnp.int32, (64, 128), 0)
+
+    slot_bests: list[jax.Array] = []
+    for _ in range(topk):
+        p0 = jnp.max(c0, axis=0, keepdims=True)
+        p1 = jnp.max(c1, axis=0, keepdims=True)
+        p2 = jnp.max(c2, axis=0, keepdims=True)
+        p3 = jnp.max(c3, axis=0, keepdims=True)
+        peak = jnp.maximum(jnp.maximum(p0, p1), jnp.maximum(p2, p3))
+
+        b0 = jnp.min(jnp.where(c0 == peak, e_base, num_experts), axis=0, keepdims=True)
+        b1 = jnp.min(jnp.where(c1 == peak, e_base + 64, num_experts), axis=0, keepdims=True)
+        b2 = jnp.min(jnp.where(c2 == peak, e_base + 128, num_experts), axis=0, keepdims=True)
+        b3 = jnp.min(jnp.where(c3 == peak, e_base + 192, num_experts), axis=0, keepdims=True)
+        best = jnp.minimum(jnp.minimum(b0, b1), jnp.minimum(b2, b3))
+        slot_bests.append(best)
+
+        c0 = jnp.where(e_base == best, neg_inf, c0)
+        c1 = jnp.where((e_base + 64) == best, neg_inf, c1)
+        c2 = jnp.where((e_base + 128) == best, neg_inf, c2)
+        c3 = jnp.where((e_base + 192) == best, neg_inf, c3)
+    del c0, c1, c2, c3
+
+    st_lo, st_hi = _load_256x128(False)
+    s0, s1 = st_lo[:64, :], st_lo[64:, :]
+    slot_ws = [
+        jnp.sum(
+            jnp.where(e_base == b, s0, 0.0)
+            + jnp.where((e_base + 64) == b, s1, 0.0),
+            axis=0,
+            keepdims=True,
+        )
+        for b in slot_bests
+    ]
+    del st_lo, s0, s1
+    s2, s3 = st_hi[:64, :], st_hi[64:, :]
+    slot_ws = [
+        w
+        + jnp.sum(
+            jnp.where((e_base + 128) == b, s2, 0.0)
+            + jnp.where((e_base + 192) == b, s3, 0.0),
+            axis=0,
+            keepdims=True,
+        )
+        for w, b in zip(slot_ws, slot_bests)
+    ]
+    del st_hi, s2, s3
+
+    w_sum8 = sum(slot_ws) + route_eps
+    if min_p_topk <= 0.0:
+        keep_flags = [w_s > 0.0 for w_s in slot_ws]
+    elif min_p_topk < 0.5:
+        keep_flags = [
+            (w_s > 0.0)
+            if s == 0
+            else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
+            for s, w_s in enumerate(slot_ws)
+        ]
+    elif min_p_topk >= 1.0:
+        k_cap = max(1, min(topk, int(min_p_topk)))
+        keep_flags = [
+            (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
+            for s, w_s in enumerate(slot_ws)
+        ]
+    else:
+        keep_flags = []
+        cum_p = jnp.zeros_like(w_sum8)
+        for s, w_s in enumerate(slot_ws):
+            keep_s = (
+                (w_s > 0.0)
+                if s == 0
+                else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
+            )
+            keep_flags.append(keep_s)
+            cum_p = cum_p + (w_s / w_sum8)
+
+    if free_max_rows > 0:
+        drop_flags = _droppable_flags_for_chunk(
+            slot_ws,
+            keep_flags,
+            route_eps=route_eps,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+        )
+        ht0 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht1 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht2 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht3 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        dt0 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        dt1 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        dt2 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        dt3 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        for b_T, k_T, d_T in zip(slot_bests, keep_flags, drop_flags):
+            bk_T = jnp.where(k_T, b_T, jnp.int32(-1))
+            ht0 = ht0 | (e_base == bk_T)
+            ht1 = ht1 | ((e_base + 64) == bk_T)
+            ht2 = ht2 | ((e_base + 128) == bk_T)
+            ht3 = ht3 | ((e_base + 192) == bk_T)
+            bd_T = jnp.where(d_T, b_T, jnp.int32(-1))
+            dt0 = dt0 | (e_base == bd_T)
+            dt1 = dt1 | ((e_base + 64) == bd_T)
+            dt2 = dt2 | ((e_base + 128) == bd_T)
+            dt3 = dt3 | ((e_base + 192) == bd_T)
+        tot_lo = jnp.sum(
+            jnp.transpose(jnp.concatenate([ht0, ht1], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del ht0, ht1
+        tot_hi = jnp.sum(
+            jnp.transpose(jnp.concatenate([ht2, ht3], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del ht2, ht3
+        drp_lo_s = jnp.sum(
+            jnp.transpose(jnp.concatenate([dt0, dt1], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del dt0, dt1
+        drp_hi_s = jnp.sum(
+            jnp.transpose(jnp.concatenate([dt2, dt3], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del dt2, dt3
+        tot_all = jnp.concatenate([tot_lo, tot_hi], axis=1)
+        drp_all = jnp.concatenate([drp_lo_s, drp_hi_s], axis=1)
+        fmask = (
+            (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+        )
+        counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
+        fm_lo = jnp.transpose(
+            jnp.broadcast_to(fmask[:, :128].astype(jnp.int32), (128, 128))
+        ) != 0
+        fm_hi = jnp.transpose(
+            jnp.broadcast_to(fmask[:, 128:].astype(jnp.int32), (128, 128))
+        ) != 0
+        eff_min_s = max(1, int(free_min_slot))
+        for s in range(eff_min_s, topk):
+            b_T = slot_bests[s]
+            freed_T = jnp.any(
+                ((e_base == b_T) & fm_lo[:64, :])
+                | (((e_base + 64) == b_T) & fm_lo[64:, :])
+                | (((e_base + 128) == b_T) & fm_hi[:64, :])
+                | (((e_base + 192) == b_T) & fm_hi[64:, :]),
+                axis=0,
+                keepdims=True,
+            )
+            keep_flags[s] = keep_flags[s] & (~(drop_flags[s] & freed_T))
+    else:
+        ht0 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht1 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht2 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        ht3 = jnp.zeros((64, 128), dtype=jnp.bool_)
+        for b_T, k_T in zip(slot_bests, keep_flags):
+            bk_T = jnp.where(k_T, b_T, jnp.int32(-1))
+            ht0 = ht0 | (e_base == bk_T)
+            ht1 = ht1 | ((e_base + 64) == bk_T)
+            ht2 = ht2 | ((e_base + 128) == bk_T)
+            ht3 = ht3 | ((e_base + 192) == bk_T)
+        tot_lo = jnp.sum(
+            jnp.transpose(jnp.concatenate([ht0, ht1], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del ht0, ht1
+        tot_hi = jnp.sum(
+            jnp.transpose(jnp.concatenate([ht2, ht3], axis=0).astype(jnp.int32))[
+                :batch_size, :
+            ],
+            axis=0,
+            keepdims=True,
+        )
+        del ht2, ht3
+        counts_acc = jnp.concatenate([tot_lo, tot_hi], axis=1)
+
+    w_sum_T = jnp.zeros((1, 128), dtype=jnp.float32)
+    for w_T, k_T in zip(slot_ws, keep_flags):
+        w_sum_T = w_sum_T + jnp.where(k_T, w_T, 0.0)
+
+    row16 = lax.broadcasted_iota(jnp.int32, (16, 128), 0)
+    pack_ids_T = jnp.zeros((16, 128), dtype=jnp.int32)
+    w_loc_raw_T = jnp.zeros((16, 128), dtype=jnp.float32)
+    loc_cnt_T = jnp.zeros((1, 128), dtype=jnp.int32)
+    first_T = jnp.broadcast_to(first, (1, 128))
+    last_excl_T = jnp.broadcast_to(last_excl, (1, 128))
+    rep_T = tuple(
+        jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (1, 128))
+        for eid in holder_cand_eids
+    )
+
+    for b_T, w_T, k_T in zip(slot_bests, slot_ws, keep_flags):
+        cand_T = jnp.where(
+            (b_T >= first_T) & (b_T < last_excl_T),
+            b_T - first_T,
+            jnp.int32(-1),
+        )
+        for r_slot, rv in enumerate(rep_T):
+            cand_T = jnp.where(
+                b_T == rv, jnp.int32(e_per_owner + r_slot), cand_T
+            )
+        is_cand_T = k_T & (cand_T >= 0)
+        id_row = jnp.int32(1) + loc_cnt_T
+        pack_ids_T = jnp.where(is_cand_T & (row16 == id_row), cand_T, pack_ids_T)
+        w_loc_raw_T = jnp.where(
+            is_cand_T & (row16 == loc_cnt_T), w_T, w_loc_raw_T
+        )
+        loc_cnt_T = loc_cnt_T + is_cand_T.astype(jnp.int32)
+
+    pack_ids_T = jnp.where(row16 == 0, loc_cnt_T, pack_ids_T)
+    w_loc_norm_T = w_loc_raw_T / (w_sum_T + route_eps)
+    if route_scale != 1.0:
+        w_loc_norm_T = w_loc_norm_T * route_scale
+    w_bits_T = lax.bitcast_convert_type(w_loc_norm_T, jnp.int32)
+    full_pack_T = jnp.concatenate(
+        [pack_ids_T, w_bits_T, jnp.zeros((96, 128), dtype=jnp.int32)], axis=0
+    )
+    scratch.route_pack_vmem[pl.ds(0, batch_size), :] = jnp.transpose(full_pack_T)[
+        :batch_size, :
+    ]
+
+    if precompute_owner_loads:
+        from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
+            precompute_imbalance_loads_vpu,
+        )
+
+        scratch.counts_vmem[...] = precompute_imbalance_loads_vpu(
+            counts_acc,
+            num_owners=num_experts // e_per_owner,
+            cost_mode=replica_cost_mode,
+            tile_m=replica_tile_m,
+        )
+    else:
+        scratch.counts_vmem[...] = jnp.broadcast_to(
+            counts_acc, scratch.counts_vmem.shape
+        )
+    cp_counts = pltpu.make_async_copy(
+        scratch.counts_vmem, scratch.counts_smem, dma_sem
+    )
+    cp_pack = pltpu.make_async_copy(
+        scratch.route_pack_vmem, scratch.route_pack_smem, dma_sem
+    )
+    cp_counts.start()
+    cp_pack.start()
+    cp_counts.wait()
+    cp_pack.wait()
+
+
 def route_topk_and_counts_in_kernel(
     logits_ref,
     bias_ref,
@@ -642,6 +986,7 @@ def route_topk_and_counts_in_kernel(
     free_max_w: float = 0.06,
     free_min_slot: int = 5,
     route_rb16_mode: int | None = None,
+    route_fast: bool | None = None,
 ) -> None:
     """VPU-filtered top-k routing compacting local-candidate hits per token in VREGs.
 
@@ -665,6 +1010,35 @@ def route_topk_and_counts_in_kernel(
         )
         return
     batch_size, num_experts = logits_ref.shape
+    use_rfast = _read_route_fast_flag() if route_fast is None else bool(route_fast)
+    if (
+        use_rfast
+        and (
+            (batch_size >= 8 and batch_size <= 64 and batch_size % 8 == 0)
+            or batch_size == 128
+        )
+        and num_experts == 256
+    ):
+        _route_vertical_lane_parallel(
+            logits_ref,
+            bias_ref,
+            scratch,
+            dma_sem,
+            my_owner=my_owner,
+            e_per_owner=e_per_owner,
+            holder_cand_eids=holder_cand_eids,
+            precompute_owner_loads=precompute_owner_loads,
+            replica_cost_mode=replica_cost_mode,
+            replica_tile_m=replica_tile_m,
+            topk=topk,
+            route_eps=route_eps,
+            route_scale=route_scale,
+            min_p_topk=min_p_topk,
+            free_max_rows=free_max_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+        )
+        return
     rb16_mode = _read_route_rb16_mode() if route_rb16_mode is None else int(route_rb16_mode)
     has_dyn_prune = (min_p_topk > 0.0) or (free_max_rows > 0)
     if rb16_mode > 0:
@@ -1401,10 +1775,44 @@ def build_exec_plan_from_masks_smem(
     *,
     num_experts: int = 256,
     spec_slot: jax.Array | None = None,
+    fast_plan: bool = False,
 ) -> jax.Array:
     """Build unified active-expert plan in ONLY ``e_per_owner + R`` (<= 36) steps!"""
     del num_experts
     first = my_owner * e_per_owner
+    if fast_plan and spec_slot is None and e_per_owner <= 32 and num_replicas <= 8:
+        k = jnp.int32(0)
+        cursor = jnp.int32(0)
+        for le in range(e_per_owner):
+            g_e = first + jnp.int32(le)
+            cnt = scratch.counts_smem[0, g_e]
+            keep = (cnt > 0) & (local_suppress_smem[le] == 0)
+            scratch.cand_exec_idx[le] = jnp.where(keep, k, jnp.int32(-1))
+            scratch.exec_expert_id[k] = g_e
+            scratch.exec_weight_src[k] = jnp.int32(0)
+            scratch.exec_weight_slot[k] = jnp.int32(le)
+            scratch.exec_start[k] = cursor
+            scratch.exec_write_ptr[k] = cursor
+            k = k + keep.astype(jnp.int32)
+            cursor = cursor + jnp.where(keep, cnt, jnp.int32(0))
+        for slot in range(num_replicas):
+            g_e = active_rep_eid_smem[slot]
+            has_rep = g_e >= 0
+            safe_e = jnp.where(has_rep, g_e, jnp.int32(0))
+            cnt = jnp.where(has_rep, scratch.counts_smem[0, safe_e], jnp.int32(0))
+            active = has_rep & (cnt > 0)
+            scratch.cand_exec_idx[e_per_owner + slot] = jnp.where(
+                active, k, jnp.int32(-1)
+            )
+            scratch.exec_expert_id[k] = safe_e
+            scratch.exec_weight_src[k] = jnp.int32(1)
+            scratch.exec_weight_slot[k] = jnp.int32(slot)
+            scratch.exec_start[k] = cursor
+            scratch.exec_write_ptr[k] = cursor
+            k = k + active.astype(jnp.int32)
+            cursor = cursor + jnp.where(active, cnt, jnp.int32(0))
+        scratch.exec_start[k] = cursor
+        return k
     k_init = jnp.int32(0)
     cursor_init = jnp.int32(0)
     if spec_slot is not None:
@@ -1638,6 +2046,7 @@ def run_replica_planner_smem(
     tile_m: int = 64,
     moved_flag_smem=None,
     vpu_precomputed_loads: bool = False,
+    fast_plan: bool = False,
 ) -> None:
     """Delegate to Track 3's ``plan_preloaded_replicas_smem`` when available."""
     try:
@@ -1645,22 +2054,40 @@ def run_replica_planner_smem(
             plan_preloaded_replicas_smem,
         )
     except ImportError:
-        plan_preloaded_replicas_smem = fallback_plan_preloaded_replicas_smem
-    plan_preloaded_replicas_smem(
-        my_owner,
-        e_owner,
-        num_owners,
-        num_replicas,
-        counts_smem,
-        replica_meta_smem,
-        local_suppress_smem,
-        holder_slot_expert_smem,
-        owner_load_smem,
-        cost_mode=cost_mode,
-        tile_m=tile_m,
-        moved_flag_smem=moved_flag_smem,
-        vpu_precomputed_loads=vpu_precomputed_loads,
-    )
+        plan_preloaded_replicas_smem = None
+    if plan_preloaded_replicas_smem is not None:
+        plan_preloaded_replicas_smem(
+            my_owner,
+            e_owner,
+            num_owners,
+            num_replicas,
+            counts_smem,
+            replica_meta_smem,
+            local_suppress_smem,
+            holder_slot_expert_smem,
+            owner_load_smem,
+            cost_mode=cost_mode,
+            tile_m=tile_m,
+            moved_flag_smem=moved_flag_smem,
+            vpu_precomputed_loads=vpu_precomputed_loads,
+            fast_unroll=fast_plan,
+        )
+    else:
+        fallback_plan_preloaded_replicas_smem(
+            my_owner,
+            e_owner,
+            num_owners,
+            num_replicas,
+            counts_smem,
+            replica_meta_smem,
+            local_suppress_smem,
+            holder_slot_expert_smem,
+            owner_load_smem,
+            cost_mode=cost_mode,
+            tile_m=tile_m,
+            moved_flag_smem=moved_flag_smem,
+            vpu_precomputed_loads=vpu_precomputed_loads,
+        )
 
 
 def pack_active_tokens_smem(

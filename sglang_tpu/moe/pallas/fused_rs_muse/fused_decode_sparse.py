@@ -83,6 +83,8 @@ class SparseDecodeConfig:
     k512_chain: bool = False  # opt-in: chain K256 MXU FP32 dots across scale_block=512 before 1x VPU scale
     unroll_strips: bool = False  # opt-in: Python-unroll n_strips <= 4 to avoid Ghostfish sbr MXU drains
     route_rb16_mode: int = 0  # 0 = cand_w8_zi rb=64 routing; 1 = 2-pass rb=16; 2 = 2-pass rb=16 unrolled
+    route_fast: bool = False  # opt-in: [256, 128] vertical lane-parallel VPU routing (0 cross-lane butterflies!)
+    fast_plan: int = 0  # 0 = stock; 1 = branchless 0-scf.if planner; 2 = 1 + unrolled k_rep<=64
     lhs_fp8: bool = False  # W4A8: online K256 FP8 activation quant
     rs_wire_bf16: bool = False
     pair_rs: bool = False  # 2-stage intra-chip XOR=1 paired Reduce-Scatter (halves off-chip ICI!)
@@ -111,12 +113,19 @@ def _env_bool_fallback(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int]:
+def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int, bool, bool]:
     import os
 
     nc_split = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512", False)
     k512_ch = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_K512_CHAIN", False)
     unroll_st = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS", False)
+    route_fast = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST", False)
+    fp_raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN")
+    if fp_raw is not None and fp_raw.strip() != "":
+        s_fp = fp_raw.strip().lower()
+        fast_plan = 1 if s_fp in ("true", "yes", "on") else (0 if s_fp in ("false", "no", "off") else int(s_fp))
+    else:
+        fast_plan = 0
     rb16_raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_RB16")
     if rb16_raw is not None and rb16_raw.strip() != "":
         s = rb16_raw.strip().lower()
@@ -146,9 +155,17 @@ def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int]:
             e_us = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS", None)
             if e_us is not None:
                 unroll_st = bool(e_us.get())
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST") is None:
+            e_rf = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST", None)
+            if e_rf is not None:
+                route_fast = bool(e_rf.get())
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN") is None:
+            e_fp = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN", None)
+            if e_fp is not None:
+                fast_plan = int(e_fp.get())
     except Exception:
         pass
-    return nc_split, k512_ch, unroll_st, rb16
+    return nc_split, k512_ch, unroll_st, rb16, route_fast, int(fast_plan)
 
 
 def _read_sparse_env_overrides() -> (
@@ -253,7 +270,14 @@ def default_sparse_decode_config(
     )
     use_ep16_bridge_ag = use_pair_rs and (ep == 16)
     eff_strip = strip_mode_ov if strip_mode_ov else "wide"
-    nc_split512, k512_chain, unroll_strips, route_rb16_mode = _read_sparse_w9_sub_knobs()
+    (
+        nc_split512,
+        k512_chain,
+        unroll_strips,
+        route_rb16_mode,
+        route_fast,
+        fast_plan,
+    ) = _read_sparse_w9_sub_knobs()
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
@@ -263,6 +287,8 @@ def default_sparse_decode_config(
         k512_chain=k512_chain,
         unroll_strips=unroll_strips,
         route_rb16_mode=route_rb16_mode,
+        route_fast=route_fast,
+        fast_plan=fast_plan,
         min_p_topk=min_p_topk,
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
@@ -1477,6 +1503,7 @@ def _sparse_decode_kernel(
             free_max_w=cfg.free_max_w,
             free_min_slot=cfg.free_min_slot,
             route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
+            route_fast=getattr(cfg, "route_fast", None),
         )
         counts_smem = r_scratch.counts_smem
 
@@ -1500,6 +1527,7 @@ def _sparse_decode_kernel(
             tile_m=tile_m,
             moved_flag_smem=moved_flag_smem,
             vpu_precomputed_loads=(not is_dense and cfg.static_holder_mask),
+            fast_plan=getattr(cfg, "fast_plan", False),
         )
         if is_dense:
             num_exec = build_dense_exec_plan_smem(
@@ -1520,6 +1548,7 @@ def _sparse_decode_kernel(
                 holder_slot_expert_smem,
                 r_scratch,
                 spec_slot=spec_slot,
+                fast_plan=getattr(cfg, "fast_plan", False),
             )
     else:
         if is_dense:

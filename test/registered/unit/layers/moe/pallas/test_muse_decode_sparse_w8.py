@@ -1368,7 +1368,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
         rep_eids = (200, 47, -1, 131)
         total_freed_experts = 0
 
-        for b_sz in (16, 32, 64):
+        for b_sz in (16, 32, 64, 128):
             # Regime 1: tie-heavy quantized + duplicated token rows + tied router bias.
             q_levels = rng.integers(-6, 7, size=(b_sz // 2, 64)).astype(np.float32) * 0.25
             lg_ties = np.repeat(q_levels, 4, axis=1)  # 4-way exact expert score ties!
@@ -1426,8 +1426,24 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         route_rb16_mode=2 if scale_mode == "off" else 1,
                         **kw,
                     )
+                    fast_run = _make_runner(
+                        routing_mod.route_topk_and_counts_in_kernel,
+                        b_sz,
+                        16,
+                        rep_eids,
+                        route_fast=True,
+                        **kw,
+                    )
                     nofree_run = _make_runner(
                         _legacy_route_rb64, b_sz, 16, rep_eids, **kw_nofree
+                    )
+                    nofree_fast_run = _make_runner(
+                        routing_mod.route_topk_and_counts_in_kernel,
+                        b_sz,
+                        16,
+                        rep_eids,
+                        route_fast=True,
+                        **kw_nofree,
                     )
 
                     for reg_name, lg_np, b_np in (
@@ -1436,41 +1452,68 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     ):
                         lg_j = jnp.asarray(lg_np, dtype=jnp.bfloat16)
                         b_j = jnp.asarray(b_np, dtype=jnp.float32)
-                        cnt_pre, _ = nofree_run(jnp.array([0], jnp.int32), lg_j, b_j)
+                        cnt_pre, pack_pre = nofree_run(jnp.array([0], jnp.int32), lg_j, b_j)
+                        cnt_pre_fast, pack_pre_fast = nofree_fast_run(
+                            jnp.array([0], jnp.int32), lg_j, b_j
+                        )
                         pre_counts = np.asarray(cnt_pre[0])
+                        self.assertTrue(
+                            np.array_equal(np.asarray(cnt_pre[0]), np.asarray(cnt_pre_fast[0]))
+                        )
+                        self.assertTrue(
+                            np.array_equal(np.asarray(pack_pre), np.asarray(pack_pre_fast))
+                        )
 
                         for owner in (0, 11):
                             own_j = jnp.array([owner], dtype=jnp.int32)
                             cnt_old, pack_old = old_run(own_j, lg_j, b_j)
                             cnt_new, pack_new = new_run(own_j, lg_j, b_j)
+                            cnt_fast, pack_fast = fast_run(own_j, lg_j, b_j)
                             cnt_old_np = np.asarray(cnt_old)
                             cnt_new_np = np.asarray(cnt_new)
+                            cnt_fast_np = np.asarray(cnt_fast)
                             pack_old_np = np.asarray(pack_old)
                             pack_new_np = np.asarray(pack_new)
+                            pack_fast_np = np.asarray(pack_fast)
 
                             ctx = f"{name}/{scale_mode}/B={b_sz}/{reg_name}/owner={owner}"
                             self.assertEqual(int(cnt_old_np[1, 0]), 0, ctx)
                             self.assertEqual(int(cnt_new_np[1, 0]), 0, ctx)
+                            self.assertEqual(int(cnt_fast_np[1, 0]), 0, ctx)
                             # 1. Bit-exact post-FREE expert counts (counts_smem[0, :]).
                             self.assertTrue(
                                 np.array_equal(cnt_old_np[0], cnt_new_np[0]),
                                 f"counts mismatch in {ctx}",
                             )
+                            self.assertTrue(
+                                np.array_equal(cnt_old_np[0], cnt_fast_np[0]),
+                                f"route_fast counts mismatch in {ctx}",
+                            )
                             # 2. Bit-exact freed-expert set.
                             freed_old = (pre_counts > 0) & (cnt_old_np[0] == 0)
                             freed_new = (pre_counts > 0) & (cnt_new_np[0] == 0)
+                            freed_fast = (pre_counts > 0) & (cnt_fast_np[0] == 0)
                             self.assertTrue(
                                 np.array_equal(freed_old, freed_new),
                                 f"freed-set mismatch in {ctx}",
+                            )
+                            self.assertTrue(
+                                np.array_equal(freed_old, freed_fast),
+                                f"route_fast freed-set mismatch in {ctx}",
                             )
                             total_freed_experts += int(np.sum(freed_new))
                             if reg_name == "nan_pad":
                                 # Expert 6 has a slot-0 hit on row 0 -> never freed!
                                 self.assertFalse(bool(freed_new[6]), ctx)
+                                self.assertFalse(bool(freed_fast[6]), ctx)
                             # 3. Bit-exact loc_cnt, compacted topk slot IDs, AND IEEE-754 FP32 weight bits!
                             self.assertTrue(
                                 np.array_equal(pack_old_np, pack_new_np),
                                 f"route_pack_smem bit mismatch in {ctx}",
+                            )
+                            self.assertTrue(
+                                np.array_equal(pack_old_np, pack_fast_np),
+                                f"route_fast route_pack_smem bit mismatch in {ctx}",
                             )
 
                         # Cross-check against standalone route_weights reference (0-ULP).

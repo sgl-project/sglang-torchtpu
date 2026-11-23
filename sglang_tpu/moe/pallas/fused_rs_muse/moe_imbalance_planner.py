@@ -1857,6 +1857,7 @@ def plan_preloaded_replicas_smem(
     vpu_precomputed_loads: bool = False,
     chip_aware: bool | None = None,
     chipmate_xor: int = 1,
+    fast_unroll: bool = False,
 ) -> None:
     """Deterministic in-kernel Section 4.5b home-vs-holder planner in Pallas SMEM.
 
@@ -1901,22 +1902,33 @@ def plan_preloaded_replicas_smem(
     num_experts = num_owners * e_owner
 
     # 1. Initialize local outputs and per-owner aggregate costs.
-    @pl.loop(0, e_owner)
-    def _init_sup(le):
-        local_suppress_smem[le] = jnp.int32(0)
+    if fast_unroll and e_owner <= 32:
+        for le in range(e_owner):
+            local_suppress_smem[le] = jnp.int32(0)
+    else:
+        @pl.loop(0, e_owner)
+        def _init_sup(le):
+            local_suppress_smem[le] = jnp.int32(0)
 
-    @pl.loop(0, num_replicas)
-    def _init_slots(s):
-        holder_slot_expert_smem[s] = jnp.int32(-1)
+    if fast_unroll and num_replicas <= 8:
+        for s in range(num_replicas):
+            holder_slot_expert_smem[s] = jnp.int32(-1)
+    else:
+        @pl.loop(0, num_replicas)
+        def _init_slots(s):
+            holder_slot_expert_smem[s] = jnp.int32(-1)
 
     moved_is_bitset = (
         moved_flag_smem is not None and int(moved_flag_smem.shape[0]) == 8
     )
     if moved_is_bitset:
-
-        @pl.loop(0, 8)
-        def _init_moved_bits(w):
-            moved_flag_smem[w] = jnp.int32(0)
+        if fast_unroll:
+            for w in range(8):
+                moved_flag_smem[w] = jnp.int32(0)
+        else:
+            @pl.loop(0, 8)
+            def _init_moved_bits(w):
+                moved_flag_smem[w] = jnp.int32(0)
 
     elif moved_flag_smem is not None:
 
@@ -1925,10 +1937,13 @@ def plan_preloaded_replicas_smem(
             moved_flag_smem[e] = jnp.int32(0)
 
     if vpu_precomputed_loads and len(counts_smem.shape) == 2:
-
-        @pl.loop(0, num_owners)
-        def _copy_owner_vpu(o):
-            owner_load_smem[o] = counts_smem[1, o]
+        if fast_unroll and num_owners <= 16:
+            for o in range(num_owners):
+                owner_load_smem[o] = counts_smem[1, o]
+        else:
+            @pl.loop(0, num_owners)
+            def _copy_owner_vpu(o):
+                owner_load_smem[o] = counts_smem[1, o]
 
     else:
 
@@ -1948,7 +1963,92 @@ def plan_preloaded_replicas_smem(
 
             owner_load_smem[o] = lax.fori_loop(0, e_owner, _sum_local, jnp.int32(0))
 
-    if not greedy_peak_first:
+    if not greedy_peak_first and fast_unroll:
+
+        def _decide_step_branchless(k):
+            eid = replica_meta_smem[0, k]
+            valid = eid >= 0
+            safe_eid = jnp.clip(eid, jnp.int32(0), jnp.int32(num_experts - 1))
+            cnt = jnp.where(valid, _read_count_smem(counts_smem, safe_eid), jnp.int32(0))
+            if moved_is_bitset:
+                word_idx = lax.shift_right_logical(safe_eid, jnp.int32(5))
+                bit_mask = lax.shift_left(jnp.int32(1), safe_eid & jnp.int32(31))
+                cur_m = moved_flag_smem[word_idx]
+                not_moved = (cur_m & bit_mask) == 0
+            elif moved_flag_smem is not None:
+                cur_m = moved_flag_smem[safe_eid]
+                not_moved = cur_m == 0
+            else:
+                cur_m = jnp.int32(0)
+                not_moved = jnp.bool_(True)
+            home = jnp.clip(
+                jnp.where(valid, replica_meta_smem[1, k], jnp.int32(0)),
+                jnp.int32(0),
+                jnp.int32(num_owners - 1),
+            )
+            holder = jnp.clip(
+                jnp.where(valid, replica_meta_smem[2, k], jnp.int32(0)),
+                jnp.int32(0),
+                jnp.int32(num_owners - 1),
+            )
+            slot = jnp.clip(
+                jnp.where(valid, replica_meta_smem[3, k], jnp.int32(0)),
+                jnp.int32(0),
+                jnp.int32(max(0, num_replicas - 1)),
+            )
+            c = _expert_cost_smem(
+                cnt,
+                cost_mode=mode,
+                tile_m=tile_m,
+                base_cost=base_cost,
+                row_weight=row_weight,
+            )
+            lh = owner_load_smem[home]
+            ld = owner_load_smem[holder]
+            if chip_aware:
+                lh_mate = owner_load_smem[lax.bitwise_xor(home, jnp.int32(chipmate_xor))]
+                ld_mate = owner_load_smem[lax.bitwise_xor(holder, jnp.int32(chipmate_xor))]
+                chip_home = lh + lh_mate
+                chip_holder = ld + ld_mate
+                ineq = ((chip_home - c) >= (chip_holder + c)) & (
+                    (ld + c) <= jnp.maximum(lh, lh_mate)
+                )
+            else:
+                ineq = (lh - c) >= (ld + c)
+            accept = valid & (cnt > 0) & not_moved & ineq & (home != holder)
+            owner_load_smem[home] = jnp.where(accept, lh - c, lh)
+            owner_load_smem[holder] = jnp.where(accept, ld + c, ld)
+            if moved_is_bitset:
+                moved_flag_smem[word_idx] = jnp.where(
+                    accept, cur_m | bit_mask, cur_m
+                )
+            elif moved_flag_smem is not None:
+                moved_flag_smem[safe_eid] = jnp.where(
+                    accept, jnp.asarray(k, jnp.int32) + jnp.int32(1), cur_m
+                )
+            is_h = accept & (home == my_owner)
+            h_loc = jnp.clip(
+                jnp.where(is_h, safe_eid - home * jnp.int32(e_owner), jnp.int32(0)),
+                jnp.int32(0),
+                jnp.int32(e_owner - 1),
+            )
+            local_suppress_smem[h_loc] = jnp.where(
+                is_h, jnp.int32(1), local_suppress_smem[h_loc]
+            )
+            is_d = accept & (holder == my_owner)
+            holder_slot_expert_smem[slot] = jnp.where(
+                is_d, safe_eid, holder_slot_expert_smem[slot]
+            )
+
+        if int(fast_unroll) >= 2 and k_rep <= 64:
+            for k_i in range(k_rep):
+                _decide_step_branchless(k_i)
+        else:
+            @pl.loop(0, k_rep)
+            def _decide_fast(k):
+                _decide_step_branchless(k)
+
+    elif not greedy_peak_first:
 
         @pl.loop(0, k_rep)
         def _decide(k):
