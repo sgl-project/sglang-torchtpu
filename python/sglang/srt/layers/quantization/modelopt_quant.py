@@ -3680,6 +3680,9 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
                 "pallas_tpu, or pallas_tpu_fused_rs"
             )
+        # The inherited get_moe_runner_backend returns this to FusedMoE; the
+        # Pallas kernel keeps no MoeRunner, so it declares the configured backend.
+        self._moe_runner_backend = moe_runner_backend
         # Compatibility is resolved after model setup in _resolve_fused_rs.
 
     def apply(
