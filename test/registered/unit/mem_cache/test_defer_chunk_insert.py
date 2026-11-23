@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
-from swa_cache_world import PAGE, WINDOW, KVWorld
+from swa_cache_world import PAGE, SWA_POOL, WINDOW, KVWorld
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
@@ -195,6 +195,75 @@ class TestSwaBranchCheckpoint(unittest.TestCase):
                     )
                     sibling = w.match(earlier + _tokens(4, PAGE))
                     self.assertEqual(sibling.device_prefix_len, branch)
+                    w.cache.sanity_check()
+
+
+class _PrefillWorld(KVWorld):
+    """A real hybrid-SWA UnifiedRadixCache that chunk-prefills a prompt as the
+    scheduler does: match and lock at admission, checkpoint_kv_cache after every
+    chunk but the last."""
+
+    def prefill(self, prompt: list[int], *, chunk: int) -> tuple[int, int]:
+        """Return the most SWA tokens the request held that no eviction could
+        free, and the longest prefix a mid-prefill checkpoint published."""
+        req = Req(
+            rid=f"r{self.rid}",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self.rid += 1
+        self.req_to_token_pool.alloc([req])
+        req.init_next_round_input(tree_cache=self.cache)
+        req.lock = self.cache.lock(req.last_node)
+        row, pos = req.kv.req_pool_idx, req.prefix_len
+        held = published = 0
+        while pos < len(prompt):
+            end = min(pos + chunk, len(prompt))
+            req.prefix_len, req.extend_end = pos, end
+            self.req_to_token_pool.write(
+                (row, slice(pos, end)), self._alloc(prompt[pos:end], pos)
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = end
+            pos = end
+            if pos < len(prompt):
+                checkpoint_kv_cache(req, self.cache, mid_prefill=True)
+                req.init_next_round_input()
+                published = max(published, self.match(prompt).device_prefix_len)
+            swa_used = self.allocator.size_swa - self.allocator.swa_available_size()
+            held = max(held, swa_used - self.cache.window_evictable_size(SWA_POOL))
+        return held, published
+
+
+class TestDeferredChunkSwaBound(unittest.TestCase):
+    CHUNK = 8 * PAGE
+
+    def test_long_prefill_keeps_swa_within_window_and_chunk(self):
+        """A prompt three times the SWA pool must prefill in chunks, holding no more
+        unevictable SWA than a window and a chunk, and leave room for the next
+        request, whether mid-prefill inserts are deferred or not and whether or not
+        out-of-window slots are freed. Otherwise the pool fills with the request's
+        own rows and the scheduler can neither continue nor admit anything."""
+        rng = random.Random(0)
+        for stride in (0, 1 << 20):
+            for free_out_of_window in (False, True):
+                with (
+                    self.subTest(stride=stride, free=free_out_of_window),
+                    envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride),
+                    envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(
+                        free_out_of_window
+                    ),
+                ):
+                    w = _PrefillWorld(full_tokens=16384, swa_tokens=1024)
+                    prompt = [rng.randrange(1, 50000) for _ in range(3000)]
+                    held, published = w.prefill(prompt, chunk=self.CHUNK)
+                    self.assertLessEqual(held, WINDOW + 1 + self.CHUNK)
+                    # The stride defers only when the deferred chunks free their tail.
+                    deferred = stride > 0 and free_out_of_window
+                    self.assertEqual(published == 0, deferred)
+                    w.prefill(
+                        [rng.randrange(1, 50000) for _ in range(600)], chunk=self.CHUNK
+                    )
                     w.cache.sanity_check()
 
 

@@ -1674,6 +1674,9 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.supports_mamba()
             or req.session_id is not None
             or req.finished()
+            # Without that free the request would hold every chunk's SWA rows,
+            # which no eviction reaches, until the SWA pool is full.
+            or not envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
             return False
         self.advance_unpublished_req(req)
