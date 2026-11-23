@@ -306,16 +306,17 @@ def moe_gmm_local_rs_nodedup(
         topk_indices = routing[..., 0].astype(jnp.int32)
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
 
-    if expert_tp:
-        # An id outside [0, E) (a NaN router score) leaves group_sizes but keeps its row,
-        # and the kernel halts or hangs: send it to expert 0 with weight 0.
-        routed_ok = (topk_indices >= 0) & (topk_indices < num_local_experts)
-        topk_indices = jnp.where(routed_ok, topk_indices, 0)
-        if sp_enabled:  # topk_weights holds only this rank's tokens
-            routed_ok = jax.lax.dynamic_slice_in_dim(
-                routed_ok, my_id * chunk_size, chunk_size, axis=0
-            )
-        topk_weights = jnp.where(routed_ok, topk_weights, 0).astype(topk_weights.dtype)
+    # An id outside [0, E) (a NaN router score) leaves group_sizes but keeps its row, and
+    # the kernel halts or hangs: send it to expert 0 with weight 0. Expert-TP ranks hold a
+    # slice of every expert, so E is num_local_experts there.
+    num_router_experts = num_local_experts if expert_tp else num_experts
+    routed_ok = (topk_indices >= 0) & (topk_indices < num_router_experts)
+    topk_indices = jnp.where(routed_ok, topk_indices, 0)
+    if sp_enabled:  # topk_weights holds only this rank's tokens
+        routed_ok = jax.lax.dynamic_slice_in_dim(
+            routed_ok, my_id * chunk_size, chunk_size, axis=0
+        )
+    topk_weights = jnp.where(routed_ok, topk_weights, 0).astype(topk_weights.dtype)
 
     # Expert TP: every rank holds a 1/ep_size slice of every expert's
     # intermediate dim, addressed as virtual experts
