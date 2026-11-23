@@ -4368,6 +4368,12 @@ class DeepseekV4Model(nn.Module):
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
                     input_ids_global = tail.rows(input_ids_global)
+                elif backend_manages_late_layout:
+                    # The backend installed the tail's DP geometry on entry.
+                    # Routing must gather the same rows as the MoE input.
+                    input_ids_global = _gather_late_layer_ids(
+                        input_ids, forward_batch.global_num_tokens_cpu, forward_batch
+                    )
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
