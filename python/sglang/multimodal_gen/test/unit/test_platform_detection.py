@@ -49,6 +49,31 @@ class TestCudaPlatformDetection(unittest.TestCase):
                 self.assertEqual(platforms.cuda_platform_plugin(), expected)
 
 
+class TestCpuFallback(unittest.TestCase):
+    def test_cpu_when_torch_has_no_available_accelerator(self):
+        with patch.object(
+            torch.accelerator, "current_accelerator", return_value=None
+        ) as current_accelerator:
+            self.assertEqual(
+                platforms.cpu_platform_plugin(),
+                "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
+            )
+        # An accelerator torch was built for but cannot use keeps the CPU.
+        current_accelerator.assert_called_once_with(check_available=True)
+
+    def test_an_unclaimed_accelerator_does_not_fall_back_to_cpu(self):
+        # E.g. torch_tpu loaded on a TPU host without the TPU platform plugin.
+        with patch.object(
+            torch.accelerator,
+            "current_accelerator",
+            return_value=SimpleNamespace(type="tpu"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "'tpu' accelerator.*SGLANG_DIFFUSION_PLATFORM_OVERRIDE"
+            ):
+                platforms.cpu_platform_plugin()
+
+
 class TestDiffusionPlatformPlugins(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(
