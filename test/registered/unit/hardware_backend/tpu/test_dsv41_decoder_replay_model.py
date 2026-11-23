@@ -466,6 +466,7 @@ class _Run:
         be.page_size = 256
         be.index_topk = TOPK
         be.forward_metadata = None
+        be._slot_tables = None
         be.is_dspark_draft = False
         be.low_ratios = (1, 2)
         be.last_candidate_consumer = be._last_candidate_consumers(cfg)

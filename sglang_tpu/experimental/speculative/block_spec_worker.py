@@ -36,6 +36,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu.compilation import slot_metadata
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
@@ -479,6 +480,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             live_mask,
             self._mask_token_id,
             width,
+        )
+        # Before the read below: the slot tables need no device value.
+        slot_metadata.prepare(
+            self._draft_runner.attn_backend, verify_input.req_pool_indices_cpu
         )
         # Read here, after the inputs are queued: the read waits for the previous verify.
         host_rows = (

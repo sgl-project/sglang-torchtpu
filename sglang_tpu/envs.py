@@ -448,6 +448,9 @@ class TpuEnvs:
     # Upload the DSV4.1 per-forward attention metadata as one buffer per dtype
     # (fields become device views) instead of one copy per field.
     SGLANG_TPU_DSV41_PACKED_METADATA = EnvBool(False)
+    # Spec step: build the slot-only attention metadata of the draft and verify
+    # forwards before the blocking length read / draft-token read (slot_metadata.py).
+    SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

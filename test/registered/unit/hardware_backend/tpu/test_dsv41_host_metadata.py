@@ -165,7 +165,7 @@ def test_packed_upload_gives_the_same_fields(name):
         packed = _metadata(BATCHES[name]())
     _assert_same(packed, reference)
     bases = {t.untyped_storage().data_ptr() for t in _flatten(packed).values()}
-    assert len(bases) == 2  # one int32 and one bool buffer
+    assert len(bases) == 3  # slot tables (int32), then rows (int32, bool)
 
 
 @pytest.mark.parametrize("name", ["multi", "verify"])
@@ -185,6 +185,28 @@ def test_runner_batch_copy_keeps_the_host_copies(name):
         lambda runner, batch: copy.copy(batch), None, fb
     )
     _assert_same(_metadata(loaded), reference)
+
+
+def test_prebuilt_slot_tables_are_used_only_for_the_forward_slots():
+    """Slot tables built ahead of a draft/verify forward replace the page-table build
+    only when built for that forward's slots; other slots' tables are rebuilt."""
+    fb = BATCHES["verify"]()
+    reference = _metadata(BATCHES["verify"]())
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=None,
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    stale = ab.build_slot_tables(req_pool_indices=torch.tensor([4, 5, 6]), **kw)
+    _assert_same(ab.build_forward_metadata(fb, slot_tables=stale, **kw), reference)
+    tables = ab.build_slot_tables(req_pool_indices=fb.req_pool_indices, **kw)
+    with patch.object(ab, "_full_page_table", side_effect=AssertionError("rebuilt")):
+        built = ab.build_forward_metadata(BATCHES["verify"](), slot_tables=tables, **kw)
+    _assert_same(built, reference)
 
 
 def test_device_values_are_not_read():

@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.compilation import host_input_mirror
+from sglang_tpu.compilation import host_input_mirror, slot_metadata
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
 from sglang_tpu.models.deepseek_v41.decoder_replay import (
     DecoderTail,
@@ -424,31 +424,36 @@ def _swa_page_table(
     return pages.reshape(full_pages.shape[0], -1)
 
 
-def _low_ratio_metadata(
+def _low_ratio_rows(
     *,
     ratio: int,
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
     valid: torch.Tensor,
     compress_valid: torch.Tensor,
-    full_pages: torch.Tensor,
-) -> LowRatioMetadata:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(out_loc, lengths) of LowRatioMetadata: the row-dependent part."""
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         _low_ratio_compression_metadata,
     )
-    from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 
     seq_lens_casual = positions + 1
     out_loc, _ = _low_ratio_compression_metadata(ratio, seq_lens_casual, out_cache_loc)
-    return LowRatioMetadata(
-        out_loc=out_loc.masked_fill(~compress_valid, -1).to(torch.int32),
-        lengths=torch.where(valid, seq_lens_casual // ratio, 0).to(torch.int32),
-        index_pages=expand_index_page_table(
-            full_pages.to(torch.int32),
-            full_page_size=FULL_PAGE_TOKENS,
-            compress_ratio=ratio,
-            index_page_size=PAGE_RECORDS,
-        ).to(torch.int32),
+    return (
+        out_loc.masked_fill(~compress_valid, -1),
+        torch.where(valid, seq_lens_casual // ratio, 0),
+    )
+
+
+def _index_pages(full_pages: torch.Tensor, ratio: int) -> torch.Tensor:
+    """[B, C * 256 / r / 128] indexer page table of LowRatioMetadata."""
+    from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+
+    return expand_index_page_table(
+        full_pages.to(torch.int32),
+        full_page_size=FULL_PAGE_TOKENS,
+        compress_ratio=ratio,
+        index_page_size=PAGE_RECORDS,
     )
 
 
@@ -502,6 +507,114 @@ def _window_swa_table(
     )
 
 
+class SlotTables(NamedTuple):
+    """Metadata of a forward that depends on its request slots, not its rows.
+
+    Built and uploaded ahead of the rows (``build_slot_tables``) while the device
+    still runs the previous forward; the row metadata needs the device lengths.
+    """
+
+    # [B] int64 host slots the tables were built for.
+    req_pool_indices: torch.Tensor
+    # [B, C] int64 host full page ids, and their upload.
+    full_pages: torch.Tensor
+    full_pages_device: torch.Tensor
+    # Uploaded SWA page table; None when the row metadata builds it (request
+    # window, or a device full_to_swa mapping).
+    swa_pages: Optional[torch.Tensor]
+    # Uploaded LowRatioMetadata.index_pages per ratio.
+    index_pages: Dict[int, torch.Tensor]
+
+
+def build_slot_tables(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    request_window: Optional[DSV41TPURequestWindow],
+    swa_ring_valid_from: Optional[torch.Tensor],
+    max_context_len: int,
+    low_ratios: Sequence[int],
+    device: torch.device,
+) -> SlotTables:
+    """The slot-only tables of a forward over host ``req_pool_indices``; reads no device."""
+    columns = _full_page_columns(max_context_len)
+    full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
+    return _slot_tables(
+        req_pool_indices=req_pool_indices,
+        full_pages=full_pages,
+        full_pages_device=None,
+        uses_window=request_window is not None,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        ring=swa_ring_valid_from is not None,
+        low_ratios=low_ratios,
+        device=device,
+    )
+
+
+def _full_page_columns(max_context_len: int) -> int:
+    return max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
+
+
+def _slot_tables(
+    *,
+    req_pool_indices: torch.Tensor,
+    full_pages: torch.Tensor,
+    full_pages_device: Optional[torch.Tensor],
+    uses_window: bool,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    ring: bool,
+    low_ratios: Sequence[int],
+    device: torch.device,
+) -> SlotTables:
+    """``full_pages_device``: an upload of ``full_pages`` to share, or None."""
+    host: Dict[str, torch.Tensor] = {}
+    if full_pages_device is None:
+        host["full_pages"] = full_pages
+    swa_columns = full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+    if ring:
+        # DSpark draft ring: every logical page is the slot's ring.
+        host["swa_pages"] = decode_window_pages(req_pool_indices, swa_columns)
+    elif not uses_window and full_to_swa_index_mapping is None:
+        host["swa_pages"] = _swa_page_table(full_pages, None)
+    for ratio in low_ratios:
+        host[f"index_pages.{ratio}"] = _index_pages(full_pages, ratio)
+    dev = _upload_metadata(host, device=device)
+    return SlotTables(
+        req_pool_indices=req_pool_indices,
+        full_pages=full_pages,
+        full_pages_device=dev.get("full_pages", full_pages_device),
+        swa_pages=dev.get("swa_pages"),
+        index_pages={ratio: dev[f"index_pages.{ratio}"] for ratio in low_ratios},
+    )
+
+
+def _matching_slot_tables(
+    slot_tables: Optional[SlotTables],
+    *,
+    req_pool_indices: torch.Tensor,
+    columns: int,
+    low_ratios: Sequence[int],
+) -> Optional[SlotTables]:
+    """``slot_tables`` if built for these slots and this table shape, else None."""
+    if slot_tables is None:
+        return None
+    ok = (
+        slot_tables.full_pages.shape[1] == columns
+        and tuple(slot_tables.index_pages) == tuple(low_ratios)
+        and torch.equal(slot_tables.req_pool_indices, req_pool_indices)
+    )
+    _SLOT_TABLE_USE["hit" if ok else "miss"] += 1
+    total = _SLOT_TABLE_USE["hit"] + _SLOT_TABLE_USE["miss"]
+    if total == 1 or total % 1000 == 0 or (not ok and _SLOT_TABLE_USE["miss"] == 1):
+        logger.info("DSV4.1 prebuilt slot tables: %s", _SLOT_TABLE_USE)
+    return slot_tables if ok else None
+
+
+# Prebuilt slot tables used / rebuilt (slots changed between prebuild and forward).
+_SLOT_TABLE_USE: Dict[str, int] = {"hit": 0, "miss": 0}
+
+
 def build_forward_metadata(
     forward_batch: ForwardBatch,
     *,
@@ -514,10 +627,12 @@ def build_forward_metadata(
     device: torch.device,
     decoder_replay: bool = False,
     decoder_low_ratios: Sequence[int] = (),
+    slot_tables: Optional[SlotTables] = None,
 ) -> DSV41TPUForwardMetadata:
     """Host-side metadata from the sglang batch, moved to ``device`` once.
 
-    ``decoder_replay``: also build the decoder rows' metadata (``tail``)."""
+    ``decoder_replay``: also build the decoder rows' metadata (``tail``).
+    ``slot_tables``: tables prebuilt by ``build_slot_tables``, used if they match."""
     bs = int(forward_batch.batch_size)
     num_tokens = forward_batch.positions.shape[0]
     positions = _extend_positions(forward_batch, num_tokens)
@@ -540,12 +655,25 @@ def build_forward_metadata(
         valid=valid,
     )
 
-    columns = max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
-    full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
-
-    def put(t: torch.Tensor) -> torch.Tensor:
-        return t.to(device=device, non_blocking=True)
-
+    tables = _matching_slot_tables(
+        slot_tables,
+        req_pool_indices=req_pool_indices,
+        columns=_full_page_columns(max_context_len),
+        low_ratios=low_ratios,
+    ) or build_slot_tables(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        request_window=request_window,
+        swa_ring_valid_from=swa_ring_valid_from,
+        max_context_len=max_context_len,
+        low_ratios=low_ratios,
+        device=device,
+    )
+    main_minimum = swa_minimum
+    if swa_ring_valid_from is not None:
+        # Ring rows before valid_from belong to the slot's previous owner.
+        main_minimum = torch.maximum(swa_minimum, swa_ring_valid_from[req_pool_indices])
     metadata = _assemble_metadata(
         forward_batch=forward_batch,
         positions=positions,
@@ -555,26 +683,53 @@ def build_forward_metadata(
         valid=valid,
         compress_valid=compress_valid,
         out_cache_loc=out_cache_loc,
-        req_pool_indices=req_pool_indices,
-        swa_minimum=swa_minimum,
-        full_pages=full_pages,
-        full_pages_device=None,
+        swa_minimum=main_minimum,
+        tables=tables,
         request_window=request_window,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        swa_ring_valid_from=swa_ring_valid_from,
-        columns=columns,
-        low_ratios=low_ratios,
         device=device,
     )
     if not decoder_replay:
         return metadata
+    _attach_tail_metadata(
+        metadata,
+        forward_batch=forward_batch,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        query_start_loc=query_start_loc,
+        valid=valid,
+        swa_minimum=swa_minimum,
+        tables=tables,
+        request_window=request_window,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        decoder_low_ratios=decoder_low_ratios,
+        device=device,
+    )
+    return metadata
 
+
+def _attach_tail_metadata(
+    metadata: DSV41TPUForwardMetadata,
+    *,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    valid: torch.Tensor,
+    swa_minimum: torch.Tensor,
+    tables: SlotTables,
+    request_window: Optional[DSV41TPURequestWindow],
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    decoder_low_ratios: Sequence[int],
+    device: torch.device,
+) -> None:
+    """Set the decoder rows' metadata (``tail``) and their row maps on ``metadata``."""
     from sglang_tpu.models.deepseek_v41.decoder_replay import plan_tail_rows
 
     if getattr(forward_batch, "decoder_rows_bucket", None) == 0:
         # No rank keeps a decoder row: the model skips the decoder layers.
         metadata.tail_rows = 0
-        return metadata
+        return
     plan = plan_tail_rows(
         fill_lens=getattr(forward_batch, "decoder_fill_lens", None),
         query_start_loc=query_start_loc,
@@ -584,12 +739,25 @@ def build_forward_metadata(
         bucket=getattr(forward_batch, "decoder_rows_bucket", None),
         warmup=getattr(forward_batch, "decoder_replay_warmup", False),
     )
+    req_pool_indices = tables.req_pool_indices
     tail_positions = positions[plan.gather]
     tail_qsl = F.pad(torch.cumsum(plan.counts, 0), (1, 0))
     real = torch.arange(plan.gather.shape[0]) < plan.num_real
     tail_loc = torch.where(real, out_cache_loc[plan.gather], 0)
     tail_token_rows, tail_valid, tail_req_pool = _token_rows(
         plan.counts, tail_loc, req_pool_indices, plan.gather.shape[0]
+    )
+    # The decoder rows share the full page table but take their own low ratios
+    # and no draft ring.
+    tail_tables = _slot_tables(
+        req_pool_indices=req_pool_indices,
+        full_pages=tables.full_pages,
+        full_pages_device=tables.full_pages_device,
+        uses_window=request_window is not None,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        ring=False,
+        low_ratios=decoder_low_ratios,
+        device=device,
     )
     metadata.tail_rows = int(plan.gather.shape[0])
     metadata.tail = _assemble_metadata(
@@ -602,23 +770,19 @@ def build_forward_metadata(
         # The decoder layers own no compressor.
         compress_valid=torch.zeros_like(tail_valid),
         out_cache_loc=tail_loc,
-        req_pool_indices=req_pool_indices,
         swa_minimum=plan.replay_starts,
-        full_pages=full_pages,
-        full_pages_device=metadata.full_pages,
+        tables=tail_tables,
         request_window=request_window,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        swa_ring_valid_from=None,
-        columns=columns,
-        low_ratios=decoder_low_ratios,
         device=device,
     )
-    metadata.tail_gather = put(plan.gather.to(torch.int32))
+    put = {"tail_gather": plan.gather}
     if tail_gather_scatter_enabled():
-        metadata.tail_inverse = put(
-            tail_inverse_rows(plan.gather, plan.num_real, int(positions.shape[0]))
+        put["tail_inverse"] = tail_inverse_rows(
+            plan.gather, plan.num_real, int(positions.shape[0])
         )
-    return metadata
+    for name, t in _upload_metadata(put, device=device).items():
+        setattr(metadata, name, t)
 
 
 def _token_rows(
@@ -649,52 +813,13 @@ def _assemble_metadata(
     valid: torch.Tensor,
     compress_valid: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    req_pool_indices: torch.Tensor,
     swa_minimum: torch.Tensor,
-    full_pages: torch.Tensor,
-    full_pages_device: Optional[torch.Tensor],
+    tables: SlotTables,
     request_window: Optional[DSV41TPURequestWindow],
     full_to_swa_index_mapping: Optional[torch.Tensor],
-    swa_ring_valid_from: Optional[torch.Tensor],
-    columns: int,
-    low_ratios: Sequence[int],
     device: torch.device,
 ) -> DSV41TPUForwardMetadata:
-    """SWA table, request-window moves and low-ratio tables of one row set.
-
-    ``full_pages_device``: the uploaded page table to share, or None to upload
-    ``full_pages`` with this row set."""
-    window_plan = None
-    if swa_ring_valid_from is not None:
-        # DSpark draft ring: every logical page is the slot's ring; rows before
-        # valid_from belong to the slot's previous owner.
-        swa_pages = decode_window_pages(
-            req_pool_indices, columns * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
-        )
-        swa_minimum = torch.maximum(swa_minimum, swa_ring_valid_from[req_pool_indices])
-    elif request_window is None:
-        swa_pages = _swa_page_table(full_pages, full_to_swa_index_mapping)
-    else:
-        swa_pages, window_plan = _window_swa_table(
-            forward_batch=forward_batch,
-            window=request_window,
-            positions=positions,
-            query_start_loc=query_start_loc,
-            req_pool_indices=req_pool_indices,
-            minimum=swa_minimum,
-            columns=columns * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS),
-        )
-    low_ratio = {
-        ratio: _low_ratio_metadata(
-            ratio=ratio,
-            positions=positions,
-            out_cache_loc=out_cache_loc,
-            valid=valid,
-            compress_valid=compress_valid,
-            full_pages=full_pages,
-        )
-        for ratio in low_ratios
-    }
+    """Row metadata of one row set over its slot tables, uploaded."""
     host = {
         "positions": positions,
         "query_start_loc": query_start_loc,
@@ -703,14 +828,33 @@ def _assemble_metadata(
         "valid": valid,
         "compress_valid": compress_valid,
         "out_cache_loc": out_cache_loc,
-        "swa_pages": swa_pages,
         "swa_minimum": swa_minimum,
     }
-    if full_pages_device is None:
-        host["full_pages"] = full_pages
-    for ratio, meta in low_ratio.items():
-        for name, t in zip(LowRatioMetadata._fields, meta):
-            host[f"low_ratio.{ratio}.{name}"] = t
+    window_plan = None
+    if tables.swa_pages is None and request_window is None:
+        host["swa_pages"] = _swa_page_table(
+            tables.full_pages, full_to_swa_index_mapping
+        )
+    elif tables.swa_pages is None:
+        host["swa_pages"], window_plan = _window_swa_table(
+            forward_batch=forward_batch,
+            window=request_window,
+            positions=positions,
+            query_start_loc=query_start_loc,
+            req_pool_indices=tables.req_pool_indices,
+            minimum=swa_minimum,
+            columns=tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS),
+        )
+    for ratio in tables.index_pages:
+        out_loc, lengths = _low_ratio_rows(
+            ratio=ratio,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            valid=valid,
+            compress_valid=compress_valid,
+        )
+        host[f"low_ratio.{ratio}.out_loc"] = out_loc
+        host[f"low_ratio.{ratio}.lengths"] = lengths
     dev = _upload_metadata(host, device=device)
     return DSV41TPUForwardMetadata(
         positions=dev["positions"],
@@ -720,14 +864,16 @@ def _assemble_metadata(
         valid=dev["valid"],
         compress_valid=dev["compress_valid"],
         out_cache_loc=dev["out_cache_loc"],
-        full_pages=dev.get("full_pages", full_pages_device),
-        swa_pages=dev["swa_pages"],
+        full_pages=tables.full_pages_device,
+        swa_pages=dev.get("swa_pages", tables.swa_pages),
         swa_minimum=dev["swa_minimum"],
         low_ratio={
             ratio: LowRatioMetadata(
-                *(dev[f"low_ratio.{ratio}.{n}"] for n in LowRatioMetadata._fields)
+                out_loc=dev[f"low_ratio.{ratio}.out_loc"],
+                lengths=dev[f"low_ratio.{ratio}.lengths"],
+                index_pages=index_pages,
             )
-            for ratio in low_ratio
+            for ratio, index_pages in tables.index_pages.items()
         },
         # int64 row ids (extend only), so not packed.
         swa_window_plan=(
@@ -743,7 +889,9 @@ def _assemble_metadata(
 def _upload_metadata(
     host: Dict[str, torch.Tensor], *, device: torch.device
 ) -> Dict[str, torch.Tensor]:
-    """Host metadata fields on ``device``: bool fields stay bool, the rest int32."""
+    """Host metadata fields on ``device``: bool fields stay bool, the rest int32.
+
+    SGLANG_TPU_DSV41_PACKED_METADATA: one upload per dtype, fields as views."""
     from sglang_tpu.envs import envs as tpu_envs
 
     host = {
@@ -892,6 +1040,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
+        # Set by prepare_slot_tables, consumed by the next metadata build.
+        self._slot_tables: Optional[SlotTables] = None
         # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
         self.is_dspark_draft = (
             model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
@@ -1022,7 +1172,21 @@ class DSV41TPUAttnBackend(AttentionBackend):
             self.init_forward_metadata(forward_batch)
         return self.forward_metadata
 
+    def prepare_slot_tables(self, req_pool_indices: torch.Tensor) -> None:
+        """Build the next forward's slot tables now, ahead of its rows."""
+        self._slot_tables = build_slot_tables(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices.to(torch.int64),
+            full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            request_window=self.request_window,
+            swa_ring_valid_from=self.token_to_kv_pool.swa_valid_from,
+            max_context_len=self.max_context_len,
+            low_ratios=self.low_ratios,
+            device=self.device,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        slot_tables, self._slot_tables = self._slot_tables, None
         self.forward_metadata = build_forward_metadata(
             forward_batch,
             req_to_token=self.req_to_token,
@@ -1034,6 +1198,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             device=self.device,
             decoder_replay=self._uses_decoder_replay(forward_batch),
             decoder_low_ratios=self.decoder_low_ratios,
+            slot_tables=slot_tables,
         )
 
     def scheduled_decoder_rows(self, batch, *, folds: bool) -> int:
@@ -1671,3 +1836,6 @@ class DSV41TPUAttnBackend(AttentionBackend):
         out, gathered = result
         metadata.gathered_main[first] = gathered
         return out
+
+
+slot_metadata.register(DSV41TPUAttnBackend, DSV41TPUAttnBackend.prepare_slot_tables)

@@ -82,7 +82,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_pin_memory_available
-from sglang_tpu.compilation import host_input_mirror
+from sglang_tpu.compilation import host_input_mirror, slot_metadata
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -702,6 +702,11 @@ class TpuSpecWorker(BaseSpecWorker):
         next_token_logits is p (or its distributed top-k when the accept reads only
         that), hidden_states is the target feature phi.
         """
+        # Ahead of the verify's first read of the draft, which waits for the draft.
+        slot_metadata.prepare(
+            self.target_worker.model_runner.attn_backend,
+            verify_input.req_pool_indices_cpu,
+        )
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
             verify_tokens = build_verify_tokens(
