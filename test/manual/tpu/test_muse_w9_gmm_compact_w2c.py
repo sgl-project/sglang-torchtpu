@@ -1593,3 +1593,119 @@ def test_sw7_pair_k512_and_fori_tail_bit_exact_vs_sw2(
         f"sw=7 mismatch vs sw=2 at m_rows={m_rows}, k_dim={k_dim}, rhs_qbs={rhs_qbs}: "
         f"max_abs={np.max(np.abs(got_sw7.astype(np.float32) - ref_sw2.astype(np.float32)))}"
     )
+
+
+def test_ep16_auto_smem_window_and_xor_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EP>=16 at M>=131072 must auto-window SMEM to 65536 rows so secondary_idx_ref (50 ints/tile)
+    never exhausts SMEM and triggers scalar-register-to-HBM spills, while EP=8 stays at 131072."""
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        fused_rs_smem_rows,
+    )
+
+    monkeypatch.setenv("SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS", "0")
+    monkeypatch.setenv("SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS", "0")
+    assert fused_rs_smem_rows(131_072, 8, False) == 131_072
+    assert fused_rs_smem_rows(131_072, 16, False) == 65_536
+    assert fused_rs_smem_rows(196_608, 16, False) == 65_536
+    assert fused_rs_smem_rows(262_144, 16, False) == 131_072
+
+    for ep_size, expected in (
+        (8, (2, 4, 6, 3, 5, 7, 1)),
+        (16, (2, 4, 6, 8, 10, 12, 14, 3, 5, 7, 9, 11, 13, 15, 1)),
+    ):
+        got = (
+            tuple(range(2, ep_size, 2))
+            + tuple(range(3, ep_size, 2))
+            + ((1,) if ep_size >= 2 else ())
+        )
+        assert got == expected
+        assert len(set(got)) == ep_size - 1
+        assert got[-1] == 1
+
+
+@pytest.mark.parametrize("sortfree_prefill", ["1", "0"])
+def test_compute_block_scatter_routing_rotate_rs2_with_pallas_sf0_bit_exact(
+    monkeypatch: pytest.MonkeyPatch, sortfree_prefill: str
+) -> None:
+    """When PALLAS_SORTFREE_ROUTING=0 (precomputed_counts=None), GMM_ROTATE_RS=2 must still
+    rotate lhs_indices consistently with _precompute_block_scatter_meta_closed_form(rotate_rs=True)."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _precompute_block_scatter_meta_closed_form,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        compute_block_scatter_routing,
+    )
+
+    monkeypatch.setenv("SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING", "0")
+    monkeypatch.setenv("SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS", "2")
+    monkeypatch.setenv("SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL", sortfree_prefill)
+
+    ep_size = 16
+    num_local_experts = 4
+    num_experts = ep_size * num_local_experts
+    topk = 8
+    num_tokens = 1024
+    chunk_size = num_tokens // ep_size
+    tile_m = 64
+
+    rng = np.random.default_rng(20261123)
+    global_topk = np.stack(
+        [rng.choice(num_experts, size=topk, replace=False) for _ in range(num_tokens)],
+        axis=0,
+    ).astype(np.int32)
+    global_topk_j = jnp.asarray(global_topk)
+
+    for my_id_int in (0, 1, 7, 15):
+        go_val = jnp.int32(my_id_int * num_local_experts)
+        my_id = jnp.int32(my_id_int)
+        lhs_idx, group_sizes, group_start_arg, _ = compute_block_scatter_routing(
+            global_topk_j,
+            go_val,
+            my_id,
+            ep_size=ep_size,
+            num_local_experts=num_local_experts,
+            topk=topk,
+            precomputed_counts=None,
+        )
+        num_slots = num_local_experts + (num_tokens * topk) // tile_m
+        meta = np.asarray(
+            _precompute_block_scatter_meta_closed_form(
+                group_sizes,
+                jnp.asarray([go_val], dtype=jnp.int32),
+                group_start_arg,
+                size_group=num_local_experts,
+                tile_m=tile_m,
+                num_slots=num_slots,
+                ep_size=ep_size,
+                rotate_rs=True,
+            )
+        )
+        lhs_np = np.asarray(lhs_idx)
+        local_start = int(np.asarray(group_start_arg)[0])
+        gs_local = np.asarray(group_sizes)[
+            my_id_int * num_local_experts : (my_id_int + 1) * num_local_experts
+        ]
+        cur_m = local_start
+        gm_slot = 0
+        for g_sz in gs_local:
+            rem = int(g_sz)
+            while rem > 0:
+                take = min(tile_m, rem)
+                tile_tokens = lhs_np[cur_m : cur_m + take]
+                covered = 0
+                for c in range(ep_size):
+                    s_c = int(meta[gm_slot, c])
+                    l_c = int(meta[gm_slot, 2 * ep_size + c])
+                    if l_c > 0:
+                        seg = tile_tokens[s_c : s_c + l_c]
+                        assert np.all(seg // chunk_size == c), (
+                            f"rank={my_id_int} gm={gm_slot} c={c}: expected chip {c}, "
+                            f"got chips {seg // chunk_size}"
+                        )
+                        covered += l_c
+                assert covered == take
+                cur_m += take
+                rem -= take
+                gm_slot += 1

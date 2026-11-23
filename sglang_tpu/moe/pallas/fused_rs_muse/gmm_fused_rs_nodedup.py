@@ -70,10 +70,16 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
             (win_override + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
         ) * _LOCAL_ROWS_ALIGN
         return min(size_m, aligned)
-    force_u16 = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0) >= 1
-    if ep_size >= 4 and (size_m > 131_072 or (force_u16 and size_m > 120_000)):
+    u16_env = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0)
+    force_u16 = u16_env >= 1
+    auto_ep16 = ep_size >= 16 and size_m >= 131_072
+    if ep_size >= 4 and (
+        size_m > 131_072 or auto_ep16 or (force_u16 and size_m > 120_000)
+    ):
         floor_rows = (
-            131_072 if size_m >= 262_144 else (98_304 if not force_u16 else 65_536)
+            131_072
+            if size_m >= 262_144
+            else (98_304 if not (force_u16 or auto_ep16) else 65_536)
         )
         target = max(floor_rows, (size_m // ep_size) * 3)
         aligned = (
@@ -2504,27 +2510,21 @@ def kernel_main_fused_rs(
     @jax.named_scope("direct_write_rows")
     def _do_direct_write(t_gm, t_stg):
         if block_scatter:
+            _bs_stride = 3 * ep_size + 2
+            _bs_base = t_gm * _bs_stride
             if topk_indices_ref.ndim == 1:
-                _bs_stride = 3 * ep_size + 2
-                _bs_base = t_gm * _bs_stride
-                s8 = [topk_indices_ref[_bs_base + c] for c in range(ep_size)]
-                d8 = [topk_indices_ref[_bs_base + ep_size + c] for c in range(ep_size)]
-                l8 = [
-                    topk_indices_ref[_bs_base + 2 * ep_size + c] for c in range(ep_size)
-                ]
                 send_blks = topk_indices_ref[_bs_base + 3 * ep_size]
                 local_blks = topk_indices_ref[_bs_base + 3 * ep_size + 1]
             else:
-                s8 = [topk_indices_ref[t_gm, c] for c in range(ep_size)]
-                d8 = [topk_indices_ref[t_gm, ep_size + c] for c in range(ep_size)]
-                l8 = [topk_indices_ref[t_gm, 2 * ep_size + c] for c in range(ep_size)]
                 send_blks = topk_indices_ref[t_gm, 3 * ep_size]
                 local_blks = topk_indices_ref[t_gm, 3 * ep_size + 1]
             gm_id_ref[1 + t_stg] = gm_id_ref[1 + t_stg] + send_blks
             gm_id_ref[9 + t_stg] = gm_id_ref[9 + t_stg] + local_blks
             if rotate_rs_mode >= 1 and (ep_size & (ep_size - 1)) == 0:
                 _xor_steps = (
-                    (2, 4, 6, 3, 5, 7, 1) if ep_size == 8 else tuple(range(1, ep_size))
+                    tuple(range(2, ep_size, 2))
+                    + tuple(range(3, ep_size, 2))
+                    + ((1,) if ep_size >= 2 else ())
                 )
                 for _st in _xor_steps:
                     _tgt = lax.bitwise_xor(my_id, jnp.int32(_st))
@@ -2571,11 +2571,19 @@ def kernel_main_fused_rs(
 
                 return
             for c in range(ep_size):
-                has_c = l8[c] > 0
+                if topk_indices_ref.ndim == 1:
+                    _src_c = topk_indices_ref[_bs_base + c]
+                    _dst_c = topk_indices_ref[_bs_base + ep_size + c]
+                    _len_c = topk_indices_ref[_bs_base + 2 * ep_size + c]
+                else:
+                    _src_c = topk_indices_ref[t_gm, c]
+                    _dst_c = topk_indices_ref[t_gm, ep_size + c]
+                    _len_c = topk_indices_ref[t_gm, 2 * ep_size + c]
+                has_c = _len_c > 0
                 is_loc_c = c == my_id
 
                 @pl.when(jnp.logical_and(has_c, ~is_loc_c))
-                def _(_c=c, _src=s8[c], _dst=d8[c], _len=l8[c]):
+                def _(_c=c, _src=_src_c, _dst=_dst_c, _len=_len_c):
                     pltpu.make_async_remote_copy(
                         src_ref=scatter_staging_3x_ref.at[
                             t_stg, pl.ds(_src, _len), :, :
@@ -2588,7 +2596,7 @@ def kernel_main_fused_rs(
                     ).start()
 
                 @pl.when(jnp.logical_and(has_c, is_loc_c))
-                def _(_src=s8[c], _dst=d8[c], _len=l8[c]):
+                def _(_src=_src_c, _dst=_dst_c, _len=_len_c):
                     pltpu.make_async_copy(
                         src_ref=scatter_staging_3x_ref.at[
                             t_stg, pl.ds(_src, _len), :, :
@@ -3617,6 +3625,7 @@ def kernel_main_fused_rs(
 
                 _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
                 if _gather_during_gmm1 and step == 0:
+
                     @jax.named_scope("dma_gather_prefetch_2ahead_gmm1")
                     @pl.when(gm_id + 2 < local_num_gm)
                     def _():
@@ -3630,6 +3639,7 @@ def kernel_main_fused_rs(
                             divisor=_gather_divisor,
                             packed_u16=packed_u16_lhs,
                         )
+
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
 
@@ -5011,9 +5021,11 @@ def gmm_v2_fused_rs(
     # as a padded 128-wide row and use column 0 when dequantizing.
     out_scale_init = jax.ShapeDtypeStruct((chunk_size * top_k, 128), jnp.float32)
 
-    force_u16_lhs = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0) >= 1
+    u16_lhs_env = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0)
+    force_u16_lhs = u16_lhs_env >= 1
+    auto_ep16_u16 = (u16_lhs_env >= 0) and (ep_size >= 16 and size_m >= 131_072)
     flatten_bs_meta = bool(envs.SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META.get()) or (
-        block_scatter and (size_m > 131_072 or force_u16_lhs)
+        block_scatter and (size_m > 131_072 or force_u16_lhs or auto_ep16_u16)
     )
     skip_pack_for_bs = block_scatter and (
         flatten_bs_meta
@@ -5028,7 +5040,7 @@ def gmm_v2_fused_rs(
         and not fp8_direct_write
         and hidden_3d.shape[0] <= 65_536
         and (smem_rows % 2 == 0)
-        and (size_m >= 262_144 or force_u16_lhs)
+        and (size_m >= 262_144 or force_u16_lhs or auto_ep16_u16)
     )
 
     perm_gm_opt = None

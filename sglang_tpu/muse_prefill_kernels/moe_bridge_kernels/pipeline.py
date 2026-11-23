@@ -638,12 +638,19 @@ def compute_block_scatter_routing(
             axis=1,
         )
         sf_scatter = envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER.get()
-        if (sf_scatter == 2 or use_zero_sort_rt) and num_tokens % 256 == 0:
+        if (
+            (sf_scatter == 2 or use_zero_sort_rt)
+            and num_tokens % 256 == 0
+            and not rotate_rs
+        ):
             # Local entries land at [0, local_total) in (bucket, token, slot) order; the rest stay 0,
             # as the fast merge leaves them.
             bucket_2d = bucket_flat.reshape(num_tokens, topk)
             lhs_indices = _mxu_bucket_scatter_lhs_indices(bucket_2d, tok_ids_flat)
-        elif int(envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0) >= 1:
+        elif (
+            rotate_rs
+            or int(envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0) >= 1
+        ):
             lhs_indices = _sort_local_packed_lhs_indices(
                 global_topk_ids=global_topk_ids,
                 topk_indices_flat=topk_indices_flat,
@@ -655,7 +662,7 @@ def compute_block_scatter_routing(
                 ep_size=ep_size,
                 num_local_experts=num_local_experts,
                 topk=topk,
-                rotate_rs=False,
+                rotate_rs=rotate_rs,
                 compact_mode=int(
                     envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT.get() or 0
                 ),
@@ -686,7 +693,13 @@ def compute_block_scatter_routing(
             or has_pad_sentinel
             or envs.SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META.get()
         )
-        if envs.SGLANG_TPU_MUSE_KERNEL_PACKED_SORTS.get():
+        if rotate_rs:
+            _flat_iota = jnp.arange(topk_indices_flat.shape[0], dtype=jnp.int32)
+            _tok_f = _flat_iota // topk
+            _chip_rot = jnp.mod(_tok_f // chunk_size + ep_size - 1 - my_id, ep_size)
+            _rot_key = topk_indices_flat.astype(jnp.int32) * ep_size + _chip_rot
+            topk_argsort_indices = jnp.argsort(_rot_key, stable=True)
+        elif envs.SGLANG_TPU_MUSE_KERNEL_PACKED_SORTS.get():
             topk_argsort_indices = _packed_sort_low(
                 topk_indices_flat, num_experts + (1 if has_pad_sentinel else 0)
             )
