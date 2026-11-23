@@ -21,7 +21,8 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
     _default_models_loaded: bool = True
-    _pending_packages: List[Tuple[str, bool]] = field(default_factory=list)
+    # (package_name, strict, override_defaults)
+    _pending_packages: List[Tuple[str, bool, bool]] = field(default_factory=list)
 
     def _load_models(self):
         if not self._default_models_loaded:
@@ -29,13 +30,23 @@ class _ModelRegistry:
             self._default_models_loaded = True
 
         while self._pending_packages:
-            package_name, strict = self._pending_packages[0]
-            self._register_classes(import_model_classes(package_name, strict=strict))
+            package_name, strict, override_defaults = self._pending_packages[0]
+            self._register_classes(
+                import_model_classes(package_name, strict=strict),
+                override_defaults=override_defaults,
+            )
             self._pending_packages.pop(0)
 
-    def register_lazy(self, package_name: str, strict: bool = False):
-        """Defer package imports and duplicate checks until catalog loading."""
-        self._pending_packages.append((package_name, strict))
+    def register_lazy(
+        self, package_name: str, strict: bool = False, override_defaults: bool = False
+    ):
+        """Defer package imports and duplicate checks until catalog loading.
+
+        With ``override_defaults``, the package's models replace the default
+        ``sglang.srt.models`` models of the same architecture, as a platform's own
+        implementations must; a duplicate of any other registration still raises.
+        """
+        self._pending_packages.append((package_name, strict, override_defaults))
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
@@ -44,13 +55,23 @@ class _ModelRegistry:
         new_models = import_model_classes(package_name, strict=strict)
         self._register_classes(new_models, overwrite=overwrite)
 
-    def _register_classes(self, new_models, overwrite: bool = False):
+    def _register_classes(
+        self, new_models, overwrite: bool = False, override_defaults: bool = False
+    ):
         if not overwrite:
-            for arch in new_models:
-                if arch in self.models:
+            for arch, model_cls in new_models.items():
+                if arch not in self.models:
+                    continue
+                if not (override_defaults and _is_default_model(self.models[arch])):
                     raise ValueError(
                         f"Model architecture {arch} already registered. Set overwrite=True to replace."
                     )
+                logger.info(
+                    "Model architecture %s: %s replaces the default from %s",
+                    arch,
+                    model_cls.__module__,
+                    self.models[arch].__module__,
+                )
         self.models.update(new_models)
 
     def get_supported_archs(self) -> AbstractSet[str]:
@@ -103,6 +124,13 @@ class _ModelRegistry:
         self,
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
+        # A pending package may replace a loaded default model; load it before the
+        # fast path can return the default.
+        if self._default_models_loaded and any(
+            override_defaults for _, _, override_defaults in self._pending_packages
+        ):
+            self._load_models()
+
         # Fast startup path: resolve registered models without importing defaults.
         if architectures:
             first_arch = (
@@ -121,6 +149,11 @@ class _ModelRegistry:
                 return (model_cls, arch)
 
         return self._raise_for_unsupported(architectures)
+
+
+def _is_default_model(model_cls) -> bool:
+    # Every EntryClass of sglang.srt.models is defined in one of its modules.
+    return model_cls.__module__.startswith("sglang.srt.models.")
 
 
 @lru_cache()

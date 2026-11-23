@@ -876,11 +876,11 @@ def _register_attention_backends() -> None:
 
 
 def _register_models() -> None:
-    """Add the model implementations that only this package provides to the registry."""
+    """Register this package's models; they replace same-architecture upstream models."""
     from sglang.srt.models.registry import ModelRegistry
 
     # Preserve the external-model fast path without importing unused catalogs.
-    ModelRegistry.register_lazy("sglang_tpu.models")
+    ModelRegistry.register_lazy("sglang_tpu.models", override_defaults=True)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
