@@ -881,7 +881,7 @@ class TestPrefillContextParallelRingValidation(CustomTestCase):
         with (
             patch.dict(os.environ, environment),
             patch(
-                "sglang.srt.utils.hf_transformers.config.get_config",
+                "sglang.srt.hf_transformers.config.get_config",
                 return_value=hf_config,
             ),
         ):
