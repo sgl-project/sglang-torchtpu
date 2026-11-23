@@ -767,6 +767,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             """u32 rows [off, off + n) of a ring chunk (n: sal_words) as a ref."""
             n = c.sal_words if n is None else n
             e, p = ring_at(geo, slot, 0)
+            if ring_fp8(geo):
+                return kv_ring_ref(geo).at[
+                    e, pl.ds(p * ps // LANE, geo.cp * ps // LANE), pl.ds(off, n), :
+                ]
             if geo.cp == c.chunk_pages:
                 if off == 0 and n == c.sal_words:
                     return kv_ring_ref(geo).at[e]
@@ -789,10 +793,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             if not ring_fp8(geo):
                 r = ring_words(geo, slot, off, n)
                 return r[...] if full else r[:, pl.ds(l0, nl)]
-            e, p = ring_at(geo, slot, 0)
-            x = kv_ring_ref(geo).at[
-                e, pl.ds((p * ps + l0) // LANE, nl // LANE), pl.ds(off, n), :
-            ][...]
+            x = ring_words(geo, slot, off, n)
+            x = (x if full else x.at[pl.ds(l0 // LANE, nl // LANE)])[...]
             return jnp.concatenate([x[t] for t in range(nl // LANE)], axis=1)
 
         k.ring_load = ring_load
