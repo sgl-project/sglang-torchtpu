@@ -111,18 +111,7 @@ def mps_platform_plugin() -> str | None:
 
 def cpu_platform_plugin() -> str:
     """Detect if CPU platform should be used."""
-    # CPU is the fallback, but not for an accelerator no platform claimed (e.g.
-    # its platform plugin is not installed): the job would run on the host.
-    import torch
-
-    accelerator = torch.accelerator.current_accelerator(check_available=True)
-    if accelerator is not None:
-        raise RuntimeError(
-            f"torch has an available {accelerator.type!r} accelerator, but no "
-            "diffusion platform supports it. Install the platform plugin for it "
-            f"(entry-point group {PLATFORM_PLUGINS_GROUP!r}), or set "
-            "SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu to run on the CPU."
-        )
+    # CPU is always available as a fallback
     return _BUILTIN_PLATFORM_QUALNAMES["cpu"]
 
 

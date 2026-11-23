@@ -22,7 +22,6 @@ from sglang.multimodal_gen.test.unit.test_attention_backend_selector import (  #
     TestAttentionBackendFallback,
 )
 from sglang.multimodal_gen.test.unit.test_platform_detection import (  # noqa: F401
-    TestCpuFallback,
     TestDiffusionPlatformPlugins,
 )
 from sglang.multimodal_gen.test.unit.test_server_args import (  # noqa: F401
