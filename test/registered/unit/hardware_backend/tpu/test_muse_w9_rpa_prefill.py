@@ -448,7 +448,8 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             )
             return dict(captured)
 
-        # 1. Verify LC_OPTS (`vreg_acc1,mrb1`) does NOT bleed onto SWA layers (`sliding_window=2048`).
+        # 1. Verify default-OFF (`PREFILL_W9=0`) preserves exact cand_w9_base LC_OPTS behavior,
+        # while `PREFILL_W9=1` (or `scope_lc`) scopes LC_OPTS off SWA layers!
         q_tp8 = SimpleNamespace(ndim=5, shape=(1, 8192, 8, 2, 128), dtype="bfloat16")
         k_tp8 = SimpleNamespace(ndim=4, shape=(8192, 1, 4, 128))
         c_d2 = SimpleNamespace(shape=(2048, 256, 1, 4, 128), dtype="float8_e4m3fn")
@@ -462,7 +463,24 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 "SGLANG_TPU_KV_PACK_DENSE2": "1",
                 "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
                 "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "0",
                 "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": "sw_w8,sw_fp8_qk",
+                "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq4096,bkv8192,s2,prefix_fast,staged_qo,fp8_qk,vreg_acc1,mrb1",
+            },
+            clear=False,
+        ):
+            kw_def = _call_invoke(q_tp8, k_tp8, None, c_d2, kl, pi_swa, sw=2048, prepared=True, d2=True, a3_out=2)
+            self.assertIn("mrb1", kw_def["_prefill_opts"])
+            self.assertIn("vreg_acc1", kw_def["_prefill_opts"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_KV_PACK_DENSE2": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": "sw_w8,sw_fp8_qk,nofull_fp8_qk",
                 "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq4096,bkv8192,s2,prefix_fast,staged_qo,fp8_qk,vreg_acc1,mrb1",
             },
             clear=False,
@@ -471,7 +489,13 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             swa_opts = kw["_prefill_opts"]
             self.assertNotIn("mrb1", swa_opts)
             self.assertNotIn("vreg_acc1", swa_opts)
+            self.assertIn("mk128", swa_opts)
             self.assertEqual(kw["m_block_sizes"][:2], (256, 2048))
+            # Verify `nofull_fp8_qk` keeps <=32K Full-Attn on bf16 QK when requested (#2518 §1).
+            pi_std_full = SimpleNamespace(shape=(64 * 36,))
+            kw_full_bf16 = _call_invoke(q_tp8, k_tp8, None, c_d2, kl, pi_std_full, sw=None, prepared=True, d2=True, a3_out=2)
+            self.assertIn("mk128", kw_full_bf16["_prefill_opts"])
+            self.assertNotIn("fp8_qk", kw_full_bf16["_prefill_opts"])
 
         # 2. Verify `SGLANG_TPU_RPA_V3_PREFILL_W9=1` activates `mk128` even under `run_e2e.py` `force_runtime_env`!
         with patch.dict(
@@ -508,12 +532,21 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             },
             clear=False,
         ):
-            kw = _call_invoke(q_tp16_prep, k_tp8, None, c_tp16, kl, pi_swa, sw=2048, prepared=True, d2=False, a3_out=1)
+            kw = _call_invoke(q_tp16_prep, k_tp8, None, c_tp16, kl, pi_swa, sw=2048, prepared=True, d2=False, a3_out=-2)
             tp16_opts = kw["_prefill_opts"]
             self.assertIn("stationary_q_m0_ring_fuse", tp16_opts)
             self.assertIn("mk128", tp16_opts)
             self.assertIn("tp16_sq", tp16_opts)
             self.assertTrue(kw.get("_a3_out_layout"))
+            # Sub-256 `L61_PRUNE=1` (`T=128`) falls back cleanly to `_fused_out_pack = -2` -> `(128, 512)`!
+            from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import prepare_head_packed_outputs
+
+            q_tp16_l61 = SimpleNamespace(ndim=5, shape=(1, 128, 4, 2, 128), dtype="bfloat16")
+            kw_l61 = _call_invoke(q_tp16_l61, k_tp8, None, c_tp16, kl, pi_swa, sw=None, prepared=True, d2=False, a3_out=-2)
+            self.assertEqual(kw_l61.get("_fused_out_pack"), -2)
+            self.assertEqual(rpa_mod._prepared_a3_layout_spec(-2).out_head_pack, 2)
+            out_l61 = prepare_head_packed_outputs(jnp.ones((1, 128, 4, 2, 128), jnp.bfloat16), -2, 8, 128)
+            self.assertEqual(out_l61.shape, (128, 512))
 
         # 4. Verify default-OFF TP=16 unprepared preserves legacy `TP16_NATIVE_PREFILL=1` (`tp16_sq` absent).
         q_tp16_unprep = SimpleNamespace(ndim=3, shape=(8192, 8, 64), dtype="bfloat16")

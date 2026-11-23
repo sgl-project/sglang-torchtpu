@@ -363,11 +363,11 @@ def _invoke_v3_kernel(
             and prefill_mode in _STATIONARY_Q_M0_MODES
             and per_seq_kv_capacity > 32768
         )
-        # Keep LC_OPTS scoped to Full-Attn >32K (unless explicitly prefixed with sw_ or w7/w8/w9)
-        # so LC mrb1/vreg_acc1 never bleed onto SWA layers.
+        # Under w9 / scope_lc, keep LC_OPTS scoped to Full-Attn >32K so LC mrb1/vreg_acc1
+        # never bleed onto SWA layers, while keeping default-OFF identical to cand_w9_base.
         scoped_lc_toks = (
             lc_prefill_toks
-            if is_lc_full
+            if (is_lc_full or not (use_w9_preset or "scope_lc" in raw_all_toks))
             else {
                 t
                 for t in lc_prefill_toks
@@ -465,7 +465,11 @@ def _invoke_v3_kernel(
         if use_w8_preset and sliding_window is not None:
             prefill_opts.update(("vreg_acc", "sw_short_fuse"))
         if use_w9_preset:
-            prefill_opts.add("fp8_qk")
+            if "nofp8_qk" not in raw_all_toks and (
+                sliding_window is not None
+                or "nofull_fp8_qk" not in raw_all_toks
+            ):
+                prefill_opts.add("fp8_qk")
             if "nomk128" not in raw_all_toks:
                 prefill_opts.add("mk128")
             if sliding_window is None and not is_lc_full and "noprefix_fast" not in raw_all_toks:
@@ -559,14 +563,14 @@ def _invoke_v3_kernel(
         extra["_skip_decode"] = True
     if skip_mixed:
         extra["_skip_mixed"] = True
-    if a3_out_layout > 0:
+    if a3_out_layout != 0:
         if use_stationary_q_prefill and extra.get("_skip_decode", False):
             extra["_a3_out_layout"] = True
         else:
             fused_out_pack = a3_out_layout
     if prefill_opts:
         extra["_prefill_opts"] = frozenset(prefill_opts)
-    if fused_out_pack > 1:
+    if fused_out_pack != 1:
         extra["_fused_out_pack"] = fused_out_pack
     if prepared_inputs:
         extra["_prepared_inputs"] = True
@@ -638,11 +642,12 @@ RPA_V3_SPEC = RpaKernelSpec(
 
 def _fused_out_spec(pack: int) -> RpaKernelSpec:
     """RPA_V3_SPEC returning packed heads' own lanes (SGLANG_TPU_RPA_V3_PREFILL_FUSED_OUT)."""
+    tag = f"pad{-pack}" if pack < 0 else str(pack)
     return dataclasses.replace(
         RPA_V3_SPEC,
-        op_name=f"{RPA_V3_SPEC.op_name}_fused_out{pack}",
+        op_name=f"{RPA_V3_SPEC.op_name}_fused_out{tag}",
         invoke_kernel=functools.partial(_invoke_v3_kernel, fused_out_pack=pack),
-        out_head_pack=pack,
+        out_head_pack=abs(pack),
     )
 
 
@@ -658,16 +663,17 @@ def _prepared_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
 
 def _prepared_a3_layout_spec(pack: int) -> RpaKernelSpec:
     """Prepared Stationary-Q RPA_V3_SPEC writing unpacked bf16[T, Hq * d] directly."""
+    tag = f"pad{-pack}" if pack < 0 else str(pack)
     return dataclasses.replace(
         RPA_V3_SPEC,
-        op_name=f"{RPA_V3_SPEC.op_name}_prepared_a3_layout{pack}",
+        op_name=f"{RPA_V3_SPEC.op_name}_prepared_a3_layout{tag}",
         invoke_kernel=functools.partial(
             _invoke_v3_kernel,
             prepared_inputs=True,
             skip_decode=True,
             a3_out_layout=pack,
         ),
-        out_head_pack=pack,
+        out_head_pack=abs(pack),
         prepared_inputs=True,
     )
 
@@ -873,14 +879,15 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
         )
         is_tp16_sq_pool = _pool_is_tp16_sq_64(self.token_to_kv_pool)
+        prep_pack = -2 if is_tp16_sq_pool else pack
         self._prepared_op = (
             _build_pallas_kernel_op(
-                _prepared_a3_layout_spec(pack)
+                _prepared_a3_layout_spec(prep_pack)
                 if use_rpa_a3_layout
                 else _prepared_spec(
-                    _fused_out_spec(pack)
+                    _fused_out_spec(prep_pack)
                     if (
-                        self._fused_out_op is not None
+                        (self._fused_out_op is not None or is_tp16_sq_pool)
                         and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
                     )
                     else RPA_V3_SPEC

@@ -533,9 +533,11 @@ def _stationary_q_v2_process(
         return vp
 
     def _psum_w(p, w_cols: int):
-        m_rows = p.shape[1]
+        sub_shape = (
+            (1, 16, 8, w_cols) if p.shape[1] == 128 else (1, 16, 16, w_cols)
+        )
         p_sum_sub = jnp.sum(
-            p.reshape(1, m_rows // 8, 8, w_cols),
+            p.reshape(sub_shape),
             axis=1,
             dtype=jnp.bfloat16,
         )
@@ -765,8 +767,7 @@ def _stationary_q_v2_process(
 
                 return
 
-            @pl.loop(0, num_s, unroll=False)
-            def _up_256_d2(s_loc):
+            for s_loc in range(num_s):
                 pair_u32 = kv_u32_all[
                     pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
                 ]
@@ -797,8 +798,7 @@ def _stationary_q_v2_process(
 
             return
 
-        @pl.loop(0, num_s, unroll=False)
-        def _up_256_nod2(s_loc):
+        for s_loc in range(num_s):
             kv_u32 = kv_u32_all[pl.ds(s_loc * 256 * bkv_stride, 256, bkv_stride)]
             _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
 
@@ -5625,6 +5625,17 @@ def prepare_head_packed_outputs(
     """-> [max_num_tokens, actual_num_q_heads * d]: q head h keeps the lanes of
     packed head h // (actual_num_q_heads // head_pack), one slice per packed head."""
     num_kv_heads, max_num_tokens, rows, q_packing, head_dim = out.shape
+    if head_pack < 0:
+        hp = -head_pack
+        d = head_dim // hp
+        if (
+            num_kv_heads != 1
+            or rows * q_packing != actual_num_q_heads
+            or head_dim != actual_head_dim
+            or head_dim % hp
+        ):
+            raise ValueError(f"no padded head output for {out.shape=}, {head_pack=}")
+        return out[0, :, :, :, :d].reshape(max_num_tokens, rows * q_packing * d)
     d = head_dim // head_pack
     rows_per_head = rows // head_pack
     if (
@@ -7050,7 +7061,7 @@ def ragged_paged_attention(
         )
     )
     if _decode_out_norm_eps is not None and out_final.ndim == 2:
-        hd = actual_head_dim // max(_fused_out_pack, 1)
+        hd = actual_head_dim // max(abs(_fused_out_pack), 1)
         heads_f = out_final.reshape(out_final.shape[0], -1, hd).astype(jnp.float32)
         inv_r = lax.rsqrt(
             jnp.mean(heads_f * heads_f, axis=-1, keepdims=True)
