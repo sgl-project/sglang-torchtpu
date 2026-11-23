@@ -277,6 +277,42 @@ def test_device_rows_match_the_host_rows(layout):
     _assert_same(built, reference)
 
 
+def test_device_rows_check_mode_catches_a_wrong_field():
+    """SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK passes matching device rows and raises,
+    naming the field, when a device-built field differs from the host build."""
+    from sglang_tpu.models.deepseek_v41 import device_rows
+
+    def batch():
+        fb = _verify_batch([4096, 98310, 17], [1, 2, 3])
+        fb.req_pool_indices_cpu = torch.tensor([1, 2, 3], dtype=torch.int64)
+        return fb
+
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=None,
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    real = device_rows.low_ratio_rows
+
+    def off_by_one(**kwargs):
+        out_loc, lengths = real(**kwargs)
+        return out_loc, lengths + 1
+
+    with (
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK", on),
+    ):
+        ab.build_forward_metadata(batch(), **kw)
+        with patch.object(device_rows, "low_ratio_rows", side_effect=off_by_one):
+            with pytest.raises(AssertionError, match="lengths"):
+                ab.build_forward_metadata(batch(), **kw)
+
+
 def test_device_window_pages_match_the_host_loop():
     """device_rows.window_pages replaces extend_window_pages' per-request page loop
     with cumsum offsets; tables and row moves must match on mixed layouts

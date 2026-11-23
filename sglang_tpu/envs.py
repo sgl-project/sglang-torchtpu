@@ -457,6 +457,9 @@ class TpuEnvs:
     # Spec step: skip the step's sequence-length read; the DSV4.1 draft and verify
     # metadata build their position-dependent rows on the device (device_rows.py).
     SGLANG_TPU_SPEC_DEVICE_ROWS = EnvBool(False)
+    # Debug: also build each device-row forward's metadata on the host from read-back
+    # rows and raise if any field differs (adds the reads back).
+    SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

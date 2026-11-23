@@ -626,7 +626,7 @@ def _device_rows_req_pool(
     """
     from sglang_tpu.envs import envs as tpu_envs
 
-    if not tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get():
+    if _DEVICE_ROWS_OFF or not tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get():
         return None
     if not forward_batch.forward_mode.is_target_verify():
         return None
@@ -733,6 +733,54 @@ def _device_row_metadata(
     )
 
 
+def _check_device_rows(
+    metadata: DSV41TPUForwardMetadata, forward_batch: ForwardBatch, **kwargs
+) -> None:
+    """SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK (debug; adds the length read back): build
+    the same forward's metadata on the host from read-back rows and raise if any
+    device-built field differs."""
+    global _DEVICE_ROWS_OFF
+    _DEVICE_ROWS_OFF = True
+    try:
+        reference = build_forward_metadata(forward_batch, **kwargs)
+    finally:
+        _DEVICE_ROWS_OFF = False
+    for name, got, want in _metadata_tensors(metadata, reference):
+        got, want = got.cpu(), want.cpu()
+        if got.dtype != want.dtype or not torch.equal(got, want):
+            raise AssertionError(
+                f"DSV4.1 device-built {name} differs from the host build: "
+                f"device={got.tolist()} host={want.tolist()}"
+            )
+    _DEVICE_ROW_CHECKS[0] += 1
+    if _DEVICE_ROW_CHECKS[0] == 1 or _DEVICE_ROW_CHECKS[0] % 1000 == 0:
+        logger.info(
+            "DSV4.1 device rows matched the host build: %d forwards",
+            _DEVICE_ROW_CHECKS[0],
+        )
+
+
+def _metadata_tensors(a: DSV41TPUForwardMetadata, b: DSV41TPUForwardMetadata):
+    """(name, a's tensor, b's tensor) over the host-built input fields."""
+    for name in _METADATA_INPUT_FIELDS:
+        x, y = getattr(a, name), getattr(b, name)
+        if isinstance(x, torch.Tensor):
+            yield name, x, y
+        elif isinstance(x, dict):
+            for ratio, meta in x.items():
+                for field_name, t, u in zip(meta._fields, meta, y[ratio]):
+                    yield f"{name}.{ratio}.{field_name}", t, u
+        elif isinstance(x, WindowPlan):
+            for field_name, t, u in zip(x._fields, x, y):
+                yield f"{name}.{field_name}", t, u
+
+
+# Forwards whose device-built rows matched the host build (check mode).
+_DEVICE_ROW_CHECKS = [0]
+# Set while the check mode builds its host reference.
+_DEVICE_ROWS_OFF = False
+
+
 def _window_fits(counts: torch.Tensor, capacity_pages: int) -> bool:
     """Whether any rows at these counts fit the workspace (the host builder's
     capacity check, from an upper bound on each request's pages)."""
@@ -759,6 +807,8 @@ def build_forward_metadata(
 
     ``decoder_replay``: also build the decoder rows' metadata (``tail``).
     ``slot_tables``: tables prebuilt by ``build_slot_tables``, used if they match."""
+    from sglang_tpu.envs import envs as tpu_envs
+
     bs = int(forward_batch.batch_size)
     device_slots = None if decoder_replay else _device_rows_req_pool(forward_batch, bs)
     if device_slots is not None:
@@ -786,6 +836,18 @@ def build_forward_metadata(
             device=device,
         )
         if metadata is not None:
+            if tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK.get():
+                _check_device_rows(
+                    metadata,
+                    forward_batch,
+                    req_to_token=req_to_token,
+                    full_to_swa_index_mapping=full_to_swa_index_mapping,
+                    request_window=request_window,
+                    swa_ring_valid_from=swa_ring_valid_from,
+                    max_context_len=max_context_len,
+                    low_ratios=low_ratios,
+                    device=device,
+                )
             return metadata
     num_tokens = forward_batch.positions.shape[0]
     positions = _extend_positions(forward_batch, num_tokens)
