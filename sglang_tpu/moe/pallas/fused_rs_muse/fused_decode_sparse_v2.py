@@ -191,7 +191,15 @@ def _apply_v2_env_overrides(
             if 32 not in m_buckets:
                 m_buckets = tuple(sorted(set(m_buckets) | {32}))
 
-    pair_rs = base.pair_rs if ov.pair_rs < 0 else (bool(ov.pair_rs) and ep in (8, 16))
+    if ov.pair_rs < 0:
+        pair_rs = base.pair_rs
+        pair_ag_relay = base.pair_ag_relay
+    elif ov.pair_rs == 0:
+        pair_rs = False
+        pair_ag_relay = False
+    else:
+        pair_rs = (ep in (8, 16)) and (batch_size >= 32 or ov.pair_rs >= 2)
+        pair_ag_relay = pair_rs
     async_gather = (
         base.async_gather if ov.async_gather < 0 else bool(ov.async_gather)
     )
@@ -229,6 +237,7 @@ def _apply_v2_env_overrides(
         fused_norm_scatter=fused_ns,
         rs_wire_bf16=rs_bf16,
         pair_rs=pair_rs,
+        pair_ag_relay=pair_ag_relay,
         static_holder_mask=ov.static_holder_mask,
         spec_prime_parts=spec_eff,
         hoist_scales=ov.hoist_scales,
@@ -241,7 +250,7 @@ def default_sparse_decode_v2_config(
     batch_size: int, ep: int, scale_block: int
 ) -> SparseDecodeV2Config:
     """Return the tuned default v2 configuration for ``(batch_size, ep, scale_block)``."""
-    use_paired_ep = ep in (8, 16)
+    use_paired_ep = ep == 8
     if scale_block == 16:
         if batch_size <= 64:
             base = SparseDecodeV2Config(
@@ -320,8 +329,8 @@ def default_sparse_decode_v2_config(
             async_gather=False,
             fused_norm_scatter=True,
             rs_wire_bf16=(batch_size >= 64),
-            pair_rs=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 64),
-            pair_ag_relay=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 64),
+            pair_rs=(ep == 8 and batch_size >= 64),
+            pair_ag_relay=(ep == 8 and batch_size >= 64),
             route_chunk_rows=32,
         )
         return _apply_v2_env_overrides(base, batch_size, ep, scale_block)

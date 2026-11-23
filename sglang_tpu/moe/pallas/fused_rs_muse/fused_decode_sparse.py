@@ -203,10 +203,11 @@ def default_sparse_decode_config(
     spec_eff = spec_parts if batch_size <= 128 else 0
     use_br64 = bridge64 and (ep in (8, 16)) and (batch_size == 64)
     use_pair_rs = (
-        (pair_rs_ov > 0 and ep in (8, 16))
-        if pair_rs_ov >= 0
-        else (ep == 16 and batch_size >= 32)
+        (pair_rs_ov > 0)
+        and (ep in (8, 16))
+        and (batch_size >= 32 or pair_rs_ov >= 2)
     )
+    use_ep16_bridge_ag = use_pair_rs and (ep == 16)
     eff_strip = strip_mode_ov if strip_mode_ov else "adaptive"
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
@@ -236,7 +237,7 @@ def default_sparse_decode_config(
             k16_strip_nc=512,
             rs_wire_bf16=(batch_size >= 128) or use_br64,
             pair_rs=use_pair_rs,
-            bridge_ag=(ep == 16 and batch_size >= 32) or (ep == 8 and batch_size >= 128) or use_br64,
+            bridge_ag=use_ep16_bridge_ag or (ep == 8 and batch_size >= 128) or use_br64,
             norm_f32_stage=True,
             route_chunk_rows=batch_size if (fast_b64 >= 1 and batch_size <= 64) else min(batch_size, 32),
             static_holder_mask=static_mask,
@@ -259,7 +260,7 @@ def default_sparse_decode_config(
             k256_dual_mode="vstage",
             rs_wire_bf16=use_br64 if batch_size == 64 else False,
             pair_rs=use_pair_rs,
-            bridge_ag=(ep == 16 and batch_size >= 32) or (use_br64 if batch_size == 64 else False),
+            bridge_ag=use_ep16_bridge_ag or (use_br64 if batch_size == 64 else False),
             norm_f32_stage=True,
             route_chunk_rows=batch_size,
             static_holder_mask=static_mask,
@@ -289,7 +290,7 @@ def default_sparse_decode_config(
             k256_dual_mode="dual" if fast_b64 == 2 else "hybrid",
             rs_wire_bf16=use_br64,
             pair_rs=use_pair_rs,
-            bridge_ag=(ep == 16) or use_br64,
+            bridge_ag=use_ep16_bridge_ag or use_br64,
             norm_f32_stage=True,
             route_chunk_rows=batch_size if fast_b64 >= 1 else 32,
             static_holder_mask=static_mask,
@@ -308,7 +309,7 @@ def default_sparse_decode_config(
         k256_dual_mode="hybrid",
         rs_wire_bf16=True,
         pair_rs=use_pair_rs,
-        bridge_ag=(ep in (8, 16)),
+        bridge_ag=(ep == 8) or use_ep16_bridge_ag,
         norm_f32_stage=True,
         route_chunk_rows=32,
         static_holder_mask=static_mask,
@@ -4041,15 +4042,19 @@ def default_fp8_sparse_decode_config(
         free_rows,
         free_max_w,
         free_min_slot,
-        _,
+        pair_rs_ov,
         _,
     ) = _read_sparse_env_overrides()
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
     fp8_static_mask = ep <= 8
-    fp8_pair_rs = ep == 16 and batch_size >= 32
-    fp8_bridge_ag = (ep == 8) or (ep == 16 and batch_size >= 32)
+    fp8_pair_rs = (
+        (pair_rs_ov > 0)
+        and (ep in (8, 16))
+        and (batch_size >= 32 or pair_rs_ov >= 2)
+    )
+    fp8_bridge_ag = (ep == 8) or (fp8_pair_rs and ep == 16)
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )

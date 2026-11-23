@@ -1007,21 +1007,439 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 (7, 1),
             )
 
-            # Verify Wave-9 zero-spill adaptive strip default & EP=16 paired RS/AG defaults.
+            # Verify Wave-9 zero-spill adaptive strip default & opt-in EP=16 paired RS/AG.
             self.assertEqual(c16.k256_strip_mode, "adaptive")
             self.assertEqual(c64.k256_strip_mode, "adaptive")
-            self.assertTrue(c32.pair_rs and c32.bridge_ag)
-            self.assertTrue(c64.pair_rs and c64.bridge_ag)
-            self.assertTrue(fp8_64.pair_rs and fp8_64.bridge_ag)
+            self.assertFalse(c16.pair_rs or c16.bridge_ag)
+            self.assertFalse(c32.pair_rs or c32.bridge_ag)
+            self.assertFalse(c64.pair_rs or c64.bridge_ag)
+            self.assertFalse(fp8_64.pair_rs or fp8_64.bridge_ag)
             self.assertFalse(fp8_64.static_holder_mask)
-            self.assertTrue(v2_64.pair_rs and v2_64.pair_ag_relay)
+            self.assertFalse(v2_32.pair_rs or v2_32.pair_ag_relay)
+            self.assertFalse(v2_64.pair_rs or v2_64.pair_ag_relay)
 
             c64_ep8 = v1_mod.default_sparse_decode_config(64, 8, 512)
             self.assertFalse(c64_ep8.pair_rs)
             with mock.patch.dict(
                 os.environ, {"SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "1"}, clear=False
             ):
+                c16_on = v1_mod.default_sparse_decode_config(16, 16, 512)
+                c32_on = v1_mod.default_sparse_decode_config(32, 16, 512)
+                c64_on = v1_mod.default_sparse_decode_config(64, 16, 512)
+                fp8_64_on = v1_mod.default_fp8_sparse_decode_config(64, 16)
+                v2_64_on = v2_mod.default_sparse_decode_v2_config(64, 16, 512)
+                self.assertFalse(c16_on.pair_rs or c16_on.bridge_ag)
+                self.assertTrue(c32_on.pair_rs and c32_on.bridge_ag)
+                self.assertTrue(c64_on.pair_rs and c64_on.bridge_ag)
+                self.assertTrue(fp8_64_on.pair_rs and fp8_64_on.bridge_ag)
+                self.assertTrue(v2_64_on.pair_rs and v2_64_on.pair_ag_relay)
                 self.assertTrue(v1_mod.default_sparse_decode_config(64, 8, 512).pair_rs)
+
+    def test_w9_routing_rb16_two_pass_bit_exact_vs_legacy_rb64(self):
+        """Bit-exact selection-mask, weight-bits, counts_smem & freed-expert parity vs legacy rb=64."""
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax import lax
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+
+            sys.modules.pop(
+                "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing", None
+            )
+            routing_mod = _load_pkg_module(
+                "fused_decode_routing", _MUSE_DIR / "fused_decode_routing.py"
+            )
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        def _legacy_route_rb64(
+            logits_ref,
+            bias_ref,
+            scratch,
+            dma_sem,
+            *,
+            my_owner,
+            e_per_owner: int,
+            holder_cand_eids: tuple,
+            topk: int = 8,
+            route_eps: float = 1e-15,
+            route_scale: float = 1.0,
+            route_chunk_rows: int = 32,
+            min_p_topk: float = 0.0,
+            free_max_rows: int = 0,
+            free_max_w: float = 0.06,
+            free_min_slot: int = 5,
+        ):
+            # Exact cand_w9_base (349b604d63) pre-Wave-9 routing implementation.
+            batch_size, num_experts = logits_ref.shape
+            eff_chunk = (
+                max(route_chunk_rows, min(batch_size, 64))
+                if (free_max_rows > 0 and batch_size <= 64)
+                else route_chunk_rows
+            )
+            rb = min(batch_size, eff_chunk)
+            if batch_size % rb != 0:
+                rb = 8 if batch_size % 8 == 0 else batch_size
+
+            first = my_owner * e_per_owner
+            last_excl = first + e_per_owner
+            bias_row = bias_ref[...].reshape(1, num_experts).astype(jnp.float32)
+            e_iota = lax.broadcasted_iota(jnp.int32, (rb, num_experts), 1)
+            col128 = lax.broadcasted_iota(jnp.int32, (rb, 128), 1)
+            counts_init = jnp.zeros((1, num_experts), jnp.int32)
+
+            n_chunks = batch_size // rb
+            eff_min_s = max(1, int(free_min_slot))
+            first_v = jnp.broadcast_to(first, (rb, 1))
+            last_excl_v = jnp.broadcast_to(last_excl, (rb, 1))
+            rep_vecs = tuple(
+                jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (rb, 1))
+                for eid in holder_cand_eids
+            )
+            free_mask_global = None
+            if free_max_rows > 0 and n_chunks > 1:
+
+                def _scan_free_sparse(ci, carry):
+                    tot_c, drp_c = carry
+                    r0 = pl.multiple_of(ci * rb, rb)
+                    sb, sw, kf = routing_mod._select_and_filter_chunk_vpu(
+                        logits_ref[pl.ds(r0, rb), :].astype(jnp.float32),
+                        bias_row,
+                        e_iota,
+                        num_experts,
+                        topk=topk,
+                        route_eps=route_eps,
+                        min_p_topk=min_p_topk,
+                    )
+                    df = routing_mod._droppable_flags_for_chunk(
+                        sw,
+                        kf,
+                        route_eps=route_eps,
+                        free_max_w=free_max_w,
+                        free_min_slot=free_min_slot,
+                    )
+                    for b_s, k_s, d_s in zip(sb, kf, df):
+                        pk = e_iota == b_s
+                        tot_c = tot_c + jnp.sum(
+                            jnp.logical_and(pk, k_s).astype(jnp.int32),
+                            axis=0,
+                            keepdims=True,
+                        )
+                        drp_c = drp_c + jnp.sum(
+                            jnp.logical_and(pk, d_s).astype(jnp.int32),
+                            axis=0,
+                            keepdims=True,
+                        )
+                    return tot_c, drp_c
+
+                tot_all, drp_all = lax.fori_loop(
+                    0, n_chunks, _scan_free_sparse, (counts_init, counts_init)
+                )
+                free_mask_global = (
+                    (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+                )
+
+            def _route_chunk_sparse_dyn(r0, counts_acc):
+                row_s = pl.ds(r0, rb)
+                slot_bests, slot_ws, keep_flags = (
+                    routing_mod._select_and_filter_chunk_vpu(
+                        logits_ref[row_s, :].astype(jnp.float32),
+                        bias_row,
+                        e_iota,
+                        num_experts,
+                        topk=topk,
+                        route_eps=route_eps,
+                        min_p_topk=min_p_topk,
+                    )
+                )
+                if free_max_rows > 0:
+                    drop_flags = routing_mod._droppable_flags_for_chunk(
+                        slot_ws,
+                        keep_flags,
+                        route_eps=route_eps,
+                        free_max_w=free_max_w,
+                        free_min_slot=free_min_slot,
+                    )
+                    if free_mask_global is None:
+                        tot_c = counts_init
+                        drp_c = counts_init
+                        for b_s, k_s, d_s in zip(slot_bests, keep_flags, drop_flags):
+                            pk = e_iota == b_s
+                            tot_c = tot_c + jnp.sum(
+                                jnp.logical_and(pk, k_s).astype(jnp.int32),
+                                axis=0,
+                                keepdims=True,
+                            )
+                            drp_c = drp_c + jnp.sum(
+                                jnp.logical_and(pk, d_s).astype(jnp.int32),
+                                axis=0,
+                                keepdims=True,
+                            )
+                        fmask = (
+                            (tot_c > 0)
+                            & (tot_c <= free_max_rows)
+                            & (drp_c == tot_c)
+                        )
+                    else:
+                        fmask = free_mask_global
+                    for s in range(eff_min_s, topk):
+                        freed_e = jnp.any(
+                            (e_iota == slot_bests[s]) & fmask,
+                            axis=1,
+                            keepdims=True,
+                        )
+                        keep_flags[s] = keep_flags[s] & (~(drop_flags[s] & freed_e))
+
+                pack_ids = jnp.zeros((rb, 128), dtype=jnp.int32)
+                w_loc_raw = jnp.zeros((rb, 128), dtype=jnp.float32)
+                loc_cnt = jnp.zeros((rb, 1), dtype=jnp.int32)
+                hit = jnp.zeros((rb, num_experts), dtype=jnp.bool_)
+                w_sum = jnp.zeros((rb, 1), dtype=jnp.float32)
+                for best, w_slot, keep_s in zip(slot_bests, slot_ws, keep_flags):
+                    pk_kept = jnp.logical_and(e_iota == best, keep_s)
+                    hit = jnp.logical_or(hit, pk_kept)
+                    w_sum = w_sum + jnp.where(keep_s, w_slot, 0.0)
+                    cand_slot = jnp.where(
+                        (best >= first_v) & (best < last_excl_v),
+                        best - first_v,
+                        jnp.int32(-1),
+                    )
+                    for r_slot, rep_v in enumerate(rep_vecs):
+                        cand_slot = jnp.where(
+                            best == rep_v,
+                            jnp.int32(e_per_owner + r_slot),
+                            cand_slot,
+                        )
+                    is_cand = keep_s & (cand_slot >= 0)
+                    id_col = jnp.int32(1) + loc_cnt
+                    w_col = jnp.int32(16) + loc_cnt
+                    pack_ids = jnp.where(
+                        jnp.logical_and(is_cand, col128 == id_col),
+                        cand_slot,
+                        pack_ids,
+                    )
+                    w_loc_raw = jnp.where(
+                        jnp.logical_and(is_cand, col128 == w_col),
+                        w_slot,
+                        w_loc_raw,
+                    )
+                    loc_cnt = loc_cnt + is_cand.astype(jnp.int32)
+                pack_ids = jnp.where(col128 == 0, loc_cnt, pack_ids)
+                w_loc_norm = w_loc_raw / (w_sum + route_eps)
+                if route_scale != 1.0:
+                    w_loc_norm = w_loc_norm * route_scale
+                w_bits = lax.bitcast_convert_type(w_loc_norm, jnp.int32)
+                scratch.route_pack_vmem[row_s, :] = jnp.where(
+                    col128 < 16, pack_ids, w_bits
+                )
+                return counts_acc + jnp.sum(
+                    hit.astype(jnp.int32), axis=0, keepdims=True
+                )
+
+            if n_chunks == 1:
+                counts_acc = _route_chunk_sparse_dyn(0, counts_init)
+            else:
+                counts_acc = lax.fori_loop(
+                    0,
+                    n_chunks,
+                    lambda ci, acc: _route_chunk_sparse_dyn(
+                        pl.multiple_of(ci * rb, rb), acc
+                    ),
+                    counts_init,
+                )
+            scratch.counts_vmem[...] = jnp.broadcast_to(
+                counts_acc, scratch.counts_vmem.shape
+            )
+            cp1 = pltpu.make_async_copy(
+                scratch.counts_vmem, scratch.counts_smem, dma_sem
+            )
+            cp2 = pltpu.make_async_copy(
+                scratch.route_pack_vmem, scratch.route_pack_smem, dma_sem
+            )
+            cp1.start()
+            cp2.start()
+            cp1.wait()
+            cp2.wait()
+
+        def _make_runner(fn, batch_size: int, ep: int, rep_eids: tuple[int, ...], **kw):
+            e_per_owner = 256 // ep
+            r_shapes = routing_mod.routing_scratch_shapes(
+                batch_size, e_per_owner + len(rep_eids)
+            )
+            v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+            s_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+
+            def _kern(owner_ref, lg_ref, b_ref, cnt_out_ref, pack_out_ref, r_scr, sem):
+                fn(
+                    lg_ref,
+                    b_ref,
+                    r_scr,
+                    sem,
+                    my_owner=owner_ref[0],
+                    e_per_owner=e_per_owner,
+                    holder_cand_eids=tuple(jnp.int32(x) for x in rep_eids),
+                    **kw,
+                )
+                cnt_out_ref[...] = r_scr.counts_vmem[...]
+                pack_out_ref[...] = r_scr.route_pack_vmem[...]
+                # Cross-check SMEM async DMA landed identical contents.
+                diff_cnt = jnp.sum(
+                    jnp.abs(r_scr.counts_smem[0, :] - r_scr.counts_vmem[0, :])
+                )
+                cnt_out_ref[1, 0] = diff_cnt
+
+            return jax.jit(
+                pl.pallas_call(
+                    _kern,
+                    out_shape=(
+                        jax.ShapeDtypeStruct((8, 256), jnp.int32),
+                        jax.ShapeDtypeStruct((batch_size, 128), jnp.int32),
+                    ),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=1,
+                        grid=(1,),
+                        in_specs=[v_spec, v_spec],
+                        out_specs=[v_spec, v_spec],
+                        scratch_shapes=[r_shapes, pltpu.SemaphoreType.DMA],
+                    ),
+                    interpret=True,
+                )
+            )
+
+        scale_free = _BREAKERS_MOD.scale_free_expert_for_batch
+        presets = [
+            ("f7m80", 7, 0.20, 1, 0.80),
+            ("f10m84", 10, 0.20, 1, 0.84),
+            ("qf4m90", 4, 0.18, 2, 0.90),
+            ("qf6m90", 6, 0.18, 2, 0.90),
+        ]
+        rng = np.random.default_rng(20261123)
+        rep_eids = (200, 47, -1, 131)
+        total_freed_experts = 0
+
+        for b_sz in (16, 32, 64):
+            # Regime 1: tie-heavy quantized + duplicated token rows + tied router bias.
+            q_levels = rng.integers(-6, 7, size=(b_sz // 2, 64)).astype(np.float32) * 0.25
+            lg_ties = np.repeat(q_levels, 4, axis=1)  # 4-way exact expert score ties!
+            lg_ties = np.concatenate([lg_ties, lg_ties[::-1]], axis=0)  # duplicated rows!
+            bias_ties = (
+                np.repeat(
+                    rng.integers(-2, 3, size=(1, 64)).astype(np.float32) * 0.125,
+                    4,
+                    axis=1,
+                )
+            )
+
+            # Regime 2: NaN pad rows + -inf rows + boundary FREE tail hits.
+            lg_nan = rng.normal(-2.5, 0.9, size=(b_sz, 256)).astype(np.float32)
+            # Force specific experts (e.g. eid=5, 21, 200) to have rare low-weight tail hits
+            # and eid=6 to have 1 slot-0 hit + tail hits (must NOT be freed when min_slot>=1).
+            lg_nan[:, 5] = -8.0
+            lg_nan[0, 5] = -0.8
+            lg_nan[0, :4] = 2.5
+            lg_nan[:, 6] = -8.0
+            lg_nan[0, 6] = 4.0  # slot-0 primary expert on row 0 -> un-droppable!
+            if b_sz > 2:
+                lg_nan[1, 6] = -0.9
+                lg_nan[1, :4] = 2.5
+            # Inject NaN pad rows (tail & interleaved) and an all -inf row.
+            lg_nan[-5:, :] = np.nan
+            lg_nan[2, :] = np.nan
+            lg_nan[3, :128] = np.nan  # partial-NaN row!
+            lg_nan[4, :] = -np.inf
+            bias_zero = np.zeros((1, 256), dtype=np.float32)
+
+            for name, f_rows, f_max_w, f_min_s, min_p in presets:
+                for scale_mode in ("b64", "off"):
+                    f_eff, ms_eff = scale_free(f_rows, f_min_s, b_sz, mode=scale_mode)
+                    kw = dict(
+                        route_chunk_rows=32,
+                        min_p_topk=min_p,
+                        free_max_rows=f_eff,
+                        free_max_w=f_max_w,
+                        free_min_slot=ms_eff,
+                    )
+                    kw_nofree = dict(
+                        route_chunk_rows=32,
+                        min_p_topk=min_p,
+                        free_max_rows=0,
+                        free_max_w=f_max_w,
+                        free_min_slot=ms_eff,
+                    )
+                    old_run = _make_runner(_legacy_route_rb64, b_sz, 16, rep_eids, **kw)
+                    new_run = _make_runner(
+                        routing_mod.route_topk_and_counts_in_kernel,
+                        b_sz,
+                        16,
+                        rep_eids,
+                        **kw,
+                    )
+                    nofree_run = _make_runner(
+                        _legacy_route_rb64, b_sz, 16, rep_eids, **kw_nofree
+                    )
+
+                    for reg_name, lg_np, b_np in (
+                        ("ties", lg_ties, bias_ties),
+                        ("nan_pad", lg_nan, bias_zero),
+                    ):
+                        lg_j = jnp.asarray(lg_np, dtype=jnp.bfloat16)
+                        b_j = jnp.asarray(b_np, dtype=jnp.float32)
+                        cnt_pre, _ = nofree_run(jnp.array([0], jnp.int32), lg_j, b_j)
+                        pre_counts = np.asarray(cnt_pre[0])
+
+                        for owner in (0, 11):
+                            own_j = jnp.array([owner], dtype=jnp.int32)
+                            cnt_old, pack_old = old_run(own_j, lg_j, b_j)
+                            cnt_new, pack_new = new_run(own_j, lg_j, b_j)
+                            cnt_old_np = np.asarray(cnt_old)
+                            cnt_new_np = np.asarray(cnt_new)
+                            pack_old_np = np.asarray(pack_old)
+                            pack_new_np = np.asarray(pack_new)
+
+                            ctx = f"{name}/{scale_mode}/B={b_sz}/{reg_name}/owner={owner}"
+                            self.assertEqual(int(cnt_old_np[1, 0]), 0, ctx)
+                            self.assertEqual(int(cnt_new_np[1, 0]), 0, ctx)
+                            # 1. Bit-exact post-FREE expert counts (counts_smem[0, :]).
+                            self.assertTrue(
+                                np.array_equal(cnt_old_np[0], cnt_new_np[0]),
+                                f"counts mismatch in {ctx}",
+                            )
+                            # 2. Bit-exact freed-expert set.
+                            freed_old = (pre_counts > 0) & (cnt_old_np[0] == 0)
+                            freed_new = (pre_counts > 0) & (cnt_new_np[0] == 0)
+                            self.assertTrue(
+                                np.array_equal(freed_old, freed_new),
+                                f"freed-set mismatch in {ctx}",
+                            )
+                            total_freed_experts += int(np.sum(freed_new))
+                            if reg_name == "nan_pad":
+                                # Expert 6 has a slot-0 hit on row 0 -> never freed!
+                                self.assertFalse(bool(freed_new[6]), ctx)
+                            # 3. Bit-exact loc_cnt, compacted topk slot IDs, AND IEEE-754 FP32 weight bits!
+                            self.assertTrue(
+                                np.array_equal(pack_old_np, pack_new_np),
+                                f"route_pack_smem bit mismatch in {ctx}",
+                            )
+
+                        # Cross-check against standalone route_weights reference (0-ULP).
+                        w_ref = np.asarray(
+                            routing_mod.route_weights(
+                                lg_j,
+                                b_j,
+                                min_p_topk=min_p,
+                                free_max_rows=f_eff,
+                                free_max_w=f_max_w,
+                                free_min_slot=ms_eff,
+                            )
+                        )
+                        ref_counts = np.sum(w_ref > 0.0, axis=0, dtype=np.int32)
+                        self.assertTrue(
+                            np.array_equal(cnt_new_np[0], ref_counts),
+                            f"route_weights count mismatch in {name}/{scale_mode}/B={b_sz}/{reg_name}",
+                        )
+
+        self.assertGreater(total_freed_experts, 0)
 
 
 if __name__ == "__main__":
