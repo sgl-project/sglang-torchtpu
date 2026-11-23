@@ -39,6 +39,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Sequence, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -508,7 +509,7 @@ def _window_swa_table(
     )
 
 
-class SlotTables(NamedTuple):
+class SlotTables(msgspec.Struct, frozen=True):
     """Metadata of a forward that depends on its request slots, not its rows.
 
     Built and uploaded ahead of the rows (``build_slot_tables``) while the device
@@ -678,7 +679,13 @@ def _device_row_metadata(
     }
     window = tables.swa_pages is None
     if window:
-        if not _window_fits(counts, request_window.workspace_pages):
+        columns = tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+        if not _window_fits(
+            counts,
+            kv_lens_bound=forward_batch.seq_lens_cpu,
+            capacity_pages=request_window.workspace_pages,
+            table_tokens=columns * SWA_PAGE_TOKENS,
+        ):
             return None
         host["counts"] = counts
         host["live"] = device_rows.window_live(req_pool_indices, counts)
@@ -703,7 +710,7 @@ def _device_row_metadata(
             live=dev["live"],
             slots=dev["req_pool_indices"],
             minimum=dev["swa_minimum"],
-            columns=tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS),
+            columns=columns,
             base_page=request_window.workspace_first_page,
         )
     low_ratio = {}
@@ -784,9 +791,21 @@ _DEVICE_ROW_CHECKS = [0]
 _DEVICE_ROWS_OFF = False
 
 
-def _window_fits(counts: torch.Tensor, capacity_pages: int) -> bool:
-    """Whether any rows at these counts fit the workspace (the host builder's
-    capacity check, from an upper bound on each request's pages)."""
+def _window_fits(
+    counts: torch.Tensor,
+    *,
+    kv_lens_bound: Optional[torch.Tensor],
+    capacity_pages: int,
+    table_tokens: int,
+) -> bool:
+    """Whether the device window build may run: the host builder's two checks
+    (workspace capacity, rows inside the SWA table), from host upper bounds. The
+    device build cannot raise, and a row past the table would alias the last page.
+
+    ``kv_lens_bound``: [B] host bound on each request's KV length after its rows
+    (the spec batch's seq_lens_cpu: committed length + rows + slack)."""
+    if kv_lens_bound is None or int(kv_lens_bound.max()) > table_tokens:
+        return False
     rows = counts[counts > 0]
     bound = (WINDOW_TOKENS + rows + SWA_PAGE_TOKENS - 1) // SWA_PAGE_TOKENS + 1
     return int(bound.sum()) <= capacity_pages

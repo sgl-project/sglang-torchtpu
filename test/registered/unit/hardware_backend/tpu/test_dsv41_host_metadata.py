@@ -82,6 +82,8 @@ def _verify_batch(seq_lens, slots, rows=6):
         batch_size=len(slots),
         positions=positions,
         out_cache_loc=loc.reshape(-1).to(torch.int32),
+        # Spec batches carry a host KV-length bound: committed + rows (+ slack).
+        seq_lens_cpu=seq + rows,
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,
         extend_prefix_lens_cpu=None,
@@ -370,6 +372,35 @@ def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows():
                 # .to("cpu") hands back the host tensor itself.
                 assert len(set(ptrs)) == len(ptrs)
                 assert not set(ptrs) & batch_ptrs
+
+
+def test_device_window_declines_rows_that_may_pass_the_swa_table():
+    """The host window builder raises on a row past the SWA table; the device
+    build cannot, and such a row would alias the table's last page (two writes
+    to one slot). When the batch's KV-length bound may pass the table, the
+    forward takes the host build."""
+    seq_lens, slots = [4096, 17], [1, 2]
+    fb = _verify_batch(seq_lens, slots)
+    fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+    fb.seq_lens_cpu = torch.tensor([MAX_CONTEXT + 1, 23])
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        ),
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    with (
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
+        patch.object(ab, "_as_cpu_int64", wraps=ab._as_cpu_int64) as host_read,
+    ):
+        ab.build_forward_metadata(fb, **kw)
+    assert host_read.called
 
 
 def test_device_rows_check_mode_catches_a_wrong_field():
