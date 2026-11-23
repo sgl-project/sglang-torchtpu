@@ -265,28 +265,6 @@ class HcNextBoundary(NamedTuple):
     accepts_mxfp8_deepgemm: bool = False
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
     extend: bool = False
-    get_hc: Optional[Callable[[], Optional[HcSubLayer]]] = None
-
-    def resolve_hc(self) -> Optional[HcSubLayer]:
-        """Read live parameters if the layer supplied an accessor."""
-        return self.hc if self.get_hc is None else self.get_hc()
-
-
-FusedHcBoundary = Callable[
-    [HcSubLayer, torch.Tensor, torch.Tensor, HcTriplet, HcNextBoundary, HcSubLayer],
-    Optional[HcState],
-]
-_FUSED_HC_BOUNDARIES: dict[str, FusedHcBoundary] = {}
-
-
-def register_fused_hc_boundary(platform_key: str, fn: FusedHcBoundary) -> None:
-    """Register an optional shifted-mHC boundary implementation during backend init.
-
-    The implementation may decline any inputs by returning None. A returned
-    state carries the updated residual, the current pre, and optionally the
-    destination's normalized input and precomputed triplet.
-    """
-    _FUSED_HC_BOUNDARIES[platform_key] = fn
 
 
 def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
@@ -326,7 +304,6 @@ def make_boundary(
     accepts_mxfp8_deepgemm: bool = False,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
     extend: bool = False,
-    get_hc: Optional[Callable[[], Optional[HcSubLayer]]] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -345,7 +322,6 @@ def make_boundary(
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
         mega_moe_input=mega_moe_input,
         extend=extend,
-        get_hc=get_hc,
     )
 
 
@@ -746,29 +722,6 @@ def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     )
 
 
-def try_platform_fused_boundary(
-    hc: HcSubLayer,
-    y: torch.Tensor,
-    residual: torch.Tensor,
-    coefficients: HcTriplet,
-    next: Optional[HcNextBoundary],
-) -> Optional[HcState]:
-    """Let an out-of-tree backend complete a boundary before the built-in post."""
-    if not _FUSED_HC_BOUNDARIES or next is None or not next.norm_fusable:
-        return None
-    from sglang.srt.platforms import current_platform
-
-    if not current_platform.is_out_of_tree():
-        return None
-    fused = _FUSED_HC_BOUNDARIES.get(current_platform.get_dispatch_key_name())
-    if fused is None:
-        return None
-    next_hc = next.resolve_hc()
-    return (
-        None if next_hc is None else fused(hc, y, residual, coefficients, next, next_hc)
-    )
-
-
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -781,9 +734,6 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    state = try_platform_fused_boundary(hc, y, residual, coefficients, next)
-    if state is not None:
-        return state
     if (
         next is not None
         and next.norm_fusable

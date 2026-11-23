@@ -99,12 +99,15 @@ tpu_dsv41_refresh_shifted_mhc_after_direct_update
   Remove when: raw weight updates notify the same weight preparation entry
        point as model.post_load_weights.
 
-tpu_dsv41_legacy_shifted_mhc
-  Why: the legacy TPU platform bypasses the OOT boundary registry.
-  How: AROUND try_platform_fused_boundary, call the plugin's registered implementation for the
-       same supported boundaries in legacy mode.
-  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
-  Remove when: the legacy TPU platform identity is retired.
+tpu_dsv41_shifted_mhc, tpu_dsv41_shifted_draft_stages
+  Why: the TPU kernel completes both sides of an mHC boundary and carries
+       the next sublayer's gates and normalized input in HcState.
+  How: AROUND deepseek_v4_mhc._post_fusion for target and
+       DeepseekV4ForCausalLMDSpark._run_stages for draft. Unsupported sites
+       use the original path. Draft embedding and head stay in the core.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2411
+  Remove when: the target boundary and draft stage runner dispatch through
+       upstream platform interfaces.
 
 tpu_dsv4_fence_hc_mix_stats
   Why: deepseek_v4_mhc._mix_stats_impl runs the mixing GEMM on the flattened
@@ -569,19 +572,26 @@ def tpu_dsv41_refresh_shifted_mhc_after_direct_update(result, model, named_tenso
     refresh_shifted_mhc_after_direct_update(model, named_tensors)
 
 
-def tpu_dsv41_legacy_shifted_mhc(original, hc, y, residual, coefficients, next):
-    if next is not None and next.norm_fusable and y.device.type == "tpu":
-        from sglang.srt.platforms import current_platform
+def tpu_dsv41_shifted_mhc(original, hc, y, residual, coefficients, next):
+    if next is not None and y.device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.ops.mhc import fused_target_boundary
 
-        if not current_platform.is_out_of_tree():
-            from sglang_tpu.models.deepseek_v41.ops.mhc import fused_boundary
-
-            next_hc = next.resolve_hc()
-            if next_hc is not None:
-                state = fused_boundary(hc, y, residual, coefficients, next, next_hc)
-                if state is not None:
-                    return state
+        state = fused_target_boundary(hc, y, residual, coefficients, next)
+        if state is not None:
+            return state
     return original(hc, y, residual, coefficients, next)
+
+
+def tpu_dsv41_shifted_draft_stages(original, model, positions, x, forward_batch):
+    if x.device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.ops.mhc import (
+            can_run_draft,
+            run_draft_stages,
+        )
+
+        if can_run_draft(model, x):
+            return run_draft_stages(model.stages, positions, x, forward_batch)
+    return original(model, positions, x, forward_batch)
 
 
 def tpu_dsv4_fence_hc_mix_stats(original, hc, x):
@@ -921,8 +931,13 @@ def hook_specs():
             HookType.AFTER,
         ),
         (
-            "sglang.srt.models.deepseek_v4_mhc.try_platform_fused_boundary",
-            tpu_dsv41_legacy_shifted_mhc,
+            "sglang.srt.models.deepseek_v4_mhc._post_fusion",
+            tpu_dsv41_shifted_mhc,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}._run_stages",
+            tpu_dsv41_shifted_draft_stages,
             HookType.AROUND,
         ),
         (

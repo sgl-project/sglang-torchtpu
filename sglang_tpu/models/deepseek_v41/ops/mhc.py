@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """TorchTPU bridge and model binding for the V4.1 shifted mHC boundary."""
 
+from weakref import ref
+
 import jax
 import torch
 
@@ -9,6 +11,7 @@ from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as k
 
 _PACKED = "_tpu_shifted_mhc_mix_weight"
 _shifted_op = None
+_OWNER = "_tpu_shifted_mhc_owner"
 
 
 def _shifted_jax(
@@ -121,17 +124,12 @@ def prepare_shifted_mhc(layers, *, draft=False):
             return
         register_shifted_mhc_op()
         # The draft begins with embeddings and has no incoming attention boundary.
-        sublayers = (
-            (layer.ffn_hc,)
-            if draft and index == 0
-            else (
-                layer.attn_hc,
-                layer.ffn_hc,
-            )
-        )
-        for hc in sublayers:
+        names = ("ffn_hc",) if draft and index == 0 else ("attn_hc", "ffn_hc")
+        for name in names:
+            hc = getattr(layer, name)
             if hc.fn.dtype == torch.float32 and hc.fn.shape == (24, 20480):
                 _refresh_packed_buffer(hc)
+                setattr(hc.norm, _OWNER, (ref(layer), name))
 
 
 def refresh_shifted_mhc_after_direct_update(model, named_tensors):
@@ -201,3 +199,68 @@ def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
         HcNormed(normalized),
         (next_pre, next_post.squeeze(-1), next_comb),
     )
+
+
+def fused_target_boundary(hc, y, residual, coefficients, boundary):
+    if boundary is None or y.device.type != "tpu":
+        return None
+    # The cached HcNextBoundary holds an HcSubLayer from its first forward.
+    # Resolve the owner each time so direct compile sees the live parameters.
+    owner = getattr(boundary.norm, _OWNER, None)
+    if owner is None:
+        return None
+    layer = owner[0]()
+    if layer is None:
+        return None
+    return fused_boundary(
+        hc, y, residual, coefficients, boundary, getattr(layer, owner[1])
+    )
+
+
+def can_run_draft(model, x):
+    return (
+        x.device.type == "tpu"
+        and model.hc_pre_from_prev_sublayer
+        and envs.SGLANG_TPU_ENABLE_DSV41_SHIFTED_MHC.get()
+        and getattr(model.stages[0].ffn_hc.norm, _PACKED, None) is not None
+        and kernel.is_supported_shape(x.shape[0], model.hc_mult, x.shape[-1])
+    )
+
+
+def run_draft_stages(stages, positions, x, forward_batch):
+    from sglang.srt.models.deepseek_v4_mhc import HcState
+
+    state = HcState(x)
+    for index, stage in enumerate(stages):
+        next_hc = stages[index + 1].attn_hc if index + 1 < len(stages) else None
+        state = _run_draft_stage(stage, positions, state, forward_batch, next_hc)
+    return state.residual, state.pre
+
+
+def _run_draft_stage(stage, positions, state, forward_batch, next_hc):
+    from sglang.srt.models import deepseek_v4_mhc as mhc
+
+    def finish(hc, rows, state, destination):
+        coefficients = state.stats
+        if coefficients is None:
+            coefficients = mhc.mix_stats(hc, state.residual)
+        if destination is not None:
+            boundary = mhc.make_boundary(
+                destination.norm, accepts_mxfp8=False, hc=destination
+            )
+            fused = fused_boundary(
+                hc, rows, state.residual, coefficients, boundary, destination
+            )
+            if fused is not None:
+                return fused
+        pre, post, comb = coefficients
+        updated = stage.hc_post(rows, state.residual, post, comb)
+        return mhc.HcState(updated, pre)
+
+    x = mhc.combine(stage.attn_hc, state)
+    with stage.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        x = stage.self_attn(positions, x, forward_batch)
+    state = finish(stage.attn_hc, x, state, stage.ffn_hc)
+    x = mhc.combine(stage.ffn_hc, state)
+    x = stage._run_ffn(x, forward_batch)
+    return finish(stage.ffn_hc, x, state, next_hc)

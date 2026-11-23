@@ -217,17 +217,14 @@ class NonCudaDecoderMixin:
             self.post_attention_layernorm,
             accepts_mxfp8=False,
             hc=self.ffn_hc,
-            get_hc=lambda: self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
-        next_layer = self._next_layer
-        if next_layer is not None:
+        if self._next_layer is not None:
             self.next_boundary = mhc.make_boundary(
-                next_layer.input_layernorm,
-                accepts_mxfp8=next_layer.self_attn.accepts_mxfp8_swizzled_input(),
-                hc=next_layer.attn_hc,
-                accepts_mxfp8_deepgemm=next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
-                get_hc=lambda: next_layer.attn_hc,
+                self._next_layer.input_layernorm,
+                accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
+                hc=self._next_layer.attn_hc,
+                accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
             )
 
     def forward(
@@ -516,10 +513,9 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.hc_pre_from_prev_sublayer:
-            state = self._forward_hc_pre_from_prev(
-                positions, mhc.HcState(hidden_states, prev_pre), forward_batch
+            return self._forward_hc_pre_from_prev(
+                positions, hidden_states, forward_batch, prev_pre
             )
-            return state.residual, state.pre
         residual = hidden_states
         x, post, comb = self._hc_pre_block(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -560,47 +556,40 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
     def _forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
-        state: mhc.HcState,
+        hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        next_stage: Optional[NonCudaDSparkMixin] = None,
-    ) -> mhc.HcState:
+        prev_pre: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The draft stages run the plain four steps: no fused post, no seams, so
+        # they need nothing from `bind_next` and never hand anything forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
         stats_stream = None
-        if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
+        if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
             stats_stream = self.hc_stats_stream
 
-        def finish(hc, rows, state, next_hc):
-            coefficients = state.stats
-            if coefficients is None:
-                coefficients = mhc.mix_stats(hc, state.residual, stats_stream)
-                if stats_stream is not None:
-                    torch.cuda.current_stream().wait_stream(stats_stream)
-            if next_hc is not None:
-                boundary = mhc.make_boundary(
-                    next_hc.norm, accepts_mxfp8=False, hc=next_hc
-                )
-                fused = mhc.try_platform_fused_boundary(
-                    hc, rows, state.residual, coefficients, boundary
-                )
-                if fused is not None:
-                    return fused
-            pre, post, comb = coefficients
-            return mhc.HcState(self.hc_post(rows, state.residual, post, comb), pre)
-
-        if state.stats is None:
-            mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.attn_hc, state)
+        residual = hidden_states
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
-        state = finish(self.attn_hc, x, state, self.ffn_hc)
-
-        if state.stats is None:
-            mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.ffn_hc, state)
-        x = self._run_ffn(x, forward_batch)
-        return finish(
-            self.ffn_hc, x, state, None if next_stage is None else next_stage.attn_hc
+        attn_pre, attn_post, attn_comb = mhc.mix_stats(
+            self.attn_hc, hidden_states, stats_stream
         )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = hidden_states
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
+            self.ffn_hc, hidden_states, stats_stream
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape

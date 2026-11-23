@@ -181,11 +181,16 @@ def _check_outputs(actual, reference, *, check_elements=False):
     [
         (16, True),
         (240, True),
+        (32, False),
+        (48, False),
         (64, False),
+        (96, False),
         (288, False),
+        (384, False),
         (512, False),
         (1024, False),
         (2048, False),
+        (8192, False),
     ],
 )
 def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
@@ -255,7 +260,7 @@ def test_direct_trace_chains_boundaries_and_reuses_updated_packed_buffer(tpu):
     assert not torch.equal(before[0][-1].cpu(), after[0][-1].cpu())
 
 
-@pytest.mark.parametrize("tokens", [0, 15])
+@pytest.mark.parametrize("tokens", [0, 8, 15, 40])
 def test_unsupported_token_bucket_falls_back(tpu, tokens):
     cfg = SimpleNamespace(mult=M, hidden=D)
     hc = SimpleNamespace(cfg=cfg)
