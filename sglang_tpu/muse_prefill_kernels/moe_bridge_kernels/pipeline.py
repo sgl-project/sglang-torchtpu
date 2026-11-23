@@ -1621,6 +1621,32 @@ def _d_with_next_in_gather(
     return new_stream, next_in_rest, gathered
 
 
+def _allow_pallas_sortfree_routing(
+    pallas_sf_rt: int,
+    *,
+    sortfree_prefill: bool,
+    topk: int,
+    ep_size: int,
+    t_local: int,
+    n_loc_eff: int,
+    has_pad_sentinel: bool,
+    eff_hoist_routing: bool,
+    eff_cm_pipe: bool,
+) -> bool:
+    """Gate PALLAS_SORTFREE_ROUTING; disabled on ep_size==16 padded EXTEND due to TPU7x halt."""
+    return (
+        pallas_sf_rt >= 1
+        and sortfree_prefill
+        and (topk & (topk - 1)) == 0
+        and (ep_size * t_local) >= 256
+        and (t_local % 128 == 0)
+        and ((t_local * topk) % 128 == 0)
+        and (n_loc_eff <= 120)
+        and not (ep_size == 16 and has_pad_sentinel)
+        and (eff_hoist_routing or has_pad_sentinel or eff_cm_pipe)
+    )
+
+
 def fused_moe_full_bridge_and_ffn(
     attn_out_sharded: jax.Array,
     stream_sharded: jax.Array,
@@ -1817,15 +1843,16 @@ def fused_moe_full_bridge_and_ffn(
         ]
 
         def _can_use_pallas_sf(n_loc_eff: int) -> bool:
-            return (
-                pallas_sf_rt >= 1
-                and envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL.get()
-                and (topk & (topk - 1)) == 0
-                and (ep_size * t_local) >= 256
-                and (t_local % 128 == 0)
-                and ((t_local * topk) % 128 == 0)
-                and (n_loc_eff <= 120)
-                and (eff_hoist_routing or vt_arg is not None or eff_cm_pipe)
+            return _allow_pallas_sortfree_routing(
+                pallas_sf_rt,
+                sortfree_prefill=bool(envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL.get()),
+                topk=topk,
+                ep_size=ep_size,
+                t_local=t_local,
+                n_loc_eff=n_loc_eff,
+                has_pad_sentinel=vt_arg is not None,
+                eff_hoist_routing=eff_hoist_routing,
+                eff_cm_pipe=eff_cm_pipe,
             )
 
         def _route_ids(u8_local, u8_global, tw_local):

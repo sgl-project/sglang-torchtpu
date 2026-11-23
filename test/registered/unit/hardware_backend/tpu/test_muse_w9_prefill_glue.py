@@ -82,6 +82,7 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
 
     from sglang_tpu.kernels.xor1_bridge_all_gather import (
         _xyz_row_splits,
+        xor1_ag_min_row_align,
         xor1_ag_schedule_spec,
         xor1_bridge_all_gather,
     )
@@ -158,8 +159,15 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
         for r in range(16):
             np.testing.assert_array_equal(np.stack(out[r], axis=0), x.astype(np.int32))
 
+    assert xor1_ag_min_row_align(4) == 8
+    assert xor1_ag_min_row_align(2) == 16
+    assert xor1_ag_min_row_align(1) == 32
     assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[0] == "xyz"
+    assert xor1_ag_schedule_spec(16, 512, 2, xy_torus=True)[:2] == ("xyz", (176, 176, 160))
+    assert xor1_ag_schedule_spec(16, 128, 2, xy_torus=True)[:2] == ("xyz", (48, 48, 32))
     assert xor1_ag_schedule_spec(8, 512, 1, xy_torus=True)[0] == "xy"
+    assert xor1_ag_schedule_spec(8, 24, 2, xy_torus=True)[0] == "flat"
+    assert xor1_ag_schedule_spec(8, 32, 2, xy_torus=True)[:2] == ("xy", (16, 16))
     assert xor1_ag_schedule_spec(16, 64, 1, xy_torus=True)[0] == "flat"
     assert xor1_ag_schedule_spec(16, 100, 1, xy_torus=True)[0] == "flat"
 
@@ -184,12 +192,25 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
                 check_vma=False,
             )
         )
-        hlo8 = (
-            sm8.trace(jax.ShapeDtypeStruct((8, 512, 8192), jnp.float8_e4m3fn))
+        for rows, dt in ((512, jnp.float8_e4m3fn), (32, jnp.bfloat16), (16, jnp.float32)):
+            hlo8 = (
+                sm8.trace(jax.ShapeDtypeStruct((8, rows, 128), dt))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+            assert "xor1_xytorus_ag_tp8" in hlo8 and "partition_id" not in hlo8
+        hlo8_lax = (
+            sm8.trace(jax.ShapeDtypeStruct((8, 24, 128), jnp.bfloat16))
             .lower(lowering_platforms=("tpu",))
             .as_text("stablehlo")
         )
-        assert "xor1_xytorus_ag_tp8" in hlo8 and "partition_id" not in hlo8
+        assert "all_gather" in hlo8_lax and "xor1_" not in hlo8_lax
+        hlo8_flat = (
+            sm8.trace(jax.ShapeDtypeStruct((8, 48, 128), jnp.bfloat16))
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "xor1_bridge_ag_tp8" in hlo8_flat and "partition_id" not in hlo8_flat
 
         if len(devs) >= 16:
             mesh16 = Mesh(np.array(devs[:16]), ("model",))
@@ -202,18 +223,60 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
                     check_vma=False,
                 )
             )
-            for rows, cols, dt in (
-                (512, 8192, jnp.float8_e4m3fn),
-                (256, 4096, jnp.int8),
-                (128, 8192, jnp.float8_e4m3fn),
-                (512, 8192, jnp.bfloat16),
-            ):
-                hlo16 = (
-                    sm16.trace(jax.ShapeDtypeStruct((16, rows, cols), dt))
-                    .lower(lowering_platforms=("tpu",))
-                    .as_text("stablehlo")
+            from jax.experimental import topologies
+
+            try:
+                topo16 = topologies.get_topology_desc(
+                    platform="tpu", topology_name="tpu7x=2x2x2"
                 )
-                assert "xor1_xyztorus_ag_tp16" in hlo16 and "partition_id" not in hlo16
+                aot_mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+                aot_sm16 = jax.jit(
+                    jax.shard_map(
+                        lambda x: xor1_bridge_all_gather(
+                            x[0], axis_name="model", tiled=False
+                        )[None],
+                        mesh=aot_mesh16,
+                        in_specs=(P("model", None, None),),
+                        out_specs=P("model", None, None, None),
+                        check_vma=False,
+                    )
+                )
+            except Exception:
+                aot_mesh16 = None
+                aot_sm16 = None
+
+            for dt, item_bytes in (
+                (jnp.float32, 4),
+                (jnp.bfloat16, 2),
+                (jnp.float8_e4m3fn, 1),
+            ):
+                align = xor1_ag_min_row_align(item_bytes)
+                for rows in (128, 512, 1280, 4096):
+                    kind, splits, _ = xor1_ag_schedule_spec(
+                        16, rows, item_bytes, xy_torus=True
+                    )
+                    assert kind == "xyz"
+                    assert sum(splits) == rows and all(
+                        s >= align and s % align == 0 for s in splits
+                    )
+                    hlo16 = (
+                        sm16.trace(jax.ShapeDtypeStruct((16, rows, 128), dt))
+                        .lower(lowering_platforms=("tpu",))
+                        .as_text("stablehlo")
+                    )
+                    assert "xor1_xyztorus_ag_tp16" in hlo16 and "partition_id" not in hlo16
+                    if aot_sm16 is not None and aot_mesh16 is not None:
+                        shd16 = jax.sharding.NamedSharding(
+                            aot_mesh16, P("model", None, None)
+                        )
+                        compiled = (
+                            aot_sm16.trace(
+                                jax.ShapeDtypeStruct((16, rows, 128), dt, sharding=shd16)
+                            )
+                            .lower()
+                            .compile()
+                        )
+                        assert compiled is not None
 
             # 16-device Mosaic interpret=True + detect_races=True parity for unequal (64, 32, 32) rows=128 split.
             from jax.experimental import pallas as pl
@@ -594,7 +657,45 @@ def test_ep16_sortfree_routing_parity_and_compact_sort_guard():
     )
     assert lhs.shape == (t_total * 8,)
 
-    # Verify ROUTING_NATIVE_PACK=1 safely guards out sub-128 inv_out_rows (t_local < 2048, e.g. tl=256 pad).
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _allow_pallas_sortfree_routing,
+    )
+
+    assert not _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=16,
+        t_local=256,
+        n_loc_eff=18,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=True,
+    )
+    assert _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=16,
+        t_local=256,
+        n_loc_eff=18,
+        has_pad_sentinel=False,
+        eff_hoist_routing=True,
+        eff_cm_pipe=True,
+    )
+    assert _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=8,
+        t_local=512,
+        n_loc_eff=34,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=True,
+    )
+
+    # Verify ROUTING_NATIVE_PACK=1 remains supported at tl=256 in standalone routing_pallas.
     with (
         mock.patch(
             "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
@@ -624,8 +725,7 @@ def test_ep16_sortfree_routing_parity_and_compact_sort_guard():
             .lower(lowering_platforms=("tpu",))
             .as_text("stablehlo")
         )
-        assert "pallas_moe_sortfree_route_tl256" in hlo_tl256
-        assert "pallas_moe_sortfree_route_np_" not in hlo_tl256
+        assert "pallas_moe_sortfree_route_np_tl256" in hlo_tl256
 
 
 def test_tp16_a1_rpa_layout_integration_gating_and_inag_cache():

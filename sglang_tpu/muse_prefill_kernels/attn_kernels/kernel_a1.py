@@ -2717,8 +2717,13 @@ def pallas_a1_chunk_1way(
         if next_ag_in.ndim == 2:
             next_ag_in = next_ag_in[None]
         _, next_rows, next_cols = next_ag_in.shape
+        from sglang_tpu.kernels.xor1_bridge_all_gather import (
+            xor1_ag_min_row_align,
+            xor1_ag_schedule_spec,
+        )
+
         item_bytes = jax.dtypes.itemsize_bits(next_ag_in.dtype) // 8
-        min_row_align = 32 if item_bytes == 1 else 8
+        min_row_align = xor1_ag_min_row_align(item_bytes)
         if (
             tp_deg < 4
             or tp_deg % 2 != 0
@@ -2728,7 +2733,6 @@ def pallas_a1_chunk_1way(
             raise ValueError(
                 f"Incompatible next_ag_in shape {next_ag_in.shape} for tp_deg={tp_deg}"
             )
-        from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_ag_schedule_spec
 
         ag_spec = xor1_ag_schedule_spec(tp_deg, int(next_rows), item_bytes, xy_torus=True)
 

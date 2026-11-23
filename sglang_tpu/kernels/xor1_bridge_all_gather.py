@@ -64,11 +64,16 @@ def _xyz_row_splits(rows: int, min_row_align: int) -> tuple[int, int, int]:
     return b0 * min_row_align, b1 * min_row_align, b2 * min_row_align
 
 
+def xor1_ag_min_row_align(item_bytes: int) -> int:
+    """Minimum dim-0 row alignment matching TPU Mosaic 8/16/32x128 sublane packing."""
+    return 8 * max(1, 4 // max(1, int(item_bytes)))
+
+
 def xor1_ag_schedule_spec(
     tp_size: int, rows: int, item_bytes: int, *, xy_torus: bool = True
 ) -> tuple[str, tuple[int, ...], tuple[int, int, int, int, int]]:
     """Return ``(schedule_kind, part_rows, (local, inter_s, inter_r, d2d_s, d2d_r))``."""
-    min_row_align = 32 if item_bytes == 1 else 8
+    min_row_align = xor1_ag_min_row_align(item_bytes)
     if (
         xy_torus
         and tp_size == 8
@@ -645,7 +650,7 @@ def xor1_bridge_all_gather(
         cols *= int(d)
 
     item_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    min_row_align = 32 if item_bytes == 1 else 8
+    min_row_align = xor1_ag_min_row_align(item_bytes)
     if rows % min_row_align != 0 or cols % 128 != 0:
         return lax.all_gather(x, axis_name, axis=axis, tiled=tiled)
 
