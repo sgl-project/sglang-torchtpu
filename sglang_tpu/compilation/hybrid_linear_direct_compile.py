@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
+    ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang_tpu.mamba_pool import TpuMambaPool
@@ -42,11 +43,15 @@ class HybridLinearKVPoolState:
 
 
 def hybrid_linear_kv_pool_state(
-    *, kv_pool: HybridLinearKVPool, req_to_token_pool: HybridReqToTokenPool
+    *, kv_pool: HybridLinearKVPool, req_to_token_pool: ReqToTokenPool
 ) -> HybridLinearKVPoolState:
-    return HybridLinearKVPoolState(
-        full_kv_pool=kv_pool.full_kv_pool, mamba_pool=req_to_token_pool.mamba_pool
-    )
+    # The GDN layers read state through the request pool, so lift that one.
+    assert isinstance(req_to_token_pool, HybridReqToTokenPool)
+    mamba_pool = req_to_token_pool.mamba_pool
+    assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+    full_kv_pool = kv_pool.full_kv_pool
+    assert isinstance(full_kv_pool, MHATokenToKVPool), type(full_kv_pool)
+    return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
 
 
 def has_linear_attention(model: nn.Module) -> bool:
