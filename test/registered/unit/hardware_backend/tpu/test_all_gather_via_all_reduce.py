@@ -101,8 +101,27 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
         self.assertFalse(torch.signbit(got).any())
 
 
-def _parallel(group):
-    return SimpleNamespace(tp_group=group, attn_tp_group=group)
+def _parallel(group, attn_tp_rank=None):
+    """Parallel state whose TP group is ``group``; it is the attention-TP group
+    only when ``attn_tp_rank`` is this rank's index in it."""
+    return SimpleNamespace(
+        tp_group=group,
+        attn_tp_group=group,
+        attn_tp_size=group.world_size,
+        attn_tp_rank=attn_tp_rank,
+    )
+
+
+def _direct_tracer(rank):
+    """The direct tracer's view while it builds a graph: compiling, not Dynamo,
+    with the attention-TP rank as a lifted runtime tensor."""
+    return (
+        mock.patch.object(torch.compiler, "_is_compiling_flag", True),
+        mock.patch(
+            "sglang.srt.layers.dp_attention._rank_tensor",
+            lambda axis, device: torch.tensor(rank),
+        ),
+    )
 
 
 class TestLogitsGatherHooks(CustomTestCase):
@@ -124,11 +143,12 @@ class TestLogitsGatherHooks(CustomTestCase):
         self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)))
 
     def test_tp_logits_gather_outside_dynamo_uses_the_wrapped_gatherer(self):
+        # Eager, and the direct tracer on a group that is not the attention-TP group.
         group = mock.Mock(world_size=8)
         fallback = mock.Mock(return_value="native")
         gatherer = agar.TpuLogitsGatherer(fallback)
         logits = torch.ones(2, 4)
-        cases = {"eager": False, "direct tracer": True}
+        cases = {"eager": False, "direct tracer, not attention TP": True}
         with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
             for name, direct_flag in cases.items():
                 with (
@@ -140,6 +160,45 @@ class TestLogitsGatherHooks(CustomTestCase):
                     self.assertEqual(gatherer(logits), "native")
         self.assertEqual(fallback.call_count, 2)
         group.all_reduce.assert_not_called()
+
+    def test_tp_logits_gather_under_direct_tracer_uses_the_all_reduce(self):
+        """Under the direct tracer the TP vocab-logits gather must be the exact
+        all-reduce: the compiled all-gather lost rank 0's block on the peers
+        (split DSA index-key cache), so TP ranks sampled different tokens."""
+        blocks = _blocks(8, (4, 64), torch.bfloat16)
+        for rank in (0, 5):
+            with self.subTest(rank=rank):
+                group = _SimulatedGroup(blocks, rank)
+                fallback = mock.Mock()
+                gatherer = agar.TpuLogitsGatherer(fallback)
+                compiling, rank_tensor = _direct_tracer(rank)
+                with (
+                    mock.patch.object(
+                        agar, "get_parallel", return_value=_parallel(group, rank)
+                    ),
+                    compiling,
+                    rank_tensor,
+                ):
+                    got = gatherer(blocks[rank])
+                fallback.assert_not_called()
+                self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)))
+
+    def test_draft_vocab_gather_under_direct_tracer_uses_the_all_reduce_and_crops(
+        self,
+    ):
+        blocks = _blocks(8, (2, 16), torch.bfloat16)
+        group = _SimulatedGroup(blocks, 0)
+        lm_head = SimpleNamespace(org_vocab_size=120)
+        original = mock.Mock()
+        compiling, rank_tensor = _direct_tracer(0)
+        with (
+            mock.patch.object(agar, "get_parallel", return_value=_parallel(group, 0)),
+            compiling,
+            rank_tensor,
+        ):
+            got = agar.gather_and_crop_vocab_around(original, blocks[0], lm_head)
+        original.assert_not_called()
+        self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)[..., :120]))
 
     def test_attn_tp_logits_gather_under_dynamo_uses_the_all_reduce(self):
         blocks = _blocks(4, (3, 32), torch.bfloat16)

@@ -15,7 +15,10 @@ logits gathers
        logits gather). While Dynamo traces
        (torch.compiler.is_dynamo_compiling()) on a multi-rank group, the gather
        is rebuilt from one all-reduce over a zero-padded [world, *block] buffer
-       (sglang_tpu.all_gather_via_all_reduce). GroupCoordinator collectives
+       (sglang_tpu.all_gather_via_all_reduce); the TP and draft gathers also
+       while the direct tracer builds an attention-TP graph, with the rank as a
+       runtime tensor (its compiled gather lost rank 0's block on the peers with
+       the split DSA index-key cache). GroupCoordinator collectives
        stay native, so per-layer gathers keep their cost (#2013).
   Upstream PR or issue: sgl-project/sglang-torchtpu#1700 (TorchTPU compiled
        all_gather_into_tensor across chips).
