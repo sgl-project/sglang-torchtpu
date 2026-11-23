@@ -207,12 +207,10 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     R = k.R
     S = k.S
     c = k.c
-    chunk_dst = k.chunk_dst
     g = k.g
     hd = k.hd
     hkv = k.hkv
     kv_prologue = k.kv_prologue
-    page_src = k.page_src
     pd = k.pd
     pf_ref = k.pf_ref
     ph = k.ph
@@ -220,8 +218,9 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     ps = k.ps
     q = k.q
     req_geom = k.req_geom
-    ring_words = k.ring_words
+    ring_load = k.ring_load
     rows_at = k.rows_at
+    start_page = k.start_page
     wait_chunk = k.wait_chunk
     yw = k.yw
     is_global, KR_g, cpt_g = geo.is_global, geo.kr, geo.cp * ps
@@ -318,7 +317,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
         fp8_v = c.kv_sal_fp8 and c.sal_fp8_dot >= 2
         x8 = pltpu.bitcast(
-            ring_words(geo, slot)[...], c.kv_dtype
+            ring_load(geo, slot), c.kv_dtype
         )  # [2 * kv_heads * hd, cpt_g]
         xb = None if (fp8_k and fp8_v) else x8.astype(jnp.bfloat16)
         xk, xv = (x8 if fp8_k else xb), (x8 if fp8_v else xb)
@@ -333,9 +332,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
         parts = []
         for h in range(hkv):
-            xh = pltpu.bitcast(
-                ring_words(geo, slot, 2 * h * w_hd, w_hd)[...], c.kv_dtype
-            )
+            xh = pltpu.bitcast(ring_load(geo, slot, 2 * h * w_hd, w_hd), c.kv_dtype)
             parts.append(xh if fp8_k else xh.astype(jnp.bfloat16))
         return jnp.concatenate(parts, axis=0)
 
@@ -345,7 +342,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         parts = []
         for h in range(hkv):
             xh = pltpu.bitcast(
-                ring_words(geo, slot, (2 * h + 1) * w_hd, w_hd)[...], c.kv_dtype
+                ring_load(geo, slot, (2 * h + 1) * w_hd, w_hd), c.kv_dtype
             )
             parts.append(xh if fp8_v else xh.astype(jnp.bfloat16))
         return jnp.concatenate(parts, axis=0)
@@ -419,11 +416,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 c.n_pages_entries - 1,
             )
             page = pf_ref[ent]  # a global layer's table
-            pltpu.make_async_copy(
-                page_src(ref, page),
-                chunk_dst(geo, slot, pi),
-                S["kv_chunk_sems"].at[slot],
-            ).start()
+            start_page(ref, page, geo, slot, pi)
 
     def body(k, carry2, ref=None, clean=False):
         """Chunks 2k, 2k+1 as two independent online-softmax streams (two dependency
@@ -721,11 +714,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                             ),
                             c.n_pages_entries - 1,
                         )
-                        pltpu.make_async_copy(
-                            page_src(ref, pf_ref[ent]),
-                            chunk_dst(geo, v % KR_g, pi),
-                            S["kv_chunk_sems"].at[v % KR_g],
-                        ).start()
+                        start_page(ref, pf_ref[ent], geo, v % KR_g, pi)
                     return carry
 
                 jax.lax.fori_loop(0, n, one, 0)
@@ -746,11 +735,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pltpu.make_async_copy(
-                    page_src(ref, pf_ref[ent]),
-                    chunk_dst(geo, slot, pi),
-                    S["kv_chunk_sems"].at[slot],
-                ).start()
+                start_page(ref, pf_ref[ent], geo, slot, pi)
 
         def refill_slots(ref, v0):
             """Chunks [v0, v0 + NS) straight-line, after the compute."""
@@ -961,9 +946,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 def kh_half(slot, h, s0):
                     with _scope("kv_unpack"):
                         kr = pltpu.bitcast(
-                            ring_words(geo, slot, 2 * h * w_hd, w_hd)[
-                                :, pl.ds(s0, 512)
-                            ],
+                            ring_load(geo, slot, 2 * h * w_hd, w_hd, s0, 512),
                             jnp.float8_e4m3fn,
                         )
                         return jnp.concatenate(
@@ -973,9 +956,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 def vh_half(slot, h, s0):
                     with _scope("kv_unpack"):
                         vr = pltpu.bitcast(
-                            ring_words(geo, slot, (2 * h + 1) * w_hd, w_hd)[
-                                :, pl.ds(s0, 512)
-                            ],
+                            ring_load(geo, slot, (2 * h + 1) * w_hd, w_hd, s0, 512),
                             jnp.float8_e4m3fn,
                         )
                         return jnp.concatenate(

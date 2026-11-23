@@ -721,6 +721,13 @@ class MuseMegakernel(torch.nn.Module):
             attn_own_rows_first=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_OWN_ROWS_FIRST.get(),
             attn_swa_prefetch=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SWA_PREFETCH.get(),
             attn_refill_next_pair=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR.get(),
+            kv_ring_fp8=kv_sal and tpu_envs.SGLANG_TPU_MUSE_MK_KV_RING_FP8.get(),
+            kv_ring_fp8_swa=kv_sal
+            and tpu_envs.SGLANG_TPU_MUSE_MK_KV_RING_FP8_SWA.get(),
+            kv_ring_slots=tpu_envs.SGLANG_TPU_MUSE_MK_KV_RING_SLOTS.get()
+            if kv_sal
+            else 0,
+            no_bounds_checks=tpu_envs.SGLANG_TPU_MUSE_MK_NO_BOUNDS_CHECKS.get(),
             alias_tiled_temps=opt and tiled,
             combine_loop=opt and tiled,
             untiled_max_rows=48 if opt else 128,

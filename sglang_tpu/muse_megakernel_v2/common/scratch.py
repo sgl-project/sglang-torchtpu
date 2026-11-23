@@ -488,7 +488,17 @@ def _scratch_plan_base(cfg: MKConfig):
         (
             "kv_chunk",
             # SAL chunks live in the expert w13 slots (sal_kv_view)
-            pltpu.VMEM((1, 8, LANE), jnp.uint32)
+            pltpu.VMEM(
+                (
+                    c.kv_ring,
+                    c.chunk_pages * c.page_size // LANE,
+                    *c.sal_block[:3],
+                    LANE,
+                ),
+                c.kv_dtype,
+            )
+            if c.kv_ring_fp8
+            else pltpu.VMEM((1, 8, LANE), jnp.uint32)
             if c.kv_sal
             else pltpu.VMEM(
                 (

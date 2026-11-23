@@ -205,6 +205,14 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # inline refill: issue pair u's refill at pair u + 1 (the last pair keeps its own). Issued
     # at its own pair the DMA chain fences the next pair's loads and the MXU starves mid-step
     attn_refill_next_pair: bool = False
+    # SAL KV ring in its own VMEM with the pool page's fp8 shape: the page DMA needs no relayout,
+    # so it lowers to a register-strided copy without SMEM descriptors (global layers; _swa: SWA too)
+    kv_ring_fp8: bool = False
+    kv_ring_fp8_swa: bool = False
+    # chunks of that ring (0: as many as the expert w13 slots hold)
+    kv_ring_slots: int = 0
+    # TP megakernel without Pallas bounds checks (they add a checked chain to every DMA issue)
+    no_bounds_checks: bool = False
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True
@@ -292,13 +300,16 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
         )
 
     @property
+    def kv_ring_w13(self):
+        """Chunks the expert w13 slots hold (sal_kv_view)."""
+        return (
+            (self.expert_depth + 1) * (self.expert_hidden // FP4_PACK) // self.sal_words
+        )
+
+    @property
     def kv_ring(self):
-        if self.kv_sal:  # every chunk the expert w13 slots hold (sal_kv_view)
-            return (
-                (self.expert_depth + 1)
-                * (self.expert_hidden // FP4_PACK)
-                // self.sal_words
-            )
+        if self.kv_sal:
+            return self.kv_ring_slots or self.kv_ring_w13
         return 2 * self.kv_group
 
     @property
@@ -375,6 +386,14 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
             == 0
         )
         assert self.sal_fp8_dot == 0 or self.kv_sal_fp8
+        assert not self.kv_ring_fp8 or self.kv_sal
+        assert not self.kv_ring_fp8_swa or self.kv_ring_fp8
+        # a traced layer flag picks no ring per layer type; the w13 view holds at most its slots
+        assert not self.kv_ring_fp8 or self.swa_chunk_pages or self.kv_ring_fp8_swa
+        assert not self.kv_ring_slots or (
+            self.kv_ring_slots <= self.kv_ring_w13
+            or (self.kv_ring_fp8 and (self.kv_ring_fp8_swa or not self.swa_chunk_pages))
+        )
         assert not self.swa_chunk_pages or (
             self.kv_sal
             and 0 < self.swa_chunk_pages < self.chunk_pages

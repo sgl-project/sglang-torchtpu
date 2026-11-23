@@ -803,6 +803,12 @@ class TpuEnvs:
     # Decode megakernel (v2): sliding-window requests use disjoint ring slots and the next
     # request's window is issued before this request's chunk loop (MKConfig.attn_swa_prefetch).
     SGLANG_TPU_MUSE_MK_ATTN_SWA_PREFETCH = EnvBool(True)
+    # SAL KV ring in its own page-shaped fp8 VMEM (MKConfig.kv_ring_fp8 / _swa / kv_ring_slots).
+    SGLANG_TPU_MUSE_MK_KV_RING_FP8 = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_KV_RING_FP8_SWA = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_KV_RING_SLOTS = EnvInt(0)
+    # TP decode megakernel without Pallas bounds checks (MKConfig.no_bounds_checks).
+    SGLANG_TPU_MUSE_MK_NO_BOUNDS_CHECKS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
