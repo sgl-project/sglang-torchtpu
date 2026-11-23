@@ -720,6 +720,7 @@ class MuseMegakernel(torch.nn.Module):
             attn_interleave=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_INTERLEAVE.get(),
             attn_refill_inline=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE.get(),
             attn_refill_inline_layers=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS.get(),
+            attn_refill_next_pair=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR.get(),
             alias_tiled_temps=opt and tiled,
             combine_loop=opt and tiled,
             untiled_max_rows=48 if opt else 128,

@@ -1314,6 +1314,11 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
             il = c.attn_interleave
             inline = c.attn_refill_inline
+            # pair index whose QK issues pair u's refill; always >= u (its PV read the slots)
+            refill_at = [
+                min(u + 1, NS // 2 - 1) if c.attn_refill_next_pair else u
+                for u in range(NS // 2)
+            ]
 
             def pv_u(i0, par, u, ac0, ac1):
                 dpv = pv_pair(
@@ -1356,12 +1361,14 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                         wait_chunk(geo, (i0 + NS + t) % KR_g)
 
                 def refill_pair(u):
-                    if not refill_here:
+                    srcs = [w for w in range(NS // 2) if refill_at[w] == u]
+                    if not refill_here or not srcs:
                         return None
 
                     def issue():
-                        for t in range(2):
-                            refill_slot(ref, i0 + KR_g + 2 * u + t)
+                        for w in srcs:
+                            for t in range(2):
+                                refill_slot(ref, i0 + KR_g + 2 * w + t)
 
                     return issue
 

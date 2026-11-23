@@ -196,6 +196,9 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # with attn_refill_inline: how many global layers (in layer order) get their own inline
     # loop copy; 0 means all
     attn_refill_inline_layers: int = 0
+    # inline refill: issue pair u's refill at pair u + 1 (the last pair keeps its own). Issued
+    # at its own pair the DMA chain fences the next pair's loads and the MXU starves mid-step
+    attn_refill_next_pair: bool = False
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True

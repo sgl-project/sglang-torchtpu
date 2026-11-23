@@ -794,6 +794,8 @@ class TpuEnvs:
     # 0: all. Each copy is a whole step; past 4 the program slows unchanged code (SWA
     # attention +1% at 6, +3-6% at 16, q4 b4-b16).
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(4)
+    # Inline refill: each chunk pair's refill DMAs issue one pair later (MKConfig.attn_refill_next_pair).
+    SGLANG_TPU_MUSE_MK_ATTN_REFILL_NEXT_PAIR = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:
