@@ -1900,6 +1900,7 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
                     packed_u16_lhs=packed_u16,
                     gather_divisor=1,
                     scale_b_id=0,
+                    unroll_m_rows=(m_rows if pq_mode >= 3 else None),
                 )
                 unpack_3d_pq_lhs_to_2d_fp8(
                     x_fp8_r,
@@ -2020,6 +2021,8 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
         _run(sw_mode=2, pq_mode=1, packed_u16=False),
         _run(sw_mode=2, pq_mode=1, packed_u16=True),
         _run(sw_mode=2, pq_mode=2, packed_u16=False),
+        _run(sw_mode=2, pq_mode=3, packed_u16=False),
+        _run(sw_mode=2, pq_mode=3, packed_u16=True),
         _run(sw_mode=8, pq_mode=1, packed_u16=True),
     ):
         assert np.isfinite(got).all()
@@ -2442,4 +2445,226 @@ def test_w9_pql1_g2a6_2x2x1_and_2x2x2_mosaic_lowering(
             else "pallas_deq_both_fp8_gmm"
         )
         assert expected_deq in hlo
+        jax.clear_caches()
+
+
+def test_w9_b1_b2_emit_fp8_gmm_interpret_zero_ulp():
+    """Verify emit_fp8_gmm=True (1-pass & 2-half) matches reference at 0-ULP on CPU interpret."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b2 import (
+        pallas_fused_b1_b2_wpool_quant,
+    )
+
+    orig_pallas_call = pl.pallas_call
+
+    def _interp_pallas_call(*args, **kwargs):
+        kwargs["interpret"] = True
+        return orig_pallas_call(*args, **kwargs)
+
+    rng = np.random.default_rng(20261124)
+    t_loc = 256
+    h_dim = 8192
+    he_dim = 4096
+    n_exp = 256
+    attn_s = jnp.asarray(rng.standard_normal((t_loc, h_dim), np.float32) * 0.3, jnp.bfloat16)
+    stream_s = jnp.asarray(rng.standard_normal((t_loc, h_dim), np.float32) * 0.3, jnp.float32)
+    a_attn = jnp.full((h_dim,), 1.05, jnp.float32)
+    b_attn = jnp.full((h_dim,), 0.85, jnp.float32)
+    pffn_w = jnp.asarray(1.0 + 0.05 * rng.standard_normal(h_dim, np.float32), jnp.bfloat16)
+    w_r = jnp.asarray(rng.standard_normal((h_dim, n_exp), np.float32) * 0.05, jnp.float32)
+    bias = jnp.zeros((n_exp,), jnp.float32)
+    wp_fp8 = jnp.asarray(rng.standard_normal((h_dim, he_dim), np.float32) * 0.05, jnp.float8_e4m3fn)
+    wp_sc = jnp.full((he_dim,), 0.05, jnp.float32)
+    pe_w = jnp.asarray(1.0 + 0.05 * rng.standard_normal(he_dim, np.float32), jnp.bfloat16)
+
+    with patch("jax.experimental.pallas.pallas_call", side_effect=_interp_pallas_call):
+        # 1-pass (pql4) vs stock emit_fp8_gmm=False
+        i8_ref, smid_ref, tk_id_ref, tk_w_ref = pallas_fused_b1_b2_wpool_quant(
+            attn_s, stream_s, a_attn, b_attn, pffn_w, w_r, bias, wp_fp8, wp_sc, pe_w,
+            router_mode="bf16_hilo", fp8_wpool=True, half_idx=None, topk=8, emit_fp8_gmm=False,
+        )
+        fp8_1p, sc_1p, smid_1p, tk_id_1p, tk_w_1p = pallas_fused_b1_b2_wpool_quant(
+            attn_s, stream_s, a_attn, b_attn, pffn_w, w_r, bias, wp_fp8, wp_sc, pe_w,
+            router_mode="bf16_hilo", fp8_wpool=True, half_idx=None, topk=8, emit_fp8_gmm=True,
+        )
+        # 2-half (pql5, exercising stream_mid_prev HBM output buffer aliasing {8: 2})
+        fp8_h0, sc_h0, smid_h0, tk_id_h0, tk_w_h0 = pallas_fused_b1_b2_wpool_quant(
+            attn_s, stream_s, a_attn, b_attn, pffn_w, w_r, bias, wp_fp8, wp_sc, pe_w,
+            router_mode="bf16_hilo", fp8_wpool=True, half_idx=0, full_stream_mid=True,
+            topk=8, emit_fp8_gmm=True,
+        )
+        fp8_h1, sc_h1, smid_2h, tk_id_h1, tk_w_h1 = pallas_fused_b1_b2_wpool_quant(
+            attn_s, stream_s, a_attn, b_attn, pffn_w, w_r, bias, wp_fp8, wp_sc, pe_w,
+            router_mode="bf16_hilo", fp8_wpool=True, half_idx=1, stream_mid_prev=smid_h0,
+            topk=8, emit_fp8_gmm=True,
+        )
+
+    assert fp8_1p.shape == (t_loc, he_dim // 128, 128) and fp8_1p.dtype == jnp.float8_e4m3fn
+    assert sc_1p.shape == (t_loc,) and sc_1p.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(smid_1p), np.asarray(smid_ref))
+    np.testing.assert_array_equal(np.asarray(tk_id_1p), np.asarray(tk_id_ref))
+    np.testing.assert_array_equal(np.asarray(tk_w_1p), np.asarray(tk_w_ref))
+
+    # 2-half pql5 must match 1-pass pql4 bit-for-bit (0-ULP)!
+    fp8_2h = jnp.concatenate([fp8_h0, fp8_h1], axis=0)
+    sc_2h = jnp.concatenate([sc_h0, sc_h1], axis=0)
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(fp8_2h, jnp.uint8)),
+        np.asarray(jax.lax.bitcast_convert_type(fp8_1p, jnp.uint8)),
+    )
+    np.testing.assert_array_equal(np.asarray(sc_2h), np.asarray(sc_1p))
+    np.testing.assert_array_equal(np.asarray(smid_2h), np.asarray(smid_ref))
+    np.testing.assert_array_equal(
+        np.asarray(jnp.concatenate([tk_id_h0, tk_id_h1], axis=0)), np.asarray(tk_id_ref)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jnp.concatenate([tk_w_h0, tk_w_h1], axis=0)), np.asarray(tk_w_ref)
+    )
+
+    # Dequantized FP8 hidden states must closely match dequantized int8 reference (>0.999 cos_sim).
+    sc_i8_u16 = (
+        i8_ref[:, he_dim : he_dim + 1].astype(jnp.uint8).astype(jnp.uint16)
+        | (i8_ref[:, he_dim + 64 : he_dim + 65].astype(jnp.uint8).astype(jnp.uint16) << 8)
+    )
+    sc_i8 = jax.lax.bitcast_convert_type(sc_i8_u16, jnp.bfloat16).astype(jnp.float32)
+    deq_i8 = i8_ref[:, :he_dim].astype(jnp.float32) * sc_i8
+    deq_fp8 = fp8_1p.reshape(t_loc, he_dim).astype(jnp.float32) * sc_1p[:, None]
+    assert np.isfinite(np.asarray(deq_fp8)).all()
+    cos = float(
+        np.dot(np.asarray(deq_fp8).ravel(), np.asarray(deq_i8).ravel())
+        / (np.linalg.norm(np.asarray(deq_fp8)) * np.linalg.norm(np.asarray(deq_i8)) + 1e-30)
+    )
+    assert cos > 0.999, f"Expected cos > 0.999 between direct FP8 and int8 B2 outputs, got {cos}"
+
+
+@pytest.mark.parametrize(
+    "ep_size,num_tok,pq_mode",
+    [
+        (8, 16384, "4"),
+        (8, 16384, "5"),
+        (16, 16384, "4"),
+        (16, 16384, "5"),
+    ],
+)
+def test_w9_pql4_pql5_zero_deq_pipeline_lowering(ep_size: int, num_tok: int, pq_mode: str):
+    """Verify pql4 (1-pass) and pql5 (2-half) lower cleanly on 2x2x1 & 2x2x2 with ZERO post-AG deq kernel."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices()) < ep_size:
+        pytest.skip(f"Needs >={ep_size} JAX devices (use XLA_FLAGS=--xla_force_host_platform_device_count=16)")
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    mesh = Mesh(np.array(jax.devices()[:ep_size]), ("model",))
+    e_loc = 256 // ep_size + 2
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+                "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "2",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                "SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+                "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": pq_mode,
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+            },
+        ),
+    ):
+        jax.clear_caches()
+
+        def _wrap(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus):
+            return jax.shard_map(
+                lambda *xs: fused_moe_full_bridge_and_ffn(
+                    *xs,
+                    mesh=mesh,
+                    router_mode="bf16_hilo",
+                    b2_layout="nstream",
+                    b2_two_half=True,
+                    b2_deq0_first=True,
+                    hoist_routing=True,
+                    d_layout="4slab",
+                    d_tok_tile=64,
+                    d_fp8_unpool=True,
+                    in_shard_map=True,
+                    b2_deq0_new_buffer=True,
+                    next_in_gather_rows=0,
+                    next_in_gather_static_fp8=False,
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P("model", None), P("model", None), P(), P(), P(), P(), P(), P(), P(), P(),
+                    P("model"), P("model"), P("model"), P("model"), P(), P("model"),
+                    P(), P(), P(), P(), P(), P(),
+                ),
+                out_specs=(
+                    P("model", None), P("model", None), P("model", None), P("model", None),
+                ),
+                check_vma=False,
+            )(a, s, aa, ba, pfw, wr, eb, wp, wps, pew, w1, w2, s1, s2, pnw, go, wu, wus, pfw, aa, ba, pfw)
+
+        hlo = (
+            jax.jit(_wrap)
+            .trace(
+                jax.ShapeDtypeStruct((num_tok, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((num_tok, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8192, 256), jnp.float32),
+                jax.ShapeDtypeStruct((256,), jnp.float32),
+                jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((4096,), jnp.float32),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((256, 8, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((256, 8, 4096), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((ep_size,), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert f"gmm_v2_fused_rs-E_{e_loc}-M_{num_tok * 8}" in hlo
+        assert f"-pql{pq_mode}" in hlo and "-g2a6" in hlo and "-cm1s2d" in hlo
+        assert "_outfp8" in hlo
+        assert "pallas_deq_both_fp8_gmm" not in hlo
+        assert "pallas_deq_single_fp8_gmm" not in hlo
+        assert "pallas_deq_both_gmm" not in hlo
+        assert "pallas_deq_single_gmm" not in hlo
         jax.clear_caches()

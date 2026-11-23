@@ -325,6 +325,7 @@ def fill_pq_lhs_scales_tree(
     packed_u16_lhs: bool,
     gather_divisor: int,
     scale_b_id: int = 0,
+    unroll_m_rows: int | None = None,
 ):
     """Populate `dst_scale_ref[scale_b_id, 0:num_valid, :]` using a 3-level binary `vselect` tree."""
     import jax.experimental.pallas as pl
@@ -357,6 +358,11 @@ def fill_pq_lhs_scales_tree(
         q03 = jnp.where(b1, p23, p01)
         q47 = jnp.where(b1, p67, p45)
         dst_scale_ref[scale_b_id, pl.ds(i0, 8), :] = jnp.where(b2, q47, q03)
+
+    if unroll_m_rows is not None and unroll_m_rows % 8 == 0:
+        for i0 in range(0, unroll_m_rows, 8):
+            _pack_8(i0)
+        return
 
     tile_m_cap = dst_scale_ref.shape[1]
     if tile_m_cap >= 32 and tile_m_cap % 32 == 0:

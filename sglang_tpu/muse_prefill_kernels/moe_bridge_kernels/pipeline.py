@@ -181,7 +181,11 @@ def _convert_both_halves_fp8_gmm_layout(
     ag_i8_1: jax.Array | None,
     ag_sc_1: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Single-pass Pallas VMEM i8 -> (fp8[T_global, H//128, 128], fp8_scale[T_global]) converter."""
+    """Row-pipelined Pallas VMEM i8 -> (fp8[T_global, H//128, 128], fp8_scale[T_global]) converter.
+
+    Tiles over `grid=(ep_sz, half_tok // row_tile)` (`row_tile <= 256`, `<= 8.7 MiB` double-buffered
+    VMEM, `< 1,500` static bundles, `0` inner branches) so HBM DMA overlaps VPU completely.
+    """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -190,6 +194,8 @@ def _convert_both_halves_fp8_gmm_layout(
     packed_sc = ag_sc_0 is None
     lane_w = 128
     hidden_sz = (raw_cols - lane_w) if packed_sc else raw_cols
+    row_tile = 256 if (half_tok >= 512 and half_tok % 256 == 0) else 128
+    num_rt = half_tok // row_tile
 
     def _k_fp8(*refs):
         if packed_sc:
@@ -210,7 +216,7 @@ def _convert_both_halves_fp8_gmm_layout(
                 i8_0_ref, sc_0_ref, i8_1_ref, sc_1_ref, fp8_out_ref, sc_out_ref = refs
                 pairs = ((i8_0_ref, sc_0_ref), (i8_1_ref, sc_1_ref))
         for half_idx, (i8_ref, sc_ref) in enumerate(pairs):
-            for t_blk in range(half_tok // lane_w):
+            for t_blk in range(row_tile // lane_w):
                 r0, r1 = t_blk * lane_w, (t_blk + 1) * lane_w
                 if packed_sc:
                     ps = i8_ref[0, r0:r1, hidden_sz : hidden_sz + lane_w]
@@ -242,7 +248,7 @@ def _convert_both_halves_fp8_gmm_layout(
                 inv_fp8 = jnp.where(
                     amax_f32 == 0.0,
                     jnp.zeros_like(amax_f32),
-                    jnp.float32(448.0) / amax_f32,
+                    jnp.float32(448.0) / jnp.maximum(amax_f32, jnp.float32(1e-30)),
                 ).astype(jnp.bfloat16)
                 row_sc = jnp.where(
                     amax_f32 == 0.0,
@@ -261,7 +267,9 @@ def _convert_both_halves_fp8_gmm_layout(
                     )
 
     if packed_sc:
-        in_specs = [pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0))] * n_halves
+        in_specs = [
+            pl.BlockSpec((1, row_tile, raw_cols), lambda r, rt: (r, rt, 0))
+        ] * n_halves
         args: tuple[jax.Array, ...] = (
             (ag_i8_0,) if n_halves == 1 else (ag_i8_0, ag_i8_1)
         )
@@ -269,21 +277,20 @@ def _convert_both_halves_fp8_gmm_layout(
         assert ag_sc_0 is not None
         if n_halves == 1:
             in_specs = [
-                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
+                pl.BlockSpec((1, row_tile, raw_cols), lambda r, rt: (r, rt, 0)),
+                pl.BlockSpec((ep_sz, row_tile), lambda r, rt: (0, rt)),
             ]
             args = (ag_i8_0, ag_sc_0)
         else:
             assert ag_sc_1 is not None
             in_specs = [
-                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
-                pl.BlockSpec((1, half_tok, raw_cols), lambda r: (r, 0, 0)),
-                pl.BlockSpec((ep_sz, half_tok), lambda r: (0, 0)),
+                pl.BlockSpec((1, row_tile, raw_cols), lambda r, rt: (r, rt, 0)),
+                pl.BlockSpec((ep_sz, row_tile), lambda r, rt: (0, rt)),
+                pl.BlockSpec((1, row_tile, raw_cols), lambda r, rt: (r, rt, 0)),
+                pl.BlockSpec((ep_sz, row_tile), lambda r, rt: (0, rt)),
             ]
             args = (ag_i8_0, ag_sc_0, ag_i8_1, ag_sc_1)
 
-    vmem_cap = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.94)
     fp8_5d, sc_4d = pl.pallas_call(
         _k_fp8,
         out_shape=(
@@ -295,22 +302,26 @@ def _convert_both_halves_fp8_gmm_layout(
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            grid=(ep_sz,),
+            grid=(ep_sz, num_rt),
             in_specs=in_specs,
             out_specs=[
                 pl.BlockSpec(
-                    (1, n_halves, half_tok, hidden_sz // lane_w, lane_w),
-                    lambda r: (r, 0, 0, 0, 0),
+                    (1, n_halves, row_tile, hidden_sz // lane_w, lane_w),
+                    lambda r, rt: (r, 0, rt, 0, 0),
                 ),
-                pl.BlockSpec((1, n_halves, half_tok, lane_w), lambda r: (r, 0, 0, 0)),
+                pl.BlockSpec(
+                    (1, n_halves, row_tile, lane_w),
+                    lambda r, rt: (r, 0, rt, 0),
+                ),
             ],
             scratch_shapes=[],
         ),
         compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
             disable_bounds_checks=True,
-            vmem_limit_bytes=vmem_cap,
+            vmem_limit_bytes=32 * 1024 * 1024,
         ),
-        name=f"pallas_deq_{'single' if n_halves == 1 else 'both'}_fp8_gmm_ep{ep_sz}_ht{half_tok}",
+        name=f"pallas_deq_{'single' if n_halves == 1 else 'both'}_fp8_gmm_ep{ep_sz}_ht{half_tok}_rt{row_tile}",
     )(*args)
     return (
         fp8_5d.reshape(ep_sz * n_halves * half_tok, hidden_sz // lane_w, lane_w),
@@ -2089,8 +2100,11 @@ def fused_moe_full_bridge_and_ffn(
             )
 
         hidden_states_scale = None
+        _pq_lhs_mode = int(
+            envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0
+        )
         _use_pq_lhs_fp8 = (
-            int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0) >= 1
+            _pq_lhs_mode >= 1
             and not ep_tp2_mode
             and (ep_size * t_local * topk) >= 16384
             and (
@@ -2106,14 +2120,55 @@ def fused_moe_full_bridge_and_ffn(
                 )
             )
         )
+        _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and _pq_lhs_mode == 4
+        _b2_direct_fp8_2half = _use_pq_lhs_fp8 and _pq_lhs_mode == 5
         with jax.named_scope("stage1_2_kernel_b1_b2_and_overlapped_ag_routing"):
-            if (fused_b1_b2_mode in (1, 2) and (t_local % 128 == 0)) or (
-                fused_b1_b2_mode in (3, 4)
-                and (t_local % 128 == 0)
-                and (t_local % 256 != 0)
+            if (
+                (fused_b1_b2_mode in (1, 2) and (t_local % 128 == 0))
+                or (
+                    fused_b1_b2_mode in (3, 4)
+                    and (t_local % 128 == 0)
+                    and (t_local % 256 != 0)
+                )
+                or (
+                    _b2_direct_fp8_1pass
+                    and fused_b1_b2_mode in (1, 2, 3, 4)
+                    and (t_local % 128 == 0)
+                )
             ):
-                i8_all, stream_shard_mid, local_topk_ids_u8, local_topk_weights = (
-                    pallas_fused_b1_b2_wpool_quant(
+                if _b2_direct_fp8_1pass:
+                    (
+                        fp8_all,
+                        sc_local_1d,
+                        stream_shard_mid,
+                        local_topk_ids_u8,
+                        local_topk_weights,
+                    ) = pallas_fused_b1_b2_wpool_quant(
+                        attn_s,
+                        stream_s,
+                        a_attn,
+                        b_attn,
+                        pffn_w,
+                        w_r,
+                        bias,
+                        wp_fp8,
+                        wp_sc,
+                        pe_w,
+                        router_mode=router_mode,
+                        fp8_wpool=(fused_b1_b2_mode in (2, 4)),
+                        half_idx=None,
+                        topk=topk,
+                        emit_fp8_gmm=True,
+                    )
+                    i8_all = fp8_all.reshape(t_local * (he_dim // 128), 128)
+                else:
+                    sc_local_1d = None
+                    (
+                        i8_all,
+                        stream_shard_mid,
+                        local_topk_ids_u8,
+                        local_topk_weights,
+                    ) = pallas_fused_b1_b2_wpool_quant(
                         attn_s,
                         stream_s,
                         a_attn,
@@ -2129,7 +2184,6 @@ def fused_moe_full_bridge_and_ffn(
                         half_idx=None,
                         topk=topk,
                     )
-                )
                 i8_all, local_topk_ids_u8 = jax.lax.optimization_barrier(
                     (i8_all, local_topk_ids_u8)
                 )
@@ -2148,6 +2202,10 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
+                if _b2_direct_fp8_1pass:
+                    hidden_states_scale = jax.lax.all_gather(
+                        sc_local_1d, axis_name=expert_axis, axis=0, tiled=True
+                    ).reshape(-1)
                 local_topk_ids_u8_b, global_topk_u8_b, _ = (
                     jax.lax.optimization_barrier(
                         (local_topk_ids_u8, global_topk_u8, i8_all)
@@ -2209,7 +2267,11 @@ def fused_moe_full_bridge_and_ffn(
                         (inv_perm_c, local_t_recv)
                     )
                     precomputed_routing = None
-                if _use_pq_lhs_fp8:
+                if _b2_direct_fp8_1pass:
+                    hidden_states = ag_i8.reshape(
+                        ep_size * t_local, he_dim // 128, 128
+                    )
+                elif _use_pq_lhs_fp8:
                     hidden_states, hidden_states_scale = (
                         _convert_both_halves_fp8_gmm_layout(ag_i8, None, None, None)
                     )
@@ -2219,23 +2281,47 @@ def fused_moe_full_bridge_and_ffn(
             elif fused_b1_b2_mode in (3, 4) and (t_local % 256 == 0):
                 half_tok = t_local // 2
                 fp8_wp = fused_b1_b2_mode == 4
-                i8_0, smid_0, tk_u8_0, tk_w_0 = pallas_fused_b1_b2_wpool_quant(
-                    attn_s,
-                    stream_s,
-                    a_attn,
-                    b_attn,
-                    pffn_w,
-                    w_r,
-                    bias,
-                    wp_fp8,
-                    wp_sc,
-                    pe_w,
-                    router_mode=router_mode,
-                    fp8_wpool=fp8_wp,
-                    half_idx=0,
-                    full_stream_mid=True,
-                    topk=topk,
-                )
+                if _b2_direct_fp8_2half:
+                    fp8_0, sc_0, smid_0, tk_u8_0, tk_w_0 = (
+                        pallas_fused_b1_b2_wpool_quant(
+                            attn_s,
+                            stream_s,
+                            a_attn,
+                            b_attn,
+                            pffn_w,
+                            w_r,
+                            bias,
+                            wp_fp8,
+                            wp_sc,
+                            pe_w,
+                            router_mode=router_mode,
+                            fp8_wpool=fp8_wp,
+                            half_idx=0,
+                            full_stream_mid=True,
+                            topk=topk,
+                            emit_fp8_gmm=True,
+                        )
+                    )
+                    i8_0 = fp8_0.reshape(half_tok * (he_dim // 128), 128)
+                else:
+                    sc_0 = None
+                    i8_0, smid_0, tk_u8_0, tk_w_0 = pallas_fused_b1_b2_wpool_quant(
+                        attn_s,
+                        stream_s,
+                        a_attn,
+                        b_attn,
+                        pffn_w,
+                        w_r,
+                        bias,
+                        wp_fp8,
+                        wp_sc,
+                        pe_w,
+                        router_mode=router_mode,
+                        fp8_wpool=fp8_wp,
+                        half_idx=0,
+                        full_stream_mid=True,
+                        topk=topk,
+                    )
                 i8_0, smid_0, tk_u8_0, tk_w_0 = jax.lax.optimization_barrier(
                     (i8_0, smid_0, tk_u8_0, tk_w_0)
                 )
@@ -2254,23 +2340,49 @@ def fused_moe_full_bridge_and_ffn(
                 attn_s_1, stream_s_1, smid_0_1, _ = jax.lax.optimization_barrier(
                     (attn_s, stream_s, smid_0, i8_0)
                 )
-                i8_1, stream_shard_mid, tk_u8_1, tk_w_1 = pallas_fused_b1_b2_wpool_quant(
-                    attn_s_1,
-                    stream_s_1,
-                    a_attn,
-                    b_attn,
-                    pffn_w,
-                    w_r,
-                    bias,
-                    wp_fp8,
-                    wp_sc,
-                    pe_w,
-                    router_mode=router_mode,
-                    fp8_wpool=fp8_wp,
-                    half_idx=1,
-                    stream_mid_prev=smid_0_1,
-                    topk=topk,
-                )
+                if _b2_direct_fp8_2half:
+                    fp8_1, sc_1, stream_shard_mid, tk_u8_1, tk_w_1 = (
+                        pallas_fused_b1_b2_wpool_quant(
+                            attn_s_1,
+                            stream_s_1,
+                            a_attn,
+                            b_attn,
+                            pffn_w,
+                            w_r,
+                            bias,
+                            wp_fp8,
+                            wp_sc,
+                            pe_w,
+                            router_mode=router_mode,
+                            fp8_wpool=fp8_wp,
+                            half_idx=1,
+                            stream_mid_prev=smid_0_1,
+                            topk=topk,
+                            emit_fp8_gmm=True,
+                        )
+                    )
+                    i8_1 = fp8_1.reshape(half_tok * (he_dim // 128), 128)
+                else:
+                    sc_1 = None
+                    i8_1, stream_shard_mid, tk_u8_1, tk_w_1 = (
+                        pallas_fused_b1_b2_wpool_quant(
+                            attn_s_1,
+                            stream_s_1,
+                            a_attn,
+                            b_attn,
+                            pffn_w,
+                            w_r,
+                            bias,
+                            wp_fp8,
+                            wp_sc,
+                            pe_w,
+                            router_mode=router_mode,
+                            fp8_wpool=fp8_wp,
+                            half_idx=1,
+                            stream_mid_prev=smid_0_1,
+                            topk=topk,
+                        )
+                    )
                 local_topk_ids_u8 = jnp.concatenate([tk_u8_0, tk_u8_1], axis=0)
                 local_topk_weights = jnp.concatenate([tk_w_0, tk_w_1], axis=0)
                 i8_1 = jax.lax.optimization_barrier(i8_1)
@@ -2289,6 +2401,11 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
+                if _b2_direct_fp8_2half:
+                    sc_01_local = jnp.concatenate([sc_0, sc_1], axis=0)
+                    hidden_states_scale = jax.lax.all_gather(
+                        sc_01_local, axis_name=expert_axis, axis=0, tiled=True
+                    ).reshape(-1)
                 ovl_deq0_env = getattr(
                     envs, "SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG", None
                 )
@@ -2384,7 +2501,15 @@ def fused_moe_full_bridge_and_ffn(
                         ).astype(jnp.int32)
                     )
                     precomputed_routing = None
-                if _use_pq_lhs_fp8:
+                if _b2_direct_fp8_2half:
+                    hidden_states = jnp.concatenate(
+                        [
+                            ag_i8_0.reshape(ep_size, half_tok, he_dim // 128, 128),
+                            ag_i8_1.reshape(ep_size, half_tok, he_dim // 128, 128),
+                        ],
+                        axis=1,
+                    ).reshape(ep_size * t_local, he_dim // 128, 128)
+                elif _use_pq_lhs_fp8:
                     hidden_states, hidden_states_scale = (
                         _convert_both_halves_fp8_gmm_layout(
                             ag_i8_0, None, ag_i8_1, None
