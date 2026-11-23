@@ -2078,7 +2078,8 @@ def prewarm_carb_bridge_ops(
     if world_size not in SUPPORTED_WORLD_SIZES:
         return
     if fuse_b1_topk:
-        get_attn_to_moe_bridge_router_topk_op(world_size, bf16_router=bool(bf16_router))
+        for bfr in (False, True):
+            get_attn_to_moe_bridge_router_topk_op(world_size, bf16_router=bfr)
     if overlap_b2_epi:
         for sh in (False, True):
             get_moe_to_attn_overlap_bridge_op(world_size, sharded_moe_in=sh)

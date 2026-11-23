@@ -441,8 +441,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 )
                 for c_blk in range(4):
                     u0, u1 = c_blk * 1024, (c_blk + 1) * 1024
-                    u_fp8_scratch_ref[:, u0:u1] = (
-                        u_scratch_ref[:, u0:u1].astype(jnp.float32) * inv_u_sc
+                    u_fp8_scratch_ref[:, u0:u1] = jnp.clip(
+                        u_scratch_ref[:, u0:u1].astype(jnp.float32) * inv_u_sc,
+                        -448.0,
+                        448.0,
                     ).astype(jnp.float8_e4m3fn)
             else:
                 u_sc = None
@@ -856,9 +858,9 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     jnp.zeros_like(row_amax_b),
                     jnp.float32(448.0) / jnp.maximum(row_amax_b, jnp.float32(1e-30)),
                 )
-                u_fp8_scratch_ref[:, k0:k1] = (u_blk_f32 * inv_sc_b).astype(
-                    jnp.float8_e4m3fn
-                )
+                u_fp8_scratch_ref[:, k0:k1] = jnp.clip(
+                    u_blk_f32 * inv_sc_b, -448.0, 448.0
+                ).astype(jnp.float8_e4m3fn)
                 u_sc_blk_ref[kb, :, :] = jnp.broadcast_to(sc_b, (tok_tile_eff, LANE))
             u_sc = None
         elif fp8_unpool:
@@ -872,8 +874,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             )
             for c_blk in range(4):
                 u0, u1 = c_blk * 1024, (c_blk + 1) * 1024
-                u_fp8_scratch_ref[:, u0:u1] = (
-                    u_scratch_ref[:, u0:u1].astype(jnp.float32) * inv_u_sc
+                u_fp8_scratch_ref[:, u0:u1] = jnp.clip(
+                    u_scratch_ref[:, u0:u1].astype(jnp.float32) * inv_u_sc,
+                    -448.0,
+                    448.0,
                 ).astype(jnp.float8_e4m3fn)
         else:
             u_sc = None
@@ -1058,8 +1062,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for c0 in range(0, h_dim, p_step):
                     c1 = c0 + p_step
                     new_s = new_stream_out_ref[:, c0:c1]
-                    next_in_out_ref[:, c0:c1] = (
-                        new_s * vecs_ref[4:5, c0:c1] * inv_q_sc
+                    next_in_out_ref[:, c0:c1] = jnp.clip(
+                        new_s * vecs_ref[4:5, c0:c1] * inv_q_sc, -448.0, 448.0
                     ).astype(jnp.float8_e4m3fn)
             elif emit_static_fp8_attn_in:
                 inv_rms_next_s32 = inv_rms_next * jnp.float32(32.0)
@@ -1339,8 +1343,10 @@ def pallas_combine_unpool_residual_nextnorm_nstream(
                     u_sc_scratch_ref[r0:r1, :] = jnp.broadcast_to(u_sc, (sub_m, LANE))
                     for c_blk in range(4):
                         u0, u1 = c_blk * 1024, (c_blk + 1) * 1024
-                        u_fp8_scratch_ref[r0:r1, u0:u1] = (
-                            u_in_ref[r0:r1, u0:u1].astype(jnp.float32) * inv_u_sc
+                        u_fp8_scratch_ref[r0:r1, u0:u1] = jnp.clip(
+                            u_in_ref[r0:r1, u0:u1].astype(jnp.float32) * inv_u_sc,
+                            -448.0,
+                            448.0,
                         ).astype(jnp.float8_e4m3fn)
 
         for rb in range(m_tile // sub_m):

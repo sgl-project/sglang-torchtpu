@@ -478,8 +478,8 @@ def pallas_postattn_res_prenorm_router_topk_fp8(
             gain_s = vecs_ref[2:3, c0:c1]
             r_f32 = smid_s * inv_rms_m * gain_s
             r_bf16 = r_f32.astype(jnp.bfloat16)
-            router_in_fp8_out_ref[:, c0:c1] = (
-                r_bf16.astype(jnp.float32) * inv_r_sc
+            router_in_fp8_out_ref[:, c0:c1] = jnp.clip(
+                r_bf16.astype(jnp.float32) * inv_r_sc, -448.0, 448.0
             ).astype(jnp.float8_e4m3fn)
 
             if router_mode == "fp32":

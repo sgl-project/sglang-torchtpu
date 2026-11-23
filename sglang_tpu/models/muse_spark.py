@@ -5631,7 +5631,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 )
 
                 prewarm_carb_bridge_ops(
-                    tp_seen,
+                    warm_tp,
                     bf16_router=router_bf16,
                     fuse_b1_topk=(do_b1 and fuse_b1_tk),
                     fuse_b2_direct_qkv=(do_qkvg and fuse_b2_dqkv),
