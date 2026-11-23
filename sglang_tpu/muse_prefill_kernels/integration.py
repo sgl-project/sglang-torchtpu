@@ -1552,12 +1552,12 @@ def _ops(
         def ag_chunk(x_slice: jax.Array) -> jax.Array:
             return ag_chunk_sm(x_slice)
 
-        def a1_chunk_body(ag_k, wqkvg, wqkvg_scale, cos_k, sin_k):
+        def a1_chunk_body(ag_k, wqkvg, wqkvg_scale, cos_k, sin_k, next_fp8=None):
             tp_d, c_k, _ = ag_k.shape
             w_sc = wqkvg_scale * kernel_a1.STATIC_A1_ACT_SCALE
             cos_3d = cos_k.reshape(tp_d, c_k, 128)
             sin_3d = sin_k.reshape(tp_d, c_k, 128)
-            q_k, gate_k, kv_k = kernel_a1.pallas_a1_chunk_1way(
+            a1_res = kernel_a1.pallas_a1_chunk_1way(
                 ag_k,
                 wqkvg,
                 w_sc,
@@ -1572,19 +1572,23 @@ def _ops(
                 mode="all",
                 tp_axis=_AXIS,
                 tm=256 if c_k % 256 == 0 else 128,
+                next_ag_in=next_fp8,
             )
+            q_k, gate_k, kv_k = a1_res[:3]
             c_tok = tp_d * c_k
             if a1_rpa_layout:
-                return (
+                formatted = (
                     q_k.reshape(1, c_tok, h_q_local // 2, 2, 128),
                     gate_k.reshape(c_tok, h_q_local * 64),
                     kv_k.reshape(c_tok, 1, 4, 128),
                 )
-            return (
-                q_k.reshape(c_tok, h_q_local * 64),
-                gate_k.reshape(c_tok, h_q_local * 64),
-                kv_k.reshape(c_tok, h_kv_local * 128),
-            )
+            else:
+                formatted = (
+                    q_k.reshape(c_tok, h_q_local * 64),
+                    gate_k.reshape(c_tok, h_q_local * 64),
+                    kv_k.reshape(c_tok, h_kv_local * 128),
+                )
+            return (*formatted, a1_res[3]) if next_fp8 is not None else formatted
 
         a1_chunk_sm = shard(a1_chunk_body, 5, 3)
 
@@ -1614,6 +1618,10 @@ def _ops(
 
             def a1_chunk_agd_body(ag_k, next_slice, wqkvg, wqkvg_scale, cos_k, sin_k):
                 next_fp8 = _prep_ccs_fp8_slice(next_slice)
+                if ccs_fuse_ag_a1 == 3:
+                    return a1_chunk_body(
+                        ag_k, wqkvg, wqkvg_scale, cos_k, sin_k, next_fp8=next_fp8
+                    )
                 next_fp8_b, ag_k_b = lax.optimization_barrier((next_fp8, ag_k))
                 ag_next = _ccs_all_gather(next_fp8_b)
                 q_out, gate_out, kv_out = a1_chunk_body(
@@ -1635,8 +1643,9 @@ def _ops(
                     ag_k, next_slice, wqkvg, wqkvg_scale, cos_k, sin_k
                 )
 
+            agd_sfx = "_inag" if ccs_fuse_ag_a1 == 3 else ccs_ag_sfx
             a1_chunk_agd_op = export(
-                "a1_chunk_agd_v6" + rpal_sfx + a1_w8_tag + ccs_ag_sfx,
+                "a1_chunk_agd_v6" + rpal_sfx + a1_w8_tag + agd_sfx,
                 a1_chunk_agd,
                 6,
                 4,
@@ -2270,10 +2279,15 @@ class MusePrefillKernels(torch.nn.Module):
 
             _get_write_kv_only_op()
         self.capture_dflash = tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAPTURE_DFLASH.get()
-        # q / kv go straight to the backend's prepared RPA op; needs the packed-head pool.
+        # q / kv go straight to the backend's prepared RPA op; TP=8 needs KV_PACK_HEADS (pack=2),
+        # while TP=16 already has h_kv_local=1 (pack=1).
         self.a1_rpa_layout = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
-            and tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
+            and not ep_tp2_mode
+            and (
+                tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
+                or (tp_size == 16 and self.a1_variant == "v6")
+            )
         )
         self.a3_rpa_out = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_RPA_OUT.get()
@@ -2466,6 +2480,10 @@ class MusePrefillKernels(torch.nn.Module):
         self.register_buffer(
             "no_next_norm", torch.zeros(hidden, device=device), persistent=False
         )
+        self._has_nope = any(
+            getattr(decoder.layers[i].self_attn, "rotary_emb", None) is None
+            for i in range(start, end)
+        )
         self.weights = torch.nn.ModuleList(
             _LayerWeights(
                 decoder.layers[i],
@@ -2565,11 +2583,11 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v1", "v6")
             or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() not in ("v3", "v16")
             or (
-                tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
-                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
+                tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
+                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() != "v6"
             )
         ):
-            reason = "native TP16 needs unpacked A1 v1/v6 and A3 v3/v16"
+            reason = "native TP16 needs A1 v1/v6 (v6 for A1_RPA_LAYOUT) and A3 v3/v16"
         elif parallel.attn_dcp_size != 1 or is_dp_attention_enabled():
             reason = "does not support DCP or DP attention"
         elif decoder.pp_group.world_size != 1:
@@ -2768,9 +2786,13 @@ class MusePrefillKernels(torch.nn.Module):
                         rope[0].index_select(0, inv_cm_perm),
                         rope[1].index_select(0, inv_cm_perm),
                     )
-                nope = (torch.ones_like(rope[0]), torch.zeros_like(rope[1]))
+                nope = (
+                    (torch.ones_like(rope[0]), torch.zeros_like(rope[1]))
+                    if getattr(self, "_has_nope", True)
+                    else None
+                )
                 rope_chunks = []
-                nope_chunks = []
+                nope_chunks = [] if nope is not None else None
                 t_off = 0
                 for c_k in chunks:
                     c_tok = self.tp_size * c_k
@@ -2780,12 +2802,13 @@ class MusePrefillKernels(torch.nn.Module):
                             rope[1][t_off : t_off + c_tok].contiguous(),
                         )
                     )
-                    nope_chunks.append(
-                        (
-                            nope[0][t_off : t_off + c_tok].contiguous(),
-                            nope[1][t_off : t_off + c_tok].contiguous(),
+                    if nope_chunks is not None:
+                        nope_chunks.append(
+                            (
+                                nope[0][t_off : t_off + c_tok].contiguous(),
+                                nope[1][t_off : t_off + c_tok].contiguous(),
+                            )
                         )
-                    )
                     t_off += c_tok
                 chunk_metas = build_chunk_rpa_metas_torch(
                     get_attn_backend().forward_metadata,
@@ -2796,7 +2819,11 @@ class MusePrefillKernels(torch.nn.Module):
             stream_shard = rank_slice(stream, 0, self.tp_size, self.tp_rank)
         if chunk_metas is None:
             rope = self._rope_tables(decoder.rotary_emb, positions)
-            nope = (torch.ones_like(rope[0]), torch.zeros_like(rope[1]))
+            nope = (
+                (torch.ones_like(rope[0]), torch.zeros_like(rope[1]))
+                if getattr(self, "_has_nope", True)
+                else None
+            )
         valid_tokens = self._prepare_valid_tokens(forward_batch, positions)
         attn_in = decoder.layers[self.start].input_layernorm(stream_shard)
         attn_in = attn_in.to(torch.bfloat16)
@@ -3232,10 +3259,15 @@ class MusePrefillKernels(torch.nn.Module):
         if chunk_meta is not None:
             if is_swa and md.swa_page_indices is not None:
                 group = be._swa_layer_groups.get(attn_layer.layer_id, 0)
+                swa_pages = getattr(md, "swa_group_pages", None)
                 page_indices = (
                     md.swa_page_indices
                     if group == 0 or md.swa_group_page_indices is None
-                    else md.swa_group_page_indices[group - 1]
+                    else (
+                        swa_pages[group - 1]
+                        if swa_pages is not None
+                        else md.swa_group_page_indices[group - 1]
+                    )
                 )
             else:
                 page_indices = md.page_indices
@@ -3316,10 +3348,15 @@ class MusePrefillKernels(torch.nn.Module):
         if chunk_meta is not None:
             if is_swa and md.swa_page_indices is not None:
                 group = be._swa_layer_groups.get(attn_layer.layer_id, 0)
+                swa_pages = getattr(md, "swa_group_pages", None)
                 page_indices = (
                     md.swa_page_indices
                     if group == 0 or md.swa_group_page_indices is None
-                    else md.swa_group_page_indices[group - 1]
+                    else (
+                        swa_pages[group - 1]
+                        if swa_pages is not None
+                        else md.swa_group_page_indices[group - 1]
+                    )
                 )
             else:
                 page_indices = md.page_indices

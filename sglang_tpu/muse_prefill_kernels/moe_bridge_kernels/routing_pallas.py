@@ -42,20 +42,23 @@ def pallas_local_inv_perm_and_counts(
     assert t_local % LANE == 0 and (t_local * topk) % LANE == 0
     assert num_local_experts <= LANE and ep_size <= LANE
 
+    b_strips = (total_id_buckets + LANE - 1) // LANE
+    b_pad = b_strips * LANE
+    n_tok_blks = t_local // LANE
+    g_rows_per_chip = (t_local * topk) // LANE
+
+    # Keep native (8, 128) packing for >=128 packed rows (t_local >= 2048); small-tl benefit is
+    # negligible and tl256_el18_b384_pad hit an unverified runtime halt when enabled.
     if native_pack is None:
         from sglang_tpu.envs import envs as _tpu_envs
 
         use_native_pack = bool(
             topk == 8
+            and (n_tok_blks * 8) >= LANE
             and _tpu_envs.SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK.get()
         )
     else:
-        use_native_pack = bool(native_pack and topk == 8)
-
-    b_strips = (total_id_buckets + LANE - 1) // LANE
-    b_pad = b_strips * LANE
-    n_tok_blks = t_local // LANE
-    g_rows_per_chip = (t_local * topk) // LANE
+        use_native_pack = bool(native_pack and topk == 8 and (n_tok_blks * 8) >= LANE)
 
     if use_native_pack:
         local_in = local_topk_ids.astype(jnp.int32).reshape(

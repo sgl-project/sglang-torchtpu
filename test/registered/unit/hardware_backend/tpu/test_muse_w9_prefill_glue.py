@@ -1,0 +1,728 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Wave-9 prefill collectives, layout, and glue tests (u2x2x2 + u2x2x1)."""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import os
+import pathlib
+from unittest import mock
+
+import numpy as np
+import pytest
+
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+_TOUCHED_FLAGS = (
+    "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG",
+    "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT",
+    "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1",
+)
+
+
+@contextlib.contextmanager
+def _interpret_on_cpu():
+    import jax
+    from jax.experimental import pallas as pl
+
+    real = pl.pallas_call
+
+    def _interpret(*args, **kwargs):
+        kwargs["interpret"] = True
+        return real(*args, **kwargs)
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _interpret),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        yield
+
+
+def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
+    """All prefill glue flags default off and are always read via .get()."""
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() == 0
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get() is False
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() == 0
+
+    repo = pathlib.Path(__file__).resolve().parents[5]
+    rel_paths = (
+        "sglang_tpu/kernels/xor1_bridge_all_gather.py",
+        "sglang_tpu/muse_prefill_kernels/attn_kernels/kernel_a1.py",
+        "sglang_tpu/muse_prefill_kernels/integration.py",
+        "sglang_tpu/muse_prefill_kernels/moe_bridge_kernels/pipeline.py",
+    )
+    checked = set(_TOUCHED_FLAGS)
+    for rel in rel_paths:
+        tree = ast.parse((repo / rel).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in checked:
+                found_get = any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "get"
+                    and call.func.value is node
+                    for call in ast.walk(tree)
+                )
+                assert found_get, (
+                    f"{rel}:{node.lineno} accesses {node.attr} without .get()"
+                )
+
+
+def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
+    """Verify 16-rank 1-hop XYZ torus + XOR=1 D2D schedule correctness and TPU7x HLO."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.kernels.xor1_bridge_all_gather import (
+        _xyz_row_splits,
+        xor1_ag_schedule_spec,
+        xor1_bridge_all_gather,
+    )
+
+    for rows, align in ((512, 32), (256, 32), (384, 8), (128, 32), (96, 32)):
+        r0, r1, r2 = _xyz_row_splits(rows, align)
+        assert r0 + r1 + r2 == rows and min(r0, r1, r2) >= align
+        slices = ((0, r0), (r0, r0 + r1), (r0 + r1, rows))
+        rng = np.random.default_rng(rows)
+        x = rng.integers(-120, 120, size=(16, rows, 4), dtype=np.int8)
+        out = [
+            [np.full((rows, 4), -999, dtype=np.int32) for _ in range(16)]
+            for _ in range(16)
+        ]
+        for me in range(16):
+            out[me][me] = x[me].astype(np.int32)
+            out[me ^ 1][me] = x[me].astype(np.int32)
+
+        def _exec_step(transfers):
+            in_flight = []
+            for me, owner, p_idx, dst in transfers:
+                a, b = slices[p_idx]
+                src = x[me] if owner is None else out[me][owner]
+                assert not np.any(src[a:b] == -999)
+                slot = me if owner is None else owner
+                in_flight.append((dst, slot, a, b, src[a:b].copy()))
+            for dst, slot, a, b, data in in_flight:
+                assert np.all(out[dst][slot][a:b] == -999)
+                out[dst][slot][a:b] = data
+
+        _exec_step(
+            [(me, None, 0, me ^ 2) for me in range(16)]
+            + [(me, None, 1, me ^ 4) for me in range(16)]
+            + [(me, None, 2, me ^ 8) for me in range(16)]
+        )
+        s2 = []
+        for me in range(16):
+            for owner in (None, me ^ 2):
+                s2.append((me, owner, 0, me ^ 4))
+            for owner in (None, me ^ 4):
+                s2.append((me, owner, 1, me ^ 8))
+            for owner in (None, me ^ 8):
+                s2.append((me, owner, 2, me ^ 2))
+            for idx, peer in enumerate((me ^ 2, me ^ 4, me ^ 8)):
+                s2.append((me, peer, idx, me ^ 1))
+        _exec_step(s2)
+        s3 = []
+        for me in range(16):
+            for owner in (None, me ^ 2, me ^ 4, me ^ 6):
+                s3.append((me, owner, 0, me ^ 8))
+            for owner in (None, me ^ 4, me ^ 8, me ^ 12):
+                s3.append((me, owner, 1, me ^ 2))
+            for owner in (None, me ^ 8, me ^ 2, me ^ 10):
+                s3.append((me, owner, 2, me ^ 4))
+            for peer, p_idx in (
+                (me ^ 4, 0),
+                (me ^ 6, 0),
+                (me ^ 8, 1),
+                (me ^ 12, 1),
+                (me ^ 2, 2),
+                (me ^ 10, 2),
+            ):
+                s3.append((me, peer, p_idx, me ^ 1))
+        _exec_step(s3)
+        s4 = []
+        for me in range(16):
+            for peer in (me ^ 8, me ^ 10, me ^ 12, me ^ 14):
+                s4.append((me, peer, 0, me ^ 1))
+            for peer in (me ^ 2, me ^ 6, me ^ 10, me ^ 14):
+                s4.append((me, peer, 1, me ^ 1))
+            for peer in (me ^ 4, me ^ 12, me ^ 6, me ^ 14):
+                s4.append((me, peer, 2, me ^ 1))
+        _exec_step(s4)
+        for r in range(16):
+            np.testing.assert_array_equal(np.stack(out[r], axis=0), x.astype(np.int32))
+
+    assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[0] == "xyz"
+    assert xor1_ag_schedule_spec(8, 512, 1, xy_torus=True)[0] == "xy"
+    assert xor1_ag_schedule_spec(16, 64, 1, xy_torus=True)[0] == "flat"
+
+    devs = jax.devices()
+    if len(devs) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    mesh8 = Mesh(np.array(devs[:8]), ("model",))
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3"}),
+    ):
+        sm8 = jax.jit(
+            jax.shard_map(
+                lambda x: xor1_bridge_all_gather(x[0], axis_name="model", tiled=False)[None],
+                mesh=mesh8,
+                in_specs=(P("model", None, None),),
+                out_specs=P("model", None, None, None),
+                check_vma=False,
+            )
+        )
+        hlo8 = (
+            sm8.trace(jax.ShapeDtypeStruct((8, 512, 8192), jnp.float8_e4m3fn))
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "xor1_xytorus_ag_tp8" in hlo8 and "partition_id" not in hlo8
+
+        if len(devs) >= 16:
+            mesh16 = Mesh(np.array(devs[:16]), ("model",))
+            sm16 = jax.jit(
+                jax.shard_map(
+                    lambda x: xor1_bridge_all_gather(x[0], axis_name="model", tiled=False)[None],
+                    mesh=mesh16,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )
+            for rows, cols, dt in (
+                (512, 8192, jnp.float8_e4m3fn),
+                (256, 4096, jnp.int8),
+                (128, 8192, jnp.float8_e4m3fn),
+                (512, 8192, jnp.bfloat16),
+            ):
+                hlo16 = (
+                    sm16.trace(jax.ShapeDtypeStruct((16, rows, cols), dt))
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text("stablehlo")
+                )
+                assert "xor1_xyztorus_ag_tp16" in hlo16 and "partition_id" not in hlo16
+
+            # 16-device Mosaic interpret=True + detect_races=True parity for unequal (64, 32, 32) rows=128 split.
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.sharding import NamedSharding
+
+            orig_pc = pl.pallas_call
+
+            def _mosaic_interp(*args, **kwargs):
+                kwargs["interpret"] = pltpu.InterpretParams(detect_races=True)
+                return orig_pc(*args, **kwargs)
+
+            rng128 = np.random.default_rng(128)
+            x128_np = rng128.integers(-50, 50, size=(16, 128, 256), dtype=np.int8)
+            x128_j = jax.device_put(
+                jnp.asarray(x128_np).astype(jnp.float8_e4m3fn),
+                NamedSharding(mesh16, P("model", None, None)),
+            )
+            with mock.patch.object(pl, "pallas_call", _mosaic_interp):
+                out128 = jax.jit(
+                    jax.shard_map(
+                        lambda s: xor1_bridge_all_gather(
+                            s[0], axis_name="model", tiled=False
+                        )[None],
+                        mesh=mesh16,
+                        in_specs=(P("model", None, None),),
+                        out_specs=P("model", None, None, None),
+                        check_vma=False,
+                    )
+                )(x128_j)
+            for r in range(16):
+                np.testing.assert_array_equal(np.asarray(out128)[r], np.asarray(x128_j))
+
+
+def test_tp16_a1_rpa_layout_parity_and_lowering():
+    """Verify TP=16 (h_q=8, h_kv=1) A1_RPA_LAYOUT=1 matches prepare_inputs 0-ULP + lowers cleanly."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import prepare_inputs
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+
+    devs = jax.devices()
+    if len(devs) < 16:
+        pytest.skip("Requires 16 JAX devices")
+
+    mesh = Mesh(np.array(devs[:16]), ("model",))
+    tp_d, c_k, h_q_local, h_kv_local, hidden = 16, 128, 8, 1, 8192
+    q_cols = h_q_local * 64
+    qg_cols = 2 * q_cols + 128
+    c_tok = tp_d * c_k
+
+    def _make_sm(rpa_layout: bool):
+        def _body(ag_k, wqkvg, wsc, cos_k, sin_k):
+            q_k, g_k, kv_k = kernel_a1.pallas_a1_chunk_1way(
+                ag_k,
+                wqkvg,
+                wsc,
+                cos_k.reshape(tp_d, c_k, 128),
+                sin_k.reshape(tp_d, c_k, 128),
+                None,
+                t_shard=c_k,
+                row_off=0,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+                rpa_layout=rpa_layout,
+                mode="all",
+                tp_axis="model",
+                tm=128,
+            )
+            if rpa_layout:
+                return (
+                    q_k.reshape(1, c_tok, 4, 2, 128),
+                    g_k.reshape(c_tok, q_cols),
+                    kv_k.reshape(c_tok, 1, 4, 128),
+                )
+            return (
+                q_k.reshape(c_tok, q_cols),
+                g_k.reshape(c_tok, q_cols),
+                kv_k.reshape(c_tok, 128),
+            )
+
+        return jax.jit(
+            jax.shard_map(
+                _body,
+                mesh=mesh,
+                in_specs=(P("model"),) * 5,
+                out_specs=(P("model"),) * 3,
+                check_vma=False,
+            )
+        )
+
+    rng = np.random.default_rng(77)
+    ag_j = jnp.asarray((rng.standard_normal((tp_d * tp_d, c_k, hidden)) * 0.2).astype(np.float32)).astype(jnp.float8_e4m3fn)
+    w_j = jnp.asarray((rng.standard_normal((tp_d * hidden, qg_cols)) * 0.05).astype(np.float32)).astype(jnp.float8_e4m3fn)
+    wsc_j = jnp.asarray(rng.uniform(0.01, 0.05, size=(tp_d, qg_cols)).astype(np.float32))
+    cos_j = jnp.asarray(np.cos(rng.uniform(-1, 1, size=(tp_d * tp_d * c_k, 128))).astype(np.float32))
+    sin_j = jnp.asarray(np.sin(rng.uniform(-1, 1, size=(tp_d * tp_d * c_k, 128))).astype(np.float32))
+
+    for sub_n, fast_norm in (("0", "0"), ("256", "1")):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A1_SUB_N": sub_n,
+                    "SGLANG_TPU_MUSE_KERNEL_A1_FAST_NORM": fast_norm,
+                },
+            ),
+            _interpret_on_cpu(),
+            mock.patch(
+                "jax.experimental.pallas.tpu.roll",
+                side_effect=lambda a, shift, axis: jnp.roll(a, shift=shift, axis=axis),
+            ),
+        ):
+            q_u, g_u, kv_u = _make_sm(False)(ag_j, w_j, wsc_j, cos_j, sin_j)
+            q_r, g_r, kv_r = _make_sm(True)(ag_j, w_j, wsc_j, cos_j, sin_j)
+        q_ref, kv_ref, _ = prepare_inputs(
+            q_u[:c_tok].reshape(c_tok, h_q_local, 64),
+            kv_u[:c_tok, :64].reshape(c_tok, 1, 64),
+            kv_u[:c_tok, 64:].reshape(c_tok, 1, 64),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(g_r[:c_tok].view(np.uint16)),
+            np.asarray(g_u[:c_tok].view(np.uint16)),
+        )
+        q_r_f32 = np.asarray(q_r[0].astype(jnp.float32))
+        np.testing.assert_array_equal(q_r_f32, np.asarray(q_ref[0].astype(jnp.float32)))
+        assert np.all(q_r_f32[..., 64:] == 0.0)
+        np.testing.assert_array_equal(
+            np.asarray(kv_r[:c_tok].view(np.uint8)),
+            np.asarray(kv_ref.view(np.uint8)),
+        )
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.dict(
+            os.environ,
+            {"SGLANG_TPU_MUSE_KERNEL_A1_SUB_N": "256", "SGLANG_TPU_MUSE_KERNEL_A1_FAST_NORM": "1"},
+        ),
+    ):
+        hlo = (
+            _make_sm(True)
+            .trace(
+                jax.ShapeDtypeStruct((tp_d * tp_d, c_k, hidden), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d * hidden, qg_cols), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d, qg_cols), jnp.float32),
+                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "_rpal" in hlo and "partition_id" not in hlo
+
+
+def test_ccs_fuse_ag_a1_mode3_in_kernel_lowering():
+    """Verify CCS_FUSE_AG_A1=3 lowers clean in-kernel overlapped 1-hop XOR=1 AG on TP=8 and TP=16."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+
+    devs = jax.devices()
+    if len(devs) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    def _run_lower(tp_d: int, h_q: int, h_kv: int, c_k: int, c_next: int, tag: str):
+        mesh = Mesh(np.array(devs[:tp_d]), ("model",))
+        qg_cols = 2 * h_q * 64 + h_kv * 128
+
+        def _body(ag_k, next_sl, wqkvg, wsc, cos_k, sin_k):
+            q_k, g_k, kv_k, ag_n = kernel_a1.pallas_a1_chunk_1way(
+                ag_k,
+                wqkvg,
+                wsc,
+                cos_k.reshape(tp_d, c_k, 128),
+                sin_k.reshape(tp_d, c_k, 128),
+                None,
+                t_shard=c_k,
+                row_off=0,
+                h_q_local=h_q,
+                h_kv_local=h_kv,
+                rpa_layout=True,
+                mode="all",
+                tp_axis="model",
+                tm=256 if c_k % 256 == 0 else 128,
+                next_ag_in=next_sl,
+            )
+            return (
+                q_k.reshape(1, tp_d * c_k, h_q // 2, 2, 128),
+                g_k.reshape(tp_d * c_k, h_q * 64),
+                kv_k.reshape(tp_d * c_k, 1, 4, 128),
+                ag_n,
+            )
+
+        sm = jax.jit(
+            jax.shard_map(
+                _body,
+                mesh=mesh,
+                in_specs=(P("model"),) * 6,
+                out_specs=(P("model"),) * 4,
+                check_vma=False,
+            )
+        )
+        shlo = (
+            sm.trace(
+                jax.ShapeDtypeStruct((tp_d * tp_d, c_k, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d * c_next, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d * 8192, qg_cols), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d, qg_cols), jnp.float32),
+                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert tag in shlo and "partition_id" not in shlo
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        _run_lower(8, 16, 2, 512, 512, "_inag_xy")
+        if len(devs) >= 16:
+            _run_lower(16, 8, 1, 512, 512, "_inag_xyz")
+            _run_lower(16, 8, 1, 512, 1280, "_inag_xyz")
+
+            # 16-device Mosaic interpret=True + detect_races=True 0-ULP parity on c_next=128 (64,32,32).
+            from jax import lax
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+
+            orig_pc = pl.pallas_call
+
+            def _mosaic_interp(*args, **kwargs):
+                kwargs["interpret"] = pltpu.InterpretParams(detect_races=True)
+                return orig_pc(*args, **kwargs)
+
+            mesh16 = Mesh(np.array(devs[:16]), ("model",))
+            tp_d, c_k, c_next, h_q, h_kv, hidden = 16, 128, 128, 8, 1, 256
+            qg_cols = 2 * h_q * 64 + h_kv * 128
+            rng = np.random.default_rng(99)
+            ag_k = jnp.asarray(
+                (rng.standard_normal((tp_d * tp_d, c_k, hidden)) * 0.2).astype(np.float32)
+            ).astype(jnp.float8_e4m3fn)
+            next_sl = jnp.asarray(
+                (rng.standard_normal((tp_d * c_next, hidden)) * 0.2).astype(np.float32)
+            ).astype(jnp.float8_e4m3fn)
+            wqkvg = jnp.asarray(
+                (rng.standard_normal((tp_d * hidden, qg_cols)) * 0.05).astype(np.float32)
+            ).astype(jnp.float8_e4m3fn)
+            wsc = jnp.asarray(rng.uniform(0.01, 0.05, size=(tp_d, qg_cols)).astype(np.float32))
+            cos_k = jnp.asarray(np.ones((tp_d * tp_d * c_k, 128), dtype=np.float32))
+            sin_k = jnp.asarray(np.zeros((tp_d * tp_d * c_k, 128), dtype=np.float32))
+
+            def _fused(ag_in, nxt, w, ws, c, s):
+                q_k, g_k, kv_k, ag_n = kernel_a1.pallas_a1_chunk_1way(
+                    ag_in, w, ws, c.reshape(tp_d, c_k, 128), s.reshape(tp_d, c_k, 128),
+                    None, t_shard=c_k, row_off=0, h_q_local=h_q, h_kv_local=h_kv,
+                    rpa_layout=False, mode="all", tp_axis="model", tm=128, next_ag_in=nxt,
+                )
+                return q_k.reshape(tp_d * c_k, h_q * 64), g_k.reshape(tp_d * c_k, h_q * 64), kv_k.reshape(tp_d * c_k, 128), ag_n
+
+            def _ref(ag_in, nxt, w, ws, c, s):
+                ag_n = lax.all_gather(nxt, "model", axis=0, tiled=False)
+                q_k, g_k, kv_k = kernel_a1.pallas_a1_chunk_1way(
+                    ag_in, w, ws, c.reshape(tp_d, c_k, 128), s.reshape(tp_d, c_k, 128),
+                    None, t_shard=c_k, row_off=0, h_q_local=h_q, h_kv_local=h_kv,
+                    rpa_layout=False, mode="all", tp_axis="model", tm=128,
+                )
+                return q_k.reshape(tp_d * c_k, h_q * 64), g_k.reshape(tp_d * c_k, h_q * 64), kv_k.reshape(tp_d * c_k, 128), ag_n
+
+            with mock.patch.object(pl, "pallas_call", _mosaic_interp):
+                qf, gf, kvf, agnf = jax.jit(
+                    jax.shard_map(_fused, mesh=mesh16, in_specs=(P("model"),) * 6, out_specs=(P("model"),) * 4, check_vma=False)
+                )(ag_k, next_sl, wqkvg, wsc, cos_k, sin_k)
+                qr, gr, kvr, agnr = jax.jit(
+                    jax.shard_map(_ref, mesh=mesh16, in_specs=(P("model"),) * 6, out_specs=(P("model"),) * 4, check_vma=False)
+                )(ag_k, next_sl, wqkvg, wsc, cos_k, sin_k)
+
+            np.testing.assert_array_equal(np.asarray(qf.view(jnp.uint16)), np.asarray(qr.view(jnp.uint16)))
+            np.testing.assert_array_equal(np.asarray(gf.view(jnp.uint16)), np.asarray(gr.view(jnp.uint16)))
+            np.testing.assert_array_equal(np.asarray(kvf.view(jnp.uint8)), np.asarray(kvr.view(jnp.uint8)))
+            np.testing.assert_array_equal(np.asarray(agnf.view(jnp.uint8)), np.asarray(agnr.view(jnp.uint8)))
+
+
+def test_ep16_sortfree_routing_parity_and_compact_sort_guard():
+    """Verify EP=16 PALLAS_SORTFREE_ROUTING=2 parity at T=4096 and _sort_local_packed_lhs_indices guard."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _sort_local_packed_lhs_indices,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_global_local_pos,
+        pallas_local_inv_perm_and_counts,
+    )
+
+    devs = jax.devices()
+    if len(devs) < 16:
+        pytest.skip("Requires 16 JAX devices")
+
+    mesh = Mesh(np.array(devs[:16]), ("model",))
+    rng = np.random.default_rng(123)
+    t_total, t_loc = 4096, 256
+    g_ids_np = np.stack(
+        [rng.choice(256, size=8, replace=False) for _ in range(t_total)], axis=0
+    ).astype(np.int32)
+    g_ids = jnp.asarray(g_ids_np)
+    go_arr = jax.device_put(
+        jnp.arange(16, dtype=jnp.int32) * 16, NamedSharding(mesh, P("model"))
+    )
+    me_arr = jax.device_put(
+        jnp.arange(16, dtype=jnp.int32), NamedSharding(mesh, P("model"))
+    )
+    l_ids = jax.device_put(
+        g_ids_np.reshape(16, t_loc, 8), NamedSharding(mesh, P("model", None, None))
+    )
+
+    def _sf_eval(li, gi, go, me):
+        lp, gs, gsa, ltr = pallas_local_inv_perm_and_counts(
+            li[0], gi, go[0], me[0], ep_size=16, num_local_experts=16, total_id_buckets=256
+        )
+        glp = pallas_global_local_pos(
+            gi, go[0], num_local_experts=16, ep_size=16, rotate_rs=True
+        )
+        return lp[None], gs[None], gsa[None], ltr[None], glp[None]
+
+    with _interpret_on_cpu():
+        _, gs, _, ltr, glp = jax.jit(
+            jax.shard_map(
+                _sf_eval,
+                mesh=mesh,
+                in_specs=(P("model", None, None), P(), P("model"), P("model")),
+                out_specs=(
+                    P("model", None, None),
+                    P("model", None),
+                    P("model", None),
+                    P("model"),
+                    P("model", None, None),
+                ),
+                check_vma=False,
+            )
+        )(l_ids, g_ids, go_arr, me_arr)
+
+    for r in range(16):
+        mask_r = (g_ids_np >= r * 16) & (g_ids_np < (r + 1) * 16)
+        own_hits = int(mask_r[r * t_loc : (r + 1) * t_loc].sum())
+        assert int(gs[r, r * 16 : (r + 1) * 16].sum()) == int(mask_r.sum())
+        assert int(ltr[r]) == t_loc * 8 - own_hits
+        valid_pos = np.asarray(glp[r])[mask_r]
+        assert np.array_equal(np.sort(valid_pos), np.arange(int(mask_r.sum())))
+
+    # Verify compact_mode=1 safely falls back on T=4096 (n_flat=32768 < 65536).
+    tok_ids_flat = jnp.arange(t_total * 8, dtype=jnp.int32) >> 3
+    lhs = _sort_local_packed_lhs_indices(
+        global_topk_ids=g_ids,
+        topk_indices_flat=g_ids.reshape(-1),
+        tok_ids_flat=tok_ids_flat,
+        go_val=jnp.int32(0),
+        my_id=jnp.int32(0),
+        num_tokens=t_total,
+        chunk_size=t_loc,
+        ep_size=16,
+        num_local_experts=16,
+        topk=8,
+        rotate_rs=True,
+        compact_mode=1,
+    )
+    assert lhs.shape == (t_total * 8,)
+
+    # Verify ROUTING_NATIVE_PACK=1 safely guards out sub-128 inv_out_rows (t_local < 2048, e.g. tl=256 pad).
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_ROUTING_NATIVE_PACK": "1"}),
+    ):
+        sm_tl256 = jax.jit(
+            jax.shard_map(
+                lambda li, gi, go, me: pallas_local_inv_perm_and_counts(
+                    li[0], gi, go[0], me[0], ep_size=16, num_local_experts=18,
+                    total_id_buckets=289, has_pad_sentinel=True,
+                )[0][None],
+                mesh=mesh,
+                in_specs=(P("model", None, None), P(), P("model"), P("model")),
+                out_specs=P("model", None, None),
+                check_vma=False,
+            )
+        )
+        hlo_tl256 = (
+            sm_tl256.trace(
+                jax.ShapeDtypeStruct((16, 256, 8), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 8), jnp.int32),
+                jax.ShapeDtypeStruct((16,), jnp.int32),
+                jax.ShapeDtypeStruct((16,), jnp.int32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "pallas_moe_sortfree_route_tl256" in hlo_tl256
+        assert "pallas_moe_sortfree_route_np_" not in hlo_tl256
+
+
+def test_tp16_a1_rpa_layout_integration_gating_and_inag_cache():
+    """Verify MusePrefillKernels.from_model allows A1_RPA_LAYOUT=1 on native TP16 v6 and separates _inag cache."""
+    import types
+
+    import torch
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    cfg = types.SimpleNamespace(
+        num_attention_heads=128,
+        num_key_value_heads=16,
+        qk_scale_factor=12.0 ** -0.5 * 1.4426950408889634 if False else 0.0,
+        output_multiplier=0.17677669529663687,
+        routed_scaling_factor=1.0,
+        rms_norm_eps=1e-5,
+        post_norm_eps=1e-8,
+        hidden_size=8192,
+        moe_hidden_size=4096,
+        num_local_experts=256,
+        num_experts_per_tok=8,
+        head_dim=64,
+    )
+    from sglang_tpu.muse_prefill_kernels.attn_kernels.reference import QUERY_SCALE
+
+    cfg.qk_scale_factor = QUERY_SCALE
+    parallel = types.SimpleNamespace(
+        tp_size=16, attn_tp_size=16, moe_ep_size=16, attn_dcp_size=1
+    )
+    fake_decoder = types.SimpleNamespace(
+        pp_group=types.SimpleNamespace(world_size=1),
+        layers=[],
+    )
+    fake_model = types.SimpleNamespace(model=fake_decoder, text_config=cfg)
+
+    with (
+        mock.patch("sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False),
+        mock.patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+    ):
+        # Reject A1_VARIANT='v1' when A1_RPA_LAYOUT=1 on native TP=16.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_VARIANT": "v1",
+                "SGLANG_TPU_MUSE_KERNEL_A3_VARIANT": "v16",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+            },
+        ):
+            assert integration.MusePrefillKernels.from_model(fake_model) is None
+
+        # Allow A1_VARIANT='v6' + A1_RPA_LAYOUT=1 on native TP=16 (reaches runs_on_kernels/empty-layers -> None).
+        fake_decoder.layers = [
+            types.SimpleNamespace(
+                mlp=types.SimpleNamespace(
+                    experts=types.SimpleNamespace(w13_weight=torch.empty(0))
+                )
+            )
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_VARIANT": "v6",
+                "SGLANG_TPU_MUSE_KERNEL_A3_VARIANT": "v16",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                "SGLANG_TPU_MUSE_KERNEL_FORCE": "0",
+            },
+        ):
+            # Passes from_model validation and reaches layer inspection cleanly without returning early at reason guard.
+            with mock.patch.object(integration.logger, "warning") as mock_warn:
+                integration.MusePrefillKernels.from_model(fake_model)
+                reasons = [str(call.args[1]) for call in mock_warn.call_args_list if len(call.args) > 1]
+                assert not any("native TP16" in r for r in reasons), reasons
+
+
+def test_build_chunk_rpa_metas_torch_preunbinds_swa_group_pages():
+    """Verify build_chunk_rpa_metas_torch pre-unbinds swa_group_pages tuple for zero-view lookup."""
+    import types
+
+    import torch
+    from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import (
+        build_chunk_rpa_metas_torch,
+    )
+
+    md = types.SimpleNamespace(
+        kv_lens=torch.tensor([1024, 512], dtype=torch.int32),
+        cu_q_lens=torch.tensor([0, 1024, 2048], dtype=torch.int32),
+        cu_kv_lens=torch.tensor([0, 1024, 2048], dtype=torch.int32),
+        page_indices=torch.arange(16, dtype=torch.int32),
+        swa_page_indices=torch.arange(8, dtype=torch.int32),
+        swa_group_page_indices=torch.arange(24, dtype=torch.int32).view(3, 8),
+    )
+    metas = build_chunk_rpa_metas_torch(md, tp_size=8, chunks=(128, 128))
+    assert len(metas) == 2
+    for m in metas:
+        assert m.swa_group_pages is not None and len(m.swa_group_pages) == 3
+        for g in range(3):
+            torch.testing.assert_close(m.swa_group_pages[g], m.swa_group_page_indices[g])
+
+

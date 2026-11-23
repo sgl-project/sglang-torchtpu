@@ -160,6 +160,7 @@ class ChunkRpaMetaTorch(NamedTuple):
     swa_page_indices: object
     swa_group_page_indices: object
     distribution: object
+    swa_group_pages: tuple[object, ...] | None = None
 
 
 def build_chunk_rpa_metas_torch(
@@ -236,6 +237,7 @@ def build_chunk_rpa_metas_torch(
             if swa_g_mat is not None
             else None
         )
+        swa_group_pages = tuple(swa_g_c.unbind(0)) if swa_g_c is not None else None
         metas.append(
             ChunkRpaMetaTorch(
                 kv_lens=kv_c,
@@ -245,6 +247,7 @@ def build_chunk_rpa_metas_torch(
                 swa_page_indices=swa_c,
                 swa_group_page_indices=swa_g_c,
                 distribution=dist_c,
+                swa_group_pages=swa_group_pages,
             )
         )
         t_start = t_end

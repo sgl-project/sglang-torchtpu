@@ -1114,7 +1114,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_FP8_STREAM_GATHER = EnvBool(False)
     # Wave-9 prefill CCS fused AG+A1: fuse next-chunk all_gather(rest_in[k+1]) inside a1_chunk's
     # shard_map MLIR module so SparseCore/ICI AG overlaps directly under pallas_a1_chunk_1way
-    # (0 = off, 1 = lax.all_gather / XOR1_BRIDGE_AG, 2 = force xor1_bridge_all_gather on CCS AG).
+    # (0 = off, 1 = lax.all_gather / XOR1_BRIDGE_AG, 2 = force xor1_bridge_all_gather on CCS AG,
+    #  3 = in-kernel overlapped 1-hop XOR=1 torus AG inside pallas_a1_chunk_1way).
     SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 = EnvInt(0)
     # Wave-9 prefill FUSED_B1_B2=3/4 overlap: run dequant_half_gmm_layout(ag_i8_0) before waiting
     # on global_topk_u8's optimization_barrier so dequant_half0 overlaps global_topk_u8 + ag_i8_1.

@@ -2667,6 +2667,8 @@ def pallas_a1_chunk_1way(
     rope_mode: str = "interleaved_roll",
     tm: int = 256,
     vmem_limit_mb: int = 64,
+    next_ag_in: jax.Array | None = None,
+    collective_id: int = 13,
 ) -> tuple[jax.Array, ...]:
     """1-Way Async-HBM-Write A1 Chunk Kernel supporting uneven chunks, `rpa_layout`, `local`/`remote` modes, and `q_gate_only`.
 
@@ -2708,6 +2710,28 @@ def pallas_a1_chunk_1way(
     q_cols = (h_q_local // 2, 2, 128) if rpa_layout else (q_size,)
     kv_cols = (4, 128) if rpa_layout else (2 * kv_size,)
 
+    ag_spec = None
+    if next_ag_in is not None:
+        if mode != "all":
+            raise ValueError("next_ag_in requires mode='all'")
+        if next_ag_in.ndim == 2:
+            next_ag_in = next_ag_in[None]
+        _, next_rows, next_cols = next_ag_in.shape
+        item_bytes = jax.dtypes.itemsize_bits(next_ag_in.dtype) // 8
+        min_row_align = 32 if item_bytes == 1 else 8
+        if (
+            tp_deg < 4
+            or tp_deg % 2 != 0
+            or next_rows % min_row_align != 0
+            or next_cols % 128 != 0
+        ):
+            raise ValueError(
+                f"Incompatible next_ag_in shape {next_ag_in.shape} for tp_deg={tp_deg}"
+            )
+        from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_ag_schedule_spec
+
+        ag_spec = xor1_ag_schedule_spec(tp_deg, int(next_rows), item_bytes, xy_torus=True)
+
     def _run_chunk(*args):
         if mode == "all":
             peers_ref = None
@@ -2718,12 +2742,14 @@ def pallas_a1_chunk_1way(
 
         x_ref, w_ref, w_sc_ref, cos_ref, sin_ref = rest[:5]
         n_out = 2 if q_gate_only else 3
-        if outs is None:
-            out_refs = rest[5 : 5 + n_out]
-            scratch_refs = rest[5 + n_out :]
-        else:
-            out_refs = rest[5 + n_out : 5 + 2 * n_out]
-            scratch_refs = rest[5 + 2 * n_out :]
+        n_in_extra = (n_out if outs is not None else 0) + (1 if ag_spec is not None else 0)
+        next_ag_hbm = rest[5 + (n_out if outs is not None else 0)] if ag_spec is not None else None
+        out_refs_all = rest[5 + n_in_extra : 5 + n_in_extra + n_out + (1 if ag_spec is not None else 0)]
+        out_refs = out_refs_all[:n_out]
+        ag_out_hbm = out_refs_all[n_out] if ag_spec is not None else None
+        scratch_all = rest[5 + n_in_extra + len(out_refs_all) :]
+        scratch_refs = scratch_all[: 2 * n_out]
+        ag_sems = scratch_all[2 * n_out :]
 
         if q_gate_only:
             q_out_hbm, g_out_hbm = out_refs
@@ -2738,6 +2764,34 @@ def pallas_a1_chunk_1way(
         m = lax.rem(step, num_m)
         slot = lax.rem(step, 2)
         dst_r = r_idx if mode == "all" else peers_ref[r_idx]
+
+        if ag_spec is not None:
+            from sglang_tpu.kernels.xor1_bridge_all_gather import emit_xor1_ag_phases
+
+            ag_kind, ag_part_rows, _ = ag_spec
+            ag_phases = emit_xor1_ag_phases(
+                next_ag_hbm,
+                ag_out_hbm,
+                *ag_sems,
+                axis_name=tp_axis,
+                tp_size=tp_deg,
+                kind=ag_kind,
+                part_rows=ag_part_rows,
+            )
+            n_prep = len(ag_phases) - 1
+            if total_steps > n_prep:
+                for p_idx, ph_fn in enumerate(ag_phases[:-1]):
+                    t_step = (p_idx * (total_steps - 1)) // n_prep
+
+                    @pl.when(step == t_step)
+                    def _(_fn=ph_fn):
+                        _fn()
+            else:
+
+                @pl.when(step == 0)
+                def _():
+                    for ph_fn in ag_phases:
+                        ph_fn()
 
         @pl.when(step >= 2)
         def _():
@@ -2832,7 +2886,7 @@ def pallas_a1_chunk_1way(
                         q_norm, cos_tile, sin_tile, lane, rope_mode=rope_mode
                     )
                     if rpa_layout:
-                        kv_head0 = s < num_q_slices // 2
+                        kv_head0 = (h_kv_local == 1) or (s < num_q_slices // 2)
                         q_words[pl.ds(s, tm_eff, stride=num_q_slices)] = _rpa_q_word(
                             q_rot, is_lo, mask_lo if kv_head0 else mask_hi
                         )
@@ -2850,7 +2904,7 @@ def pallas_a1_chunk_1way(
                     k_pair = acc_kv[:, 0:128]
                     v_pair = acc_kv[:, 128:256].astype(jnp.bfloat16)
                 else:
-                    assert h_kv_local == 1 and not rpa_layout
+                    assert h_kv_local == 1
                     kv_pair = _strip_dot_c(2 * q_size, 2 * q_size + 128)
         else:
             if has_packed_f8_sc:
@@ -2903,7 +2957,7 @@ def pallas_a1_chunk_1way(
                     q_norm, cos_tile, sin_tile, lane, rope_mode=rope_mode
                 )
                 if rpa_layout:
-                    kv_head0 = s < num_q_slices // 2
+                    kv_head0 = (h_kv_local == 1) or (s < num_q_slices // 2)
                     q_words[pl.ds(s, tm_eff, stride=num_q_slices)] = _rpa_q_word(
                         q_rot, is_lo, mask_lo if kv_head0 else mask_hi
                     )
@@ -2921,7 +2975,7 @@ def pallas_a1_chunk_1way(
                         jnp.bfloat16
                     )
                 else:
-                    assert h_kv_local == 1 and not rpa_layout
+                    assert h_kv_local == 1
                     kv_pair = acc[:, 2 * q_size : 2 * q_size + 128]
 
         if not q_gate_only:
@@ -2964,10 +3018,26 @@ def pallas_a1_chunk_1way(
                 kv_rot = _rope_128_vreg(
                     kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
                 )
-                kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
-                kv_vmem[slot, 0, :, 0:128] = jnp.clip(
-                    kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
-                ).astype(jnp.float8_e4m3fn)
+                kv_f32 = kv_rot.astype(jnp.float32)
+                if rpa_layout:
+                    k8 = jnp.clip(
+                        jnp.where(is_lo, kv_f32 * inv_k_scale, 0.0),
+                        -FP8_MAX,
+                        FP8_MAX,
+                    ).astype(jnp.float8_e4m3fn)
+                    v8 = jnp.clip(
+                        jnp.where(is_lo, pltpu.roll(kv_f32, shift=64, axis=1) * inv_v_scale, 0.0),
+                        -FP8_MAX,
+                        FP8_MAX,
+                    ).astype(jnp.float8_e4m3fn)
+                    kv_vmem.bitcast(jnp.uint32).at[slot, 0].reshape(tm_eff, 128)[...] = (
+                        _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
+                    )
+                else:
+                    kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
+                    kv_vmem[slot, 0, :, 0:128] = jnp.clip(
+                        kv_f32 * kv_sc, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
             pltpu.make_async_copy(
                 kv_vmem.at[slot],
                 kv_out_hbm.at[pl.ds(dst_r, 1), pl.ds(row_off + m * tm_eff, tm_eff)],
@@ -2993,6 +3063,8 @@ def pallas_a1_chunk_1way(
                         kv_out_hbm.at[pl.ds(0, 1), pl.ds(0, tm_eff)],
                         kv_sems.at[s],
                     ).wait()
+            if ag_spec is not None and total_steps > len(ag_phases) - 1:
+                ag_phases[-1]()
 
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     row_blk_base = 0 if cos_is_chunk else row_off // tm_eff
@@ -3093,6 +3165,15 @@ def pallas_a1_chunk_1way(
         out_shapes.append(pltpu.HBM((tp_deg, t_shard, *kv_cols), jnp.float8_e4m3fn))
         scratches.append(pltpu.VMEM((2, 1, tm_eff, *kv_cols), jnp.float8_e4m3fn))
         sems.append(pltpu.SemaphoreType.DMA((2,)))
+    out_specs = [hbm_spec] * n_out
+    if ag_spec is not None:
+        in_specs = in_specs + [hbm_spec]
+        call_args = call_args + (next_ag_in,)
+        out_specs = out_specs + [hbm_spec]
+        out_shapes.append(
+            pltpu.HBM((tp_deg, int(next_ag_in.shape[1]), int(next_ag_in.shape[2])), next_ag_in.dtype)
+        )
+        sems.extend(pltpu.SemaphoreType.DMA((n,)) for n in ag_spec[2])
 
     from sglang_tpu.envs import envs as _a1_name_envs
 
@@ -3107,20 +3188,30 @@ def pallas_a1_chunk_1way(
         + (f"_sn{_sn_val}" if _sn_val > 0 else "")
         + ("_fn" if _fn_on else "")
         + ("_rpal" if rpa_layout else "")
+        + (f"_inag_{ag_spec[0]}" if ag_spec is not None else "")
     )
     if mode == "all":
+        c_params = (
+            pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+                collective_id=collective_id,
+            )
+            if ag_spec is not None
+            else pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+            )
+        )
         return pl.pallas_call(
             _run_chunk,
             grid=(total_steps,),
             in_specs=in_specs,
-            out_specs=[hbm_spec] * n_out,
+            out_specs=out_specs,
             out_shape=out_shapes,
             scratch_shapes=scratches + sems,
             input_output_aliases=aliases,
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_mb * (1 << 20),
-            ),
+            compiler_params=c_params,
             name=name,
         )(*call_args)
 
