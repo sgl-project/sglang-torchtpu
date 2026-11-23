@@ -980,32 +980,24 @@ def _stationary_q_v2_process(
 
             @pl.when(valid_tq == tq_sz)
             def _up_tq_full():
-                for kv_h_u in range(sq_kv_heads):
-
-                    @pl.loop(0, 4, unroll=False)
-                    def _up_gp_full(gp_u, kv_h_u=kv_h_u):
-                        s = kv_h_u * 4 + gp_u
-                        u_s = q_u32_ref[
-                            pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                        ]
-                        pair_q_t = _decode_q_pair(u_s, kv_h_u * 4, lane_is_lo)
-                        _store_qt_pair(pair_q_t, s, t_sl)
+                for s in range(sq_pairs):
+                    u_s = q_u32_ref[
+                        pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                    ]
+                    pair_q_t = _decode_q_pair(u_s, (s // 4) * 4, lane_is_lo)
+                    _store_qt_pair(pair_q_t, s, t_sl)
 
             @pl.when(jnp.logical_and(valid_tq > 0, valid_tq < tq_sz))
             def _up_tq_partial():
                 q_row_io = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 0)
                 row_ok = q_row_io < valid_tq
-                for kv_h_u in range(sq_kv_heads):
-
-                    @pl.loop(0, 4, unroll=False)
-                    def _up_gp_part(gp_u, kv_h_u=kv_h_u):
-                        s = kv_h_u * 4 + gp_u
-                        u_s = q_u32_ref[
-                            pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                        ]
-                        u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
-                        pair_q_t = _decode_q_pair(u_s, kv_h_u * 4, lane_is_lo)
-                        _store_qt_pair(pair_q_t, s, t_sl)
+                for s in range(sq_pairs):
+                    u_s = q_u32_ref[
+                        pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                    ]
+                    u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
+                    pair_q_t = _decode_q_pair(u_s, (s // 4) * 4, lane_is_lo)
+                    _store_qt_pair(pair_q_t, s, t_sl)
 
         def unpack_bq_to_qt_v2(sem_q):
             q_u32_ref = (
@@ -1087,82 +1079,9 @@ def _stationary_q_v2_process(
         def _eval_mk128_head(kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs):
             n_h = 2 * n_slices
             z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
-            z_l = jnp.zeros((1, 8, tq_sz), jnp.float32)
 
             def _h_ring(h_idx):
                 return (h_idx & ring_h_mask) if ring_covers_all else h_idx
-
-            if bias_specs == ("none",) * n_slices and n_h >= 4:
-                h_r0 = _h_ring(h_base)
-                ks_0 = k_sub_ref[kv_h, h_r0][:, :64][None, :, :]
-                qk_0 = _kq_dot(ks_0, qt_1)
-                p_0, ps_0, psc_0 = _sm_eval(qk_0, "none", qsc_1)
-
-                def _pipe_step(h_off, carry):
-                    acc_c, l_c, p_prev, psc_prev = carry
-                    h_cur = _h_ring(h_base + h_off)
-                    h_prev = _h_ring(h_base + h_off - 1)
-                    ks_cur = k_sub_ref[kv_h, h_cur][:, :64][None, :, :]
-                    qk_cur = _kq_dot(ks_cur, qt_1)
-                    vts_prev = vt_sub_ref[kv_h : kv_h + 1, h_prev]
-                    acc_nxt = acc_c + _vp_scaled(vts_prev, p_prev, psc_prev)
-                    p_cur, ps_cur, psc_cur = _sm_eval(qk_cur, "none", qsc_1)
-                    return acc_nxt, l_c + ps_cur, p_cur, psc_cur
-
-                acc_f, l_f, p_last, psc_last = lax.fori_loop(
-                    1, n_h, _pipe_step, (z_acc, ps_0, p_0, psc_0)
-                )
-                h_rlast = _h_ring(h_base + n_h - 1)
-                vts_last = vt_sub_ref[kv_h : kv_h + 1, h_rlast]
-                return acc_f + _vp_scaled(vts_last, p_last, psc_last), l_f
-
-            if (
-                n_slices == 9
-                and bias_specs == ("ut",) + ("none",) * 7 + ("lt",)
-            ):
-                h_r0 = _h_ring(h_base)
-                qk_0 = _kq_dot(k_sub_ref[kv_h, h_r0][:, :64][None, :, :], qt_1)
-                p_prev, l_cur, psc_prev = _sm_eval(qk_0, "ut0", qsc_1)
-                h_r1 = _h_ring(h_base + 1)
-                qk_1 = _kq_dot(k_sub_ref[kv_h, h_r1][:, :64][None, :, :], qt_1)
-                acc_cur = z_acc + _vp_scaled(
-                    vt_sub_ref[kv_h : kv_h + 1, h_r0], p_prev, psc_prev
-                )
-                p_prev, ps_1, psc_prev = _sm_eval(qk_1, "ut1", qsc_1)
-                l_cur = l_cur + ps_1
-
-                def _sw_mid(h_off, carry):
-                    acc_c, l_c, p_p, psc_p = carry
-                    h_cur = _h_ring(h_base + h_off)
-                    h_prv = _h_ring(h_base + h_off - 1)
-                    qk_c = _kq_dot(
-                        k_sub_ref[kv_h, h_cur][:, :64][None, :, :], qt_1
-                    )
-                    acc_n = acc_c + _vp_scaled(
-                        vt_sub_ref[kv_h : kv_h + 1, h_prv], p_p, psc_p
-                    )
-                    p_c, ps_c, psc_c = _sm_eval(qk_c, "none", qsc_1)
-                    return acc_n, l_c + ps_c, p_c, psc_c
-
-                acc_cur, l_cur, p_prev, psc_prev = lax.fori_loop(
-                    2, 16, _sw_mid, (acc_cur, l_cur, p_prev, psc_prev)
-                )
-                for h_tail, b_tail in ((16, "lt0"), (17, "lt1")):
-                    h_ct = _h_ring(h_base + h_tail)
-                    h_pt = _h_ring(h_base + h_tail - 1)
-                    qk_t = _kq_dot(
-                        k_sub_ref[kv_h, h_ct][:, :64][None, :, :], qt_1
-                    )
-                    acc_cur = acc_cur + _vp_scaled(
-                        vt_sub_ref[kv_h : kv_h + 1, h_pt], p_prev, psc_prev
-                    )
-                    p_prev, ps_t, psc_prev = _sm_eval(qk_t, b_tail, qsc_1)
-                    l_cur = l_cur + ps_t
-                h_r17 = _h_ring(h_base + 17)
-                acc_cur = acc_cur + _vp_scaled(
-                    vt_sub_ref[kv_h : kv_h + 1, h_r17], p_prev, psc_prev
-                )
-                return acc_cur, l_cur
 
             h_specs = _expand_mk128_specs(bias_specs)
             h_r0 = _h_ring(h_base)
@@ -1189,35 +1108,45 @@ def _stationary_q_v2_process(
         ):
             if use_mk128:
                 h_base = 2 * s_start
-                for kv_h in range(sq_kv_heads):
 
-                    @pl.loop(0, 8, unroll=False)
-                    def _mk_head_loop(g_off, kv_h=kv_h):
-                        g = kv_h * 8 + g_off
-                        g_sl = pl.ds(g, 1)
-                        qt_1 = q_t_ref[g_sl, :, t_sl]
-                        qsc_1 = (
-                            jnp.tile(q_sc_ref[g_sl, :, t_sl], (1, 16, 1))
-                            if use_fp8_qk_dyn
-                            else None
+                def _run_one_mk_head(kv_h, g):
+                    g_sl = pl.ds(g, 1) if not isinstance(g, int) else slice(g, g + 1)
+                    qt_1 = q_t_ref[g_sl, :, t_sl]
+                    qsc_1 = (
+                        jnp.tile(q_sc_ref[g_sl, :, t_sl], (1, 16, 1))
+                        if use_fp8_qk_dyn
+                        else None
+                    )
+                    acc_1, l_1 = _eval_mk128_head(
+                        kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs
+                    )
+                    if static_first:
+                        l_ref[g_sl, :, t_sl] = l_1
+                        acc_ref[g_sl, :, t_sl] = acc_1
+                    else:
+                        l_ref[g_sl, :, t_sl] = jnp.where(
+                            first_vis_cond,
+                            l_1,
+                            l_ref[g_sl, :, t_sl] + l_1,
                         )
-                        acc_1, l_1 = _eval_mk128_head(
-                            kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs
+                        acc_ref[g_sl, :, t_sl] = jnp.where(
+                            first_vis_cond,
+                            acc_1,
+                            acc_ref[g_sl, :, t_sl] + acc_1,
                         )
-                        if static_first:
-                            l_ref[g_sl, :, t_sl] = l_1
-                            acc_ref[g_sl, :, t_sl] = acc_1
-                        else:
-                            l_ref[g_sl, :, t_sl] = jnp.where(
-                                first_vis_cond,
-                                l_1,
-                                l_ref[g_sl, :, t_sl] + l_1,
-                            )
-                            acc_ref[g_sl, :, t_sl] = jnp.where(
-                                first_vis_cond,
-                                acc_1,
-                                acc_ref[g_sl, :, t_sl] + acc_1,
-                            )
+
+                if n_slices <= 8:
+                    for kv_h in range(sq_kv_heads):
+                        for g_off in range(8):
+                            _run_one_mk_head(kv_h, kv_h * 8 + g_off)
+                else:
+                    for kv_h in range(sq_kv_heads):
+
+                        @pl.loop(0, 4, unroll=False)
+                        def _mk_pair_loop(gp_off, kv_h=kv_h):
+                            g0 = kv_h * 8 + 2 * gp_off
+                            _run_one_mk_head(kv_h, g0)
+                            _run_one_mk_head(kv_h, g0 + 1)
 
                 return
 
@@ -1818,20 +1747,16 @@ def _stationary_q_v2_process(
             return packed_u32 & (mask_lo_u32 if s < 4 else mask_hi_u32)
 
         def _epilogue_one_tq(tq_start, t_sl):
-            for kv_h_e in range(sq_kv_heads):
-
-                @pl.loop(0, 4, unroll=False)
-                def _ep_gp(gp_e, kv_h_e=kv_h_e):
-                    s = kv_h_e * 4 + gp_e
-                    h0 = 2 * s
-                    h1 = 2 * s + 1
-                    l0 = l_ref[h0, :, t_sl]
-                    l1 = l_ref[h1, :, t_sl]
-                    a0 = acc_ref[h0, :, t_sl]
-                    a1 = acc_ref[h1, :, t_sl]
-                    out_u32_ref[
-                        pl.ds(tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                    ] = _pack_pair_out(a0, a1, l0, l1, kv_h_e * 4)
+            for s in range(sq_pairs):
+                h0 = 2 * s
+                h1 = 2 * s + 1
+                l0 = l_ref[h0, :, t_sl]
+                l1 = l_ref[h1, :, t_sl]
+                a0 = acc_ref[h0, :, t_sl]
+                a1 = acc_ref[h1, :, t_sl]
+                out_u32_ref[
+                    pl.ds(tq_start * sq_pairs + s, tq_sz, sq_pairs)
+                ] = _pack_pair_out(a0, a1, l0, l1, (s // 4) * 4)
 
         def _emit_unfused_epilogue_and_send():
             if use_staged_qo:
@@ -1853,11 +1778,10 @@ def _stationary_q_v2_process(
                         total_rows_st = lead_st + st_valid
                         full_rows_st = (total_rows_st // 16) * 16
 
-                        @pl.loop(0, sq_pairs, unroll=False)
-                        def _st_a3_pair(s):
+                        for s in range(sq_pairs):
                             h0 = 2 * s
                             h1 = 2 * s + 1
-                            c_sl = pl.ds(pl.multiple_of(s * 128, 128), 128)
+                            c_sl = slice(s * 128, (s + 1) * 128)
                             col_s = jnp.concatenate(
                                 [
                                     _pair_col_f32(
@@ -1873,13 +1797,13 @@ def _stationary_q_v2_process(
                             col_s = jnp.where(row_iota_st < st_valid, col_s, 0.0)
 
                             @pl.when(lead_st == 0)
-                            def _store_al_st():
+                            def _store_al_st(c_sl=c_sl, col_s=col_s):
                                 bo_x2_ref[st_slot, :, c_sl] = col_s.astype(
                                     jnp.bfloat16
                                 )
 
                             @pl.when(lead_st > 0)
-                            def _store_sh_st():
+                            def _store_sh_st(c_sl=c_sl, col_s=col_s):
                                 shifted = col_s
                                 for sh in (1, 2, 4, 8):
                                     shifted = jnp.where(
@@ -1914,22 +1838,18 @@ def _stationary_q_v2_process(
                             .at[st_slot, 0]
                             .reshape(tq_sz * sq_pairs, 128)
                         )
-                        for kv_h_st in range(sq_kv_heads):
-
-                            @pl.loop(0, 4, unroll=False)
-                            def _st_u32_gp(gp_st, kv_h_st=kv_h_st):
-                                s = kv_h_st * 4 + gp_st
-                                h0 = 2 * s
-                                h1 = 2 * s + 1
-                                out_u32_st[pl.ds(s, tq_sz, sq_pairs)] = (
-                                    _pack_pair_out(
-                                        acc_ref[h0, :, t_sl],
-                                        acc_ref[h1, :, t_sl],
-                                        l_ref[h0, :, t_sl],
-                                        l_ref[h1, :, t_sl],
-                                        kv_h_st * 4,
-                                    )
+                        for s in range(sq_pairs):
+                            h0 = 2 * s
+                            h1 = 2 * s + 1
+                            out_u32_st[pl.ds(s, tq_sz, sq_pairs)] = (
+                                _pack_pair_out(
+                                    acc_ref[h0, :, t_sl],
+                                    acc_ref[h1, :, t_sl],
+                                    l_ref[h0, :, t_sl],
+                                    l_ref[h1, :, t_sl],
+                                    (s // 4) * 4,
                                 )
+                            )
 
                         g0_st = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz + st_q_start
                         start_send_bo_staged(g0_st, st_valid, st_slot)
@@ -1945,11 +1865,10 @@ def _stationary_q_v2_process(
                 row_iota_ep = lax.broadcasted_iota(jnp.int32, (bq_sz + 16, 128), 0)
                 zero_tail_16 = jnp.zeros((16, 128), jnp.float32)
 
-                @pl.loop(0, sq_pairs, unroll=False)
-                def _ep_a3_pair(s):
+                for s in range(sq_pairs):
                     h0 = 2 * s
                     h1 = 2 * s + 1
-                    c_sl = pl.ds(pl.multiple_of(s * 128, 128), 128)
+                    c_sl = slice(s * 128, (s + 1) * 128)
                     parts_s = []
                     for tq_idx in range(bq_sz // tq_sz):
                         tq_start = tq_idx * tq_sz
@@ -1966,13 +1885,13 @@ def _stationary_q_v2_process(
                     col_s = jnp.where(row_iota_ep < valid_ep, col_s, 0.0)
 
                     @pl.when(lead_ep == 0)
-                    def _store_aligned_v2():
+                    def _store_aligned_v2(c_sl=c_sl, col_s=col_s):
                         bo_x2_ref[bo_sem_idx, :, c_sl] = col_s.astype(
                             jnp.bfloat16
                         )
 
                     @pl.when(lead_ep > 0)
-                    def _store_shifted_v2():
+                    def _store_shifted_v2(c_sl=c_sl, col_s=col_s):
                         shifted = col_s
                         for sh in (1, 2, 4, 8):
                             shifted = jnp.where(
@@ -2115,9 +2034,7 @@ def _stationary_q_v2_process(
             if use_mk128:
                 h_base_sw = 2 * s_lo
                 for kv_h in range(sq_kv_heads):
-
-                    @pl.loop(0, 4, unroll=False)
-                    def _sw9_mk_gp(gp, kv_h=kv_h):
+                    for gp in range(4):
                         s_pair = kv_h * 4 + gp
                         u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
                         pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
@@ -2801,25 +2718,79 @@ def _stationary_q_v2_process(
                         _unpack_full_bkv_block(bkv_sem_idx)
                         is_first_bkv = bkv_idx == start_bkv_idx
 
-                        def _exec_prefix_tq(_tqi):
-                            tq_start = _tqi * tq_sz
-                            t_sl = pl.ds(tq_start, tq_sz)
+                        if use_mk128 and "gqa8" in prefill_opts and not use_fp8_qk_dyn:
+                            n_q128 = cdiv(valid_bq_rows, 128)
 
-                            @pl.when(tq_start < valid_bq_rows)
-                            def _do_prefix_tq():
-                                _run_ring_chunk(
-                                    0,
-                                    num_s,
-                                    is_first_bkv,
-                                    ("none",) * num_s,
-                                    t_sl,
-                                )
+                            @pl.loop(0, n_q128, unroll=False)
+                            def _exec_prefix_gqa8(i128):
+                                q128_start = pl.multiple_of(i128 * 128, 128)
+                                sl128 = pl.ds(q128_start, 128)
+                                for kv_h in range(sq_kv_heads):
+                                    h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
+                                    acc_subs = []
+                                    l_subs = []
+                                    for sub_c in range(4):
+                                        c0 = sub_c * 32
+                                        c1 = c0 + 32
+                                        qt_8h = jnp.concatenate(
+                                            [
+                                                q_t_ref[kv_h * 8 + g_i, :, sl128][:, c0:c1]
+                                                for g_i in range(8)
+                                            ],
+                                            axis=1,
+                                        )[None, :, :]
+                                        acc_8h, l_8h = _eval_mk128_head(
+                                            kv_h,
+                                            qt_8h,
+                                            None,
+                                            0,
+                                            num_s,
+                                            ("none",) * num_s,
+                                        )
+                                        acc_subs.append(
+                                            jnp.swapaxes(
+                                                acc_8h[0].reshape(64, 8, 32), 0, 1
+                                            )
+                                        )
+                                        l_subs.append(
+                                            jnp.swapaxes(
+                                                l_8h[0].reshape(8, 8, 32), 0, 1
+                                            )
+                                        )
+                                    acc_128 = jnp.concatenate(acc_subs, axis=2)
+                                    l_128 = jnp.concatenate(l_subs, axis=2)
+                                    l_ref[h_sl, :, sl128] = jnp.where(
+                                        is_first_bkv,
+                                        l_128,
+                                        l_ref[h_sl, :, sl128] + l_128,
+                                    )
+                                    acc_ref[h_sl, :, sl128] = jnp.where(
+                                        is_first_bkv,
+                                        acc_128,
+                                        acc_ref[h_sl, :, sl128] + acc_128,
+                                    )
 
-                        if use_tq_loop and (bq_sz // tq_sz) > 1:
-                            pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_prefix_tq)
                         else:
-                            for _tqi in range(bq_sz // tq_sz):
-                                _exec_prefix_tq(_tqi)
+
+                            def _exec_prefix_tq(_tqi):
+                                tq_start = _tqi * tq_sz
+                                t_sl = pl.ds(tq_start, tq_sz)
+
+                                @pl.when(tq_start < valid_bq_rows)
+                                def _do_prefix_tq():
+                                    _run_ring_chunk(
+                                        0,
+                                        num_s,
+                                        is_first_bkv,
+                                        ("none",) * num_s,
+                                        t_sl,
+                                    )
+
+                            if use_tq_loop and (bq_sz // tq_sz) > 1:
+                                pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_prefix_tq)
+                            else:
+                                for _tqi in range(bq_sz // tq_sz):
+                                    _exec_prefix_tq(_tqi)
 
             @pl.loop(tail_bkv_start, end_bkv_idx, unroll=False)
             def _stream_bkv(bkv_idx):

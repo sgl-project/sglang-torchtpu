@@ -375,8 +375,8 @@ def _invoke_v3_kernel(
             }
         )
         all_prefill_toks = w7_prefill_toks | scoped_lc_toks
-        use_w8_preset = ("w8" in all_prefill_toks) or use_w9_preset
-        use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset
+        use_w8_preset = ("w8" in all_prefill_toks) and not use_w9_preset
+        use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset or use_w9_preset
         eff_lc_toks = set(lc_prefill_toks)
         if use_w9_preset and is_lc_full and not (
             eff_lc_toks & {"bq1024", "bq2048", "bq4096", "bq8192"}
@@ -470,10 +470,22 @@ def _invoke_v3_kernel(
                 or "nofull_fp8_qk" not in raw_all_toks
             ):
                 prefill_opts.add("fp8_qk")
-            if "nomk128" not in raw_all_toks:
-                prefill_opts.add("mk128")
-            if sliding_window is None and not is_lc_full and "noprefix_fast" not in raw_all_toks:
-                prefill_opts.add("prefix_fast")
+            if sliding_window is not None:
+                if sliding_window == 2048 and "nosw2048_fuse" not in raw_all_toks:
+                    prefill_opts.add("sw2048_fuse")
+                if "sw_mk128" in raw_all_toks:
+                    prefill_opts.add("mk128")
+            else:
+                if "nomk128" not in raw_all_toks:
+                    prefill_opts.add("mk128")
+                    if (
+                        is_lc_full
+                        and not (allow_tp16_sq and is_tp16_sq_shape)
+                        and "nogqa8" not in raw_all_toks
+                    ):
+                        prefill_opts.add("gqa8")
+                if not is_lc_full and "noprefix_fast" not in raw_all_toks:
+                    prefill_opts.add("prefix_fast")
         for w7_opt in (
             "fp8_kv",
             "fp8_qk",
@@ -489,6 +501,7 @@ def _invoke_v3_kernel(
             "vreg_acc",
             "vreg_acc1",
             "mk128",
+            "gqa8",
             "tp16_sq",
             "sw_short_fuse",
             "tq_unroll",
@@ -503,6 +516,8 @@ def _invoke_v3_kernel(
                 prefill_opts.add(w7_opt)
             if sliding_window is None and f"full_{w7_opt}" in all_prefill_toks:
                 prefill_opts.add(w7_opt)
+        if "mk128" in prefill_opts:
+            prefill_opts.difference_update(("vreg_acc", "vreg_acc1", "mrb1"))
         if (
             not (allow_tp16_sq and is_tp16_sq_shape)
             and envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()

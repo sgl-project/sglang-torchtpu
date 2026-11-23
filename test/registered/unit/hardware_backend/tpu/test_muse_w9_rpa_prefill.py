@@ -489,9 +489,14 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             swa_opts = kw["_prefill_opts"]
             self.assertNotIn("mrb1", swa_opts)
             self.assertNotIn("vreg_acc1", swa_opts)
-            self.assertIn("mk128", swa_opts)
+            self.assertNotIn("vreg_acc", swa_opts)
+            self.assertNotIn("sw_short_fuse", swa_opts)
+            self.assertNotIn("mk128", swa_opts)
+            self.assertIn("mrb3", swa_opts)
+            self.assertIn("fp8_qk", swa_opts)
+            self.assertIn("sw2048_fuse", swa_opts)
             self.assertEqual(kw["m_block_sizes"][:2], (256, 2048))
-            # Verify `nofull_fp8_qk` keeps <=32K Full-Attn on bf16 QK when requested (#2518 §1).
+            # Verify `nofull_fp8_qk` keeps <=32K Full-Attn on bf16 QK while enabling unrolled `mk128` (#2518 §1).
             pi_std_full = SimpleNamespace(shape=(64 * 36,))
             kw_full_bf16 = _call_invoke(q_tp8, k_tp8, None, c_d2, kl, pi_std_full, sw=None, prepared=True, d2=True, a3_out=2)
             self.assertIn("mk128", kw_full_bf16["_prefill_opts"])
@@ -514,9 +519,12 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             kw = _call_invoke(q_tp8_4k, k_tp8, None, c_d2, kl, pi_lc, sw=None, prepared=True, d2=True, a3_out=2)
             lc_opts = kw["_prefill_opts"]
             self.assertIn("mk128", lc_opts)
+            self.assertIn("gqa8", lc_opts)
             self.assertIn("fp8_qk", lc_opts)
             self.assertIn("staged_qo", lc_opts)
             self.assertIn("prefix_fast", lc_opts)
+            self.assertNotIn("vreg_acc1", lc_opts)
+            self.assertNotIn("mrb1", lc_opts)
             self.assertEqual(kw["m_block_sizes"][:2], (4096, 8192))
 
         # 3. Verify `TP=16` (`q=(1, T, 4, 2, 128)`) prepared Stationary-Q v2 + `[T, 512]` `a3_out_layout`.
@@ -535,9 +543,14 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             kw = _call_invoke(q_tp16_prep, k_tp8, None, c_tp16, kl, pi_swa, sw=2048, prepared=True, d2=False, a3_out=-2)
             tp16_opts = kw["_prefill_opts"]
             self.assertIn("stationary_q_m0_ring_fuse", tp16_opts)
-            self.assertIn("mk128", tp16_opts)
+            self.assertIn("mrb3", tp16_opts)
+            self.assertIn("sw2048_fuse", tp16_opts)
+            self.assertNotIn("mk128", tp16_opts)
             self.assertIn("tp16_sq", tp16_opts)
             self.assertTrue(kw.get("_a3_out_layout"))
+            kw_tp16_full = _call_invoke(q_tp16_prep, k_tp8, None, c_tp16, kl, SimpleNamespace(shape=(64 * 36,)), sw=None, prepared=True, d2=False, a3_out=-2)
+            self.assertIn("mk128", kw_tp16_full["_prefill_opts"])
+            self.assertIn("tp16_sq", kw_tp16_full["_prefill_opts"])
             # Sub-256 `L61_PRUNE=1` (`T=128`) falls back cleanly to `_fused_out_pack = -2` -> `(128, 512)`!
             from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import prepare_head_packed_outputs
 
@@ -706,9 +719,11 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             ("tp8_full_16k_mk128_p512_d2", 8, 8192, 512, 36, (512, 4096, 256, 512), None, full_opts, True, True, True),
             ("tp8_lc_bq4k_bkv8k_mk128_p512_d2", 8, 4096, 512, 545, (4096, 8192, 256, 512), None, lc_opts, True, True, True),
             ("tp8_lc_bq4k_bkv4k_mk128_p512_d2", 8, 4096, 512, 545, (4096, 4096, 256, 512), None, lc_opts, True, True, True),
+            ("tp8_lc_bq4k_bkv4k_gqa8_p512_d2", 8, 4096, 512, 545, (4096, 4096, 256, 512), None, lc_opts | {"gqa8"}, True, True, True),
             ("tp16_swa_16k_mk128_prep_p512", 4, 8192, 512, 8, (256, 2048, 256, 512), 2048, swa_opts | {"tp16_sq"}, False, True, True),
             ("tp16_full_16k_mk128_prep_p512", 4, 8192, 512, 36, (512, 4096, 256, 512), None, full_opts | {"tp16_sq"}, False, True, True),
             ("tp16_lc_bq4k_bkv8k_mk128_prep_p512", 4, 4096, 512, 545, (4096, 8192, 256, 512), None, lc_opts | {"tp16_sq"}, False, True, True),
+            ("tp16_lc_bq4k_bkv8k_gqa8_prep_p512", 4, 4096, 512, 545, (4096, 8192, 256, 512), None, lc_opts | {"tp16_sq", "gqa8"}, False, True, True),
             ("tp16_lc_bq4k_bkv8k_mk128_unprep_p512", 8, 8192, 512, 545, (4096, 8192, 256, 512), None, lc_opts | {"tp16_sq"}, False, False, False),
         )
         with (
