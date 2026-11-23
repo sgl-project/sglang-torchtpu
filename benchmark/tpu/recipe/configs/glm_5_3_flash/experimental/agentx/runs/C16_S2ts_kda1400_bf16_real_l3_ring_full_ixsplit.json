@@ -97,7 +97,7 @@
     "ENABLE_TPU_TELEMETRY": "0",
     "TPU_TELEMETRY_INTERVAL_SECONDS": "86400",
     "TPU_TELEMETRY_INTERVAL_SEC": "86400",
-    "LIBTPU_INIT_ARGS": "--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false",
+    "LIBTPU_INIT_ARGS": "--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
     "SGLANG_MAMBA_SSM_DTYPE": "float32",
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "0",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "0",

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Boot one GLM-5.3-Flash AgentX point of glm_5_3_flash/agentx.py on one tpu7x 2x2x1 host (tp8),
-# with its caches on a PVC, as jobs 36d0 (c1-c8) and 01cc (c16, c32, c48) ran them. Ready when
+# with its caches on a PVC, as jobs 36d0 (c1-c16) and 7605 (c32, c48) ran them. Ready when
 # the log prints "The server is fired up and ready to roll".
 # usage: launch_agentx.sh <1|4|8|16|32|48> [--dry-run]
 #   CACHE_ROOT=<dir>     compile caches and TMPDIR, on a PVC (default /cache/agentx)

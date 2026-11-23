@@ -12,7 +12,8 @@ them). experimental/agentx/launch_agentx.sh boots one point with its caches on a
 Every point runs fp8 weights and KV with 128-token pages and 4096-token prefill
 chunks, MTP (topk 1) at InferenceX's golden acceptance length, the MoE ring kernel
 with decode on the model path (megakernel off), and a raiden host tier that also holds
-KDA states, with a KDA checkpoint at every prefill chunk.
+KDA states, with a KDA checkpoint at every prefill chunk. c32 and c48 also split the
+index-key cache, with libtpu's SparseCore all-gather offload off (SPARSE_CORE_FIX).
 """
 
 import argparse
@@ -28,6 +29,9 @@ CONTEXT_LENGTH = 1048576
 # (speculative_num_steps; K + 1 draft tokens), SPEED-Bench coding, thinking on.
 GOLDEN_AL = {1: 1.86, 2: 2.52, 3: 3.00, 4: 3.35, 5: 3.60, 6: 3.79, 7: 3.93, 8: 3.99}
 
+# The SparseCore-offloaded all-gathers return wrong data in the index-split decode graph.
+SPARSE_CORE_FIX = " --xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
+
 
 class Profile(NamedTuple):
     running: int  # max running requests
@@ -38,6 +42,8 @@ class Profile(NamedTuple):
     interval: int  # decode steps between prefill batches
     mk_rows: int  # megakernel row cap: inert while it is off, as the runs set it
     shards: int = 1  # ranks splitting the MLA latent cache by page (1: unsplit)
+    index_split: bool = False  # split the index-key cache too (needs shards=8)
+    bf16_merge: bool = False  # the split cache's prefill merge in bf16
     state_ratio: float | None = None  # host KDA states, x KDA slots (None: host_ratio)
     compile_bs: tuple[int, ...] | None = None  # decode buckets (None: 1..running)
     spmd_compile: bool = False  # unsplit cache only: compile once, broadcast the result
@@ -63,7 +69,7 @@ PROFILES = {
         interval=16,
         mk_rows=32,
     ),
-    # Split 2 without the index-key split: c8 with it diverged once on rank 0.
+    # Split 2 without the index-key split, as measured.
     8: Profile(
         running=8,
         steps="1:7,2:3",
@@ -74,15 +80,18 @@ PROFILES = {
         mk_rows=32,
         shards=2,
     ),
+    # Unsplit index keys. Split (runs/C16_S2ts_kda1400_bf16_real_l3_ring_full_ixsplit.json:
+    # 8 shards, pool 25M, host 1.71x): same tok/s, lower E2E-normalized p90, more host RAM.
     16: Profile(
         running=16,
         steps=3,
-        pool_tokens=25000000,
+        pool_tokens=9437184,
         kda_slots=1400,
-        host_ratio=1.71,
+        host_ratio=1.7,
         interval=16,
         mk_rows=64,
-        shards=8,
+        shards=2,
+        bf16_merge=True,
         state_ratio=1.429,
     ),
     # A fixed interval starves admission from c32: prefill runs whenever it waits.
@@ -95,6 +104,8 @@ PROFILES = {
         interval=0,
         mk_rows=64,
         shards=8,
+        index_split=True,
+        bf16_merge=True,
         state_ratio=2.5,
         # Host RAM grows with every decode program: 1..32 does not fit.
         compile_bs=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
@@ -108,6 +119,8 @@ PROFILES = {
         interval=0,
         mk_rows=64,
         shards=8,
+        index_split=True,
+        bf16_merge=True,
         state_ratio=2.5,
         compile_bs=(*range(1, 17), *range(20, 49, 4)),
     ),
@@ -118,7 +131,7 @@ MEASURED = {
     1: "R1b_c1_real_l3_ring_full",
     4: "C4u_c4_real_l3_ring_full",
     8: "K2ts_c8_real_l3_ring_full",
-    16: "C16_S2ts_kda1400_bf16_real_l3_ring_full_ixsplit",
+    16: "C16_S2ts_kda1400_bf16_real_l3_ring_full",
     32: "R10_c32_mr32_combo_real_l3_ring_full_ixsplit",
     48: "R9_c48_mr48_real_l3_ring_full_ixsplit",
 }
@@ -196,11 +209,12 @@ def config_for(conc, *, simulate_acceptance=True, spmd_compile=True):
         env["SGLANG_TPU_DSA_MLA_KV_SHARDS"] = str(p.shards)
         # Each selected cache row is gathered by the rank that holds it.
         env["SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT"] = "1"
-    if p.shards == 8:
-        # The index-key cache split too (its exact prefill exchange needs 8 shards),
-        # and the split cache's prefill merge in bf16.
-        env["SGLANG_TPU_DSA_INDEX_KV_SHARD"] = "1"
+    if p.bf16_merge:
         env["SGLANG_TPU_DSA_MLA_KV_SHARD_BF16_MERGE"] = "1"
+    if p.index_split:
+        assert p.shards == 8, "the index split's exact prefill exchange needs 8 shards"
+        env["SGLANG_TPU_DSA_INDEX_KV_SHARD"] = "1"
+        env["LIBTPU_INIT_ARGS"] += SPARSE_CORE_FIX
     if p.state_ratio is not None:
         env["SGLANG_TPU_HICACHE_STATE_RATIO"] = str(p.state_ratio)
     if schedule:
