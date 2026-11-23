@@ -1224,8 +1224,12 @@ class TpuSpecWorker(BaseSpecWorker):
         seq_lens_cpu: torch.Tensor | None = None,
     ) -> StepHostRows | None:
         """The step's host rows, or None where no attention backend reads them:
-        their seq_lens read would only add a host sync."""
+        their seq_lens read would only add a host sync. With
+        SGLANG_TPU_SPEC_DEVICE_ROWS the backend builds the rows on the device
+        instead, so the read is skipped; host lengths (idle ranks) still give rows."""
         if not host_input_mirror.has_consumer():
+            return None
+        if seq_lens_cpu is None and tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get():
             return None
         return StepHostRows(
             seq_lens=seq_lens,

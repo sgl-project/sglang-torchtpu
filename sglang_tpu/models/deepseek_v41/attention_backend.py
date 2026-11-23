@@ -63,6 +63,7 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
 )
 from sglang_tpu.models.deepseek_v41.metadata_pack import pack_upload
 from sglang_tpu.models.deepseek_v41.request_window import (
+    WINDOW_TOKENS,
     DSV41TPURequestWindow,
     WindowPlan,
     decode_window_pages,
@@ -615,6 +616,131 @@ def _matching_slot_tables(
 _SLOT_TABLE_USE: Dict[str, int] = {"hit": 0, "miss": 0}
 
 
+def _device_rows_req_pool(
+    forward_batch: ForwardBatch, bs: int
+) -> Optional[torch.Tensor]:
+    """[B] host slots of a spec forward that may build its rows on the device, else None.
+
+    Only with SGLANG_TPU_SPEC_DEVICE_ROWS, for a TARGET_VERIFY forward (spec draft
+    or verify) whose rows were not mirrored to the host, that folds nothing.
+    """
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS.get():
+        return None
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    if host_input_mirror.host_copy(forward_batch, "positions") is not None:
+        return None
+    if forward_batch.encoder_swa_row_floor is not None:
+        return None
+    slots = forward_batch.req_pool_indices_cpu
+    if not isinstance(slots, torch.Tensor) or slots.device.type != "cpu":
+        return None
+    if slots.shape[0] != bs:
+        return None
+    return slots.to(torch.int64)
+
+
+def _device_row_metadata(
+    forward_batch: ForwardBatch,
+    *,
+    req_pool_indices: torch.Tensor,
+    tables: SlotTables,
+    request_window: Optional[DSV41TPURequestWindow],
+    swa_ring_valid_from: Optional[torch.Tensor],
+    device: torch.device,
+) -> Optional[DSV41TPUForwardMetadata]:
+    """Metadata of a spec forward whose position-dependent rows are built on the
+    device from its device positions and cache slots (no read back); the layout
+    fields come from the host. None where the SWA table needs host rows."""
+    from sglang_tpu.models.deepseek_v41 import device_rows
+
+    if tables.swa_pages is None and request_window is None:
+        return None  # SWA table from a device full_to_swa mapping
+    bs = int(forward_batch.batch_size)
+    num_tokens = forward_batch.positions.shape[0]
+    counts = _request_token_counts(forward_batch, bs)
+    query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
+    host_rows = torch.full((num_tokens,), -1, dtype=torch.int64)
+    host_rows[: int(query_start_loc[-1])] = torch.repeat_interleave(
+        torch.arange(bs), counts
+    )
+    swa_minimum = torch.zeros(bs, dtype=torch.int64)
+    if swa_ring_valid_from is not None:
+        # Ring rows before valid_from belong to the slot's previous owner.
+        swa_minimum = torch.maximum(swa_minimum, swa_ring_valid_from[req_pool_indices])
+    host = {
+        "query_start_loc": query_start_loc,
+        "swa_minimum": swa_minimum,
+        "host_rows": host_rows,
+        "req_pool_indices": req_pool_indices,
+    }
+    window = tables.swa_pages is None
+    if window:
+        if not _window_fits(counts, request_window.workspace_pages):
+            return None
+        host["counts"] = counts
+        host["live"] = device_rows.window_live(req_pool_indices, counts)
+        host["first_row"] = query_start_loc[:-1].clamp(max=max(num_tokens - 1, 0))
+    host_input_mirror.release(forward_batch)
+    dev = _upload_metadata(host, device=device)
+
+    positions = forward_batch.positions.to(torch.int32)
+    out_cache_loc = forward_batch.out_cache_loc.to(torch.int32)
+    token_rows, valid, token_req_pool = device_rows.token_rows(
+        host_rows=dev["host_rows"],
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=dev["req_pool_indices"],
+    )
+    swa_pages, window_plan = tables.swa_pages, None
+    if window:
+        swa_pages, window_plan = device_rows.window_pages(
+            first=positions.index_select(0, dev["first_row"]),
+            counts=dev["counts"],
+            live=dev["live"],
+            slots=dev["req_pool_indices"],
+            minimum=dev["swa_minimum"],
+            columns=tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS),
+            base_page=request_window.workspace_first_page,
+        )
+    low_ratio = {}
+    for ratio, index_pages in tables.index_pages.items():
+        out_loc, lengths = device_rows.low_ratio_rows(
+            ratio=ratio,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            valid=valid,
+            compress_valid=valid,
+        )
+        low_ratio[ratio] = LowRatioMetadata(
+            out_loc=out_loc, lengths=lengths, index_pages=index_pages
+        )
+    return DSV41TPUForwardMetadata(
+        positions=positions,
+        query_start_loc=dev["query_start_loc"],
+        token_rows=token_rows,
+        token_req_pool=token_req_pool,
+        valid=valid,
+        # No fold in a spec forward: every valid row compresses.
+        compress_valid=valid,
+        out_cache_loc=out_cache_loc,
+        full_pages=tables.full_pages_device,
+        swa_pages=swa_pages.to(torch.int32),
+        swa_minimum=dev["swa_minimum"],
+        low_ratio=low_ratio,
+        swa_window_plan=window_plan,
+    )
+
+
+def _window_fits(counts: torch.Tensor, capacity_pages: int) -> bool:
+    """Whether any rows at these counts fit the workspace (the host builder's
+    capacity check, from an upper bound on each request's pages)."""
+    rows = counts[counts > 0]
+    bound = (WINDOW_TOKENS + rows + SWA_PAGE_TOKENS - 1) // SWA_PAGE_TOKENS + 1
+    return int(bound.sum()) <= capacity_pages
+
+
 def build_forward_metadata(
     forward_batch: ForwardBatch,
     *,
@@ -634,6 +760,33 @@ def build_forward_metadata(
     ``decoder_replay``: also build the decoder rows' metadata (``tail``).
     ``slot_tables``: tables prebuilt by ``build_slot_tables``, used if they match."""
     bs = int(forward_batch.batch_size)
+    device_slots = None if decoder_replay else _device_rows_req_pool(forward_batch, bs)
+    if device_slots is not None:
+        metadata = _device_row_metadata(
+            forward_batch,
+            req_pool_indices=device_slots,
+            tables=_matching_slot_tables(
+                slot_tables,
+                req_pool_indices=device_slots,
+                columns=_full_page_columns(max_context_len),
+                low_ratios=low_ratios,
+            )
+            or build_slot_tables(
+                req_to_token=req_to_token,
+                req_pool_indices=device_slots,
+                full_to_swa_index_mapping=full_to_swa_index_mapping,
+                request_window=request_window,
+                swa_ring_valid_from=swa_ring_valid_from,
+                max_context_len=max_context_len,
+                low_ratios=low_ratios,
+                device=device,
+            ),
+            request_window=request_window,
+            swa_ring_valid_from=swa_ring_valid_from,
+            device=device,
+        )
+        if metadata is not None:
+            return metadata
     num_tokens = forward_batch.positions.shape[0]
     positions = _extend_positions(forward_batch, num_tokens)
     out_cache_loc = _host_or_read(forward_batch, "out_cache_loc", num_tokens)

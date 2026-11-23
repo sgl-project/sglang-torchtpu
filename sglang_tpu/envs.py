@@ -454,6 +454,9 @@ class TpuEnvs:
     # DSpark: apply the queued Engram verify commits right after the spec step's
     # sequence-length read, when the host has already waited for the previous verify.
     SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ = EnvBool(False)
+    # Spec step: skip the step's sequence-length read; the DSV4.1 draft and verify
+    # metadata build their position-dependent rows on the device (device_rows.py).
+    SGLANG_TPU_SPEC_DEVICE_ROWS = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

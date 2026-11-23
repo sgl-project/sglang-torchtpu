@@ -240,6 +240,74 @@ def test_slot_tables_are_reused_only_when_asked():
     assert len(builds) == 3
 
 
+@pytest.mark.parametrize("layout", ["plain", "draft_ring", "request_window"])
+def test_device_rows_match_the_host_rows(layout):
+    """SGLANG_TPU_SPEC_DEVICE_ROWS builds a spec forward's position-dependent rows
+    on the device: every field, dtype and the window plan must equal the host build."""
+    seq_lens, slots = [4096, 98310, 17, 700], [1, 2, 3, 2]
+
+    def batch():
+        fb = _verify_batch(seq_lens, slots)
+        fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+        return fb
+
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=None,
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    if layout == "draft_ring":
+        kw["swa_ring_valid_from"] = torch.arange(SLOTS, dtype=torch.int64) * 1000
+    if layout == "request_window":
+        kw["request_window"] = SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        )
+    reference = ab.build_forward_metadata(batch(), **kw)
+    with (
+        patch.object(
+            tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", SimpleNamespace(get=lambda: True)
+        ),
+        patch.object(ab, "_as_cpu_int64", side_effect=AssertionError("read back")),
+    ):
+        built = ab.build_forward_metadata(batch(), **kw)
+    _assert_same(built, reference)
+
+
+def test_device_window_pages_match_the_host_loop():
+    """device_rows.window_pages replaces extend_window_pages' per-request page loop
+    with cumsum offsets; tables and row moves must match on mixed layouts
+    (empty requests, repeated and padding slots, floors, page-boundary starts)."""
+    import random
+
+    from sglang_tpu.models.deepseek_v41 import device_rows
+    from sglang_tpu.models.deepseek_v41.request_window import extend_window_pages
+
+    rng = random.Random(0)
+    for _ in range(200):
+        bs, columns = rng.randint(1, 8), rng.choice([64, 256])
+        slots = torch.tensor([rng.choice([0, 1, 2, 3, 3, 5, 7]) for _ in range(bs)])
+        counts = torch.tensor([rng.choice([0, 1, 6, 8, 16]) for _ in range(bs)])
+        first = torch.tensor([rng.randint(0, columns * 64 - 40) for _ in range(bs)])
+        floor = torch.tensor([rng.choice([0, max(0, int(f) - 60)]) for f in first])
+        args = dict(first=first, counts=counts, minimum=floor, columns=columns)
+        pages, plan = extend_window_pages(
+            slots=slots, base_page=100, capacity_pages=10**6, **args
+        )
+        got_pages, got_plan = device_rows.window_pages(
+            live=device_rows.window_live(slots, counts),
+            slots=slots,
+            base_page=100,
+            **args,
+        )
+        assert torch.equal(got_pages, pages)
+        for got, want in zip(got_plan, plan):
+            assert got.dtype == want.dtype and torch.equal(got, want)
+
+
 def test_device_values_are_not_read():
     fb = BATCHES["multi"]()
     _upload(fb)
@@ -558,7 +626,15 @@ def test_spec_worker_builds_host_rows_only_for_a_consumer():
     worker.num_verify_rows = VERIFY_ROWS
     plan = _verify_plan()
     kwargs = dict(seq_lens=plan.seq_lens, verify_input=_verify_input(plan))
-    with patch.object(host_input_mirror, "_consumers", 0):
-        assert worker._new_step_host_rows(**kwargs) is None
-    with patch.object(host_input_mirror, "_consumers", 1):
-        assert worker._new_step_host_rows(**kwargs) is not None
+    device_rows = SimpleNamespace(get=lambda: False)
+    with patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", device_rows):
+        with patch.object(host_input_mirror, "_consumers", 0):
+            assert worker._new_step_host_rows(**kwargs) is None
+        with patch.object(host_input_mirror, "_consumers", 1):
+            assert worker._new_step_host_rows(**kwargs) is not None
+            # Device-built rows skip the length read; host lengths (idle ranks)
+            # still give rows.
+            device_rows.get = lambda: True
+            assert worker._new_step_host_rows(**kwargs) is None
+            idle = torch.zeros(plan.seq_lens.shape, dtype=torch.int64)
+            assert worker._new_step_host_rows(**kwargs, seq_lens_cpu=idle) is not None
