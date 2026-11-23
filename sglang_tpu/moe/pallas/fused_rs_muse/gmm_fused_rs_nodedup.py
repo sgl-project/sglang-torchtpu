@@ -1451,7 +1451,7 @@ def kernel_main_fused_rs(
                     _issue_all_cm_wt_sends()
                     cm_awaited_ref[_cm_flag_slots] = jnp.int32(1)
 
-        if not cm_defer_send:
+        if not cm_defer_send and not _split_entry_barrier:
             _issue_all_cm_wt_sends()
 
         def _ensure_cm_wt_ready(slot_idx: int = 0):
@@ -2949,6 +2949,8 @@ def kernel_main_fused_rs(
 
     if _split_entry_barrier:
         sync_barrier_wait()
+        if enable_chipmate and not cm_defer_send:
+            _issue_all_cm_wt_sends()
 
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, skip_cur):
