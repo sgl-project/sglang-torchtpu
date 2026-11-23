@@ -3646,6 +3646,11 @@ class MuseSparkDecoderLayer(nn.Module):
             )
 
             tp = _layer_tp_size(self.self_attn.o_proj)
+            if chip_sharded_stream:
+                assert stream.shape[0] * (tp // 2) == n_tok, (
+                    f"chip_sharded_stream shape mismatch: stream={tuple(stream.shape)}, "
+                    f"n_tok={n_tok}, tp={tp}"
+                )
             attn_input: Optional[torch.Tensor] = None
             if precomputed_qkv_gate is None and precomputed_prepared_qkvg is None:
                 if precomputed_attn_input is not None:
@@ -4900,6 +4905,7 @@ class MuseSparkTextModel(nn.Module):
             and n_tok_in <= br_max_tok
             and n_tok_in in chip_sh_batches
             and (self.end_layer - 1) not in self._capture_slots_by_layer
+            and not bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False))
             and int(os.environ.get("WORLD_SIZE", str(chip_sh_tp))) == chip_sh_tp
         )
         tok_sh_batches = self.__dict__.get("_w8_tok_sharded_batches", (64, 128))
