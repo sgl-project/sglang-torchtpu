@@ -107,7 +107,7 @@ class SparseDecodeV2Config:
     lhs_fp8: bool = False  # True: online K256 W4A8/W3A8 FP8 activation quant (2x MXU)
     k16_strip_nc: int = 512
     k16_dual_mode: str = "hybrid"  # "dual", "vstage", "hybrid" (dual at m<=32, vstage at m>=64)
-    k256_strip_mode: str = "adaptive"  # "adaptive" (1024 at m<=16, 512 at m>=32: 0 expert spills!), "wide"
+    k256_strip_mode: str = "wide"  # "wide" (cand_w8_zi default: 2048 at m<=16, 1024 at m<=64), "adaptive"
     k256_dual_mode: str = "hybrid"  # "dual", "vstage", "hybrid" (dual at m<=16, vstage at m>=32)
     async_gather: bool = True  # double-buffered async DMA token gather overlapped w/ W2
     fused_norm_scatter: bool = True  # single-pass y_stage -> inv_rms -> accum_3d scatter
@@ -304,7 +304,7 @@ def default_sparse_decode_v2_config(
             k16_blockdiag_rows=(),
             fp4_unpack_mode="via_fp8",
             kc_step=256,
-            k256_strip_mode="adaptive",
+            k256_strip_mode="wide",
             k256_dual_mode="vstage",
             async_gather=False,
             fused_norm_scatter=True,
@@ -324,7 +324,7 @@ def default_sparse_decode_v2_config(
             k16_blockdiag_rows=(),
             fp4_unpack_mode="via_fp8",
             kc_step=256,
-            k256_strip_mode="adaptive",
+            k256_strip_mode="wide",
             k256_dual_mode="hybrid",
             async_gather=False,
             fused_norm_scatter=True,
@@ -343,7 +343,7 @@ def default_sparse_decode_v2_config(
         k16_blockdiag_rows=(),
         fp4_unpack_mode="via_fp8",
         kc_step=256,
-        k256_strip_mode="adaptive",
+        k256_strip_mode="wide",
         k256_dual_mode="hybrid",
         async_gather=False,
         fused_norm_scatter=True,
@@ -507,12 +507,14 @@ def _fp4_gmm_chunked_v2(
     is_w3: bool = False,
     x_col_base: int = 0,
     b_offset: int = 0,
+    nc_split512: bool = False,
+    k512_chain: bool = False,
 ) -> jax.Array:
     """Single-projection pipelined FP4/W3 matmul over ``kc_step`` chunks."""
     eff_kc = 256 if (block256 or kperm_order or is_w3) else kc_step
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
-    if block256 and not use_w4a8:
+    if block256 and not use_w4a8 and (nc_split512 or k512_chain):
         n_k_blocks = k_dim // scale_block
         sub_nc = min(nc, 512)
         n_sub = nc // sub_nc
@@ -671,6 +673,8 @@ def _fp4_dual_gmm_chunked_v2(
     is_w3: bool = False,
     x_col_base: int = 0,
     b_offset: int = 0,
+    nc_split512: bool = False,
+    k512_chain: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Interleaved gate + up matmul pushing ``wg`` to MXU BEFORE unpacking ``wu``!
 
@@ -680,7 +684,7 @@ def _fp4_dual_gmm_chunked_v2(
     eff_kc = 256 if (block256 or kperm_order or is_w3) else kc_step
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
-    if block256 and not use_w4a8:
+    if block256 and not use_w4a8 and (nc_split512 or k512_chain):
         n_k_blocks = k_dim // scale_block
         sub_nc = min(nc, 512)
         n_sub = nc // sub_nc

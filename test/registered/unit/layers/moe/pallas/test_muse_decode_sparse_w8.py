@@ -1014,9 +1014,13 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 (7, 1),
             )
 
-            # Verify Wave-9 zero-spill adaptive strip default & opt-in EP=16 paired RS/AG.
-            self.assertEqual(c16.k256_strip_mode, "adaptive")
-            self.assertEqual(c64.k256_strip_mode, "adaptive")
+            # Verify cand_w8_zi legacy defaults ("wide", all W9 sub-knobs off) & opt-in toggles.
+            self.assertEqual(c16.k256_strip_mode, "wide")
+            self.assertEqual(c64.k256_strip_mode, "wide")
+            self.assertEqual(v2_64.k256_strip_mode, "wide")
+            self.assertFalse(
+                c64.nc_split512 or c64.k512_chain or c64.unroll_strips or c64.route_rb16_mode
+            )
             self.assertFalse(c16.pair_rs or c16.bridge_ag)
             self.assertFalse(c32.pair_rs or c32.bridge_ag)
             self.assertFalse(c64.pair_rs or c64.bridge_ag)
@@ -1028,13 +1032,28 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             c64_ep8 = v1_mod.default_sparse_decode_config(64, 8, 512)
             self.assertFalse(c64_ep8.pair_rs)
             with mock.patch.dict(
-                os.environ, {"SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "1"}, clear=False
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_STRIP_MODE": "adaptive",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_K512_CHAIN": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_RB16": "2",
+                },
+                clear=False,
             ):
                 c16_on = v1_mod.default_sparse_decode_config(16, 16, 512)
                 c32_on = v1_mod.default_sparse_decode_config(32, 16, 512)
                 c64_on = v1_mod.default_sparse_decode_config(64, 16, 512)
                 fp8_64_on = v1_mod.default_fp8_sparse_decode_config(64, 16)
                 v2_64_on = v2_mod.default_sparse_decode_v2_config(64, 16, 512)
+                self.assertEqual(c64_on.k256_strip_mode, "adaptive")
+                self.assertTrue(
+                    c64_on.nc_split512 and c64_on.k512_chain and c64_on.unroll_strips
+                )
+                self.assertEqual(c64_on.route_rb16_mode, 2)
+                self.assertEqual(fp8_64_on.route_rb16_mode, 2)
                 self.assertFalse(c16_on.pair_rs or c16_on.bridge_ag)
                 self.assertTrue(c32_on.pair_rs and c32_on.bridge_ag)
                 self.assertTrue(c64_on.pair_rs and c64_on.bridge_ag)
@@ -1404,6 +1423,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         b_sz,
                         16,
                         rep_eids,
+                        route_rb16_mode=2 if scale_mode == "off" else 1,
                         **kw,
                     )
                     nofree_run = _make_runner(

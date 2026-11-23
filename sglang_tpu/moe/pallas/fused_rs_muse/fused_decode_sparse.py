@@ -77,8 +77,12 @@ class SparseDecodeConfig:
     k16_bd_fp8: bool = False  # True: per-(tok,16-grp) FP8 masked_x -> 4,614 TFLOP/s MXU!
     k16_dequant_mode: str = "repeat"  # "repeat" or "reshape3d"
     k16_strip_nc: int = 512
-    k256_strip_mode: str = "adaptive"  # "adaptive" (1024 at m<=16, 512 at m>=32: 0 expert spills!), "wide", "fixed512"
+    k256_strip_mode: str = "wide"  # "wide" (cand_w8_zi default: 2048 at m<=16, 1024 at m<=64), "adaptive", "fixed512"
     k256_dual_mode: str = "hybrid"  # "vstage", "dual", "hybrid" (dual at m<=16, vstage at m>=32)
+    nc_split512: bool = False  # opt-in: sub-tile N into <=512-col sub-strips inside _fp4_gmm_chunked
+    k512_chain: bool = False  # opt-in: chain K256 MXU FP32 dots across scale_block=512 before 1x VPU scale
+    unroll_strips: bool = False  # opt-in: Python-unroll n_strips <= 4 to avoid Ghostfish sbr MXU drains
+    route_rb16_mode: int = 0  # 0 = cand_w8_zi rb=64 routing; 1 = 2-pass rb=16; 2 = 2-pass rb=16 unrolled
     lhs_fp8: bool = False  # W4A8: online K256 FP8 activation quant
     rs_wire_bf16: bool = False
     pair_rs: bool = False  # 2-stage intra-chip XOR=1 paired Reduce-Scatter (halves off-chip ICI!)
@@ -105,6 +109,46 @@ def _env_bool_fallback(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int]:
+    import os
+
+    nc_split = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512", False)
+    k512_ch = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_K512_CHAIN", False)
+    unroll_st = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS", False)
+    rb16_raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_RB16")
+    if rb16_raw is not None and rb16_raw.strip() != "":
+        s = rb16_raw.strip().lower()
+        rb16 = 1 if s in ("true", "yes", "on") else (0 if s in ("false", "no", "off") else int(s))
+    else:
+        rb16 = 0
+        try:
+            from sglang_tpu.envs import envs
+
+            e_rb16 = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_RB16", None)
+            if e_rb16 is not None:
+                rb16 = int(e_rb16.get())
+        except Exception:
+            pass
+    try:
+        from sglang_tpu.envs import envs
+
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512") is None:
+            e_nc = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512", None)
+            if e_nc is not None:
+                nc_split = bool(e_nc.get())
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_K512_CHAIN") is None:
+            e_k5 = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_K512_CHAIN", None)
+            if e_k5 is not None:
+                k512_ch = bool(e_k5.get())
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS") is None:
+            e_us = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS", None)
+            if e_us is not None:
+                unroll_st = bool(e_us.get())
+    except Exception:
+        pass
+    return nc_split, k512_ch, unroll_st, rb16
 
 
 def _read_sparse_env_overrides() -> (
@@ -208,12 +252,17 @@ def default_sparse_decode_config(
         and (batch_size >= 32 or pair_rs_ov >= 2)
     )
     use_ep16_bridge_ag = use_pair_rs and (ep == 16)
-    eff_strip = strip_mode_ov if strip_mode_ov else "adaptive"
+    eff_strip = strip_mode_ov if strip_mode_ov else "wide"
+    nc_split512, k512_chain, unroll_strips, route_rb16_mode = _read_sparse_w9_sub_knobs()
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
+        nc_split512=nc_split512,
+        k512_chain=k512_chain,
+        unroll_strips=unroll_strips,
+        route_rb16_mode=route_rb16_mode,
         min_p_topk=min_p_topk,
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
@@ -394,44 +443,47 @@ def _fp4_gmm_chunked(
     hoist_scales: bool = True,
     k_offset: int = 0,
     init_acc: jax.Array | None = None,
+    nc_split512: bool = False,
+    k512_chain: bool = False,
 ) -> jax.Array:
     """Compute ``x[0:m_rows, k_offset:k_offset+k_dim] @ w[:, n0:n0+nc]`` in FP32 over K256 chunks."""
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
-    if block256 and not use_w4a8:
-        # Sub-tile N to <= 512 cols (<= 32 VREGs for [256, 512] fp8 weight -> 0 expert spills!)
-        # and chain MXU FP32 accumulation across all K256 chunks sharing a scale_block (2x fewer
-        # MXU pops & VPU scale muls at scale_block=512; 0.0-ULP bit-identical at scale_block=256).
-        n_sb = k_dim // scale_block
-        sub_nc = min(nc, 512)
+    if block256 and not use_w4a8 and (nc_split512 or k512_chain):
+        eff_sb = scale_block if k512_chain else _KC
+        n_sb = k_dim // eff_sb
+        n_real_sb = k_dim // scale_block
+        sub_nc = min(nc, 512) if nc_split512 else nc
         n_sub = nc // sub_nc
-        can_hoist_s = hoist_scales and n_sb >= 8 and (n_sb % 8 == 0)
-        s_subs = [
-            s_ref[pl.ds(0, n_sb), pl.ds(n0 + si * sub_nc, sub_nc)]
-            if can_hoist_s
-            else None
-            for si in range(n_sub)
-        ]
-        accs = [
-            (
+        can_hoist_s = (
+            hoist_scales
+            and n_real_sb >= 8
+            and (n_real_sb % 8 == 0)
+            and ((m_rows * sub_nc) // 1024 <= 16 or sub_nc <= 1024 or (k_dim // _KC) <= 8)
+        )
+        chunks_per_sb = eff_sb // _KC
+        accs: list[jax.Array] = []
+        for si in range(n_sub):
+            col0 = n0 + si * sub_nc
+            s_sub = (
+                s_ref[pl.ds(0, n_real_sb), pl.ds(col0, sub_nc)]
+                if can_hoist_s
+                else None
+            )
+            acc_si = (
                 init_acc[:, si * sub_nc : (si + 1) * sub_nc]
                 if init_acc is not None
                 else None
             )
-            for si in range(n_sub)
-        ]
-        chunks_per_sb = scale_block // _KC
-        for sb_id in range(n_sb):
-            c_base = sb_id * scale_block
-            blk_accs: list[jax.Array | None] = [None] * n_sub
-            for ci in range(chunks_per_sb):
-                c0 = c_base + ci * _KC
-                x = x_2d_ref[pl.ds(0, read_m), pl.ds(k_offset + c0, _KC)]
-                if read_m != m_rows:
-                    x = x[:m_rows, :]
-                for si in range(n_sub):
-                    col0 = n0 + si * sub_nc
+            for sb_id in range(n_sb):
+                c_base = sb_id * eff_sb
+                blk_acc = None
+                for ci in range(chunks_per_sb):
+                    c0 = c_base + ci * _KC
+                    x = x_2d_ref[pl.ds(0, read_m), pl.ds(k_offset + c0, _KC)]
+                    if read_m != m_rows:
+                        x = x[:m_rows, :]
                     w_fp8 = pltpu.bitcast(
                         w_ref[
                             pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
@@ -442,19 +494,17 @@ def _fp4_gmm_chunked(
                     part = jnp.dot(
                         x, w_fp8, preferred_element_type=jnp.float32
                     )
-                    blk_accs[si] = (
-                        part if blk_accs[si] is None else blk_accs[si] + part
-                    )
-            for si in range(n_sub):
-                col0 = n0 + si * sub_nc
-                if s_subs[si] is not None:
-                    s = s_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
+                    blk_acc = part if blk_acc is None else blk_acc + part
+                real_sb = c_base // scale_block
+                if s_sub is not None:
+                    s = s_sub[real_sb : real_sb + 1, :].astype(jnp.float32)
                 else:
-                    s = s_ref[pl.ds(sb_id, 1), pl.ds(col0, sub_nc)].astype(
+                    s = s_ref[pl.ds(real_sb, 1), pl.ds(col0, sub_nc)].astype(
                         jnp.float32
                     )
-                scaled = blk_accs[si] * s
-                accs[si] = scaled if accs[si] is None else accs[si] + scaled
+                scaled = blk_acc * s
+                acc_si = scaled if acc_si is None else acc_si + scaled
+            accs.append(acc_si)
         return accs[0] if n_sub == 1 else jnp.concatenate(accs, axis=1)
 
     x_read_m = max(32, read_m) if use_w4a8 else read_m
@@ -534,42 +584,38 @@ def _fp4_dual_gmm_chunked(
     scale_block: int,
     *,
     k16_dequant_mode: str = "repeat",
+    nc_split512: bool = False,
+    k512_chain: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Interleaved gate + up K256 matmul reading ``x`` once per K256 chunk."""
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
-    if block256:
-        n_sb = k_dim // scale_block
-        sub_nc = min(nc, 512)
+    if block256 and (nc_split512 or k512_chain):
+        eff_sb = scale_block if k512_chain else _KC
+        n_sb = k_dim // eff_sb
+        n_real_sb = k_dim // scale_block
+        sub_nc = min(nc, 512) if nc_split512 else nc
         n_sub = nc // sub_nc
-        can_hoist = n_sb >= 8 and (n_sb % 8 == 0)
-        sg_subs = [
-            s_ref[pl.ds(0, n_sb), pl.ds(n0_g + si * sub_nc, sub_nc)]
-            if can_hoist
-            else None
-            for si in range(n_sub)
-        ]
-        su_subs = [
-            s_ref[pl.ds(0, n_sb), pl.ds(n0_u + si * sub_nc, sub_nc)]
-            if can_hoist
-            else None
-            for si in range(n_sub)
-        ]
-        accs_g: list[jax.Array | None] = [None] * n_sub
-        accs_u: list[jax.Array | None] = [None] * n_sub
-        chunks_per_sb = scale_block // _KC
-        for sb_id in range(n_sb):
-            c_base = sb_id * scale_block
-            bg_list: list[jax.Array | None] = [None] * n_sub
-            bu_list: list[jax.Array | None] = [None] * n_sub
-            for ci in range(chunks_per_sb):
-                c0 = c_base + ci * _KC
-                x = x_2d_ref[pl.ds(0, read_m), pl.ds(c0, _KC)]
-                if m_rows == 8:
-                    x = x[:8, :]
-                for si in range(n_sub):
-                    cg = n0_g + si * sub_nc
-                    cu = n0_u + si * sub_nc
+        can_hoist = n_real_sb >= 8 and (n_real_sb % 8 == 0)
+        chunks_per_sb = eff_sb // _KC
+        accs_g: list[jax.Array] = []
+        accs_u: list[jax.Array] = []
+        for si in range(n_sub):
+            cg = n0_g + si * sub_nc
+            cu = n0_u + si * sub_nc
+            sg_sub = s_ref[pl.ds(0, n_real_sb), pl.ds(cg, sub_nc)] if can_hoist else None
+            su_sub = s_ref[pl.ds(0, n_real_sb), pl.ds(cu, sub_nc)] if can_hoist else None
+            acc_g_si = None
+            acc_u_si = None
+            for sb_id in range(n_sb):
+                c_base = sb_id * eff_sb
+                bg = None
+                bu = None
+                for ci in range(chunks_per_sb):
+                    c0 = c_base + ci * _KC
+                    x = x_2d_ref[pl.ds(0, read_m), pl.ds(c0, _KC)]
+                    if m_rows == 8:
+                        x = x[:8, :]
                     wg_fp8 = pltpu.bitcast(
                         w_ref[
                             pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
@@ -577,10 +623,8 @@ def _fp4_dual_gmm_chunked(
                         ],
                         jnp.float4_e2m1fn,
                     ).astype(jnp.float8_e4m3fn)
-                    rg = jnp.dot(
-                        x, wg_fp8, preferred_element_type=jnp.float32
-                    )
-                    bg_list[si] = rg if bg_list[si] is None else bg_list[si] + rg
+                    rg = jnp.dot(x, wg_fp8, preferred_element_type=jnp.float32)
+                    bg = rg if bg is None else bg + rg
                     wu_fp8 = pltpu.bitcast(
                         w_ref[
                             pl.ds(c0 // _FP4_PACK, _KC // _FP4_PACK),
@@ -588,31 +632,25 @@ def _fp4_dual_gmm_chunked(
                         ],
                         jnp.float4_e2m1fn,
                     ).astype(jnp.float8_e4m3fn)
-                    ru = jnp.dot(
-                        x, wu_fp8, preferred_element_type=jnp.float32
-                    )
-                    bu_list[si] = ru if bu_list[si] is None else bu_list[si] + ru
-            for si in range(n_sub):
-                cg = n0_g + si * sub_nc
-                cu = n0_u + si * sub_nc
+                    ru = jnp.dot(x, wu_fp8, preferred_element_type=jnp.float32)
+                    bu = ru if bu is None else bu + ru
+                real_sb = c_base // scale_block
                 sg = (
-                    sg_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
-                    if sg_subs[si] is not None
-                    else s_ref[pl.ds(sb_id, 1), pl.ds(cg, sub_nc)].astype(
-                        jnp.float32
-                    )
+                    sg_sub[real_sb : real_sb + 1, :].astype(jnp.float32)
+                    if sg_sub is not None
+                    else s_ref[pl.ds(real_sb, 1), pl.ds(cg, sub_nc)].astype(jnp.float32)
                 )
                 su = (
-                    su_subs[si][sb_id : sb_id + 1, :].astype(jnp.float32)
-                    if su_subs[si] is not None
-                    else s_ref[pl.ds(sb_id, 1), pl.ds(cu, sub_nc)].astype(
-                        jnp.float32
-                    )
+                    su_sub[real_sb : real_sb + 1, :].astype(jnp.float32)
+                    if su_sub is not None
+                    else s_ref[pl.ds(real_sb, 1), pl.ds(cu, sub_nc)].astype(jnp.float32)
                 )
-                gs_v = bg_list[si] * sg
-                us_v = bu_list[si] * su
-                accs_g[si] = gs_v if accs_g[si] is None else accs_g[si] + gs_v
-                accs_u[si] = us_v if accs_u[si] is None else accs_u[si] + us_v
+                gs_v = bg * sg
+                us_v = bu * su
+                acc_g_si = gs_v if acc_g_si is None else acc_g_si + gs_v
+                acc_u_si = us_v if acc_u_si is None else acc_u_si + us_v
+            accs_g.append(acc_g_si)
+            accs_u.append(acc_u_si)
         out_g = accs_g[0] if n_sub == 1 else jnp.concatenate(accs_g, axis=1)
         out_u = accs_u[0] if n_sub == 1 else jnp.concatenate(accs_u, axis=1)
         return out_g, out_u
@@ -1438,6 +1476,7 @@ def _sparse_decode_kernel(
             free_max_rows=cfg.free_max_rows,
             free_max_w=cfg.free_max_w,
             free_min_slot=cfg.free_min_slot,
+            route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
         )
         counts_smem = r_scratch.counts_smem
 
@@ -1738,6 +1777,8 @@ def _sparse_decode_kernel(
                 k16_dequant_mode=cfg.k16_dequant_mode,
                 lhs_sc_ref=sc_eff,
                 hoist_scales=cfg.hoist_k256_scales,
+                nc_split512=cfg.nc_split512,
+                k512_chain=cfg.k512_chain,
             )
             if not is_up:
                 sg_bf = jax.nn.silu(res).astype(jnp.bfloat16)
@@ -1755,11 +1796,10 @@ def _sparse_decode_kernel(
             return carry
 
         n_strips = width // nc
-        if n_strips == 1:
-            _strip(0, 0)
-        elif n_strips == 2:
-            _strip(0, 0)
-            _strip(1, 0)
+        max_unr = 4 if cfg.unroll_strips else 2
+        if n_strips <= max_unr:
+            for jj in range(n_strips):
+                _strip(jj, 0)
         else:
             lax.fori_loop(0, n_strips, _strip, 0)
 
@@ -1802,6 +1842,8 @@ def _sparse_decode_kernel(
                     lhs_sc_ref=sc_eff,
                     hoist_scales=cfg.hoist_k256_scales,
                     k_offset=0,
+                    nc_split512=cfg.nc_split512,
+                    k512_chain=cfg.k512_chain,
                 )
                 acc_dst[pl.ds(0, m_rows), pl.ds(n0, nc)] = p0
                 return carry
@@ -1832,6 +1874,8 @@ def _sparse_decode_kernel(
                 hoist_scales=cfg.hoist_k256_scales,
                 k_offset=half_k,
                 init_acc=acc_dst[pl.ds(0, m_rows), pl.ds(n0, nc)],
+                nc_split512=cfg.nc_split512,
+                k512_chain=cfg.k512_chain,
             )
             u = _fp4_gmm_chunked(
                 lhs_eff,
@@ -1848,6 +1892,8 @@ def _sparse_decode_kernel(
                 hoist_scales=cfg.hoist_k256_scales,
                 k_offset=half_k,
                 init_acc=acc_dst[pl.ds(0, m_rows), pl.ds(u_n0, nc)],
+                nc_split512=cfg.nc_split512,
+                k512_chain=cfg.k512_chain,
             )
             h = (
                 jax.nn.silu(g).astype(jnp.bfloat16).astype(jnp.float32) * u
@@ -1856,11 +1902,10 @@ def _sparse_decode_kernel(
             return carry
 
         n_s1 = _I // nc
-        if n_s1 == 1:
-            _strip_k1(0, 0)
-        elif n_s1 == 2:
-            _strip_k1(0, 0)
-            _strip_k1(1, 0)
+        max_unr1 = 4 if cfg.unroll_strips else 2
+        if n_s1 <= max_unr1:
+            for jj in range(n_s1):
+                _strip_k1(jj, 0)
         else:
             lax.fori_loop(0, n_s1, _strip_k1, 0)
 
@@ -1911,6 +1956,8 @@ def _sparse_decode_kernel(
                     is_k256,
                     scale_block,
                     k16_dequant_mode=cfg.k16_dequant_mode,
+                    nc_split512=cfg.nc_split512,
+                    k512_chain=cfg.k512_chain,
                 )
                 h = (
                     jax.nn.silu(g).astype(jnp.bfloat16).astype(jnp.float32) * u
@@ -1930,6 +1977,8 @@ def _sparse_decode_kernel(
                     k16_dequant_mode=cfg.k16_dequant_mode,
                     lhs_sc_ref=sc_eff,
                     hoist_scales=cfg.hoist_k256_scales,
+                    nc_split512=cfg.nc_split512,
+                    k512_chain=cfg.k512_chain,
                 )
                 sg_bf = jax.nn.silu(g).astype(jnp.bfloat16)
                 act_dst[pl.ds(0, write_m), col_out] = _pad_rows_to(
@@ -1948,6 +1997,8 @@ def _sparse_decode_kernel(
                     k16_dequant_mode=cfg.k16_dequant_mode,
                     lhs_sc_ref=sc_eff,
                     hoist_scales=cfg.hoist_k256_scales,
+                    nc_split512=cfg.nc_split512,
+                    k512_chain=cfg.k512_chain,
                 )
                 sg_read = act_dst[pl.ds(0, write_m), col_out]
                 if m_rows == 8:
@@ -1957,11 +2008,10 @@ def _sparse_decode_kernel(
             return carry
 
         n_strips = width // nc
-        if n_strips == 1:
-            _strip(0, 0)
-        elif n_strips == 2:
-            _strip(0, 0)
-            _strip(1, 0)
+        max_unr = 4 if cfg.unroll_strips else 2
+        if n_strips <= max_unr:
+            for jj in range(n_strips):
+                _strip(jj, 0)
         else:
             lax.fori_loop(0, n_strips, _strip, 0)
 
@@ -2003,6 +2053,8 @@ def _sparse_decode_kernel(
                 k16_dequant_mode=cfg.k16_dequant_mode,
                 lhs_sc_ref=sc_eff,
                 hoist_scales=cfg.hoist_k256_scales,
+                nc_split512=cfg.nc_split512,
+                k512_chain=cfg.k512_chain,
             ).astype(jnp.bfloat16)
             g_col = gain_f32_buf[0:1, col_out]
             if cfg.norm_f32_stage:
@@ -2019,11 +2071,11 @@ def _sparse_decode_kernel(
             return sq_acc
 
         n_strips = width // nc
-        if n_strips == 1:
-            return _strip(0, sq_sum)
-        if n_strips == 2:
-            sq_sum = _strip(0, sq_sum)
-            return _strip(1, sq_sum)
+        max_unr = 4 if cfg.unroll_strips else 2
+        if n_strips <= max_unr:
+            for jj in range(n_strips):
+                sq_sum = _strip(jj, sq_sum)
+            return sq_sum
         return lax.fori_loop(0, n_strips, _strip, sq_sum)
 
     # =========================================================================
@@ -4023,6 +4075,7 @@ class Fp8SparseDecodeConfig:
     free_max_rows: int = 0
     free_max_w: float = 0.06
     free_min_slot: int = 5
+    route_rb16_mode: int = 0
 
 
 def default_fp8_sparse_decode_config(
@@ -4045,6 +4098,7 @@ def default_fp8_sparse_decode_config(
         pair_rs_ov,
         _,
     ) = _read_sparse_env_overrides()
+    _, _, _, route_rb16_mode = _read_sparse_w9_sub_knobs()
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
@@ -4063,6 +4117,7 @@ def default_fp8_sparse_decode_config(
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
         free_min_slot=free_min_slot_eff,
+        route_rb16_mode=route_rb16_mode,
         pair_rs=fp8_pair_rs,
     )
     if batch_size <= 16 or use_dense_k2:
@@ -4631,6 +4686,7 @@ def _sparse_fp8_decode_kernel(
             free_max_rows=cfg.free_max_rows,
             free_max_w=cfg.free_max_w,
             free_min_slot=cfg.free_min_slot,
+            route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
         )
         counts_smem = r_scratch.counts_smem
 
