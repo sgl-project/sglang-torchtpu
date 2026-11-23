@@ -1,5 +1,6 @@
 """TPU lowering of the real-draft-token accept and the vocab-shard argmax, under direct compile."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -81,3 +82,7 @@ def test_compiled_accept_and_shard_argmax_match_eager_argmax(bs):
         _, ids = _shard_argmax(inputs[0], _TP)
         assert torch.equal(ids[:, 0].cpu().long(), logits.argmax(-1))
         _assert_same(accept_real_draft_top_k_step(ids, *inputs[1:]), expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
