@@ -378,13 +378,13 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
     def test_default_off_flags_and_ast_no_bare_envfield_bool(self):
         from sglang_tpu.envs import envs
 
-        for env_key in (
-            "SGLANG_TPU_RPA_V3_PREFILL_W9",
-            "SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q",
+        for env_key, expected in (
+            ("SGLANG_TPU_RPA_V3_PREFILL_W9", False),
+            ("SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q", True),
         ):
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop(env_key, None)
-                self.assertIs(getattr(envs, env_key).get(), False, f"{env_key} must default to False")
+                self.assertIs(getattr(envs, env_key).get(), expected, f"{env_key} must default to {expected}")
 
         for rel in _TOUCHED_FILES:
             src = (_REPO_ROOT / rel).read_text(encoding="utf-8")
@@ -577,10 +577,39 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             out_l61 = prepare_head_packed_outputs(jnp.ones((1, 128, 4, 2, 128), jnp.bfloat16), -2, 8, 128)
             self.assertEqual(out_l61.shape, (128, 512))
 
-        # 4. Verify default-OFF TP=16 unprepared preserves legacy `TP16_NATIVE_PREFILL=1` (`tp16_sq` absent).
+        # 4. Verify TP=16 unprepared routes to `tp16_sq` by default (#2390 fix), while
+        #    kill-switch (`TP16_STATIONARY_Q=0`) or explicit `TP16_NATIVE_PREFILL=1` disables it cleanly.
         q_tp16_unprep = SimpleNamespace(ndim=3, shape=(8192, 8, 64), dtype="bfloat16")
         k_tp16_unprep = SimpleNamespace(shape=(8192, 1, 64))
         c_tp16_p128 = SimpleNamespace(shape=(2048, 128, 1, 4, 128), dtype="float8_e4m3fn")
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "0",
+            },
+            clear=False,
+        ):
+            os.environ.pop("SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q", None)
+            os.environ.pop("SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL", None)
+            kw_def_tp16 = _call_invoke(q_tp16_unprep, k_tp16_unprep, k_tp16_unprep, c_tp16_p128, kl, pi_swa, sw=2048, prepared=False)
+            self.assertIn("tp16_sq", kw_def_tp16["_prefill_opts"])
+            self.assertIn("stationary_q_m0_ring_fuse", kw_def_tp16["_prefill_opts"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q": "0",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+            },
+            clear=False,
+        ):
+            kw_kill = _call_invoke(q_tp16_unprep, k_tp16_unprep, k_tp16_unprep, c_tp16_p128, kl, pi_swa, sw=2048, prepared=False)
+            kill_opts = kw_kill.get("_prefill_opts", frozenset())
+            self.assertNotIn("tp16_sq", kill_opts)
+            self.assertNotIn("stationary_q_m0_ring_fuse", kill_opts)
+
         with patch.dict(
             os.environ,
             {

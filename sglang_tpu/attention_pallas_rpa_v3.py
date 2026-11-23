@@ -17,6 +17,7 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 import dataclasses
 import functools
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -273,12 +274,27 @@ def _invoke_v3_kernel(
         w9_prefill_env is not None and w9_prefill_env.get()
     )
     tp16_sq_env = getattr(envs, "SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q", None)
+    tp16_sq_explicit_env = os.environ.get("SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q")
+    tp16_sq_env_on = True if tp16_sq_env is None else bool(tp16_sq_env.get())
+    tp16_native_on = bool(envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get())
     a1_rpa_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT", None)
-    allow_tp16_sq = (
-        use_w9_preset
-        or ("tp16_sq" in raw_all_toks)
-        or bool(tp16_sq_env is not None and tp16_sq_env.get())
-        or bool(is_prepared and a1_rpa_env is not None and a1_rpa_env.get())
+    allow_tp16_sq = "notp16_sq" not in raw_all_toks and (
+        ("tp16_sq" in raw_all_toks)
+        or bool(
+            is_prepared
+            and a1_rpa_env is not None
+            and a1_rpa_env.get()
+            and tp16_sq_env_on
+        )
+        or (
+            tp16_sq_env_on
+            and (
+                use_w9_preset
+                or is_prepared
+                or tp16_sq_explicit_env is not None
+                or not tp16_native_on
+            )
+        )
     )
     # stationary_q supports TP8 (16 Q / 2 packed KV) and opt-in TP16 (8 Q / 1 KV, d=64),
     # plus legacy TP16_NATIVE_PREFILL block-size routing when explicitly requested.
@@ -887,7 +903,12 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             and prefill_mode in _STATIONARY_Q_MODES
             and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
         )
-        is_tp16_sq_pool = _pool_is_tp16_sq_64(self.token_to_kv_pool)
+        tp16_sq_backend_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_TP16_STATIONARY_Q", None
+        )
+        is_tp16_sq_pool = _pool_is_tp16_sq_64(self.token_to_kv_pool) and bool(
+            tp16_sq_backend_env is None or tp16_sq_backend_env.get()
+        )
         prep_pack = -2 if is_tp16_sq_pool else pack
         self._prepared_op = (
             _build_pallas_kernel_op(
