@@ -24,6 +24,7 @@ requests, accept length simulated at 3.51: c8 6179 and c32 12348 output
 tok/s/chip.
 """
 
+import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.deepseek_v41_flash_agx.deepseek_v41_flash import (
@@ -88,3 +89,14 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_SPEC_DEVICE_ROWS": "1",
     }
 )
+
+# tcmalloc for the host side (scheduler, tokenizer, metadata building) when the
+# image ships it. The recipe is evaluated on the serving host, so images without
+# the library still start with the default allocator.
+_TCMALLOC = "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+if os.path.exists(_TCMALLOC):
+    _preload = os.environ.get("LD_PRELOAD", "")
+    if _TCMALLOC not in _preload.split(":"):
+        CONFIG["runtime_env"]["LD_PRELOAD"] = ":".join(
+            p for p in (_TCMALLOC, _preload) if p
+        )
