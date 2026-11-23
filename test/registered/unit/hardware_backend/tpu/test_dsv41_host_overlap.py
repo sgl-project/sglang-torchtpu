@@ -2501,3 +2501,71 @@ def test_attention_backend_reports_no_decoder_tail():
     backend = object.__new__(DSV41TPUAttnBackend)
 
     assert backend.tail_forward_metadata is None
+
+
+def test_next_chunk_prefetch_survives_staging_on_another_bucket():
+    """A DSpark verify between two prompt chunks stages on its own (smaller) padded
+    bucket, so the next-chunk prefetch keeps its slots and the next chunk takes it;
+    staging on the prefetch's own bucket still discards it."""
+    coordinator, embeddings, _ = _coordinator()
+    prompt = [1, 2, 3, 4, 5, 6, 7, 0, 2, 4, 6, 1, 3, 5, 7, 2, 4, 6]
+    req = _request(prompt)
+
+    coordinator.prepare(_batch([req], starts=[0], lengths=[8]))
+    staged1, uploads1, _ = coordinator.stage_all(8)
+    coordinator.record_consumers(uploads1, [torch.tensor([1])])
+    coordinator.finish_forward(8)
+    prefetch = coordinator._prefetch
+    assert (
+        prefetch is not None and prefetch.starts == [8] and prefetch.padded_tokens == 8
+    )
+    coordinator.clear_step()
+
+    # A verify-shaped step: stage_verify for a non-verify forward returns early,
+    # then fallback staging runs on bucket 4. Neither touches the bucket-8 prefetch.
+    not_verify = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: False)
+    )
+    assert (
+        coordinator.stage_verify(torch.zeros(4, dtype=torch.int64), not_verify) is None
+    )
+    verify_hashes = hash_on_host(
+        _reference_capture([req], [12], [4], NGRAM), **_tables()
+    )
+    staged_v, uploads_v, _ = coordinator.stage_from_hashes(verify_hashes, 4)
+    coordinator.record_consumers(uploads_v, [torch.tensor([2])])
+    assert coordinator._prefetch is prefetch
+    for upload in prefetch.uploads.values():
+        assert all(upload is not u for u in uploads_v)
+
+    # Chunk 2 [8:16] takes the prefetch and stages the reference rows.
+    coordinator.prepare(_batch([req], starts=[8], lengths=[8]))
+    assert coordinator._prefetch is None
+    assert coordinator.hashes is prefetch.hashes
+    staged2, uploads2, _ = coordinator.stage_all(8)
+    coordinator.record_consumers(uploads2, [torch.tensor([3])])
+    expected = hash_on_host(_reference_capture([req], [8], [8], NGRAM), **_tables())
+    for (layer, embedding), dev in zip(embeddings, staged2, strict=True):
+        assert dev is prefetch.uploads[layer].device
+        reference = pack_rows(
+            embedding.weight,
+            embedding.scale,
+            expected[:, layer],
+            row_start=0,
+            padded_tokens=8,
+        )
+        assert torch.equal(dev, reference)
+    coordinator.clear_step()
+
+    # Same bucket: fallback staging at 8 must drop a bucket-8 prefetch.
+    req2 = _request(prompt)
+    coordinator.prepare(_batch([req2], starts=[0], lengths=[8]))
+    _, uploads3, _ = coordinator.stage_all(8)
+    coordinator.record_consumers(uploads3, [torch.tensor([4])])
+    coordinator.finish_forward(8)
+    assert coordinator._prefetch is not None
+    coordinator.clear_step()
+    same_hashes = hash_on_host(_reference_capture([req2], [0], [8], NGRAM), **_tables())
+    _, uploads4, _ = coordinator.stage_from_hashes(same_hashes, 8)
+    coordinator.record_consumers(uploads4, [torch.tensor([5])])
+    assert coordinator._prefetch is None

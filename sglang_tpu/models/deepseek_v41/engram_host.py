@@ -1101,10 +1101,15 @@ class HostEngramCoordinator:
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
         if hashes.shape[0] > padded_tokens:
             raise ValueError("Host Engram rows exceed the padded local token count")
-        if not use_prestaged:
-            # Verify and fallback staging bypass prepare(), so any pending
-            # next-chunk prefetch must be dropped before _reserve_upload can
-            # reuse its slot on the same padded token bucket.
+        if (
+            not use_prestaged
+            and self._prefetch is not None
+            and self._prefetch.padded_tokens == padded_tokens
+        ):
+            # Verify and fallback staging bypass prepare(); on the prefetch's
+            # padded token bucket _reserve_upload would reuse its slot. Other
+            # buckets have their own slots, so a next-chunk prefetch survives a
+            # DSpark verify between two prompt chunks.
             self._discard_prefetch()
         if not use_prestaged or (
             self._staged_uploads
@@ -1159,7 +1164,6 @@ class HostEngramCoordinator:
         self, input_ids: torch.Tensor, forward_batch
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
-        self._discard_prefetch()
         flush_engram_commits(self._hasher)
         if not forward_batch.forward_mode.is_target_verify():
             return None
