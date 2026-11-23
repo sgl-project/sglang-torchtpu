@@ -219,6 +219,21 @@ def _local_rows_m(tile):
     return {m_key: tile for m_key in _EXPERT_TP_LOCAL_ROWS_M_KEYS}
 
 
+def _h4096_i4096_expert_tp_local_rows():
+    """Expert-TP local-rows tiles for both expert scale layouts: the checkpoint's block 16
+    and the block-256 requant (SGLANG_TPU_MUSE_MK_QBLOCK=256). The tiles don't depend
+    on the scale block (K tiles are multiples of both); measured on each at TP8."""
+    return {
+        f"k-4096_n-{n1}_g-256_lhs_quant_rhs_bs-{bs}"
+        f"+k-{k2}_n-4096_g-256_lhs_quant_rhs_bs-{bs}": _local_rows_m(tile)
+        for bs in (16, 256)
+        for n1, k2, tile in (
+            (1024, 512, _H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
+            (512, 256, _H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
+        )
+    }
+
+
 def _h4096_i4096_fp4_size_dependent():
     """H4096-I4096 fp4: full tiles for small M, smaller tiles for large M.
 
@@ -536,6 +551,8 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
         # (num_w1_bufs=2) that FP8 couldn't afford. No size-dependent
         # split needed — the caching overhead is negligible at FP4 sizes.
         "lhs_bfloat16_rhs_float4_e2m1fn": {
+            **_h4096_i4096_expert_tp_local_rows(),
+            # Block-16 TP8 also has tuned tiles below the local-rows sizes.
             (
                 "k-4096_n-1024_g-256_lhs_quant_rhs_bs-16"
                 "+k-512_n-4096_g-256_lhs_quant_rhs_bs-16"
@@ -543,19 +560,6 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 **_all_m(_H4096_I4096_EXPERT_TP8),
                 **_local_rows_m(_H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
             },
-            (
-                "k-4096_n-512_g-256_lhs_quant_rhs_bs-16"
-                "+k-256_n-4096_g-256_lhs_quant_rhs_bs-16"
-            ): _local_rows_m(_H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
-            # Block-256 experts (SGLANG_TPU_MUSE_MK_QBLOCK=256 requantizes them in place).
-            (
-                "k-4096_n-1024_g-256_lhs_quant_rhs_bs-256"
-                "+k-512_n-4096_g-256_lhs_quant_rhs_bs-256"
-            ): _local_rows_m(_H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
-            (
-                "k-4096_n-512_g-256_lhs_quant_rhs_bs-256"
-                "+k-256_n-4096_g-256_lhs_quant_rhs_bs-256"
-            ): _local_rows_m(_H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.
