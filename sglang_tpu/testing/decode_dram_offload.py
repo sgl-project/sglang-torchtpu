@@ -679,6 +679,7 @@ def _bare_prefill_manager():
     engine, on which a real RaidenKVSender can be built."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
     mgr.attn_tp_rank = 0
+    mgr.pp_size = 1
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL

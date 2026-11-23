@@ -510,28 +510,26 @@ class RaidenSenderMixin:
         concurrent abort is never overwritten.
         """
         with self._state_lock:
-            if room in self._aborted or not self._decode_requested_locked(room):
-                return False
-            if (
-                self.dram_offload_channel is not None
-                and self.dram_offload_channel.prefix_pull_open_locked(room)
-            ):
-                return False
-            if self.request_status.get(room) == KVPoll.Bootstrapping:
-                self.update_status(room, KVPoll.WaitingForInput)
-            return True
+            return self._finish_bootstrap_locked(room)
+
+    def _finish_bootstrap_locked(self, room: int) -> bool:
+        if room in self._aborted or not self._decode_requested_locked(room):
+            return False
+        if (
+            self.dram_offload_channel is not None
+            and self.dram_offload_channel.prefix_pull_open_locked(room)
+        ):
+            return False
+        if self.request_status.get(room) == KVPoll.Bootstrapping:
+            self.update_status(room, KVPoll.WaitingForInput)
+        return True
 
     def _finish_pp_bootstrap_locked(self, room: int) -> None:
         """On a pipeline-parallel prefill, end a requested room's Bootstrapping
         as soon as the request lands: only stage 0 polls bootstrapping rooms, and
         it waits on every stage's status (RaidenKVSender.poll_pp_consensus)."""
-        if (
-            self.pp_size > 1
-            and room not in self._aborted
-            and self._decode_requested_locked(room)
-            and self.request_status.get(room) == KVPoll.Bootstrapping
-        ):
-            self.update_status(room, KVPoll.WaitingForInput)
+        if self.pp_size > 1:
+            self._finish_bootstrap_locked(room)
 
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.
@@ -1612,6 +1610,8 @@ class RaidenKVSender(CommonKVSender):
         if consensus == KVPoll.Bootstrapping and self.kv_mgr.fail_pp_bootstrap_timeout(
             self.bootstrap_room, self.init_time, self.kv_mgr.bootstrap_timeout
         ):
+            # This stage's decode already reserved the room's pages.
+            self._tell_decode_room_failed()
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         return min(status, consensus)

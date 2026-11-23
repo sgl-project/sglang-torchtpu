@@ -551,6 +551,8 @@ class TpuKVSenderBase(CommonKVSender):
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
     def _poll_with_status(self, check_status) -> KVPoll:
+        """This sender's state machine over one status reader; it replaces
+        CommonKVSender's for both poll and poll_pp_consensus."""
         if self.conclude_state is not None:
             return self.conclude_state
         self._pre_poll()
