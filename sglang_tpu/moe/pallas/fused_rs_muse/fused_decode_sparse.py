@@ -32,6 +32,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
+    scale_free_expert_for_batch,
+)
 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
     DenseRoutingScratch,
     RoutingScratch,
@@ -186,12 +189,15 @@ def default_sparse_decode_config(
     ) = _read_sparse_env_overrides()
     spec_eff = spec_parts if batch_size <= 128 else 0
     use_br64 = bridge64 and (ep == 8) and (batch_size == 64)
+    free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
+        free_rows, free_min_slot, batch_size
+    )
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
         min_p_topk=min_p_topk,
-        free_max_rows=free_rows,
+        free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
-        free_min_slot=free_min_slot,
+        free_min_slot=free_min_slot_eff,
     )
     if scale_block == 16:
         tile_m = (
@@ -3763,11 +3769,14 @@ def default_fp8_sparse_decode_config(
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
+    free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
+        free_rows, free_min_slot, batch_size
+    )
     route_kw = dict(
         min_p_topk=min_p_topk,
-        free_max_rows=free_rows,
+        free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
-        free_min_slot=free_min_slot,
+        free_min_slot=free_min_slot_eff,
     )
     if batch_size <= 16 or use_dense_k2:
         return Fp8SparseDecodeConfig(

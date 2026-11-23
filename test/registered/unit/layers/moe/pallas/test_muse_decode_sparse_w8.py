@@ -919,6 +919,94 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     self.assertEqual(out_sd.shape, (8, 4096))
                     self.assertEqual(out_sd.dtype, jnp.bfloat16)
 
+    def test_w9_bucket_scaled_free_expert_pruning(self):
+        """Verify #2407 bucket-scaled FREE pruning across v1 FP4, v1 FP8, and v2."""
+        scale_free_expert_for_batch = _BREAKERS_MOD.scale_free_expert_for_batch
+        route_weights_with_breakers_np = _BREAKERS_MOD.route_weights_with_breakers_np
+
+        # Direct unit checks across b64, b64_ms16, ge32, and off modes.
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 16, mode="b64"), (2, 2))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 32, mode="b64"), (4, 2))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 64, mode="b64"), (7, 1))
+        self.assertEqual(scale_free_expert_for_batch(10, 1, 16, mode="b64"), (2, 2))
+        self.assertEqual(scale_free_expert_for_batch(10, 1, 32, mode="b64"), (5, 2))
+        self.assertEqual(scale_free_expert_for_batch(10, 1, 64, mode="b64"), (10, 1))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 32, mode="b64_ms16"), (4, 1))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 16, mode="ge32"), (0, 1))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 32, mode="ge32"), (4, 2))
+        self.assertEqual(scale_free_expert_for_batch(7, 1, 16, mode="off"), (7, 1))
+        self.assertEqual(scale_free_expert_for_batch(0, 1, 16, mode="b64"), (0, 1))
+
+        # Verify tail-batch protection (5 real tokens + 11 identical dummy rows at B=16):
+        # unscaled f7 (7:0.20:1) collapses real tokens to top-1, whereas b64-scaled (2:0.20:2)
+        # preserves >= 2 experts on every real token!
+        rng = np.random.default_rng(2407)
+        real_lg = rng.normal(-3.0, 0.8, size=(5, 256)).astype(np.float32)
+        dummy_row = rng.normal(-3.0, 0.8, size=(1, 256)).astype(np.float32)
+        logits_b16 = np.concatenate([real_lg, np.repeat(dummy_row, 11, axis=0)], axis=0)
+        bias = np.zeros((1, 256), dtype=np.float32)
+
+        f_rows_eff, ms_eff = scale_free_expert_for_batch(7, 1, 16, mode="b64")
+        w_scaled, _, _ = route_weights_with_breakers_np(
+            logits_b16,
+            bias,
+            DecodeRoutingPruneConfig(
+                free_expert_rows=f_rows_eff,
+                free_min_rank=ms_eff,
+                free_max_weight=0.20,
+            ),
+        )
+        real_kept_counts = np.sum(w_scaled[:5] > 0.0, axis=1)
+        self.assertTrue(np.all(real_kept_counts >= 2), f"got {real_kept_counts}")
+        np.testing.assert_allclose(np.sum(w_scaled[:5], axis=1), 1.0, atol=1e-6)
+
+        try:
+            v1_mod = _load_pkg_module(
+                "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+            )
+            v2_mod = _load_pkg_module(
+                "fused_decode_sparse_v2", _MUSE_DIR / "fused_decode_sparse_v2.py"
+            )
+        except Exception:
+            return
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS": "7:0.20:1",
+                "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK": "0.80",
+                "SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE": "b64",
+            },
+            clear=False,
+        ):
+            c16 = v1_mod.default_sparse_decode_config(16, 16, 512)
+            c32 = v1_mod.default_sparse_decode_config(32, 16, 512)
+            c64 = v1_mod.default_sparse_decode_config(64, 16, 512)
+            self.assertEqual((c16.free_max_rows, c16.free_min_slot), (2, 2))
+            self.assertEqual((c32.free_max_rows, c32.free_min_slot), (4, 2))
+            self.assertEqual((c64.free_max_rows, c64.free_min_slot), (7, 1))
+
+            fp8_16 = v1_mod.default_fp8_sparse_decode_config(16, 16)
+            fp8_64 = v1_mod.default_fp8_sparse_decode_config(64, 16)
+            self.assertEqual((fp8_16.free_max_rows, fp8_16.free_min_slot), (2, 2))
+            self.assertEqual((fp8_64.free_max_rows, fp8_64.free_min_slot), (7, 1))
+
+            v2_16 = v2_mod.default_sparse_decode_v2_config(16, 16, 512)
+            v2_32 = v2_mod.default_sparse_decode_v2_config(32, 16, 512)
+            v2_64 = v2_mod.default_sparse_decode_v2_config(64, 16, 512)
+            self.assertEqual(
+                (v2_16.routing_prune.free_expert_rows, v2_16.routing_prune.free_min_rank),
+                (2, 2),
+            )
+            self.assertEqual(
+                (v2_32.routing_prune.free_expert_rows, v2_32.routing_prune.free_min_rank),
+                (4, 2),
+            )
+            self.assertEqual(
+                (v2_64.routing_prune.free_expert_rows, v2_64.routing_prune.free_min_rank),
+                (7, 1),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,7 @@ from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
     read_sparse_v2_env_overrides,
     route_dense_and_counts_v2_in_kernel,
     route_topk_and_counts_v2_in_kernel,
+    scale_free_expert_for_batch,
     unpack_w3_u32_chunk_pallas,
 )
 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
@@ -204,6 +205,16 @@ def _apply_v2_env_overrides(
     )
     spec_eff = ov.spec_prime_parts if batch_size <= 128 else 0
     lhs_fp8 = base.lhs_fp8 or (ov.lhs_fp8 and scale_block >= 256)
+    prune = ov.routing_prune
+    if prune.free_expert_rows > 0:
+        f_rows_eff, f_rank_eff = scale_free_expert_for_batch(
+            prune.free_expert_rows, prune.free_min_rank, batch_size
+        )
+        prune = dataclasses.replace(
+            prune,
+            free_expert_rows=f_rows_eff,
+            free_min_rank=max(1, min(7, f_rank_eff)),
+        )
 
     return dataclasses.replace(
         base,
@@ -222,7 +233,7 @@ def _apply_v2_env_overrides(
         spec_prime_parts=spec_eff,
         hoist_scales=ov.hoist_scales,
         contig_parts_mode=contig_mode,
-        routing_prune=ov.routing_prune,
+        routing_prune=prune,
     )
 
 

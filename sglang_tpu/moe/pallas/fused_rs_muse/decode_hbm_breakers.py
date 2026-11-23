@@ -203,6 +203,54 @@ def read_decode_routing_prune_config() -> DecodeRoutingPruneConfig:
     )
 
 
+def read_free_expert_scale_mode() -> str:
+    """Read ``SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE`` (defaults to ``'b64'``)."""
+    return str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", "b64")).strip()
+
+
+def scale_free_expert_for_batch(
+    free_rows: int,
+    free_min_slot: int,
+    batch_size: int,
+    mode: str | None = None,
+) -> tuple[int, int]:
+    """Scale ``(free_rows, free_min_slot)`` for tail decode batch buckets (#2407).
+
+    Calibrates ``free_rows`` tuned at steady-state ``B=64`` down to ``B=16, 32``
+    so tail decode steps (e.g. ``<=7`` real tokens padded to ``B=16`` or ``c=16``
+    shared-prefix decode) never collapse real tokens to ``top-1``, while leaving
+    ``B >= 64`` 100% unchanged under default ``mode='b64'``.
+    """
+    if free_rows <= 0:
+        return 0, free_min_slot
+    eff_mode = (
+        read_free_expert_scale_mode() if mode is None else str(mode)
+    ).strip().lower()
+    if eff_mode in ("0", "false", "no", "off", "none"):
+        return free_rows, free_min_slot
+    if not eff_mode:
+        eff_mode = "b64"
+    if eff_mode == "ge32":
+        if batch_size < 32:
+            return 0, free_min_slot
+        if batch_size < 64:
+            scaled = max(1, int(round(free_rows * batch_size / 64.0)))
+            return scaled, max(free_min_slot, 2)
+        return free_rows, free_min_slot
+    if eff_mode not in ("b64", "b64_ms16", "b64_all"):
+        raise ValueError(
+            f"Invalid SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE={eff_mode!r}; "
+            "expected one of ('b64', 'b64_ms16', 'b64_all', 'ge32', 'off')"
+        )
+    if batch_size < 64 or eff_mode == "b64_all":
+        scaled = max(1, int(round(free_rows * batch_size / 64.0)))
+    else:
+        scaled = free_rows
+    ms_cap_b = 16 if eff_mode == "b64_ms16" else 32
+    eff_min_slot = max(free_min_slot, 2) if batch_size <= ms_cap_b else free_min_slot
+    return scaled, eff_min_slot
+
+
 def read_sparse_v2_env_overrides() -> SparseV2EnvOverrides:
     """Read granular ``SparseDecodeV2Config`` overrides from environment."""
     m_bkt_str = str(_env_raw("SGLANG_TPU_MUSE_KERNEL_DECODE_M_BUCKETS", ""))
