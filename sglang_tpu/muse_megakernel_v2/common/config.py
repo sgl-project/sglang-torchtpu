@@ -193,6 +193,9 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # stack2 pipelined step: global-layer loops run per layer (no pool dispatch tree) and a
     # pair's KV refill is issued inside the step's compute, right after its slots are read
     attn_refill_inline: bool = False
+    # with attn_refill_inline: how many global layers (in layer order) get their own inline
+    # loop copy; 0 means all
+    attn_refill_inline_layers: int = 0
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True

@@ -1388,8 +1388,24 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 carry4 = jax.lax.fori_loop(
                     0, k_full, functools.partial(step_body, ref=KV[l]), init4
                 )
-            elif inline or hoist_rows is None or hoist_kv:
-                # inline refill needs the layer's pool without a branch: a loop per layer
+            elif inline:
+                # inline refill needs the layer's pool without a branch: a loop per layer.
+                # Each copy is a whole step and too many slow unchanged code (SWA attention),
+                # so layers past attn_refill_inline_layers keep the tree refill
+                inl = gls[: c.attn_refill_inline_layers or len(gls)]
+
+                def leaf(x):
+                    if x in inl:
+                        return lambda r=KV[x]: (
+                            jax.lax.fori_loop(
+                                0, k_full, functools.partial(step_body, ref=r), init4
+                            ),
+                            k_full,
+                        )
+                    return lambda: (init4, jnp.int32(0))
+
+                carry4, k_full = branch_layers(gls, [leaf(x) for x in gls])
+            elif hoist_rows is None or hoist_kv:
                 carry4, k_full = hoisted(step_body, k_full, init4)
             else:
                 carry4, k_full = init4, 0

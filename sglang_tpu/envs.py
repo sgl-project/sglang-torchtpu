@@ -790,6 +790,10 @@ class TpuEnvs:
     # KV refill DMAs issued inside the step's compute from per-layer loops.
     SGLANG_TPU_MUSE_MK_ATTN_INTERLEAVE = EnvBool(True)
     SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE = EnvBool(True)
+    # Global layers given an inline-refill loop copy (MKConfig.attn_refill_inline_layers);
+    # 0: all. Each copy is a whole step; past 4 the program slows unchanged code (SWA
+    # attention +1% at 6, +3-6% at 16, q4 b4-b16).
+    SGLANG_TPU_MUSE_MK_ATTN_REFILL_INLINE_LAYERS = EnvInt(4)
 
     @classmethod
     def names(cls) -> list[str]:
