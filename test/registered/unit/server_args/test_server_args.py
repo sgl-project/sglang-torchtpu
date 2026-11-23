@@ -3150,6 +3150,27 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_hicache_swa_fraction_needs_a_share_of_hicache_size(self):
+        """The fraction splits --hicache-size, so a ratio-sized host pool rejects
+        it instead of ignoring it."""
+        for fraction, size, error in (
+            (0.3, 56, None),
+            (0.3, 0, "pass --hicache-size"),
+            (0.0, 56, r"in \(0, 1\)"),
+            (1.0, 56, r"in \(0, 1\)"),
+        ):
+            with self.subTest(fraction=fraction, size=size):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_size=size,
+                    hicache_swa_fraction=fraction,
+                )
+                if error is None:
+                    handle_hicache(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
