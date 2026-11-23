@@ -89,6 +89,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    prefill_chunk_share_min_tokens: A[
+        int,
+        "While a prompt is prefilled in chunks, waiting requests whose uncached prefill fits share each prefill batch with it, in queue order, passing over longer ones; the chunked prompt keeps at least this many tokens of each batch. Cuts the wait of short turns behind a long cold prompt. Not for --schedule-policy shortest-prefill-first, which reserves room for shorter prefills itself. 0 disables.",
+    ] = 0
     schedule_policy: A[
         str,
         Arg(

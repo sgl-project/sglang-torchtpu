@@ -1624,6 +1624,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
             bounded_lpm_enabled=self.dllm_config is None,
+            prefill_chunk_share_min_tokens=get_schedule().prefill_chunk_share_min_tokens,
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -5048,7 +5049,7 @@ class Scheduler(
         resumed_req = self.chunked_req
         if resumed_req is not None:
             resumed_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.policy.continuing_chunk_limit(
                 resumed_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
@@ -5125,6 +5126,14 @@ class Scheduler(
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
+                continue
+            # Chunk sharing passes over a request too long for what the continuing
+            # chunk left this pass, instead of ending admission at it.
+            if self.chunked_req is not None and not self.policy.fits_shared_chunk(
+                req, adder.rem_chunk_tokens
             ):
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)

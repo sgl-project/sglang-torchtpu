@@ -28,6 +28,108 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
     )
 
 
+class TestPrefillChunkShare(CustomTestCase):
+    def make_policy(self, share_min_tokens, schedule_policy="fcfs"):
+        return SchedulePolicy(
+            policy=schedule_policy,
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            prefill_chunk_share_min_tokens=share_min_tokens,
+        )
+
+    def make_req(self, rid, uncached, *, cached=0):
+        req = _make_req(rid, "", list(range(uncached + cached)))
+        req.full_untruncated_fill_ids = req.origin_input_ids[:]
+        req.num_matched_prefix_tokens = cached
+        req.prefix_len = cached
+        return req
+
+    def test_long_waiter_is_passed_over_not_a_stop(self):
+        """In queue order, a cold prompt ahead of a short turn does not keep the
+        turn out of the continuing chunk's batch."""
+        policy = self.make_policy(1024)
+        self.assertEqual(
+            policy.continuing_chunk_limit(
+                self.make_req("continuation", 300000),
+                [self.make_req("cold", 200000), self.make_req("turn", 1500)],
+                4096,
+                256,
+                processed_tokens=0,
+            ),
+            2560,
+        )
+
+    def test_continuation_keeps_the_page_rounded_minimum(self):
+        policy = self.make_policy(1000)
+        continuation = self.make_req("continuation", 300000)
+        for budget, waiting, expected in [
+            # The second request would leave the continuation under 1024 tokens.
+            (4096, [self.make_req("a", 2000), self.make_req("b", 2000)], 2048),
+            # Mixed decode rows leave a budget off the page grid.
+            (4090, [self.make_req("a", 3000)], None),
+            (4090, [self.make_req("a", 2500)], 1280),
+        ]:
+            with self.subTest(budget=budget, waiting=[r.rid for r in waiting]):
+                self.assertEqual(
+                    policy.continuing_chunk_limit(
+                        continuation, waiting, budget, 256, processed_tokens=0
+                    ),
+                    expected,
+                )
+
+    def test_cached_turn_is_sized_by_its_uncached_tail(self):
+        """FCFS never matches the waiting queue itself, so the reservation does:
+        a turn behind a long cached prefix fits by its new tokens alone."""
+        import torch
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        policy = self.make_policy(1024)
+        history = array("q", range(100000))
+        policy.tree_cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids=history, extra_key=None),
+                value=torch.empty(len(history), dtype=torch.bool),
+            )
+        )
+        turn = _make_req("turn", "", list(history) + list(range(-500, 0)))
+        self.assertEqual(turn.num_matched_prefix_tokens, 0)
+        self.assertEqual(
+            policy.continuing_chunk_limit(
+                self.make_req("continuation", 300000),
+                [turn],
+                4096,
+                256,
+                processed_tokens=0,
+            ),
+            3584,
+        )
+        self.assertTrue(policy.fits_shared_chunk(turn, 512))
+
+    def test_off_by_default_and_rejected_where_it_does_not_apply(self):
+        policy = self.make_policy(0)
+        self.assertIsNone(
+            policy.continuing_chunk_limit(
+                self.make_req("continuation", 300000),
+                [self.make_req("turn", 512)],
+                4096,
+                256,
+                processed_tokens=0,
+            )
+        )
+        self.assertTrue(policy.fits_shared_chunk(self.make_req("cold", 200000), 0))
+        for schedule_policy, share_min_tokens in [
+            ("shortest-prefill-first", 1024),
+            ("fcfs", -1),
+        ]:
+            with self.subTest(policy=schedule_policy, share=share_min_tokens):
+                with self.assertRaises(ValueError):
+                    self.make_policy(share_min_tokens, schedule_policy)
+
+
 class TestSchedulePolicyHRRN(CustomTestCase):
     def test_calc_priority_hrrn(self):
         """HRRN sorts by response ratio (waited_tokens / uncached_tokens).
