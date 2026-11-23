@@ -709,9 +709,9 @@ def test_global_requirements():
     assert check(_parallel(), _exec(eplb=True), A2A_NONE) == [
         "EPLB and redundant experts off"
     ]
-    assert check(_parallel(), _exec(replay=True), A2A_NONE) == [
-        "decoder SWA bounded replay off (it drops rows per layer)"
-    ]
+    # Decoder SWA bounded replay is allowed: the tail's real rows are a
+    # contiguous prefix and its num_token_non_padded is swapped on entry.
+    assert check(_parallel(), _exec(replay=True), A2A_NONE) == []
     # Fused layers skip TopK: no routed-experts capture, no recorder, and the
     # experts are laid out in logical order.
     assert check(_parallel(), _exec(enable_return_routed_experts=True), A2A_NONE) == [
@@ -995,7 +995,10 @@ def test_fused_forward_matches_current_path(cpu_op, dtype):
     assert _rel_rows(got[:6], want[:6]) < tol
     # Padding rows: routed part exactly 0, so only the shared expert remains.
     np.testing.assert_array_equal(
-        _bits(got[6:].float().numpy()), _bits(shared(x[6:]).float().numpy())
+        # shared() over the same full batch: a CPU matmul over 2 rows may sum in
+        # another order than over all 8 and differ in the last f32 bits.
+        _bits(got[6:].float().numpy()),
+        _bits(shared(x)[6:].float().numpy()),
     )
 
     (call,) = kernel.calls

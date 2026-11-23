@@ -473,10 +473,10 @@ def unmet_global_requirements(parallel, exec_ctx, a2a_backend) -> list[str]:
             "--init-expert-location trivial (experts in logical order)",
             moe_args.init_expert_location == "trivial",
         ),
-        (
-            "decoder SWA bounded replay off (it drops rows per layer)",
-            not features.enable_decoder_swa_bounded_replay,
-        ),
+        # Decoder SWA bounded replay runs layers 21..39 on the decoder tail:
+        # enter_late_layer_tail packs the kept rows first (plan_tail_rows), so
+        # the tail's real rows are a contiguous prefix, and it swaps
+        # num_token_non_padded to that count with the DP row counts. Allowed.
     )
     return [name for name, met in requirements if not met]
 

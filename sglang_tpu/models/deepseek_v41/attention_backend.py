@@ -229,6 +229,12 @@ _METADATA_INPUT_FIELDS = (
 )
 
 
+def _fused_ep_enabled() -> bool:
+    from sglang_tpu.models.deepseek_v41.fused_ep_op import is_dsv41_fused_ep_enabled
+
+    return is_dsv41_fused_ep_enabled()
+
+
 def _register_metadata_pytree() -> None:
     try:
         from jax import tree_util
@@ -1103,6 +1109,18 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 ),
             )
             counts = [rows] * dp_size
+            # Fused EP masks MoE padding rows by num_token_non_padded (this
+            # rank's real rows at the head of its hidden states). The tail
+            # keeps its real rows first (plan_tail_rows), so its count is the
+            # number of valid tail rows; restored on exit.
+            saved_non_padded = getattr(forward_batch, "num_token_non_padded", None)
+            if saved_non_padded is not None and _fused_ep_enabled():
+                forward_batch.num_token_non_padded = (
+                    tail.valid.sum()
+                    .to(saved_non_padded.dtype)
+                    .reshape(saved_non_padded.shape)
+                )
+            saved = (saved[0], saved[1] + (saved_non_padded,))
             forward_batch.global_num_tokens_cpu = counts
             forward_batch.global_num_tokens_gpu = torch.full(
                 (dp_size,), rows, dtype=torch.int64, device=gather.device
@@ -1128,7 +1146,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.tail_forward_batch = None
         if dp is None:
             return
-        published, counts, counts_gpu, buffer_len = dp
+        published, counts, counts_gpu, buffer_len, non_padded = dp
+        if non_padded is not None:
+            forward_batch.num_token_non_padded = non_padded
         forward_batch.global_num_tokens_cpu = counts
         forward_batch.global_num_tokens_gpu = counts_gpu
         forward_batch.global_dp_buffer_len = buffer_len
