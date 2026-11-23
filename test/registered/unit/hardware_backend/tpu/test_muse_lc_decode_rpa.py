@@ -1546,19 +1546,20 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 self.assertGreater(_cosine(out_np[:n_act], ref[:n_act]), min_cos)
                 self.assertEqual(np.max(np.abs(out_np[n_act:])), 0.0)
 
-        for tag, pps, mode, lens in (
-            ("streamdyn_d2_ps512", 10, "w8,c1024,batchfull,dyn4k,pbf16", [17, 512, 1025, 2048, 4096, 4097, 4500, 5119]),
-            ("ring4k_d2_ps512", 10, "w8,c4096,ring4k,pbf16", [17, 512, 1025, 4096, 4097, 4500, 5119, 5120]),
-            ("swapipe_512_odd", 4, "w8,c1024,batchfull,swapipe,pbf16", [17, 100, 255, 256, 400, 511, 512]),
-            ("swapipe_1536_even", 4, "w8,c1024,batchfull,swapipe,pbf16", [17, 512, 1025, 1400, 1535, 1536]),
-            ("swapipe_1536_n1", 4, "w8,c1024,batchfull,swapipe,pbf16", [1500]),
+        for tag, pps, mode, d2, lens in (
+            ("streamdyn_d2_ps512", 10, "w8,c1024,batchfull,dyn4k,pbf16", True, [17, 512, 1025, 2048, 4096, 4097, 4500, 5119]),
+            ("ring4k_d2_ps512", 10, "w8,c4096,ring4k,pbf16", True, [17, 512, 1025, 4096, 4097, 4500, 5119, 5120]),
+            ("swapipe_512_odd", 4, "w8,c1024,batchfull,swapipe,pbf16", True, [17, 100, 255, 256, 400, 511, 512]),
+            ("swapipe_1536_even", 4, "w8,c1024,batchfull,swapipe,pbf16", True, [17, 512, 1025, 1400, 1535, 1536]),
+            ("swapipe_1536_n1", 4, "w8,c1024,batchfull,swapipe,pbf16", True, [1500]),
+            ("swapipe_nod2_1024_odd", 4, "w8,c1024,batchfull,swapipe", False, [17, 512, 513, 777, 1024]),
         ):
             with self.subTest(case=tag):
                 bs, n_act = 16, len(lens)
                 n_phys = bs * pps + 4
                 stock_u8 = np.full((n_phys, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
                 stock_u8[:, :, 0, :2, :] = _rand_fp8_u8(rng, (n_phys, ps, 2, 128))
-                d2_u8 = _pack_stock_cache_to_dense2_u8(stock_u8, ps)
+                cache_u8 = _pack_stock_cache_to_dense2_u8(stock_u8, ps) if d2 else stock_u8
                 pi = np.arange(1, 1 + bs * pps, dtype=np.int32).reshape(bs, pps)
                 kv_lens = np.zeros((bs,), dtype=np.int32)
                 kv_lens[:n_act] = lens
@@ -1569,7 +1570,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     q_bf16,
                     _u8_to_fp8(kn_u8)[:, None, :],
                     _u8_to_fp8(vn_u8)[:, None, :],
-                    _u8_to_fp8(d2_u8),
+                    _u8_to_fp8(cache_u8),
                     jnp.asarray(kv_lens, dtype=jnp.int32),
                     jnp.asarray(pi.ravel(), dtype=jnp.int32),
                     jnp.arange(bs + 1, dtype=jnp.int32),
@@ -1582,7 +1583,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     mode_str=mode,
                     decode_query_size=1,
                     fused_out_pack=1,
-                    kv_pack_dense2=True,
+                    kv_pack_dense2=d2,
                     interpret=True,
                 )
                 ref = _exact_decode_ref(
@@ -1603,21 +1604,23 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
             tpu_info_for_cpu_export(),
         ):
-            for tag, bs, pps, sw, mode, n_grp, exp_sub in (
-                ("exp_sh1x", 16, 513, None, "w8,c4096,batchfull,dyn4k,shared16,q64,shsub512,sh1x,pbf16", 1, "sh1x"),
-                ("exp_dyn4k", 64, 18, None, "w8,c1024,batchfull,dyn4k,pbf16", 0, "streamdyn"),
-                ("exp_ring4k", 64, 532, None, "w8,c4096,ring4k,pbf16", 0, "ring4k"),
-                ("exp_swapipe", 64, 4, 2048, "w8,c1024,batchfull,dyn4k,swapipe", 0, "swapipe"),
+            for tag, bs, pps, sw, mode, n_grp, d2, exp_sub in (
+                ("exp_sh1x", 16, 513, None, "w8,c4096,batchfull,dyn4k,shared16,q64,shsub512,sh1x,pbf16", 1, True, "sh1x"),
+                ("exp_dyn4k", 64, 18, None, "w8,c1024,batchfull,dyn4k,pbf16", 0, True, "streamdyn"),
+                ("exp_ring4k", 64, 532, None, "w8,c4096,ring4k,pbf16", 0, True, "ring4k"),
+                ("exp_swapipe", 64, 4, 2048, "w8,c1024,batchfull,dyn4k,swapipe", 0, True, "swapipe"),
+                ("exp_nod2_swapipe_pk2t64", 64, 4, 2048, "w8,c1024,batchfull,dyn4k,swapipe,pk2t64", 0, False, "swapipe"),
             ):
                 with self.subTest(export=tag):
                     dist_len = 3 + n_grp
+                    phys_pg = 256 if d2 else 512
                     hlo = jax_export.export(
                         jax.jit(
-                            lambda q, kv, g, c, kl, pi, cq, ckv, d, _sw=sw, _m=mode, _ng=n_grp: run_decode_fast_rpa(
+                            lambda q, kv, g, c, kl, pi, cq, ckv, d, _sw=sw, _m=mode, _ng=n_grp, _d2=d2: run_decode_fast_rpa(
                                 q, kv, None, c, kl, pi, cq, ckv, d[:3] if _ng else d,
                                 sm_scale=sm_scale, sliding_window=_sw, k_scale=1.0, v_scale=1.0,
                                 mode_str=_m, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
-                                gate=g, out_norm_eps=1e-5, kv_pack_dense2=True,
+                                gate=g, out_norm_eps=1e-5, kv_pack_dense2=_d2,
                                 shared_pages=d[3:] if _ng else None,
                             )
                         ),
@@ -1626,7 +1629,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         jax.ShapeDtypeStruct((1, bs, 8, 2, 128), jnp.bfloat16),
                         jax.ShapeDtypeStruct((bs, 1, 4, 128), jnp.float8_e4m3fn),
                         jax.ShapeDtypeStruct((bs, 1024), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((4096, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((4096, phys_pg, 1, 4, 128), jnp.float8_e4m3fn),
                         jax.ShapeDtypeStruct((bs,), jnp.int32),
                         jax.ShapeDtypeStruct((bs * pps,), jnp.int32),
                         jax.ShapeDtypeStruct((bs + 1,), jnp.int32),

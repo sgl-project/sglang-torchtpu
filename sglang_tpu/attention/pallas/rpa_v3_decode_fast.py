@@ -61,6 +61,7 @@ class DecodeFastConfig:
     shared_1x_kv: bool = False
     batch_full: bool = False
     pipe_2seq: bool = False
+    pack2_tile_r: int = 16
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -306,6 +307,11 @@ def parse_decode_fast_config(
     )
     batch_full = "batchfull" in toks_cfg
     pipe_2seq = "swapipe" in toks_cfg
+    pack2_tile_r = (
+        64
+        if "pk2t64" in toks_cfg
+        else (32 if "pk2t32" in toks_cfg else 16)
+    )
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -404,6 +410,9 @@ def parse_decode_fast_config(
                 "dyn4k",
                 "batchfull",
                 "swapipe",
+                "pk2t16",
+                "pk2t32",
+                "pk2t64",
                 "ring8k",
             ):
                 continue
@@ -556,6 +565,7 @@ def parse_decode_fast_config(
         shared_1x_kv=shared_1x_kv,
         batch_full=batch_full,
         pipe_2seq=pipe_2seq,
+        pack2_tile_r=pack2_tile_r,
     )
 
 
@@ -2383,6 +2393,8 @@ def _decode_fast_kernel(
                     if cfg.shared_sub_k > 0
                     else max(512, page_size)
                 )
+                if max_ring_rows % sub_k_1x != 0:
+                    sub_k_1x = max(512, page_size)
                 n_sub_1x = max_ring_rows // sub_k_1x
                 half_sub_1x = sub_k_1x // 2
                 n_half_1x = half_sub_1x // 128
@@ -2542,6 +2554,12 @@ def _decode_fast_kernel(
                             else max_ring_rows
                         )
                     )
+                    if max_ring_rows % sub_k != 0:
+                        sub_k = (
+                            max(512, page_size)
+                            if max_ring_rows % max(512, page_size) == 0
+                            else max_ring_rows
+                        )
                     if sub_k < max_ring_rows:
                         half_sub = sub_k // 2
                         n_half_sub = half_sub // 128
@@ -3325,19 +3343,28 @@ def _decode_fast_kernel(
                 cfg.pipe_2seq
                 and probe is None
                 and num_slots >= 4
-                and kv_pack_dense2
                 and (w_pg * page_size) in (512, 1024, 1536)
                 and not cfg.fp8_dots
             ):
                 w_tot = w_pg * page_size
                 half_w = w_tot // 2
                 n_half_b = half_w // 128
+                n_blocks_b = w_tot // 128
                 n_pairs = n_active // 2
 
                 def _prep_qk_seq(slot_s, q_r_s, rf_s, re_s):
                     q_bf = q_vmem_ref[q_r_s]
                     s_new, _, acc0 = init_new_token_state(q_bf, q_r_s)
                     sanitize_slot_boundaries(slot_s, rf_s, re_s, w_pg)
+                    if not kv_pack_dense2:
+                        k_blk = _bkv_fp8_chunk(slot_s, 0, w_tot, kind="k")
+                        s_blk = jnp.matmul(q_bf, k_blk.T, preferred_element_type=jnp.float32)
+                        c_col = _col_iota(0, w_tot, 16)
+                        if sliding_window is not None:
+                            s_blk = jnp.where((c_col >= rf_s) & (c_col < re_s), s_blk, _MASK_LOGIT)
+                        else:
+                            s_blk = jnp.where(c_col < re_s, s_blk, _MASK_LOGIT)
+                        return s_new, acc0, s_blk, None
 
                     def _qk_h(odd: bool) -> jax.Array:
                         k_h = _load_bkv_fp8_split_half(
@@ -3361,6 +3388,39 @@ def _decode_fast_kernel(
                     return s_new, acc0, _qk_h(False), _qk_h(True)
 
                 def _finish_pv_seq(slot_s, q_r_s, s_new, acc0, s_e, s_o):
+                    if not kv_pack_dense2:
+                        if cfg.page_reduce:
+                            s_pgs = jnp.max(s_e.reshape(16, n_blocks_b, 128), axis=1)
+                            m = jnp.maximum(
+                                s_new, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
+                            )
+                        else:
+                            m = jnp.maximum(
+                                s_new, _broadcast_minor_128(jnp.max(s_e, axis=1, keepdims=True))
+                            )
+                        p_new = jnp.exp2((s_new - m) * exp2_scale)
+                        p_blk = jnp.exp2(
+                            (s_e - _broadcast_minor_128_any(m, w_tot)) * exp2_scale
+                        )
+                        if cfg.page_reduce:
+                            l_pgs = jnp.sum(p_blk.reshape(16, n_blocks_b, 128), axis=1)
+                            l_sum = _broadcast_minor_128(jnp.sum(l_pgs, axis=1, keepdims=True)) + p_new
+                        else:
+                            l_sum = _broadcast_minor_128(jnp.sum(p_blk, axis=1, keepdims=True)) + p_new
+                        v_blk = _bkv_fp8_chunk(slot_s, 0, w_tot, kind="v")
+                        p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
+                        pv = jnp.matmul(p_dot, v_blk, preferred_element_type=jnp.float32)
+                        if v_scale is not None and v_scale_val != 1.0:
+                            pv = pv * v_scale_val
+                        acc = pv + p_new * acc0
+                        if interpret_mode:
+                            o_vmem_ref[q_r_s] = (acc / l_sum).astype(jnp.bfloat16)
+                        else:
+                            o_vmem_ref[q_r_s] = (acc * pltpu.reciprocal(l_sum, approx=True)).astype(
+                                jnp.bfloat16
+                            )
+                        return
+
                     s_eo_max = jnp.maximum(s_e, s_o)
                     if cfg.page_reduce:
                         s_pgs = jnp.max(s_eo_max.reshape(16, n_half_b, 128), axis=1)
@@ -3654,7 +3714,12 @@ def _decode_fast_kernel(
 
     if in_kernel_pack2:
         tile_r = max_num_tokens
-        for cand_r in (16, 8):
+        cand_list = (
+            (cfg.pack2_tile_r, 16, 8)
+            if cfg.pack2_tile_r in (32, 64)
+            else (16, 8)
+        )
+        for cand_r in cand_list:
             if max_num_tokens >= cand_r and max_num_tokens % cand_r == 0:
                 tile_r = cand_r
                 break
@@ -3880,6 +3945,8 @@ def run_decode_fast_rpa(
             scope_name += "-batchfull"
         if run_cfg.pipe_2seq:
             scope_name += "-swapipe"
+        if run_cfg.pack2_tile_r != 16:
+            scope_name += f"-pk2t{run_cfg.pack2_tile_r}"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
@@ -4118,6 +4185,7 @@ def run_decode_fast_rpa(
             fine_gears=cfg.fine_gears,
             batch_full=cfg.batch_full,
             pipe_2seq=cfg.pipe_2seq,
+            pack2_tile_r=cfg.pack2_tile_r,
         )
         active_mask = jnp.arange(max_num_seqs) < jnp.clip(
             distribution[0], 0, max_num_seqs
