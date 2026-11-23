@@ -42,7 +42,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.dsv4.dsv4_attention_backend import (
     DSV4TPUAttnBackend,
@@ -240,10 +240,15 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
             get_kv_transfer_buf_infos,
             setup_state_kv_args,
         )
+        from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
         pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        # PD peers register a static pool through the storage the scheduler
+        # builds over its allocator (`kv_storage_of`).
+        allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+        storage = StaticKVStorage(None, allocator, num_hidden_layers=6)
 
-        kv_ptrs, kv_lens, kv_items = get_kv_transfer_buf_infos(pool)
+        kv_ptrs, kv_lens, kv_items = get_kv_transfer_buf_infos(storage)
         # 2 C4 NoPE + 2 C4 RoPE + 2 C4 Indexer + 2 C128 HCA = 8 full-page tensors
         self.assertEqual(len(kv_ptrs), 8)
         self.assertEqual(
@@ -255,7 +260,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         )
 
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, pool, total_kv_layers=6)
+        setup_state_kv_args(kv_args, storage, total_kv_layers=6)
         self.assertEqual(
             kv_args.state_types,
             [StateType.SWA, StateType.DSV4_REQUEST_STATE],
@@ -606,6 +611,7 @@ class TestDSV4TPUPatches(CustomTestCase):
 
         # Verify build_tpu_dsv4_kv_pool patches DeepSeekV4TokenToKVPool and registers C4 state reset
         req_to_token_pool = MagicMock()
+        req_to_token_pool._on_alloc_rows = None  # no core hook registered
         kvc_stub = SimpleNamespace(is_draft_worker=False)
 
         def fake_original(kvc_arg, **kw):
@@ -622,12 +628,135 @@ class TestDSV4TPUPatches(CustomTestCase):
             pool.clear_c4_req_states
         )
 
+    def test_tpu_row_reset_runs_after_the_core_pool_hook(self):
+        """The core DSV4 pool build registers its own row-allocation hook (C4
+        ring and request-window resets); the TPU reset runs after it rather than
+        tripping the pool's one-hook registration."""
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang_tpu.hooks.dsv4 import chain_on_alloc_rows
+
+        pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        calls = []
+        pool.register_on_alloc_rows(lambda rows: calls.append(("core", rows)))
+        chain_on_alloc_rows(pool, lambda rows: calls.append(("tpu", rows)))
+        pool._on_alloc_rows([3, 5])
+        self.assertEqual(calls, [("core", [3, 5]), ("tpu", [3, 5])])
+
+        fresh = ReqToTokenPool.__new__(ReqToTokenPool)
+        chain_on_alloc_rows(fresh, calls.append)
+        fresh._on_alloc_rows([7])
+        self.assertEqual(calls[-1], [7])
+
+    def test_engram_gate_keeps_image_rows(self):
+        """The TPU engram gate takes upstream's image-token arguments: rows whose
+        input id is the image token keep x, the others are gated."""
+        from sglang_tpu.models.deepseek_v41.hooks import tpu_dsv41_engram_gate
+
+        torch.manual_seed(0)
+        hc, dim, rows = 2, 4, 3
+        x = torch.randn(rows, hc, dim)
+        kv = torch.randn(rows, (hc + 1) * dim)
+        q, k = torch.ones(hc, dim), torch.ones(hc, dim)
+        plain = tpu_dsv41_engram_gate(None, x, kv, q, k, 1e-6, 1e-6)
+        ids = torch.tensor([5, 9, 5])
+        masked = tpu_dsv41_engram_gate(None, x, kv, q, k, 1e-6, 1e-6, ids, 9)
+        self.assertTrue(torch.equal(masked[1], x[1]))
+        self.assertTrue(torch.equal(masked[0], plain[0]))
+        self.assertFalse(torch.equal(plain[1], x[1]))
+
+    def test_encoder_replay_hook_keeps_decoder_replay_off(self):
+        """The validator runs with get_platform reporting CUDA, where it turns
+        decoder SWA bounded replay on by default; the TPU attention backend has
+        none, so an unset flag is declared off first and an explicit one kept."""
+        from unittest import mock
+
+        from sglang.srt.arg_groups import deepseek_v4_hook as validator
+        from sglang_tpu.models.deepseek_v41.hooks import allow_tpu_dsv41_encoder_replay
+
+        seen = []
+
+        def original(server_args):
+            cfg = validator.resolving_view(server_args)
+            seen.append(
+                (
+                    validator.get_platform().is_cuda,
+                    cfg.enable_decoder_swa_bounded_replay,
+                )
+            )
+
+        v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+        tpu = SimpleNamespace(is_tpu=True)
+        with (
+            mock.patch("sglang.srt.runtime_context.get_platform", lambda: tpu),
+            mock.patch.object(validator, "model_config_of", lambda _: v41),
+        ):
+            for decoder in (None, True):
+                args = SimpleNamespace(
+                    enable_encoder_swa_bounded_replay=True,
+                    enable_decoder_swa_bounded_replay=decoder,
+                )
+                allow_tpu_dsv41_encoder_replay(original, args)
+        self.assertEqual(seen, [(True, False), (True, True)])
+
+    def test_hc_split_sinkhorn_runs_the_torch_reference_off_cuda(self):
+        """Off CUDA the TileLang sinkhorn is replaced by the torch reference with
+        the same arguments; the original is never called."""
+        from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+        from sglang_tpu.models.deepseek_v41.hooks import tpu_dsv4_hc_split_sinkhorn
+
+        def tilelang(*args, **kwargs):
+            raise AssertionError("TileLang sinkhorn called off CUDA")
+
+        torch.manual_seed(0)
+        hc = 4
+        mixes = torch.randn(3, 1, (2 + hc) * hc)
+        scale, base = torch.rand(3), torch.randn((2 + hc) * hc)
+        got = tpu_dsv4_hc_split_sinkhorn(tilelang, mixes, scale, base, hc, 20, 1e-6)
+        want = _hc_split_sinkhorn_torch(mixes, scale, base, hc, 20, 1e-6)
+        for g, w in zip(got, want):
+            self.assertTrue(torch.equal(g, w))
+
+    def test_v41_backend_has_no_decoder_replay_tail(self):
+        """TpModelWorker reads attn_backend.tail_forward_metadata after a folded
+        encoder replay; the TPU backend has no decoder replay, so it is None."""
+        from sglang_tpu.models.deepseek_v41.attention_backend import (
+            DSV41TPUAttnBackend,
+        )
+
+        self.assertIsNone(DSV41TPUAttnBackend.tail_forward_metadata)
+
+    def test_hc_sublayers_read_through_the_layer(self):
+        """attn_hc rebuilds from the layer's current attributes on every read, so
+        a swapped parameter (the tracer's placeholder) reaches the tuple; it is
+        None until the layer builds it."""
+        from collections import namedtuple
+
+        from sglang_tpu.models.deepseek_v41.hooks import _live_hc_property
+
+        Sub = namedtuple("Sub", "cfg fn scale base norm tf32 bf16")
+
+        class Layer:
+            attn_hc = _live_hc_property(
+                "attn_hc", ("fn", "scale", "base", "norm", "tf32", "bf16"), Sub
+            )
+
+        layer = Layer()
+        layer.hc_cfg, layer.fn, layer.scale = "cfg", torch.zeros(2), torch.ones(1)
+        layer.base, layer.norm, layer.tf32, layer.bf16 = torch.ones(1), None, None, None
+        layer.attn_hc = None
+        self.assertIsNone(layer.attn_hc)
+        layer.attn_hc = Sub("cfg", layer.fn, layer.scale, layer.base, None, None, None)
+        placeholder = torch.full((2,), 7.0)
+        layer.fn = placeholder
+        self.assertIs(layer.attn_hc.fn, placeholder)
+        self.assertEqual(layer.attn_hc.cfg, "cfg")
+
     def test_dsv4_tpu_compressor_and_resolution_hooks(self):
         from unittest.mock import MagicMock
 
         from sglang.srt.arg_groups import model_override_base, resolution_hooks
         from sglang.srt.environ import envs
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_tpu.hooks.dsv4 import (
             _tpu_deepseek_v4_env_adjustments,
             _tpu_deepseek_v4_overrides,
@@ -687,8 +816,8 @@ class TestDSV4TPUPatches(CustomTestCase):
         server_args = SimpleNamespace(
             device="tpu",
             model_path="/tmp/fake-dsv4",
+            # A fixture-supplied config carries no cache key and is used as is.
             _model_config=SimpleNamespace(hf_config=hf),
-            _model_config_built_from="/tmp/fake-dsv4",
         )
         prev_called = []
         with (
@@ -700,6 +829,7 @@ class TestDSV4TPUPatches(CustomTestCase):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
             envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.override(False),
+            envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.override(True),
         ):
             _tpu_deepseek_v4_env_adjustments(
                 server_args, lambda sa: prev_called.append(sa)
@@ -713,32 +843,32 @@ class TestDSV4TPUPatches(CustomTestCase):
             self.assertFalse(envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             self.assertFalse(envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get())
             self.assertTrue(envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get())
+            self.assertFalse(envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get())
 
     def test_dsv4_tpu_moe_mhc_and_model_hooks(self):
         from unittest.mock import patch
 
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.hash_topk import HashTopK
-        from sglang.srt.layers.moe.mhc_post_fusion import (
-            MhcPostFusion,
-            current_mhc_post_fusion,
-            use_mhc_post_fusion,
-        )
+        from sglang.srt.runtime_context import get_context
         from sglang_tpu.hooks.dsv4 import (
             disable_tpu_dsv4_wo_a_fp8_gemm,
             forward_tpu_dsv4_hash_topk,
             forward_tpu_dsv4_hash_topk_torch,
             get_tpu_dsv4_kernel_num_heads,
             skip_tpu_dsv4_prewarm_mhc_kernels,
-            tpu_dsv4_current_mhc_post_fusion,
             tpu_dsv4_silu_and_mul_clamp,
         )
+
+        # HashTopK reads the published model config bag at construction.
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
 
         # 1. HashTopK hooks: int64 gather, float32 weights, out-of-place padded row mask
         topk = HashTopK(
             topk=2,
             num_experts=8,
-            num_fused_shared_experts=0,
             vocab_size=16,
             scoring_func="sqrtsoftplus",
         )
@@ -780,26 +910,44 @@ class TestDSV4TPUPatches(CustomTestCase):
         expected = (torch.nn.functional.silu(g_ref) * u_ref).to(torch.bfloat16)
         torch.testing.assert_close(x_out, expected)
 
-        # 3. current_mhc_post_fusion hook
-        dummy_state = MhcPostFusion(
-            residual=torch.zeros(1), post=None, comb=None, stats_stream=None
-        )
-        with use_mhc_post_fusion(dummy_state):
-            self.assertIs(
-                tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion), dummy_state
-            )
-            with patch("torch.compiler.is_compiling", return_value=True):
-                self.assertIsNone(
-                    tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion)
-                )
-
-        # 4. deepseek_v4 model hooks
+        # 3. deepseek_v4 model hooks
         self.assertFalse(disable_tpu_dsv4_wo_a_fp8_gemm(None, object()))
         attn_stub = SimpleNamespace(n_local_heads=16, attn_tp_size=8, n_heads=128)
         self.assertEqual(get_tpu_dsv4_kernel_num_heads(None, attn_stub, 4), 16)
         model_stub = SimpleNamespace(_mhc_prewarmed_at_load=False)
         skip_tpu_dsv4_prewarm_mhc_kernels(None, model_stub)
         self.assertTrue(model_stub._mhc_prewarmed_at_load)
+
+
+class TestTpuDsv4KvPoolOutOfTreeCheck(CustomTestCase):
+    def test_only_the_dsv4_pool_check_is_lifted(self):
+        """The out-of-tree TPU platform must reach the DeepSeek-V4 pool builder,
+        or every DeepSeek-V4 / V4.1 server fails while building its KV pool; the
+        builder's other out-of-tree checks must still raise."""
+        import inspect
+
+        import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+        from sglang_tpu.hooks import dsv4 as hooks
+
+        build = inspect.unwrap(kvc_mod.KVCacheConfigurator._build_token_to_kv_pool)
+        self.assertIn(
+            f'subsystem="{hooks._DSV4_POOL_SUBSYSTEM}"', inspect.getsource(build)
+        )
+        oot = SimpleNamespace(is_out_of_tree=lambda: True, device_name="tpu")
+        reject = kvc_mod.reject_out_of_tree_path
+        with self.assertRaises(NotImplementedError):
+            reject(oot, subsystem=hooks._DSV4_POOL_SUBSYSTEM)
+
+        def build_pools(kvc):
+            kvc_mod.reject_out_of_tree_path(oot, subsystem=hooks._DSV4_POOL_SUBSYSTEM)
+            with self.assertRaises(NotImplementedError):
+                kvc_mod.reject_out_of_tree_path(
+                    oot, subsystem="the HiSparse DSA KV pool"
+                )
+            return "pool"
+
+        self.assertEqual(hooks.allow_tpu_dsv4_kv_pool(build_pools, None), "pool")
+        self.assertIs(kvc_mod.reject_out_of_tree_path, reject)
 
 
 if __name__ == "__main__":

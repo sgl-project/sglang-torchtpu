@@ -56,7 +56,7 @@ def _qualifies(tree_cache) -> bool:
         isinstance(tree_cache, UnifiedRadixCache)
         and isinstance(tree_cache.tree_core, UnifiedTreeCore)
         and set(tree_cache.tree_components) == {ComponentType.FULL, ComponentType.SWA}
-        and tree_cache.swa_reprefill_tail_tokens() == 0
+        and tree_cache.window_reprefill_tail_tokens() == 0
     )
 
 
@@ -79,7 +79,7 @@ def prefix_depth(tree_core, node_id) -> int:
 def swa_prefix_match(tree_core, match_result) -> SwaPrefixMatch:
     reusable = max(
         prefix_depth(tree_core, match_result.best_match_node),
-        len(match_result.device_indices) + match_result.host_hit_length,
+        match_result.device_prefix_len + match_result.host_hit_length,
     )
     # Producers that skip the tree walk leave the full-KV length at 0;
     # whatever the match reuses has full KV too.
@@ -102,7 +102,7 @@ def _charge_scheduled_chunk(adder, req) -> None:
     if req.retracted_stain or req not in _miss_ranges:
         return
     start, end = _miss_ranges[req]
-    tokens = max(0, min(end, req.extend_range.end) - max(start, req.extend_range.start))
+    tokens = max(0, min(end, req.extend_end) - max(start, req.prefix_len))
     if tokens:
         _adder_tokens[adder] = _adder_tokens.get(adder, 0) + tokens
 

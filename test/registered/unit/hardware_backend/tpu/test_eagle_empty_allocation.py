@@ -9,6 +9,7 @@ import torch
 
 import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as spec_utils
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -18,10 +19,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def test_page_reserve_boundary(committed, expected_new):
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=64, kv_committed_len=n),
+            kv=ReqKvInfo(req_pool_idx=i + 1, kv_allocated_len=64, kv_committed_len=n),
             decode_batch_idx=7,
         )
-        for n in (1, committed)
+        for i, n in enumerate((1, committed))
     ]
     batch = SimpleNamespace(
         maybe_evict_swa=Mock(),
@@ -37,6 +38,7 @@ def test_page_reserve_boundary(committed, expected_new):
         enable_overlap=False,
         req_pool_indices=torch.tensor([1, 2]),
         req_pool_indices_cpu=torch.tensor([1, 2]),
+        seq_lens_cpu=torch.tensor([1, committed]),
         device=torch.device("cpu"),
     )
     # prepare_device_accept_tpu is imported under `if _is_tpu`, so it is absent

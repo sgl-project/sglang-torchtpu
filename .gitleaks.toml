@@ -41,7 +41,9 @@ regexes = [
   '''^[a-z_][a-z0-9_.]*=[A-Za-z0-9_.]+$''',
   '''^[A-Za-z0-9]+ForCausalLM$''',
   '''^h100-235b-bf16-(instruct|thinking)$''',
-  '''^(0123456789abcdef|fedcba9876543210)+$''',
+  '''^(0123456789abcdef|fedcba9876543210|abcdef0123456789)+$''',
+  # UPPER_SNAKE constant names, optionally private or module-qualified.
+  '''^([a-z_][a-z0-9_]*\.)?_?[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$''',
 ]
 
 # Bare hex digests (checksums, commit SHAs, test keys) in tests and in the

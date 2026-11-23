@@ -14,7 +14,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -282,7 +282,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         stack = enter_scope(self, ExitStack())
         context = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=False),
+            features=SimpleNamespace(
+                enable_custom_logit_processor=False, enable_watermark=False
+            ),
         )
         stack.enter_context(
             patch(
@@ -459,7 +461,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
             "meta"  # An accidental upload is observable without TPU hardware.
         )
         resolve_forward_inputs(
-            batch, SimpleNamespace(_resolve_spec_extras=lambda batch: None)
+            batch,
+            SimpleNamespace(
+                _resolve_spec_extras=lambda batch: None,
+                takes_deferred_relay=lambda batch: False,
+                flush_deferred_relay=lambda: None,
+            ),
         )
         self.assertIs(batch.input_ids, prompt)
         self.assertIsNone(batch.prefill_input_ids_cpu)
@@ -485,7 +492,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
         batch.mix_running_indices = torch.tensor([0])
         with self.assertRaisesRegex(AssertionError, "mixed chunks"):
             resolve_forward_inputs(
-                batch, SimpleNamespace(_resolve_spec_extras=lambda batch: None)
+                batch,
+                SimpleNamespace(
+                    _resolve_spec_extras=lambda batch: None,
+                    takes_deferred_relay=lambda batch: False,
+                    flush_deferred_relay=lambda: None,
+                ),
             )
 
     def test_worker_publishes_plugin_owned_draft_state(self):
@@ -970,8 +982,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsInstance(init(True).sampler, TpuSampler)
 
     def test_worker_rejects_mixed_phase_dp_steps(self):
-        """Under DP attention, prefill coordination or a skipped MLP sync lets one
-        rank prefill while another decodes; the worker must refuse, not desync."""
+        """Under DP attention, prefill coordination lets one rank prefill while
+        another decodes; the worker must refuse, not desync."""
         from sglang.srt.environ import envs as srt_envs
         from sglang_tpu.experimental.speculative import base_spec_worker
         from sglang_tpu.experimental.speculative.block_spec_worker import (
@@ -989,7 +1001,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 # Reached only past the mixed-phase check.
                 raise _Stop
 
-        def init(*, dp_attention, coordination=False, skip_mlp_sync=False):
+        def init(*, dp_attention, coordination=False):
             runner = SimpleNamespace(sampler=_tpu_sampler())
             worker = object.__new__(TpuBlockSpecWorker)
             with (
@@ -1003,13 +1015,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     "is_dp_attention_enabled",
                     return_value=dp_attention,
                 ),
-                patch.object(
-                    base_spec_worker,
-                    "get_spec",
-                    return_value=SimpleNamespace(
-                        speculative_skip_dp_mlp_sync=skip_mlp_sync
-                    ),
-                ),
                 srt_envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(
                     coordination
                 ),
@@ -1021,11 +1026,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     3,
                 )
 
-        for flags in ({"coordination": True}, {"skip_mlp_sync": True}):
-            with self.assertRaisesRegex(NotImplementedError, "mixed prefill/decode"):
-                init(dp_attention=True, **flags)
-            with self.assertRaises(_Stop):
-                init(dp_attention=False, **flags)
+        with self.assertRaisesRegex(NotImplementedError, "mixed prefill/decode"):
+            init(dp_attention=True, coordination=True)
+        with self.assertRaises(_Stop):
+            init(dp_attention=False, coordination=True)
         with self.assertRaises(_Stop):
             init(dp_attention=True)
 

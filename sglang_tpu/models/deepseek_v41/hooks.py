@@ -51,18 +51,69 @@ tpu_dsv41_hc_combine
   Why: the shifted-mHC forward (DeepseekV4DecoderLayer._hc_combine and the
        model's final hc_head) calls the Triton hc_combine with no device
        guard; Dynamo cannot trace a Triton launch on TPU.
-  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_combine computes the same
+  How: AROUND sglang.kernels.ops.layernorm.mhc.mhc_combine computes the same
        fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
+
+tpu_dsv4_hc_split_sinkhorn
+  Why: deepseek_v4_mhc._mix_stats_impl takes its sinkhorn from get_mhc_ops()
+       on XPU only and calls the TileLang hc_split_sinkhorn everywhere else,
+       which does not run on TPU ("tilelang is not installed").
+  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn runs the
+       torch reference (deepseek_v4._hc_split_sinkhorn_torch, the same
+       arguments) for non-CUDA tensors.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: _mix_stats_impl takes the sinkhorn from get_mhc_ops() on every
+       platform.
+
+tpu_dsv4_live_hc_sublayers
+  Why: DeepseekV4DecoderLayerBase keeps attn_hc / ffn_hc, HcSubLayer named
+       tuples holding the layer's mHC parameters by reference. The direct
+       tracer swaps parameters for placeholders by attribute path and cannot
+       reach inside a tuple, so a trace read the real hc fn and build_mlir
+       rejected it as an unprovided argument.
+  How: AROUND DeepseekV4DecoderLayerBase.__init__ installs, once per class,
+       attn_hc / ffn_hc properties that rebuild the tuple from the layer's
+       current attributes on every read (the placeholders while tracing); the
+       setter records only whether the layer built them.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: the direct tracer swaps tensors inside named tuples, or
+       HcSubLayer reads the parameters through the layer.
+
+tpu_dsv4_fence_hc_mix_stats
+  Why: deepseek_v4_mhc._mix_stats_impl runs the mixing GEMM on the flattened
+       hyper-connection state right after the previous sublayer's post-combine;
+       XLA folds that producer into the GEMM operand in a transposed layout the
+       TPU fusion emitter cannot window, and the compile aborts.
+  How: AROUND _mix_stats_impl passes the state through an optimization
+       barrier (hc_fence) on non-CUDA tensors. Values unchanged.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: the TPU compiler windows that fusion.
 
 tpu_dsv41_engram_gate
   Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
   How: AROUND engram_gate keeps the original on CUDA; elsewhere computes the
-       same gate with torch.where(dot >= 0, |dot|', -|dot|') for the sign.
+       same gate via engram_host.signed_sqrt (int32 sign-bit check so -0.0
+       preserves its sign, matching copysign).
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
+
+tpu_dsv41_engram_worker_forward
+  Why: hashing on CPU from device input_ids/positions stalls every decode step
+       on D2H copies and oversubscribes PyTorch's intra-op thread pool across
+       8 scheduler processes. Core TpModelWorker.forward_batch_generation has
+       no host-input preparation seam before ForwardBatch construction.
+  How: AROUND TpModelWorker.forward_batch_generation captures the scheduled
+       batch's host Engram windows (including folded encoder SWA replay prefixes
+       and speculative extends) without waiting for step N-1's sampled token
+       (overlap holes are resolved right before the compiled forward), records
+       PendingTokens after non-speculative sampling, and clears per-step state
+       in finally. Unsupported modes (warmup, non-folded two-pass SWA replay
+       hits, beam search, PP/CP/DCP > 1) fall back cleanly.
+  Upstream PR or issue: not filed (ported from sgl-project/sglang-torchtpu#2092).
+  Remove when: upstream exposes a worker-level host-input preparation seam.
 
 tpu_dsv41_engram_embed_init, tpu_dsv41_engram_embed_forward,
 tpu_dsv41_hasher_forward
@@ -72,14 +123,73 @@ tpu_dsv41_hasher_forward
        and its offloaded gather halted a SparseCore. _HostTable pins its
        mapping with cudaHostRegister, and the core lookup reads it from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
-       builds the table with cudaHostRegister stubbed out. The V4 compile
-       policy (deepseek_v41/compile_policy.py) hashes on the host and stages
-       raw rows after padding; inside the graph EngramHasher.forward returns
-       the staged row ids and EngramEmbedding.forward dequantizes the staged
-       rows.
+       builds the table with cudaHostRegister and the GPU row-order probe
+       (sglang#45879) stubbed out. The V4 compile
+       policy and its forward shim (deepseek_v41/compile_policy.py) hash on the
+       host and stage packed rows via double-buffered async raw DMA; inside the
+       graph EngramHasher.forward returns the staged row ids and
+       EngramEmbedding.forward unpacks and dequantizes the staged rows.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: the device can read host tables, or the in-graph HBM lookup
        is correct under attention DP.
+
+allow_tpu_dsv41_encoder_replay
+  Why: validate_deepseek_v41_features rejects --enable-encoder-swa-bounded-replay
+       on hardware other than CUDA and gfx950 with one inline check, so the TPU
+       request window and folded replay rows cannot be enabled. Every other check
+       (prefill graphs, CP, ROCm DP, PD, mixed chunk, LoRA, radix sessions) must
+       still apply.
+  How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
+       original with the module's get_platform reporting CUDA and not ROCm, the
+       only two platform facts the validator reads. Since the validator also
+       turns decoder SWA bounded replay on by default on CUDA, which the TPU
+       attention backend does not serve, an unset
+       --enable-decoder-swa-bounded-replay is declared off first.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: the validator asks current_platform whether it folds encoder
+       SWA replay.
+
+fold_tpu_dsv41_encoder_replay
+  Why: encoder_swa_replay._fold_batch concatenates each hit's replay rows with
+       the scheduled rows assuming one device and int64 slots: replay token ids
+       go to runner.device and replay slots are read from req_to_token. On TPU
+       req_to_token is host-resident (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST), the
+       DSpark spec worker stages input_ids and out_cache_loc on the host, and the
+       compiled extend graph rejects an int64 out_cache_loc (it is int32).
+  How: AROUND _fold_batch for the V4.1 TPU pool: runs the original against a
+       runner view whose device is input_ids' device and whose req_to_token
+       returns int64 slots on out_cache_loc's device, with out_cache_loc cast to
+       int64 once up front; then casts the folded out_cache_loc back to the
+       scheduled dtype and moves the row maps and Engram history to the runner's
+       device, where the original places them.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: _fold_batch builds the replay rows on the scheduled tensors'
+       devices and keeps out_cache_loc's dtype.
+
+init_tpu_dsv41_pool_configurator
+  Why: DSV4PoolConfigurator.__init__ counts the DSpark draft layers kept in a
+       per-request SWA ring as a local; get_tpu_dsv41_swa_fixed_bytes prices those
+       ring pages in the TPU layout and needs the count.
+  How: AROUND __init__: after the original, set draft_ring_layers by core's rule
+       and assert it agrees with the paged_draft_layers core kept.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR4).
+  Remove when: the configurator exposes the draft ring layer count.
+
+derive_tpu_dsv41_pool_sizes, build_tpu_dsv41_allocator, get_tpu_dsv41_swa_fixed_bytes
+  Why: under --enable-encoder-swa-bounded-replay the core sizes the paged SWA pool
+       at 0 tokens (SWA lives in the request window), which the TPU 8-page SWA
+       floor in _derive_pool_sizes refuses; the allocator builder then takes the
+       core PagedTokenToKVPoolAllocator, whose alloc paths launch Triton; and the
+       configurator prices core's FlashMLA-packed window instead of the TPU
+       window's bf16 pages.
+  How: AROUND each target, bodies in sglang_tpu.models.deepseek_v41.memory_pool:
+       skip the floor for a 0-token SWA size only, bind the module's
+       PagedTokenToKVPoolAllocator to the TPU paged allocator, and swap the
+       window bytes. Every other case calls the original unchanged.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: the SWA floor skips pools without a paged SWA allocator, that
+       allocator arm asks current_platform for its class, and the configurator
+       asks the pool for its window bytes.
 
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
@@ -90,6 +200,42 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
+
+tpu_dsv41_dspark_attention, tpu_dsv41_dspark_forward,
+tpu_dsv41_dspark_write_target_hidden_kv
+  Why: DSparkAttention.forward and write_target_hidden_kv write the draft KV
+       with the CUDA FlashMLA writer, and the attention inverse-rotates its
+       output, which CSA2 already does; the draft forward returns no
+       next_draft_tokens, which TpuBlockSpecWorker reads for greedy drafts.
+  How: AROUND each when the draft runs on the CSA2 backend (dspark.py):
+       attention goes through the backend's prepare_mqa_qkv and non-causal
+       forward, then wo_a / wo_b; the KV write publishes into the CSA2 SWA
+       pages; the forward appends the greedy Markov chain in-graph, as
+       vllm-torchtpu models/vllm/deepseek_v41/v2/dspark.py does.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: the V4 draft reads its KV write and inverse RoPE from the
+       attention backend and returns draft tokens.
+
+tpu_dsv41_dspark_compute_base_logits
+  Why: under attention DP each rank's lm_head holds the full vocab
+       (tp_size 1), but gather_and_crop_vocab gathers over the full TP group
+       and keeps TP rank 0's rows, so every rank drafted rank 0's tokens.
+  How: AROUND compute_base_logits projects this rank's rows without a gather
+       when the head is unsharded.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: compute_base_logits gathers over the lm_head's own group.
+
+tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
+  Why: the target's Engram history lives on the host (engram_host), so
+       committing a verify reads its outputs back and blocks the host for the
+       whole verify; core commit_after_verify also writes padded rows into
+       req slot 0.
+  How: AROUND NgramEmbeddingManager.update_after_verify queues the commit;
+       the next host Engram staging (compile_policy) applies the queue, and a
+       PD prebuilt batch, which writes history rows in _prepare_engram_history
+       without staging, applies it first.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: the Engram history lives on the device and commits in-graph.
 """
 
 from __future__ import annotations
@@ -121,6 +267,123 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
     return _impl(original, configurator)
 
 
+def allow_tpu_dsv41_encoder_replay(original, server_args):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.srt.arg_groups import deepseek_v4_hook as validator
+    from sglang.srt.arg_groups.overrides import declare_resolution
+    from sglang.srt.runtime_context import get_platform
+
+    cfg = validator.resolving_view(server_args)
+    if (
+        not get_platform().is_tpu
+        or validator.model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        or not cfg.enable_encoder_swa_bounded_replay
+    ):
+        return original(server_args)
+    if cfg.enable_decoder_swa_bounded_replay is None:
+        # The validator's default for CUDA; DSV41TPUAttnBackend has no decoder replay.
+        declare_resolution(
+            server_args,
+            "tpu.allow_tpu_dsv41_encoder_replay",
+            enable_decoder_swa_bounded_replay=False,
+        )
+    cuda = SimpleNamespace(is_cuda=True, is_hip=False)
+    with patch.object(validator, "get_platform", lambda: cuda):
+        return original(server_args)
+
+
+class _SlotsOnDevice:
+    """req_to_token view: each indexed slice as int64 on ``device``."""
+
+    def __init__(self, table: torch.Tensor, device: torch.device):
+        self._table = table
+        self._device = device
+
+    def __getitem__(self, key) -> torch.Tensor:
+        return self._table[key].to(device=self._device, dtype=torch.int64)
+
+
+def fold_tpu_dsv41_encoder_replay(original, *, batch, runner, rows):
+    """AROUND encoder_swa_replay._fold_batch: fold on the scheduled tensors'
+    devices and keep out_cache_loc's dtype."""
+    from copy import copy
+    from types import SimpleNamespace
+
+    import msgspec
+
+    from sglang.srt.runtime_context import get_platform
+    from sglang_tpu.models.deepseek_v41.memory_pool import DSV41TPUTokenToKVPool
+
+    if not get_platform().is_tpu or not isinstance(
+        runner.token_to_kv_pool, DSV41TPUTokenToKVPool
+    ):
+        return original(batch=batch, runner=runner, rows=rows)
+    loc = batch.out_cache_loc
+    scheduled = copy(batch)
+    # One cast here makes the original's per-request .long() calls no-ops.
+    scheduled.out_cache_loc = loc.to(torch.int64)
+    # The original reads only these three runner fields.
+    view = SimpleNamespace(
+        device=batch.input_ids.device,
+        model=runner.model,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=_SlotsOnDevice(
+                runner.req_to_token_pool.req_to_token, loc.device
+            )
+        ),
+    )
+    folded = original(batch=scheduled, runner=view, rows=rows)
+    folded.batch.out_cache_loc = folded.batch.out_cache_loc.to(loc.dtype)
+    if folded.batch.engram_history is not None:
+        folded.batch.engram_history = folded.batch.engram_history.to(
+            runner.device, non_blocking=True
+        )
+
+    def put(t: torch.Tensor) -> torch.Tensor:
+        return t.to(runner.device, non_blocking=True)
+
+    return msgspec.structs.replace(
+        folded,
+        keep_rows=put(folded.keep_rows),
+        scheduled_row=put(folded.scheduled_row),
+        row_floor=put(folded.row_floor),
+    )
+
+
+def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        derive_tpu_dsv41_pool_sizes as _impl,
+    )
+
+    return _impl(original, kvc, config=config)
+
+
+def build_tpu_dsv41_allocator(original, kvc, **kwargs):
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        build_tpu_dsv41_allocator as _impl,
+    )
+
+    return _impl(original, kvc, **kwargs)
+
+
+def init_tpu_dsv41_pool_configurator(original, configurator, kvc) -> None:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        init_tpu_dsv41_pool_configurator as _impl,
+    )
+
+    _impl(original, configurator, kvc)
+
+
+def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        get_tpu_dsv41_swa_fixed_bytes as _impl,
+    )
+
+    return _impl(original, configurator)
+
+
 def select_tpu_dsv41_loader(result, load_config, model_config=None):
     from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
     from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
@@ -129,13 +392,18 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     if (
         type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
         or model_config is None
-        # Without Engram tables the generic EP-local loader does everything.
-        or not model_config.use_engram
-        or model_config.is_draft_model
         or load_config.draft_model_idx is not None
     ):
         return result
-    from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
+    from sglang_tpu.models.deepseek_v41.loader import (
+        DSV41RunaiModelStreamerLoader,
+        is_bundled_dspark_draft,
+    )
+
+    # Without Engram tables the generic EP-local loader does everything; a
+    # bundled DSpark draft comes here to stream only its mtp.* tensors.
+    if not (model_config.use_engram or is_bundled_dspark_draft(model_config)):
+        return result
 
     return DSV41RunaiModelStreamerLoader(load_config)
 
@@ -197,10 +465,91 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
-def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value):
-    """engram_gate without torch.copysign (no TorchTPU kernel)."""
+def tpu_dsv4_hc_split_sinkhorn(original, mixes, *args, **kwargs):
+    """hc_split_sinkhorn in torch for non-CUDA tensors (TileLang is CUDA-only)."""
+    if mixes.is_cuda:
+        return original(mixes, *args, **kwargs)
+    from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+
+    return _hc_split_sinkhorn_torch(mixes, *args, **kwargs)
+
+
+_HC_SUBLAYER_FIELDS = {
+    "attn_hc": (
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "input_layernorm",
+        "_hc_attn_tf32_parts",
+        "_hc_attn_bf16_parts",
+    ),
+    "ffn_hc": (
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "post_attention_layernorm",
+        "_hc_ffn_tf32_parts",
+        "_hc_ffn_bf16_parts",
+    ),
+}
+
+
+def _live_hc_property(name: str, fields: tuple, sublayer_cls) -> property:
+    built = f"_tpu_{name}_built"
+
+    def get(layer):
+        if not layer.__dict__.get(built):
+            return None
+        return sublayer_cls(layer.hc_cfg, *(getattr(layer, f) for f in fields))
+
+    def set_(layer, value):
+        layer.__dict__[built] = value is not None
+
+    return property(get, set_)
+
+
+def tpu_dsv4_live_hc_sublayers(original, layer, *args, **kwargs):
+    """AROUND DeepseekV4DecoderLayerBase.__init__: attn_hc / ffn_hc read through
+    to the layer's current parameters (the tracer's placeholders while tracing)."""
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
+    from sglang.srt.models.deepseek_v4_mhc import HcSubLayer
+
+    cls = DeepseekV4DecoderLayerBase
+    if not isinstance(cls.__dict__.get("attn_hc"), property):
+        for name, fields in _HC_SUBLAYER_FIELDS.items():
+            setattr(cls, name, _live_hc_property(name, fields, HcSubLayer))
+    return original(layer, *args, **kwargs)
+
+
+def tpu_dsv4_fence_hc_mix_stats(original, hc, x):
+    """AROUND deepseek_v4_mhc._mix_stats_impl: an optimization barrier on the
+    state first, so XLA does not fold its producer into the GEMM operand."""
     if x.is_cuda:
-        return original(x, kv, q_weight, k_weight, eps, clamp_value)
+        return original(hc, x)
+    from sglang_tpu.models.deepseek_v41.hc_fence import hc_fence
+
+    return original(hc, hc_fence(x))
+
+
+def tpu_dsv41_engram_gate(
+    original,
+    x,
+    kv,
+    q_weight,
+    k_weight,
+    eps,
+    clamp_value,
+    input_ids=None,
+    image_token_id=None,
+):
+    """engram_gate without torch.copysign (no TorchTPU kernel); rows whose
+    ``input_ids`` entry is ``image_token_id`` keep ``x``, as upstream."""
+    if x.is_cuda:
+        return original(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
+    from sglang_tpu.models.deepseek_v41.engram_host import signed_sqrt
+
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -210,15 +559,79 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
         key.square().mean(-1) + eps
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
-    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
-    gate = torch.sigmoid(torch.where(dot >= 0, magnitude, -magnitude))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    gate = torch.sigmoid(signed_sqrt(dot, clamp_value))
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if input_ids is not None:
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
+
+
+def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
+    """AROUND TpModelWorker.forward_batch_generation: capture host Engram inputs."""
+    runner = worker.model_runner
+    if not runner.model_config.use_engram or runner.is_draft_worker:
+        return original(worker, batch, *args, **kwargs)
+    model = runner.model
+    hasher = model.model.engram_hasher
+    if hasher is None:
+        return original(worker, batch, *args, **kwargs)
+    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    coordinator = engram_host.get_or_create_coordinator(model, hasher, runner.device)
+    if coordinator is None:
+        return original(worker, batch, *args, **kwargs)
+    is_verify = bool(kwargs.get("is_verify", False))
+    spec_active = (
+        batch is not None
+        and batch.spec_algorithm is not None
+        and not batch.spec_algorithm.is_none()
+    )
+    is_dllm_fn = getattr(worker, "is_dllm", None)
+    is_dllm = bool(is_dllm_fn()) if callable(is_dllm_fn) else False
+    attn_backend = getattr(runner, "attn_backend", None)
+    kv_pool = getattr(runner, "token_to_kv_pool", None)
+    prepared = (
+        None
+        if is_verify
+        else coordinator.prepare_if_supported(
+            batch,
+            parallel=get_parallel(),
+            enable_encoder_swa_bounded_replay=bool(
+                get_exec().features.enable_encoder_swa_bounded_replay
+            ),
+            folds_encoder_swa_replay=bool(
+                getattr(attn_backend, "folds_encoder_swa_replay", False)
+            ),
+            has_request_window=getattr(kv_pool, "request_window", None) is not None,
+            is_dllm=is_dllm,
+        )
+    )
+    try:
+        result = original(worker, batch, *args, **kwargs)
+        if prepared is not None and not spec_active:
+            requests, positions = prepared
+            coordinator.remember(requests, positions, result)
+        elif is_verify or spec_active:
+            coordinator.pending = None
+        else:
+            coordinator.remember_fallback_if_applicable(batch, result)
+        return result
+    finally:
+        coordinator.clear_step()
 
 
 def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     """AROUND EngramHasher.forward: in the TPU graph, the host-staged row ids."""
-    if forward_batch.tpu_engram_local_ids is not None:
-        return forward_batch.tpu_engram_local_ids
+    if input_ids.device.type == "cpu":
+        # The V4 compile policy hashing on the host (engram_host.host_hash_ids):
+        # the metadata may still carry the previous forward's staged ids.
+        return original(hasher, input_ids, forward_batch)
+    from sglang_tpu.models.deepseek_v41.engram_host import staged_inputs
+
+    local_ids, _ = staged_inputs(forward_batch)
+    if local_ids is not None:
+        return local_ids
     return original(hasher, input_ids, forward_batch)
 
 
@@ -249,15 +662,97 @@ def tpu_dsv41_engram_embed_forward(
     """AROUND EngramEmbedding.forward: dequantize the host-staged rows."""
     if indices.is_cuda or embedding.host_table is None:
         return original(embedding, indices, forward_batch, **kwargs)
-    from sglang_tpu.models.deepseek_v41.engram_host import staged_lookup
+    from sglang_tpu.models.deepseek_v41.engram_host import (
+        staged_inputs,
+        staged_lookup,
+    )
 
     # The core host-table lookup reads a raw host pointer from the device.
-    if forward_batch is None or forward_batch.tpu_engram_staged is None:
+    _, staged = staged_inputs(forward_batch)
+    if staged is None:
         raise RuntimeError(
-            "DeepSeek-V4.1 Engram on TPU reads rows staged by the compiled-forward "
-            "shim; this forward did not stage them"
+            "DeepSeek-V4.1 Engram on TPU reads rows staged by the V4 compile "
+            "policy; this forward did not stage them"
         )
-    return staged_lookup(embedding, indices, forward_batch)
+    return staged_lookup(embedding, indices, staged)
+
+
+def tpu_dsv41_dspark_attention(original, attn, positions, hidden_states, forward_batch):
+    """AROUND DSparkAttention.forward: the draft on the CSA2 backend."""
+    from sglang_tpu.models.deepseek_v41.dspark import (
+        dspark_attention_forward,
+        serves_dspark_draft,
+    )
+
+    if hidden_states.is_cuda or not serves_dspark_draft():
+        return original(attn, positions, hidden_states, forward_batch)
+    return dspark_attention_forward(attn, positions, hidden_states, forward_batch)
+
+
+def tpu_dsv41_dspark_forward(original, model, input_ids, positions, *args, **kwargs):
+    """AROUND DeepseekV4ForCausalLMDSpark.forward: add the greedy drafts."""
+    from sglang_tpu.models.deepseek_v41.dspark import (
+        dspark_forward,
+        serves_dspark_draft,
+    )
+
+    if input_ids.is_cuda or not serves_dspark_draft():
+        return original(model, input_ids, positions, *args, **kwargs)
+    return dspark_forward(original, model, input_ids, positions, *args, **kwargs)
+
+
+def tpu_dsv41_dspark_write_target_hidden_kv(original, model, **kwargs):
+    """AROUND DeepseekV4ForCausalLMDSpark.write_target_hidden_kv: CSA2 SWA pages."""
+    from sglang_tpu.models.deepseek_v41.dspark import write_target_hidden_kv
+
+    if kwargs["main_hidden"].is_cuda:
+        return original(model, **kwargs)
+    return write_target_hidden_kv(model, **kwargs)
+
+
+def tpu_dsv41_dspark_compute_base_logits(original, model, x):
+    """AROUND DeepseekV4ForCausalLMDSpark.compute_base_logits: no gather of an
+    unsharded head."""
+    from sglang_tpu.models.deepseek_v41.dspark import tpu_compute_base_logits
+
+    if x.is_cuda or model.lm_head is None or model.lm_head.tp_size != 1:
+        return original(model, x)
+    return tpu_compute_base_logits(model, x)
+
+
+def tpu_dsv41_defer_engram_commit(
+    original, manager, *, verify_ids_2d, req_pool_indices, commit_lens
+):
+    """AROUND NgramEmbeddingManager.update_after_verify: queue the host commit."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    hasher = manager.engram_hasher
+    if hasher is None or verify_ids_2d.is_cuda:
+        return original(
+            manager,
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )
+    engram_host.defer_engram_commit(
+        hasher,
+        verify_ids_2d=verify_ids_2d,
+        req_pool_indices=req_pool_indices,
+        commit_lens=commit_lens,
+    )
+
+
+def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
+    """AROUND NgramEmbeddingManager._prepare_engram_history: a PD prebuilt batch
+    writes history rows directly, so queued verify commits land first."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    hasher = manager.engram_hasher
+    if batch.forward_mode.is_prebuilt() and engram_host.has_pending_engram_commits(
+        hasher
+    ):
+        engram_host.flush_engram_commits(hasher)
+    return original(manager, batch)
 
 
 def hook_specs():
@@ -268,6 +763,11 @@ def hook_specs():
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
+    dspark = "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark"
+    ngram = (
+        "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
+        ".NgramEmbeddingManager"
+    )
     return [
         (f"{kvc}._build_dsv4_kv_pool", build_tpu_dsv41_kv_pool, HookType.AROUND),
         (
@@ -278,6 +778,28 @@ def hook_specs():
         (
             f"{cfg}._get_bytes_per_full_token",
             get_tpu_dsv41_bytes_per_full_token,
+            HookType.AROUND,
+        ),
+        (
+            f"{cfg}._get_swa_fixed_bytes",
+            get_tpu_dsv41_swa_fixed_bytes,
+            HookType.AROUND,
+        ),
+        (f"{cfg}.__init__", init_tpu_dsv41_pool_configurator, HookType.AROUND),
+        (f"{kvc}._derive_pool_sizes", derive_tpu_dsv41_pool_sizes, HookType.AROUND),
+        (
+            f"{kvc}._build_token_to_kv_pool_allocator",
+            build_tpu_dsv41_allocator,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.arg_groups.deepseek_v4_hook.validate_deepseek_v41_features",
+            allow_tpu_dsv41_encoder_replay,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.encoder_swa_replay._fold_batch",
+            fold_tpu_dsv41_encoder_replay,
             HookType.AROUND,
         ),
         (
@@ -301,13 +823,33 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.kernels.ops.layernorm.mhc.hc_combine",
+            "sglang.kernels.ops.layernorm.mhc.mhc_combine",
             tpu_dsv41_hc_combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
+            tpu_dsv4_hc_split_sinkhorn,
             HookType.AROUND,
         ),
         (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase.__init__",
+            tpu_dsv4_live_hc_sublayers,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_mhc._mix_stats_impl",
+            tpu_dsv4_fence_hc_mix_stats,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation",
+            tpu_dsv41_engram_worker_forward,
             HookType.AROUND,
         ),
         (
@@ -323,6 +865,36 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding.forward",
             tpu_dsv41_engram_embed_forward,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_dspark.DSparkAttention.forward",
+            tpu_dsv41_dspark_attention,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.forward",
+            tpu_dsv41_dspark_forward,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.write_target_hidden_kv",
+            tpu_dsv41_dspark_write_target_hidden_kv,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}.compute_base_logits",
+            tpu_dsv41_dspark_compute_base_logits,
+            HookType.AROUND,
+        ),
+        (
+            f"{ngram}.update_after_verify",
+            tpu_dsv41_defer_engram_commit,
+            HookType.AROUND,
+        ),
+        (
+            f"{ngram}._prepare_engram_history",
+            tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
         ),
     ]

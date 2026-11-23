@@ -17,7 +17,7 @@ from typing import Any, Mapping, Sequence
 import msgspec
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden import pool_side_engine, pp_mxint8

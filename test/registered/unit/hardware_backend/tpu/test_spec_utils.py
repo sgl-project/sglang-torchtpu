@@ -12,6 +12,7 @@ import torch
 
 import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as kernels
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang_tpu import eagle_utils_tpu
 
 
@@ -386,11 +387,11 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
     # Both lengths live on Req.kv (ReqKvInfo).
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=2, kv_committed_len=3),
+            kv=ReqKvInfo(kv_allocated_len=2, kv_committed_len=3),
             decode_batch_idx=0,
         ),
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=5, kv_committed_len=1),
+            kv=ReqKvInfo(kv_allocated_len=5, kv_committed_len=1),
             decode_batch_idx=0,
         ),
     ]
@@ -408,6 +409,7 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
         req_to_token_pool=SimpleNamespace(host_resident=True),
         req_pool_indices=req_pool_indices,
         req_pool_indices_cpu=req_pool_indices_cpu,
+        seq_lens_cpu=torch.tensor([3, 1], dtype=torch.int64),
         device=torch.device("cpu"),
         enable_overlap=False,
         spec_info=None,
@@ -448,12 +450,12 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
     # Both lengths live on Req.kv (ReqKvInfo).
     reqs = [
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=2, kv_committed_len=3),
+            kv=ReqKvInfo(kv_allocated_len=2, kv_committed_len=3),
             sampling_params=SimpleNamespace(top_k=1),
             decode_batch_idx=0,
         ),
         SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=5, kv_committed_len=1),
+            kv=ReqKvInfo(kv_allocated_len=5, kv_committed_len=1),
             sampling_params=SimpleNamespace(top_k=1),
             decode_batch_idx=0,
         ),
@@ -531,7 +533,7 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
     )
     host_base = max(1, page_size - 2)
     req = SimpleNamespace(
-        kv=SimpleNamespace(kv_allocated_len=0, kv_committed_len=host_base - 1),
+        kv=ReqKvInfo(kv_allocated_len=0, kv_committed_len=host_base - 1),
         decode_batch_idx=0,
         seqlen=host_base,
         lora_id=None,
@@ -554,6 +556,8 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         req_to_token_pool=SimpleNamespace(host_resident=True, req_to_token=table),
         req_pool_indices=torch.tensor([1], dtype=torch.int64),
         req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+        # Unset so the assertion below checks the device-accept prep writes it.
+        seq_lens_cpu=None,
         device=torch.device("cpu"),
         enable_overlap=True,
         spec_info=draft_input,
@@ -680,7 +684,7 @@ def test_device_accept_rejects_invalid_future_window(candidate_shape, accept_sha
 
 @pytest.mark.parametrize("is_tpu", (False, True))
 def test_device_accept_cache_window_follows_verify_input(is_tpu):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative import eagle_worker_common
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -852,7 +856,7 @@ def test_draft_extend_positions_follow_device_seq_lens():
 def test_prepare_for_draft_extend_tpu_ignores_stale_host_seq_lens():
     """Device accept routing leaves seq_lens_cpu one acceptance behind; the
     draft-extend positions must come from the device seq_lens."""
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative import eagle_worker_common
 
     seq_lens = torch.tensor([7, 12])

@@ -40,6 +40,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation as HybridPrefetchOperation,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_kv_host_pool,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
@@ -47,7 +50,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -68,7 +70,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
-    get_parallel,
     get_serving,
 )
 from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
@@ -135,8 +136,6 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        allocator_type = get_allocator_type()
-
         if isinstance(self.kv_cache, MHATokenToKVPool):
             # The host pool must mirror the device pool's layout (e.g. the TPU
             # fused 5D pool needs the fused host pool); the platform hook returns
@@ -144,32 +143,32 @@ class HiRadixCache(RadixCache):
             # base platform delegates to get_mha_host_pool_cls (layout dispatch);
             # TPU overrides it to return the fused/raiden host pool.
             host_pool_cls = current_platform.get_mha_kv_pool_host_cls(self.kv_cache)
-            self.token_to_kv_pool_host = host_pool_cls(
-                self.kv_cache,
-                get_memory().hicache_ratio,
-                get_memory().hicache_size,
-                self.page_size,
-                get_memory().hicache_mem_layout,
-                allocator_type=allocator_type,
-            )
             if host_pool_cls is TpuFusedMHATokenToKVPoolHost:
+                # The fused host pool derives its geometry from the device pool.
+                self.token_to_kv_pool_host = host_pool_cls(
+                    self.kv_cache,
+                    get_memory().hicache_ratio,
+                    get_memory().hicache_size,
+                    self.page_size,
+                    get_memory().hicache_mem_layout,
+                    allocator_type=get_allocator_type(),
+                )
                 # TPU fused host: pre-compile the native reload/backup XLA
                 from sglang_tpu.compilation.compiled_forward_shim import (
                     precompile_kv_offload,
                 )
 
                 precompile_kv_offload(self.token_to_kv_pool_host)
+            else:
+                # Upstream host pools take the device pool's buffer info and
+                # explicit geometry.
+                self.token_to_kv_pool_host = build_kv_host_pool(
+                    kv_pool=self.kv_cache, page_size=self.page_size
+                )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            _parallel = get_parallel()
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                get_memory().hicache_ratio,
-                get_memory().hicache_size,
-                self.page_size,
-                get_memory().hicache_mem_layout,
-                allocator_type=allocator_type,
-                dcp_size=_parallel.attn_dcp_size,
-                dcp_rank=_parallel.attn_dcp_rank,
+            # Applies the DCP rank/size and the MLA geometry upstream needs.
+            self.token_to_kv_pool_host = build_kv_host_pool(
+                kv_pool=self.kv_cache, page_size=self.page_size
             )
         else:
             raise ValueError("HiRadixCache only supports MHA and MLA models")
@@ -1520,6 +1519,7 @@ class HiRadixCache(RadixCache):
         self,
         params: InitLoadBackParams,
     ):
+        """Returns (loaded tokens, new last node), see ``BasePrefixCache``."""
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
@@ -1528,15 +1528,14 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                return len(loading_values), last_node
 
-            while last_node.evicted:
-                last_node = last_node.parent
-
-        return (
-            self._empty_match_result.device_indices,
-            last_node,
-        )
+        # Nothing loaded: the request keeps its matched device prefix.
+        if params.req is not None:
+            return 0, params.req.last_node
+        while last_node.evicted:
+            last_node = last_node.parent
+        return 0, last_node
 
     def query_storage_hit_length(
         self,
@@ -1804,10 +1803,6 @@ class HiRadixCache(RadixCache):
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
-        else:
-            value = self._empty_match_result.device_indices
 
         host_hit_length = 0
         last_host_node = last_node
@@ -1818,7 +1813,7 @@ class HiRadixCache(RadixCache):
             last_host_node = last_host_node.parent
 
         return MatchResult(
-            device_indices=value,
+            device_prefix_len=sum(len(v) for v in value),
             last_device_node=last_node,
             last_host_node=last_host_node,
             # TODO(ispobock): use best_match_node as start node for load_back
@@ -2070,7 +2065,7 @@ class HiRadixCache(RadixCache):
                 self._inc_hit_count(new_node)
         return InsertResult(prefix_len=total_prefix_length)
 
-    def release_aborted_request(self, handle: CacheRequestHandle):
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         rid = handle.rid
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)

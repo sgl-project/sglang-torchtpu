@@ -6,11 +6,12 @@ from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import torch
+from pytest import MonkeyPatch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 NUM_LAYERS = 4
 
@@ -23,7 +24,11 @@ def import_model(name):
     vllm.__path__ = []
     custom_ops = ModuleType("vllm._custom_ops")
     custom_ops.awq_dequantize = MagicMock()
-    with patch.dict(sys.modules, {"vllm": vllm, "vllm._custom_ops": custom_ops}):
+    # Restore only the stubs; evicting dependencies imported here can register
+    # native dtypes twice when the next model imports them again.
+    with MonkeyPatch.context() as modules:
+        modules.setitem(sys.modules, "vllm", vllm)
+        modules.setitem(sys.modules, "vllm._custom_ops", custom_ops)
         return importlib.import_module(f"sglang.srt.models.{name}")
 
 

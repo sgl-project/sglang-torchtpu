@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -43,7 +43,12 @@ def _load_configurator(**dependencies):
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
+    import sglang.srt.mem_cache.kv_cache_configurator as kv_cache_configurator
+
     scope = {
+        # Module-level names the class reads; the entries below replace the
+        # ones under test.
+        **vars(kv_cache_configurator),
         "__name__": __name__,
         "dataclass": dataclass,
         "field": field,
@@ -59,6 +64,8 @@ def _load_configurator(**dependencies):
         "mambaish_config": lambda _: None,
         "hybrid_gdn_config": lambda _: None,
         "hybrid_kda_config": lambda _: None,
+        # Logical-page KV sharding is off in these configurations.
+        "make_page_shard_spec": lambda _: None,
         **dependencies,
     }
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
@@ -76,7 +83,7 @@ class TestMXINT8Configurator(CustomTestCase):
         self.addCleanup(override.restore)
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
-            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            get_kv_pool_cls=Mock(return_value=self.platform_pool),
             unified_kv_pool_enabled=lambda *_: False,
             build_swa_kv_pool=lambda *_, **__: None,
             is_cpu=lambda: False,
@@ -131,7 +138,7 @@ class TestMXINT8Configurator(CustomTestCase):
                 num_effective_layers=2,
                 swa_attention_layer_ids=[1],
                 full_attention_layer_ids=[0],
-                is_hybrid_swa_mtp_draft=False,
+                draft_owns_its_depth=False,
             ),
             forward_stream=None,
             req_to_token_pool=None,
@@ -204,14 +211,14 @@ class TestMXINT8Configurator(CustomTestCase):
                 self.assertIsNone(kvc.kv_group_size)
                 self.assertEqual(kvc._mxint8_pool_kwargs(), {})
                 self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.assertEqual(self.platform.get_mha_kv_pool_cls.call_count, 4)
+        self.assertEqual(self.platform.get_kv_pool_cls.call_count, 4)
 
     def test_validation_override_retains_default_group_and_platform_factory(self):
         with patch.object(self.configurator, "_validate_mxint8", return_value=None):
             kvc = self._make(kv_group_size=None)
         self.assertEqual(kvc.kv_group_size, 32)
         self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.platform.get_mha_kv_pool_cls.assert_called_once_with()
+        self.platform.get_kv_pool_cls.assert_called_once_with(kind="mha")
 
     def test_bare_int8_rejected_before_profiling(self):
         for name in (None, "auto", "bf16"):
@@ -261,14 +268,17 @@ class TestMXINT8Configurator(CustomTestCase):
             kvc._build_hybrid_linear_kv_pool(
                 max_total_num_tokens=512,
                 req_to_token_pool=SimpleNamespace(mamba_pool=object()),
+                state_pool=object(),
                 mha_pool_class=self.platform_pool,
+                mla_pool_class=Mock(name="mla_pool"),
+                dsa_pool_class=Mock(name="dsa_pool"),
             )
             self.assertIs(
                 self.hybrid_pool.call_args.kwargs["full_kv_pool"],
                 backend_pool.return_value,
             )
             self.assertEqual(backend_pool.call_args.kwargs["layer_num"], 1)
-            self.platform.get_mha_kv_pool_cls.assert_not_called()
+            self.platform.get_kv_pool_cls.assert_not_called()
         self._assert_preflight_error()
 
     def test_unified_kv_pool_uses_blocked_mxint8_layout_and_forwards_pool_kwargs(

@@ -48,6 +48,8 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, copy_or_rebind_param
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -55,7 +57,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, process_model_config
-from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import _free_replaced_storage
@@ -961,6 +962,13 @@ class MuseSparkForConditionalGeneration(nn.Module):
             )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        if megakernel is not None and megakernel.moe_mode == "ep":
+            # the experts hold the EP megakernel layout, which no native MoE reads
+            raise RuntimeError(
+                f"Muse EP serving: a {forward_batch.forward_mode.name} step of "
+                f"{input_ids.shape[0]} tokens fell outside the EP programs (decode/verify up "
+                "to SGLANG_TPU_MUSE_MK_MAX_ROWS rows, extend through prefill/spep)"
             )
         hidden_states = self.model(
             input_ids,

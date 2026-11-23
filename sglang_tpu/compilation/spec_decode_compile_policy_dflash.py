@@ -147,6 +147,11 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def _infer_dflash_target_hidden_size(self) -> int:
         """Infer target hidden dimension for DFlash project_target_hidden."""
         model = self.model_runner.model
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            # Its stage-0 main_proj takes the concatenated target aux hidden.
+            return int(model.stages[0].main_proj.input_size)
         fc = getattr(model, "fc", None)
         if fc is not None:
             # LinearBase (row-parallel included) reports the full input width.

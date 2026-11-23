@@ -3,8 +3,12 @@
 draft: z_j = l_j + bias(d_{j-1}, h_j), d_0 = r, d_j ~ softmax(z_j / T), so
        q_j = softmax(z_j / T), with l_j = lm_head(h_j) the base logits.
 
+As core DSparkWorkerV2, one drafter serves the dense DSparkDraftModel and the
+DeepSeek-V4 MoE DeepseekV4ForCausalLMDSpark; the MoE draft keeps the target's
+placement (draft_uses_compressed_kv_attention).
+
 Not ported yet: the confidence verify budget (num_verify_drafts is always
-gamma) and MoE/MLA drafts.
+gamma).
 """
 
 from __future__ import annotations
@@ -15,14 +19,16 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.draft_parallel import DraftTPExecution
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
-from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
     DraftSampler,
@@ -36,15 +42,14 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
         draft_model = self.model_runner.model
-        if not isinstance(draft_model, DSparkDraftModel):
+        if not isinstance(draft_model, (DSparkDraftModel, DeepseekV4ForCausalLMDSpark)):
             raise TypeError(
-                f"TpuDsparkDraftWorker needs a dense DSparkDraftModel, got {type(draft_model)}."
+                f"TpuDsparkDraftWorker needs a DSpark draft, got {type(draft_model)}."
             )
-        target_model_config = target_runner.model_config
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-            target_vocab_size=target_model_config.vocab_size,
+            target_vocab_size=target_runner.model_config.vocab_size,
         )
         # The draft graph's markov chain (sample_draft_tokens_tpu) uses the config gamma.
         if draft_model.gamma != runtime_config.gamma:
@@ -52,14 +57,24 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
                 f"Draft config gamma={draft_model.gamma} != runtime gamma={runtime_config.gamma}."
             )
         self.num_drafts = runtime_config.gamma
-        self.block_width = block_draft_width(draft_model, self.num_drafts + 1)
+        # Anchor drafts read all gamma rows, so the block drops the last mask row.
+        self.block_width = (
+            self.num_drafts if draft_model.sample_from_anchor else self.num_drafts + 1
+        )
         self.mask_token_id = runtime_config.mask_token_id
         self._dspark_model = draft_model
         _attach_target_vocab(
             draft_model=draft_model,
             target_model=cast(nn.Module, target_runner.model),
-            target_hf_text_config=target_model_config.hf_text_config,
+            target_hf_text_config=target_runner.model_config.hf_text_config,
         )
+
+    def _draft_tp_execution(self) -> DraftTPExecution:
+        # As core DSparkWorkerV2: the MoE draft's stages gather over DP and run
+        # the target's EP MoE, so it keeps the target placement.
+        if draft_uses_compressed_kv_attention():
+            return DraftTPExecution.TARGET_LAYOUT
+        return super()._draft_tp_execution()
 
     def sample_drafts(
         self,
@@ -93,11 +108,11 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
 
 def _attach_target_vocab(
     *,
-    draft_model: DSparkDraftModel,
+    draft_model: DSparkDraftModel | DeepseekV4ForCausalLMDSpark,
     target_model: nn.Module,
     target_hf_text_config: PretrainedConfig,
 ) -> None:
-    """Share the target embedding and lm_head with the draft (dense DSpark)."""
+    """Share the target embedding and lm_head with the draft, as DSparkWorkerV2."""
     # HF configs carry this key only for muP targets; the draft trained on the folded head.
     draft_model.logits_mup_width_multiplier = target_hf_text_config.to_dict().get(
         "logits_mup_width_multiplier"

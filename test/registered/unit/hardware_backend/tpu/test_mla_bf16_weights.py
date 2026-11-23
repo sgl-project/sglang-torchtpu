@@ -60,10 +60,16 @@ class TestMlaBf16Weights(unittest.TestCase):
             should_deepgemm_weight_requant_ue8m0=lambda **kw: False,
             bind_or_assign=lambda old, new: new,
             input_to_float8=tensor_quant,
+            CompressedTensorsLinearMethod=type("CompressedTensorsLinearMethod", (), {}),
+            CompressedTensorsWNA16=type("CompressedTensorsWNA16", (), {}),
         )
         for name in ["block_quant_dequant", "block_quant_to_tensor_quant"]:
             exec(extract(utils, name), g)
-        for name in ["mla_absorbed_weight_layout", "post_load_weights"]:
+        for name in [
+            "_resolve_layer_weight_block_size",
+            "mla_absorbed_weight_layout",
+            "post_load_weights",
+        ]:
             exec(extract(loader, name), g)
         torch.manual_seed(91011)
         w = (torch.randn(1024, 512) * 25).to(torch.float8_e4m3fn)
@@ -75,7 +81,11 @@ class TestMlaBf16Weights(unittest.TestCase):
         ]:
             g["_is_cuda"], g["_is_tpu"] = cuda, not cuda
             attention = NS(
-                kv_b_proj=NS(weight=w.clone(), weight_scale_inv=scales.clone()),
+                kv_b_proj=NS(
+                    weight=w.clone(),
+                    weight_scale_inv=scales.clone(),
+                    quant_method=None,
+                ),
                 attn_mha=NS(kv_b_proj=None),
                 qk_nope_head_dim=128,
                 v_head_dim=128,

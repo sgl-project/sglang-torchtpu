@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
+    mla_latents_for_store,
 )
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
@@ -40,6 +41,11 @@ from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_kpool_topk_split_op,
     indexer_forward,
     kpool_indexer_forward,
+)
+from sglang_tpu.dsa_layer_kv_store_op import (
+    call_op,
+    plain_store_op_name,
+    pooled_store_op_name,
 )
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pallas_export import (
@@ -314,6 +320,13 @@ def _assemble_split_rows(
     return (buf - 1).reshape(world * local_rows.shape[0], local_rows.shape[1])
 
 
+def _split_pool(pool):
+    """The TPU split MLA pool behind a hybrid linear-attention model's pool."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
@@ -329,9 +342,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._zero_rope = _has_zero_rope(hf_config)
         super().__init__(model_runner, speculative_step_id)
         self._topk = get_dsa_index_topk(hf_config)
+        self.raw_ring_pages_cnt = 0
         if self._kpool > 1:
             self._kpool_width = topk_row_width(hf_config)
             self._index_topk_op = build_dsa_kpool_topk_op()
+            pool = _split_pool(self.token_to_kv_pool)
+            self.raw_ring_pages_cnt = pool.raw_ring_pages_cnt
+            pool.attach_raw_ring(self.req_to_token_pool.req_to_token.shape[0])
         else:
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
@@ -366,6 +383,34 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         get_oneshot_all_to_all_op(world)  # build before torch.compile traces
         self._window_op = _build_pallas_sparse_mla_kernel_op(window=True)
         self._attn_split_world = world
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.raw_ring_pages_cnt:
+            self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
+
+    def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """i32[rows]: each row's first raw-ring page, its request slot times the ring."""
+        from sglang_tpu.cp_forward import get_tpu_cp_layout
+
+        if get_tpu_cp_layout(forward_batch) is not None:
+            raise NotImplementedError(
+                "The pooled indexer's raw ring addresses one row per request; "
+                "prefill context parallelism runs two pseudo-rows per request."
+            )
+        rows = forward_batch.req_pool_indices_cpu
+        if rows is None:
+            rows = forward_batch.req_pool_indices
+        base = rows.to(torch.int32) * self.raw_ring_pages_cnt
+        return base.to(forward_batch.seq_lens.device, non_blocking=True)
+
+    def _raw_ring_args(self) -> tuple[torch.Tensor, int]:
+        """(raw_page_base, raw_ring_pages_cnt) for the pooled indexer ops. Without a
+        ring the op ignores the base, so kv_lens stands in as an i32[rows] input."""
+        metadata = self.forward_metadata
+        if self.raw_ring_pages_cnt:
+            return metadata.raw_page_base, self.raw_ring_pages_cnt
+        return metadata.kv_lens, 0
 
     def _init_indexer_token_split(self) -> None:
         """Set up the DSA indexer token split (always on with attn-TP > 1)."""
@@ -663,6 +708,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 kpool=kpool,
                 split_rows=split_rows,
             )
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -675,12 +721,14 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.page_indices,
             metadata.cu_q_lens,
             metadata.distribution,
+            raw_page_base,
             weight_scale,
             self._topk,
             kpool,
             self._kpool_width,
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
+            raw_ring_pages_cnt,
         )
 
     def _index_topk_kpool_token_split(
@@ -715,6 +763,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         kv_lens = self._kv_lens(forward_batch)
         rank = _rank_tensor("attn_tp", query.device)
         row_start = (rank * split_rows).to(torch.int32).reshape(1)
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
         local_picked = self._index_topk_split_op(
             query.contiguous(),
             key.contiguous(),
@@ -728,11 +777,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.cu_q_lens,
             metadata.distribution,
             row_start,
+            raw_page_base,
             weight_scale,
             self._topk,
             kpool,
             _kpool_query_bound(metadata, num_tokens=num_tokens),
             split_rows,
+            raw_ring_pages_cnt,
         )  # i32[split_rows, topk // kpool]
         picked = _assemble_split_rows(
             local_picked, rank, self._idx_split_size, self._idx_split_group.all_reduce
@@ -853,3 +904,100 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # has one. The op takes them in this order.
         pool = self.token_to_kv_pool
         return (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
+
+    def store_layer_kv(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer: "RadixAttention",
+        index_layer_id: int,
+        k: torch.Tensor,  # [num_tokens, 1, kv_lora_rank], as _forward_mla's k
+        k_rope: torch.Tensor,  # [num_tokens, 1, rope_dim], as _forward_mla's k_rope
+        index_keys: torch.Tensor,  # [num_tokens, index_head_dim], as index_topk's key
+        key_store: str,
+    ) -> None:
+        """Plain DSA: store one layer's latents and index keys, without
+        attending or scoring.
+
+        The caches end up as ``_forward_mla`` and ``index_topk`` leave them
+        for the same inputs: every token of the batch is stored, on every
+        attention-TP rank, as under the token splits.
+        """
+        if self._kpool > 1:
+            raise NotImplementedError(
+                "the pooled indexer stores through store_layer_kv_pooled"
+            )
+        new_kv_c, new_k_pe = self._latents_for_store(layer=layer, k=k, k_rope=k_rope)
+        metadata = self.forward_metadata
+        call_op(
+            plain_store_op_name(key_store, write_rope=not self._zero_rope),
+            new_kv_c,
+            new_k_pe,
+            index_keys.contiguous(),
+            *self._kv_cache_buffers(layer.layer_id),
+            self.token_to_kv_pool.get_index_key_cache(index_layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+        )
+
+    def store_layer_kv_pooled(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer: "RadixAttention",
+        index_layer_id: int,
+        k: torch.Tensor,  # [num_tokens, 1, kv_lora_rank], as _forward_mla's k
+        k_rope: torch.Tensor,  # [num_tokens, 1, rope_dim], as _forward_mla's k_rope
+        keys: torch.Tensor,  # [num_tokens, index_head_dim], as index_topk_kpool's key
+        gates: torch.Tensor,  # [num_tokens, index_head_dim], as its gate
+        ape: torch.Tensor,  # [kpool, index_head_dim], f32, as its ape
+    ) -> None:
+        """Pooled indexer: store one layer's latents and raw key | gate
+        records and close the step's pools, without attending or scoring.
+
+        The caches end up as ``_forward_mla`` and ``index_topk_kpool`` leave
+        them for the same inputs, on every attention-TP rank.
+        """
+        if self._kpool == 1:
+            raise NotImplementedError("plain DSA stores through store_layer_kv")
+        new_kv_c, new_k_pe = self._latents_for_store(layer=layer, k=k, k_rope=k_rope)
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
+        call_op(
+            pooled_store_op_name(
+                self._kpool,
+                _kpool_query_bound(metadata, num_tokens=keys.shape[0]),
+                raw_ring_pages_cnt,
+                write_rope=not self._zero_rope,
+            ),
+            new_kv_c,
+            new_k_pe,
+            keys.contiguous(),
+            gates.contiguous(),
+            ape.contiguous(),
+            *self._kv_cache_buffers(layer.layer_id),
+            pool.get_kpool_raw_cache(index_layer_id),
+            pool.get_index_key_cache(index_layer_id),
+            self._kv_lens(forward_batch),
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            raw_page_base,
+        )
+
+    def _latents_for_store(
+        self, *, layer: "RadixAttention", k: torch.Tensor, k_rope: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._zero_rope:
+            # As in _forward_mla: the zero-rope store is exact only without rope.
+            assert layer.qk_head_dim == layer.v_head_dim, (
+                f"layer {layer.layer_id} has rope dims, but the store ops were "
+                "built for a model without rope."
+            )
+        new_kv_c, new_k_pe, _, _ = mla_latents_for_store(
+            k=k, k_rope=k_rope, layer=layer, quant_dtype=self.kv_cache_quant_dtype
+        )
+        return new_kv_c, new_k_pe

@@ -34,7 +34,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
@@ -55,6 +57,8 @@ class _BackendNoInit(TpuGDNAttnBackend):
         self._read_offsets = None
         self._req_pool_indices = None
         self._num_spec_tokens = 0
+        # Identity slot-id translation, as on a static (non-virtual) pool.
+        self._state_ids = IdSpace(key=("mamba", None))
 
 
 class TestGDNDistribution(CustomTestCase):
@@ -236,6 +240,27 @@ class TestGDNVerifyMetadata(CustomTestCase):
         bases, read_offsets = backend._state_rows()
         self.assertEqual(bases.tolist(), [16, 13, 10])
         self.assertEqual((bases + read_offsets).tolist(), [2, 15, 0])
+
+    def test_verify_metadata_carries_the_host_track_slots(self):
+        # The commit after acceptance reads checkpoint slots from the verify's
+        # metadata. They stay the scheduler's live-length host ids: a TPU op on
+        # the bucket-padded upload would compile one eager program per bucket.
+        backend = self._backend(torch.zeros(3, dtype=torch.int32))
+        batch = self._batch(ForwardMode.TARGET_VERIFY)
+        host_track = torch.tensor([3, 4])
+        batch.mamba_track_indices = torch.tensor([3, 4, 0])
+        batch._tpu_mamba_tracking_cpu = {"mamba_track_indices": host_track}
+        backend.init_forward_metadata(batch)
+        self.assertIs(backend.forward_metadata.mamba_track_indices, host_track)
+        # The kernel itself takes no snapshot during verify.
+        self.assertIsNone(backend._track_indices)
+
+    def test_verify_metadata_without_tracking_has_no_track_slots(self):
+        backend = self._backend(torch.zeros(3, dtype=torch.int32))
+        batch = self._batch(ForwardMode.TARGET_VERIFY)
+        batch.mamba_track_indices = None
+        backend.init_forward_metadata(batch)
+        self.assertIsNone(backend.forward_metadata.mamba_track_indices)
 
     def test_extend_resets_the_batch_offsets(self):
         offsets = torch.tensor([0, 2, 1], dtype=torch.int32)

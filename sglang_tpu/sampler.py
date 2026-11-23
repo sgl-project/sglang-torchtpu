@@ -4,12 +4,14 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import replace
 from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.sampler import (
     SYNC_TOKEN_IDS_ACROSS_TP,
@@ -24,6 +26,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -327,16 +330,47 @@ def sample_from_global_top_k_logits(
     )
 
 
-def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
+def _sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
     """Exact categorical draw per row as argmax(p_i / E_i), E_i ~ Exp(1).
 
     Elementwise ops plus one reduce, so it stays inside the compiled graph;
     ``torch.multinomial`` runs eagerly on TPU. All-zero rows return 0.
+    The compiled boundary keeps pending probability views out of the draw,
+    so warmup and serving reuse the same program.
+
+    Eagerly, the ops after the random draw run as one program (fused_eager.py):
+    every value is that of the per-op programs, as the argmax picks the same
+    index in any reduction order.
     """
+    # The random draw stays outside the fused region: a fused program that
+    # draws gets a different cache key on repeat calls, so it would recompile.
     u = torch.rand_like(probs)
-    # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
-    e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
-    return torch.argmax(probs / e, dim=-1).to(torch.int32)
+    with fused_eager_ops(probs.device.type == "tpu") as fused:
+        # -log(u) ~ Exp(1); clamp keeps u=0 from producing inf/nan.
+        e = torch.log(u.clamp_min(torch.finfo(probs.dtype).tiny)).neg_()
+        token_ids = torch.argmax(probs / e, dim=-1).to(torch.int32)
+    if fused:
+        submit((token_ids,))
+    return token_ids
+
+
+_compiled_sample_exponential_race = compiled_op(uses_rng=True)(_sample_exponential_race)
+_warmed_sampling_draws: set[tuple[torch.Size, torch.dtype, torch.device]] = set()
+
+
+@functools.wraps(_sample_exponential_race)
+def sample_exponential_race(probs: torch.Tensor, *, _warmup_async=False):
+    if torch.compiler.is_compiling():
+        return _sample_exponential_race(probs)
+    key = (probs.shape, probs.dtype, probs.device)
+    if _warmup_async:
+        pending = _compiled_sample_exponential_race(probs, _warmup_async=True)
+        _warmed_sampling_draws.add(key)
+        return pending
+    # Live-row decode modes and policies without warmup keep their eager draw.
+    if key not in _warmed_sampling_draws:
+        return _sample_exponential_race(probs)
+    return _compiled_sample_exponential_race(probs)
 
 
 def _capture_sampling_mask(

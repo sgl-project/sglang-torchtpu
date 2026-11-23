@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pool_side_engine as ps
 from sglang_tpu.disaggregation.raiden import pool_transfer as pl

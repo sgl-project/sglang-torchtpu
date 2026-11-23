@@ -113,6 +113,24 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def kpool_raw_ring_pages(*, page_size: int, kpool: int) -> int:
+    """Ring pages per request slot for the pooled indexer's raw key|gate rows,
+    or 0 to keep one raw row per cached token.
+
+    Only the open pool (fewer than ``kpool`` tokens) is ever read back, so a
+    request needs raw rows for at most one step's extend plus the pool before
+    it. With chunked prefill a step extends a request by at most one chunk.
+    """
+    if kpool <= 1 or not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
+        return 0
+    from sglang.srt.runtime_context import get_schedule
+
+    chunk = get_schedule().chunked_prefill_size
+    if chunk is None or chunk <= 0:
+        return 0
+    return _cdiv(chunk + kpool - 1, page_size) + 1
+
+
 class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """MHA KV pool with the fused 5D layout consumed by the Pallas kernel.
 
@@ -301,6 +319,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+
+    def get_device_pool_infos(self):
+        """Name this pool's KV layers for HiCache host assembly.
+
+        No upstream buffer info describes the fused pages, and the TPU host
+        pool is built from this pool itself (``get_device_pool_kv_host_cls``),
+        so ``buffer_info`` is None rather than the K/V-buffer description
+        ``MHATokenToKVPool`` builds from buffers this pool does not have.
+        """
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=None,
+            ),
+        )
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
@@ -327,15 +368,17 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # Buffer creation / accessors
     # ------------------------------------------------------------------ #
 
-    def _create_buffers(self):
-        kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
-        shape = (
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
             self.num_blocks,
             self.page_size,
-            kv_heads_packed,
+            self.num_kv_heads_x2 // self.kv_packing,
             self.kv_packing,
             self.padded_head_dim,
         )
+
+    def _create_buffers(self):
+        shape = self._buffer_shape()
         logger.info(
             "Allocating fused TPU KV buffers: layers=%d, shape per layer=%s, dtype=%s",
             self.layer_num,
@@ -611,6 +654,31 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # them twice and inflated every KV-transfer byte count by that factor.
         kv_item_lens = [buf[0].nbytes for buf in self.kv_buffer]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+
+class TpuFlywheelKVPool(TpuFusedMHATokenToKVPool):
+    """The fused pool with its packing axis merged, for --attention-backend flywheel:
+    [num_blocks, page_size, num_kv_heads_x2, head_dim], flywheel's cache layout.
+
+    Same bytes and K/V interleave as the 5D buffer. At head_dim 256 the 5D
+    buffer's TPU tiling differs from the 4D view the kernels take, so every call
+    would relayout the whole layer buffer; this shape needs none.
+    """
+
+    KV_LAYOUT_NAME = "token-major-flywheel"
+
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
+            self.num_blocks,
+            self.page_size,
+            self.num_kv_heads_x2,
+            self.padded_head_dim,
+        )
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_blocks, page_size, kv_heads_x2, hd = buf.shape
+        return buf.view(n_blocks * page_size, kv_heads_x2, hd)
 
 
 class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
@@ -978,6 +1046,8 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
         self._synchronize_device()
 
     def get_contiguous_buf_infos(self):
+        if self.layer_num == 0:
+            return [], [], []
         # One item = one block's bundle row, every layer included.
         return (
             [self.kv_bundle.data_ptr()],
@@ -1096,6 +1166,9 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
             device=self.device,
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self._finalize_allocation_log(size)
 
@@ -1248,7 +1321,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     * NoPE, ``[num_pages, page_size, 4, 128]``: 512 bytes per token.
     * RoPE, ``[num_pages, page_size // 4, 4, 128]``: 64 bytes per token, padded
-      to 128.
+      to 128. A model without RoPE dims (``qk_rope_head_dim == 0``,
+      GLM-5.3-Flash) never writes or reads it (the ops attend with a zero rope
+      lane), so it gets a one-row placeholder instead, and the pool's bytes per
+      token leave it out.
 
     The values are FP8, stored as raw bytes.
 
@@ -1325,6 +1401,12 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self._index_head_dim = index_head_dim
         self._index_key_layers = index_key_layers
         self._index_kpool = index_kpool
+        # With a raw ring, request slot r keeps its raw rows at pages
+        # r * raw_ring_pages_cnt + p % raw_ring_pages_cnt, allocated by attach_raw_ring().
+        self.raw_ring_pages_cnt = kpool_raw_ring_pages(
+            page_size=page_size, kpool=index_kpool
+        )
+        self._raw_ring_slots = 0
 
         if self.size % self.page_size != 0:
             raise ValueError(
@@ -1340,20 +1422,35 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
         # page 0 is never a real page.
         self.num_pages = self.size // self.page_size + 1
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
 
         self._create_buffers()
         self._finalize_allocation_log(size)
 
     @classmethod
     def bytes_per_token(
-        cls, *, index_head_dim: int, index_key_layers: list[bool], index_kpool: int
+        cls,
+        *,
+        index_head_dim: int,
+        index_key_layers: list[bool],
+        index_kpool: int,
+        raw_ring: bool = False,
+        qk_rope_head_dim: int = 64,
     ) -> int:
-        """Bytes one token takes across all layers' buffers, as allocated."""
+        """Bytes one token takes across all layers' buffers, as allocated.
+        A raw ring is sized by request slots, not tokens, so it is not counted."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
-        if index_kpool > 1:
+        if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
-        layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
+        layer_bytes = cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim)
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
+
+    @classmethod
+    def rope_bytes_per_token(cls, qk_rope_head_dim: int) -> int:
+        """RoPE cache bytes per token: one lane, or none without RoPE dims."""
+        return cls.LANE_BYTES if qk_rope_head_dim > 0 else 0
 
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:
@@ -1376,12 +1473,18 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             self.NOPE_BYTES // self.LANE_BYTES,
             self.LANE_BYTES,
         )
-        rope_shape = (
-            self.num_pages,
-            rows_per_page,
-            self.TOKENS_PER_ROW,
-            self.LANE_BYTES,
-        )
+        if self.qk_rope_head_dim > 0:
+            rope_shape = (
+                self.num_pages,
+                rows_per_page,
+                self.TOKENS_PER_ROW,
+                self.LANE_BYTES,
+            )
+        else:
+            # No RoPE dims: the ops neither write nor read the rope cache
+            # (zero_rope), so one row stands in for it. It is not a page
+            # buffer: P/D transfer and HiCache leave it out.
+            rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
             self.num_pages,
             rows_per_page // self._index_kpool,
@@ -1415,15 +1518,48 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             )
             for has_indexer in self._index_key_layers
         ]
-        raw_shape = (self.num_pages, self.page_size, 2 * self._index_head_dim)
-        self.kpool_raw_buffer = [
+        self.kpool_raw_buffer = self._raw_buffers()
+
+    def _raw_buffers(self) -> list[Optional[torch.Tensor]]:
+        """Each indexer layer's raw key|gate buffer: one row per pool token, or
+        the ring once attach_raw_ring() has sized it (None until then)."""
+        if self.raw_ring_pages_cnt:
+            raw_pages = self._raw_ring_slots * self.raw_ring_pages_cnt
+        else:
+            raw_pages = self.num_pages
+        if self._index_kpool <= 1 or raw_pages == 0:
+            return [None] * len(self._index_key_layers)
+        raw_shape = (raw_pages, self.page_size, 2 * self._index_head_dim)
+        return [
             (
                 _zeros_kv_buffer(raw_shape, torch.bfloat16, self.device)
-                if has_indexer and self._index_kpool > 1
+                if has_indexer
                 else None
             )
             for has_indexer in self._index_key_layers
         ]
+
+    def attach_raw_ring(self, req_slots: int) -> None:
+        """Allocate the raw ring for ``req_slots`` request-pool rows, padding row
+        included. The request pool is built beside this pool, so the attention
+        backend passes its size; a no-op without a ring."""
+        if not self.raw_ring_pages_cnt:
+            return
+        if self._raw_ring_slots:
+            if self._raw_ring_slots != req_slots:
+                raise ValueError(
+                    f"raw ring already sized for {self._raw_ring_slots} request "
+                    f"slots, asked for {req_slots}"
+                )
+            return
+        self._raw_ring_slots = req_slots
+        self.kpool_raw_buffer = self._raw_buffers()
+        logger.info(
+            "Pooled indexer raw rows in a ring: %d request slots x %d pages per "
+            "indexer layer",
+            req_slots,
+            self.raw_ring_pages_cnt,
+        )
 
     def _clear_buffers(self):
         del self.nope_buffer
@@ -1431,28 +1567,72 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         del self.index_key_buffer
         del self.kpool_raw_buffer
 
+    def get_state(self) -> list[torch.Tensor]:
+        """Every buffer the ops update in place, for direct_compile.
+
+        Every layer's NoPE, then RoPE, then the index keys and raw key|gate of
+        the layers that have them. The inherited MLA version returns
+        ``kv_buffer``, which this pool does not have.
+        """
+        return [
+            buf
+            for kind in (
+                self.nope_buffer,
+                self.rope_buffer,
+                self.index_key_buffer,
+                self.kpool_raw_buffer,
+            )
+            for buf in kind
+            if buf is not None
+        ]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Install a list laid out like ``get_state``; absent buffers stay None."""
+        expected = len(self.get_state())
+        if len(state) != expected:
+            raise ValueError(
+                f"TpuSplitMLATokenToKVPool.set_state expects {expected} tensors, "
+                f"got {len(state)}"
+            )
+        it = iter(state)
+
+        def take(kind: list) -> list:
+            return [None if buf is None else next(it) for buf in kind]
+
+        self.nope_buffer = take(self.nope_buffer)
+        self.rope_buffer = take(self.rope_buffer)
+        self.index_key_buffer = take(self.index_key_buffer)
+        self.kpool_raw_buffer = take(self.kpool_raw_buffer)
+
     def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
         """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
         index keys and raw key|gate when it has them. Each leads with
         ``num_pages``, so a request's page ids address it in all of them."""
         i = layer_id - self.start_layer
-        optional = (self.index_key_buffer[i], self.kpool_raw_buffer[i])
-        return [self.nope_buffer[i], self.rope_buffer[i]] + [
+        rope = (self.rope_buffer[i],) if self.qk_rope_head_dim > 0 else ()
+        optional = (self.index_key_buffer[i], self._paged_raw_buffers()[i])
+        return [self.nope_buffer[i], *rope] + [
             buf for buf in optional if buf is not None
         ]
+
+    def _paged_raw_buffers(self) -> list[Optional[torch.Tensor]]:
+        """The raw key|gate buffers when a page id addresses them. A raw ring is
+        indexed by request slot, so page copies (host tier, P/D) leave it out."""
+        if self.raw_ring_pages_cnt:
+            return [None] * len(self.kpool_raw_buffer)
+        return self.kpool_raw_buffer
 
     def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
         """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
 
         Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
-        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) only
-        writes zeros to its RoPE buffer, so the buffer stays behind: the
-        receiver's starts zeroed too.
+        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) has only
+        a placeholder RoPE buffer that no op reads, so it stays behind.
         """
         kinds = [self.nope_buffer]
         if self.qk_rope_head_dim > 0:
             kinds.append(self.rope_buffer)
-        kinds += [self.index_key_buffer, self.kpool_raw_buffer]
+        kinds += [self.index_key_buffer, self._paged_raw_buffers()]
         return [
             (self.start_layer + i, buf)
             for kind in kinds

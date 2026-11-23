@@ -79,6 +79,8 @@ class Submission:
     """Owner-only metadata distributed before executable transfer."""
     pending: Any = None
     """Owner-only native compilation future, cleared after retrieval."""
+    record: Callable[[Any, bytes | None], None] | None = None
+    """Owner-only callback given the executable and its distribution bytes."""
     executable: Any = None
     """Locally compiled or loaded executable available after distribution."""
 
@@ -86,6 +88,33 @@ class Submission:
         if self.executable is None:
             raise RuntimeError("Shared compilation must finish before graph execution")
         return self.executable
+
+
+def serialize_executable(executable: Any) -> bytes:
+    """Serialize an executable for another process: zstd-compressed TorchTPU bytes."""
+    return zstandard.ZstdCompressor(level=1).compress(
+        tc.serialize_executable(executable)
+    )
+
+
+def load_serialized_executable(serialized: bytes, subslice_origin: Any = None) -> Any:
+    """Load an executable written by ``serialize_executable``. The bytes omit
+    the TPU subslice's chip coordinates: pass the original executable's
+    ``subslice_origin()``."""
+    return tc.load_serialized_executable(
+        zstandard.ZstdDecompressor().decompress(serialized),
+        subslice_origin=subslice_origin,
+    )
+
+
+class _LoadedExecutable:
+    """A pending compilation that already holds its executable."""
+
+    def __init__(self, executable: Any) -> None:
+        self._executable = executable
+
+    def get(self) -> Any:
+        return self._executable
 
 
 def _prepare_executable(
@@ -97,9 +126,9 @@ def _prepare_executable(
         submission.pending = None
     serialized = None
     if serialize:
-        serialized = zstandard.ZstdCompressor(level=1).compress(
-            tc.serialize_executable(executable)
-        )
+        serialized = serialize_executable(executable)
+    if submission.record is not None:
+        submission.record(executable, serialized)
     return executable, serialized
 
 
@@ -260,6 +289,18 @@ class SPMDCompiler:
             argument_layouts=interface.argument_layouts,
             donated_inputs=donated_inputs,
         )
+        return submission
+
+    def provide(
+        self, graph: str, *, interface: ExecutableInterface, executable: Any
+    ) -> Submission:
+        """Submit the owner's executable without compiling it, e.g. one loaded
+        from a store. Distribution and consumer binding are unchanged."""
+        submission = self.submissions[graph]
+        if self.verify_spmd_safe or submission.owner != self.rank:
+            raise ValueError(f"Invalid TPU executable provider: {graph}")
+        submission.interface = interface
+        submission.pending = _LoadedExecutable(executable)
         return submission
 
     def get(self) -> Any:
@@ -430,11 +471,8 @@ class SPMDCompiler:
                 if executable is None:
                     # Serialized bytes omit the TPU subslice's chip coordinates.
                     # Preserve the owner's origin when loading on its TP peers.
-                    executable = tc.load_serialized_executable(
-                        zstandard.ZstdDecompressor().decompress(
-                            buffer.numpy().tobytes()
-                        ),
-                        subslice_origin=subslice_origin,
+                    executable = load_serialized_executable(
+                        buffer.numpy().tobytes(), subslice_origin
                     )
                 item.executable = executable
 

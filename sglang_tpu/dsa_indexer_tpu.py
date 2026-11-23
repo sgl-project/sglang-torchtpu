@@ -339,11 +339,11 @@ def indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
-    key, _ = indexer.wk(x)
-    key = indexer.k_norm(key)
+    key = _project_index_key(indexer, x)
 
     # Only the first rope_dim dimensions of each vector are rotated; a NoPE
-    # indexer (Kimi-K3.1) has no rotary embedding at all.
+    # indexer (Kimi-K3.1) has no rotary embedding at all. index_key mirrors
+    # this for the key alone; keep the two in step.
     if not indexer.skip_rope:
         rope_dim = indexer.rope_head_dim
         q_rope, k_rope = indexer.rotary_emb(
@@ -367,8 +367,34 @@ def indexer_forward(
         key=key,
         head_weights=head_weights,
         weight_scale=weight_scale,
-        key_store=_key_store_mode(indexer, x.shape[0]),
+        key_store=key_store_mode(indexer, x.shape[0]),
     )
+
+
+def _project_index_key(indexer: "Indexer", x: torch.Tensor) -> torch.Tensor:
+    """The indexer's key before rope, ``[num_tokens, index_head_dim]``."""
+    key, _ = indexer.wk(x)
+    return indexer.k_norm(key)
+
+
+def index_key(
+    indexer: "Indexer", *, x: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """The key ``indexer_forward`` stores for each token, without its query side.
+
+    For a writer that fills the index-key cache without scoring: same
+    projection, same rotary module and the same rotated columns, so the key
+    matches the one ``indexer_forward`` hands ``index_topk``.
+    """
+    key = _project_index_key(indexer, x)
+    if indexer.skip_rope:
+        return key
+    rope_dim = indexer.rope_head_dim
+    k_rope = key[..., :rope_dim]
+    # The rotary module ropes a query and a key in one call. A copy stands in
+    # for the query: aliasing the key would rotate it twice if rope is in place.
+    _, k_rope = indexer.rotary_emb(positions, k_rope.clone(), k_rope)
+    return torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
 
 
 # Batches up to this many tokens store their index keys with the Pallas
@@ -377,7 +403,7 @@ def indexer_forward(
 _PALLAS_KEY_STORE_MAX_TOKENS = 16
 
 
-def _key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
+def key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
     """The ``key_store`` of ``dsa_indexer_step`` for this layer and batch."""
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -388,6 +414,19 @@ def _key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
     ):
         return "xla"
     return "pallas"
+
+
+def pooled_index_key_and_gate(
+    indexer: "IndexerKPool", x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pooled indexer's raw record inputs: the key (no rope) and the
+    compression gate, each ``[num_tokens, index_head_dim]``.
+
+    ``kpool_indexer_forward`` stores them; any other writer of the pooled
+    caches must store the same.
+    """
+    gate = torch.nn.functional.linear(x, indexer.index_kpool_compress_gate)
+    return _project_index_key(indexer, x), gate
 
 
 def build_dsa_kpool_topk_op():
@@ -416,12 +455,14 @@ def build_dsa_kpool_topk_op():
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        raw_page_base: jax.Array,
         weight_scale: float,
         topk: int,
         kpool: int,
         out_width: int,
         decode_query_size: int,
         max_query_length: int,
+        raw_ring_pages_cnt: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return kpool_indexer_step(
             query,
@@ -441,6 +482,8 @@ def build_dsa_kpool_topk_op():
             out_width=out_width,
             decode_query_size=decode_query_size,
             max_query_length=max_query_length or None,
+            raw_page_base=raw_page_base,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
 
     raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
@@ -455,6 +498,7 @@ def build_dsa_kpool_topk_op():
             "out_width",
             "decode_query_size",
             "max_query_length",
+            "raw_ring_pages_cnt",
         ),
         # Both caches are updated in place: outputs 1 and 2 alias them.
         donate_argnums=(raw_argnum, pooled_argnum),
@@ -479,12 +523,14 @@ def build_dsa_kpool_topk_op():
         page_indices: torch.Tensor,
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
+        raw_page_base: torch.Tensor,
         weight_scale: float,
         topk: int,
         kpool: int,
         out_width: int,
         decode_query_size: int = 1,
         max_query_length: int = 0,
+        raw_ring_pages_cnt: int = 0,
     ) -> torch.Tensor:
         # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
         with tpu_info_for_cpu_export():
@@ -500,17 +546,19 @@ def build_dsa_kpool_topk_op():
                 page_indices,
                 cu_q_lens,
                 distribution,
+                raw_page_base,
                 weight_scale,
                 topk,
                 kpool,
                 out_width,
                 decode_query_size,
                 max_query_length,
+                raw_ring_pages_cnt,
             )
         return topk_indices
 
     def _fake_impl(query: torch.Tensor, *args, **kwargs):
-        topk, kpool, out_width = args[11:14]
+        topk, kpool, out_width = args[12:15]
         width = max(out_width, topk + kpool - 1)
         return torch.empty(
             (query.shape[0], width), dtype=torch.int32, device=query.device
@@ -558,11 +606,13 @@ def build_dsa_kpool_topk_split_op():
         cu_q_lens: jax.Array,
         distribution: jax.Array,
         row_start: jax.Array,
+        raw_page_base: jax.Array,
         weight_scale: float,
         topk: int,
         kpool: int,
         max_query_length: int,
         row_count: int,
+        raw_ring_pages_cnt: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return kpool_indexer_step(
             query,
@@ -582,6 +632,8 @@ def build_dsa_kpool_topk_split_op():
             max_query_length=max_query_length or None,
             row_start=row_start,
             row_count=row_count,
+            raw_page_base=raw_page_base,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
 
     raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
@@ -595,6 +647,7 @@ def build_dsa_kpool_topk_split_op():
             "kpool",
             "max_query_length",
             "row_count",
+            "raw_ring_pages_cnt",
         ),
         donate_argnums=(raw_argnum, pooled_argnum),
         input_output_aliases={raw_argnum: 1, pooled_argnum: 2},
@@ -619,11 +672,13 @@ def build_dsa_kpool_topk_split_op():
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
         row_start: torch.Tensor,
+        raw_page_base: torch.Tensor,
         weight_scale: float,
         topk: int,
         kpool: int,
         max_query_length: int,
         row_count: int,
+        raw_ring_pages_cnt: int = 0,
     ) -> torch.Tensor:
         # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
         with tpu_info_for_cpu_export():
@@ -640,16 +695,18 @@ def build_dsa_kpool_topk_split_op():
                 cu_q_lens,
                 distribution,
                 row_start,
+                raw_page_base,
                 weight_scale,
                 topk,
                 kpool,
                 max_query_length,
                 row_count,
+                raw_ring_pages_cnt,
             )
         return picked
 
     def _fake_impl(query: torch.Tensor, *args, **kwargs):
-        topk, kpool, _max_query_length, row_count = args[12:16]
+        topk, kpool, _max_query_length, row_count = args[13:17]
         return torch.empty(
             (row_count, topk // kpool), dtype=torch.int32, device=query.device
         )
@@ -751,9 +808,7 @@ def kpool_indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
-    key, _ = indexer.wk(x)
-    key = indexer.k_norm(key)
-    gate = torch.nn.functional.linear(x, indexer.index_kpool_compress_gate)
+    key, gate = pooled_index_key_and_gate(indexer, x)
     head_weights, _ = indexer.weights_proj(x.float())
     return backend.index_topk_kpool(
         forward_batch=forward_batch,

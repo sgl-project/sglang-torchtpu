@@ -38,6 +38,8 @@ class TestCompileCacheHook(unittest.TestCase):
                 sp_degree=1,
                 dp_size=1,
                 dist_timeout=None,
+                allow_cudnn_tf32=False,
+                allow_bf16_reduced_precision_reduction=False,
             ),
             master_port=29500,
             local_rank=0,

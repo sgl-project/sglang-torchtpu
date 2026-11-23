@@ -14,19 +14,16 @@ from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
-from sglang.utils import LazyImport
-from sglang_tpu import shared_slice
+
+# By module: importing dp_replicas first runs platform discovery from its own
+# sglang import, which loads this module before dp_replicas defines its names.
+from sglang_tpu import dp_replicas, shared_slice
 from sglang_tpu._logging import get_logger
-from sglang_tpu.dp_replicas import (
-    ReplicaSession,
-    get_replica_session,
-    prepare_host_session,
-    validate_dp_replicas,
-)
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -128,6 +125,8 @@ def _rpa_kernel_spec(backend: str | None):
         from sglang_tpu.attention_pallas_rpa_batched import RPA_BATCHED_SPEC as spec
     elif backend == "pallas_tpu_rpa_v3":
         from sglang_tpu.attention_pallas_rpa_v3 import RPA_V3_SPEC as spec
+    elif backend == "flywheel":
+        from sglang_tpu.attention_flywheel import FLYWHEEL_SPEC as spec
     else:
         return None
     return spec
@@ -243,7 +242,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         raise NotImplementedError(
             f"{feature} requires --cp-strategy zigzag, got {cfg.cp_strategy!r}."
         )
-    from sglang.srt.utils.hf_transformers.config import get_config
+    from sglang.srt.hf_transformers.config import get_config
 
     hf_config = get_config(
         cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
@@ -382,12 +381,14 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
 
         return TpuSeqAlongLaneKVPool
 
+    if backend == "flywheel":
+        from sglang_tpu.kv_pool import TpuFlywheelKVPool
+
+        return TpuFlywheelKVPool
+
     # RPA v3 and batched use the fused 5D KV layout; pallas_tpu_flash and
     # torch_native read the generic MHA pool.
-    if backend in (
-        "pallas_tpu_rpa_v3",
-        "pallas_tpu_rpa_batched",
-    ):
+    if backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool
@@ -698,7 +699,7 @@ def _validate_dsa(server_args) -> None:
     """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.configs.model_config import is_deepseek_dsa
-    from sglang.srt.utils.hf_transformers.config import get_config
+    from sglang.srt.hf_transformers.config import get_config
 
     cfg = resolving_view(server_args)
     try:
@@ -731,15 +732,31 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
-    # The direct tracer gets the KV cache buffers from the pool's get_state and
-    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
-    # buffers, so the first compile would fail.
-    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
-    # tracer.
-    if cfg.tpu_compile_tracer != "dynamo":
+    _validate_kpool_raw_ring(cfg)
+
+
+def _validate_kpool_raw_ring(cfg) -> None:
+    """The pooled indexer's raw ring (SGLANG_TPU_DSA_KPOOL_RAW_RING) keeps raw
+    rows by request slot, not by page, so nothing that moves pages can carry an
+    open pool's raw rows, and an unchunked prefill would overrun the ring."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
+        return
+    if cfg.disaggregation_mode != "null":
         raise ValueError(
-            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
-            f"{cfg.tpu_compile_tracer!r}."
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --disaggregation-mode "
+            f"{cfg.disaggregation_mode!r}: a P/D transfer moves pages, and the "
+            "ring's raw rows are not paged."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --enable-prefill-cp."
+        )
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING needs chunked prefill: the ring is sized "
+            "for one chunk per request per step."
         )
 
 
@@ -842,6 +859,12 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
+    @register_attention_backend("flywheel")
+    def create_flywheel_backend(runner):
+        from sglang_tpu.attention_flywheel import TpuFlywheelAttnBackend
+
+        return TpuFlywheelAttnBackend(runner)
+
     # Vision: opt in to block-skipping splash for the "tpu" backend.
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -865,7 +888,7 @@ def _resolve_num_hidden_layers(server_args) -> int:
     unresolvable — an unloadable model fails later with its real error, and
     the prefetch containment stays off rather than guessing."""
     try:
-        from sglang.srt.utils.hf_transformers.config import get_config
+        from sglang.srt.hf_transformers.config import get_config
 
         hf_config = get_config(
             server_args.model_path,
@@ -1090,8 +1113,12 @@ class TpuSRTPlatform(SRTPlatform):
         # torch_tpu.
         # One device per scheduler process across all pipeline stages.
         if cfg.dp_size > 1:
-            validate_dp_replicas(cfg)
-            prepare_host_session(cfg.dp_size, cfg.tp_size)
+            dp_replicas.validate_dp_replicas(cfg)
+            dp_replicas.prepare_host_session(
+                cfg.dp_size,
+                cfg.tp_size,
+                cfg.dist_init_addr if cfg.nnodes > 1 else None,
+            )
         _prepare_tpu_env(
             cfg.dp_size * cfg.tp_size * cfg.pp_size,
             setup_slicebuilder=not cfg.use_ray,
@@ -1253,6 +1280,12 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        if cfg.attention_backend == "flywheel":
+            from sglang_tpu.attention_flywheel import validate_flywheel_server_args
+
+            validate_flywheel_server_args(cfg)
+            # The host plans each step's KV writes from the page table.
+            _pin_req_to_token_on_host("--attention-backend flywheel")
         if _uses_block_major_kv():
             _check_block_major_supported(server_args)
         _resolve_unified_kv_pool(server_args)
@@ -1331,7 +1364,11 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
+    # In-tree (SGLANG_PLATFORM=tpu) answer; the method is the tpu_oot answer.
     supports_mamba_extra_buffer = True
+
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        return True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
@@ -1392,7 +1429,7 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         from sglang.srt.mem_cache.pool_host.base import (
-            host_memory_budget_bytes,
+            host_memory_budget_plain_hugetlb,
             host_memory_budget_scope,
         )
         from sglang.srt.runtime_context import get_memory
@@ -1400,7 +1437,7 @@ class TpuSRTPlatform(SRTPlatform):
         if not is_tpu_dma_hicache_backend(get_memory().hicache_io_backend):
             return super().get_hicache_explicit_size_context()
         # Full, SWA, and draft pools must fit within one combined RAM budget.
-        return host_memory_budget_scope(host_memory_budget_bytes())
+        return host_memory_budget_scope(host_memory_budget_plain_hugetlb())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -1420,6 +1457,34 @@ class TpuSRTPlatform(SRTPlatform):
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
         return MHATokenToKVPoolHost
+
+    def get_device_pool_kv_host_cls(self, device_pool) -> Optional[type]:
+        # The TPU host pools mirror the device pool's fused pages, which no
+        # buffer info describes, so they build from the device pool. MLA pools
+        # keep the upstream MLA host pool.
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang_tpu.kv_pool_host import (
+            TpuDMAHostKVPool,
+            TpuFusedMHATokenToKVPoolHost,
+        )
+
+        if isinstance(device_pool, MLATokenToKVPool):
+            return None
+        host_cls = self.get_mha_kv_pool_host_cls(device_pool)
+        if issubclass(host_cls, (TpuDMAHostKVPool, TpuFusedMHATokenToKVPoolHost)):
+            return host_cls
+        return None
+
+    def get_hybrid_cache_controller_cls(self, io_backend: str) -> Optional[type]:
+        # A TPU DMA backend has no device streams and drives per-pool
+        # all-layer DMAs, so it needs its own hybrid controller.
+        if not is_tpu_dma_hicache_backend(io_backend):
+            return None
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+            TpuDMAHybridCacheController,
+        )
+
+        return TpuDMAHybridCacheController
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
@@ -1442,6 +1507,15 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
         return TpuSplitMLATokenToKVPool
+
+    def get_kv_pool_cls(self, *, kind):
+        if kind == "mha":
+            return self.get_mha_kv_pool_cls()
+        if kind == "mla":
+            return self.get_mla_kv_pool_cls()
+        # The TPU DSA pool is an MLA pool plus index-key caches, not a
+        # DSATokenToKVPool; the TPU DSA builder asks get_dsa_kv_pool_cls().
+        return None
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -1509,14 +1583,21 @@ class TpuSRTPlatform(SRTPlatform):
     def get_batch_input_device(self, batch) -> str | None:
         """Keep eligible prefill inputs on CPU until backend padding."""
         from sglang.srt.layers.cp.base import get_cp_strategy
-        from sglang.srt.utils.common import print_warning_once
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.utils.log_utils import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
+        # Pipeline stages pad prefill to the same buckets, so host-pad it too. A
+        # PD decode server's prebuilt first token keeps the device placement.
+        staged = _can_stage_forward_metadata(batch) or (
+            _can_stage_forward_metadata(batch, allow_pipeline_parallel=True)
+            and batch.forward_mode == ForwardMode.EXTEND
+        )
         checks = (
-            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("forward metadata is not staged", staged),
             ("context parallelism is on", get_cp_strategy() is None),
             ("the allocator returns device indices", host_return_allocators(allocator)),
             # Page size 1 uses alloc(), which has no host-return contract.
@@ -1539,6 +1620,11 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_torch_compile(self) -> bool:
         return True
 
+    def narrows_padded_extend_attention(self) -> bool:
+        # The compiled forward runs the bucket-padded batch whole; narrowing
+        # would trace data_ptr() and bake each real-row count into a shape.
+        return False
+
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")
 
@@ -1558,12 +1644,6 @@ class TpuSRTPlatform(SRTPlatform):
         return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
 
     def is_pin_memory_available(self, device=None) -> bool:
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
         return False
 
     def supports_decode_context_parallel(self) -> bool:
@@ -1620,7 +1700,7 @@ class TpuSRTPlatform(SRTPlatform):
     # Initialization
     # ------------------------------------------------------------------
 
-    _dp_replica_session: Optional[ReplicaSession] = None
+    _dp_replica_session: Optional[dp_replicas.ReplicaSession] = None
 
     def prepare_worker(
         self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -1628,16 +1708,17 @@ class TpuSRTPlatform(SRTPlatform):
         cfg = _resolving_view(server_args)
         if cfg.dp_size <= 1:
             return
-        validate_dp_replicas(cfg)
+        dp_replicas.validate_dp_replicas(cfg)
         if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
             raise ValueError(f"Invalid TPU engine DP rank: {dp_rank}")
-        self._dp_replica_session = ReplicaSession(
+        self._dp_replica_session = dp_replicas.ReplicaSession(
             dp_rank,
             cfg.dp_size,
             cfg.tp_size,
             cfg.ep_size,
             dp_rank * cfg.tp_size + tp_rank,
             cfg.dist_timeout or 7200,
+            cfg.dcp_size,
         )
         # The session rank chooses the physical device. Engine-local co-location
         # binding would put every replica on the first engine's devices.
@@ -1645,9 +1726,19 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.pop("TPU_VISIBLE_DEVICES", None)
 
     def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
-        if get_replica_session() is not None:
+        if dp_replicas.get_replica_session() is not None:
             return _ReplicaGroupCoordinator._load()
         return super().get_group_coordinator_cls()
+
+    def get_group_coordinator_device(self, local_rank: int) -> torch.device:
+        # Collectives run over the tpu_dist backend, not a device module the
+        # coordinator binds; keep the CPU binding the TPU path has always had.
+        return torch.device("cpu")
+
+    def get_moe_expert_executor_cls(self, context) -> Optional[type]:
+        # TPU serves MoE through the built-in FusedMoE with TPU quant methods,
+        # so no executor replaces it.
+        return None
 
     def init_backend(self) -> None:
         if getattr(self, "_backend_initialized", False):

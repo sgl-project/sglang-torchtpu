@@ -434,10 +434,8 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
         from sglang.srt.runtime_context import get_context, get_parallel
         from sglang.test.test_utils import enter_scope
-        from sglang_tpu.fp8_moe import (
-            _dequantize_dsv4_mxfp4_block32,
-            prepare_tpu_fp8_moe_weights,
-        )
+        from sglang_tpu.dsv4_mxfp4_moe import _dequantize_dsv4_mxfp4_block32
+        from sglang_tpu.fp8_moe import prepare_tpu_fp8_moe_weights
         from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         enter_scope(self, get_parallel().override(tp_size=1))

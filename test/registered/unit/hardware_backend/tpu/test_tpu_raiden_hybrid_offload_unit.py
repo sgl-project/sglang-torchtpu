@@ -24,14 +24,18 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
+from sglang.srt.managers.cache_controller import (
+    BatchDoneCounter,
+    CacheOperation,
+    LayerDoneCounter,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    CacheOperation,
     HybridCacheController,
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+from sglang.srt.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
 from sglang_tpu.kv_pool_host import (
@@ -42,6 +46,7 @@ from sglang_tpu.raiden_transfer import RaidenKVTransfer
 from sglang_tpu.tpu_dma_hybrid_cache_controller import (
     TpuDMAHybridCacheController,
 )
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 class _FakeFuture:
@@ -114,6 +119,7 @@ def _make_controller() -> TpuDMAHybridCacheController:
     ctrl.ack_write_queue = []
     ctrl.ack_load_queue = []
     ctrl.layer_done_counter = BatchDoneCounter()
+    ctrl.kv_storage = None
     return ctrl
 
 
@@ -144,19 +150,32 @@ class TestPlainKvController(CustomTestCase):
             )
             controller.layer_done_counter = object.__new__(LayerDoneCounter)
 
+        device_pool.layer_num = 1
         with (
             patch.object(HybridCacheController, "__init__", init_base),
-            patch.object(hybrid_pool_assembler, "build_kv_only_group"),
+            patch.object(hybrid_pool_assembler, "prepare_host_pool_config"),
+            patch.object(hybrid_pool_assembler, "build_host_pool_group"),
             patch.object(hybrid_pool_assembler, "get_memory") as memory,
+            # On TPU the platform picks the DMA hybrid controller for raiden.
+            patch.object(
+                current_platform,
+                "get_hybrid_cache_controller_cls",
+                lambda io_backend: TpuSRTPlatform.get_hybrid_cache_controller_cls(
+                    current_platform, io_backend
+                ),
+            ),
         ):
             memory.return_value.hicache_io_backend = "raiden"
-            _, controller = hybrid_pool_assembler.build_kv_only_stack(
-                params=MagicMock(),
-                kv_pool=device_pool,
-                full_layer_mapping={0: 0},
-                load_cache_event=None,
-                storage_backend=None,
-                use_mla=False,
+            controller = (
+                hybrid_pool_assembler._KvStrategy()
+                .build(
+                    cache=MagicMock(),
+                    kvcache=device_pool,
+                    params=MagicMock(),
+                    server_args=None,
+                    load_cache_event=None,
+                )
+                .cache_controller
             )
 
         counter = controller.layer_done_counter
@@ -481,7 +500,9 @@ class TestAssemblerPlatformHook(CustomTestCase):
                 built["kwargs"] = kwargs
 
         fake_platform = MagicMock()
-        fake_platform.get_mha_kv_pool_host_cls = MagicMock(return_value=_RecordingPool)
+        fake_platform.get_device_pool_kv_host_cls = MagicMock(
+            return_value=_RecordingPool
+        )
 
         args = ServerArgs(model_path="dummy")
         kv_pool = object()
@@ -493,15 +514,44 @@ class TestAssemblerPlatformHook(CustomTestCase):
                 pool = hybrid_pool_assembler.build_kv_host_pool(
                     kv_pool=kv_pool,
                     page_size=64,
-                    use_mla=False,
                     pool_label="swa",
                 )
         finally:
             reset_context()
 
-        fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(kv_pool)
+        fake_platform.get_device_pool_kv_host_cls.assert_called_once_with(kv_pool)
+        self.assertIs(built["args"][0], kv_pool)
         self.assertIsInstance(pool, _RecordingPool)
         self.assertEqual(built["kwargs"]["pool_label"], "swa")
+
+    def test_fused_pool_describes_its_layers_for_host_assembly(self):
+        # The assembler asks every KV root for its model layer IDs before the
+        # platform hook builds the host pool from the device pool itself.
+        from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+            prepare_host_pool_config,
+        )
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        pool = TpuFusedMHATokenToKVPool(
+            size=64,
+            page_size=16,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            start_layer=4,
+        )
+        config = prepare_host_pool_config(
+            root=pool,
+            full_layer_mapping={0: 0, 1: 1},
+            transfer_layer_id_max=2,
+            transfer_page_size=16,
+        )
+        self.assertIs(config.root, pool)
+        self.assertEqual(config.pool_infos[PoolName.KV].layer_ids, (4, 5))
+        self.assertEqual(config.sidecars, ())
 
 
 class TestSplitDsaAndStateOffload(CustomTestCase):
@@ -568,10 +618,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             hicache_write_policy="write_through",
             hicache_host_memory_mode=None,
         )
-        req_pool = SimpleNamespace(
-            mamba_pool=object(),
-            mamba_map={1: 0, 2: 1},
-            mamba_allocator=SimpleNamespace(alloc=MagicMock(), free=MagicMock()),
+        allocator = SimpleNamespace(
+            state=SimpleNamespace(pool=SimpleNamespace(mamba_layer_ids=[1, 2])),
+            state_slots=SimpleNamespace(alloc=MagicMock(), free=MagicMock()),
         )
         kvcache = SimpleNamespace(
             full_kv_pool=SimpleNamespace(layer_num=2),
@@ -582,9 +631,8 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         draft = object()
         params = SimpleNamespace(
             mtp_draft_device_pools=(draft,),
-            req_to_token_pool=req_pool,
             page_size=128,
-            token_to_kv_pool_allocator=object(),
+            token_to_kv_pool_allocator=allocator,
             tp_cache_group=None,
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
@@ -612,8 +660,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                 server_args=None,
                 load_cache_event=None,
             )
-        self.assertIs(result.cache_controller, controller.return_value)
-        self.assertEqual(controller.call_args.kwargs["io_backend"], "raiden")
+        create = controller.create_for_backend
+        self.assertIs(result.cache_controller, create.return_value)
+        self.assertEqual(create.call_args.kwargs["io_backend"], "raiden")
         self.assertEqual(
             result.component_host_pools,
             {ComponentType.FULL: kv_host, ComponentType.MAMBA: state_host},
@@ -621,7 +670,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         self.assertEqual(
             set(result.host_pool_group.entry_map), {PoolName.KV, PoolName.MAMBA}
         )
-        self.assertTrue(result.register_req_to_token_counter)
+        self.assertTrue(result.loads_state_layer_wise)
         # MTP draft KV packs into the KV entry and its host pool, like upstream.
         kv_entry = result.host_pool_group.entry_map[PoolName.KV]
         self.assertEqual(kv_entry.packed_draft_device_pools, (draft,))
@@ -883,19 +932,18 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
                 built["args"] = args
                 built["kwargs"] = kwargs
 
-        class _FakeMHAPool:
-            pass
-
         fake_platform = MagicMock()
-        fake_platform.get_mha_kv_pool_host_cls = MagicMock(return_value=_RecordingPool)
+        fake_platform.get_device_pool_kv_host_cls = MagicMock(
+            return_value=_RecordingPool
+        )
 
-        pool = _FakeMHAPool()
-        with (
-            patch("sglang.srt.platforms.current_platform", fake_platform),
-            patch("sglang.srt.mem_cache.memory_pool.MHATokenToKVPool", _FakeMHAPool),
-        ):
+        pool = object()
+        with patch("sglang.srt.platforms.current_platform", fake_platform):
             host_pool = hybrid_pool_assembler._build_mha_mla_host_pool(
                 pool=pool,
+                # TPU fused MHA pools describe no buffer layout (buffer_info
+                # None); an MLA fallback would read their kv_cache_dim.
+                buffer_info=None,
                 host_to_device_ratio=2.0,
                 page_size=64,
                 layout="page_first_fused",
@@ -903,8 +951,9 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
                 pool_label="draft",
             )
 
-        fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(pool)
+        fake_platform.get_device_pool_kv_host_cls.assert_called_once_with(pool)
         self.assertIsInstance(host_pool, _RecordingPool)
+        self.assertIs(built["args"][0], pool)
         self.assertEqual(built["kwargs"]["pool_label"], "draft")
 
 
