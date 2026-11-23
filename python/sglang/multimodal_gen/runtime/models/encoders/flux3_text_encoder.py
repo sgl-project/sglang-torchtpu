@@ -205,8 +205,11 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                 max_length=length,
                 padding_side="right",
             )
-            mask = toks["attention_mask"].to(self.device, non_blocking=True)
-            positions = (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)
+            # From the host mask: an int64 cumsum on the device aborts torch_tpu.
+            host_mask = toks["attention_mask"]
+            positions = (host_mask.long().cumsum(-1) - 1).masked_fill(host_mask == 0, 1)
+            positions = positions.to(self.device, non_blocking=True)
+            mask = host_mask.to(self.device, non_blocking=True)
             # Reference numerics: PyTorch's default SDPA backend choice.
             with torch_default_sdpa_backends():
                 out = self.model(

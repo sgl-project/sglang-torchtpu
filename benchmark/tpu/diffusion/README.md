@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `flux3_image.sh` | `black-forest-labs/flux-3-image-klein` | 8 or 1 | Ulysses = cores (24 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,14 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| FLUX.3 Image Klein | T2I 1024x1024, 16 steps | 8 | 0.54 s | 0.022 s | 0.15 s | 34.3 GiB |
+| FLUX.3 Image Klein | T2I 1024x1024, 16 steps | 1 | 1.5 s | 0.074 s | 0.22 s | 40.0 GiB |
+| FLUX.3 Image Klein | Edit, one 896x1120 reference, 16 steps | 8 | 1.0 s | 0.040 s | 0.15 s | 34.3 GiB |
+| FLUX.3 Image Klein | Edit, two references, 896x1120, 16 steps | 8 | 1.5 s | 0.062 s | 0.15 s | 34.3 GiB |
+
+FLUX.3 Image Klein compiles once per new 80-token prompt bucket (10 s on 8 cores) and per new combination of output
+and reference sizes (36-40 s). With `--batching-max-size 2 --batching-delay-ms 5`, two concurrent 1024x1024 requests
+take 1.0 s on 8 cores.
 
 
 ## Example requests
