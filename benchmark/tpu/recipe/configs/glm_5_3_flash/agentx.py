@@ -112,7 +112,7 @@ PROFILES = {
         # Decode-time KDA checkpoints off: unused, they forced KDA and KV evictions.
         track_interval=CONTEXT_LENGTH,
         # Host RAM grows with every decode program: 1..32 does not fit.
-        compile_bs=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+        compile_bs=(*range(1, 21), 24, 28, 32),
     ),
 }
 
