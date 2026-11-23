@@ -432,14 +432,8 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 wait_chunk(geo, i1 % KR_g)
 
         s_a, v_a = chunk_scores(i0, True, clean)
-        if c.attn_skip_idle_streams and not clean and ref is None:
-            carry_b = jax.lax.cond(
-                valid_b,
-                lambda cr: online(cr, *chunk_scores(i1, True, False), c.kv_sal),
-                lambda cr: cr,
-                carry2[1],
-            )
-            return online(carry2[0], s_a, v_a, c.kv_sal), carry_b
+        # stream b is always computed (masked past n_ch): a cond around it splits the body
+        # into serial blocks and exposes MXU latency (SWA +28%). SKIP_IDLE applies to v1 only
         s_b, v_b = chunk_scores(
             i1 if clean else jnp.minimum(i1, n_ch - 1), valid_b, clean
         )

@@ -532,8 +532,9 @@ class TpuEnvs:
     # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
     # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
     SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
-    # Megakernel attention: a softmax stream past the request's last chunk skips its iteration
-    # (MKConfig.attn_skip_idle_streams); and, with SWA chunks set, a full-attention layer's last
+    # Megakernel attention: v1 (sglang_tpu/muse_megakernel) only, a softmax stream past the
+    # request's last chunk skips its iteration (attn_skip_idle_streams; muse_megakernel_v2
+    # always computes it masked); and, with SWA chunks set, a full-attention layer's last
     # chunk is masked by key column only (MKConfig.attn_col_mask).
     SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
     SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)

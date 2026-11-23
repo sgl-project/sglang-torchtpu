@@ -704,8 +704,6 @@ class MuseMegakernel(torch.nn.Module):
             attn_streams=_ATTN_STREAMS[
                 ("sal_fp8" if kv_sal_fp8 else "sal") if kv_sal else "fused"
             ],
-            attn_skip_idle_streams=opt
-            or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
             attn_col_mask=bool(swa_chunk_pages)
             and (opt or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get()),
             fold_attn_scale=(opt or tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get())
