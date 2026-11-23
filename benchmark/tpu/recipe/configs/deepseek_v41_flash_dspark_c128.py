@@ -27,3 +27,12 @@ from benchmark.tpu.recipe.configs.deepseek_v41_flash_dspark_agentx import (
 )
 
 CONFIG = with_max_running_requests(384)
+# Defer mid-prefill radix inserts of long chunked prompts to every 131072 tokens
+# (upstream #1514). At c128 those inserts caused ~52% of the cross-rank scheduler
+# stalls. Paired AgentX canonical c128, only this env differs
+# (j-316fa37a-e844-4163-abbb vs j-2570ac08-b486-46df-bd8a, 11,237 matched requests):
+# median per-request interactivity ratio 1.0154 (95% CI 1.0137-1.0175), TTFT
+# 1.0009 (0.985-1.016, neutral); p90 interactivity 40.4 -> 41.1, 92,057 -> 92,754
+# tok/s/chip, prefix hit 0.9421 -> 0.9427. GSM8K 0.904 (j-aa594f84-81e8-4913-8388).
+# Off at c32: TTFT ratio 1.0136 (1.007-1.019), worse.
+CONFIG["runtime_env"]["SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE"] = "131072"
