@@ -746,6 +746,27 @@ def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     )
 
 
+def try_platform_fused_boundary(
+    hc: HcSubLayer,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    coefficients: HcTriplet,
+    next: Optional[HcNextBoundary],
+) -> Optional[HcState]:
+    """Let an out-of-tree backend complete a boundary before the built-in post."""
+    if not _FUSED_HC_BOUNDARIES or next is None or not next.norm_fusable:
+        return None
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.is_out_of_tree():
+        return None
+    fused = _FUSED_HC_BOUNDARIES.get(current_platform.get_dispatch_key_name())
+    if fused is None:
+        return None
+    next_hc = next.resolve_hc()
+    return None if next_hc is None else fused(hc, y, residual, coefficients, next, next_hc)
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -758,16 +779,9 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    if _FUSED_HC_BOUNDARIES and next is not None and next.norm_fusable:
-        from sglang.srt.platforms import current_platform
-
-        if current_platform.is_out_of_tree():
-            fused = _FUSED_HC_BOUNDARIES.get(current_platform.get_dispatch_key_name())
-            next_hc = next.resolve_hc() if fused is not None else None
-            if next_hc is not None:
-                state = fused(hc, y, residual, coefficients, next, next_hc)
-                if state is not None:
-                    return state
+    state = try_platform_fused_boundary(hc, y, residual, coefficients, next)
+    if state is not None:
+        return state
     if (
         next is not None
         and next.norm_fusable

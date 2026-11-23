@@ -57,6 +57,7 @@ from sglang.srt.models.deepseek_v4 import (
     hc_head_torch,
     make_hc_head_params,
 )
+from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDSparkMixin
 from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
@@ -939,11 +940,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             residual_batch.start(forward_batch)
         # Draft stages do not have recorder layer indices.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                if _is_cuda:
-                    x = stage(positions, x, forward_batch)
-                else:
-                    x, pre = stage(positions, x, forward_batch, pre)
+            if not _is_cuda and self.hc_pre_from_prev_sublayer:
+                state = HcState(x)
+                for i, stage in enumerate(self.stages):
+                    next_stage = self.stages[i + 1] if i + 1 < self.num_stages else None
+                    state = stage._forward_hc_pre_from_prev(
+                        positions, state, forward_batch, next_stage
+                    )
+                x, pre = state.residual, state.pre
+            else:
+                for stage in self.stages:
+                    if _is_cuda:
+                        x = stage(positions, x, forward_batch)
+                    else:
+                        x, pre = stage(positions, x, forward_batch, pre)
         if _is_cuda:
             x = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
