@@ -658,9 +658,11 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
                 jax.lax.fori_loop(0, n, one, 0)
 
-            @pl.when(n > 0)
-            def _():
-                _dispatch(l, KV, leaf, only=gls)
+            with _scope("kv_refill"):
+
+                @pl.when(n > 0)
+                def _():
+                    _dispatch(l, KV, leaf, only=gls)
 
         def refill_slot(ref, v):
             """Chunk v (known < n_ch) into ring slot v % KR_g, straight-line."""
@@ -677,6 +679,12 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     chunk_dst(geo, slot, pi),
                     S["kv_chunk_sems"].at[slot],
                 ).start()
+
+        def refill_slots(ref, v0):
+            """Chunks [v0, v0 + NS) straight-line, after the compute."""
+            with _scope("kv_refill"):
+                for t in range(NS):
+                    refill_slot(ref, v0 + t)
 
         def pipelined_opt(n_it):
             """Hoisted straight-line KV refill + 2-acc PV/QK pipeline (stack2 for q<=4)."""
@@ -1008,8 +1016,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     pv_all_h(i0, par)
                     qk_all_h(i0 + NS, npar)
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return dummy
@@ -1194,8 +1201,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     accs = pv_all(i0, par, accs)
                     ls = ls + qk_all(i0 + NS, npar)
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return ls, accs
@@ -1262,8 +1268,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                         else:
                             p_put(npar, t, nxt[t][0])
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return [x[1] for x in nxt], accs
@@ -1366,9 +1371,10 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                         return None
 
                     def issue():
-                        for w in srcs:
-                            for t in range(2):
-                                refill_slot(ref, i0 + KR_g + 2 * w + t)
+                        with _scope("kv_refill_inline"):
+                            for w in srcs:
+                                for t in range(2):
+                                    refill_slot(ref, i0 + KR_g + 2 * w + t)
 
                     return issue
 
@@ -1385,8 +1391,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 if ref is None:
                     refill_global(i0 + KR_g)
                 elif not inline:
-                    for t in range(NS):
-                        refill_slot(ref, i0 + KR_g + t)
+                    refill_slots(ref, i0 + KR_g)
                 return ls0, ls1, ac0, ac1
 
             k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
