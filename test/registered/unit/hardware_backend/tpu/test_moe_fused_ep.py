@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU checks for the fused EP MoE selection envs (sglang_tpu.moe.fused_ep).
+"""CPU checks for the fused EP MoE selection envs and the DP-local MoE step
+hook (sglang_tpu.moe.fused_ep).
 
 PYTHONPATH=<tree>/python:<tree> python -m pytest -q <this file>
 """
@@ -7,6 +8,7 @@ PYTHONPATH=<tree>/python:<tree> python -m pytest -q <this file>
 import ast
 import logging
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,8 +58,10 @@ def _unset(monkeypatch):
         monkeypatch.delenv(fused_ep.push_option_env(option), raising=False)
 
 
-def test_push_options_mirror_the_kernel():
-    assert fused_ep.PUSH_OPTIONS == _kernel_push_options()
+def test_push_options_exist_on_the_kernel():
+    # A renamed kernel option would otherwise fail only on TPU, in
+    # fused_ep_moe_v2's push_options check.
+    assert set(fused_ep.PUSH_OPTIONS) <= set(_kernel_push_options())
 
 
 def test_every_push_option_has_a_typed_env_that_keeps_the_kernel_default():
@@ -125,3 +129,64 @@ def test_push_knobs_under_v2_warn(caplog):
     ):
         fused_ep.check_fused_ep_env()
     assert "SGLANG_TPU_MOE_FUSED_EP_PUSH_SC_PREPUSH" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# The AROUND hook on NonCudaDecoderMixin._run_moe_ffn_dp_sync.
+# --------------------------------------------------------------------------- #
+ORDINARY = object()
+
+
+def _run(dp_local_forward=None, **kwargs):
+    """Call the wrapper on a stand-in layer; returns (output, original calls)."""
+    calls = []
+
+    def original(layer, hidden_states, forward_batch, **kw):
+        calls.append((layer, hidden_states, forward_batch, kw))
+        return ORDINARY
+
+    mlp = SimpleNamespace()
+    if dp_local_forward is not None:
+        setattr(mlp, fused_ep.DP_LOCAL_FORWARD_ATTR, dp_local_forward)
+    layer = SimpleNamespace(mlp=mlp)
+    kwargs.setdefault("input_ids", "ids")
+    out = fused_ep.run_moe_ffn_dp_sync_around(
+        original, layer, "rows", "batch", input_ids_global="global", **kwargs
+    )
+    return out, calls, layer
+
+
+def test_unprepared_layer_takes_the_original_unchanged():
+    out, calls, layer = _run(return_moe_output=True)
+    assert out is ORDINARY
+    assert calls == [
+        (
+            layer,
+            "rows",
+            "batch",
+            dict(input_ids="ids", input_ids_global="global", return_moe_output=True),
+        )
+    ]
+
+
+def test_prepared_layer_skips_the_gather_and_all_reduce():
+    seen = []
+
+    def local(hidden_states, forward_batch, *, input_ids):
+        seen.append((hidden_states, forward_batch, input_ids))
+        return "local"
+
+    out, calls, _ = _run(local)
+    assert out == "local" and calls == []
+    assert seen == [("rows", "batch", "ids")]
+
+
+def test_a_declining_provider_takes_the_original():
+    out, calls, _ = _run(lambda *a, **k: None, return_moe_output=True)
+    assert out is ORDINARY and len(calls) == 1
+
+
+def test_a_complete_output_cannot_be_deferred():
+    # A deferred MoEOutput would be reduced again by the caller.
+    with pytest.raises(RuntimeError, match="return_moe_output"):
+        _run(lambda *a, **k: "local", return_moe_output=True)

@@ -4,9 +4,10 @@ SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL).
 
 sglang_tpu/models/deepseek_v41/fused_ep_op.py converts the FP4 experts in the
 gmm layout (see fused_ep.py) into fused_ep_moe_v2 operands at load and sets
-each prepared layer's ``mlp.dp_local_forward``, through which the non-CUDA
-DeepSeek V4 decoder layer replaces its DP gather -> gmm_v2 -> all-reduce ->
-scatter by gate on local rows -> one fused EP op -> + TP1 shared expert.
+each prepared layer's ``fused_ep.DP_LOCAL_FORWARD_ATTR``, through which the
+plugin's hook on the non-CUDA DeepSeek V4 decoder layer replaces its DP gather
+-> gmm_v2 -> all-reduce -> scatter by gate on local rows -> one fused EP op ->
++ TP1 shared expert.
 Nothing here needs a TPU: torch_tpu's mesh and op export are replaced by a CPU
 JAX mesh and an eager runner that hands the op body the global arrays
 torch_tpu would, and the kernel by dsv41_fused_ep_reference.reference_moe
@@ -74,6 +75,11 @@ PUSH = fused_ep_mod.FusedEpImpl(
     name="push", dispatch="push", push_options=(("sc_prepush", 1),)
 )
 IMPL_ENV = fused_ep_mod.IMPL_ENV
+
+
+def _dp_local(moe):
+    # Set by the provider on prepared layers only.
+    return getattr(moe, fused_ep_mod.DP_LOCAL_FORWARD_ATTR, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +215,6 @@ class FakeMoE(torch.nn.Module):
         self._shared_expert_tp1 = tp1
         self.is_hash = False
         self.is_nextn = False
-        self.dp_local_forward = None
         from sglang.srt.layers.moe.topk import TopKConfig
 
         self.topk = SimpleNamespace(
@@ -405,6 +410,10 @@ def _rel_rows(got, want):
 # Switch off: nothing registered, nothing touched.
 # --------------------------------------------------------------------------- #
 _LOADER = "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights"
+_DP_SYNC = (
+    "sglang.srt.models.deepseek_v4_platform_stage."
+    "NonCudaDecoderMixin._run_moe_ffn_dp_sync"
+)
 
 
 def _hook_mod():
@@ -425,7 +434,8 @@ def test_switch_off_registers_no_hook(monkeypatch):
     for impl in ("v2", "push"):
         monkeypatch.setenv(IMPL_ENV, impl)
         assert hooks.hook_specs() == [
-            (_LOADER, hooks.prepare_tpu_moe_fused_ep, HookType.AFTER)
+            (_LOADER, hooks.prepare_tpu_moe_fused_ep, HookType.AFTER),
+            (_DP_SYNC, hooks.run_moe_ffn_dp_sync, HookType.AROUND),
         ]
     # Building the specs never raises (load_plugins would drop every TPU hook);
     # startup rejects the value instead.
@@ -456,7 +466,7 @@ def test_bad_selection_fails_at_startup(monkeypatch):
     fused_ep_mod.check_fused_ep_env()
 
 
-def test_hook_target_and_seam_exist():
+def test_hook_targets_exist():
     from sglang.srt.model_loader.loader import DefaultModelLoader
 
     assert isinstance(DefaultModelLoader.__dict__["postprocess_weights"], staticmethod)
@@ -481,9 +491,25 @@ def test_hook_target_and_seam_exist():
         for n in layer.body
         if isinstance(n, ast.FunctionDef) and n.name == "_run_moe_ffn_dp_sync"
     ]
-    body = ast.unparse(method)
-    assert "dp_local_forward = self.mlp.dp_local_forward" in body
-    assert "dp_local_forward(hidden_states, forward_batch, input_ids=input_ids)" in body
+    # The AROUND wrapper restates core's parameters; a renamed or added one
+    # would reach it as an unexpected keyword or a dropped argument.
+    params = list(
+        inspect.signature(fused_ep_mod.run_moe_ffn_dp_sync_around).parameters.values()
+    )[1:]
+    positional = [p.name for p in params if p.kind is p.POSITIONAL_OR_KEYWORD]
+    kwonly = [p.name for p in params if p.kind is p.KEYWORD_ONLY]
+    assert positional == ["layer"] + [a.arg for a in method.args.args[1:]]
+    assert kwonly == [a.arg for a in method.args.kwonlyargs]
+    # The decoder layer and the DSpark stages inherit the hooked method; an
+    # override elsewhere would bypass the hook.
+    models = os.path.dirname(path)
+    defs = [
+        name
+        for name in os.listdir(models)
+        if name.endswith(".py")
+        and "def _run_moe_ffn_dp_sync(" in open(os.path.join(models, name)).read()
+    ]
+    assert defs == ["deepseek_v4_platform_stage.py"]
 
 
 def test_hook_applies_like_the_registry_does(monkeypatch):
@@ -808,7 +834,7 @@ def test_layer_requirements_and_skips():
             moe, ep=1, ep_rank=0, multimodal_enabled=False, impl=V2
         )
         assert moe.experts.w13_weight.numel() > 0
-        assert moe.dp_local_forward is None
+        assert _dp_local(moe) is None
     with pytest.raises(ValueError, match="SGLANG_SHARED_EXPERT_TP1"):
         op_mod.prepare_moe_layer_for_fused_ep(
             _moe(gmm, gate, shared, tp1=False),
@@ -871,10 +897,10 @@ def test_prepare_model_checks_and_counts(monkeypatch):
     # and draft layers keep their gmm_v2 experts.
     for m in (hashed, draft):
         assert m.experts.w13_weight.numel() > 0
-        assert m.dp_local_forward is None
+        assert _dp_local(m) is None
     for m in layers[1:3]:
-        assert m.dp_local_forward.func is op_mod.forward_fused_ep_moe
-        assert m.dp_local_forward.args == (m,)
+        assert _dp_local(m).func is op_mod.forward_fused_ep_moe
+        assert _dp_local(m).args == (m,)
     # A model without V4.1 MoE layers (e.g. a draft) is left alone.
     assert op_mod.prepare_model_for_fused_ep(torch.nn.Linear(2, 2), impl=V2) == 0
 
@@ -1032,7 +1058,7 @@ def test_fused_forward_matches_current_path(cpu_op, dtype, impl):
             moe, ep=1, ep_rank=0, multimodal_enabled=False, impl=impl
         )
         # As NonCudaDecoderMixin._run_moe_ffn_dp_sync calls it.
-        got = moe.dp_local_forward(x, fb, input_ids=ids)
+        got = _dp_local(moe)(x, fb, input_ids=ids)
     assert got.dtype == dtype and got.shape == x.shape
 
     want = _current_path(_moe(gmm, gate, shared), x, ids, gmm)
@@ -1083,7 +1109,7 @@ def test_two_ranks_against_gathered_current_path(cpu_op):
                 global_num_tokens_cpu=[t_local, t_local],
                 dp_padding_mode=MaxLen(),
             )
-            outs.append(moe.dp_local_forward(xs[rank], fb, input_ids=None))
+            outs.append(_dp_local(moe)(xs[rank], fb, input_ids=None))
             moes.append(moe)
         (exported,) = cpu_op  # one op for both ranks (same key)
         assert len(exported.calls) == 2

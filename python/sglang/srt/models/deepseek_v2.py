@@ -724,9 +724,6 @@ class DeepseekV2MoE(nn.Module):
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
-        # Seam for DeepSeek V4's NonCudaDecoderMixin._run_moe_ffn_dp_sync; a
-        # backend sets it.
-        self.dp_local_forward: Optional[Callable] = None
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 

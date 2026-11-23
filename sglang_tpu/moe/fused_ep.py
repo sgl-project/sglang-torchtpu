@@ -10,9 +10,11 @@ never inside the kernel package.
 
 A provider is a module in ``_PROVIDERS`` with
 ``prepare_model_for_fused_ep(model, *, impl) -> int``: it finds its own MoE
-layers, converts their experts and sets their ``dp_local_forward``, and returns
-how many it prepared. Process-wide admission is shared
+layers, converts their experts, sets ``DP_LOCAL_FORWARD_ATTR`` on each, and
+returns how many it prepared. Process-wide admission is shared
 (``unmet_global_requirements``); per-layer admission is the provider's.
+``run_moe_ffn_dp_sync_around`` (an AROUND hook, so core stays untouched)
+routes a prepared layer's MoE step to it.
 
 Importable without torch_tpu or JAX.
 """
@@ -33,32 +35,18 @@ _PUSH_ENV_PREFIX = "SGLANG_TPU_MOE_FUSED_EP_PUSH_"
 # Implementation name -> fused_ep_moe_v2's dispatch.
 _DISPATCH = {"v2": "all_gather", "push": "push"}
 
-# push_fused_moe.PUSH_OPTIONS, repeated so that reading the envs needs no JAX
-# import (checked equal in test_moe_fused_ep.py).
-PUSH_OPTIONS = (
-    "sc_prepush",
-    "tc_exchange",
-    "height_rungs_override",
-    "tail_barrier",
-    "onehot_slots",
-    "hbm_staging",
-    "dispatch_ahead",
-    "matmul_scale_repeat",
-    "exchange_row_gather",
-    "bf16_sort_counts",
-    "slim_prepush_barrier",
-    "fused_dispatch_meta",
-    "table_kernel",
-    "exchange_tables",
-    "kernel_plan_tables",
-    "light_prepush",
-    "single_barrier",
-    "early_scale_scatter",
-    "fuse_metadata",
-)
+# The push knobs with an env: the ones vllm-torchtpu's DSV4.1 recipe sets
+# (scripts/dsv41_bench). Every other push_fused_moe.PUSH_OPTIONS entry keeps
+# the kernel default; add one here (and its env) once a measurement needs it.
+PUSH_OPTIONS = ("sc_prepush", "tc_exchange")
 
 # Modules that admit MoE layers to the fused path.
 _PROVIDERS = ("sglang_tpu.models.deepseek_v41.fused_ep_op",)
+
+# Set by a provider on each prepared MoE block (``layer.mlp``): a callable
+# ``(hidden_states, forward_batch, *, input_ids) -> Optional[Tensor]``
+# returning this rank's complete MoE output, or None for the ordinary path.
+DP_LOCAL_FORWARD_ATTR = "_tpu_fused_ep_dp_local_forward"
 
 
 class FusedEpImpl(msgspec.Struct, frozen=True):
@@ -190,4 +178,41 @@ def prepare_model_for_fused_ep(model) -> int:
     return sum(
         importlib.import_module(path).prepare_model_for_fused_ep(model, impl=impl)
         for path in _PROVIDERS
+    )
+
+
+def run_moe_ffn_dp_sync_around(
+    original,
+    layer,
+    hidden_states,
+    forward_batch,
+    *,
+    input_ids,
+    input_ids_global,
+    return_moe_output: bool = False,
+):
+    """AROUND NonCudaDecoderMixin._run_moe_ffn_dp_sync (same signature after
+    ``original``): a prepared layer runs on this rank's own rows, with no DP
+    gather, scatter or post-experts all-reduce; any other layer, or a None
+    from the provider, takes the original path."""
+    # Plugin-owned and set only on prepared layers, so core never declares it.
+    dp_local_forward = getattr(layer.mlp, DP_LOCAL_FORWARD_ATTR, None)
+    if dp_local_forward is not None:
+        out = dp_local_forward(hidden_states, forward_batch, input_ids=input_ids)
+        if out is not None:
+            if return_moe_output:
+                # The output is already reduced; a deferred-finalize caller
+                # would reduce it again.
+                raise RuntimeError(
+                    "the fused EP output is complete, but the caller asked for a "
+                    "deferred MoEOutput (return_moe_output)"
+                )
+            return out
+    return original(
+        layer,
+        hidden_states,
+        forward_batch,
+        input_ids=input_ids,
+        input_ids_global=input_ids_global,
+        return_moe_output=return_moe_output,
     )

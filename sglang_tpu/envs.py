@@ -666,28 +666,11 @@ class TpuEnvs:
     # dispatch; push runs it with dispatch="push". Needs SGLANG_SHARED_EXPERT_TP1=1
     # (checked at startup). Read when the plugin hooks are built.
     SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL = EnvStr(None)
-    # Push-dispatch knobs, one per push_fused_moe.PUSH_OPTIONS entry, forwarded
-    # only under SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=push. Unset keeps the
-    # kernel's default (fused_ep_moe_push's signature).
+    # Push-dispatch knobs (fused_ep.PUSH_OPTIONS), forwarded only under
+    # SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=push. Unset keeps the kernel default
+    # (fused_ep_moe_push: sc_prepush=2, tc_exchange=False).
     SGLANG_TPU_MOE_FUSED_EP_PUSH_SC_PREPUSH = EnvInt(None)
     SGLANG_TPU_MOE_FUSED_EP_PUSH_TC_EXCHANGE = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_HEIGHT_RUNGS_OVERRIDE = EnvInt(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_TAIL_BARRIER = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_ONEHOT_SLOTS = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_HBM_STAGING = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_DISPATCH_AHEAD = EnvInt(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_TABLE_KERNEL = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_EXCHANGE_TABLES = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_LIGHT_PREPUSH = EnvInt(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_SINGLE_BARRIER = EnvBool(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER = EnvInt(None)
-    SGLANG_TPU_MOE_FUSED_EP_PUSH_FUSE_METADATA = EnvBool(None)
 
     @classmethod
     def names(cls) -> list[str]:

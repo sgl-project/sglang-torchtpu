@@ -15,8 +15,10 @@ all ranks' hidden states (``dp_gather_replicate``), runs gate, top-k and
 gmm_v2 on the gathered rows, all-reduces the expert sums and scatters each
 rank its rows back (``NonCudaDecoderMixin._run_moe_ffn_dp_sync`` in
 ``sglang.srt.models.deepseek_v4_platform_stage``). With it
-on, preparation sets ``mlp.dp_local_forward`` on every eligible layer;
-``_run_moe_ffn_dp_sync`` calls it with this rank's own rows, and it:
+on, preparation sets ``fused_ep.DP_LOCAL_FORWARD_ATTR`` on every eligible layer;
+the plugin's AROUND hook on ``_run_moe_ffn_dp_sync``
+(``sglang_tpu/hooks/moe_fused_ep.py``) calls it with this rank's own rows, and
+it:
 
 1. computes the router logits of this rank's own rows with the layer's own
    ``MoEGate`` (same matmul and dtype as today), upcast to FP32;
@@ -87,6 +89,7 @@ import torch
 
 from sglang_tpu.models.deepseek_v41 import fused_ep as fe
 from sglang_tpu.moe.fused_ep import (
+    DP_LOCAL_FORWARD_ATTR,
     IMPL_ENV,
     FusedEpImpl,
     unmet_global_requirements,
@@ -95,7 +98,7 @@ from sglang_tpu.moe.fused_ep import (
 logger = logging.getLogger(__name__)
 
 # Set on a DeepseekV2MoE once its experts carry the fused-EP operands, together
-# with its ``dp_local_forward`` (the seam in _run_moe_ffn_dp_sync).
+# with its DP_LOCAL_FORWARD_ATTR (read by the _run_moe_ffn_dp_sync hook).
 READY_ATTR = "_tpu_dsv41_fused_ep_ready"
 _KEY_ATTR = "_tpu_dsv41_fused_ep_key"
 _RANK_ATTR = "_tpu_dsv41_fused_ep_ep_rank"
@@ -557,7 +560,7 @@ def prepare_moe_layer_for_fused_ep(
     impl: FusedEpImpl,
 ) -> bool:
     """Replace one layer's gmm-layout expert tensors by the kernel operands,
-    build its op and set ``moe.dp_local_forward``. Returns False for a layer
+    build its op and set its DP_LOCAL_FORWARD_ATTR. Returns False for a layer
     that keeps the gmm_v2 path; raises when the switch cannot be honored."""
     if getattr(moe, READY_ATTR, False):
         return True
@@ -608,9 +611,9 @@ def prepare_moe_layer_for_fused_ep(
 
     setattr(moe, _KEY_ATTR, key)
     setattr(moe, _RANK_ATTR, int(ep_rank))
-    # The seam in NonCudaDecoderMixin._run_moe_ffn_dp_sync: from now on this
-    # layer runs on local rows only (the gmm_v2 tensors are gone).
-    moe.dp_local_forward = functools.partial(forward_fused_ep_moe, moe)
+    # Read by the _run_moe_ffn_dp_sync hook: from now on this layer runs on
+    # local rows only (the gmm_v2 tensors are gone).
+    setattr(moe, DP_LOCAL_FORWARD_ATTR, functools.partial(forward_fused_ep_moe, moe))
     setattr(moe, READY_ATTR, True)
     return True
 
@@ -763,7 +766,7 @@ def forward_fused_ep_moe(
     *,
     input_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """A prepared layer's ``dp_local_forward``: local rows in, this rank's
+    """A prepared layer's DP_LOCAL_FORWARD_ATTR: local rows in, this rank's
     complete MoE output out (routed + shared experts), with no DP
     gather/scatter and no post-experts all-reduce.
 
