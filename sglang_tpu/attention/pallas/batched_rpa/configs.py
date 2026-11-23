@@ -522,12 +522,17 @@ class RpaConfigs:
     @property
     def max_schedule_steps(self) -> int:
         """Most schedule steps an input of these static shapes can produce."""
+        kv_len = self.serve.pages_per_seq * self.serve.page_size
         if self.serve.attention_scope.skips_cached_keys:
             # Only the k blocks holding new tokens, a span that may start mid-block.
             # Under CP its positions are global, past this rank's stripe table.
             kv_len = self.serve.total_q_tokens + self.bkv_sz - 1
-        else:
-            kv_len = self.serve.pages_per_seq * self.serve.page_size
+        elif (
+            self.serve.skip_kv_write
+            and self.serve.attention_scope == AttentionScope.FULL
+        ):
+            # New keys that are not written come from k/v, after the cached ones.
+            kv_len += self.serve.total_q_tokens
         # Each q block visits a k block at most once.
         num_k = pl.cdiv(kv_len, self.bkv_sz)
         if self.mode == RpaCase.DECODE:
