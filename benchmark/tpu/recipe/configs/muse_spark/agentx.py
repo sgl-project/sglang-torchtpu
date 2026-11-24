@@ -119,11 +119,11 @@ MK_PREFILL_ENV = {
 
 
 # MOE_MODE=ep: the env PR #2231's _validate_ep_serving requires; KPERM and the e4m3 prefill
-# gathers are TP-layout knobs the EP programs refuse.
+# gathers are TP-layout knobs the EP programs refuse. EP keeps the profile's stacked expert
+# groups (SGLANG_TPU_MUSE_MK_EXPERT_GROUP=15).
 EP_ENV = {
     "SGLANG_TPU_MUSE_MOE_MODE": "ep",
     "SGLANG_TPU_MUSE_MK_QBLOCK": "256",
-    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "0",
     "SGLANG_TPU_MUSE_MK_PREFILL": "1",
     "SGLANG_TPU_MUSE_MK_PREFILL_SP": "1",
     "SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT": "1",

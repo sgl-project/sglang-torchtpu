@@ -10,25 +10,13 @@ from sglang_tpu.muse_megakernel_v2.common.config import (
 )
 from sglang_tpu.muse_megakernel_v2.common.consts import LANE, SMALL
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rms
-from sglang_tpu.muse_megakernel_v2.common.plan import expert_units, n_expert_refs
+from sglang_tpu.muse_megakernel_v2.common.plan import layer_units, n_expert_refs
 from sglang_tpu.muse_megakernel_v2.common.qkv import attention_inputs
 from sglang_tpu.muse_megakernel_v2.prefill.tp.attn_out import attn_out_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.post_moe import post_moe_call
 
 # Leading operands before the weights: meta, pos, kv_lens, cu_q, dist, pf, psw, emb.
 N_STEP_ARGS = 8
-
-
-def _layer_experts(c: PFConfig) -> list:
-    """Per layer: (expert unit index, layer index in its stacked group or None)."""
-    out: list = [None] * c.n_layers
-    for u, unit in enumerate(expert_units(c)):
-        if unit[0] == "group":
-            for li in range(unit[1], unit[2]):
-                out[li] = (u, li - unit[1])
-        else:
-            out[unit[1]] = (u, None)
-    return out
 
 
 def build_forward(c: PFConfig, axis: str = "model"):
@@ -45,7 +33,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     L, T, hd = c.n_layers, c.rows, c.head_dim
     qd, kvd, He = c.q_dim, c.kv_dim, c.expert_hidden
     ne = n_expert_refs(c)
-    layer_experts = _layer_experts(c)
+    layer_experts = layer_units(c)
     attn_out = attn_out_call(c, ATTN_OUT_TILE, axis)
     post_moe = {
         r: post_moe_call(c, POST_MOE_TILE, next_rope=r, axis=axis)
