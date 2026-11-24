@@ -641,12 +641,17 @@ def inner_kernel(
             row_scale = cfgs.lhs_cfgs.row_scale
             k_step = q_block_size
             scales_dtype = jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
+            is_float_lhs_q = jnp.issubdtype(lhs_q_dtype, jnp.floating)
             if row_scale:
                 # one scale per row over the tile's K: partials need only their rhs scale
                 row_abs_max = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True)
                 row_s = row_abs_max / dtype_max
-                row_s_inv = jnp.where(row_s == 0, 0, 1 / row_s)
-                lhs_q_all = (tiled_lhs * row_s_inv).astype(lhs_q_dtype)
+                row_s_inv_raw = jnp.where(row_s == 0, 0, 1 / row_s)
+                row_s_inv = jnp.where(jnp.isfinite(row_s_inv_raw), row_s_inv_raw, 0)
+                lhs_scaled = tiled_lhs * row_s_inv
+                if is_float_lhs_q:
+                    lhs_scaled = jnp.clip(lhs_scaled, -dtype_max, dtype_max)
+                lhs_q_all = lhs_scaled.astype(lhs_q_dtype)
                 k_step = cfgs.rhs_cfgs.quant_block_size
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
@@ -680,9 +685,15 @@ def inner_kernel(
                     # If block_scale=0, it will cause division by zero and return either
                     # NaN or Inf. Since this can cause numeric issue when downcasting to
                     # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                    block_scale_inv_raw = jnp.where(block_scale == 0, 0, 1 / block_scale)
+                    block_scale_inv = jnp.where(
+                        jnp.isfinite(block_scale_inv_raw), block_scale_inv_raw, 0
+                    )
+                    # Convert lhs into quantized dtype (clamping float8 against >464 -> 0x7F NaN).
+                    block_scaled = block_lhs * block_scale_inv
+                    if is_float_lhs_q:
+                        block_scaled = jnp.clip(block_scaled, -dtype_max, dtype_max)
+                    block_lhs_q = block_scaled.astype(lhs_q_dtype)
 
                     block_acc = jnp.matmul(
                         block_lhs_q,

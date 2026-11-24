@@ -980,4 +980,26 @@ def test_pytorch_sampler_tpu_nan_sentinel_and_disagg_prefill_oov_audit():
     ids = torch.where(nan_rows, torch.full_like(ids, 0x7FFFFFFF), ids)
     assert ids.tolist() == [1, 0x7FFFFFFF, 2]
 
+    # Verify stock TpuFp8MoEMethod (gmm_v2 / moe_stream) bf16 -> float8_e4m3fn clamp (#2835)
+    import jax.numpy as jnp
+    from sglang_tpu.moe.pallas import gmm_v2, moe_stream
+
+    for mod in (gmm_v2, moe_stream):
+        src_m = inspect.getsource(mod)
+        assert "isfinite" in src_m and "clip(" in src_m
+    # Subnormal bf16 row (1e-37 / 448 != 0 yet 1/s == +inf in bf16) + near-448 rounding row
+    x_bf16 = jnp.array(
+        [
+            [0.0, 1e-37, 0.0, -1e-37],
+            [448.0, -448.0, 123.0, 0.0],
+        ],
+        dtype=jnp.bfloat16,
+    )
+    s_bf16 = jnp.max(jnp.abs(x_bf16), axis=1, keepdims=True) / 448.0
+    inv_raw = jnp.where(s_bf16 == 0, 0, 1 / s_bf16)
+    # Without isfinite+clip, row 0 produces 0.0 * inf = NaN -> 0x7F in float8_e4m3fn!
+    inv_safe = jnp.where(jnp.isfinite(inv_raw), inv_raw, 0)
+    q_f8 = jnp.clip(x_bf16 * inv_safe, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+    assert not bool(jnp.isnan(q_f8.astype(jnp.float32)).any())
+
 

@@ -56,9 +56,10 @@ def _block_quant_dot(x, w, w_scale, *, fp8_dtype):
     for start in range(0, k, block):
         xb = x[:, start : start + block]
         scale = jnp.max(jnp.abs(xb), axis=1, keepdims=True) / fp8_max
-        scale_inv = jnp.where(scale == 0, 0, 1 / scale)
+        scale_inv_raw = jnp.where(scale == 0, 0, 1 / scale)
+        scale_inv = jnp.where(jnp.isfinite(scale_inv_raw), scale_inv_raw, 0)
         partial = jax.lax.dot_general(
-            (xb * scale_inv).astype(fp8_dtype),
+            jnp.clip(xb * scale_inv, -fp8_max, fp8_max).astype(fp8_dtype),
             w[start : start + block, :],
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
