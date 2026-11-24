@@ -13,8 +13,8 @@ import torch
 import torch.compiler.config as compiler_config
 import torch.multiprocessing as mp
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
-    MiniMaxH3DiTArchConfig,
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
