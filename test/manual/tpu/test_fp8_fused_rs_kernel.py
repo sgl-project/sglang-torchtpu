@@ -77,6 +77,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--skewed-routing", action="store_true")
+    # Some slots get an expert id >= world_size, as a NaN router score can; the
+    # reference treats them as weight 0.
+    parser.add_argument("--invalid-ids", action="store_true")
     args = parser.parse_args()
 
     dist.init_process_group(backend="tpu_dist")
@@ -98,6 +101,7 @@ def main():
     fp8_direct_write = (
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE", "0") == "1"
     )
+    test_invalid_ids = args.invalid_ids
     layers = args.layers
     skewed_routing = args.skewed_routing
     assert layers >= 1
@@ -139,6 +143,12 @@ def main():
         slots = torch.arange(topk, dtype=torch.int32)[None, :]
         topk_ids = (token_ids + slots) % world_size
     topk_weights = torch.full((tokens, topk), 1 / topk, dtype=torch.bfloat16)
+    reference_weights = topk_weights
+    invalid = torch.zeros(tokens, topk, dtype=torch.bool)
+    if test_invalid_ids:
+        invalid[::7, 0] = True
+        invalid[1::7, topk - 1] = True
+        reference_weights = torch.where(invalid, 0, topk_weights)
     post_expert_norm_weight = torch.linspace(
         -0.2, 0.2, hidden_size, dtype=torch.bfloat16
     )
@@ -148,7 +158,7 @@ def main():
             hidden_states,
             w1_dequantized,
             w2_dequantized,
-            topk_weights,
+            reference_weights,
             topk_ids,
             post_expert_norm_weight if test_post_expert_norm else None,
         )
@@ -162,6 +172,10 @@ def main():
         # in the compiled dataflow. It does not imply that production routing
         # IDs have been observed to diverge.
         kernel_topk_ids = (topk_ids + rank) % world_size
+    if test_invalid_ids:
+        # Just past the last expert, and far past it.
+        kernel_topk_ids = torch.where(invalid, world_size, kernel_topk_ids)
+        kernel_topk_ids[1::7, topk - 1] = 255
     kernel_topk_weights = topk_weights
     if test_divergent_weights and rank != 0:
         # The compiled fused-RS path must consume rank 0's routing
@@ -267,7 +281,7 @@ def main():
         f"blockwise={test_blockwise} divergent_ids={test_divergent_ids} "
         f"divergent_weights={test_divergent_weights} "
         f"fp8_direct_write={fp8_direct_write} layers={layers} "
-        f"skewed_routing={skewed_routing}"
+        f"skewed_routing={skewed_routing} invalid_ids={test_invalid_ids}"
     )
     dist.destroy_process_group()
 
