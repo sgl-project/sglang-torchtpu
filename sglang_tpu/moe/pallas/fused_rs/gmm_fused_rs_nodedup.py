@@ -3386,11 +3386,11 @@ def gmm_v2_fused_rs(
         kernel_kwargs["q8_in_gmm1"] = q8_in_gmm1
         kernel_kwargs["q8_tree"] = q8_tree
     if gather_in_gmm1:
-        if not expert_tp or gather_in_gmm1 > tile_m - 16:
-            raise ValueError(
-                f"gather_in_gmm1={gather_in_gmm1} needs expert TP, <= tile_m - 16"
-            )
-        kernel_kwargs["gather_in_gmm1"] = gather_in_gmm1
+        if not expert_tp:
+            raise ValueError("gather_in_gmm1 needs expert TP")
+        # rows past a tile land in the buffer's slack: at most tile_m - 16 (fp8 layers' tiles
+        # are smaller than the fp4 ones)
+        kernel_kwargs["gather_in_gmm1"] = max(0, min(gather_in_gmm1, tile_m - 16))
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1
