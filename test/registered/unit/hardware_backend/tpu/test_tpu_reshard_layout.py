@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import kv_pool
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
@@ -28,7 +29,6 @@ from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang_tpu.unified_kv_pool import (
     AttnLayerSpec,
     TpuUnifiedSWAKVPool,
@@ -202,9 +202,7 @@ class TestTpuReshardLayout(unittest.TestCase):
         mgr.kv_args = SimpleNamespace(
             total_kv_head_num=total_heads, total_swa_kv_head_num=total_heads
         )
-        geometry = mgr._make_geometry(
-            src_tp, dst_tp, group="swa" if swa else "full"
-        )
+        geometry = mgr._make_geometry(src_tp, dst_tp, group="swa" if swa else "full")
         source_width = source.stride(1) * source.element_size()
         destination_width = destination.stride(1) * destination.element_size()
         for dst_rank in range(dst_tp):
@@ -1629,9 +1627,7 @@ def _unified_with_draft(
         enable_memory_saver=False,
     )
     fl, sl = ([], [0, 1]) if draft_is_swa else ([0, 1], [])
-    with mock.patch.object(
-        kv_pool, "_seq_along_lane_head_dim", _sublane_tile_head_dim
-    ):
+    with mock.patch.object(kv_pool, "_seq_along_lane_head_dim", _sublane_tile_head_dim):
         if draft_is_swa:
             draft_pool = SWAKVPool(
                 size=pages * page_size,
@@ -1651,7 +1647,9 @@ def _unified_with_draft(
         is_hybrid_swa=draft_is_swa,
         sliding_window_size=2 * page_size if draft_is_swa else None,
         model_config=SimpleNamespace(sliding_window_size=None),
-        layer_info=SimpleNamespace(full_attention_layer_ids=fl, swa_attention_layer_ids=sl),
+        layer_info=SimpleNamespace(
+            full_attention_layer_ids=fl, swa_attention_layer_ids=sl
+        ),
     )
     alloc.attach_draft_kv_pool(kvc, draft_pool)
     return target_pool, alloc, draft_pool
@@ -1688,7 +1686,9 @@ def _fill_draft_caches(
                 for local, head in enumerate(heads):
                     for kv in (0, 1):
                         slot = 2 * local + kv
-                        tag = ((2 * head + kv) * 137 + salt + token * 7 + byte * 3) % 251
+                        tag = (
+                            (2 * head + kv) * 137 + salt + token * 7 + byte * 3
+                        ) % 251
                         raw[blk, :, slot // packing, slot % packing, :] = tag.to(
                             torch.uint8
                         )

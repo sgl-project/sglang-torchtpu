@@ -477,9 +477,7 @@ class RaidenKVManager(
                     else self.kv_args.total_kv_head_num
                 )
             )
-            head_nums = (
-                self._swa_kv_head_nums if group == "swa" else self._kv_head_nums
-            )
+            head_nums = self._swa_kv_head_nums if group == "swa" else self._kv_head_nums
             heads = (head_nums[0] if head_nums else 0) or max(
                 1, resolved_total // max(1, self.attn_tp_size)
             )

@@ -1927,9 +1927,9 @@ class RaidenReceiverMixin:
         with self._state_lock:
             live = room in self._decode.reshard_meta and room not in self._aborted
             if live:
-                self._reshard_plans.setdefault(room, {})[
-                    self._draft_req_id(room)
-                ] = room
+                self._reshard_plans.setdefault(room, {})[self._draft_req_id(room)] = (
+                    room
+                )
         if not live:
             self._unregister_draft_plan(room)
             return False, False

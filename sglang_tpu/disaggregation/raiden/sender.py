@@ -1227,9 +1227,7 @@ class RaidenSenderMixin:
             # owed (it is sent once the send accumulation is finalized), so the
             # closing push can carry them; earlier chunks never do.
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
-            draft_swa_blocks = list(
-                self._prefill.send_draft_swa_blocks.get(room, [])
-            )
+            draft_swa_blocks = list(self._prefill.send_draft_swa_blocks.get(room, []))
             aux_blob = self._prefill.send_aux.get(room, b"")
         with self._announce_lock:
             with self._state_lock:

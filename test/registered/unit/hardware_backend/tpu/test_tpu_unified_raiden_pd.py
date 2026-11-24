@@ -517,7 +517,9 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
         infos = [{"rank_ip": "127.0.0.1", "rank_port": 44010 + i} for i in range(ratio)]
 
         def common_init(recv_self, _dp_rank, *, layout=dec.kv_args.kv_layout, bs=infos):
-            recv_self.prefill_info = SimpleNamespace(kv_layout=layout, attn_tp_size=src_tp)
+            recv_self.prefill_info = SimpleNamespace(
+                kv_layout=layout, attn_tp_size=src_tp
+            )
             recv_self.target_pp_ranks = [0]
             recv_self.target_cp_ranks = [0]
             recv_self.bootstrap_infos = bs
@@ -600,11 +602,15 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
         self.assertEqual(recv.conclude_state, KVPoll.Failed)
         self.assertEqual(dec_ld.check_status(8320), KVPoll.Failed)
         self.assertIn("SEQ_ALONG_LANE", dec_ld.failure_records[8320])
-        self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_ld.failure_records[8320])
+        self.assertNotIn(
+            "SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_ld.failure_records[8320]
+        )
         abort.assert_called_once()
 
         # 3. Landing-target + direct-draft is refused even when landing arena is enabled.
-        tm_fp8_target = _pool(head_num=2, dtype=torch.float8_e4m3fn, sal=False, page_size=64)
+        tm_fp8_target = _pool(
+            head_num=2, dtype=torch.float8_e4m3fn, sal=False, page_size=64
+        )
         bf16_tm_draft_64 = TpuFusedMHATokenToKVPool(
             size=4 * 64,
             page_size=64,
@@ -630,7 +636,9 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
         self.assertEqual(recv.conclude_state, KVPoll.Failed)
         self.assertEqual(dec_lt.check_status(8321), KVPoll.Failed)
         self.assertIn("SEQ_ALONG_LANE", dec_lt.failure_records[8321])
-        self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_lt.failure_records[8321])
+        self.assertNotIn(
+            "SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_lt.failure_records[8321]
+        )
         abort.assert_called_once()
 
 
