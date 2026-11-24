@@ -178,8 +178,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
         return num_pages <= len(self.free_pages)
 
-    def alloc(self, need_size: int):
-        # Page-aligned bulk allocation, returns contiguous device indices.
+    def alloc(self, need_size: int, *, return_host: bool = False):
+        # DMA consumers can keep the indices on the host; forward allocations
+        # retain the device-return contract. Both paths share ownership/fences.
         assert need_size % self.page_size == 0, (
             "The allocation size should be page-aligned"
         )
@@ -191,12 +192,16 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_pages:]
         self._mark_handed_out(out_pages)
 
-        # Expand to per-token indices on CPU, then one async H2D.
+        # Expand to per-token indices on CPU, uploading only for device consumers.
         out_indices = (
             out_pages[:, None] * self.page_size
             + torch.arange(self.page_size, dtype=torch.int32)
         ).reshape(-1)
-        return out_indices.to(self.device, non_blocking=True)
+        return (
+            out_indices
+            if return_host
+            else out_indices.to(self.device, non_blocking=True)
+        )
 
     def alloc_extend(
         self,

@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.kv_free_fence import (
     KVFreeFence,
     assert_not_forward_write_target,
@@ -138,6 +139,19 @@ class TpuDMAHybridCacheController(HybridCacheController):
         super().reset()
 
     # ----- index handling -----------------------------------------------------
+
+    def _alloc_load_kv_indices(self, allocator, need_size, extra_pools):
+        # Start with the full-attention, single-pool path. Wrapped allocators
+        # and side-pool mappings retain their existing placement contracts.
+        if (
+            allocator is self.mem_pool_device_allocator
+            and type(allocator) is TpuPagedTokenToKVPoolAllocator
+            and not extra_pools
+        ):
+            if need_size == 0:
+                return torch.empty((0,), dtype=torch.int64, device="cpu")
+            return allocator.alloc(need_size, return_host=True)
+        return super()._alloc_load_kv_indices(allocator, need_size, extra_pools)
 
     def move_indices(self, host_indices, device_indices):
         # Engines address whole pages; the token->page conversion happens in

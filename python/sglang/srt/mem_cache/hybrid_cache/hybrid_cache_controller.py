@@ -41,13 +41,13 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -966,6 +966,12 @@ class HybridCacheController(BaseHiCacheController):
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 
+    def _alloc_load_kv_indices(self, allocator, need_size, extra_pools):
+        """Allocate reload destinations in the backend's metadata representation."""
+        if need_size == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        return allocator.alloc(need_size)
+
     def load(
         self,
         host_indices: torch.Tensor,
@@ -980,12 +986,11 @@ class HybridCacheController(BaseHiCacheController):
             "full_attn_allocator",
             self.mem_pool_device_allocator,
         )
-        if not need_load_kv:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
-        else:
-            device_indices = full_allocator.alloc(len(host_indices))
-            if device_indices is None:
-                return None
+        device_indices = self._alloc_load_kv_indices(
+            full_allocator, len(host_indices), extra_pools
+        )
+        if device_indices is None:
+            return None
 
         pool_transfers = self._resolve_device_transfers(
             extra_pools,
