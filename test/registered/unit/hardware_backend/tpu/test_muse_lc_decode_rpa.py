@@ -1517,6 +1517,35 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(np.asarray(o_opt, dtype=np.float32))))
                 self.assertGreater(_cosine(np.asarray(o_opt), np.asarray(o_ref)), 0.9999)
 
+        # Also verify ps=256 streamdyn,dyn2ku tail (4096 < rel_end <= 5120 -> 5120 // 256 == 20 pages).
+        with self.subTest(ps256_dyn2ku_5k=True):
+            ps_256, pps_256 = 256, 36
+            lens_256 = [4500, 5120, 6000, 8192] * 2
+            bs_256 = len(lens_256)
+            u8_256 = np.full((bs_256 * pps_256 + 8, ps_256, 1, 4, 128), 0x7F, dtype=np.uint8)
+            u8_256[:, :, 0, :2, :] = _rand_fp8_u8(rng, (bs_256 * pps_256 + 8, ps_256, 2, 128))
+            kvc_256 = _u8_to_fp8(u8_256)
+            q_256 = jnp.asarray((rng.standard_normal((bs_256, 16, 128)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+            k_256 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_256, 1, 128)))
+            v_256 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_256, 1, 128)))
+            pi_256 = jnp.arange(bs_256 * pps_256, dtype=jnp.int32)
+            cuq_256 = jnp.arange(bs_256 + 1, dtype=jnp.int32)
+            cukv_256 = jnp.arange(bs_256 + 1, dtype=jnp.int32) * (pps_256 * ps_256)
+            dist_256 = jnp.asarray([bs_256, bs_256, bs_256], dtype=jnp.int32)
+            kvl_256 = jnp.asarray(lens_256, dtype=jnp.int32)
+            o_256_ref, _ = run_decode_fast_rpa(
+                q_256, k_256, v_256, kvc_256, kvl_256, pi_256, cuq_256, cukv_256, dist_256,
+                sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,streamdyn,c2048", interpret=True,
+            )
+            o_256_opt, _ = run_decode_fast_rpa(
+                q_256, k_256, v_256, kvc_256, kvl_256, pi_256, cuq_256, cukv_256, dist_256,
+                sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,streamdyn,dyn2ku", interpret=True,
+            )
+            self.assertTrue(np.all(np.isfinite(np.asarray(o_256_opt, dtype=np.float32))))
+            self.assertGreater(_cosine(np.asarray(o_256_opt), np.asarray(o_256_ref)), 0.9999)
+
         # 0x7F NaN-poisoned u4flat SWA 1/1K parity (1p, 2p, mixed).
         for tag, lens_s in (
             ("swa_1p", [512] * 16),

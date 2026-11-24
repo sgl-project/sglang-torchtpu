@@ -1985,7 +1985,7 @@ def _decode_fast_kernel(
                 n_chunks_d * c_pgs,
                 jnp.where(
                     rel_end <= 5120,
-                    10,
+                    5120 // page_size,
                     jnp.where(rel_end <= 8192, n_chunks_d * c_pgs, fb_pgs),
                 ),
             )
