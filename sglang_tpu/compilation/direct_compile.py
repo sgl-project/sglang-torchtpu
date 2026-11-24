@@ -78,16 +78,20 @@ class _InsertedCallback:
 _ACTIVE_CALLBACKS: ContextVar[list[_InsertedCallback] | None] = ContextVar(
     "tpu_direct_compile_callbacks", default=None
 )
+_COLLECTING_CALLBACKS_COUNT: int = 0
 
 
 @contextmanager
 def _collect_callbacks() -> Iterator[list[_InsertedCallback]]:
+    global _COLLECTING_CALLBACKS_COUNT
     callbacks: list[_InsertedCallback] = []
+    _COLLECTING_CALLBACKS_COUNT += 1
     token = _ACTIVE_CALLBACKS.set(callbacks)
     try:
         yield callbacks
     finally:
         _ACTIVE_CALLBACKS.reset(token)
+        _COLLECTING_CALLBACKS_COUNT -= 1
 
 
 def insert_callback(
@@ -112,6 +116,8 @@ def insert_callback(
     (a module-level function or partial) and capture only tensor-free,
     rank-independent metadata, never a model or recorder instance.
     """
+    if _COLLECTING_CALLBACKS_COUNT == 0:
+        return False
     callbacks = _ACTIVE_CALLBACKS.get()
     if callbacks is None:
         return False

@@ -1400,6 +1400,44 @@ def test_muse_nan_trap_optin_stage_and_pad_isolation():
     err_log.assert_called_once()
     assert "MUSE_NAN_TRAP" in err_log.call_args.args[0]
 
+    # Real TorchDynamo torch.compile(fullgraph=True) trace of _init_nan_trap + _record_nan_trap + _emit_nan_trap:
+    # proves insert_callback does not trip Dynamo on _ACTIVE_CALLBACKS.get().
+    pk.nan_trap_first.fill_(-1)
+    pk.nan_trap_last.fill_(-1)
+    pk.nan_trap_count.zero_()
+    pk._nan_trap_seen = 0
+    pk.last_nan_trap = []
+
+    def _compiled_trap_step(s_in, ss_in, rpa_in, fb_in):
+        c_dyn = pk._init_nan_trap(
+            forward_batch=fb_in,
+            stream=s_in,
+            stream_shard=ss_in,
+            chunks=chunks,
+            t_shard=t_shard,
+            t_total=t_total,
+        )
+        integration._record_nan_trap(
+            c_dyn, 12, 2, ((rpa_in, 0),), c_dyn["full_real"], c_dyn["orig_full"]
+        )
+        pk._emit_nan_trap(c_dyn)
+        return s_in + 0.0
+
+    compiled_step = torch.compile(_compiled_trap_step, backend="eager", fullgraph=True)
+    rpa_dyn_bad = torch.zeros((t_total, 4), dtype=torch.bfloat16)
+    rpa_dyn_bad[77, 0] = float("nan")
+    rpa_dyn_bad[real_tokens:, :] = float("nan")
+    fb_dyn = types.SimpleNamespace(
+        extend_seq_lens=torch.tensor([real_tokens], dtype=torch.int32)
+    )
+    compiled_step(stream, stream_shard, rpa_dyn_bad, fb_dyn)
+    assert int(pk.nan_trap_count[0]) == 1
+    with mock.patch.object(integration.logger, "error") as err_log_dyn:
+        shim._flush_prefill_nan_trap(shim.fn, ext_fb)
+    assert pk.last_nan_trap == [[12, 2, 1, 77]]
+    err_log_dyn.assert_called_once()
+
+
 
 
 
