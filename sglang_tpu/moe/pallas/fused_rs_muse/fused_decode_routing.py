@@ -262,7 +262,7 @@ def routing_scratch_shapes(
 ) -> RoutingScratch:
     """Return Pallas VMEM/SMEM scratch specs matching ``RoutingScratch``."""
     pack_rows = max(8, ((batch_size + 7) // 8) * 8)
-    max_packed = max(128, batch_size * topk)
+    max_packed = max(128, batch_size * topk) + 1
     return RoutingScratch(
         counts_vmem=pltpu.VMEM((8, num_experts), jnp.int32),
         counts_smem=pltpu.SMEM((8, num_experts), jnp.int32),
@@ -1697,10 +1697,28 @@ def build_default_exec_plan_smem(
     *,
     num_experts: int = 256,
     spec_slot: jax.Array | None = None,
+    fast_plan: bool = False,
 ) -> jax.Array:
     """Build compact active-expert plan in SMEM in ONLY ``e_per_owner`` (32) steps!"""
     del num_experts
     first = my_owner * e_per_owner
+    if fast_plan and spec_slot is None and e_per_owner <= 64:
+        k = jnp.int32(0)
+        cursor = jnp.int32(0)
+        for le in range(e_per_owner):
+            g_e = first + jnp.int32(le)
+            cnt = scratch.counts_smem[0, g_e]
+            active = cnt > 0
+            scratch.cand_exec_idx[le] = jnp.where(active, k, jnp.int32(-1))
+            scratch.exec_expert_id[k] = g_e
+            scratch.exec_weight_src[k] = jnp.int32(0)
+            scratch.exec_weight_slot[k] = jnp.int32(le)
+            scratch.exec_start[k] = cursor
+            scratch.exec_write_ptr[k] = cursor
+            k = k + active.astype(jnp.int32)
+            cursor = cursor + jnp.where(active, cnt, jnp.int32(0))
+        scratch.exec_start[k] = cursor
+        return k
     k_init = jnp.int32(0)
     cursor_init = jnp.int32(0)
     if spec_slot is not None:
@@ -1780,7 +1798,7 @@ def build_exec_plan_from_masks_smem(
     """Build unified active-expert plan in ONLY ``e_per_owner + R`` (<= 36) steps!"""
     del num_experts
     first = my_owner * e_per_owner
-    if fast_plan and spec_slot is None and e_per_owner <= 32 and num_replicas <= 8:
+    if fast_plan and spec_slot is None and e_per_owner <= 64 and num_replicas <= 8:
         k = jnp.int32(0)
         cursor = jnp.int32(0)
         for le in range(e_per_owner):
@@ -2095,12 +2113,18 @@ def pack_active_tokens_smem(
     scratch: RoutingScratch,
     *,
     has_replicas: bool = False,
+    fast_gs: bool = False,
 ) -> None:
     """Scatter ONLY VPU-compacted local-candidate hits into per-expert SMEM buckets.
 
     When ``has_replicas=False``, every compacted local hit has ``k >= 0``
     unconditionally, executing ~B branch-free iterations total (~0.4 us at B=256).
     """
+    use_branchless_rep = has_replicas and fast_gs
+    if use_branchless_rep:
+        trash_k = jnp.int32(int(scratch.exec_write_ptr.shape[0]) - 1)
+        trash_pos = jnp.int32(int(scratch.packed_tok_ids.shape[0]) - 1)
+        scratch.exec_write_ptr[trash_k] = trash_pos
 
     def _scan_tok(t, _):
         n_loc = scratch.route_pack_smem[t, 0]
@@ -2111,7 +2135,16 @@ def pack_active_tokens_smem(
             w_val = lax.bitcast_convert_type(
                 scratch.route_pack_smem[t, 16 + j], jnp.float32
             )
-            if has_replicas:
+            if use_branchless_rep:
+                valid_k = k >= 0
+                safe_k = jnp.where(valid_k, k, trash_k)
+                pos = scratch.exec_write_ptr[safe_k]
+                scratch.packed_tok_ids[pos] = t
+                scratch.packed_tok_w[pos] = w_val
+                scratch.exec_write_ptr[safe_k] = jnp.where(
+                    valid_k, pos + jnp.int32(1), trash_pos
+                )
+            elif has_replicas:
 
                 @pl.when(k >= 0)
                 def _store():

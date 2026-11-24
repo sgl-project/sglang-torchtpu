@@ -16,7 +16,7 @@ from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_experts import (
 )
 
 SUPPORTED_FUSE_ALL_MODES = ("sparse", "sparse_v2", "sparse_fp8", "fp8_sparse", "ep_tp2", "chipmate")
-SUPPORTED_SHARDED_FUSE_ALL_MODES = ("sparse", "sparse_v2", "sparse_fp8", "fp8_sparse")
+SUPPORTED_SHARDED_FUSE_ALL_MODES = ("sparse", "sparse_v2", "sparse_fp8", "fp8_sparse", "ep_tp2")
 SUPPORTED_FULL_MOE_MODES = ("full", "stage_a", "stage_b")
 SUPPORTED_FUSE_ALL_BATCHES = (16, 32, 64, 128, 256)
 SUPPORTED_FUSE_ALL_BATCHES_B384 = (16, 32, 64, 128, 256, 384)
@@ -110,7 +110,7 @@ def muse_fuse_all_decode_op_name(
             f"got {mode!r}"
         )
     if block not in SUPPORTED_FUSE_ALL_BLOCKS or (
-        block == 512 and mode in ("ep_tp2", "chipmate")
+        block == 512 and mode == "chipmate"
     ):
         raise ValueError(
             f"Unsupported FP4 scale block {block} for mode={mode!r}; "
@@ -171,11 +171,13 @@ def _validate_fuse_all_shapes(
     s1: jax.Array,
     *,
     ep: int = 8,
+    tp: int = 1,
     return_sharded: bool = False,
 ) -> None:
-    if return_sharded and (x.shape[0] < ep or x.shape[0] % ep != 0):
+    sh_div = ep * tp
+    if return_sharded and (x.shape[0] < sh_div or x.shape[0] % sh_div != 0):
         raise ValueError(
-            f"{op_name} return_sharded=True requires batch_size divisible by ep={ep}, "
+            f"{op_name} return_sharded=True requires batch_size divisible by world_size={sh_div}, "
             f"got {x.shape[0]}"
         )
     if mode in ("sparse_fp8", "fp8_sparse"):
@@ -251,7 +253,7 @@ def _resolve_fuse_all_kernel(
             fused_decode_ep_tp2_from_logits,
         )
 
-        kwargs = {"ep": ep, "tp": tp, "replica_cost_mode": replica_cost_mode}
+        kwargs = {"ep": ep, "tp": tp, "replica_cost_mode": replica_cost_mode, **sh_kw}
         if chipmate_xor is not None:
             kwargs["chipmate_xor"] = chipmate_xor
         return partial(fused_decode_ep_tp2_from_logits, **kwargs)
@@ -351,7 +353,7 @@ def _get_muse_fuse_all_decode_op(
             norm: jax.Array,
         ) -> jax.Array:
             _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, return_sharded=return_sharded
+                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
             )
             return mapped(rank, logits, bias, x, w1, s1, w2, s2, norm)
 
@@ -366,7 +368,7 @@ def _get_muse_fuse_all_decode_op(
         @op.register_fake
         def abstract(rank, logits, bias, x, w1, s1, w2, s2, norm):
             if return_sharded:
-                return x.new_empty((x.shape[0] // ep, x.shape[1]))
+                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
             return torch.empty_like(x)
 
         return op
@@ -396,7 +398,7 @@ def _get_muse_fuse_all_decode_op(
             w3_mask: jax.Array,
         ) -> jax.Array:
             _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, return_sharded=return_sharded
+                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
             )
             return mapped_w3(rank, logits, bias, x, w1, s1, w2, s2, norm, w3_mask)
 
@@ -411,7 +413,7 @@ def _get_muse_fuse_all_decode_op(
         @op.register_fake
         def abstract_w3(rank, logits, bias, x, w1, s1, w2, s2, norm, w3_mask):
             if return_sharded:
-                return x.new_empty((x.shape[0] // ep, x.shape[1]))
+                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
             return torch.empty_like(x)
 
         return op
@@ -443,7 +445,7 @@ def _get_muse_fuse_all_decode_op(
             replica_meta: jax.Array,
         ) -> jax.Array:
             _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, return_sharded=return_sharded
+                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
             )
             if rep_w2.shape[0] != num_replicas:
                 raise ValueError(
@@ -493,7 +495,7 @@ def _get_muse_fuse_all_decode_op(
             replica_meta,
         ):
             if return_sharded:
-                return x.new_empty((x.shape[0] // ep, x.shape[1]))
+                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
             return torch.empty_like(x)
 
         return op
@@ -525,7 +527,7 @@ def _get_muse_fuse_all_decode_op(
         w3_mask: jax.Array,
     ) -> jax.Array:
         _validate_fuse_all_shapes(
-            op_name, mode, block, x, w1, s1, ep=ep, return_sharded=return_sharded
+            op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
         )
         if rep_w2.shape[0] != num_replicas:
             raise ValueError(
@@ -577,7 +579,7 @@ def _get_muse_fuse_all_decode_op(
         w3_mask,
     ):
         if return_sharded:
-            return x.new_empty((x.shape[0] // ep, x.shape[1]))
+            return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
         return torch.empty_like(x)
 
     return op
@@ -652,6 +654,9 @@ def ep_tp2_fallback_from_topk(
     )
     virt_w = jnp.ones((padded_tokens, kernel_topk), dtype=hidden_states.dtype)
     group_offset = (rank.reshape((1,)) * jnp.int32(e_chip)).astype(jnp.int32)
+    if hidden_size // s1.shape[1] == 512:
+        s1 = jnp.repeat(s1, 2, axis=1)
+        s2 = jnp.repeat(s2, 2, axis=1)
 
     out_buf = moe_gmm_local_rs_nodedup(
         hidden_states_local=hs_pad,
@@ -703,7 +708,7 @@ def get_muse_ep_tp2_fallback_op(
     chipmate_xor: int | None = None,
 ):
     """Return cached TorchTPU jax_op for mixed-mode EPxTP2 prefill/fallback."""
-    if ep not in (4, 8) or tp != 2 or block not in (16, 256):
+    if ep not in (4, 8) or tp != 2 or block not in (16, 256, 512):
         raise ValueError(
             f"Unsupported EPxTP2 fallback config: ep={ep}, tp={tp}, block={block}"
         )

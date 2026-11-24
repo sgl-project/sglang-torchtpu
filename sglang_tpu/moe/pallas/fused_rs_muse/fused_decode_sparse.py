@@ -85,6 +85,7 @@ class SparseDecodeConfig:
     route_rb16_mode: int = 0  # 0 = cand_w8_zi rb=64 routing; 1 = 2-pass rb=16; 2 = 2-pass rb=16 unrolled
     route_fast: bool = False  # opt-in: [256, 128] vertical lane-parallel VPU routing (0 cross-lane butterflies!)
     fast_plan: int = 0  # 0 = stock; 1 = branchless 0-scf.if planner; 2 = 1 + unrolled k_rep<=64
+    fast_gs: bool = False  # opt-in: 0-sbr branchless <=8-row gather/scatter (+1 trash row) + unrolled prologue/RS
     lhs_fp8: bool = False  # W4A8: online K256 FP8 activation quant
     rs_wire_bf16: bool = False
     pair_rs: bool = False  # 2-stage intra-chip XOR=1 paired Reduce-Scatter (halves off-chip ICI!)
@@ -166,6 +167,22 @@ def _read_sparse_w9_sub_knobs() -> tuple[bool, bool, bool, int, bool, int]:
     except Exception:
         pass
     return nc_split, k512_ch, unroll_st, rb16, route_fast, int(fast_plan)
+
+
+def _read_fast_gs_knob() -> bool:
+    import os
+
+    val = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS", False)
+    if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS") is None:
+        try:
+            from sglang_tpu.envs import envs
+
+            ev = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS", None)
+            if ev is not None:
+                val = bool(ev.get())
+        except Exception:
+            pass
+    return val
 
 
 def _read_sparse_env_overrides() -> (
@@ -278,9 +295,15 @@ def default_sparse_decode_config(
         route_fast,
         fast_plan,
     ) = _read_sparse_w9_sub_knobs()
+    if route_fast:
+        # Silicon-proven (#2647 / #2767): vertical ROUTE_FAST (~3.5 us) finishes before
+        # speculative slot-0 16 MiB DMA (~4.3 us), causing _drain_spec_miss stalls (+4.55 us)
+        # and bypassing branchless FAST_PLAN (spec_slot is not None).
+        spec_eff = 0
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
+    fast_gs = _read_fast_gs_knob()
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
         nc_split512=nc_split512,
@@ -289,6 +312,7 @@ def default_sparse_decode_config(
         route_rb16_mode=route_rb16_mode,
         route_fast=route_fast,
         fast_plan=fast_plan,
+        fast_gs=fast_gs,
         min_p_topk=min_p_topk,
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
@@ -1557,7 +1581,11 @@ def _sparse_decode_kernel(
             )
         else:
             num_exec = build_default_exec_plan_smem(
-                me, e_local, r_scratch, spec_slot=spec_slot
+                me,
+                e_local,
+                r_scratch,
+                spec_slot=spec_slot,
+                fast_plan=bool(getattr(cfg, "fast_plan", False)),
             )
 
     if stop_stage == "plan":
@@ -1718,12 +1746,21 @@ def _sparse_decode_kernel(
         if use_lhs_fp8:
             _prequant_lhs_k256(x_in_ref, lhs_fp8_buf, lhs_sc_buf, batch_size)
     else:
-        if cfg.fast_b64_epi_pro and batch_size <= 64:
+        if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
+            cfg.fast_gs and batch_size <= 128
+        ):
             z_chunk = min(batch_size, 32)
             z_acc = jnp.zeros((z_chunk, 32, 128), dtype=jnp.float32)
             for r0 in range(0, batch_size, z_chunk):
                 accum_3d[pl.ds(r0, z_chunk), :, :] = z_acc
-            io_3d_buf[...] = jnp.zeros((tile_m, 32, 128), dtype=jnp.bfloat16)
+            if cfg.fast_gs:
+                accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
+                    (1, 32, 128), dtype=jnp.float32
+                )
+            z_io_chunk = min(tile_m, 32)
+            z_io = jnp.zeros((z_io_chunk, 32, 128), dtype=jnp.bfloat16)
+            for r0 in range(0, tile_m, z_io_chunk):
+                io_3d_buf[pl.ds(r0, z_io_chunk), :, :] = z_io
             x_chunk = min(batch_size, 32)
             for r0 in range(0, batch_size, x_chunk):
                 for h_idx in range(2):
@@ -1739,6 +1776,10 @@ def _sparse_decode_kernel(
                 return _
 
             lax.fori_loop(0, batch_size // zero_rc, _zero_acc_chunk, jnp.int32(0))
+            if cfg.fast_gs:
+                accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
+                    (1, 32, 128), dtype=jnp.float32
+                )
 
             zeros_io = jnp.zeros((8, 32, 128), dtype=jnp.bfloat16)
 
@@ -1761,7 +1802,10 @@ def _sparse_decode_kernel(
             lax.fori_loop(0, batch_size // x_rc, _reshape_x_chunk, jnp.int32(0))
 
         pack_active_tokens_smem(
-            batch_size, r_scratch, has_replicas=has_replicas
+            batch_size,
+            r_scratch,
+            has_replicas=has_replicas,
+            fast_gs=cfg.fast_gs,
         )
 
     if stop_stage == "pack":
@@ -2313,6 +2357,46 @@ def _sparse_decode_kernel(
 
         @jax.named_scope("gather_rows")
         def _gather_rows_to_3d(base_pos, cur_rows):
+            if cfg.fast_gs:
+                max_pk = int(r_scratch.packed_tok_ids.shape[0])
+                safe_b = jnp.minimum(base_pos, jnp.int32(max_pk - 1))
+                ts8 = [
+                    jnp.clip(
+                        r_scratch.packed_tok_ids[
+                            jnp.where(jnp.int32(s) < cur_rows, base_pos + s, safe_b)
+                        ],
+                        jnp.int32(0),
+                        jnp.int32(batch_size - 1),
+                    )
+                    for s in range(8)
+                ]
+                io_3d_buf[pl.ds(0, 8), :, :] = jnp.concatenate(
+                    [x_3d_buf[pl.ds(t, 1), :, :] for t in ts8], axis=0
+                )
+
+                @pl.when(cur_rows > 8)
+                def _gather_gt8_fgs():
+                    n8 = cur_rows >> 3
+
+                    def _gather_8_hi(q, _):
+                        i0 = pl.multiple_of(q << 3, 8)
+                        p0 = base_pos + i0
+                        ts = [r_scratch.packed_tok_ids[p0 + s] for s in range(8)]
+                        rows = [x_3d_buf[pl.ds(t, 1), :, :] for t in ts]
+                        io_3d_buf[pl.ds(i0, 8), :, :] = jnp.concatenate(rows, axis=0)
+                        return _
+
+                    lax.fori_loop(1, n8, _gather_8_hi, jnp.int32(0))
+
+                    def _gather_tail_hi(i, _):
+                        tok = r_scratch.packed_tok_ids[base_pos + i]
+                        io_3d_buf[pl.ds(i, 1), :, :] = x_3d_buf[pl.ds(tok, 1), :, :]
+                        return _
+
+                    lax.fori_loop(n8 << 3, cur_rows, _gather_tail_hi, jnp.int32(0))
+
+                return
+
             if cfg.fast_b64_epi_pro:
 
                 @pl.when(cur_rows <= 8)
@@ -2416,6 +2500,60 @@ def _sparse_decode_kernel(
         @jax.named_scope("scatter_acc")
         def _scatter_accumulate(base_pos, cur_rows):
             # All token IDs within a single expert are strictly distinct.
+            if cfg.fast_gs:
+                max_pk = int(r_scratch.packed_tok_ids.shape[0])
+                safe_b = jnp.minimum(base_pos, jnp.int32(max_pk - 1))
+                y8_f = io_3d_buf[pl.ds(0, 8), :, :].astype(jnp.float32)
+                for s in range(8):
+                    valid_s = jnp.int32(s) < cur_rows
+                    p_s = jnp.where(valid_s, base_pos + s, safe_b)
+                    tok = jnp.where(
+                        valid_s,
+                        r_scratch.packed_tok_ids[p_s],
+                        jnp.int32(batch_size),
+                    )
+                    w = jnp.where(
+                        valid_s,
+                        r_scratch.packed_tok_w[p_s],
+                        jnp.float32(0.0),
+                    )
+                    ys = y8_f[s : s + 1, :, :] * w
+                    accum_3d[pl.ds(tok, 1), :, :] = (
+                        accum_3d[pl.ds(tok, 1), :, :] + ys
+                    )
+
+                @pl.when(cur_rows > 8)
+                def _acc_gt8_fgs():
+                    n8 = cur_rows >> 3
+
+                    def _acc_8_hi(q, _):
+                        i0 = pl.multiple_of(q << 3, 8)
+                        p0 = base_pos + i0
+                        ts = [r_scratch.packed_tok_ids[p0 + s] for s in range(8)]
+                        ws = [r_scratch.packed_tok_w[p0 + s] for s in range(8)]
+                        y8_hi = io_3d_buf[pl.ds(i0, 8), :, :].astype(jnp.float32)
+                        for s in range(8):
+                            ys_hi = y8_hi[s : s + 1, :, :] * ws[s]
+                            accum_3d[pl.ds(ts[s], 1), :, :] = (
+                                accum_3d[pl.ds(ts[s], 1), :, :] + ys_hi
+                            )
+                        return _
+
+                    lax.fori_loop(1, n8, _acc_8_hi, jnp.int32(0))
+
+                    def _acc_tail_hi(i, _):
+                        tok = r_scratch.packed_tok_ids[base_pos + i]
+                        w = r_scratch.packed_tok_w[base_pos + i]
+                        y_row = io_3d_buf[pl.ds(i, 1), :, :].astype(jnp.float32)
+                        accum_3d[pl.ds(tok, 1), :, :] = (
+                            accum_3d[pl.ds(tok, 1), :, :] + y_row * w
+                        )
+                        return _
+
+                    lax.fori_loop(n8 << 3, cur_rows, _acc_tail_hi, jnp.int32(0))
+
+                return
+
             if cfg.fast_b64_epi_pro:
 
                 @pl.when(cur_rows <= 8)
@@ -3326,11 +3464,17 @@ def _sparse_decode_kernel(
             n_row_tiles = (r_e + tile_m - 1) // tile_m
 
             def _row_tile_body(tile_idx, _c):
-                tile_off = tile_idx * tile_m
-                base_pos = row_start + tile_off
-                cur_rows = jnp.minimum(tile_m, r_e - tile_off)
-                is_first_tile = tile_idx == 0
-                is_last_tile = tile_idx == (n_row_tiles - 1)
+                if cfg.fast_gs and batch_size <= tile_m:
+                    base_pos = row_start
+                    cur_rows = r_e
+                    is_first_tile = jnp.bool_(True)
+                    is_last_tile = jnp.bool_(True)
+                else:
+                    tile_off = tile_idx * tile_m
+                    base_pos = row_start + tile_off
+                    cur_rows = jnp.minimum(tile_m, r_e - tile_off)
+                    is_first_tile = tile_idx == 0
+                    is_last_tile = tile_idx == (n_row_tiles - 1)
 
                 _gather_rows_to_3d(base_pos, cur_rows)
 
@@ -3396,7 +3540,10 @@ def _sparse_decode_kernel(
                 _scatter_accumulate(base_pos, cur_rows)
                 return _c
 
-            lax.fori_loop(0, n_row_tiles, _row_tile_body, jnp.int32(0))
+            if cfg.fast_gs and batch_size <= tile_m:
+                _row_tile_body(jnp.int32(0), jnp.int32(0))
+            else:
+                lax.fori_loop(0, n_row_tiles, _row_tile_body, jnp.int32(0))
             return _
 
         lax.fori_loop(0, num_exec, _sparse_expert_body, jnp.int32(0))
@@ -3407,7 +3554,9 @@ def _sparse_decode_kernel(
 
     # 7. Contiguous EP-1 multi-row Reduce-Scatter.
     if cfg.rs_wire_bf16:
-        if cfg.fast_b64_epi_pro and batch_size <= 64:
+        if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
+            cfg.fast_gs and batch_size <= 128
+        ):
             cast_step = min(batch_size, 32)
             for r0 in range(0, batch_size, cast_step):
                 rs_send_bf16[pl.ds(r0, cast_step), :, :] = accum_3d[
@@ -3542,6 +3691,15 @@ def _sparse_decode_kernel(
             for src in range(ep - 1):
                 acc = acc + rs_recv_3d[src, :, :, :].astype(jnp.float32)
             owner_3d[...] = acc.astype(jnp.bfloat16)
+        elif cfg.fast_gs and rows_per_rank <= 16:
+            red_rc = min(rows_per_rank, 4)
+            for r0 in range(0, rows_per_rank, red_rc):
+                acc = accum_3d[pl.ds(me * rows_per_rank + r0, red_rc), :, :]
+                for src in range(ep - 1):
+                    acc = acc + rs_recv_3d[src, pl.ds(r0, red_rc), :, :].astype(
+                        jnp.float32
+                    )
+                owner_3d[pl.ds(r0, red_rc), :, :] = acc.astype(jnp.bfloat16)
         else:
             red_rc = min(rows_per_rank, 4)
 
@@ -3965,10 +4123,11 @@ def fused_decode_sparse_from_logits(
                 scratch_shapes.append(
                     vmem((max_bd * 16, (_H // _KC) * 128), jnp.float32)
                 )
+        accum_rows = (batch_size + 1) if config.fast_gs else batch_size
         scratch_shapes.extend(
             [
                 vmem((1, _H), jnp.float32),  # gain_f32_buf
-                vmem((batch_size, 32, 128), jnp.float32),  # accum_3d
+                vmem((accum_rows, 32, 128), jnp.float32),  # accum_3d (+1 trash row when fast_gs)
             ]
         )
 
@@ -4057,6 +4216,14 @@ def fused_decode_sparse_from_logits(
     )
     rep_tag = f"_r{num_replicas}" if has_replicas else ""
     out_tag = "_sh" if return_sharded else "_rep"
+    w9_tag = (
+        f"{'_sm1' if config.static_holder_mask else ''}"
+        f"{f'_sp{config.spec_prime_parts}' if config.spec_prime_parts else ''}"
+        f"{'_rf1' if config.route_fast else ''}"
+        f"{f'_fp{config.fast_plan}' if config.fast_plan else ''}"
+        f"{'_us1' if config.unroll_strips else ''}"
+        f"{'_fgs1' if config.fast_gs else ''}"
+    )
     return pl.pallas_call(
         kernel_fn,
         out_shape=out_shape,
@@ -4073,7 +4240,7 @@ def fused_decode_sparse_from_logits(
         ),
         name=(
             f"muse_sparse_ep{ep}_b{batch_size}_k{scale_block}"
-            f"_{config.row_mode}_{config.weight_mode}_tm{tile_m}{rep_tag}{out_tag}"
+            f"_{config.row_mode}_{config.weight_mode}_tm{tile_m}{rep_tag}{w9_tag}{out_tag}"
         ),
     )(*call_args)
 
@@ -4130,6 +4297,8 @@ def default_fp8_sparse_decode_config(
         _,
     ) = _read_sparse_env_overrides()
     _, _, _, route_rb16_mode, route_fast, fast_plan = _read_sparse_w9_sub_knobs()
+    if route_fast:
+        spec_parts = 0
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
@@ -4776,7 +4945,11 @@ def _sparse_fp8_decode_kernel(
             )
         else:
             num_exec = build_default_exec_plan_smem(
-                me, e_local, r_scratch, spec_slot=spec_slot
+                me,
+                e_local,
+                r_scratch,
+                spec_slot=spec_slot,
+                fast_plan=bool(getattr(cfg, "fast_plan", False)),
             )
 
     exec_eid_smem = (
@@ -6446,6 +6619,12 @@ def fused_decode_sparse_fp8_from_logits(
     )
     rep_tag = f"_r{num_replicas}" if has_replicas else ""
     out_tag = "_sh" if return_sharded else "_rep"
+    fp8_w9_tag = (
+        f"{'_sm1' if config.static_holder_mask else ''}"
+        f"{f'_sp{config.spec_prime_parts}' if config.spec_prime_parts else ''}"
+        f"{'_rf1' if config.route_fast else ''}"
+        f"{f'_fp{config.fast_plan}' if config.fast_plan else ''}"
+    )
     return pl.pallas_call(
         kernel_fn,
         out_shape=out_shape,
@@ -6462,6 +6641,6 @@ def fused_decode_sparse_fp8_from_logits(
         ),
         name=(
             f"muse_sparse_fp8_ep{ep}_b{batch_size}"
-            f"_{config.row_mode}_{config.weight_mode}_tm{tile_m}{rep_tag}{out_tag}"
+            f"_{config.row_mode}_{config.weight_mode}_tm{tile_m}{rep_tag}{fp8_w9_tag}{out_tag}"
         ),
     )(*call_args)

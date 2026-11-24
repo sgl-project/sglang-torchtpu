@@ -1535,6 +1535,400 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
 
         self.assertGreater(total_freed_experts, 0)
 
+    def test_w9_ep_tp2_k512_route_fast_and_sparse_fast_gs_parity(self):
+        """Verify EPxTP2 k512 + ROUTE_FAST + FAST_PLAN + FAST_GS + PAIR_RS + return_sharded
+        Mosaic TPU lowering and CPU Pallas interpret 0.0-ULP race-free parity."""
+        import dataclasses
+        import sys
+        from functools import partial
+
+        for mod_name in (
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing",
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_ep_tp2",
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op",
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse",
+        ):
+            sys.modules.pop(mod_name, None)
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.moe.pallas.fused_rs_muse import fused_decode_routing as r_mod
+        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_ep_tp2 import (
+            fused_decode_ep_tp2_from_logits,
+        )
+        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
+            ep_tp2_fallback_from_topk,
+            muse_fuse_all_decode_op_name,
+        )
+        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+            default_fp8_sparse_decode_config,
+            default_sparse_decode_config,
+            fused_decode_sparse_from_logits,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST": "1",
+            },
+            clear=False,
+        ):
+            self.assertEqual(default_sparse_decode_config(64, 8, 512).spec_prime_parts, 0)
+            self.assertEqual(default_fp8_sparse_decode_config(64, 8).spec_prime_parts, 0)
+
+        # 1. Verify fused_decode_op k512 + return_sharded naming/validation for ep_tp2.
+        op_sh = muse_fuse_all_decode_op_name(
+            mode="ep_tp2",
+            ep=8,
+            tp=2,
+            block=512,
+            num_replicas=8,
+            replica_cost_mode="tiles",
+            return_sharded=True,
+        )
+        self.assertIn("muse_decode_ep8_tp2_k512_r8_tiles_sh", op_sh)
+
+        # 2. CPU Pallas interpret (with detect_races=True) 0.0-ULP parity on:
+        #    (a) pack_active_tokens_smem(fast_gs=True) vs fast_gs=False with replicas + suppressed hits
+        #    (b) FAST_GS branchless 8-row gather + trash-row scatter (cur_rows <= 8 & cur_rows > 8 + NaN pad!)
+        rng = np.random.default_rng(20261124)
+        b_sz = 32
+        max_exec = 20
+        r_shapes = r_mod.routing_scratch_shapes(b_sz, max_exec)
+        max_pk = int(r_shapes.packed_tok_ids.shape[0])
+
+        # Build deterministic route_pack_smem, cand_exec_idx (with -1 suppressed replicas!), and exec_start.
+        cand_map = np.full((max_exec,), -1, dtype=np.int32)
+        active_cands = [0, 2, 5, 9, 14, 18]  # 6 active experts; others (-1) suppressed!
+        counts_per_act = [11, 5, 1, 8, 3, 2]  # covers cur_rows=1,2,3,5,8 AND >8 (11)!
+        starts = np.zeros((max_exec + 1,), dtype=np.int32)
+        cur_off = 0
+        for k_i, (c_id, cnt_v) in enumerate(zip(active_cands, counts_per_act)):
+            cand_map[c_id] = k_i
+            starts[k_i] = cur_off
+            cur_off += cnt_v
+        starts[len(active_cands)] = cur_off
+
+        pack_arr = np.zeros((b_sz, 128), dtype=np.int32)
+        rem_per_cand = {c: n for c, n in zip(active_cands, counts_per_act)}
+        suppressed_cands = [1, 3, 7, 12, 19]
+        for t in range(b_sz - 2):  # last 2 tokens are NaN pad tokens (0 hits)
+            hits_c = []
+            for c_id in active_cands:
+                if rem_per_cand[c_id] > 0 and (rng.random() < 0.45 or t >= b_sz - 12):
+                    hits_c.append(c_id)
+                    rem_per_cand[c_id] -= 1
+                    if len(hits_c) == 6:
+                        break
+            # Inject 1-2 suppressed replica hits (k == -1) on every token!
+            hits_c.append(int(rng.choice(suppressed_cands)))
+            pack_arr[t, 0] = len(hits_c)
+            for j, c_id in enumerate(hits_c):
+                pack_arr[t, 1 + j] = c_id
+                w_f32 = np.float32(rng.uniform(0.05, 0.4))
+                pack_arr[t, 16 + j] = w_f32.view(np.int32)
+        # Drain any remaining counts onto early tokens
+        for c_id, rem_n in list(rem_per_cand.items()):
+            for t in range(b_sz - 2):
+                if rem_n <= 0:
+                    break
+                cur_n = int(pack_arr[t, 0])
+                existing = set(pack_arr[t, 1 : 1 + cur_n].tolist())
+                if c_id not in existing and cur_n < 8:
+                    pack_arr[t, 1 + cur_n] = c_id
+                    pack_arr[t, 16 + cur_n] = np.float32(0.125).view(np.int32)
+                    pack_arr[t, 0] = cur_n + 1
+                    rem_n -= 1
+            self.assertEqual(rem_n, 0)
+
+        x_in = rng.normal(0.0, 1.0, size=(b_sz, 2, 128)).astype(np.float32)
+        x_in[-2:, :, :] = np.nan  # NaN pad rows must NEVER leak into valid rows!
+        x_bf16 = jnp.asarray(x_in, dtype=jnp.bfloat16)
+
+        def _make_gs_kernel(use_fast_gs: bool):
+            acc_rows = (b_sz + 1) if use_fast_gs else b_sz
+
+            def _kern(pack_in_ref, cand_in_ref, start_in_ref, x_ref, out_acc_ref, io_buf, acc_buf, p_ids, p_w, w_ptr):
+                # Initialize SMEM state
+                for m_i in range(max_exec + 1):
+                    w_ptr[m_i] = start_in_ref[m_i]
+                for p_i in range(max_pk):
+                    p_ids[p_i] = jnp.int32(b_sz - 1)  # poison with NaN pad token ID!
+                    p_w[p_i] = jnp.float32(999.0)
+                fake_scratch = r_mod.RoutingScratch(
+                    counts_vmem=None,
+                    counts_smem=None,
+                    route_pack_vmem=None,
+                    route_pack_smem=pack_in_ref,
+                    exec_expert_id=None,
+                    exec_weight_src=None,
+                    exec_weight_slot=None,
+                    exec_start=start_in_ref,
+                    exec_write_ptr=w_ptr,
+                    cand_exec_idx=cand_in_ref,
+                    packed_tok_ids=p_ids,
+                    packed_tok_w=p_w,
+                )
+                r_mod.pack_active_tokens_smem(
+                    b_sz, fake_scratch, has_replicas=True, fast_gs=use_fast_gs
+                )
+                # Poison scratch VMEM with NaNs before gather/scatter (#2770 guardrail)!
+                io_buf[...] = jnp.full((16, 2, 128), jnp.nan, dtype=jnp.bfloat16)
+                acc_buf[...] = jnp.full((acc_rows, 2, 128), jnp.nan, dtype=jnp.float32)
+                acc_buf[pl.ds(0, b_sz), :, :] = jnp.zeros((b_sz, 2, 128), dtype=jnp.float32)
+                if use_fast_gs:
+                    acc_buf[pl.ds(b_sz, 1), :, :] = jnp.zeros((1, 2, 128), dtype=jnp.float32)
+
+                def _exp_loop(k_idx, _):
+                    base_p = start_in_ref[k_idx]
+                    cur_r = start_in_ref[k_idx + 1] - base_p
+                    if use_fast_gs:
+                        safe_b = jnp.minimum(base_p, jnp.int32(max_pk - 1))
+                        ts8 = [
+                            jnp.clip(
+                                p_ids[jnp.where(jnp.int32(s) < cur_r, base_p + s, safe_b)],
+                                jnp.int32(0),
+                                jnp.int32(b_sz - 1),
+                            )
+                            for s in range(8)
+                        ]
+                        io_buf[pl.ds(0, 8), :, :] = jnp.concatenate(
+                            [x_ref[pl.ds(t, 1), :, :] for t in ts8], axis=0
+                        )
+
+                        @pl.when(cur_r > 8)
+                        def _ghi():
+                            def _gt(i, _c):
+                                tok = p_ids[base_p + i]
+                                io_buf[pl.ds(i, 1), :, :] = x_ref[pl.ds(tok, 1), :, :]
+                                return _c
+
+                            jax.lax.fori_loop(8, cur_r, _gt, jnp.int32(0))
+
+                        # Simulate expert transform on gathered rows (2x scale in bf16)
+                        io_buf[...] = (io_buf[...].astype(jnp.float32) * 1.5).astype(jnp.bfloat16)
+                        y8_f = io_buf[pl.ds(0, 8), :, :].astype(jnp.float32)
+                        for s in range(8):
+                            valid_s = jnp.int32(s) < cur_r
+                            p_s = jnp.where(valid_s, base_p + s, safe_b)
+                            tok = jnp.where(valid_s, p_ids[p_s], jnp.int32(b_sz))
+                            w = jnp.where(valid_s, p_w[p_s], jnp.float32(0.0))
+                            acc_buf[pl.ds(tok, 1), :, :] = (
+                                acc_buf[pl.ds(tok, 1), :, :] + y8_f[s : s + 1, :, :] * w
+                            )
+
+                        @pl.when(cur_r > 8)
+                        def _shi():
+                            def _st(i, _c):
+                                tok = p_ids[base_p + i]
+                                w = p_w[base_p + i]
+                                yr = io_buf[pl.ds(i, 1), :, :].astype(jnp.float32)
+                                acc_buf[pl.ds(tok, 1), :, :] = acc_buf[pl.ds(tok, 1), :, :] + yr * w
+                                return _c
+
+                            jax.lax.fori_loop(8, cur_r, _st, jnp.int32(0))
+                    else:
+                        def _g_ref(i, _c):
+                            tok = p_ids[base_p + i]
+                            io_buf[pl.ds(i, 1), :, :] = x_ref[pl.ds(tok, 1), :, :]
+                            return _c
+
+                        jax.lax.fori_loop(0, cur_r, _g_ref, jnp.int32(0))
+                        io_buf[...] = (io_buf[...].astype(jnp.float32) * 1.5).astype(jnp.bfloat16)
+
+                        def _s_ref(i, _c):
+                            tok = p_ids[base_p + i]
+                            w = p_w[base_p + i]
+                            yr = io_buf[pl.ds(i, 1), :, :].astype(jnp.float32)
+                            acc_buf[pl.ds(tok, 1), :, :] = acc_buf[pl.ds(tok, 1), :, :] + yr * w
+                            return _c
+
+                        jax.lax.fori_loop(0, cur_r, _s_ref, jnp.int32(0))
+                    return _
+
+                jax.lax.fori_loop(0, len(active_cands), _exp_loop, jnp.int32(0))
+                out_acc_ref[...] = acc_buf[pl.ds(0, b_sz), :, :]
+
+            return pl.pallas_call(
+                _kern,
+                out_shape=jax.ShapeDtypeStruct((b_sz, 2, 128), jnp.float32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    grid=(1,),
+                    in_specs=(
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                    ),
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                    scratch_shapes=(
+                        pltpu.VMEM((16, 2, 128), jnp.bfloat16),
+                        pltpu.VMEM((acc_rows, 2, 128), jnp.float32),
+                        pltpu.SMEM((max_pk,), jnp.int32),
+                        pltpu.SMEM((max_pk,), jnp.float32),
+                        pltpu.SMEM((max_exec + 1,), jnp.int32),
+                    ),
+                ),
+                interpret=pltpu.InterpretParams(
+                    detect_races=True,
+                    **(
+                        {"uninitialized_memory": "nan"}
+                        if "uninitialized_memory"
+                        in pltpu.InterpretParams.__annotations__
+                        else {}
+                    ),
+                ),
+            )(
+                jnp.asarray(pack_arr, dtype=jnp.int32),
+                jnp.asarray(cand_map, dtype=jnp.int32),
+                jnp.asarray(starts, dtype=jnp.int32),
+                x_bf16,
+            )
+
+        out_ref_gs = np.asarray(_make_gs_kernel(False))
+        out_fast_gs = np.asarray(_make_gs_kernel(True))
+        self.assertFalse(np.isnan(out_fast_gs[:-2]).any())
+        self.assertTrue(
+            np.array_equal(out_ref_gs, out_fast_gs),
+            f"FAST_GS gather/scatter/pack must be 0-ULP bit-exact; max diff={np.max(np.abs(out_ref_gs - out_fast_gs))}",
+        )
+
+        # 3. Verify Mosaic TPU lowering of EP4xTP2 k512 (Wave-9 bundle + return_sharded + pair_rs + fallback)
+        #    and muse_sparse FAST_GS=1 across 8 XLA devices!
+        from jax.experimental.topologies import get_topology_desc
+
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            h, i_half, block, r_slots = 4096, 2048, 512, 2
+            e_chip = 64
+            in_shapes_tp2 = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((64, 256), jnp.float32),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((64, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_chip, h, 2 * i_half), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_chip, h // block, 2 * i_half), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_chip, i_half, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_chip, i_half // block, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, h, 2 * i_half), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, h // block, 2 * i_half), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, i_half, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, i_half // block, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4, 4 * r_slots), jnp.int32),
+            )
+            for pair_rs in (False, True):
+                for ret_sh in (False, True):
+                    sm_tp2 = jax.jit(
+                        jax.shard_map(
+                            partial(
+                                fused_decode_ep_tp2_from_logits,
+                                ep=4,
+                                tp=2,
+                                replica_cost_mode="tiles",
+                                return_sharded=ret_sh,
+                                min_p_topk=0.90,
+                                free_max_rows=6,
+                                free_max_w=0.18,
+                                free_min_slot=1,
+                                static_holder_mask=True,
+                                route_fast=True,
+                                fast_plan=2,
+                                unroll_strips=True,
+                                fast_gs=True,
+                                pair_rs=pair_rs,
+                            ),
+                            mesh=mesh,
+                            in_specs=(P(),) * len(in_shapes_tp2),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    )
+                    hlo_tp2 = (
+                        sm_tp2.trace(*in_shapes_tp2)
+                        .lower(lowering_platforms=("tpu",))
+                        .as_text("hlo")
+                    )
+                    self.assertIn("tpu_custom_call", hlo_tp2)
+
+            # Verify ep_tp2_fallback_from_topk k512 Mosaic TPU lowering (B=8 warmup).
+            fb_shapes = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((8, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8, 8), jnp.float32),
+                jax.ShapeDtypeStruct((8, 8), jnp.int32),
+                in_shapes_tp2[4],
+                in_shapes_tp2[5],
+                in_shapes_tp2[6],
+                in_shapes_tp2[7],
+                in_shapes_tp2[8],
+            )
+            sm_fb = jax.jit(
+                jax.shard_map(
+                    partial(ep_tp2_fallback_from_topk, ep=4, tp=2, chipmate_xor=1),
+                    mesh=mesh,
+                    in_specs=(P(),) * len(fb_shapes),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+            )
+            hlo_fb = sm_fb.trace(*fb_shapes).lower(lowering_platforms=("tpu",)).as_text("hlo")
+            self.assertIn("tpu_custom_call", hlo_fb)
+
+            # Verify muse_sparse FAST_GS=1 Mosaic TPU lowering on EP=8 k512!
+            cfg_fgs = dataclasses.replace(
+                default_sparse_decode_config(64, 8, 512),
+                static_holder_mask=True,
+                route_fast=True,
+                fast_plan=2,
+                unroll_strips=True,
+                fast_gs=True,
+            )
+            in_shapes_sp = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((64, 256), jnp.float32),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((64, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4, 8 * r_slots), jnp.int32),
+            )
+            sm_sp = jax.jit(
+                jax.shard_map(
+                    partial(
+                        fused_decode_sparse_from_logits,
+                        ep=8,
+                        return_sharded=True,
+                        replica_cost_mode="tiles",
+                        config=cfg_fgs,
+                    ),
+                    mesh=mesh,
+                    in_specs=(P(),) * len(in_shapes_sp),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+            )
+            hlo_sp = sm_sp.trace(*in_shapes_sp).lower(lowering_platforms=("tpu",)).as_text("hlo")
+            self.assertIn("tpu_custom_call", hlo_sp)
+
 
 if __name__ == "__main__":
     unittest.main()

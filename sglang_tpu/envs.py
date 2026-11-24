@@ -578,6 +578,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN = EnvInt(0)
+    SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS = EnvBool(False)
+    SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)

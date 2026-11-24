@@ -22,12 +22,30 @@ supporting:
 from __future__ import annotations
 
 import functools
+import os
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
+    scale_free_expert_for_batch,
+)
+from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
+    RoutingScratch,
+    _bridge1_prerouted_active,
+    _route_prerouted_topk_in_kernel,
+    build_default_exec_plan_smem,
+    build_exec_plan_from_masks_smem,
+    extract_my_holder_candidates_smem,
+    extract_my_holder_candidates_tuple,
+    pack_active_tokens_smem,
+    parse_free_expert_rows_spec,
+    route_topk_and_counts_in_kernel,
+    routing_scratch_shapes,
+    run_replica_planner_smem,
+)
 from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
     _fp4_blockdiag_gmm,
     _fp4_k256_dual_gmm,
@@ -363,6 +381,75 @@ def _fp4_hoisted_blockdiag_gmm(
     return jnp.concatenate(cols, axis=1)
 
 
+def _ep_tp2_kblock_gmm(
+    x_ref, w_ref, scale_ref, k: int, n0, nc: int, block256: bool, scale_block: int
+):
+    """K256/K512 compact-scale or K16 dequant GMM hoisting scales & reusing K512 VREGs."""
+    if not block256:
+        return _fp4_k256_gmm(x_ref, w_ref, scale_ref, k, n0, nc, False, scale_block)
+    kc = 256
+    n_sb = k // scale_block
+    can_hoist = n_sb >= 8 and (n_sb % 8 == 0)
+    s_all = scale_ref[pl.ds(0, n_sb), pl.ds(n0, nc)] if can_hoist else None
+    acc = None
+    s_cur = None
+    for c0 in range(0, k, kc):
+        x = x_ref[:, c0 : c0 + kc].astype(jnp.bfloat16)
+        w = pltpu.bitcast(
+            w_ref[pl.ds(c0 // 8, kc // 8), pl.ds(n0, nc)], jnp.float4_e2m1fn
+        ).astype(jnp.float8_e4m3fn)
+        res = jnp.dot(x, w, preferred_element_type=jnp.float32)
+        if (c0 % scale_block) == 0 or s_cur is None:
+            sb_id = c0 // scale_block
+            if s_all is not None:
+                s_cur = s_all[sb_id : sb_id + 1, :].astype(jnp.float32)
+            else:
+                s_cur = scale_ref[pl.ds(sb_id, 1), pl.ds(n0, nc)].astype(jnp.float32)
+        res = res * s_cur
+        acc = res if acc is None else acc + res
+    return acc
+
+
+def _ep_tp2_kblock_dual_gmm(
+    x_ref, w_ref, scale_ref, k: int, n0_g, n0_u, nc: int, block256: bool, scale_block: int
+):
+    """Interleaved gate + up K256/K512 GMM hoisting scales & reusing K512 VREGs."""
+    if not block256:
+        return _fp4_k256_dual_gmm(
+            x_ref, w_ref, scale_ref, k, n0_g, n0_u, nc, False, scale_block
+        )
+    kc = 256
+    n_sb = k // scale_block
+    can_hoist = n_sb >= 8 and (n_sb % 8 == 0)
+    sg_all = scale_ref[pl.ds(0, n_sb), pl.ds(n0_g, nc)] if can_hoist else None
+    su_all = scale_ref[pl.ds(0, n_sb), pl.ds(n0_u, nc)] if can_hoist else None
+    acc_g = None
+    acc_u = None
+    sg_cur = None
+    su_cur = None
+    for c0 in range(0, k, kc):
+        x = x_ref[:, c0 : c0 + kc].astype(jnp.bfloat16)
+        wg = pltpu.bitcast(
+            w_ref[pl.ds(c0 // 8, kc // 8), pl.ds(n0_g, nc)], jnp.float4_e2m1fn
+        ).astype(jnp.float8_e4m3fn)
+        wu = pltpu.bitcast(
+            w_ref[pl.ds(c0 // 8, kc // 8), pl.ds(n0_u, nc)], jnp.float4_e2m1fn
+        ).astype(jnp.float8_e4m3fn)
+        if (c0 % scale_block) == 0 or sg_cur is None:
+            sb_id = c0 // scale_block
+            if sg_all is not None:
+                sg_cur = sg_all[sb_id : sb_id + 1, :].astype(jnp.float32)
+                su_cur = su_all[sb_id : sb_id + 1, :].astype(jnp.float32)
+            else:
+                sg_cur = scale_ref[pl.ds(sb_id, 1), pl.ds(n0_g, nc)].astype(jnp.float32)
+                su_cur = scale_ref[pl.ds(sb_id, 1), pl.ds(n0_u, nc)].astype(jnp.float32)
+        rg = jnp.dot(x, wg, preferred_element_type=jnp.float32) * sg_cur
+        ru = jnp.dot(x, wu, preferred_element_type=jnp.float32) * su_cur
+        acc_g = rg if acc_g is None else acc_g + rg
+        acc_u = ru if acc_u is None else acc_u + ru
+    return acc_g, acc_u
+
+
 def _compute_tile_gmm1_gmm2(
     x_tile_2d,
     act_ref,
@@ -383,11 +470,12 @@ def _compute_tile_gmm1_gmm2(
     out_2d: bool = False,
     x_bd_buf=None,
     bd_w4a8: bool = False,
+    unroll_strips: bool = False,
 ):
     """Run GMM1 + SwiGLU + GMM2 -> p_send_slot_ref (2D [m,4096] or 3D [m,32,128])."""
     h = 4096
     i_half = 2048
-    block256 = block == 256
+    block256 = block in (256, 512)
 
     if use_blockdiag_k16 and (not block256) and m_valid_bd > 0:
         chunk_bd = 8 if m_valid_bd > 8 else m_valid_bd
@@ -431,16 +519,16 @@ def _compute_tile_gmm1_gmm2(
     def _gmm1_strip(j):
         col = pl.multiple_of(j * strip_nc1, strip_nc1)
         if use_dual_gmm1:
-            g, u = _fp4_k256_dual_gmm(
+            g, u = _ep_tp2_kblock_dual_gmm(
                 x_sub, w1_ref, s1_ref, h, col, i_half + col, strip_nc1, block256, block
             )
             act_sub[:, pl.ds(col, strip_nc1)] = (
                 jax.nn.silu(g).astype(jnp.bfloat16).astype(jnp.float32) * u
             ).astype(jnp.bfloat16)
         else:
-            g = _fp4_k256_gmm(x_sub, w1_ref, s1_ref, h, col, strip_nc1, block256, block)
+            g = _ep_tp2_kblock_gmm(x_sub, w1_ref, s1_ref, h, col, strip_nc1, block256, block)
             act_sub[:, pl.ds(col, strip_nc1)] = jax.nn.silu(g).astype(jnp.bfloat16)
-            u = _fp4_k256_gmm(
+            u = _ep_tp2_kblock_gmm(
                 x_sub, w1_ref, s1_ref, h, i_half + col, strip_nc1, block256, block
             )
             sg = act_sub[:, pl.ds(col, strip_nc1)].astype(jnp.float32)
@@ -449,6 +537,9 @@ def _compute_tile_gmm1_gmm2(
     n_strips1 = i_half // strip_nc1
     if n_strips1 == 1:
         _gmm1_strip(0)
+    elif unroll_strips and n_strips1 <= 4:
+        for s_j in range(n_strips1):
+            _gmm1_strip(s_j)
     else:
         @pl.loop(0, n_strips1)
         def _loop1(j):
@@ -459,7 +550,7 @@ def _compute_tile_gmm1_gmm2(
 
         def _gmm2_2d(j):
             col = pl.multiple_of(j * strip_nc2, strip_nc2)
-            d = _fp4_k256_gmm(
+            d = _ep_tp2_kblock_gmm(
                 act_sub, w2_ref, s2_ref, i_half, col, strip_nc2, block256, block
             )
             p_send_slot_ref[pl.ds(0, m_bucket), pl.ds(col, strip_nc2)] = d.astype(
@@ -468,6 +559,9 @@ def _compute_tile_gmm1_gmm2(
 
         if n_strips2 == 1:
             _gmm2_2d(0)
+        elif unroll_strips and n_strips2 <= 4:
+            for s_j in range(n_strips2):
+                _gmm2_2d(s_j)
         else:
             @pl.loop(0, n_strips2)
             def _loop2_2d(j):
@@ -483,12 +577,12 @@ def _compute_tile_gmm1_gmm2(
     def _gmm2_store_group(g_idx):
         base_col = pl.multiple_of(g_idx * store_cols, store_cols)
         if strips_per_store == 1:
-            part = _fp4_k256_gmm(
+            part = _ep_tp2_kblock_gmm(
                 act_sub, w2_ref, s2_ref, i_half, base_col, strip_nc2, block256, block
             )
         else:
             parts = [
-                _fp4_k256_gmm(
+                _ep_tp2_kblock_gmm(
                     act_sub,
                     w2_ref,
                     s2_ref,
@@ -511,6 +605,9 @@ def _compute_tile_gmm1_gmm2(
     elif n_stores == 2 and wire_dtype == jnp.bfloat16:
         _gmm2_store_group(0)
         _gmm2_store_group(1)
+    elif unroll_strips and n_stores <= 4:
+        for g_i in range(n_stores):
+            _gmm2_store_group(g_i)
     else:
         @pl.loop(0, n_stores)
         def _loop2(g_idx):
@@ -524,12 +621,13 @@ def _select_strip_nc(m_bucket: int, block: int, override_nc: int | None) -> tupl
         nc2 = min(override_nc, 4096)
         use_dual = (m_bucket * (nc1 // 128) * 2) <= 32
         return nc1, nc2, use_dual
+    compact_blk = block in (256, 512)
     if m_bucket <= 8:
-        return (1024, 2048, True) if block == 256 else (1024, 1024, True)
+        return (1024, 2048, True) if compact_blk else (1024, 1024, True)
     if m_bucket <= 16:
-        return (1024, 1024, True) if block == 256 else (512, 1024, True)
+        return (1024, 1024, True) if compact_blk else (512, 1024, True)
     if m_bucket <= 32:
-        return (512, 1024, True) if block == 256 else (512, 1024, False)
+        return (512, 1024, True) if compact_blk else (512, 1024, False)
     return (512, 1024, False)
 
 
@@ -1016,8 +1114,74 @@ def _ep_tp2_dense_kernel(
             op.wait_send()
 
 
+def _read_ep_tp2_env_knobs(batch_size: int):
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            return raw.strip().lower() not in ("0", "false", "no", "off")
+        try:
+            from sglang_tpu.envs import envs
+
+            ev = getattr(envs, name, None)
+            if ev is not None:
+                return bool(ev.get())
+        except Exception:
+            pass
+        return default
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            s = raw.strip().lower()
+            if s in ("true", "yes", "on"):
+                return 1
+            if s in ("false", "no", "off"):
+                return 0
+            return int(s)
+        try:
+            from sglang_tpu.envs import envs
+
+            ev = getattr(envs, name, None)
+            if ev is not None:
+                return int(ev.get())
+        except Exception:
+            pass
+        return default
+
+    min_p = float(os.environ.get("SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK", "0.0") or 0.0)
+    free_spec = os.environ.get("SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS", "")
+    try:
+        from sglang_tpu.envs import envs
+
+        if os.environ.get("SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK") is None:
+            e_mp = getattr(envs, "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK", None)
+            if e_mp is not None:
+                min_p = float(e_mp.get())
+        if os.environ.get("SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS") is None:
+            e_fr = getattr(envs, "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS", None)
+            if e_fr is not None:
+                free_spec = str(e_fr.get())
+    except Exception:
+        pass
+    f_rows, f_max_w, f_min_s = parse_free_expert_rows_spec(free_spec)
+    f_rows_eff, f_min_s_eff = scale_free_expert_for_batch(f_rows, f_min_s, batch_size)
+    return (
+        max(0.0, float(min_p)),
+        f_rows_eff,
+        f_max_w,
+        f_min_s_eff,
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_STATIC_HOLDER_MASK", False),
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST", False),
+        _env_int("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN", 0),
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS", False),
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS", False),
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS", False),
+        _env_bool("SGLANG_TPU_MUSE_KERNEL_DECODE_SPARSE_BRIDGE64", False),
+    )
+
+
 # =============================================================================
-# MODE B: Symmetric Sparse TP2 Kernel (B >= 64 & K16, spill-free & low-bundle!)
+# MODE B: Symmetric Sparse TP2 Kernel (B >= 16, K16/K256/K512, Wave-9 0-ULP!)
 # =============================================================================
 def _ep_tp2_sparse_kernel(
     rank_ref,
@@ -1040,6 +1204,16 @@ def _ep_tp2_sparse_kernel(
     bd_w4a8: bool,
     rs_wire_dtype_str: str,
     bucket_policy: str,
+    min_p_topk: float,
+    free_max_rows: int,
+    free_max_w: float,
+    free_min_slot: int,
+    static_holder_mask: bool,
+    route_fast: bool,
+    fast_plan: int,
+    unroll_strips: bool,
+    fast_gs: bool,
+    pair_rs: bool,
 ):
     idx = 0
     replica_meta_smem = rest_refs[idx] if has_replicas else None
@@ -1094,21 +1268,9 @@ def _ep_tp2_sparse_kernel(
     else:
         x_fwd_send_sem = x_fwd_recv_sem = x_fwd_free_sem = None
 
-    counts_vmem = rest_refs[idx]; idx += 1
-    counts_smem = rest_refs[idx]; idx += 1
-    slot_ids_vmem = rest_refs[idx]; idx += 1
-    slot_ids_smem = rest_refs[idx]; idx += 1
-    slot_w_vmem = rest_refs[idx]; idx += 1
-    slot_w_smem = rest_refs[idx]; idx += 1
+    r_scratch = RoutingScratch(*rest_refs[idx : idx + 12])
+    idx += 12
     route_dma_sem = rest_refs[idx]; idx += 1
-
-    expert_exec_idx = rest_refs[idx]; idx += 1
-    exec_w_src = rest_refs[idx]; idx += 1
-    exec_w_slot = rest_refs[idx]; idx += 1
-    exec_start = rest_refs[idx]; idx += 1
-    exec_write_ptr = rest_refs[idx]; idx += 1
-    packed_tok_ids = rest_refs[idx]; idx += 1
-    packed_tok_w = rest_refs[idx]; idx += 1
 
     tile_w_src = rest_refs[idx]; idx += 1
     tile_w_slot = rest_refs[idx]; idx += 1
@@ -1124,14 +1286,27 @@ def _ep_tp2_sparse_kernel(
         holder_slot_expert_smem = rest_refs[idx]; idx += 1
         owner_load_smem = rest_refs[idx]; idx += 1
         moved_flag_smem = rest_refs[idx]; idx += 1
+        if not static_holder_mask:
+            holder_cand_smem = rest_refs[idx]; idx += 1
+        else:
+            holder_cand_smem = None
     else:
         local_suppress_smem = holder_slot_expert_smem = owner_load_smem = moved_flag_smem = None
+        holder_cand_smem = None
+
+    if pair_rs:
+        pair_recv = rest_refs[idx]; idx += 1
+        pair_sum_buf = rest_refs[idx]; idx += 1
+        pair_send_sem = rest_refs[idx]; idx += 1
+        pair_recv_sem = rest_refs[idx]; idx += 1
+    else:
+        pair_recv = pair_sum_buf = pair_send_sem = pair_recv_sem = None
 
     rs_recv = rest_refs[idx]; idx += 1
     rs_send_sem = rest_refs[idx]; idx += 1
     rs_recv_sem = rest_refs[idx]; idx += 1
     owner_buf = rest_refs[idx]; idx += 1
-    if rs_wire_dtype_str == "bfloat16":
+    if (not pair_rs) and rs_wire_dtype_str == "bfloat16":
         rs_send_bf16 = rest_refs[idx]; idx += 1
     else:
         rs_send_bf16 = None
@@ -1151,14 +1326,13 @@ def _ep_tp2_sparse_kernel(
 
     world_size = ep * tp
     e_chip = 256 // ep
-    max_exec = e_chip + num_replicas
-    dummy_pack_pos = batch_size * 8
     wire_dtype = jnp.float32 if bridge_dtype_str == "float32" else jnp.bfloat16
+    rs_dt = jnp.float32 if rs_wire_dtype_str == "float32" else jnp.bfloat16
     me = rank_ref[0]
     mate = chipmate_rank(me, chipmate_xor=chipmate_xor)
     chip_id, tp_half = rank_to_chip_and_half(me, chipmate_xor=chipmate_xor)
 
-    # 1. Signal entry readiness + speculative slot-0 HBM weight prime BEFORE routing!
+    # 1. Signal entry readiness + global RS barrier early so network converges under routing!
     pl.semaphore_signal(
         chip_entry_sem, 1, device_id={"model": mate}, device_id_type=pl.DeviceIdType.MESH
     )
@@ -1212,123 +1386,141 @@ def _ep_tp2_sparse_kernel(
         pltpu.make_async_copy(w2_buf.at[buf_idx], w2_buf.at[buf_idx], w2_sem.at[buf_idx]).wait()
         pltpu.make_async_copy(s2_buf.at[buf_idx], s2_buf.at[buf_idx], w2_sem.at[buf_idx]).wait()
 
-    # Speculative prime of home expert slot 0 right at kernel entry!
-    _start_w1(0, jnp.int32(0), jnp.int32(0))
-    if weight_bufs == 2:
-        _start_w2(0, jnp.int32(0), jnp.int32(0))
-
-    # 2. In-kernel exact NaN-safe routing -> SMEM counts + slot_ids + slot_w
-    _route_topk_and_counts_in_kernel(
-        logits_ref,
-        bias_ref,
-        counts_vmem,
-        counts_smem,
-        slot_ids_vmem,
-        slot_ids_smem,
-        slot_w_vmem,
-        slot_w_smem,
-        None,
-        route_dma_sem,
-        batch_size=batch_size,
-        emit_slots_smem=True,
-    )
-
+    # 2. Exact Wave-9 0-ULP VPU routing (with MIN_P + #2407 b64_ms16 FREE + ROUTE_FAST)
     if has_replicas:
-        _plan_preloaded_replicas_smem_inline(
+        if static_holder_mask:
+            cand_eids = extract_my_holder_candidates_tuple(
+                chip_id, num_replicas, replica_meta_smem
+            )
+        else:
+            extract_my_holder_candidates_smem(
+                chip_id, num_replicas, replica_meta_smem, holder_cand_smem
+            )
+            cand_eids = tuple(holder_cand_smem[s] for s in range(num_replicas))
+    else:
+        cand_eids = ()
+
+    if _bridge1_prerouted_active():
+        _route_prerouted_topk_in_kernel(
+            logits_ref,
+            r_scratch,
+            route_dma_sem,
+            my_owner=chip_id,
+            e_per_owner=e_chip,
+            holder_cand_eids=cand_eids,
+            hoist_holder_vecs=static_holder_mask,
+            precompute_owner_loads=(has_replicas and static_holder_mask),
+            replica_cost_mode=replica_cost_mode,
+            replica_tile_m=tile_m,
+            topk=8,
+            route_chunk_rows=min(batch_size, 32),
+        )
+    else:
+        route_topk_and_counts_in_kernel(
+            logits_ref,
+            bias_ref,
+            r_scratch,
+            route_dma_sem,
+            my_owner=chip_id,
+            e_per_owner=e_chip,
+            holder_cand_eids=cand_eids,
+            hoist_holder_vecs=static_holder_mask,
+            precompute_owner_loads=(has_replicas and static_holder_mask),
+            replica_cost_mode=replica_cost_mode,
+            replica_tile_m=tile_m,
+            topk=8,
+            route_eps=1e-15,
+            route_scale=1.0,
+            route_chunk_rows=min(batch_size, 32),
+            min_p_topk=min_p_topk,
+            free_max_rows=free_max_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            route_fast=route_fast,
+        )
+
+    # 3. Branchless 0-sbr SMEM replica & execution plan
+    if has_replicas:
+        run_replica_planner_smem(
             chip_id,
             e_chip,
             ep,
             num_replicas,
-            counts_smem,
+            r_scratch.counts_smem,
             replica_meta_smem,
             local_suppress_smem,
             holder_slot_expert_smem,
             owner_load_smem,
-            moved_flag_smem,
             cost_mode=replica_cost_mode,
             tile_m=tile_m,
+            moved_flag_smem=moved_flag_smem,
+            vpu_precomputed_loads=static_holder_mask,
+            fast_plan=fast_plan,
+        )
+        num_active_exp = build_exec_plan_from_masks_smem(
+            chip_id,
+            e_chip,
+            num_replicas,
+            local_suppress_smem,
+            holder_slot_expert_smem,
+            r_scratch,
+            fast_plan=bool(fast_plan),
+        )
+    else:
+        num_active_exp = build_default_exec_plan_smem(
+            chip_id, e_chip, r_scratch, fast_plan=bool(fast_plan)
         )
 
-    # Initialize expert_exec_idx[0..256] = max_exec (dummy sink index for branchless pack!)
-    @pl.loop(0, 257)
-    def _clear_exec_map(e):
-        expert_exec_idx[e] = jnp.int32(max_exec)
+    exec_w_src = r_scratch.exec_weight_src
+    exec_w_slot = r_scratch.exec_weight_slot
+    exec_start = r_scratch.exec_start
+    packed_tok_ids = r_scratch.packed_tok_ids
+    packed_tok_w = r_scratch.packed_tok_w
+    max_packed_len = int(packed_tok_ids.shape[0])
 
-    exec_write_ptr[max_exec] = jnp.int32(dummy_pack_pos)
-    first_e = chip_id * e_chip
-
-    def _scan_home(le, carry):
-        n_act, row_off = carry
-        eid = first_e + le
-        cnt = counts_smem[0, eid]
-        suppressed = local_suppress_smem[le] if has_replicas else jnp.int32(0)
-        keep = (cnt > 0) & (suppressed == 0)
-
-        def _add():
-            expert_exec_idx[eid] = n_act
-            exec_w_src[n_act] = jnp.int32(0)
-            exec_w_slot[n_act] = le
-            exec_start[n_act] = row_off
-            exec_write_ptr[n_act] = row_off
-            return n_act + jnp.int32(1), row_off + cnt
-
-        return lax.cond(keep, _add, lambda: (n_act, row_off))
-
-    num_active_exp, total_chip_rows = lax.fori_loop(
-        0, e_chip, _scan_home, (jnp.int32(0), jnp.int32(0))
-    )
-
-    if has_replicas:
-        def _scan_rep(rs, carry):
-            n_act, row_off = carry
-            eid = holder_slot_expert_smem[rs]
-            valid = eid >= 0
-
-            def _add_r():
-                cnt = counts_smem[0, eid]
-                expert_exec_idx[eid] = n_act
-                exec_w_src[n_act] = jnp.int32(1)
-                exec_w_slot[n_act] = rs
-                exec_start[n_act] = row_off
-                exec_write_ptr[n_act] = row_off
-                return n_act + jnp.int32(1), row_off + cnt
-
-            return lax.cond(valid, _add_r, lambda: (n_act, row_off))
-
-        num_active_exp, total_chip_rows = lax.fori_loop(
-            0, num_replicas, _scan_rep, (num_active_exp, total_chip_rows)
-        )
-
-    # Reconcile speculative slot-0 prime + pre-prime expert 1 into w_buf[1] if hit!
-    spec_hit = (num_active_exp > 0) & (exec_w_src[0] == 0) & (exec_w_slot[0] == 0)
-
-    @pl.when(~spec_hit)
-    def _reissue_exp0():
-        _wait_w1(0)
+    # 4. Immediate 100%-hit Expert 0 HBM prime overlapped with tile-expand, pack & VMEM setup!
+    @pl.when(num_active_exp > 0)
+    def _prime_exp0():
+        s0 = exec_w_src[0]
+        sl0 = exec_w_slot[0]
+        _start_w1(0, s0, sl0)
         if weight_bufs == 2:
-            _wait_w2(0)
+            _start_w2(0, s0, sl0)
 
-        @pl.when(num_active_exp > 0)
-        def _start_real0():
-            _start_w1(0, exec_w_src[0], exec_w_slot[0])
-            if weight_bufs == 2:
-                _start_w2(0, exec_w_src[0], exec_w_slot[0])
+    # Build flat tile schedule in SMEM (exec_start[num_active_exp] == total_rows sentinel)
+    max_nt = (batch_size + tile_m - 1) // tile_m
+    tm_shift = tile_m.bit_length() - 1
 
-    # Build flat tile schedule in SMEM
     def _expand_tiles(a_idx, n_tiles):
         src_a = exec_w_src[a_idx]
         slot_a = exec_w_slot[a_idx]
         base_a = exec_start[a_idx]
-        end_a = lax.cond(
-            a_idx + 1 < num_active_exp,
-            lambda: exec_start[a_idx + 1],
-            lambda: total_chip_rows,
-        )
+        end_a = exec_start[a_idx + 1]
         cnt_a = end_a - base_a
-        nt_a = (cnt_a + jnp.int32(tile_m - 1)) // jnp.int32(tile_m)
+        nt_a = lax.shift_right_logical(
+            cnt_a + jnp.int32(tile_m - 1), jnp.int32(tm_shift)
+        )
         has_next_e = (a_idx + 1) < num_active_exp
-        next_src = lax.cond(has_next_e, lambda: exec_w_src[a_idx + 1], lambda: jnp.int32(-1))
-        next_slot = lax.cond(has_next_e, lambda: exec_w_slot[a_idx + 1], lambda: jnp.int32(-1))
+        next_src = jnp.where(has_next_e, exec_w_src[a_idx + 1], jnp.int32(-1))
+        next_slot = jnp.where(has_next_e, exec_w_slot[a_idx + 1], jnp.int32(-1))
+
+        if fast_plan and max_nt <= 4:
+            cur_t = n_tiles
+            for sub_t in range(max_nt):
+                act_sub = jnp.int32(sub_t) < nt_a
+                r_off = jnp.int32(sub_t * tile_m)
+                rcnt = jnp.minimum(cnt_a - r_off, jnp.int32(tile_m))
+                is_last = (jnp.int32(sub_t + 1) == nt_a)
+                tile_w_src[cur_t] = src_a
+                tile_w_slot[cur_t] = slot_a
+                tile_row_base[cur_t] = base_a + r_off
+                tile_row_cnt[cur_t] = rcnt
+                tile_is_new_exp[cur_t] = jnp.int32(1 if sub_t == 0 else 0)
+                tile_is_last_of_exp[cur_t] = is_last.astype(jnp.int32)
+                tile_next_exp_src[cur_t] = jnp.where(is_last, next_src, jnp.int32(-1))
+                tile_next_exp_slot[cur_t] = jnp.where(is_last, next_slot, jnp.int32(-1))
+                cur_t = cur_t + act_sub.astype(jnp.int32)
+            return cur_t
 
         def _fill_one(sub_t, cur_t):
             r_off = sub_t * jnp.int32(tile_m)
@@ -1349,25 +1541,11 @@ def _ep_tp2_sparse_kernel(
 
     num_tiles = lax.fori_loop(0, num_active_exp, _expand_tiles, jnp.int32(0))
 
-    # OOB-safe conditional SALU token packing (skips 75-88% non-local slots with 0 dummy SMEM RMWs!)
     @pl.when(num_active_exp > 0)
     def _pack_tokens_fast():
-        @pl.loop(0, batch_size)
-        def _t_loop(tok):
-            for s in range(8):
-                eid = slot_ids_smem[s, tok]
-                ex_raw = expert_exec_idx[eid]
-
-                @pl.when(ex_raw < jnp.int32(max_exec))
-                def _hit_chip():
-                    wt = slot_w_smem[s, tok]
-
-                    @pl.when(wt > 0.0)
-                    def _store_hit():
-                        pos = exec_write_ptr[ex_raw]
-                        packed_tok_ids[pos] = tok
-                        packed_tok_w[pos] = wt
-                        exec_write_ptr[ex_raw] = pos + jnp.int32(1)
+        pack_active_tokens_smem(
+            batch_size, r_scratch, has_replicas=has_replicas, fast_gs=fast_gs
+        )
 
     # Spill-free VMEM buffer setup (static 16-row chunks for 2D bf16 -> 0 E2003, <= 16 VREGs!)
     norm_gain_3d[...] = (norm_ref[0:1, :].astype(jnp.float32) + 1.0).reshape(32, 128)
@@ -1375,9 +1553,12 @@ def _ep_tp2_sparse_kernel(
     for b0 in range(0, batch_size, 16):
         x_3d_buf[pl.ds(b0, 16), :, :] = x_ref[pl.ds(b0, 16), :].reshape(16, 32, 128)
 
-    z4 = jnp.zeros((4, 32, 128), dtype=jnp.float32)
-    for b0 in range(0, batch_size, 4):
-        accum_buf[pl.ds(b0, 4), :, :] = z4
+    z_step = 8 if (fast_gs and batch_size % 8 == 0) else 4
+    z_blk = jnp.zeros((z_step, 32, 128), dtype=jnp.float32)
+    for b0 in range(0, batch_size, z_step):
+        accum_buf[pl.ds(b0, z_step), :, :] = z_blk
+    if fast_gs:
+        accum_buf[batch_size] = jnp.zeros((32, 128), dtype=jnp.float32)
 
     z8_bf = jnp.zeros((8, 32, 128), dtype=jnp.bfloat16)
     for r0 in range(0, tile_m, 8):
@@ -1428,8 +1609,6 @@ def _ep_tp2_sparse_kernel(
                 b_recv_sem.at[prev_slot],
             ).wait()
 
-            # Binary-peeled 4 + 2 + 1 unrolled RMSNorm + scatter-add:
-            # 0 wasted ops at own_len=1..3, 4x VLIW-pipelined cross-lane/rsqrt at own_len>=4!
             ng = norm_gain_3d[...]
 
             def _do_k_rows(r_start, k_cnt: int):
@@ -1449,25 +1628,75 @@ def _ep_tp2_sparse_kernel(
                     wt = packed_tok_w[row_idx]
                     accum_buf[tok_id] = accum_buf[tok_id] + us[k] * (invs[k] * wt)
 
-            n4 = lax.shift_right_logical(own_len, jnp.int32(2))
+            if fast_gs:
+                # 0-sbr branchless 4-row RMSNorm + scatter-add covering 95%+ of tiles (own_len <= 4)!
+                us4 = []
+                invs4 = []
+                max_rk = own_len - jnp.int32(1)
+                for k in range(4):
+                    rk = jnp.minimum(jnp.int32(k), max_rk)
+                    po = p_send[prev_slot, own_start + rk].astype(jnp.float32)
+                    pr = p_recv[prev_slot, rk].astype(jnp.float32)
+                    uk = (po + pr) * ng
+                    sq = jnp.sum(jnp.sum(uk * uk, axis=0, keepdims=True), axis=1, keepdims=True)
+                    us4.append(uk)
+                    invs4.append(lax.rsqrt(sq * (1.0 / 4096.0) + 1e-8))
+                for k in range(4):
+                    valid_k = jnp.int32(k) < own_len
+                    safe_p = jnp.where(
+                        valid_k,
+                        prev_base + own_start + jnp.int32(k),
+                        jnp.minimum(prev_base + own_start, jnp.int32(max_packed_len - 1)),
+                    )
+                    tok_id = jnp.where(valid_k, packed_tok_ids[safe_p], jnp.int32(batch_size))
+                    wt = jnp.where(valid_k, packed_tok_w[safe_p], jnp.float32(0.0))
+                    accum_buf[tok_id] = accum_buf[tok_id] + us4[k] * (invs4[k] * wt)
 
-            @pl.loop(0, n4)
-            def _blk4(bi):
-                _do_k_rows(lax.shift_left(bi, jnp.int32(2)), 4)
+                @pl.when(own_len > 4)
+                def _gt4():
+                    rem_len = own_len - jnp.int32(4)
+                    n4_hi = lax.shift_right_logical(rem_len, jnp.int32(2))
 
-            rem_off = lax.shift_left(n4, jnp.int32(2))
-            has_2 = lax.bitwise_and(lax.shift_right_logical(own_len, jnp.int32(1)), jnp.int32(1)) != 0
+                    @pl.loop(0, n4_hi)
+                    def _blk4_hi(bi):
+                        _do_k_rows(jnp.int32(4) + lax.shift_left(bi, jnp.int32(2)), 4)
 
-            @pl.when(has_2)
-            def _tail2():
-                _do_k_rows(rem_off, 2)
+                    rem_off = jnp.int32(4) + lax.shift_left(n4_hi, jnp.int32(2))
+                    has_2 = (
+                        lax.bitwise_and(lax.shift_right_logical(rem_len, jnp.int32(1)), jnp.int32(1))
+                        != 0
+                    )
 
-            off_1 = rem_off + jnp.where(has_2, jnp.int32(2), jnp.int32(0))
-            has_1 = lax.bitwise_and(own_len, jnp.int32(1)) != 0
+                    @pl.when(has_2)
+                    def _tail2_hi():
+                        _do_k_rows(rem_off, 2)
 
-            @pl.when(has_1)
-            def _tail1():
-                _do_k_rows(off_1, 1)
+                    off_1 = rem_off + jnp.where(has_2, jnp.int32(2), jnp.int32(0))
+                    has_1 = lax.bitwise_and(rem_len, jnp.int32(1)) != 0
+
+                    @pl.when(has_1)
+                    def _tail1_hi():
+                        _do_k_rows(off_1, 1)
+            else:
+                n4 = lax.shift_right_logical(own_len, jnp.int32(2))
+
+                @pl.loop(0, n4)
+                def _blk4(bi):
+                    _do_k_rows(lax.shift_left(bi, jnp.int32(2)), 4)
+
+                rem_off = lax.shift_left(n4, jnp.int32(2))
+                has_2 = lax.bitwise_and(lax.shift_right_logical(own_len, jnp.int32(1)), jnp.int32(1)) != 0
+
+                @pl.when(has_2)
+                def _tail2():
+                    _do_k_rows(rem_off, 2)
+
+                off_1 = rem_off + jnp.where(has_2, jnp.int32(2), jnp.int32(0))
+                has_1 = lax.bitwise_and(own_len, jnp.int32(1)) != 0
+
+                @pl.when(has_1)
+                def _tail1():
+                    _do_k_rows(off_1, 1)
 
         if signal_free:
             pl.semaphore_signal(
@@ -1503,6 +1732,7 @@ def _ep_tp2_sparse_kernel(
                     use_dual_gmm1=use_dual,
                     use_blockdiag_k16=False,
                     wire_dtype=wire_dtype,
+                    unroll_strips=unroll_strips,
                 )
 
             if bi == len(row_buckets) - 1:
@@ -1511,8 +1741,6 @@ def _ep_tp2_sparse_kernel(
                 lax.cond(m_valid <= mb, _do_this, lambda: _dispatch_bucket(bi + 1))
 
         if use_blockdiag_k16 and block == 16:
-            # Crossover <= 8 rows (#265): hoisted x_bd_buf eliminates 15/16 of VPU broadcasts;
-            # above 8 rows falls back to spill-free nc=256 dequant!
             bd_sizes = (1, 2, 4, 8)
 
             def _bd_branch(a_val: int):
@@ -1534,9 +1762,9 @@ def _ep_tp2_sparse_kernel(
                     m_valid_bd=a_val,
                     x_bd_buf=x_bd_buf,
                     bd_w4a8=bd_w4a8,
+                    unroll_strips=unroll_strips,
                 )
 
-            # Fallback bucket index for m_valid > bd_sizes[-1]
             fb_bi = next((i for i, b in enumerate(row_buckets) if b > bd_sizes[-1]), len(row_buckets) - 1)
 
             def _dispatch_bd(idx_bd: int):
@@ -1612,6 +1840,22 @@ def _ep_tp2_sparse_kernel(
                     x_tile_3d.at[pl.ds(0, m_valid)],
                     x_fwd_recv_sem,
                 ).wait()
+        elif fast_gs:
+            safe_base = jnp.minimum(r_base, jnp.int32(max_packed_len - 1))
+            for s in range(8):
+                safe_p = jnp.where(
+                    jnp.int32(s) < m_valid,
+                    r_base + jnp.int32(s),
+                    safe_base,
+                )
+                tok_s = jnp.clip(packed_tok_ids[safe_p], jnp.int32(0), jnp.int32(batch_size - 1))
+                x_tile_3d[s] = x_3d_buf[tok_s]
+
+            @pl.when(m_valid > 8)
+            def _g_vmem_rest():
+                @pl.loop(8, m_valid)
+                def _g_hi(r):
+                    x_tile_3d[r] = x_3d_buf[packed_tok_ids[r_base + r]]
         else:
             @pl.loop(0, m_valid)
             def _g_vmem(r):
@@ -1678,11 +1922,106 @@ def _ep_tp2_sparse_kernel(
         _drain_bridge_send(0)
         _drain_bridge_send(1)
 
-    # Spill-free Reduce-Scatter skipping self-DMA (d != me) + 4-row chunked summation!
     rows_per_rank = batch_size // world_size
+    r_step = min(rows_per_rank, 4)
+
+    if pair_rs:
+        # Intra-chip XOR=1 FP32 swap-sum (733 GB/s die-to-die) -> halved ep-way ICI RS!
+        half_b = batch_size // 2
+        own_r0 = pl.multiple_of(
+            jnp.where(tp_half == 0, jnp.int32(0), jnp.int32(half_b)), half_b
+        )
+        send_r0 = pl.multiple_of(
+            jnp.where(tp_half == 0, jnp.int32(half_b), jnp.int32(0)), half_b
+        )
+        pl.semaphore_wait(barrier, world_size)
+        pair_cp = pltpu.make_async_remote_copy(
+            accum_buf.at[pl.ds(send_r0, half_b)],
+            pair_recv,
+            pair_send_sem,
+            pair_recv_sem,
+            device_id={"model": mate},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        pair_cp.start()
+        pltpu.make_async_copy(pair_recv, pair_recv, pair_recv_sem).wait()
+        p_step = min(half_b, 8)
+        for r0 in range(0, half_b, p_step):
+            own_sl = pl.ds(pl.multiple_of(own_r0 + r0, p_step), p_step)
+            r_sl = pl.ds(r0, p_step)
+            pair_sum_buf[r_sl] = (accum_buf[own_sl] + pair_recv[r_sl]).astype(rs_dt)
+        pair_cp.wait_send()
+
+        base_dest = tp_half * ep
+        rs_copies = [
+            pltpu.make_async_remote_copy(
+                pair_sum_buf.at[pl.ds(c * rows_per_rank, rows_per_rank)],
+                rs_recv.at[chip_id],
+                rs_send_sem.at[c],
+                rs_recv_sem,
+                device_id={"model": base_dest + jnp.int32(c)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            for c in range(ep)
+        ]
+        for op in rs_copies:
+            op.start()
+        pltpu.make_async_copy(rs_recv, rs_recv, rs_recv_sem).wait()
+        for r0 in range(0, rows_per_rank, r_step):
+            r_sl = pl.ds(r0, r_step)
+            tot = rs_recv[0, r_sl].astype(jnp.float32)
+            for src_c in range(1, ep):
+                tot = tot + rs_recv[src_c, r_sl].astype(jnp.float32)
+            owner_buf[r_sl] = tot.astype(jnp.bfloat16)
+
+        if return_sharded:
+            output_ref[...] = owner_buf[...].reshape(rows_per_rank, 4096)
+            for op in rs_copies:
+                op.wait_send()
+        else:
+            fan_recv[me] = owner_buf[...]
+            for dest in range(world_size):
+                @pl.when(me != dest)
+                def _send_fan_p(dest=dest):
+                    pltpu.make_async_remote_copy(
+                        owner_buf,
+                        fan_recv.at[me],
+                        fan_send_sem.at[dest],
+                        fan_recv_sem,
+                        device_id={"model": jnp.int32(dest)},
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+            pltpu.make_async_copy(
+                fan_recv.at[pl.ds(0, world_size - 1)],
+                fan_recv.at[pl.ds(0, world_size - 1)],
+                fan_recv_sem,
+            ).wait()
+            chunk_ranks = 1 if (rows_per_rank >= 8 and rows_per_rank % 8 == 0) else (8 // rows_per_rank)
+            chunk_rows = chunk_ranks * rows_per_rank
+            for r0 in range(0, world_size, chunk_ranks):
+                output_ref[pl.ds(r0 * rows_per_rank, chunk_rows), :] = (
+                    fan_recv[pl.ds(r0, chunk_ranks)].reshape(chunk_rows, 4096)
+                )
+            for dest in range(world_size):
+                @pl.when(me != dest)
+                def _ws_fan_p(dest=dest):
+                    pltpu.make_async_remote_copy(
+                        owner_buf,
+                        fan_recv.at[me],
+                        fan_send_sem.at[dest],
+                        fan_recv_sem,
+                        device_id={"model": jnp.int32(dest)},
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).wait_send()
+            for op in rs_copies:
+                op.wait_send()
+        return
+
+    # Spill-free Reduce-Scatter skipping self-DMA (d != me) + 4-row chunked summation!
     if rs_wire_dtype_str == "bfloat16":
-        for b0 in range(0, batch_size, 4):
-            rs_send_bf16[pl.ds(b0, 4), :, :] = accum_buf[pl.ds(b0, 4), :, :].astype(jnp.bfloat16)
+        c_step = 8 if (fast_gs and batch_size % 8 == 0) else 4
+        for b0 in range(0, batch_size, c_step):
+            rs_send_bf16[pl.ds(b0, c_step), :, :] = accum_buf[pl.ds(b0, c_step), :, :].astype(jnp.bfloat16)
         rs_src_buf = rs_send_bf16
     else:
         rs_src_buf = accum_buf
@@ -1701,7 +2040,6 @@ def _ep_tp2_sparse_kernel(
             ).start()
 
     # Copy local slice into rs_recv[me] while remote peers stream into rs_recv[d != me]
-    r_step = min(rows_per_rank, 4)
     for r0 in range(0, rows_per_rank, r_step):
         rs_recv[me, pl.ds(r0, r_step)] = rs_src_buf[
             pl.ds(me * rows_per_rank + r0, r_step)
@@ -1822,6 +2160,16 @@ def fused_decode_ep_tp2_from_logits(
     rs_wire_dtype: str | None = None,
     row_mode: str = "auto",
     bucket_policy: str = "2bucket",
+    min_p_topk: float | None = None,
+    free_max_rows: int | None = None,
+    free_max_w: float | None = None,
+    free_min_slot: int | None = None,
+    static_holder_mask: bool | None = None,
+    route_fast: bool | None = None,
+    fast_plan: int | None = None,
+    unroll_strips: bool | None = None,
+    fast_gs: bool | None = None,
+    pair_rs: bool | None = None,
 ):
     """Symmetric EP(P/2)xTP2 Fuse-All decode MoE from pre-scaled FP32 logits."""
     if tp != 2 or ep not in (4, 8):
@@ -1842,8 +2190,10 @@ def fused_decode_ep_tp2_from_logits(
     if norm.shape != (1, 4096):
         raise ValueError(f"Expected norm shape (1, 4096), got {norm.shape}")
     block = h // s1.shape[1]
-    if block not in (16, 256):
-        raise ValueError(f"Unsupported FP4 scale block size {block}; expected 16 or 256")
+    if block not in (16, 256, 512):
+        raise ValueError(
+            f"Unsupported FP4 scale block size {block}; expected 16, 256, or 512"
+        )
     if (
         w1.shape != (e_chip, h, 2 * i_half)
         or w2.shape != (e_chip, i_half, h)
@@ -1876,10 +2226,35 @@ def fused_decode_ep_tp2_from_logits(
             raise ValueError(
                 f"Replica tensor shape mismatch: rep_w1={rep_w1.shape}, replica_meta={replica_meta.shape}"
             )
+
+    (
+        env_min_p,
+        env_free_rows,
+        env_free_w,
+        env_free_slot,
+        env_sm,
+        env_rfast,
+        env_fplan,
+        env_unroll,
+        env_fgs,
+        env_pair_rs,
+        env_br64,
+    ) = _read_ep_tp2_env_knobs(b)
+    eff_min_p = env_min_p if min_p_topk is None else float(min_p_topk)
+    eff_free_rows = env_free_rows if free_max_rows is None else int(free_max_rows)
+    eff_free_w = env_free_w if free_max_w is None else float(free_max_w)
+    eff_free_slot = env_free_slot if free_min_slot is None else int(free_min_slot)
+    eff_sm = env_sm if static_holder_mask is None else bool(static_holder_mask)
+    eff_rfast = env_rfast if route_fast is None else bool(route_fast)
+    eff_fplan = env_fplan if fast_plan is None else int(fast_plan)
+    eff_unroll = env_unroll if unroll_strips is None else bool(unroll_strips)
+    eff_fgs = env_fgs if fast_gs is None else bool(fast_gs)
+    eff_pair_rs = env_pair_rs if pair_rs is None else bool(pair_rs)
+
     if bridge_dtype not in ("float32", "bfloat16"):
         raise ValueError(f"Invalid bridge_dtype: {bridge_dtype}")
     if rs_wire_dtype is None:
-        rs_wire_dtype = "bfloat16" if b >= 128 else "float32"
+        rs_wire_dtype = "bfloat16" if (b >= 128 or (env_br64 and b == 64)) else "float32"
     if rs_wire_dtype not in ("float32", "bfloat16"):
         raise ValueError(f"Invalid rs_wire_dtype: {rs_wire_dtype}")
     if gather_mode not in ("vmem", "coop_bridge"):
@@ -1891,14 +2266,22 @@ def fused_decode_ep_tp2_from_logits(
     if bucket_policy not in ("2bucket", "4bucket"):
         raise ValueError(f"Invalid bucket_policy: {bucket_policy}")
 
-    # Auto row_mode: dense-half ONLY at B == 16 on Compact K256;
-    # B >= 32 K256 and ALL Native K16 batches use sparse 2-bucket (faster & NaN-isolated)!
+    has_w9_route_pruning = (
+        eff_min_p > 0.0
+        or eff_free_rows > 0
+        or eff_rfast
+        or eff_fplan > 0
+        or eff_fgs
+        or eff_pair_rs
+        or _bridge1_prerouted_active()
+    )
     if row_mode == "auto":
         use_dense = (
             gather_mode == "vmem"
             and tile_m is None
-            and block == 256
+            and block in (256, 512)
             and b == 16
+            and not has_w9_route_pruning
         )
     else:
         use_dense = row_mode == "dense"
@@ -2025,8 +2408,9 @@ def fused_decode_ep_tp2_from_logits(
     # Sparse TP2 path
     tm = _auto_tile_m(b) if tile_m is None else int(tile_m)
     tm = min(tm, b)
-    pad_b = max(128, b)
-    max_tiles = max_exec + (b * 8) // tm + 2
+    max_nt = (b + tm - 1) // tm
+    max_tiles = max_exec * max_nt + max_nt + 4
+    accum_rows = (b + 1) if eff_fgs else b
 
     scratch_shapes: list = [
         vmem((weight_bufs, h // 8, 2 * i_half), jnp.uint32),
@@ -2040,7 +2424,7 @@ def fused_decode_ep_tp2_from_logits(
         vmem((tm, h), jnp.bfloat16),
         vmem((tm, i_half), jnp.bfloat16),
         vmem((32, 128), jnp.float32),
-        vmem((b, 32, 128), jnp.float32),
+        vmem((accum_rows, 32, 128), jnp.float32),
         vmem((2, tm, 32, 128), wire_dt),
         vmem((2, tm, 32, 128), wire_dt),
         sem_dma((2,)),
@@ -2052,21 +2436,10 @@ def fused_decode_ep_tp2_from_logits(
     if gather_mode == "coop_bridge":
         scratch_shapes.extend([sem_dma, sem_dma, sem_reg])
 
+    r_shapes = routing_scratch_shapes(b, max_exec)
+    scratch_shapes.extend(list(r_shapes))
+    scratch_shapes.append(sem_dma)
     scratch_shapes.extend([
-        vmem((8, 256), jnp.int32),
-        smem((8, 256), jnp.int32),
-        vmem((8, pad_b), jnp.int32),
-        smem((8, pad_b), jnp.int32),
-        vmem((8, pad_b), jnp.float32),
-        smem((8, pad_b), jnp.float32),
-        sem_dma,
-        smem((257,), jnp.int32),
-        smem((max_exec,), jnp.int32),
-        smem((max_exec,), jnp.int32),
-        smem((max_exec,), jnp.int32),
-        smem((max_exec + 1,), jnp.int32),
-        smem((b * 8 + 1,), jnp.int32),
-        smem((b * 8 + 1,), jnp.float32),
         smem((max_tiles,), jnp.int32),
         smem((max_tiles,), jnp.int32),
         smem((max_tiles,), jnp.int32),
@@ -2077,21 +2450,37 @@ def fused_decode_ep_tp2_from_logits(
         smem((max_tiles,), jnp.int32),
     ])
     if has_replicas:
+        moved_len = 8 if eff_sm else 256
         scratch_shapes.extend([
             smem((e_chip,), jnp.int32),
             smem((num_replicas,), jnp.int32),
             smem((ep,), jnp.int32),
-            smem((256,), jnp.int32),
+            smem((moved_len,), jnp.int32),
         ])
+        if not eff_sm:
+            scratch_shapes.append(smem((num_replicas,), jnp.int32))
 
-    scratch_shapes.extend([
-        vmem((world_size, rows_per_rank, 32, 128), rs_dt),
-        sem_dma((world_size,)),
-        sem_dma,
-        vmem((rows_per_rank, 32, 128), jnp.bfloat16),
-    ])
-    if rs_wire_dtype == "bfloat16":
-        scratch_shapes.append(vmem((b, 32, 128), jnp.bfloat16))
+    if eff_pair_rs:
+        half_b = b // 2
+        scratch_shapes.extend([
+            vmem((half_b, 32, 128), jnp.float32),
+            vmem((half_b, 32, 128), rs_dt),
+            sem_dma,
+            sem_dma,
+            vmem((ep, rows_per_rank, 32, 128), rs_dt),
+            sem_dma((ep,)),
+            sem_dma,
+            vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+        ])
+    else:
+        scratch_shapes.extend([
+            vmem((world_size, rows_per_rank, 32, 128), rs_dt),
+            sem_dma((world_size,)),
+            sem_dma,
+            vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+        ])
+        if rs_wire_dtype == "bfloat16":
+            scratch_shapes.append(vmem((b, 32, 128), jnp.bfloat16))
     if not return_sharded:
         scratch_shapes.extend([
             vmem((world_size, rows_per_rank, 32, 128), jnp.bfloat16),
@@ -2105,6 +2494,10 @@ def fused_decode_ep_tp2_from_logits(
     kname = (
         f"muse_ep{ep}tp2_b{b}_k{block}_tm{tm}_{bucket_policy}"
         f"{f'_r{num_replicas}' if has_replicas else ''}"
+        f"{'_rfast' if eff_rfast else ''}"
+        f"{f'_fp{eff_fplan}' if eff_fplan else ''}"
+        f"{'_fgs' if eff_fgs else ''}"
+        f"{'_prs' if eff_pair_rs else ''}"
         f"{'_bf16br' if bridge_dtype == 'bfloat16' else ''}"
         f"{'_bf16rs' if rs_wire_dtype == 'bfloat16' else ''}"
         f"{'_coop' if gather_mode == 'coop_bridge' else ''}"
@@ -2132,6 +2525,16 @@ def fused_decode_ep_tp2_from_logits(
             bd_w4a8=bool(bd_w4a8),
             rs_wire_dtype_str=rs_wire_dtype,
             bucket_policy=bucket_policy,
+            min_p_topk=eff_min_p,
+            free_max_rows=eff_free_rows,
+            free_max_w=eff_free_w,
+            free_min_slot=eff_free_slot,
+            static_holder_mask=eff_sm,
+            route_fast=eff_rfast,
+            fast_plan=eff_fplan,
+            unroll_strips=eff_unroll,
+            fast_gs=eff_fgs,
+            pair_rs=eff_pair_rs,
         ),
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
