@@ -1555,6 +1555,7 @@ class MuseSparkMoE(nn.Module):
         self._fused_decode_v2_sharded_op = None
         self._fused_decode_v2_batches: Tuple[int, ...] = ()
         self._fused_decode_num_replicas = 0
+        self._fused_decode_has_spec_slot = False
         self._fused_decode_mode = ""
         self._fused_decode_block = 256
         self._fused_decode_replica_cost_mode = "tiles"
@@ -2268,6 +2269,11 @@ class MuseSparkMoE(nn.Module):
                         has_w3_mask=has_w3_mask,
                     )
             else:
+                has_spec_slot = (
+                    mode == "sparse"
+                    and "_fused_decode_spec_slot" in self._buffers
+                )
+                self._fused_decode_has_spec_slot = has_spec_slot
                 self._fused_decode_op = get_muse_fuse_all_decode_op(
                     mode=mode,
                     ep=ep_owners,
@@ -2276,6 +2282,7 @@ class MuseSparkMoE(nn.Module):
                     num_replicas=num_replicas,
                     replica_cost_mode=replica_cost_mode,
                     chipmate_xor=chipmate_xor,
+                    has_spec_slot=has_spec_slot,
                 )
                 if mode == "sparse" and self.__dict__.get("_decode_sparse_v2", False):
                     v2_b_env = str(
@@ -2421,6 +2428,10 @@ class MuseSparkMoE(nn.Module):
         cost_m = str(self.__dict__.get("_fused_decode_replica_cost_mode", "tiles"))
         blk = int(self.__dict__.get("_fused_decode_block", 256))
         has_w3 = bool(self.__dict__.get("_fused_decode_v2_has_w3", False))
+        has_spec_slot = (
+            fmode == "sparse"
+            and bool(self.__dict__.get("_fused_decode_has_spec_slot", False))
+        )
         self._fused_decode_sharded_op = get_muse_fuse_all_decode_op(
             mode=fmode,
             ep=(self.tp_size // 2 if fmode == "ep_tp2" else self.tp_size),
@@ -2430,6 +2441,7 @@ class MuseSparkMoE(nn.Module):
             replica_cost_mode=cost_m,
             return_sharded=True,
             has_w3_mask=(has_w3 and fmode == "sparse_v2"),
+            has_spec_slot=has_spec_slot,
         )
         if self.__dict__.get("_fused_decode_v2_op") is not None:
             self._fused_decode_v2_sharded_op = get_muse_fuse_all_decode_op(
@@ -3139,6 +3151,14 @@ class MuseSparkMoE(nn.Module):
                 if (is_v2_call and self.__dict__.get("_fused_decode_v2_has_w3", False))
                 else ()
             )
+            spec_tail = (
+                (self._fused_decode_spec_slot,)
+                if (
+                    not is_v2_call
+                    and self.__dict__.get("_fused_decode_has_spec_slot", False)
+                )
+                else ()
+            )
             if self.__dict__.get("_fused_decode_num_replicas", 0) > 0:
                 output = fused_op(
                     *base_args,
@@ -3148,9 +3168,10 @@ class MuseSparkMoE(nn.Module):
                     self._fused_decode_rep_s2,
                     self._fused_decode_replica_meta,
                     *w3_tail,
+                    *spec_tail,
                 )
             else:
-                output = fused_op(*base_args, *w3_tail)
+                output = fused_op(*base_args, *w3_tail, *spec_tail)
             if return_sharded_moe_out:
                 return output
         elif self.__dict__.get("_tpu_v2_extend_fallback", False):
@@ -6076,6 +6097,38 @@ class MuseSparkForConditionalGeneration(nn.Module):
 
     def _finalize_decode_replica_banks(self, *, compact_k256: bool) -> None:
         """Convert pending checkpoint replica slices into device FP4 or FP8 replica banks."""
+        spec_slots_map = self.__dict__.pop("_decode_spec_home_slots", None) or {}
+        if spec_slots_map:
+            parallel = get_parallel()
+            spec_owner = int(parallel.moe_ep_rank)
+            manual_slot = int(
+                _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT", -1)
+            )
+            e_owner = self.text_config.num_local_experts // max(1, parallel.moe_ep_size)
+            for layer_idx, hot_slots in spec_slots_map.items():
+                mlp = self.model.layers[layer_idx].mlp
+                if getattr(mlp, "quantized_experts", False) and (
+                    "_decode_fp4_w1" in mlp._buffers
+                    or mlp.experts.w13_weight.dtype == torch.float4_e2m1fn_x2
+                ):
+                    slot_val = (
+                        manual_slot
+                        if 0 <= manual_slot < e_owner
+                        else (
+                            int(hot_slots[spec_owner])
+                            if 0 <= spec_owner < len(hot_slots)
+                            else -1
+                        )
+                    )
+                    if 0 <= slot_val < e_owner:
+                        dev = mlp.experts.w13_weight.device
+                        mlp.register_buffer(
+                            "_fused_decode_spec_slot",
+                            torch.tensor([slot_val], dtype=torch.int32).to(
+                                device=dev, copy=True
+                            ),
+                            persistent=False,
+                        )
         plans = self.__dict__.pop("_decode_replica_plans", None) or {}
         for layer_idx in range(self.start_layer, self.end_layer):
             mlp = self.model.layers[layer_idx].mlp
@@ -6699,17 +6752,22 @@ class MuseSparkForConditionalGeneration(nn.Module):
             or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2", False)
             or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_FULL_MOE", False)
         )
+        spec_fast_enabled = bool(
+            _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST", False)
+        ) and int(_env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME", 0)) > 0
         if (
-            num_replicas <= 0
+            (num_replicas <= 0 and not spec_fast_enabled)
             or not stats_path
             or not enabled
             or get_disagg().disaggregation_mode == "prefill"
         ):
             self._decode_replica_plans = {}
+            self._decode_spec_home_slots = {}
             return
         from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
             build_preloaded_replica_plan,
             load_calibration_counts,
+            select_hot_non_replicated_home_slots,
             validate_replica_plan,
         )
 
@@ -6736,6 +6794,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             or int(_env_get("SGLANG_TPU_MUSE_QUANT_BOUNDARY_MOE_FP4", 0)) != 0
         )
         plans = {}
+        spec_hot_slots = {}
         for layer_idx in range(self.start_layer, self.end_layer):
             mlp = self.model.layers[layer_idx].mlp
             if not getattr(mlp, "quantized_experts", False) and not allow_boundary_rep:
@@ -6748,17 +6807,27 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 self.text_config.num_local_experts,
             )
             placement = None if order is None else order.cpu().numpy()
-            plan = build_preloaded_replica_plan(
-                counts,
-                num_owners=num_owners,
-                num_replicas_per_owner=num_replicas,
-                placement=placement,
-                owner_to_chip=owner_to_chip,
-                selection_mode=sel_mode,
-            )
-            validate_replica_plan(plan)
-            plans[layer_idx] = plan
+            plan = None
+            if num_replicas > 0:
+                plan = build_preloaded_replica_plan(
+                    counts,
+                    num_owners=num_owners,
+                    num_replicas_per_owner=num_replicas,
+                    placement=placement,
+                    owner_to_chip=owner_to_chip,
+                    selection_mode=sel_mode,
+                )
+                validate_replica_plan(plan)
+                plans[layer_idx] = plan
+            if spec_fast_enabled:
+                spec_hot_slots[layer_idx] = select_hot_non_replicated_home_slots(
+                    counts,
+                    num_owners=num_owners,
+                    replica_meta=(plan.replica_meta if plan is not None else None),
+                    placement=placement,
+                )
         self._decode_replica_plans = plans
+        self._decode_spec_home_slots = spec_hot_slots
 
     def _capture_pending_replica_slice(
         self,

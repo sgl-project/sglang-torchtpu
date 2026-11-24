@@ -1044,6 +1044,7 @@ def _sparse_decode_kernel(
     replica_cost_mode: str,
     ep_axis_name: str,
     cfg: SparseDecodeConfig,
+    has_spec_slot_arg: bool = False,
 ):
     has_replicas = num_replicas > 0
     is_k256 = scale_block >= 256
@@ -1061,6 +1062,7 @@ def _sparse_decode_kernel(
     it = iter(all_refs)
     rank_ref = next(it)
     replica_meta_ref = next(it) if has_replicas else None
+    spec_slot_ref = next(it) if has_spec_slot_arg else None
     logits_ref = next(it)
     bias_ref = next(it)
     x_in_ref = next(it)
@@ -1463,6 +1465,8 @@ def _sparse_decode_kernel(
                     )
                     for r in range(ep)
                 ) - jnp.int32(1)
+        elif spec_slot_ref is not None:
+            pref_slot = spec_slot_ref[0]
         else:
             pref_slot = jnp.int32(0)
         if has_replicas and cfg.spec_skip_replicated:
@@ -3945,6 +3949,7 @@ def fused_decode_sparse_from_logits(
     rep_w2: jax.Array | None = None,
     rep_s2: jax.Array | None = None,
     replica_meta: jax.Array | None = None,
+    spec_home_slot: jax.Array | None = None,
     *,
     ep: int = 8,
     return_sharded: bool = False,
@@ -4234,12 +4239,31 @@ def fused_decode_sparse_from_logits(
         h_spec,  # s2
         v_spec,  # norm
     )
+    has_spec_slot_arg = spec_home_slot is not None
+    if has_spec_slot_arg:
+        if spec_home_slot.ndim > 1:
+            raise ValueError(
+                f"Expected 0D or 1D spec_home_slot, got shape {spec_home_slot.shape}"
+            )
+        spec_slot_arg = jnp.atleast_1d(spec_home_slot).astype(jnp.int32)
+        if spec_slot_arg.shape[0] < 1:
+            raise ValueError(
+                f"Expected non-empty spec_home_slot, got shape {spec_home_slot.shape}"
+            )
+    else:
+        spec_slot_arg = None
+
+    scalar_args = [rank]
+    if has_replicas:
+        scalar_args.append(replica_meta)
+    if has_spec_slot_arg:
+        scalar_args.append(spec_slot_arg)
+    num_scalar_prefetch = len(scalar_args)
+
     if has_replicas:
         in_specs = base_in_specs + (h_spec, h_spec, h_spec, h_spec)
-        num_scalar_prefetch = 2
         call_args = (
-            rank,
-            replica_meta,
+            *scalar_args,
             logits,
             bias_2d,
             x_2d,
@@ -4255,8 +4279,7 @@ def fused_decode_sparse_from_logits(
         )
     else:
         in_specs = base_in_specs
-        num_scalar_prefetch = 1
-        call_args = (rank, logits, bias_2d, x_2d, w1, s1, w2, s2, norm_2d)
+        call_args = (*scalar_args, logits, bias_2d, x_2d, w1, s1, w2, s2, norm_2d)
 
     out_rows = rows_per_rank if return_sharded else batch_size
     out_shape = jax.ShapeDtypeStruct((out_rows, _H), jnp.bfloat16)
@@ -4271,6 +4294,7 @@ def fused_decode_sparse_from_logits(
         replica_cost_mode=replica_cost_mode,
         ep_axis_name=ep_axis_name,
         cfg=config,
+        has_spec_slot_arg=has_spec_slot_arg,
     )
     rep_tag = f"_r{num_replicas}" if has_replicas else ""
     out_tag = "_sh" if return_sharded else "_rep"

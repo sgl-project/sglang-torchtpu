@@ -1052,6 +1052,57 @@ def build_preloaded_replica_plan(
     return plan
 
 
+def select_hot_non_replicated_home_slots(
+    expert_counts: Any,
+    *,
+    num_owners: int,
+    replica_meta: Any | None = None,
+    placement: Any | None = None,
+) -> np.ndarray:
+    """Return each owner's hottest local home slot not replicated in ``replica_meta``.
+
+    Args:
+      expert_counts: 1D calibration counts `[num_experts]` in checkpoint order.
+      num_owners: Number of EP owners dividing `num_experts`.
+      replica_meta: Optional `int32[4, K_rep]` table whose row 0 holds placed
+        replicated expert IDs (`>= 0`).
+      placement: Optional permutation mapping runtime placed slot -> checkpoint ID.
+    """
+    counts = np.asarray(expert_counts, dtype=np.float64)
+    if counts.ndim != 1 or counts.size == 0:
+        raise ValueError(f"Expected 1D expert_counts, got shape {counts.shape}")
+    num_experts = int(counts.size)
+    if num_owners < 2 or num_experts % num_owners != 0:
+        raise ValueError(
+            f"num_owners={num_owners} must be >= 2 and divide num_experts={num_experts}"
+        )
+    perm = _validate_permutation(placement, num_experts) if placement is not None else None
+    placed_counts = counts[perm] if perm is not None else counts
+
+    replicated_eids: set[int] = set()
+    if replica_meta is not None:
+        meta = np.asarray(replica_meta)
+        if meta.ndim != 2 or meta.shape[0] < 1:
+            raise ValueError(f"Invalid replica_meta shape {meta.shape}")
+        replicated_eids = {int(e) for e in meta[0].tolist() if int(e) >= 0}
+
+    e_per_owner = num_experts // num_owners
+    hot_slots = np.zeros((num_owners,), dtype=np.int32)
+    for owner in range(num_owners):
+        base = owner * e_per_owner
+        cands = [
+            le
+            for le in range(e_per_owner)
+            if (base + le) not in replicated_eids
+        ]
+        if not cands:
+            cands = list(range(e_per_owner))
+        hot_slots[owner] = max(
+            cands, key=lambda le: (float(placed_counts[base + le]), -le)
+        )
+    return hot_slots
+
+
 def validate_replica_plan(plan: PreloadedReplicaPlan) -> None:
     """Strictly validate all structural and disjointness invariants of a plan."""
     num_owners = plan.num_owners

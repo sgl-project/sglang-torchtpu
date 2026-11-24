@@ -2150,6 +2150,146 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 self.assertIn("tpu_custom_call", hlo_sp)
                 self.assertGreater(comp_sp.memory_analysis().generated_code_size_in_bytes, 0)
 
+    def test_w9_per_layer_hot_spec_slot_selection_and_lowering(self):
+        """Verify per-(layer, owner) hot-slot selection, op naming, and runtime SMEM lowering."""
+        import dataclasses
+        from functools import partial
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental.topologies import get_topology_desc
+        from jax.sharding import Mesh, PartitionSpec as P
+        import numpy as np
+
+        from sglang_tpu.moe.pallas.fused_rs_muse import (
+            fused_decode_op as op_mod,
+            fused_decode_sparse as v1_mod,
+            moe_imbalance_planner as planner,
+        )
+
+        # 1. Per-owner hottest non-replicated slot selection (placement + replica_meta + ties).
+        counts = np.zeros(256, dtype=np.float64)
+        counts[17] = 100.0   # owner 0 hottest, replicated below
+        counts[5] = 80.0     # owner 0 hottest non-replicated -> expected slot 5
+        counts[64 + 10] = 50.0
+        counts[64 + 3] = 50.0  # tie on owner 2 -> smallest slot (3)
+        placement = np.arange(256, dtype=np.int32)
+        placement[32 + 9], placement[32 + 12] = placement[32 + 12], placement[32 + 9]
+        counts[32 + 12] = 90.0  # placed at runtime slot (1, 9)
+        replica_meta = np.full((4, 16), -1, dtype=np.int32)
+        replica_meta[0, 0] = 17  # runtime expert 17 (owner 0, slot 17) is replicated
+        # Replicate all 32 slots of owner 7 -> fallback selects hottest overall on owner 7.
+        all_o7_meta = np.full((4, 32), -1, dtype=np.int32)
+        all_o7_meta[0, :32] = np.arange(7 * 32, 8 * 32, dtype=np.int32)
+        counts[7 * 32 + 21] = 75.0
+        combined_meta = np.concatenate([replica_meta, all_o7_meta], axis=1)
+
+        hot = planner.select_hot_non_replicated_home_slots(
+            counts,
+            num_owners=8,
+            replica_meta=combined_meta,
+            placement=placement,
+        )
+        self.assertEqual(hot.dtype, np.int32)
+        self.assertEqual(hot.shape, (8,))
+        self.assertEqual(int(hot[0]), 5)
+        self.assertEqual(int(hot[1]), 9)
+        self.assertEqual(int(hot[2]), 3)
+        self.assertEqual(int(hot[7]), 21)
+
+        # 2. TorchTPU op name and mode validation for has_spec_slot.
+        ss_name = op_mod.muse_fuse_all_decode_op_name(
+            mode="sparse",
+            ep=8,
+            tp=1,
+            block=512,
+            num_replicas=8,
+            replica_cost_mode="tiles",
+            return_sharded=True,
+            has_spec_slot=True,
+        )
+        self.assertEqual(
+            ss_name,
+            "sglang_tpu_pallas::muse_decode_sparse_ep8_k512_r8_tiles_ss_sh",
+        )
+        with self.assertRaises(ValueError):
+            op_mod.muse_fuse_all_decode_op_name(
+                mode="sparse_v2",
+                ep=8,
+                tp=1,
+                block=512,
+                has_spec_slot=True,
+            )
+
+        # 3. TPU7x Mosaic lowering with runtime spec_home_slot SMEM arg (R=0 and R=8).
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            h, r_slots = 4096, 8
+            base_shapes = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((64, 256), jnp.float32),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((64, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+            )
+            rep_shapes = (
+                jax.ShapeDtypeStruct((r_slots, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4, 8 * r_slots), jnp.int32),
+            )
+            ss_shape = jax.ShapeDtypeStruct((1,), jnp.int32)
+            base_cfg = v1_mod.default_sparse_decode_config(64, 8, 512)
+            cfg_dyn = dataclasses.replace(
+                base_cfg,
+                static_holder_mask=True,
+                route_fast=True,
+                fast_plan=2,
+                unroll_strips=True,
+                spec_prime_parts=2,
+                spec_home_slots=(),
+            )
+            for with_rep in (False, True):
+                shapes = (
+                    (*base_shapes, *rep_shapes, ss_shape)
+                    if with_rep
+                    else (*base_shapes, ss_shape)
+                )
+                def _call_dyn(*args):
+                    return v1_mod.fused_decode_sparse_from_logits(
+                        *args[:-1],
+                        spec_home_slot=args[-1],
+                        ep=8,
+                        return_sharded=True,
+                        replica_cost_mode="tiles",
+                        config=cfg_dyn,
+                    )
+
+                sm_dyn = jax.jit(
+                    jax.shard_map(
+                        _call_dyn,
+                        mesh=mesh,
+                        in_specs=(P(),) * len(shapes),
+                        out_specs=P(),
+                        check_vma=False,
+                    )
+                )
+                comp_dyn = sm_dyn.trace(*shapes).lower(lowering_platforms=("tpu",)).compile()
+                self.assertIn("tpu_custom_call", comp_dyn.as_text())
+                self.assertGreater(
+                    comp_dyn.memory_analysis().generated_code_size_in_bytes, 0
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
