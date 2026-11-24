@@ -55,7 +55,30 @@ def qkv_epilogue(c: PFConfig, qkvg, rope):
     )
 
 
-def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True, kc: int = _KC):
+def _q_rpa(q, kvh: int, g: int, d: int):
+    """[tm, kvh * g * d] heads -> [kvh, tm, g, 128] with each head's d lanes zero-padded to 128 (the
+    batched RPA kernel's query layout), the padding as a 0/1 dot (exact for bf16)."""
+    w = g * d
+    pad = (
+        jax.lax.broadcasted_iota(jnp.int32, (w, g * 128), 0) // d * 128
+        + jax.lax.broadcasted_iota(jnp.int32, (w, g * 128), 0) % d
+        == jax.lax.broadcasted_iota(jnp.int32, (w, g * 128), 1)
+    ).astype(jnp.bfloat16)
+    parts = []
+    for k in range(kvh):
+        qp = jnp.dot(q[:, k * w : (k + 1) * w], pad, preferred_element_type=jnp.float32)
+        parts.append(qp.astype(jnp.bfloat16).reshape(q.shape[0], g, 128))
+    return jnp.stack(parts)
+
+
+def qkvg_call(
+    c: PFConfig,
+    tm: int,
+    rope: bool,
+    mxu_norm: bool = True,
+    kc: int = _KC,
+    q_rpa: bool = False,
+):
     """(x8 [T, H] e4m3, xs [T, 1] f32, w [H, nq] e4m3, sm [16, H] f32, rope [T, 2 hd] f32) ->
     (q [T, qd], kv [T, 2 kvd], gate [T, qd]) bf16; rope False: a NoPE layer (rope unread)."""
     T, H, nq = c.rows, c.hidden, c.qkvg_dim
@@ -77,21 +100,34 @@ def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True, kc: int =
         with _scope("qk_epilogue"):
             epi = qkv_epilogue if mxu_norm else qkv_from_proj
             q, kv, g = epi(c, qkvg, rope_ref[...] if rope else None)
-        q_ref[...] = q
+        if q_rpa:
+            q_ref[...] = _q_rpa(q, c.kv_heads, c.q_heads // c.kv_heads, hd)
+        else:
+            q_ref[...] = q
         kv_ref[...] = kv
         g_ref[...] = g
 
     rows = lambda w: pl.BlockSpec((tm, w), lambda i: (i, 0))
     whole = lambda a, b: pl.BlockSpec((a, b), lambda i: (0, 0))
+    gq = c.q_heads // c.kv_heads
+    q_shape = (c.kv_heads, T, gq, 128) if q_rpa else (T, qd)
     outs = (
-        jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
+        jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
         jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
         jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
     )
     params = pltpu.CompilerParams(
         dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
     )
-    name = f"muse_sptp_qkvg_t{T}_m{tm}_k{kc}_r{int(rope)}{'_mxun' if mxu_norm else ''}"
+    name = (
+        f"muse_sptp_qkvg_t{T}_m{tm}_k{kc}_r{int(rope)}{'_mxun' if mxu_norm else ''}"
+        f"{'_qrpa' if q_rpa else ''}"
+    )
+
+    def q_spec(blk):
+        if q_rpa:
+            return pl.BlockSpec((c.kv_heads, tm, gq, 128), lambda i: (0, blk(i), 0, 0))
+        return pl.BlockSpec((tm, qd), lambda i: (blk(i), 0))
 
     def call(x8, xs, w, sm, rope_rows):
         return pl.pallas_call(
@@ -104,7 +140,7 @@ def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True, kc: int =
                 whole(sm.shape[0], H),
                 rows(2 * hd),
             ],
-            out_specs=(rows(qd), rows(2 * kvd), rows(qd)),
+            out_specs=(q_spec(lambda i: i), rows(2 * kvd), rows(qd)),
             out_shape=outs,
             compiler_params=params,
             name=name,
@@ -139,7 +175,7 @@ def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True, kc: int =
             body,
             grid=(c.tp * bpr,),
             in_specs=specs,
-            out_specs=(drows(qd), drows(2 * kvd), drows(qd)),
+            out_specs=(q_spec(dst), drows(2 * kvd), drows(qd)),
             out_shape=outs,
             input_output_aliases=aliases,
             compiler_params=params,

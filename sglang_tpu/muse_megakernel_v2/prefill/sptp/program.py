@@ -39,6 +39,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     to_owner,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import _heads_rms_mxu, qkvg_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
     fused_rs_moe,
@@ -130,12 +131,16 @@ def build_forward(c: PFConfig, axis: str = "model"):
     mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
     qkvg_tile = int(os.environ.get("SPTP_QKVG_TILE", str(QKVG_TILE)))
     kc = int(os.environ.get("SPTP_QKVG_KC", "512"))
-    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm, kc) for r in (True, False)}
+    # SPTP_RPA_WRAPPER=1: q [T, H, D] through batched_rpa.wrapper (its relayouts) instead of
+    # the qkvg card writing the kernel's query layout and reading its raw output (sptp/rpa.py)
+    q_rpa = not xla_qkvg and os.environ.get("SPTP_RPA_WRAPPER", "0") != "1"
+    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
     # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
     n_xag = int(os.environ.get("SPTP_XAG_CHUNKS", str(XAG_CHUNKS)))
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
-    qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc) for r in (True, False)}
+    qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
+    gq = c.q_heads // c.kv_heads
 
     def forward(
         meta,
@@ -204,21 +209,65 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     q, kvs, gate = qkvg_k[c.use_rope(l)](
                         a8, a_s, wqkvg[l], sm, rope_rows
                     )
-            o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
-            with _scope("sp_o_gate"):
-                if ogate_mxu:
-                    attn = _heads_rms_mxu(
-                        o.reshape(T, qd).astype(_F32), c.q_heads, hd, c.rms_eps
+            if q_rpa:
+                kvd = c.kv_dim
+                is_global = l in c.global_layers
+                o, kv[l] = rpa_prepared(
+                    q.reshape(c.kv_heads, T, gq // 2, 2, 128),
+                    kvs[:, :kvd].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
+                    kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
+                    kv[l],
+                    kv_lens,
+                    pf if is_global else psw,
+                    cu_q,
+                    dist,
+                    num_q_heads=c.q_heads,
+                    sm_scale=c.attn_scale,
+                    sliding_window=None if is_global else c.window,
+                )
+                with _scope("sp_o_gate"):
+                    # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
+                    o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
+                    o4 = o4 * jax.lax.rsqrt(
+                        jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
                     )
-                else:
-                    attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
-                g8, g_s = q8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
-            with _scope("sp_o_a2a"):
-                g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
-            # own rows' every head, then the o proj on the whole wo: no partial sums
-            with _scope("sp_o_proj"):
-                g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
-                o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                    g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
+                    a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                    g_s = (
+                        jnp.maximum(
+                            jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
+                        ).reshape(T, 1)
+                        / 448.0
+                    )
+                    g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
+                with _scope("sp_o_a2a"):
+                    g8 = jax.lax.all_to_all(
+                        g8.reshape(c.kv_heads, tp, Ts, gq, hd), axis, 1, 1, tiled=True
+                    )
+                    g_s = to_owner(g_s, tp, axis)
+                with _scope("sp_o_proj"):
+                    # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
+                    a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
+                        Ts, tp, 1, 1, 1
+                    )
+                    g8, g_s = q8(a.reshape(Ts, tp * qd))
+                    o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+            else:
+                o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
+                with _scope("sp_o_gate"):
+                    if ogate_mxu:
+                        attn = _heads_rms_mxu(
+                            o.reshape(T, qd).astype(_F32), c.q_heads, hd, c.rms_eps
+                        )
+                    else:
+                        attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
+                    g8, g_s = q8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
+                with _scope("sp_o_a2a"):
+                    g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                # own rows' every head, then the o proj on the whole wo: no partial sums
+                with _scope("sp_o_proj"):
+                    g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                    o_own = dense(g8, g_s, wo[l], sm, "wo", H)
             with _scope("sp_attn_res"):
                 stream = residual(c, stream, sm, "attn", o_own)
             with _scope("sp_router"):
