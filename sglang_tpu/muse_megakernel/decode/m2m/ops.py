@@ -1960,6 +1960,9 @@ def maybe_forward_m2m_decode(
 
     if not any(m[-1] for m in layer_meta):
         return None
+    # Guard TP=8 R1 (`chip_sharded_stream`) >4K workloads (`w_pg >= 5` SWA fallback, #2838):
+    if tp == 8 and chip_sharded_stream and any(not m[-1] for m in layer_meta):
+        return None
 
     if cos_sin_step is None and getattr(model.rotary_emb, "cos_sin_pairs", None) is not None:
         cos_sin_step = get_decode_rope_step_op()(

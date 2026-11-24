@@ -294,6 +294,28 @@ def test_w9_m2m_hybrid_swa_and_long_full_dispatch():
         )
 
     assert out is not None and out.shape == (B, H)
+    # Also verify #2838 TP=8 R1 (`chip_sharded_stream=True`) >4K context guard falls back cleanly (`None`):
+    with (
+        mock.patch(
+            "sglang_tpu.decode_qkv_epilogue_tpu._resolve_decode_attn_backend",
+            return_value=backend,
+        ),
+        mock.patch(
+            "sglang_tpu.attention_pallas_rpa_base._fused_kv_operands",
+            side_effect=lambda pool, lid: ((swa_kv if lid != 1 else full_kv), None),
+        ),
+    ):
+        out_r1_long = m2m_ops.maybe_forward_m2m_decode(
+            model,
+            positions=torch.zeros((B,), dtype=torch.int32),
+            stream=torch.zeros((B // 4, H), dtype=torch.float32),
+            carried_attn_input=torch.zeros((B, H), dtype=torch.bfloat16),
+            cos_sin_step=torch.zeros((B, 2, 128), dtype=torch.float32),
+            forward_batch=object(),
+            tok_sharded_stream=False,
+            chip_sharded_stream=True,
+        )
+    assert out_r1_long is None
     assert calls == [
         "l0_m2m",
         "moe_l0",
