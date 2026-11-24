@@ -1607,9 +1607,12 @@ def _d_with_next_in_gather(
     from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
 
     # Split _d_with_next_in_gather overlaps AG with Kernel D Part 2 only when AG runs on
-    # SparseCore (jax.lax.all_gather); keep TC xor1 opt-in via XOR1_AG_UNDER_D.
-    use_xor1 = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 1 and (
-        not split or envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get()
+    # SparseCore (jax.lax.all_gather); XOR1_BRIDGE_AG=4 is MoE-only and keeps D on SparseCore.
+    bridge_ag_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
+    under_d_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get()
+    use_xor1 = bool(under_d_mode) if split else (bridge_ag_mode in (1, 2, 3))
+    xor1_xy_torus = (bridge_ag_mode >= 3) or (
+        bool(under_d_mode) and bridge_ag_mode == 0
     )
 
     def _prep_part0(x_part):
@@ -1622,8 +1625,11 @@ def _d_with_next_in_gather(
     def _ag_d(x_part):
         x_ag = _prep_part0(x_part)
         if use_xor1:
-            return xor1_bridge_all_gather(x_ag, axis_name=axis_name, tiled=False)
+            return xor1_bridge_all_gather(
+                x_ag, axis_name=axis_name, tiled=False, xy_torus=xor1_xy_torus
+            )
         return jax.lax.all_gather(x_ag, axis_name, axis=0, tiled=False)
+
 
     if not split:  # rows0 not on a D tile boundary: same outputs, no overlap
         new_stream, next_in = d_fn(*d_args)
@@ -1634,6 +1640,24 @@ def _d_with_next_in_gather(
     gathered = _ag_d(next_in_0)
     new_stream, next_in_rest = d_fn(*d_args, row_start=rows0, stream_out=stream_0)
     return new_stream, next_in_rest, gathered
+
+
+def _moe_b2_all_gather(arr, *, axis_name: str):
+    """MoE-internal B2 ag_i8 all-gather controlled by XOR1_AG_MOE or XOR1_BRIDGE_AG >= 2."""
+    bridge_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
+    moe_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE.get()
+    eff_mode = (
+        moe_mode if moe_mode > 0 else (bridge_mode if bridge_mode >= 2 else 0)
+    )
+    if eff_mode >= 2 or moe_mode >= 1:
+        from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
+
+        return xor1_bridge_all_gather(
+            arr, axis_name=axis_name, tiled=False, xy_torus=(eff_mode >= 3)
+        )
+    return jax.lax.all_gather(
+        arr[None, ...], axis_name=axis_name, axis=0, tiled=True
+    )
 
 
 def _allow_pallas_sortfree_routing(
@@ -2126,6 +2150,9 @@ def fused_moe_full_bridge_and_ffn(
         )
         _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and _pq_lhs_mode == 4
         _b2_direct_fp8_2half = _use_pq_lhs_fp8 and _pq_lhs_mode == 5
+
+        def _moe_b2_all_gather_local(arr):
+            return _moe_b2_all_gather(arr, axis_name=expert_axis)
         with jax.named_scope("stage1_2_kernel_b1_b2_and_overlapped_ag_routing"):
             if (
                 (fused_b1_b2_mode in (1, 2) and (t_local % 128 == 0))
@@ -2191,18 +2218,7 @@ def fused_moe_full_bridge_and_ffn(
                 i8_all, local_topk_ids_u8 = jax.lax.optimization_barrier(
                     (i8_all, local_topk_ids_u8)
                 )
-                if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                    from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                        xor1_bridge_all_gather,
-                    )
-
-                    ag_i8 = xor1_bridge_all_gather(
-                        i8_all, axis_name=expert_axis, tiled=False
-                    )
-                else:
-                    ag_i8 = jax.lax.all_gather(
-                        i8_all[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                    )
+                ag_i8 = _moe_b2_all_gather_local(i8_all)
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
@@ -2329,18 +2345,7 @@ def fused_moe_full_bridge_and_ffn(
                 i8_0, smid_0, tk_u8_0, tk_w_0 = jax.lax.optimization_barrier(
                     (i8_0, smid_0, tk_u8_0, tk_w_0)
                 )
-                if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                    from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                        xor1_bridge_all_gather,
-                    )
-
-                    ag_i8_0 = xor1_bridge_all_gather(
-                        i8_0, axis_name=expert_axis, tiled=False
-                    )
-                else:
-                    ag_i8_0 = jax.lax.all_gather(
-                        i8_0[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                    )
+                ag_i8_0 = _moe_b2_all_gather_local(i8_0)
                 attn_s_1, stream_s_1, smid_0_1, _ = jax.lax.optimization_barrier(
                     (attn_s, stream_s, smid_0, i8_0)
                 )
@@ -2390,18 +2395,7 @@ def fused_moe_full_bridge_and_ffn(
                 local_topk_ids_u8 = jnp.concatenate([tk_u8_0, tk_u8_1], axis=0)
                 local_topk_weights = jnp.concatenate([tk_w_0, tk_w_1], axis=0)
                 i8_1 = jax.lax.optimization_barrier(i8_1)
-                if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                    from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                        xor1_bridge_all_gather,
-                    )
-
-                    ag_i8_1 = xor1_bridge_all_gather(
-                        i8_1, axis_name=expert_axis, tiled=False
-                    )
-                else:
-                    ag_i8_1 = jax.lax.all_gather(
-                        i8_1[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                    )
+                ag_i8_1 = _moe_b2_all_gather_local(i8_1)
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
@@ -2544,18 +2538,7 @@ def fused_moe_full_bridge_and_ffn(
                                 (i8_0, sc0_1d, smid_0, tk_u8_0, tk_w_0)
                             )
                         )
-                    if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                        from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                            xor1_bridge_all_gather,
-                        )
-
-                        ag_i8_0 = xor1_bridge_all_gather(
-                            i8_0, axis_name=expert_axis, tiled=False
-                        )
-                    else:
-                        ag_i8_0 = jax.lax.all_gather(
-                            i8_0[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                        )
+                    ag_i8_0 = _moe_b2_all_gather_local(i8_0)
                     if not b2_pack_sc and not b2_i8pack:
                         ag_sc_0 = jax.lax.psum(
                             jnp.where(rank_mask_2d, sc0_1d[None, :], jnp.bfloat16(0.0)),
@@ -2610,18 +2593,7 @@ def fused_moe_full_bridge_and_ffn(
                         i8_0 = jax.lax.optimization_barrier(i8_0)
                     else:
                         i8_0, sc0_1d = jax.lax.optimization_barrier((i8_0, sc0_1d))
-                    if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                        from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                            xor1_bridge_all_gather,
-                        )
-
-                        ag_i8_0 = xor1_bridge_all_gather(
-                            i8_0, axis_name=expert_axis, tiled=False
-                        )
-                    else:
-                        ag_i8_0 = jax.lax.all_gather(
-                            i8_0[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                        )
+                    ag_i8_0 = _moe_b2_all_gather_local(i8_0)
                     if b2_pack_bf16_sc:
                         ag_sc_0 = None
                     elif not b2_pack_sc and not b2_i8pack:
@@ -2658,18 +2630,7 @@ def fused_moe_full_bridge_and_ffn(
                         i8_1 = jax.lax.optimization_barrier(i8_1)
                     else:
                         i8_1, sc1_1d = jax.lax.optimization_barrier((i8_1, sc1_1d))
-                    if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                        from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                            xor1_bridge_all_gather,
-                        )
-
-                        ag_i8_1 = xor1_bridge_all_gather(
-                            i8_1, axis_name=expert_axis, tiled=False
-                        )
-                    else:
-                        ag_i8_1 = jax.lax.all_gather(
-                            i8_1[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                        )
+                    ag_i8_1 = _moe_b2_all_gather_local(i8_1)
                     if b2_pack_bf16_sc:
                         ag_sc_1 = None
                     elif not b2_i8pack:
@@ -2877,18 +2838,7 @@ def fused_moe_full_bridge_and_ffn(
                         )
                         precomputed_routing = None
 
-                    if envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 2:
-                        from sglang_tpu.kernels.xor1_bridge_all_gather import (
-                            xor1_bridge_all_gather,
-                        )
-
-                        ag_i8_1 = xor1_bridge_all_gather(
-                            i8_1, axis_name=expert_axis, tiled=False
-                        )
-                    else:
-                        ag_i8_1 = jax.lax.all_gather(
-                            i8_1[None, ...], axis_name=expert_axis, axis=0, tiled=True
-                        )
+                    ag_i8_1 = _moe_b2_all_gather_local(i8_1)
                     hs_4d = jnp.empty(
                         (ep_size, 2, half_tok, he_dim), dtype=jnp.bfloat16
                     )

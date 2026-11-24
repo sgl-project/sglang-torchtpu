@@ -141,11 +141,19 @@ def _a1_body(
     from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
 
     eff_a1_zc = a1_zc or skip_pad_tokens or (variant == "v6_s8str128_bf16kv")
-    use_xor1_ag = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 1
+    bridge_ag_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
+    chunk_ag_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK.get()
+    a1_ag_mode = (
+        chunk_ag_mode
+        if chunk_ag_mode > 0
+        else (bridge_ag_mode if bridge_ag_mode in (1, 2, 3) else 0)
+    )
 
     def _ag(x_in, *, tiled: bool):
-        if use_xor1_ag:
-            return xor1_bridge_all_gather(x_in, axis_name=_AXIS, tiled=tiled)
+        if a1_ag_mode >= 1:
+            return xor1_bridge_all_gather(
+                x_in, axis_name=_AXIS, tiled=tiled, xy_torus=(a1_ag_mode >= 3)
+            )
         return lax.all_gather(x_in, _AXIS, axis=0, tiled=tiled)
 
     def a1_body(attn_in_shard, wqkvg, wqkvg_scale, cos, sin):
@@ -1099,10 +1107,21 @@ def _ops(
     from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
 
     xor1_ag_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
+    xor1_moe_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE.get()
+    xor1_chunk_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK.get()
+    xor1_b2_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_B2.get()
+    xor1_under_d_mode = tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get()
+    exit_ag_mode = (
+        xor1_b2_mode
+        if xor1_b2_mode > 0
+        else (xor1_ag_mode if xor1_ag_mode in (1, 2, 3) else 0)
+    )
     gather_sm = shard(
         (
-            lambda x: xor1_bridge_all_gather(x, axis_name=_AXIS, tiled=True)
-            if xor1_ag_mode >= 1
+            lambda x: xor1_bridge_all_gather(
+                x, axis_name=_AXIS, tiled=True, xy_torus=(exit_ag_mode >= 3)
+            )
+            if exit_ag_mode >= 1
             else lax.all_gather(x, _AXIS, axis=0, tiled=True)
         ),
         1,
@@ -1164,8 +1183,13 @@ def _ops(
             )
             packed_u8 = jnp.concatenate([q_u8, sc_u8], axis=1)
             ag_u8 = (
-                xor1_bridge_all_gather(packed_u8, axis_name=_AXIS, tiled=True)
-                if xor1_ag_mode >= 1
+                xor1_bridge_all_gather(
+                    packed_u8,
+                    axis_name=_AXIS,
+                    tiled=True,
+                    xy_torus=(exit_ag_mode >= 3),
+                )
+                if exit_ag_mode >= 1
                 else lax.all_gather(packed_u8, _AXIS, axis=0, tiled=True)
             )
             if causal_chunk_stream:
@@ -1189,7 +1213,7 @@ def _ops(
         gather_fp8_op = export(
             "gather_fp8"
             + ccs_tag
-            + (f"_xag{xor1_ag_mode}" if xor1_ag_mode > 0 else ""),
+            + (f"_xag{exit_ag_mode}" if exit_ag_mode > 0 else ""),
             gather_fp8,
             1,
             1,
@@ -1369,7 +1393,12 @@ def _ops(
         + (f"_sn{strip_n}" if strip_n > 0 else "")
         + (f"_kf{kp_fp8}" if kp_fp8 > 0 else "")
         + (f"_knc{kp_nc}" if kp_nc > 0 else "")
-        + (f"_xag{xor1_ag_mode}" if xor1_ag_mode > 0 else "")
+        + (
+            f"_xagm{xor1_moe_mode}"
+            if xor1_moe_mode > 0
+            else (f"_xag{xor1_ag_mode}" if xor1_ag_mode >= 2 else "")
+        )
+        + ("_xagd" if xor1_under_d_mode else "")
         + (
             f"_fb12_{tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2.get()}"
             if tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2.get()
@@ -1460,7 +1489,13 @@ def _ops(
         + ("_sk" if a1_skip else "")
         + ("_fbk" if finer_bkt else "")
         + a1_parts_tag
-        + (f"_xag{xor1_ag_mode}" if xor1_ag_mode > 0 else "")
+        + (
+            f"_xagc{xor1_chunk_mode}"
+            if xor1_chunk_mode > 0
+            else (
+                f"_xag{xor1_ag_mode}" if xor1_ag_mode in (1, 2, 3) else ""
+            )
+        )
         + a1_w8_tag
     )
     agd_ops = {}
@@ -1524,7 +1559,12 @@ def _ops(
         import jax.numpy as jnp
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
 
-        use_xor1_ccs_ag = (xor1_ag_mode >= 1) or (ccs_fuse_ag_a1 == 2)
+        ccs_ag_mode = (
+            xor1_chunk_mode
+            if xor1_chunk_mode > 0
+            else (xor1_ag_mode if xor1_ag_mode in (1, 2, 3) else 0)
+        )
+        use_xor1_ccs_ag = (ccs_ag_mode >= 1) or (ccs_fuse_ag_a1 == 2)
 
         def _prep_ccs_fp8_slice(x_slice):
             if x_slice.dtype != jnp.float8_e4m3fn:
@@ -1541,7 +1581,12 @@ def _ops(
 
         def _ccs_all_gather(x_fp8):
             if use_xor1_ccs_ag:
-                return xor1_bridge_all_gather(x_fp8, axis_name=_AXIS, tiled=False)
+                return xor1_bridge_all_gather(
+                    x_fp8,
+                    axis_name=_AXIS,
+                    tiled=False,
+                    xy_torus=(ccs_ag_mode >= 3),
+                )
             return lax.all_gather(x_fp8, _AXIS, axis=0, tiled=False)
 
         def ag_chunk_body(x_slice):
@@ -1602,8 +1647,8 @@ def _ops(
             return a1_chunk_sm(ag_k, wqkvg, wqkvg_scale, cos_k, sin_k)
 
         ccs_ag_sfx = (
-            f"_xag{xor1_ag_mode}"
-            if xor1_ag_mode > 0
+            f"_xag{ccs_ag_mode}"
+            if ccs_ag_mode > 0
             else ("_xagccs" if use_xor1_ccs_ag else "")
         )
         rpal_sfx = "_rpal" if a1_rpa_layout else "_unpk"

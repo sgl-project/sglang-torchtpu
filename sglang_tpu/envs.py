@@ -657,12 +657,20 @@ class TpuEnvs:
     # fused_rs_muse K256_PREFILL_TILES=1 prefill: column strip width nc_cur (0 = default 256;
     # >0 e.g. 512/1024/2048).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_NC = EnvInt(0)
-    # Muse prefill Pallas All-Gather (0 = off; 1 = 2-stage XOR=1 bridge on A1+exit; 2 = +B2;
-    # 3 = Dual-Port 1-Hop XY-Torus + XOR=1 bridge), cutting inter-chip ICI bytes by 4/7 (-57%).
+    # Muse prefill Pallas All-Gather (0 = off; 1 = 2-stage XOR=1 bridge on A1+exit; 2 = +MoE;
+    # 3 = Dual-Port 1-Hop XY/XYZ-Torus + XOR=1 bridge across A1+exit+MoE; 4 = MoE/B2-only XY/XYZ-Torus
+    # keeping A1, chunk, exit, and split Kernel D on overlapped SparseCore lax.all_gather).
     SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG = EnvInt(0)
+    # Per-call-site opt-in overrides (all default off so XOR1_BRIDGE_AG=0 keeps SparseCore):
+    # MoE-internal B2 ag_i8 all-gather in pipeline.py (0 = off; 1/2 = flat; 3 = xy/xyz torus).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE = EnvInt(0)
+    # Chunk/A1 entry all-gather in integration.py (0 = off; 1/2 = flat; 3 = xy/xyz torus).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK = EnvInt(0)
     # Opt-in: also run xor1_bridge_all_gather inside split _d_with_next_in_gather (False keeps
     # SparseCore jax.lax.all_gather so it overlaps under Kernel D Part 2 on TensorCore).
     SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D = EnvBool(False)
+    # Standalone pre-attn/stream gather_sm & gather_fp8 override (0 = off; 1/2 = flat; 3 = torus).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_B2 = EnvInt(0)
     # Muse prefill Kernel B2: collapse grid=(num_m, 4) -> (num_m,) with 2-slot double-buffered
     # wpool_fp8 async DMA prefetch, eliminating 3/4 redundant garbage HBM output writes (-804 MB/fwd).
     SGLANG_TPU_MUSE_KERNEL_B2_SINGLE_WRITE = EnvBool(False)
