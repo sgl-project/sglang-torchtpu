@@ -494,6 +494,7 @@ def routing_pairs_from_tables(
     t_local,
     block,
     shard_stride,
+    slab_row=None,
 ):
     """build_routing_tables_sharded's per-pair tables -- (pos, mirror_pos,
     slab_row rebased as local_slab_rows rebases it) -- from the small tables
@@ -501,7 +502,8 @@ def routing_pairs_from_tables(
     recv_base_me [e_total] (the plan's my_recv_base), mirror_base [e_total]
     (the mirror table less my_off) and run_base [ep, g_local] (the slab row
     each (source, local expert) run starts at, in this shard's own slab).
-    Same values as the sharded plan's."""
+    Same values as the sharded plan's. A given `slab_row` (the
+    exchange-table kernel's) is returned as the third table, not rebuilt."""
     T, K = gathered.n_tokens, gathered.topk
     n = T * K
     g_local = e_total // ep
@@ -519,6 +521,8 @@ def routing_pairs_from_tables(
     mirror_pos = (
         _lookup_per_pair(my_off + mirror_base[None, :], my_blocks, bins) + my_rank
     ).reshape(t_local, K)
+    if slab_row is not None:
+        return pos, mirror_pos, slab_row
     first = me * g_local
     my_experts = first + jnp.arange(g_local, dtype=jnp.int32)
     win_hist = _window_hist(expert_blocks, my_experts, window)
