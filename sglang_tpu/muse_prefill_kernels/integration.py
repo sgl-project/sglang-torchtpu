@@ -2489,14 +2489,13 @@ class MusePrefillKernels(torch.nn.Module):
                         src_w = torch.where(
                             row_mask[:, None], src_w, torch.zeros_like(src_w)
                         )
-                embed_col = None
-                for c in range(tp_size):
-                    g_c = self._gather(
-                        src_w[:, c * h_col : (c + 1) * h_col].contiguous()
-                    )
-                    if c == tp_rank:
-                        embed_col = g_c
-                assert embed_col is not None
+                embed_col = _gather_sp_entry_embed_col(
+                    self._gather,
+                    src_w,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    h_col=h_col,
+                )
             else:
                 if org_vocab < local_col.shape[0]:
                     row_mask = (
@@ -2507,6 +2506,10 @@ class MusePrefillKernels(torch.nn.Module):
                     )
                 else:
                     embed_col = local_col + 0
+            if not bool(torch.isfinite(embed_col).all().cpu()):
+                raise RuntimeError(
+                    f"Muse sp_entry embed_col contains non-finite values on rank={tp_rank}"
+                )
             self.register_buffer("embed_col", embed_col, persistent=False)
             self.entry_op = _build_entry_op(
                 org_vocab,
@@ -4600,6 +4603,50 @@ class MusePrefillKernels(torch.nn.Module):
 
 
 _NAN_TRAP_STAGE_NAMES = ("entry", "a1", "rpa", "a3", "moe", "exit")
+
+
+def _gather_sp_entry_embed_col(
+    gather_fn,
+    src_w: torch.Tensor,
+    *,
+    tp_size: int,
+    tp_rank: int,
+    h_col: int,
+) -> torch.Tensor:
+    """Gather `[src_rows, h_col]` slices across TP ranks with 128-row alignment when unaligned."""
+    src_rows = int(src_w.shape[0])
+    pad_rows = ((src_rows + 127) // 128) * 128 if src_rows % 8 != 0 else src_rows
+    src_w_pad = (
+        torch.nn.functional.pad(src_w, (0, 0, 0, pad_rows - src_rows))
+        if pad_rows > src_rows
+        else src_w
+    )
+    embed_col = None
+    for c in range(tp_size):
+        g_c = gather_fn(src_w_pad[:, c * h_col : (c + 1) * h_col].contiguous())
+        if c == tp_rank:
+            if pad_rows > src_rows:
+                embed_col = (
+                    g_c.reshape(tp_size, pad_rows, h_col)[:, :src_rows, :]
+                    .reshape(tp_size * src_rows, h_col)
+                    .contiguous()
+                )
+            else:
+                embed_col = g_c
+    assert embed_col is not None
+    own_slice = src_w[:, tp_rank * h_col : (tp_rank + 1) * h_col]
+    got_own = embed_col[tp_rank * src_rows : (tp_rank + 1) * src_rows]
+    if not bool(torch.equal(got_own.cpu(), own_slice.cpu())):
+        raise RuntimeError(
+            f"Muse sp_entry embed_col self-slice mismatch on rank={tp_rank}"
+        )
+    own_amax = float(src_w.abs().amax().cpu()) if src_w.numel() > 0 else 0.0
+    col_amax = float(embed_col.abs().amax().cpu()) if embed_col.numel() > 0 else 0.0
+    if not (col_amax <= max(1e4, own_amax * 10.0)):
+        raise RuntimeError(
+            f"Muse sp_entry embed_col corrupt magnitude ({col_amax} > max(1e4, 10*{own_amax})) on rank={tp_rank}"
+        )
+    return embed_col
 
 
 def _record_nan_trap(

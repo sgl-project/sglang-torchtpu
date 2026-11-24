@@ -1438,6 +1438,80 @@ def test_muse_nan_trap_optin_stage_and_pad_isolation():
     err_log_dyn.assert_called_once()
 
 
+def test_sp_entry_embed_col_pad_gather_unpad_12628_tp16():
+    """Verify _gather_sp_entry_embed_col pads unaligned 12628-row TP=16 shards, leaves TP=8 25256 untouched, and rejects NaNs/garbage."""
+    import torch
+
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    rng = np.random.default_rng(3360)
+    for tp_size, src_rows, exp_gather_rows in ((16, 12628, 12672), (8, 25256, 25256)):
+        h_col = 32
+        full_wide = torch.tensor(
+            rng.standard_normal((tp_size, src_rows, tp_size * h_col)).astype(np.float32),
+            dtype=torch.bfloat16,
+        )
+        tp_rank = tp_size - 5
+        seen_shapes = []
+        c_off_ref = [0]
+
+        def _mock_gather_wide(col_slice):
+            seen_shapes.append(tuple(col_slice.shape))
+            assert col_slice.shape == (exp_gather_rows, h_col)
+            c = c_off_ref[0]
+            c_off_ref[0] += 1
+            out = torch.full(
+                (tp_size, exp_gather_rows, h_col),
+                float("nan") if exp_gather_rows > src_rows else 0.0,
+                dtype=col_slice.dtype,
+            )
+            for r in range(tp_size):
+                out[r, :src_rows, :] = full_wide[r, :, c * h_col : (c + 1) * h_col]
+            out[tp_rank, :, :] = col_slice
+            return out.reshape(tp_size * exp_gather_rows, h_col)
+
+        got = integration._gather_sp_entry_embed_col(
+            _mock_gather_wide,
+            full_wide[tp_rank],
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            h_col=h_col,
+        )
+        assert len(seen_shapes) == tp_size
+        assert got.shape == (tp_size * src_rows, h_col)
+        expected = full_wide[:, :, tp_rank * h_col : (tp_rank + 1) * h_col].reshape(
+            tp_size * src_rows, h_col
+        )
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    # Verify self-slice mismatch and cross-rank finite garbage (>1e4 / 1e20) raise RuntimeError loudly.
+    tp_size, src_rows, h_col, tp_rank = 16, 12628, 32, 3
+    w_ok = torch.ones((src_rows, tp_size * h_col), dtype=torch.bfloat16)
+
+    def _mock_bad_self(col_slice):
+        out = torch.ones((tp_size, 12672, h_col), dtype=torch.bfloat16)
+        out[tp_rank, 100, 0] = 2.0
+        return out.reshape(tp_size * 12672, h_col)
+
+    with pytest.raises(RuntimeError, match="self-slice mismatch"):
+        integration._gather_sp_entry_embed_col(
+            _mock_bad_self, w_ok, tp_size=tp_size, tp_rank=tp_rank, h_col=h_col
+        )
+
+    def _mock_peer_garbage(col_slice):
+        out = torch.ones((tp_size, 12672, h_col), dtype=torch.bfloat16)
+        out[tp_rank, :, :] = col_slice
+        out[0, 50, 0] = 1e20
+        return out.reshape(tp_size * 12672, h_col)
+
+    with pytest.raises(RuntimeError, match="corrupt magnitude"):
+        integration._gather_sp_entry_embed_col(
+            _mock_peer_garbage, w_ok, tp_size=tp_size, tp_rank=tp_rank, h_col=h_col
+        )
+
+
+
+
 
 
 
