@@ -258,12 +258,13 @@ def oproj_a2a_call(
         @pl.when(r == 0)
         def _():
             # every peer is in this kernel (its gq free) before anyone writes into it
-            bar = pltpu.get_barrier_semaphore()
-            for p in range(tp):
-                pl.semaphore_signal(
-                    bar, device_id=(p,), device_id_type=pl.DeviceIdType.MESH
-                )
-            pl.semaphore_wait(bar, tp)
+            with _scope("pa_barrier"):
+                bar = pltpu.get_barrier_semaphore()
+                for p in range(tp):
+                    pl.semaphore_signal(
+                        bar, device_id=(p,), device_id_type=pl.DeviceIdType.MESH
+                    )
+                pl.semaphore_wait(bar, tp)
             for cp in locals_(me):
                 cp.start()
             for k in range(1, min(la, tp - 1) + 1):
