@@ -60,6 +60,10 @@ class DecodeFastConfig:
     batch_full: bool = False
     dyn2k_unroll: bool = False
     u4_flat: bool = False
+    gear_4k: bool = False
+    fold_128: bool = False
+    fold_col: bool = False
+    no_mask0: bool = False
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -292,6 +296,11 @@ def parse_decode_fast_config(
     batch_full = "batchfull" in toks_cfg
     dyn2k_unroll = "dyn2ku" in toks_cfg
     u4_flat = "u4flat" in toks_cfg
+    gear_4k = "g4k" in toks_cfg
+    no_fold = "nofold" in toks_cfg
+    fold_col = ("foldcol" in toks_cfg or gear_4k) and not no_fold
+    fold_128 = ("fold128" in toks_cfg or fold_col) and not no_fold
+    no_mask0 = "nomask0" in toks_cfg or gear_4k
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -536,6 +545,10 @@ def parse_decode_fast_config(
         batch_full=batch_full,
         dyn2k_unroll=dyn2k_unroll,
         u4_flat=u4_flat,
+        gear_4k=gear_4k,
+        fold_128=fold_128,
+        fold_col=fold_col,
+        no_mask0=no_mask0,
     )
 
 
@@ -543,6 +556,43 @@ def _broadcast_minor_128(src: jax.Array) -> jax.Array:
     if src.shape[-1] == 128:
         return src
     return jnp.broadcast_to(src, (*src.shape[:-1], 128))
+
+
+def _fold128_op(x: jax.Array, op) -> jax.Array:
+    """Folds 2D ``[q_rows, k*128]`` down to ``[q_rows, 128]`` via pure-2D slicing."""
+    cur = x
+    while cur.shape[1] > 128:
+        n_b = cur.shape[1] // 128
+        half_b = n_b // 2
+        hw = half_b * 128
+        folded = op(cur[:, :hw], cur[:, hw : 2 * hw])
+        if (n_b & 1) == 0:
+            cur = folded
+        else:
+            cur = (
+                op(folded[:, :128], cur[:, 2 * hw :])
+                if half_b == 1
+                else jnp.concatenate([folded, cur[:, 2 * hw :]], axis=1)
+            )
+    return cur
+
+
+def _exp2_fold_col(
+    scores: jax.Array, ref_m_128: jax.Array, exp2_sc
+) -> tuple[jax.Array, jax.Array]:
+    """Computes ``exp2((scores - ref_m) * exp2_sc)`` & ``[q, 128]`` sum without wide concats."""
+    n_cols = scores.shape[1] // 128
+    p_cols = [
+        jnp.exp2((scores[:, j * 128 : (j + 1) * 128] - ref_m_128) * exp2_sc)
+        for j in range(n_cols)
+    ]
+    p_full = jnp.concatenate(p_cols, axis=1)
+    while len(p_cols) > 1:
+        nxt = [p_cols[i] + p_cols[i + 1] for i in range(0, len(p_cols) - 1, 2)]
+        if len(p_cols) & 1:
+            nxt.append(p_cols[-1])
+        p_cols = nxt
+    return p_full, p_cols[0]
 
 
 def _broadcast_minor_128_any(src_128: jax.Array, width: int) -> jax.Array:
@@ -1515,7 +1565,14 @@ def _decode_fast_kernel(
                 s_o = jnp.where(c_o < rel_end, s_o, _MASK_LOGIT)
 
             s_eo_max = jnp.maximum(s_e, s_o)
-            if cfg.page_reduce:
+            if cfg.fold_128:
+                m = jnp.maximum(
+                    s_new_eff,
+                    _broadcast_minor_128(
+                        jnp.max(_fold128_op(s_eo_max, jnp.maximum), axis=1, keepdims=True)
+                    ),
+                )
+            elif cfg.page_reduce:
                 s_pgs = jnp.max(s_eo_max.reshape(q_rows, n_half_blocks, 128), axis=1)
                 m = jnp.maximum(
                     s_new_eff, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
@@ -1524,12 +1581,19 @@ def _decode_fast_kernel(
                 m = jnp.maximum(
                     s_new_eff, _broadcast_minor_128(jnp.max(s_eo_max, axis=1, keepdims=True))
                 )
-            m_hw = _broadcast_minor_128_any(m, half_w)
+            m_hw = m[:, :1] if cfg.fold_128 else _broadcast_minor_128_any(m, half_w)
             p_e = jnp.exp2((s_e - m_hw) * exp2_sc_eff)
             p_o = jnp.exp2((s_o - m_hw) * exp2_sc_eff)
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
             p_eo_sum = p_e + p_o
-            if cfg.page_reduce:
+            if cfg.fold_128:
+                l_sum = (
+                    _broadcast_minor_128(
+                        jnp.sum(_fold128_op(p_eo_sum, jnp.add), axis=1, keepdims=True)
+                    )
+                    + p_new
+                )
+            elif cfg.page_reduce:
                 p_pgs = jnp.sum(p_eo_sum.reshape(q_rows, n_half_blocks, 128), axis=1)
                 l_sum = _broadcast_minor_128(jnp.sum(p_pgs, axis=1, keepdims=True)) + p_new
             else:
@@ -1877,16 +1941,32 @@ def _decode_fast_kernel(
                 valid_s = k_col < rel_end
             s_c = jnp.where(valid_s, s_c, _MASK_LOGIT)
 
-            s_pages = jnp.max(s_c.reshape(q_rows, chunk_sz // 128, 128), axis=1)
-            m_new = jnp.maximum(
-                m_prev,
-                _broadcast_minor_128(jnp.max(s_pages, axis=1, keepdims=True)),
-            )
-            alpha = jnp.exp2((m_prev - m_new) * exp2_sc_dyn)
-            p_c = jnp.exp2(
-                (s_c - _broadcast_minor_128_any(m_new, chunk_sz)) * exp2_sc_dyn
-            )
-            l_add = jnp.sum(p_c.reshape(q_rows, chunk_sz // 128, 128), axis=1)
+            if cfg.fold_col:
+                m_blk = _broadcast_minor_128(
+                    jnp.max(_fold128_op(s_c, jnp.maximum), axis=1, keepdims=True)
+                )
+                m_new = jnp.maximum(m_prev, m_blk)
+                alpha = jnp.exp2((m_prev - m_new) * exp2_sc_dyn)
+                p_c, l_add = _exp2_fold_col(s_c, m_new, exp2_sc_dyn)
+            elif cfg.fold_128:
+                m_blk = _broadcast_minor_128(
+                    jnp.max(_fold128_op(s_c, jnp.maximum), axis=1, keepdims=True)
+                )
+                m_new = jnp.maximum(m_prev, m_blk)
+                alpha = jnp.exp2((m_prev - m_new) * exp2_sc_dyn)
+                p_c = jnp.exp2((s_c - m_new[:, :1]) * exp2_sc_dyn)
+                l_add = _fold128_op(p_c, jnp.add)
+            else:
+                s_pages = jnp.max(s_c.reshape(q_rows, chunk_sz // 128, 128), axis=1)
+                m_new = jnp.maximum(
+                    m_prev,
+                    _broadcast_minor_128(jnp.max(s_pages, axis=1, keepdims=True)),
+                )
+                alpha = jnp.exp2((m_prev - m_new) * exp2_sc_dyn)
+                p_c = jnp.exp2(
+                    (s_c - _broadcast_minor_128_any(m_new, chunk_sz)) * exp2_sc_dyn
+                )
+                l_add = jnp.sum(p_c.reshape(q_rows, chunk_sz // 128, 128), axis=1)
 
             v_c = _bkv_fp8_chunk(slot, row0, chunk_sz, kind="v")
             p_dot = p_c.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_c
@@ -1903,7 +1983,17 @@ def _decode_fast_kernel(
         _, l_fin, acc_fin = lax.fori_loop(0, n_chunks, _dyn_chunk, (m0, l0, a0))
         return finalize_out(l_fin, acc_fin)
 
-    def _step_2k_blk(slot, q_bf16, rel_first, rel_end, r0, w_k: int, carry):
+    def _step_2k_blk(
+        slot,
+        q_bf16,
+        rel_first,
+        rel_end,
+        r0,
+        w_k: int,
+        carry,
+        *,
+        mask_bounds: bool = True,
+    ):
         m_prev, l_prev, acc_prev = carry
         if kv_pack_dense2:
             half_w = w_k // 2
@@ -1911,25 +2001,44 @@ def _decode_fast_kernel(
             k_e, k_o = _bkv_fp8_split(slot, r0, w_k, kind="k")
             s_e = jnp.matmul(q_bf16, k_e.T, preferred_element_type=jnp.float32)
             s_o = jnp.matmul(q_bf16, k_o.T, preferred_element_type=jnp.float32)
-            h_io = lax.broadcasted_iota(jnp.int32, (q_rows, half_w), 1)
-            c_e = r0 + 2 * h_io
-            c_o = c_e + 1
-            if sliding_window is not None:
-                s_e = jnp.where((c_e >= rel_first) & (c_e < rel_end), s_e, _MASK_LOGIT)
-                s_o = jnp.where((c_o >= rel_first) & (c_o < rel_end), s_o, _MASK_LOGIT)
-            else:
-                s_e = jnp.where(c_e < rel_end, s_e, _MASK_LOGIT)
-                s_o = jnp.where(c_o < rel_end, s_o, _MASK_LOGIT)
+            if mask_bounds:
+                h_io = lax.broadcasted_iota(jnp.int32, (q_rows, half_w), 1)
+                c_e = r0 + 2 * h_io
+                c_o = c_e + 1
+                if sliding_window is not None:
+                    s_e = jnp.where((c_e >= rel_first) & (c_e < rel_end), s_e, _MASK_LOGIT)
+                    s_o = jnp.where((c_o >= rel_first) & (c_o < rel_end), s_o, _MASK_LOGIT)
+                else:
+                    s_e = jnp.where(c_e < rel_end, s_e, _MASK_LOGIT)
+                    s_o = jnp.where(c_o < rel_end, s_o, _MASK_LOGIT)
             s_max = jnp.maximum(s_e, s_o)
-            s_pgs = jnp.max(s_max.reshape(q_rows, n_hb, 128), axis=1)
-            m_new = jnp.maximum(
-                m_prev, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
-            )
-            alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-            m_hw = _broadcast_minor_128_any(m_new, half_w)
-            p_e = jnp.exp2((s_e - m_hw) * exp2_scale)
-            p_o = jnp.exp2((s_o - m_hw) * exp2_scale)
-            l_add = jnp.sum((p_e + p_o).reshape(q_rows, n_hb, 128), axis=1)
+            if cfg.fold_128:
+                m_new = jnp.maximum(
+                    m_prev,
+                    _broadcast_minor_128(
+                        jnp.max(_fold128_op(s_max, jnp.maximum), axis=1, keepdims=True)
+                    ),
+                )
+                alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                if cfg.fold_col:
+                    p_e, l_e = _exp2_fold_col(s_e, m_new, exp2_scale)
+                    p_o, l_o = _exp2_fold_col(s_o, m_new, exp2_scale)
+                    l_add = l_e + l_o
+                else:
+                    m_1 = m_new[:, :1]
+                    p_e = jnp.exp2((s_e - m_1) * exp2_scale)
+                    p_o = jnp.exp2((s_o - m_1) * exp2_scale)
+                    l_add = _fold128_op(p_e + p_o, jnp.add)
+            else:
+                s_pgs = jnp.max(s_max.reshape(q_rows, n_hb, 128), axis=1)
+                m_new = jnp.maximum(
+                    m_prev, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
+                )
+                alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                m_hw = _broadcast_minor_128_any(m_new, half_w)
+                p_e = jnp.exp2((s_e - m_hw) * exp2_scale)
+                p_o = jnp.exp2((s_o - m_hw) * exp2_scale)
+                l_add = jnp.sum((p_e + p_o).reshape(q_rows, n_hb, 128), axis=1)
             v_e, v_o = _bkv_fp8_split(slot, r0, w_k, kind="v")
             pe_dot = p_e.astype(jnp.bfloat16) if cfg.pv_bf16 else p_e
             po_dot = p_o.astype(jnp.bfloat16) if cfg.pv_bf16 else p_o
@@ -1942,20 +2051,37 @@ def _decode_fast_kernel(
 
         k_c = _bkv_fp8_chunk(slot, r0, w_k, kind="k")
         s_c = jnp.matmul(q_bf16, k_c.T, preferred_element_type=jnp.float32)
-        k_col = _col_iota(r0, w_k, q_rows)
-        valid_s = (
-            ((k_col >= rel_first) & (k_col < rel_end))
-            if sliding_window is not None
-            else (k_col < rel_end)
-        )
-        s_c = jnp.where(valid_s, s_c, _MASK_LOGIT)
-        s_pgs = jnp.max(s_c.reshape(q_rows, w_k // 128, 128), axis=1)
-        m_new = jnp.maximum(
-            m_prev, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
-        )
-        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-        p_c = jnp.exp2((s_c - _broadcast_minor_128_any(m_new, w_k)) * exp2_scale)
-        l_add = jnp.sum(p_c.reshape(q_rows, w_k // 128, 128), axis=1)
+        if mask_bounds:
+            k_col = _col_iota(r0, w_k, q_rows)
+            valid_s = (
+                ((k_col >= rel_first) & (k_col < rel_end))
+                if sliding_window is not None
+                else (k_col < rel_end)
+            )
+            s_c = jnp.where(valid_s, s_c, _MASK_LOGIT)
+        if cfg.fold_col:
+            m_blk = _broadcast_minor_128(
+                jnp.max(_fold128_op(s_c, jnp.maximum), axis=1, keepdims=True)
+            )
+            m_new = jnp.maximum(m_prev, m_blk)
+            alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+            p_c, l_add = _exp2_fold_col(s_c, m_new, exp2_scale)
+        elif cfg.fold_128:
+            m_blk = _broadcast_minor_128(
+                jnp.max(_fold128_op(s_c, jnp.maximum), axis=1, keepdims=True)
+            )
+            m_new = jnp.maximum(m_prev, m_blk)
+            alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+            p_c = jnp.exp2((s_c - m_new[:, :1]) * exp2_scale)
+            l_add = _fold128_op(p_c, jnp.add)
+        else:
+            s_pgs = jnp.max(s_c.reshape(q_rows, w_k // 128, 128), axis=1)
+            m_new = jnp.maximum(
+                m_prev, _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True))
+            )
+            alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+            p_c = jnp.exp2((s_c - _broadcast_minor_128_any(m_new, w_k)) * exp2_scale)
+            l_add = jnp.sum(p_c.reshape(q_rows, w_k // 128, 128), axis=1)
         v_c = _bkv_fp8_chunk(slot, r0, w_k, kind="v")
         p_dot = p_c.astype(jnp.bfloat16) if cfg.pv_bf16 else p_c
         pv = jnp.matmul(p_dot, v_c, preferred_element_type=jnp.float32)
@@ -2141,7 +2267,7 @@ def _decode_fast_kernel(
                 o_vmem_ref[q_row] = compute_streamdyn(
                     slot, q_bf16, q_row, rel_first, rel_end, n_pages
                 )
-        elif cfg.dyn2k_unroll and max_ring_pages * page_size >= 8192 and cfg.chunk_sz == 5120:
+        elif (cfg.dyn2k_unroll or cfg.gear_4k) and max_ring_pages * page_size >= 8192 and cfg.chunk_sz == 5120:
             @pl.when((rel_end > 1024) & (rel_end <= 5120))
             def _mid_5k_u():
                 o_vmem_ref[q_row] = compute_streamdyn(
@@ -2152,11 +2278,72 @@ def _decode_fast_kernel(
             def _mid_8k_2ku():
                 st = init_new_token_state(q_bf16, q_row)
                 sanitize_slot_v2(slot, rel_first, rel_end, n_pages, 8192 // page_size)
-                for ci in range(4):
-                    st = _step_2k_blk(slot, q_bf16, rel_first, rel_end, ci * 2048, 2048, st)
+                if cfg.gear_4k:
+                    for ci in range(2):
+                        st = _step_2k_blk(
+                            slot,
+                            q_bf16,
+                            rel_first,
+                            rel_end,
+                            ci * 4096,
+                            4096,
+                            st,
+                            mask_bounds=(ci > 0 or not cfg.no_mask0),
+                        )
+                else:
+                    for ci in range(4):
+                        st = _step_2k_blk(slot, q_bf16, rel_first, rel_end, ci * 2048, 2048, st)
                 o_vmem_ref[q_row] = finalize_out(st[1], st[2])
 
-            @pl.when(rel_end > 8192)
+            if cfg.gear_4k and max_ring_pages * page_size >= 9216:
+                @pl.when((rel_end > 8192) & (rel_end <= 9216))
+                def _mid_9k_g4k():
+                    st = init_new_token_state(q_bf16, q_row)
+                    sanitize_slot_v2(slot, rel_first, rel_end, n_pages, cdiv(9216, page_size))
+                    for ci in range(2):
+                        st = _step_2k_blk(
+                            slot,
+                            q_bf16,
+                            rel_first,
+                            rel_end,
+                            ci * 4096,
+                            4096,
+                            st,
+                            mask_bounds=(not cfg.no_mask0),
+                        )
+                    st = _step_2k_blk(
+                        slot, q_bf16, rel_first, rel_end, 8192, 1024, st, mask_bounds=True
+                    )
+                    o_vmem_ref[q_row] = finalize_out(st[1], st[2])
+
+            if cfg.gear_4k and max_ring_pages * page_size >= 10240:
+                @pl.when((rel_end > 9216) & (rel_end <= 10240))
+                def _mid_10k_g4k():
+                    st = init_new_token_state(q_bf16, q_row)
+                    sanitize_slot_v2(slot, rel_first, rel_end, n_pages, cdiv(10240, page_size))
+                    for ci in range(2):
+                        st = _step_2k_blk(
+                            slot,
+                            q_bf16,
+                            rel_first,
+                            rel_end,
+                            ci * 4096,
+                            4096,
+                            st,
+                            mask_bounds=(not cfg.no_mask0),
+                        )
+                    st = _step_2k_blk(
+                        slot, q_bf16, rel_first, rel_end, 8192, 2048, st, mask_bounds=True
+                    )
+                    o_vmem_ref[q_row] = finalize_out(st[1], st[2])
+
+            gt_thresh = (
+                10240
+                if (cfg.gear_4k and max_ring_pages * page_size >= 10240)
+                else (9216 if (cfg.gear_4k and max_ring_pages * page_size >= 9216) else 8192)
+            )
+
+            @pl.when(rel_end > gt_thresh)
             def _long_gt8k_u():
                 o_vmem_ref[q_row] = compute_streamdyn(
                     slot, q_bf16, q_row, rel_first, rel_end, n_pages
@@ -2428,7 +2615,11 @@ def _decode_fast_kernel(
                     if mask_valid:
                         valid_col = _col_iota(0, max_ring_rows, q_w) < valid
                         scores = jnp.where(valid_col, scores, _MASK_LOGIT)
-                    blk_max = jnp.max(scores, axis=1, keepdims=True)
+                    blk_max = jnp.max(
+                        _fold128_op(scores, jnp.maximum) if cfg.fold_128 else scores,
+                        axis=1,
+                        keepdims=True,
+                    )
 
                 blk_m_128 = _broadcast_minor_128(blk_max)
                 old_m = state_vmem_ref[0, lanes, :]
@@ -2436,7 +2627,7 @@ def _decode_fast_kernel(
                 alpha = jnp.exp2((old_m - m) * eff_sc)
                 eff_sc_w = (
                     _broadcast_minor_128_any(eff_sc, width_s)
-                    if q_exp2_sc is not None
+                    if (q_exp2_sc is not None and not cfg.fold_col)
                     else eff_sc
                 )
                 if use_fp8_pv:
@@ -2451,11 +2642,17 @@ def _decode_fast_kernel(
                     l_scale = jnp.float32(1.0)
                     pv_scale = jnp.float32(v_scale_val)
 
-                ref_m_w = _broadcast_minor_128_any(ref_m_128, width_s)
+                ref_m_w = None if cfg.fold_col else _broadcast_minor_128_any(ref_m_128, width_s)
 
                 def _pv_half(s_x: jax.Array, v_x: jax.Array) -> tuple[jax.Array, jax.Array]:
-                    p_x = jnp.exp2((s_x - ref_m_w) * eff_sc_w)
-                    l_x = jnp.sum(p_x.reshape(q_w, width_s // 128, 128), axis=1)
+                    if cfg.fold_col:
+                        p_x, l_x = _exp2_fold_col(s_x, ref_m_128, eff_sc)
+                    elif cfg.fold_128:
+                        p_x = jnp.exp2((s_x - ref_m_128[:, :1]) * eff_sc)
+                        l_x = _fold128_op(p_x, jnp.add)
+                    else:
+                        p_x = jnp.exp2((s_x - ref_m_w) * eff_sc_w)
+                        l_x = jnp.sum(p_x.reshape(q_w, width_s // 128, 128), axis=1)
                     if use_fp8_pv:
                         p_dot = (p_x * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
                     elif cfg.pv_bf16:
@@ -2890,22 +3087,42 @@ def _decode_fast_kernel(
                     s_blk = jnp.matmul(
                         q_bf16, k_blk.T, preferred_element_type=jnp.float32
                     )
-                    s_pgs = jnp.max(
-                        s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                    )
                     m_prev = state_vmem_ref[0]
-                    m_new = jnp.maximum(
-                        m_prev,
-                        _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
-                    )
-                    alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                    p_blk = jnp.exp2(
-                        (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
-                        * exp2_scale
-                    )
-                    l_add = jnp.sum(
-                        p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                    )
+                    if cfg.fold_col:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk, l_add = _exp2_fold_col(s_blk, m_new, exp2_scale)
+                    elif cfg.fold_128:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2((s_blk - m_new[:, :1]) * exp2_scale)
+                        l_add = _fold128_op(p_blk, jnp.add)
+                    else:
+                        s_pgs = jnp.max(
+                            s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
+                        )
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2(
+                            (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
+                            * exp2_scale
+                        )
+                        l_add = jnp.sum(
+                            p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
+                        )
                     v_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="v")
                     p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
                     pv = jnp.matmul(
@@ -2926,22 +3143,42 @@ def _decode_fast_kernel(
                     )
                     k_col = _col_iota(0, max_ring_rows, q_rows)
                     s_blk = jnp.where(k_col < loc_end, s_blk, _MASK_LOGIT)
-                    s_pgs = jnp.max(
-                        s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                    )
                     m_prev = state_vmem_ref[0]
-                    m_new = jnp.maximum(
-                        m_prev,
-                        _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
-                    )
-                    alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                    p_blk = jnp.exp2(
-                        (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
-                        * exp2_scale
-                    )
-                    l_add = jnp.sum(
-                        p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                    )
+                    if cfg.fold_col:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk, l_add = _exp2_fold_col(s_blk, m_new, exp2_scale)
+                    elif cfg.fold_128:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2((s_blk - m_new[:, :1]) * exp2_scale)
+                        l_add = _fold128_op(p_blk, jnp.add)
+                    else:
+                        s_pgs = jnp.max(
+                            s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
+                        )
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2(
+                            (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
+                            * exp2_scale
+                        )
+                        l_add = jnp.sum(
+                            p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
+                        )
                     v_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="v")
                     p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
                     pv = jnp.matmul(
@@ -3497,6 +3734,12 @@ def run_decode_fast_rpa(
             scope_name += "-tp16"
         if use_tp16_q8:
             scope_name += "-q8"
+        if run_cfg.gear_4k:
+            scope_name += "-g4k"
+        if run_cfg.fold_col:
+            scope_name += "-foldcol"
+        elif run_cfg.fold_128:
+            scope_name += "-fold128"
         if probe:
             scope_name += f"-probe_{probe}"
 
@@ -3722,6 +3965,10 @@ def run_decode_fast_rpa(
             fine_gears=cfg.fine_gears,
             batch_full=cfg.batch_full,
             u4_flat=cfg.u4_flat,
+            gear_4k=cfg.gear_4k,
+            fold_128=cfg.fold_128,
+            fold_col=cfg.fold_col,
+            no_mask0=cfg.no_mask0,
         )
         active_mask = jnp.arange(max_num_seqs) < jnp.clip(
             distribution[0], 0, max_num_seqs

@@ -1979,6 +1979,114 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(a8)))
                 self.assertEqual(float(np.max(np.abs(a8 - a16))), 0.0)
 
+    def test_cand5_g4k_foldcol_gears_and_exports(self):
+        """#2935/#2948: Opt-in g4k + foldcol (incl. 9216/10240, shared64, ring4k, d2 swa) 0x7F parity + export."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        rng = np.random.default_rng(20270)
+        bs = 4
+        # 1. TP=8 nod2 g4k (5K / 8K / 9216 / 10240 / >10240) + ring4k foldcol
+        ps, pps = 512, 24
+        lens = [5120, 8704, 9500, 11000]
+        s_u8 = np.full((bs * pps + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_np = np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+        for s, L in enumerate(lens):
+            old = L - 1
+            lp, rem = old // ps, old % ps
+            if lp > 0:
+                s_u8[pi_np[s, :lp], :, 0, 0, :] = _rand_fp8_u8(rng, (lp, ps, 128))
+                s_u8[pi_np[s, :lp], :, 0, 1, :] = _rand_fp8_u8(rng, (lp, ps, 128))
+            if rem > 0:
+                s_u8[pi_np[s, lp], :rem, 0, 0, :] = _rand_fp8_u8(rng, (rem, 128))
+                s_u8[pi_np[s, lp], :rem, 0, 1, :] = _rand_fp8_u8(rng, (rem, 128))
+        kvc = _u8_to_fp8(s_u8)
+        q = jnp.asarray((rng.standard_normal((bs, 16, 128)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        kn = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 128)))
+        vn = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 128)))
+        gate = jnp.asarray((rng.standard_normal((bs, 1024)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        kvl = jnp.asarray(lens, dtype=jnp.int32)
+        pi = jnp.asarray(pi_np.ravel(), dtype=np.int32)
+        cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+        cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+        dist = jnp.asarray([bs, bs, bs], dtype=jnp.int32)
+
+        o_ref, _ = run_decode_fast_rpa(
+            q, kn, vn, kvc, kvl, pi, cuq, cukv, dist,
+            sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="w8,hoistkv,dyn2ku", fused_out_pack=2, gate=gate, out_norm_eps=1e-6, interpret=True,
+        )
+        for m in ("w8,hoistkv,g4k", "w8,ring4k,c4096,foldcol"):
+            o_g, _ = run_decode_fast_rpa(
+                q, kn, vn, kvc, kvl, pi, cuq, cukv, dist,
+                sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=m, fused_out_pack=2, gate=gate, out_norm_eps=1e-6, interpret=True,
+            )
+            self.assertTrue(np.all(np.isfinite(np.asarray(o_g, dtype=np.float32))))
+            self.assertGreater(_cosine(np.asarray(o_g), np.asarray(o_ref)), 0.99999)
+
+        # 2. shared64 foldcol
+        bs_sh, pps_sh = 16, 4
+        s_sh = np.full((bs_sh * pps_sh + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        s_sh[:, :, 0, 0, :] = _rand_fp8_u8(rng, (bs_sh * pps_sh + 4, ps, 128))
+        s_sh[:, :, 0, 1, :] = _rand_fp8_u8(rng, (bs_sh * pps_sh + 4, ps, 128))
+        q_sh = jnp.asarray((rng.standard_normal((bs_sh, 16, 128)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        k_sh = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 128)))
+        v_sh = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 128)))
+        pi_sh = jnp.asarray(np.broadcast_to(np.arange(pps_sh, dtype=np.int32), (bs_sh, pps_sh)).ravel(), dtype=jnp.int32)
+        o_sh_ref, _ = run_decode_fast_rpa(
+            q_sh, k_sh, v_sh, _u8_to_fp8(s_sh), jnp.full((bs_sh,), 1025, dtype=jnp.int32), pi_sh,
+            jnp.arange(bs_sh + 1, dtype=jnp.int32), jnp.arange(bs_sh + 1, dtype=jnp.int32) * (pps_sh * ps),
+            jnp.asarray([bs_sh, bs_sh, bs_sh], dtype=jnp.int32),
+            sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="w8,hoistkv,shared64,c1024", interpret=True, shared_pages=jnp.asarray([2], dtype=jnp.int32),
+        )
+        o_sh_fc, _ = run_decode_fast_rpa(
+            q_sh, k_sh, v_sh, _u8_to_fp8(s_sh), jnp.full((bs_sh,), 1025, dtype=jnp.int32), pi_sh,
+            jnp.arange(bs_sh + 1, dtype=jnp.int32), jnp.arange(bs_sh + 1, dtype=jnp.int32) * (pps_sh * ps),
+            jnp.asarray([bs_sh, bs_sh, bs_sh], dtype=jnp.int32),
+            sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="w8,hoistkv,shared64,c1024,foldcol", interpret=True, shared_pages=jnp.asarray([2], dtype=jnp.int32),
+        )
+        self.assertGreater(_cosine(np.asarray(o_sh_fc), np.asarray(o_sh_ref)), 0.999999)
+
+        # 3. TPU v7 export check for g4k-foldcol
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import ragged_paged_attention
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            bs_e, pps_e = 64, 32
+            hlo = jax_export.export(
+                jax.jit(
+                    lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: ragged_paged_attention(
+                        q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_,
+                        None, None, sm_scale=128 ** -0.5, sliding_window=None,
+                        k_scale=1.0, v_scale=1.0, decode_query_size=1,
+                        _fused_out_pack=2, _prepared_inputs=True, _skip_mixed=True,
+                        _decode_fast="w8,hoistkv,g4k", _decode_out_norm_eps=1e-6,
+                        _decode_gate_in_values=True, _kv_pack_dense2=False,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, bs_e, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e, 1024), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e * pps_e + 16, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("-g4k-foldcol", hlo)
+
 
 if __name__ == "__main__":
     unittest.main()
