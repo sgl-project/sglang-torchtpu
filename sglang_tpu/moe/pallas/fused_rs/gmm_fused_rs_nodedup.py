@@ -1135,12 +1135,12 @@ def kernel_main_fused_rs(
         M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
     if (extra := tpu_envs.SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS.get()) is not None:
         add = {int(b) for b in extra.split(",") if b}
-        if any(b % _sls_b or b > tile_m for b in add):
+        if any(b % _sls_b for b in add):
             raise ValueError(
-                f"extra row buckets {sorted(add)} must be multiples of {_sls_b} "
-                f"and <= tile_m {tile_m}"
+                f"extra row buckets {sorted(add)} must be multiples of {_sls_b}"
             )
-        M_BUCKETS = sorted(set(M_BUCKETS) | add)
+        # capped at tile_m like the power-of-two buckets
+        M_BUCKETS = sorted(set(M_BUCKETS) | {b for b in add if b < tile_m})
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
@@ -1322,6 +1322,29 @@ def kernel_main_fused_rs(
             def _():
                 pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
 
+            if pair_q8_ref is not None:
+                # All cross-chip runs in 16-row blocks, one block of each run per step so
+                # their reduce -> scale -> store chains overlap. Short runs repeat their
+                # last block and the last block is clamped into the tile: a recomputed
+                # row gets the same bytes.
+                runs = []
+                for k in range(1, num_chips):
+                    d = jax.lax.rem(my_chip + k, num_chips) * 2 + my_core
+                    n_k = (group_start_ref[base + d] + _Q8_ROWS - 1) // _Q8_ROWS
+                    runs.append((row0 + _src_off_fast(d), jnp.maximum(n_k - 1, 0)))
+                max_n = runs[0][1]
+                for _, last in runs[1:]:
+                    max_n = jnp.maximum(max_n, last)
+                n_steps = max_n + 1
+
+                def _q8_step(i, c):
+                    for r_run, last in runs:
+                        r = r_run + jnp.minimum(i, last) * _Q8_ROWS
+                        _psum_rows(jnp.minimum(r, tile_m - _Q8_ROWS), _Q8_ROWS)
+                    return c
+
+                lax.fori_loop(0, n_steps, _q8_step, 0)
+
             # Stream each cross-chip role's pair sum and immediately launch its ICI DMA.
             for k in range(1, num_chips):
                 d_chip = jax.lax.rem(my_chip + k, num_chips)
@@ -1333,16 +1356,6 @@ def kernel_main_fused_rs(
                 ]
                 src_off = _src_off_fast(d)
                 dst0 = block * rows_per_block + rank
-                if pair_q8_ref is not None:
-                    # the whole run in 16-row blocks, the last one clamped into the tile:
-                    # a row recomputed by an overlapping block gets the same bytes
-                    def _q8_block(i, c, r_run=row0 + src_off):
-                        r = jnp.minimum(r_run + i * _Q8_ROWS, tile_m - _Q8_ROWS)
-                        _psum_rows(r, _Q8_ROWS)
-                        return c
-
-                    n_blocks = (run_len + _Q8_ROWS - 1) // _Q8_ROWS
-                    lax.fori_loop(0, n_blocks, _q8_block, 0)
                 off = jnp.int32(0)
                 for b in pair_pieces:
                     has = (run_len & b) != 0

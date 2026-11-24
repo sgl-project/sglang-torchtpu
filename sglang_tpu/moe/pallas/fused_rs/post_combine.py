@@ -86,12 +86,20 @@ def fused_post_combine(
     return out.reshape(chunk_size, h1 * h2)
 
 
-def _pair_combine_kernel(x_ref, gain_ref, w_ref, o_ref, *, eps):
+def _pair_combine_kernel(x_ref, gain_ref, w_ref, *refs, eps, q8: bool = False):
+    if q8:
+        q8_ref, qs_ref, o_ref = refs
+    else:
+        (o_ref,) = refs
     blocks = x_ref.shape[0]
     hidden = x_ref.shape[2] * x_ref.shape[3]
     acc = x_ref[0].astype(jnp.float32)
     for e in range(1, blocks):
         acc = acc + x_ref[e].astype(jnp.float32)
+    if q8:
+        for e in range(q8_ref.shape[0]):
+            scale = qs_ref[e][:, :1]
+            acc = acc + q8_ref[e].astype(jnp.float32) * scale[:, :, None]
     y = acc.astype(x_ref.dtype).astype(jnp.float32) * gain_ref[...][None]
     sum_sq = jnp.sum(jnp.sum(y * y, axis=1), axis=-1, keepdims=True)
     z = (y * jax.lax.rsqrt(sum_sq / hidden + eps)[:, :, None]).astype(x_ref.dtype)
@@ -107,26 +115,45 @@ def pair_post_combine(
     rows: int,
     eps: float,
     rows_per_block: int = 256,
+    recv_q8: jax.Array | None = None,  # [q8_blocks * rows, H1, H2] e4m3 receive blocks
+    recv_q8_scale: jax.Array | None = None,  # [q8_blocks * rows, 128] f32 row scales
 ) -> jax.Array:
     """[rows, H1, H2] bf16: block sum, post-expert RMS norm and top-k weight, per rank row."""
     h1, h2 = recv.shape[1:]
     blocks = recv.shape[0] // rows
-    rb = min(rows_per_block, rows)
+    if (recv_q8 is None) != (recv_q8_scale is None):
+        raise ValueError("recv_q8 and recv_q8_scale come together")
+    q8 = recv_q8 is not None
+    # e4m3 blocks add VMEM per row: halve the row block
+    rb = min(rows_per_block // (2 if q8 else 1), rows)
     x = recv.reshape(blocks, rows, h1, h2)
     gain = (post_norm_weight.astype(jnp.float32) + 1.0).reshape(h1, h2)
     w = jnp.broadcast_to(rank_weight.astype(jnp.float32)[:, None], (rows, 128))
+    in_specs = [
+        pl.BlockSpec((blocks, rb, h1, h2), lambda i: (0, i, 0, 0)),
+        pl.BlockSpec((h1, h2), lambda i: (0, 0)),
+        pl.BlockSpec((rb, 128), lambda i: (i, 0)),
+    ]
+    args = [x, gain, w]
+    if q8:
+        q8_blocks = recv_q8.shape[0] // rows
+        lanes = recv_q8_scale.shape[-1]
+        in_specs += [
+            pl.BlockSpec((q8_blocks, rb, h1, h2), lambda i: (0, i, 0, 0)),
+            pl.BlockSpec((q8_blocks, rb, lanes), lambda i: (0, i, 0)),
+        ]
+        args += [
+            recv_q8.reshape(q8_blocks, rows, h1, h2),
+            recv_q8_scale.reshape(q8_blocks, rows, lanes),
+        ]
     return pl.pallas_call(
-        functools.partial(_pair_combine_kernel, eps=eps),
+        functools.partial(_pair_combine_kernel, eps=eps, q8=q8),
         grid=(rows // rb,),
-        in_specs=[
-            pl.BlockSpec((blocks, rb, h1, h2), lambda i: (0, i, 0, 0)),
-            pl.BlockSpec((h1, h2), lambda i: (0, 0)),
-            pl.BlockSpec((rb, 128), lambda i: (i, 0)),
-        ],
+        in_specs=in_specs,
         out_specs=pl.BlockSpec((rb, h1, h2), lambda i: (i, 0, 0)),
         out_shape=jax.ShapeDtypeStruct((rows, h1, h2), recv.dtype),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-    )(x, gain, w)
+    )(*args)
 
 
 def _pair_combine_scatter_kernel(

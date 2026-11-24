@@ -204,11 +204,17 @@ def _pair_post_combine(
             recv_q8=recv.q8_blocks if q8 else None,
             recv_q8_scale=recv.q8_scales if q8 else None,
         )
-    if q8:
-        raise ValueError("e4m3 pair sums need the fused scatter combine")
-    if post_expert_norm_weight is not None and recv.ndim == 3:
+    if q8 and post_expert_norm_weight is None:
+        raise ValueError("e4m3 pair sums need the post-expert norm combine")
+    if post_expert_norm_weight is not None and recv_bf16.ndim == 3:
         weighted = pair_post_combine(
-            recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
+            recv_bf16,
+            post_expert_norm_weight,
+            weight,
+            rows=rows,
+            eps=1e-8,
+            recv_q8=recv.q8_blocks if q8 else None,
+            recv_q8_scale=recv.q8_scales if q8 else None,
         ).reshape(rows, hidden_size)
     else:
         y = jnp.sum(recv.reshape(-1, rows, hidden_size).astype(jnp.float32), axis=0)
