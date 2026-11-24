@@ -1640,12 +1640,66 @@ def test_tp16_xor1_ag_moe_int8_lowering_and_fused_b1_b2_fp8_parity():
         assert bool(jnp.array_equal(tk_4, tk_s[:128]))
 
 
+def test_d_zs_t128_static_fp8_partial_parity():
+    """Verify opt-in D zero-spill t128 static_fp8 partial split NaN-poisoned parity."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
 
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import kernel_d
 
+    real_pc = pl.pallas_call
 
+    def _nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
 
+    rng = np.random.default_rng(3444)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _nan_interp),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        ob = jnp.array((rng.standard_normal((256 * 8, 32, 128)) * 0.2).astype(np.float32)).astype(
+            jnp.float8_e4m3fn
+        )
+        ip = jnp.array(rng.integers(0, 256 * 8, size=(256, 8), dtype=np.int32))
+        tw = jnp.ones((256, 8), jnp.float32) * 0.125
+        sm = jnp.array(rng.standard_normal((256, 8192)).astype(np.float32))
+        wu = jnp.array((rng.standard_normal((4096, 8192)) * 0.4).astype(np.float32)).astype(
+            jnp.float8_e4m3fn
+        )
+        ws = jnp.ones((8192,), jnp.float32) * 0.05
+        wv = jnp.ones((8192,), jnp.float32) * 0.1
 
-
+        s0_ref, n0_ref = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+            ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+            tok_tile=64, zero_spill=False, emit_static_fp8_attn_in=True, num_rows=128,
+        )
+        ns_ref, n1_ref = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+            ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+            tok_tile=64, zero_spill=False, emit_static_fp8_attn_in=True, row_start=128, stream_out=s0_ref,
+        )
+        with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True):
+            s0_zs, n0_zs = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                emit_static_fp8_attn_in=True, num_rows=128,
+            )
+            ns_zs, n1_zs = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                emit_static_fp8_attn_in=True, row_start=128, stream_out=s0_zs,
+            )
+        np.testing.assert_allclose(np.asarray(ns_zs), np.asarray(ns_ref), atol=1e-6, rtol=1e-6)
+        np.testing.assert_array_equal(
+            np.asarray(jnp.concatenate([n0_zs, n1_zs], axis=0)),
+            np.asarray(jnp.concatenate([n0_ref, n1_ref], axis=0)),
+        )
 
 
 

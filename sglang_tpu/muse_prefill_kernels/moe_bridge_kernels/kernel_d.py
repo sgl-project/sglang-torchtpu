@@ -116,9 +116,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     elif (
         use_d_t128_fast
         and tok_tile == 64
-        and row_start == 0
-        and num_rows is None
-        and stream_out is None
+        and row_start % 128 == 0
+        and (num_rows is None or num_rows % 128 == 0)
         and chunk_size >= 128
         and chunk_size % 128 == 0
     ):
@@ -139,7 +138,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         zero_spill
         or envs.SGLANG_TPU_MUSE_KERNEL_D_ZERO_SPILL.get()
         or tok_tile_eff > 64
-    ) and not (emit_fp8_attn_in or emit_static_fp8_attn_in or use_blk_fp8_unpool)
+    ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
 
     num_rows = chunk_size - row_start if num_rows is None else num_rows
     assert row_start % tok_tile_eff == 0 and num_rows % tok_tile_eff == 0, (
@@ -147,9 +146,6 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         num_rows,
     )
     partial_rows = num_rows != chunk_size or stream_out is not None
-    assert not (partial_rows and use_zero_spill), (
-        "partial Kernel D rows need the non-zero-spill path"
-    )
     tile_off = row_start // tok_tile_eff
     # Token-indexed blocks of grid step i are tile i + tile_off (the default map traces unchanged).
     tok_map = (
@@ -251,7 +247,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             ns_sem_ref,
         ):
             step = pl.program_id(0)
-            base_tok = step * tok_tile_eff
+            base_tok = (step + tile_off) * tok_tile_eff if tile_off else step * tok_tile_eff
+            next_tok = step * tok_tile_eff
             slot = step % 2
             eff_salu_ovlp_zs = (
                 use_d_t128_fast
@@ -267,7 +264,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             c_step_zs = 16 if use_c16_zs else 4
 
             def _start_step_range(s, sl, t0, t1):
-                b_tok = s * tok_tile_eff
+                b_tok = (s + tile_off) * tok_tile_eff if tile_off else s * tok_tile_eff
 
                 def _dma_tok(t, _):
                     tok = b_tok + t
@@ -569,6 +566,11 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 jnp.sum(sq_next_128, axis=1, keepdims=True) * jnp.float32(inv_h)
                 + jnp.float32(rms_eps)
             )
+            inv_rms_next_eff = (
+                inv_rms_next * jnp.float32(32.0)
+                if emit_static_fp8_attn_in
+                else inv_rms_next
+            )
 
             # Phase 4: Double-buffered next_in norm & HBM write
             for s in range(num_slabs):
@@ -577,7 +579,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     pltpu.make_async_copy(
                         src_ref=next_2x_ref.at[s_slot],
                         dst_ref=next_in_hbm_ref.at[
-                            pl.ds(base_tok, tok_tile_eff),
+                            pl.ds(next_tok, tok_tile_eff),
                             pl.ds((s - 2) * slab_w, slab_w),
                         ],
                         sem=next_sem_ref.at[s_slot],
@@ -585,13 +587,14 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for sub in range(slab_w // p34_col_step):
                     cn0, cn1 = sub * p34_col_step, (sub + 1) * p34_col_step
                     new_s = fw_buf_ref[s, :, cn0:cn1]
-                    next_2x_ref[s_slot, :, cn0:cn1] = (
-                        new_s * inv_rms_next * vecs_3d_ref[s, 4:5, cn0:cn1]
-                    ).astype(jnp.bfloat16)
+                    scaled_next = new_s * inv_rms_next_eff * vecs_3d_ref[s, 4:5, cn0:cn1]
+                    if emit_static_fp8_attn_in:
+                        scaled_next = jnp.clip(scaled_next, -448.0, 448.0)
+                    next_2x_ref[s_slot, :, cn0:cn1] = scaled_next.astype(next_in_dtype)
                 pltpu.make_async_copy(
                     src_ref=next_2x_ref.at[s_slot],
                     dst_ref=next_in_hbm_ref.at[
-                        pl.ds(base_tok, tok_tile_eff), pl.ds(s * slab_w, slab_w)
+                        pl.ds(next_tok, tok_tile_eff), pl.ds(s * slab_w, slab_w)
                     ],
                     sem=next_sem_ref.at[s_slot],
                 ).start()
@@ -600,7 +603,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 pltpu.make_async_copy(
                     src_ref=next_2x_ref.at[s_rem % 2],
                     dst_ref=next_in_hbm_ref.at[
-                        pl.ds(base_tok, tok_tile_eff), pl.ds(s_rem * slab_w, slab_w)
+                        pl.ds(next_tok, tok_tile_eff), pl.ds(s_rem * slab_w, slab_w)
                     ],
                     sem=next_sem_ref.at[s_rem % 2],
                 ).wait()
@@ -631,22 +634,40 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         fast_tag = "_c16so" if use_d_t128_fast else ""
         do_tag = f"_do{eff_d_opt}" if eff_d_opt else ""
         mxu_tag = "_mxuc" if eff_mxu_combine else ""
+        sfp8_tag = "_sfp8" if emit_static_fp8_attn_in else ""
+        zs_in_specs = [
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec((tok_tile_eff, LANE), tok_map),
+            pl.BlockSpec((num_slabs, 8, slab_w), lambda i, *_: (0, 0, 0)),
+        ]
+        zs_call_args = [
+            inv_perm_c.reshape(-1),
+            out_buf_3d,
+            wunpool_fp8,
+            stream_shard_mid,
+            w_pad,
+            vecs_3d,
+        ]
+        zs_kernel_fn = _d_4slab_zs_kernel
+        zs_aliases: dict[int, int] = {}
+        if stream_out is not None:
+            zs_aliases = {len(zs_call_args): 0}
+            zs_in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))
+            zs_call_args.append(stream_out)
+            # Operand 6 (after scalar prefetch + 5 base refs) is aliased stream_out HBM buffer.
+            zs_kernel_fn = lambda *r: _d_4slab_zs_kernel(*r[:6], *r[7:])  # noqa: E731
         return pl.pallas_call(
-            _d_4slab_zs_kernel,
+            zs_kernel_fn,
             out_shape=(
                 jax.ShapeDtypeStruct((chunk_size, h_dim), jnp.float32),
-                jax.ShapeDtypeStruct((chunk_size, next_in_cols), next_in_dtype),
+                jax.ShapeDtypeStruct((num_rows, next_in_cols), next_in_dtype),
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
                 grid=(num_steps,),
-                in_specs=[
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                    pl.BlockSpec((tok_tile_eff, LANE), lambda i, *_: (i, 0)),
-                    pl.BlockSpec((num_slabs, 8, slab_w), lambda i, *_: (0, 0, 0)),
-                ],
+                in_specs=zs_in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -672,15 +693,9 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=62 * 1024 * 1024,
             ),
-            name=f"pallas_d_combine_4slab_v3_t{tok_tile_eff}_sn{sub_n_dot}_p{p34_col_step}{km_tag}{ls_tag}{ud_tag}{fp8_tag}{fast_tag}{do_tag}{mxu_tag}",
-        )(
-            inv_perm_c.reshape(-1),
-            out_buf_3d,
-            wunpool_fp8,
-            stream_shard_mid,
-            w_pad,
-            vecs_3d,
-        )
+            input_output_aliases=zs_aliases,
+            name=f"pallas_d_combine_4slab_v3_t{tok_tile_eff}_sn{sub_n_dot}_p{p34_col_step}{km_tag}{ls_tag}{ud_tag}{fp8_tag}{sfp8_tag}{fast_tag}{do_tag}{mxu_tag}",
+        )(*zs_call_args)
 
     def _d_4slab_kernel(
         inv_perm_ref,
