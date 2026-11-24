@@ -374,6 +374,7 @@ def _stationary_q_v2_process(
     start_fetch_bq_stage=None,
     wait_fetch_bq_stage=None,
     start_send_bo_staged=None,
+    interpret: bool = False,
 ):
     """Stationary-Q v2 prefill engine: unpacked-KV VMEM ring, exact 256-slice unrolling,
     precomputed bf16 mask bias tiles, SW-2049 Q-unpack/epilogue fusion, direct 2D A3
@@ -474,6 +475,27 @@ def _stationary_q_v2_process(
 
     @pl.when(seq_idx == start_seq_idx)
     def _init_static_mask_tiles():
+        if "poison_vmem_nan" in prefill_opts:
+            nan_f32 = jnp.float32(jnp.nan)
+            nan_bf16 = jnp.bfloat16(jnp.nan)
+            nan_f8 = lax.bitcast_convert_type(jnp.uint8(0x7F), jnp.float8_e4m3fn)
+            l_ref[...] = jnp.full(l_ref.shape, nan_f32, jnp.float32)
+            acc_ref[...] = jnp.full(acc_ref.shape, nan_f32, jnp.float32)
+            q_t_ref[...] = jnp.full(
+                q_t_ref.shape,
+                nan_f8 if q_t_ref.dtype == jnp.float8_e4m3fn else nan_bf16,
+                q_t_ref.dtype,
+            )
+            k_sub_ref[...] = jnp.full(
+                k_sub_ref.shape,
+                nan_f8 if k_sub_ref.dtype == jnp.float8_e4m3fn else nan_bf16,
+                k_sub_ref.dtype,
+            )
+            vt_sub_ref[...] = jnp.full(
+                vt_sub_ref.shape,
+                nan_f8 if vt_sub_ref.dtype == jnp.float8_e4m3fn else nan_bf16,
+                vt_sub_ref.dtype,
+            )
         if use_mk128:
             q_io_h = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 2)
             k_128 = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 1)
@@ -761,19 +783,35 @@ def _stationary_q_v2_process(
             if sq_kv_heads > 1:
                 vt_sub_ref[1, dst_s] = vt_128[64:, :]
 
+    def _bkv_slice_u32(kv_u32_all, bkv_sem_idx, row_start, n_rows):
+        if interpret:
+            u8 = lax.bitcast_convert_type(
+                bkv_x2_ref[bkv_sem_idx, pl.ds(row_start, n_rows), 0, :, :],
+                jnp.uint8,
+            ).astype(jnp.uint32)
+            return (
+                u8[:, 0, :]
+                | (u8[:, 1, :] << jnp.uint32(8))
+                | (u8[:, 2, :] << jnp.uint32(16))
+                | (u8[:, 3, :] << jnp.uint32(24))
+            )
+        return kv_u32_all[pl.ds(row_start * bkv_stride, n_rows, bkv_stride)]
+
     def _unpack_full_bkv_block(bkv_sem_idx, slot_base_s=0):
         if kv_pack_dense2:
             kv_u32_all = (
-                bkv_x2_ref.bitcast(jnp.uint32)
+                None
+                if interpret
+                else bkv_x2_ref.bitcast(jnp.uint32)
                 .at[bkv_sem_idx]
                 .reshape((bkv_sz // 2) * bkv_stride, 128)
             )
             if use_mk128:
                 if use_unroll_up:
                     for s_loc in range(num_s):
-                        pair_u32 = kv_u32_all[
-                            pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
-                        ]
+                        pair_u32 = _bkv_slice_u32(
+                            kv_u32_all, bkv_sem_idx, s_loc * 128, 128
+                        )
                         _write_unpacked_kv_slice(
                             2 * (slot_base_s + s_loc),
                             pair_u32 & jnp.uint32(0xFFFF),
@@ -786,9 +824,9 @@ def _stationary_q_v2_process(
 
                 @pl.loop(0, num_s, unroll=False)
                 def _up_mk_d2(s_loc):
-                    pair_u32 = kv_u32_all[
-                        pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
-                    ]
+                    pair_u32 = _bkv_slice_u32(
+                        kv_u32_all, bkv_sem_idx, s_loc * 128, 128
+                    )
                     _write_unpacked_kv_slice(
                         2 * (slot_base_s + s_loc),
                         pair_u32 & jnp.uint32(0xFFFF),
@@ -801,9 +839,9 @@ def _stationary_q_v2_process(
                 return
 
             for s_loc in range(num_s):
-                pair_u32 = kv_u32_all[
-                    pl.ds(s_loc * 128 * bkv_stride, 128, bkv_stride)
-                ]
+                pair_u32 = _bkv_slice_u32(
+                    kv_u32_all, bkv_sem_idx, s_loc * 128, 128
+                )
                 kv_u32 = jnp.concatenate(
                     [
                         pair_u32 & jnp.uint32(0xFFFF),
@@ -816,36 +854,40 @@ def _stationary_q_v2_process(
             return
 
         kv_u32_all = (
-            bkv_x2_ref.bitcast(jnp.uint32)
+            None
+            if interpret
+            else bkv_x2_ref.bitcast(jnp.uint32)
             .at[bkv_sem_idx]
             .reshape(bkv_sz * bkv_stride, 128)
         )
         if use_mk128:
             if use_unroll_up:
                 for h_loc in range(2 * num_s):
-                    kv_u32_h = kv_u32_all[
-                        pl.ds(h_loc * 128 * bkv_stride, 128, bkv_stride)
-                    ]
+                    kv_u32_h = _bkv_slice_u32(
+                        kv_u32_all, bkv_sem_idx, h_loc * 128, 128
+                    )
                     _write_unpacked_kv_slice(2 * slot_base_s + h_loc, kv_u32_h)
                 return
 
             @pl.loop(0, 2 * num_s, unroll=False)
             def _up_mk_nod2(h_loc):
-                kv_u32_h = kv_u32_all[
-                    pl.ds(h_loc * 128 * bkv_stride, 128, bkv_stride)
-                ]
+                kv_u32_h = _bkv_slice_u32(
+                    kv_u32_all, bkv_sem_idx, h_loc * 128, 128
+                )
                 _write_unpacked_kv_slice(2 * slot_base_s + h_loc, kv_u32_h)
 
             return
 
         for s_loc in range(num_s):
-            kv_u32 = kv_u32_all[pl.ds(s_loc * 256 * bkv_stride, 256, bkv_stride)]
+            kv_u32 = _bkv_slice_u32(kv_u32_all, bkv_sem_idx, s_loc * 256, 256)
             _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
 
     def _unpack_bkv_block(bkv_sem_idx, bkv_block_idx, slot_base_s, valid_keys):
         if kv_pack_dense2:
             kv_u32_all = (
-                bkv_x2_ref.bitcast(jnp.uint32)
+                None
+                if interpret
+                else bkv_x2_ref.bitcast(jnp.uint32)
                 .at[bkv_sem_idx]
                 .reshape((bkv_sz // 2) * bkv_stride, 128)
             )
@@ -861,9 +903,9 @@ def _stationary_q_v2_process(
                 @pl.loop(0, s_lim, unroll=False)
                 def _up_one_d2(s_loc):
                     pair_start = s_loc * 128
-                    pair_u32 = kv_u32_all[
-                        pl.ds(pair_start * bkv_stride, 128, bkv_stride)
-                    ]
+                    pair_u32 = _bkv_slice_u32(
+                        kv_u32_all, bkv_sem_idx, pair_start, 128
+                    )
                     r_128 = lax.broadcasted_iota(jnp.int32, (128, 128), 0)
                     tok_even = s_loc * 256 + 2 * r_128
                     lo_u32 = jnp.where(
@@ -890,7 +932,9 @@ def _stationary_q_v2_process(
             return
 
         kv_u32_all = (
-            bkv_x2_ref.bitcast(jnp.uint32)
+            None
+            if interpret
+            else bkv_x2_ref.bitcast(jnp.uint32)
             .at[bkv_sem_idx]
             .reshape(bkv_sz * bkv_stride, 128)
         )
@@ -912,9 +956,9 @@ def _stationary_q_v2_process(
                 @pl.loop(0, h_lim, unroll=False)
                 def _up_one_mk(h_loc):
                     bkv_start = h_loc * 128
-                    kv_u32_h = kv_u32_all[
-                        pl.ds(bkv_start * bkv_stride, 128, bkv_stride)
-                    ]
+                    kv_u32_h = _bkv_slice_u32(
+                        kv_u32_all, bkv_sem_idx, bkv_start, 128
+                    )
                     k_pos = bkv_start + lax.broadcasted_iota(
                         jnp.int32, (128, 128), 0
                     )
@@ -929,7 +973,7 @@ def _stationary_q_v2_process(
             @pl.loop(0, s_lim, unroll=False)
             def _up_one(s_loc):
                 bkv_start = s_loc * 256
-                kv_u32 = kv_u32_all[pl.ds(bkv_start * bkv_stride, 256, bkv_stride)]
+                kv_u32 = _bkv_slice_u32(kv_u32_all, bkv_sem_idx, bkv_start, 256)
                 k_pos = bkv_start + lax.broadcasted_iota(jnp.int32, (256, 128), 0)
                 kv_u32 = jnp.where(k_pos < valid_keys, kv_u32, jnp.uint32(0))
                 _write_unpacked_kv_slice(slot_base_s + s_loc, kv_u32)
@@ -1020,15 +1064,26 @@ def _stationary_q_v2_process(
                 q_t_ref[2 * s, :, t_sl] = pair_q_t[:64, :]
                 q_t_ref[2 * s + 1, :, t_sl] = pair_q_t[64:, :]
 
-        def _unpack_one_tq_qt_from_ref(q_u32_ref, src_tq_start, dst_tq_start, valid_tq, lane_is_lo):
+        def _bq_pair_u32(q_u32_ref, sem_q, src_tq_start, s_pair):
+            if interpret:
+                u16 = lax.bitcast_convert_type(
+                    bq_x2_ref[
+                        sem_q, 0, pl.ds(src_tq_start, tq_sz), s_pair, :, :
+                    ],
+                    jnp.uint16,
+                ).astype(jnp.uint32)
+                return u16[:, 0, :] | (u16[:, 1, :] << jnp.uint32(16))
+            return q_u32_ref[pl.ds(src_tq_start * sq_pairs + s_pair, tq_sz, sq_pairs)]
+
+        def _unpack_one_tq_qt_from_ref(
+            q_u32_ref, sem_q, src_tq_start, dst_tq_start, valid_tq, lane_is_lo
+        ):
             t_sl = pl.ds(dst_tq_start, tq_sz)
 
             @pl.when(valid_tq == tq_sz)
             def _up_tq_full():
                 for s in range(sq_pairs):
-                    u_s = q_u32_ref[
-                        pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                    ]
+                    u_s = _bq_pair_u32(q_u32_ref, sem_q, src_tq_start, s)
                     pair_q_t = _decode_q_pair(u_s, (s // 4) * 4, lane_is_lo)
                     _store_qt_pair(pair_q_t, s, t_sl)
 
@@ -1037,16 +1092,16 @@ def _stationary_q_v2_process(
                 q_row_io = lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 0)
                 row_ok = q_row_io < valid_tq
                 for s in range(sq_pairs):
-                    u_s = q_u32_ref[
-                        pl.ds(src_tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                    ]
+                    u_s = _bq_pair_u32(q_u32_ref, sem_q, src_tq_start, s)
                     u_s = jnp.where(row_ok, u_s, jnp.uint32(0))
                     pair_q_t = _decode_q_pair(u_s, (s // 4) * 4, lane_is_lo)
                     _store_qt_pair(pair_q_t, s, t_sl)
 
         def unpack_bq_to_qt_v2(sem_q):
             q_u32_ref = (
-                bq_x2_ref.bitcast(jnp.uint32)
+                None
+                if interpret
+                else bq_x2_ref.bitcast(jnp.uint32)
                 .at[sem_q, 0]
                 .reshape(bq_sz * sq_pairs, 128)
             )
@@ -1056,14 +1111,14 @@ def _stationary_q_v2_process(
                 valid_tq = jnp.clip(valid_bq_rows - tq_start, 0, tq_sz)
                 if tq_idx == 0:
                     _unpack_one_tq_qt_from_ref(
-                        q_u32_ref, tq_start, tq_start, valid_tq, is_lo
+                        q_u32_ref, sem_q, tq_start, tq_start, valid_tq, is_lo
                     )
                 else:
 
                     @pl.when(tq_start < valid_bq_rows)
                     def _up_tail_tq(tq_start=tq_start, valid_tq=valid_tq):
                         _unpack_one_tq_qt_from_ref(
-                            q_u32_ref, tq_start, tq_start, valid_tq, is_lo
+                            q_u32_ref, sem_q, tq_start, tq_start, valid_tq, is_lo
                         )
 
         def _wait_and_unpack_cur_bq(sem_q):
@@ -1098,12 +1153,14 @@ def _stationary_q_v2_process(
                     wait_fetch_bq_stage(q_row_base + st_q_start, st_sz, st_slot)
                     if probe != "nocompute":
                         q_u32_stage = (
-                            bq_x2_ref.bitcast(jnp.uint32)
+                            None
+                            if interpret
+                            else bq_x2_ref.bitcast(jnp.uint32)
                             .at[st_slot, 0]
                             .reshape(tq_sz * sq_pairs, 128)
                         )
                         _unpack_one_tq_qt_from_ref(
-                            q_u32_stage, 0, st_q_start, st_sz, is_lo
+                            q_u32_stage, st_slot, 0, st_q_start, st_sz, is_lo
                         )
 
         def _expand_mk128_specs(bias_specs):
@@ -1765,7 +1822,7 @@ def _stationary_q_v2_process(
         )
         out_u32_ref = (
             None
-            if (use_a3_out or use_staged_qo)
+            if (use_a3_out or use_staged_qo or interpret)
             else bo_x2_ref.bitcast(jnp.uint32)
             .at[bo_sem_idx, 0]
             .reshape(bq_sz * sq_pairs, 128)
@@ -1837,6 +1894,21 @@ def _stationary_q_v2_process(
             )
             return packed_u32 & (mask_lo_u32 if s < 4 else mask_hi_u32)
 
+        def _write_bo_pair_u32(target_u32_ref, sem_o, dst_tq_start, s_pair, val_u32):
+            if interpret:
+                lo16 = (val_u32 & jnp.uint32(0xFFFF)).astype(jnp.uint16)
+                hi16 = (val_u32 >> jnp.uint32(16)).astype(jnp.uint16)
+                pair_bf16 = lax.bitcast_convert_type(
+                    jnp.stack([lo16, hi16], axis=1), jnp.bfloat16
+                )
+                bo_x2_ref[
+                    sem_o, 0, pl.ds(dst_tq_start, tq_sz), s_pair, :, :
+                ] = pair_bf16
+                return
+            target_u32_ref[pl.ds(dst_tq_start * sq_pairs + s_pair, tq_sz, sq_pairs)] = (
+                val_u32
+            )
+
         def _epilogue_one_tq(tq_start, t_sl):
             for s in range(sq_pairs):
                 h0 = 2 * s
@@ -1845,9 +1917,13 @@ def _stationary_q_v2_process(
                 l1 = l_ref[h1, :, t_sl]
                 a0 = acc_ref[h0, :, t_sl]
                 a1 = acc_ref[h1, :, t_sl]
-                out_u32_ref[
-                    pl.ds(tq_start * sq_pairs + s, tq_sz, sq_pairs)
-                ] = _pack_pair_out(a0, a1, l0, l1, (s // 4) * 4)
+                _write_bo_pair_u32(
+                    out_u32_ref,
+                    bo_sem_idx,
+                    tq_start,
+                    s,
+                    _pack_pair_out(a0, a1, l0, l1, (s // 4) * 4),
+                )
 
         def _emit_unfused_epilogue_and_send():
             if use_staged_qo:
@@ -1925,21 +2001,27 @@ def _stationary_q_v2_process(
                         start_send_bo_a3(aligned_g0_st, full_rows_st, st_slot)
                     else:
                         out_u32_st = (
-                            bo_x2_ref.bitcast(jnp.uint32)
+                            None
+                            if interpret
+                            else bo_x2_ref.bitcast(jnp.uint32)
                             .at[st_slot, 0]
                             .reshape(tq_sz * sq_pairs, 128)
                         )
                         for s in range(sq_pairs):
                             h0 = 2 * s
                             h1 = 2 * s + 1
-                            out_u32_st[pl.ds(s, tq_sz, sq_pairs)] = (
+                            _write_bo_pair_u32(
+                                out_u32_st,
+                                st_slot,
+                                0,
+                                s,
                                 _pack_pair_out(
                                     acc_ref[h0, :, t_sl],
                                     acc_ref[h1, :, t_sl],
                                     l_ref[h0, :, t_sl],
                                     l_ref[h1, :, t_sl],
                                     (s // 4) * 4,
-                                )
+                                ),
                             )
 
                         g0_st = cu_q_lens_ref[seq_idx] + bq_idx * actual_bq_sz + st_q_start
@@ -2109,13 +2191,19 @@ def _stationary_q_v2_process(
                     c_sl_sw,
                 ] = _pair_col_f32(a0, a1, l0, l1).astype(jnp.bfloat16)
             else:
-                out_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)] = _pack_pair_out(
-                    a0, a1, l0, l1, kv_h_tag * 4
+                _write_bo_pair_u32(
+                    out_u32_ref,
+                    bo_sem_idx,
+                    0,
+                    s_pair,
+                    _pack_pair_out(a0, a1, l0, l1, kv_h_tag * 4),
                 )
 
         def _run_sw9_fused_qe(s_lo):
             q_u32_ref = (
-                bq_x2_ref.bitcast(jnp.uint32)
+                None
+                if interpret
+                else bq_x2_ref.bitcast(jnp.uint32)
                 .at[bq_sem_idx, 0]
                 .reshape(256 * sq_pairs, 128)
             )
@@ -2127,7 +2215,7 @@ def _stationary_q_v2_process(
                 for kv_h in range(sq_kv_heads):
                     for gp in range(4):
                         s_pair = kv_h * 4 + gp
-                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                        u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
                         pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                         if use_fp8_qk_dyn:
                             q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
@@ -2163,7 +2251,7 @@ def _stationary_q_v2_process(
                         qt_parts = []
                         for p_off in range(pairs_per_grp):
                             sp = kv_h * 4 + grp_i * pairs_per_grp + p_off
-                            u_sp = q_u32_ref[pl.ds(sp, tq_sz, sq_pairs)]
+                            u_sp = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, sp)
                             pq_t = _decode_q_pair(u_sp, kv_h * 4, is_lo_ep)
                             qt_parts.append(pq_t[:64, :])
                             qt_parts.append(pq_t[64:, :])
@@ -2233,7 +2321,7 @@ def _stationary_q_v2_process(
                 for kv_h in range(sq_kv_heads):
                     for gp in range(4):
                         s_pair = kv_h * 4 + gp
-                        u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                        u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
                         pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                         if use_fp8_qk_dyn:
                             q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
@@ -2339,7 +2427,7 @@ def _stationary_q_v2_process(
             for kv_h in range(sq_kv_heads):
                 for gp in range(4):
                     s_pair = kv_h * 4 + gp
-                    u_s = q_u32_ref[pl.ds(s_pair, tq_sz, sq_pairs)]
+                    u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
                     pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                     if use_fp8_qk_dyn:
                         q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
@@ -3191,6 +3279,7 @@ def _ragged_paged_attention_kernel_loop(
     prefill_opts: frozenset = frozenset(),
     debug_mode: bool = False,
     kv_pack_dense2: bool = False,
+    interpret: bool = False,
 ):
     use_a3_out = bo_carry_ref is not None and "a3_out_layout" in prefill_opts
     if use_a3_out:
@@ -3486,8 +3575,12 @@ def _ragged_paged_attention_kernel_loop(
         vmem_ref = bkv_x2_ref.at[bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
 
         cache_hbm_shape = kv_cache_hbm_ref.shape
-        cache_hbm_ref = kv_cache_hbm_ref.reshape(
-            cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
+        cache_hbm_ref = (
+            None
+            if interpret
+            else kv_cache_hbm_ref.reshape(
+                cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
+            )
         )
         kv_len = kv_lens_ref[seq_idx]
         base = kv_base(seq_idx)
@@ -3524,13 +3617,20 @@ def _ragged_paged_attention_kernel_loop(
                             page_idx = jnp.minimum(
                                 page_indices_offset + i, num_page_indices - 1
                             )
-                            _async_copy(
-                                cache_hbm_ref.at[
+                            src_d2 = (
+                                kv_cache_hbm_ref.at[
+                                    page_indices_ref[page_idx], pl.ds(0, pair_sz)
+                                ]
+                                if interpret
+                                else cache_hbm_ref.at[
                                     pl.ds(
                                         page_indices_ref[page_idx] * phys_page_size,
                                         pair_sz,
                                     )
-                                ],
+                                ]
+                            )
+                            _async_copy(
+                                src_d2,
                                 vmem_ref.at[pl.ds(i * phys_page_size, pair_sz)],
                                 sem,
                                 wait=False,
@@ -3574,51 +3674,102 @@ def _ragged_paged_attention_kernel_loop(
                         wait=True,
                     )
                     if not debug_mode:
-                        bnew_u32 = (
-                            bnew_kv_ref.bitcast(jnp.uint32)
-                            .at[bkv_sem_idx]
-                            .reshape(bkv_sz, head_dim)
-                        )
-                        dst_u32 = (
-                            bkv_x2_ref.bitcast(jnp.uint32)
-                            .at[bkv_sem_idx, :, :1]
-                            .reshape(bkv_sz // 2, head_dim)
-                        )
                         total_valid = bkv_sz_frm_cache + bkv_sz_frm_new
-                        pair_chunk = 128 if (bkv_sz // 2) >= 128 else 64
-                        n_pair_chunks = (bkv_sz // 2) // pair_chunk
-                        r_iota = lax.broadcasted_iota(
-                            jnp.int32, (pair_chunk, head_dim), 0
-                        )
-                        for c_idx in range(n_pair_chunks):
-                            tok_base = c_idx * (2 * pair_chunk)
-                            pair_base = c_idx * pair_chunk
-                            t_even = tok_base + 2 * r_iota
-                            t_odd = t_even + 1
-                            old_p = dst_u32[pl.ds(pair_base, pair_chunk)]
-                            new_lo = bnew_u32[
-                                pl.ds(tok_base, pair_chunk, 2)
-                            ] & jnp.uint32(0xFFFF)
-                            new_hi = bnew_u32[
-                                pl.ds(tok_base + 1, pair_chunk, 2)
-                            ] & jnp.uint32(0xFFFF)
-                            lo = jnp.where(
-                                t_even < bkv_sz_frm_cache,
-                                old_p & jnp.uint32(0xFFFF),
-                                jnp.where(
-                                    t_even < total_valid, new_lo, jnp.uint32(0)
-                                ),
+                        if interpret:
+                            b_u8 = lax.bitcast_convert_type(
+                                bnew_kv_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
                             )
-                            hi = jnp.where(
-                                t_odd < bkv_sz_frm_cache,
-                                (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
-                                jnp.where(
-                                    t_odd < total_valid, new_hi, jnp.uint32(0)
-                                ),
+                            old_u8 = lax.bitcast_convert_type(
+                                bkv_x2_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
                             )
-                            dst_u32[pl.ds(pair_base, pair_chunk)] = lo | (
-                                hi << jnp.uint32(16)
+                            r_all = lax.broadcasted_iota(
+                                jnp.int32, (bkv_sz // 2, head_dim), 0
                             )
+                            te = 2 * r_all
+                            to = te + 1
+                            n_lo = b_u8[0::2, 0, :].astype(jnp.uint32) | (
+                                b_u8[0::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            n_hi = b_u8[1::2, 0, :].astype(jnp.uint32) | (
+                                b_u8[1::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
+                                old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            o_hi = old_u8[:, 2, :].astype(jnp.uint32) | (
+                                old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
+                            )
+                            lo_m = jnp.where(
+                                te < bkv_sz_frm_cache,
+                                o_lo,
+                                jnp.where(te < total_valid, n_lo, jnp.uint32(0)),
+                            )
+                            hi_m = jnp.where(
+                                to < bkv_sz_frm_cache,
+                                o_hi,
+                                jnp.where(to < total_valid, n_hi, jnp.uint32(0)),
+                            )
+                            out_u8 = jnp.stack(
+                                [
+                                    (lo_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                    ((lo_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                        jnp.uint8
+                                    ),
+                                    (hi_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                    ((hi_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                        jnp.uint8
+                                    ),
+                                ],
+                                axis=1,
+                            )
+                            bkv_x2_ref[bkv_sem_idx, :, 0, :, :] = (
+                                lax.bitcast_convert_type(out_u8, bkv_x2_ref.dtype)
+                            )
+                        else:
+                            bnew_u32 = (
+                                bnew_kv_ref.bitcast(jnp.uint32)
+                                .at[bkv_sem_idx]
+                                .reshape(bkv_sz, head_dim)
+                            )
+                            dst_u32 = (
+                                bkv_x2_ref.bitcast(jnp.uint32)
+                                .at[bkv_sem_idx, :, :1]
+                                .reshape(bkv_sz // 2, head_dim)
+                            )
+                            pair_chunk = 128 if (bkv_sz // 2) >= 128 else 64
+                            n_pair_chunks = (bkv_sz // 2) // pair_chunk
+                            r_iota = lax.broadcasted_iota(
+                                jnp.int32, (pair_chunk, head_dim), 0
+                            )
+                            for c_idx in range(n_pair_chunks):
+                                tok_base = c_idx * (2 * pair_chunk)
+                                pair_base = c_idx * pair_chunk
+                                t_even = tok_base + 2 * r_iota
+                                t_odd = t_even + 1
+                                old_p = dst_u32[pl.ds(pair_base, pair_chunk)]
+                                new_lo = bnew_u32[
+                                    pl.ds(tok_base, pair_chunk, 2)
+                                ] & jnp.uint32(0xFFFF)
+                                new_hi = bnew_u32[
+                                    pl.ds(tok_base + 1, pair_chunk, 2)
+                                ] & jnp.uint32(0xFFFF)
+                                lo = jnp.where(
+                                    t_even < bkv_sz_frm_cache,
+                                    old_p & jnp.uint32(0xFFFF),
+                                    jnp.where(
+                                        t_even < total_valid, new_lo, jnp.uint32(0)
+                                    ),
+                                )
+                                hi = jnp.where(
+                                    t_odd < bkv_sz_frm_cache,
+                                    (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
+                                    jnp.where(
+                                        t_odd < total_valid, new_hi, jnp.uint32(0)
+                                    ),
+                                )
+                                dst_u32[pl.ds(pair_base, pair_chunk)] = lo | (
+                                    hi << jnp.uint32(16)
+                                )
 
             return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
@@ -3635,10 +3786,17 @@ def _ragged_paged_attention_kernel_loop(
                         page_idx = jnp.minimum(
                             page_indices_offset + i, num_page_indices - 1
                         )
-                        _async_copy(
-                            cache_hbm_ref.at[
+                        src_c = (
+                            kv_cache_hbm_ref.at[
+                                page_indices_ref[page_idx], pl.ds(0, sz)
+                            ]
+                            if interpret
+                            else cache_hbm_ref.at[
                                 pl.ds(page_indices_ref[page_idx] * page_size, sz)
-                            ],
+                            ]
+                        )
+                        _async_copy(
+                            src_c,
                             vmem_ref.at[pl.ds(i * page_size, sz)],
                             sem,
                             wait=False,
@@ -3650,10 +3808,17 @@ def _ragged_paged_attention_kernel_loop(
                     page_idx = jnp.minimum(
                         page_indices_offset + i, num_page_indices - 1
                     )
-                    _async_copy(
-                        cache_hbm_ref.at[
+                    src_c = (
+                        kv_cache_hbm_ref.at[
+                            page_indices_ref[page_idx], pl.ds(0, sz)
+                        ]
+                        if interpret
+                        else cache_hbm_ref.at[
                             pl.ds(page_indices_ref[page_idx] * page_size, sz)
-                        ],
+                        ]
+                    )
+                    _async_copy(
+                        src_c,
                         vmem_ref.at[pl.ds(i * page_size, sz)],
                         sem,
                         wait=False,
@@ -3697,8 +3862,12 @@ def _ragged_paged_attention_kernel_loop(
         page_indices_offset = start_kv_page_idx + kv_p_start
 
         cache_hbm_shape = updated_kv_cache_hbm_ref.shape
-        cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
-            cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
+        cache_hbm_ref = (
+            None
+            if interpret
+            else updated_kv_cache_hbm_ref.reshape(
+                cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
+            )
         )
 
         if kv_pack_dense2:
@@ -3708,15 +3877,23 @@ def _ragged_paged_attention_kernel_loop(
                 sz = jnp.minimum(page_size - ign, rem_sz)
                 pair_lo = ign // 2
                 n_pairs = cdiv(ign + sz, 2) - pair_lo
-                _async_copy(
-                    vmem_ref.at[pl.ds((p_ignore + i) * phys_page_size + pair_lo, n_pairs)],
-                    cache_hbm_ref.at[
+                dst_d2 = (
+                    updated_kv_cache_hbm_ref.at[
+                        page_indices_ref[page_indices_offset + i],
+                        pl.ds(pair_lo, n_pairs),
+                    ]
+                    if interpret
+                    else cache_hbm_ref.at[
                         pl.ds(
                             page_indices_ref[page_indices_offset + i] * phys_page_size
                             + pair_lo,
                             n_pairs,
                         )
-                    ],
+                    ]
+                )
+                _async_copy(
+                    vmem_ref.at[pl.ds((p_ignore + i) * phys_page_size + pair_lo, n_pairs)],
+                    dst_d2,
                     sem,
                     wait,
                 )
@@ -3732,27 +3909,48 @@ def _ragged_paged_attention_kernel_loop(
                 )
             else:
                 total_pairs = cdiv(offset + update_sz, 2) - (offset // 2)
-                dst = cache_hbm_ref.at[pl.ds(0, total_pairs)]
-                _async_copy(
-                    src=dst,
-                    dst=dst,
-                    sem=sem,
-                    wait=True,
-                )
+                if interpret:
+                    def wait_d2_i(i, states):
+                        rem_sz, ign = states
+                        sz = jnp.minimum(page_size - ign, rem_sz)
+                        pair_lo = ign // 2
+                        n_pairs = cdiv(ign + sz, 2) - pair_lo
+                        d_i = updated_kv_cache_hbm_ref.at[
+                            page_indices_ref[page_indices_offset + i],
+                            pl.ds(pair_lo, n_pairs),
+                        ]
+                        _async_copy(src=d_i, dst=d_i, sem=sem, wait=True)
+                        return rem_sz - sz, 0
+                    lax.fori_loop(0, kv_p_end - kv_p_start, wait_d2_i, (update_sz, ignore), unroll=False)
+                else:
+                    dst = cache_hbm_ref.at[pl.ds(0, total_pairs)]
+                    _async_copy(
+                        src=dst,
+                        dst=dst,
+                        sem=sem,
+                        wait=True,
+                    )
             return
 
         def loop_body(i, states):
             update_sz, ignore = states
             sz = jnp.minimum(page_size - ignore, update_sz)
-
-            _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                cache_hbm_ref.at[
+            dst_n = (
+                updated_kv_cache_hbm_ref.at[
+                    page_indices_ref[page_indices_offset + i],
+                    pl.ds(ignore, sz),
+                ]
+                if interpret
+                else cache_hbm_ref.at[
                     pl.ds(
                         page_indices_ref[page_indices_offset + i] * page_size + ignore,
                         sz,
                     )
-                ],
+                ]
+            )
+            _async_copy(
+                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                dst_n,
                 sem,
                 wait,
             )
@@ -3767,13 +3965,25 @@ def _ragged_paged_attention_kernel_loop(
                 unroll=False,
             )
         else:
-            dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
-            _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
-            )
+            if interpret:
+                def wait_n_i(i, states):
+                    rem_sz, ign = states
+                    sz = jnp.minimum(page_size - ign, rem_sz)
+                    d_i = updated_kv_cache_hbm_ref.at[
+                        page_indices_ref[page_indices_offset + i],
+                        pl.ds(ign, sz),
+                    ]
+                    _async_copy(src=d_i, dst=d_i, sem=sem, wait=True)
+                    return rem_sz - sz, 0
+                lax.fori_loop(0, kv_p_end - kv_p_start, wait_n_i, (update_sz, ignore), unroll=False)
+            else:
+                dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
+                _async_copy(
+                    src=dst,
+                    dst=dst,
+                    sem=sem,
+                    wait=True,
+                )
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -4213,6 +4423,7 @@ def _ragged_paged_attention_kernel_loop(
                 start_fetch_bq_stage=start_fetch_bq_stage,
                 wait_fetch_bq_stage=wait_fetch_bq_stage,
                 start_send_bo_staged=start_send_bo_staged,
+                interpret=interpret,
             )
             return
 
@@ -6275,6 +6486,7 @@ def get_vmem_limit():
         "_decode_out_norm_eps",
         "_decode_gate_in_values",
         "_kv_pack_dense2",
+        "_interpret",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -6352,6 +6564,8 @@ def ragged_paged_attention(
     _decode_gate_in_values: bool = False,
     # Private: dense 2-tokens-per-u32 KV cache packing (phys page rows = page_size // 2).
     _kv_pack_dense2: bool = False,
+    # Private: Pallas interpret configuration (e.g. pltpu.InterpretParams(uninitialized_memory="nan")).
+    _interpret: object = False,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -6578,7 +6792,7 @@ def ragged_paged_attention(
     use_custom_mask = custom_mask is not None
     if use_custom_mask and use_causal_mask:
         raise ValueError("custom_mask requires causal=0.")
-    tpu_version = get_tpu_version()
+    tpu_version = 0 if _interpret else get_tpu_version()
 
     def run_rpa_kernel(
         q,
@@ -6717,6 +6931,7 @@ def ragged_paged_attention(
                 "la2",
                 "unroll_up",
                 "sw_short_v2",
+                "poison_vmem_nan",
                 "tp16_sq",
                 "w9",
                 "sw_short_fuse",
@@ -7011,6 +7226,7 @@ def ragged_paged_attention(
                 prefill_opts=prefill_opts,
                 debug_mode=debug_mode,
                 kv_pack_dense2=_kv_pack_dense2,
+                interpret=bool(_interpret),
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -7038,6 +7254,7 @@ def ragged_paged_attention(
                 ]
             ),
             input_output_aliases=out_aliases,
+            interpret=_interpret,
             name=scope_name,
         )
 

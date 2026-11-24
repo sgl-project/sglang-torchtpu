@@ -750,6 +750,148 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
         self.assertIn("h_lim = 2 * cdiv(valid_keys, 256)", src_rpa)
         self.assertNotIn("h_lim = cdiv(valid_keys, 128)", src_rpa)
 
+    def test_pallas_interpret_uninitialized_nan_scratch(self):
+        """Execute real `ragged_paged_attention` under `pltpu.InterpretParams(uninitialized_memory='nan')`
+        with `0x7F`-poisoned KV cache across `nod2`/`d2`, `TP=8`/`TP=16`, `Full`/`SWA`, and odd-half `kv_len` (#2770/#2773).
+        """
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import ragged_paged_attention
+
+        rng = np.random.default_rng(20261124)
+        interp = pltpu.InterpretParams(uninitialized_memory="nan")
+        sm_scale = 0.125
+
+        for qh_pairs, use_d2 in ((8, False), (8, True), (4, False)):
+            phys_pg = 256 if use_d2 else 512
+            n_q_heads = 2 * qh_pairs
+            n_kv_heads = 2 if qh_pairs == 8 else 1
+            extra_tp = {"tp16_sq"} if qh_pairs == 4 else set()
+            sw_mk = {"mk128", "la2", "unroll_up"} if qh_pairs == 8 else set()
+
+            for seq_lens in ((6,), (300,), (6, 506)):
+                tot = sum(seq_lens)
+                t_bkt = 256 if tot <= 256 else 768
+                q_heads_f32 = (rng.standard_normal((tot, n_q_heads, 64)) * 0.6).astype(np.float32)
+                q_pad_f32 = np.zeros((t_bkt, n_q_heads, 64), dtype=np.float32)
+                q_pad_f32[:tot] = q_heads_f32
+                q_5d = _pack_q_tp8_5d(q_pad_f32) if qh_pairs == 8 else _pack_q_tp16_5d(q_pad_f32)
+
+                kv_u8 = np.full((t_bkt, 1, 4, 128), 0x7F, dtype=np.uint8)
+                k_cols = 128 if qh_pairs == 8 else 64
+                kv_u8[:tot, 0, :2, :k_cols] = _rand_fp8_u8(rng, (tot, 2, k_cols), scale=0.4)
+                if k_cols == 64:
+                    kv_u8[:tot, 0, :2, 64:] = 0
+                kv_u8[:tot, 0, 2:, :] = 0
+                kv_in = _u8_to_fp8(kv_u8)
+
+                kv_tok_f32 = np.asarray(_u8_to_fp8(kv_u8[:tot, 0, :2, :k_cols]).astype(jnp.float32))
+                k_all_f32 = kv_tok_f32[:, 0, :].reshape(tot, n_kv_heads, 64)
+                v_all_f32 = kv_tok_f32[:, 1, :].reshape(tot, n_kv_heads, 64)
+
+                n_s = len(seq_lens)
+                kl = np.zeros((8,), dtype=np.int32)
+                cq = np.zeros((9,), dtype=np.int32)
+                pps = 3
+                pi = np.zeros((8 * pps,), dtype=np.int32)
+                cur_q = 0
+                cur_pg = 1
+                for si, sl in enumerate(seq_lens):
+                    kl[si] = sl
+                    cur_q += sl
+                    cq[si + 1] = cur_q
+                    npg = (sl + 511) // 512
+                    pi[si * pps : si * pps + npg] = np.arange(cur_pg, cur_pg + npg, dtype=np.int32)
+                    cur_pg += npg
+                cq[n_s + 1 :] = cur_q
+                ckv = np.arange(9, dtype=np.int32) * (pps * 512)
+                dist = np.array([0, 0, n_s], dtype=np.int32)
+
+                for mode_tag, sw, mb, opts in (
+                    (
+                        "full_w94",
+                        None,
+                        (256, 1024, 256, 512),
+                        {
+                            "stationary_q_m0_ring_fuse",
+                            "skip_empty_cdma",
+                            "bkv_full_unroll",
+                            "mixed_s3",
+                            "prefix_fast",
+                            "fp8_qk",
+                            "mk128",
+                            "la2",
+                            "sub8_l",
+                            "bf16_pop",
+                            "unroll_up",
+                        }
+                        | extra_tp,
+                    ),
+                    (
+                        "swa_w94",
+                        2048,
+                        (256, 2048, 256, 512),
+                        {
+                            "stationary_q_m0_ring_fuse",
+                            "skip_empty_cdma",
+                            "mixed_s3",
+                            "sw2048_fuse",
+                            "sw_short_v2",
+                            "fp8_qk",
+                            "mrb3",
+                            "sub8_l",
+                            "bf16_pop",
+                        }
+                        | sw_mk
+                        | extra_tp,
+                    ),
+                ):
+                    with self.subTest(tp=16 // (8 // qh_pairs), d2=use_d2, seqs=seq_lens, mode=mode_tag):
+                        cache_poison = _u8_to_fp8(np.full((16, phys_pg, 1, 4, 128), 0x7F, dtype=np.uint8))
+                        out_2d, _ = ragged_paged_attention(
+                            jnp.array(q_5d),
+                            jnp.array(kv_in),
+                            None,
+                            cache_poison,
+                            jnp.asarray(kl),
+                            jnp.asarray(pi),
+                            jnp.asarray(cq),
+                            jnp.asarray(ckv),
+                            jnp.asarray(dist),
+                            None,
+                            None,
+                            sm_scale=sm_scale,
+                            sliding_window=sw,
+                            k_scale=1.0,
+                            v_scale=1.0,
+                            m_block_sizes=mb,
+                            _prefill_opts=frozenset(opts),
+                            _fused_out_pack=2,
+                            _prepared_inputs=True,
+                            _skip_decode=True,
+                            _a3_out_layout=True,
+                            _kv_pack_dense2=use_d2,
+                            _interpret=interp,
+                        )
+                        got_all = np.asarray(out_2d.astype(jnp.float32))
+                        self.assertEqual(got_all.shape, (t_bkt, 128 * qh_pairs))
+                        self.assertFalse(np.isnan(got_all).any(), f"NaN found in {mode_tag} {seq_lens} d2={use_d2}")
+                        self.assertFalse(np.isinf(got_all).any(), f"Inf found in {mode_tag} {seq_lens} d2={use_d2}")
+
+                        q_off = 0
+                        for sl in seq_lens:
+                            ref = _ref_attention_gqa(
+                                q_heads_f32[q_off : q_off + sl],
+                                k_all_f32[q_off : q_off + sl],
+                                v_all_f32[q_off : q_off + sl],
+                                q_first=0,
+                                kv_len=sl,
+                                sm_scale=sm_scale,
+                                sliding_window=sw,
+                            )
+                            got_seq = got_all[q_off : q_off + sl, : 64 * n_q_heads]
+                            cos = float(np.sum(got_seq * ref) / (np.linalg.norm(got_seq) * np.linalg.norm(ref)))
+                            self.assertGreater(cos, 0.999)
+                            q_off += sl
+
     def test_tpu7x_mosaic_exports_w9_mk128_tp8_and_tp16(self):
         try:
             from jax._src import tpu_info as _tpu_info  # noqa: F401
@@ -761,15 +903,15 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
 
         swa_opts = frozenset({
             "stationary_q_m0_ring_fuse", "skip_empty_cdma", "mixed_s3",
-            "sw2048_fuse", "sw_short_fuse", "fp8_qk", "mk128", "mrb3",
+            "sw2048_fuse", "sw_short_v2", "fp8_qk", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up", "mrb3",
         })
         full_opts = frozenset({
             "stationary_q_m0_ring_fuse", "skip_empty_cdma", "bkv_full_unroll",
-            "mixed_s3", "prefix_fast", "fp8_qk", "mk128",
+            "mixed_s3", "prefix_fast", "fp8_qk", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up",
         })
         lc_opts = frozenset({
             "stationary_q_m0_ring_fuse", "skip_empty_cdma", "bkv_full_unroll",
-            "prefix_fast", "staged_qo", "fp8_qk", "mk128",
+            "prefix_fast", "staged_qo", "fp8_qk", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up",
         })
 
         cases = (
