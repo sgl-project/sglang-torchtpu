@@ -707,6 +707,12 @@ class TpuEnvs:
     # the fused EP preparation. k32z needs SGLANG_TPU_DSV41_FUSED_EP=1 (checked
     # at startup); layers that keep gmm_v2 (hash-routed, NextN) still get k512.
     SGLANG_TPU_DSV41_EXPERT_FORMAT = EnvStr("k512")
+    # DeepSeek-V4.1 fused EP token dispatch: "all_gather" (default), "push"
+    # (fused_moe_v2's push dispatch, fused_ep.tuned_push_options) or "auto",
+    # which pushes a compiled token bucket of at most fused_ep.PUSH_MAX_ROWS
+    # rows per EP rank and all-gathers a larger one. Needs
+    # SGLANG_TPU_DSV41_FUSED_EP=1 (checked at startup).
+    SGLANG_TPU_DSV41_FUSED_EP_DISPATCH = EnvStr("all_gather")
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
