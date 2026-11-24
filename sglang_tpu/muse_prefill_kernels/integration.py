@@ -854,7 +854,9 @@ def _a3_body(
             )
         w4_wo_qbs = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0)
         a3_kdeep = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0)
-        if (a3_kdeep >= 1 or w4_wo_qbs > 0) and vtok is None:
+        if (a3_kdeep >= 1 and vtok is None) or (
+            w4_wo_qbs > 0 and jnp.dtype(wo.dtype) == jnp.float4_e2m1fn
+        ):
             from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
                 a3_v16_kdeep_sp,
             )
@@ -878,6 +880,7 @@ def _a3_body(
                 head_norm_eps=head_norm_eps,
                 rpa_packed_out=rpa_packed_out,
                 prologue_tm=1024 if opt_wo else prologue_tm,
+                valid_tokens_1d=vtok,
                 w4_qbs=eff_w4_wo,
             )
         return kernel_a3.a3_v16_option3d_zero_copy9_persrc_sem_async_a2a_wo_3d_sp(
@@ -1002,6 +1005,8 @@ def _w8_carb_cache_tag() -> str:
 
 
 def _ccs_wo_uses_kdeep_nvfp4() -> bool:
+    if int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0) > 0:
+        return True
     ccs_pro_env = getattr(
         tpu_envs, "SGLANG_TPU_MUSE_KERNEL_CCS_CHUNK_A3_PROLOGUE", None
     )
@@ -1731,19 +1736,23 @@ def _ops(
         a3_bn2k_ccs = _env_bool("SGLANG_TPU_MUSE_KERNEL_A3_BN2048")
 
         def a3_wo_only_body(q_3d, wo, wo_scale, *opt_valid):
-            vtok = opt_valid[0] if (a3_skip and opt_valid) else None
-            if (a3_kdeep_ccs_wo1 == 1 or w4_wo_ccs_mode > 0) and vtok is None:
-                import jax.numpy as jnp
+            import jax.numpy as jnp
 
+            vtok = opt_valid[0] if (a3_skip and opt_valid) else None
+            is_nvfp4_wo = (
+                w4_wo_ccs_mode > 0 and jnp.dtype(wo.dtype) == jnp.float4_e2m1fn
+            )
+            if (a3_kdeep_ccs_wo1 == 1 and vtok is None) or is_nvfp4_wo:
+                if is_nvfp4_wo and vtok is not None:
+                    raise ValueError(
+                        "SGLANG_TPU_MUSE_KERNEL_W4_WO under CCS requires "
+                        "SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_ATTN_TOKENS=0."
+                    )
                 from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
                     pallas_a3_wo_kdeep_static_fp8,
                 )
 
-                eff_w4 = (
-                    w4_wo_ccs_mode
-                    if (w4_wo_ccs_mode > 0 and jnp.dtype(wo.dtype) == jnp.float4_e2m1fn)
-                    else 0
-                )
+                eff_w4 = w4_wo_ccs_mode if is_nvfp4_wo else 0
                 eff_sc = (
                     wo_scale.squeeze(0)
                     if (eff_w4 > 0 and wo_scale.ndim == 4)
@@ -4613,9 +4622,9 @@ def _gather_sp_entry_embed_col(
     tp_rank: int,
     h_col: int,
 ) -> torch.Tensor:
-    """Gather `[src_rows, h_col]` slices across TP ranks with 128-row alignment when unaligned."""
+    """Gather `[src_rows, h_col]` slices across TP ranks with 128-row alignment."""
     src_rows = int(src_w.shape[0])
-    pad_rows = ((src_rows + 127) // 128) * 128 if src_rows % 8 != 0 else src_rows
+    pad_rows = ((src_rows + 127) // 128) * 128
     src_w_pad = (
         torch.nn.functional.pad(src_w, (0, 0, 0, pad_rows - src_rows))
         if pad_rows > src_rows

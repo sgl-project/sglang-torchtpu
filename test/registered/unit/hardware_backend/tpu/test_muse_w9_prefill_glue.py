@@ -1439,13 +1439,13 @@ def test_muse_nan_trap_optin_stage_and_pad_isolation():
 
 
 def test_sp_entry_embed_col_pad_gather_unpad_12628_tp16():
-    """Verify _gather_sp_entry_embed_col pads unaligned 12628-row TP=16 shards, leaves TP=8 25256 untouched, and rejects NaNs/garbage."""
+    """Verify _gather_sp_entry_embed_col pads unaligned TP=16 (12628->12672) and TP=8 (25256->25344) shards to 128 rows and rejects NaNs/garbage."""
     import torch
 
     from sglang_tpu.muse_prefill_kernels import integration
 
     rng = np.random.default_rng(3360)
-    for tp_size, src_rows, exp_gather_rows in ((16, 12628, 12672), (8, 25256, 25256)):
+    for tp_size, src_rows, exp_gather_rows in ((16, 12628, 12672), (8, 25256, 25344)):
         h_col = 32
         full_wide = torch.tensor(
             rng.standard_normal((tp_size, src_rows, tp_size * h_col)).astype(np.float32),
@@ -1508,6 +1508,137 @@ def test_sp_entry_embed_col_pad_gather_unpad_12628_tp16():
         integration._gather_sp_entry_embed_col(
             _mock_peer_garbage, w_ok, tp_size=tp_size, tp_rank=tp_rank, h_col=h_col
         )
+
+
+def test_w4_wo_ccs_kdeep_gate_and_d_radical_static_fp8_forwarding():
+    """Verify W4_WO=256 enables NVFP4 Wo under CCS+prologue and pipeline forwards eff_emit_static_fp8 to pallas_d_radical_4slab."""
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    with (
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO, "get", return_value=256),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM, "get", return_value=True
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_CHUNK_A3_PROLOGUE, "get", return_value=True
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO, "get", return_value=0
+        ),
+    ):
+        assert integration._ccs_wo_uses_kdeep_nvfp4() is True
+
+    with (
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO, "get", return_value=0),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM, "get", return_value=True
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_CHUNK_A3_PROLOGUE, "get", return_value=True
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO, "get", return_value=0
+        ),
+    ):
+        assert integration._ccs_wo_uses_kdeep_nvfp4() is False
+
+    src_pipe = (
+        pathlib.Path(__file__).resolve().parents[5]
+        / "sglang_tpu/muse_prefill_kernels/moe_bridge_kernels/pipeline.py"
+    ).read_text()
+    assert "emit_static_fp8_attn_in=eff_emit_static_fp8" in src_pipe
+    src_int = (
+        pathlib.Path(__file__).resolve().parents[5]
+        / "sglang_tpu/muse_prefill_kernels/integration.py"
+    ).read_text()
+    assert "is_nvfp4_wo" in src_int
+    assert "SGLANG_TPU_MUSE_KERNEL_W4_WO under CCS requires" in src_int
+
+
+def test_tp16_xor1_ag_moe_int8_lowering_and_fused_b1_b2_fp8_parity():
+    """Verify TP=16 XOR1_AG_MOE=3 int8 lowering (cols=4096/4224) and FUSED_B1_B2=4 CPU parity."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import pipeline
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b1 import (
+        pallas_postattn_res_prenorm_router_topk,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b2 import (
+        dequant_half_gmm_layout,
+        pallas_fused_b1_b2_wpool_quant,
+        pallas_wpool_prenorm_int8_quant_nstream,
+    )
+
+    topo16 = topologies.get_topology_desc(topology_name="tpu7x=2x2x2")
+    mesh16 = Mesh(topo16.devices, ("model",))
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE, "get", return_value=3),
+    ):
+        for tl, cols in ((128, 4096), (1024, 4224)):
+            x = jax.ShapeDtypeStruct(
+                (16 * tl, cols), jnp.int8, sharding=NamedSharding(mesh16, P("model", None))
+            )
+            hlo_txt = (
+                jax.jit(
+                    jax.shard_map(
+                        lambda a: pipeline._moe_b2_all_gather(a, axis_name="model"),
+                        mesh=mesh16,
+                        in_specs=P("model", None),
+                        out_specs=P(None),
+                        check_vma=False,
+                    )
+                )
+                .trace(x)
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+            assert "xor1_xyztorus_ag_tp16" in hlo_txt
+
+    rng = np.random.default_rng(3395)
+    with _interpret_on_cpu():
+        att = jnp.array((rng.standard_normal((256, 8192)) * 0.3).astype(np.float32)).astype(
+            jnp.bfloat16
+        )
+        st = jnp.array((rng.standard_normal((256, 8192)) * 0.5).astype(np.float32))
+        af = jnp.ones((8192,), jnp.float32) * 0.9
+        bf = jnp.ones((8192,), jnp.float32) * 0.5
+        pf = jnp.ones((8192,), jnp.float32) * 0.1
+        wr = jnp.array((rng.standard_normal((8192, 256)) * 0.05).astype(np.float32))
+        eb = jnp.zeros((256,), jnp.float32)
+        wp = jnp.array((rng.standard_normal((8192, 4096)) * 0.5).astype(np.float32)).astype(
+            jnp.float8_e4m3fn
+        )
+        wpsc = jnp.ones((4096,), jnp.float32) * 0.05
+        pe = jnp.ones((4096,), jnp.float32) * 0.1
+        r, _, tk_s, _ = pallas_postattn_res_prenorm_router_topk(
+            att, st, af, bf, pf, wr, eb
+        )
+        i0_s, sc0_s = pallas_wpool_prenorm_int8_quant_nstream(
+            r, wp, wpsc, pe, pack_bf16_sc=False, half_idx=0
+        )
+        x_sep = i0_s.astype(jnp.float32) * sc0_s[:, None].astype(jnp.float32)
+        i0_4, _, tk_4, _ = pallas_fused_b1_b2_wpool_quant(
+            att, st, af, bf, pf, wr, eb, wp, wpsc, pe,
+            fp8_wpool=True, half_idx=0, full_stream_mid=True,
+        )
+        x_f4 = dequant_half_gmm_layout(i0_4[None], None)[0, 0].reshape(128, 4096).astype(
+            jnp.float32
+        )
+        cos = float(
+            jnp.sum(x_f4.reshape(-1) * x_sep.reshape(-1))
+            / (jnp.linalg.norm(x_f4) * jnp.linalg.norm(x_sep) + 1e-30)
+        )
+        assert cos >= 0.999
+        assert bool(jnp.array_equal(tk_4, tk_s[:128]))
+
 
 
 
