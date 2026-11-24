@@ -337,13 +337,103 @@ def test_all_gather_recipe_applies_at_2048_only(v2):
         assert host.combine_fuse_scales(k32z=True, t_local=rows) == on
         assert host.sc_side_core(k32z=True, t_local=rows) == (2 if on else 0)
         assert host.gather_unroll_mode(k32z=True, t_local=rows) == (8 if on else 0)
-        assert host.early_ship_select(k32z=True, t_local=rows, ep=8) == on
+        assert (
+            host.early_ship_select(
+                k32z=True, t_local=rows, ep=8, shard_xy=_shard_xy_of(range(8))
+            )
+            == on
+        )
     # K512 builds keep the plain program everywhere.
     assert not host.combine_fuse_scales(k32z=False, t_local=2048)
     assert host.sc_side_core(k32z=False, t_local=2048) == 0
     assert host.gather_unroll_mode(k32z=False, t_local=2048) == 0
     # The selector needs the EP8 chip grid of the plan model.
-    assert not host.early_ship_select(k32z=True, t_local=2048, ep=4)
+    assert not host.early_ship_select(k32z=True, t_local=2048, ep=4, shard_xy=None)
+    assert host.early_ship_shard_xy(_mesh_of(range(4))) is None
+
+
+# Physical device d sits on chip d // 2 of the 2 x 2 grid, this (x, y) each.
+_CHIP_XY = ((0, 0), (1, 0), (0, 1), (1, 1))
+_SERVING_ORDER = (0, 1, 4, 5, 6, 7, 2, 3)  # torch rank -> physical device id
+
+
+def _mesh_of(device_ids):
+    devices = np.empty(len(device_ids), dtype=object)
+    for i, d in enumerate(device_ids):
+        x, y = _CHIP_XY[d // 2]
+        devices[i] = SimpleNamespace(id=d, coords=(x, y, 0), core_on_chip=d % 2)
+    return SimpleNamespace(devices=devices)
+
+
+def _shard_xy_of(device_ids):
+    return tuple(d.coords[:2] for d in _mesh_of(device_ids).devices)
+
+
+# Directed links of the 2 x 2 grid in the table's order (chips (0,0), (1,0),
+# (0,1), (1,1); by source chip, then destination chip).
+_LINKS = (
+    ((0, 0), (1, 0)),
+    ((0, 0), (0, 1)),
+    ((1, 0), (0, 0)),
+    ((1, 0), (1, 1)),
+    ((0, 1), (0, 0)),
+    ((0, 1), (1, 1)),
+    ((1, 1), (1, 0)),
+    ((1, 1), (0, 1)),
+)
+# Links each chip-to-chip push crosses, routed x first, worked out by hand.
+_ROUTES = {
+    ((0, 0), (1, 0)): (0,),
+    ((0, 0), (0, 1)): (1,),
+    ((0, 0), (1, 1)): (0, 3),
+    ((1, 0), (0, 0)): (2,),
+    ((1, 0), (1, 1)): (3,),
+    ((1, 0), (0, 1)): (2, 1),
+    ((0, 1), (0, 0)): (4,),
+    ((0, 1), (1, 1)): (5,),
+    ((0, 1), (1, 0)): (5, 6),
+    ((1, 1), (1, 0)): (6,),
+    ((1, 1), (0, 1)): (7,),
+    ((1, 1), (0, 0)): (7, 4),
+}
+
+
+def _expected_incidence(shard_xy):
+    inc = [[[0] * 8 for _ in range(8)] for _ in _LINKS]
+    for s in range(8):
+        for d in range(8):
+            for link in _ROUTES.get((shard_xy[s], shard_xy[d]), ()):
+                inc[link][s][d] = 1
+    return inc
+
+
+@pytest.mark.parametrize("order", [tuple(range(8)), _SERVING_ORDER])
+def test_early_ship_link_model_follows_the_mesh_placement(v2, order):
+    host = v2.host
+    shard_xy = host.early_ship_shard_xy(_mesh_of(order))
+    assert shard_xy == tuple(_CHIP_XY[d // 2] for d in order)
+    assert host.early_ship_link_incidence(shard_xy) == _expected_incidence(shard_xy)
+
+
+def test_early_ship_identity_order_keeps_the_fitted_table(v2):
+    # Shard d on chip d // 2 is the placement the model was fitted on.
+    host = v2.host
+    inc = host.early_ship_link_incidence(host.early_ship_shard_xy(_mesh_of(range(8))))
+    assert inc[0][0][2] == 1 and inc[0][0][6] == 1  # shard 0 -> chips (1,0), (1,1)
+    # The serving order differs: shards 2, 3 are on chip (0,1), shards 6, 7 on (1,0).
+    serving = host.early_ship_link_incidence(
+        host.early_ship_shard_xy(_mesh_of(_SERVING_ORDER))
+    )
+    assert serving != inc
+
+
+def test_early_ship_needs_a_two_by_two_grid_of_two_shard_chips(v2):
+    host = v2.host
+    bad = _mesh_of(range(8))
+    bad.devices[3] = SimpleNamespace(id=3, coords=(0, 0, 0), core_on_chip=1)
+    assert host.early_ship_shard_xy(bad) is None  # chip (0,0) holds three shards
+    no_coords = SimpleNamespace(devices=np.array([object()] * 8, dtype=object))
+    assert host.early_ship_shard_xy(no_coords) is None
 
 
 def test_decode_buckets_loop_their_tall_bodies(v2):

@@ -816,7 +816,10 @@ def fused_ep_moe_v2(
     sc_side = _host.sc_side_core(k32z=is_k32z, t_local=t_local)
     # Early shipping of every own expert's runs, switched per call inside the
     # kernel (early_ship_flag) from the plan (host.early_ship_pick).
-    es_select = _host.early_ship_select(k32z=is_k32z, t_local=t_local, ep=ep)
+    es_shard_xy = _host.early_ship_shard_xy(mesh)
+    es_select = _host.early_ship_select(
+        k32z=is_k32z, t_local=t_local, ep=ep, shard_xy=es_shard_xy
+    )
     # The token-row gather loop unrolled (kernel-only, same DMAs and bits).
     gather_unroll = _host.gather_unroll_mode(k32z=is_k32z, t_local=t_local)
     kfn = build_fused_ep_moe_kernel(
@@ -1234,6 +1237,7 @@ def fused_ep_moe_v2(
                     ep=ep,
                     g_local=g_local,
                     tile_m=capacity,
+                    shard_xy=es_shard_xy,
                 ),
                 ep,
             )

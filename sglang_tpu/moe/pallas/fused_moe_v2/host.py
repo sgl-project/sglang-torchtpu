@@ -1587,18 +1587,45 @@ K32Z_ES_A_US = 0.0402
 K32Z_ES_B_US = 0.05553
 K32Z_ES_W_US = 5.44
 K32Z_ES_THETA_US = 171.5
-# The model's chips in shard order: shard d on chip d // 2 at these (x, y)
-# coordinates, routes x first. Only an EP8 build (four two-core chips) selects.
-K32Z_ES_CHIP_XY = ((0, 0), (1, 0), (0, 1), (1, 1))
+# The link model follows the mesh's device placement: shard d sits on the chip
+# of mesh device d, and a push routes x first over that chip's (x, y) grid
+# position. Serving's mesh is not in chip order (shard 2 is on physical device
+# 4), so the positions are read from the devices, not assumed from d // 2.
+# Only an EP8 build on a 2 x 2 grid of four two-core chips selects.
+K32Z_ES_GRID = 2
 
 
-def early_ship_select(*, k32z, t_local, ep):
+def early_ship_shard_xy(mesh):
+    """Each shard's chip (x, y) on the 2 x 2 chip grid, from the mesh's devices
+    (shard d = mesh index d), or None when the mesh is not eight shards on four
+    chips, two per chip, in a 2 x 2 grid."""
+    devices = list(mesh.devices.reshape(-1))
+    if len(devices) != 2 * K32Z_ES_GRID**2:
+        return None
+    try:
+        xy = [tuple(int(c) for c in d.coords)[:2] for d in devices]
+    except (AttributeError, TypeError):
+        return None
+    if any(len(c) != 2 for c in xy):
+        return None
+    x0 = min(c[0] for c in xy)
+    y0 = min(c[1] for c in xy)
+    xy = tuple((x - x0, y - y0) for x, y in xy)
+    grid = {(x, y) for x in range(K32Z_ES_GRID) for y in range(K32Z_ES_GRID)}
+    if set(xy) != grid or any(xy.count(c) != 2 for c in grid):
+        return None
+    return xy
+
+
+def early_ship_select(*, k32z, t_local, ep, shard_xy):
     """Whether an all-gather build picks early shipping per call: K32Z at 2048
-    rows per rank on an EP8 mesh (four two-core chips)."""
+    rows per rank on an EP8 mesh of four two-core chips (shard_xy is not None,
+    from early_ship_shard_xy)."""
     return (
         bool(k32z)
         and t_local in ALL_GATHER_RECIPE_TOKENS
-        and ep == 2 * len(K32Z_ES_CHIP_XY)
+        and shard_xy is not None
+        and ep == len(shard_xy)
     )
 
 
@@ -1614,11 +1641,14 @@ def gather_unroll_mode(*, k32z, t_local):
     return K32Z_GATHER_UNROLL if k32z and t_local in ALL_GATHER_RECIPE_TOKENS else 0
 
 
-def early_ship_link_incidence(ep):
+def early_ship_link_incidence(shard_xy):
     """[links][src][dst] 0 / 1: whether the push src -> dst crosses each
-    directed ICI link of K32Z_ES_CHIP_XY (x first; one chip's two shards and
-    an own-rank hop cross none)."""
-    xy = K32Z_ES_CHIP_XY
+    directed ICI link of the 2 x 2 chip grid (x first; one chip's two shards
+    and an own-rank hop cross none). shard_xy[d] is shard d's chip (x, y).
+    Chips are numbered (0,0), (1,0), (0,1), (1,1) and links listed by chip
+    pair, so the identity placement gives the table the model was fitted on."""
+    ep = len(shard_xy)
+    xy = tuple((x, y) for y in range(K32Z_ES_GRID) for x in range(K32Z_ES_GRID))
     chip_of = {c: i for i, c in enumerate(xy)}
     links = [
         (a, b)
@@ -1629,7 +1659,7 @@ def early_ship_link_incidence(ep):
     inc = [[[0] * ep for _ in range(ep)] for _ in links]
     for s in range(ep):
         for d in range(ep):
-            cur, dst = list(xy[s // 2]), xy[d // 2]
+            cur, dst = list(shard_xy[s]), tuple(shard_xy[d])
             for axis in (0, 1):
                 while cur[axis] != dst[axis]:
                     nxt = list(cur)
@@ -1639,7 +1669,9 @@ def early_ship_link_incidence(ep):
     return inc
 
 
-def early_ship_tail_us(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
+def early_ship_tail_us(
+    run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy
+):
     """The selector's X in us (f32 scalar) from the replicated plan.
 
     run_rows [E, ep] true rows per (expert, dest shard); expert_rows_aligned
@@ -1670,7 +1702,7 @@ def early_ship_tail_us(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
     # visit's at the shard's compute end.
     rel = (start + dur + jnp.sum(jnp.where(nxt, first[:, None, :], f32(0)), axis=2))
     comp_end = jnp.max(jnp.sum(dur, axis=1))
-    inc = jnp.asarray(early_ship_link_incidence(ep), jnp.int32)  # [l, s, d]
+    inc = jnp.asarray(early_ship_link_incidence(shard_xy), jnp.int32)  # [l, s, d]
     rr = run_rows.reshape(ep, g_local, ep).astype(jnp.int32)  # [s, g, d]
     w = jnp.sum(inc[:, :, None, :] * rr[None], axis=3).reshape(inc.shape[0], -1)
     rel = rel.reshape(-1)
@@ -1682,11 +1714,18 @@ def early_ship_tail_us(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
     return jnp.max(fin) - comp_end
 
 
-def early_ship_pick(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
+def early_ship_pick(
+    run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy
+):
     """Mode 2's per-call choice: early shipping iff X > K32Z_ES_THETA_US."""
     return (
         early_ship_tail_us(
-            run_rows, expert_rows_aligned, ep=ep, g_local=g_local, tile_m=tile_m
+            run_rows,
+            expert_rows_aligned,
+            ep=ep,
+            g_local=g_local,
+            tile_m=tile_m,
+            shard_xy=shard_xy,
         )
         > K32Z_ES_THETA_US
     )
