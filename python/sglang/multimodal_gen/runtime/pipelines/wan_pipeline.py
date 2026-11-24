@@ -24,6 +24,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+def request_flow_shift(batch, server_args) -> tuple[str, float | None]:
+    """``set_timesteps``' shift: the request's ``flow_shift``, else (None) the
+    scheduler's own, the server's ``--flow-shift``."""
+    return "shift", batch.flow_shift
+
+
 class WanPipeline(LoRAPipeline, ComposedPipelineBase):
     """
     Wan video diffusion pipeline with LoRA support.
@@ -49,7 +55,9 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
         self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage()
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=[request_flow_shift]
+        )
         self.add_progressive_denoising_stage(WanProgressiveDenoisingStage)
         self.add_standard_decoding_stage()
 
