@@ -149,7 +149,7 @@ class DecoderTail(msgspec.Struct, frozen=True):
     """Fixed TPU decoder layout, with valid rows followed by masked padding."""
 
     token_indices: torch.Tensor
-    scatter_indices: torch.Tensor
+    output_indices: torch.Tensor
     positions: torch.Tensor
     num_real_rows: torch.Tensor
     extend_seq_lens_cpu: tuple[int, ...]
@@ -157,6 +157,12 @@ class DecoderTail(msgspec.Struct, frozen=True):
 
     def rows(self, value: torch.Tensor) -> torch.Tensor:
         return value.index_select(0, self.token_indices)
+
+    def restore_rows(self, value: torch.Tensor) -> torch.Tensor:
+        # Padded positions all gather the final zero row. This avoids many
+        # padded rows scattering to the same destination.
+        zero = value.new_zeros((1, *value.shape[1:]))
+        return torch.cat((value, zero), dim=0).index_select(0, self.output_indices)
 
 
 # A dataclass like DSV4TPUForwardMetadata: layers set fields on it inside the
@@ -240,7 +246,7 @@ def _register_metadata_pytree() -> None:
         from jax import tree_util
     except ModuleNotFoundError:  # CPU unit tests without JAX
         return
-    tail_tensors = ("token_indices", "scatter_indices", "positions", "num_real_rows")
+    tail_tensors = ("token_indices", "output_indices", "positions", "num_real_rows")
     tree_util.register_pytree_with_keys(
         DecoderTail,
         lambda t: (
@@ -861,11 +867,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
         )
         padded = rows - count
         indices = torch.tensor(plan.row_indices, dtype=torch.int32)
+        output_indices = torch.full((encoder_bucket,), rows, dtype=torch.int32)
+        output_indices[indices.long()] = torch.arange(count, dtype=torch.int32)
         metadata.late_layer_tail = DecoderTail(
             F.pad(indices, (0, padded)).to(self.device, non_blocking=True),
-            F.pad(indices.to(torch.int64), (0, padded), value=encoder_bucket).to(
-                self.device, non_blocking=True
-            ),
+            output_indices.to(self.device),
             tail.positions,
             torch.tensor(count, dtype=torch.int32).to(self.device, non_blocking=True),
             plan.lengths,

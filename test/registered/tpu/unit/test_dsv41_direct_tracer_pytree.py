@@ -236,6 +236,22 @@ class TestDecoderReplayMetadata(CustomTestCase):
 
 
 class TestDecoderReplayForward(CustomTestCase):
+    def test_restore_rows_ignores_padding_on_idle_and_live_ranks(self):
+        values = torch.tensor([[7.0], [float("nan")], [float("nan")]])
+        for count, output_indices, expected in (
+            (0, [3, 3, 3, 3], [[0.0], [0.0], [0.0], [0.0]]),
+            (1, [3, 0, 3, 3], [[0.0], [7.0], [0.0], [0.0]]),
+        ):
+            tail = DecoderTail(
+                token_indices=torch.tensor([1, 0, 0], dtype=torch.int32),
+                output_indices=torch.tensor(output_indices, dtype=torch.int32),
+                positions=torch.tensor([1, 0, 0], dtype=torch.int32),
+                num_real_rows=torch.tensor(count, dtype=torch.int32),
+                extend_seq_lens_cpu=(count,),
+                skip_decoder=False,
+            )
+            torch.testing.assert_close(tail.restore_rows(values), torch.tensor(expected))
+
     def test_decoder_replay_rejects_unshifted_mhc(self):
         from sglang.srt import runtime_context
 
@@ -349,7 +365,7 @@ class TestDecoderReplayForward(CustomTestCase):
                 with self.subTest(skip=skip):
                     tail = DecoderTail(
                         torch.tensor([2, 0]),
-                        torch.tensor([2, 4]),
+                        torch.tensor([2, 2, 0, 2], dtype=torch.int32),
                         torch.tensor([2, 0]),
                         torch.tensor(0 if skip else 1),
                         (0 if skip else 1,),

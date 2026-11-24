@@ -122,7 +122,6 @@ def _forward_prefill(
     from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.models import deepseek_v4_mhc as mhc
-    from sglang.srt.models.deepseek_v4 import _scatter_tail_rows
     from sglang.srt.runtime_context import get_forward, get_parallel
 
     assert model.pp_group.world_size == 1 and not get_forward().sp_active
@@ -214,11 +213,9 @@ def _forward_prefill(
     pre_head = state.residual.flatten(1)
     hidden = model.norm(mhc_combine(pre_head, state.pre, model.hc_mult, pre_head.dtype))
     output = (
-        _scatter_tail_rows(tail=tail, rows=hidden, num_tokens=num_tokens, zero=True),
-        _scatter_tail_rows(tail=tail, rows=pre_head, num_tokens=num_tokens, zero=True),
+        tail.restore_rows(hidden),
+        tail.restore_rows(pre_head),
     )
     if aux is not None:
-        return output, _scatter_tail_rows(
-            tail=tail, rows=aux.finalize(), num_tokens=num_tokens, zero=True
-        )
+        return output, tail.restore_rows(aux.finalize())
     return output
