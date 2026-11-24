@@ -2049,7 +2049,65 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         )
         self.assertGreater(_cosine(np.asarray(o_sh_fc), np.asarray(o_sh_ref)), 0.999999)
 
-        # 3. TPU v7 export check for g4k-foldcol
+        # 3. #3016 §1: Verify default record configs keep gear_4k=fold_128=fold_col=no_mask0=False & 0-ULP
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import parse_decode_fast_config
+
+        for m, sw_c, pps_c, d2_c in (
+            ("w8,hoistkv,dyn2ku", None, 24, False),
+            ("w8,hoistkv,shared64,c1024", None, 4, False),
+            ("w8,ring4k,c4096", None, 24, False),
+            ("w8", 2048, 5, True),
+        ):
+            c_def = parse_decode_fast_config(
+                m, sliding_window=sw_c, pages_per_seq=pps_c, page_size=ps, kv_pack_dense2=d2_c
+            )
+            self.assertFalse(c_def.gear_4k)
+            self.assertFalse(c_def.fold_128)
+            self.assertFalse(c_def.fold_col)
+            self.assertFalse(c_def.no_mask0)
+
+        s_d2 = np.full((bs * 5 + 4, ps // 2, 1, 4, 128), 0x7F, dtype=np.uint8)
+        s_d2[: bs * 5, : 2500 // 2 - (2500 // ps) * (ps // 2) or (ps // 2), 0, :, :] = 0
+        s_d2[:, :, 0, :, :] = _rand_fp8_u8(rng, (bs * 5 + 4, ps // 2, 4, 128))
+        kvl_d2 = jnp.full((bs,), 2500, dtype=jnp.int32)
+        pi_d2 = jnp.arange(bs * 5, dtype=np.int32)
+        cukv_d2 = jnp.arange(bs + 1, dtype=jnp.int32) * (5 * ps)
+
+        for tag_0, q_0, kn_0, vn_0, kvc_0, kvl_0, pi_0, cq_0, ckv_0, d_0, sw_0, m_0, d2_0, shp_0 in (
+            ("dyn2ku", q, kn, vn, kvc, kvl, pi, cuq, cukv, dist, None, "w8,hoistkv,dyn2ku", False, None),
+            ("ring4k", q, kn, vn, kvc, kvl, pi, cuq, cukv, dist, None, "w8,ring4k,c4096", False, None),
+            (
+                "shared64",
+                q_sh,
+                k_sh,
+                v_sh,
+                _u8_to_fp8(s_sh),
+                jnp.full((bs_sh,), 1025, dtype=jnp.int32),
+                pi_sh,
+                jnp.arange(bs_sh + 1, dtype=jnp.int32),
+                jnp.arange(bs_sh + 1, dtype=jnp.int32) * (pps_sh * ps),
+                jnp.asarray([bs_sh, bs_sh, bs_sh], dtype=jnp.int32),
+                None,
+                "w8,hoistkv,shared64,c1024",
+                False,
+                jnp.asarray([2], dtype=jnp.int32),
+            ),
+            ("d2_swa", q, kn, vn, _u8_to_fp8(s_d2), kvl_d2, pi_d2, cuq, cukv_d2, dist, 2048, "w8", True, None),
+        ):
+            with self.subTest(default_0ulp=tag_0):
+                o_a, _ = run_decode_fast_rpa(
+                    q_0, kn_0, vn_0, kvc_0, kvl_0, pi_0, cq_0, ckv_0, d_0,
+                    sm_scale=128 ** -0.5, sliding_window=sw_0, k_scale=1.0, v_scale=1.0,
+                    mode_str=m_0, kv_pack_dense2=d2_0, interpret=True, shared_pages=shp_0,
+                )
+                o_b, _ = run_decode_fast_rpa(
+                    q_0, kn_0, vn_0, kvc_0, kvl_0, pi_0, cq_0, ckv_0, d_0,
+                    sm_scale=128 ** -0.5, sliding_window=sw_0, k_scale=1.0, v_scale=1.0,
+                    mode_str=f"{m_0},nofold", kv_pack_dense2=d2_0, interpret=True, shared_pages=shp_0,
+                )
+                self.assertEqual(float(np.max(np.abs(np.asarray(o_a, dtype=np.float32) - np.asarray(o_b, dtype=np.float32)))), 0.0)
+
+        # 4. TPU v7 export check for g4k-foldcol
         try:
             from jax._src import tpu_info  # noqa: F401
         except ImportError:
