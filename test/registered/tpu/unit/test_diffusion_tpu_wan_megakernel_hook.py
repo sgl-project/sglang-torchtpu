@@ -2,7 +2,7 @@
 """CPU tests for the Wan2.2 megakernel hook (sglang_tpu.multimodal_gen.wan_megakernel.hook).
 
 The hook's request state (cross-attention keys and values cached a request, the per-request op-call
-log line, the step constants and the step cache) with the kernel and torch replaced by stand-ins.
+log line and the step constants) with the kernel and torch replaced by stand-ins.
 Skipped where JAX is unavailable.
 """
 
@@ -12,10 +12,20 @@ import types
 import unittest
 import unittest.mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
@@ -25,6 +35,9 @@ if _REPO_ROOT not in sys.path:
 
 try:
     import jax.numpy  # noqa: F401
+
+    from sglang_tpu.multimodal_gen.wan_megakernel import reference as ref
+    from sglang_tpu.multimodal_gen.wan_megakernel.tiling import Tiling
 
     _HAS_JAX = True
 except Exception:  # pragma: no cover - depends on JAX availability
@@ -294,79 +307,6 @@ class TestStepConstants(CustomTestCase):
         self.assertTrue(all(v is valids[3] for v in valids[3:]))
         self.assertIsNot(valids[0], valids[3])
         self.assertEqual([int(v[0]) for v in (valids[0], valids[3])], [72, 64])
-
-
-class TestStepCache(CustomTestCase):
-    """hook._step_cache_*: which steps reuse the cached residual, and what they return."""
-
-    def setUp(self):
-        import torch
-
-        from sglang_tpu.multimodal_gen.wan_megakernel import hook
-
-        self.hook, self.torch = hook, torch
-        self.state = types.SimpleNamespace()
-
-    def run_steps(self, spec, n=6, rid="r", start=0, n_steps=6):
-        steps, kinds = self.hook._parse_step_cache(spec), []
-        for i in range(start, start + n):
-            xs = self.torch.full((4, 8), float(i))
-            reuse = self.hook._step_cache_reuse(self.state, steps, rid, n_steps, i, xs)
-            if (
-                reuse is None
-            ):  # the kernel's output: input + a residual of 10 * (step + 1)
-                out = (xs + 10.0 * (i + 1)).to(self.torch.bfloat16)
-                self.hook._step_cache_store(self.state, rid, i, xs, out)
-                kinds.append("run")
-            else:
-                # the last computed step's residual on this step's input
-                last = max(j for j, k in enumerate(kinds) if k == "run") + start
-                self.assertTrue(self.torch.equal(reuse.float(), xs + 10.0 * (last + 1)))
-                kinds.append("reuse")
-        return kinds
-
-    def test_explicit_steps(self):
-        # step 2 and 4 are not listed and reuse; the last step always runs
-        self.assertEqual(
-            self.run_steps("steps=0,1,3"),
-            ["run", "run", "reuse", "run", "reuse", "run"],
-        )
-
-    def test_branches_cache_separately(self):
-        """One rank serving both CFG branches in turn keeps a residual for each."""
-        steps = self.hook._parse_step_cache("steps=0")
-        pos, neg = self.torch.ones(1), self.torch.zeros(1)
-        for i in range(3):
-            for branch, res in ((pos, 10.0), (neg, 100.0)):
-                xs = self.torch.full((4, 8), float(i))
-                got = self.hook._step_cache_reuse(
-                    self.state, steps, "r", 6, i, xs, branch
-                )
-                if i == 0:
-                    self.assertIsNone(got)
-                    out = (xs + res).to(self.torch.bfloat16)
-                    self.hook._step_cache_store(self.state, "r", i, xs, out, branch)
-                else:
-                    self.assertTrue(self.torch.equal(got.float(), xs + res))
-
-    def test_new_request_or_gap_runs(self):
-        self.assertEqual(self.run_steps("steps=0", n=3), ["run", "reuse", "reuse"])
-        # a new request's first step runs whatever the list says
-        self.assertEqual(
-            self.run_steps("steps=0", n=2, rid="other", start=3), ["run", "reuse"]
-        )
-        self.assertEqual(
-            self.run_steps("steps=0", n=1, rid="other", start=1), ["run"]
-        )  # not consecutive
-
-    def test_parse(self):
-        self.assertEqual(
-            self.hook._parse_step_cache("steps=0,1,4"), frozenset({0, 1, 4})
-        )
-        self.assertIsNone(self.hook._parse_step_cache(""))
-        self.assertIsNone(self.hook._parse_step_cache(None))
-        with self.assertRaises(ValueError):
-            self.hook._parse_step_cache("0.2:3")
 
 
 if __name__ == "__main__":

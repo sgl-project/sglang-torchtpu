@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import weakref
 
 import torch
@@ -45,60 +44,7 @@ def _op_for(cfg, cfg_ranks: int, sp: int, tiling):
 
 
 def requested() -> bool:
-    """The hook is installed for the kernel or for DiT dumps (debug)."""
-    return (
-        envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL.get()
-        or envs.SGLANG_TPU_DEBUG_WAN_DUMP_DIR.get() is not None
-    )
-
-
-def _dump_only() -> bool:
-    """Dumps without the kernel: sglang's blocks run, the hook only saves."""
-    return not envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL.get()
-
-
-_dump_calls: dict = {}
-
-
-def _maybe_dump(model, args, kwargs, out) -> None:
-    root = envs.SGLANG_TPU_DEBUG_WAN_DUMP_DIR.get()
-    if not root:
-        return
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_classifier_free_guidance_rank,
-        get_ulysses_ctx,
-    )
-
-    if get_ulysses_ctx()[1] != 0:
-        return
-    t = kwargs.get("timestep", args[2] if len(args) > 2 else None)
-    if (
-        t is None
-        or float(t.reshape(-1)[0]) < envs.SGLANG_TPU_DEBUG_WAN_DUMP_MIN_T.get()
-    ):
-        return
-    key = id(model)
-    n = _dump_calls.get(key, 0)
-    _dump_calls[key] = n + 1
-    if n >= envs.SGLANG_TPU_DEBUG_WAN_DUMP_CALLS.get():
-        return
-    tag = "mk" if is_packed(model) else "torch"
-    names = ("hidden_states", "encoder_hidden_states", "timestep")
-    data = {k: v for k, v in zip(names, args)}
-    data.update({k: kwargs[k] for k in names if k in kwargs})
-    out_d = {
-        k: (v.detach().float().cpu() if isinstance(v, torch.Tensor) else v)
-        for k, v in data.items()
-        if isinstance(v, torch.Tensor)
-    }
-    out_d["output"] = out.detach().float().cpu()
-    os.makedirs(root, exist_ok=True)
-    path = os.path.join(
-        root,
-        f"{tag}_cfg{get_classifier_free_guidance_rank()}_model{model.__dict__.get('_wan_dump_id', key % 1000)}_call{n}.pt",
-    )
-    torch.save(out_d, path)
-    logger.warning("Wan megakernel debug: dumped %s", path)
+    return envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL.get()
 
 
 class _Megakernel:
@@ -229,12 +175,7 @@ def enable(model) -> bool:
     from sglang_tpu.multimodal_gen.wan_megakernel.tiling import Tiling
 
     cfg = pack.config_from_model(model)
-    # W8A8 projections: faster, with about 4x the bf16 path's rounding error a layer.
     tiling = Tiling(
-        fp8=envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_FP8.get(),
-        fp8_qk=envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_FP8_QK.get(),
-        floor_guard=envs.SGLANG_TPU_WAN_MEGAKERNEL_FLOOR_GUARD.get() or "inline",
-        online_one_loop=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_ONLINE_ONE_LOOP.get(),
         pipelined_epilogues=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_PIPELINED_EPILOGUES.get(),
         dma_bounds_checks=not envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_BOUNDS_CHECKS.get(),
     )
@@ -255,7 +196,6 @@ def enable(model) -> bool:
         tiling.cols,
         stage_on_host=True,
         down_cols=tiling.down_cols if tiling.mlp_mode == "twopass" else None,
-        fp8=tiling.fp8,
     )
     failed = _ranks_agree(error)
     if failed is not None:
@@ -358,101 +298,6 @@ def _cross_kv(model, state, encoder_hidden_states, b, batch, batch_ctx):
     return kv
 
 
-def _cache_stats(model, state, timestep, xs, out, real, uncond=False) -> None:
-    """Debug (SGLANG_TPU_DEBUG_WAN_CACHE_STATS): one JSON line a forward with the
-    block stack's residual r = out - x over this rank's real rows: |r|, |x|, and
-    against the previous forward of the same model and CFG branch the relative
-    change |r - r_prev| / |r| (the error of reusing r_prev) and |r| / |r_prev|.
-    SGLANG_TPU_DEBUG_WAN_CACHE_ROWS > 0 also saves that many evenly spaced rows of
-    r a forward (fp16 .npy) for offline step-plan search."""
-    prefix = envs.SGLANG_TPU_DEBUG_WAN_CACHE_STATS.get()
-    if not prefix or real == 0:
-        return
-    import json
-
-    import torch.distributed as dist
-
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_classifier_free_guidance_rank,
-    )
-    from sglang.multimodal_gen.runtime.managers.forward_context import (
-        get_forward_context,
-    )
-
-    ctx = get_forward_context()
-    r = out[:real].float() - xs[:real].float()
-    rec = {
-        "t": float(timestep.reshape(-1)[0]),
-        "step": ctx.current_timestep,
-        "rid": getattr(ctx.forward_batch, "request_id", None),
-        "model": model.__dict__.get("_wan_dump_id", 0),
-        "cfg": get_classifier_free_guidance_rank(),
-        "uncond": bool(uncond),
-        "rows": int(real),
-        "r": float(r.norm()),
-        "x": float(xs[:real].float().norm()),
-    }
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    sample = envs.SGLANG_TPU_DEBUG_WAN_CACHE_ROWS.get()
-    if sample:
-        import numpy as np
-
-        idx = torch.linspace(0, real - 1, sample, device=r.device).round().long()
-        np.save(
-            f"{prefix}.r{rank}.{rec['rid']}.m{rec['model']}.s{rec['step']:02d}"
-            f".{'u' if uncond else 'c'}.npy",
-            r[idx].to(torch.float16).cpu().numpy(),
-        )
-    hist = [
-        h
-        for h in state.__dict__.get("_stats_hist", [])
-        if h[0] == rec["model"]
-        and h[3] == rec["uncond"]
-        and h[2].shape == r.shape
-        and h[1] > rec["t"]
-    ]
-    if hist:
-        t1, r1 = hist[-1][1], hist[-1][2].float()
-        rec["dr"] = float((r - r1).norm()) / max(rec["r"], 1e-30)
-        rec["ratio"] = rec["r"] / max(float(r1.norm()), 1e-30)
-        if len(hist) > 1:  # first-order extrapolation from the two previous residuals
-            t0, r0 = hist[-2][1], hist[-2][2].float()
-            lin = r1 + (r1 - r0) * ((rec["t"] - t1) / (t1 - t0))
-            rec["dlin"] = float((r - lin).norm()) / max(rec["r"], 1e-30)
-            if (
-                len(hist) > 2
-            ):  # skipping one step: from the residuals two and three back
-                tm, rm = hist[-3][1], hist[-3][2].float()
-                rec["dr2"] = float((r - r0).norm()) / max(rec["r"], 1e-30)
-                lin2 = r0 + (r0 - rm) * ((rec["t"] - t0) / (t0 - tm))
-                rec["dlin2"] = float((r - lin2).norm()) / max(rec["r"], 1e-30)
-    # The last three residuals of each branch this rank serves.
-    other = [h for h in state.__dict__.get("_stats_hist", []) if h[3] != uncond]
-    mine = hist + [(rec["model"], rec["t"], r.to(torch.bfloat16), rec["uncond"])]
-    state.__dict__["_stats_hist"] = other[-3:] + mine[-3:]
-    with open(f"{prefix}.r{rank}", "a") as f:
-        f.write(json.dumps(rec) + "\n")
-
-
-# Step caching (SGLANG_TPU_WAN_STEP_CACHE="steps=i,j,..."): the block stack's
-# residual (output - input) changes slowly between neighbouring denoising steps,
-# so only the listed steps run the kernel; every other step adds its expert's last
-# computed residual for the same CFG branch to its own input. The plan reads only
-# the step index, so every rank (both CFG branches) skips the same steps. Plans
-# are calibrated offline from SGLANG_TPU_DEBUG_WAN_CACHE_STATS/_ROWS dumps.
-
-
-def _parse_step_cache(spec):
-    """The steps that run the kernel, from SGLANG_TPU_WAN_STEP_CACHE, or None."""
-    if not spec:
-        return None
-    if not spec.startswith("steps="):
-        raise ValueError(
-            f"SGLANG_TPU_WAN_STEP_CACHE: expected steps=i,j,..., got {spec!r}"
-        )
-    return frozenset(int(v) for v in spec[6:].split(",") if v)
-
-
 def _schedule(state, batch_ctx):
     """The request's step count (read once a request)."""
     rid = getattr(batch_ctx, "request_id", None)
@@ -482,49 +327,6 @@ def _count_op_call(state, batch_ctx, batch: int) -> None:
             _OP_CALLS["n"],
             " (warmup)" if getattr(batch_ctx, "is_warmup", False) else "",
         )
-
-
-def _step_cache_entry(state, branch):
-    """This expert's cache entry for CFG branch ``branch`` (its live text tensor:
-    one rank may serve both branches in turn), or None."""
-    for ref, entry in state.__dict__.get("_step_cache", []):
-        if ref() is branch:
-            return entry
-    return None
-
-
-def _step_cache_reuse(state, steps, rid, n_steps, step, xs, branch=None):
-    """Step ``step`` of request ``rid`` (``n_steps`` steps) rebuilt from this
-    expert's cached residual for ``branch``, or None when the kernel must run:
-    a listed step, the last step, or no residual from this request's previous
-    step (a new request, an expert's first step, a shape change)."""
-    c = _step_cache_entry(state, branch)
-    if (
-        step in steps
-        or rid is None
-        or n_steps is None
-        or step >= n_steps - 1
-        or c is None
-        or c["rid"] != rid
-        or c["step"] != step - 1
-        or c["residual"].shape[0] != xs.shape[0]
-    ):
-        return None
-    c["step"] = step
-    return (xs.float() + c["residual"]).to(torch.bfloat16)
-
-
-def _step_cache_store(state, rid, step, xs, out, branch=None) -> None:
-    """Remember the residual of a step that ran the kernel (for ``branch``)."""
-    entry = {"rid": rid, "step": step, "residual": out.float() - xs.float()}
-    # Keep live branches only (a request's text tensors die with it).
-    kept = [
-        (r, e)
-        for r, e in state.__dict__.get("_step_cache", [])
-        if r() is not None and r() is not branch and e["rid"] == rid
-    ]
-    ref = weakref.ref(branch) if branch is not None else (lambda: None)
-    state.__dict__["_step_cache"] = kept + [(ref, entry)]
 
 
 def _forward_one(
@@ -572,50 +374,22 @@ def _forward_one(
     cos, sin = _rope_rows(model, state, f_, h_, w_, rows, rank, x.device)
     if valid is None:
         valid = torch.tensor([tokens], dtype=torch.int32, device=x.device)
-    branch = encoder_hidden_states  # the CFG branch's text: its step-cache key
-    steps = _parse_step_cache(envs.SGLANG_TPU_WAN_STEP_CACHE.get())
-    if (
-        steps is not None
-        and batch_ctx is not None
-        and state.__dict__.get("_one_sample")
-    ):
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            get_forward_context,
-        )
-
-        step = get_forward_context().current_timestep
-        rid = getattr(batch_ctx, "request_id", None)
-        reuse = _step_cache_reuse(
-            state, steps, rid, _schedule(state, batch_ctx), step, xs, branch
-        )
-    else:
-        steps = reuse = None
-    if reuse is not None:
-        out = reuse
-    else:
-        if op is None:
-            op = _op_for(cfg, state.cfg_ranks, sp, tiling)
-        out = op(
-            xs.to(torch.bfloat16).contiguous(),
-            cos,
-            sin,
-            e,
-            k2,
-            v2,
-            keys,
-            key_weights,
-            valid,
-            *(state.weights[n] for n in pack.WEIGHT_ORDER),
-        )
-        if batch_ctx is not None:
-            _count_op_call(state, batch_ctx, batch)
-        if steps is not None:
-            _step_cache_store(state, rid, step, xs, out, branch)
-    negs = getattr(batch_ctx, "negative_prompt_embeds", None)
-    uncond = isinstance(negs, (list, tuple)) and any(t is branch for t in negs)
-    _cache_stats(
-        model, state, timestep, xs, out, max(0, min(rows, tokens - rank * rows)), uncond
+    if op is None:
+        op = _op_for(cfg, state.cfg_ranks, sp, tiling)
+    out = op(
+        xs.to(torch.bfloat16).contiguous(),
+        cos,
+        sin,
+        e,
+        k2,
+        v2,
+        keys,
+        key_weights,
+        valid,
+        *(state.weights[n] for n in pack.WEIGHT_ORDER),
     )
+    if batch_ctx is not None:
+        _count_op_call(state, batch_ctx, batch)
     # The head is per row: run it on my rows, then gather its narrow output.
     shift, scale = (model.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
     hidden = model.norm_out(out.unsqueeze(0), shift, scale)
@@ -670,7 +444,6 @@ def forward(
             f"Wan megakernel takes scalar timesteps a sample (got {tuple(timestep.shape)})"
         )
     state.kv_cache_size = max(2, batch)
-    state.__dict__["_one_sample"] = batch == 1  # step caching keeps one residual
 
     def pick(t, b):  # sample b of a per-sample tensor, or the one shared by all
         return t[b : b + 1] if t.shape[0] == batch else t
@@ -708,20 +481,13 @@ def install() -> None:
 
     def _post_load_weights(self) -> None:
         post_load(self)
-        cls._wan_models = getattr(cls, "_wan_models", 0) + 1
-        # Load order, not the expert's role (in B1 the high-noise expert loaded second).
-        self.__dict__["_wan_dump_id"] = cls._wan_models
-        if not _dump_only():
-            enable(self)
+        enable(self)
 
     @functools.wraps(torch_forward)
     def _forward(self, *args, **kwargs):
         if is_packed(self):
-            out = forward(self, *args, **kwargs)
-        else:
-            out = torch_forward(self, *args, **kwargs)
-        _maybe_dump(self, args, kwargs, out)
-        return out
+            return forward(self, *args, **kwargs)
+        return torch_forward(self, *args, **kwargs)
 
     cls.post_load_weights = _post_load_weights
     cls.forward = _forward
