@@ -8,6 +8,7 @@ import torch
 _PACKED = "_tpu_shifted_mhc_mix_weight"
 _shifted_op = None
 _OWNER = "_tpu_shifted_mhc_owner"
+_MIX_SUBLAYERS = {"hc_attn_fn": "attn_hc", "hc_ffn_fn": "ffn_hc"}
 
 
 def _fake(y, residual, post, comb, packed, scale, base, pre, norm_weight, *args):
@@ -63,11 +64,13 @@ def _refresh_packed_buffer(hc):
         existing.copy_(packed)
 
 
-def prepare_shifted_mhc(layers, *, draft=False):
+def prepare_shifted_mhc(layers, *, draft=False, weight_names=None):
     """Refresh traceable buffers for destinations of serving boundaries."""
     from sglang.srt.models.deepseek_v4 import DeepseekV4PlatformDecoderLayer
     from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
+    touched = None if weight_names is None else set(weight_names)
+    prefix = "stages" if draft else "model.layers"
     for index, layer in enumerate(layers):
         if not isinstance(layer, DeepseekV4PlatformDecoderLayer):
             continue
@@ -84,22 +87,36 @@ def prepare_shifted_mhc(layers, *, draft=False):
             return
         register_shifted_mhc_op()
         # The draft begins with embeddings and has no incoming attention boundary.
-        names = ("ffn_hc",) if draft and index == 0 else ("attn_hc", "ffn_hc")
-        for name in names:
+        for field, name in _MIX_SUBLAYERS.items():
+            if draft and index == 0 and name == "attn_hc":
+                continue
             hc = getattr(layer, name)
+            if (
+                touched is not None
+                and f"{prefix}.{index}.{field}" not in touched
+                and getattr(hc.norm, _PACKED, None) is not None
+            ):
+                continue
             if hc.fn.dtype == torch.float32 and hc.fn.shape == (24, 20480):
                 _refresh_packed_buffer(hc)
                 setattr(hc.norm, _OWNER, (ref(layer), name))
+
+
+def packed_mhc_sublayers(model):
+    """Resolve the sublayers that own packed buffers on this model."""
+    for norm in model.modules():
+        owner = getattr(norm, _OWNER, None)
+        if owner is not None and (layer := owner[0]()) is not None:
+            yield getattr(layer, owner[1])
 
 
 def refresh_shifted_mhc_after_direct_update(model, named_tensors):
     """The raw update API bypasses model.post_load_weights."""
     if _shifted_op is None:
         return
-    sublayers = {"hc_attn_fn": "attn_hc", "hc_ffn_fn": "ffn_hc"}
     for name, _ in named_tensors:
         layer_path, _, field = name.rpartition(".")
-        sublayer = sublayers.get(field)
+        sublayer = _MIX_SUBLAYERS.get(field)
         if sublayer is None:
             continue
         hc = getattr(model.get_submodule(layer_path), sublayer, None)

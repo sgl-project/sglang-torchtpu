@@ -96,6 +96,109 @@ class TestDeepSeekV4MhcBoundary(CustomTestCase):
                 self.assertIs(result, original.return_value)
                 fused.assert_not_called()
 
+    def test_partial_load_initializes_missing_and_refreshes_only_touched_buffers(self):
+        layer = torch.nn.Module()
+        layer.hc_cfg = SimpleNamespace(
+            pre_from_prev=True, cp_prefill=False, mult=4, hidden=5120
+        )
+        layer.hc_attn_fn = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), dtype=torch.float32, shape=(24, 20480)
+        )
+        layer.attn_hc = SimpleNamespace(fn=layer.hc_attn_fn, norm=torch.nn.Module())
+        layer.ffn_hc = SimpleNamespace(fn=layer.hc_attn_fn, norm=torch.nn.Module())
+
+        def pack(hc):
+            setattr(hc.norm, tpu_mhc._PACKED, object())
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.DeepseekV4PlatformDecoderLayer",
+                torch.nn.Module,
+            ),
+            patch(
+                "sglang_tpu.pallas_export.get_pallas_tpu_device_kind",
+                return_value="TPU7x",
+            ),
+            patch.object(tpu_mhc, "register_shifted_mhc_op"),
+            patch.object(
+                tpu_mhc, "_refresh_packed_buffer", side_effect=pack
+            ) as refresh,
+        ):
+            tpu_mhc.prepare_shifted_mhc(
+                [layer], weight_names=["model.layers.0.hc_attn_fn"]
+            )
+            self.assertEqual(
+                [call.args[0] for call in refresh.call_args_list],
+                [layer.attn_hc, layer.ffn_hc],
+            )
+            refresh.reset_mock()
+            tpu_mhc.prepare_shifted_mhc(
+                [layer], weight_names=["model.layers.0.mlp.weight"]
+            )
+            refresh.assert_not_called()
+            tpu_mhc.prepare_shifted_mhc(
+                [layer], weight_names=["model.layers.0.hc_ffn_fn"]
+            )
+            refresh.assert_called_once_with(layer.ffn_hc)
+
+    def test_custom_loader_is_rejected_before_mutation_only_for_packed_models(self):
+        model = torch.nn.Module()
+        model.norm = torch.nn.Module()
+        model.attn_hc = self.hc
+        updater = SimpleNamespace(
+            custom_weight_loaders={"custom"}, get_model=lambda: model
+        )
+        original = Mock(return_value=(True, "Success"))
+        run = hooks.tpu_dsv41_guard_shifted_mhc_custom_loader
+        self.assertTrue(run(original, updater, [], "custom")[0])
+        setattr(model.norm, tpu_mhc._OWNER, (ref(model), "attn_hc"))
+        original.reset_mock()
+        self.assertFalse(run(original, updater, [], "custom")[0])
+        original.assert_not_called()
+        for fmt in (None, "direct", "flattened_bucket"):
+            self.assertTrue(run(original, updater, [], fmt)[0])
+
+    def test_weight_checker_excludes_packed_buffer_and_repacks_after_reset(self):
+        from sglang.srt.model_executor.weight_checker import WeightChecker
+        from sglang.srt.plugins.hook_registry import HookType, _wrap_fn
+
+        model = torch.nn.Module()
+        model.mix = torch.nn.Parameter(torch.zeros(24, 20480), requires_grad=False)
+        model.norm = torch.nn.Module()
+        model.attn_hc = self.hc._replace(fn=model.mix, norm=model.norm)
+        tpu_mhc._refresh_packed_buffer(model.attn_hc)
+        retained = getattr(model.norm, tpu_mhc._PACKED)
+        setattr(model.norm, tpu_mhc._OWNER, (ref(model), "attn_hc"))
+        checker = WeightChecker.__new__(WeightChecker)
+        checker._get_model = lambda: model
+        checker._placement = dict(
+            tp_rank=0, tp_size=1, dp_rank=0, dp_size=1, pp_rank=0, pp_size=1
+        )
+        with patch.object(
+            WeightChecker,
+            "_model_state",
+            _wrap_fn(
+                WeightChecker._model_state,
+                hooks.tpu_dsv41_exclude_packed_mhc_from_weight_checks,
+                HookType.AROUND,
+            ),
+        ):
+            self.assertEqual(set(dict(checker._model_state())), {"mix"})
+            raw = checker.handle("raw_checksum", role="target")
+            self.assertEqual(set(raw["checksums"]), {"mix"})
+            reset = _wrap_fn(
+                WeightChecker._reset_tensors,
+                hooks.tpu_dsv41_refresh_shifted_mhc_after_weight_reset,
+                HookType.AFTER,
+            )
+            with patch(
+                "sglang.srt.model_executor.weight_checker._random_like",
+                side_effect=lambda tensor: torch.full_like(tensor, 0.1),
+            ):
+                reset(checker)
+        self.assertIs(getattr(model.norm, tpu_mhc._PACKED), retained)
+        torch.testing.assert_close(retained, tpu_mhc.pack_mix_weight(model.mix))
+
     def test_draft_small_bucket_calls_original_before_embedding(self):
         model = SimpleNamespace(
             hc_pre_from_prev_sublayer=True, forward_embed=Mock(), _expand_hc=Mock()
