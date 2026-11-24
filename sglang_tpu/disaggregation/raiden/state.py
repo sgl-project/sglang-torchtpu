@@ -122,8 +122,11 @@ class DecodeState:
     # Registered chunk spans; the closing plan covers their complement.
     reshard_covered: Dict[int, List[Tuple[int, int]]] = field(default_factory=dict)
 
-    # Per-room block ids from each source rank, for full and SWA KV.
+    # Per-room block ids from each source rank, for full, SWA, and draft SWA KV.
     reshard_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
+    reshard_draft_swa_sources: Dict[int, Dict[int, List[int]]] = field(
+        default_factory=dict
+    )
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)

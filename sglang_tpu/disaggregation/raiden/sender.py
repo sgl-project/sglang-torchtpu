@@ -777,13 +777,70 @@ class RaidenSenderMixin:
             if self._draft_engine is not None and not draft_read_blocks:
                 self._completed_send.add(self._draft_req_id(room))
 
-    def _on_reshard_req(self, msg: List[bytes]) -> None:
-        if self._draft_engine is not None:
-            raise NotImplementedError(
-                "Raiden push resharding does not support speculative draft KV "
-                "over TpuUnifiedSWAKVPool yet; use equal attention TP on "
-                "prefill and decode."
+    def _validate_reshard_draft_req(self, req: ReshardReq) -> Optional[str]:
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            push_reshard_refusal,
+            push_reshard_where,
+        )
+
+        where = push_reshard_where(self.attn_tp_size, req.dst_attn_tp)
+        has_local_draft = bool(self._draft_kv_caches)
+        if bool(req.draft_push_endpoint) != has_local_draft:
+            return (
+                f"{where}: prefill and decode disagree on speculative draft KV over "
+                f"TpuUnifiedSWAKVPool (prefill_draft={has_local_draft}, "
+                f"decode_draft={bool(req.draft_push_endpoint)})"
             )
+        if not has_local_draft:
+            return None
+        local_sal = bool(self._draft_seq_along_lane)
+        if req.decode_draft_seq_along_lane != local_sal:
+            return (
+                f"{where}: draft KV layout mismatch between prefill "
+                f"(seq_along_lane={local_sal}) and decode "
+                f"(seq_along_lane={req.decode_draft_seq_along_lane})"
+            )
+        if req.decode_draft_is_swa != self._draft_is_swa:
+            return (
+                f"{where}: draft KV window mode mismatch between prefill "
+                f"(draft_is_swa={self._draft_is_swa}) and decode "
+                f"(draft_is_swa={req.decode_draft_is_swa})"
+            )
+        if req.decode_draft_kv_head_num <= 0:
+            return (
+                f"{where}: decode sent invalid decode_draft_kv_head_num="
+                f"{req.decode_draft_kv_head_num}"
+            )
+        total_heads = req.decode_draft_kv_head_num * req.dst_attn_tp
+        try:
+            geom = self._make_geometry(
+                src_attn_tp=self.attn_tp_size,
+                dst_attn_tp=req.dst_attn_tp,
+                group="draft",
+                total_kv_heads=total_heads,
+            )
+        except (ValueError, RuntimeError) as e:
+            return f"{where}: {e}"
+        page_size = int(self.kv_args.page_size)
+        for shape, element_size, _heads in self._reshard_layers("draft"):
+            try:
+                reason = push_reshard_refusal(
+                    geom,
+                    shape,
+                    element_size,
+                    total_heads=total_heads,
+                    own_tp=self.attn_tp_size,
+                    page_size=page_size,
+                    seq_along_lane=local_sal,
+                    land_ok=False,
+                )
+            except ValueError as e:
+                return f"{where}: {e}"
+            if reason is not None:
+                return reason
+        return None
+
+    def _on_reshard_req(self, msg: List[bytes]) -> None:
         req = ReshardReq.from_frames(msg)
         if self._bounded_staging:
             # The reshard push copies every layer with one engine.d2h call, which
@@ -835,10 +892,12 @@ class RaidenSenderMixin:
         reason = None
         if not self.is_aborted(room):
             reason = self.reshard_refusal(self.attn_tp_size, dst_attn_tp)
+            if reason is None:
+                reason = self._validate_reshard_draft_req(req)
         if reason is not None:
             # The decode refuses the same geometry at init; this covers a
             # decode that does not, so nothing is staged or pushed.
-            self.log_reshard_refusal(("reshard_req", dst_attn_tp), reason)
+            self.log_reshard_refusal(("reshard_req", dst_attn_tp, reason), reason)
             failed_here = False
             with self._state_lock:
                 if room not in self._aborted:
@@ -865,6 +924,9 @@ class RaidenSenderMixin:
                     dst_attn_tp=dst_attn_tp,
                     decode_swa_blocks=decode_swa_blocks,
                     swa_push_endpoint=swa_push_endpoint,
+                    draft_push_endpoint=req.draft_push_endpoint,
+                    decode_draft_swa_blocks=list(req.decode_draft_swa_blocks),
+                    decode_draft_kv_head_num=int(req.decode_draft_kv_head_num),
                 )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
@@ -966,7 +1028,7 @@ class RaidenSenderMixin:
                         self._make_geometry(
                             src_attn_tp=self.attn_tp_size,
                             dst_attn_tp=dst_attn_tp,
-                            swa=True,
+                            group="swa",
                         )
                         if swa
                         else self._make_geometry(
@@ -1152,6 +1214,11 @@ class RaidenSenderMixin:
             if (
                 room not in self._prefill.reshard_req
                 or room not in self._prefill.reshard_finalized
+                or (
+                    self._draft_engine is not None
+                    and self._draft_is_swa
+                    and room not in self._prefill.send_draft_swa_blocks
+                )
             ):
                 return
             addr = self._prefill.reshard_req[room]["reply_addr"]
@@ -1160,6 +1227,7 @@ class RaidenSenderMixin:
             # owed (it is sent once the send accumulation is finalized), so the
             # closing push can carry them; earlier chunks never do.
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            draft_swa_blocks = list(self._prefill.send_draft_swa_blocks.get(room, []))
             aux_blob = self._prefill.send_aux.get(room, b"")
         with self._announce_lock:
             with self._state_lock:
@@ -1196,6 +1264,7 @@ class RaidenSenderMixin:
                 aux_blob=aux_blob,
                 prefill_swa_blocks=swa_blocks,
                 kv_layout=self.kv_layout,
+                prefill_draft_swa_blocks=draft_swa_blocks,
             ).to_frames()
             self._send_multipart_locked(endpoint, payload)
 
@@ -1404,7 +1473,7 @@ class RaidenSenderMixin:
         fut = None
         try:
             geom = self._make_geometry(
-                self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
+                self.attn_tp_size, req_meta["dst_attn_tp"], group="swa"
             )
             if scratch is not None:
                 geom = geom.with_land()
@@ -1433,7 +1502,7 @@ class RaidenSenderMixin:
                     )
                 )
             self._check_reshard_bounds(
-                req, self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
+                req, self.attn_tp_size, req_meta["dst_attn_tp"], group="swa"
             )
             engine.register_active_plan(room, req, is_sender=True)
             host_blocks = engine.plan_host_blocks(room, swa_blocks)
@@ -1494,6 +1563,146 @@ class RaidenSenderMixin:
             with self._state_lock:
                 self._completed_send.add(swa_req_id)
 
+    def _run_reshard_draft_push(
+        self,
+        *,
+        room: int,
+        req_meta: dict,
+        prefill_blocks: List[int],
+        draft_swa_blocks: List[int],
+    ) -> None:
+        if self._draft_engine is None:
+            return
+        draft_req_id = self._draft_req_id(room)
+        draft_push_endpoint = req_meta.get("draft_push_endpoint") or ""
+        dst_attn_tp = req_meta["dst_attn_tp"]
+        decode_draft_kv_head_num = int(req_meta.get("decode_draft_kv_head_num") or 0)
+        if self._draft_is_swa:
+            dst_blocks = list(req_meta.get("decode_draft_swa_blocks") or [])
+            src_blocks = list(draft_swa_blocks)
+            if not dst_blocks and req_meta.get("decode_swa_blocks"):
+                reason = (
+                    f"Raiden reshard draft push: SWA draft room {room} has no "
+                    "decode_draft_swa_blocks while decode_swa_blocks is non-empty"
+                )
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                with self._state_lock:
+                    self._fail_room_locked(room, reason)
+                    self._completed_send.add(draft_req_id)
+                return
+        else:
+            dst_blocks = list(req_meta.get("decode_blocks") or [])
+            src_blocks = list(prefill_blocks)
+        n_draft = len(dst_blocks)
+        if not n_draft:
+            with self._state_lock:
+                self._completed_send.add(draft_req_id)
+            return
+        if (
+            not draft_push_endpoint
+            or decode_draft_kv_head_num <= 0
+            or len(src_blocks) < n_draft
+        ):
+            reason = (
+                f"Raiden reshard draft push: room {room} invalid draft transfer "
+                f"(src_pages={len(src_blocks)} dst_pages={n_draft} "
+                f"heads={decode_draft_kv_head_num} peer={draft_push_endpoint!r})"
+            )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._fail_room_locked(room, reason)
+                self._completed_send.add(draft_req_id)
+            return
+        src_blocks = src_blocks[-n_draft:]
+
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            build_sender_request,
+        )
+
+        engine = self._draft_engine
+        fut = None
+        registered = False
+        try:
+            geom_draft = self._make_geometry(
+                src_attn_tp=self.attn_tp_size,
+                dst_attn_tp=dst_attn_tp,
+                group="draft",
+                total_kv_heads=decode_draft_kv_head_num * dst_attn_tp,
+            )
+            req = build_sender_request(
+                pb2,
+                uuid=room,
+                req_id=draft_req_id,
+                peer=draft_push_endpoint,
+                prefill_rank=self.attn_tp_rank,
+                decode_rank=self.attn_tp_rank // geom_draft.ratio,
+                geom=geom_draft,
+                src_block_ids=src_blocks,
+                dst_block_ids=dst_blocks,
+                live_tokens=[self.kv_args.page_size] * n_draft,
+            )
+            self._check_reshard_bounds(
+                req, self.attn_tp_size, dst_attn_tp, group="draft"
+            )
+            engine.register_active_plan(room, req, is_sender=True)
+            registered = True
+            host_blocks = engine.plan_host_blocks(room, src_blocks)
+            fut = engine.d2h(src_blocks, host_blocks, [1] * n_draft)
+            deadline = self._monotonic() + self._timeout_s
+            while fut is not None and not fut.is_ready():
+                if self._monotonic() > deadline:
+                    raise TimeoutError(
+                        f"raiden reshard draft D2H stage for room {room} timed out"
+                    )
+                time.sleep(0.0005)
+            if fut is not None and not fut.ok():
+                raise RuntimeError(
+                    f"raiden reshard draft D2H stage for room {room} failed: "
+                    f"{fut.error_message()}"
+                )
+            with self._reshard_push_lock:
+                for layer_idx in range(len(self._draft_kv_caches)):
+                    engine.push_registered_plan(
+                        room,
+                        draft_push_endpoint,
+                        src_blocks,
+                        dst_blocks,
+                        layer_idx,
+                        parallelism=self._transfer_parallelism,
+                    )
+            logger.info(
+                "raiden reshard draft pushed room=%s prefill_rank=%d decode_rank=%d "
+                "pages=%d layers=%d swa=%s peer=%s",
+                room,
+                self.attn_tp_rank,
+                self.attn_tp_rank // geom_draft.ratio,
+                n_draft,
+                len(self._draft_kv_caches),
+                self._draft_is_swa,
+                draft_push_endpoint,
+            )
+        except Exception as e:
+            reason = f"Raiden reshard draft push for room {room} failed: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._fail_room_locked(room, reason)
+        finally:
+            if fut is not None and not fut.is_ready():
+                with self._state_lock:
+                    self._stale_plans.append((room, room, fut, "draft"))
+                threading.Thread(
+                    target=self._reap_stale_plan,
+                    args=(room, room, fut),
+                    kwargs={"draft": True},
+                    daemon=True,
+                ).start()
+            elif registered:
+                self._unregister_draft_plan(room)
+            with self._state_lock:
+                self._completed_send.add(draft_req_id)
+
     def _run_reshard_push(
         self,
         room: int,
@@ -1521,6 +1730,9 @@ class RaidenSenderMixin:
                 scratch = self._prefill.reshard_ready_scratch.get(room)
                 swa_scratch = self._prefill.reshard_ready_swa_scratch.get(room)
                 swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+                draft_swa_blocks = list(
+                    self._prefill.send_draft_swa_blocks.get(room, [])
+                )
                 start = 0
             else:
                 swa_scratch = None
@@ -1543,6 +1755,12 @@ class RaidenSenderMixin:
                 req_meta=req_meta,
                 swa_blocks=swa_blocks,
                 scratch=swa_scratch,
+            )
+            self._run_reshard_draft_push(
+                room=room,
+                req_meta=req_meta,
+                prefill_blocks=prefill_blocks,
+                draft_swa_blocks=draft_swa_blocks,
             )
             if self._unified_swa_pool is not None:
                 unified_swa_pair = self._pair_unified_reshard_swa_push(

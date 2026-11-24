@@ -139,8 +139,10 @@ class RaidenKVCacheGroups:
     draft: List[torch.Tensor] = field(default_factory=list)
     draft_is_swa: bool = False
     draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
-    # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
+    # True when the target KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
+    target_seq_along_lane: bool = False
+    draft_seq_along_lane: Optional[bool] = None
     # Most heads any pool stores side by side in one row (kv_pack_heads).
     kv_pack_heads: int = 1
 
@@ -373,7 +375,8 @@ def get_raiden_kv_caches(
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     full_heads, swa_heads = list(groups.full_head_nums), list(groups.swa_head_nums)
-    seq_along_lane = groups.seq_along_lane or _is_seq_along_lane_pool(pool)
+    target_seq_along_lane = groups.seq_along_lane or _is_seq_along_lane_pool(pool)
+    draft_seq_along_lane: Optional[bool] = None
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
@@ -403,12 +406,13 @@ def get_raiden_kv_caches(
             swa_ids.extend(draft_groups.swa_layer_ids)
             full_heads.extend(draft_groups.full_head_nums)
             swa_heads.extend(draft_groups.swa_head_nums)
-        seq_along_lane = seq_along_lane or draft_groups.seq_along_lane
+        draft_seq_along_lane = draft_groups.seq_along_lane or _is_seq_along_lane_pool(
+            draft_pool
+        )
         full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
-        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
@@ -483,6 +487,8 @@ def get_raiden_kv_caches(
         draft=draft,
         draft_is_swa=draft_is_swa,
         draft_swa_sidecar=draft_swa_sidecar,
-        seq_along_lane=seq_along_lane,
+        seq_along_lane=target_seq_along_lane,
+        target_seq_along_lane=target_seq_along_lane,
+        draft_seq_along_lane=draft_seq_along_lane,
         kv_pack_heads=kv_pack_heads,
     )

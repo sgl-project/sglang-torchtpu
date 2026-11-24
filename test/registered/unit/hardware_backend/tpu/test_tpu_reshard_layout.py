@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import kv_pool
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
@@ -28,7 +29,11 @@ from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
 )
-from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
+from sglang_tpu.unified_kv_pool import (
+    AttnLayerSpec,
+    TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -137,8 +142,9 @@ def _replay(
     def layer(mgr):
         return (mgr._swa_kv_caches if swa else mgr._kv_caches)[0]
 
-    send_geom = sender._make_geometry(src_tp, dst_tp, swa=swa)
-    recv_geom = receiver._make_geometry(src_tp, dst_tp, swa=swa)
+    group = "swa" if swa else "full"
+    send_geom = sender._make_geometry(src_tp, dst_tp, group=group)
+    recv_geom = receiver._make_geometry(src_tp, dst_tp, group=group)
     if land:
         send_geom, recv_geom = send_geom.with_land(), recv_geom.with_land()
     for dst_rank in range(dst_tp):
@@ -196,7 +202,7 @@ class TestTpuReshardLayout(unittest.TestCase):
         mgr.kv_args = SimpleNamespace(
             total_kv_head_num=total_heads, total_swa_kv_head_num=total_heads
         )
-        geometry = mgr._make_geometry(src_tp, dst_tp, swa=swa)
+        geometry = mgr._make_geometry(src_tp, dst_tp, group="swa" if swa else "full")
         source_width = source.stride(1) * source.element_size()
         destination_width = destination.stride(1) * destination.element_size()
         for dst_rank in range(dst_tp):
@@ -235,7 +241,7 @@ class TestTpuReshardLayout(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "SGLANG_TPU_USE_BLOCK_MAJOR_KV.*TP 8 on prefill and 4"
                 ):
-                    mgr._make_geometry(8, 4, swa=swa)
+                    mgr._make_geometry(8, 4, group="swa" if swa else "full")
 
     def test_non_token_major_5d_layouts_refuse_unequal_tp(self):
         with patch(
@@ -280,7 +286,9 @@ class TestTpuReshardLayout(unittest.TestCase):
                     ):
                         mgr = _manager(torch.bfloat16, full_heads, swa_heads, dst_tp)
                         self.assertEqual(
-                            mgr._make_geometry(src_tp, dst_tp, swa=swa).total_kv_heads,
+                            mgr._make_geometry(
+                                src_tp, dst_tp, group="swa" if swa else "full"
+                            ).total_kv_heads,
                             swa_heads if swa else full_heads,
                         )
                         self.assertTrue(
@@ -302,7 +310,7 @@ class TestTpuReshardLayout(unittest.TestCase):
                 with self.subTest(dtype=dtype, heads=heads, tp=(src_tp, dst_tp)):
                     mgr = _manager(dtype, heads, heads, dst_tp)
                     full = mgr._make_geometry(src_tp, dst_tp)
-                    swa = mgr._make_geometry(src_tp, dst_tp, swa=True)
+                    swa = mgr._make_geometry(src_tp, dst_tp, group="swa")
                     for src_rank in range(src_tp):
                         dst_rank = src_rank // swa.ratio
                         try:
@@ -333,7 +341,7 @@ class TestTpuReshardLayout(unittest.TestCase):
                 cell = (full_heads, swa_heads, src_tp, dst_tp)
                 with self.subTest(cell=cell):
                     mgr = _manager(fp8, full_heads, swa_heads, dst_tp)
-                    geom = mgr._make_geometry(src_tp, dst_tp, swa=True)
+                    geom = mgr._make_geometry(src_tp, dst_tp, group="swa")
                     self.assertEqual(geom.total_kv_heads, swa_heads)
                     try:
                         exact = _replay(*cell, dtype=fp8, swa=True)
@@ -1473,7 +1481,7 @@ def _replay_unified(
         if receiver.reshard_refusal(src_attn_tp=src_tp, dst_attn_tp=dst_tp) is not None:
             return False
         recv_geom = receiver._make_geometry(
-            src_attn_tp=src_tp, dst_attn_tp=dst_tp, swa=False
+            src_attn_tp=src_tp, dst_attn_tp=dst_tp, group="full"
         )
         dst_blocks = dst_full + got_pool.expand_swa_pages(dst_swa)
         ratio = recv_geom.ratio
@@ -1503,7 +1511,7 @@ def _replay_unified(
             ):
                 return False
             send_geom = sender._make_geometry(
-                src_attn_tp=src_tp, dst_attn_tp=dst_tp, swa=False
+                src_attn_tp=src_tp, dst_attn_tp=dst_tp, group="full"
             )
             if not _copy_unified_contribution(
                 src_caches=sender._kv_caches,
@@ -1569,7 +1577,7 @@ class TestSeqAlongLaneUnequalTP(unittest.TestCase):
             pool=pool, total_heads=4, tp=4, mode=DisaggregationMode.DECODE
         )
         self.assertEqual(
-            mgr._make_geometry(src_attn_tp=8, dst_attn_tp=4, swa=False).ratio, 2
+            mgr._make_geometry(src_attn_tp=8, dst_attn_tp=4, group="full").ratio, 2
         )
         mgr._kv_caches = [torch.zeros(9, 4, 128, 256, dtype=torch.bfloat16)]
         for src_tp in (8, 4):
@@ -1577,8 +1585,435 @@ class TestSeqAlongLaneUnequalTP(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "5D token-major fused KV tensors"
                 ) as cm:
-                    mgr._make_geometry(src_attn_tp=src_tp, dst_attn_tp=4, swa=False)
+                    mgr._make_geometry(src_attn_tp=src_tp, dst_attn_tp=4, group="full")
                 self.assertNotIn("seq-along-lane", str(cm.exception))
+
+
+def _unified_with_draft(
+    *,
+    target_dtype: torch.dtype,
+    target_heads: int,
+    draft_dtype: torch.dtype,
+    draft_heads: int,
+    draft_sal: bool,
+    draft_is_swa: bool,
+    page_size: int = SAL_PAGE,
+    pages: int = 12,
+):
+    target_pool = _unified_sal_pool(
+        dtype=target_dtype,
+        heads=target_heads,
+        full_layers=2,
+        swa_layers=2,
+        page_size=page_size,
+        pages=pages,
+    )
+    alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+        size=pages * page_size,
+        page_size=page_size,
+        dtype=target_dtype,
+        device="cpu",
+        kvcache=target_pool,
+        need_sort=False,
+        sliding_window_size=2 * page_size,
+    )
+    pool_cls = TpuSeqAlongLaneKVPool if draft_sal else TpuFusedMHATokenToKVPool
+    draft_kw = dict(
+        page_size=page_size,
+        dtype=draft_dtype,
+        head_num=draft_heads,
+        head_dim=128,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    fl, sl = ([], [0, 1]) if draft_is_swa else ([0, 1], [])
+    with mock.patch.object(kv_pool, "_seq_along_lane_head_dim", _sublane_tile_head_dim):
+        if draft_is_swa:
+            draft_pool = SWAKVPool(
+                size=pages * page_size,
+                size_swa=max(pages // 2, 4) * page_size,
+                swa_attention_layer_ids=sl,
+                full_attention_layer_ids=fl,
+                token_to_kv_pool_class=pool_cls,
+                **draft_kw,
+            )
+        else:
+            draft_pool = pool_cls(
+                size=pages * page_size,
+                layer_num=len(fl),
+                **draft_kw,
+            )
+    kvc = SimpleNamespace(
+        is_hybrid_swa=draft_is_swa,
+        sliding_window_size=2 * page_size if draft_is_swa else None,
+        model_config=SimpleNamespace(sliding_window_size=None),
+        layer_info=SimpleNamespace(
+            full_attention_layer_ids=fl, swa_attention_layer_ids=sl
+        ),
+    )
+    alloc.attach_draft_kv_pool(kvc, draft_pool)
+    return target_pool, alloc, draft_pool
+
+
+def _fill_draft_caches(
+    *,
+    caches: Sequence[torch.Tensor],
+    heads: list[int],
+    blocks: list[int],
+    sal: bool,
+) -> list[torch.Tensor]:
+    live_masks: list[torch.Tensor] = []
+    for layer_idx, buf in enumerate(caches):
+        raw = buf.view(torch.uint8)
+        raw.fill_(0xFF)
+        live = torch.zeros_like(raw, dtype=torch.bool)
+        if sal:
+            w, r, b = (torch.arange(n) for n in raw.shape[2:])
+            pos = w[:, None, None] * 5 + r[None, :, None] * 3 + b[None, None, :] * 7
+            for ordinal, blk in enumerate(blocks):
+                salt = (layer_idx + 1) * 29 + ordinal * 13
+                for local, head in enumerate(heads):
+                    for kv in (0, 1):
+                        tag = ((2 * head + kv) * 137 + salt + pos) % 251
+                        raw[blk, 2 * local + kv] = tag.to(torch.uint8)
+                        live[blk, 2 * local + kv] = True
+        else:
+            packing = int(raw.shape[3])
+            token = torch.arange(raw.shape[1])[:, None]
+            byte = torch.arange(raw.shape[-1])[None, :]
+            for ordinal, blk in enumerate(blocks):
+                salt = (layer_idx + 1) * 29 + ordinal * 13
+                for local, head in enumerate(heads):
+                    for kv in (0, 1):
+                        slot = 2 * local + kv
+                        tag = (
+                            (2 * head + kv) * 137 + salt + token * 7 + byte * 3
+                        ) % 251
+                        raw[blk, :, slot // packing, slot % packing, :] = tag.to(
+                            torch.uint8
+                        )
+                        live[blk, :, slot // packing, slot % packing, :] = True
+        live_masks.append(live)
+    return live_masks
+
+
+def _unified_draft_manager(
+    *,
+    target_pool: TpuUnifiedSWAKVPool,
+    draft_pool,
+    total_target_heads: int,
+    tp: int,
+    mode: DisaggregationMode,
+) -> RaidenKVManager:
+    groups = get_raiden_kv_caches(target_pool, draft_pool=draft_pool)
+    mgr = object.__new__(RaidenKVManager)
+    mgr.attn_tp_size = tp
+    mgr.disaggregation_mode = mode
+    mgr._unified_swa_pool = groups.unified_swa_pool
+    mgr._kv_caches = groups.full
+    mgr._swa_kv_caches = groups.swa
+    mgr._kv_head_nums = tuple(groups.full_head_nums)
+    mgr._swa_kv_head_nums = tuple(groups.swa_head_nums)
+    mgr._draft_kv_caches = list(groups.draft)
+    mgr._draft_is_swa = groups.draft_is_swa
+    mgr._draft_swa_sidecar = groups.draft_swa_sidecar
+    mgr._draft_seq_along_lane = groups.draft_seq_along_lane
+    mgr._draft_kv_head_num = (
+        groups.draft_swa_kv_head_num
+        if groups.draft_is_swa
+        else groups.draft_kv_head_num
+    ) or 0
+    mgr._seq_along_lane = groups.seq_along_lane
+    mgr._kv_pack_heads = groups.kv_pack_heads
+    mgr.kv_args = SimpleNamespace(
+        total_kv_head_num=total_target_heads,
+        total_swa_kv_head_num=total_target_heads,
+        page_size=target_pool.page_size,
+        sliding_window_size=None,
+    )
+    return mgr
+
+
+def _replay_unified_draft(
+    *,
+    total_target_heads: int,
+    total_draft_heads: int,
+    src_tp: int,
+    dst_tp: int,
+    target_dtype: torch.dtype,
+    draft_dtype: torch.dtype,
+    draft_sal: bool,
+    draft_is_swa: bool,
+) -> bool:
+    src_t_heads = max(1, total_target_heads // src_tp)
+    dst_t_heads = max(1, total_target_heads // dst_tp)
+    src_d_heads = max(1, total_draft_heads // src_tp)
+    dst_d_heads = max(1, total_draft_heads // dst_tp)
+    wire_total_draft_heads = dst_d_heads * dst_tp
+    src_full, src_swa = [1, 2], [3, 4]
+    dst_full, dst_swa = [2, 1], [4, 3]
+    for dst_rank in range(dst_tp):
+        want_t, want_a, want_d = _unified_with_draft(
+            target_dtype=target_dtype,
+            target_heads=dst_t_heads,
+            draft_dtype=draft_dtype,
+            draft_heads=dst_d_heads,
+            draft_sal=draft_sal,
+            draft_is_swa=draft_is_swa,
+        )
+        got_t, got_a, got_d = _unified_with_draft(
+            target_dtype=target_dtype,
+            target_heads=dst_t_heads,
+            draft_dtype=draft_dtype,
+            draft_heads=dst_d_heads,
+            draft_sal=draft_sal,
+            draft_is_swa=draft_is_swa,
+        )
+        if draft_is_swa:
+            # Allocate logical SWA pages so _DraftSwaSidecar assigns compact IDs.
+            dst_swa_tok = torch.cat(
+                [got_a.swa_attn_allocator.alloc(SAL_PAGE) for _ in range(2)]
+            )
+            dst_swa_logical = (dst_swa_tok[::SAL_PAGE] // SAL_PAGE).tolist()
+            want_swa_tok = torch.cat(
+                [want_a.swa_attn_allocator.alloc(SAL_PAGE) for _ in range(2)]
+            )
+            want_swa_logical = (want_swa_tok[::SAL_PAGE] // SAL_PAGE).tolist()
+            dst_draft_blocks = got_a.draft_swa_sidecar.translate_pages(
+                torch.tensor(dst_swa_logical)
+            ).tolist()
+            want_draft_blocks = want_a.draft_swa_sidecar.translate_pages(
+                torch.tensor(want_swa_logical)
+            ).tolist()
+        else:
+            dst_draft_blocks = list(dst_full)
+            want_draft_blocks = list(dst_full)
+        receiver = _unified_draft_manager(
+            target_pool=got_t,
+            draft_pool=got_d,
+            total_target_heads=total_target_heads,
+            tp=dst_tp,
+            mode=DisaggregationMode.DECODE,
+        )
+        want_mgr = _unified_draft_manager(
+            target_pool=want_t,
+            draft_pool=want_d,
+            total_target_heads=total_target_heads,
+            tp=dst_tp,
+            mode=DisaggregationMode.DECODE,
+        )
+        if receiver.reshard_refusal(src_attn_tp=src_tp, dst_attn_tp=dst_tp) is not None:
+            return False
+        _fill_unified_sal_pool(
+            pool=want_t,
+            heads=_rank_heads(total=total_target_heads, tp=dst_tp, rank=dst_rank),
+            full_pages=dst_full,
+            swa_pages=dst_swa,
+        )
+        for buf in got_t.kv_pool.page_buffers():
+            buf.view(torch.uint8).fill_(0xFF)
+        live_masks = _fill_draft_caches(
+            caches=want_mgr._draft_kv_caches,
+            heads=_rank_heads(total=total_draft_heads, tp=dst_tp, rank=dst_rank),
+            blocks=want_draft_blocks,
+            sal=draft_sal,
+        )
+        for buf in receiver._draft_kv_caches:
+            buf.view(torch.uint8).fill_(0xFF)
+
+        recv_t_geom = receiver._make_geometry(
+            src_attn_tp=src_tp, dst_attn_tp=dst_tp, group="full"
+        )
+        recv_d_geom = receiver._make_geometry(
+            src_attn_tp=src_tp,
+            dst_attn_tp=dst_tp,
+            group="draft",
+            total_kv_heads=wire_total_draft_heads,
+        )
+        ratio = recv_d_geom.ratio
+        dst_t_blocks = dst_full + got_t.expand_swa_pages(dst_swa)
+        for src_rank in range(dst_rank * ratio, (dst_rank + 1) * ratio):
+            src_t, src_a, src_d = _unified_with_draft(
+                target_dtype=target_dtype,
+                target_heads=src_t_heads,
+                draft_dtype=draft_dtype,
+                draft_heads=src_d_heads,
+                draft_sal=draft_sal,
+                draft_is_swa=draft_is_swa,
+            )
+            if draft_is_swa:
+                src_swa_tok = torch.cat(
+                    [src_a.swa_attn_allocator.alloc(SAL_PAGE) for _ in range(2)]
+                )
+                src_swa_logical = (src_swa_tok[::SAL_PAGE] // SAL_PAGE).tolist()
+                src_draft_blocks = src_a.draft_swa_sidecar.translate_pages(
+                    torch.tensor(src_swa_logical)
+                ).tolist()
+            else:
+                src_draft_blocks = list(src_full)
+            sender = _unified_draft_manager(
+                target_pool=src_t,
+                draft_pool=src_d,
+                total_target_heads=total_target_heads,
+                tp=src_tp,
+                mode=DisaggregationMode.PREFILL,
+            )
+            if (
+                sender.reshard_refusal(src_attn_tp=src_tp, dst_attn_tp=dst_tp)
+                is not None
+            ):
+                return False
+            _fill_unified_sal_pool(
+                pool=src_t,
+                heads=_rank_heads(total=total_target_heads, tp=src_tp, rank=src_rank),
+                full_pages=src_full,
+                swa_pages=src_swa,
+            )
+            _fill_draft_caches(
+                caches=sender._draft_kv_caches,
+                heads=_rank_heads(total=total_draft_heads, tp=src_tp, rank=src_rank),
+                blocks=src_draft_blocks,
+                sal=draft_sal,
+            )
+            send_t_geom = sender._make_geometry(
+                src_attn_tp=src_tp, dst_attn_tp=dst_tp, group="full"
+            )
+            send_d_geom = sender._make_geometry(
+                src_attn_tp=src_tp,
+                dst_attn_tp=dst_tp,
+                group="draft",
+                total_kv_heads=wire_total_draft_heads,
+            )
+            if not _copy_unified_contribution(
+                src_caches=sender._kv_caches,
+                dst_caches=receiver._kv_caches,
+                send_geom=send_t_geom,
+                recv_geom=recv_t_geom,
+                src_rank=src_rank,
+                dst_rank=dst_rank,
+                src_blocks=src_full + src_t.expand_swa_pages(src_swa),
+                dst_blocks=dst_t_blocks,
+            ):
+                return False
+            if not _copy_unified_contribution(
+                src_caches=sender._draft_kv_caches,
+                dst_caches=receiver._draft_kv_caches,
+                send_geom=send_d_geom,
+                recv_geom=recv_d_geom,
+                src_rank=src_rank,
+                dst_rank=dst_rank,
+                src_blocks=src_draft_blocks,
+                dst_blocks=dst_draft_blocks,
+            ):
+                return False
+        for got_buf, want_buf in zip(
+            got_t.kv_pool.page_buffers(),
+            want_t.kv_pool.page_buffers(),
+            strict=True,
+        ):
+            if not torch.equal(got_buf.view(torch.uint8), want_buf.view(torch.uint8)):
+                return False
+        for got_buf, want_buf, live in zip(
+            receiver._draft_kv_caches,
+            want_mgr._draft_kv_caches,
+            live_masks,
+            strict=True,
+        ):
+            got_raw, want_raw = got_buf.view(torch.uint8), want_buf.view(torch.uint8)
+            for g_blk, w_blk in zip(dst_draft_blocks, want_draft_blocks, strict=True):
+                mask = live[w_blk]
+                if not torch.equal(got_raw[g_blk][mask], want_raw[w_blk][mask]):
+                    return False
+    return True
+
+
+class TestUnifiedSpecDraftReshardLayout(unittest.TestCase):
+    def test_sal_all_full_draft_replays_byte_exact(self):
+        for dtype in (torch.bfloat16, _FP8):
+            for src_tp, dst_tp in ((8, 4), (8, 2)):
+                with self.subTest(dtype=dtype, tp=(src_tp, dst_tp)):
+                    self.assertTrue(
+                        _replay_unified_draft(
+                            total_target_heads=8,
+                            total_draft_heads=8,
+                            src_tp=src_tp,
+                            dst_tp=dst_tp,
+                            target_dtype=dtype,
+                            draft_dtype=dtype,
+                            draft_sal=True,
+                            draft_is_swa=False,
+                        )
+                    )
+
+    def test_sal_all_swa_draft_via_sidecar_replays_byte_exact(self):
+        for dtype in (torch.bfloat16, _FP8):
+            for src_tp, dst_tp in ((8, 4), (8, 2)):
+                with self.subTest(dtype=dtype, tp=(src_tp, dst_tp)):
+                    self.assertTrue(
+                        _replay_unified_draft(
+                            total_target_heads=8,
+                            total_draft_heads=8,
+                            src_tp=src_tp,
+                            dst_tp=dst_tp,
+                            target_dtype=dtype,
+                            draft_dtype=dtype,
+                            draft_sal=True,
+                            draft_is_swa=True,
+                        )
+                    )
+
+    def test_heterogeneous_sal_target_and_bf16_token_major_draft_replays_byte_exact(
+        self,
+    ):
+        target_pool, _, draft_pool = _unified_with_draft(
+            target_dtype=_FP8,
+            target_heads=2,
+            draft_dtype=torch.bfloat16,
+            draft_heads=2,
+            draft_sal=False,
+            draft_is_swa=False,
+        )
+        groups = get_raiden_kv_caches(target_pool, draft_pool=draft_pool)
+        self.assertTrue(groups.target_seq_along_lane)
+        self.assertTrue(groups.seq_along_lane)
+        self.assertIs(groups.draft_seq_along_lane, False)
+        for src_tp, dst_tp in ((8, 4), (8, 2)):
+            with self.subTest(tp=(src_tp, dst_tp)):
+                self.assertTrue(
+                    _replay_unified_draft(
+                        total_target_heads=8,
+                        total_draft_heads=8,
+                        src_tp=src_tp,
+                        dst_tp=dst_tp,
+                        target_dtype=_FP8,
+                        draft_dtype=torch.bfloat16,
+                        draft_sal=False,
+                        draft_is_swa=False,
+                    )
+                )
+
+    def test_replicated_head_draft_replays_byte_exact(self):
+        for draft_dtype, draft_sal in (
+            (_FP8, True),
+            (torch.bfloat16, False),
+            (_FP8, False),
+        ):
+            for src_tp, dst_tp in ((8, 4), (8, 2)):
+                with self.subTest(
+                    draft_dtype=draft_dtype, draft_sal=draft_sal, tp=(src_tp, dst_tp)
+                ):
+                    self.assertTrue(
+                        _replay_unified_draft(
+                            total_target_heads=8,
+                            total_draft_heads=1,
+                            src_tp=src_tp,
+                            dst_tp=dst_tp,
+                            target_dtype=_FP8,
+                            draft_dtype=draft_dtype,
+                            draft_sal=draft_sal,
+                            draft_is_swa=False,
+                        )
+                    )
 
 
 if __name__ == "__main__":

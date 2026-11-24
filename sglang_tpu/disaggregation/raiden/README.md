@@ -84,7 +84,7 @@ ride in the existing `BLOCKS` reply.
 Push-resharding runs the same two-engine split. `RESHARD_REQ` carries the
 decode's SWA pages and its SWA transfer address alongside the full ones, and
 `RESHARD_BLOCKS` carries the prefill's; each side then builds a second plan
-over the SWA sub-pool with `_make_geometry(..., swa=True)`, which takes the
+over the SWA sub-pool with `_make_geometry(..., group="swa")`, which takes the
 head-pair granule from the SWA tensor and the kv-head count from
 `total_swa_kv_head_num`, so the two pools may differ in dtype, head_dim or
 kv-head count. The window is **never chunked** — it is settled only when the prefill
@@ -125,8 +125,11 @@ or dtype differ from the first layer's (e.g. a draft model's), and fp8 with
 more than one kv head per decode rank. `SEQ_ALONG_LANE` pools, regular or
 unified, reshard by whole head runs, and both sides must match. Pools with
 hybrid model state (GDN/Mamba linear-attention rows or DSV4 compressor state)
-or unified speculative draft KV are refused too: push-resharding does not
-move them. The prefill re-checks the push geometry on `RESHARD_REQ`,
+are refused too: push-resharding does not move them. Unified speculative draft
+KV push-reshards on the closing push via `_draft_engine` for direct/head-run
+schedules (`SEQ_ALONG_LANE`, `bf16`, or direct `fp8`), while landing-target +
+draft or landing-draft pairs are refused at `init()`. The prefill re-checks
+the push geometry (including draft metadata) on `RESHARD_REQ`,
 and every push plan is bounds-checked per block before registration.
 
 ## Tunables (env)
