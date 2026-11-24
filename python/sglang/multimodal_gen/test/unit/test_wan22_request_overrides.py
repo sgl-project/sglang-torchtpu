@@ -28,10 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     timestep_preparation as module,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cuda_ci(est_time=10, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 _SERVER_SHIFT = Wan2_2_T2V_A14B_Config().flow_shift  # 12.0
 
@@ -78,7 +75,7 @@ class TestWan22RequestOverrides(CustomTestCase):
     def test_timesteps_follow_the_request_flow_shift(self):
         default = _stage_timesteps(None)
         self.assertTrue(torch.equal(default, _scheduler_timesteps(None)))
-        # The spec's 12.0 is the server's default: the same schedule, bit for bit.
+        # A request for 12.0, the server's default, gets the same schedule bit for bit.
         self.assertTrue(torch.equal(_stage_timesteps(12.0), default))
         shifted = _stage_timesteps(5.0)
         self.assertTrue(torch.equal(shifted, _scheduler_timesteps(5.0)))
