@@ -51,6 +51,31 @@ class TestExpertWriteTracker(CustomTestCase):
 
 
 class TestStagedWeightLoader(CustomTestCase):
+    def test_platform_stages_opted_in_non_pipeline_loads(self):
+        from sglang_tpu.envs import envs
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        # PP retains its existing default; TP/EP only stages when requested.
+        for pp_size, enabled in ((1, False), (1, True), (2, False)):
+            with (
+                self.subTest(pp_size=pp_size, enabled=enabled),
+                envs.SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING.override(enabled),
+                patch(
+                    "sglang.srt.runtime_context.get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ),
+            ):
+                expected_staging = pp_size > 1 or enabled
+                param = _param()
+                with TpuSRTPlatform.weight_loading_context(None, iter(())) as weights:
+                    self.assertEqual(list(weights), [])
+                    stager = expert_loading.get_expert_stager()
+                    self.assertEqual(stager is not None, expected_staging)
+                    if stager is not None:
+                        stager.host_param(param).data.fill_(7)
+                self.assertIsNone(expert_loading.get_expert_stager())
+                self.assertTrue(torch.all(param == (7 if expected_staging else 0)))
+
     def test_context_routes_staged_expert_writes_to_the_host_buffer(self):
         """While a stage loads, FusedMoE's expert loader writes a device
         parameter's shard to its host buffer and reports the write; scales

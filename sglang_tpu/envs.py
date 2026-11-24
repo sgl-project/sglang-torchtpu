@@ -515,6 +515,9 @@ class TpuEnvs:
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap or Run:AI).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
+    # Assemble MoE expert shards in host buffers before chunked TPU uploads.
+    # PP already uses this path; opt in for TP/EP and replicated draft models.
+    SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

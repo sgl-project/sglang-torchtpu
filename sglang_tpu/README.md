@@ -26,6 +26,13 @@ fork already satisfies the plugin's `sglang` requirement.
 `tpu_oot` only activates when named: with `SGLANG_PLATFORM` unset the loader
 calls every installed `activate()` and errors when two answer.
 
+## Expert weight loading
+
+Set `SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING=1` to assemble expert slices on CPU
+before chunked TPU uploads outside pipeline parallelism. This uses additional
+host memory and can reduce loading time for replicated experts. It defaults off;
+pipeline-parallel loading continues to use host staging as before.
+
 ## Mode-B divergences (gates that take a different arm under OOT)
 
 Measured against the fork at the wave-0 move; re-audit after every sync.
