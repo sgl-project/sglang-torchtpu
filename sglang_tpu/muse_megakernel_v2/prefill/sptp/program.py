@@ -146,8 +146,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
-    # SPTP_OGATE_XLA=1: the o gate in XLA on the RPA layout (layout copies) instead of the kernel
-    ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_XLA", "0") != "1"
+    # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (its 64-lane head relayouts and f32 MXU head
+    # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
+    ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
     o_gate = o_gate_call(c)
     # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
     aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
