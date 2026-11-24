@@ -49,7 +49,9 @@ def _interpret_on_cpu():
 
 
 def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
-    """All prefill glue flags default off and are always read via .get()."""
+    """All prefill glue flags default off and every sglang_tpu EnvVar is read via .get()."""
+    import re
+
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() == 0
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE.get() == 0
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK.get() == 0
@@ -80,6 +82,81 @@ def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
                 assert found_get, (
                     f"{rel}:{node.lineno} accesses {node.attr} without .get()"
                 )
+
+    declared: set[str] = set()
+    for env_rel in ("sglang_tpu/envs.py", "python/sglang/srt/environ.py"):
+        env_p = repo / env_rel
+        if env_p.exists():
+            declared.update(
+                re.findall(r"^\s*(SGLANG_TPU_[A-Z0-9_]+)\s*=\s*Env", env_p.read_text(), re.M)
+            )
+    assert declared
+
+    def _is_env_ref(node: ast.AST, local_aliases: set[str] | None = None) -> str | None:
+        if isinstance(node, ast.Attribute) and node.attr in declared:
+            if isinstance(node.value, ast.Name) and node.value.id in (
+                "envs",
+                "tpu_envs",
+                "_tpu_envs",
+                "_envs_mod",
+            ):
+                return node.attr
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in declared
+        ):
+            return str(node.args[1].value)
+        if local_aliases and isinstance(node, ast.Name) and node.id in local_aliases:
+            return f"alias:{node.id}"
+        return None
+
+    violations: list[str] = []
+    for py_path in sorted((repo / "sglang_tpu").rglob("*.py")):
+        tree = ast.parse(py_path.read_text(errors="replace"), filename=str(py_path))
+        # Track per-module assigned EnvVar local aliases (e.g. `_e = getattr(envs, "SGLANG_TPU_...", None)`).
+        local_aliases: set[str] = set()
+        for stmt in ast.walk(tree):
+            if isinstance(stmt, ast.Assign) and _is_env_ref(stmt.value) is not None:
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        local_aliases.add(tgt.id)
+        for node in ast.walk(tree):
+            candidates: list[ast.AST] = []
+            if isinstance(node, (ast.If, ast.IfExp, ast.While, ast.Assert)):
+                candidates.append(node.test)
+            elif isinstance(node, ast.BoolOp):
+                candidates.extend(node.values)
+            elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                candidates.append(node.operand)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("bool", "int", "float", "str")
+                and node.args
+            ):
+                candidates.append(node.args[0])
+            elif isinstance(node, ast.Compare):
+                is_none_cmp = all(
+                    isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops
+                ) and any(
+                    isinstance(c, ast.Constant) and c.value is None
+                    for c in node.comparators
+                )
+                if not is_none_cmp:
+                    candidates.append(node.left)
+                    candidates.extend(node.comparators)
+            for cand in candidates:
+                env_name = _is_env_ref(cand, local_aliases=local_aliases)
+                if env_name is not None:
+                    rel = py_path.relative_to(repo)
+                    violations.append(
+                        f"{rel}:{getattr(cand, 'lineno', 0)} ({env_name})"
+                    )
+    assert not violations, "EnvVar read without .get() in boolean/cast/compare context: " + ", ".join(violations)
 
 
 def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():

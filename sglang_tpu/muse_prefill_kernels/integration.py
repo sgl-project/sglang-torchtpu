@@ -3059,7 +3059,7 @@ class MusePrefillKernels(torch.nn.Module):
             c_off = 0
             for k, c_k in enumerate(chunks):
                 has_next_c = k + 1 < len(chunks)
-                if has_next_c and self.ops.a1_chunk_agd is not None:
+                if has_next_c and getattr(self.ops, "a1_chunk_agd", None) is not None:
                     c_next = chunks[k + 1]
                     q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
                         ag_cur,
@@ -3537,7 +3537,7 @@ class MusePrefillKernels(torch.nn.Module):
             q_size = attn.num_heads * 64
             for k, c_k in enumerate(chunks):
                 has_next_c = k + 1 < len(chunks)
-                if has_next_c and self.ops.a1_chunk_agd is not None:
+                if has_next_c and getattr(self.ops, "a1_chunk_agd", None) is not None:
                     c_next = chunks[k + 1]
                     q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
                         ag_cur,
