@@ -83,6 +83,15 @@ def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True):
 
     rows = lambda w: pl.BlockSpec((tm, w), lambda i: (i, 0))
     whole = lambda a, b: pl.BlockSpec((a, b), lambda i: (0, 0))
+    outs = (
+        jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
+        jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
+        jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
+    )
+    params = pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
+    )
+    name = f"muse_sptp_qkvg_t{T}_m{tm}_r{int(rope)}{'_mxun' if mxu_norm else ''}"
 
     def call(x8, xs, w, sm, rope_rows):
         return pl.pallas_call(
@@ -96,15 +105,46 @@ def qkvg_call(c: PFConfig, tm: int, rope: bool, mxu_norm: bool = True):
                 rows(2 * hd),
             ],
             out_specs=(rows(qd), rows(2 * kvd), rows(qd)),
-            out_shape=(
-                jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
-                jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
-                jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
-            ),
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
-            ),
-            name=f"muse_sptp_qkvg_t{T}_m{tm}_r{int(rope)}{'_mxun' if mxu_norm else ''}",
+            out_shape=outs,
+            compiler_params=params,
+            name=name,
         )(x8, xs, w, sm, rope_rows)
 
+    def chunk_call(chunk, n_chunks, x8, xs, w, sm, rope_rows, prev):
+        """Rows of one all-gathered chunk (rank r's rows [chunk * Ts / n, (chunk + 1) * Ts / n),
+        rank-major) into their places in the [T, .] outputs, which alias prev (the previous
+        chunk's outputs; None: the first chunk)."""
+        ts = T // c.tp
+        sub = ts // n_chunks
+        if sub % tm:
+            raise ValueError(f"{sub} rows per rank and chunk do not tile by {tm}")
+        bpr = sub // tm
+
+        def dst(j):
+            return ((j // bpr) * ts + chunk * sub) // tm + j % bpr
+
+        drows = lambda wd: pl.BlockSpec((tm, wd), lambda j: (dst(j), 0))
+        args = [x8, xs, w, sm, rope_rows]
+        specs = [rows(H), rows(1), whole(H, nq), whole(sm.shape[0], H), drows(2 * hd)]
+        aliases = {}
+        if prev is not None:
+            args += list(prev)
+            specs += [pl.BlockSpec(memory_space=pl.ANY)] * 3
+            aliases = {5: 0, 6: 1, 7: 2}
+
+        def body(*refs):
+            kernel(*refs[:5], *refs[-3:])
+
+        return pl.pallas_call(
+            body,
+            grid=(c.tp * bpr,),
+            in_specs=specs,
+            out_specs=(drows(qd), drows(2 * kvd), drows(qd)),
+            out_shape=outs,
+            input_output_aliases=aliases,
+            compiler_params=params,
+            name=f"{name}_c{chunk}of{n_chunks}",
+        )(*args)
+
+    call.chunk = chunk_call
     return call

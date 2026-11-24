@@ -49,6 +49,9 @@ from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
 DEBUG_BF16_ACTIVATIONS = False
 # row tile of the Pallas qkvg card
 QKVG_TILE = 256
+# x_norm AG chunks overlapped with the chunked qkvg card, and that card's row tile
+XAG_CHUNKS = 4
+XAG_TILE = 128
 
 
 def _bf16_rows(x):
@@ -79,6 +82,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
     mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
     qkvg_k = {r: qkvg_call(c, QKVG_TILE, r, mxu_norm) for r in (True, False)}
+    # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
+    # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
+    n_xag = int(os.environ.get("SPTP_XAG_CHUNKS", str(XAG_CHUNKS)))
+    qkvg_c = {r: qkvg_call(c, XAG_TILE, r, mxu_norm) for r in (True, False)}
 
     def forward(
         meta,
@@ -113,10 +120,30 @@ def build_forward(c: PFConfig, axis: str = "model"):
             sm = smalls[l]
             with _scope("sp_in_norm"):
                 a8, a_s = q8(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
-            with _scope("sp_x_ag"):
-                a8, a_s = ag(a8, axis), ag(a_s, axis)
+            if n_xag > 1 and not xla_qkvg:
+                with _scope("sp_xag_qkvg"):
+                    sub = Ts // n_xag
+                    out = None
+                    for i in range(n_xag):
+                        rs = slice(i * sub, (i + 1) * sub)
+                        out = qkvg_c[c.use_rope(l)].chunk(
+                            i,
+                            n_xag,
+                            ag(a8[rs], axis),
+                            ag(a_s[rs], axis),
+                            wqkvg[l],
+                            sm,
+                            rope_rows,
+                            out,
+                        )
+                    q, kvs, gate = out
+            else:
+                with _scope("sp_x_ag"):
+                    a8, a_s = ag(a8, axis), ag(a_s, axis)
             with _scope("sp_qkvg"):
-                if xla_qkvg:
+                if n_xag > 1 and not xla_qkvg:
+                    pass
+                elif xla_qkvg:
                     qkvg = dense(a8, a_s, wqkvg[l], sm, "wqkvg", c.qkvg_dim)
                     q, kvs, gate = qkv_from_proj(
                         c, qkvg, rope_rows if c.use_rope(l) else None, xla=True
