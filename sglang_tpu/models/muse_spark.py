@@ -2042,7 +2042,7 @@ class MuseSparkMoE(nn.Module):
 
         block = 4096 // int(s1_chk.shape[1])
         if block not in (16, 256) and not (
-            block == 512 and mode not in ("ep_tp2", "chipmate")
+            block == 512 and mode != "chipmate"
         ):
             return
 
@@ -2408,6 +2408,7 @@ class MuseSparkMoE(nn.Module):
             "sparse_v2",
             "fp8_sparse",
             "sparse_fp8",
+            "ep_tp2",
         ):
             return False
         if self.__dict__.get("_fused_decode_sharded_op") is not None:
@@ -2422,8 +2423,8 @@ class MuseSparkMoE(nn.Module):
         has_w3 = bool(self.__dict__.get("_fused_decode_v2_has_w3", False))
         self._fused_decode_sharded_op = get_muse_fuse_all_decode_op(
             mode=fmode,
-            ep=self.tp_size,
-            tp=1,
+            ep=(self.tp_size // 2 if fmode == "ep_tp2" else self.tp_size),
+            tp=(2 if fmode == "ep_tp2" else 1),
             block=blk,
             num_replicas=num_rep,
             replica_cost_mode=cost_m,
@@ -5770,6 +5771,8 @@ class MuseSparkForConditionalGeneration(nn.Module):
             )
             errs.extend(layer_errs)
             if in_place:
+                if _is_decode_ep_tp2_layout(get_parallel()):
+                    ex.__dict__["_tpu_ep_tp2_packed_fp4"] = True
                 if ex.handles_moe_reduction:
                     if has_tpu_fused_rs_post_expert_norm(ex):
                         prepare_tpu_fused_rs_post_expert_norm(ex)
