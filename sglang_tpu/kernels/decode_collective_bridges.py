@@ -213,7 +213,11 @@ def _dot_fp8_scaled_to_ref(
                 w_buf[:, pl.ds(cn, tn)],
                 preferred_element_type=jnp.float32,
             )
-            sc = scale_ref[0:1, pl.ds(scale_c0 + cn, tn)]
+            sc = (
+                scale_ref[pl.ds(scale_c0 + cn, tn)].reshape(1, tn)
+                if scale_ref.ndim == 1
+                else scale_ref[0:1, pl.ds(scale_c0 + cn, tn)]
+            )
             out = acc * sc
             if row_s is not None:
                 out = out * row_s
@@ -1993,7 +1997,11 @@ def _dot_fp8_row_block_to_ref(
                 w_buf[:, pl.ds(cn, _DOT_TN)],
                 preferred_element_type=jnp.float32,
             )
-            sc = scale_ref[0:1, pl.ds(cn, _DOT_TN)]
+            sc = (
+                scale_ref[pl.ds(cn, _DOT_TN)].reshape(1, _DOT_TN)
+                if scale_ref.ndim == 1
+                else scale_ref[0:1, pl.ds(cn, _DOT_TN)]
+            )
             dst_ref[rs, pl.ds(cn, _DOT_TN)] = (acc * sc).astype(dst_ref.dtype)
 
     _fori_strips(n_r, bm, _sub)

@@ -2527,6 +2527,7 @@ class MuseSparkMoE(nn.Module):
         free_bf16: bool = False,
         tok_sharded: bool = False,
         chip_sharded: bool = False,
+        tp2_wpost: bool = False,
     ) -> Tuple[bool, bool]:
         """Prepare K-major FP8 weights for Wave-7/Wave-8/Wave-9 decode collective bridges 1 & 2."""
         from sglang_tpu.kernels.decode_collective_bridges import (
@@ -2601,11 +2602,29 @@ class MuseSparkMoE(nn.Module):
                 and wpo_mod.weight.shape[0] % 256 == 0
                 and wpo_mod.weight.shape[1] % 128 == 0
             ):
-                wpost_q, wpost_s = quantize_weight_fp8_k_major(wpo_mod.weight)
-                wpost_s = _as_1d_fp8_scale(wpost_s)
-                _wait_for(wpost_q, wpost_s)
+                wpost_q, wpost_s_2d = quantize_weight_fp8_k_major(wpo_mod.weight)
+                wpost_s = _as_1d_fp8_scale(wpost_s_2d)
+                _wait_for(wpost_q, wpost_s_2d, wpost_s)
                 self.register_buffer("_w7_wpost_w8k", wpost_q, persistent=False)
                 self.register_buffer("_w7_spost", wpost_s, persistent=False)
+                if tp2_wpost and can_pair_ag and self.tp_size == 8:
+                    full_wpost = tensor_model_parallel_all_gather(wpost_q.contiguous())
+                    full_spost = tensor_model_parallel_all_gather(
+                        wpost_s_2d.contiguous()
+                    )
+                    half_post = full_wpost.shape[1] // 2
+                    pair_wpost = full_wpost[
+                        :, side * half_post : (side + 1) * half_post
+                    ].contiguous()
+                    pair_spost = _as_1d_fp8_scale(
+                        full_spost[:, side * half_post : (side + 1) * half_post]
+                    )
+                    _wait_for(pair_wpost, pair_spost)
+                    del full_wpost, full_spost
+                    self.register_buffer(
+                        "_w9_wpost_pair_w8k", pair_wpost, persistent=False
+                    )
+                    self.register_buffer("_w9_spost_pair", pair_spost, persistent=False)
                 if free_bf16 and wpo_mod.weight.device.type != "meta":
                     old_po = wpo_mod.weight.data
                     wpo_mod.weight = nn.Parameter(
@@ -3941,8 +3960,12 @@ class MuseSparkDecoderLayer(nn.Module):
                         get_moe_to_attn_chip_sharded_bridge_op,
                     )
 
-                    w_post_p = self.mlp._buffers["_w7_wpost_w8k"]
-                    s_post_p = self.mlp._buffers["_w7_spost"]
+                    w_post_p = self.mlp._buffers.get(
+                        "_w9_wpost_pair_w8k", self.mlp._buffers["_w7_wpost_w8k"]
+                    )
+                    s_post_p = self.mlp._buffers.get(
+                        "_w9_spost_pair", self.mlp._buffers["_w7_spost"]
+                    )
                     if b2_kind == 3:
                         assert (
                             next_input_layernorm is not None
@@ -5838,6 +5861,9 @@ class MuseSparkForConditionalGeneration(nn.Module):
             bool(_env_get("SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES", False))
             and not chip_sharded
         )
+        chip_b2_tp2_wpost = bool(
+            chip_sharded and tpu_envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.get()
+        )
         bridge_qkv_epi = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI", False))
         tp16_qkv_epi = bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
         fuse_final_norm = bool(
@@ -5872,6 +5898,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     free_bf16=can_free,
                     tok_sharded=tok_sharded,
                     chip_sharded=chip_sharded,
+                    tp2_wpost=chip_b2_tp2_wpost,
                 )
             want_ret_sh = bool(
                 tok_sharded

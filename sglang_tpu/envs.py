@@ -1478,6 +1478,9 @@ class TpuEnvs:
     # and Entry on BOTH TP=8 (B=32..384) and TP=16 (B=64..384), eliminating intra-chip stream
     # split/re-gather D2D barriers and concat loops.
     SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
+    # Wave-9 opt-in TP_chip=2 W_post [4096, 4096] in chip-sharded Bridge 2b & L61 Final Norm on TP=8,
+    # eliminating both tok_s2 and post_ici inter-chip ICI collectives (+0.97 GiB/rank HBM).
+    SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across

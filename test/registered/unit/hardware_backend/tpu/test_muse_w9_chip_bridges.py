@@ -34,8 +34,14 @@ def test_w9_env_default_and_lock_free_prewarm():
 
     assert envs.SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES.default is False
     assert envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.default is False
+    assert envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.default is False
 
-    for rel_path in ("sglang_tpu/models/muse_spark.py", "sglang_tpu/decode_qkv_epilogue_tpu.py"):
+    for rel_path in (
+        "sglang_tpu/models/muse_spark.py",
+        "sglang_tpu/decode_qkv_epilogue_tpu.py",
+        "sglang_tpu/kernels/decode_collective_bridges.py",
+        "sglang_tpu/kernels/decode_collective_bridges_w8.py",
+    ):
         tree = ast.parse((_REPO_ROOT / rel_path).read_text())
         for node in ast.walk(tree):
             if isinstance(node, (ast.If, ast.While)):
@@ -43,6 +49,7 @@ def test_w9_env_default_and_lock_free_prewarm():
                 for env_name in (
                     "SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES",
                     "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI",
+                    "SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST",
                 ):
                     if env_name in src and ("envs." in src or "tpu_envs." in src):
                         assert ".get()" in src, f"bare EnvField bool in `{src}`"
@@ -1001,5 +1008,206 @@ def test_pytorch_sampler_tpu_nan_sentinel_and_disagg_prefill_oov_audit():
     inv_safe = jnp.where(jnp.isfinite(inv_raw), inv_raw, 0)
     q_f8 = jnp.clip(x_bf16 * inv_safe, -448.0, 448.0).astype(jnp.float8_e4m3fn)
     assert not bool(jnp.isnan(q_f8.astype(jnp.float32)).any())
+
+
+def test_w95_stacked_chip_bridges_and_tp2_wpost_0ulp_race_free():
+    """Verify cand_w9_5 Bug A/B/C + 1-pass VREG norm + TP2_WPOST 0.0-ULP parity & race-freedom."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    mesh8 = Mesh(np.array(jax.devices("cpu")[:8]), ("model",))
+    rng = np.random.default_rng(20261125)
+
+    TP = 8
+    n_chips = TP // 2
+    H = 2048  # post_cols=256 (TP=8) vs post_cols=1024 (TP2_WPOST)
+    H_PRE = 1024
+    qkv_cols = 1280  # exact production non-1024-multiple scale shape -> exercises _as_dot_scale_f32!
+    gate_cols = 512
+
+    wpost_full = jnp.asarray(
+        (rng.standard_normal((H_PRE, H)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn
+    )
+    spost_full = jnp.asarray((np.abs(rng.standard_normal((H,))) * 0.02 + 1e-3).astype(np.float32))
+    # Build TP_chip=2 W_post: even ranks get [:, :H//2], odd ranks get [:, H//2:]
+    wpost_tp2 = jnp.concatenate(
+        [wpost_full[:, : H // 2] if (r & 1) == 0 else wpost_full[:, H // 2 :] for r in range(TP)],
+        axis=1,
+    )
+    spost_tp2 = jnp.concatenate(
+        [spost_full[: H // 2] if (r & 1) == 0 else spost_full[H // 2 :] for r in range(TP)],
+        axis=0,
+    )
+    pff_g = jnp.asarray((np.ones((H,)) * 1.03).astype(np.float32))
+    pf_a = jnp.asarray((np.ones((H,)) * 0.92).astype(np.float32))
+    pf_b = jnp.asarray((np.ones((H,)) * 0.88).astype(np.float32))
+    nin_g = jnp.asarray((np.ones((H,)) * 1.07).astype(np.float32))
+    wq = jnp.asarray(
+        (rng.standard_normal((H, TP * qkv_cols)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn
+    )
+    sq = jnp.asarray((np.abs(rng.standard_normal((TP * qkv_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    wg = jnp.asarray(
+        (rng.standard_normal((H, TP * gate_cols)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn
+    )
+    sg = jnp.asarray((np.abs(rng.standard_normal((TP * gate_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    cs_pairs = jnp.asarray(rng.standard_normal((256, 128)).astype(np.float32) * 0.5)
+
+    for B_cur, sh_in in ((32, False), (64, True), (128, True)):
+        r_pair = B_cur // n_chips
+        valid = B_cur - 1
+        st_in = (rng.standard_normal((B_cur, H)) * 0.5).astype(np.float32)
+        st_in[-1, :] = np.nan  # Poisoned pad row!
+        st_stacked = jnp.asarray(
+            np.concatenate(
+                [st_in[(r >> 1) * r_pair : ((r >> 1) + 1) * r_pair] for r in range(TP)], axis=0
+            )
+        )
+        moe_np = (rng.standard_normal((B_cur, H_PRE)) * 0.3).astype(np.float32)
+        moe_np[-1, :] = np.nan
+        moe_bf16 = jnp.asarray(moe_np, dtype=jnp.bfloat16)
+        cs_step = build_decode_rope_step_tables(jnp.arange(B_cur, dtype=jnp.int32), cs_pairs)
+
+        def _run_b2(wp_arg, sp_arg, use_epi: bool):
+            out_sp = (
+                (
+                    P("model", None),
+                    P(None, None, "model", None, None),
+                    P(None, "model", None, None),
+                    P(None, "model"),
+                )
+                if use_epi
+                else (P("model", None), P(None, "model"), P(None, "model"))
+            )
+            return jax.shard_map(
+                lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+                    *a,
+                    world_size=TP,
+                    sharded_moe_in=sh_in,
+                    post_ff_eps=1e-5,
+                    post_ff_scale_input=True,
+                    next_in_eps=1e-5,
+                    next_in_scale_input=False,
+                    fuse_qkv_epi=use_epi,
+                    qkv_norm_eps=1e-6,
+                    query_scale=0.125,
+                    k_scale=0.75,
+                    v_scale=1.25,
+                    interpret=ip_race,
+                ),
+                mesh=mesh8,
+                in_specs=(
+                    P("model", None),
+                    P("model", None) if sh_in else P(),
+                    P(None, "model"),
+                    P("model"),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(None, "model"),
+                    P("model"),
+                    P(None, "model"),
+                    P("model"),
+                    P() if use_epi else None,
+                ),
+                out_specs=out_sp,
+                check_vma=False,
+            )(
+                st_stacked,
+                moe_bf16,
+                wp_arg,
+                sp_arg,
+                pff_g,
+                pf_a,
+                pf_b,
+                nin_g,
+                wq,
+                sq,
+                wg,
+                sg,
+                cs_step if use_epi else None,
+            )
+
+        st0, q0, kv0, g0 = _run_b2(wpost_full, spost_full, True)
+        st1, q1, kv1, g1 = _run_b2(wpost_tp2, spost_tp2, True)
+
+        # Bit-for-bit 0.0-ULP identity between TP2_WPOST=1 and TP2_WPOST=0 on all valid rows!
+        st0_np = np.asarray(st0).reshape(TP, r_pair, H)
+        st1_np = np.asarray(st1).reshape(TP, r_pair, H)
+        st0_reasm = np.concatenate([st0_np[2 * c] for c in range(n_chips)], axis=0)
+        st1_reasm = np.concatenate([st1_np[2 * c] for c in range(n_chips)], axis=0)
+        assert not np.isnan(st1_reasm[:valid]).any()
+        np.testing.assert_array_equal(st1_reasm[:valid], st0_reasm[:valid])
+        np.testing.assert_array_equal(np.asarray(q1)[:, :valid], np.asarray(q0)[:, :valid])
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(kv1, jnp.uint8))[:valid],
+            np.asarray(jax.lax.bitcast_convert_type(kv0, jnp.uint8))[:valid],
+        )
+        np.testing.assert_array_equal(np.asarray(g1)[:valid], np.asarray(g0)[:valid])
+
+        # Also check chip_fn (return_stream_too=False and True) 0.0-ULP TP2_WPOST=1 vs TP2_WPOST=0!
+        for ret_st in (False, True):
+            fn_out_sp = (P("model", None), P("model", None)) if ret_st else P("model", None)
+
+            def _run_fn(wp_arg, sp_arg):
+                return jax.shard_map(
+                    lambda *a: w8.moe_post_chip_sharded_final_norm_jax(
+                        *a,
+                        world_size=TP,
+                        sharded_moe_in=sh_in,
+                        post_ff_eps=1e-5,
+                        post_ff_scale_input=True,
+                        final_eps=1e-5,
+                        final_scale_input=False,
+                        return_stream_too=ret_st,
+                        interpret=ip_race,
+                    ),
+                    mesh=mesh8,
+                    in_specs=(
+                        P("model", None),
+                        P("model", None) if sh_in else P(),
+                        P(None, "model"),
+                        P("model"),
+                        P(),
+                        P(),
+                        P(),
+                        P(),
+                    ),
+                    out_specs=fn_out_sp,
+                    check_vma=False,
+                )(st_stacked, moe_bf16, wp_arg, sp_arg, pff_g, pf_a, pf_b, nin_g)
+
+            out_fn0 = _run_fn(wpost_full, spost_full)
+            out_fn1 = _run_fn(wpost_tp2, spost_tp2)
+            if ret_st:
+                s_fn0, h_fn0 = out_fn0
+                s_fn1, h_fn1 = out_fn1
+                s0_r = np.concatenate(
+                    [np.asarray(s_fn0).reshape(TP, r_pair, H)[2 * c] for c in range(n_chips)], axis=0
+                )
+                s1_r = np.concatenate(
+                    [np.asarray(s_fn1).reshape(TP, r_pair, H)[2 * c] for c in range(n_chips)], axis=0
+                )
+                np.testing.assert_array_equal(s1_r[:valid], s0_r[:valid])
+            else:
+                h_fn0, h_fn1 = out_fn0, out_fn1
+            h0_np = np.asarray(h_fn0).reshape(TP, B_cur, H)
+            h1_np = np.asarray(h_fn1).reshape(TP, B_cur, H)
+            assert not np.isnan(h1_np[0, :valid].astype(np.float32)).any()
+            np.testing.assert_array_equal(h1_np[:, :valid], h0_np[:, :valid])
+
 
 
