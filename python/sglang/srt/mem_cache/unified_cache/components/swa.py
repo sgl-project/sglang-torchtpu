@@ -152,17 +152,53 @@ class SWAComponent(TreeComponent):
         return unbacked
 
     def _window_shadowed_by_children(self, node: UnifiedTreeNode) -> bool:
-        """``node`` is a pass-through: its one child holds a full window of its own.
+        """``node`` is a pass-through: its one child holds (or is backing up) a
+        full host window of its own.
 
-        A branch point keeps its window even when every child holds one, since a
-        prompt sharing only the common prefix ends its match there.
+        Leaves keep their windows. Branch points keep theirs even when every
+        child holds one, since a prompt sharing only the common prefix ends its
+        match there. An unbranched pass-through node skips its copy; the first
+        prompt diverging at or inside it after device SWA eviction recomputes
+        that prefix and creates the branch point for later prompts.
         """
         if len(node.children) != 1:
             return False
         (child,) = node.children.values()
-        cd = child.component_data[self.component_type]
-        return len(child.key) >= self.sliding_window_size and (
-            cd.value is not None or cd.host_value is not None
+        if len(child.key) < self.sliding_window_size:
+            return False
+        return self._has_or_will_have_host_swa(child)
+
+    def _has_or_will_have_host_swa(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        if cd.host_value is not None or node.write_through_pending_id is not None:
+            return True
+        if cd.value is None:
+            return False
+        planned = getattr(self.tree_core, "_planned_backup_node_ids", None)
+        if planned is not None and node.id in planned:
+            return True
+        if not self.tree_core.is_write_back or node.backuped:
+            return False
+        lru = self.tree_core.lru_lists.get(self.component_type)
+        return lru is None or not lru.skips_host_backup(node)
+
+    def is_unmatchable_host_leaf(self, node: UnifiedTreeNode) -> bool:
+        """True when a host-only leaf lacks the host SWA window needed to match."""
+        if (
+            not self._host_tail_only
+            or not self.tree_core.has_swa_host_pool
+            or self.tree_core.is_host_memory_buffer_only
+        ):
+            return False
+        cache = getattr(self, "cache", None)
+        if cache is not None and is_swa_req_ring(cache.token_to_kv_pool_allocator):
+            return False
+        cd = node.component_data[self.component_type]
+        return (
+            cd.value is None
+            and cd.host_value is None
+            and node.write_through_pending_id is None
+            and node.load_back_pending_id is None
         )
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:

@@ -1691,27 +1691,34 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
         written = 0
-        for node_id in action.node_ids:
-            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            # Overlapping chain actions may revisit nodes with Full KV already
-            # backed up. Skip only when no transfer remains.
-            if device_value.numel() == 0 and not comp_xfers:
-                continue
-            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
-            host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
-            )
-            if host_indices is None:
-                return 0
-            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
-            lock_params = None
-            if not write_back:
-                lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
-            self._track_write_through_node(
-                node_id, lock_params, publish_node_ids=publish_node_ids
-            )
-            written = len(host_indices)
+        has_planned_attr = hasattr(self.tree_core, "_planned_backup_node_ids")
+        if has_planned_attr:
+            self.tree_core._planned_backup_node_ids = frozenset(action.node_ids)
+        try:
+            for node_id in action.node_ids:
+                device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+                # Overlapping chain actions may revisit nodes with Full KV already
+                # backed up. Skip only when no transfer remains.
+                if device_value.numel() == 0 and not comp_xfers:
+                    continue
+                sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+                host_indices = self._execute_kv_backup(
+                    node_id, device_value, comp_xfers, sidecar_xfers
+                )
+                if host_indices is None:
+                    return 0
+                self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+                lock_params = None
+                if not write_back:
+                    lock_params = self.inc_lock_ref(node_id).to_dec_params()
+                publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+                self._track_write_through_node(
+                    node_id, lock_params, publish_node_ids=publish_node_ids
+                )
+                written = len(host_indices)
+        finally:
+            if has_planned_attr:
+                self.tree_core._planned_backup_node_ids = None
         return written
 
     @staticmethod

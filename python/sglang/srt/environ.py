@@ -843,9 +843,11 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Hybrid-SWA HiCache: skip the SWA host copy of a non-branching node whose child
-    # holds a full window of SWA KV, so the host keeps windows only where a match can
-    # end (node ends and branch points) instead of every token's SWA KV.
+    # Hybrid-SWA HiCache: skip the SWA host copy of a non-branching pass-through
+    # node whose child holds (or is backing up) a full host window of SWA KV, so
+    # host DRAM keeps windows at leaves and existing branch points rather than
+    # every token's SWA KV (a first divergence at an unbranched pass-through node
+    # after device SWA eviction recomputes that prefix and creates the branch).
     SGLANG_HICACHE_SWA_HOST_TAIL_ONLY = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).

@@ -70,6 +70,12 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         and ComponentType.SWA in params.tree_components
     ):
         return "SGLANG_OPT_SWA_CAP requires the Python TreeCore"
+    if (
+        envs.SGLANG_HICACHE_SWA_HOST_TAIL_ONLY.get()
+        and params.tree_components is not None
+        and ComponentType.SWA in params.tree_components
+    ):
+        return "SGLANG_HICACHE_SWA_HOST_TAIL_ONLY requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (

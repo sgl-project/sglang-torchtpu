@@ -540,6 +540,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._tracked_unbacked_tokens = 0
         self._is_tracking_unbacked_tokens = False
         self._device_frees_write_horizon: Optional[float] = None
+        self._planned_backup_node_ids: Optional[frozenset[NodeId]] = None
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -2323,9 +2324,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         host_frees=host_frees,
                     )
 
-            if has_host:
+            swa = self.components_by_type.get(ComponentType.SWA)
+            unmatchable_host_leaf = (
+                has_host and swa is not None and swa.is_unmatchable_host_leaf(cur)
+            )
+            if has_host and not unmatchable_host_leaf:
                 self._update_evictable_leaf_sets(cur)
                 break
+
+            if unmatchable_host_leaf:
+                self.kv_events.record_remove(cur, medium=StorageMedium.CPU)
 
             # Full absent on both layers — evict remaining host data, delete.
             for comp in self.components_by_type.values():
