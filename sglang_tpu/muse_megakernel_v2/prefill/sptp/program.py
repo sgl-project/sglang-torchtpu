@@ -45,6 +45,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     qkvg_call,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.xag_qkvg import xag_qkvg_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
     fused_rs_moe,
@@ -161,6 +162,60 @@ def build_forward(c: PFConfig, axis: str = "model"):
         and os.environ.get("SPTP_XE_PALLAS_DEQUANT", "0") == "1"
     )
     dequant = dequant_rows_call(T, He)
+    # SPTP_XAG_FUSED=1: the x_norm AG by in-kernel remote DMA inside the qkvg kernel, one row
+    # tile of SPTP_XAG_SEG rows per rank at a time (sptp/xag_qkvg.py)
+    xag_fused = not xla_qkvg and os.environ.get("SPTP_XAG_FUSED", "0") == "1"
+    xag_seg = int(os.environ.get("SPTP_XAG_SEG", "32"))
+    xag_gap = int(os.environ.get("SPTP_XAG_GAP", "0"))
+    # SPTP_XAG_NORM=1 (with SPTP_XAG_FUSED=1): the input norm and e4m3 row quant per tile in
+    # that kernel too, the row scales gathered with the rows
+    xag_norm = xag_fused and fused_rq and os.environ.get("SPTP_XAG_NORM", "0") == "1"
+    # SPTP_XAG_ORDER=0: common.coll.run_pipeline's stage order (partner share issued late)
+    xag_dma_first = os.environ.get("SPTP_XAG_ORDER", "1") != "0"
+    # SPTP_XAG_EPI=1: head norms as split-bf16 dots (2 passes, not HIGHEST) and vreg-wide rope
+    xag_split_epi = os.environ.get("SPTP_XAG_EPI", "0") == "1"
+    # SPTP_XAG_GATE4=1: gate in the [Hkv, T, G, 128] head layout (no transpose before the o gate)
+    xag_gate4 = xag_fused and q_rpa and os.environ.get("SPTP_XAG_GATE4", "0") == "1"
+    xag_norm_dbg = xag_norm and os.environ.get("SPTP_XAG_NORM_DBG", "0") == "1"  # debug
+    # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
+    # unfused-norm kernel on XLA's rows
+    xag_mix = int(os.environ.get("SPTP_XAG_NORM_DBG", "0")) if xag_norm else 0
+    xag_k = {
+        r: xag_qkvg_call(
+            c,
+            xag_seg,
+            r,
+            mxu_norm=mxu_norm,
+            kc=int(os.environ.get("SPTP_XAG_KC", str(kc))),
+            q_rpa=q_rpa,
+            gap=xag_gap,
+            fuse_norm=xag_norm,
+            axis=axis,
+            dbg_xs=xag_norm_dbg,
+            dma_first=xag_dma_first,
+            split_epi=xag_split_epi,
+            gate4=xag_gate4,
+            w_start=int(os.environ.get("SPTP_XAG_WSTART", "0")),
+        )
+        for r in (True, False)
+    }
+
+    xag_mix_k = {
+        r: xag_qkvg_call(
+            c,
+            xag_seg,
+            r,
+            mxu_norm=mxu_norm,
+            kc=kc,
+            q_rpa=q_rpa,
+            gap=xag_gap,
+            axis=axis,
+            dma_first=xag_dma_first,
+            split_epi=xag_split_epi,
+            gate4=xag_gate4,
+        )
+        for r in (True, False)
+    }
 
     def forward(
         meta,
@@ -193,9 +248,49 @@ def build_forward(c: PFConfig, axis: str = "model"):
         aux = []
         for l in range(L):
             sm = smalls[l]
-            with _scope("sp_in_norm"):
-                a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
-            if n_xag > 1 and not xla_qkvg:
+            if xag_norm:
+                with _scope("sp_xag_qkvg"):
+                    dbg = []
+                    if xag_norm_dbg:
+                        dbg = [ag(rms_q8(stream, small_row(sm, "pre_attn_w"))[1], axis)]
+                    q, kvs, gate = xag_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        *dbg,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+                    if xag_mix >= 2:
+                        a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
+                        ref = xag_mix_k[c.use_rope(l)](
+                            jnp.full((1,), l, jnp.int32),
+                            a8,
+                            ag(a_s, axis),
+                            rope_rows,
+                            wqkvg,
+                            smalls,
+                        )
+                        mine = (q, kvs, gate)
+                        q, kvs, gate = [
+                            mine[i] if i == xag_mix - 2 else ref[i] for i in range(3)
+                        ]
+            else:
+                with _scope("sp_in_norm"):
+                    a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
+            if xag_norm:
+                pass
+            elif xag_fused:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate = xag_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        a8,
+                        ag(a_s, axis),
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+            elif n_xag > 1 and not xla_qkvg:
                 with _scope("sp_xag_qkvg"):
                     sub = Ts // n_xag
                     out = None
@@ -218,7 +313,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 with _scope("sp_x_ag"):
                     a8, a_s = ag(a8, axis), ag(a_s, axis)
             with _scope("sp_qkvg"):
-                if n_xag > 1 and not xla_qkvg:
+                if xag_fused or (n_xag > 1 and not xla_qkvg):  # done above
                     pass
                 elif xla_qkvg:
                     qkvg = dense(a8, a_s, wqkvg[l], sm, "wqkvg", c.qkvg_dim)
@@ -260,14 +355,20 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         o4 = o4 * jax.lax.rsqrt(
                             jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
                         )
-                        g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
+                        if xag_gate4:
+                            g4 = gate[..., :hd]
+                        else:
+                            g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(
+                                1, 0, 2, 3
+                            )
                         a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
-                        g_s = (
-                            jnp.maximum(
-                                jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
-                            ).reshape(T, 1)
-                            / 448.0
-                        )
+                        if xag_gate4:
+                            # per kv head first: one reduce over (0, 2, 3) with gate4's operands
+                            # fuses into a 10x slower reduction
+                            amax = jnp.max(jnp.max(jnp.abs(a4), axis=(2, 3)), axis=0)
+                        else:
+                            amax = jnp.max(jnp.abs(a4), axis=(0, 2, 3))
+                        g_s = jnp.maximum(amax, 1e-30).reshape(T, 1) / 448.0
                         g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
                     with _scope("sp_o_a2a"):
                         g8 = jax.lax.all_to_all(
