@@ -89,8 +89,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
-    # SPTP_ROUTE_ITER=1: spep's top-k argmax rounds
-    router = route if os.environ.get("SPTP_ROUTE_ITER", "0") == "1" else route_top_k
+    # SPTP_ROUTE_TOPK=1: XLA TopK (same picks; measured 1.6 ms / chunk slower than the rounds)
+    router = route_top_k if os.environ.get("SPTP_ROUTE_TOPK", "0") == "1" else route
     # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
     xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
     # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
