@@ -421,6 +421,8 @@ class TpuEnvs:
     # Muse prefill MoE: mask padded tail tokens (tok >= sum(extend_seq_lens)) out of expert
     # routing and GMM-RS so pad rows neither execute expert matmuls nor pile onto 8 pad experts.
     SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_MOE_TOKENS = EnvBool(False)
+    # Opt-in 0-cost-when-off per-stage isfinite trap over real tokens in MusePrefillKernels.
+    SGLANG_TPU_MUSE_NAN_TRAP = EnvBool(False)
     # fused_rs_muse NVFP4 short/medium prefill (4096 <= size_m <= 16384, i.e. T in {512, 1024, 2048}):
     # use half-N W1+W2-cached (128,4096,2048,4096,2048,2,2) tiles and skip multi-bucket W4A16 unroll
     # on block_scatter calls (decode size_m <= 2048 and T >= 4096 stay unchanged).

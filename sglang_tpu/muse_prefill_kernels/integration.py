@@ -2451,6 +2451,7 @@ class MusePrefillKernels(torch.nn.Module):
         )
         self._cm_perm_cache: dict[tuple[tuple[int, ...], bool], torch.Tensor] = {}
         self.debug_compare = tpu_envs.SGLANG_TPU_MUSE_KERNEL_DEBUG_COMPARE.get()
+        self.nan_trap = tpu_envs.SGLANG_TPU_MUSE_NAN_TRAP.get()
         hidden = decoder.config.hidden_size
         device = decoder.norm.weight.device
         if self.ep_tp2_mode:
@@ -2883,6 +2884,14 @@ class MusePrefillKernels(torch.nn.Module):
         stats = []
         calib_hists = []
         self._cur_real_tokens_t = self._prepare_eplb_calib_tokens(forward_batch, stream)
+        trap_ctx = self._init_nan_trap(
+            forward_batch=forward_batch,
+            stream=stream,
+            stream_shard=stream_shard,
+            chunks=chunks,
+            t_shard=t_shard,
+            t_total=t_total,
+        )
         use_agd_out = self.a1_ag_under_d or (chunk_metas is not None)
         use_l61_prune = (
             getattr(self, "l61_prune", False)
@@ -2899,7 +2908,7 @@ class MusePrefillKernels(torch.nn.Module):
             idx = self.start + offset
             layer = decoder.layers[idx]
             if use_l61_prune and idx == self.end - 1:
-                return self._layer_l61_pruned(
+                out_l61 = self._layer_l61_pruned(
                     layer=layer,
                     weights=weights,
                     rope=rope if layer.self_attn.rotary_emb is not None else nope,
@@ -2920,7 +2929,11 @@ class MusePrefillKernels(torch.nn.Module):
                     if chunk_metas is not None
                     else None,
                     chunk_metas=chunk_metas,
+                    trap_ctx=trap_ctx,
+                    layer_idx=idx,
                 )
+                self._emit_nan_trap(trap_ctx)
+                return out_l61
             next_norm = (
                 decoder.layers[idx + 1].input_layernorm.weight
                 if idx + 1 < self.end
@@ -2950,12 +2963,23 @@ class MusePrefillKernels(torch.nn.Module):
                 if chunk_metas is not None
                 else None,
                 chunk_metas=chunk_metas,
+                trap_ctx=trap_ctx,
+                layer_idx=idx,
             )
             if self.eplb_calib_active:
                 stream_shard, attn_in, layer_hist = layer_out
                 calib_hists.append(layer_hist)
             else:
                 stream_shard, attn_in = layer_out
+            if trap_ctx is not None:
+                _record_nan_trap(
+                    trap_ctx,
+                    idx,
+                    4,
+                    ((stream_shard, 0),),
+                    trap_ctx["shard_real"],
+                    trap_ctx["shard_orig"],
+                )
             if captured_by_slot is not None:
                 slots = decoder._capture_slots_by_layer.get(idx)
                 if slots:
@@ -2981,13 +3005,16 @@ class MusePrefillKernels(torch.nn.Module):
             self.debug_stats.copy_(torch.stack(stats))
             self.debug_count.add_(1)
         if exit_last_index is not None and self.ops.sum_stream is not None:
-            eff_idx = torch.where(
+            eff_orig = torch.where(
                 exit_last_index < 0,
                 exit_last_index + t_total,
                 exit_last_index,
             )
-            if inv_cm_perm is not None:
-                eff_idx = inv_cm_perm.index_select(0, eff_idx.long()).to(eff_idx.dtype)
+            eff_idx = (
+                inv_cm_perm.index_select(0, eff_orig.long()).to(eff_orig.dtype)
+                if inv_cm_perm is not None
+                else eff_orig
+            )
             t_start = self.tp_rank * t_shard
             in_range = (eff_idx >= t_start) & (eff_idx < t_start + t_shard)
             local_idx = (eff_idx - t_start).clamp(0, t_shard - 1)
@@ -2996,18 +3023,53 @@ class MusePrefillKernels(torch.nn.Module):
                 stream_shard.index_select(0, local_idx),
                 0.0,
             )
-            return self.ops.sum_stream(local_rows)
+            out_exit = self.ops.sum_stream(local_rows)
+            if trap_ctx is not None:
+                ext_lens = getattr(forward_batch, "extend_seq_lens", None)
+                exit_mask = (
+                    (ext_lens > 0)
+                    if (
+                        isinstance(ext_lens, torch.Tensor)
+                        and ext_lens.shape == exit_last_index.shape
+                    )
+                    else torch.ones_like(exit_last_index, dtype=torch.bool)
+                )
+                _record_nan_trap(
+                    trap_ctx,
+                    self.end - 1,
+                    5,
+                    ((out_exit, 0),),
+                    exit_mask,
+                    eff_orig.to(torch.int32),
+                )
+                self._emit_nan_trap(trap_ctx)
+            return out_exit
         if self.ops.gather_fp8_stream is not None:
             if self.exit_gather_bf16:
-                return self.ops.gather_fp8_stream(
+                out_full = self.ops.gather_fp8_stream(
                     stream_shard.to(torch.bfloat16)
                 ).float()
-            return self.ops.gather_fp8_stream(stream_shard)
-        if self.exit_gather_bf16:
+            else:
+                out_full = self.ops.gather_fp8_stream(stream_shard)
+        elif self.exit_gather_bf16:
             out_full = self._gather(stream_shard.to(torch.bfloat16)).float()
-            return out_full.index_select(0, inv_cm_perm) if inv_cm_perm is not None else out_full
-        out_full = self._gather(stream_shard)
-        return out_full.index_select(0, inv_cm_perm) if inv_cm_perm is not None else out_full
+            if inv_cm_perm is not None:
+                out_full = out_full.index_select(0, inv_cm_perm)
+        else:
+            out_full = self._gather(stream_shard)
+            if inv_cm_perm is not None:
+                out_full = out_full.index_select(0, inv_cm_perm)
+        if trap_ctx is not None:
+            _record_nan_trap(
+                trap_ctx,
+                self.end - 1,
+                5,
+                ((out_full, 0),),
+                trap_ctx["full_real"],
+                trap_ctx["orig_full"],
+            )
+            self._emit_nan_trap(trap_ctx)
+        return out_full
 
     def _layer_l61_pruned(
         self,
@@ -3026,6 +3088,8 @@ class MusePrefillKernels(torch.nn.Module):
         chunks=None,
         rope_chunks=None,
         chunk_metas=None,
+        trap_ctx=None,
+        layer_idx: int = -1,
     ) -> torch.Tensor:
         """Exact L61 pruning: run A1 + KV write for all T rows, then slice Q and residual
         to ``last_token_indices`` (padded to 128) before RPAm -> o_proj -> MoE."""
@@ -3044,6 +3108,7 @@ class MusePrefillKernels(torch.nn.Module):
         active = ext_lens > 0
         eff_idx = torch.where(active, exit_last_index, 0).clamp(0, t_total - 1)
         idx_128 = torch.nn.functional.pad(eff_idx.long(), (0, 128 - bs))
+        q_tok_dim = 1 if self.a1_rpa_layout else 0
         if chunk_metas is not None and chunks is not None and rope_chunks is not None:
             if isinstance(attn_in, tuple):
                 ag_cur, rest_in = attn_in
@@ -3086,6 +3151,15 @@ class MusePrefillKernels(torch.nn.Module):
                     )
                 be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=chunk_metas[k])
                 c_tok = self.tp_size * c_k
+                if trap_ctx is not None:
+                    _record_nan_trap(
+                        trap_ctx,
+                        layer_idx,
+                        1,
+                        ((q_k, q_tok_dim), (kv_k, 0)),
+                        trap_ctx["full_real"][c_off : c_off + c_tok],
+                        trap_ctx["orig_full"][c_off : c_off + c_tok],
+                    )
                 loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
                 q_sel = q_k.index_select(1, loc_idx)
                 gate_sel = gate_k.reshape(-1, q_size).index_select(0, loc_idx)
@@ -3144,6 +3218,16 @@ class MusePrefillKernels(torch.nn.Module):
                     attn_in, wqkvg, wqkvg_scale, rope[0], rope[1], *a1_extra
                 )
             be.write_kv_only(kv_all, attn.attn, forward_batch)
+            if trap_ctx is not None:
+                a1_rows = q_all.shape[q_tok_dim]
+                a1_mask, a1_orig = (
+                    (trap_ctx["shard_real"], trap_ctx["shard_orig"])
+                    if a1_rows == t_shard
+                    else (trap_ctx["full_real"], trap_ctx["orig_full"])
+                )
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 1, ((q_all, q_tok_dim), (kv_all, 0)), a1_mask, a1_orig
+                )
             q_pruned = q_all.index_select(1, idx_128)
             gate_pruned = gate_all.index_select(0, idx_128)
             kv_pruned = kv_all.index_select(0, idx_128)
@@ -3187,6 +3271,13 @@ class MusePrefillKernels(torch.nn.Module):
         attn_out = attn._per_head_normalize(out_128).to(torch.bfloat16)
         gated = torch.sigmoid(gate_pruned) * attn_out
         attn_proj = attn._forward_o_proj(gated, forward_batch)
+        if trap_ctx is not None:
+            l61_mask = (
+                torch.arange(128, device=out_128.device) < bs
+            ) & torch.nn.functional.pad(active, (0, 128 - bs))
+            l61_orig = idx_128.to(torch.int32)
+            _record_nan_trap(trap_ctx, layer_idx, 2, ((out_128, 0),), l61_mask, l61_orig)
+            _record_nan_trap(trap_ctx, layer_idx, 3, ((attn_proj, 0),), l61_mask, l61_orig)
         if getattr(self.ops, "moe", None) is not None or getattr(
             self, "eplb_moe_op", None
         ) is not None:
@@ -3279,7 +3370,12 @@ class MusePrefillKernels(torch.nn.Module):
                 moe_out_shard.index_select(0, loc_i),
                 0.0,
             )
-            return self.ops.sum_stream(loc_rows)
+            out_l61 = self.ops.sum_stream(loc_rows)
+            if trap_ctx is not None:
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 4, ((out_l61, 0),), active, eff_idx.to(torch.int32)
+                )
+            return out_l61
 
         residual_128 = layer.post_attention_residual_gate(
             residual_128, layer.post_attention_layernorm(attn_proj)
@@ -3289,7 +3385,12 @@ class MusePrefillKernels(torch.nn.Module):
         residual_128 = layer.post_feedforward_residual_gate(
             residual_128, layer.post_feedforward_layernorm(ffn_out)
         )
-        return residual_128[:bs]
+        out_l61 = residual_128[:bs]
+        if trap_ctx is not None:
+            _record_nan_trap(
+                trap_ctx, layer_idx, 4, ((out_l61, 0),), active, eff_idx.to(torch.int32)
+            )
+        return out_l61
 
     def _forward_rpa_raw_packed(self, q, kv, attn_layer, forward_batch, chunk_meta=None):
         """Runs packed-KV RPA v3 and returns raw ``bf16[T, Hq, 128]`` before ``_unpack_out_heads``."""
@@ -3483,6 +3584,8 @@ class MusePrefillKernels(torch.nn.Module):
         chunks=None,
         rope_chunks=None,
         chunk_metas=None,
+        trap_ctx=None,
+        layer_idx: int = -1,
     ):
         """``attn_in`` is a tensor, or (AG_UNDER_D) the previous layer's (gathered A1 part 0,
         remaining rows); ``gather_next`` returns this layer's next input in that form."""
@@ -3495,6 +3598,7 @@ class MusePrefillKernels(torch.nn.Module):
         wo = weights.wo.view(weights.wo_shape)
         a1_extra = (valid_tokens,) if self._a1_skip else ()
         a3_extra = (valid_tokens,) if self._a3_skip else ()
+        q_tok_dim = 1 if self.a1_rpa_layout else 0
         attn_out_shard = None
         if (
             chunk_metas is not None
@@ -3516,6 +3620,8 @@ class MusePrefillKernels(torch.nn.Module):
                 rope_chunks=rope_chunks,
                 chunk_metas=chunk_metas,
                 forward_batch=forward_batch,
+                trap_ctx=trap_ctx,
+                layer_idx=layer_idx,
             )
         elif chunk_metas is not None and chunks is not None and rope_chunks is not None:
             if isinstance(attn_in, tuple):
@@ -3535,6 +3641,7 @@ class MusePrefillKernels(torch.nn.Module):
             gate_parts = []
             out_tail: tuple[int, ...] = ()
             q_size = attn.num_heads * 64
+            c_off = 0
             for k, c_k in enumerate(chunks):
                 has_next_c = k + 1 < len(chunks)
                 if has_next_c and getattr(self.ops, "a1_chunk_agd", None) is not None:
@@ -3579,6 +3686,17 @@ class MusePrefillKernels(torch.nn.Module):
                     if (out_k.ndim > 2 and out_k.shape[0] == 1)
                     else out_k
                 )
+                c_tok = self.tp_size * c_k
+                if trap_ctx is not None:
+                    c_real = trap_ctx["full_real"][c_off : c_off + c_tok]
+                    c_orig = trap_ctx["orig_full"][c_off : c_off + c_tok]
+                    _record_nan_trap(
+                        trap_ctx, layer_idx, 1, ((q_k, q_tok_dim), (kv_k, 0)), c_real, c_orig
+                    )
+                    _record_nan_trap(
+                        trap_ctx, layer_idx, 2, ((out_tok, 0),), c_real, c_orig
+                    )
+                c_off += c_tok
                 if use_chunk_pro:
                     if not self.fused_glue and not self.a3_rpa_out:
                         out_tok = attn._per_head_normalize(out_tok).to(torch.bfloat16)
@@ -3640,6 +3758,16 @@ class MusePrefillKernels(torch.nn.Module):
                 q, gate, kv = self.ops.a1(
                     attn_in, wqkvg, wqkvg_scale, rope[0], rope[1], *a1_extra
                 )
+            if trap_ctx is not None:
+                a1_rows = q.shape[q_tok_dim]
+                a1_mask, a1_orig = (
+                    (trap_ctx["shard_real"], trap_ctx["shard_orig"])
+                    if a1_rows == trap_ctx["t_shard"]
+                    else (trap_ctx["full_real"], trap_ctx["orig_full"])
+                )
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 1, ((q, q_tok_dim), (kv, 0)), a1_mask, a1_orig
+                )
             if self.a3_rpa_out:
                 out = self._forward_rpa_raw_packed(q, kv, attn.attn, forward_batch)
             elif self.a1_rpa_layout:
@@ -3648,10 +3776,31 @@ class MusePrefillKernels(torch.nn.Module):
                 k = kv[:, : self.kv_size].to(torch.bfloat16)
                 v = kv[:, self.kv_size :].to(torch.bfloat16)
                 out = attn.attn(q, k, v, forward_batch)
+            if trap_ctx is not None:
+                out_chk = (
+                    out.squeeze(0) if (out.ndim > 2 and out.shape[0] == 1) else out
+                )
+                _record_nan_trap(
+                    trap_ctx,
+                    layer_idx,
+                    2,
+                    ((out_chk, 0),),
+                    trap_ctx["full_real"],
+                    trap_ctx["orig_full"],
+                )
         if attn_out_shard is None:
             if not self.fused_glue and not self.a3_rpa_out:
                 out = attn._per_head_normalize(out).to(torch.bfloat16)
             attn_out_shard = self.ops.a3(out, gate, wo, wo_scale, *a3_extra)
+        if trap_ctx is not None:
+            _record_nan_trap(
+                trap_ctx,
+                layer_idx,
+                3,
+                ((attn_out_shard, 0),),
+                trap_ctx["shard_real"],
+                trap_ctx["shard_orig"],
+            )
         experts = moe.experts
         is_fp8_expert = experts.w13_weight.dtype == torch.float8_e4m3fn
         lw_bufs = getattr(weights, "_buffers", {})
@@ -3712,6 +3861,8 @@ class MusePrefillKernels(torch.nn.Module):
         rope_chunks,
         chunk_metas,
         forward_batch,
+        trap_ctx=None,
+        layer_idx: int = -1,
     ) -> torch.Tensor:
         """CCS Mode-2 (`A3_KDEEP_WO=2`): overlap Chunks `0..K-2` prologue+A2A + fused last-chunk K-deep `Wo`."""
         if isinstance(attn_in, tuple):
@@ -3724,9 +3875,11 @@ class MusePrefillKernels(torch.nn.Module):
         be = None if self.a3_rpa_out else get_attn_backend()
         q_prev_parts = []
         q_last_loc = None
+        q_tok_dim = 1 if self.a1_rpa_layout else 0
+        c_off = 0
         for k, _c_k in enumerate(chunks):
             has_next = k + 1 < len(chunks)
-            if has_next and self.ops.a1_chunk_agd is not None:
+            if has_next and getattr(self.ops, "a1_chunk_agd", None) is not None:
                 c_next = chunks[k + 1]
                 q_k, gate_k, kv_k, ag_next = self.ops.a1_chunk_agd(
                     ag_cur,
@@ -3766,6 +3919,15 @@ class MusePrefillKernels(torch.nn.Module):
                 if (out_k.ndim > 2 and out_k.shape[0] == 1)
                 else out_k
             )
+            c_tok = self.tp_size * _c_k
+            if trap_ctx is not None:
+                c_real = trap_ctx["full_real"][c_off : c_off + c_tok]
+                c_orig = trap_ctx["orig_full"][c_off : c_off + c_tok]
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 1, ((q_k, q_tok_dim), (kv_k, 0)), c_real, c_orig
+                )
+                _record_nan_trap(trap_ctx, layer_idx, 2, ((out_tok, 0),), c_real, c_orig)
+            c_off += c_tok
             if not self.fused_glue and not self.a3_rpa_out:
                 out_tok = attn._per_head_normalize(out_tok).to(torch.bfloat16)
             if has_next:
@@ -4247,6 +4409,90 @@ class MusePrefillKernels(torch.nn.Module):
                 self.eplb_controller.last_observed_skew,
             )
 
+    def _init_nan_trap(
+        self,
+        *,
+        forward_batch,
+        stream: torch.Tensor,
+        stream_shard: torch.Tensor,
+        chunks: tuple[int, ...],
+        t_shard: int,
+        t_total: int,
+    ) -> Optional[dict[str, object]]:
+        if not getattr(self, "nan_trap", False):
+            return None
+        from sglang_tpu.rank_local import rank_slice
+
+        ext_lens = getattr(forward_batch, "extend_seq_lens", None)
+        real_tok = (
+            ext_lens.sum(dim=0, keepdim=True).to(torch.int32)
+            if isinstance(ext_lens, torch.Tensor)
+            else stream.new_full((1,), t_total, dtype=torch.int32)
+        )
+        orig_full = torch.arange(t_total, device=stream.device, dtype=torch.int32)
+        full_real = orig_full < real_tok
+        if len(chunks) > 1:
+            perm_cm = self._cm_perm_tensor(chunks, stream.device, inverse=False).to(
+                torch.int32
+            )
+            shard_orig = rank_slice(perm_cm, 0, self.tp_size, self.tp_rank)
+        else:
+            shard_orig = self.tp_rank * t_shard + torch.arange(
+                t_shard, device=stream.device, dtype=torch.int32
+            )
+        shard_real = shard_orig < real_tok
+        trap_ctx: dict[str, object] = {
+            "records": [],
+            "t_total": t_total,
+            "t_shard": t_shard,
+            "orig_full": orig_full,
+            "full_real": full_real,
+            "shard_orig": shard_orig,
+            "shard_real": shard_real,
+        }
+        _record_nan_trap(
+            trap_ctx, self.start, 0, ((stream_shard, 0),), shard_real, shard_orig
+        )
+        return trap_ctx
+
+    def _emit_nan_trap(self, trap_ctx: Optional[dict[str, object]]) -> None:
+        if trap_ctx is None or not trap_ctx["records"]:
+            return
+        packed = torch.stack(trap_ctx["records"])
+        if torch.compiler.is_compiling():
+            return
+        from sglang_tpu.compilation.direct_compile import insert_callback
+
+        if insert_callback(
+            packed,
+            self._consume_nan_trap,
+            callback_factory=_make_nan_trap_callback,
+        ):
+            return
+        self._consume_nan_trap(packed)
+
+    def _consume_nan_trap(self, report: torch.Tensor) -> None:
+        arr = report.detach().cpu()
+        bad = arr[arr[:, 2] > 0]
+        self.last_nan_trap = bad.tolist()
+        if bad.numel() == 0:
+            return
+        first = [int(x) for x in bad[0].tolist()]
+        stage_name = (
+            _NAN_TRAP_STAGE_NAMES[first[1]]
+            if 0 <= first[1] < len(_NAN_TRAP_STAGE_NAMES)
+            else str(first[1])
+        )
+        logger.error(
+            "MUSE_NAN_TRAP rank=%d first=(layer=%d stage=%s n_bad=%d first_tok=%d) count=%d",
+            self.tp_rank,
+            first[0],
+            stage_name,
+            first[2],
+            first[3],
+            int(bad.shape[0]),
+        )
+
     def _log_debug_stats(self) -> None:
         seen = 0
         while True:
@@ -4268,6 +4514,54 @@ class MusePrefillKernels(torch.nn.Module):
                     for i, row in enumerate(rows)
                 },
             )
+
+
+_NAN_TRAP_STAGE_NAMES = ("entry", "a1", "rpa", "a3", "moe", "exit")
+
+
+def _record_nan_trap(
+    trap_ctx: dict[str, object],
+    layer_idx: int,
+    stage_id: int,
+    items: tuple[tuple[torch.Tensor, int], ...],
+    real_mask: torch.Tensor,
+    orig_idx: torch.Tensor,
+) -> None:
+    bad_row = None
+    for tensor, tok_dim in items:
+        x = tensor if tok_dim == 0 else tensor.movedim(tok_dim, 0)
+        cur = (~torch.isfinite(x.float())).reshape(x.shape[0], -1).any(dim=1)
+        bad_row = cur if bad_row is None else (bad_row | cur)
+    assert bad_row is not None
+    bad_real = bad_row & real_mask
+    n_bad = bad_real.sum(dtype=torch.int32)
+    first_bad = (
+        torch.where(bad_real, orig_idx, int(trap_ctx["t_total"])).min().to(torch.int32)
+    )
+    trap_ctx["records"].append(
+        torch.stack(
+            [
+                n_bad.new_full((), layer_idx, dtype=torch.int32),
+                n_bad.new_full((), stage_id, dtype=torch.int32),
+                n_bad,
+                first_bad,
+            ]
+        )
+    )
+
+
+def _make_nan_trap_callback(model):
+    """Picklable direct_compile callback factory binding to each rank's MusePrefillKernels."""
+    if isinstance(model, MusePrefillKernels):
+        return model._consume_nan_trap
+    pk = getattr(model, "prefill_kernels", None)
+    if pk is None and hasattr(model, "model"):
+        pk = getattr(model.model, "prefill_kernels", None)
+    if pk is None:
+        raise AttributeError(
+            f"Could not resolve prefill_kernels on {type(model).__name__} for NaN trap callback"
+        )
+    return pk._consume_nan_trap
 
 
 def _make_eplb_hist_callback(model):

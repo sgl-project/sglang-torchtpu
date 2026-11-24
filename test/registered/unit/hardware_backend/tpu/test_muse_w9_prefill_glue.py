@@ -1250,6 +1250,114 @@ def test_xor1_nan_poisoned_scratch_interpret_parity():
             np.testing.assert_array_equal(out_u16[r], ref_u16)
 
 
+def test_muse_nan_trap_optin_stage_and_pad_isolation():
+    """Verify SGLANG_TPU_MUSE_NAN_TRAP is default-OFF (0-cost), ignores pad NaNs, and traps real-token NaNs."""
+    import types
+
+    import torch
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.compilation.direct_compile import _collect_callbacks
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    assert tpu_envs.SGLANG_TPU_MUSE_NAN_TRAP.get() is False
+
+    tp_size, t_shard = 16, 8
+    t_total = tp_size * t_shard
+    chunks = (4, 4)
+    real_tokens = 99  # straddles chunks and ranks in chunk-major order
+
+    pk = integration.MusePrefillKernels.__new__(integration.MusePrefillKernels)
+    torch.nn.Module.__init__(pk)
+    pk.start = 0
+    pk.tp_size = tp_size
+    pk.tp_rank = 12  # owns chunk0 [48..52) (all real) and chunk1 [112..116) (all pad)
+    pk._cm_perm_cache = {}
+    pk.nan_trap = False
+
+    fb = types.SimpleNamespace(
+        extend_seq_lens=torch.tensor([real_tokens], dtype=torch.int32)
+    )
+    stream = torch.zeros((t_total, 4), dtype=torch.float32)
+    stream_shard = torch.zeros((t_shard, 4), dtype=torch.float32)
+
+    assert (
+        pk._init_nan_trap(
+            forward_batch=fb,
+            stream=stream,
+            stream_shard=stream_shard,
+            chunks=chunks,
+            t_shard=t_shard,
+            t_total=t_total,
+        )
+        is None
+    )
+
+    pk.nan_trap = True
+    ctx = pk._init_nan_trap(
+        forward_batch=fb,
+        stream=stream,
+        stream_shard=stream_shard,
+        chunks=chunks,
+        t_shard=t_shard,
+        t_total=t_total,
+    )
+    assert ctx is not None
+    # Rank 12 in chunks=(4,4): local rows 0..3 -> orig 48..51 (real), rows 4..7 -> orig 112..115 (pad).
+    assert ctx["shard_orig"].tolist() == [48, 49, 50, 51, 112, 113, 114, 115]
+
+    # Pad-only NaNs (including fp8_e4m3fn 0x7F in KV, bf16 NaN in Q [H, T, D], shard pad rows) must NOT fire.
+    q_pad = torch.zeros((2, t_total, 4), dtype=torch.bfloat16)
+    q_pad[:, real_tokens:, :] = float("nan")
+    kv_pad_u8 = torch.zeros((t_total, 4), dtype=torch.uint8)
+    kv_pad_u8[real_tokens:, :] = 0x7F
+    kv_pad = kv_pad_u8.view(torch.float8_e4m3fn)
+    shard_pad = torch.zeros((t_shard, 4), dtype=torch.bfloat16)
+    shard_pad[4:, :] = float("nan")  # orig tokens 112..115 >= 99
+    integration._record_nan_trap(
+        ctx, 7, 1, ((q_pad, 1), (kv_pad, 0)), ctx["full_real"], ctx["orig_full"]
+    )
+    integration._record_nan_trap(
+        ctx, 7, 4, ((shard_pad, 0),), ctx["shard_real"], ctx["shard_orig"]
+    )
+    pk._emit_nan_trap(ctx)
+    assert pk.last_nan_trap == []
+
+    # Real-token NaNs: inject at orig token 98 in RPA (stage 2) and orig token 50 in MoE (stage 4).
+    rpa_bad = torch.zeros((t_total, 4), dtype=torch.bfloat16)
+    rpa_bad[98, 2] = float("nan")
+    shard_bad = torch.zeros((t_shard, 4), dtype=torch.bfloat16)
+    shard_bad[2, 1] = float("inf")  # shard_orig[2] == 50
+    ctx2 = pk._init_nan_trap(
+        forward_batch=fb,
+        stream=stream,
+        stream_shard=stream_shard,
+        chunks=chunks,
+        t_shard=t_shard,
+        t_total=t_total,
+    )
+    integration._record_nan_trap(
+        ctx2, 19, 2, ((rpa_bad, 0),), ctx2["full_real"], ctx2["orig_full"]
+    )
+    integration._record_nan_trap(
+        ctx2, 19, 4, ((shard_bad, 0),), ctx2["shard_real"], ctx2["shard_orig"]
+    )
+
+    # Verify insert_callback registration + _make_nan_trap_callback binding + error logging.
+    with _collect_callbacks() as cbs:
+        pk._emit_nan_trap(ctx2)
+    assert len(cbs) == 1
+    assert cbs[0].callback_factory is integration._make_nan_trap_callback
+    fake_model = types.SimpleNamespace(prefill_kernels=pk)
+    bound_cb = cbs[0].callback_factory(fake_model)
+    with mock.patch.object(integration.logger, "error") as err_log:
+        bound_cb(cbs[0].tensor)
+    assert pk.last_nan_trap == [[19, 2, 1, 98], [19, 4, 1, 50]]
+    err_log.assert_called_once()
+    assert "MUSE_NAN_TRAP" in err_log.call_args.args[0]
+
+
+
 
 
 
