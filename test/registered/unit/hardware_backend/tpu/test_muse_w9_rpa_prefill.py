@@ -1493,6 +1493,119 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 self.assertEqual(exp_zt.out_avals[0].shape, (128, 512))
                 self.assertIn("-zt", exp_zt.mlir_module())
 
+    def test_fp8_qk_dyn_clip_and_poisoned_hbm_tp16_rpam(self):
+        """Regression (#3203/#3194): fp8_qk_dyn Q clip + 0x7F KV / NaN pad HBM stay finite on TP=16 RPAm."""
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+        from sglang_tpu import attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        rng = np.random.default_rng(3203)
+        page_size = 512
+        interp = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+
+        cases = (
+            ("fp8_qk_dyn_swa", 256, 615, 512, 2048, frozenset({
+                "stationary_q_m0_ring_fuse", "skip_empty_cdma", "mixed_s3",
+                "sw2048_fuse", "sw_short_v2", "fp8_qk_dyn", "mk128", "la2",
+                "sub8_l", "bf16_pop", "unroll_up", "mrb3", "tp16_sq",
+            })),
+            ("poison_q1_kv1_t512_full", 1, 1, 512, None, None),
+            ("poison_q1_kv1_t512_swa", 1, 1, 512, 2048, None),
+            ("poison_l61_q1_kv615_t128", 1, 615, 128, None, None),
+        )
+        env_patch = {
+            "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+            "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+            "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+            "SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE": "1",
+            "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+            "SGLANG_TPU_MUSE_KERNEL_A3_RPA_OUT": "0",
+            "SGLANG_TPU_KV_PACK_HEADS": "2",
+        }
+        with patch.dict(os.environ, env_patch, clear=False), patch.object(
+            rpa_v3_mod, "get_tpu_version", return_value=7
+        ):
+            for tag, ql, kl, max_tok, sw, direct_opts in cases:
+                with self.subTest(case=tag):
+                    q_np = rng.standard_normal((max_tok, 8, 64)).astype(np.float32) * 0.5
+                    if "fp8_qk_dyn" in tag:
+                        # Mix tiny (<=1e-12 floor) and moderate values to stress 448.0 / q_amax clip without exp2 overflow.
+                        q_np[:ql:3] *= 8.0
+                        q_np[1:ql:3] *= 1e-13
+                    q_jax = _pack_q_tp16_5d(q_np)
+                    q_jax = q_jax.at[:, ql:, :, :, :].set(jnp.bfloat16(jnp.nan))
+
+                    kv_u8 = np.array(
+                        _rand_fp8_u8(rng, (max_tok, 1, 4, 128), scale=0.5), copy=True
+                    )
+                    kv_u8[ql:, :, :, :] = 0x7F
+                    kv_jax = _u8_to_fp8(kv_u8)
+
+                    cache_u8 = np.full((6, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+                    gap = kl - ql
+                    for pg in range((gap + page_size - 1) // page_size):
+                        cache_u8[pg, :, 0, :2, :64] = _rand_fp8_u8(
+                            rng, (page_size, 2, 64), scale=0.4
+                        )
+                    kv_cache = _u8_to_fp8(cache_u8)
+
+                    kl_arr = jnp.array([kl, 0, 0, 0], dtype=jnp.int32)
+                    cq_arr = jnp.array([0, ql, ql, ql, ql], dtype=jnp.int32)
+                    ckv_arr = jnp.array([0, kl, kl, kl, kl], dtype=jnp.int32)
+                    pi_arr = jnp.array([0, 1, 2, 0] + [0] * 12, dtype=jnp.int32)
+                    dist_arr = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+                    if direct_opts is not None:
+                        out, _ = rpa_v3_mod.ragged_paged_attention(
+                            q_jax,
+                            kv_jax,
+                            None,
+                            kv_cache,
+                            kl_arr,
+                            pi_arr,
+                            cq_arr,
+                            ckv_arr,
+                            dist_arr,
+                            None,
+                            None,
+                            sm_scale=0.125,
+                            sliding_window=sw,
+                            k_scale=1.0,
+                            v_scale=1.0,
+                            m_block_sizes=(256, 2048, 256, 512),
+                            _prefill_opts=direct_opts,
+                            _fused_out_pack=-2,
+                            _prepared_inputs=True,
+                            _skip_decode=True,
+                            _a3_out_layout=True,
+                            _interpret=interp,
+                        )
+                    else:
+                        out, _ = rpa_wrap_mod._invoke_v3_kernel(
+                            functools.partial(rpa_v3_mod.ragged_paged_attention, _interpret=interp),
+                            queries=q_jax,
+                            keys=kv_jax,
+                            values=None,
+                            kv_cache_fused=kv_cache,
+                            kv_lens=kl_arr,
+                            page_indices=pi_arr,
+                            cu_q_lens=cq_arr,
+                            cu_kv_lens=ckv_arr,
+                            distribution=dist_arr,
+                            attention_sink=None,
+                            sm_scale=0.125,
+                            sliding_window=sw,
+                            soft_cap=None,
+                            k_scale=1.0,
+                            v_scale=1.0,
+                            prepared_inputs=True,
+                            skip_decode=True,
+                            a3_out_layout=-2,
+                        )
+                    out_np = np.asarray(out.astype(jnp.float32))
+                    self.assertTrue(np.all(np.isfinite(out_np[:ql])), f"{tag}: non-finite valid output")
+                    self.assertTrue(np.all(out_np[ql:] == 0.0), f"{tag}: non-zero pad rows")
+
 
 if __name__ == "__main__":
     unittest.main()

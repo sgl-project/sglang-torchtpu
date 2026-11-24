@@ -607,7 +607,7 @@ def _stationary_q_v2_process(
             jnp.float32(0.0),
             jnp.float32(448.0) / jnp.maximum(q_amax, jnp.float32(1e-12)),
         )
-        qt_f8 = (qf * q_inv).astype(jnp.float8_e4m3fn)
+        qt_f8 = jnp.clip(qf * q_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
         q_exp_sc_8 = jnp.where(
             q_amax_8 == 0.0,
             jnp.float32(exp_scale),
