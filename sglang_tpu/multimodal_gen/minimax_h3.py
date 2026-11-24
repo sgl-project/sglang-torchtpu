@@ -17,17 +17,71 @@ Runtime patch, tracked debt:
   core. The attention backend reads the live length
   on device (``trailing_padding_on_device``), so the blocks take no host
   bounds and compile once per padded length.
+- Each SP rank embeds its own row shard, and how many video and audio rows
+  fall in a shard moves with the prompt length. Those eager ops compiled again
+  for every new prompt length: 6 s of a Pika-H3-Flex request. (4) The serving
+  ``_embed`` projects every video and audio row into one padded-length buffer
+  and returns the rank's slice, so only the text-row copy has a
+  prompt-length shape. Each row's projection and placement are unchanged.
 - Upstream PR or issue: none.
 - Remove when: the H3 packed builder takes a platform-provided alignment, the
-  refiner pads to a bucket, and the attention break point is skipped where BCG
-  cannot run.
+  refiner pads to a bucket, the embedding takes shard-independent shapes, and
+  the attention break point is skipped where BCG cannot run.
 """
 
 from __future__ import annotations
 
+import functools
+
+import torch
+
 # Most prompt lengths of one video size share a 512 bucket; the padding costs
 # at most 511 extra rows next to ~32k packed rows at 1344x768x4s.
 TPU_PACKED_SEQUENCE_ALIGNMENT = 512
+_EMBED_CHUNK_ROWS = 8192
+
+
+def _embed_full_rows(embed):
+    """The serving ``_embed`` with shapes that do not move with the prompt."""
+
+    @functools.wraps(embed)
+    def embed_rows(self, **kwargs):
+        text_len = kwargs.get("refined_prompt_embeds_length")
+        if (
+            kwargs.get("out") is not None
+            or kwargs.get("local_embedding_layout") is None
+            or not isinstance(text_len, int)
+        ):
+            return embed(self, **kwargs)
+        x, audio_x = kwargs["x"], kwargs["audio_x"]
+        img_pos, audio_pos = kwargs["img_pos"], kwargs["audio_pos"]
+        text = kwargs["text_embeddings_selected"][:text_len]
+        if int(text.shape[-1]) != self.hidden_size:
+            return embed(self, **kwargs)
+        rows = torch.zeros(
+            (x.shape[1], self.hidden_size),
+            device=kwargs["device"],
+            dtype=torch.bfloat16,
+        )
+        # The packed sequence starts with the text rows.
+        rows[:text_len].copy_(text.to(device=rows.device, dtype=torch.bfloat16))
+        for pos, latents, project in (
+            (img_pos, x, self.video_patch_proj),
+            (audio_pos, audio_x, self.audio_patch_proj),
+        ):
+            latents = latents.view(-1, latents.shape[-1])
+            # Chunks bound the float32 projection's scratch.
+            for chunk in pos.split(_EMBED_CHUNK_ROWS) if pos.numel() else ():
+                picked = latents.index_select(0, chunk).to(torch.float32)
+                embedded, _ = project(picked)
+                rows.index_copy_(0, chunk, embedded.to(torch.bfloat16))
+        # Its own storage: the compiled blocks guard input offsets, and the
+        # full buffer is not kept for the step.
+        local = rows[kwargs["row_start"] : kwargs["row_stop"]].clone()
+        return local, self._time_embedding(kwargs["unique_timesteps"])
+
+    embed_rows.__wrapped_by_sglang_tpu__ = True
+    return embed_rows
 
 
 def _is_dit_block(name: str, module: object) -> bool:
@@ -57,3 +111,6 @@ def install() -> None:
         module.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = TPU_PACKED_SEQUENCE_ALIGNMENT
     dit.MiniMaxH3DiTModel._compile_conditions = [_is_dit_block]
     dit._minimax_h3_attention_core_bcg = dit._minimax_h3_attention_core_impl
+    model = dit.MiniMaxH3DiTModel
+    if not getattr(model._embed, "__wrapped_by_sglang_tpu__", False):
+        model._embed = _embed_full_rows(model._embed)
