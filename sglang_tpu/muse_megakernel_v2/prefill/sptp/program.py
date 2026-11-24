@@ -38,7 +38,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
-from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import qkvg_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import _heads_rms_mxu, qkvg_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
     fused_rs_moe,
@@ -89,6 +89,17 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
+    # SPTP_OGATE_XLA_NORM=1: the 3-D head norm (relayout copies) instead of the MXU one
+    ogate_mxu = os.environ.get("SPTP_OGATE_XLA_NORM", "0") != "1"
+    # SPTP_A2A_U8=1: the gated output a2a as bytes (prefill/spep) instead of e4m3 itself
+    a2a_u8 = os.environ.get("SPTP_A2A_U8", "0") == "1"
+
+    def to_owner_x(x):
+        if a2a_u8 or x.dtype != jnp.float8_e4m3fn:
+            return to_owner(x, tp, axis)
+        b = jax.lax.all_to_all(x, axis, 0, 0, tiled=True).reshape(tp, Ts, -1)
+        return b.transpose(1, 0, 2)
+
     # SPTP_ROUTE_TOPK=1: XLA TopK (same picks; measured 1.6 ms / chunk slower than the rounds)
     router = route_top_k if os.environ.get("SPTP_ROUTE_TOPK", "0") == "1" else route
     # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
@@ -173,10 +184,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     )
             o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             with _scope("sp_o_gate"):
-                attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
+                if ogate_mxu:
+                    attn = _heads_rms_mxu(
+                        o.reshape(T, qd).astype(_F32), c.q_heads, hd, c.rms_eps
+                    )
+                else:
+                    attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
                 g8, g_s = q8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
             with _scope("sp_o_a2a"):
-                g8, g_s = to_owner(g8, tp, axis), to_owner(g_s, tp, axis)
+                g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
             # own rows' every head, then the o proj on the whole wo: no partial sums
             with _scope("sp_o_proj"):
                 g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
