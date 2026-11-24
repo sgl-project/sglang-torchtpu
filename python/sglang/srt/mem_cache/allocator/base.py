@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 class BaseTokenToKVPoolAllocator(abc.ABC):
     # Holds freed pages back from non-forward allocations; None frees at once.
     kv_free_fence: KVFreeFence | None = None
+    # True when alloc_extend computes indices on the host from the CPU lengths
+    # and last_loc, and accepts return_host=True for host indices.
+    extend_indices_on_host: bool = False
     # Whether every pool takes its rows from one shared memory, so the prefix
     # cache reclaims an allocation's demand as one; else each pool is its own.
     pools_share_memory = False

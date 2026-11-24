@@ -171,6 +171,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._swa_req_ring
 
     @property
+    def extend_indices_on_host(self) -> bool:
+        return (
+            self.full_attn_allocator.extend_indices_on_host
+            and self.swa_attn_allocator.extend_indices_on_host
+        )
+
+    @property
     def swa_ring_cost_tokens(self) -> int:
         return self._swa_ring_cost
 
@@ -432,6 +439,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 num_new_pages=num_full_pages,
             )
 
+        # Allocators that compute indices on the host (TPU) also keep the
+        # full-to-SWA mapping there: take host indices and upload the full
+        # ones once, instead of reading device indices back for the mapping
+        # (a read-back that waits for the queued forward).
+        on_host = self.extend_indices_on_host
+        host_kwargs = {"return_host": True} if on_host else {}
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -440,13 +453,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
             num_new_pages=num_full_pages,
+            **host_kwargs,
         )
         assert alloc_full_indices is not None
+        alloc_full_indices_host = alloc_full_indices if on_host else None
+        if on_host:
+            alloc_full_indices = alloc_full_indices_host.to(
+                self.device, non_blocking=True
+            )
 
         if swa_tail_len == 0:
             return alloc_full_indices
 
-        device = self.device
+        device = "cpu" if on_host else self.device
         swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
         swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
         swa_seq_lens = async_h2d([swa_tail_len], dtype=torch.int64, device=device)
@@ -461,13 +480,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_last_loc,
             swa_tail_len,
             num_new_pages=num_swa_pages,
+            **host_kwargs,
         )
         assert alloc_swa_indices is not None
 
         # TPU mappings live on CPU. Slice after the copy so request-dependent
         # lengths do not accumulate native TPU slice compilations in host RAM.
-        mapping_full_indices = alloc_full_indices.to(
-            self.full_to_swa_index_mapping.device
+        mapping_full_indices = (
+            alloc_full_indices_host
+            if on_host
+            else alloc_full_indices.to(self.full_to_swa_index_mapping.device)
         )
         self.set_full_to_swa_mapping(
             mapping_full_indices[-swa_tail_len:], alloc_swa_indices
