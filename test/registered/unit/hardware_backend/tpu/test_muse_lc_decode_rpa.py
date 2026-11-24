@@ -1915,6 +1915,70 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         self.assertEqual(o_sh.shape, (bs_sh, 512))
         self.assertTrue(np.all(np.isfinite(np.asarray(o_sh, dtype=np.float32))))
 
+    def test_cand5_tp16_q8_all_gears_zero_ulp(self):
+        """#2907/#2992: TP=16 q8=8 rows must be 0-ULP exact vs q16 (noq8) across all gears."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        rng = np.random.default_rng(20269)
+        bs = 4
+        n_act = 3  # exercises inactive zero-row path on every gear
+        cases = [
+            ("w7auto_le1k", 512, 4, None, [512, 900, 1024, 1], "tp16,w8,hoistkv,dyn2ku", False),
+            ("u4flat_swa", 512, 2, 1024, [512, 900, 1024, 1], "tp16,w8,u4flat", False),
+            ("stream1p_swa", 512, 5, 2048, [512, 2000, 2500, 1], "tp16,w8", False),
+            ("dyn2ku_8k", 512, 16, None, [1024, 5120, 7500, 1], "tp16,w8,hoistkv,dyn2ku", False),
+            ("streamdyn_5k", 512, 12, None, [1024, 3000, 5120, 1], "tp16,w8,hoistkv,streamdyn,c4096", False),
+            ("ring4k_lc", 512, 24, None, [1024, 6000, 9500, 1], "tp16,w8,ring4k,c4096", False),
+            ("subblock2k_gt16k", 128, 130, None, [200, 1000, 2049, 1], "tp16,stream0b", False),
+            ("qepi_dyn2ku", 512, 16, None, [512, 5120, 7500, 1], "tp16,w8,hoistkv,dyn2ku", True),
+        ]
+        for tag, ps, pps, sw, lens, mode, prep in cases:
+            with self.subTest(gear=tag):
+                s_u8 = np.full((bs * pps + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                pi_np = np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+                for s in range(n_act):
+                    old = lens[s] - 1
+                    lp = old // ps
+                    rem = old % ps
+                    if lp > 0:
+                        s_u8[pi_np[s, :lp], :, 0, 0, :64] = _rand_fp8_u8(rng, (lp, ps, 64))
+                        s_u8[pi_np[s, :lp], :, 0, 1, :64] = _rand_fp8_u8(rng, (lp, ps, 64))
+                        s_u8[pi_np[s, :lp], :, 0, :2, 64:] = 0
+                    if rem > 0:
+                        s_u8[pi_np[s, lp], :rem, 0, 0, :64] = _rand_fp8_u8(rng, (rem, 64))
+                        s_u8[pi_np[s, lp], :rem, 0, 1, :64] = _rand_fp8_u8(rng, (rem, 64))
+                        s_u8[pi_np[s, lp], :rem, 0, :2, 64:] = 0
+                kvc = _u8_to_fp8(s_u8)
+                q16 = jnp.asarray((rng.standard_normal((bs, 8, 64)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+                k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+                v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+                gate = jnp.asarray((rng.standard_normal((bs, 512)) * 0.4).astype(np.float32), dtype=jnp.bfloat16) if prep else None
+                q_in = jnp.pad(q16, ((0, 0), (0, 8), (0, 64))).reshape(1, bs, 8, 2, 128) if prep else q16
+                k_in = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs, 1, 4, 128) if prep else k16
+                v_in = None if prep else v16
+                kvl = jnp.asarray(lens, dtype=jnp.int32)
+                pi = jnp.asarray(pi_np.ravel(), dtype=np.int32)
+                cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+                cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+                dist = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
+
+                o_q16, _ = run_decode_fast_rpa(
+                    q_in, k_in, v_in, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=64 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                    mode_str=f"{mode},noq8", fused_out_pack=(2 if prep else 1),
+                    prepared_inputs=prep, gate=gate, out_norm_eps=(1e-6 if prep else None), interpret=True,
+                )
+                o_q8, _ = run_decode_fast_rpa(
+                    q_in, k_in, v_in, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=64 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode, fused_out_pack=(2 if prep else 1),
+                    prepared_inputs=prep, gate=gate, out_norm_eps=(1e-6 if prep else None), interpret=True,
+                )
+                a16 = np.asarray(o_q16, dtype=np.float32)
+                a8 = np.asarray(o_q8, dtype=np.float32)
+                self.assertTrue(np.all(np.isfinite(a8)))
+                self.assertEqual(float(np.max(np.abs(a8 - a16))), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
