@@ -2891,11 +2891,13 @@ def kernel_main_fused_rs(
         and not eo3_enabled
         and not eo_pair_enabled
     )
+    _wla1 = int(use_weight_lookahead) == 1
+    _wla2 = int(use_weight_lookahead) == 2
     _gather_divisor_top = top_k if pack_indices else 1
     _w_base_idx = 17 + 2 * ep_size
     _la_started_idx = 18 + 2 * ep_size
-    _next_act_grp_off = 3 if enable_chipmate else 1
-    if use_weight_lookahead:
+    _next_act_grp_off = (1 + 2 * eff_cm_slots) if enable_chipmate else 1
+    if _wla1 or _wla2:
         gm_id_ref[_w_base_idx] = jnp.int32(0)
         gm_id_ref[_la_started_idx] = jnp.int32(0)
 
@@ -3399,7 +3401,7 @@ def kernel_main_fused_rs(
                     for _i in range(min(num_w2_bufs, total_w2_steps)):
                         start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
 
-            if use_weight_lookahead:
+            if _wla1:
 
                 @pl.when(jnp.logical_and(gm_id > 0, is_new_expert))
                 def _advance_w_ring():
@@ -3421,6 +3423,33 @@ def kernel_main_fused_rs(
                 def _start_la_step0():
                     start_w1_dma(_slot_la, _e_after_cur, 0, 0)
                     start_w2_dma(_slot_la, _e_after_cur, 0, 0)
+                    gm_id_ref[_la_started_idx] = jnp.int32(1)
+            elif _wla2:
+
+                @pl.when(jnp.logical_and(gm_id > 0, is_new_expert))
+                def _advance_w_pingpong():
+                    gm_id_ref[_w_base_idx] = jnp.int32(1) - gm_id_ref[_w_base_idx]
+                    gm_id_ref[_la_started_idx] = jnp.int32(0)
+
+                _w_base = gm_id_ref[_w_base_idx]
+                _slot_la2 = jnp.int32(1) - _w_base
+                _e_after_cur = max_num_gm_ref[_next_act_grp_off + expert_id]
+                _is_last_tile_of_e = jnp.logical_or(
+                    jnp.logical_not(has_next), next_e != expert_id
+                )
+                if enable_chipmate and cm_defer_send:
+
+                    @pl.when(gm_id == 0)
+                    def _():
+                        _maybe_start_deferred_cm_wt_send()
+
+                @pl.when(
+                    jnp.logical_and(_e_after_cur >= 0, gm_id_ref[_la_started_idx] == 0)
+                )
+                def _start_la_pingpong():
+                    start_w1_dma(_slot_la2, _e_after_cur, 0, 0)
+                    if num_w2_bufs >= 2:
+                        start_w2_dma(_slot_la2, _e_after_cur, 0, 0)
                     gm_id_ref[_la_started_idx] = jnp.int32(1)
             else:
                 _w_base = None
@@ -3703,9 +3732,13 @@ def kernel_main_fused_rs(
                 _n1 = step // num_k1
                 _k1 = step % num_k1
                 buf_id = (
-                    (_w_base + jnp.int32(step)) % jnp.int32(3)
-                    if use_weight_lookahead
-                    else (step % num_w1_bufs)
+                    _w_base
+                    if _wla2
+                    else (
+                        (_w_base + jnp.int32(step)) % jnp.int32(3)
+                        if _wla1
+                        else (step % num_w1_bufs)
+                    )
                 )
 
                 @pl.when(
@@ -3745,12 +3778,12 @@ def kernel_main_fused_rs(
                             _ns % num_w1_bufs, expert_id, _ns // num_k1, _ns % num_k1
                         )
 
-                if step == 0 and use_weight_lookahead:
+                if step == 0 and _wla1:
 
                     @pl.when(jnp.logical_and(_is_last_tile_of_e, _e_after_cur >= 0))
                     def _():
                         start_w1_dma(_w_base, _e_after_cur, 1 // num_k1, 1 % num_k1)
-                elif step == 0 and can_cache_w1:
+                elif step == 0 and can_cache_w1 and not _wla2:
 
                     @pl.when(
                         jnp.logical_and(
@@ -3769,7 +3802,7 @@ def kernel_main_fused_rs(
                 def _():
                     _do_direct_write(gm_id - 1, _prev_stg)
 
-            if enable_chipmate and cm_defer_send:
+            if enable_chipmate and cm_defer_send and not _wla2:
 
                 @pl.when(gm_id == 0)
                 def _():
@@ -3807,7 +3840,7 @@ def kernel_main_fused_rs(
                         packed_u16=packed_u16_lhs,
                     )
 
-            if not use_weight_lookahead:
+            if not _wla1 and not _wla2:
 
                 @pl.when(has_next)
                 def _():
@@ -3854,9 +3887,13 @@ def kernel_main_fused_rs(
                 _n2 = step // num_k2
                 _k2 = step % num_k2
                 buf_id = (
-                    (_w_base + jnp.int32(step)) % jnp.int32(3)
-                    if use_weight_lookahead
-                    else (step % num_w2_bufs)
+                    (_w_base if num_w2_bufs >= 2 else 0)
+                    if _wla2
+                    else (
+                        (_w_base + jnp.int32(step)) % jnp.int32(3)
+                        if _wla1
+                        else (step % num_w2_bufs)
+                    )
                 )
 
                 # Skip wait if W2 was cached (same expert as prev + buffers fit all).
@@ -3902,18 +3939,18 @@ def kernel_main_fused_rs(
                 if step + num_w2_bufs < total_w2_steps:
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
-                if step == 0 and use_weight_lookahead:
+                if step == 0 and _wla1:
 
                     @pl.when(jnp.logical_and(_is_last_tile_of_e, _e_after_cur >= 0))
                     def _():
                         start_w2_dma(_w_base, _e_after_cur, 1 // num_k2, 1 % num_k2)
-                elif step == 0 and can_cache_w2:
+                elif step == 0 and can_cache_w2 and not (_wla2 and num_w2_bufs >= 2):
 
                     @pl.when(jnp.logical_and(has_next, next_e != expert_id))
                     def _():
                         start_w2_dma(0, next_e, 0, 0)
 
-            if not use_weight_lookahead:
+            if not _wla1 and not _wla2:
 
                 @pl.when(
                     jnp.logical_and(
@@ -4774,8 +4811,9 @@ def gmm_v2_fused_rs(
     smem_rows = fused_rs_smem_rows(size_m, ep_size, expert_tp)
     max_num_gm_static = size_group + pl.cdiv(smem_rows, tile_m) - 1
     n2_cols = aligned_n2 // num_lanes
+    _wla_cfg = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0)
     eff_weight_lookahead = (
-        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) >= 1
+        _wla_cfg == 1
         and is_quantized
         and not fp8_direct_write
         and not eff_hot_interleave
@@ -4787,6 +4825,17 @@ def gmm_v2_fused_rs(
         and (size_k2 // tile_k2) * (size_n2 // tile_n2) == 2
         and (-(-tile_k1 // rhs1_quant_block_size)) % 16 == 0
         and (-(-tile_k2 // rhs2_quant_block_size)) % 16 == 0
+    )
+    eff_wla2 = (
+        _wla_cfg == 2
+        and is_quantized
+        and not fp8_direct_write
+        and not eff_hot_interleave
+        and size_m >= _PREFILL_TILES_MIN_SIZE_M
+        and num_w1_bufs >= 2
+        and (size_k1 // tile_k1) * ((size_n1 // 2 if act_fn else size_n1) // tile_n1)
+        == 1
+        and (size_k2 // tile_k2) * (size_n2 // tile_n2) == 1
     )
     use_w2_prequant_cache = (
         is_quantized
@@ -4993,7 +5042,10 @@ def gmm_v2_fused_rs(
         # zero_sem_ref
         pltpu.SemaphoreType.DMA((1,)),
         # gm_id_ref: [0]=gm_id, [1..8]=send counts, [9..16]=local counts (+2 for w_ring)
-        pltpu.SMEM(((19 if eff_weight_lookahead else 17) + 2 * ep_size,), jnp.int32),
+        pltpu.SMEM(
+            ((19 if (eff_weight_lookahead or eff_wla2) else 17) + 2 * ep_size,),
+            jnp.int32,
+        ),
         # w1_buf_ref
         pltpu.VMEM(
             (
@@ -5088,7 +5140,7 @@ def gmm_v2_fused_rs(
         )
     else:
         max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
-    if eff_weight_lookahead:
+    if eff_weight_lookahead or eff_wla2:
         _go_la = group_offset[0]
         _sz_la = lax.dynamic_slice_in_dim(group_sizes, _go_la, size_group).astype(
             jnp.int32
@@ -5499,7 +5551,7 @@ def gmm_v2_fused_rs(
         f"{f'-rb{_rb_val}' if _rb_active else ''}"
         f"{f'-flq{_flq_val}' if _flq_val > 0 else ''}"
         f"{f'-g2a{_g2a_val}' if _g2a_val > 0 else ''}"
-        f"{'-wla1' if eff_weight_lookahead else ''}"
+        f"{'-wla2' if eff_wla2 else ('-wla1' if eff_weight_lookahead else '')}"
         f"{'-w2c1' if use_dedicated_w2_fp8_cache else ''}"
         f"{f'-rrs{_rot_rs_val}' if _rot_rs_val > 0 else ''}"
         f"{f'-ds{_dsilu_val}' if _dsilu_val > 0 else ''}"
@@ -5540,7 +5592,7 @@ def gmm_v2_fused_rs(
         decode_dual_k256=decode_dual_k256,
         packed_u16_lhs=pack_u16_lhs,
         gather_2ahead_mode=(0 if eff_eo_mode >= 3 else _g2a_val),
-        use_weight_lookahead=eff_weight_lookahead,
+        use_weight_lookahead=(2 if eff_wla2 else (1 if eff_weight_lookahead else 0)),
         rotate_rs_mode=_rot_rs_val,
         static_fp8_rs_scale=eff_static_fp8_rs,
         cm_defer_send=eff_cm_defer,
