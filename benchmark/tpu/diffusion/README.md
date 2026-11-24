@@ -82,13 +82,13 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
 }'
 ```
 
-VDN-H3 (`vdn_h3.sh`) takes MiniMax-H3's video request; nine sigma points are its eight DiT forwards:
+VDN-H3 (`vdn_h3.sh`) takes MiniMax-H3's video request at its eight DiT forwards:
 
 ```bash
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A skateboarder does a kickflip down a set of concrete stairs in a sunny city plaza, the camera tracks alongside him",
   "task": "t2va", "conditions": [], "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 4},
-  "num_inference_steps": 9, "quality": "lossless", "seed": 42
+  "num_inference_steps": 8, "quality": "lossless", "seed": 42
 }'
 ```
 
