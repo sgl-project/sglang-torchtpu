@@ -134,8 +134,8 @@ class TpuEnvs:
     # _embed, instead of projecting every row into one padded-length buffer.
     # The full-row form keeps prompt lengths on shared compiled shapes; with the
     # prompt-length warmup (SGLANG_TPU_OPT_H3_TEXT_WARMUP_LENGTHS) those shapes
-    # compile at startup instead: at 1344x768x124 on 4 chips a request takes
-    # about 0.8 s less, and the server takes about 10 minutes longer to start.
+    # compile at startup instead: requests run faster, and the server takes
+    # longer to start.
     SGLANG_TPU_OPT_H3_SHARD_EMBEDDING = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
