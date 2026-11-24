@@ -129,20 +129,6 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
-    # Wan VAE decode (AutoencoderKLWan.decode): float32 convolution precision
-    # for the decode only, "high" (3 bf16 passes, bf16_3x) or "highest" (6
-    # passes); its attention block stays at "highest". Unset: the worker's
-    # global precision ("highest", see worker.py). Not bit-exact with
-    # "highest" (multimodal_gen/wan_vae.py).
-    SGLANG_TPU_WAN_VAE_DECODE_FP32_MATMUL_PRECISION = EnvStr(None)
-    # Debug: decode every Wan VAE call once per listed variant, comma-separated
-    # "chunk:precision[:compile]" (latent frames per decoder call after the
-    # first frame, "high" or "highest", and ":compile" for compiled decoder
-    # calls, SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE; eager without),
-    # e.g. "5:highest,5:highest:compile,1:high". Logs each variant's
-    # synchronized time and its difference from the first, which is also the
-    # decode returned. Never set in measured runs.
-    SGLANG_TPU_DEBUG_WAN_VAE_AB = EnvStr(None)
     # Wan VAE decode: output channels the decoder's last convolution (96 -> 3)
     # computes, with zero-padded weights; the real channels are kept, each the
     # same sum of products. tpu7x ran the 3-channel convolution ~9x slower per

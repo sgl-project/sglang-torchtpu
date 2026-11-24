@@ -17,8 +17,8 @@ def install_runtime_patches() -> None:
     torch.set_float32_matmul_precision("highest")
     rope.install()
     minimax_h3.install()
-    # Wan VAE decode (wan_vae.py): the full-frame mid-block attention, and
-    # the opt-in decode options.
+    # Wan VAE decode (wan_vae.py): full-frame mid-block attention; opt-in
+    # conv_out padding and decode-scoped XLA options.
     wan_vae.install()
 
 

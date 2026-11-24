@@ -298,12 +298,14 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   (`SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`) keeps the default and still hangs
   with CFG-parallel and Ulysses on the two-stage pipeline.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  the debt header: `rope.py` (RoPE without stride-2 lane access),
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe, the embedding built
-  with shapes that do not move with the prompt length) and, opt-in, `wan_vae.py`
-  (a float32 matmul precision for the Wan VAE decode only); worker init also
+  with shapes that do not move with the prompt length) and `wan_vae.py` (the
+  Wan VAE mid-block attention over the whole gathered frame under a
+  spatial-parallel decode; opt-in, a zero-padded last convolution and XLA
+  options for the decode only); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 
