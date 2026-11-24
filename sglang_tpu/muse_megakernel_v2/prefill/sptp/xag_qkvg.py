@@ -163,7 +163,7 @@ def xag_qkvg_call(
     dbg_xs: bool = False,
     dma_first: bool = True,
     split_epi: bool = False,
-    exact_cast: bool = True,
+    exact_cast: bool = False,
     gate4: bool = False,
     w_start: int = 0,
 ):

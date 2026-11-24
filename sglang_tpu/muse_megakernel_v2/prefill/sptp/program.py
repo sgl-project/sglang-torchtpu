@@ -38,6 +38,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.ogate import o_gate_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
     oproj_a2a_call,
     oproj_call,
@@ -46,7 +47,6 @@ from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     _heads_rms_mxu,
     dequant_rows_call,
-    o_gate_call,
     qkvg_call,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
@@ -158,8 +158,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
     local_counts = os.environ.get("SPTP_GLOBAL_COUNTS", "0") != "1"
     # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (its 64-lane head relayouts and f32 MXU head
     # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
-    ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
-    o_gate = o_gate_call(c)
     # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
     aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
     # SPTP_XE_PALLAS_DEQUANT=1: row-major Pallas xe dequant (measured 171.1 vs 169.7 ms / chunk
@@ -183,6 +181,14 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_split_epi = os.environ.get("SPTP_XAG_EPI", "0") == "1"
     # SPTP_XAG_GATE4=1: gate in the [Hkv, T, G, 128] head layout (no transpose before the o gate)
     xag_gate4 = xag_fused and q_rpa and os.environ.get("SPTP_XAG_GATE4", "0") == "1"
+    # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (sptp/ogate.py; gate4-aware) instead of XLA
+    ogate_k = (
+        o_gate_call(c, gate4=xag_gate4)
+        if q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
+        else None
+    )
+    ogate_kernel = ogate_k is not None
+    o_gate = ogate_k
     xag_norm_dbg = xag_norm and os.environ.get("SPTP_XAG_NORM_DBG", "0") == "1"  # debug
     # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
     # unfused-norm kernel on XLA's rows
@@ -202,6 +208,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
             dma_first=xag_dma_first,
             split_epi=xag_split_epi,
             gate4=xag_gate4,
+            # SPTP_XAG_RNE=1: explicit ties-to-even e4m3 rounding in the fused norm (same bits
+            # as the plain cast in the 1-layer check, 1.5 us / tile)
+            exact_cast=os.environ.get("SPTP_XAG_RNE", "0") == "1",
             w_start=int(os.environ.get("SPTP_XAG_WSTART", "0")),
         )
         for r in (True, False)
