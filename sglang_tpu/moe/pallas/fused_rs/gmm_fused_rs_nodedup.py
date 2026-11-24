@@ -2304,8 +2304,8 @@ def _pair_exchange_metadata(
     onehot = (owner[:, None] == jnp.arange(ep_size, dtype=jnp.int32)[None, :]).astype(
         jnp.int32
     )
-    m_offset = group_start[4 + num_slots : 4 + 2 * num_slots + 1]
     if tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_MXU_COUNTS.get():
+        m_offset = group_start[4 + num_slots : 4 + 2 * num_slots + 1]
         # rows before each boundary per owner: [slots + 1, rows] 0/1 @ [rows, ep] 0/1, exact
         # in f32 accumulation (rows < 2^24)
         rows = jnp.arange(local_idx.shape[0], dtype=jnp.int32)
@@ -2319,6 +2319,7 @@ def _pair_exchange_metadata(
         counts = jnp.concatenate(
             [jnp.zeros((1, ep_size), jnp.int32), jnp.cumsum(onehot, axis=0)]
         )
+        m_offset = group_start[4 + num_slots : 4 + 2 * num_slots + 1]
         run_rank = counts[m_offset[:num_slots]]
         run_len = counts[m_offset[1:]] - run_rank
     my_rank = group_offset[0] // size_group
