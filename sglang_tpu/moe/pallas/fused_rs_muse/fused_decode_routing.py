@@ -1702,14 +1702,36 @@ def build_default_exec_plan_smem(
     """Build compact active-expert plan in SMEM in ONLY ``e_per_owner`` (32) steps!"""
     del num_experts
     first = my_owner * e_per_owner
-    if fast_plan and spec_slot is None and e_per_owner <= 64:
-        k = jnp.int32(0)
-        cursor = jnp.int32(0)
+    if fast_plan and e_per_owner <= 64:
+        if spec_slot is not None:
+            use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)
+            safe_sp = jnp.where(use_sp, spec_slot, jnp.int32(0))
+            g_sp = first + safe_sp
+            cnt_sp = scratch.counts_smem[0, g_sp]
+            act_sp = use_sp & (cnt_sp > 0)
+            scratch.exec_expert_id[0] = g_sp
+            scratch.exec_weight_src[0] = jnp.int32(0)
+            scratch.exec_weight_slot[0] = safe_sp
+            scratch.exec_start[0] = jnp.int32(0)
+            scratch.exec_write_ptr[0] = jnp.int32(0)
+            k = act_sp.astype(jnp.int32)
+            cursor = jnp.where(act_sp, cnt_sp, jnp.int32(0))
+        else:
+            use_sp = jnp.bool_(False)
+            safe_sp = jnp.int32(-1)
+            act_sp = jnp.bool_(False)
+            k = jnp.int32(0)
+            cursor = jnp.int32(0)
         for le in range(e_per_owner):
+            is_sp = use_sp & (jnp.int32(le) == safe_sp)
             g_e = first + jnp.int32(le)
             cnt = scratch.counts_smem[0, g_e]
-            active = cnt > 0
-            scratch.cand_exec_idx[le] = jnp.where(active, k, jnp.int32(-1))
+            active = (~is_sp) & (cnt > 0)
+            scratch.cand_exec_idx[le] = jnp.where(
+                is_sp,
+                jnp.where(act_sp, jnp.int32(0), jnp.int32(-1)),
+                jnp.where(active, k, jnp.int32(-1)),
+            )
             scratch.exec_expert_id[k] = g_e
             scratch.exec_weight_src[k] = jnp.int32(0)
             scratch.exec_weight_slot[k] = jnp.int32(le)
@@ -1798,14 +1820,36 @@ def build_exec_plan_from_masks_smem(
     """Build unified active-expert plan in ONLY ``e_per_owner + R`` (<= 36) steps!"""
     del num_experts
     first = my_owner * e_per_owner
-    if fast_plan and spec_slot is None and e_per_owner <= 64 and num_replicas <= 8:
-        k = jnp.int32(0)
-        cursor = jnp.int32(0)
+    if fast_plan and e_per_owner <= 64 and num_replicas <= 8:
+        if spec_slot is not None:
+            use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)
+            safe_sp = jnp.where(use_sp, spec_slot, jnp.int32(0))
+            g_sp = first + safe_sp
+            cnt_sp = scratch.counts_smem[0, g_sp]
+            keep_sp = use_sp & (cnt_sp > 0) & (local_suppress_smem[safe_sp] == 0)
+            scratch.exec_expert_id[0] = g_sp
+            scratch.exec_weight_src[0] = jnp.int32(0)
+            scratch.exec_weight_slot[0] = safe_sp
+            scratch.exec_start[0] = jnp.int32(0)
+            scratch.exec_write_ptr[0] = jnp.int32(0)
+            k = keep_sp.astype(jnp.int32)
+            cursor = jnp.where(keep_sp, cnt_sp, jnp.int32(0))
+        else:
+            use_sp = jnp.bool_(False)
+            safe_sp = jnp.int32(-1)
+            keep_sp = jnp.bool_(False)
+            k = jnp.int32(0)
+            cursor = jnp.int32(0)
         for le in range(e_per_owner):
+            is_sp = use_sp & (jnp.int32(le) == safe_sp)
             g_e = first + jnp.int32(le)
             cnt = scratch.counts_smem[0, g_e]
-            keep = (cnt > 0) & (local_suppress_smem[le] == 0)
-            scratch.cand_exec_idx[le] = jnp.where(keep, k, jnp.int32(-1))
+            keep = (~is_sp) & (cnt > 0) & (local_suppress_smem[le] == 0)
+            scratch.cand_exec_idx[le] = jnp.where(
+                is_sp,
+                jnp.where(keep_sp, jnp.int32(0), jnp.int32(-1)),
+                jnp.where(keep, k, jnp.int32(-1)),
+            )
             scratch.exec_expert_id[k] = g_e
             scratch.exec_weight_src[k] = jnp.int32(0)
             scratch.exec_weight_slot[k] = jnp.int32(le)

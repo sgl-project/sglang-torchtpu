@@ -185,6 +185,34 @@ def _read_fast_gs_knob() -> bool:
     return val
 
 
+def _read_spec_prime_fast_knobs() -> tuple[bool, int]:
+    import os
+
+    sp_fast = _env_bool_fallback(
+        "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST", False
+    )
+    raw_slot = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT")
+    home_slot = int(raw_slot) if (raw_slot is not None and raw_slot.strip() != "") else -1
+    try:
+        from sglang_tpu.envs import envs
+
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST") is None:
+            e_spf = getattr(
+                envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST", None
+            )
+            if e_spf is not None:
+                sp_fast = bool(e_spf.get())
+        if raw_slot is None:
+            e_shs = getattr(
+                envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT", None
+            )
+            if e_shs is not None:
+                home_slot = int(e_shs.get())
+    except Exception:
+        pass
+    return sp_fast, home_slot
+
+
 def _read_sparse_env_overrides() -> (
     tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int, int, str]
 ):
@@ -295,11 +323,17 @@ def default_sparse_decode_config(
         route_fast,
         fast_plan,
     ) = _read_sparse_w9_sub_knobs()
-    if route_fast:
+    spec_prime_fast, spec_home_slot = _read_spec_prime_fast_knobs()
+    if route_fast and not spec_prime_fast:
         # Silicon-proven (#2647 / #2767): vertical ROUTE_FAST (~3.5 us) finishes before
-        # speculative slot-0 16 MiB DMA (~4.3 us), causing _drain_spec_miss stalls (+4.55 us)
-        # and bypassing branchless FAST_PLAN (spec_slot is not None).
+        # speculative slot-0 16 MiB DMA (~4.3 us), causing _drain_spec_miss stalls (+4.55 us).
+        # Keep spec_eff=0 unless explicitly opted into SPEC_PRIME_FAST=1 (#3035).
         spec_eff = 0
+    spec_home_slots = (
+        (spec_home_slot,) * ep
+        if (spec_eff > 0 and 0 <= spec_home_slot < (_E_TOTAL // ep))
+        else ()
+    )
     free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
         free_rows, free_min_slot, batch_size
     )
@@ -313,6 +347,7 @@ def default_sparse_decode_config(
         route_fast=route_fast,
         fast_plan=fast_plan,
         fast_gs=fast_gs,
+        spec_home_slots=spec_home_slots,
         min_p_topk=min_p_topk,
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w,
@@ -1605,6 +1640,29 @@ def _sparse_decode_kernel(
     # 4. IMMEDIATELY prime weight prefetch ring BEFORE prologue zeroing/packing!
     if stop_stage == "pack":
         pass
+    elif do_spec and w_mode in ("stream3", "stream3_k2") and spec_parts == 1:
+        spec_hit = (
+            spec_enabled
+            & (num_exec > 0)
+            & (exec_src_smem[0] == 0)
+            & (exec_slot_smem[0] == spec_slot)
+        )
+
+        @pl.when(num_exec > 0)
+        def _prime_s3_p1_down():
+            s0 = exec_src_smem[0]
+            sl0 = exec_slot_smem[0]
+            start_s3_part(1, s0, sl0)
+            start_s3_down(s0, sl0)
+
+        @pl.when(spec_enabled & (~spec_hit))
+        def _drain_s3_p0_miss():
+            wait_s3_part(0)
+
+        @pl.when((~spec_hit) & (num_exec > 0))
+        def _prime_s3_p0_after_miss():
+            start_s3_part(0, exec_src_smem[0], exec_slot_smem[0])
+
     elif do_spec:
         spec_hit = (
             spec_enabled
@@ -4297,8 +4355,14 @@ def default_fp8_sparse_decode_config(
         _,
     ) = _read_sparse_env_overrides()
     _, _, _, route_rb16_mode, route_fast, fast_plan = _read_sparse_w9_sub_knobs()
-    if route_fast:
+    spec_prime_fast, spec_home_slot = _read_spec_prime_fast_knobs()
+    if route_fast and not spec_prime_fast:
         spec_parts = 0
+    spec_home_slots = (
+        (spec_home_slot,) * ep
+        if (spec_parts > 0 and 0 <= spec_home_slot < (_E_TOTAL // ep))
+        else ()
+    )
     use_k2 = fp8_mode in ("w1_k2_w2_1x", "w1_k2_w8a8", "dense_k2") or contig_parts
     use_w8a8 = fp8_mode == "w1_k2_w8a8"
     use_dense_k2 = fp8_mode == "dense_k2" and batch_size <= 64
@@ -4326,6 +4390,7 @@ def default_fp8_sparse_decode_config(
         route_rb16_mode=route_rb16_mode,
         route_fast=route_fast,
         fast_plan=fast_plan,
+        spec_home_slots=spec_home_slots,
         pair_rs=fp8_pair_rs,
     )
     if batch_size <= 16 or use_dense_k2:

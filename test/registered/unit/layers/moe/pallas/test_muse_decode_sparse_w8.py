@@ -1929,6 +1929,227 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             hlo_sp = sm_sp.trace(*in_shapes_sp).lower(lowering_platforms=("tpu",)).as_text("hlo")
             self.assertIn("tpu_custom_call", hlo_sp)
 
+    def test_w9_spec_prime_fast_with_fast_plan_parity_and_lowering(self):
+        """Verify SPEC_PRIME_FAST opt-in enables SPEC_PRIME alongside FAST_PLAN=2 with 0-ULP parity."""
+        import dataclasses
+        from functools import partial
+
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        routing_mod = _load_pkg_module(
+            "fused_decode_routing", _MUSE_DIR / "fused_decode_routing.py"
+        )
+
+        # 1. Verify default-OFF gating of SPEC_PRIME_FAST & SPEC_HOME_SLOT.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST": "0",
+            },
+            clear=False,
+        ):
+            cfg_off = v1_mod.default_sparse_decode_config(64, 8, 512)
+            self.assertEqual(cfg_off.spec_prime_parts, 0)
+            self.assertEqual(cfg_off.spec_home_slots, ())
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT": "29",
+            },
+            clear=False,
+        ):
+            cfg_on = v1_mod.default_sparse_decode_config(64, 8, 512)
+            self.assertEqual(cfg_on.spec_prime_parts, 2)
+            self.assertEqual(cfg_on.spec_home_slots, (29,) * 8)
+            fp8_on = v1_mod.default_fp8_sparse_decode_config(64, 8)
+            self.assertEqual(fp8_on.spec_prime_parts, 2)
+            self.assertEqual(fp8_on.spec_home_slots, (29,) * 8)
+            # EP=16 e_local=16 rejects out-of-range slot=29 safely.
+            cfg_ep16 = v1_mod.default_sparse_decode_config(64, 16, 512)
+            self.assertEqual(cfg_ep16.spec_home_slots, ())
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        # 2. SMEM exec-plan parity across hit/suppressed/zero/empty/slot0/slot31/disabled under nan-scratch.
+        interp_kw = {
+            "detect_races": True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        }
+
+        def _check_plan(fast_p: bool, with_rep: bool, spec_val: int, cnt_np, sup_np, rep_np):
+            e_loc, num_rep = 32, 8
+            max_exec = e_loc + (num_rep if with_rep else 0)
+            r_sh = routing_mod.routing_scratch_shapes(64, max_exec)
+
+            def _k(me_ref, sp_ref, cnt_ref, sup_ref, rep_ref, out_ref, r_sc):
+                r_sc.counts_smem[...] = cnt_ref[...]
+                if with_rep:
+                    ne = routing_mod.build_exec_plan_from_masks_smem(
+                        me_ref[0],
+                        e_loc,
+                        num_rep,
+                        sup_ref,
+                        rep_ref,
+                        r_sc,
+                        spec_slot=sp_ref[0],
+                        fast_plan=fast_p,
+                    )
+                else:
+                    ne = routing_mod.build_default_exec_plan_smem(
+                        me_ref[0],
+                        e_loc,
+                        r_sc,
+                        spec_slot=sp_ref[0],
+                        fast_plan=fast_p,
+                    )
+                out_ref[0, 0] = ne
+                for i in range(max_exec):
+                    out_ref[1, i] = r_sc.cand_exec_idx[i]
+                    out_ref[2, i] = jnp.where(
+                        i < ne, r_sc.exec_expert_id[i], jnp.int32(-1)
+                    )
+                    out_ref[3, i] = jnp.where(
+                        i < ne, r_sc.exec_weight_src[i], jnp.int32(-1)
+                    )
+                    out_ref[4, i] = jnp.where(
+                        i < ne, r_sc.exec_weight_slot[i], jnp.int32(-1)
+                    )
+                for i in range(max_exec + 1):
+                    out_ref[5, i] = jnp.where(
+                        i <= ne, r_sc.exec_start[i], jnp.int32(-1)
+                    )
+
+            fn = pl.pallas_call(
+                _k,
+                out_shape=jax.ShapeDtypeStruct((6, max_exec + 1), jnp.int32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=5,
+                    grid=(1,),
+                    in_specs=(),
+                    out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
+                    scratch_shapes=(r_sh,),
+                ),
+                interpret=pltpu.InterpretParams(**interp_kw),
+            )
+            return np.asarray(
+                fn(
+                    jnp.array([2], jnp.int32),
+                    jnp.array([spec_val], jnp.int32),
+                    jnp.asarray(cnt_np, jnp.int32),
+                    jnp.asarray(sup_np, jnp.int32),
+                    jnp.asarray(rep_np, jnp.int32),
+                )
+            )
+
+        rng = np.random.default_rng(1234)
+        for mode_name, sp_v in (
+            ("normal_hit", 17),
+            ("suppressed_miss", 5),
+            ("zero_cnt_miss", 12),
+            ("all_zero", 3),
+            ("disabled_neg1", -1),
+            ("slot0_hit", 0),
+            ("slot31_hit", 31),
+        ):
+            cnt = np.zeros((8, 256), dtype=np.int32)
+            if mode_name != "all_zero":
+                cnt[0] = rng.choice([0, 0, 1, 4, 15], size=256)
+                if mode_name in ("normal_hit", "slot0_hit", "slot31_hit", "suppressed_miss"):
+                    cnt[0, 2 * 32 + max(0, sp_v)] = 9
+                if mode_name == "zero_cnt_miss":
+                    cnt[0, 2 * 32 + sp_v] = 0
+            sup = (rng.random(32) < 0.25).astype(np.int32)
+            if mode_name == "suppressed_miss":
+                sup[sp_v] = 1
+            elif sp_v >= 0:
+                sup[sp_v] = 0
+            rep = np.array([10, -1, 200, 145, -1, 3, -1, 250], dtype=np.int32)
+            for w_rep in (True, False):
+                o_ref = _check_plan(False, w_rep, sp_v, cnt, sup, rep)
+                o_fast = _check_plan(True, w_rep, sp_v, cnt, sup, rep)
+                self.assertTrue(
+                    np.array_equal(o_ref, o_fast),
+                    f"spec_prime fast_plan SMEM mismatch on {mode_name} (rep={w_rep}, sp={sp_v})",
+                )
+
+        # 3. Verify TPU7x Mosaic lowering for sp=1 (overlapping prime-rest) & sp=2 with fast_plan=2.
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            h, r_slots = 4096, 8
+            in_shapes_sp = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((64, 256), jnp.float32),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((64, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((32, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((32, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, h, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, h // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((r_slots, 4096, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((r_slots, 4096 // 512, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4, 8 * r_slots), jnp.int32),
+            )
+            base_cfg = v1_mod.default_sparse_decode_config(64, 8, 512)
+            for sp_parts in (1, 2):
+                cfg_sp = dataclasses.replace(
+                    base_cfg,
+                    static_holder_mask=True,
+                    route_fast=True,
+                    fast_plan=2,
+                    unroll_strips=True,
+                    spec_prime_parts=sp_parts,
+                    spec_home_slots=(29,) * 8,
+                )
+                sm_sp = jax.jit(
+                    jax.shard_map(
+                        partial(
+                            v1_mod.fused_decode_sparse_from_logits,
+                            ep=8,
+                            return_sharded=True,
+                            replica_cost_mode="tiles",
+                            config=cfg_sp,
+                        ),
+                        mesh=mesh,
+                        in_specs=(P(),) * len(in_shapes_sp),
+                        out_specs=P(),
+                        check_vma=False,
+                    )
+                )
+                comp_sp = sm_sp.trace(*in_shapes_sp).lower(lowering_platforms=("tpu",)).compile()
+                hlo_sp = comp_sp.as_text()
+                self.assertIn("tpu_custom_call", hlo_sp)
+                self.assertGreater(comp_sp.memory_analysis().generated_code_size_in_bytes, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
