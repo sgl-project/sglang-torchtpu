@@ -242,22 +242,28 @@ def _page_runs(
     head_exp_rows = fmt.head_scale_rows * per_scale_row
     src_exp = blocks * src_payload
     dst_exp = blocks * dst_payload
+    src_row = src_exp + src_head * head_exp_rows
+    dst_row = dst_exp + dst_head * head_exp_rows
+    exp_rows = num_heads * head_exp_rows
+    src_exp_end = src_exp + src_heads * head_exp_rows
+    used = dst_exp + dst_heads * head_exp_rows
+    padding = fmt.rows(dst_heads) - used if fill_padding else 0
+    if dst_row + exp_rows == used and src_row + exp_rows + padding <= src_exp_end:
+        # The padding follows the slice's exponent rows;
+        # filling it from the source rows after them moves both as one run.
+        exp_rows, used, padding = exp_rows + padding, used + padding, 0
     for src_off, dst_off, size, count in _row_runs(
-        src_exp + src_head * head_exp_rows,
-        dst_exp + dst_head * head_exp_rows,
-        num_heads * head_exp_rows,
-        width,
+        src_row=src_row, dst_row=dst_row, rows=exp_rows, width=width
     ):
         runs.append((src_off, dst_off, size, TILE_BYTES, TILE_BYTES, count))
-    if fill_padding:
-        used = dst_exp + dst_heads * head_exp_rows
-        padding = fmt.rows(dst_heads) - used
-        src_exp_rows = src_heads * head_exp_rows
-        while padding:
-            rows = min(padding, src_exp_rows)
-            for src_off, dst_off, size, count in _row_runs(src_exp, used, rows, width):
-                runs.append((src_off, dst_off, size, TILE_BYTES, TILE_BYTES, count))
-            used, padding = used + rows, padding - rows
+    src_exp_rows = src_heads * head_exp_rows
+    while padding:
+        rows = min(padding, src_exp_rows)
+        for src_off, dst_off, size, count in _row_runs(
+            src_row=src_exp, dst_row=used, rows=rows, width=width
+        ):
+            runs.append((src_off, dst_off, size, TILE_BYTES, TILE_BYTES, count))
+        used, padding = used + rows, padding - rows
     return runs
 
 

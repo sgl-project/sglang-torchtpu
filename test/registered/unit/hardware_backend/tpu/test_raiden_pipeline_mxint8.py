@@ -188,6 +188,28 @@ def test_head_slices_rebuild_each_rank_page(
                 assert (got[~used] < 128).all(), (rank, i)
 
 
+def test_whole_page_slice_moves_exponents_and_padding_in_one_run():
+    """A slice filling its destination page moves in two spans per page;
+    the slice whose exponent rows end the source page keeps a padding run."""
+    fmt = pp_mxint8.Mxint8PageFormat(
+        layout="blocked", head_dim=64, group_size=32, page_size=512
+    )
+    heads, num_pages = 16, 3
+    tensor = SimpleNamespace(shape=(num_pages + 1, fmt.rows(heads), fmt.width))
+    part = pp_mxint8.head_slice_part(
+        fmt,
+        tag="fa.l0",
+        tensor=tensor,
+        blocks=list(range(num_pages)),
+        dst_attn_tp=heads,
+        total_kv_heads=heads,
+    )
+    per_rank = [0] * heads
+    for span in part.spans:
+        per_rank[span.dst_unit_ordinal] += 1
+    assert per_rank == [2 * num_pages] * (heads - 1) + [3 * num_pages]
+
+
 def _fingerprint(heads, *, layout="blocked", group_size=32, page_size=512):
     fmt = pp_mxint8.Mxint8PageFormat(
         layout=layout, head_dim=128, group_size=group_size, page_size=page_size
