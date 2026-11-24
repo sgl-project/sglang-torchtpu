@@ -277,13 +277,13 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
             with _scope("ao_xe_norm"):
                 xe = gathered(xe_pad, xsc_pad, s, tp)
                 gain = sm[SMALL["pre_expert_w"] : SMALL["pre_expert_w"] + 1, :He]
-                xe = (_rms(xe, c.rms_eps) * gain).astype(jnp.bfloat16)
 
             @pl.when(j >= 2)
             def _():
                 xe_out_copy(j - 2).wait()
 
-            xe_v[b] = xe
+            with _scope("ao_xe_norm"):
+                xe_v[b] = (_rms(xe, c.rms_eps) * gain).astype(jnp.bfloat16)
             xe_out_copy(j).start()
 
         s4a = lambda j: col.ag_relay(ag_kp, j % _SLOTS)
