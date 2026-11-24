@@ -145,9 +145,13 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
-    # SPTP_XE_XLA_DEQUANT=1: XLA's xe dequant (transposed layout + a conversion copy)
+    # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
+    aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
+    # SPTP_XE_PALLAS_DEQUANT=1: row-major Pallas xe dequant (measured 171.1 vs 169.7 ms / chunk
+    # for XLA's fusion + layout copy, which overlap the MoE routing glue)
     xe_pallas = (
-        not DEBUG_BF16_ACTIVATIONS and os.environ.get("SPTP_XE_XLA_DEQUANT", "0") != "1"
+        not DEBUG_BF16_ACTIVATIONS
+        and os.environ.get("SPTP_XE_PALLAS_DEQUANT", "0") == "1"
     )
     dequant = dequant_rows_call(T, He)
 
@@ -319,9 +323,17 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     c, stream, sm, "ffn", f.astype(_F32) * small_row(sm, "post_ffn_w")
                 )
             if l in c.capture_layers:
-                aux.append(stream.astype(_BF16))
+                # gathered at capture time: the AG overlaps the later layers instead of one
+                # [T, 5H] AG after the last layer
+                aux.append(
+                    ag(stream.astype(_BF16), axis)
+                    if aux_early
+                    else stream.astype(_BF16)
+                )
         hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
         aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
-        return (ag(hidden, axis), ag(aux_out, axis), *kv)
+        if not aux_early or not aux:
+            aux_out = ag(aux_out, axis)
+        return (ag(hidden, axis), aux_out, *kv)
 
     return forward
