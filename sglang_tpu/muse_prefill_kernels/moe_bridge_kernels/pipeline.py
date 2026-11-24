@@ -1606,7 +1606,11 @@ def _d_with_next_in_gather(
     """Kernel D with the first ``rows0`` rows of next_attn_in all-gathered: (new_stream, rest, gathered)."""
     from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
 
-    use_xor1 = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 1
+    # Split _d_with_next_in_gather overlaps AG with Kernel D Part 2 only when AG runs on
+    # SparseCore (jax.lax.all_gather); keep TC xor1 opt-in via XOR1_AG_UNDER_D.
+    use_xor1 = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() >= 1 and (
+        not split or envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get()
+    )
 
     def _prep_part0(x_part):
         if gather_static_fp8 and x_part.dtype != jnp.float8_e4m3fn:

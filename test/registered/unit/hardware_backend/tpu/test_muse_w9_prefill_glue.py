@@ -17,6 +17,7 @@ from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 _TOUCHED_FLAGS = (
     "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG",
+    "SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D",
     "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT",
     "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1",
 )
@@ -47,6 +48,7 @@ def _interpret_on_cpu():
 def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
     """All prefill glue flags default off and are always read via .get()."""
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get() == 0
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() == 0
 
@@ -908,6 +910,80 @@ def test_extend_full_vocab_logits_mode_gating_and_hygiene():
     with mock.patch.dict(os.environ, {"SGLANG_TPU_EXTEND_FULL_VOCAB_LOGITS": "1"}):
         assert pol._extend_logits_output_modes(64) == (LogitsOutputMode.FULL_VOCAB,)
         assert LogitsOutputMode.DISTRIBUTED_TOP_K in pol._warmup_logits_output_modes(64)
+
+
+def test_d_with_next_in_gather_split_keeps_sparsecore_ag_unless_opted_in():
+    """Split _d_with_next_in_gather must keep SparseCore all_gather unless XOR1_AG_UNDER_D=1."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _d_with_next_in_gather,
+    )
+
+    devs = jax.devices()
+    if len(devs) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    mesh8 = Mesh(np.array(devs[:8]), ("model",))
+
+    def _fake_d(x, *, num_rows=None, row_start=0, stream_out=None):
+        total = x.shape[0]
+        end = total if num_rows is None else row_start + num_rows
+        sl = x[row_start:end]
+        stream = sl if stream_out is None else jnp.concatenate([stream_out, sl], axis=0)
+        return stream, sl
+
+    def _run_hlo(split: bool, env_dict: dict[str, str]) -> str:
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.dict(os.environ, env_dict),
+        ):
+            fn = jax.jit(
+                jax.shard_map(
+                    lambda x: _d_with_next_in_gather(
+                        d_fn=_fake_d,
+                        d_args=(x[0],),
+                        rows0=512,
+                        split=split,
+                        axis_name="model",
+                        gather_static_fp8=False,
+                    )[2][None],
+                    mesh=mesh8,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )
+            return (
+                fn.trace(jax.ShapeDtypeStruct((8, 1024, 128), jnp.float8_e4m3fn))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+
+    hlo_split_default = _run_hlo(
+        True, {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3"}
+    )
+    assert "all_gather" in hlo_split_default and "xor1_" not in hlo_split_default
+
+    hlo_split_optin = _run_hlo(
+        True,
+        {
+            "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3",
+            "SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D": "1",
+        },
+    )
+    assert "xor1_xytorus_ag_tp8" in hlo_split_optin
+
+    hlo_unsplit = _run_hlo(
+        False, {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3"}
+    )
+    assert "xor1_xytorus_ag_tp8" in hlo_unsplit
+
 
 
 

@@ -660,6 +660,9 @@ class TpuEnvs:
     # Muse prefill Pallas All-Gather (0 = off; 1 = 2-stage XOR=1 bridge on A1+exit; 2 = +B2;
     # 3 = Dual-Port 1-Hop XY-Torus + XOR=1 bridge), cutting inter-chip ICI bytes by 4/7 (-57%).
     SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG = EnvInt(0)
+    # Opt-in: also run xor1_bridge_all_gather inside split _d_with_next_in_gather (False keeps
+    # SparseCore jax.lax.all_gather so it overlaps under Kernel D Part 2 on TensorCore).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D = EnvBool(False)
     # Muse prefill Kernel B2: collapse grid=(num_m, 4) -> (num_m,) with 2-slot double-buffered
     # wpool_fp8 async DMA prefetch, eliminating 3/4 redundant garbage HBM output writes (-804 MB/fwd).
     SGLANG_TPU_MUSE_KERNEL_B2_SINGLE_WRITE = EnvBool(False)
