@@ -2619,7 +2619,7 @@ class MuseSparkMoE(nn.Module):
                 _wait_for(wpost_q, wpost_s_2d, wpost_s)
                 self.register_buffer("_w7_wpost_w8k", wpost_q, persistent=False)
                 self.register_buffer("_w7_spost", wpost_s, persistent=False)
-                if tp2_wpost and can_pair_ag and self.tp_size == 8:
+                if tp2_wpost and can_pair_ag and self.tp_size in (8, 16):
                     full_wpost = tensor_model_parallel_all_gather(wpost_q.contiguous())
                     full_spost = tensor_model_parallel_all_gather(
                         wpost_s_2d.contiguous()
@@ -3375,8 +3375,9 @@ class MuseSparkDecoderLayer(nn.Module):
         self._decode_norm_layout = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_NORM_LAYOUT.get()
         )
-        self._decode_fuse_target_verify = (
+        self._decode_fuse_target_verify = bool(
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_FUSE_TARGET_VERIFY.get()
+            or _env_get("SGLANG_TPU_MUSE_VERIFY_BRIDGE_LIFT", False)
         )
         self._decode_col_bridges = int(
             _env_get("SGLANG_TPU_MUSE_DECODE_COLLECTIVE_BRIDGES", 0)
@@ -5328,16 +5329,7 @@ class MuseSparkTextModel(nn.Module):
             if slots is not None:
                 # Drafts read the operator dtype, not the fp32 residual.
                 snap = stream.to(torch.bfloat16)
-                if use_chip_sharded_relay:
-                    ag_snap = tensor_model_parallel_all_gather(
-                        snap.contiguous(), dim=0
-                    )
-                    snap = (
-                        ag_snap.view(chip_sh_tp // 2, 2, -1, snap.shape[-1])[:, 0]
-                        .reshape(n_tok_eff, snap.shape[-1])
-                        .contiguous()
-                    )
-                elif use_tok_sharded_relay:
+                if not use_chip_sharded_relay and use_tok_sharded_relay:
                     snap = tensor_model_parallel_all_gather(snap.contiguous(), dim=0)
                 for slot in slots:
                     captured_by_slot[slot] = snap
@@ -5363,6 +5355,54 @@ class MuseSparkTextModel(nn.Module):
             return hidden
         # One tensor, not a list: packing a list happens outside the compiled
         # graph and costs a separate eager program on every decode step.
+        if use_chip_sharded_relay and aux_buffer is None:
+            r_pair_cap = stream.shape[0]
+            h_dim = self.config.hidden_size
+            unfilled = None
+            cap_slots: List[torch.Tensor] = []
+            for s in range(len(self.layers_to_capture)):
+                t = captured_by_slot.get(s)
+                if t is None:
+                    if unfilled is None:
+                        unfilled = torch.zeros(
+                            (r_pair_cap, h_dim),
+                            dtype=torch.bfloat16,
+                            device=hidden.device,
+                        )
+                    t = unfilled
+                cap_slots.append(t)
+            local_cat = (
+                cap_slots[0]
+                if len(cap_slots) == 1
+                else torch.cat(cap_slots, dim=-1)
+            ).contiguous()
+            tot_cols = local_cat.shape[1]
+            half_cols = tot_cols // 2
+            ag_w = min(half_cols, 1024 if r_pair_cap <= 16 else 512) if tot_cols >= 256 else 0
+            vmem_need = (
+                r_pair_cap + n_tok_eff + (n_tok_eff // 2 if r_pair_cap == 8 else 0)
+            ) * tot_cols * 2
+            if (
+                r_pair_cap >= 8
+                and r_pair_cap % 8 == 0
+                and tot_cols % 256 == 0
+                and half_cols % 128 == 0
+                and ag_w > 0
+                and half_cols % ag_w == 0
+                and vmem_need <= 48 * 1024 * 1024
+            ):
+                from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                    get_ag_chip_sharded_capture_op,
+                )
+
+                return hidden, get_ag_chip_sharded_capture_op(chip_sh_tp)(local_cat)
+            ag_cat = tensor_model_parallel_all_gather(local_cat, dim=0)
+            aux = (
+                ag_cat.view(chip_sh_tp // 2, 2, r_pair_cap, tot_cols)[:, 0]
+                .reshape(n_tok_eff, tot_cols)
+                .contiguous()
+            )
+            return hidden, aux
         aux = self._relay_aux_hidden_states(
             aux_buffer, captured_by_slot, hidden.shape[0], hidden.device
         )
@@ -6003,9 +6043,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
             or torch.distributed.get_world_size() != warm_tp
         ):
             all_chip_sh_ready = False
-        # On TP=8, B=32 (r_pair=8) keeps the faster 50.0 us/L W7+W8 path (vs 52.7 us/L 3D bf16 pack),
-        # while B>=64 (r_pair>=16) wins by -3.45 us/L (-0.21 ms/step) on Ghostfish silicon.
-        chip_sh_batches = (64, 128, 256, 384) if warm_tp in SUPPORTED_WORLD_SIZES else ()
+        # Require r_pair >= 16: r_pair == 8 (B=32 on TP=8 -> 50.0 vs 52.7 us/L; B=64 on TP=16 ->
+        # 61.26 vs 63.61 us/L) keeps the faster W7+W8 path without 3D bf16 pack, while r_pair >= 16
+        # wins cleanly (-3.45 us/L at B=64 TP=8; -59.00 us/L at B=256 TP=16 on Ghostfish silicon).
+        chip_sh_batches = (
+            (64, 128, 256, 384)
+            if warm_tp == 8
+            else ((128, 256, 384) if warm_tp == 16 else ())
+        )
         eff_bridge_qkv_epi = bridge_qkv_epi and (warm_tp == 8 or tp16_qkv_epi)
         prewarm_ok = warm_tp in SUPPORTED_WORLD_SIZES and dist_ok
         if prewarm_ok:
