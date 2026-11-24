@@ -23,8 +23,10 @@ from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
     RpaKernelSpec,
 )
+from sglang_tpu.attention_pallas_rpa_pcp import check_pcp_ring_schedule
 from sglang_tpu.cp_forward import get_tpu_cp_layout
 from sglang_tpu.envs import envs
+from sglang_tpu.pp_attention_capacity import check_batch_schedule, check_cp_schedule
 
 __all__ = [
     "PallasForwardMetadata",
@@ -150,16 +152,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
     def init_forward_metadata(self, forward_batch):
         cp_layout = get_tpu_cp_layout(forward_batch)
         if cp_layout is not None:
-            from sglang_tpu.pp_attention_capacity import (
-                check_cp_schedule,
-            )
-
-            # The kernel runs the context-parallel rows, not the global lengths.
-            check_cp_schedule(self._cp_schedule_runner, self, cp_layout.host)
+            if cp_layout.host.ring is not None:
+                check_pcp_ring_schedule(self._cp_schedule_runner, self, cp_layout.host)
+            else:
+                # The kernel runs the context-parallel rows, not the global lengths.
+                check_cp_schedule(self._cp_schedule_runner, self, cp_layout.host)
         elif self._pp_schedule_runner is not None:
-            from sglang_tpu.pp_attention_capacity import (
-                check_batch_schedule,
-            )
-
             check_batch_schedule(self._pp_schedule_runner, self, forward_batch)
         super().init_forward_metadata(forward_batch)
