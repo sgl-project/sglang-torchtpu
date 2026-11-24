@@ -12,6 +12,7 @@ native torch here without touching the generic FP8 quantization method.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,8 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
 from sglang_tpu.envs import envs
+
+logger = logging.getLogger(__name__)
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -429,6 +432,56 @@ def prepare_tpu_online_fp8_moe_weights(
         use_mxfp8=False,
         is_fp4_expert=False,
     )
+
+
+def finalize_tpu_fp8_moe_after_loading(method: Any, layer: torch.nn.Module) -> None:
+    """Run fused-RS selection and dispatcher quant config setup after online TPU FP8 MoE."""
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    moe_runner_backend = get_moe_runner_backend()
+    if moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs():
+        from sglang_tpu.fp8_moe_fused_rs import prepare_fp8_fused_rs
+
+        method.handles_moe_reduction = prepare_fp8_fused_rs(layer)
+        if method.handles_moe_reduction and get_parallel().tp_rank == 0:
+            logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
+        if (
+            moe_runner_backend.is_pallas_tpu_fused_rs()
+            and not method.handles_moe_reduction
+        ):
+            reason = getattr(
+                layer,
+                "_tpu_fused_rs_unsupported_reason",
+                "unknown incompatibility",
+            )
+            raise ValueError(
+                "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
+                f"this model or parallel layout: {reason}"
+            )
+
+    if hasattr(layer, "dispatcher"):
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            build_dispatcher_quant_config,
+        )
+
+        kernel_quant_config = getattr(
+            getattr(layer, "w13_kernel", None), "DISPATCHER_QUANT_CONFIG", None
+        )
+        layer.dispatcher.set_quant_config(
+            kernel_quant_config
+            if kernel_quant_config is not None
+            else {
+                **build_dispatcher_quant_config(
+                    layer,
+                    layer.w13_weight.dtype,
+                    method._aiter_moe_quant_type(),
+                    gate_up_interleaved=getattr(
+                        layer, "_aiter_gate_up_interleaved", None
+                    ),
+                ),
+                "use_mxfp8": False,
+            }
+        )
 
 
 def prepare_tpu_fp8_moe_weights(

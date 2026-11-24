@@ -13,6 +13,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
+    ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -162,6 +163,9 @@ def _requantize_tpu_block_fp8_to_channelwise(
 class _TpuFp8LinearReloadSpec(NamedTuple):
     weight_shape: tuple[int, int]
     weight_dtype: torch.dtype
+    weight_loader: Callable | None
+    weight_input_dim: int | None
+    weight_output_dim: int | None
     has_weight_scale: bool
     weight_scale_shape: tuple[int, ...] | None
     weight_scale_loader: Callable | None
@@ -186,6 +190,9 @@ def record_tpu_fp8_linear_reload_state(layer: Module) -> None:
     layer._tpu_fp8_linear_reload_spec = _TpuFp8LinearReloadSpec(
         weight_shape=(int(weight.shape[0]), int(weight.shape[1])),
         weight_dtype=weight.dtype,
+        weight_loader=getattr(weight, "weight_loader", None),
+        weight_input_dim=getattr(weight, "input_dim", None),
+        weight_output_dim=getattr(weight, "output_dim", None),
         has_weight_scale=has_weight_scale,
         weight_scale_shape=tuple(weight_scale.shape) if has_weight_scale else None,
         weight_scale_loader=(
@@ -224,7 +231,23 @@ def restore_tpu_fp8_linear_weights_before_loading(layer: Module) -> None:
     if spec is None:
         return
     device = layer.weight.device
-    if (
+    if not isinstance(layer.weight, ModelWeightParameter) and (
+        spec.weight_loader is not None
+        and spec.weight_input_dim is not None
+        and spec.weight_output_dim is not None
+    ):
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    spec.weight_shape, dtype=spec.weight_dtype, device=device
+                ),
+                input_dim=spec.weight_input_dim,
+                output_dim=spec.weight_output_dim,
+                weight_loader=spec.weight_loader,
+            ),
+        )
+    elif (
         tuple(layer.weight.shape) != spec.weight_shape
         or layer.weight.dtype != spec.weight_dtype
     ):
@@ -241,7 +264,7 @@ def restore_tpu_fp8_linear_weights_before_loading(layer: Module) -> None:
             dtype=torch.float32,
             device=device,
         )
-        if isinstance(getattr(layer, "weight_scale", None), Parameter):
+        if isinstance(getattr(layer, "weight_scale", None), PerTensorScaleParameter):
             copy_or_rebind_param(layer, "weight_scale", scale_buf)
         else:
             layer.register_parameter(
