@@ -250,7 +250,6 @@ def oproj_a2a_call(
                 for cp in sends(jnp.bitwise_xor(me, k)):
                     cp.start()
             wr_cp.start()
-            big[...] = jnp.zeros((Ts, H), _F32)
 
         if la < tp - 1:
             # one more send per step, la ahead of its use: a block lands every step instead of
@@ -267,7 +266,7 @@ def oproj_a2a_call(
             # src's row scales as a column
             g_col = jnp.transpose(jnp.broadcast_to(gsr[src], (8, Ts)))[:, 0:1]
 
-            def block(n0):
+            def block(n0, first=False):
                 acc = None
                 for k0 in range(0, qd, _KC):
                     part = jnp.dot(
@@ -276,9 +275,15 @@ def oproj_a2a_call(
                         preferred_element_type=_F32,
                     )
                     acc = part if acc is None else acc + part
-                return big[:, n0 : n0 + tn] + acc * g_col
+                acc = acc * g_col
+                return acc if first else big[:, n0 : n0 + tn] + acc
 
-            @pl.when(r < tp - 1)
+            @pl.when(r == 0)
+            def _():
+                for n0 in range(0, H, tn):
+                    big[:, n0 : n0 + tn] = block(n0, first=True)
+
+            @pl.when(jnp.logical_and(r > 0, r < tp - 1))
             def _():
                 for n0 in range(0, H, tn):
                     big[:, n0 : n0 + tn] = block(n0)
