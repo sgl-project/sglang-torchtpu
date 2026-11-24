@@ -277,8 +277,14 @@ def prepare_tpu_fp8_moe_weights(
             "TPU FP8 MoE currently does not support MXFP8 experts."
         )
     if is_fp4_expert:
+        from sglang_tpu.dsv4_mxfp4_k32z import defer_to_fused_ep
         from sglang_tpu.dsv4_mxfp4_moe import prepare_tpu_dsv4_mxfp4_moe_weights
 
+        # SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z: the fused EP preparation converts
+        # the checkpoint experts itself (K32Z, or this block-512 layout for the
+        # layers that keep gmm_v2), so they are left as loaded here.
+        if defer_to_fused_ep(layer):
+            return
         prepare_tpu_dsv4_mxfp4_moe_weights(layer)
         return
 

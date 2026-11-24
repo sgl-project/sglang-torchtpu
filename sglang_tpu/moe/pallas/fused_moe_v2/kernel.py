@@ -121,8 +121,6 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 # only one the kernel carried before the selector existed; "swigluoai" is
 # the clamped GPT-OSS form and "silu_and_mul_with_clamp" from DeepSeek-V4
 ACT_FNS = ("silu", "swigluoai", "silu_and_mul_with_clamp")
-
-
 def _apply_act(gate, up, act_fn):
     """The FFN activation, on the POST-SCALE gate and up halves.
 
@@ -435,6 +433,388 @@ def expert_ffn_blockscale(
     return acc2, mid_scale
 
 
+# --------------------------------------------------------------------------- #
+# K32Z expert compute (host.WeightFormat.K32Z; the layout is in host.py).
+# --------------------------------------------------------------------------- #
+# What a K32Z block decodes to. Every e2m1 value converts to e5m2 exactly, and
+# an e5m2 byte's exponent field starts at its bit 2, so adding 4 * d to a
+# nonzero byte multiplies its value by 2^d. A zero code becomes 2^(d - 15)
+# instead of 0 where d >= 1: that, and only that, is what K32Z changes.
+K32Z_WEIGHT_DTYPE = jnp.float8_e5m2
+# One e5m2 exponent step in every byte of a 32-bit word.
+K32Z_SHIFT_WORD = 0x04040404
+# 32-bit words a K group of one column takes: four e5m2 bytes to a word.
+K32Z_GROUP_WORDS = host.K32Z_GROUP // 4
+
+
+def k32z_blocks(k):
+    """(first row, rows) of each decoded contraction block of a K-row matmul:
+    K32Z_KBLOCK rows each, the last one possibly a 256-row tail."""
+    return tuple(
+        (k0, min(host.K32Z_KBLOCK, k - k0)) for k0 in range(0, k, host.K32Z_KBLOCK)
+    )
+
+
+def k32z_shift_words(raw, field, bits):
+    """One column tile's shift words out of its packed table bytes.
+
+    `raw` is the tile's byte column of the table widened to int32 [groups,
+    128], and the tile's shift sits in field `field` (T % F) of each byte.
+    Returns int32 [groups, 128] holding d * 0x04040404, i.e. d added to the
+    exponent field of each of the four e5m2 bytes of a 32-bit word. Plain jnp
+    on values, so the host can hold it to the loader's fields.
+    """
+    mask = (1 << bits) - 1
+    return jnp.bitwise_and(jnp.right_shift(raw, bits * field), mask) * K32Z_SHIFT_WORD
+
+
+def k32z_build_table(shift_vm, slot, n_start, groups, tab_vm, parity, bits):
+    """The shift words of output chunk [n_start, n_start + K32Z_CHUNK) into
+    tab_vm[parity] ([column tile in the chunk, group, lane]).
+
+    A chunk's column tiles are consecutive fields of one packed byte column,
+    which host.k32z_table_geometry guarantees by keeping chunks whole.
+    """
+    lanes = host.K32Z_LANE_TILE
+    byte_tile, field = divmod(n_start // lanes, 8 // bits)
+    raw = shift_vm[slot, :, pl.ds(byte_tile * lanes, lanes)].astype(jnp.int32)
+    raw = raw[:groups]
+    for t in range(host.K32Z_CHUNK // lanes):
+        tab_vm[parity, t, pl.ds(0, groups), :] = k32z_shift_words(raw, field + t, bits)
+
+
+def k32z_fill_colscale(w2s_vm, slot, col_vm, *, hidden, inter):
+    """col_vm row 0 <- the gate|up column scales, row 1 <- the down ones.
+
+    Each is 2^(b - 127), built as the f32 bit pattern b << 23 from the base
+    bytes in the down table's padding rows; the loader refuses a base outside
+    [1, 254], so the pattern is always a normal power of two.
+    """
+    lanes = host.K32Z_LANE_TILE
+    g2 = inter // host.K32Z_GROUP
+    # The uint8 sublane tile(s) the four base rows sit in.
+    first = g2 - g2 % host.K32Z_U8_SUBLANE_TILE
+    rows = host.align_up(g2 + host.K32Z_BASE_ROWS, host.K32Z_U8_SUBLANE_TILE) - first
+    r0 = g2 - first
+
+    def scale_row(block, r):
+        return pltpu.bitcast(jnp.left_shift(block[r : r + 1], 23), jnp.float32)
+
+    for byte_tile in range(hidden * host.K32Z_DOWN_BITS // 8 // lanes):
+        block = w2s_vm[
+            slot, pl.ds(first, rows), pl.ds(byte_tile * lanes, lanes)
+        ].astype(jnp.int32)
+        for half in range(2):
+            tile = 2 * byte_tile + half
+            cols = pl.ds(tile * lanes, lanes)
+            col_vm[pl.ds(1, 1), cols] = scale_row(block, r0 + half)
+            if tile * lanes < 2 * inter:
+                col_vm[pl.ds(0, 1), cols] = scale_row(block, r0 + 2 + half)
+
+
+def k32z_block_readers(
+    w1_vm,
+    w2_vm,
+    w1s_vm,
+    w2s_vm,
+    tab_vm,
+    slot,
+    *,
+    hidden,
+    inter,
+    gate_up_bits,
+    wait_slab=None,
+    slab_retired=None,
+    interpret=False,
+):
+    """(w1_block, w2_block) K32Z block readers at weight slot `slot`.
+
+    `w_block(b, n_start, n_end)` returns contraction block b of output chunk
+    [n_start, n_end) as e5m2 [rows, K32Z_CHUNK]: the codes converted in
+    hardware, then d added to every byte's exponent, a 32-bit add of the
+    chunk's shift words loaded with a stride-0 broadcast per K group.
+
+    A chunk's first block also builds that chunk's shift words, ahead of its
+    reads, into the half of tab_vm its parity selects. `wait_slab(which)`
+    (1 gate/up, 2 down) lands a slab before the first block of its matmul,
+    and `slab_retired()` fires after the last read of the gate/up slab, as
+    the four-bit readers do. `interpret` loads a table row and broadcasts it
+    instead, for the CPU interpreter, which has no stride-0 load (tests).
+    """
+    lanes = host.K32Z_LANE_TILE
+    tiles = host.K32Z_CHUNK // lanes
+    blocks = (k32z_blocks(hidden), k32z_blocks(inter))
+    groups = (hidden // host.K32Z_GROUP, inter // host.K32Z_GROUP)
+    bits = (gate_up_bits, host.K32Z_DOWN_BITS)
+    slabs = ((w1_vm, w1s_vm), (w2_vm, w2s_vm))
+    last_column = (2 * inter, hidden)
+
+    def shift_words(parity, g0, n_groups):
+        """int32 [n_groups * K32Z_GROUP_WORDS, K32Z_CHUNK]: each group's words
+        on the sublanes its 32 rows of codes take."""
+
+        def load(t, g):
+            if interpret:
+                row = tab_vm[parity, t, pl.ds(g, 1), :]
+                return jnp.broadcast_to(row, (K32Z_GROUP_WORDS, lanes))
+            return tab_vm[parity, t, pl.ds(g, K32Z_GROUP_WORDS, stride=0), :]
+
+        return jnp.concatenate(
+            [
+                jnp.concatenate([load(t, g0 + i) for t in range(tiles)], axis=1)
+                for i in range(n_groups)
+            ],
+            axis=0,
+        )
+
+    def reader(m):
+        w_vm, shift_vm = slabs[m]
+
+        def block(b, n_start, n_end):
+            if n_end - n_start != host.K32Z_CHUNK or n_start % host.K32Z_CHUNK:
+                raise ValueError(
+                    f"K32Z decodes whole {host.K32Z_CHUNK}-column chunks; got "
+                    f"columns [{n_start}, {n_end})"
+                )
+            k0, rows = blocks[m][b]
+            parity = (n_start // host.K32Z_CHUNK) % 2
+            if b == 0:
+                if wait_slab is not None and n_start == 0:
+                    wait_slab(m + 1)
+                k32z_build_table(
+                    shift_vm, slot, n_start, groups[m], tab_vm, parity, bits[m]
+                )
+            codes = w_vm[
+                slot, pl.ds(k0 // PACK4, rows // PACK4), pl.ds(n_start, n_end - n_start)
+            ]
+            e5 = pltpu.bitcast(codes, FP4).astype(K32Z_WEIGHT_DTYPE)
+            words = pltpu.bitcast(e5, jnp.int32) + shift_words(
+                parity, k0 // host.K32Z_GROUP, rows // host.K32Z_GROUP
+            )
+            if (
+                slab_retired is not None
+                and m == 0
+                and b == len(blocks[0]) - 1
+                and n_end == last_column[0]
+            ):
+                slab_retired()
+            return pltpu.bitcast(words, K32Z_WEIGHT_DTYPE)
+
+        return block
+
+    return reader(0), reader(1)
+
+
+def expert_ffn_colscale(
+    act_q, act_scale, w1_block, w2_block, w1s_col, *, hidden, act_fn="silu", w1b=None
+):
+    """One expert's FFN on K32Z weights.
+
+    Each matmul is, per output chunk, a plain sum over K of exact e4m3 x e5m2
+    block products: K32Z folds every group's exponent into the decoded block,
+    so no block carries a post-scale. What is left is one power of two per
+    column, the f32 w1s_col [1, 2 * inter], which applies to the gate/up
+    halves before the activation exactly where the per-channel formats apply
+    theirs. The down matmul's column scale is the caller's, through the wire
+    epilogue's w2s. Returns (acc2, mid_scale) as expert_ffn_blockscale does.
+    """
+    inter = w1s_col.shape[-1] // 2
+
+    def contract(lhs, rhs_block, k, n_out):
+        chunks = []
+        for n_start in range(0, n_out, host.K32Z_CHUNK):
+            n_end = n_start + host.K32Z_CHUNK
+            acc = None
+            for b, (k0, rows) in enumerate(k32z_blocks(k)):
+                part = lax.dot_general(
+                    lhs[:, k0 : k0 + rows],
+                    rhs_block(b, n_start, n_end),
+                    DN,
+                    preferred_element_type=jnp.float32,
+                )
+                acc = part if acc is None else acc + part
+            chunks.append(acc)
+        return jnp.concatenate(chunks, axis=-1)
+
+    acc1 = contract(act_q, w1_block, hidden, 2 * inter)
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=w1s_col, act_fn=act_fn, w1b=w1b
+    )
+    acc2 = contract(mid_q, w2_block, inter, hidden)
+    return acc2, mid_scale
+
+
+def _pow2_split(x, d):
+    """(x // d, x % d) of a traced int32 x >= 0 and a static power of two d."""
+    if d == 1:
+        return x, 0
+    return jnp.right_shift(x, d.bit_length() - 1), jnp.bitwise_and(x, d - 1)
+
+
+def k32z_chunk_decoders(
+    w1_vm,
+    w2_vm,
+    w1s_vm,
+    w2s_vm,
+    tab_vm,
+    slot,
+    *,
+    hidden,
+    inter,
+    gate_up_bits,
+    interpret=False,
+):
+    """(decode1, decode2): k32z_block_readers' decode for a body that walks
+    its output chunks in a loop (host.k32z_roll_plan).
+
+    `decode(b, n, parity)` returns contraction block b of output chunk `n` --
+    a traced chunk index, so columns [n * K32Z_CHUNK, (n + 1) * K32Z_CHUNK)
+    -- as e5m2 [rows, K32Z_CHUNK], the bytes k32z_block_readers' block(b,
+    n * K32Z_CHUNK, ...) returns. Block 0 first builds the chunk's shift
+    words into tab_vm[parity], a static half. The slab waits and the gate/up
+    retire are the caller's, since a loop step cannot tell statically whether
+    it holds the first or the last chunk.
+    """
+    lanes = host.K32Z_LANE_TILE
+    tiles = host.K32Z_CHUNK // lanes
+    blocks = (k32z_blocks(hidden), k32z_blocks(inter))
+    groups = (hidden // host.K32Z_GROUP, inter // host.K32Z_GROUP)
+    bits = (gate_up_bits, host.K32Z_DOWN_BITS)
+    slabs = ((w1_vm, w1s_vm), (w2_vm, w2s_vm))
+
+    def shift_words(parity, g0, n_groups):
+        def load(t, g):
+            if interpret:
+                row = tab_vm[parity, t, pl.ds(g, 1), :]
+                return jnp.broadcast_to(row, (K32Z_GROUP_WORDS, lanes))
+            return tab_vm[parity, t, pl.ds(g, K32Z_GROUP_WORDS, stride=0), :]
+
+        return jnp.concatenate(
+            [
+                jnp.concatenate([load(t, g0 + i) for t in range(tiles)], axis=1)
+                for i in range(n_groups)
+            ],
+            axis=0,
+        )
+
+    def build_table(shift_vm, n, n_groups, parity, nbits):
+        # Chunk n's column tiles are fields [field, field + tiles) of byte
+        # column byte_tile (k32z_build_table); a chunk of whole bytes always
+        # starts at field 0.
+        fields = 8 // nbits
+        byte_tile, field = _pow2_split(n * tiles, fields)
+        if tiles % fields == 0:
+            field = 0
+        start = pl.multiple_of(byte_tile * lanes, lanes)
+        raw = shift_vm[slot, :, pl.ds(start, lanes)].astype(jnp.int32)
+        raw = raw[:n_groups]
+        for t in range(tiles):
+            tab_vm[parity, t, pl.ds(0, n_groups), :] = k32z_shift_words(
+                raw, field + t, nbits
+            )
+
+    def decoder(m):
+        w_vm, shift_vm = slabs[m]
+
+        def block(b, n, parity):
+            k0, rows = blocks[m][b]
+            if b == 0:
+                build_table(shift_vm, n, groups[m], parity, bits[m])
+            n_start = pl.multiple_of(n * host.K32Z_CHUNK, host.K32Z_CHUNK)
+            codes = w_vm[
+                slot,
+                pl.ds(k0 // PACK4, rows // PACK4),
+                pl.ds(n_start, host.K32Z_CHUNK),
+            ]
+            e5 = pltpu.bitcast(codes, FP4).astype(K32Z_WEIGHT_DTYPE)
+            words = pltpu.bitcast(e5, jnp.int32) + shift_words(
+                parity, k0 // host.K32Z_GROUP, rows // host.K32Z_GROUP
+            )
+            return pltpu.bitcast(words, K32Z_WEIGHT_DTYPE)
+
+        return block
+
+    return decoder(0), decoder(1)
+
+
+def expert_ffn_colscale_rolled(
+    act_q,
+    act_scale,
+    decode1,
+    decode2,
+    w1s_col,
+    acc_vm,
+    *,
+    hidden,
+    act_fn="silu",
+    w1b=None,
+    unroll=1,
+    wait_slab=None,
+    slab_retired=None,
+):
+    """expert_ffn_colscale with each matmul's output chunks walked by a loop
+    of `unroll` chunks a step (host.k32z_roll_plan).
+
+    Every chunk is the same sum of the same block products in the same
+    order, so the result is expert_ffn_colscale's bit for bit; what changes
+    is that the program holds `unroll` chunks' decode instead of all of
+    them. A step stores its chunks' accumulators into acc_vm (f32
+    [>= rows, >= max(2 * inter, hidden)]), the gate/up one and then, once
+    the activation has read it, the down one. `decode1` / `decode2` are
+    k32z_chunk_decoders'. `wait_slab(which)` (1 gate/up, 2 down) lands a
+    slab before its matmul and `slab_retired()` fires after the last read of
+    the gate/up slab, as the readers of expert_ffn_colscale do.
+    """
+    rows = act_q.shape[0]
+    inter = w1s_col.shape[-1] // 2
+    chunk = host.K32Z_CHUNK
+    # `unroll` is one chunk count for both matmuls or a (gate/up,
+    # down) pair (host.K32Z_DECODE_STEP). A step's chunks alternate the two
+    # tab_vm halves; with an odd count the next step's first chunk reuses
+    # the half its last chunk read, after it in program order.
+    unroll_gu, unroll_dn = host.k32z_roll_steps(unroll)
+
+    def contract(lhs, decode, k, n_out, unroll):
+        steps, rem = divmod(n_out // chunk, unroll)
+        if rem or n_out % chunk:
+            raise ValueError(
+                f"{n_out} columns are not whole steps of {unroll} {chunk}-column chunks"
+            )
+        blocks = k32z_blocks(k)
+
+        def step(j, carry):
+            for u in range(unroll):
+                n = j * unroll + u
+                acc = None
+                for b, (k0, k_rows) in enumerate(blocks):
+                    part = lax.dot_general(
+                        lhs[:, k0 : k0 + k_rows],
+                        decode(b, n, u % 2),
+                        DN,
+                        preferred_element_type=jnp.float32,
+                    )
+                    acc = part if acc is None else acc + part
+                n_start = pl.multiple_of(n * chunk, chunk)
+                acc_vm[pl.ds(0, rows), pl.ds(n_start, chunk)] = acc
+            return carry
+
+        lax.fori_loop(0, steps, step, jnp.int32(0))
+        return acc_vm[pl.ds(0, rows), pl.ds(0, n_out)]
+
+    if wait_slab is not None:
+        wait_slab(1)
+    acc1 = contract(act_q, decode1, hidden, 2 * inter, unroll_gu)
+    if slab_retired is not None:
+        slab_retired()
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=w1s_col, act_fn=act_fn, w1b=w1b
+    )
+    if wait_slab is not None:
+        wait_slab(2)
+    acc2 = contract(mid_q, decode2, inter, hidden, unroll_dn)
+    return acc2, mid_scale
+
+
 def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
     """One expert's FFN on unquantized sixteen-bit weights.
 
@@ -574,8 +954,32 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     pad_scale_rows=False,
     logical_intermediate_size=None,
+    k32z_gate_up_bits=host.K32Z_GATE_UP_BITS[0],
+    k32z_ffn_roll=0,
+    k32z_roll_from=0,
+    mirror_unit=0,
+    k32z_rungs=None,
+    k32z_roll_rungs=None,
+    push_from_vmem_rows=None,
+    defer_push=False,
+    early_ship=False,
+    early_ship_flag=False,
+    gather_unroll=0,
 ):
     """Build the pallas_call and the function that invokes it.
+
+    `gather_unroll=k` (2, 4 or 8; 0: off) issues a tile's token-row
+    gather k blocks per loop step, then a remainder loop: the same DMAs in the
+    same order (name token `_gu<k>`).
+
+    Build choices, K32Z only (host.k32z_build_plan; every
+    other format keeps the defaults): `k32z_roll_rungs` the rung heights
+    whose bodies loop when `k32z_ffn_roll` is on (None: `k32z_roll_from` and
+    up), `push_from_vmem_rows` the tile height the push-from-VMEM bound
+    counts in (None: tile_m), `defer_push` a two-hop build's commit drain and
+    push one tile into the next visit. (A non-zero DMA priority for the
+    return's remote copies was tried and is refused by Mosaic: "non-zero
+    priority is not supported for remote DMA", jax 0.11.2.)
 
     `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
     rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
@@ -583,6 +987,13 @@ def _build_fused_ep_moe_kernel(
     viewed per expert. Each slot then stages an expert's whole padded table
     and the FFN reads only its first K / rhs_qb rows, so the result is the
     unpadded build's bit for bit.
+
+    `k32z_gate_up_bits` is the K32Z gate/up shift-field width (2 or 4; the
+    other formats ignore it), and `k32z_ffn_roll` how its FFN body walks the
+    output chunks (host.k32z_roll_plan; 0 unrolls them). `mirror_unit` below
+    the tile height makes every scale mirror [sublanes, mirror_unit], a
+    tile's scales that many-lane rows (host.K32Z_MIRROR_UNIT; 0 keeps a
+    sublane per tile).
     """
     if pad_scale_rows and weight_format != host.WeightFormat.FP4:
         raise ValueError(
@@ -600,6 +1011,47 @@ def _build_fused_ep_moe_kernel(
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
+    k32z = weight_format == host.WeightFormat.K32Z
+    # Both stream their e2m1 codes as packed u32 words.
+    packed4 = rhs_packed4 or k32z
+    if k32z:
+        # Raises naming what the shape or the field width cannot take.
+        host.k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+        if capacity % host.K32Z_RUNG_STEP:
+            raise ValueError(
+                f"K32Z tile height {capacity} is not a whole number of "
+                f"{host.K32Z_RUNG_STEP}-row rungs"
+            )
+        k32z_ffn_roll = host.check_k32z_ffn_roll(k32z_ffn_roll, hidden, inter)
+    else:
+        k32z_ffn_roll = 0
+    # These choices are K32Z-only; each is normalized so that a
+    # choice which changes nothing in this build keeps the default name.
+    if not k32z and (
+        k32z_roll_rungs is not None or push_from_vmem_rows is not None or defer_push
+    ):
+        raise ValueError(
+            "k32z_roll_rungs, push_from_vmem_rows and defer_push are K32Z build choices"
+        )
+    if k32z_roll_rungs is not None:
+        k32z_roll_rungs = (
+            tuple(sorted({int(h) for h in k32z_roll_rungs})) if k32z_ffn_roll else None
+        )
+    if push_from_vmem_rows is not None:
+        if (
+            isinstance(push_from_vmem_rows, bool)
+            or int(push_from_vmem_rows) != push_from_vmem_rows
+            or push_from_vmem_rows <= 0
+            or push_from_vmem_rows % ROWBLK
+        ):
+            raise ValueError(
+                f"push_from_vmem_rows {push_from_vmem_rows!r} is not a positive "
+                f"whole number of {ROWBLK}-row blocks"
+            )
+        push_from_vmem_rows = (
+            int(push_from_vmem_rows) if push_from_vmem_rows < capacity else None
+        )
+    defer_push = bool(defer_push)
     if (
         logical_intermediate_size is not None
         and int(logical_intermediate_size) != logical_intermediate_size
@@ -721,6 +1173,9 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        k32z_gate_up_bits=k32z_gate_up_bits,
+        k32z_ffn_roll=k32z_ffn_roll,
+        mirror_unit=mirror_unit,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -743,8 +1198,9 @@ def _build_fused_ep_moe_kernel(
     # it rather than waiting at the beginning of each expert's visit.
     # fp4, fp8 expert FFN are running different code paths. This flag can
     # be activated only for fp4 expert FFN now. But the idea should be
-    # applicable to fp8 expert FFN as well.
-    streams_weights = rhs_packed4
+    # applicable to fp8 expert FFN as well. K32Z streams them the same way
+    # for its short visits and waits them at the visit head for tall ones.
+    streams_weights = packed4
     # Whether issue async copy the NEXT expert's weights as soon as we finish
     # reading the current expert's weights, instead of at the beginning of the
     # next expert's visit.
@@ -754,7 +1210,7 @@ def _build_fused_ep_moe_kernel(
     # last gate/up block of an expert's last tile, which is overlapped with
     # a whole down matmul plus an epilogue.
     starts_next_weights = streams_weights and not prefetches
-    if rhs_packed4:
+    if packed4:
         # Asked here, beside the other device reads, because the packed
         # four-bit layout is the one place a written-down device fact and a
         # queried one have to agree: the block-size check above uses the
@@ -811,7 +1267,33 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    # The scale mirror's lanes per sublane (host.mirror_lanes): the tile, or
+    # a fixed unit below it, and then a tile's scales are unit_k sublanes and
+    # every mirror offset counts units instead of tiles.
+    mirror_m = host.mirror_lanes(tile_m, mirror_unit)
+    unit_k = tile_m // mirror_m
+    unit_blocks = mirror_m // ROWBLK
+    mirror_block_shift = host.pow2_shift(unit_blocks, "mirror lanes // ROWBLK")
+    mirror_shift = host.pow2_shift(mirror_m, "mirror lanes")
+    height_rungs = (
+        host.k32z_tile_height_rungs(tile_m, k32z_rungs)
+        if k32z
+        else tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    )
+    # K32Z visits whose first tile is taller than this wait both weight slabs
+    # at their head (host.K32Z_STREAMED_ROWS for the default ladder, else the
+    # ladder's tallest rung up to it: host.k32z_streamed_rows); a tile that
+    # tall exists only where tile_m is.
+    k32z_streamed = host.k32z_streamed_rows(height_rungs) if k32z else 0
+    k32z_head_waits = k32z and tile_m > k32z_streamed
+    if k32z_roll_rungs is not None and not set(k32z_roll_rungs) <= set(height_rungs):
+        raise ValueError(
+            f"k32z_roll_rungs {k32z_roll_rungs} are not all rungs of this "
+            f"build's ladder {height_rungs}"
+        )
+    # Rows one tile's mirror sublane is split over (host.mirror_split): 1 up
+    # to 128-row tiles, whose mirrors are [sublanes, tile_m] as before.
+    mirror_k = host.mirror_split(tile_m)
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -827,7 +1309,33 @@ def _build_fused_ep_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
+    #
+    # `push_from_vmem_rows` counts the bound in a lower tile
+    # height than tile_m: 128 gives a 256-row K32Z build the bound of a
+    # 128-row K512 build. Where that does not change the path it is dropped,
+    # so the build keeps its default name.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    if push_from_vmem_rows is not None:
+        capped = ragged_rows_alloc <= ep * g_local * push_from_vmem_rows
+        if capped == push_from_vmem:
+            push_from_vmem_rows = None
+        push_from_vmem = capped
+    # Deferring the drain and push applies to the two-hop path only (and
+    # needs a return); elsewhere it changes nothing and keeps the name.
+    defer_push = defer_push and not push_from_vmem
+    # Early shipping (a kernel-only return-path change, no work moves): on the
+    # two-hop path every own expert ships each (expert, dest) run two tiles
+    # after the tile that completes it, instead of all of them at its visit's
+    # end. Same DMAs and totals, earlier.
+    early_ship = bool(early_ship) and k32z and not push_from_vmem
+    # The early shipping above is switched per call by lane 0 of the counts
+    # table's extra row COUNT_ES_FLAG (the layer's plan-model pick); off, the
+    # kernel pushes every run at its visit's end as without early shipping.
+    # The same DMAs either way.
+    early_ship_flag = bool(early_ship_flag) and early_ship
+    gather_unroll = int(gather_unroll)
+    if gather_unroll not in (0, 2, 4, 8):
+        raise ValueError(f"gather_unroll is 0 (off), 2, 4 or 8; got {gather_unroll}")
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -882,6 +1390,8 @@ def _build_fused_ep_moe_kernel(
         # instead, where they are read, because that is the end of the
         # kernel and their arithmetic has everything before it to hide in.
         n_visit = count(host.COUNT_VISITS)
+        # The per-call early-ship switch (early_ship_flag).
+        es_on = counts_sm[host.COUNT_ES_FLAG, 0] != 0 if early_ship_flag else None
         # The full token-gather table stays in HBM. Two fixed SMEM windows
         # below stream only the rows the current expert tiles consume.
         token_gather_hbm = next(it)
@@ -898,7 +1408,7 @@ def _build_fused_ep_moe_kernel(
         # same [G, N] layout as the per-channel weight scales beside them.
         w1b_hbm = next(it) if has_w1_bias else None
         w2b_hbm = next(it) if has_w2_bias else None
-        if rhs_packed4:
+        if packed4:
             # Packed-u32 weight stream: the four-bit [G, K, N] refs viewed as
             # [G, K//8, N] uint32, so the DMA moves half the bytes. This is
             # the ref-level view, and it is a PRIVATE jax method -- Pallas
@@ -935,11 +1445,28 @@ def _build_fused_ep_moe_kernel(
         (lhs_vm, w1_vm, w2_vm) = (next(it) for _ in range(3))
         w1s_vm = next(it) if has_scales else None
         w2s_vm = next(it) if has_scales else None
+        # K32Z's decode buffers: the shift words of a chunk and the column
+        # scales (host.vmem_scratch_arrays).
+        tab_vm = next(it) if k32z else None
+        col_vm = next(it) if k32z else None
+        acc_vm = next(it) if k32z_ffn_roll else None
         w1b_vm = next(it) if has_w1_bias else None
         w2b_vm = next(it) if has_w2_bias else None
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
-        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        oscl_vm = next(it)  # [parities, mirror_k, tile_m // mirror_k] f32
+
+        def staged_scales(parity):
+            """`parity`'s staged scales as one mirror sublane, the source
+            every mirror transport takes (a [1, k, lanes] block once the
+            mirrors are 3-D)."""
+            return oscl_vm.at[parity] if mirror_k == 1 else oscl_vm.at[pl.ds(parity, 1)]
+
+        def staged_unit(parity, j):
+            """Unit j of `parity`'s staged scales, one [1, mirror_m] row
+            (a mirror unit below the tile only)."""
+            return oscl_vm.at[parity, j]
+
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
@@ -1040,8 +1567,9 @@ def _build_fused_ep_moe_kernel(
             # visit_sm[1] would be a statically out-of-bounds read before
             # the predicate could save it.
             for b in range(min(prefetch_distance, g_local)):
+                go = jnp.int32(b) < n_visit
 
-                @pl.when(jnp.int32(b) < n_visit)
+                @pl.when(go)
                 def _(b=b):
                     weight_starts(visit_sm[b], b)
 
@@ -1235,7 +1763,27 @@ def _build_fused_ep_moe_kernel(
                         ).start()
                     return _
 
-                lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                if not gather_unroll:
+                    lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                else:
+                    # gather_unroll (_gu<k>) blocks per step, then the
+                    # remainder; the same DMAs in the same order. (The bounds
+                    # are traced, so fori_loop's unroll= is refused.)
+                    def issue_chunk(c, carry):
+                        for j in range(gather_unroll):
+                            issue_block(c * gather_unroll + j, carry)
+                        return carry
+
+                    n_chunks = jnp.right_shift(
+                        live_blocks, gather_unroll.bit_length() - 1
+                    )
+                    lax.fori_loop(0, n_chunks, issue_chunk, jnp.int32(0))
+                    lax.fori_loop(
+                        n_chunks * gather_unroll,
+                        live_blocks,
+                        issue_block,
+                        jnp.int32(0),
+                    )
 
             @pl.when(gather_slot == 0)
             def _():
@@ -1280,7 +1828,7 @@ def _build_fused_ep_moe_kernel(
             (rows >> shift) + 1 while the next expert's base is at least
             that much further on.
             """
-            return jnp.right_shift(expert_base_sm[e], tile_shift) + 2 * e
+            return jnp.right_shift(expert_base_sm[e], mirror_shift) + 2 * e
 
         def _run_tiles(e, d, region_blocks):
             """A run's mirror sublanes: (source, destination, count).
@@ -1291,9 +1839,9 @@ def _build_fused_ep_moe_kernel(
             runs only -- the callers predicate on the length.
             """
             start = commit_start_sm[e, d]
-            lo = jnp.right_shift(start, tile_block_shift)
-            hi = jnp.right_shift(start + region_blocks - 1, tile_block_shift)
-            dst = jnp.right_shift(push_dst_sm[e, d], tile_block_shift) + 2 * (
+            lo = jnp.right_shift(start, mirror_block_shift)
+            hi = jnp.right_shift(start + region_blocks - 1, mirror_block_shift)
+            dst = jnp.right_shift(push_dst_sm[e, d], mirror_block_shift) + 2 * (
                 me * g_local + e
             )
             return _mirror_base(e) + lo, dst, hi - lo + 1
@@ -1302,8 +1850,9 @@ def _build_fused_ep_moe_kernel(
             """Wait one tile's commits on `parity`: data rows, then scales."""
             assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
-            # One tile committed one mirror sublane, whatever its row count.
-            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
+            # One tile committed one mirror sublane (unit_k units), whatever
+            # its row count.
+            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, unit_k)
 
         def wait_shipped(parity, rows, subs):
             """Wait until the wire has read `parity`'s staging slot.
@@ -1408,6 +1957,16 @@ def _build_fused_ep_moe_kernel(
                     weight_starts(ahead, refill_slot)
 
             rows = expert_rows_sm[e]
+            if k32z_head_waits:
+                # A K32Z visit whose first tile is taller than
+                # K32Z_STREAMED_ROWS runs rung bodies with no reader waits:
+                # both slabs land here, after the refill above is queued and
+                # before the tile loop. Its tail tiles never wait again.
+                @pl.when(rows > k32z_streamed)
+                def _():
+                    w1_copy(e, slot).wait()
+                    w2_copy(e, slot).wait()
+
             slab_base = expert_base_sm[e]
             n_tiles = -(-rows // tile_m)
             wslot = carry[-1]
@@ -1457,11 +2016,19 @@ def _build_fused_ep_moe_kernel(
 
                 # The tile's scales are one sublane wherever its rows
                 # went, so they commit once, outside the per-dest loop.
-                pltpu.make_async_copy(
-                    oscl_vm.at[parity],
-                    cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
-                    commit_scl_sems.at[parity],
-                ).start()
+                if unit_k == 1:
+                    pltpu.make_async_copy(
+                        staged_scales(parity),
+                        cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                        commit_scl_sems.at[parity],
+                    ).start()
+                else:
+                    for j in range(unit_k):
+                        pltpu.make_async_copy(
+                            staged_unit(parity, j),
+                            cscl_hbm.at[pl.ds(_mirror_base(e) + unit_k * t + j, 1)],
+                            commit_scl_sems.at[parity],
+                        ).start()
 
             def ship_tile(parity, t, tile_block_base, live_blocks):
                 """Ship the tile straight out of `out_vm`, no slab in between.
@@ -1537,27 +2104,73 @@ def _build_fused_ep_moe_kernel(
                             send_sems.at[parity],
                         ).start()
 
-                    @pl.when(_and_nonempty(jnp.logical_not(is_me), overlap))
-                    def _(dst_sub=dst_sub, parity=parity, d=d):
-                        pltpu.make_async_remote_copy(
-                            src_ref=oscl_vm.at[parity],
-                            dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
-                            send_sem=send_scl_sems.at[parity],
-                            recv_sem=recv_scl_sem,
-                            device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
+                    if unit_k == 1:
 
-                    @pl.when(_and_nonempty(is_me, overlap))
-                    def _(dst_sub=dst_sub, parity=parity):
-                        pltpu.make_async_copy(
-                            oscl_vm.at[parity],
-                            rscl_hbm.at[pl.ds(dst_sub, 1)],
-                            send_scl_sems.at[parity],
-                        ).start()
+                        @pl.when(_and_nonempty(jnp.logical_not(is_me), overlap))
+                        def _(dst_sub=dst_sub, parity=parity, d=d):
+                            pltpu.make_async_remote_copy(
+                                src_ref=staged_scales(parity),
+                                dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
+                                send_sem=send_scl_sems.at[parity],
+                                recv_sem=recv_scl_sem,
+                                device_id=(jnp.int32(d),),
+                                device_id_type=pl.DeviceIdType.MESH,
+                            ).start()
+
+                        @pl.when(_and_nonempty(is_me, overlap))
+                        def _(dst_sub=dst_sub, parity=parity):
+                            pltpu.make_async_copy(
+                                staged_scales(parity),
+                                rscl_hbm.at[pl.ds(dst_sub, 1)],
+                                send_scl_sems.at[parity],
+                            ).start()
+
+                    else:
+                        # A unit goes where the run's own rows put it: the
+                        # units of this tile that hold rows of the run.
+                        subs_here = jnp.int32(0)
+                        run_unit0 = jnp.right_shift(run_start, mirror_block_shift)
+                        for j in range(unit_k):
+                            u0 = (unit_k * t + j) * unit_blocks
+                            u_lo = jnp.maximum(run_start, u0)
+                            u_hi = jnp.minimum(
+                                jnp.minimum(run_start + run_len, u0 + unit_blocks),
+                                tile_block_base + live_blocks,
+                            )
+                            u_has = u_hi > u_lo
+                            dst_unit = (
+                                jnp.right_shift(push_dst_sm[e, d], mirror_block_shift)
+                                + 2 * (me * g_local + e)
+                                + unit_k * t
+                                + j
+                                - run_unit0
+                            )
+
+                            @pl.when(jnp.logical_and(jnp.logical_not(is_me), u_has))
+                            def _(dst_unit=dst_unit, parity=parity, d=d, j=j):
+                                pltpu.make_async_remote_copy(
+                                    src_ref=staged_unit(parity, j),
+                                    dst_ref=rscl_hbm.at[pl.ds(dst_unit, 1)],
+                                    send_sem=send_scl_sems.at[parity],
+                                    recv_sem=recv_scl_sem,
+                                    device_id=(jnp.int32(d),),
+                                    device_id_type=pl.DeviceIdType.MESH,
+                                ).start()
+
+                            @pl.when(jnp.logical_and(is_me, u_has))
+                            def _(dst_unit=dst_unit, parity=parity, j=j):
+                                pltpu.make_async_copy(
+                                    staged_unit(parity, j),
+                                    rscl_hbm.at[pl.ds(dst_unit, 1)],
+                                    send_scl_sems.at[parity],
+                                ).start()
+
+                            subs_here = subs_here + jnp.where(u_has, 1, 0)
 
                     rows_out = rows_out + jnp.where(is_me, overlap * ROWBLK, true_here)
-                    subs_out = subs_out + jnp.where(overlap > 0, 1, 0)
+                    subs_out = subs_out + (
+                        jnp.where(overlap > 0, 1, 0) if unit_k == 1 else subs_here
+                    )
                 return rows_out, subs_out
 
             def tile_body(t, carried):
@@ -1584,6 +2197,24 @@ def _build_fused_ep_moe_kernel(
                     @pl.when(pending > 0)
                     def _():
                         wait_commits(parity, pending)
+
+                    if early_ship:
+                        # A nonempty run whose last block is in tile t - 2 ships
+                        # now (early_ship); the rest ship at the
+                        # visit's end (_push_own_expert).
+                        own = t >= 2
+                        if early_ship_flag:
+                            own = jnp.logical_and(own, es_on)
+
+                        @pl.when(own)
+                        def _():
+                            for d in range(ep):
+                                pl.when(
+                                    jnp.logical_and(
+                                        commit_len_sm[e, d] > 0,
+                                        _own_run_last_tile(e, d) == t - 2,
+                                    )
+                                )(functools.partial(_push_own_run, e, d))
 
                 # Wait this tile's stream, then issue tile t+1's into the other
                 # slot before compute, so the fetch runs under the MXU window.
@@ -1702,6 +2333,94 @@ def _build_fused_ep_moe_kernel(
                                 effective_inter if trim_gate_up_padding else None
                             ),
                         )
+                    elif k32z:
+                        assert w1s_vm is not None and w2s_vm is not None
+                        assert tab_vm is not None and col_vm is not None
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        # Bodies up to the streamed height (K32Z_STREAMED_ROWS
+                        # on the default ladder) wait each slab in the block
+                        # that first reads it, on the expert's first tile
+                        # only, so a tail tile never waits; a taller body's
+                        # visit waited both slabs at its head.
+                        streamed = height <= k32z_streamed
+                        waiter = (
+                            _slab_waiter(e, slot, first_tile)
+                            if streamed
+                            else None
+                        )
+                        # Every tile rebuilds the column scales: a few dozen
+                        # row stores, read by this tile alone.
+                        k32z_fill_colscale(
+                            w2s_vm, slot, col_vm, hidden=hidden, inter=inter
+                        )
+                        wait_slab = (
+                            None
+                            if waiter is None
+                            else lambda which: waiter(
+                                w1_copy if which == 1 else w2_copy, 0
+                            )
+                        )
+                        slab_retired = (
+                            _start_next_gate_up(visit_i, slot, last_tile)
+                            if starts_next_weights
+                            else None
+                        )
+                        if k32z_ffn_roll and (
+                            height in k32z_roll_rungs
+                            if k32z_roll_rungs is not None
+                            else height >= k32z_roll_from
+                        ):
+                            # The looped body (host.k32z_roll_plan): the same
+                            # bits from a fraction of the decode text.
+                            decode1, decode2 = k32z_chunk_decoders(
+                                w1_vm,
+                                w2_vm,
+                                w1s_vm,
+                                w2s_vm,
+                                tab_vm,
+                                slot,
+                                hidden=hidden,
+                                inter=inter,
+                                gate_up_bits=k32z_gate_up_bits,
+                            )
+                            acc2, mid_scale = expert_ffn_colscale_rolled(
+                                act_rows,
+                                act_scales,
+                                decode1,
+                                decode2,
+                                col_vm[pl.ds(0, 1), pl.ds(0, 2 * inter)],
+                                acc_vm,
+                                hidden=hidden,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                                unroll=k32z_ffn_roll,
+                                wait_slab=wait_slab,
+                                slab_retired=slab_retired,
+                            )
+                        else:
+                            w1_block, w2_block = k32z_block_readers(
+                                w1_vm,
+                                w2_vm,
+                                w1s_vm,
+                                w2s_vm,
+                                tab_vm,
+                                slot,
+                                hidden=hidden,
+                                inter=inter,
+                                gate_up_bits=k32z_gate_up_bits,
+                                wait_slab=wait_slab,
+                                slab_retired=slab_retired,
+                            )
+                            acc2, mid_scale = expert_ffn_colscale(
+                                act_rows,
+                                act_scales,
+                                w1_block,
+                                w2_block,
+                                col_vm[pl.ds(0, 1), pl.ds(0, 2 * inter)],
+                                hidden=hidden,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
                     elif weight_format == host.WeightFormat.INT8:
                         assert w1s_vm is not None
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
@@ -1743,14 +2462,18 @@ def _build_fused_ep_moe_kernel(
                     # placement of each of these -- and the down bias's
                     # add-once property in particular -- has a host-side
                     # witness rather than only a device-marked one.
+                    if k32z:
+                        # The down matmul's column scales, as a per-channel
+                        # format's w2s.
+                        w2s_row = cast(jax.Ref, col_vm)[pl.ds(1, 1), pl.ds(0, hidden)]
+                    elif has_scales and not rhs_packed4:
+                        w2s_row = cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
+                    else:
+                        w2s_row = None
                     wire_rows, wire_scales = wire_row_and_scale(
                         acc2,
                         mid_scale,
-                        w2s=(
-                            cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
-                            if (has_scales and not rhs_packed4)
-                            else None
-                        ),
+                        w2s=w2s_row,
                         w2b=(
                             cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
                             if has_w2_bias
@@ -1769,12 +2492,31 @@ def _build_fused_ep_moe_kernel(
                         slot."""
                         if full:
                             out_vm[static_parity] = wire_rows_staged
-                            oscl_vm[static_parity] = wire_scales_staged
                         else:
                             out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
+                        if unit_k > 1:
+                            # One [1, mirror_m] row per unit the tile fills.
+                            for j in range(-(-height // mirror_m)):
+                                width = min(mirror_m, height - j * mirror_m)
+                                oscl_vm[static_parity, j, :, pl.ds(0, width)] = (
+                                    wire_scales_staged[
+                                        :, j * mirror_m : j * mirror_m + width
+                                    ]
+                                )
+                        elif mirror_k == 1 and full:
+                            oscl_vm[static_parity] = wire_scales_staged
+                        elif mirror_k == 1:
                             oscl_vm[static_parity, :, pl.ds(0, height)] = (
                                 wire_scales_staged
                             )
+                        else:
+                            # The sublane split over mirror_k rows of lanes.
+                            lanes = tile_m // mirror_k
+                            for j in range(-(-height // lanes)):
+                                width = min(lanes, height - j * lanes)
+                                oscl_vm[static_parity, pl.ds(j, 1), pl.ds(0, width)] = (
+                                    wire_scales_staged[:, j * lanes : j * lanes + width]
+                                )
 
                     # Store slots must be static, so these branches stay
                     # static.
@@ -1812,6 +2554,31 @@ def _build_fused_ep_moe_kernel(
                     )
 
                 commit_tile(parity, t, tile_block_base, live_blocks)
+
+                if defer_push:
+                    # Deferred push: the previous expert's drain and push, one
+                    # tile late. Its last tile is the one before this, so
+                    # on the other parity; its earlier commits were taken
+                    # by the reuse guards (this tile's included), so this
+                    # one wait completes its slab and the push may read it.
+                    other_pending = jnp.where(parity == 0, carried[2], carried[1])
+                    deferred = jnp.logical_and(t == 0, visit_i > 0)
+
+                    @pl.when(deferred)
+                    def _():
+                        @pl.when(other_pending > 0)
+                        def _():
+                            wait_commits(other_parity, other_pending)
+
+                        push_expert(visit_sm[visit_i - 1])
+
+                    other_pending = jnp.where(deferred, 0, other_pending)
+                    return (
+                        tile_count + 1,
+                        jnp.where(parity == 0, live_blocks, other_pending),
+                        jnp.where(parity == 1, live_blocks, other_pending),
+                        wslot,
+                    )
 
                 return (
                     tile_count + 1,
@@ -1873,66 +2640,91 @@ def _build_fused_ep_moe_kernel(
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
+            _push_own_expert(e)
+
+        def _own_run_last_tile(e, d):
+            """The expert-local tile run (e, d)'s last block falls in (nonempty runs)."""
+            return jnp.right_shift(
+                commit_start_sm[e, d] + commit_len_sm[e, d] - 1, tile_block_shift
+            )
+
+        def _push_own_expert(e):
+            """Push own expert e's remote regions and hop its own-dest region:
+            every run, or (early_ship) the runs whose last tile is one of the
+            visit's last two, the others having shipped from its tile loop."""
+            if not early_ship:
+                for d in range(ep):
+                    _push_own_run(e, d)
+                return
+            n_tiles_e = jnp.right_shift(expert_rows_sm[e] + (tile_m - 1), tile_shift)
+            for d in range(ep):
+                late = _own_run_last_tile(e, d) >= n_tiles_e - 2
+                if early_ship_flag:
+                    # Switched off: every run ships here, in dest order.
+                    late = jnp.logical_or(late, jnp.logical_not(es_on))
+                pl.when(late)(functools.partial(_push_own_run, e, d))
+
+        def _push_own_run(e, d):
+            """Push own expert e's run to dest d, or hop it where d is this shard."""
             # Remote pushes go per (expert, dest) at true length; run starts
             # stay aligned, so recv positions are unchanged. Each is predicated
             # on its own length: a zero-length REMOTE DMA must never issue.
-            for d in range(ep):
-                region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
-                dst_block = push_dst_sm[e, d]
-                is_me = jnp.int32(d) == me
+            region_blocks = commit_len_sm[e, d]
+            src_block = contrib_off_sm[e, d]
+            dst_block = push_dst_sm[e, d]
+            is_me = jnp.int32(d) == me
 
-                @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
-                def _():
-                    # One expert per push, so the region IS expert e's run.
-                    true_rows = true_rows_sm[e, d]
+            @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
+            def _():
+                # One expert per push, so the region IS expert e's run.
+                true_rows = true_rows_sm[e, d]
 
-                    def push_run():
-                        """The rows themselves, at their true length."""
-                        pltpu.make_async_remote_copy(
-                            src_ref=contrib_hbm.at[
-                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
-                            ],
-                            dst_ref=recv_hbm.at[
-                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
-                            ],
-                            send_sem=send_sem,
-                            recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
-
-                    # A nonempty region can hold an empty (e, d) run.
-                    pl.when(true_rows > 0)(push_run)
-                    # Scale mirror: the source tiles this run's rows
-                    # fall in, landing at the base the destination's own
-                    # plan gave the run.
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                def push_run():
+                    """The rows themselves, at their true length."""
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                        send_sem=send_scl_sem,
-                        recv_sem=recv_scl_sem,
+                        src_ref=contrib_hbm.at[
+                            pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                        ],
+                        dst_ref=recv_hbm.at[
+                            pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                        ],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
                         device_id=(jnp.int32(d),),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
-                # Safe to defer: recv is read only after the drain.
-                @pl.when(_and_nonempty(is_me, region_blocks))
-                def _():
-                    pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
-                        recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
-                        mehop_sem,
-                    ).start()
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
-                    pltpu.make_async_copy(
-                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                        mehop_scl_sem,
-                    ).start()
+                # A nonempty region can hold an empty (e, d) run.
+                pl.when(true_rows > 0)(push_run)
+                # Scale mirror: the source tiles this run's rows
+                # fall in, landing at the base the destination's own
+                # plan gave the run.
+                src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                pltpu.make_async_remote_copy(
+                    src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                    dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                    send_sem=send_scl_sem,
+                    recv_sem=recv_scl_sem,
+                    device_id=(jnp.int32(d),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            # Safe to defer: recv is read only after the drain.
+            @pl.when(_and_nonempty(is_me, region_blocks))
+            def _():
+                pltpu.make_async_copy(
+                    contrib_hbm.at[
+                        pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
+                    ],
+                    recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
+                    mehop_sem,
+                ).start()
+                src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                pltpu.make_async_copy(
+                    cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                    rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                    mehop_scl_sem,
+                ).start()
 
         def visit_step(visit_i, carry):
             """One step of the visit list: compute, then drain and push."""
@@ -1941,12 +2733,22 @@ def _build_fused_ep_moe_kernel(
             if push_from_vmem:
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
+            if defer_push:
+                # The next visit's first tile drains and pushes this expert
+                # (tile_body); the last visit's go after the loop.
+                return carry
             carry = drain_commits(carry)
             push_expert(e)
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        if defer_push:
+            carry_end = drain_commits(carry_end)
+
+            @pl.when(n_visit > 0)
+            def _():
+                push_expert(visit_sm[n_visit - 1])
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
@@ -2004,6 +2806,9 @@ def _build_fused_ep_moe_kernel(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 pad_scale_rows=pad_scale_rows,
+                k32z_gate_up_bits=k32z_gate_up_bits,
+                k32z_ffn_roll=k32z_ffn_roll,
+                mirror_unit=mirror_unit,
             )
         ]
         + [
@@ -2078,12 +2883,18 @@ def _build_fused_ep_moe_kernel(
         out_shape = [
             jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m), tile_m),
+                host.mirror_shape(
+                    host.arrival_mirror_rows(recv_rows, ep * g_local, mirror_m),
+                    mirror_m,
+                ),
                 jnp.float32,
             ),
             jax.ShapeDtypeStruct((contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), tile_m),
+                host.mirror_shape(
+                    host.contrib_mirror_rows(contrib_rows, g_local, mirror_m),
+                    mirror_m,
+                ),
                 jnp.float32,
             ),
         ]
@@ -2096,16 +2907,38 @@ def _build_fused_ep_moe_kernel(
             host.WeightFormat.FP4: "_fp4w",
             host.WeightFormat.INT8: "_int8w",
             host.WeightFormat.BF16: "_bf16w",
+            host.WeightFormat.K32Z: (
+                "_k32zw"
+                if k32z_gate_up_bits == host.K32Z_GATE_UP_BITS[0]
+                else f"_k32zw_gu{k32z_gate_up_bits}"
+            ),
         }[weight_format]
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        # Which rung bodies loop: a set ("s"), or from a height up.
+        if k32z_roll_rungs is not None:
+            roll_tag = "s" + "_".join(map(str, k32z_roll_rungs))
+        else:
+            roll_tag = f"f{k32z_roll_from}" if k32z_ffn_roll and k32z_roll_from else ""
+        # Return-path choices, each only where it changes the build.
+        r2_tag = (
+            f"_pv{push_from_vmem_rows}" if push_from_vmem_rows is not None else ""
+        ) + ("_dp" if defer_push else "")
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
+            f"{f'_r{host.k32z_roll_tag(k32z_ffn_roll)}' if k32z_ffn_roll else ''}"
+            f"{roll_tag}"
+            f"{f'_mu{mirror_m}' if unit_k > 1 else ''}"
+            f"{'' if k32z_rungs is None else '_q' + '_'.join(map(str, k32z_rungs))}"
+            f"{r2_tag}"
+            f"{'_es' if early_ship else ''}"
+            f"{'x' if early_ship_flag else ''}"
+            f"{f'_gu{gather_unroll}' if gather_unroll else ''}"
         )
         return pl.pallas_call(
             kernel,
@@ -2191,9 +3024,20 @@ def _build_fused_ep_moe_kernel(
             if has_act_scale
             else ()
         )
-        scale_args = (
-            (w1s.astype(jnp.float32), w2s.astype(jnp.float32)) if has_scales else ()
-        )
+        if k32z:
+            # The shift tables are bytes; a widening would change their
+            # meaning, so a table that is not uint8 is refused instead.
+            for what, table in (("w1s", w1s), ("w2s", w2s)):
+                if jnp.dtype(table.dtype) != jnp.dtype(jnp.uint8):
+                    raise ValueError(
+                        f"the K32Z {what} shift table is uint8; got "
+                        f"{jnp.dtype(table.dtype).name}"
+                    )
+            scale_args = (w1s, w2s)
+        else:
+            scale_args = (
+                (w1s.astype(jnp.float32), w2s.astype(jnp.float32)) if has_scales else ()
+            )
         biases = tuple(b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
         call = make_call(recv_rows)
         res = call(
@@ -2211,7 +3055,11 @@ def _build_fused_ep_moe_kernel(
             *scale_args,
             *biases,
         )
-        recv, rscl, _contrib, _contrib_scl = res
+        recv, rscl, _contrib, _contrib_scl = res[:4]
+        if rscl.ndim == 3:
+            # A split mirror back as [sublanes, tile_m]: the same values in
+            # the same order, which is all the combine's lookup reads.
+            rscl = rscl.reshape(rscl.shape[0], -1)
         return recv, rscl
 
     return fn
@@ -2321,7 +3169,15 @@ def combine_step_tokens(t_local):
 
 
 def _build_combine_kernel(
-    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, fuse_scales=False
+    *,
+    t_local,
+    topk,
+    hidden,
+    lane_blocks,
+    wire_dtype,
+    out_dtype,
+    fuse_scales=False,
+    fold_select=False,
 ):
     """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
 
@@ -2343,6 +3199,11 @@ def _build_combine_kernel(
     The same f32 scale * weight product runs in SMEM, avoiding an XLA gather
     behind push's other SparseCore work. All row DMAs and reduction ordering
     are shared by the two builds; the choice is static at trace time.
+
+    With ``fold_select`` (on the coefficient build too), scalar prefetch also carries one route
+    flag per token, and a token whose flag is zero stores zeros instead of
+    its sum: the layer's where(row_routes, out, 0) pass after the combine,
+    folded in, the same bits.
     """
     tb = combine_step_tokens(t_local)
     steps = t_local // tb
@@ -2355,6 +3216,9 @@ def _build_combine_kernel(
             scl_sm, tw_sm, scales_sm, *refs = refs
         else:
             coef_sm, *refs = refs
+        route_sm = None
+        if fold_select:
+            route_sm, *refs = refs
         arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems = refs
 
         def start_row(base, parity, i, k):
@@ -2383,6 +3247,11 @@ def _build_combine_kernel(
                         * coef_sm[(base + i) * topk + k]
                     )
                 acc = term if acc is None else acc + term
+            if route_sm is not None:
+                # An unrouted token read rows nobody wrote: its sum may be
+                # NaN, so it is selected away, not multiplied by zero.
+                keep = jnp.full(acc.shape, route_sm[base + i], jnp.int32) != 0
+                acc = jnp.where(keep, acc, 0.0)
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
 
         def one_step(step, parity):
@@ -2442,7 +3311,7 @@ def _build_combine_kernel(
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4 if fuse_scales else 2,
+            num_scalar_prefetch=(4 if fuse_scales else 2) + int(fold_select),
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
@@ -2463,23 +3332,36 @@ def _build_combine_kernel(
         name=(
             f"moe_v2_combine_t{t_local}_k{topk}_b{tb}"
             + (f"_p{COMBINE_PARITIES}_fs" if fuse_scales else "")
+            + ("_sel" if fold_select else "")
         ),
     )
 
     if fuse_scales:
 
-        def fn_with_scales(arrivals, arrival_scales, scl, topk_weights, pos):
+        def fn_with_scales(
+            arrivals, arrival_scales, scl, topk_weights, pos, routes=None
+        ):
+            if (routes is not None) != fold_select:
+                raise ValueError(
+                    f"the combine was built with fold_select={fold_select}, "
+                    f"so it {'takes' if fold_select else 'has no operand for'} "
+                    "the route flags"
+                )
+            route_arg = ()
+            if fold_select:
+                route_arg = (routes.astype(jnp.int32).reshape(-1),)
             return call(
                 pos.astype(jnp.int32).reshape(-1),
                 scl.astype(jnp.int32).reshape(-1),
                 topk_weights.astype(jnp.float32).reshape(-1),
                 arrival_scales.astype(jnp.float32).reshape(-1),
+                *route_arg,
                 arrivals,
             )
 
         return fn_with_scales
 
-    def fn(arrivals, coef, pos):
+    def fn(arrivals, coef, pos, routes=None):
         # Both tables flatten TOKEN-major, so a token's topk entries are one
         # contiguous SMEM run and its 2 * topk scalar reads share a single
         # address computation. That is also the order the plan builds them in,
@@ -2490,7 +3372,18 @@ def _build_combine_kernel(
                 f"[{t_local}, {topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+        if (routes is not None) != fold_select:
+            raise ValueError(
+                f"the combine was built with fold_select={fold_select}, "
+                f"so it {'takes' if fold_select else 'has no operand for'} "
+                "the route flags"
+            )
+        route_arg = ()
+        if fold_select:
+            route_arg = (routes.astype(jnp.int32).reshape(-1),)
+        return call(
+            pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), *route_arg, arrivals
+        )
 
     return fn
 

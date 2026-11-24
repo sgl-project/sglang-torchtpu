@@ -701,6 +701,12 @@ class TpuEnvs:
     # SGLANG_SHARED_EXPERT_TP1=1 (checked at startup). Read when the plugin
     # hooks are built; False registers nothing.
     SGLANG_TPU_DSV41_FUSED_EP = EnvBool(False)
+    # DeepSeek-V4.1 fused EP expert format: "k512" (default) requantizes the
+    # checkpoint's block-32 MXFP4 experts to block 512 (dsv4_mxfp4_moe.py);
+    # "k32z" converts them losslessly to K32Z operands (dsv4_mxfp4_k32z.py) in
+    # the fused EP preparation. k32z needs SGLANG_TPU_DSV41_FUSED_EP=1 (checked
+    # at startup); layers that keep gmm_v2 (hash-routed, NextN) still get k512.
+    SGLANG_TPU_DSV41_EXPERT_FORMAT = EnvStr("k512")
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
