@@ -6485,6 +6485,7 @@ def get_vmem_limit():
         "_decode_fast",
         "_decode_out_norm_eps",
         "_decode_gate_in_values",
+        "_decode_tp16_prepared",
         "_kv_pack_dense2",
         "_interpret",
     ),

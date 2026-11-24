@@ -1737,7 +1737,8 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                                 k_scale=1.0, v_scale=1.0, decode_query_size=1,
                                 _fused_out_pack=2, _prepared_inputs=True, _skip_mixed=True,
                                 _decode_fast=_m, _decode_out_norm_eps=1e-6,
-                                _decode_gate_in_values=True, _kv_pack_dense2=False,
+                                _decode_gate_in_values=True, _decode_tp16_prepared=True,
+                                _kv_pack_dense2=False,
                             )
                         ),
                         platforms=["tpu"],
@@ -1755,6 +1756,32 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     self.assertIn("RPAd_fast", hlo)
                     self.assertIn("-pk2-onorm-gate", hlo)
                     self.assertIn("-tp16", hlo)
+
+            # Also verify ungated _decode_tp16_prepared=True exports cleanly (Shared16 [64, 512]).
+            hlo_sh = jax_export.export(
+                jax.jit(
+                    lambda q, kv, c, kl, pi, cq, ckv, d: ragged_paged_attention(
+                        q, kv, None, c, kl, pi, cq, ckv, d,
+                        None, None, sm_scale=64 ** -0.5, sliding_window=None,
+                        k_scale=1.0, v_scale=1.0, decode_query_size=1,
+                        _fused_out_pack=2, _prepared_inputs=True, _skip_mixed=True,
+                        _decode_fast="shared16_host", _decode_tp16_prepared=True,
+                        _kv_pack_dense2=False,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 64, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((64, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1024, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 4,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((7,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("RPAd_fast", hlo_sh)
+            self.assertIn("-tp16", hlo_sh)
 
     def test_cand4_tp16_backend_init_pack1_and_fake_impl_shapes(self):
         """Backend __init__ builds _decode_prepared* ops for pack==1 (1KV d=64), FakeTensor matches [B, 512]."""
