@@ -5981,8 +5981,6 @@ def _run_chip_sharded_post_fast_core(
     tok_s1_recv,
     tok_s2_send,
     tok_s2_recv,
-    tok_d2d2_send,
-    tok_d2d2_recv,
     post_d2d_send,
     post_d2d_recv,
     post_ici_send,
@@ -5997,6 +5995,8 @@ def _run_chip_sharded_post_fast_core(
     next_in_scale_input: bool,
     round_stream_bf16_for_norm: bool,
     on_stream_updated_fn=None,
+    tok_d2d2_send=None,
+    tok_d2d2_recv=None,
     out_next_full_ref=None,
 ) -> None:
     """Wave-9 chip-sharded `W_post` + `0-scf.for` epilogue (`TP=8` & `TP=16`, sharded or full `moe_out`)."""
@@ -6084,7 +6084,12 @@ def _run_chip_sharded_post_fast_core(
         if sharded_moe_in:
             r_tok = moe_out_ref.shape[0]
             half_k = k_in // 2
-            if r_pair >= 16 and half_k % 128 == 0:
+            if (
+                r_pair >= 16
+                and half_k % 128 == 0
+                and tok_d2d2_send is not None
+                and tok_d2d2_recv is not None
+            ):
                 # Bug A Fix: race-free half-column `ts1` (`other_k0` push) + `-50%` `tok_s2` ICI!
                 side_k0 = pl.multiple_of(side * half_k, 128)
                 other_k0 = pl.multiple_of(other_side * half_k, 128)
@@ -6177,7 +6182,12 @@ def _run_chip_sharded_post_fast_core(
                 rows=rows, n_cols=post_cols,
             )
 
-        if r_pair == 8:
+        use_compact_post_ag = (
+            r_pair >= 16
+            and mate_post_shard.shape == (r_pair, half_h)
+            and chip_cols_buf.shape == (r_pair, half_h)
+        )
+        if not use_compact_post_ag:
             op_pd2d = pltpu.make_async_remote_copy(
                 post_shard, mate_post_shard, post_d2d_send.at[0], post_d2d_recv.at[0],
                 device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
@@ -6193,35 +6203,59 @@ def _run_chip_sharded_post_fast_core(
                 chip_cols_buf[:, pl.ds(c0, cs_w)] = lax.select(is_even, s_v, m_v)
                 chip_cols_buf[:, pl.ds(post_cols + c0, cs_w)] = lax.select(is_even, m_v, s_v)
 
-            pair_w = min(pair_cols, 1024)
-            for p in range(n_chips // 2):
-                r16 = pl.ds(16 * p, 16)
+            pair_w = min(pair_cols, 1024 if r_pair <= 16 else 512)
+            if r_pair == 8:
+                for p in range(n_chips // 2):
+                    r16 = pl.ds(16 * p, 16)
+                    for c0 in range(0, pair_cols, pair_w):
+                        c_sl = pl.ds(c0, pair_w)
+                        blk16 = chip_cols_buf[r16, c_sl]
+                        cols_3d_buf[2 * p, :, c_sl] = blk16[0:8, :]
+                        cols_3d_buf[2 * p + 1, :, c_sl] = blk16[8:16, :]
                 for c0 in range(0, pair_cols, pair_w):
                     c_sl = pl.ds(c0, pair_w)
-                    blk16 = chip_cols_buf[r16, c_sl]
-                    cols_3d_buf[2 * p, :, c_sl] = blk16[0:8, :]
-                    cols_3d_buf[2 * p + 1, :, c_sl] = blk16[8:16, :]
-            for c0 in range(0, pair_cols, pair_w):
-                c_sl = pl.ds(c0, pair_w)
-                post_pair_full[:, pl.ds(pl.multiple_of(chip_c0 + c0, 128), pair_w)] = cols_3d_buf[
-                    chip, :, c_sl
-                ]
-            pici_ops = []
-            for d in range(1, n_chips):
-                dst_chip = chip ^ jnp.int32(d)
-                peer = me ^ jnp.int32(d << 1)
-                op = pltpu.make_async_remote_copy(
-                    cols_3d_buf.at[dst_chip],
-                    post_pair_full.at[:, pl.ds(chip_c0, pair_cols)],
-                    post_ici_send.at[d - 1],
-                    post_ici_recv.at[d - 1],
-                    device_id=(peer,),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-                op.start()
-                pici_ops.append(op)
-            for op in pici_ops:
-                op.wait()
+                    post_pair_full[:, pl.ds(pl.multiple_of(chip_c0 + c0, 128), pair_w)] = cols_3d_buf[
+                        chip, :, c_sl
+                    ]
+                pici_ops = []
+                for d in range(1, n_chips):
+                    dst_chip = chip ^ jnp.int32(d)
+                    peer = me ^ jnp.int32(d << 1)
+                    op = pltpu.make_async_remote_copy(
+                        cols_3d_buf.at[dst_chip],
+                        post_pair_full.at[:, pl.ds(chip_c0, pair_cols)],
+                        post_ici_send.at[d - 1],
+                        post_ici_recv.at[d - 1],
+                        device_id=(peer,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    op.start()
+                    pici_ops.append(op)
+                for op in pici_ops:
+                    op.wait()
+            else:
+                for c0 in range(0, pair_cols, pair_w):
+                    c_sl = pl.ds(c0, pair_w)
+                    post_pair_full[:, pl.ds(pl.multiple_of(chip_c0 + c0, 128), pair_w)] = chip_cols_buf[
+                        pl.ds(chip_r0, r_pair), c_sl
+                    ]
+                pici_ops = []
+                for d in range(1, n_chips):
+                    dst_chip = chip ^ jnp.int32(d)
+                    dst_r0 = pl.multiple_of(dst_chip * r_pair, 16)
+                    peer = me ^ jnp.int32(d << 1)
+                    op = pltpu.make_async_remote_copy(
+                        chip_cols_buf.at[pl.ds(dst_r0, r_pair), :],
+                        post_pair_full.at[:, pl.ds(chip_c0, pair_cols)],
+                        post_ici_send.at[d - 1],
+                        post_ici_recv.at[d - 1],
+                        device_id=(peer,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    op.start()
+                    pici_ops.append(op)
+                for op in pici_ops:
+                    op.wait()
         else:
             # Bug B Fix (r_pair >= 16): `-50%` `post_ici` direct all-to-all into `[r_pair, half_h]`
             # + single `[r_pair, half_h]` intra-chip D2D swap (eliminates `[rows, 2*post_cols]` select)!
@@ -6553,7 +6587,6 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
         post_shard, mate_post_shard, chip_cols_buf, post_pair_full, cols_3d_buf,
         w_post_sem, s_in_sem,
         tok_s1_send, tok_s1_recv, tok_s2_send, tok_s2_recv,
-        tok_d2d2_send, tok_d2d2_recv,
         post_d2d_send, post_d2d_recv, post_ici_send, post_ici_recv,
         me=me, world_size=world_size, sharded_moe_in=sharded_moe_in,
         post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
@@ -6562,6 +6595,8 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
         on_stream_updated_fn=lambda: pltpu.make_async_copy(
             s_buf, out_stream_chip_hbm, s_out_sem.at[0]
         ).start(),
+        tok_d2d2_send=tok_d2d2_send,
+        tok_d2d2_recv=tok_d2d2_recv,
         out_next_full_ref=next_in_vmem if r_pair >= 16 else None,
     )
 
@@ -6849,7 +6884,6 @@ def _moe_post_chip_sharded_final_norm_kernel(
         post_shard, mate_post_shard, chip_cols_buf, post_pair_full, cols_3d_buf,
         w_post_sem, s_in_sem,
         tok_s1_send, tok_s1_recv, tok_s2_send, tok_s2_recv,
-        tok_d2d2_send, tok_d2d2_recv,
         post_d2d_send, post_d2d_recv, post_ici_send, post_ici_recv,
         me=me, world_size=world_size, sharded_moe_in=sharded_moe_in,
         post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
@@ -6860,6 +6894,8 @@ def _moe_post_chip_sharded_final_norm_kernel(
             if return_stream_too
             else None
         ),
+        tok_d2d2_send=tok_d2d2_send,
+        tok_d2d2_recv=tok_d2d2_recv,
         out_next_full_ref=out_hidden_ref if r_pair >= 16 else None,
     )
 
