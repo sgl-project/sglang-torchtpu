@@ -554,6 +554,11 @@ def kernel_main_fused_rs(
     out_q8_ref=None,  # HBM (3 * rows, N2//NL, NL) e4m3: cross-chip receive blocks
     out_qs_ref=None,  # HBM (3 * rows, NL) f32: their row scales
     pair_sum_bf16: bool = False,
+    skip_gs1: bool = False,  # no w1 global scale: skip the x1.0 epilogue multiply
+    skip_gs2: bool = False,
+    skip_row_mask: bool = False,  # rows outside the tile stay unzeroed (never sent)
+    q8_in_gmm1: int = 0,  # leading q8 blocks per forwarded run of tile g - 2 done in GMM1(g)
+    q8_tree: bool = False,  # q8 blocks of 8 rows, row maxima by a sublane tree
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -653,12 +658,14 @@ def kernel_main_fused_rs(
         and not (_self_sib or _self_cross or _self_ring)
         and pair_fp8_ref is None
     )
+    # ring slots of sibling partials: 3 when the q8 blocks of tile g - 2 run in GMM1(g)
+    pair_ring = pair_ring_ref.shape[0] if pair_ring_ref is not None else _PAIR_RING
     if pair_exchange:
         sibling = my_id if _self_ring else jnp.bitwise_xor(my_id, 1)
     if pair_self_count_ref is not None:
         pair_self_count_ref[0] = jnp.int32(0)
     if _no_ring:
-        for _r in range(_PAIR_RING):
+        for _r in range(pair_ring):
             pair_ring_ref[_r] = jnp.zeros(pair_ring_ref.shape[1:], pair_ring_ref.dtype)
 
     @jax.named_scope("sync_barrier_signal")
@@ -1043,14 +1050,23 @@ def kernel_main_fused_rs(
             ],
             fused_metadata_ref,
             cfgs=_cfgs1,
-            gs_gate_ref=w1_gs_gate_ref,
-            gs_up_ref=w1_gs_up_ref,
+            gs_gate_ref=None if skip_gs1 else w1_gs_gate_ref,
+            gs_up_ref=None if skip_gs1 else w1_gs_up_ref,
             scatter_mode=True,
+            skip_row_mask=skip_row_mask,
             _k_id=k_id,
             _num_k=num_k1,
             _gm_id=0,
             _n_id=n_id,
         )
+        if q8_in_gmm1 and n_id == 0 and k_id == 0:
+            # Straight-line code in the bucket branch: co-issues with the matmul (no shared
+            # refs). Tiles 0 and 1 recompute tile 0's blocks from a stale ring; GMM1(2)
+            # redoes them, and the epilogue covers the last two tiles in full.
+            g2 = jnp.maximum(gm_id - 2, 0)
+            runs = _q8_runs(g2)
+            for i in range(q8_in_gmm1):
+                _q8_step(g2, runs, i)
 
     @jax.named_scope("compute_gmm2_tile")
     def compute_gmm2_tile(buf_id, n_id, k_id, gm_id, m_rows):
@@ -1086,9 +1102,10 @@ def kernel_main_fused_rs(
             shared_acc_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_n2)],
             fused_metadata_ref,
             cfgs=_cfgs2,
-            gs_gate_ref=w2_gs_ref,
-            gs_up_ref=w2_gs_ref,
+            gs_gate_ref=None if skip_gs2 else w2_gs_ref,
+            gs_up_ref=None if skip_gs2 else w2_gs_ref,
             scatter_mode=True,
+            skip_row_mask=skip_row_mask,
             _k_id=k_id,
             _num_k=num_k2,
             _gm_id=0,
@@ -1174,14 +1191,177 @@ def kernel_main_fused_rs(
             n = n + ((num_valid & b) != 0).astype(jnp.int32)
         return n
 
+    q8_rows = 8 if q8_tree else _Q8_ROWS
+
+    def _q8_rows16(stg, ring_slot, r):
+        rows = pl.ds(r, _Q8_ROWS)
+        x = scatter_staging_3x_ref[stg, rows] + pair_ring_ref[ring_slot, rows]
+        amax = jnp.max(jnp.max(jnp.abs(x), axis=1), axis=1, keepdims=True)
+        return x, amax.astype(jnp.float32)
+
+    def _q8_rows8(stg, ring_slot, r):
+        """8 rows; row maxima by a sublane tree (row i ends in sublane i), one lane reduce."""
+        x = (
+            scatter_staging_3x_ref[stg, pl.ds(r, 8)]
+            + pair_ring_ref[ring_slot, pl.ds(r, 8)]
+        )
+        a = jnp.abs(x)
+        h = jnp.maximum(a[:, :16], a[:, 16:]).astype(jnp.float32)
+        m = jnp.maximum(h[:, :8], h[:, 8:])  # (8, 8, 128): one vreg per row
+        sub = lax.broadcasted_iota(jnp.int32, (8, num_lanes), 0)
+
+        def fold(v, k):  # v[s] max v[s + k], sublanes mod 8
+            return jnp.maximum(v, pltpu.roll(v, 8 - k, 0))
+
+        f = [fold(m[i], 4) for i in range(8)]
+        # row i on sublanes i..i+3, row i + 4 on the other four
+        p = [jnp.where((sub - i) % 8 < 4, f[i], f[i + 4]) for i in range(4)]
+        g = [fold(v, 2) for v in p]  # row i valid on sublanes i, i + 1
+        xa = jnp.where(
+            sub % 4 < 2, g[0], g[2]
+        )  # rows 0, 2, 4, 6 on pairs from 0, 2, 4, 6
+        xb = jnp.where((sub - 1) % 4 < 2, g[1], g[3])  # rows 1, 3, 5, 7 from 1, 3, 5, 7
+        z = jnp.where(sub % 2 == 0, fold(xa, 1), fold(xb, 1))  # sublane i = row i
+        return x, jnp.max(z, axis=1, keepdims=True)
+
+    def _q8_rows(stg, ring_slot, r):
+        x, amax = (_q8_rows8 if q8_tree else _q8_rows16)(stg, ring_slot, r)
+        n = x.shape[0]
+        rows = pl.ds(r, n)
+        inv = jnp.where(amax == 0, 0.0, _Q8_TARGET / amax).astype(x.dtype)
+        pair_q8_ref[stg, rows] = (x * inv[:, :, None]).astype(pair_q8_ref.dtype)
+        inv = inv.astype(jnp.float32)
+        pair_qs_ref[stg, rows, :] = jnp.broadcast_to(
+            jnp.where(inv == 0, 0.0, 1.0 / inv), (n, pair_qs_ref.shape[-1])
+        )
+
+    def _tile_runs(g):
+        """lens[d] of tile g's owner runs and the start row of each."""
+        base = pair_meta_base + g * ep_size
+        lens = [group_start_ref[base + d] for d in range(ep_size)]
+        row0 = metadata_ref.gm_id_to_m_offset[g] % _sls_pair
+
+        def src_off(d):
+            acc = jnp.int32(0)
+            for e in range(ep_size):
+                acc = acc + jnp.where(e < d, lens[e], 0)
+            return acc
+
+        return base, lens, row0, src_off
+
+    def _q8_runs(g):
+        """Tile g's cross-chip runs this core forwards: (owner, length, first row, last block)."""
+        my_chip, num_chips, my_core = my_id // 2, ep_size // 2, my_id % 2
+        base, _, row0, src_off = _tile_runs(g)
+        runs = []
+        for k in range(1, num_chips):
+            d = jax.lax.rem(my_chip + k, num_chips) * 2 + my_core
+            n = group_start_ref[base + d]
+            last = jnp.maximum((n + q8_rows - 1) // q8_rows - 1, 0)
+            runs.append((k, d, n, row0 + src_off(d), last))
+        return runs
+
+    def _q8_step(g, runs, i):
+        stg, ring = g % staging_slots, g % pair_ring
+        for _, _, _, r_run, last in runs:
+            r = r_run + jnp.minimum(i, last) * q8_rows
+            _q8_rows(stg, ring, jnp.minimum(r, tile_m - q8_rows))
+
+    def _wait_ring(g):
+        n_pieces = _pair_count_pieces(
+            metadata_ref.gm_id_to_m_offset[g + 1] - metadata_ref.gm_id_to_m_offset[g]
+        )
+
+        @pl.when(jnp.logical_and(n_pieces > 0, not _no_ring))
+        def _():
+            pl.semaphore_wait(pair_recv_sem_ref.at[g % pair_ring], n_pieces)
+
+    def _send_pieces(run_len, src, dst, src_ref, dst_ref, dev):
+        """One DMA per set bit of run_len; returns the count issued."""
+        off, sent = jnp.int32(0), jnp.int32(0)
+        for b in pair_pieces:
+            has = (run_len & b) != 0
+
+            @pl.when(has)
+            def _(b=b, off=off):
+                pltpu.make_async_remote_copy(
+                    src_ref=src_ref.at[pl.ds(src + off, b)],
+                    dst_ref=dst_ref.at[pl.ds(dst + off, b)],
+                    send_sem=send_sems_ref.at[stg_of[0]],
+                    recv_sem=recv_sem_ref.at[0],
+                    device_id={ep_axis_name: dev},
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
+            off = off + jnp.where(has, b, 0)
+            sent = sent + has.astype(jnp.int32)
+        return sent
+
+    stg_of = [None]  # staging slot whose send semaphore the pieces signal
+
+    @jax.named_scope("pair_finish_local")
+    def _pf_local(g):
+        """Tile g's own and sibling runs: one core's partial, straight from staging."""
+        stg = g % staging_slots
+        stg_of[0] = stg
+        base, _, row0, src_off = _tile_runs(g)
+        rows_per_block = out_buf_ref.shape[0] // 2
+        sent = jnp.int32(0)
+        for d, block in ((my_id, 0), (jnp.bitwise_xor(my_id, 1), 1)):
+            rank = group_start_ref[pair_meta_base + pair_meta_stride + g * ep_size + d]
+            sent = sent + _send_pieces(
+                group_start_ref[base + d],
+                row0 + src_off(d),
+                block * rows_per_block + rank,
+                scatter_staging_3x_ref.at[stg],
+                out_buf_ref,
+                d,
+            )
+        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
+
+    @jax.named_scope("pair_finish_cross")
+    def _pf_cross(g, done_blocks, wait):
+        """Tile g's cross-chip runs: pair sums as e4m3 rows + scales, then free the ring slot."""
+        stg = g % staging_slots
+        stg_of[0] = stg
+        num_chips = ep_size // 2
+        if wait:
+            _wait_ring(g)
+        runs = _q8_runs(g)
+        n_steps = runs[0][4]
+        for run in runs[1:]:
+            n_steps = jnp.maximum(n_steps, run[4])
+        lax.fori_loop(
+            done_blocks, n_steps + 1, lambda i, c: (_q8_step(g, runs, i), c)[1], 0
+        )
+        rows_per_block = out_buf_ref.shape[0] // 2
+        sent = jnp.int32(0)
+        for k, d, n, r_run, _ in runs:
+            block = 1 + (num_chips - k) % num_chips
+            rank = group_start_ref[pair_meta_base + pair_meta_stride + g * ep_size + d]
+            q_dst = (block - 2) * rows_per_block + rank
+            sent = sent + _send_pieces(
+                n, r_run, q_dst, pair_q8_ref.at[stg], out_q8_ref, d
+            )
+            sent = sent + _send_pieces(
+                n, r_run, q_dst, pair_qs_ref.at[stg], out_qs_ref, d
+            )
+        if not _no_ring:
+            pl.semaphore_signal(
+                pair_credit_ref.at[0],
+                device_id={ep_axis_name: sibling},
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
+
     @jax.named_scope("pair_send")
     def _pair_send(gm_id, stg_id, row0, num_valid):
         """Ship tile gm_id's valid partial rows to the sibling's ring slot (power-of-two DMAs)."""
         if _no_ring:
             return
-        ring_slot = gm_id % _PAIR_RING
+        ring_slot = gm_id % pair_ring
 
-        @pl.when(gm_id >= _PAIR_RING)
+        @pl.when(gm_id >= pair_ring)
         def _():
             pl.semaphore_wait(pair_credit_ref.at[0], 1)  # the sibling freed this slot
 
@@ -1771,6 +1951,12 @@ def kernel_main_fused_rs(
                 else:
                     fn(*args, tile_m)
 
+            if q8_in_gmm1:
+
+                @pl.when(gm_id >= 2)
+                def _():
+                    _wait_ring(gm_id - 2)
+
             # GMM1 loop.
             for step in range(total_w1_steps):
                 _n1 = step // num_k1
@@ -1906,9 +2092,21 @@ def kernel_main_fused_rs(
                 # tile g's rows go to the sibling now; tile g-1 completes while they fly
                 _pair_send(gm_id, stg_id, _ml, num_valid)
 
-                @pl.when(gm_id >= 1)
-                def _():
-                    _pair_finish(gm_id - 1)
+                if q8_in_gmm1:
+
+                    @pl.when(gm_id >= 1)
+                    def _():
+                        _pf_local(gm_id - 1)
+
+                    @pl.when(gm_id >= 2)
+                    def _():
+                        _pf_cross(gm_id - 2, q8_in_gmm1, wait=False)
+
+                else:
+
+                    @pl.when(gm_id >= 1)
+                    def _():
+                        _pair_finish(gm_id - 1)
 
             @jax.named_scope("direct_write_rows")
             def _do_direct_write():
@@ -2091,7 +2289,18 @@ def kernel_main_fused_rs(
         return _
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
-    if pair_exchange:
+    if pair_exchange and q8_in_gmm1:
+
+        @pl.when(local_num_gm > 1)
+        def _():
+            _pf_cross(local_num_gm - 2, 0, wait=True)
+
+        @pl.when(local_num_gm > 0)
+        def _():
+            _pf_local(local_num_gm - 1)
+            _pf_cross(local_num_gm - 1, 0, wait=True)
+
+    elif pair_exchange:
 
         @pl.when(local_num_gm > 0)
         def _():
@@ -2102,11 +2311,11 @@ def kernel_main_fused_rs(
         for _s in range(staging_slots):
             wait_staging_slot_writes(_s)
     if pair_exchange and not _no_ring:
-        # one credit per tile the sibling consumed; the first _PAIR_RING were never waited
+        # one credit per tile the sibling consumed; the first pair_ring were never waited
         @pl.when(local_num_gm > 0)
         def _():
             pl.semaphore_wait(
-                pair_credit_ref.at[0], jnp.minimum(local_num_gm, _PAIR_RING)
+                pair_credit_ref.at[0], jnp.minimum(local_num_gm, pair_ring)
             )
 
     # Post-Scatter Cross-Rank Optical Barrier
@@ -2366,6 +2575,9 @@ def _pair_exchange_metadata(
         "gmm2_fold",
         "gmm1_fold",
         "pair_sum_bf16",
+        "lean_epilogue",
+        "q8_in_gmm1",
+        "q8_tree",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2407,6 +2619,9 @@ def gmm_v2_fused_rs(
     gmm2_fold: bool = False,
     gmm1_fold: bool = False,
     pair_sum_bf16: bool = False,
+    lean_epilogue: bool = False,
+    q8_in_gmm1: int = 0,
+    q8_tree: bool = False,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3073,6 +3288,19 @@ def gmm_v2_fused_rs(
     )
     if pair_sum_bf16:
         kernel_kwargs["pair_sum_bf16"] = True
+    if lean_epilogue:
+        if not pair_fp8_rows:
+            raise ValueError(
+                "lean_epilogue relies on the e4m3 pair path's row consumers"
+            )
+        kernel_kwargs["skip_gs1"] = w1_global_scale is None
+        kernel_kwargs["skip_gs2"] = w2_global_scale is None
+        kernel_kwargs["skip_row_mask"] = True
+    if q8_in_gmm1:
+        if not pair_fp8_rows:
+            raise ValueError("q8_in_gmm1 needs the e4m3 pair path")
+        kernel_kwargs["q8_in_gmm1"] = q8_in_gmm1
+        kernel_kwargs["q8_tree"] = q8_tree
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1
@@ -3127,10 +3355,11 @@ def gmm_v2_fused_rs(
         # occupy the optional positional slots.
         # e4m3 pair sums replace the bf16 pair-sum staging
         pair_sum_slots = (1, _sls_out) if pair_fp8_rows else (staging_slots, tile_m)
+        ring_depth = 3 if q8_in_gmm1 else _PAIR_RING
         scratch_shapes = scratch_shapes + [
-            pltpu.VMEM((_PAIR_RING, tile_m, n2_cols, num_lanes), out_dtype),
+            pltpu.VMEM((ring_depth, tile_m, n2_cols, num_lanes), out_dtype),
             pltpu.VMEM((*pair_sum_slots, n2_cols, num_lanes), out_dtype),
-            pltpu.SemaphoreType.REGULAR((_PAIR_RING,)),
+            pltpu.SemaphoreType.REGULAR((ring_depth,)),
             pltpu.SemaphoreType.REGULAR((1,)),
         ]
 

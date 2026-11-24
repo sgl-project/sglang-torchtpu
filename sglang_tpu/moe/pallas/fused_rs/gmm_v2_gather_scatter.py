@@ -280,6 +280,7 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    skip_row_mask: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -571,7 +572,11 @@ def inner_kernel(
                 sls_out = pltpu.get_tpu_info().get_sublane_tiling(tiled_out_ref.dtype)
                 cols_per_grp = sls_out * num_lanes
                 if rhs_tile_n % cols_per_grp == 0 and cols_per_grp % mxu_size == 0:
-                    mask_col = _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
+                    mask_col = (
+                        None
+                        if skip_row_mask
+                        else _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
+                    )
                     has_gs = cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None
                     _gid = (
                         metadata_ref.gm_id_to_group_id[_resolved_gm_id] if has_gs else 0
@@ -601,9 +606,11 @@ def inner_kernel(
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
+                                    (
+                                        acc_n
+                                        if mask_col is None
+                                        else jnp.where(mask_col, acc_n, 0)
+                                    ).astype(tiled_out_ref.dtype)
                                 )
                         else:
                             grp_outs = []
@@ -629,9 +636,11 @@ def inner_kernel(
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
+                                    (
+                                        acc_n
+                                        if mask_col is None
+                                        else jnp.where(mask_col, acc_n, 0)
+                                    ).astype(tiled_out_ref.dtype)
                                 )
                         g_blk = g_col // num_lanes
                         tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = jnp.concatenate(
@@ -690,7 +699,7 @@ def inner_kernel(
                 # In scatter mode, write masked acc directly to 2D output.
                 # No 3D reshape needed — avoids VMEM tiling mismatch with DMA.
                 # No partial_out needed — each scatter tile is independent.
-                acc_masked = jnp.where(mask, acc, 0)
+                acc_masked = acc if skip_row_mask else jnp.where(mask, acc, 0)
                 tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype).reshape(
                     tiled_out_ref.shape
                 )

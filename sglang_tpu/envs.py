@@ -721,6 +721,14 @@ class TpuEnvs:
     # Fused-RS routing: argsort of expert ids as one sort of (id, index) packed in an int32 key
     # (index in the low bits) instead of a key + iota two-operand sort; the same order.
     SGLANG_TPU_FUSED_RS_KEY_SORT = EnvBool(False)
+    # e4m3 pair exchange: GMM epilogues skip the x1.0 global scale when the experts have none
+    # and the zeroing of rows outside the tile (never sent); bit-identical sent rows.
+    SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE = EnvBool(False)
+    # e4m3 pair exchange: the first N q8 blocks of each forwarded run of tile g - 2 are summed
+    # and quantized inside tile g's GMM1 (co-issued with its matmul) instead of after GMM2.
+    SGLANG_TPU_FUSED_RS_Q8_IN_GMM1 = EnvInt(0)
+    # With Q8_IN_GMM1: q8 blocks of 8 rows whose row maxima come from a sublane tree (same bytes).
+    SGLANG_TPU_FUSED_RS_Q8_TREE = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

@@ -474,6 +474,9 @@ def moe_gmm_local_rs_nodedup(
     gmm1_fold = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM1_FOLD.get()
     pair_fp8_rows = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS.get()
     pair_sum_bf16 = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16.get()
+    lean_epilogue = pair_fp8_rows and tpu_envs.SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE.get()
+    q8_in_gmm1 = tpu_envs.SGLANG_TPU_FUSED_RS_Q8_IN_GMM1.get() if pair_fp8_rows else 0
+    q8_tree = bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_Q8_TREE.get()
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -512,6 +515,9 @@ def moe_gmm_local_rs_nodedup(
         gmm2_fold=gmm2_fold,
         gmm1_fold=gmm1_fold,
         pair_sum_bf16=pair_sum_bf16,
+        lean_epilogue=lean_epilogue,
+        q8_in_gmm1=q8_in_gmm1,
+        q8_tree=q8_tree,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
