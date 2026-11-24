@@ -2270,6 +2270,126 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             ).mlir_module()
             self.assertNotIn("-pbf16-", hlo_full)
 
+    def test_cand7_ring4k_tail1k_2k_zero_ulp_and_export(self):
+        """cand_w9_7: ring4k <=1K/<=2K/4K tails 0x7F NaN-poisoned parity (nod2+d2, Mixed) & TPU v7 export."""
+        from jax import export as jax_export
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        rng = np.random.default_rng(707)
+        bs, ps, pps = 8, 512, 512
+        # Covers tail <= 1024 (500, 8704, 9215), 1024 < tail <= 2048 (1500, 6000, 9728), exact 4K (8192), >2K (7500).
+        kv_lens_np = np.asarray([8704, 9728, 1500, 6000, 8192, 500, 7500, 9215], dtype=np.int32)
+        n_pages = bs * 24 + 8
+        q = jnp.asarray(rng.normal(0.0, 0.4, (bs, 16, 128)), jnp.bfloat16)
+        kn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 64, (bs, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+        vn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 64, (bs, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+        pi_np = np.zeros(bs * pps, dtype=np.int32)
+        for b_i in range(bs):
+            pi_np[b_i * pps : b_i * pps + 20] = np.arange(b_i * 20, (b_i + 1) * 20, dtype=np.int32)
+        pi = jnp.asarray(pi_np)
+        cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+        cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+        dist = jnp.asarray([bs, bs, bs], dtype=jnp.int32)
+        ip = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+
+        rf8 = jax.device_get(
+            jnp.asarray(rng.normal(0.0, 0.4, (bs * 20, ps, 2, 128)), jnp.float32).astype(jnp.float8_e4m3fn)
+        )
+        ru8 = np.frombuffer(rf8.tobytes(), dtype=np.uint8).reshape(bs, 20, ps, 2, 128)
+        tok = np.arange(20 * ps).reshape(20, ps)
+
+        for d2_flag in (False, True):
+            phys_r = ps // 2 if d2_flag else ps
+            kvc_u8 = np.full((n_pages, phys_r, 1, 4, 128), 0x7F, dtype=np.uint8)
+            for b_i, kl in enumerate(kv_lens_np):
+                vld = tok < (int(kl) - 1)
+                p0 = b_i * 20
+                if not d2_flag:
+                    kvc_u8[p0 : p0 + 20, :, 0, 0, :] = np.where(vld[:, :, None], ru8[b_i, :, :, 0, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + 20, :, 0, 1, :] = np.where(vld[:, :, None], ru8[b_i, :, :, 1, :], np.uint8(0x7F))
+                else:
+                    ke = np.where(vld[:, 0::2, None], ru8[b_i, :, 0::2, 0, :], np.uint8(0x7F))
+                    ve = np.where(vld[:, 0::2, None], ru8[b_i, :, 0::2, 1, :], np.uint8(0x7F))
+                    ko = np.where(vld[:, 1::2, None], ru8[b_i, :, 1::2, 0, :], np.uint8(0x7F))
+                    vo = np.where(vld[:, 1::2, None], ru8[b_i, :, 1::2, 1, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + 20, :, 0, 0, :] = ke
+                    kvc_u8[p0 : p0 + 20, :, 0, 1, :] = ve
+                    kvc_u8[p0 : p0 + 20, :, 0, 2, :] = ko
+                    kvc_u8[p0 : p0 + 20, :, 0, 3, :] = vo
+            kvc = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8), jnp.float8_e4m3fn)
+            o_r4k, _ = run_decode_fast_rpa(
+                q, kn, vn, kvc, jnp.asarray(kv_lens_np), pi, cuq, cukv, dist,
+                sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,g4k,foldcol", kv_pack_dense2=d2_flag, interpret=ip,
+            )
+            o_nofold, _ = run_decode_fast_rpa(
+                q, kn, vn, kvc, jnp.asarray(kv_lens_np), pi, cuq, cukv, dist,
+                sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,ring4k,nofold", kv_pack_dense2=d2_flag, interpret=ip,
+            )
+            # Exact ground-truth reference in fp32 per sequence using unpoisoned cached tokens + (kn, vn).
+            kn_f = np.asarray(jax.lax.bitcast_convert_type(kn, jnp.float8_e4m3fn).astype(jnp.float32))
+            vn_f = np.asarray(jax.lax.bitcast_convert_type(vn, jnp.float8_e4m3fn).astype(jnp.float32))
+            q_f = np.asarray(q, dtype=np.float32)
+            ref_rows = []
+            for b_i, kl in enumerate(kv_lens_np):
+                n_c = int(kl) - 1
+                k_seq = np.concatenate(
+                    [np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 0, :]), jnp.float8_e4m3fn).astype(jnp.float32)).reshape(-1, 128)[:n_c], kn_f[b_i]],
+                    axis=0,
+                )
+                v_seq = np.concatenate(
+                    [np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 1, :]), jnp.float8_e4m3fn).astype(jnp.float32)).reshape(-1, 128)[:n_c], vn_f[b_i]],
+                    axis=0,
+                )
+                logits = (q_f[b_i] @ k_seq.T) * (128 ** -0.5)
+                logits = logits - np.max(logits, axis=-1, keepdims=True)
+                probs = np.exp(logits)
+                probs = probs / np.sum(probs, axis=-1, keepdims=True)
+                ref_rows.append(np.asarray(jnp.asarray(probs @ v_seq, jnp.bfloat16), dtype=np.float32))
+            a_ref = np.stack(ref_rows, axis=0)
+            a_r4k = np.asarray(o_r4k, dtype=np.float32)
+            a_nf = np.asarray(o_nofold, dtype=np.float32)
+            with self.subTest(d2=d2_flag):
+                self.assertTrue(np.all(np.isfinite(a_r4k)))
+                self.assertEqual(float(np.max(np.abs(a_r4k - a_nf))), 0.0)
+                cos_v = float(np.dot(a_r4k.ravel(), a_ref.ravel()) / (np.linalg.norm(a_r4k) * np.linalg.norm(a_ref)))
+                self.assertGreater(cos_v, 0.99999)
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            bs_e, pps_e = 64, 512
+            hlo = jax_export.export(
+                jax.jit(
+                    lambda q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,g4k,foldcol", kv_pack_dense2=False,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((bs_e, 16, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((4096, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("ring4k", hlo)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3116,116 +3116,99 @@ def _decode_fast_kernel(
                 state_vmem_ref[2] = a0
 
             if probe != "nocompute":
+                def _exec_ring4k_blk(tw_k: int, *, mask_bounds: bool):
+                    tw_pg = tw_k // page_size
+                    if mask_bounds:
+                        sanitize_slot_v2(slot, 0, loc_end, cur_pg, tw_pg)
+                    else:
+                        written_cnt_smem_ref[2 + slot] = max_ring_pages
+                    k_blk = _bkv_fp8_chunk(slot, 0, tw_k, kind="k")
+                    s_blk = jnp.matmul(
+                        q_bf16, k_blk.T, preferred_element_type=jnp.float32
+                    )
+                    if mask_bounds:
+                        k_col = _col_iota(0, tw_k, q_rows)
+                        s_blk = jnp.where(k_col < loc_end, s_blk, _MASK_LOGIT)
+                    m_prev = state_vmem_ref[0]
+                    if cfg.fold_col:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(
+                                    _fold128_op(s_blk, jnp.maximum),
+                                    axis=1,
+                                    keepdims=True,
+                                )
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk, l_add = _exp2_fold_col(s_blk, m_new, exp2_scale)
+                    elif cfg.fold_128:
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(
+                                jnp.max(
+                                    _fold128_op(s_blk, jnp.maximum),
+                                    axis=1,
+                                    keepdims=True,
+                                )
+                            ),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2((s_blk - m_new[:, :1]) * exp2_scale)
+                        l_add = _fold128_op(p_blk, jnp.add)
+                    else:
+                        s_pgs = jnp.max(
+                            s_blk.reshape(q_rows, tw_k // 128, 128), axis=1
+                        )
+                        m_new = jnp.maximum(
+                            m_prev,
+                            _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
+                        )
+                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
+                        p_blk = jnp.exp2(
+                            (s_blk - _broadcast_minor_128_any(m_new, tw_k))
+                            * exp2_scale
+                        )
+                        l_add = jnp.sum(
+                            p_blk.reshape(q_rows, tw_k // 128, 128), axis=1
+                        )
+                    v_blk = _bkv_fp8_chunk(slot, 0, tw_k, kind="v")
+                    p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
+                    pv = jnp.matmul(
+                        p_dot, v_blk, preferred_element_type=jnp.float32
+                    )
+                    if v_scale is not None and v_scale_val != 1.0:
+                        pv = pv * v_scale_val
+                    state_vmem_ref[0] = m_new
+                    state_vmem_ref[1] = state_vmem_ref[1] * alpha + l_add
+                    state_vmem_ref[2] = state_vmem_ref[2] * alpha + pv
 
                 @pl.when(loc_end == max_ring_rows)
                 def _full_4k():
-                    written_cnt_smem_ref[2 + slot] = max_ring_pages
-                    k_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="k")
-                    s_blk = jnp.matmul(
-                        q_bf16, k_blk.T, preferred_element_type=jnp.float32
-                    )
-                    m_prev = state_vmem_ref[0]
-                    if cfg.fold_col:
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(
-                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
-                            ),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk, l_add = _exp2_fold_col(s_blk, m_new, exp2_scale)
-                    elif cfg.fold_128:
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(
-                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
-                            ),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk = jnp.exp2((s_blk - m_new[:, :1]) * exp2_scale)
-                        l_add = _fold128_op(p_blk, jnp.add)
-                    else:
-                        s_pgs = jnp.max(
-                            s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                        )
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk = jnp.exp2(
-                            (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
-                            * exp2_scale
-                        )
-                        l_add = jnp.sum(
-                            p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                        )
-                    v_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="v")
-                    p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
-                    pv = jnp.matmul(
-                        p_dot, v_blk, preferred_element_type=jnp.float32
-                    )
-                    if v_scale is not None and v_scale_val != 1.0:
-                        pv = pv * v_scale_val
-                    state_vmem_ref[0] = m_new
-                    state_vmem_ref[1] = state_vmem_ref[1] * alpha + l_add
-                    state_vmem_ref[2] = state_vmem_ref[2] * alpha + pv
+                    _exec_ring4k_blk(max_ring_rows, mask_bounds=False)
 
-                @pl.when(loc_end < max_ring_rows)
-                def _tail_4k():
-                    sanitize_slot_v2(slot, 0, loc_end, cur_pg, max_ring_pages)
-                    k_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="k")
-                    s_blk = jnp.matmul(
-                        q_bf16, k_blk.T, preferred_element_type=jnp.float32
-                    )
-                    k_col = _col_iota(0, max_ring_rows, q_rows)
-                    s_blk = jnp.where(k_col < loc_end, s_blk, _MASK_LOGIT)
-                    m_prev = state_vmem_ref[0]
-                    if cfg.fold_col:
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(
-                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
-                            ),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk, l_add = _exp2_fold_col(s_blk, m_new, exp2_scale)
-                    elif cfg.fold_128:
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(
-                                jnp.max(_fold128_op(s_blk, jnp.maximum), axis=1, keepdims=True)
-                            ),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk = jnp.exp2((s_blk - m_new[:, :1]) * exp2_scale)
-                        l_add = _fold128_op(p_blk, jnp.add)
+                if max_ring_rows >= 2048:
+                    @pl.when(loc_end <= 1024)
+                    def _tail_1k():
+                        _exec_ring4k_blk(1024, mask_bounds=True)
+
+                    if max_ring_rows >= 4096:
+                        @pl.when((loc_end > 1024) & (loc_end <= 2048))
+                        def _tail_2k():
+                            _exec_ring4k_blk(2048, mask_bounds=True)
+
+                        @pl.when((loc_end > 2048) & (loc_end < max_ring_rows))
+                        def _tail_4k():
+                            _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
                     else:
-                        s_pgs = jnp.max(
-                            s_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                        )
-                        m_new = jnp.maximum(
-                            m_prev,
-                            _broadcast_minor_128(jnp.max(s_pgs, axis=1, keepdims=True)),
-                        )
-                        alpha = jnp.exp2((m_prev - m_new) * exp2_scale)
-                        p_blk = jnp.exp2(
-                            (s_blk - _broadcast_minor_128_any(m_new, max_ring_rows))
-                            * exp2_scale
-                        )
-                        l_add = jnp.sum(
-                            p_blk.reshape(q_rows, max_ring_rows // 128, 128), axis=1
-                        )
-                    v_blk = _bkv_fp8_chunk(slot, 0, max_ring_rows, kind="v")
-                    p_dot = p_blk.astype(jnp.bfloat16) if cfg.pv_bf16 else p_blk
-                    pv = jnp.matmul(
-                        p_dot, v_blk, preferred_element_type=jnp.float32
-                    )
-                    if v_scale is not None and v_scale_val != 1.0:
-                        pv = pv * v_scale_val
-                    state_vmem_ref[0] = m_new
-                    state_vmem_ref[1] = state_vmem_ref[1] * alpha + l_add
-                    state_vmem_ref[2] = state_vmem_ref[2] * alpha + pv
+                        @pl.when((loc_end > 1024) & (loc_end < max_ring_rows))
+                        def _tail_2k_rem():
+                            _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
+                else:
+                    @pl.when(loc_end < max_ring_rows)
+                    def _tail_small():
+                        _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
 
             @pl.when(is_last)
             def _fin_4k():
