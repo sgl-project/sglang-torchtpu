@@ -224,6 +224,14 @@ def _invoke_v3_kernel(
         w8_dec_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_W8", None)
         if w8_dec_env is not None and w8_dec_env.get() and "w8" not in df_val.lower():
             df_val = f"{df_val}_w8"
+        if decode_query_size > 1:
+            vopts_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS", None)
+            vopts_raw = vopts_env.get().strip() if vopts_env is not None else ""
+            if vopts_raw:
+                if vopts_raw.lower() == "auto":
+                    vchunk = "c1024" if decode_query_size <= 4 else "c512"
+                    vopts_raw = f"{vchunk},noz,pbf16,g4k,foldcol,noadapt,verify"
+                df_val = f"{df_val},{vopts_raw}"
         adapt_env = getattr(envs, "SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE", None)
         if (
             adapt_env is not None

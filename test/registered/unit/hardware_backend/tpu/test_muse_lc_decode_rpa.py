@@ -2390,6 +2390,315 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             ).mlir_module()
             self.assertIn("ring4k", hlo)
 
+    def test_cand10_swabatch_gears_dense2_verify_opts_and_export(self):
+        """cand_w9_10: swabatch 1536/2048 gears + sequential d2 + DFlash verify opts (0x7F NaN-poisoned & TPU v7 export)."""
+        import os
+
+        from jax import export as jax_export
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+        from sglang_tpu.envs import envs
+
+        rng = np.random.default_rng(1010)
+        bs, ps, pps = 8, 512, 8
+        pi = jnp.arange(bs * pps, dtype=jnp.int32)
+        cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+        dist = jnp.asarray([bs, bs, bs], dtype=jnp.int32)
+        ip = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+
+        rf8 = jax.device_get(
+            jnp.asarray(rng.normal(0.0, 0.4, (bs * pps, ps, 2, 128)), jnp.float32).astype(jnp.float8_e4m3fn)
+        )
+        ru8 = np.frombuffer(rf8.tobytes(), dtype=np.uint8).reshape(bs, pps, ps, 2, 128)
+        tok = np.arange(pps * ps).reshape(pps, ps)
+        n_pages = bs * pps + 4
+
+        def _make_kvc(kv_lens_np, dq: int, d2: bool):
+            phys_r = ps // 2 if d2 else ps
+            kvc_u8 = np.full((n_pages, phys_r, 1, 4, 128), 0x7F, dtype=np.uint8)
+            for b_i, kl in enumerate(kv_lens_np):
+                vld = tok < (int(kl) - dq)
+                p0 = b_i * pps
+                if not d2:
+                    kvc_u8[p0 : p0 + pps, :, 0, 0, :] = np.where(vld[:, :, None], ru8[b_i, :, :, 0, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + pps, :, 0, 1, :] = np.where(vld[:, :, None], ru8[b_i, :, :, 1, :], np.uint8(0x7F))
+                else:
+                    kvc_u8[p0 : p0 + pps, :, 0, 0, :] = np.where(vld[:, 0::2, None], ru8[b_i, :, 0::2, 0, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + pps, :, 0, 1, :] = np.where(vld[:, 0::2, None], ru8[b_i, :, 0::2, 1, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + pps, :, 0, 2, :] = np.where(vld[:, 1::2, None], ru8[b_i, :, 1::2, 0, :], np.uint8(0x7F))
+                    kvc_u8[p0 : p0 + pps, :, 0, 3, :] = np.where(vld[:, 1::2, None], ru8[b_i, :, 1::2, 1, :], np.uint8(0x7F))
+            return jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8), jnp.float8_e4m3fn)
+
+        def _fp32_ref(q_arr, kn_arr, vn_arr, kv_lens_np, dq: int, sw):
+            q_f = np.asarray(q_arr, dtype=np.float32)
+            kn_f = np.asarray(jax.lax.bitcast_convert_type(kn_arr, jnp.float8_e4m3fn).astype(np.float32))
+            vn_f = np.asarray(jax.lax.bitcast_convert_type(vn_arr, jnp.float8_e4m3fn).astype(np.float32))
+            refs = []
+            for b_i, kl in enumerate(kv_lens_np):
+                n_c = int(kl) - dq
+                k_c = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 0, :]), jnp.float8_e4m3fn).astype(np.float32)).reshape(-1, 128)[:n_c]
+                v_c = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 1, :]), jnp.float8_e4m3fn).astype(np.float32)).reshape(-1, 128)[:n_c]
+                k_seq = np.concatenate([k_c, kn_f[b_i * dq : (b_i + 1) * dq, 0, :]], axis=0)
+                v_seq = np.concatenate([v_c, vn_f[b_i * dq : (b_i + 1) * dq, 0, :]], axis=0)
+                for qi in range(dq):
+                    tot_k = n_c + qi + 1
+                    first_k = max(0, tot_k - sw) if sw is not None else 0
+                    logits = (q_f[b_i * dq + qi] @ k_seq[first_k:tot_k].T) * (128 ** -0.5)
+                    logits -= np.max(logits, axis=-1, keepdims=True)
+                    probs = np.exp(logits)
+                    probs /= np.sum(probs, axis=-1, keepdims=True)
+                    refs.append(np.asarray(jnp.asarray(probs @ v_seq[first_k:tot_k], jnp.bfloat16), dtype=np.float32))
+            return np.stack(refs, axis=0)
+
+        # 1. dq=1 swabatch 1536 (3p) and 2048 (4p) gears (nod2 + sequential d2, SWA & Full)
+        for case_name, kl_vals, sw, d2_flag, mode_s in (
+            ("swabatch_3p_d2_fc", [1050, 1100, 1200, 1300, 1400, 1500, 1536, 1025], 2049, True, "w8,noz,batchfull,g4k,foldcol"),
+            ("swabatch_4p_nod2_u4", [1550, 1600, 1700, 1800, 1900, 2000, 2048, 1537], None, False, "w8,noz,batchfull,u4flat,g4k,foldcol"),
+            ("swabatch_4p_d2_nf", [1550, 1600, 1700, 1800, 1900, 2000, 2048, 1537], 2049, True, "w8,noz,batchfull,nofold"),
+        ):
+            kl_np = np.asarray(kl_vals, dtype=np.int32)
+            q = jnp.asarray(rng.normal(0.0, 0.4, (bs, 16, 128)), jnp.bfloat16)
+            kn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (bs, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            vn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (bs, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+            kvc = _make_kvc(kl_np, 1, d2_flag)
+            out, _ = run_decode_fast_rpa(
+                q, kn, vn, kvc, jnp.asarray(kl_np), pi, cuq, cukv, dist,
+                sm_scale=128 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                mode_str=mode_s, kv_pack_dense2=d2_flag, interpret=ip,
+            )
+            a_out = np.asarray(out, dtype=np.float32)
+            a_ref = _fp32_ref(q, kn, vn, kl_np, 1, sw)
+            with self.subTest(case=case_name):
+                self.assertTrue(np.all(np.isfinite(a_out)))
+                cos_v = float(np.dot(a_out.ravel(), a_ref.ravel()) / (np.linalg.norm(a_out) * np.linalg.norm(a_ref)))
+                self.assertGreater(cos_v, 0.99999)
+
+        # 2. DFlash verify dq=4 & dq=5 (d2 split & nod2, SWA + Full, pbf16 + foldcol)
+        for dq_v, d2_flag, sw, mode_s in (
+            (4, False, 2049, "w8,c1024,noz,pbf16,g4k,foldcol,verify"),
+            (4, True, 2049, "w8,c1024,noz,pbf16,g4k,foldcol,verify"),
+            (4, True, None, "w8,c1024,noz,pbf16,g4k,foldcol,verify"),
+            (5, True, 2049, "w8,c512,noz,pbf16,g4k,foldcol,verify"),
+        ):
+            kl_np = np.asarray([400, 900, 1400, 1900, 512, 1025, 1537, 2048], dtype=np.int32)
+            n_tok = bs * dq_v
+            q = jnp.asarray(rng.normal(0.0, 0.4, (n_tok, 16, 128)), jnp.bfloat16)
+            kn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (n_tok, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            vn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (n_tok, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            cuq = jnp.arange(bs + 1, dtype=jnp.int32) * dq_v
+            kvc = _make_kvc(kl_np, dq_v, d2_flag)
+            out, _ = run_decode_fast_rpa(
+                q, kn, vn, kvc, jnp.asarray(kl_np), pi, cuq, cukv, dist,
+                sm_scale=128 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                mode_str=mode_s, kv_pack_dense2=d2_flag, decode_query_size=dq_v, interpret=ip,
+            )
+            a_out = np.asarray(out, dtype=np.float32)
+            a_ref = _fp32_ref(q, kn, vn, kl_np, dq_v, sw)
+            with self.subTest(dq=dq_v, d2=d2_flag, sw=sw):
+                self.assertTrue(np.all(np.isfinite(a_out)))
+                cos_v = float(np.dot(a_out.ravel(), a_ref.ravel()) / (np.linalg.norm(a_out) * np.linalg.norm(a_ref)))
+                self.assertGreater(cos_v, 0.99999)
+
+        # 2b. TP=16 (8, 64) DFlash verify dq=4 (q8, nod2 + d2 split, 0x7F NaN-poisoned)
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import can_use_decode_fast, parse_decode_fast_config
+        for d2_flag in (False, True):
+            kl_np = np.asarray([400, 900, 1400, 1900, 512, 1025, 1537, 2048], dtype=np.int32)
+            n_tok = bs * 4
+            q_tp16 = jnp.asarray(rng.normal(0.0, 0.4, (n_tok, 8, 64)), jnp.bfloat16)
+            kn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (n_tok, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            vn = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 60, (n_tok, 1, 128), np.uint8)), jnp.float8_e4m3fn)
+            cuq = jnp.arange(bs + 1, dtype=jnp.int32) * 4
+            kvc = _make_kvc(kl_np, 4, d2_flag)
+            self.assertTrue(
+                can_use_decode_fast(
+                    mode_str="tp16,w8,c1024,noz,pbf16,g4k,foldcol,noadapt,verify",
+                    q=q_tp16,
+                    kv_cache_fused=kvc,
+                    out_dtype=jnp.bfloat16,
+                    decode_query_size=4,
+                    custom_mask=None,
+                    attention_sink=None,
+                    soft_cap=None,
+                    xai_temperature_len=None,
+                    q_scale=None,
+                    actual_num_q_heads=8,
+                    actual_num_kv_heads=1,
+                    actual_head_dim=64,
+                    sliding_window=2049,
+                    pages_per_seq=pps,
+                    pure_unpacked_decode=True,
+                    kv_pack_dense2=d2_flag,
+                )
+            )
+            out, _ = run_decode_fast_rpa(
+                q_tp16, kn, vn, kvc, jnp.asarray(kl_np), pi, cuq, cukv, dist,
+                sm_scale=64 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                mode_str="tp16,w8,c1024,noz,pbf16,g4k,foldcol,noadapt,verify",
+                kv_pack_dense2=d2_flag, decode_query_size=4, force_native_tp16=True, interpret=ip,
+            )
+            a_out = np.asarray(out, dtype=np.float32)
+            # Compute fp32 reference on the 8 Q heads (cols :64) with sm_scale = 64**-0.5
+            q_f = np.asarray(q_tp16, dtype=np.float32)
+            kn_f = np.asarray(jax.lax.bitcast_convert_type(kn, jnp.float8_e4m3fn).astype(np.float32))[:, :, :64]
+            vn_f = np.asarray(jax.lax.bitcast_convert_type(vn, jnp.float8_e4m3fn).astype(np.float32))[:, :, :64]
+            refs = []
+            for b_i, kl in enumerate(kl_np):
+                n_c = int(kl) - 4
+                k_c = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 0, :]), jnp.float8_e4m3fn).astype(np.float32)).reshape(-1, 128)[:n_c, :64]
+                v_c = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(ru8[b_i, :, :, 1, :]), jnp.float8_e4m3fn).astype(np.float32)).reshape(-1, 128)[:n_c, :64]
+                k_seq = np.concatenate([k_c, kn_f[b_i * 4 : (b_i + 1) * 4, 0, :]], axis=0)
+                v_seq = np.concatenate([v_c, vn_f[b_i * 4 : (b_i + 1) * 4, 0, :]], axis=0)
+                for qi in range(4):
+                    tot_k = n_c + qi + 1
+                    first_k = max(0, tot_k - 2049)
+                    logits = (q_f[b_i * 4 + qi] @ k_seq[first_k:tot_k].T) * (64 ** -0.5)
+                    logits -= np.max(logits, axis=-1, keepdims=True)
+                    probs = np.exp(logits)
+                    probs /= np.sum(probs, axis=-1, keepdims=True)
+                    refs.append(np.asarray(jnp.asarray(probs @ v_seq[first_k:tot_k], jnp.bfloat16), dtype=np.float32))
+            a_ref = np.stack(refs, axis=0)
+            with self.subTest(tp16_dq4_d2=d2_flag):
+                self.assertTrue(np.all(np.isfinite(a_out)))
+                cos_v = float(np.dot(a_out.ravel(), a_ref.ravel()) / (np.linalg.norm(a_out) * np.linalg.norm(a_ref)))
+                self.assertGreater(cos_v, 0.99999)
+
+        # 3. Verify SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS default-off, dyn4k/adapt precedence & TPU v7 export
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS", None)
+            self.assertEqual(envs.SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS.get(), "")
+
+        try:
+            import torch  # noqa: F401
+            from sglang_tpu.attention_pallas_rpa_v3 import _invoke_v3_kernel
+            captured = {}
+            def _cap(*_a, **kw):
+                captured.clear()
+                captured.update(kw)
+                return "ok"
+            with patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_RPA_V3_DECODE_FAST": "w8,c1024,batchfull,dyn4k",
+                    "SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE": "1",
+                    "SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY": "1",
+                    "SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS": "auto",
+                },
+                clear=False,
+            ):
+                _invoke_v3_kernel(
+                    _cap,
+                    queries=jax.ShapeDtypeStruct((256, 16, 128), jnp.bfloat16),
+                    keys=jax.ShapeDtypeStruct((256, 1, 128), jnp.float8_e4m3fn),
+                    values=jax.ShapeDtypeStruct((256, 1, 128), jnp.float8_e4m3fn),
+                    kv_cache_fused=jax.ShapeDtypeStruct((256, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                    kv_lens=jax.ShapeDtypeStruct((64,), jnp.int32),
+                    page_indices=jax.ShapeDtypeStruct((64 * 6,), jnp.int32),
+                    cu_q_lens=jax.ShapeDtypeStruct((65,), jnp.int32),
+                    cu_kv_lens=jax.ShapeDtypeStruct((65,), jnp.int32),
+                    distribution=jax.ShapeDtypeStruct((3,), jnp.int32),
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=2049,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    decode_query_size=4,
+                )
+                df_dq4 = captured.get("_decode_fast", "")
+                self.assertIn("c1024,noz,pbf16,g4k,foldcol,noadapt,verify", df_dq4)
+                self.assertNotIn("_adapt", df_dq4)
+                cfg_dq4 = parse_decode_fast_config(
+                    df_dq4, sliding_window=2049, pages_per_seq=6, page_size=512, decode_query_size=4
+                )
+                self.assertEqual(cfg_dq4.chunk_sz, 1024)
+                self.assertTrue(cfg_dq4.pv_bf16)
+                self.assertTrue(cfg_dq4.fold_col)
+                _invoke_v3_kernel(
+                    _cap,
+                    queries=jax.ShapeDtypeStruct((64, 16, 128), jnp.bfloat16),
+                    keys=jax.ShapeDtypeStruct((64, 1, 128), jnp.float8_e4m3fn),
+                    values=jax.ShapeDtypeStruct((64, 1, 128), jnp.float8_e4m3fn),
+                    kv_cache_fused=jax.ShapeDtypeStruct((256, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                    kv_lens=jax.ShapeDtypeStruct((64,), jnp.int32),
+                    page_indices=jax.ShapeDtypeStruct((64 * 6,), jnp.int32),
+                    cu_q_lens=jax.ShapeDtypeStruct((65,), jnp.int32),
+                    cu_kv_lens=jax.ShapeDtypeStruct((65,), jnp.int32),
+                    distribution=jax.ShapeDtypeStruct((3,), jnp.int32),
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=2049,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    decode_query_size=1,
+                )
+                self.assertNotIn("pbf16", captured.get("_decode_fast", ""))
+                self.assertIn("_adapt", captured.get("_decode_fast", ""))
+        except ImportError:
+            pass
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            bs_e, dq_e, pps_e = 64, 4, 6
+            hlo = jax_export.export(
+                jax.jit(
+                    lambda q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,c1024,noz,pbf16,g4k,foldcol,verify",
+                        kv_pack_dense2=True, decode_query_size=dq_e,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((bs_e * dq_e, 16, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e * dq_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e * dq_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((512, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("dq4", hlo)
+            self.assertIn("pbf16", hlo)
+
+            hlo_tp16 = jax_export.export(
+                jax.jit(
+                    lambda q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=64 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                        mode_str="tp16,w8,c1024,noz,pbf16,g4k,foldcol,noadapt,verify",
+                        kv_pack_dense2=True, decode_query_size=dq_e, force_native_tp16=True,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((bs_e * dq_e, 8, 64), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e * dq_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e * dq_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((512, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("tp16", hlo_tp16)
+            self.assertIn("q8", hlo_tp16)
+            self.assertIn("dq4", hlo_tp16)
+            self.assertIn("pbf16", hlo_tp16)
+
 
 if __name__ == "__main__":
     unittest.main()
