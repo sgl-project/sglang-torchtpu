@@ -197,7 +197,6 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
     # pages_swa stays in HBM and each step DMAs every request's window of it into SMEM: at
     # 1M context and cc >= 28 the two page tables would crowd the 1 MiB SMEM out
     swa_window_table: bool = False
-    attn_skip_idle_streams: bool = False
     attn_col_mask: bool = False
     fold_attn_scale: bool = False
     expert_split: int = 0
@@ -283,6 +282,14 @@ class MKConfig(MuseGeometry, frozen=True, kw_only=True):
                 // self.sal_words
             )
         return 2 * self.kv_group
+
+    @property
+    def kv_ring_fp8(self) -> bool:
+        """Global-layer SAL chunks in their own page-shaped fp8 ring (DMAs need no relayout).
+
+        Needs the global geometry split from SWA; SWA stays on the w13 view (no gain there).
+        """
+        return self.kv_sal and self.swa_chunk_pages > 0
 
     @property
     def swa_kv_group(self):

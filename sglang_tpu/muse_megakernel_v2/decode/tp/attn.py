@@ -207,12 +207,10 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     R = k.R
     S = k.S
     c = k.c
-    chunk_dst = k.chunk_dst
     g = k.g
     hd = k.hd
     hkv = k.hkv
     kv_prologue = k.kv_prologue
-    page_src = k.page_src
     pd = k.pd
     pf_ref = k.pf_ref
     ph = k.ph
@@ -220,13 +218,25 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     ps = k.ps
     q = k.q
     req_geom = k.req_geom
-    ring_words = k.ring_words
+    ring_load = k.ring_load
     rows_at = k.rows_at
+    start_page = k.start_page
     wait_chunk = k.wait_chunk
     yw = k.yw
     is_global, KR_g, cpt_g = geo.is_global, geo.kr, geo.cp * ps
     r0 = pl.multiple_of(j * q, q)
     qg = q * g
+    # SWA window prefetch: request j's chunks take ring slots from (j * W) % KR, W slots apart,
+    # so request j + 1's window can be in flight during request j's chunk loop
+    swa_pre = is_global is False
+    if swa_pre:
+        W = (c.window + q + cpt_g - 3) // cpt_g + 1
+        assert 2 * W <= KR_g, (W, KR_g)
+        sbase = (j * W) % KR_g
+
+    def ring_slot(i):
+        return (i + sbase) % KR_g if swa_pre else i % KR_g
+
     p_lo, first_ch, n_ch = req_geom(geo, j)
     qrows = rows_at(S["qn_s"], r0, q)  # [q, q_dim]
 
@@ -307,7 +317,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
         fp8_v = c.kv_sal_fp8 and c.sal_fp8_dot >= 2
         x8 = pltpu.bitcast(
-            ring_words(geo, slot)[...], c.kv_dtype
+            ring_load(geo, slot), c.kv_dtype
         )  # [2 * kv_heads * hd, cpt_g]
         xb = None if (fp8_k and fp8_v) else x8.astype(jnp.bfloat16)
         xk, xv = (x8 if fp8_k else xb), (x8 if fp8_v else xb)
@@ -322,9 +332,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
         parts = []
         for h in range(hkv):
-            xh = pltpu.bitcast(
-                ring_words(geo, slot, 2 * h * w_hd, w_hd)[...], c.kv_dtype
-            )
+            xh = pltpu.bitcast(ring_load(geo, slot, 2 * h * w_hd, w_hd), c.kv_dtype)
             parts.append(xh if fp8_k else xh.astype(jnp.bfloat16))
         return jnp.concatenate(parts, axis=0)
 
@@ -334,7 +342,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         parts = []
         for h in range(hkv):
             xh = pltpu.bitcast(
-                ring_words(geo, slot, (2 * h + 1) * w_hd, w_hd)[...], c.kv_dtype
+                ring_load(geo, slot, (2 * h + 1) * w_hd, w_hd), c.kv_dtype
             )
             parts.append(xh if fp8_v else xh.astype(jnp.bfloat16))
         return jnp.concatenate(parts, axis=0)
@@ -379,7 +387,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
         every row and skip the position and window masks.
         """
-        slot = i % KR_g
+        slot = ring_slot(i)
         ci = first_ch + i
         kk, vk = chunk_kv(slot)
         live = None if c.packed_attn else colhead == rowhead
@@ -408,11 +416,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 c.n_pages_entries - 1,
             )
             page = pf_ref[ent]  # a global layer's table
-            pltpu.make_async_copy(
-                page_src(ref, page),
-                chunk_dst(geo, slot, pi),
-                S["kv_chunk_sems"].at[slot],
-            ).start()
+            start_page(ref, page, geo, slot, pi)
 
     def body(k, carry2, ref=None, clean=False):
         """Chunks 2k, 2k+1 as two independent online-softmax streams (two dependency
@@ -425,21 +429,15 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
         i0, i1 = 2 * k, 2 * k + 1
         valid_b = i1 < n_ch
         with _scope("kv_wait"):
-            wait_chunk(geo, i0 % KR_g)
+            wait_chunk(geo, ring_slot(i0))
 
             @pl.when(valid_b)  # an odd tail re-reads chunk i0, already waited for
             def _():
-                wait_chunk(geo, i1 % KR_g)
+                wait_chunk(geo, ring_slot(i1))
 
         s_a, v_a = chunk_scores(i0, True, clean)
-        if c.attn_skip_idle_streams and not clean and ref is None:
-            carry_b = jax.lax.cond(
-                valid_b,
-                lambda cr: online(cr, *chunk_scores(i1, True, False), c.kv_sal),
-                lambda cr: cr,
-                carry2[1],
-            )
-            return online(carry2[0], s_a, v_a, c.kv_sal), carry_b
+        # stream b is always computed (masked past n_ch): a cond around it splits the body
+        # into serial blocks and exposes MXU latency (SWA +28%). SKIP_IDLE applies to v1 only
         s_b, v_b = chunk_scores(
             i1 if clean else jnp.minimum(i1, n_ch - 1), valid_b, clean
         )
@@ -454,6 +452,13 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
 
     # Global-layer chunks before a request's last one lie wholly in the past of every
     # verify row: chunks [0, n_clean) need only the cross-head mask.
+    if swa_pre:
+
+        @pl.when(j + 1 < n_req_live)
+        def _():
+            with _scope("kv_prologue"):
+                kv_prologue(geo, l, j + 1, ((j + 1) * W) % KR_g)
+
     n_clean = _sel(is_global, jnp.maximum(n_ch - 1, 0), 0)
     NS = c.attn_streams
     gls = sorted(c.global_layers)
@@ -649,18 +654,16 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                             ),
                             c.n_pages_entries - 1,
                         )
-                        pltpu.make_async_copy(
-                            page_src(ref, pf_ref[ent]),
-                            chunk_dst(geo, v % KR_g, pi),
-                            S["kv_chunk_sems"].at[v % KR_g],
-                        ).start()
+                        start_page(ref, pf_ref[ent], geo, v % KR_g, pi)
                     return carry
 
                 jax.lax.fori_loop(0, n, one, 0)
 
-            @pl.when(n > 0)
-            def _():
-                _dispatch(l, KV, leaf, only=gls)
+            with _scope("kv_refill"):
+
+                @pl.when(n > 0)
+                def _():
+                    _dispatch(l, KV, leaf, only=gls)
 
         def refill_slot(ref, v):
             """Chunk v (known < n_ch) into ring slot v % KR_g, straight-line."""
@@ -672,11 +675,13 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pltpu.make_async_copy(
-                    page_src(ref, pf_ref[ent]),
-                    chunk_dst(geo, slot, pi),
-                    S["kv_chunk_sems"].at[slot],
-                ).start()
+                start_page(ref, pf_ref[ent], geo, slot, pi)
+
+        def refill_slots(ref, v0):
+            """Chunks [v0, v0 + NS) straight-line, after the compute."""
+            with _scope("kv_refill"):
+                for t in range(NS):
+                    refill_slot(ref, v0 + t)
 
         def pipelined_opt(n_it):
             """Hoisted straight-line KV refill + 2-acc PV/QK pipeline (stack2 for q<=4)."""
@@ -881,9 +886,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 def kh_half(slot, h, s0):
                     with _scope("kv_unpack"):
                         kr = pltpu.bitcast(
-                            ring_words(geo, slot, 2 * h * w_hd, w_hd)[
-                                :, pl.ds(s0, 512)
-                            ],
+                            ring_load(geo, slot, 2 * h * w_hd, w_hd, s0, 512),
                             jnp.float8_e4m3fn,
                         )
                         return jnp.concatenate(
@@ -893,9 +896,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 def vh_half(slot, h, s0):
                     with _scope("kv_unpack"):
                         vr = pltpu.bitcast(
-                            ring_words(geo, slot, (2 * h + 1) * w_hd, w_hd)[
-                                :, pl.ds(s0, 512)
-                            ],
+                            ring_load(geo, slot, (2 * h + 1) * w_hd, w_hd, s0, 512),
                             jnp.float8_e4m3fn,
                         )
                         return jnp.concatenate(
@@ -1008,8 +1009,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     pv_all_h(i0, par)
                     qk_all_h(i0 + NS, npar)
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return dummy
@@ -1194,8 +1194,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     accs = pv_all(i0, par, accs)
                     ls = ls + qk_all(i0 + NS, npar)
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return ls, accs
@@ -1262,8 +1261,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                         else:
                             p_put(npar, t, nxt[t][0])
                     if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR_g + t)
+                        refill_slots(ref, i0 + KR_g)
                     else:
                         refill_global(i0 + KR_g)
                     return [x[1] for x in nxt], accs
@@ -1312,63 +1310,11 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                     sum(accs[1:], accs[0]),
                 ), init
 
-            ls0, ls1 = zl, zl
-            for u in range(NS // 2):
-                pa, pb, psc_ab, ls0, ls1 = qk_pair(2 * u, 2 * u + 1, ls0, ls1)
-                p_put(0, 2 * u, pa)
-                p_put(0, 2 * u + 1, pb)
-                if use_fp8_p:
-                    psc_put(0, 2 * u, psc_ab)
+            # pair index whose QK issues pair u's refill: one pair later (the last keeps its
+            # own); at its own pair the DMA chain fences the next pair's loads, starving the MXU
+            refill_at = [min(u + 1, NS // 2 - 1) for u in range(NS // 2)]
 
-            def step_body(k, carry, ref=None):
-                ls0, ls1, ac0, ac1 = carry
-                i0 = NS * k
-                par, npar = k % 2, (k + 1) % 2
-                with _scope("kv_wait"):
-                    for t in range(NS):
-                        wait_chunk(geo, (i0 + NS + t) % KR_g)
-                for u in range(NS // 2):
-                    dpv = pv_pair(
-                        i0 + 2 * u,
-                        i0 + 2 * u + 1,
-                        p_get(par, 2 * u),
-                        p_get(par, 2 * u + 1),
-                    )
-                    if use_fp8_p:
-                        dpv = _scale_pv(dpv, psc_get(par, 2 * u))
-                    if u % 2 == 0:
-                        ac0 = ac0 + dpv
-                    else:
-                        ac1 = ac1 + dpv
-                for u in range(NS // 2):
-                    pa, pb, psc_ab, ls0, ls1 = qk_pair(
-                        i0 + NS + 2 * u, i0 + NS + 2 * u + 1, ls0, ls1
-                    )
-                    p_put(npar, 2 * u, pa)
-                    p_put(npar, 2 * u + 1, pb)
-                    if use_fp8_p:
-                        psc_put(npar, 2 * u, psc_ab)
-                if ref is not None:
-                    for t in range(NS):
-                        refill_slot(ref, i0 + KR_g + t)
-                else:
-                    refill_global(i0 + KR_g)
-                return ls0, ls1, ac0, ac1
-
-            k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
-            init4 = (ls0, ls1, za, za)
-            if isinstance(l, int):
-                carry4 = jax.lax.fori_loop(
-                    0, k_full, functools.partial(step_body, ref=KV[l]), init4
-                )
-            elif hoist_rows is None or hoist_kv:
-                carry4, k_full = hoisted(step_body, k_full, init4)
-            else:
-                carry4, k_full = init4, 0
-            ls0, ls1, ac0, ac1 = jax.lax.fori_loop(k_full, n_it - 1, step_body, carry4)
-            i0 = NS * (n_it - 1)
-            par = (n_it - 1) % 2
-            for u in range(NS // 2):
+            def pv_u(i0, par, u, ac0, ac1):
                 dpv = pv_pair(
                     i0 + 2 * u,
                     i0 + 2 * u + 1,
@@ -1378,9 +1324,80 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 if use_fp8_p:
                     dpv = _scale_pv(dpv, psc_get(par, 2 * u))
                 if u % 2 == 0:
-                    ac0 = ac0 + dpv
-                else:
-                    ac1 = ac1 + dpv
+                    return ac0 + dpv, ac1
+                return ac0, ac1 + dpv
+
+            def qk_u(i0, par, u, ls0, ls1, refill=None):
+                pa, pb, psc_ab, ls0, ls1 = qk_pair(i0 + 2 * u, i0 + 2 * u + 1, ls0, ls1)
+                if refill is not None:
+                    # DMA starts order against vector loads and stores only: after the K
+                    # loads, before the P stores, the issue overlaps the pops and exp2
+                    refill()
+                p_put(par, 2 * u, pa)
+                p_put(par, 2 * u + 1, pb)
+                if use_fp8_p:
+                    psc_put(par, 2 * u, psc_ab)
+                return ls0, ls1
+
+            ls0, ls1 = zl, zl
+            for u in range(NS // 2):
+                ls0, ls1 = qk_u(0, 0, u, ls0, ls1)
+
+            def step_body(k, carry, ref=None):
+                ls0, ls1, ac0, ac1 = carry
+                i0 = NS * k
+                # one P buffer: pair u's P is read by its PV before its QK overwrites it, so
+                # QK(u)'s exp tail overlaps PV(u + 1)
+                par = npar = 0
+                with _scope("kv_wait"):
+                    for t in range(NS):
+                        wait_chunk(geo, (i0 + NS + t) % KR_g)
+
+                def refill_pair(u):
+                    srcs = [w for w in range(NS // 2) if refill_at[w] == u]
+                    if ref is None or not srcs:
+                        return None
+
+                    def issue():
+                        with _scope("kv_refill_inline"):
+                            for w in srcs:
+                                for t in range(2):
+                                    refill_slot(ref, i0 + KR_g + 2 * w + t)
+
+                    return issue
+
+                for u in range(NS // 2):
+                    ac0, ac1 = pv_u(i0, par, u, ac0, ac1)
+                    # pair u's slots were read by its PV just above
+                    ls0, ls1 = qk_u(i0 + NS, npar, u, ls0, ls1, refill_pair(u))
+                if ref is None:
+                    refill_global(i0 + KR_g)
+                return ls0, ls1, ac0, ac1
+
+            k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+            init4 = (ls0, ls1, za, za)
+            if isinstance(l, int):
+                carry4 = jax.lax.fori_loop(
+                    0, k_full, functools.partial(step_body, ref=KV[l]), init4
+                )
+            else:
+                # inline refill needs the layer's pool without a branch: a loop per layer
+                carry4, k_full = branch_layers(
+                    gls,
+                    [
+                        lambda r=KV[x]: (
+                            jax.lax.fori_loop(
+                                0, k_full, functools.partial(step_body, ref=r), init4
+                            ),
+                            k_full,
+                        )
+                        for x in gls
+                    ],
+                )
+            ls0, ls1, ac0, ac1 = jax.lax.fori_loop(k_full, n_it - 1, step_body, carry4)
+            i0 = NS * (n_it - 1)
+            for u in range(NS // 2):
+                ac0, ac1 = pv_u(i0, 0, u, ac0, ac1)
             refill_global(i0 + KR_g)
             return (init[0], ls0 + ls1, ac0 + ac1), init
 
@@ -1500,10 +1517,12 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     # every ring slot is read and every copy waited for: the next request's first
     # chunks fly during this request's own-row attention (request 0's were requested
     # before the qkv matvec)
-    @pl.when(j + 1 < n_req_live)
-    def _():
-        with _scope("kv_prologue"):
-            kv_prologue(geo, l, j + 1)
+    if not swa_pre:
+
+        @pl.when(j + 1 < n_req_live)
+        def _():
+            with _scope("kv_prologue"):
+                kv_prologue(geo, l, j + 1)
 
     # the request's own new rows (causal within a verify block), padded to a sublane
     # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows

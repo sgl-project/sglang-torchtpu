@@ -728,11 +728,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 def one(u, carry):
                     slot = (slot0 + u) % geo.kr
                     for pi, page in enumerate(chunk_pages_of(geo, j, ci0 + u)):
-                        pltpu.make_async_copy(
-                            page_src(ref, page),
-                            chunk_dst(geo, slot, pi),
-                            S["kv_chunk_sems"].at[slot],
-                        ).start()
+                        start_page(ref, page, geo, slot, pi)
                     return carry
 
                 jax.lax.fori_loop(0, n, one, 0)
@@ -742,7 +738,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 only = [x for x in range(c.n_layers) if (x in gl) == geo.is_global]
             _dispatch(l, KV, leaf, only)
 
-        def kv_ring_ref():
+        def ring_fp8(geo):
+            return c.kv_ring_fp8 and geo.is_global is True
+
+        def kv_ring_ref(geo):
             """The KV chunk ring.
 
             SAL: the expert w13 slots, idle during attention (every expert DMA of the
@@ -750,6 +749,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             sal_words, chunk tokens] u32 in the native tiling: the page DMA relayouts
             the pool's (pk, 128) tiles, so chunk loads are whole vregs.
             """
+            if ring_fp8(geo):
+                # [chunk, lane tile, word, LANE]: a lane tile's word rows are contiguous
+                return (
+                    S["kv_chunk"]
+                    .bitcast(jnp.uint32)
+                    .reshape(c.kv_ring, c.chunk_pages * ps // LANE, c.sal_words, LANE)
+                )
             if c.kv_sal:
                 return S["w13"].reshape(c.kv_ring, c.sal_words, c.chunk_pages * ps)
             return S["kv_chunk"]
@@ -758,24 +764,42 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             """u32 rows [off, off + n) of a ring chunk (n: sal_words) as a ref."""
             n = c.sal_words if n is None else n
             e, p = ring_at(geo, slot, 0)
+            if ring_fp8(geo):
+                return kv_ring_ref(geo).at[
+                    e, pl.ds(p * ps // LANE, geo.cp * ps // LANE), pl.ds(off, n), :
+                ]
             if geo.cp == c.chunk_pages:
                 if off == 0 and n == c.sal_words:
-                    return kv_ring_ref().at[e]
-                return kv_ring_ref().at[e, pl.ds(off, n), :]
+                    return kv_ring_ref(geo).at[e]
+                return kv_ring_ref(geo).at[e, pl.ds(off, n), :]
             if off == 0 and n == c.sal_words:
-                return kv_ring_ref().at[
+                return kv_ring_ref(geo).at[
                     e, :, pl.ds(pl.multiple_of(p * ps, LANE), geo.cp * ps)
                 ]
-            return kv_ring_ref().at[
+            return kv_ring_ref(geo).at[
                 e, pl.ds(off, n), pl.ds(pl.multiple_of(p * ps, LANE), geo.cp * ps)
             ]
 
         k.ring_words = ring_words
 
+        def ring_load(geo, slot, off=0, n=None, l0=0, nl=None):
+            """u32 rows [off, off + n) x tokens [l0, l0 + nl) of a ring chunk, as a value."""
+            n = c.sal_words if n is None else n
+            full = nl is None
+            nl = geo.cp * ps if full else nl
+            if not ring_fp8(geo):
+                r = ring_words(geo, slot, off, n)
+                return r[...] if full else r[:, pl.ds(l0, nl)]
+            x = ring_words(geo, slot, off, n)
+            x = (x if full else x.at[pl.ds(l0 // LANE, nl // LANE)])[...]
+            return jnp.concatenate([x[t] for t in range(nl // LANE)], axis=1)
+
+        k.ring_load = ring_load
+
         def chunk_dst(geo, slot, pi):
             if c.kv_sal:
                 e, p = ring_at(geo, slot, pi)
-                return kv_ring_ref().at[e, :, pl.ds(p * ps, ps)]
+                return kv_ring_ref(geo).at[e, :, pl.ds(p * ps, ps)]
             return S["kv_chunk"].at[slot, pi]
 
         k.chunk_dst = chunk_dst
@@ -787,22 +811,41 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
         k.page_src = page_src
 
+        def start_page(ref, page, geo, slot, pi):
+            """Page pi of chunk slot: its DMA(s) into the ring, signalling the slot."""
+            sem = S["kv_chunk_sems"].at[slot]
+            if not ring_fp8(geo):
+                pltpu.make_async_copy(
+                    page_src(ref, page), chunk_dst(geo, slot, pi), sem
+                ).start()
+                return
+            e, p = ring_at(geo, slot, pi)
+            # one DMA per lane tile: pool tiles land unchanged, no stride descriptor
+            for t in range(ps // LANE):
+                pltpu.make_async_copy(
+                    ref.at[page, :, :, :, pl.ds(t * LANE, LANE)],
+                    S["kv_chunk"].at[e, p * ps // LANE + t],
+                    sem,
+                ).start()
+
+        k.start_page = start_page
+
         def wait_chunk(geo, slot):
             if c.kv_sal:
                 r = ring_words(geo, slot)
                 pltpu.make_async_copy(r, r, S["kv_chunk_sems"].at[slot]).wait()
                 return
-            ring = kv_ring_ref()
+            ring = kv_ring_ref(geo)
             pltpu.make_async_copy(
                 ring.at[slot], ring.at[slot], S["kv_chunk_sems"].at[slot]
             ).wait()
 
         k.wait_chunk = wait_chunk
 
-        def kv_prologue(geo, l, j):
-            # the request's first geo.kr chunks
+        def kv_prologue(geo, l, j, slot0=0):
+            # the request's first geo.kr chunks, into ring slots from slot0
             _, first_ch, n_ch = req_geom(geo, j)
-            issue_range(geo, l, j, first_ch, 0, jnp.minimum(n_ch, geo.kr))
+            issue_range(geo, l, j, first_ch, slot0, jnp.minimum(n_ch, geo.kr))
 
         k.kv_prologue = kv_prologue
 
@@ -1526,8 +1569,9 @@ def megakernel_call(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None
             compiler_params=pltpu.CompilerParams(
                 vmem_limit_bytes=cfg.vmem_limit_bytes,
                 collective_id=_COLLECTIVE_ID if cfg.tp > 1 else None,
-                disable_bounds_checks=ep is not None
-                and tpu_envs.SGLANG_TPU_EP_NO_BOUNDS.get(),
+                # TP: each checked DMA issue adds ~22 serial bundles (shalt.err chain)
+                disable_bounds_checks=ep is None
+                or tpu_envs.SGLANG_TPU_EP_NO_BOUNDS.get(),
             ),
             name=f"muse_{'ep_' if ep else ''}megakernel_r{cfg.rows}_q{cfg.rows_per_req}",
         )

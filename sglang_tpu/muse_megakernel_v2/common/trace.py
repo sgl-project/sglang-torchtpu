@@ -30,6 +30,7 @@ _INNER = frozenset(
         "ex_scatter",
         "ex_accum",
         "kv_prologue",
+        "kv_refill_inline",
         "own_rows",
         "y_row_wait",
         "combine_rows",
