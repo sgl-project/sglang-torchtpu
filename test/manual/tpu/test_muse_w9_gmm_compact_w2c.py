@@ -3454,8 +3454,8 @@ def test_w9_cand6_m16k_tm128_stepdown_and_rb4_buckets():
 
 
 def test_w9_cand6_wla1_qb512_nan_interpret_and_lowering():
-    """Verify wla1 3-buffer ring (total_steps=2, qb512 % 8 == 0) + 2-slot chipmate
-    under InterpretParams(detect_races=True, uninitialized_memory='nan')."""
+    """Verify real gmm_v2_fused_rs_nodedup under InterpretParams(detect_races=True, uninitialized_memory='nan'):
+    wla=1 (qb512 % 8 == 0, 3-buf W1+W2 ring) + cm_defer_send=1 + gm_id=0 >= borrowed_slot on both ranks."""
     from unittest.mock import patch
 
     import jax
@@ -3469,8 +3469,12 @@ def test_w9_cand6_wla1_qb512_nan_interpret_and_lowering():
     if len(jax.devices()) < 2:
         pytest.skip("Requires >=2 virtual/physical JAX devices")
 
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_moe import moe_gmm_local_rs_nodedup
     from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
         _select_fused_rs_block_sizes,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        compute_block_scatter_routing,
     )
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
@@ -3494,253 +3498,157 @@ def test_w9_cand6_wla1_qb512_nan_interpret_and_lowering():
         )
         assert (bs65k.tile_m, bs65k.tile_n1, bs65k.tile_n2, bs65k.num_w1_bufs, bs65k.num_w2_bufs) == (256, 2048, 2048, 3, 3)
 
+    # Real gmm_v2_fused_rs_nodedup 2-rank InterpretParams(detect_races=True, uninitialized_memory='nan'):
+    # EP=2, e_loc=2 (+2 chipmate slots -> size_group=4, borrowed_slot=2).
+    # Tokens route exclusively to borrowed slots (r0 -> 2,3; r1 -> 6,7) across >=2 tiles on slot 2
+    # followed by slot 3, so BOTH ranks hit gm_id == 0 and expert_id >= borrowed_slot while cm_defer_send=1!
     rng = np.random.default_rng(20261129)
-    w1_data = jnp.asarray(rng.standard_normal((2, 3, 2, 16, 128), np.float32) * 0.4, jnp.bfloat16)
-    w2_data = jnp.asarray(rng.standard_normal((2, 3, 2, 16, 128), np.float32) * 0.4, jnp.bfloat16)
-    x_data = jnp.asarray(rng.standard_normal((2, 5, 16, 128), np.float32) * 0.4, jnp.bfloat16)
-    gm_eids = jnp.asarray([0, 0, 2, 3, 3], jnp.int32)
-    max_gm_meta = jnp.asarray([5, 0, 1, 1, 1, 2, 2, 3, -1, -1], jnp.int32)
+    T = 2048
+    K, N1, N2, QB = 4096, 8192, 4096, 512
+    x_np = (rng.standard_normal((T, K // 128, 128)).astype(np.float32) * 0.25)
+    x_flat = x_np.reshape(T, K)
+    amax = np.max(np.abs(x_flat), axis=1, keepdims=True)
+    inv = np.where(amax == 0, 0.0, 448.0 / np.maximum(amax, 1e-12))
+    sc_np = np.where(amax == 0, 0.0, amax / 448.0).reshape(-1).astype(np.float32)
+    x_fp8 = jnp.asarray((x_flat * inv).reshape(T, K // 128, 128), jnp.float8_e4m3fn)
+    sc_j = jnp.asarray(sc_np, jnp.float32)
+
+    # Use valid packed FP4 nibbles & positive scales for 2 ranks * 2 local experts = 4 total.
+    w1_u8 = rng.integers(0, 256, size=(4, K, N1 // 2), dtype=np.uint8)
+    w2_u8 = rng.integers(0, 256, size=(4, K, N2 // 2), dtype=np.uint8)
+    w1_fp4 = jax.lax.bitcast_convert_type(jnp.asarray(w1_u8), jnp.float4_e2m1fn).reshape(4, K, N1)
+    w2_fp4 = jax.lax.bitcast_convert_type(jnp.asarray(w2_u8), jnp.float4_e2m1fn).reshape(4, K, N2)
+    s1_bf = jnp.asarray(rng.uniform(0.01, 0.04, size=(4, K // QB, N1)).astype(np.float32), jnp.bfloat16)
+    s2_bf = jnp.asarray(rng.uniform(0.01, 0.04, size=(4, K // QB, N2)).astype(np.float32), jnp.bfloat16)
+    pnw_j = jnp.asarray((1.0 + 0.05 * rng.standard_normal(N2)).astype(np.float32), jnp.bfloat16)
+    go_j = jnp.asarray([0, 4], jnp.int32)
+    tw_j = jnp.asarray(rng.uniform(0.05, 0.2, size=(T, 8)).astype(np.float32), jnp.bfloat16)
+
+    # Virtual expert IDs: both ranks start at borrowed slot (2 on r0, 6 on r1) for 160 rows (2 tiles
+    # at tile_m=128) then transition to borrowed slot +1 (3 on r0, 7 on r1) for 48 rows; rest sentinel 8.
+    v_ids_np = np.full((T, 8), 8, dtype=np.int32)
+    for t in range(10):
+        v_ids_np[t, :] = 2
+        v_ids_np[1024 + t, :] = 2
+    for t in range(10, 13):
+        v_ids_np[t, :] = 3
+        v_ids_np[1024 + t, :] = 3
+    for t in range(13, 23):
+        v_ids_np[t, :] = 6
+        v_ids_np[1024 + t, :] = 6
+    for t in range(23, 26):
+        v_ids_np[t, :] = 7
+        v_ids_np[1024 + t, :] = 7
+    v_ids_j = jnp.asarray(v_ids_np, jnp.int32)
+    cm_plan_2 = jnp.asarray([[0, 1, 1, 1], [0, 1, 1, 1]], jnp.int32)
+
     mesh2 = Mesh(np.array(jax.devices()[:2]), ("ep",))
+    real_pallas_call = pl.pallas_call
 
-    def _run_ring(use_wla1: bool) -> np.ndarray:
-        def _ker(
-            meta_r, eid_r, x_hbm, w1_hbm, w2_hbm,
-            out_hbm, cm_w1_pad, cm_w2_pad,
-            x_vmem, w1_buf, w2_buf,
-            g_sem, w1_sem, w2_sem, cm_send_sem, cm_recv_sem, cm_awaited, st_smem, bar_sem,
-        ):
-            my_id = jax.lax.axis_index("ep")
-            partner = jax.lax.bitwise_xor(my_id, jnp.int32(1))
-            borrowed_slot = jnp.int32(3)
-            next_act_off = 5
-            for i in range(5):
-                cm_awaited[i] = jnp.int32(0)
-            st_smem[0] = jnp.int32(0)
-            st_smem[1] = jnp.int32(0)
+    def _run_real(wla_mode: str) -> tuple[np.ndarray, list[str]]:
+        names: list[str] = []
 
-            pl.semaphore_signal(bar_sem.at[0], 1, device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH)
-            e0 = eid_r[0]
-            pltpu.make_async_copy(src_ref=x_hbm.at[0], dst_ref=x_vmem.at[0], sem=g_sem.at[0]).start()
-
-            @pl.when(e0 < borrowed_slot)
-            def _pro_w():
-                for s_idx in range(2):
-                    pltpu.make_async_copy(src_ref=w1_hbm.at[e0, s_idx], dst_ref=w1_buf.at[s_idx], sem=w1_sem.at[s_idx]).start()
-                    pltpu.make_async_copy(src_ref=w2_hbm.at[e0, s_idx], dst_ref=w2_buf.at[s_idx], sem=w2_sem.at[s_idx]).start()
-
-            pltpu.make_async_copy(src_ref=x_hbm.at[1], dst_ref=x_vmem.at[1], sem=g_sem.at[1]).start()
-            pl.semaphore_wait(bar_sem.at[0], 1)
-
-            def _def_send():
-                @pl.when(cm_awaited[4] == 0)
-                def _do():
-                    for ci in range(2):
-                        pltpu.make_async_remote_copy(
-                            src_ref=w1_hbm.at[ci], dst_ref=cm_w1_pad.at[ci],
-                            send_sem=cm_send_sem.at[2 * ci], recv_sem=cm_recv_sem.at[2 * ci],
-                            device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
-                        pltpu.make_async_remote_copy(
-                            src_ref=w2_hbm.at[ci], dst_ref=cm_w2_pad.at[ci],
-                            send_sem=cm_send_sem.at[2 * ci + 1], recv_sem=cm_recv_sem.at[2 * ci + 1],
-                            device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
-                    cm_awaited[4] = jnp.int32(1)
-
-            def _wait_cm_w1(ci: int):
-                @pl.when(cm_awaited[ci] == 0)
-                def _():
-                    pltpu.make_async_copy(src_ref=cm_w1_pad.at[ci], dst_ref=cm_w1_pad.at[ci], sem=cm_recv_sem.at[2 * ci]).wait()
-                    cm_awaited[ci] = jnp.int32(1)
-
-            def _wait_cm_w2(ci: int):
-                @pl.when(cm_awaited[2 + ci] == 0)
-                def _():
-                    pltpu.make_async_copy(src_ref=cm_w2_pad.at[ci], dst_ref=cm_w2_pad.at[ci], sem=cm_recv_sem.at[2 * ci + 1]).wait()
-                    cm_awaited[2 + ci] = jnp.int32(1)
-
-            def _start_w1(sl, eid, step_idx: int):
-                for ci in range(2):
-                    @pl.when(eid == borrowed_slot + ci)
-                    def _cm(_c=ci):
-                        _wait_cm_w1(_c)
-                        pltpu.make_async_copy(src_ref=cm_w1_pad.at[_c, step_idx], dst_ref=w1_buf.at[sl], sem=w1_sem.at[sl]).start()
-
-                @pl.when(eid < borrowed_slot)
-                def _hm():
-                    pltpu.make_async_copy(src_ref=w1_hbm.at[eid, step_idx], dst_ref=w1_buf.at[sl], sem=w1_sem.at[sl]).start()
-
-            def _start_w2(sl, eid, step_idx: int):
-                for ci in range(2):
-                    @pl.when(eid == borrowed_slot + ci)
-                    def _cm(_c=ci):
-                        _wait_cm_w2(_c)
-                        pltpu.make_async_copy(src_ref=cm_w2_pad.at[_c, step_idx], dst_ref=w2_buf.at[sl], sem=w2_sem.at[sl]).start()
-
-                @pl.when(eid < borrowed_slot)
-                def _hm():
-                    pltpu.make_async_copy(src_ref=w2_hbm.at[eid, step_idx], dst_ref=w2_buf.at[sl], sem=w2_sem.at[sl]).start()
-
-            def _body(gm_id, carry):
-                sem_id = gm_id % 2
-                eid = eid_r[gm_id]
-                prev_e = eid_r[jnp.maximum(gm_id - 1, 0)]
-                is_new = jnp.logical_or(gm_id == 0, prev_e != eid)
-                has_nxt = gm_id + 1 < 5
-                nxt_e = eid_r[jnp.minimum(gm_id + 1, 4)]
-                is_last_e = jnp.logical_or(jnp.logical_not(has_nxt), nxt_e != eid)
-
-                @pl.when(jnp.logical_and(gm_id == 0, eid >= borrowed_slot))
-                def _():
-                    for s_idx in range(2):
-                        _start_w1(s_idx, eid, s_idx)
-                        _start_w2(s_idx, eid, s_idx)
-
-                if use_wla1:
-                    @pl.when(gm_id == 0)
-                    def _():
-                        _def_send()
-
-                    @pl.when(jnp.logical_and(gm_id > 0, is_new))
-                    def _adv():
-                        st_smem[0] = (st_smem[0] + jnp.int32(2)) % jnp.int32(3)
-                        st_smem[1] = jnp.int32(0)
-
-                    w_base = st_smem[0]
-                    sl_la = (w_base + jnp.int32(2)) % jnp.int32(3)
-                    e_after = meta_r[next_act_off + eid]
-
-                    @pl.when(jnp.logical_and(e_after >= 0, st_smem[1] == 0))
-                    def _la():
-                        _start_w1(sl_la, e_after, 0)
-                        _start_w2(sl_la, e_after, 0)
-                        st_smem[1] = jnp.int32(1)
-                else:
-                    w_base = jnp.int32(0)
-                    e_after = jnp.int32(-1)
-
-                pltpu.make_async_copy(src_ref=x_vmem.at[sem_id], dst_ref=x_vmem.at[sem_id], sem=g_sem.at[sem_id]).wait()
-                y1 = jnp.zeros_like(x_vmem[sem_id])
-                for s_idx in range(2):
-                    b1 = (w_base + jnp.int32(s_idx)) % jnp.int32(3) if use_wla1 else jnp.int32(s_idx)
-
-                    @pl.when(is_new)
-                    def _(_b=b1):
-                        pltpu.make_async_copy(src_ref=w1_buf.at[_b], dst_ref=w1_buf.at[_b], sem=w1_sem.at[_b]).wait()
-
-                    y1 = y1 + x_vmem[sem_id] + w1_buf[b1]
-                    if use_wla1 and s_idx == 0:
-                        @pl.when(jnp.logical_and(is_last_e, e_after >= 0))
-                        def _():
-                            _start_w1(w_base, e_after, 1)
-                    elif not use_wla1 and s_idx == 0:
-                        @pl.when(gm_id == 0)
-                        def _():
-                            _def_send()
-
-                        @pl.when(jnp.logical_and(has_nxt, nxt_e != eid))
-                        def _():
-                            _start_w1(0, nxt_e, 0)
-
-                @pl.when(gm_id + 2 < 5)
-                def _():
-                    pltpu.make_async_copy(src_ref=x_hbm.at[gm_id + 2], dst_ref=x_vmem.at[sem_id], sem=g_sem.at[sem_id]).start()
-
-                if not use_wla1:
-                    @pl.when(jnp.logical_and(has_nxt, nxt_e != eid))
-                    def _():
-                        _start_w1(1, nxt_e, 1)
-
-                y2 = y1
-                for s_idx in range(2):
-                    b2 = (w_base + jnp.int32(s_idx)) % jnp.int32(3) if use_wla1 else jnp.int32(s_idx)
-
-                    @pl.when(is_new)
-                    def _(_b=b2):
-                        pltpu.make_async_copy(src_ref=w2_buf.at[_b], dst_ref=w2_buf.at[_b], sem=w2_sem.at[_b]).wait()
-
-                    y2 = y2 + w2_buf[b2]
-                    if use_wla1 and s_idx == 0:
-                        @pl.when(jnp.logical_and(is_last_e, e_after >= 0))
-                        def _():
-                            _start_w2(w_base, e_after, 1)
-                    elif not use_wla1 and s_idx == 0:
-                        @pl.when(jnp.logical_and(has_nxt, nxt_e != eid))
-                        def _():
-                            _start_w2(0, nxt_e, 0)
-
-                out_hbm[gm_id] = y2
-                if not use_wla1:
-                    @pl.when(jnp.logical_and(has_nxt, nxt_e != eid))
-                    def _():
-                        _start_w2(1, nxt_e, 1)
-                return carry
-
-            jax.lax.fori_loop(0, 5, _body, jnp.int32(0))
-            for ci in range(2):
-                pltpu.make_async_remote_copy(
-                    src_ref=w1_hbm.at[ci], dst_ref=cm_w1_pad.at[ci],
-                    send_sem=cm_send_sem.at[2 * ci], recv_sem=cm_recv_sem.at[2 * ci],
-                    device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH,
-                ).wait_send()
-                pltpu.make_async_remote_copy(
-                    src_ref=w2_hbm.at[ci], dst_ref=cm_w2_pad.at[ci],
-                    send_sem=cm_send_sem.at[2 * ci + 1], recv_sem=cm_recv_sem.at[2 * ci + 1],
-                    device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH,
-                ).wait_send()
-                _wait_cm_w1(ci)
-                _wait_cm_w2(ci)
-            pl.semaphore_signal(bar_sem.at[0], 1, device_id={"ep": partner}, device_id_type=pl.DeviceIdType.MESH)
-            pl.semaphore_wait(bar_sem.at[0], 1)
-
-        def _shard(m_s, e_s, x_s, w1_s, w2_s):
-            out, _, _ = pl.pallas_call(
-                _ker,
-                out_shape=(
-                    jax.ShapeDtypeStruct((5, 16, 128), jnp.bfloat16),
-                    jax.ShapeDtypeStruct((2, 2, 16, 128), jnp.bfloat16),
-                    jax.ShapeDtypeStruct((2, 2, 16, 128), jnp.bfloat16),
-                ),
-                grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=2,
-                    in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
-                    out_specs=(
-                        pl.BlockSpec(memory_space=pltpu.VMEM),
-                        pl.BlockSpec(memory_space=pltpu.HBM),
-                        pl.BlockSpec(memory_space=pltpu.HBM),
-                    ),
-                    scratch_shapes=[
-                        pltpu.VMEM((2, 16, 128), jnp.bfloat16),
-                        pltpu.VMEM((3, 16, 128), jnp.bfloat16),
-                        pltpu.VMEM((3, 16, 128), jnp.bfloat16),
-                        pltpu.SemaphoreType.DMA((2,)),
-                        pltpu.SemaphoreType.DMA((3,)),
-                        pltpu.SemaphoreType.DMA((3,)),
-                        pltpu.SemaphoreType.DMA((4,)),
-                        pltpu.SemaphoreType.DMA((4,)),
-                        pltpu.SMEM((5,), jnp.int32),
-                        pltpu.SMEM((2,), jnp.int32),
-                        pltpu.SemaphoreType.REGULAR((1,)),
-                    ],
-                ),
-                interpret=pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan"),
-            )(m_s, e_s, x_s[0], w1_s[0], w2_s[0])
-            return out[None, ...]
-
-        return np.asarray(
-            jax.jit(
-                jax.shard_map(
-                    _shard, mesh=mesh2, in_specs=(P(), P(), P("ep"), P("ep"), P("ep")),
-                    out_specs=P("ep"), check_vma=False,
+        def _cap_pallas(*args, **kwargs):
+            names.append(str(kwargs.get("name", "")))
+            if kwargs.get("interpret") is None:
+                kwargs["interpret"] = pltpu.InterpretParams(
+                    detect_races=True,
+                    uninitialized_memory="nan",
+                    dma_execution_mode="eager",
                 )
-            )(max_gm_meta, gm_eids, x_data, w1_data, w2_data),
-            dtype=np.float32,
-        )
 
-    ref0 = _run_ring(False)
-    got1 = _run_ring(True)
-    assert np.isfinite(got1).all()
-    np.testing.assert_array_equal(got1, ref0)
+            def _wrapped_call(*call_args):
+                # Upstream JAX CPU interpret to_range() cannot index BitcastTransform(uint32) on
+                # float4 HBM DMA refs; pre-pack w1/w2 args as uint32 for interpret execution only.
+                n_sp = kwargs["grid_spec"].num_scalar_prefetch
+                patched = list(call_args)
+                for idx in (n_sp + 1, n_sp + 2):
+                    arr = patched[idx]
+                    if arr.dtype == jnp.float4_e2m1fn:
+                        e_d, k_d, n_d = arr.shape
+                        patched[idx] = jax.lax.bitcast_convert_type(
+                            jnp.swapaxes(arr.reshape(e_d, k_d // 8, 8, n_d), 2, 3),
+                            jnp.uint32,
+                        )
+                return real_pallas_call(*args, **kwargs)(*patched)
+
+            return _wrapped_call
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.object(pl, "pallas_call", _cap_pallas),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+                    "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": wla_mode,
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "128,4096,2048,4096,2048,3,3" if wla_mode == "1" else "128,4096,2048,4096,2048,2,2",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+                    "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "512",
+                },
+            ),
+        ):
+            jax.clear_caches()
+
+            def _fn(x_i, sc_i, w1_i, s1_i, w2_i, s2_i, pnw_i, go_i, tw_i, v_i, cm_i):
+                my_id = go_i[0] // 4
+                lhs_i, grp_sz, grp_st, loc_r = compute_block_scatter_routing(
+                    v_i, go_i[0], my_id, ep_size=2, num_local_experts=4, topk=8, stable_sort=True, has_pad_sentinel=True,
+                )
+                return moe_gmm_local_rs_nodedup(
+                    x_i, w1_i, s1_i, None, w2_i, s2_i, None, None, None,
+                    go_i, tw_i, v_i, pnw_i, None,
+                    activation="silu", topk=8, ep_size=2, ep_axis_name="ep",
+                    has_post_norm=True, sp_enabled=True,
+                    local_t_recv=loc_r, block_scatter=True, return_tiled=True,
+                    return_raw_out_buf=True,
+                    precomputed_routing=(lhs_i, grp_sz, grp_st),
+                    precomputed_chipmate_plan=cm_i[0],
+                    hidden_states_scale=sc_i,
+                )
+
+            out = jax.jit(
+                jax.shard_map(
+                    _fn,
+                    mesh=mesh2,
+                    in_specs=(
+                        P(), P(), P("ep"), P("ep"), P("ep"), P("ep"),
+                        P(), P("ep"), P("ep", None), P(), P("ep"),
+                    ),
+                    out_specs=P("ep", None, None),
+                    check_vma=False,
+                )
+            )(x_fp8, sc_j, w1_fp4, s1_bf, w2_fp4, s2_bf, pnw_j, go_j, tw_j, v_ids_j, cm_plan_2)
+            return np.asarray(out, dtype=np.float32), names
+
+    ref0, names0 = _run_real("0")
+    got1, names1 = _run_real("1")
+    assert any("-wla1" in n for n in names1), names1
+    assert not any("-wla1" in n for n in names0), names0
+    # Active received rows per rank live in [rank, :26*8] = [rank, :208] (rest are unvisited sentinels).
+    got_act = got1.reshape(2, -1, 32, 128)[:, : 26 * 8]
+    ref_act = ref0.reshape(2, -1, 32, 128)[:, : 26 * 8]
+    assert np.isfinite(got_act).all() and np.linalg.norm(got_act) > 0
+    np.testing.assert_array_equal(got_act, ref_act)
 
     if len(jax.devices()) < 8:
         pytest.skip("8-rank HLO check needs >=8 virtual/physical JAX devices")

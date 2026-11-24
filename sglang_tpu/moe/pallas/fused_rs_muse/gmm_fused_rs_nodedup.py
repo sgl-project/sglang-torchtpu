@@ -1340,11 +1340,11 @@ def kernel_main_fused_rs(
     # (out_buf was zero-initialized and awaited above, before the entry-barrier
     # signal, so incoming ICI writes can never race the zeroing.)
 
-    if cfgs1.rhs_cfgs.quant_dtype is not None:
+    if cfgs1.rhs_cfgs.quant_dtype is not None and w1_ref.dtype != jnp.uint32:
         w1_packed = w1_ref.bitcast(jnp.uint32)
     else:
         w1_packed = w1_ref
-    if cfgs2.rhs_cfgs.quant_dtype is not None:
+    if cfgs2.rhs_cfgs.quant_dtype is not None and w2_ref.dtype != jnp.uint32:
         w2_packed = w2_ref.bitcast(jnp.uint32)
     else:
         w2_packed = w2_ref
@@ -3381,6 +3381,25 @@ def kernel_main_fused_rs(
                 jnp.logical_not(is_new_expert), jnp.bool_(can_cache_w2)
             )
 
+            if enable_chipmate and cm_defer_send:
+                _cond_early_cm = (
+                    (gm_id == 0)
+                    if (_wla1 or _wla2)
+                    else jnp.logical_and(
+                        gm_id == 0,
+                        jnp.logical_or(
+                            expert_id >= borrowed_slot,
+                            (has_next & (next_e >= borrowed_slot))
+                            if can_cache_w1
+                            else jnp.bool_(False),
+                        ),
+                    )
+                )
+
+                @pl.when(_cond_early_cm)
+                def _():
+                    _maybe_start_deferred_cm_wt_send()
+
             if _prologue_w_dma:
                 if enable_chipmate:
 
@@ -3408,12 +3427,6 @@ def kernel_main_fused_rs(
                 def _():
                     for _i in range(min(num_w2_bufs, total_w2_steps)):
                         start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
-
-            if enable_chipmate and cm_defer_send and (_wla1 or _wla2):
-
-                @pl.when(gm_id == 0)
-                def _():
-                    _maybe_start_deferred_cm_wt_send()
 
             if _wla1:
 
