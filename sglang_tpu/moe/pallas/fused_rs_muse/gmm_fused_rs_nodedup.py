@@ -622,7 +622,7 @@ def _select_fused_rs_block_sizes(
             tile_n1 = min(tile_n1, 1024)
             tile_n2 = min(tile_n2, 1024)
     if (
-        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) >= 1
+        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) == 1
         and is_quantized
         and not fp8_direct_write
         and not hot_interleave
@@ -630,8 +630,8 @@ def _select_fused_rs_block_sizes(
         and jax.dtypes.itemsize_bits(w1_dtype) in (4, 32)
         and (size_k1, aligned_n1, padded_k2, aligned_n2) == (4096, 8192, 4096, 4096)
         and (tile_k1, tile_n1, tile_k2, tile_n2) == (4096, 2048, 4096, 2048)
-        and (-(-tile_k1 // (quant_block_size or size_k1))) % 16 == 0
-        and (-(-tile_k2 // (quant_block_size or padded_k2))) % 16 == 0
+        and (-(-tile_k1 // (quant_block_size or size_k1))) % 8 == 0
+        and (-(-tile_k2 // (quant_block_size or padded_k2))) % 8 == 0
     ):
         num_w1_bufs, num_w2_bufs = 3, 3
     # --- Step 4a': decode tile override (env, FP4 experts, decode M) ---
@@ -3409,6 +3409,12 @@ def kernel_main_fused_rs(
                     for _i in range(min(num_w2_bufs, total_w2_steps)):
                         start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
 
+            if enable_chipmate and cm_defer_send and (_wla1 or _wla2):
+
+                @pl.when(gm_id == 0)
+                def _():
+                    _maybe_start_deferred_cm_wt_send()
+
             if _wla1:
 
                 @pl.when(jnp.logical_and(gm_id > 0, is_new_expert))
@@ -3445,11 +3451,6 @@ def kernel_main_fused_rs(
                 _is_last_tile_of_e = jnp.logical_or(
                     jnp.logical_not(has_next), next_e != expert_id
                 )
-                if enable_chipmate and cm_defer_send:
-
-                    @pl.when(gm_id == 0)
-                    def _():
-                        _maybe_start_deferred_cm_wt_send()
 
                 @pl.when(
                     jnp.logical_and(_e_after_cur >= 0, gm_id_ref[_la_started_idx] == 0)
@@ -3810,7 +3811,7 @@ def kernel_main_fused_rs(
                 def _():
                     _do_direct_write(gm_id - 1, _prev_stg)
 
-            if enable_chipmate and cm_defer_send and not _wla2:
+            if enable_chipmate and cm_defer_send and not (_wla1 or _wla2):
 
                 @pl.when(gm_id == 0)
                 def _():
@@ -4831,8 +4832,8 @@ def gmm_v2_fused_rs(
         and (size_k1 // tile_k1) * ((size_n1 // 2 if act_fn else size_n1) // tile_n1)
         == 2
         and (size_k2 // tile_k2) * (size_n2 // tile_n2) == 2
-        and (-(-tile_k1 // rhs1_quant_block_size)) % 16 == 0
-        and (-(-tile_k2 // rhs2_quant_block_size)) % 16 == 0
+        and (-(-tile_k1 // rhs1_quant_block_size)) % 8 == 0
+        and (-(-tile_k2 // rhs2_quant_block_size)) % 8 == 0
     )
     eff_wla2 = (
         _wla_cfg == 2
