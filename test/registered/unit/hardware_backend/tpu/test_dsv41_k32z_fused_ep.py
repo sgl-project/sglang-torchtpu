@@ -438,11 +438,13 @@ def test_early_ship_needs_a_two_by_two_grid_of_two_shard_chips(v2):
 
 def test_decode_buckets_loop_their_tall_bodies(v2):
     host, ep, g_local = v2.host, 8, 48
+    # DeepSeek-V4.1-Flash's expert shape (hidden 5120, intermediate 2304),
+    # whose chunk counts the (3, 4) step divides.
     for rows in (8, 16, 32, 64):
         stride = host.ragged_stride_bound(ep * rows, 6, ep * g_local, 256)
-        roll, roll_from = host.k32z_roll_plan(stride, ep, g_local, HIDDEN, INTER)
+        roll, roll_from = host.k32z_roll_plan(stride, ep, g_local, 5120, 2304)
         assert roll == (3, 4) and roll_from == 128, rows
-        assert host.k32z_build_plan(stride, ep, g_local, HIDDEN, INTER)[
+        assert host.k32z_build_plan(stride, ep, g_local, 5120, 2304)[
             "k32z_ffn_roll"
         ] == (3, 4)
     # A shape the (3, 4) step does not divide takes the plain count.
