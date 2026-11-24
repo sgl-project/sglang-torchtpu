@@ -244,8 +244,8 @@ class WriteBackCopyAhead:
         self, *, core: UnifiedTreeCore, budget: int, window: set[int]
     ) -> None:
         full = self._cache.components[BASE_COMPONENT_TYPE]
-        full._ensure_eviction_strategy()
-        priority = full.session_ref_eviction_strategy
+        # The device walk's key, which skips session coverage when it is host-only.
+        priority = full._device_eviction_key
         heap = [(priority(n), n) for n in core.evictable_device_leaves]
         heapq.heapify(heap)
         taken: set[int] = set()

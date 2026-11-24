@@ -149,7 +149,10 @@ class _FakeRaidenController(TpuDMAHybridCacheController):
 
 
 def _build_cache(
-    *, kv_size: int = 64
+    *,
+    kv_size: int = 64,
+    enable_session_radix_cache: bool = False,
+    session_coverage_host_only: bool = False,
 ) -> tuple[UnifiedRadixCache, TokenToKVPoolAllocator]:
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
     req_to_token_pool = ReqToTokenPool(
@@ -179,6 +182,8 @@ def _build_cache(
         page_size=1,
         tree_slots=tree_slots_of((FULL,)),
         tree_core_backend="python",
+        enable_session_radix_cache=enable_session_radix_cache,
+        session_coverage_host_only=session_coverage_host_only,
     )
     return UnifiedRadixCache(params), allocator
 
@@ -253,6 +258,22 @@ def _insert(cache: UnifiedRadixCache, allocator, tokens: list[int]) -> int:
 
 def _node(cache: UnifiedRadixCache, node_id: int):
     return cache.tree_core.node_by_id(node_id)
+
+
+def _cover_by_session(
+    cache: UnifiedRadixCache, *, node_id: int, tokens: list[int], session_id: str
+) -> None:
+    cache.session_refs.register_session_ref(
+        SimpleNamespace(
+            session_id=session_id,
+            session_generation=cache.ensure_session_generation(session_id),
+            session=None,
+            origin_input_ids=array("q", tokens),
+            output_ids=array("q"),
+            extra_key=None,
+        ),
+        leaf=node_id,
+    )
 
 
 class TestWriteBackCopyAhead(CustomTestCase):
@@ -397,6 +418,35 @@ class TestWriteBackCopyAhead(CustomTestCase):
 
         self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {parent})
         self.assertTrue(cache.tree_core.is_backuped(parent))
+
+    def test_window_copies_the_device_eviction_order_under_session_coverage(self):
+        # Covered leaves go last on device by default; host-only coverage keeps
+        # device eviction plain LRU, so the oldest leaf goes first even if covered.
+        for host_only, first_victim in ((False, "active"), (True, "idle")):
+            with self.subTest(session_coverage_host_only=host_only):
+                cache, allocator = _build_cache(
+                    enable_session_radix_cache=True,
+                    session_coverage_host_only=host_only,
+                )
+                controller = _attach_write_back(
+                    cache, host_capacity=64, copy_ahead_tokens=8
+                )
+                nodes = {"idle": _insert(cache, allocator, [1] * 8)}
+                _cover_by_session(
+                    cache, node_id=nodes["idle"], tokens=[1] * 8, session_id="idle"
+                )
+                nodes["active"] = _insert(cache, allocator, [2] * 8)
+                cache.check_hicache_events()
+                window = set(cache._write_back_copy_ahead.pending_node_ids)
+                controller.land_all()
+                cache.check_hicache_events()
+
+                cache.evict(EvictParams(num_tokens=8))
+
+                evicted = {n for n in nodes.values() if _node(cache, n).evicted}
+                self.assertEqual(window, {nodes[first_victim]})
+                self.assertEqual(evicted, window)
+                self.assertEqual(controller.waits, [])
 
     def test_window_copy_ack_leaves_the_write_horizon_alone(self):
         """A request's lock release marks its path as just written; a window copy's
