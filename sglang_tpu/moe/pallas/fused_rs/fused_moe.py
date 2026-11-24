@@ -88,6 +88,20 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 # ============================================================================
 
 
+def _stable_argsort_ids(ids: jax.Array, num_ids: int) -> jax.Array:
+    """jnp.argsort(ids) (stable) of non-negative ids < num_ids; SGLANG_TPU_FUSED_RS_KEY_SORT packs
+    (id, index) into one int32 key so the sort carries no second operand."""
+    n = ids.shape[0]
+    bits = max(1, (n - 1).bit_length())
+    if (
+        not tpu_envs.SGLANG_TPU_FUSED_RS_KEY_SORT.get()
+        or (num_ids - 1).bit_length() + bits > 31
+    ):
+        return jnp.argsort(ids)
+    key = (ids.astype(jnp.int32) << bits) | jnp.arange(n, dtype=jnp.int32)
+    return jnp.sort(key) & ((1 << bits) - 1)
+
+
 def _compute_rs_routing(topk_indices, *, num_experts, topk):
     """Inline routing for the RS path.
 
@@ -110,7 +124,7 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
     integers for scalar prefetch refs (``tpu.memref_slice`` constraint).
     """
     topk_indices_flat = topk_indices.flatten()
-    topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    topk_argsort_indices = _stable_argsort_ids(topk_indices_flat, num_experts)
     expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
     group_sizes = jnp.sum(
         (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
@@ -171,7 +185,7 @@ def _pair_post_combine(
         local_topk = jax.lax.dynamic_slice_in_dim(
             topk_indices, my_id * chunk_size, chunk_size, axis=0
         )
-        local_flat = jnp.argsort(local_topk.reshape(-1))
+        local_flat = _stable_argsort_ids(local_topk.reshape(-1), 1 << 15)
         token = local_flat // topk
         weight = topk_weights.astype(jnp.float32)[token, local_flat % topk]
     else:
