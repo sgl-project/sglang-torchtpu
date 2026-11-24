@@ -749,6 +749,9 @@ class TpuEnvs:
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)
+    # Opt-in RPAd_fast mode override/suffix applied when decode_query_size > 1
+    # (e.g. "auto" -> c1024,noz,pbf16,g4k,foldcol for dq<=4 and c512,... for dq>=5).
+    SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY_OPTS = EnvStr("")
     # Wave-8 RPAd_fast inner-loop optimizations: swafast2 (zero upfront VMEM zeroing via
     # lazy-HWM sanitizer + per-seq 512/1024/2176 gears + vertical page_reduce), w7auto
     # c512 gear + pv_bf16 pass-through fix, and hoisted whole-batch new_kv precompute.
