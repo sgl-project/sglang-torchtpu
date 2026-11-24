@@ -25,6 +25,38 @@ from sglang_tpu.attention.pallas.mla_sparse_fused import (
 )
 
 
+def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:
+    """Stable compaction along axis 1: kept entries first, in order, then -1.
+
+    Each kept entry moves left by the number of dropped entries before it.
+    Applying the shift one bit at a time from the lowest never lands two kept
+    entries on one slot (the shifts never decrease along the row), so every
+    stage is a static slice and a select instead of a dynamic scatter or sort.
+    """
+    values = jnp.where(keep, values, -1)
+    shift = jnp.cumsum(~keep, axis=1, dtype=jnp.int32)
+    width = keep.shape[1]
+    bit = 1
+    while bit < width:
+        moves = keep & ((shift & bit) != 0)
+
+        def left(x, fill):
+            pad = jnp.full(x.shape[:1] + (bit,) + x.shape[2:], fill, x.dtype)
+            return jnp.concatenate([x[:, bit:], pad], axis=1)
+
+        arrive = left(moves, False)
+        stay = keep & ~moves
+        values = jnp.where(
+            arrive,
+            left(values, -1),
+            jnp.where(stay, values, -1),
+        )
+        shift = jnp.where(arrive, left(shift, 0), shift)
+        keep = arrive | stay
+        bit *= 2
+    return values
+
+
 def localize_topk(
     topk_indices: jax.Array,  # i32[T, K], global positions, -1 padded at the tail
     dcp_rank: jax.Array,  # i32 scalar
@@ -33,18 +65,24 @@ def localize_topk(
     interleave_size: int,
 ) -> tuple[jax.Array, jax.Array]:
     """This rank's share of every row, in local positions."""
-    num_rows, width = topk_indices.shape
-    chunk = topk_indices // interleave_size
-    owned = (topk_indices >= 0) & (chunk % dcp_size == dcp_rank)
-    local = (chunk // dcp_size) * interleave_size + topk_indices % interleave_size
+    if interleave_size & (interleave_size - 1) == 0:
+        interleave_shift = interleave_size.bit_length() - 1
+        chunk = topk_indices >> interleave_shift
+        offset = topk_indices & (interleave_size - 1)
+    else:
+        chunk = topk_indices // interleave_size
+        offset = topk_indices % interleave_size
 
-    dest = jnp.where(owned, jnp.cumsum(owned, axis=1, dtype=jnp.int32) - 1, width)
-    rows = jnp.broadcast_to(jnp.arange(num_rows, dtype=jnp.int32)[:, None], dest.shape)
-    packed = (
-        jnp.full_like(topk_indices, -1)
-        .at[rows, dest]
-        .set(jnp.where(owned, local, -1), mode="drop")
-    )
+    if dcp_size & (dcp_size - 1) == 0:
+        dcp_shift = dcp_size.bit_length() - 1
+        owned = (topk_indices >= 0) & ((chunk & (dcp_size - 1)) == dcp_rank)
+        local_chunk = chunk >> dcp_shift
+    else:
+        owned = (topk_indices >= 0) & (chunk % dcp_size == dcp_rank)
+        local_chunk = chunk // dcp_size
+
+    local = local_chunk * interleave_size + offset
+    packed = compact_left(local, owned)
     return packed, jnp.any(owned, axis=1)
 
 

@@ -33,7 +33,11 @@ import ml_dtypes
 import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.pallas.mla_sparse_dcp import sparse_mla_attention_dcp
+from sglang_tpu.attention.pallas.mla_sparse_dcp import (
+    compact_left,
+    localize_topk,
+    sparse_mla_attention_dcp,
+)
 from sglang_tpu.attention.pallas.mla_sparse_fused import (
     NOPE_DIM,
     ROPE_DIM,
@@ -209,6 +213,50 @@ class TestSparseMlaDcpKernel(CustomTestCase):
         decode_lens = [n + 1 for n in lens]
         ones = [1] * len(lens)
         self._step(layout, caches, ones, decode_lens, is_decode=True, seed=1)
+
+    def test_localize_topk_compact_left_matches_reference(self):
+        rng = np.random.default_rng(123)
+        for dcp_size, interleave_size, width in (
+            (4, 128, 1),
+            (4, 128, 17),
+            (8, 128, 256),
+            (8, 4, 256),
+            (3, 6, 31),
+        ):
+            with self.subTest(
+                dcp_size=dcp_size, interleave_size=interleave_size, width=width
+            ):
+                rows = rng.integers(-1, 4096, size=(12, width), dtype=np.int32)
+                # Force an all-padding row and an all-rank-0 row.
+                rows[0, :] = -1
+                rows[1, :] = np.arange(width, dtype=np.int32) % interleave_size
+                for rank in range(dcp_size):
+                    got, owns = localize_topk(
+                        jnp.asarray(rows),
+                        jnp.asarray(rank, jnp.int32),
+                        dcp_size=dcp_size,
+                        interleave_size=interleave_size,
+                    )
+                    got_np = np.asarray(got)
+                    owns_np = np.asarray(owns)
+                    for r in range(rows.shape[0]):
+                        expected = [
+                            (int(p) // (interleave_size * dcp_size)) * interleave_size
+                            + int(p) % interleave_size
+                            for p in rows[r]
+                            if p >= 0 and (int(p) // interleave_size) % dcp_size == rank
+                        ]
+                        self.assertEqual(bool(owns_np[r]), len(expected) > 0)
+                        padded = expected + [-1] * (width - len(expected))
+                        np.testing.assert_array_equal(got_np[r], padded)
+
+        # Direct compact_left edge check: width=1 with keep=False must yield -1.
+        out = np.asarray(
+            compact_left(
+                jnp.asarray([[42], [7]], jnp.int32), jnp.asarray([[False], [True]])
+            )
+        )
+        np.testing.assert_array_equal(out, np.array([[-1], [7]], dtype=np.int32))
 
 
 if __name__ == "__main__":
