@@ -237,6 +237,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "0") == "1"
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
+    # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
+    pa_fp = int(os.environ.get("SPTP_PA_FUSE_POOL", "0")) if pa_a2a else 0
 
     def forward(
         meta,
@@ -401,11 +403,23 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             pa_tn,
                             pa_rc,
                             pa_la,
+                            pa_fp,
                         )
-                        stream, ids, tw, f8, f_s = pa_o(
-                            l, me, g8, g_s.reshape(1, T), stream, smalls, wo, wrouter
+                        args = (
+                            l,
+                            me,
+                            g8,
+                            g_s.reshape(1, T),
+                            stream,
+                            smalls,
+                            wo,
+                            wrouter,
                         )
-                        xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                        if pa_fp:
+                            stream, ids, tw, xe8, xs = pa_o(*args, wpool)
+                        else:
+                            stream, ids, tw, f8, f_s = pa_o(*args)
+                            xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
                 elif pa:
                     with _scope("sp_o_a2a"):
                         # the token-major [T, qd] gated output (the o gate's layout to come)

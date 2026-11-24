@@ -179,6 +179,7 @@ def oproj_a2a_call(
     tn: int = 512,
     rc: int = 64,
     la: int = 7,
+    pool_tn: int = 0,
 ):
     """oproj_call with the gated-output a2a inside: (lyr_me [2] i32 (layer, rank), g8 [T, qd]
     e4m3 (this rank's heads of every row, token major), gs [1, T] f32 (their row scales),
@@ -189,7 +190,10 @@ def oproj_a2a_call(
     sources first), so each block's
     matmul runs while later blocks land. Each source block keeps its own row scale (applied to
     its partial product): no requant, one e4m3 rounding of the gated output instead of two.
-    la: sends in flight ahead of the receivers' use (7: all at the start)."""
+    la: sends in flight ahead of the receivers' use (7: all at the start).
+    pool_tn > 0: pool_call's steps (wpool [L, H, He] after wrouter, column blocks of pool_tn)
+    follow in this kernel (the pool input stays in VMEM, wpool's first block loads under the
+    epilogue); outputs (stream, ids, tw, xe8 [Ts, He] e4m3, xs [1, Ts] f32)."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
     if (
@@ -202,11 +206,27 @@ def oproj_a2a_call(
     ):
         raise ValueError(f"o proj tiles {tn} / {rc} do not fit H {H} Ts {Ts}")
 
-    def kernel(
-        lm, g8_hbm, gs_hbm, st_hbm, sm_ref, wo_ref, wr_hbm,
-        so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
-        gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-    ):  # fmt: skip
+    fuse = pool_tn > 0
+    He = c.expert_hidden
+    nP = He // pool_tn if fuse else 0
+    if fuse and (He % pool_tn or He > H):
+        raise ValueError(f"pool tile {pool_tn} does not fit He {He}")
+
+    def kernel(lm, *refs):
+        if fuse:
+            (
+                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_ref, wr_hbm, wp_ref,
+                so_hbm, ids_ref, tw_ref, xe_ref, xs_ref,
+                gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
+                fs_ref, ssq, amx, xsc,
+            ) = refs  # fmt: skip
+            f8_hbm = None
+        else:
+            (
+                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_ref, wr_hbm,
+                so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
+                gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
+            ) = refs  # fmt: skip
         r = pl.program_id(0)
         me = lm[1]
         # step r takes source m ^ r: own block, the partner core, then the other chips' cores
@@ -259,45 +279,47 @@ def oproj_a2a_call(
                 for cp in sends(jnp.bitwise_xor(me, r + la)):
                     cp.start()
 
-        with _scope("pa_a2a_wait"):
-            for cp in locals_(src):
-                cp.wait()
-        with _scope("pa_oproj"):
-            # src's row scales as a column
-            g_col = jnp.transpose(jnp.broadcast_to(gsr[src], (8, Ts)))[:, 0:1]
+        @pl.when(r < tp)
+        def _():
+            with _scope("pa_a2a_wait"):
+                for cp in locals_(src):
+                    cp.wait()
+            with _scope("pa_oproj"):
+                # src's row scales as a column
+                g_col = jnp.transpose(jnp.broadcast_to(gsr[src], (8, Ts)))[:, 0:1]
 
-            def block(n0, first=False):
-                acc = None
-                for k0 in range(0, qd, _KC):
-                    part = jnp.dot(
-                        gq[src, :, k0 : k0 + _KC],
-                        wo_ref[k0 : k0 + _KC, n0 : n0 + tn],
-                        preferred_element_type=_F32,
-                    )
-                    acc = part if acc is None else acc + part
-                acc = acc * g_col
-                return acc if first else big[:, n0 : n0 + tn] + acc
+                def block(n0, first=False):
+                    acc = None
+                    for k0 in range(0, qd, _KC):
+                        part = jnp.dot(
+                            gq[src, :, k0 : k0 + _KC],
+                            wo_ref[k0 : k0 + _KC, n0 : n0 + tn],
+                            preferred_element_type=_F32,
+                        )
+                        acc = part if acc is None else acc + part
+                    acc = acc * g_col
+                    return acc if first else big[:, n0 : n0 + tn] + acc
 
-            @pl.when(r == 0)
-            def _():
-                for n0 in range(0, H, tn):
-                    big[:, n0 : n0 + tn] = block(n0, first=True)
+                @pl.when(r == 0)
+                def _():
+                    for n0 in range(0, H, tn):
+                        big[:, n0 : n0 + tn] = block(n0, first=True)
 
-            @pl.when(jnp.logical_and(r > 0, r < tp - 1))
-            def _():
-                for n0 in range(0, H, tn):
-                    big[:, n0 : n0 + tn] = block(n0)
+                @pl.when(jnp.logical_and(r > 0, r < tp - 1))
+                def _():
+                    for n0 in range(0, H, tn):
+                        big[:, n0 : n0 + tn] = block(n0)
 
-            # the last block: wo's column scales and the residual's row sums of squares under
-            # its matmuls
-            @pl.when(r == tp - 1)
-            def _():
-                ss = jnp.zeros((Ts, 1), _F32)
-                for n0 in range(0, H, tn):
-                    o = block(n0) * _row(sm_ref, "wo_s", n0, tn)
-                    big[:, n0 : n0 + tn] = o
-                    ss = ss + jnp.sum(o * o, axis=1, keepdims=True)
-                sso[...] = ss
+                # the last block: wo's column scales and the residual's row sums of squares under
+                # its matmuls
+                @pl.when(r == tp - 1)
+                def _():
+                    ss = jnp.zeros((Ts, 1), _F32)
+                    for n0 in range(0, H, tn):
+                        o = block(n0) * _row(sm_ref, "wo_s", n0, tn)
+                        big[:, n0 : n0 + tn] = o
+                        ss = ss + jnp.sum(o * o, axis=1, keepdims=True)
+                    sso[...] = ss
 
         ep = _Epilogue(c, Ts, rc, sm_ref, st_hbm, so_hbm, big, sbuf, obuf, sin, sout)
 
@@ -316,6 +338,15 @@ def oproj_a2a_call(
                 for cp in sends(d):
                     cp.wait_send()
 
+        if fuse:
+            # the pool input stays in gq; pooled over big's dead router input
+            @pl.when(r >= tp)
+            def _():
+                _pool_step(
+                    c, r - tp, nP, pool_tn, rc, gq, fs_ref, sm_ref, wp_ref, big, ssq,
+                    amx, xsc, xe_ref, xs_ref,
+                )  # fmt: skip
+
     anyspec = pl.BlockSpec(memory_space=pl.ANY)
 
     def whole(*shape):
@@ -327,19 +358,35 @@ def oproj_a2a_call(
         anyspec,
         pl.BlockSpec((None, SMALL_ROWS, H), lambda r, lm: (lm[0], 0, 0)),
         pl.BlockSpec(
-            (None, qd, H), lambda r, lm: (lm[0], jnp.bitwise_xor(lm[1], r), 0)
+            (None, qd, H),
+            lambda r, lm: (lm[0], jnp.bitwise_xor(lm[1], jnp.minimum(r, tp - 1)), 0),
         ),
         anyspec,
     ]
     k_top = c.top_k
-    out_specs = (anyspec, whole(k_top, Ts), whole(k_top, Ts), anyspec, whole(Ts, 1))
-    out_shape = (
+    out_specs = [anyspec, whole(k_top, Ts), whole(k_top, Ts)]
+    out_shape = [
         jax.ShapeDtypeStruct((Ts, H), _F32),
         jax.ShapeDtypeStruct((k_top, Ts), jnp.int32),
         jax.ShapeDtypeStruct((k_top, Ts), _F32),
-        jax.ShapeDtypeStruct((tp, Ts, qd), _FP8),
-        jax.ShapeDtypeStruct((Ts, 1), _F32),
-    )
+    ]
+    if fuse:
+        in_specs.append(
+            pl.BlockSpec(
+                (None, H, pool_tn), lambda r, lm: (lm[0], 0, jnp.maximum(r - tp, 0))
+            )
+        )
+        out_specs += [whole(Ts, He), whole(1, Ts)]
+        out_shape += [
+            jax.ShapeDtypeStruct((Ts, He), _FP8),
+            jax.ShapeDtypeStruct((1, Ts), _F32),
+        ]
+    else:
+        out_specs += [anyspec, whole(Ts, 1)]
+        out_shape += [
+            jax.ShapeDtypeStruct((tp, Ts, qd), _FP8),
+            jax.ShapeDtypeStruct((Ts, 1), _F32),
+        ]
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
     scratch = [
         vmem((tp, Ts, qd), _FP8),
@@ -357,11 +404,13 @@ def oproj_a2a_call(
         dma((2,)),
         dma((2,)),
     ]
+    if fuse:
+        scratch += [vmem((Ts, 1), _F32) for _ in range(4)]
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
-        grid=(tp,),
+        grid=(tp + nP,),
         in_specs=in_specs,
-        out_specs=out_specs,
+        out_specs=tuple(out_specs),
         scratch_shapes=scratch,
     )
     params = pltpu.CompilerParams(
@@ -370,15 +419,15 @@ def oproj_a2a_call(
         collective_id=collective_id,
     )
 
-    def call(layer: int, me, g8, gs, stream, smalls, wo, wrouter):
+    def call(layer: int, me, g8, gs, stream, smalls, wo, wrouter, *wpool):
         lm = jnp.stack([jnp.asarray(layer, jnp.int32), me.astype(jnp.int32)])
         return pl.pallas_call(
             kernel,
             grid_spec=grid_spec,
-            out_shape=out_shape,
+            out_shape=tuple(out_shape),
             compiler_params=params,
-            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}",
-        )(lm, g8, gs, stream, smalls, wo, wrouter)
+            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}",
+        )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool)
 
     return call
 
@@ -453,8 +502,9 @@ class _Epilogue:
 
     def route(self, gq, f8_hbm, f8_sem, wr, wr_cp, E, ids_ref, tw_ref):
         c, Ts, big = self.c, self.Ts, self.big
-        f8_cp = pltpu.make_async_copy(gq, f8_hbm, f8_sem)
-        f8_cp.start()
+        f8_cp = None if f8_hbm is None else pltpu.make_async_copy(gq, f8_hbm, f8_sem)
+        if f8_cp is not None:
+            f8_cp.start()
         wr_cp.wait()
         bias = _row(self.sm, "expert_bias", 0, E)
         rr = min(_ROUTER_ROWS, Ts)
@@ -467,7 +517,8 @@ class _Epilogue:
                 ids, tw = _top_k(sc, bias, c.top_k, c.router_eps, c.route_scale)
                 ids_ref[:, r0 : r0 + rr] = ids
                 tw_ref[:, r0 : r0 + rr] = tw
-        f8_cp.wait()
+        if f8_cp is not None:
+            f8_cp.wait()
         for i in range(max(self.n_rc - 2, 0), self.n_rc):
             self.cp_out(i, i % 2).wait()
 
@@ -509,52 +560,10 @@ def pool_call(c: PFConfig, tpn: int = 512, rc: int = 64):
     def kernel(
         lyr, f8_ref, fs_ref, sm_ref, wp_ref, xe_ref, xs_ref, pooled, ssq, amx, xsc
     ):
-        p = pl.program_id(0)
-        with _scope("pa_pool"):
-            acc = None
-            for k0 in range(0, H, _KC):
-                src, c0 = divmod(k0, qd)
-                part = jnp.dot(
-                    f8_ref[src, :, c0 : c0 + _KC],
-                    wp_ref[k0 : k0 + _KC, :],
-                    preferred_element_type=_F32,
-                )
-                acc = part if acc is None else acc + part
-            lo = pl.multiple_of(p * tpn, tpn)
-            pb = acc * fs_ref[...] * _row(sm_ref, "wpool_s", lo, tpn)
-            pooled[:, pl.ds(lo, tpn)] = pb
-            ss = jnp.sum(pb * pb, axis=1, keepdims=True)
-            pe = _row(sm_ref, "pre_expert_w", lo, tpn)
-            mx = jnp.max(jnp.abs(pb * pe), axis=1, keepdims=True)
-
-            @pl.when(p == 0)
-            def _():
-                ssq[...] = ss
-                amx[...] = mx
-
-            @pl.when(p > 0)
-            def _():
-                ssq[...] += ss
-                amx[...] = jnp.maximum(amx[...], mx)
-
-        @pl.when(p == nP - 1)
-        def _():
-            with _scope("pa_xe_quant"):
-                r = jax.lax.rsqrt(ssq[...] * (1.0 / He) + c.rms_eps)
-                xs = jnp.maximum(amx[...] * r, 1e-30) / _FP8_MAX
-                xsc[...] = xs
-                # lane dense [1, Ts] (a [Ts, 1] output pads every row to 128 lanes)
-                xs_ref[...] = jnp.transpose(jnp.broadcast_to(xs, (Ts, 128)))[0:1]
-                pe = _row(sm_ref, "pre_expert_w", 0, He)
-
-                def body(i, carry):
-                    rows = pl.ds(pl.multiple_of(i * rc, rc), rc)
-                    f = jax.lax.rsqrt(ssq[rows, :] * (1.0 / He) + c.rms_eps)
-                    f = f / xsc[rows, :]
-                    xe_ref[rows, :] = (pooled[rows, :] * f * pe).astype(_FP8)
-                    return carry
-
-                jax.lax.fori_loop(0, n_rc, body, 0)
+        _pool_step(
+            c, pl.program_id(0), nP, tpn, rc, f8_ref, fs_ref, sm_ref, wp_ref, pooled,
+            ssq, amx, xsc, xe_ref, xs_ref,
+        )  # fmt: skip
 
     def whole(*shape):
         return pl.BlockSpec(shape, lambda p, lyr: (0,) * len(shape))
@@ -593,3 +602,56 @@ def pool_call(c: PFConfig, tpn: int = 512, rc: int = 64):
         )(jnp.full((1,), layer, jnp.int32), f8, fs, smalls, wpool)
 
     return call
+
+
+def _pool_step(c, p, nP, tpn, rc, f8_ref, fs_ref, sm_ref, wp_ref, pooled, ssq, amx, xsc, xe_ref, xs_ref):  # fmt: skip
+    """Pool column block p of nP (f8 [tp, Ts, qd] by K block) into pooled[:, p * tpn ...], the
+    pre-expert rms sums and amax; the last block quantizes the rows into xe_ref / xs_ref."""
+    Ts, H, He = pooled.shape[0], c.hidden, c.expert_hidden
+    qd = f8_ref.shape[2]
+    n_rc = Ts // rc
+    with _scope("pa_pool"):
+        acc = None
+        for k0 in range(0, H, _KC):
+            src, c0 = divmod(k0, qd)
+            part = jnp.dot(
+                f8_ref[src, :, c0 : c0 + _KC],
+                wp_ref[k0 : k0 + _KC, :],
+                preferred_element_type=_F32,
+            )
+            acc = part if acc is None else acc + part
+        lo = pl.multiple_of(p * tpn, tpn)
+        pb = acc * fs_ref[...] * _row(sm_ref, "wpool_s", lo, tpn)
+        pooled[:, pl.ds(lo, tpn)] = pb
+        ss = jnp.sum(pb * pb, axis=1, keepdims=True)
+        pe = _row(sm_ref, "pre_expert_w", lo, tpn)
+        mx = jnp.max(jnp.abs(pb * pe), axis=1, keepdims=True)
+
+        @pl.when(p == 0)
+        def _():
+            ssq[...] = ss
+            amx[...] = mx
+
+        @pl.when(p > 0)
+        def _():
+            ssq[...] += ss
+            amx[...] = jnp.maximum(amx[...], mx)
+
+    @pl.when(p == nP - 1)
+    def _():
+        with _scope("pa_xe_quant"):
+            r = jax.lax.rsqrt(ssq[...] * (1.0 / He) + c.rms_eps)
+            xs = jnp.maximum(amx[...] * r, 1e-30) / _FP8_MAX
+            xsc[...] = xs
+            # lane dense [1, Ts] (a [Ts, 1] output pads every row to 128 lanes)
+            xs_ref[...] = jnp.transpose(jnp.broadcast_to(xs, (Ts, 128)))[0:1]
+            pe = _row(sm_ref, "pre_expert_w", 0, He)
+
+            def body(i, carry):
+                rows = pl.ds(pl.multiple_of(i * rc, rc), rc)
+                f = jax.lax.rsqrt(ssq[rows, :] * (1.0 / He) + c.rms_eps)
+                f = f / xsc[rows, :]
+                xe_ref[rows, :] = (pooled[rows, :He] * f * pe).astype(_FP8)
+                return carry
+
+            jax.lax.fori_loop(0, n_rc, body, 0)
