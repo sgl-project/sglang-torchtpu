@@ -27,6 +27,7 @@ from sglang_tpu.muse_megakernel_v2.common.consts import (
     SMALL,
 )
 from sglang_tpu.muse_megakernel_v2.common.numerics import _heads_rms, _rms, _topk_iter
+from sglang_tpu.muse_megakernel_v2.common.trace import _scope
 
 # One idle iteration after every stage: each stage's remote DMAs get two iterations to land.
 _GAP = 1
@@ -158,23 +159,28 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
                     cp.start()
 
             b = j % 2
-            o = _heads_rms(o_v[b], c.q_heads, hd, c.rms_eps)
-            a = (jax.nn.sigmoid(g_v[b].astype(jnp.float32)) * o).astype(jnp.bfloat16)
-            part = jnp.dot(a, wo_v[...], preferred_element_type=jnp.float32) * row(
-                "wo_s"
-            )
-            send_v[b] = part.astype(jnp.bfloat16)
+            with _scope("ao_oproj"):
+                o = _heads_rms(o_v[b], c.q_heads, hd, c.rms_eps)
+                a = (jax.nn.sigmoid(g_v[b].astype(jnp.float32)) * o).astype(
+                    jnp.bfloat16
+                )
+                part = jnp.dot(a, wo_v[...], preferred_element_type=jnp.float32) * row(
+                    "wo_s"
+                )
+                send_v[b] = part.astype(jnp.bfloat16)
             for cp in col.rs_pair(j % _SLOTS, send_v.at[b], rsp_pad, Hl):
                 cp.start()
 
         def s2(j):
             """Pair sums; RS phase 1."""
             s, b = j % _SLOTS, j % 2
-            wait_all(col.rs_pair(s, send_v.at[b], rsp_pad, Hl))
-            for ch in range(nchip):
-                ps_v[s, ch] = col.rs_pair_sum(s, send_v.at[b], rsp_pad, Hl, ch).astype(
-                    jnp.bfloat16
-                )
+            with _scope("ao_rs0_wait"):
+                wait_all(col.rs_pair(s, send_v.at[b], rsp_pad, Hl))
+            with _scope("ao_rs_sum"):
+                for ch in range(nchip):
+                    ps_v[s, ch] = col.rs_pair_sum(
+                        s, send_v.at[b], rsp_pad, Hl, ch
+                    ).astype(jnp.bfloat16)
             for cp in col.rs2_first(s, ps_v.at[s], rsc_pad):
                 cp.start()
 
@@ -183,23 +189,28 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
             s = j % _SLOTS
             _, m2 = col.masks()
             other = jnp.bitwise_xor(col.chip, m2)
-            wait_all(col.rs2_first(s, ps_v.at[s], rsc_pad))
-            rsc_pad[s, 3] = (
-                ps_v[s, other].astype(jnp.float32) + rsc_pad[s, 1].astype(jnp.float32)
-            ).astype(jnp.bfloat16)
+            with _scope("ao_rs1_wait"):
+                wait_all(col.rs2_first(s, ps_v.at[s], rsc_pad))
+            with _scope("ao_rs_sum"):
+                rsc_pad[s, 3] = (
+                    ps_v[s, other].astype(jnp.float32)
+                    + rsc_pad[s, 1].astype(jnp.float32)
+                ).astype(jnp.bfloat16)
             for cp in col.rs2_second(s, rsc_pad):
                 cp.start()
 
         def s3(j):
             """This rank's reduced block of tile j; its all-gather starts."""
             s = j % _SLOTS
-            wait_all(col.rs2_second(s, rsc_pad))
-            red = (
-                ps_v[s, col.chip].astype(jnp.float32)
-                + rsc_pad[s, 0].astype(jnp.float32)
-                + rsc_pad[s, 2].astype(jnp.float32)
-            )
-            ag_pad[s, me] = red.astype(jnp.bfloat16)
+            with _scope("ao_rs2_wait"):
+                wait_all(col.rs2_second(s, rsc_pad))
+            with _scope("ao_rs_sum"):
+                red = (
+                    ps_v[s, col.chip].astype(jnp.float32)
+                    + rsc_pad[s, 0].astype(jnp.float32)
+                    + rsc_pad[s, 2].astype(jnp.float32)
+                )
+                ag_pad[s, me] = red.astype(jnp.bfloat16)
             col.ag_start(ag_kp, s)
 
         def s4(j):
@@ -209,10 +220,14 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
         def s5(j):
             """Residual, router top-k and this rank's expert-projection columns of tile j."""
             s, b = j % _SLOTS, j % 2
-            col.ag_wait(ag_kp, s)
-            x_copy(j).wait()
-            attn = gathered(ag_pad, None, s, tp)
-            x = row("attn_alpha") * x_v[b] + row("attn_beta") * _rms(attn, c.post_eps)
+            with _scope("ao_ag_wait"):
+                col.ag_wait(ag_kp, s)
+                x_copy(j).wait()
+            with _scope("ao_residual"):
+                attn = gathered(ag_pad, None, s, tp)
+                x = row("attn_alpha") * x_v[b] + row("attn_beta") * _rms(
+                    attn, c.post_eps
+                )
 
             @pl.when(j >= 2)
             def _():
@@ -220,33 +235,35 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
                     cp.wait()
 
             xn_v[b] = x
-            r_in = (_rms(x, c.rms_eps) * row("pre_ffn_w")).astype(jnp.bfloat16)
-            logits = jnp.dot(r_in, wr_v[...], preferred_element_type=jnp.float32)
-            scores = jax.nn.sigmoid(logits * c.router_mult)
-            lane = jax.lax.broadcasted_iota(jnp.int32, (tm, Ep), 1)
-            scores = jnp.where(lane < E, scores, 0.0)
-            ids, picks = _topk_iter(scores + row("expert_bias")[:, :Ep], K)
-            tws = [
-                jnp.sum(jnp.where(pk, scores, 0.0), axis=1, keepdims=True)
-                for pk in picks
-            ]
-            denom = sum(tws) + c.router_eps
-            lane8 = jax.lax.broadcasted_iota(jnp.int32, (tm, LANE), 1)
-            ids_t = jnp.zeros((tm, LANE), jnp.int32)
-            tw_t = jnp.zeros((tm, LANE), jnp.float32)
-            for k in range(K):
-                ids_t = jnp.where(lane8 == k, ids[k], ids_t)
-                tw_t = jnp.where(lane8 == k, tws[k] / denom * c.route_scale, tw_t)
-            ids_v[b] = ids_t
-            tw_v[b] = tw_t
+            with _scope("ao_router"):
+                r_in = (_rms(x, c.rms_eps) * row("pre_ffn_w")).astype(jnp.bfloat16)
+                logits = jnp.dot(r_in, wr_v[...], preferred_element_type=jnp.float32)
+                scores = jax.nn.sigmoid(logits * c.router_mult)
+                lane = jax.lax.broadcasted_iota(jnp.int32, (tm, Ep), 1)
+                scores = jnp.where(lane < E, scores, 0.0)
+                ids, picks = _topk_iter(scores + row("expert_bias")[:, :Ep], K)
+                tws = [
+                    jnp.sum(jnp.where(pk, scores, 0.0), axis=1, keepdims=True)
+                    for pk in picks
+                ]
+                denom = sum(tws) + c.router_eps
+                lane8 = jax.lax.broadcasted_iota(jnp.int32, (tm, LANE), 1)
+                ids_t = jnp.zeros((tm, LANE), jnp.int32)
+                tw_t = jnp.zeros((tm, LANE), jnp.float32)
+                for k in range(K):
+                    ids_t = jnp.where(lane8 == k, ids[k], ids_t)
+                    tw_t = jnp.where(lane8 == k, tws[k] / denom * c.route_scale, tw_t)
+                ids_v[b] = ids_t
+                tw_v[b] = tw_t
             for cp in out_copies(j):
                 cp.start()
-            xe = jnp.dot(r_in, wp_v[...], preferred_element_type=jnp.float32)
-            xe = (xe * row("wpool_s")[:, :Hel]).astype(jnp.bfloat16)
-            if fp8:
-                xe_pad[s, me], xsc_pad[s, me] = to_fp8(xe.astype(jnp.float32))
-            else:
-                xe_pad[s, me] = xe
+            with _scope("ao_pool"):
+                xe = jnp.dot(r_in, wp_v[...], preferred_element_type=jnp.float32)
+                xe = (xe * row("wpool_s")[:, :Hel]).astype(jnp.bfloat16)
+                if fp8:
+                    xe_pad[s, me], xsc_pad[s, me] = to_fp8(xe.astype(jnp.float32))
+                else:
+                    xe_pad[s, me] = xe
             col.ag_start(xe_kp, s)
 
         def s6(j):
@@ -255,15 +272,18 @@ def attn_out_call(c: PFConfig, tm: int, axis: str = "model"):
         def s7(j):
             """Gathered expert input of tile j, pre-expert normed."""
             s, b = j % _SLOTS, j % 2
-            col.ag_wait(xe_kp, s)
-            xe = gathered(xe_pad, xsc_pad, s, tp)
-            gain = sm[SMALL["pre_expert_w"] : SMALL["pre_expert_w"] + 1, :He]
+            with _scope("ao_xe_wait"):
+                col.ag_wait(xe_kp, s)
+            with _scope("ao_xe_norm"):
+                xe = gathered(xe_pad, xsc_pad, s, tp)
+                gain = sm[SMALL["pre_expert_w"] : SMALL["pre_expert_w"] + 1, :He]
+                xe = (_rms(xe, c.rms_eps) * gain).astype(jnp.bfloat16)
 
             @pl.when(j >= 2)
             def _():
                 xe_out_copy(j - 2).wait()
 
-            xe_v[b] = (_rms(xe, c.rms_eps) * gain).astype(jnp.bfloat16)
+            xe_v[b] = xe
             xe_out_copy(j).start()
 
         s4a = lambda j: col.ag_relay(ag_kp, j % _SLOTS)
