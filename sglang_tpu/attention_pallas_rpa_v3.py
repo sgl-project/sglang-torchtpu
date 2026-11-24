@@ -477,11 +477,19 @@ def _invoke_v3_kernel(
                 bq_sz = (
                     512
                     if (
-                        sliding_window is None
-                        and (
-                            per_seq_kv_capacity > 32768
-                            or "full_bq512" in all_prefill_toks
-                            or use_w7_preset
+                        (
+                            (
+                                sliding_window is None
+                                and (
+                                    per_seq_kv_capacity > 32768
+                                    or "full_bq512" in all_prefill_toks
+                                    or use_w7_preset
+                                )
+                            )
+                            or (
+                                sliding_window is not None
+                                and "sw_bq512" in all_prefill_toks
+                            )
                         )
                         and num_q_tokens >= 512
                     )
@@ -489,6 +497,12 @@ def _invoke_v3_kernel(
                 )
             else:
                 bq_sz = 512 if num_q_tokens >= 512 else 256
+            if (
+                sliding_window is None
+                and "full_bq1024" in all_prefill_toks
+                and num_q_tokens >= 1024
+            ):
+                bq_sz = 1024
             if is_lc_full:
                 if "bq8192" in eff_lc_toks and num_q_tokens >= 8192:
                     bq_sz = 8192
@@ -613,6 +627,7 @@ def _invoke_v3_kernel(
             "mrb3",
             "mrb4",
             "f32_exp",
+            "staged_qo",
         ):
             if w7_opt in all_prefill_toks:
                 prefill_opts.add(w7_opt)

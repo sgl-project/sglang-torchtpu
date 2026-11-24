@@ -1606,6 +1606,264 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                     self.assertTrue(np.all(np.isfinite(out_np[:ql])), f"{tag}: non-finite valid output")
                     self.assertTrue(np.all(out_np[ql:] == 0.0), f"{tag}: non-zero pad rows")
 
+    def test_w910_optin_levers_parity_and_24k_32k_exports(self):
+        """Verify opt-in Full fp8_qkpv_norm, sw_bq512, TP=16 sw_mk128, and T=24K/32K RPAm (#3395)."""
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+        from sglang_tpu import attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        # 1. Verify opt-in routing scopes (without changing default w9 behavior).
+        class _FakeRng:
+            def __init__(self, sh):
+                self.shape = sh
+                self.ndim = len(sh)
+                self.dtype = "bfloat16"
+
+        class _FakeCache:
+            def __init__(self, sh):
+                self.shape = sh
+                self.ndim = len(sh)
+                self.dtype = "float8_e4m3fn"
+
+        def _capture_route(w7_opts, *, t_tok, qh, sw, pps):
+            captured = {}
+
+            def _stub(*args, **kwargs):
+                captured.update(kwargs)
+                return ("out", "kvc")
+
+            env = {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": w7_opts,
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                "SGLANG_TPU_KV_PACK_HEADS": "2",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                rpa_wrap_mod._invoke_v3_kernel(
+                    _stub,
+                    queries=_FakeRng((1, t_tok, qh, 2, 128)),
+                    keys=_FakeRng((t_tok, 1, 4, 128)),
+                    values=None,
+                    kv_cache_fused=_FakeCache((2048, 512, 1, 4, 128)),
+                    kv_lens=_FakeRng((64,)),
+                    page_indices=_FakeRng((64 * pps,)),
+                    cu_q_lens=_FakeRng((65,)),
+                    cu_kv_lens=_FakeRng((65,)),
+                    distribution=_FakeRng((3,)),
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=sw,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+            return captured
+
+        c_full_qkpv = _capture_route(
+            "full_fp8_qkpv,full_fp8_qkpv_norm,sw_bq512,sw_mk128",
+            t_tok=10240,
+            qh=4,
+            sw=None,
+            pps=36,
+        )
+        self.assertEqual(c_full_qkpv["m_block_sizes"], (512, 4096, 256, 512))
+        self.assertIn("fp8_qkpv", c_full_qkpv["_prefill_opts"])
+        self.assertIn("fp8_qkpv_norm", c_full_qkpv["_prefill_opts"])
+
+        c_swa_512 = _capture_route(
+            "full_fp8_qkpv,full_fp8_qkpv_norm,sw_bq512,sw_mk128",
+            t_tok=10240,
+            qh=4,
+            sw=2048,
+            pps=8,
+        )
+        self.assertEqual(c_swa_512["m_block_sizes"], (512, 2048, 256, 512))
+        self.assertIn("mk128", c_swa_512["_prefill_opts"])
+        self.assertNotIn("fp8_qkpv", c_swa_512["_prefill_opts"])
+
+        c_full_24k = _capture_route(
+            "full_bq1024,full_staged_qo",
+            t_tok=16384,
+            qh=8,
+            sw=None,
+            pps=48,
+        )
+        self.assertEqual(c_full_24k["m_block_sizes"], (1024, 4096, 256, 512))
+        self.assertIn("staged_qo", c_full_24k["_prefill_opts"])
+
+        # 2. CPU InterpretParams(detect_races=True, uninitialized_memory="nan") + 0x7F KV poison parity.
+        rng = np.random.default_rng(3395)
+        page_size = 512
+        interp = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+
+        for tp_mode in ("tp8", "tp16"):
+            qh = 8 if tp_mode == "tp8" else 4
+            fused_pack = 2 if tp_mode == "tp8" else -2
+            extra_opt = set() if tp_mode == "tp8" else {"tp16_sq"}
+
+            t_tok = 512
+            q_np = rng.normal(0.0, 0.4, (1, t_tok, qh, 2, 128)).astype(np.float32)
+            if tp_mode == "tp16":
+                q_np[..., 64:] = 0.0
+            q_jax = jnp.asarray(q_np, dtype=jnp.bfloat16)
+            kv_jax = jnp.asarray(rng.normal(0.0, 0.4, (t_tok, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+            cache_u8 = np.full((6, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            cache_u8[0, :, 0, :2, : (128 if tp_mode == "tp8" else 64)] = 0x30
+            kv_cache = _u8_to_fp8(cache_u8)
+            kl = jnp.array([768, 0, 0, 0], dtype=jnp.int32)
+            cq = jnp.array([0, 512, 512, 512, 512], dtype=jnp.int32)
+            ckv = jnp.array([0, 768, 768, 768, 768], dtype=jnp.int32)
+            pi = jnp.array([0, 1, 2, 3] * 4, dtype=jnp.int32)
+            dist = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+            base_full = frozenset(
+                {
+                    "stationary_q_m0_ring_fuse",
+                    "skip_empty_cdma",
+                    "bkv_full_unroll",
+                    "mixed_s3",
+                    "prefix_fast",
+                    "fp8_qk",
+                    "mk128",
+                    "la2",
+                    "sub8_l",
+                    "bf16_pop",
+                    "unroll_up",
+                }
+                | extra_opt
+            )
+            with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                out_base, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                    kl, pi, cq, ckv, dist, None, None,
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(512, 4096, 256, 512), _prefill_opts=base_full,
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+                out_fp8pv, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                    kl, pi, cq, ckv, dist, None, None,
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(512, 4096, 256, 512),
+                    _prefill_opts=base_full | {"fp8_qkpv", "fp8_qkpv_norm"},
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+            b_np = np.asarray(out_base, dtype=np.float32)
+            p_np = np.asarray(out_fp8pv, dtype=np.float32)
+            self.assertTrue(np.all(np.isfinite(p_np)), f"{tp_mode} full_fp8_qkpv_norm non-finite")
+            cos = float(np.dot(b_np.ravel(), p_np.ravel()) / (np.linalg.norm(b_np) * np.linalg.norm(p_np) + 1e-12))
+            self.assertGreater(cos, 0.999, f"{tp_mode} full_fp8_qkpv_norm cos={cos}")
+
+            kl_sw = jnp.array([2560, 0, 0, 0], dtype=jnp.int32)
+            ckv_sw = jnp.array([0, 2560, 2560, 2560, 2560], dtype=jnp.int32)
+            pi_sw = jnp.arange(24, dtype=jnp.int32)
+            cache_sw_u8 = np.full((26, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            cache_sw_u8[:4, :, 0, :2, : (128 if tp_mode == "tp8" else 64)] = 0x30
+            kv_cache_sw = _u8_to_fp8(cache_sw_u8)
+            base_swa = frozenset(
+                {
+                    "stationary_q_m0_ring_fuse",
+                    "skip_empty_cdma",
+                    "mixed_s3",
+                    "sw2048_fuse",
+                    "sw_short_v2",
+                    "fp8_qk",
+                    "sub8_l",
+                    "bf16_pop",
+                    "mrb3",
+                }
+                | ({"mk128", "la2", "unroll_up"} if tp_mode == "tp8" else {"tp16_sq"})
+            )
+            with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                out_sw_base, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache_sw),
+                    kl_sw, pi_sw, cq, ckv_sw, dist, None, None,
+                    sm_scale=0.125, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(256, 2048, 256, 512), _prefill_opts=base_swa,
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+                out_sw_512, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache_sw),
+                    kl_sw, pi_sw, cq, ckv_sw, dist, None, None,
+                    sm_scale=0.125, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(512, 2048, 256, 512),
+                    _prefill_opts=base_swa | {"mk128", "la2", "unroll_up"},
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+            sb_np = np.asarray(out_sw_base, dtype=np.float32)
+            s5_np = np.asarray(out_sw_512, dtype=np.float32)
+            self.assertTrue(np.all(np.isfinite(s5_np)), f"{tp_mode} sw_bq512 non-finite")
+            cos_sw = float(np.dot(sb_np.ravel(), s5_np.ravel()) / (np.linalg.norm(sb_np) * np.linalg.norm(s5_np) + 1e-12))
+            self.assertGreater(cos_sw, 0.999, f"{tp_mode} sw_bq512 cos={cos_sw}")
+
+        # 3. TPU7x Mosaic AOT exports (16K fp8_qkpv_norm, sw_bq512, TP16 sw_mk128, and 24K/32K Full).
+        try:
+            from jax._src import tpu_info as _tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available in lightweight CPU venv")
+
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        swa_opts = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "mixed_s3",
+            "sw2048_fuse", "sw_short_v2", "fp8_qk", "mk128", "la2", "sub8_l",
+            "bf16_pop", "unroll_up", "mrb3",
+        })
+        full_opts = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "bkv_full_unroll",
+            "mixed_s3", "prefix_fast", "fp8_qk", "mk128", "la2", "sub8_l",
+            "bf16_pop", "unroll_up",
+        })
+        export_cases = (
+            ("tp8_full_16k_fp8_qkpv_norm", 8, 10240, 36, (512, 4096, 256, 512), None, full_opts | {"fp8_qkpv", "fp8_qkpv_norm"}),
+            ("tp16_full_16k_fp8_qkpv_norm", 4, 10240, 36, (512, 4096, 256, 512), None, full_opts | {"tp16_sq", "fp8_qkpv", "fp8_qkpv_norm"}),
+            ("tp8_swa_16k_bq512_mk128", 8, 10240, 8, (512, 2048, 256, 512), 2048, swa_opts),
+            ("tp16_swa_16k_mk128", 4, 10240, 8, (256, 2048, 256, 512), 2048, swa_opts | {"tp16_sq"}),
+            ("tp16_swa_16k_bq512_mk128", 4, 10240, 8, (512, 2048, 256, 512), 2048, swa_opts | {"tp16_sq"}),
+            ("tp8_full_24k_bq512", 8, 16384, 48, (512, 4096, 256, 512), None, full_opts),
+            ("tp8_full_32k_bq1024_staged", 8, 16384, 64, (1024, 4096, 256, 512), None, full_opts | {"staged_qo"}),
+            ("tp16_full_24k_bq512", 4, 16384, 48, (512, 4096, 256, 512), None, full_opts | {"tp16_sq"}),
+            ("tp16_full_32k_bq1024_staged", 4, 16384, 64, (1024, 4096, 256, 512), None, full_opts | {"tp16_sq", "staged_qo"}),
+        )
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag, qh, t_tok, pps, mb, sw, opts in export_cases:
+                with self.subTest(export=tag):
+                    c_sd = jax.ShapeDtypeStruct((2048, 512, 1, 4, 128), jnp.float8_e4m3fn)
+                    kl_sd = jax.ShapeDtypeStruct((64,), jnp.int32)
+                    pi_sd = jax.ShapeDtypeStruct((64 * pps,), jnp.int32)
+                    cq_sd = jax.ShapeDtypeStruct((65,), jnp.int32)
+                    ckv_sd = jax.ShapeDtypeStruct((65,), jnp.int32)
+                    d_sd = jax.ShapeDtypeStruct((3,), jnp.int32)
+                    exp = jax_export.export(
+                        jax.jit(
+                            lambda q, kv, c, kl, pi, cq, ckv, d, _mb=mb, _sw=sw, _op=opts: rpa_v3_mod.ragged_paged_attention(
+                                q, kv, None, c, kl, pi, cq, ckv, d, None, None,
+                                sm_scale=0.125, sliding_window=_sw, k_scale=1.0, v_scale=1.0,
+                                m_block_sizes=_mb, _prefill_opts=_op, _fused_out_pack=2,
+                                _prepared_inputs=True, _skip_decode=True, _a3_out_layout=True,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, t_tok, qh, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((t_tok, 1, 4, 128), jnp.float8_e4m3fn),
+                        c_sd, kl_sd, pi_sd, cq_sd, ckv_sd, d_sd,
+                    )
+                    self.assertIn("RPAm", exp.mlir_module())
+
 
 if __name__ == "__main__":
     unittest.main()
