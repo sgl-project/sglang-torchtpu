@@ -170,7 +170,9 @@ def expand_fp4_chunk_to_scaled_fp8(
         col_max = jnp.max(jnp.abs(s_all), axis=0, keepdims=True)
         col_c = col_max * jnp.float32(_FP4_MAX / _FP8_E4M3_MAX)
         inv_col_c = jnp.where(
-            col_c == 0.0, jnp.zeros_like(col_c), jnp.float32(1.0) / col_c
+            col_c == 0.0,
+            jnp.zeros_like(col_c),
+            jnp.float32(1.0) / jnp.maximum(col_c, jnp.float32(1e-30)),
         )
         rel_s_bf16 = (s_all * inv_col_c).astype(jnp.bfloat16)
         w_colc_8_ref[:, pl.ds(c0, col_w)] = jnp.broadcast_to(
@@ -192,9 +194,9 @@ def expand_fp4_chunk_to_scaled_fp8(
                 w_scaled = (
                     w_bf16.reshape(groups_per_chunk, rhs_qbs, col_w) * s_grp[:, None, :]
                 ).reshape(k_chunk, col_w)
-            w_half_fp8_ref[pl.ds(rk0, k_chunk), pl.ds(c0, col_w)] = w_scaled.astype(
-                jnp.float8_e4m3fn
-            )
+            w_half_fp8_ref[pl.ds(rk0, k_chunk), pl.ds(c0, col_w)] = jnp.clip(
+                w_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+            ).astype(jnp.float8_e4m3fn)
 
 
 def dot_unrolled_chunk_fp8(
@@ -335,6 +337,13 @@ def run_eo3_expert_batch(
         unpack_3d_pq_lhs_to_2d_fp8,
     )
 
+    if num_n1 > w1_buf_ref.shape[0] or num_n2 > w2_buf_ref.shape[0]:
+        raise ValueError(
+            "run_eo3_expert_batch requires full-expert W1/W2 buffer caching: "
+            f"num_n1={num_n1} > w1_bufs={w1_buf_ref.shape[0]} or "
+            f"num_n2={num_n2} > w2_bufs={w2_buf_ref.shape[0]}"
+        )
+
     gm_id_ref[0] = gm_id
     expert_id = metadata_ref.gm_id_to_group_id[gm_id]
     fused_metadata_ref.gm_id_to_group_id[0] = expert_id
@@ -344,6 +353,12 @@ def run_eo3_expert_batch(
 
     @pl.when(gm_id == 0)
     def _prologue_gm0():
+        if (
+            enable_chipmate
+            and cm_defer_send
+            and maybe_start_deferred_cm_wt_send_fn is not None
+        ):
+            maybe_start_deferred_cm_wt_send_fn()
         dma_gather_gm_start_fn(
             hidden_states_ref,
             gathered_lhs_2x_ref.at[0],
@@ -386,8 +401,13 @@ def run_eo3_expert_batch(
             metadata_ref,
         )
         if has_ext_pq_lhs:
+            _n_sl_eo = metadata_ref.gm_id_to_group_id.shape[0]
             m_st_t = metadata_ref.gm_id_to_m_offset[cur_g]
-            m_en_t = metadata_ref.gm_id_to_m_offset[cur_g + 1]
+            m_en_t = (
+                metadata_ref.gm_id_to_m_offset[_n_sl_eo + cur_g]
+                if metadata_ref.gm_id_to_m_offset.shape[0] == 2 * _n_sl_eo
+                else metadata_ref.gm_id_to_m_offset[cur_g + 1]
+            )
             unpack_3d_pq_lhs_to_2d_fp8(
                 gathered_lhs_2x_ref.at[cur_sem],
                 eo_lhs_fp8_4x_ref.at[t],
@@ -569,12 +589,6 @@ def run_eo3_expert_batch(
         @pl.when(jnp.logical_and(has_after, after_e != expert_id))
         def _prefetch_next_w1(_b=_n1):
             start_w1_dma_fn(_b, after_e, _b, 0)
-
-    if enable_chipmate and cm_defer_send:
-
-        @pl.when(gm_id == 0)
-        def _start_cm_sends():
-            maybe_start_deferred_cm_wt_send_fn()
 
     # 3. Interlude: quantize GMM1 output (bf16 -> fp8) for all batch_n tiles.
     @pl.loop(0, batch_n)

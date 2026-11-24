@@ -3791,6 +3791,433 @@ def test_w9_cand6_fp8_clip_max_scale_and_subnormal_nan_free():
         assert np.max(np.abs(fp8_b2_f32)) <= 448.0
 
 
+def test_w910_eo3_eo4_n2k_nan_interpret_and_lowering():
+    """Verify eo3_n2k / eo4_n2k auto-n2k tiling, NaN clamps, multi-batch skip_cur, cm_defer_send,
+    and full multi-rank InterpretParams(detect_races=True, uninitialized_memory='nan')."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_moe import moe_gmm_local_rs_nodedup
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _select_fused_rs_block_sizes,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.w1_fp8_expert_cache import (
+        expand_fp4_chunk_to_scaled_fp8,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        compute_block_scatter_routing,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    real_pallas_call = pl.pallas_call
+
+    # 1. Tile selection under eo>=3 must pick n2k (2048,2048,2,2), ignore wla=1 (3,3),
+    # and step down any inherited n4k PREFILL_GMM_TILES (which would OOM VMEM by +3.48M).
+    for eo_mode in ("3", "4"):
+        for prefill_t in ("", "256,4096,4096,4096,4096,2,1"):
+            with (
+                patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+                tpu_info_for_cpu_export(),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": eo_mode,
+                        "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "1",
+                        "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                        "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": prefill_t,
+                    },
+                ),
+            ):
+                bs131 = _select_fused_rs_block_sizes(
+                    size_m=131072, size_k1=4096, size_n1=8192, size_k2=4096, size_n2=4096,
+                    size_group=34, size_lhs_group=34, ep_size=8,
+                    out_dtype=jnp.bfloat16, w1_dtype=jnp.float4_e2m1fn, w2_dtype=jnp.float4_e2m1fn,
+                    is_quantized=True, quant_block_size=512, act_fn="silu", fp8_direct_write=False,
+                )
+                assert (
+                    bs131.tile_m,
+                    bs131.tile_k1,
+                    bs131.tile_n1,
+                    bs131.tile_k2,
+                    bs131.tile_n2,
+                    bs131.num_w1_bufs,
+                    bs131.num_w2_bufs,
+                ) == (256, 4096, 2048, 4096, 2048, 2, 2)
+                bs16 = _select_fused_rs_block_sizes(
+                    size_m=16384, size_k1=4096, size_n1=8192, size_k2=4096, size_n2=4096,
+                    size_group=34, size_lhs_group=34, ep_size=8,
+                    out_dtype=jnp.bfloat16, w1_dtype=jnp.float4_e2m1fn, w2_dtype=jnp.float4_e2m1fn,
+                    is_quantized=True, quant_block_size=512, act_fn="silu", fp8_direct_write=False,
+                )
+                assert (
+                    bs16.tile_m,
+                    bs16.tile_n1,
+                    bs16.tile_n2,
+                    bs16.num_w1_bufs,
+                    bs16.num_w2_bufs,
+                ) == (128, 2048, 2048, 2, 2)
+
+    # 2. expand_fp4_chunk_to_scaled_fp8 must remain NaN/Inf-free on subnormal/zero & saturated scales.
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+    ):
+        w_edge_u32 = jnp.full((512 // 8, 256), 0x77777777, dtype=jnp.uint32)
+        s_edge = np.ones((1, 256), dtype=np.float32) * 0.05
+        s_edge[0, :32] = 0.0
+        s_edge[0, 32:64] = 1e-37
+        s_edge[0, 64:96] = 65504.0
+
+        def _k_exp(w_r, s_r, out_w, out_c):
+            expand_fp4_chunk_to_scaled_fp8(
+                w_r,
+                s_r,
+                out_w,
+                out_c,
+                src_start_n=0,
+                chunk_cols=256,
+                strip_step=256,
+                tile_k=512,
+                rhs_qbs=512,
+                packing=8,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+                global_scale_val=jnp.float32(1.0),
+            )
+
+        out_w_e, out_c_e = real_pallas_call(
+            _k_exp,
+            out_shape=(
+                jax.ShapeDtypeStruct((512, 256), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 256), jnp.float32),
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+            ),
+            interpret=pltpu.InterpretParams(
+                detect_races=True, uninitialized_memory="nan", dma_execution_mode="eager"
+            ),
+        )(w_edge_u32, jnp.asarray(s_edge, jnp.bfloat16))
+        assert np.isfinite(np.asarray(out_w_e.astype(jnp.float32))).all()
+        assert np.isfinite(np.asarray(out_c_e)).all()
+
+    if len(jax.devices()) < 2:
+        pytest.skip("Requires >=2 virtual/physical JAX devices")
+
+    # 3. Real 2-rank moe_gmm_local_rs_nodedup interpret test (cm_defer_send=1, FLATTEN_BS_META=1,
+    # pql4, borrowed gm_id=0, batch_n > max_batch split, and partial tail tile < tile_m).
+    rng = np.random.default_rng(20261130)
+    T = 2048
+    K, N1, N2, QB = 4096, 8192, 4096, 512
+    x_np = rng.standard_normal((T, K // 128, 128)).astype(np.float32) * 0.25
+    x_flat = x_np.reshape(T, K)
+    amax = np.max(np.abs(x_flat), axis=1, keepdims=True)
+    inv = np.where(amax == 0, 0.0, 448.0 / np.maximum(amax, 1e-12))
+    sc_np = np.where(amax == 0, 0.0, amax / 448.0).reshape(-1).astype(np.float32)
+    x_fp8 = jnp.asarray((x_flat * inv).reshape(T, K // 128, 128), jnp.float8_e4m3fn)
+    sc_j = jnp.asarray(sc_np, jnp.float32)
+
+    w1_u8 = rng.integers(0, 256, size=(4, K, N1 // 2), dtype=np.uint8)
+    w2_u8 = rng.integers(0, 256, size=(4, K, N2 // 2), dtype=np.uint8)
+    w1_fp4 = jax.lax.bitcast_convert_type(jnp.asarray(w1_u8), jnp.float4_e2m1fn).reshape(4, K, N1)
+    w2_fp4 = jax.lax.bitcast_convert_type(jnp.asarray(w2_u8), jnp.float4_e2m1fn).reshape(4, K, N2)
+    s1_bf = jnp.asarray(rng.uniform(0.01, 0.04, size=(4, K // QB, N1)).astype(np.float32), jnp.bfloat16)
+    s2_bf = jnp.asarray(rng.uniform(0.01, 0.04, size=(4, K // QB, N2)).astype(np.float32), jnp.bfloat16)
+    pnw_j = jnp.asarray((1.0 + 0.05 * rng.standard_normal(N2)).astype(np.float32), jnp.bfloat16)
+    go_j = jnp.asarray([0, 4], jnp.int32)
+    tw_j = jnp.asarray(rng.uniform(0.05, 0.2, size=(T, 8)).astype(np.float32), jnp.bfloat16)
+
+    # Route 92 tokens*8 = 736 rows (6 tiles at tm=128 -> crosses max_batch=5 split!) to borrowed
+    # slot 2/6 so gm_id=0 is borrowed on both ranks + batch_n=5 then batch_n=1 tail, plus 48 rows
+    # on slot 3/7 (partial tile) and local rows on 0/4; rest sentinel 8.
+    v_ids_np = np.full((T, 8), 8, dtype=np.int32)
+    for t in range(92):
+        v_ids_np[t, :] = 2
+        v_ids_np[1024 + t, :] = 6
+    for t in range(92, 98):
+        v_ids_np[t, :] = 3
+        v_ids_np[1024 + t, :] = 7
+    for t in range(98, 118):
+        v_ids_np[t, :] = 0
+        v_ids_np[1024 + t, :] = 4
+    v_ids_j = jnp.asarray(v_ids_np, jnp.int32)
+    cm_plan_2 = jnp.asarray([[0, 1, 1, 1], [0, 1, 1, 1]], jnp.int32)
+    mesh2 = Mesh(np.array(jax.devices()[:2]), ("ep",))
+    active_rows = 118 * 8
+
+    def _run_eo(eo_mode: str, k_step: str = "1024") -> tuple[np.ndarray, list[str]]:
+        names: list[str] = []
+
+        def _cap_pallas(*args, **kwargs):
+            names.append(str(kwargs.get("name", "")))
+            if kwargs.get("interpret") is None:
+                kwargs["interpret"] = pltpu.InterpretParams(
+                    detect_races=True,
+                    uninitialized_memory="nan",
+                    dma_execution_mode="eager",
+                )
+
+            def _wrapped_call(*call_args):
+                n_sp = kwargs["grid_spec"].num_scalar_prefetch
+                patched = list(call_args)
+                for idx in (n_sp + 1, n_sp + 2):
+                    arr = patched[idx]
+                    if arr.dtype == jnp.float4_e2m1fn:
+                        e_d, k_d, n_d = arr.shape
+                        patched[idx] = jax.lax.bitcast_convert_type(
+                            jnp.swapaxes(arr.reshape(e_d, k_d // 8, 8, n_d), 2, 3),
+                            jnp.uint32,
+                        )
+                return real_pallas_call(*args, **kwargs)(*patched)
+
+            return _wrapped_call
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.object(pl, "pallas_call", _cap_pallas),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE": "split",
+                    "SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": eo_mode,
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_K_STEP": k_step,
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "128,4096,2048,4096,2048,2,2",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "0.0",
+                    "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "2048",
+                },
+            ),
+        ):
+            jax.clear_caches()
+            def _fn(x_i, sc_i, w1_i, s1_i, w2_i, s2_i, pnw_i, go_i, tw_i, v_i, cm_i):
+                my_id = go_i[0] // 4
+                lhs_i, grp_sz, grp_st, loc_r = compute_block_scatter_routing(
+                    v_i, go_i[0], my_id, ep_size=2, num_local_experts=4, topk=8, stable_sort=True, has_pad_sentinel=True,
+                )
+                return moe_gmm_local_rs_nodedup(
+                    x_i, w1_i, s1_i, None, w2_i, s2_i, None, None, None,
+                    go_i, tw_i, v_i, pnw_i, None,
+                    activation="silu", topk=8, ep_size=2, ep_axis_name="ep",
+                    has_post_norm=True, sp_enabled=True,
+                    local_t_recv=loc_r, block_scatter=True, return_tiled=True,
+                    return_raw_out_buf=True,
+                    precomputed_routing=(lhs_i, grp_sz, grp_st),
+                    precomputed_chipmate_plan=cm_i[0],
+                    hidden_states_scale=sc_i,
+                )
+
+            out = jax.jit(
+                jax.shard_map(
+                    _fn,
+                    mesh=mesh2,
+                    in_specs=(
+                        P(), P(), P("ep"), P("ep"), P("ep"), P("ep"),
+                        P(), P("ep"), P("ep", None), P(), P("ep"),
+                    ),
+                    out_specs=P("ep", None, None),
+                    check_vma=False,
+                )
+            )(x_fp8, sc_j, w1_fp4, s1_bf, w2_fp4, s2_bf, pnw_j, go_j, tw_j, v_ids_j, cm_plan_2)
+            return np.asarray(out, dtype=np.float32), names
+
+    ref, ref_names = _run_eo("0")
+    ref_act = ref.reshape(2, -1, 32, 128)[:, :active_rows].reshape(-1)
+    assert np.isfinite(ref_act).all() and np.linalg.norm(ref_act) > 0
+    assert not any("-eo" in n for n in ref_names)
+
+    for eo_mode, k_step, min_cos in (("4", "1024", 0.9999), ("3", "1024", 0.995), ("3", "4096", 0.995)):
+        got, got_names = _run_eo(eo_mode, k_step=k_step)
+        assert any(f"-eo{eo_mode}" in n for n in got_names), got_names
+        got_act = got.reshape(2, -1, 32, 128)[:, :active_rows].reshape(-1)
+        assert np.isfinite(got_act).all(), f"non-finite output for eo={eo_mode} k_step={k_step}"
+        cos = float(np.dot(got_act, ref_act) / (np.linalg.norm(got_act) * np.linalg.norm(ref_act)))
+        assert cos >= min_cos, f"eo={eo_mode} k_step={k_step} cos={cos:.6f} < {min_cos}"
+
+    if len(jax.devices()) >= 8:
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "3",
+                "SGLANG_TPU_MUSE_KERNEL_FP4_TWO_LEVEL_K_STEP": "4096",
+            },
+        ):
+            for t_glob in (16384, 24576):
+                hlo = _lower_ep8_tpu7x_wla_hlo(
+                    wla_mode="2",
+                    tiles_str="256,4096,4096,4096,4096,2,1",
+                    t_global=t_glob,
+                )
+                assert "-eo3" in hlo and "-pql4" in hlo
 
 
+def test_w910_ep16_eplb_num_base_local():
+    """Verify EP=16 (16 base experts/rank) does not hardcode num_base_local=32 in EPLB or pipeline."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    import torch
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.eplb import PrefillEplbManager
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        fused_moe_full_bridge_and_ffn,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    tp_size, num_replicas, num_base = 16, 2, 16
+    decoder = torch.nn.Module()
+    decoder.norm = torch.nn.Module()
+    decoder.norm.weight = torch.nn.Parameter(torch.ones(8), requires_grad=False)
+    layer = torch.nn.Module()
+    moe = torch.nn.Module()
+    experts = torch.nn.Module()
+    experts.w13_weight = torch.nn.Parameter(torch.zeros((num_base, 8, 16), dtype=torch.int8), requires_grad=False)
+    experts.w2_weight = torch.nn.Parameter(torch.zeros((num_base, 8, 8), dtype=torch.int8), requires_grad=False)
+    experts.w13_weight_scale = torch.nn.Parameter(torch.ones((num_base, 1, 16), dtype=torch.float32), requires_grad=False)
+    experts.w2_weight_scale = torch.nn.Parameter(torch.ones((num_base, 1, 8), dtype=torch.float32), requires_grad=False)
+    experts.num_local_experts = num_base
+    experts.register_buffer("_tpu_fused_rs_group_offset", torch.tensor(0, dtype=torch.int32))
+    moe.experts = experts
+    layer.mlp = moe
+    decoder.layers = torch.nn.ModuleList([layer])
+
+    mgr = PrefillEplbManager(
+        decoder=decoder,
+        weights_list=[None],
+        gather_fn=lambda t: t.repeat(tp_size, *([1] * (t.dim() - 1))),
+        start=0,
+        end=1,
+        tp_size=tp_size,
+        tp_rank=0,
+        mode="home",
+        num_replicas=num_replicas,
+    )
+    assert mgr.num_base_local == 16
+    assert mgr.num_experts == 256
+    assert mgr.e_local == 18
+    assert experts.w13_weight.shape[0] == 18
+
+    if len(jax.devices()) < 16:
+        pytest.skip("16-rank HLO check needs >=16 virtual/physical JAX devices")
+
+    import re
+
+    mesh16 = Mesh(np.array(jax.devices()[:16]), ("model",))
+    for cm_rebal, exp_e_tag in (("0", "E_18"), ("1", "E_19")):
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE": cm_rebal,
+                    "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+                    "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+                },
+            ),
+        ):
+            jax.clear_caches()
+            t_glob = 16384
+
+            def _wrap16(*xs):
+                return jax.shard_map(
+                    lambda *ys: fused_moe_full_bridge_and_ffn(
+                        *ys,
+                        mesh=mesh16,
+                        router_mode="bf16_hilo",
+                        b2_layout="nstream",
+                        b2_two_half=True,
+                        b2_deq0_first=True,
+                        hoist_routing=True,
+                        d_layout="4slab",
+                        d_tok_tile=64,
+                        d_fp8_unpool=True,
+                        in_shard_map=True,
+                        b2_deq0_new_buffer=True,
+                        eplb_mode="home",
+                        next_in_gather_rows=0,
+                        next_in_gather_static_fp8=False,
+                    ),
+                    mesh=mesh16,
+                    in_specs=(
+                        P("model", None), P("model", None), P(), P(), P(), P(), P(), P(), P(), P(),
+                        P("model"), P('model'), P("model"), P("model"), P(), P("model"),
+                        P(), P(), P(), P(), P(), P(),
+                    ),
+                    out_specs=(P("model", None), P("model", None), P("model", None), P("model", None)),
+                    check_vma=False,
+                )(*xs)
+
+            hlo = (
+                jax.jit(_wrap16)
+                .trace(
+                    jax.ShapeDtypeStruct((t_glob, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((t_glob, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((256,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((4096,), jnp.float32),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16 * 18, 4096, 8192), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((16 * 18, 4096, 4096), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((16 * 18, 8, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16 * 18, 8, 4096), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16,), jnp.int32),
+                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+                )
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+            gmm_names = re.findall(r'gmm_v2[^"\\]*', hlo)
+            assert any(f"-{exp_e_tag}-" in n and "-eo3" in n for n in gmm_names), gmm_names
+            if cm_rebal == "0":
+                assert all("-cm" not in n for n in gmm_names), gmm_names
+            jax.clear_caches()
 

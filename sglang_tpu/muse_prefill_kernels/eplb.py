@@ -1292,6 +1292,7 @@ class PrefillEplbManager:
         initial_col_perms: Sequence[np.ndarray] | None = None,
         dual_decode: bool = False,
         decode_counts_by_layer: dict[int, np.ndarray] | None = None,
+        num_base_local: int | None = None,
     ) -> None:
         self.decoder = decoder
         self.weights_list = weights_list
@@ -1307,7 +1308,14 @@ class PrefillEplbManager:
         self.decode_counts_by_layer = (
             dict(decode_counts_by_layer) if decode_counts_by_layer else {}
         )
-        self.num_base_local = 32
+        if num_base_local is not None:
+            self.num_base_local = int(num_base_local)
+        elif start < end and hasattr(decoder, "layers") and len(decoder.layers) > start:
+            _exp0 = getattr(getattr(decoder.layers[start], "mlp", None), "experts", None)
+            _w13 = getattr(_exp0, "w13_weight", None)
+            self.num_base_local = int(_w13.shape[0]) if _w13 is not None else 32
+        else:
+            self.num_base_local = 32
         self.num_experts = tp_size * self.num_base_local
         self.e_local = self.num_base_local + num_replicas
         if initial_col_perms is not None:

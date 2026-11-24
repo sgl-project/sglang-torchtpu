@@ -4325,6 +4325,7 @@ class MusePrefillKernels(torch.nn.Module):
             initial_col_perms=init_perms,
             dual_decode=dual_decode,
             decode_counts_by_layer=dec_counts_map,
+            num_base_local=num_e // self.tp_size,
         )
         if loaded_counts is not None:
             self.eplb_manager.rebalance_from_counts(loaded_counts)
@@ -4348,7 +4349,7 @@ class MusePrefillKernels(torch.nn.Module):
             self.register_buffer(
                 "eplb_counts",
                 torch.zeros(
-                    self.end - self.start, 256, dtype=torch.int64, device=device
+                    self.end - self.start, num_e, dtype=torch.int64, device=device
                 ),
                 persistent=False,
             )

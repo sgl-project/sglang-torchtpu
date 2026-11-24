@@ -623,8 +623,40 @@ def _select_fused_rs_block_sizes(
             tile_m = 256
             tile_n1 = min(tile_n1, 1024)
             tile_n2 = min(tile_n2, 1024)
+    _eo_pref = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
     if (
-        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) == 1
+        _eo_pref >= 3
+        and is_quantized
+        and not fp8_direct_write
+        and not hot_interleave
+        and size_m >= _PREFILL_TILES_MIN_SIZE_M
+        and jax.dtypes.itemsize_bits(w1_dtype) in (4, 32)
+        and (size_k1, aligned_n1, padded_k2, aligned_n2) == (4096, 8192, 4096, 4096)
+        and (
+            not prefill_tiles
+            or tile_n1 > 2048
+            or tile_n2 > 2048
+            or num_w1_bufs < 2
+            or num_w2_bufs < 2
+        )
+    ):
+        _eo_tm = (
+            tile_m
+            if (prefill_tiles and tile_m <= 128)
+            else (256 if size_m >= _PREFILL_TM256_MIN_SIZE_M else 128)
+        )
+        tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = (
+            _eo_tm,
+            4096,
+            2048,
+            4096,
+            2048,
+            2,
+            2,
+        )
+    if (
+        _eo_pref < 3
+        and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) == 1
         and is_quantized
         and not fp8_direct_write
         and not hot_interleave
@@ -2889,7 +2921,9 @@ def kernel_main_fused_rs(
                 pl.semaphore_wait(scale_send_sems_ref.at[t_stg], send_sz)
 
     _early_rs = gather_2ahead_mode in (1, 2, 4, 6)
-    _two_ahead_gather = gather_2ahead_mode in (1, 3, 4, 5, 6)
+    _two_ahead_gather = (
+        gather_2ahead_mode in (1, 3, 4, 5, 6) and not eo3_enabled
+    )
     _gather_during_gmm1 = (
         gather_2ahead_mode in (4, 5, 6)
         and (use_lhs_fp8_vmem or has_ext_pq_lhs)
@@ -3996,7 +4030,7 @@ def kernel_main_fused_rs(
                     ):
                         start_w2_dma(_i, next_e, _i // num_k2, _i % num_k2)
 
-        return next_skip_out if eo_pair_enabled else skip_cur
+        return next_skip_out if eo_skip_enabled else skip_cur
 
     lax.fori_loop(
         0,

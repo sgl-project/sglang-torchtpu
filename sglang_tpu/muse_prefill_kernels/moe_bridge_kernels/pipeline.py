@@ -1804,6 +1804,7 @@ def fused_moe_full_bridge_and_ffn(
         fused_b1_b2_mode = envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2.get()
         t_local = attn_s.shape[0]
         he_dim = wp_fp8.shape[1]
+        num_base_local = max(1, int(bias.shape[0]) // ep_size)
         num_local_experts = w1_l.shape[0]
         go_val = go_l[0]
         my_id = go_val // num_local_experts
@@ -1824,7 +1825,11 @@ def fused_moe_full_bridge_and_ffn(
             int(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1)
             if (
                 eff_cm_pipe
-                and (not eplb_mode or eplb_mode == "off" or num_local_experts <= 32)
+                and (
+                    not eplb_mode
+                    or eplb_mode == "off"
+                    or num_local_experts <= num_base_local
+                )
             )
             else 0
         )
@@ -1862,7 +1867,7 @@ def fused_moe_full_bridge_and_ffn(
             ).tile_m
 
         def _maybe_remap_eplb(raw_global_ids, raw_local_ids):
-            if not eplb_mode or eplb_mode == "off" or num_local_experts <= 32:
+            if not eplb_mode or eplb_mode == "off" or num_local_experts <= num_base_local:
                 return raw_global_ids, raw_local_ids
             kernel_tile_m = _query_kernel_tile_m(
                 num_local_experts + eff_cm_slots_pipe
@@ -1872,6 +1877,7 @@ def fused_moe_full_bridge_and_ffn(
                 my_id,
                 ep_size=ep_size,
                 num_local_experts=num_local_experts,
+                num_base_local=num_base_local,
                 mode=eplb_mode,
                 quantum=kernel_tile_m,
             )
@@ -1902,7 +1908,7 @@ def fused_moe_full_bridge_and_ffn(
             eff_go_here = my_id * eff_n_loc if eff_cm_pipe else go_val
             _pallas_counts_slot[0] = None
             if vt_arg is None:
-                if eplb_mode and eplb_mode != "off" and num_local_experts > 32:
+                if eplb_mode and eplb_mode != "off" and num_local_experts > num_base_local:
                     raw_local = u8_local.astype(jnp.int32)
                     raw_global = u8_global.astype(jnp.int32)
                     g_ids, l_ids = _maybe_remap_eplb(raw_global, raw_local)
@@ -1986,8 +1992,8 @@ def fused_moe_full_bridge_and_ffn(
                 l_active = (my_id * t_local + jnp.arange(t_local, dtype=jnp.int32))[
                     :, None
                 ] < vt
-            if eplb_mode and eplb_mode != "off" and num_local_experts > 32:
-                sentinel_base = jnp.int32(ep_size * 32)
+            if eplb_mode and eplb_mode != "off" and num_local_experts > num_base_local:
+                sentinel_base = jnp.int32(ep_size * num_base_local)
                 masked_global = jnp.where(g_active, raw_global, sentinel_base)
                 masked_local = jnp.where(l_active, raw_local, sentinel_base)
                 g_ids, l_ids = _maybe_remap_eplb(masked_global, masked_local)
