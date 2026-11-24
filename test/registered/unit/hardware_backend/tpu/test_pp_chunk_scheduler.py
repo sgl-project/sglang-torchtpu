@@ -132,7 +132,7 @@ def test_spread_splits_light_load_over_more_steps():
     assert pending_step_limit(scheduler(below, spread=1.5)) == 12288
 
 
-def test_default_spread_keeps_one_step_per_stage():
+def test_spread_one_keeps_one_step_per_stage():
     def one_step_per_stage(pending):
         share = -(-pending // 8)
         return min(16384, max(2048, -(-share // 2048) * 2048))

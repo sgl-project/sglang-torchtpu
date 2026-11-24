@@ -425,8 +425,8 @@ class TpuEnvs:
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # Divisor multiplier for the per-step prefill share while the pending work is under
-    # one full step per stage; 1 spreads it over one step per stage.
-    SGLANG_TPU_PP_CHUNK_SPREAD = EnvFloat(1.0)
+    # one full step per stage; 1 spreads it over one step per stage, 2 over two.
+    SGLANG_TPU_PP_CHUNK_SPREAD = EnvFloat(2.0)
 
     # PD disaggregation tracing
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
