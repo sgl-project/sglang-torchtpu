@@ -1928,6 +1928,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
+        cp_rank = md.dcp_cp_rank if md.dcp_cp_rank is not None else self._cp_rank_t
+        cp_rank_index = cp_rank.to(torch.int64)
+        cp_rank_mask = (
+            torch.arange(cp, device=cp_rank.device, dtype=cp_rank.dtype) == cp_rank
+        )
+
         # The kernels run on every query head the group holds; each rank then
         # keeps its own ``layer_q_heads`` of the result.
         group_q_heads = layer_q_heads * self._dcp_head_blocks
@@ -1936,12 +1942,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # the whole group's (--dcp-replicate-q-proj).
             q_all = q.contiguous()
         else:
-            q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
+            q_all = gather_heads(q.contiguous(), group, cp, cp_rank_mask)
 
         def keep_own_heads(x: torch.Tensor) -> torch.Tensor:
             if x.shape[1] == layer_q_heads:
                 return x
-            return own_heads(x, cp, self._cp_rank_index)
+            return own_heads(x, cp, cp_rank_index)
 
         if forward_batch.forward_mode.is_decode():
             # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
@@ -1972,9 +1978,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 3,  # attention_scope: STRIPED
                 1,  # rpa_cases: DECODE only
             )
-            out, lse = merge_across_ranks(
-                out_p.float(), lse_p, group, cp, self._cp_rank_mask
-            )
+            out, lse = merge_across_ranks(out_p.float(), lse_p, group, cp, cp_rank_mask)
             out, lse = keep_own_heads(out), keep_own_heads(lse)
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
@@ -2038,7 +2042,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             0 if is_mixed else 2,  # rpa_cases: DECODE + MIXED / MIXED only
         )
         out_prefix, lse_prefix = merge_across_ranks(
-            out_prefix.float(), lse_prefix, group, cp, self._cp_rank_mask
+            out_prefix.float(), lse_prefix, group, cp, cp_rank_mask
         )
         out_prefix, lse_prefix = keep_own_heads(out_prefix), keep_own_heads(lse_prefix)
         out_chunk = keep_own_heads(out_chunk).float()

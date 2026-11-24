@@ -1249,8 +1249,15 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_refuses_eager_mode(self):
         self._assert_refused("(?i)torch[-_ ]compile", enable_torch_compile=False)
 
-    def test_refuses_the_direct_tracer(self):
-        self._assert_refused("(?i)tracer", tpu_compile_tracer="direct")
+    def test_accepts_the_direct_tracer(self):
+        self._validate(self._args(tpu_compile_tracer="direct"))
+        self._validate(
+            self._args(
+                attention_backend="pallas_tpu_mla_sparse",
+                kv_cache_dtype="fp8_e4m3",
+                tpu_compile_tracer="direct",
+            )
+        )
 
     def test_refuses_a_device_resident_req_to_token(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"):

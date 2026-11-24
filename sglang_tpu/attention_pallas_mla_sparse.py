@@ -38,7 +38,11 @@ from sglang_tpu.attention_pallas_mla_sparse_dcp import (
     build_sparse_mla_dcp_op,
     index_page_indices,
 )
-from sglang_tpu.attention_pallas_rpa_dcp import gather_heads, merge_across_ranks
+from sglang_tpu.attention_pallas_rpa_dcp import (
+    gather_heads,
+    merge_across_ranks,
+    own_heads,
+)
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
@@ -877,7 +881,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             )
         )
         # _mla_kernel_args passes page_indices, the indexer's under DCP.
-        args[7] = self.forward_metadata.dcp_latent_page_indices
+        md = self.forward_metadata
+        args[7] = md.dcp_latent_page_indices
+        cp_rank = getattr(md, "dcp_cp_rank", None)
+        if cp_rank is None:
+            cp_rank = self._cp_rank_t
+        cp_rank_index = cp_rank.to(torch.int64)
+        cp_rank_mask = (
+            torch.arange(self._dcp, device=cp_rank.device, dtype=cp_rank.dtype)
+            == cp_rank
+        )
         ql_nope, q_pe = args[0], args[1]
         nope = ql_nope.shape[-1]
         # One gather for both nope and pe.
@@ -885,23 +898,23 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             torch.cat([ql_nope, q_pe], dim=-1).contiguous(),
             self._dcp_group,
             self._dcp,
-            self._cp_rank_mask,
+            cp_rank_mask,
         )
         out, lse = self._dcp_op(
             q_all[..., :nope].contiguous(),
             q_all[..., nope:].contiguous(),
             *args[2:],
             topk_indices.contiguous(),
-            self._cp_rank_t,
+            cp_rank,
         )
         out, _ = merge_across_ranks(
             out.float(),
             lse,
             self._dcp_group,
             self._dcp,
-            self._cp_rank_mask,
-            self._cp_rank_index,
+            cp_rank_mask,
         )
+        out = own_heads(out, self._dcp, cp_rank_index)
         return out.to(ql_nope.dtype).reshape(
             q.shape[0], layer.tp_q_head_num * layer.v_head_dim
         )

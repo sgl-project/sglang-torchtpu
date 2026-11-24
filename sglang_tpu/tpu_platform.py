@@ -1080,9 +1080,9 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-torch-compile is required with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.tpu_compile_tracer != "dynamo":
+    if cfg.tpu_compile_tracer not in ("dynamo", "direct"):
         raise ValueError(
-            "--tpu-compile-tracer must be 'dynamo' with "
+            "--tpu-compile-tracer must be 'dynamo' or 'direct' with "
             "--decode-context-parallel-size > 1 on TPU (got "
             f"{cfg.tpu_compile_tracer!r})."
         )
