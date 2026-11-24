@@ -1661,7 +1661,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             return
 
-        enabled = tree_core.enable_session_radix_cache
+        enabled = tree_core.session_orders_device
         orig_next = swa_comp._evict_device_next_node
 
         def _owns_sidecar_pages(swa_indices: torch.Tensor) -> bool:

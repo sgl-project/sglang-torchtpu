@@ -56,6 +56,41 @@ tpu_dsv41_hc_combine
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
 
+tpu_dsv4_hc_split_sinkhorn
+  Why: deepseek_v4_mhc._mix_stats_impl takes its sinkhorn from get_mhc_ops()
+       on XPU only and calls the TileLang hc_split_sinkhorn everywhere else,
+       which does not run on TPU ("tilelang is not installed").
+  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn runs the
+       torch reference (deepseek_v4._hc_split_sinkhorn_torch, the same
+       arguments) for non-CUDA tensors.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: _mix_stats_impl takes the sinkhorn from get_mhc_ops() on every
+       platform.
+
+tpu_dsv4_live_hc_sublayers
+  Why: DeepseekV4DecoderLayerBase keeps attn_hc / ffn_hc, HcSubLayer named
+       tuples holding the layer's mHC parameters by reference. The direct
+       tracer swaps parameters for placeholders by attribute path and cannot
+       reach inside a tuple, so a trace read the real hc fn and build_mlir
+       rejected it as an unprovided argument.
+  How: AROUND DeepseekV4DecoderLayerBase.__init__ installs, once per class,
+       attn_hc / ffn_hc properties that rebuild the tuple from the layer's
+       current attributes on every read (the placeholders while tracing); the
+       setter records only whether the layer built them.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: the direct tracer swaps tensors inside named tuples, or
+       HcSubLayer reads the parameters through the layer.
+
+tpu_dsv4_fence_hc_mix_stats
+  Why: deepseek_v4_mhc._mix_stats_impl runs the mixing GEMM on the flattened
+       hyper-connection state right after the previous sublayer's post-combine;
+       XLA folds that producer into the GEMM operand in a transposed layout the
+       TPU fusion emitter cannot window, and the compile aborts.
+  How: AROUND _mix_stats_impl passes the state through an optimization
+       barrier (hc_fence) on non-CUDA tensors. Values unchanged.
+  Upstream PR or issue: not filed (follow-up to the upstream sync).
+  Remove when: the TPU compiler windows that fusion.
+
 tpu_dsv41_engram_gate
   Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
@@ -88,7 +123,8 @@ tpu_dsv41_hasher_forward
        and its offloaded gather halted a SparseCore. _HostTable pins its
        mapping with cudaHostRegister, and the core lookup reads it from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
-       builds the table with cudaHostRegister stubbed out. The V4 compile
+       builds the table with cudaHostRegister and the GPU row-order probe
+       (sglang#45879) stubbed out. The V4 compile
        policy and its forward shim (deepseek_v41/compile_policy.py) hash on the
        host and stage packed rows via double-buffered async raw DMA; inside the
        graph EngramHasher.forward returns the staged row ids and
@@ -105,7 +141,10 @@ allow_tpu_dsv41_encoder_replay
        still apply.
   How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
        original with the module's get_platform reporting CUDA and not ROCm, the
-       only two platform facts the validator reads.
+       only two platform facts the validator reads. Since the validator also
+       turns decoder SWA bounded replay on by default on CUDA, which the TPU
+       attention backend does not serve, an unset
+       --enable-decoder-swa-bounded-replay is declared off first.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
   Remove when: the validator asks current_platform whether it folds encoder
        SWA replay.
@@ -233,6 +272,7 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
     from unittest.mock import patch
 
     from sglang.srt.arg_groups import deepseek_v4_hook as validator
+    from sglang.srt.arg_groups.overrides import declare_resolution
     from sglang.srt.runtime_context import get_platform
 
     cfg = validator.resolving_view(server_args)
@@ -242,6 +282,13 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
         or not cfg.enable_encoder_swa_bounded_replay
     ):
         return original(server_args)
+    if cfg.enable_decoder_swa_bounded_replay is None:
+        # The validator's default for CUDA; DSV41TPUAttnBackend has no decoder replay.
+        declare_resolution(
+            server_args,
+            "tpu.allow_tpu_dsv41_encoder_replay",
+            enable_decoder_swa_bounded_replay=False,
+        )
     cuda = SimpleNamespace(is_cuda=True, is_hip=False)
     with patch.object(validator, "get_platform", lambda: cuda):
         return original(server_args)
@@ -418,10 +465,89 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
-def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value):
-    """engram_gate without torch.copysign (no TorchTPU kernel)."""
+def tpu_dsv4_hc_split_sinkhorn(original, mixes, *args, **kwargs):
+    """hc_split_sinkhorn in torch for non-CUDA tensors (TileLang is CUDA-only)."""
+    if mixes.is_cuda:
+        return original(mixes, *args, **kwargs)
+    from sglang.srt.models.deepseek_v4 import _hc_split_sinkhorn_torch
+
+    return _hc_split_sinkhorn_torch(mixes, *args, **kwargs)
+
+
+_HC_SUBLAYER_FIELDS = {
+    "attn_hc": (
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "input_layernorm",
+        "_hc_attn_tf32_parts",
+        "_hc_attn_bf16_parts",
+    ),
+    "ffn_hc": (
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "post_attention_layernorm",
+        "_hc_ffn_tf32_parts",
+        "_hc_ffn_bf16_parts",
+    ),
+}
+
+
+def _live_hc_property(name: str, fields: tuple, sublayer_cls) -> property:
+    built = f"_tpu_{name}_built"
+
+    def get(layer):
+        if not layer.__dict__.get(built):
+            return None
+        return sublayer_cls(layer.hc_cfg, *(getattr(layer, f) for f in fields))
+
+    def set_(layer, value):
+        layer.__dict__[built] = value is not None
+
+    return property(get, set_)
+
+
+def tpu_dsv4_live_hc_sublayers(original, layer, *args, **kwargs):
+    """AROUND DeepseekV4DecoderLayerBase.__init__: attn_hc / ffn_hc read through
+    to the layer's current parameters (the tracer's placeholders while tracing)."""
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
+    from sglang.srt.models.deepseek_v4_mhc import HcSubLayer
+
+    cls = DeepseekV4DecoderLayerBase
+    if not isinstance(cls.__dict__.get("attn_hc"), property):
+        for name, fields in _HC_SUBLAYER_FIELDS.items():
+            setattr(cls, name, _live_hc_property(name, fields, HcSubLayer))
+    return original(layer, *args, **kwargs)
+
+
+def tpu_dsv4_fence_hc_mix_stats(original, hc, x):
+    """AROUND deepseek_v4_mhc._mix_stats_impl: an optimization barrier on the
+    state first, so XLA does not fold its producer into the GEMM operand."""
     if x.is_cuda:
-        return original(x, kv, q_weight, k_weight, eps, clamp_value)
+        return original(hc, x)
+    from sglang_tpu.models.deepseek_v41.hc_fence import hc_fence
+
+    return original(hc, hc_fence(x))
+
+
+def tpu_dsv41_engram_gate(
+    original,
+    x,
+    kv,
+    q_weight,
+    k_weight,
+    eps,
+    clamp_value,
+    input_ids=None,
+    image_token_id=None,
+):
+    """engram_gate without torch.copysign (no TorchTPU kernel); rows whose
+    ``input_ids`` entry is ``image_token_id`` keep ``x``, as upstream."""
+    if x.is_cuda:
+        return original(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     from sglang_tpu.models.deepseek_v41.engram_host import signed_sqrt
 
     hc_mult, dim = x.shape[-2:]
@@ -434,7 +560,10 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     gate = torch.sigmoid(signed_sqrt(dot, clamp_value))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if input_ids is not None:
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
 
 
 def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
@@ -699,8 +828,23 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
+            "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
+            tpu_dsv4_hc_split_sinkhorn,
+            HookType.AROUND,
+        ),
+        (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase.__init__",
+            tpu_dsv4_live_hc_sublayers,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_mhc._mix_stats_impl",
+            tpu_dsv4_fence_hc_mix_stats,
             HookType.AROUND,
         ),
         (

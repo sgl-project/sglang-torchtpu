@@ -49,7 +49,6 @@ def _backend(tp, *, pages_per_seq=1089, qblock_op=True, split=True, dqs=1):
     """A backend as the K3.1 recipe sets it up (139264 context, the q-block
     flag on), built without __init__."""
     backend = TpuPallasSparseMlaAttnBackend.__new__(TpuPallasSparseMlaAttnBackend)
-    backend._dcp, backend._dcp_gathers_prefill = 1, False
     backend._idx_split_group = SimpleNamespace(world_size=tp)
     backend._idx_split_size = tp
     backend._idx_split_min_tokens = max(1024, 32 * tp)
