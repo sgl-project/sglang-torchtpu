@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import NodeId
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -55,7 +55,7 @@ class UnifiedSessionRefTracker:
 
     def register_session_ref(self, req: Req, leaf: NodeId) -> None:
         """Register the leaf a finished request's insert ended on with each
-        component; the lock anchor ``req.last_node`` is a different node."""
+        component; the request's lock sits on a different node."""
         if not self.enable_session_radix_cache:
             return
 
@@ -96,7 +96,27 @@ class UnifiedSessionRefTracker:
         generation = self._session_generations.get(session_id)
         if generation is None:
             generation = self.open_radix_session(session_id)
+            self._log_session_growth()
         return generation
+
+    def _log_session_growth(self) -> None:
+        """Implicit sessions (a top-level session_id, e.g. from --session-id-header) are
+        released only by /close_session; log their bookkeeping at the first id and
+        every 100th."""
+        n = len(self._session_generations)
+        if n != 1 and n % 100:
+            return
+        leaves = covered = 0
+        for component in self.components:
+            leaves += sum(len(v) for v in component._session_leaves.values())
+            for by_leaf in getattr(component, "_session_leaf_covered_len", {}).values():
+                covered += sum(by_leaf.values())
+        logger.info(
+            "Radix sessions: %d open ids, %d component leaves, %d covered SWA tokens",
+            n,
+            leaves,
+            covered,
+        )
 
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:

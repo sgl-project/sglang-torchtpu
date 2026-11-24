@@ -33,7 +33,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
 
@@ -140,6 +140,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_page_ids_group = []
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        # The parent's PD reuse guard (set_reuse_guard_event) over staged pages.
+        self._reuse_guard_event = None
+        self._staged_guard_event = None
         # Pages freed while a forward was in flight; see kv_free_fence.py.
         self.held_pages = HeldPages()
         # True while a page sits in free_pages, staged_pages or held_pages; a

@@ -636,6 +636,23 @@ def fused_conv1d_gdn(
         attention_mode=attention_mode,
         max_mixed_tile_size=max_mixed_tile_size,
     )
+    decode_state_out_buffers = 2
+    if not pooled:
+        decode_state_out_buffers = tiling.calculate_decode_state_out_buffers(
+            tile_b=decode_tile_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            conv_state_dim_size=conv_state.shape[-1],
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=recurrent_state.dtype,
+            num_lanes=num_lanes,
+            vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
+            kernel_size=kernel_size,
+            window_size=window_size,
+            attention_mode=attention_mode,
+        )
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -691,9 +708,11 @@ def fused_conv1d_gdn(
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
             window_size = 1
+            state_out_buffers = 2
         else:
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
+            state_out_buffers = decode_state_out_buffers
 
         cfg = config.GDNConfig(
             mode=mode,
@@ -719,6 +738,7 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
             packed_weights=packed_weights is not None,
+            state_out_buffers=state_out_buffers,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer

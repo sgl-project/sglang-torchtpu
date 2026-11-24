@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.attention_pallas_rpa_base import (
@@ -94,7 +94,8 @@ def test_eagle_refresh_requires_complete_host_query_shape_without_readback(
 def test_query_mirror_survives_padding_before_metadata(
     padding, physical_bs, mirror_kind, enabled
 ):
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang_tpu.compilation.bucketer import Bucketer
     from sglang_tpu.compilation.compiled_forward_shim import (
         _pad_forward_batch_inputs,
@@ -254,7 +255,7 @@ def test_other_extend_paths_use_complete_mirror_or_device_lengths(
 def test_eagle_query_producer_precedes_idle_normalization(idle):
     from unittest.mock import Mock
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative import eagle_worker_common as common
 
     bs = 0 if idle else 2
@@ -309,7 +310,8 @@ def test_eagle_query_producer_precedes_idle_normalization(idle):
 
 
 def test_padding_does_not_mutate_a_borrowed_cpu_query_list():
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     original = [4, 4]
     batch = ForwardBatch(

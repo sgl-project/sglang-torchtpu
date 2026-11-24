@@ -39,7 +39,7 @@ PYTHON=${PYTHON:-python3}
 # Sends CONCURRENCY requests at once and waits for all of them.
 send_wave() {
     local log=$1 seed=$2
-    "$PYTHON" -m sglang.bench_serving --backend sglang --base-url "$BASE_URL" \
+    "$PYTHON" -m sglang.benchmark.serving --backend sglang --base-url "$BASE_URL" \
         --model "$MODEL" --dataset-name random-ids --tokenize-prompt \
         --random-input-len "$ISL" --random-output-len "$OSL" --random-range-ratio 0.8 \
         --num-prompts "$CONCURRENCY" --max-concurrency "$CONCURRENCY" \

@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional, Union
 import msgspec
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang_tpu.disaggregation.decode_dram_offload.decode_dram_prefix_offerer import (
     DecodeDramPrefixOfferer,
@@ -85,7 +85,9 @@ def attach_dram_offload_extension(
     """Extend ``cache``'s L2 controller to the peer role's DRAM, reached over
     the raiden ``channel``. A decode passes its transfer queue."""
     host_pool, swa_pool = anchor_host_pool(cache), swa_host_pool(cache)
-    channel.bind_host_pools(host_pool, swa_pool)
+    channel.bind_host_pools(
+        host_pool, swa_pool, retain_metadata=decode_queue is not None
+    )
     page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
     ctx = DramOffloadWorkerContext(
         cache=cache,
@@ -182,8 +184,8 @@ def _decode_init_kv_manager(upstream: Callable, queue: DecodePreallocQueue) -> A
     return manager
 
 
-def _pop_bootstrapped(upstream: Callable, queue: Any, *args, **kwargs) -> Any:
-    """Wraps ``PrefillBootstrapQueue.pop_bootstrapped``: drive the prefill's
+def _move_bootstrapped(upstream: Callable, queue: Any, *args, **kwargs) -> Any:
+    """Wraps ``PrefillBootstrapQueue.move_bootstrapped``: drive the prefill's
     end before the step, settle the requests that left bootstrap after it."""
     scheduler = queue.scheduler
     extension = _extension(scheduler.tree_cache)
@@ -192,17 +194,15 @@ def _pop_bootstrapped(upstream: Callable, queue: Any, *args, **kwargs) -> Any:
         serving=bool(queue.queue or scheduler.waiting_queue)
         or not scheduler.running_batch.is_empty()
     )
-    result = upstream(queue, *args, **kwargs)
-    # With return_failed_reqs the result is (bootstrapped, failed). Core
-    # all-reduces the polls, so every rank bootstraps and drops the same
+    bootstrapped = upstream(queue, *args, **kwargs)
+    # Core all-reduces the polls, so every rank bootstraps and drops the same
     # requests in a step and the tree inserts below are in step.
-    bootstrapped = result[0] if isinstance(result, tuple) else result
     for req in bootstrapped:
         extension.push.note_decode_of(
             req, recalled=extension.recall.insert_recalled_host_prefix(req)
         )
     extension.recall.drop_departed(queue.queue)
-    return result
+    return bootstrapped
 
 
 def _release_memory_occupation(upstream: Callable, queue: Any) -> Any:
@@ -240,9 +240,11 @@ def _send_kv_metadata(
     return upstream(queue, decode_req, kv_indices, page_size, *args, **kwargs)
 
 
-def _pop_transferred(upstream: Callable, queue: DecodeTransferQueue, *args, **kwargs):
-    """Wraps ``DecodeTransferQueue.pop_transferred``: close the offers of the
-    requests that left the queue in this step, on every rank."""
+def _move_transferred_with_outcomes(
+    upstream: Callable, queue: DecodeTransferQueue, *args, **kwargs
+):
+    """Wraps ``DecodeTransferQueue.move_transferred_with_outcomes``: close the
+    offers of the requests that left the queue in this step, on every rank."""
     result = upstream(queue, *args, **kwargs)
     _extension(queue.tree_cache).source.close_departed_offers()
     return result
@@ -356,7 +358,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         (DecodePreallocQueue, "_init_kv_manager", _decode_init_kv_manager),
         (DecodePreallocQueue, "_send_kv_metadata", _send_kv_metadata),
         (PrefillBootstrapQueue, "_init_kv_manager", _prefill_init_kv_manager),
-        (PrefillBootstrapQueue, "pop_bootstrapped", _pop_bootstrapped),
+        (PrefillBootstrapQueue, "move_bootstrapped", _move_bootstrapped),
         (
             PrefillBootstrapQueue,
             "release_memory_occupation",
@@ -373,7 +375,11 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
             "_record_scheduler_state_for_paused_engine",
             _record_scheduler_state_for_paused_engine,
         ),
-        (DecodeTransferQueue, "pop_transferred", _pop_transferred),
+        (
+            DecodeTransferQueue,
+            "move_transferred_with_outcomes",
+            _move_transferred_with_outcomes,
+        ),
         (DecodeTransferQueue, "resolve_deferred_releases", _resolve_deferred_releases),
         (
             DecodeTransferQueue,

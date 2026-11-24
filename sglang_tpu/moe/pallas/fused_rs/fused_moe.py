@@ -27,11 +27,20 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+    EXPERT,
+    MLP_DATA,
     _select_fused_rs_block_sizes,
+    fused_rs_smem_rows,
 )
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
+)
+from sglang_tpu.moe.pallas.fused_rs.post_combine import (
+    supports_twolevel_post_combine_scatter,
+    twolevel_post_combine,
+    twolevel_post_combine_scatter,
 )
 from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
@@ -39,9 +48,7 @@ from sglang_tpu.moe.pallas.fused_rs.utils import (
     get_moe_expert_axis,
 )
 from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
-
-EXPERT = "model"
-MLP_DATA = "data"
+from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
 # ============================================================================
 # SMEM safety guard
@@ -57,7 +64,7 @@ _FUSED_RS_MAX_SAFE_SIZE_M = 262144
 
 
 def _assert_fused_rs_smem_safe(size_m: int) -> None:
-    """Assert ``size_m`` fits the v7x SMEM budget for ``gmm_v2_fused_rs``."""
+    """Assert ``size_m`` SMEM routing rows (fused_rs_smem_rows) fit the v7x SMEM budget."""
     assert size_m < _FUSED_RS_MAX_SAFE_SIZE_M, (
         f"gmm_v2_fused_rs SMEM OOM at size_m={size_m} (>= "
         f"{_FUSED_RS_MAX_SAFE_SIZE_M}). Per-row scalar-prefetch arrays "
@@ -134,6 +141,90 @@ def _compute_expert_tp_routing(
     return lhs_indices, group_sizes, lhs_indices, topk_slot_indices
 
 
+def _ep_ranks_pair_cores(ep_size: int) -> bool:
+    """Whether expert ranks 2c and 2c + 1 are the two TensorCores of one chip, as the
+    fused-RS two-level reduce-scatter assumes. Holds for torch ranks under get_pallas_mesh
+    on TPU7x (see k3_megakernel/config.py); needs at least two chips."""
+    if ep_size < 4 or ep_size % 2:
+        return False
+    try:
+        return get_pallas_tpu_device_kind() == "TPU7x"
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _twolevel_post_combine(
+    recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
+    topk_indices: jax.Array,  # [num_tokens, topk], replicated
+    topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
+    post_expert_norm_weight: jax.Array | None,
+    *,
+    my_id: jax.Array,
+    chunk_size: int,
+    topk: int,
+    hidden_size: int,
+) -> jax.Array:
+    """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
+
+    Rank r is the r-th row owned by this rank in the kernel's row order (expert-sorted,
+    then token-sorted). Ranks go back to tokens by an f32 scatter-add in VMEM when the
+    [chunk, hidden] accumulator fits, else by a 0/1 matmul.
+    """
+    rows = chunk_size * topk
+    # The kernel's row order is a stable sort by expert of the flat (token, slot)
+    # index; this rank's rows keep that order, so a stable sort of its own pairs,
+    # carrying the index and weight, gives the ranks without a global sort.
+    local_ids = jax.lax.dynamic_slice_in_dim(
+        topk_indices, my_id * chunk_size, chunk_size, axis=0
+    ).reshape(-1)
+    _, flat, weight = jax.lax.sort(
+        (
+            local_ids,
+            jnp.arange(rows, dtype=jnp.int32),
+            topk_weights.astype(jnp.float32).reshape(-1),
+        ),
+        num_keys=1,
+        is_stable=True,
+    )
+    token = flat // topk
+    out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    if post_expert_norm_weight is not None and supports_twolevel_post_combine_scatter(
+        recv, rows=rows, chunk=chunk_size, out_dtype=out_dtype
+    ):
+        return twolevel_post_combine_scatter(
+            recv,
+            post_expert_norm_weight,
+            weight,
+            token,
+            rows=rows,
+            chunk=chunk_size,
+            eps=1e-8,
+            out_dtype=out_dtype,
+        ).reshape(chunk_size, hidden_size)
+    if post_expert_norm_weight is not None and recv.ndim == 3:
+        weighted = twolevel_post_combine(
+            recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
+        ).reshape(rows, hidden_size)
+    else:
+        y = jnp.sum(recv.reshape(-1, rows, hidden_size).astype(jnp.float32), axis=0)
+        y = y.astype(recv.dtype).astype(jnp.float32)
+        if post_expert_norm_weight is not None:
+            norm_size = post_expert_norm_weight.shape[0]
+            y = y * (post_expert_norm_weight.astype(jnp.float32) + 1.0)[None, :]
+            y = y * jax.lax.rsqrt(
+                jnp.sum(y * y, axis=-1, keepdims=True) / norm_size + 1e-8
+            )
+        weighted = (y.astype(recv.dtype).astype(jnp.float32) * weight[:, None]).astype(
+            recv.dtype
+        )
+    scatter = (
+        token[None, :] == jnp.arange(chunk_size, dtype=jnp.int32)[:, None]
+    ).astype(weighted.dtype)
+    return jnp.dot(scatter, weighted, preferred_element_type=jnp.float32).astype(
+        out_dtype
+    )
+
+
 # ============================================================================
 # Per-chip MoE body (nodedup kernel variant)
 # ============================================================================
@@ -163,8 +254,12 @@ def moe_gmm_local_rs_nodedup(
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
+    allow_twolevel_rs: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
+
+    ``allow_twolevel_rs``: expert TP whose ranks 2c and 2c + 1 are one chip's two
+    cores (see _ep_ranks_pair_cores).
 
     Sends every row to its (local_row, topk_slot) slot via ICI direct-write,
     then applies topk weights and reduces over the top_k dim post-kernel.
@@ -211,6 +306,18 @@ def moe_gmm_local_rs_nodedup(
         topk_indices = routing[..., 0].astype(jnp.int32)
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
 
+    # An id outside [0, E) (a NaN router score) leaves group_sizes but keeps its row, and
+    # the kernel halts or hangs: send it to expert 0 with weight 0. Expert-TP ranks hold a
+    # slice of every expert, so E is num_local_experts there.
+    num_router_experts = num_local_experts if expert_tp else num_experts
+    routed_ok = (topk_indices >= 0) & (topk_indices < num_router_experts)
+    topk_indices = jnp.where(routed_ok, topk_indices, 0)
+    if sp_enabled:  # topk_weights holds only this rank's tokens
+        routed_ok = jax.lax.dynamic_slice_in_dim(
+            routed_ok, my_id * chunk_size, chunk_size, axis=0
+        )
+    topk_weights = jnp.where(routed_ok, topk_weights, 0).astype(topk_weights.dtype)
+
     # Expert TP: every rank holds a 1/ep_size slice of every expert's
     # intermediate dim, addressed as virtual experts
     # [rank * E, (rank + 1) * E). Route each (token, slot) to all ep_size
@@ -233,7 +340,7 @@ def moe_gmm_local_rs_nodedup(
             _compute_rs_routing(topk_indices, num_experts=num_experts, topk=topk)
         )
     size_m = lhs_indices.shape[0]
-    _assert_fused_rs_smem_safe(size_m)
+    _assert_fused_rs_smem_safe(fused_rs_smem_rows(size_m, ep_size, expert_tp))
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
@@ -297,6 +404,17 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
+    # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
+    # The two-level combine norms whole rows: a padded hidden takes the plain path.
+    padded_hidden = (
+        has_post_norm and post_expert_norm_weight_input.shape[0] < hidden_size
+    )
+    twolevel_rs = (
+        allow_twolevel_rs
+        and num_tokens >= 4096
+        and not fp8_direct_write
+        and not padded_hidden
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -323,6 +441,7 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
+        twolevel_rs=twolevel_rs,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -336,7 +455,28 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
-    if expert_tp:
+    post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
+    if twolevel_rs:
+        return _twolevel_post_combine(
+            out_buf,
+            topk_indices,
+            local_topk_weights,
+            post_expert_norm_weight,
+            my_id=my_id,
+            chunk_size=chunk_size,
+            topk=topk,
+            hidden_size=hidden_size,
+        )
+    if expert_tp and out_buf.ndim == 3:
+        # Split rows only: the ep sum reads the kernel's tiled layout in place.
+        out_3d = (
+            out_buf.reshape(chunk_size, topk, ep_size, *out_buf.shape[1:])
+            .astype(jnp.float32)
+            .sum(axis=2)
+            .astype(out_buf.dtype)
+            .reshape(chunk_size, topk, hidden_size)
+        )
+    elif expert_tp:
         out_3d = (
             out_buf.reshape(chunk_size, topk, ep_size, hidden_size)
             .astype(jnp.float32)
@@ -476,6 +616,11 @@ def expert_parallel_gmm_rs(
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
             fp4_w4a16=fp4_w4a16,
+            allow_twolevel_rs=(
+                expert_tp
+                and tpu_envs.SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL.get()
+                and _ep_ranks_pair_cores(ep_size)
+            ),
         ),
         mesh=mesh,
         in_specs=(

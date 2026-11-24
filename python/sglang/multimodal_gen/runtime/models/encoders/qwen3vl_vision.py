@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -19,7 +19,6 @@ from sglang.srt.models.qwen3_vl import (
     Qwen3VLMoeVisionPatchMerger,
     Qwen3VLVisionPatchEmbed,
 )
-from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass(frozen=True)
@@ -70,7 +69,6 @@ class Qwen3VLVisionBlock(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
-        parallel = get_parallel()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = QwenVLVisionAttention(
@@ -86,8 +84,7 @@ class Qwen3VLVisionBlock(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"{prefix}.blocks.{layer_idx}.mlp",
             quant_config=quant_config,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
         )
 
     def forward(
@@ -210,7 +207,6 @@ class Qwen3VLVisionTransformer(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
-        parallel = get_parallel()
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
@@ -233,8 +229,7 @@ class Qwen3VLVisionTransformer(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
             use_postshuffle_norm=False,
             prefix="visual.merger",
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
         )
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
@@ -245,8 +240,7 @@ class Qwen3VLVisionTransformer(nn.Module):
                 spatial_merge_size=config.spatial_merge_size,
                 use_postshuffle_norm=True,
                 prefix=f"visual.deepstack_merger_list.{merger_idx}",
-                tp_rank=parallel.tp_rank,
-                tp_size=parallel.tp_size,
+                parallel_group="tp",
             )
             for merger_idx, _ in enumerate(self.deepstack_visual_indexes)
         )
@@ -285,17 +279,24 @@ class Qwen3VLVisionTransformer(nn.Module):
         **_: Any,
     ) -> Qwen3VLVisionOutput:
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
+        host_grid_thw = grid_thw.cpu()
         grid_thw = grid_thw.to(self.device)
         hidden_states = self.patch_embed(hidden_states)
         position_embeddings = self._interpolate_position_embeddings(grid_thw)
         hidden_states = hidden_states + position_embeddings.to(hidden_states.dtype)
 
         position_ids = _vision_position_ids(grid_thw, self.spatial_merge_size)
-        rotary = self.rotary_pos_emb(int(grid_thw[:, 1:].max()))[position_ids]
+        rotary = self.rotary_pos_emb(int(host_grid_thw[:, 1:].max()))[position_ids]
         rotary = rotary.flatten(1)
         rotary = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (rotary.cos(), rotary.sin())
-        metadata = PackedSequenceMetadata.from_cu_seqlens(_vision_cu_seqlens(grid_thw))
+        # The packed bounds come from the host grid, which the attention reads
+        # anyway: no int cumsum on the device, which TPU fails to compile for
+        # more than one grid row (H3 ref2va's images and video).
+        metadata = PackedSequenceMetadata.from_cu_seqlens(
+            _vision_cu_seqlens(host_grid_thw)
+        )
+        metadata = replace(metadata, cu_seqlens=metadata.cu_seqlens.to(self.device))
 
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):

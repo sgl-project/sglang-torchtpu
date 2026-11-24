@@ -11,13 +11,11 @@ maybe_stub_sgl_kernel()
 
 import torch  # noqa: E402
 
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang_tpu.pp_buffered import PPBufferedHandoff, Transport  # noqa: E402
 from sglang_tpu.pp_wave import PPWave  # noqa: E402
 
@@ -82,8 +80,9 @@ def run_loop(
     scheduler.pp_group.recv_object = Mock(return_value=[])
     scheduler.disaggregation_mode = mode
     scheduler.device_module = Mock()
+    scheduler.token_to_kv_pool_allocator = Mock()
     scheduler.waiting_queue = []
-    scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_transfer_queue = []
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
@@ -132,7 +131,7 @@ def run_loop(
     wave.end_iteration = Mock(side_effect=hand_off)
     scheduler._pp_init_wave = Mock(return_value=wave)
 
-    def recv_requests():
+    def recv_requests(**kwargs):
         step[0] += 1
         if step[0] == len(schedule):
             raise EndSchedule
@@ -144,6 +143,12 @@ def run_loop(
     scheduler.process_prefill_chunk = Mock()
     scheduler.maybe_prefetch_staging_for_batch = Mock()
     scheduler.on_idle = Mock()
+    scheduler.increment_scheduler_iterations = Mock()
+    scheduler.pause_state = SimpleNamespace(may_launch=lambda: True)
+    scheduler.invariant_checker = Mock()
+    scheduler._apply_war_barrier = Mock()
+    scheduler._flush_staging_scatters = Mock()
+    scheduler._on_step_processed = Mock()
 
     def plan(running_batch):
         return SimpleNamespace(
@@ -166,7 +171,7 @@ def run_loop(
         "process_retract_queue",
         "process_prealloc_queue",
         "process_decode_transfer_queue",
-        "process_disagg_prefill_inflight_queue",
+        "process_disagg_prefill_transfer_queue",
     ):
         setattr(scheduler, name, Mock(return_value=[]))
     scheduler._pp_recv_pyobj_from_prev_stage = Mock(return_value=[])
@@ -214,6 +219,9 @@ def run_loop(
         enable_dsa_prefill_context_parallel=False,
     )
     with (
+        # The PP loop fences on torch.accelerator.current_stream(); CPU CI has
+        # no accelerator, so stub it like the mocked device_module events.
+        patch.object(torch.accelerator, "current_stream"),
         patch.object(scheduler_pp_mixin, "_is_tpu", use_wave),
         patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
         patch.object(
@@ -314,7 +322,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                     scheduler._pp_pd_get_prefill_transferred_ids.call_count,
                     len(schedule),
                 )
-                scheduler.process_disagg_prefill_inflight_queue.assert_called()
+                scheduler.process_disagg_prefill_transfer_queue.assert_called()
                 scheduler.process_bootstrapped_queue.assert_called()
                 if rank != 3:
                     forwarded_requests = [

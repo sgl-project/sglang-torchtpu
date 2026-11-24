@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.mem_cache import kv_cache_configurator
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -21,11 +22,15 @@ class TestKVCacheMemoryProfile(unittest.TestCase):
         self.configurator.device = "tpu"
         self.configurator.gpu_id = 0
         self.configurator.mambaish_config = None
+        self.configurator.is_draft_worker = False
         self.configurator.model_config = SimpleNamespace(is_multimodal=False)
 
         stack.enter_context(
             get_context().override_server_args(
-                mem_fraction_static=0.75, mm_feature_transport=None
+                mem_fraction_static=0.75,
+                mm_feature_transport=None,
+                # Resolved at launch; the budget reads its prefill request cap.
+                cuda_graph_config=default_cuda_graph_config(),
             )
         )
         self.platform = stack.enter_context(

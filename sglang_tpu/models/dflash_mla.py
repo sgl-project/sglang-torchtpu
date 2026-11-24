@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.model_config import compute_mla_mscale_scaling
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -33,7 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.dflash import _get_dflash_layer_attention_params
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 def is_dflash_mla_draft(config) -> bool:

@@ -7,12 +7,13 @@ import inspect
 import logging
 import pickle
 import time
+import types
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
-from typing import Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Protocol
 
 import torch
 from jax import tree_util
@@ -32,10 +33,16 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
+from sglang_tpu.attention_flywheel import FlywheelForwardMetadata
 from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
-from sglang_tpu.compilation.graph_identity import _key_value, canonical, digest
+from sglang_tpu.compilation.graph_identity import digest, graph_name
+from sglang_tpu.compilation.lowered_graph import (
+    NO_CALLBACKS,
+    LoweredGraph,
+    LoweredGraphRequest,
+)
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
@@ -44,9 +51,17 @@ from sglang_tpu.compilation.spmd_compiler import (
     ExecutableInterface,
     InputSpec,
     SPMDCompiler,
+    load_serialized_executable,
+    serialize_executable,
 )
-from sglang_tpu.compilation.warmup_queue import current_warmup_queue
+from sglang_tpu.compilation.warmup_queue import (
+    current_lowered_graph_store,
+    current_warmup_queue,
+)
 from sglang_tpu.rank_local import trace_rank
+
+if TYPE_CHECKING:
+    from sglang_tpu.compilation.lowered_graph_cache import FileLoweredGraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +164,7 @@ class KVPool(Protocol):
 # flatten their tensor fields and reconstruct the same objects for tracing.
 tree_util.register_dataclass(ForwardBatch)
 tree_util.register_dataclass(PallasForwardMetadata)
+tree_util.register_dataclass(FlywheelForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
 register_pp_proxy_pytree(tree_util)
@@ -193,6 +209,16 @@ def direct_compile(
     Enable coordination with ``--use-spmd-compile`` and add a recipe test using
     ``sglang_tpu.testing.spmd_safe`` to validate identical graphs and input layouts
     on every rank. ``VERIFY_SPMD_SAFE=1`` runs that verification without execution.
+
+    ``name`` also opts the function into the warmup queue's lowered-graph
+    store (``lowered_graph_cache``), so it must name the traced function
+    stably across processes. In a warmup with a store, a stored executable
+    replaces tracing and compiling, and freshly compiled executables are
+    offered to the store. Under shared SPMD compilation only a graph's owner
+    consults the store, and consumers bind its executable as usual. Reusing a
+    graph assumes tracing has no Python side effects other than inserted
+    callbacks; graphs that insert callbacks, and functions with ``uses_rng``,
+    are always traced.
 
     ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
     Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
@@ -282,6 +308,16 @@ def direct_compile(
     return functools.update_wrapper(compiled, fn)
 
 
+def _input_spec(tensor: torch.Tensor) -> tuple:
+    """(shape, dtype, device, device layout) a compiled executable binds."""
+    layout = (
+        tpu_torch_compile.get_device_layout_if_materialized(tensor)
+        if tensor.device.type == "tpu"
+        else None
+    )
+    return (tuple(tensor.shape), tensor.dtype, tensor.device, layout)
+
+
 class CompiledFunction:
     """A CompiledFunction is a collection of 0+ CompiledArtifacts.
 
@@ -316,6 +352,17 @@ class CompiledFunction:
             self._model_extra_tensor_attrs
         ):
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
+        if self._model_extra_tensor_attrs:
+            err = getattr(self._model, "_derived_weight_cache_error", None)
+            if not err:
+                # Compiled artifacts retain load-time extra tensors; load_weights
+                # rebinds plain attributes to new tensors, leaving graphs stale.
+                self._model._derived_weight_cache_error = (
+                    "Online weight updates are not supported with "
+                    "--tpu-compile-tracer direct when model_extra_tensor_attrs "
+                    "are bound at compile time. Restart the server or use "
+                    "--tpu-compile-tracer dynamo to update weights online."
+                )
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
@@ -326,6 +373,10 @@ class CompiledFunction:
         self._spmd_safe = spmd_safe
         self._lift_rank = lift_rank
         self._rank_input: torch.Tensor | None = None
+        # Explicit tensor inputs the traced fn writes in place (e.g. a capture
+        # buffer the forward fills). Learned on first trace; traced on clones and
+        # copied back after each execute, like KV state.
+        self._mutated_input_paths: set[tree_util.KeyPath] = set()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         artifact = self._get_artifact(args, kwargs)
@@ -376,6 +427,79 @@ class CompiledFunction:
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 
+    def release_model_inputs(self) -> None:
+        """Drop every artifact's references to its model-input tensors, keeping
+        their shape, dtype, device and device layout, so the caller can free and
+        rebuild the parameters; refresh_model_inputs re-attaches them. "keep"
+        inputs (the lifted rank) stay attached."""
+        for artifact in self.cache.values():
+            if (
+                artifact is None
+                or artifact.released_input_specs is not None
+                or not artifact.model_input_sources
+            ):
+                continue
+            specs, kept = [], []
+            for tensor, source in zip(
+                artifact.model_inputs, artifact.model_input_sources, strict=True
+            ):
+                specs.append(_input_spec(tensor))
+                kept.append(tensor if source[0] == "keep" else None)
+            artifact.released_input_specs = tuple(specs)
+            artifact.model_inputs = tuple(kept)
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(kept):
+                    full[index] = tensor
+                    flat[index] = tensor
+
+    def refresh_model_inputs(self) -> int:
+        """Re-resolve every compiled artifact's model inputs from the model.
+
+        For callers that rebind parameters after compiling (e.g. load the real
+        weights while the compile runs): each input is looked up again by the
+        name or attribute it was traced from, and must keep the shape, dtype,
+        device and device layout it was traced with. Returns the number of
+        inputs that changed."""
+        if self._model is None:
+            return 0
+        changed = 0
+        for artifact in self.cache.values():
+            if artifact is None or not artifact.model_input_sources:
+                continue
+            specs = artifact.released_input_specs
+            fresh = []
+            for position, (old, source) in enumerate(
+                zip(artifact.model_inputs, artifact.model_input_sources, strict=True)
+            ):
+                if source[0] == "module":
+                    try:
+                        new = self._model.get_parameter(source[1])
+                    except AttributeError:
+                        new = self._model.get_buffer(source[1])
+                elif source[0] == "attr":
+                    new = getattr(source[1], source[2])
+                else:
+                    new = old
+                want = specs[position] if specs is not None else _input_spec(old)
+                got = _input_spec(new)
+                if got != want:
+                    raise ValueError(
+                        f"refresh_model_inputs: {source[1:]} was traced as {want}, "
+                        f"now {got}"
+                    )
+                if new is not old:
+                    changed += 1
+                fresh.append(new)
+            artifact.model_inputs = tuple(fresh)
+            artifact.released_input_specs = None
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(fresh):
+                    full[index] = tensor
+                    flat[index] = tensor
+        return changed
+
     def _get_artifact(
         self,
         args: tuple[Any, ...],
@@ -386,11 +510,7 @@ class CompiledFunction:
         key = self.specialization_key(*args, **kwargs)
         queue = current_warmup_queue() if async_compile and self._spmd_safe else None
         spmd_compiler = queue.spmd_compiler if queue is not None else None
-        graph = (
-            f"{self._name}:{canonical(_key_value(key))}"
-            if spmd_compiler is not None
-            else None
-        )
+        graph = graph_name(self._name, key) if spmd_compiler is not None else None
         artifact = self.cache.get(key)
         if spmd_compiler is not None:
             pending = (
@@ -420,8 +540,13 @@ class CompiledFunction:
             logger.info(
                 "[direct_compile] new specialization %r (async=%s)", key, async_compile
             )
+            store = self._lowered_graph_store(spmd_compiler)
             if spmd_compiler is not None:
                 spmd_compiler.enqueue(graph)
+            elif store is not None:
+                graph = self._store_identity(key)
+                if graph is None:
+                    store = None
             trace_start = time.perf_counter()
             artifact = self._compile(
                 args,
@@ -429,6 +554,7 @@ class CompiledFunction:
                 async_compile=async_compile,
                 spmd_compiler=spmd_compiler,
                 graph=graph,
+                store=store,
             )
             if (
                 spmd_compiler is not None
@@ -447,12 +573,15 @@ class CompiledFunction:
         async_compile: bool = False,
         spmd_compiler: SPMDCompiler | None = None,
         graph: str | None = None,
+        store: FileLoweredGraphStore | None = None,
     ) -> _CompiledArtifact:
-        """Compile one specialization into a PJRT executable."""
+        """Compile one specialization into a PJRT executable; ``store`` (with
+        ``graph`` as its identity) reuses and records lowered graphs."""
 
         # Step 1: Figure out a flat list of Tensor inputs.
         if spmd_compiler is not None and self._uses_rng:
             raise ValueError("Shared TPU compilation requires explicit RNG inputs")
+        shared = spmd_compiler is not None and not spmd_compiler.verify_spmd_safe
         call = (args, kwargs)
         # Yes, use jax's tree_util API. jax is required for pallas anyways
         # and their tree_util API is pretty nice.
@@ -464,6 +593,9 @@ class CompiledFunction:
         registered_model_inputs: list[tuple[str, int]] = []
         extra_model_inputs: list[tuple[object, str, int]] = []
         model_inputs: list[torch.Tensor] = []
+        # Where each model input comes from, aligned with model_inputs, so a
+        # compiled artifact can re-resolve them (refresh_model_inputs).
+        model_input_sources: list[tuple] = []
         if self._model is not None:
             all_names_and_tensors = [
                 *self._model.named_parameters(remove_duplicate=False),
@@ -478,6 +610,7 @@ class CompiledFunction:
                 tensor_index = len(model_inputs)
                 tensor_indices[tensor_id] = tensor_index
                 model_inputs.append(tensor)
+                model_input_sources.append(("module", name))
                 registered_model_inputs.append((name, tensor_index))
 
             for path in self._model_extra_tensor_attrs:
@@ -498,6 +631,7 @@ class CompiledFunction:
                     tensor_index = len(model_inputs)
                     tensor_indices[tensor_id] = tensor_index
                     model_inputs.append(tensor)
+                    model_input_sources.append(("attr", parent, attr_name))
                 extra_model_inputs.append((parent, attr_name, tensor_index))
 
         rank_input_index = None
@@ -510,11 +644,14 @@ class CompiledFunction:
                 self._rank_input.cpu()
             rank_input_index = len(model_inputs)
             model_inputs.append(self._rank_input)
+            model_input_sources.append(("keep",))
 
         kv_pool_inputs = self._kv_pool.get_state() if self._kv_pool is not None else []
 
         tensor_leaf_indices: list[int] = []
         tensor_inputs_key_paths: list[tree_util.KeyPath] = []
+        tensor_leaves: list[torch.Tensor] = []
+        static_leaves: list[tuple[tree_util.KeyPath, Any]] = []
         for leaf_index, (path, leaf) in enumerate(path_leaves):
             # We need to subtract out the ignored_argnames.
             if any(path[: len(prefix)] == prefix for prefix in ignored_paths):
@@ -522,8 +659,9 @@ class CompiledFunction:
             if _is_tpu_tensor(leaf):
                 tensor_leaf_indices.append(leaf_index)
                 tensor_inputs_key_paths.append(path)
+                tensor_leaves.append(leaf)
             elif isinstance(leaf, _STATIC_INPUT_TYPES):
-                continue
+                static_leaves.append((path, leaf))
             else:
                 raise TypeError(
                     f"Unsupported direct_compile input type "
@@ -534,15 +672,28 @@ class CompiledFunction:
         model_input_count = len(model_inputs)
         kv_pool_input_start = model_input_count
         kv_pool_input_stop = kv_pool_input_start + len(kv_pool_inputs)
-        flat_inputs = [*model_inputs, *kv_pool_inputs]
-        flat_inputs.extend(path_leaves[index][1] for index in tensor_leaf_indices)
+        flat_inputs = [*model_inputs, *kv_pool_inputs, *tensor_leaves]
         if spmd_compiler is not None:
             sync.synchronize(flat_inputs)
+        bindings = _InputBindings(
+            registered_model_inputs=registered_model_inputs,
+            extra_model_inputs=extra_model_inputs,
+            model_inputs=model_inputs,
+            kv_pool_inputs=kv_pool_inputs,
+            tensor_paths=tensor_inputs_key_paths,
+            tensor_inputs=tensor_leaves,
+            static_leaves=static_leaves,
+            flat_inputs=flat_inputs,
+            rank_input_index=rank_input_index,
+            model_input_sources=model_input_sources,
+        )
+        tensor_inputs_traced_shapes = tuple(tuple(t.shape) for t in tensor_leaves)
 
         binding_input_digest = None
         interface = None
-        if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
-            # The digest checks that every rank assembles inputs in the same order.
+        if store is not None or shared:
+            # The digest checks that every rank, and every stored graph,
+            # assembles inputs in the same order.
             binding_input_digest = digest(
                 dict(
                     model=registered_model_inputs,
@@ -562,6 +713,7 @@ class CompiledFunction:
                     ],
                 )
             )
+        if shared:
             submission = spmd_compiler.submissions[graph]
             if submission.owner != spmd_compiler.rank:
                 artifact = _CompiledArtifact(
@@ -569,53 +721,38 @@ class CompiledFunction:
                     model_inputs=tuple(model_inputs),
                     kv_pool=self._kv_pool,
                     tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
-                    tensor_inputs_traced_shapes=tuple(
-                        tuple(path_leaves[index][1].shape)
-                        for index in tensor_leaf_indices
-                    ),
+                    tensor_inputs_traced_shapes=tensor_inputs_traced_shapes,
                     output_treespec=None,
                     output_count=0,
                     pending_compile=submission,
+                    model_input_sources=tuple(model_input_sources),
+                    # bind() narrows these lists to the owner's live inputs; until
+                    # then release/refresh update them in place.
+                    unbound_inputs=(model_inputs, flat_inputs),
                 )
 
                 def bind(owner_interface: ExecutableInterface) -> None:
-                    if owner_interface.input_digest != binding_input_digest:
+                    mismatch = _interface_mismatch(
+                        owner_interface,
+                        "owner",
+                        input_digest=binding_input_digest,
+                        model_inputs=model_inputs,
+                        other_inputs=flat_inputs[model_input_count:],
+                        prune_unused_inputs=self._prune_unused_inputs,
+                    )
+                    if mismatch is not None:
                         raise ValueError(
-                            f"Shared TPU input binding changed: graph={graph}, "
-                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
-                            f"owner_digest={owner_interface.input_digest}, "
-                            f"local_digest={binding_input_digest}"
+                            f"Shared TPU {mismatch}: graph={graph}, "
+                            f"owner={submission.owner}, rank={spmd_compiler.rank}"
                         )
-                    live_model_inputs = tuple(
+                    artifact.model_inputs = tuple(
                         model_inputs[index] for index in owner_interface.model_indices
                     )
-                    selected = [*live_model_inputs, *flat_inputs[model_input_count:]]
-                    layouts = []
-                    for tensor in selected:
-                        layout = None
-                        if tensor.device.type == "tpu":
-                            layout = (
-                                tpu_torch_compile.get_device_layout_if_materialized(
-                                    tensor
-                                )
-                            )
-                        layouts.append(layout[0] if layout is not None else [])
-                    local_specs = _tensor_specs(selected)
-                    if local_specs != owner_interface.input_specs:
-                        raise ValueError(
-                            f"Shared TPU input views changed: graph={graph}, "
-                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
-                            f"owner_specs={owner_interface.input_specs}, "
-                            f"local_specs={local_specs}"
-                        )
-                    if layouts != owner_interface.argument_layouts:
-                        raise ValueError(
-                            f"Shared TPU input layouts changed: graph={graph}, "
-                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
-                            f"owner_layouts={owner_interface.argument_layouts}, "
-                            f"local_layouts={layouts}"
-                        )
-                    artifact.model_inputs = live_model_inputs
+                    artifact.unbound_inputs = None
+                    artifact.model_input_sources = tuple(
+                        model_input_sources[index]
+                        for index in owner_interface.model_indices
+                    )
                     artifact.output_treespec = owner_interface.output_treespec
                     artifact.output_count = owner_interface.output_treespec.num_leaves
                     artifact.callbacks = tuple(
@@ -624,6 +761,21 @@ class CompiledFunction:
                     )
 
                 submission.bind = bind
+                return artifact
+
+        # Reuse a stored executable instead of tracing (only the owner of a
+        # shared graph gets here).
+        if store is not None:
+            request = self._lowered_graph_request(graph, input_treespec, bindings)
+            artifact = self._artifact_from_store(
+                store,
+                request,
+                bindings,
+                tensor_inputs_traced_shapes,
+                spmd_compiler=spmd_compiler,
+                input_digest=binding_input_digest,
+            )
+            if artifact is not None:
                 return artifact
 
         # Step 2: We've figured out all of our args. Now, we can create
@@ -640,10 +792,25 @@ class CompiledFunction:
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
-        for input_index, leaf_index in enumerate(
-            tensor_leaf_indices, start=kv_pool_input_stop
+        mutated_leaf_positions: set[int] = set()
+        for position, (input_index, leaf_index) in enumerate(
+            zip(
+                range(
+                    kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)
+                ),
+                tensor_leaf_indices,
+            )
         ):
+            if tensor_inputs_key_paths[position] in self._mutated_input_paths:
+                # Trace in-place writes on a clone: a mutated placeholder would
+                # carry deferred ops into argument binding.
+                trace_inputs[input_index] = graph_inputs[input_index].clone()
+                mutated_leaf_positions.add(position)
             trace_leaves[leaf_index] = trace_inputs[input_index]
+        explicit_trace_inputs = trace_inputs[
+            kv_pool_input_stop : kv_pool_input_stop + len(tensor_leaf_indices)
+        ]
+        explicit_versions = [_tensor_version(t) for t in explicit_trace_inputs]
 
         rng_device = flat_inputs[0].device if self._uses_rng else None
         rng_output = None
@@ -714,15 +881,53 @@ class CompiledFunction:
                 self._kv_pool.set_state(kv_pool_trace_inputs)
                 stack.callback(self._kv_pool.set_state, previous_state)
             trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
+            stack.enter_context(_trace_forward_context(call, trace_arguments))
             with _collect_callbacks() as inserted_callbacks:
                 outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
             if rng_device is not None:
                 rng_output = tpu_torch_compile.get_device_state_tensor(trace_generator)
 
+        newly_mutated = {
+            tensor_inputs_key_paths[position]
+            for position, (tensor, version) in enumerate(
+                zip(explicit_trace_inputs, explicit_versions, strict=True)
+            )
+            if position not in mutated_leaf_positions
+            and version is not None
+            and _tensor_version(tensor) != version
+        }
+        if newly_mutated:
+            if spmd_compiler is not None:
+                raise NotImplementedError(
+                    "Shared TPU compilation does not support in-place writes to "
+                    f"explicit inputs: {[tree_util.keystr(p) for p in newly_mutated]}"
+                )
+            logger.info(
+                "[direct_compile] retracing: fn writes explicit inputs in place: %s",
+                [tree_util.keystr(p) for p in newly_mutated],
+            )
+            self._mutated_input_paths |= newly_mutated
+            return self._compile(
+                args,
+                kwargs,
+                async_compile=async_compile,
+                spmd_compiler=spmd_compiler,
+                graph=graph,
+                store=store,
+            )
+        # Paths and graph outputs must line up; keep them in input order.
+        ordered_mutated_positions = sorted(mutated_leaf_positions)
+        mutated_input_paths = tuple(
+            tensor_inputs_key_paths[position] for position in ordered_mutated_positions
+        )
+        mutated_trace_inputs = [
+            explicit_trace_inputs[position] for position in ordered_mutated_positions
+        ]
+
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
         if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
             raise TypeError("All direct_compile output leaves must be TPU tensors")
-        result_tensors = output_leaves + kv_pool_trace_inputs
+        result_tensors = output_leaves + kv_pool_trace_inputs + mutated_trace_inputs
         # Forward hooks see Torch tensors here, not JAX values, and JAX export
         # cannot serialize host callbacks. Preserve callback values as extra
         # executable outputs, then invoke their Python callbacks after execute.
@@ -750,6 +955,9 @@ class CompiledFunction:
                 *range(model_input_count, len(graph_inputs)),
             )
             model_inputs = [model_inputs[index] for index in live_model_indices]
+            model_input_sources = [
+                model_input_sources[index] for index in live_model_indices
+            ]
             graph_inputs = [graph_inputs[index] for index in retained_indices]
             flat_inputs = [
                 flat_inputs[index]
@@ -768,20 +976,15 @@ class CompiledFunction:
             "and %d callbacks",
             len(graph_inputs),
             len(output_leaves),
-            len(kv_pool_inputs),
+            len(kv_pool_inputs) + len(mutated_trace_inputs),
             len(inserted_callbacks),
         )
-        # Placeholders do not retain the physical layout of their buffers.
-        argument_layouts = []
-        for tensor in flat_inputs:
-            layout = None
-            if tensor.device.type == "tpu":
-                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-            argument_layouts.append(layout[0] if layout is not None else [])
+        argument_layouts = _argument_layouts(flat_inputs)
         if rng_device is not None:
             argument_layouts.append([])
         callbacks = tuple(entry.callback for entry in inserted_callbacks)
-        if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
+        callback_factories = NO_CALLBACKS
+        if shared:
             factories = tuple(entry.callback_factory for entry in inserted_callbacks)
             if any(factory is None for factory in factories):
                 raise ValueError(
@@ -791,6 +994,9 @@ class CompiledFunction:
             # accidentally captures an unpicklable recorder or local closure.
             callback_factories = pickle.dumps(factories)
             callbacks = tuple(factory(self._model) for factory in factories)
+        if binding_input_digest is not None:
+            # Published to shared-compile consumers, and stored (only for
+            # graphs without callbacks, so NO_CALLBACKS is right outside SPMD).
             interface = ExecutableInterface(
                 input_digest=binding_input_digest,
                 input_specs=_tensor_specs(flat_inputs),
@@ -798,6 +1004,15 @@ class CompiledFunction:
                 model_indices=live_model_indices,
                 output_treespec=output_treespec,
                 callback_factories=callback_factories,
+            )
+        record = None
+        if store is not None and not inserted_callbacks:
+            record = functools.partial(
+                _record_lowered_graph,
+                store,
+                request,
+                interface,
+                tuple(ordered_mutated_positions),
             )
         pending_compile = None
         executable = None
@@ -827,6 +1042,11 @@ class CompiledFunction:
                 "[direct_compile] native async submission %.3fs",
                 time.perf_counter() - start,
             )
+            if record is not None and spmd_compiler is None:
+                pending_compile = _RecordingPendingCompile(pending_compile, record)
+            elif record is not None:
+                # The owner records with the bytes it serializes for distribution.
+                pending_compile.record = record
         else:
             with dynamo_timed("direct_compile_traverse_and_compile"):
                 compile_result = tpu_torch_compile.traverse_and_compile(
@@ -840,24 +1060,437 @@ class CompiledFunction:
                 "[direct_compile] synchronous compilation %.3fs",
                 time.perf_counter() - start,
             )
+            if record is not None:
+                record(executable)
         return _CompiledArtifact(
             executable=executable,
             model_inputs=tuple(model_inputs),
+            model_input_sources=tuple(model_input_sources),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
-            tensor_inputs_traced_shapes=tuple(
-                tuple(path_leaves[index][1].shape) for index in tensor_leaf_indices
-            ),
+            tensor_inputs_traced_shapes=tensor_inputs_traced_shapes,
             output_treespec=output_treespec,
             output_count=len(output_leaves),
+            mutated_input_paths=mutated_input_paths,
             callbacks=callbacks,
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
 
+    def _store_identity(self, key: Hashable) -> str | None:
+        """The identity the store keys a graph compiled without shared
+        compilation by, or None when the key can't be encoded (the graph is
+        then traced and not stored)."""
+        try:
+            return graph_name(self._name, key)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[direct_compile] %s: specialization key without a stable "
+                "identity; not using the lowered-graph store",
+                self._name,
+                exc_info=True,
+            )
+            return None
+
+    def _lowered_graph_store(
+        self, spmd_compiler: SPMDCompiler | None
+    ) -> FileLoweredGraphStore | None:
+        """The warmup queue's store, if this function is named and its graphs
+        can be stored.
+
+        Stored graphs have no generator-state input or output, so a uses_rng
+        function is always traced; SPMD verification always traces.
+        """
+        if self._name is None or self._uses_rng:
+            return None
+        if spmd_compiler is not None and spmd_compiler.verify_spmd_safe:
+            return None
+        return current_lowered_graph_store()
+
+    def _lowered_graph_request(
+        self, graph: str, input_treespec: Any, bindings: _InputBindings
+    ) -> LoweredGraphRequest:
+        """Describe this specialization's inputs without tracing it."""
+        first_names: dict[int, str] = {}
+        for name, index in bindings.registered_model_inputs:
+            first_names.setdefault(index, name)
+        model_input_names = list(bindings.registered_model_inputs)
+        for path, (_, _, index) in zip(
+            self._model_extra_tensor_attrs, bindings.extra_model_inputs, strict=True
+        ):
+            first_names.setdefault(index, path)
+            model_input_names.append((path, index))
+        if bindings.rank_input_index is not None:
+            first_names[bindings.rank_input_index] = "<rank>"
+        return LoweredGraphRequest(
+            name=self._name,
+            graph=graph,
+            input_treedef=str(input_treespec),
+            input_tensors=tuple(
+                zip(
+                    [tree_util.keystr(path) for path in bindings.tensor_paths],
+                    _tensor_specs(bindings.tensor_inputs),
+                    strict=True,
+                )
+            ),
+            # Static leaves are baked into the graph, so their values are part
+            # of the request even when the caller's specialization key omits
+            # them.
+            static_inputs=tuple(
+                (tree_util.keystr(path), type(leaf).__qualname__, repr(leaf))
+                for path, leaf in bindings.static_leaves
+            ),
+            model_inputs=tuple(
+                zip(
+                    [first_names[i] for i in range(len(bindings.model_inputs))],
+                    _tensor_specs(bindings.model_inputs),
+                    strict=True,
+                )
+            ),
+            model_input_names=tuple(model_input_names),
+            kv_inputs=_tensor_specs(bindings.kv_pool_inputs),
+            argument_layouts=tuple(
+                repr(_keyed_layout(tensor)) for tensor in bindings.flat_inputs
+            ),
+            prune_unused_inputs=self._prune_unused_inputs,
+        )
+
+    def _artifact_from_store(
+        self,
+        store: FileLoweredGraphStore,
+        request: LoweredGraphRequest,
+        bindings: _InputBindings,
+        tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...],
+        *,
+        spmd_compiler: SPMDCompiler | None,
+        input_digest: str,
+    ) -> _CompiledArtifact | None:
+        """Rebuild an artifact from a stored graph, or return None to trace.
+
+        A stored graph that cannot be used here is logged as an error naming
+        the graph and the reason; the graph is then traced and compiled.
+        """
+        try:
+            stored = store.lookup(request)
+        except Exception:
+            logger.error(
+                "[direct_compile] lowered-graph lookup failed for %s; tracing",
+                request.graph,
+                exc_info=True,
+            )
+            return None
+        if stored is None:
+            return None
+        model_inputs = bindings.model_inputs
+        interface = stored.interface
+        # The check a shared-compile consumer applies to its owner's interface.
+        mismatch = _interface_mismatch(
+            interface,
+            "stored",
+            input_digest=input_digest,
+            model_inputs=model_inputs,
+            other_inputs=bindings.flat_inputs[len(model_inputs) :],
+            prune_unused_inputs=self._prune_unused_inputs,
+        )
+        mutated = stored.mutated_inputs
+        tensor_paths = bindings.tensor_paths
+        if mismatch is None and (
+            list(mutated) != sorted(set(mutated))
+            or any(index < 0 or index >= len(tensor_paths) for index in mutated)
+        ):
+            mismatch = f"writes inputs {mutated} of {len(tensor_paths)}"
+        if mismatch is None and mutated and spmd_compiler is not None:
+            # Shared compilation can't write explicit inputs; tracing says so.
+            mismatch = "writes explicit inputs under shared compilation"
+        if mismatch is not None:
+            logger.error(
+                "[direct_compile] stored graph for %s does not fit its inputs "
+                "(%s); tracing",
+                request.graph,
+                mismatch,
+            )
+            return None
+        mutated_input_paths = tuple(tensor_paths[index] for index in mutated)
+        retained = interface.model_indices
+        start = time.perf_counter()
+        try:
+            with dynamo_timed("direct_compile_lowered_graph_load"):
+                executable = load_serialized_executable(
+                    stored.executable, stored.subslice_origin
+                )
+            fingerprint = executable.fingerprint_executable()
+        except Exception:
+            logger.error(
+                "[direct_compile] loading the stored executable for %s failed; tracing",
+                request.graph,
+                exc_info=True,
+            )
+            return None
+        if fingerprint != stored.fingerprint:
+            logger.error(
+                "[direct_compile] stored executable for %s loaded with "
+                "fingerprint %s, expected %s; tracing",
+                request.graph,
+                fingerprint,
+                stored.fingerprint,
+            )
+            return None
+        logger.info(
+            "[direct_compile] reused stored executable %s (%d bytes) in %.3fs",
+            request.graph,
+            len(stored.executable),
+            time.perf_counter() - start,
+        )
+        pending_compile = None
+        if spmd_compiler is not None:
+            # Distribute the stored executable exactly like a compiled one.
+            pending_compile = spmd_compiler.provide(
+                request.graph, interface=interface, executable=executable
+            )
+            executable = None
+        # Later traces of this function then clone these inputs up front.
+        self._mutated_input_paths |= set(mutated_input_paths)
+        return _CompiledArtifact(
+            executable=executable,
+            model_inputs=tuple(model_inputs[index] for index in retained),
+            model_input_sources=tuple(
+                bindings.model_input_sources[index] for index in retained
+            ),
+            kv_pool=self._kv_pool,
+            tensor_inputs_key_paths=tuple(tensor_paths),
+            tensor_inputs_traced_shapes=tensor_inputs_traced_shapes,
+            output_treespec=interface.output_treespec,
+            output_count=interface.output_treespec.num_leaves,
+            mutated_input_paths=mutated_input_paths,
+            pending_compile=pending_compile,
+        )
+
+
+class _InputBindings(NamedTuple):
+    """One call's inputs as the graph binds them, collected once in
+    ``_compile`` for the lowered-graph store."""
+
+    registered_model_inputs: list[tuple[str, int]]
+    extra_model_inputs: list[tuple[object, str, int]]
+    model_inputs: list[torch.Tensor]
+    kv_pool_inputs: list[torch.Tensor]
+    tensor_paths: list[tree_util.KeyPath]
+    tensor_inputs: list[torch.Tensor]
+    static_leaves: list[tuple[tree_util.KeyPath, Any]]
+    flat_inputs: list[torch.Tensor]
+    rank_input_index: int | None
+    model_input_sources: list[tuple]
+
+
+class _RecordingPendingCompile:
+    """A pending compile that offers its executable to the store when
+    retrieved; ``_CompiledArtifact.wait_for_compile`` retrieves it once."""
+
+    def __init__(self, pending: Any, record: Callable[[Any], None]) -> None:
+        self._pending = pending
+        self._record = record
+
+    def get(self) -> Any:
+        executable = self._pending.get()
+        self._record(executable)
+        return executable
+
+
+def _record_lowered_graph(
+    store: FileLoweredGraphStore,
+    request: LoweredGraphRequest,
+    interface: ExecutableInterface,
+    mutated_inputs: tuple[int, ...],
+    executable: Any,
+    serialized: bytes | None = None,
+) -> None:
+    """Offer a freshly traced and compiled executable to the store, reusing
+    ``serialized`` if shared compilation already serialized it."""
+    try:
+        if not store.wants_record():
+            return
+        with dynamo_timed("direct_compile_lowered_graph_record"):
+            if serialized is None:
+                serialized = serialize_executable(executable)
+            fingerprint = executable.fingerprint_executable()
+        store.record(
+            request,
+            LoweredGraph(
+                interface=interface,
+                executable=serialized,
+                fingerprint=fingerprint,
+                subslice_origin=executable.subslice_origin(),
+                mutated_inputs=mutated_inputs,
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "[direct_compile] recording the executable for %s failed",
+            request.graph,
+            exc_info=True,
+        )
+
+
+def _device_layout(tensor: torch.Tensor) -> Any:
+    if tensor.device.type != "tpu":
+        return None
+    return tpu_torch_compile.get_device_layout_if_materialized(tensor)
+
+
+def _keyed_layout(tensor: torch.Tensor) -> Any:
+    """The layout an executable is compiled for, whether or not it is materialized.
+
+    An unmaterialized buffer compiles with the default layout (``[]``), so it
+    keys like a materialized buffer that has the default layout. Otherwise the
+    key would depend on whether eager work reached the buffer before tracing.
+    """
+    layout = _device_layout(tensor)
+    if layout is None and tensor.device.type == "tpu":
+        layout = tpu_torch_compile.get_default_layout(tensor.dtype, tensor.shape)
+    return layout
+
+
+def _argument_layouts(tensors: Sequence[torch.Tensor]) -> list[list[int]]:
+    """Physical layouts in executable input order; placeholders do not retain them."""
+    layouts = []
+    for tensor in tensors:
+        layout = _device_layout(tensor)
+        layouts.append(layout[0] if layout is not None else [])
+    return layouts
+
+
+def _layouts_match(
+    expected: Sequence[Sequence[int]], tensors: Sequence[torch.Tensor]
+) -> bool:
+    """Whether ``tensors`` have the layouts an executable was compiled for.
+
+    ``[]`` compiles to the default layout, so it matches a buffer that has the
+    default layout, as in ``_keyed_layout``.
+    """
+    if len(expected) != len(tensors):
+        return False
+    for layout, tensor, actual in zip(expected, tensors, _argument_layouts(tensors)):
+        layout = list(layout)
+        if layout == actual:
+            continue
+        if tensor.device.type != "tpu":
+            return False
+        default = list(
+            tpu_torch_compile.get_default_layout(tensor.dtype, tensor.shape)[0]
+        )
+        if (layout or default) != (actual or default):
+            return False
+    return True
+
+
+def _interface_mismatch(
+    interface: ExecutableInterface,
+    source: str,
+    *,
+    input_digest: str,
+    model_inputs: Sequence[torch.Tensor],
+    other_inputs: Sequence[torch.Tensor],
+    prune_unused_inputs: bool,
+) -> str | None:
+    """Why an executable this process did not trace (a shared-compile
+    owner's, or a stored one) cannot run on these inputs, or None.
+
+    The inputs must be assembled in the same order (``input_digest``), the
+    retained model indices must select local model inputs, and the selected
+    inputs (retained model inputs, then ``other_inputs``) must have the same
+    logical views and physical layouts. The reason names what changed and both
+    values, labelled ``<source>_`` for the interface (``owner`` or ``stored``)
+    and ``local_`` for these inputs; callers add their graph and rank context.
+    """
+
+    def changed(kind: str, field: str, expected: Any, local: Any) -> str:
+        return (
+            f"input {kind} changed: {source}_{field}={expected}, local_{field}={local}"
+        )
+
+    if interface.input_digest != input_digest:
+        return changed("binding", "digest", interface.input_digest, input_digest)
+    retained = interface.model_indices
+    count = len(model_inputs)
+    if (
+        list(retained) != sorted(set(retained))
+        or any(index < 0 or index >= count for index in retained)
+        or (not prune_unused_inputs and retained != tuple(range(count)))
+    ):
+        return changed("selection", "model_indices", retained, f"range({count})")
+    selected = [*(model_inputs[index] for index in retained), *other_inputs]
+    specs = _tensor_specs(selected)
+    if specs != tuple(interface.input_specs):
+        return changed("views", "specs", interface.input_specs, specs)
+    if not _layouts_match(interface.argument_layouts, selected):
+        return changed(
+            "layouts",
+            "layouts",
+            interface.argument_layouts,
+            _argument_layouts(selected),
+        )
+    return None
+
+
+@contextmanager
+def _trace_forward_context(call: Any, trace_call: Any) -> Iterator[None]:
+    """Point the published MoE padded-row bound at the traced ForwardBatch.
+
+    The serving forward context binds ``moe_num_token_non_padded`` to the live
+    batch, whose tensors are runtime values, not graph inputs. Tracing through
+    that getter would capture the live tensor as an argument the executable is
+    never given. Rebind it to the reconstructed batch, so the bound comes from
+    the same placeholder leaf that serving later feeds from its own batch.
+    """
+    from sglang.srt.model_executor.forward_context import (
+        forward_context,
+        get_forward_context,
+        has_forward_context,
+    )
+
+    getter = (
+        get_forward_context().moe_num_token_non_padded
+        if has_forward_context()
+        else None
+    )
+    owner = getattr(getter, "__self__", None)
+    if not isinstance(owner, ForwardBatch):
+        yield
+        return
+
+    def is_batch(value: Any) -> bool:
+        return isinstance(value, ForwardBatch)
+
+    live = tree_util.tree_leaves(call, is_leaf=is_batch)
+    traced = tree_util.tree_leaves(trace_call, is_leaf=is_batch)
+    pairs = [(a, b) for a, b in zip(live, traced, strict=True) if is_batch(a)]
+    match = [b for a, b in pairs if a is owner]
+    if not match and len(pairs) == 1:
+        # precompile/warmup_async may hand _compile a tree_map copy of the batch.
+        match = [pairs[0][1]]
+    if not match:
+        # Otherwise leave it; tracing then fails loudly on the captured tensor
+        # rather than masking with another batch's bound.
+        yield
+        return
+    ctx = replace(
+        get_forward_context(),
+        moe_num_token_non_padded=types.MethodType(getter.__func__, match[0]),
+    )
+    with forward_context(ctx):
+        yield
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    """The in-place version counter, or None when the tensor has none."""
+    try:
+        return tensor._version
+    except RuntimeError:  # Inference tensors carry no version counter.
+        return None
+
 
 def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:
-    """Check logical input compatibility before binding another rank's executable."""
+    """The logical views of ``tensors``, as an ``ExecutableInterface`` records them."""
     return tuple(
         InputSpec(
             tuple(tensor.shape),
@@ -880,9 +1513,17 @@ class _CompiledArtifact:
     tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
+    mutated_input_paths: tuple[tree_util.KeyPath, ...] = ()
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
+    # Aligned with model_inputs: ("module", name) | ("attr", owner, name) | ("keep",).
+    model_input_sources: tuple = ()
+    # (shape, dtype, device, layout) per model input while released.
+    released_input_specs: tuple | None = None
+    # SPMD consumer before bind(): (model_inputs, flat_inputs) lists its bind
+    # closure reads; their model-input entries are released/refreshed in place.
+    unbound_inputs: tuple | None = None
 
     def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
@@ -944,19 +1585,40 @@ class _CompiledArtifact:
                 tpu_torch_compile.set_device_state_tensor(generator, outputs[-1])
                 outputs = outputs[:-1]
 
+        # A short output list would otherwise skip KV copy-backs silently; the
+        # executable may come from a store rather than this trace.
+        expected = (
+            self.output_count
+            + len(kv_pool_inputs)
+            + len(self.mutated_input_paths)
+            + len(self.callbacks)
+        )
+        if len(outputs) != expected:
+            raise RuntimeError(
+                "direct_compile executable output count changed: "
+                f"expected={expected} (outputs={self.output_count}, "
+                f"kv={len(kv_pool_inputs)}, "
+                f"mutated={len(self.mutated_input_paths)}, "
+                f"callbacks={len(self.callbacks)}) actual={len(outputs)}"
+            )
+
         # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():
             for tensor, replacement in zip(
                 kv_pool_inputs, outputs[self.output_count :]
             ):
                 tensor.copy_(replacement)
+            mutated_start = self.output_count + len(kv_pool_inputs)
+            for path, replacement in zip(
+                self.mutated_input_paths,
+                outputs[mutated_start : mutated_start + len(self.mutated_input_paths)],
+                strict=True,
+            ):
+                _get_path(call, path).copy_(replacement)
 
-        callback_outputs = outputs[self.output_count + len(kv_pool_inputs) :]
-        if len(callback_outputs) != len(self.callbacks):
-            raise RuntimeError(
-                "direct_compile callback output count changed: "
-                f"expected={len(self.callbacks)} actual={len(callback_outputs)}"
-            )
+        callback_outputs = outputs[
+            self.output_count + len(kv_pool_inputs) + len(self.mutated_input_paths) :
+        ]
         for callback, tensor in zip(self.callbacks, callback_outputs):
             callback(tensor)
 

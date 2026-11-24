@@ -3,6 +3,7 @@
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang_tpu.host_padding_relay import HostPaddingFutureMap
 
 
 @torch.no_grad()
@@ -14,15 +15,16 @@ def warmup_sequence_lengths(device, batch_buckets):
 
 @torch.no_grad()
 def warmup_host_relay(runner, bucketer, max_live, *, extend_cap):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
-
     relay = HostPaddingFutureMap(
         runner.device,
         runner.spec_algorithm,
         runner.req_to_token_pool,
         needs_cpu_seq_lens=False,
     )
-    for rows in sorted(set(bucketer.buckets) | {extend_cap}):
+    # Prefill sampling can return any live count, without decode bucket padding.
+    widths = set(bucketer.buckets) | {extend_cap}
+    widths.update(range(1, min(extend_cap, max_live) + 1))
+    for rows in sorted(widths):
         live = min(rows, max_live)
         indices = torch.arange(1, live + 1, dtype=torch.int64)
         for dtype in (torch.int64, torch.int32):

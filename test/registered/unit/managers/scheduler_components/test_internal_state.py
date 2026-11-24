@@ -17,6 +17,7 @@ class TestCompilationCacheMisses(CustomTestCase):
         super().setUp()
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
+                tpu_compile_tracer="dynamo",
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             )
@@ -50,6 +51,20 @@ class TestCompilationCacheMisses(CustomTestCase):
             self.controller._add_torch_compile(state)
 
         self.assertNotIn("compilation_cache_misses", state)
+
+    def test_bundle_counters_only_outside_the_direct_tracer(self):
+        args = self.controller.scheduler.server_args
+        args.unsafe_load_torch_compile_bundle = "/bundle"
+        platform = SimpleNamespace(get_compilation_cache_misses=lambda: None)
+        for tracer, reported in (("dynamo", True), ("direct", False)):
+            with self.subTest(tracer):
+                args.tpu_compile_tracer = tracer
+                state = {}
+                with patch.object(internal_state, "current_platform", platform):
+                    self.controller._add_torch_compile(state)
+                self.assertEqual(
+                    "torch_compile_bundle_dynamo_graphs" in state, reported
+                )
 
 
 if __name__ == "__main__":

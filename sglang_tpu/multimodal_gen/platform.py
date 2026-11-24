@@ -178,6 +178,12 @@ class TpuOOTPlatform(TpuPlatform):
         return False
 
     @classmethod
+    def runs_dit_attention_eager_under_compile(cls) -> bool:
+        # The TPU attention path traces, and a compiled DiT block must stay
+        # one program (#1886); an eager attention island splits it.
+        return False
+
+    @classmethod
     def drain_device_queue_after_request(cls) -> bool:
         # Workaround for torch_tpu 0.2.0rc4 and 0.2.0: seeding torch.Generator("tpu")
         # does a blocking host-to-device copy that waits behind queued collectives.

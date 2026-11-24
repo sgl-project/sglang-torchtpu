@@ -330,7 +330,7 @@ class TpuKVManager(TpuKVManagerBase):
             # no-ops on an unregistered room. A rank with nothing to push (its
             # KV-head lanes are replicated on a sibling rank, so it plans no
             # sends) would otherwise stay at WaitingForInput forever, and the
-            # attn-TP MIN all-reduce in process_disagg_prefill_inflight_queue()
+            # attn-TP MIN all-reduce in process_disagg_prefill_transfer_queue()
             # would pin the whole group there -- the prefill never answers and
             # the request hangs until the client times out.
             self._note_push_submitted(room, total_lanes)

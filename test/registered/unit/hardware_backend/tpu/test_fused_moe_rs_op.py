@@ -232,7 +232,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 np.testing.assert_array_equal(np.asarray(a), np.asarray(e))
 
     def test_expert_tp_gather_chunks_under_the_routed_row_limit(self):
-        self.assertEqual(fused_moe_rs_op.fused_moe_rs_expert_tp_max_tokens(8, 8), 2048)
+        self.assertEqual(fused_moe_rs_op.fused_moe_rs_expert_tp_max_tokens(8), 16384)
         calls = []
 
         def fake_call(**kwargs):
@@ -248,7 +248,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             return base + torch.arange(shard.shape[0] * 8, dtype=torch.float32)[:, None]
 
         tp_group = Mock(world_size=8, all_gather=Mock(side_effect=fake_all_gather))
-        tokens = 5001
+        tokens = 40001
         hidden = torch.arange(tokens, dtype=torch.float32)[:, None]
         with (
             patch(
@@ -275,7 +275,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 expert_tp=True,
             )
 
-        self.assertEqual(calls, [2048, 2048, 905])
+        self.assertEqual(calls, [16384, 16384, 7233])
         torch.testing.assert_close(
             output, torch.arange(tokens, dtype=torch.float32)[:, None]
         )

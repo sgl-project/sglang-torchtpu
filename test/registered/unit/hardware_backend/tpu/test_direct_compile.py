@@ -16,17 +16,15 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
+from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import decoder_compile_policy, direct_compile
@@ -417,10 +415,11 @@ class TestDirectCompile(CustomTestCase):
                     artifact.pending_compile = future
 
                 def compile_helper(
-                    args, kwargs, *, async_compile, spmd_compiler, graph
+                    args, kwargs, *, async_compile, spmd_compiler, graph, store
                 ):
                     self.assertEqual(async_compile, asynchronous)
                     self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(store)
                     self.assertIsNone(graph)
                     return artifact
 
@@ -948,6 +947,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertIs(runtime_inputs[1], original_value)
         self.assertIs(runtime_inputs[2], value)
+        self.assertIn("Online weight updates", model._derived_weight_cache_error)
 
     def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
         with self.assertRaisesRegex(ValueError, "requires model"):
@@ -1017,6 +1017,76 @@ class TestDirectCompile(CustomTestCase):
 
         compile_fn.assert_called_once()
         self.assertEqual(execute.call_count, len(routing_inputs))
+
+    def test_published_moe_bound_traces_from_the_batch_input(self):
+        """The forward context's MoE bound getter is bound to the live batch;
+        tracing must read it from the traced batch, or the live int32 scalar
+        becomes an argument the executable is never given."""
+        from sglang.srt.model_executor.forward_context import get_forward_context
+
+        bound = torch.tensor(3, dtype=torch.int32)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.ones(2, dtype=torch.int64),
+            out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            seq_lens_sum=2,
+            num_token_non_padded=bound,
+        )
+        seen = []
+
+        def forward(forward_batch):
+            seen.append(get_forward_context().moe_num_token_non_padded())
+            return forward_batch.input_ids + 1
+
+        compiler = direct_compile.tpu_torch_compile
+        # precompile/warmup_async may compile a tree_map copy of the bound batch.
+        for name, called in (("same", batch), ("copy", replace(batch))):
+            seen.clear()
+            with (
+                self.subTest(batch=name),
+                patch.object(
+                    ForwardBatch,
+                    "moe_num_token_non_padded",
+                    lambda self: self.num_token_non_padded,
+                ),
+                patch.object(
+                    direct_compile,
+                    "_is_tpu_tensor",
+                    side_effect=lambda item: isinstance(item, torch.Tensor),
+                ),
+                patch.object(
+                    direct_compile.execution_mode,
+                    "set_eager_mode",
+                    return_value=nullcontext(),
+                ),
+                patch.object(
+                    compiler,
+                    "placeholder_like",
+                    side_effect=lambda tensor: tensor.clone(),
+                ),
+                patch.object(
+                    compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+                ) as compile_fn,
+                forward_context(
+                    ForwardContext(attn_backend=MagicMock(spec=AttentionBackend)),
+                    forward_batch=batch,
+                ),
+            ):
+                compiled = direct_compile.direct_compile(
+                    forward, specialization_key=lambda forward_batch: 0
+                )
+                compiled._compile((called,), {})
+                # Serving's binding is restored after the trace.
+                getter = get_forward_context().moe_num_token_non_padded
+                self.assertIs(getter.__self__, batch)
+
+                graph_inputs = compile_fn.call_args.args[1]
+                (traced_bound,) = seen
+                self.assertIsNot(traced_bound, bound)
+                self.assertTrue(any(t is traced_bound for t in graph_inputs))
 
     def test_registered_tensor_aliases_are_traced(self):
         model = _ModelWithRegisteredAlias()
@@ -1615,6 +1685,50 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(kv_pool.value, pool_input)
         self.assertTrue(torch.equal(kv_pool.value, pool_output))
         self.assertEqual(len(traverse.call_args.args[0]), 1)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_policy_kv_pool_keeps_topk_capture_buffer_readable(self):
+        """Bug regression: a capture buffer written inside the forward must stay
+        readable after a direct-traced forward, on the trace call and on replay."""
+        cache = BaseDeviceCache(
+            max_batch_size=4, num_layers=2, topk_size=3, device="tpu", name="test"
+        )
+        buffer = cache.buffer
+        model = torch.nn.Identity()
+        policy = DecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(
+                model=model, token_to_kv_pool=_KVPool(torch.zeros(2, device="tpu"))
+            ),
+            owner=model,
+        )
+        # The TPU configuration: routed-experts capture on, no indexer capturer.
+        with (
+            patch.object(
+                decoder_compile_policy,
+                "get_global_experts_capturer",
+                return_value=SimpleNamespace(device_cache=cache),
+            ),
+            patch.object(
+                decoder_compile_policy, "get_global_indexer_capturer", return_value=None
+            ),
+        ):
+            kv_pool = policy.get_direct_compile_kv_pool()
+
+        def fn(topk):
+            cache.capture(layer_id=1, topk_indices=topk)
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda topk: tuple(topk.shape),
+            kv_pool=kv_pool,
+        )
+        for rows in ([[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]):
+            expected = torch.zeros((4, 2, 3), dtype=torch.int32)
+            expected[:2, 1] = torch.tensor(rows, dtype=torch.int32)
+            with torch.no_grad():
+                compiled(torch.tensor(rows, dtype=torch.int32, device="tpu"))
+            self.assertIs(cache.buffer, buffer)
+            self.assertTrue(torch.equal(cache.buffer.cpu(), expected))
 
     def test_rejects_function_with_neither_outputs_nor_mutations(self):
         """Negative branch: without a KV pool, a fn returning None traces an

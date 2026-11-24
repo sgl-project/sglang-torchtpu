@@ -15,6 +15,7 @@ from sglang.srt.managers import schedule_batch as schedule_batch_module  # noqa:
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.platforms.interface import SRTPlatform  # noqa: E402
 from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
+from sglang.srt.sampling import penaltylib  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -223,6 +224,54 @@ class TestSeedRetractedPenaltyHistory(CustomTestCase):
         batch._seed_retracted_penalty_history(reqs)
         self.assertEqual(seen, [("seed", [1], [[13, 101]])])
 
+    def test_pad_valued_last_input_token(self):
+        """A prompt ending in a multimodal pad value must not raise IndexError on retraction."""
+        item = schedule_batch_module.MultimodalDataItem(
+            modality=schedule_batch_module.Modality.IMAGE, offsets=[(0, 0)]
+        )
+        item.set_hash(123456789)
+        pad = item.pad_value
+        req = _req([101, 102], 0)
+        req.origin_input_ids = PROMPT[:-1] + [pad]
+        req.sampling_params = SamplingParams(
+            repetition_penalty=1.2, frequency_penalty=0.4, presence_penalty=0.3
+        )
+        batch = _batch([req], [])
+        orch = penaltylib.BatchedPenalizerOrchestrator(
+            256,
+            batch,
+            {
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            },
+        )
+        batch.sampling_info.penalizer_orchestrator = orch
+        batch._seed_retracted_penalty_history([req])
+        pens = orch.penalizers
+        for row, untouched in (
+            (
+                pens[
+                    penaltylib.BatchedFrequencyPenalizer
+                ].cumulated_frequency_penalties[0],
+                0.0,
+            ),
+            (
+                pens[penaltylib.BatchedPresencePenalizer].cumulated_presence_penalties[
+                    0
+                ],
+                0.0,
+            ),
+            (
+                pens[
+                    penaltylib.BatchedRepetitionPenalizer
+                ].cumulated_repetition_penalties[0],
+                1.0,
+            ),
+        ):
+            # Only output token 101 is seeded; the pad is skipped.
+            self.assertEqual(torch.nonzero(row != untouched).flatten().tolist(), [101])
+
     def test_no_seed_without_penalties(self):
         seen = []
         batch = _batch([], seen)
@@ -242,9 +291,9 @@ def _prefill_again_after_retraction(overlap, spec):
     req = Req("req", "", array("q", PROMPT), SamplingParams(), False)
     req.output_ids.extend([101, 102])
     req.refresh_fill_ids()
-    req.prefix_indices = torch.arange(0)
+    req.prefix_len = 0
     n = len(req.full_untruncated_fill_ids)
-    req.set_extend_range(0, n)
+    req.extend_end = n
     batch = ScheduleBatch(
         reqs=[req],
         device="meta",

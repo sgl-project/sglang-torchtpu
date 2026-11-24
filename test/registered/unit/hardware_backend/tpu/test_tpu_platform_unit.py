@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.compiler.config as compiler_config
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
@@ -144,8 +144,8 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.is_pin_memory_available())
 
     def test_cuda_graph_disabled(self):
-        self.assertFalse(self.platform.support_cuda_graph())
-        self.assertFalse(self.platform.support_piecewise_cuda_graph())
+        self.assertFalse(self.platform.capabilities.graph_capture)
+        self.assertFalse(self.platform.capabilities.piecewise_graph)
 
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())
@@ -749,7 +749,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         args = self._args(**fields)
         hf_config = SimpleNamespace(architectures=list(architectures))
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)
@@ -871,7 +871,7 @@ class TestDsaValidation(CustomTestCase):
             **config_fields,
         )
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)
@@ -890,15 +890,13 @@ class TestDsaValidation(CustomTestCase):
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
 
-    def test_dsa_needs_the_dynamo_tracer(self):
-        """The direct tracer reads the KV cache through the pool's get_state,
-        which the split MLA pool does not implement. The launch must say so
-        instead of failing at the first compile."""
-        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
-            self._apply_dsa(
-                attention_backend="pallas_tpu_mla_sparse",
-                tpu_compile_tracer="direct",
-            )
+    def test_dsa_accepts_the_direct_tracer(self):
+        """TpuSplitMLATokenToKVPool implements get_state/set_state, so DSA runs
+        under both the dynamo and direct compile tracers."""
+        self._apply_dsa(
+            attention_backend="pallas_tpu_mla_sparse",
+            tpu_compile_tracer="direct",
+        )
 
     def test_mtp_index_share_runs_only_on_the_chain_worker(self):
         """Only the experimental chain worker reuses the MTP draft's DSA top-k
@@ -1184,6 +1182,49 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
+
+    def test_hybrid_linear_dsa_leaf_is_the_split_pool(self):
+        # get_kv_pool_cls(kind="dsa") is None on TPU; the hybrid-linear leaf
+        # must still build the split pool with its index_key_layers.
+        from sglang.srt.mem_cache import memory_pool
+
+        class _Stop(Exception):
+            pass
+
+        built = {}
+
+        class _SplitPool:
+            def __init__(self, **kwargs):
+                built.update(kwargs)
+                raise _Stop
+
+        platform = SimpleNamespace(
+            is_out_of_tree=lambda: False,
+            is_tpu=lambda: True,
+            get_kv_pool_cls=lambda *, kind: None,
+            get_dsa_kv_pool_cls=lambda: _SplitPool,
+        )
+        with patch.object(memory_pool, "current_platform", platform):
+            with self.assertRaises(_Stop):
+                memory_pool.HybridLinearKVPool(
+                    size=64,
+                    dtype=torch.bfloat16,
+                    page_size=16,
+                    head_num=1,
+                    head_dim=576,
+                    full_attention_layer_ids=[1, 3],
+                    device="cpu",
+                    mamba_pool=None,
+                    use_mla=True,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    use_dsa=True,
+                    index_head_dim=128,
+                    kv_cache_dim=576,
+                    skip_topk_layers=[False, True],
+                )
+        self.assertEqual(built["index_key_layers"], [True, False])
+        self.assertEqual(built["layer_num"], 2)
 
     def test_draft_backends_run_their_target_backend_per_step(self):
         from sglang.srt.layers.attention import attention_registry as registry

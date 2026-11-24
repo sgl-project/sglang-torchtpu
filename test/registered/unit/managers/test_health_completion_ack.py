@@ -14,15 +14,16 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import HealthCheckOutput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.health_monitor import (
     SchedulerHealthMonitor,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -214,17 +215,19 @@ class TestSchedulerHealthWiring(CustomTestCase):
         self.sent = []
         scheduler.scheduler_stage_metrics = None
         scheduler.disaggregation_mode = mode
+        empty_request_lists(scheduler)
+        # Plain lists: the test inspects them directly.
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_bootstrap_queue = (
             SimpleNamespace(queue=[]) if mode == DisaggregationMode.PREFILL else None
         )
         # State read by the real is_fully_idle(for_health_check=True).
         scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
-        scheduler.chunked_req = None
         scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         scheduler.last_batch = None
         scheduler.enable_overlap = False
         scheduler._engine_paused = False
+        scheduler.pause_state = SimpleNamespace(paused=False)
         scheduler._pp_microbatches_drained = lambda: True
         scheduler.health_monitor = SchedulerHealthMonitor(self.sent.append, dp_rank=0)
         # process_input_requests collaborators outside the code under test.
@@ -243,6 +246,7 @@ class TestSchedulerHealthWiring(CustomTestCase):
         scheduler.process_batch_result_disagg_prefill = Mock()
         scheduler.tree_cache = Mock()
         scheduler._record_step_counters = Mock()
+        scheduler._on_step_processed = Mock()
         scheduler.metrics_reporter = Mock()
         scheduler.enable_fpm = False
         scheduler._maybe_clear_mm_inputs = Mock()

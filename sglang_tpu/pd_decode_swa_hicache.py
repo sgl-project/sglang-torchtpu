@@ -37,16 +37,16 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 
-from sglang.srt.disaggregation import decode, decode_hicache_mixin
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_auto_size import (
     auto_size_hicache,
@@ -414,7 +414,6 @@ def _build_full_only_host_stack(
     full_host_pool = hybrid_pool_assembler.build_kv_host_pool(
         kv_pool=full_device_pool,
         page_size=params.page_size,
-        use_mla=False,
         host_size=memory.hicache_size if memory.hicache_size > 0 else None,
         pool_label="full",
     )
@@ -467,26 +466,20 @@ def _build_full_swa_host_stack(
     allocator = params.token_to_kv_pool_allocator
     memory = get_memory()
     kv_host_size, swa_host_size = _upstream_host_pool_sizes(memory, kvcache)
-    enable_unified_memory = memory.enable_unified_memory
     host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
         page_size=params.page_size,
         full_kv_pool=kvcache.full_kv_pool,
         swa_kv_pool=kvcache.swa_kv_pool,
         full_layer_mapping=full_layer_mapping,
         swa_layer_mapping=swa_layer_mapping,
-        use_mla=False,
         kv_host_size=kv_host_size,
         swa_host_size=swa_host_size,
-        host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
         host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
         device_swa_evict_fn=lambda n: hybrid_pool_assembler._evict_swa_for_device_alloc(
             cache, n
         ),
         swa_attn_allocator=allocator.swa_attn_allocator,
-        swa_indices_from_anchor_fn=(
-            allocator.bind_swa_for_loaded_rows if enable_unified_memory else None
-        ),
-        swa_free_from_anchor_fn=allocator.free_swa if enable_unified_memory else None,
+        transfer_layer_id_max=transfer_layer_id_max,
     )
     cache_controller = _create_cache_controller(
         params=params,
@@ -512,10 +505,6 @@ def _upstream_host_pool_sizes(memory: Any, kvcache: Any) -> tuple:
     ``--hicache-size`` split by the pools' device bytes, or (None, None) for
     the ``--hicache-ratio`` sizing the group applies itself."""
     if memory.hicache_size <= 0:
-        return None, None
-    if hybrid_pool_assembler._uses_unified_page_envelope_host(
-        kvcache.full_kv_pool, kvcache.swa_kv_pool, False, ()
-    ):
         return None, None
     return hybrid_pool_assembler._split_hicache_size(
         memory.hicache_size, (kvcache.full_kv_pool, kvcache.swa_kv_pool)
@@ -615,7 +604,12 @@ def _finalize_swa_match_result(
         component.cache
     ):
         return result
-    return result._replace(swa_host_hit_length=0)
+    return result._replace(
+        window_host_hit_lengths={
+            **result.window_host_hit_lengths,
+            component.component_type: 0,
+        }
+    )
 
 
 def _build_swa_hicache_transfers(
@@ -643,21 +637,20 @@ def _match_prefix_and_lock(
     if not uses_full_only_host_cache(queue.tree_cache):
         return upstream(queue, req)
     assert queue._uses_swa_tail_prealloc(), "full-only caches need SWA tail prealloc"
-    fill_len = queue._pre_alloc_fill_len(req)
-    swa_window_start = fill_len - queue._swa_tail_len(fill_len)
+    fill_len = pre_alloc_fill_len(req)
+    swa_window_start = fill_len - max(
+        queue._window_tails(fill_len).values(), default=fill_len
+    )
     # Device and host hits stop at the window start. Prefill sends the window,
     # so decode reserves and restores only the prefix before it.
     match_end = swa_window_start + _bigram_boundary(queue.tree_cache)
-    result = match_prefix_for_req(
-        queue.tree_cache,
+    result = match_kv_cache(
         req,
+        queue.tree_cache,
         req.origin_input_ids[:match_end],
         cow_mamba=False,
-        include_req=True,
     )
-    req.lock_receipt = queue.tree_cache.inc_lock_ref(
-        result.last_device_node
-    ).to_dec_params()
+    req.lock = queue.tree_cache.lock(result.last_device_node)
     return queue._build_decode_prefix_match(req, result)
 
 
@@ -755,78 +748,6 @@ def _unbacked_swa_nodes_within(
 # ---------------------------------------------------------------------------
 
 
-def _alloc_for_decode_prealloc(
-    upstream: Callable,
-    allocator: Any,
-    *,
-    prefix_len: int,
-    total_prefix_len: int,
-    prefix_indices: Optional[torch.Tensor],
-    uses_swa_tail: bool,
-    **other_kwargs,
-) -> torch.Tensor:
-    """Wraps ``alloc_for_decode_prealloc``: allocate new KV after the restored range.
-
-    Upstream's SWA-tail branch passes ``prefix_lens=[prefix_len]`` (the HBM hit)
-    next to ``extend_num_tokens=fill_len - total_prefix_len``. The two disagree
-    once a RAM restore makes ``total_prefix_len > prefix_len``. Upstream never
-    gets there, because it has no decode RAM offload for SWA models and so the
-    two lengths are always equal. This wrapper starts at ``total_prefix_len``.
-    """
-    kwargs = dict(uses_swa_tail=uses_swa_tail, **other_kwargs)
-    has_host_restore = total_prefix_len > prefix_len
-    if not (uses_swa_tail and has_host_restore):
-        return upstream(
-            allocator,
-            prefix_len=prefix_len,
-            total_prefix_len=total_prefix_len,
-            prefix_indices=prefix_indices,
-            **kwargs,
-        )
-    # The restore range ends on a page, so the allocator never extends a
-    # partial page from last_loc. Upstream reads only prefix_indices[-1:] to
-    # build last_loc, so the device hit's tail (or -1 without one) still
-    # supplies it.
-    assert total_prefix_len % allocator.page_size == 0, (
-        f"host restore must end on a page, got {total_prefix_len=}"
-    )
-    last_loc_source = (
-        prefix_indices
-        if prefix_len > 0
-        else torch.tensor([-1], dtype=torch.int64, device=allocator.device)
-    )
-    return upstream(
-        allocator,
-        prefix_len=total_prefix_len,
-        total_prefix_len=total_prefix_len,
-        prefix_indices=last_loc_source,
-        **kwargs,
-    )
-
-
-def _restore_rematch(
-    upstream: Callable,
-    tree_cache: Any,
-    req: Any,
-    token_ids: Optional[Any] = None,
-    **kwargs,
-):
-    """Wraps ``match_prefix_for_req`` in the restore: keep the last page under EAGLE.
-
-    Without the extra token the restore's re-match comes up one page short and
-    the restore fails.
-    """
-    boundary = (
-        _bigram_boundary(tree_cache) if uses_full_only_host_cache(tree_cache) else 0
-    )
-    if boundary and token_ids is not None:
-        token_ids = req.origin_input_ids[: len(token_ids) + boundary]
-        # Upstream also caps the key at the decode prefix; widen it the same way.
-        if kwargs.get("max_prefix_len") is not None:
-            kwargs["max_prefix_len"] += boundary
-    return upstream(tree_cache, req, token_ids, **kwargs)
-
-
 def _commit_hicache_local_restore_to_req(
     upstream: Callable, queue: DecodeHiCacheTransferMixin, decode_req: DecodeRequest
 ) -> None:
@@ -840,9 +761,7 @@ def _commit_hicache_local_restore_to_req(
     upstream(queue, decode_req)
     if not (uses_full_only_host_cache(queue.tree_cache) and needs_restore):
         return
-    req = decode_req.req
-    queue.tree_cache.dec_swa_lock_only(req.last_node, req.lock_receipt)
-    req.swa_prefix_lock_released = True
+    queue.tree_cache.release_swa(decode_req.req.lock)
 
 
 def _gate_decode_restores(cache: Any) -> None:
@@ -980,12 +899,6 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         # Stop decode cache hits where the SWA window starts, so prefill always
         # sends the window.
         (DecodePreallocQueue, "_match_prefix_and_lock", _match_prefix_and_lock),
-        # Allocate new KV after the RAM-restored range. Upstream, which has no
-        # decode RAM offload for SWA models, starts at the HBM hit instead.
-        (decode, "alloc_for_decode_prealloc", _alloc_for_decode_prealloc),
-        # Under EAGLE the restore's re-match comes up one page short and the
-        # restore fails, so add the token that covers the last page.
-        (decode_hicache_mixin, "match_prefix_for_req", _restore_rematch),
         # When the restore commits, also drop the SWA part of the request's
         # lock, since the SWA window comes from prefill.
         (

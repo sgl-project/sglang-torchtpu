@@ -24,9 +24,8 @@ import time
 
 import torch
 
-from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.managers.cache_controller import BatchDoneCounter, CacheOperation
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
 from sglang_tpu.tpu_dma_hybrid_cache_controller import (

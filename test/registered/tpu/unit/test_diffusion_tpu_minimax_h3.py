@@ -69,6 +69,7 @@ def _installed():
             (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
             (dit, "_minimax_h3_attention_core_bcg"),
             (dit.MiniMaxH3DiTModel, "_compile_conditions"),
+            (dit.MiniMaxH3DiTModel, "_embed"),
         ):
             stack.enter_context(patch.object(target, name, getattr(target, name)))
         minimax_h3.install()
@@ -142,6 +143,8 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
         empty = torch.zeros(0, dtype=torch.long)
         comfyui_layout = {
             "seq_len": 600,
+            # (text, T, H, W, audio_t), as serialize_comfyui_layout exports it.
+            "signature": (600, 1, 2, 2, 0),
             "position_ids": torch.ones(600, 3),
             "segments": [(0, 600, "text")],
             "img_pos": empty,
@@ -422,7 +425,15 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
 
 class TestMiniMaxH3FullLoopPlatform(CustomTestCase):
     def test_full_loop_admits_tpu_and_rejects_an_unlisted_platform(self):
-        listed = ("is_cuda", "is_hip", "is_cpu", "is_mps", "is_npu", "is_xpu")
+        listed = (
+            "is_cuda",
+            "is_hip",
+            "is_cpu",
+            "is_mps",
+            "is_npu",
+            "is_xpu",
+            "is_out_of_tree",
+        )
         past_gate = RuntimeError("past the platform gate")
         for is_tpu, error in ((True, "past the platform gate"), (False, "requires")):
             platform = Mock(**{f"{name}.return_value": False for name in listed})
