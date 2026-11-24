@@ -17,6 +17,7 @@ from sglang_tpu.dflash_utils_tpu import select_dflash_verify_cache_locs_tpu
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     DraftBlockInputs,
+    PackedVerify,
     VerifyRows,
     map_carry,
 )
@@ -261,6 +262,119 @@ def _block_inputs(
         seq_lens=seq_lens + live * end,
         extend_prefix_lens=(seq_lens + live * offset).to(torch.int32),
         extend_seq_lens=extend_seq_lens,
+    )
+
+
+@compiled_op()
+def schedule_verify_drafts(
+    confidence: torch.Tensor,
+    live_mask: torch.Tensor,
+    drafts_per_live_row: int,
+    survival_eps: float = 1e-6,
+) -> torch.Tensor:
+    """schedule_verify_caps as its own program."""
+    return schedule_verify_caps(
+        confidence, live_mask, drafts_per_live_row, survival_eps
+    )
+
+
+def schedule_verify_caps(
+    confidence: torch.Tensor,
+    live_mask: torch.Tensor,
+    drafts_per_live_row: int,
+    survival_eps: float = 1e-6,
+) -> torch.Tensor:
+    """[pbs] int32 drafts each row verifies under a batch budget of drafts_per_live_row per live row.
+
+    confidence [pbs, gamma] is p(d_j accepted | d_1..d_{j-1} accepted). The budget goes
+    to the highest survival cumprod cells across the batch, so each row keeps a prefix.
+    Ties break by position, then row, as core's ScheduleVerifyLensTopk. Ranks come
+    from pairwise counts, so the budget stays data and one program serves every live bs.
+    """
+    pbs, gamma = confidence.shape
+    survival = torch.cumprod(confidence.float(), dim=1)
+    valid = live_mask[:, None] & (survival >= survival_eps)
+    score = torch.where(valid, survival, torch.full_like(survival, -1.0)).reshape(-1)
+    # Tie key: position-major, then row.
+    rows = torch.arange(pbs, device=confidence.device)[:, None].expand(pbs, gamma)
+    positions = torch.arange(gamma, device=confidence.device)[None, :].expand(
+        pbs, gamma
+    )
+    key = (positions * pbs + rows).reshape(-1)
+    ahead = (score[None, :] > score[:, None]) | (
+        (score[None, :] == score[:, None]) & (key[None, :] < key[:, None])
+    )
+    rank = ahead.to(torch.int32).sum(dim=1)
+    budget = live_mask.to(torch.int32).sum() * drafts_per_live_row
+    chosen = (rank < budget) & valid.reshape(-1)
+    # int32 like the full-width caps the accept ops were warmed with; sum() would widen.
+    return chosen.view(pbs, gamma).sum(dim=1, dtype=torch.int32)
+
+
+@compiled_op()
+def pack_verify(
+    verify_tokens: torch.Tensor,
+    rows: VerifyRows,
+    num_verify_drafts: torch.Tensor,
+    live_mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_tokens: int,
+) -> PackedVerify:
+    """Pack each live request's first 1 + num_verify_drafts verify rows into num_tokens rows.
+
+    verify_tokens and rows are the strided [pbs, N + 1] window; the caller's budget
+    keeps sum(1 + num_verify_drafts) over live rows <= num_tokens. Also returns the
+    RPA metadata (kv lengths, token count) so the backend builds it without eager ops.
+    """
+    pbs, width = rows.cache_locs.shape
+    device = rows.cache_locs.device
+    verify_lens = live_mask.to(torch.int32) * (1 + num_verify_drafts.to(torch.int32))
+    ends = torch.cumsum(verify_lens, dim=0, dtype=torch.int32)
+    cu_q_lens = torch.cat([torch.zeros((1,), dtype=torch.int32, device=device), ends])
+    active_num_tokens = ends[-1]
+    token = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    # Request of each packed row: how many requests end at or before it.
+    req = (ends[None, :] <= token[:, None]).to(torch.int32).sum(dim=1)
+    valid = token < active_num_tokens
+    req = torch.where(valid, req, torch.zeros_like(req)).to(torch.int64)
+    col = torch.where(valid, token - cu_q_lens[req], torch.zeros_like(token)).to(
+        torch.int64
+    )
+    flat = req * width + col
+
+    def gather(table: torch.Tensor) -> torch.Tensor:
+        picked = table.reshape(-1)[flat]
+        return torch.where(valid, picked, torch.zeros_like(picked))
+
+    j = torch.arange(width, dtype=torch.int32, device=device)[None, :]
+    strided = torch.where(
+        j < verify_lens[:, None], cu_q_lens[:-1, None] + j, torch.zeros_like(j)
+    )
+    return PackedVerify(
+        input_ids=gather(verify_tokens.view(pbs, width)),
+        positions=gather(rows.positions),
+        cache_locs=gather(rows.cache_locs),
+        verify_lens=verify_lens,
+        cu_q_lens=cu_q_lens,
+        query_starts=cu_q_lens[:-1].contiguous(),
+        kv_lens=(seq_lens + verify_lens).to(torch.int32),
+        active_num_tokens=active_num_tokens,
+        strided_rows=strided.reshape(-1).to(torch.int64),
+    )
+
+
+@compiled_op()
+def unpack_verify_outputs(
+    strided_rows: torch.Tensor,
+    next_token_logits: torch.Tensor | None,
+    top_k_logits: torch.Tensor | None,
+    top_k_ids: torch.Tensor | None,
+    hidden_states: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, ...]:
+    """[pbs * (N + 1), ...] strided verify outputs from [T, ...] packed ones, in one program."""
+    return tuple(
+        None if rows is None else rows.index_select(0, strided_rows)
+        for rows in (next_token_logits, top_k_logits, top_k_ids, hidden_states)
     )
 
 

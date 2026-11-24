@@ -14,6 +14,8 @@ it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per token to the default
 configurator's cell size and reject the configurators it does not size.
 reject_overlong_pd_draft_prompt: the decode's draft prompt pass takes a whole
 prompt in one extend bucket; abort a longer one at admission, before its KV transfer.
+needs_confidence_relay: TpuBlockSpecWorker schedules ragged verify on device from
+the width table, so core's DSpark confidence relay (and its budget prepare) stays off.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -427,6 +429,15 @@ def spec_need_hidden_states(original):
     return original()
 
 
+def needs_confidence_relay(original):
+    # TpuBlockSpecWorker takes its ragged budget from the width table and splits it
+    # on device, so the scheduler never relays confidence through FutureMap.
+    algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if is_experimental_spec_worker(algorithm):
+        return False
+    return original()
+
+
 def kimi_spec_defaults(original, server_args):
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang_tpu.experimental import experimental_spec_enabled
@@ -521,6 +532,11 @@ def hook_specs():
         (
             "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
             spec_need_hidden_states,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.overlap_utils.decide_needs_confidence_relay",
+            needs_confidence_relay,
             HookType.AROUND,
         ),
         (
