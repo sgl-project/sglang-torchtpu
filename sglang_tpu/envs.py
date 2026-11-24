@@ -140,10 +140,6 @@ class TpuEnvs:
     # generated prompt of that many tokens, the synthetic-warmup canvas, the
     # stages before decoding, one denoise step), results dropped. Unset: off.
     SGLANG_TPU_OPT_H3_TEXT_WARMUP_LENGTHS = EnvStr(None)
-    # Debug: with the text-length warmup, synchronize the device after its text
-    # encode, token refiner and denoise step and log each part's time per
-    # length (where the per-length compiles land). Never in measured runs.
-    SGLANG_TPU_DEBUG_H3_TEXT_WARMUP_TIMING = EnvBool(False)
     # Kimi-K3: run attention-residual aggregation for decode-sized batches as
     # one Pallas kernel (pending add + mix + out norm) instead of the torch
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not

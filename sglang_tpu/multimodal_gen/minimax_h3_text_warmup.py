@@ -9,8 +9,8 @@ Runtime patch, tracked debt:
   projections, whose row counts move with the prompt length on the ranks
   holding the text rows and the end of the live rows. The first request of
   each new prompt length waits for those compiles in its denoise phase (+6.8 s
-  at 1344x768x124 on v7x-8: 6 of the 20 benchmark clips, whose 21 prompts have
-  9 token counts).
+  at 1344x768x124 on v7x-8: 6 of the 20 clips of a 21-prompt benchmark set,
+  whose prompts have 9 token counts).
 - How: with ``SGLANG_TPU_OPT_H3_TEXT_WARMUP_LENGTHS`` set, :func:`install`
   wraps ``MiniMaxH3Pipeline.__init__``: once the pipeline is built, every rank
   runs one warmup request per listed length (and warmup resolution) through
@@ -120,7 +120,7 @@ def warmup_requests(server_args, prompt: str) -> list[Any]:
     """sglang's synthetic H3 warmup request with ``prompt``, one a warmup
     resolution: the canvas ``prepare_synthetic_warmup_request_for_queue``
     resolves from ``--warmup-resolutions`` / ``--warmup-num-frames`` (default:
-    768 short edge, 16:9, 5 s, the 1344x768 canvas), one denoise step."""
+    768 short edge, 16:9, 5 s: the 1344x768 canvas), one denoise step."""
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
     from sglang.multimodal_gen.runtime.utils.common import parse_size
     from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -166,46 +166,6 @@ def _wait(*tensors) -> None:
             tensor.reshape(-1)[:1].cpu()
 
 
-def _denoise_model(pipeline):
-    transformer = pipeline.get_module("transformer")
-    return getattr(transformer, "model", transformer)
-
-
-def _run_timed(pipeline, server_args, head, text_end: int, req) -> tuple:
-    """Debug: the request in two executor calls with a device wait after the
-    text encode, the token refiner and the denoise step."""
-    times = []
-    t0 = time.perf_counter()
-    req = pipeline.executor.execute_with_profiling(
-        head[: text_end + 1], req, server_args
-    )
-    _wait(*(req.prompt_embeds or ()))
-    times.append(time.perf_counter() - t0)
-    model = _denoise_model(pipeline)
-    refine = model.refine_prompt_embeds
-    marks = {}
-
-    def timed_refine(*args, **kwargs):
-        refined = refine(*args, **kwargs)
-        _wait(refined)
-        marks["refined"] = time.perf_counter()
-        return refined
-
-    t1 = time.perf_counter()
-    model.refine_prompt_embeds = timed_refine
-    try:
-        req = pipeline.executor.execute_with_profiling(
-            head[text_end + 1 :], req, server_args
-        )
-    finally:
-        del model.refine_prompt_embeds
-    _wait(req.latents, req.audio_latents)
-    t2 = time.perf_counter()
-    refined_at = marks.get("refined", t1)
-    times += [refined_at - t1, t2 - refined_at]
-    return req, times
-
-
 def warm(pipeline, server_args, lengths: Sequence[int]) -> dict | None:
     """One warmup request a length (and warmup resolution) through the stages
     before decoding, on this rank; every rank runs the same sequence, so the
@@ -237,8 +197,6 @@ def warm(pipeline, server_args, lengths: Sequence[int]) -> dict | None:
         return None
 
     head = pipeline.stages[: names.index(STOP_STAGE)]
-    text_end = names.index(_TEXT_STAGE)
-    timed = tpu_envs.SGLANG_TPU_DEBUG_H3_TEXT_WARMUP_TIMING.get()
     pipeline._install_component_residency_manager(server_args)
     seconds: dict[int, float] = {}
     started = time.perf_counter()
@@ -246,17 +204,8 @@ def warm(pipeline, server_args, lengths: Sequence[int]) -> dict | None:
         t0 = time.perf_counter()
         # Requests are built here and dropped after their run: none outlives it.
         for req in warmup_requests(server_args, prompt):
-            if timed:
-                req, parts = _run_timed(pipeline, server_args, head, text_end, req)
-                logger.info(
-                    "MiniMax H3 text-length warmup: %d tokens: text encode %.2f s, "
-                    "token refiner %.2f s, denoise step %.2f s",
-                    length,
-                    *parts,
-                )
-            else:
-                req = pipeline.executor.execute_with_profiling(head, req, server_args)
-                _wait(req.latents, req.audio_latents)
+            req = pipeline.executor.execute_with_profiling(head, req, server_args)
+            _wait(req.latents, req.audio_latents)
             del req
         seconds[length] = time.perf_counter() - t0
         logger.debug(
@@ -264,8 +213,8 @@ def warm(pipeline, server_args, lengths: Sequence[int]) -> dict | None:
             length,
             seconds[length],
         )
-    # Nothing a warmup request computed stays behind (the conditioning cache is
-    # off in the production recipes; clearing it is then a no-op).
+    # Nothing a warmup request computed stays behind (with the conditioning
+    # cache disabled, clearing it is a no-op).
     cache = getattr(pipeline.executor, "conditioning_cache", None)
     if cache is not None:
         cache.clear()

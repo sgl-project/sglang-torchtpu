@@ -10,6 +10,11 @@ import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
@@ -21,15 +26,20 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_plan_from_batch,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
 )
-# The CPU gate installs python/ only; an installed sglang_tpu still wins.
+# sglang_tpu from the checkout where it is not installed.
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
@@ -113,9 +123,6 @@ class _Executor:
         if "MiniMaxH3TextEncodingStage" in names:
             req.prompt_embeds = [torch.zeros(len(req.prompt.split()), 4)]
         if "MiniMaxH3DenoisingStage" in names:
-            model = req.extra.get("_test_model")
-            if model is not None:
-                model.refine_prompt_embeds(torch.ones(2))
             req.latents = torch.zeros(1, 2, 3).as_subclass(_WaitTensor)
             req.audio_latents = torch.zeros(2, 3).as_subclass(_WaitTensor)
         return req
@@ -187,7 +194,7 @@ class TestFillerPrompt(CustomTestCase):
 
 
 class TestWarmupRequests(CustomTestCase):
-    def test_benchmark_canvas_one_step_warmup(self):
+    def test_1344x768_canvas_one_step_warmup(self):
         (req,) = tw.warmup_requests(_server_args(), "the the the")
         self.assertTrue(req.is_warmup)
         self.assertFalse(req.save_output)
@@ -196,7 +203,7 @@ class TestWarmupRequests(CustomTestCase):
         self.assertEqual(plan.task, "t2va")
         self.assertEqual(plan.prompt, "the the the")
         shape = plan.shape
-        # The 1344x768x124 request (short edge 768, 16:9, 5 s) resolves to this.
+        # The default warmup request (short edge 768, 16:9, 5 s) resolves to this.
         self.assertEqual(
             (shape["width"], shape["height"], shape["frame_count"]), (1344, 768, 124)
         )
@@ -327,38 +334,6 @@ class TestWarm(CustomTestCase):
         pipeline.executor.execute_with_profiling = fail
         with self.assertRaises(RuntimeError):
             tw.warm(pipeline, _server_args(), [3])
-
-    def test_debug_timing_splits_at_the_text_stage(self):
-        refined = []
-
-        class Model:
-            def refine_prompt_embeds(self, x):
-                refined.append(x)
-                return x
-
-        model = Model()
-        pipeline = _Pipeline()
-        pipeline.modules["transformer"] = model
-        execute = pipeline.executor.execute_with_profiling
-
-        def with_model(stages, req, server_args):
-            req.extra["_test_model"] = model
-            return execute(stages, req, server_args)
-
-        pipeline.executor.execute_with_profiling = with_model
-        with _env(SGLANG_TPU_DEBUG_H3_TEXT_WARMUP_TIMING=True):
-            with self.assertLogs(level="INFO") as logs:
-                tw.warm(pipeline, _server_args(), [3])
-        text_end = _STAGES.index("MiniMaxH3TextEncodingStage") + 1
-        decode = _STAGES.index("MiniMaxH3DecodingStage")
-        self.assertEqual(
-            pipeline.executor.calls,
-            [list(_STAGES[:text_end]), list(_STAGES[text_end:decode])],
-        )
-        self.assertEqual(len(refined), 1)
-        # The timing wrapper is gone: the class method serves requests again.
-        self.assertNotIn("refine_prompt_embeds", vars(model))
-        self.assertTrue(any("token refiner" in line for line in logs.output))
 
 
 class TestInstall(CustomTestCase):
