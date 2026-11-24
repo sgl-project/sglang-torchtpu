@@ -304,9 +304,9 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   skipped, regionally compiled blocks marked spmd-safe, the embedding built
   with shapes that do not move with the prompt length) and `qwen_image.py`
   (Qwen-Image prompt rows padded to 512 with real key counts on device,
-  host-built RoPE, prompt tokens padded to 256, spmd-safe blocks); worker init
-  also registers srt's ATen fallbacks (`patches._register_aten_fallbacks`,
-  e.g. `logaddexp`).
+  host-built RoPE, prompt tokens padded to 256, spmd-safe blocks, serial CFG);
+  worker init also registers srt's ATen fallbacks
+  (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 

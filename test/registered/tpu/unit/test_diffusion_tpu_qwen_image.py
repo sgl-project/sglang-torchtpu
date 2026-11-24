@@ -202,6 +202,17 @@ def _causal_hidden(input_ids):
     return SimpleNamespace(hidden_states=(input_ids[..., None].float().cumsum(1),))
 
 
+class TestQwenImageSerialCfg(CustomTestCase):
+    def test_cfg_parallel_is_refused_at_startup(self):
+        create = Mock(return_value="stages")
+        wrapped = qwen_image._serial_cfg(create)
+        with self.assertRaisesRegex(ValueError, "CFG serially"):
+            wrapped(None, SimpleNamespace(enable_cfg_parallel=True))
+        args = SimpleNamespace(enable_cfg_parallel=False)
+        self.assertEqual(wrapped(None, args), "stages")
+        create.assert_called_once_with(None, args)
+
+
 class TestQwenImagePromptPadding(_TestBase):
     def test_prompt_tokens_pad_to_256_and_keep_real_rows(self):
         ids = torch.arange(1, 41)[None]

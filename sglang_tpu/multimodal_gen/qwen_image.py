@@ -19,7 +19,10 @@ Runtime patch, tracked debt:
   (4) right-pads the prompt tokens to a multiple of 256 (the encoder is causal,
       and only real rows reach the DiT);
   (5) marks the blocks spmd-safe through the platform's region wrapper; they
-      carry no rank-dependent value.
+      carry no rank-dependent value;
+  (6) refuses CFG parallel at startup: at CFG 2 x Ulysses 4 (the default for
+      CFG models given no parallel flags) the first request on 3 of 5 fresh
+      servers returned a blank or different image.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform-provided prompt bucket and key counts,
   and RoPE goes through a platform rotation.
@@ -289,6 +292,21 @@ def _padded_processor_init(init):
     return wrapped
 
 
+def _serial_cfg(create_pipeline_stages):
+    @functools.wraps(create_pipeline_stages)
+    def create(self, server_args):
+        if server_args.enable_cfg_parallel:
+            raise ValueError(
+                "Qwen-Image on TPU runs CFG serially: CFG parallel returned blank "
+                "images. Serve with --ulysses-degree <cores> "
+                "(benchmark/tpu/diffusion/qwen_image.sh)."
+            )
+        return create_pipeline_stages(self, server_args)
+
+    create.__wrapped_for_tpu__ = True
+    return create
+
+
 def _mark_blocks_spmd_safe() -> None:
     """Wraps the blocks with the platform's spmd-safe region wrapper when a
     Qwen-Image DiT first runs, so its compile-cache tag reaches only this model."""
@@ -301,9 +319,15 @@ def _mark_blocks_spmd_safe() -> None:
 
 
 def install() -> None:
+    from sglang.multimodal_gen.runtime.pipelines import qwen_image as pipelines
     from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
         ImageEncodingStage,
     )
+
+    for cls in (pipelines.QwenImagePipeline, pipelines.QwenImageEditPipeline):
+        create = cls.create_pipeline_stages
+        if not getattr(create, "__wrapped_for_tpu__", False):
+            cls.create_pipeline_stages = _serial_cfg(create)
 
     pipeline_config = config.QwenImagePipelineConfig
     if not getattr(pipeline_config.tokenize_prompt, "__wrapped_for_tpu__", False):
