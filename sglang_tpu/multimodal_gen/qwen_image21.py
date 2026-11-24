@@ -267,8 +267,13 @@ def _dit_call(self, *args, **kwargs):
     return torch.nn.Module.__call__(self, *args, **kwargs)
 
 
-def attention_forward(self, x, ropes, prefixes, layouts, caches):
+def attention_forward(
+    self, x, ropes, prefixes, layouts, caches, prefix_pad=None, project_out=True
+):
     """``QwenImage21Attention.forward`` over padded layouts."""
+    if prefix_pad is not None:
+        # set only by breakable CUDA graph replays, which TPU workers never run
+        raise NotImplementedError("Qwen-Image 2.1 on TPU takes no prefix_pad")
     q, k, v = self.project_qkv(x)
     outputs, prefix_outputs = [], []
     for sample, layout in enumerate(layouts):
@@ -284,7 +289,10 @@ def attention_forward(self, x, ropes, prefixes, layouts, caches):
         )
         outputs.append(out)
         prefix_outputs.append(prefix_out)
-    return self.to_out[0](dit.cat_outputs(outputs).flatten(2))[0], prefix_outputs
+    hidden = dit.cat_outputs(outputs).flatten(2)
+    if not project_out:
+        return hidden, prefix_outputs
+    return self.to_out[0](hidden)[0], prefix_outputs
 
 
 def block_forward(
@@ -296,12 +304,15 @@ def block_forward(
     layouts,
     ropes,
     caches,
+    prefix_pad=None,
+    use_packed_bf16_mlp=False,
 ):
     """``QwenImage21TransformerBlock.forward`` on caches already sliced to this layer.
 
     The stock forward slices them by ``self._layer_id``, an int the compiler
     guards on, so every layer compiled its own graph (64 per image size, the
     recompile limit). :func:`_block_call` slices outside the compiled region.
+    The stock forward's two-rank TP partial sums run only on CUDA.
     """
     scale1, gate1, scale2, gate2 = modulation
     prefixes = [
@@ -318,11 +329,15 @@ def block_forward(
         prefixes,
         layouts,
         caches,
+        prefix_pad,
     )
     hidden_states = dit.residual_gate_add(hidden_states, attention, gate1)
     hidden_states = dit.residual_gate_add(
         hidden_states,
-        self.img_mlp(dit.apply_modulation(hidden_states, self.img_norm2, scale2)),
+        self.img_mlp(
+            dit.apply_modulation(hidden_states, self.img_norm2, scale2),
+            use_packed_bf16=use_packed_bf16_mlp,
+        ),
         gate2,
     )
     for state, attention in zip(prefix_states, prefix_attentions, strict=True):
@@ -346,6 +361,8 @@ def _block_call(
     layouts,
     ropes,
     caches,
+    prefix_pad=None,
+    **kwargs,
 ):
     caches = [cache[self._layer_id] for cache in caches]
     # A copy at offset 0: the compiled program bakes an input's storage offset.
@@ -359,6 +376,8 @@ def _block_call(
         layouts,
         ropes,
         caches,
+        prefix_pad,
+        **kwargs,
     )
 
 
