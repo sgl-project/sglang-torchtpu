@@ -129,6 +129,14 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # MiniMax-H3 (multimodal_gen/minimax_h3.py): each sequence-parallel rank
+    # embeds only its own video and audio rows on each DiT forward, the stock
+    # _embed, instead of projecting every row into one padded-length buffer.
+    # The full-row form keeps prompt lengths on shared compiled shapes; with the
+    # prompt-length warmup (SGLANG_TPU_OPT_H3_TEXT_WARMUP_LENGTHS) those shapes
+    # compile at startup instead: at 1344x768x124 on 4 chips a request takes
+    # about 0.8 s less, and the server takes about 10 minutes longer to start.
+    SGLANG_TPU_OPT_H3_SHARD_EMBEDDING = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

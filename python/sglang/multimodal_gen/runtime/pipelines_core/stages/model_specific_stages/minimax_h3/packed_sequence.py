@@ -115,6 +115,18 @@ def _temporal_position_span(temporal_length: int) -> float:
     return float(spans.sum())
 
 
+def minimax_h3_padded_seq_len(used: int) -> int:
+    """Packed rows for ``used`` live rows: ``used`` rounded up to
+    ``MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT``.
+
+    The packed-sequence builders and the ComfyUI layout pad through this one
+    function (looked up on this module at call time), so a platform whose
+    kernels need another row count can replace it here.
+    """
+    alignment = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
+    return (used + alignment - 1) // alignment * alignment
+
+
 def minimax_h3_packed_sequence(
     *,
     text_len: int,
@@ -130,7 +142,8 @@ def minimax_h3_packed_sequence(
 ) -> dict[str, Any]:
     """Build the packed-sequence structural fields for one CFG branch.
 
-    The used length is padded up to a multiple of 64.
+    The used length is padded by ``minimax_h3_padded_seq_len`` (to a multiple
+    of 64 by default).
     """
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
@@ -146,11 +159,7 @@ def minimax_h3_packed_sequence(
     video_rows = latent_t * frame_rows
     audio_rows = audio_t * audio_channel
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = (
-        (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
-        // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-        * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-    )
+    seq_len = minimax_h3_padded_seq_len(used)
 
     text_sl = slice(0, text_len)
     cond_sl = slice(text_len, text_len + cond_rows)
@@ -384,11 +393,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_rows = ref_visual_rows + ref_audio_rows
     used = text_len + keyframe_rows + ref_rows + audio_rows + video_rows
     if seq_len is None:
-        seq_len = (
-            (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
-            // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-            * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-        )
+        seq_len = minimax_h3_padded_seq_len(used)
     if seq_len < used:
         raise ValueError(f"seq_len {seq_len} < used rows {used}")
 
@@ -603,4 +608,5 @@ def minimax_h3_packed_sequence_ref2va_blocks(
 __all__ = [
     "minimax_h3_packed_sequence",
     "minimax_h3_packed_sequence_ref2va_blocks",
+    "minimax_h3_padded_seq_len",
 ]
