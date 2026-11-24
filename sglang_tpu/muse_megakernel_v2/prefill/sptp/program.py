@@ -76,7 +76,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
     # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
     xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
-    qkvg_k = {r: qkvg_call(c, QKVG_TILE, r) for r in (True, False)}
+    # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
+    mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
+    qkvg_k = {r: qkvg_call(c, QKVG_TILE, r, mxu_norm) for r in (True, False)}
 
     def forward(
         meta,
