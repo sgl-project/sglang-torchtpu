@@ -6,6 +6,12 @@ The trainer and this engine are two jobs of one slice: libtpu builds the slice f
 RANK / WORLD_SIZE, while each job's torch.distributed world keeps its own ranks. Needs a torch_tpu
 build with job-local worlds (TORCH_TPU_JOB_DEVICE_IDS), so neither job waits on the other's
 programs, and a libtpu without the 0.0.49 SparseCore regression (0.0.48 works).
+
+The slice may span hosts: the trainer holds its first half (slice ranks 0 .. size / 2 - 1) and one
+or more engines of equal size hold the second half, each at the offset its launcher gives it. Slice
+ranks are host-contiguous blocks of TORCH_TPU_DEVICES_PER_HOST (8) devices in the order of
+TORCH_TPU_SLICEBUILDER_ADDRESSES, so a worker's device on its host is `slice rank % 8`, and the
+trainer rank paired with a worker is `slice rank - size / 2`.
 """
 
 import json
@@ -26,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 ENV_VAR = "SGLANG_TPU_SHARED_SLICE"
 BACKEND_NAME = "tpu_shared_slice"
+# torch_tpu's slice-builder layout: one host's devices are consecutive slice ranks, so a
+# worker's device index on its host is its slice rank modulo this
+DEVICES_PER_HOST_ENV_VAR = "TORCH_TPU_DEVICES_PER_HOST"
+DEFAULT_DEVICES_PER_HOST = 8
 TRANSFER_ALIGN_BYTES = 4096
 _TIMEOUT = timedelta(minutes=30)
 
@@ -53,16 +63,32 @@ def spec() -> Optional[SharedSlice]:
     return SharedSlice(int(offset), int(size), host, int(port))
 
 
+def devices_per_host() -> int:
+    return int(os.environ.get(DEVICES_PER_HOST_ENV_VAR) or DEFAULT_DEVICES_PER_HOST)
+
+
+def local_device_index(slice_rank: int) -> int:
+    """The device this slice rank drives on its host: torch_tpu pins TPU_VISIBLE_CHIPS to LOCAL_RANK.
+
+    On a single host the slice rank is the device index already (the trainer holds devices 0..n-1,
+    the engine n..); on a further host the slice rank carries that host's offset, which the host's
+    device numbering does not.
+    """
+    return slice_rank % devices_per_host()
+
+
 def enter_slice_env(shared: SharedSlice) -> JobRank:
     """Swap the worker's job RANK / WORLD_SIZE for the slice-wide ones libtpu reads at startup."""
     job = JobRank(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]))
-    os.environ["RANK"] = os.environ["LOCAL_RANK"] = str(shared.rank_offset + job.rank)
+    slice_rank = shared.rank_offset + job.rank
+    os.environ["RANK"] = str(slice_rank)
+    os.environ["LOCAL_RANK"] = str(local_device_index(slice_rank))
     os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = str(shared.size)
     return job
 
 
 class SharedSliceReceiver(WeightUpdateReceiver):
-    """Receives each update bucket from the trainer rank paired with this TP rank."""
+    """Receives each update bucket from the trainer rank paired with this worker's slice rank."""
 
     def __init__(
         self,
@@ -140,6 +166,7 @@ class _State:
     backend: Optional[dist.ProcessGroup] = None
     store: Optional[dist.Store] = None
     slice_rank: int = -1
+    shared: Optional[SharedSlice] = None
 
 
 # a worker process joins the slice once, at backend init, before any weight-update group exists
@@ -167,8 +194,11 @@ def join(shared: SharedSlice, job: JobRank) -> None:
     _state.backend = tpu_distributed.create_process_group(
         PrefixStore(BACKEND_NAME, store), slice_rank, shared.size, _TIMEOUT
     )
-    _state.store, _state.slice_rank = store, slice_rank
-    os.environ["RANK"] = os.environ["LOCAL_RANK"] = str(job.rank)
+    _state.store, _state.slice_rank, _state.shared = store, slice_rank, shared
+    os.environ["RANK"] = str(job.rank)
+    # the job's rank within its host, as monkey_patch_torch_tpu_env set it: the device is
+    # pinned by now, and the per-host leader checks (LOCAL_RANK == 0) read this value
+    os.environ["LOCAL_RANK"] = str(job.rank % devices_per_host())
     os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = str(job.size)
     logger.info(
         "Joined the shared TPU slice as rank %d of %d (job devices %s)",
@@ -182,13 +212,26 @@ def joined() -> bool:
     return _state.backend is not None
 
 
+def paired_trainer_slice_rank(slice_rank: int, shared: SharedSlice) -> int:
+    """The trainer rank that sends to this worker: the trainer holds the first half of the slice
+    and the engines the second, in the same order, so the pair sits half a slice below. With one
+    engine on one host (slice rank = trainer size + TP rank) this is the TP rank, as before; with
+    n engines of k devices it is TP rank i % k of engine i // k for trainer rank i."""
+    assert shared.size % 2 == 0, (
+        f"a shared slice holds trainer and engine halves, not {shared.size} ranks"
+    )
+    return slice_rank - shared.size // 2
+
+
 def receiver(tp_rank: int) -> SharedSliceReceiver:
-    """The trainer's rank i (slice rank i) sends to TP rank i."""
-    assert _state.backend is not None, f"{ENV_VAR} is unset or the slice was not joined"
+    """The trainer's rank i (slice rank i) sends to the worker at slice rank size / 2 + i."""
+    assert _state.backend is not None and _state.shared is not None, (
+        f"{ENV_VAR} is unset or the slice was not joined"
+    )
     return SharedSliceReceiver(
         _state.backend,
         _state.store,
-        src_slice_rank=tp_rank,
+        src_slice_rank=paired_trainer_slice_rank(_state.slice_rank, _state.shared),
         slice_rank=_state.slice_rank,
     )
 
