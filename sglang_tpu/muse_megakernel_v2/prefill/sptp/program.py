@@ -81,7 +81,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
     # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
     mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
-    qkvg_k = {r: qkvg_call(c, QKVG_TILE, r, mxu_norm) for r in (True, False)}
+    qkvg_tile = int(os.environ.get("SPTP_QKVG_TILE", str(QKVG_TILE)))
+    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm) for r in (True, False)}
     # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
     # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
     n_xag = int(os.environ.get("SPTP_XAG_CHUNKS", str(XAG_CHUNKS)))
