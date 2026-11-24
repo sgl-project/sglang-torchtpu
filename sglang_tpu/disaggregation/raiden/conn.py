@@ -201,6 +201,8 @@ class RaidenKVManager(
     _draft_kv_caches: Tuple[Any, ...] = ()
     _draft_is_swa: bool = False
     _draft_swa_sidecar: Optional[Any] = None
+    _draft_kv_head_num: int = 0
+    _draft_seq_along_lane: Optional[bool] = None
     _draft_engine_max_blocks = 0
     draft_raiden_endpoint: Optional[str] = None
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
@@ -413,21 +415,25 @@ class RaidenKVManager(
 
     # ----- resharding geometry / host-slot helpers --------------------------
 
-    def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
-        """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, from
-        the local fused KV tensor's layout (only its head count differs from
-        the peer's) and the global kv-head count.
-
-        ``swa`` uses the sliding-window sub-pool and ``total_swa_kv_head_num``
-        instead: SWA layers may carry a different kv-head count than full
-        attention (MiMo-V2: 8 vs 4).
-        """
-        tensors = self._swa_kv_caches if swa else self._kv_caches
+    def _make_geometry(
+        self,
+        src_attn_tp: int,
+        dst_attn_tp: int,
+        *,
+        group: Literal["full", "swa", "draft"] = "full",
+        total_kv_heads: Optional[int] = None,
+    ):
+        """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer for the
+        requested KV group (``full``, ``swa``, or ``draft``)."""
+        if group == "swa":
+            tensors, label = self._swa_kv_caches, "sliding-window"
+        elif group == "draft":
+            tensors, label = self._draft_kv_caches, "speculative draft"
+        else:
+            tensors, label = self._kv_caches, "full-attention"
         if not tensors:
             raise RuntimeError(
-                "Raiden has no "
-                + ("sliding-window" if swa else "full-attention")
-                + " KV tensors to build a reshard geometry from"
+                f"Raiden has no {label} KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
         # Resharding runs only for unequal attention TP (the pull path serves
@@ -449,31 +455,67 @@ class RaidenKVManager(
                 f"attention TP {src_attn_tp} on prefill and {dst_attn_tp} on decode. "
                 "Run both at equal attention TP for blocked MXINT8."
             )
-        # Distinct model kv-head counts (model_config.get_total_num_kv_heads()
-        # and get_total_swa_num_kv_heads()), set on both the prefill and decode
-        # KVArgs.
-        total_kv_heads = int(
-            self.kv_args.total_swa_kv_head_num
-            if swa
-            else self.kv_args.total_kv_head_num
-        )
-        head_nums = self._swa_kv_head_nums if swa else self._kv_head_nums
-        heads = (head_nums[0] if head_nums else 0) or max(
-            1, total_kv_heads // max(1, self.attn_tp_size)
+        if group == "draft":
+            if self._draft_kv_head_num <= 0:
+                raise ValueError(
+                    "Raiden push resharding requires a positive per-rank draft "
+                    f"kv-head count; got {self._draft_kv_head_num}"
+                )
+            heads = int(self._draft_kv_head_num)
+            resolved_total = (
+                int(total_kv_heads)
+                if total_kv_heads is not None
+                else heads * max(1, self.attn_tp_size)
+            )
+        else:
+            resolved_total = (
+                int(total_kv_heads)
+                if total_kv_heads is not None
+                else int(
+                    self.kv_args.total_swa_kv_head_num
+                    if group == "swa"
+                    else self.kv_args.total_kv_head_num
+                )
+            )
+            head_nums = (
+                self._swa_kv_head_nums if group == "swa" else self._kv_head_nums
+            )
+            heads = (head_nums[0] if head_nums else 0) or max(
+                1, resolved_total // max(1, self.attn_tp_size)
+            )
+        sal = (
+            bool(self._draft_seq_along_lane)
+            if group == "draft"
+            else self._seq_along_lane
         )
         layout = KVLayoutGeometry.from_tensor(
             tensor.shape,
             tensor.element_size(),
             heads,
-            seq_along_lane=self._seq_along_lane,
-            page_size=int(self.kv_args.page_size) if self._seq_along_lane else None,
+            seq_along_lane=sal,
+            page_size=int(self.kv_args.page_size) if sal else None,
         )
         return ReshardGeometry.from_layout(
-            src_attn_tp, dst_attn_tp, layout, total_kv_heads
+            src_attn_tp, dst_attn_tp, layout, resolved_total
         )
 
-    def _reshard_layers(self, swa: bool) -> List[Tuple[tuple, int, int]]:
+    def _reshard_layers(
+        self, group: Literal["full", "swa", "draft"] = "full"
+    ) -> List[Tuple[tuple, int, int]]:
         """Distinct (shape, element_size, per-rank kv heads) of a KV group."""
+        if group == "draft":
+            if self._draft_kv_head_num <= 0:
+                raise ValueError(
+                    "Raiden push resharding requires a positive per-rank draft "
+                    f"kv-head count; got {self._draft_kv_head_num}"
+                )
+            heads = int(self._draft_kv_head_num)
+            layers = {}
+            for tensor in self._draft_kv_caches or ():
+                key = (tuple(tensor.shape), int(tensor.element_size()), heads)
+                layers.setdefault(key, None)
+            return list(layers)
+        swa = group == "swa"
         tensors = (self._swa_kv_caches if swa else self._kv_caches) or []
         head_nums = self._swa_kv_head_nums if swa else self._kv_head_nums
         total = int(
@@ -523,12 +565,6 @@ class RaidenKVManager(
                 "hybrid model state (GDN/Mamba linear-attention rows or DSV4 "
                 "compressor state); use equal attention TP on prefill and decode"
             )
-        if self._draft_kv_caches:
-            return (
-                f"{push_reshard_where(src_tp=src_attn_tp, dst_tp=dst_attn_tp)} "
-                "does not support speculative draft KV over TpuUnifiedSWAKVPool; "
-                "use equal attention TP on prefill and decode"
-            )
         if self._kv_pack_heads > 1:
             # TODO(#829): plan the sub-granule head runs of a packed row.
             return (
@@ -539,32 +575,61 @@ class RaidenKVManager(
         own_tp = self.attn_tp_size
         peer_tp = dst_attn_tp if own_tp == src_attn_tp else src_attn_tp
         page_size = int(self.kv_args.page_size)
-        for swa in (False, True) if self._swa_kv_caches else (False,):
-            layers = self._reshard_layers(swa)
+        has_draft = bool(self._draft_kv_caches)
+        groups: List[Literal["full", "swa", "draft"]] = ["full"]
+        if self._swa_kv_caches:
+            groups.append("swa")
+        if has_draft:
+            groups.append("draft")
+        for group in groups:
+            layers = self._reshard_layers(group)
             for shape, _, _ in layers:
                 if len(shape) == _BLOCK_MAJOR_KV_RANK:
                     continue  # _make_geometry names the block-major refusal.
                 reason = fused_layout_refusal(src_attn_tp, dst_attn_tp, len(shape))
                 if reason is not None:
                     return reason
-            try:
-                geom = self._make_geometry(src_attn_tp, dst_attn_tp, swa=swa)
-            except (ValueError, RuntimeError) as e:
-                return f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
-            land_ok = self._land_ok(swa=swa)
+            geom = None
+            if group != "draft":
+                try:
+                    geom = self._make_geometry(src_attn_tp, dst_attn_tp, group=group)
+                except (ValueError, RuntimeError) as e:
+                    return f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+            # Unified spec draft resharding is direct/head-run only (no landing arena).
+            land_ok = False if has_draft else self._land_ok(swa=group == "swa")
+            sal = (
+                bool(self._draft_seq_along_lane)
+                if group == "draft"
+                else self._seq_along_lane
+            )
             for shape, element_size, heads in layers:
                 reasons = []
                 hinted = None
                 for total in candidate_total_heads(heads, own_tp, peer_tp):
+                    if group == "draft":
+                        try:
+                            cur_geom = self._make_geometry(
+                                src_attn_tp,
+                                dst_attn_tp,
+                                group="draft",
+                                total_kv_heads=total,
+                            )
+                        except (ValueError, RuntimeError) as e:
+                            reasons.append(
+                                f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+                            )
+                            continue
+                    else:
+                        cur_geom = geom
                     check = functools.partial(
                         push_reshard_refusal,
-                        geom,
+                        cur_geom,
                         shape,
                         element_size,
                         total_heads=total,
                         own_tp=own_tp,
                         page_size=page_size,
-                        seq_along_lane=self._seq_along_lane,
+                        seq_along_lane=sal,
                     )
                     try:
                         reason = check(land_ok=land_ok)
@@ -574,7 +639,15 @@ class RaidenKVManager(
                         # The hint probe never replaces the refusal itself.
                         try:
                             if check(land_ok=True) is None:
-                                reason += self._land_hint(swa=swa)
+                                if has_draft:
+                                    reason += (
+                                        " (speculative draft KV over "
+                                        "TpuUnifiedSWAKVPool does not use a landing "
+                                        "arena; use SEQ_ALONG_LANE, bf16 KV, or "
+                                        "equal attention TP)"
+                                    )
+                                else:
+                                    reason += self._land_hint(swa=group == "swa")
                                 hinted = hinted or reason
                         except ValueError:
                             pass
@@ -654,7 +727,12 @@ class RaidenKVManager(
         )
 
     def _check_reshard_bounds(
-        self, req: Any, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False
+        self,
+        req: Any,
+        src_attn_tp: int,
+        dst_attn_tp: int,
+        *,
+        group: Literal["full", "swa", "draft"] = "full",
     ) -> None:
         """Raise ValueError if a push plan would move bytes outside a block of
         any of the group's KV layers. The decode estimates the prefill block
@@ -664,8 +742,13 @@ class RaidenKVManager(
         )
 
         prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        sal = (
+            bool(self._draft_seq_along_lane)
+            if group == "draft"
+            else self._seq_along_lane
+        )
         pairs = []
-        for shape, element_size, heads in self._reshard_layers(swa):
+        for shape, element_size, heads in self._reshard_layers(group):
             if len(shape) != 5:
                 continue
             block = math.prod(shape[1:]) * element_size
@@ -673,7 +756,7 @@ class RaidenKVManager(
                 pairs.append((block, None))
                 continue
             src_heads = max(1, heads * dst_attn_tp // src_attn_tp)
-            if self._seq_along_lane:
+            if sal:
                 own_rows, src_rows = shape[1], 2 * src_heads
             else:
                 own_rows, src_rows = shape[2], -(-2 * src_heads // shape[3])
@@ -703,6 +786,12 @@ class RaidenKVManager(
         self._draft_kv_caches = list(kv_caches.draft)
         self._draft_is_swa = kv_caches.draft_is_swa
         self._draft_swa_sidecar = kv_caches.draft_swa_sidecar
+        self._draft_seq_along_lane = kv_caches.draft_seq_along_lane
+        self._draft_kv_head_num = (
+            kv_caches.draft_swa_kv_head_num
+            if kv_caches.draft_is_swa
+            else kv_caches.draft_kv_head_num
+        ) or 0
         self._seq_along_lane = kv_caches.seq_along_lane
         self.kv_layout = (
             UNIFIED_SWA_KV_LAYOUT
@@ -1474,8 +1563,8 @@ class RaidenKVManager(
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
-                for uuid in settled_plans:
-                    self._unregister_plan(uuid)
+                for req_id, uuid in settled_plans:
+                    self._unregister_plan(uuid, req_id=req_id)
                 self._log_settled_transfers(
                     sent=[self._norm_req_id(t.req_id) for t in done_send],
                     received=[self._norm_req_id(t.req_id) for t in done_recv],
@@ -1492,8 +1581,11 @@ class RaidenKVManager(
             settled_stale = [e for e in self._stale_plans if e[2].is_ready()]
             for entry in settled_stale:
                 self._stale_plans.remove(entry)
-        for uuid, _room, _fut in settled_stale:
-            self._unregister_plan(uuid)
+        for entry in settled_stale:
+            if len(entry) >= 4 and entry[3] == "draft":
+                self._unregister_draft_plan(entry[0])
+            else:
+                self._unregister_plan(entry[0])
 
     def _record_native_failures_locked(
         self, failed: Iterable[SettledTransfer]
@@ -1598,15 +1690,26 @@ class RaidenKVManager(
         times = [self._send_done_at.get(rid) for rid in rids]
         return None if None in times else max(times)
 
-    def _unregister_plan(self, uuid: int) -> None:
+    def _unregister_draft_plan(self, uuid: int) -> None:
+        engine = self._draft_engine
+        if engine is None:
+            return
+        try:
+            engine.unregister_active_plan(uuid)
+        except RuntimeError as e:
+            if "not registered" not in str(e):
+                raise
+
+    def _unregister_plan(self, uuid: int, *, req_id: Optional[str] = None) -> None:
         """Drops a receiver plan whose push has settled.
 
-        Raiden drops a timed-out plan itself, so one it no longer knows has
-        already been dropped -- which is also why this can sweep both engines
-        unconditionally: a hybrid room registers the same uuid on each, and on
-        an engine that never held it the drop is the same no-op as for a plan
-        raiden already reaped.
+        Draft plans share the room uuid on ``_draft_engine`` and are dropped
+        only for ``draft:`` req IDs so settling ``str(room)`` never tears down
+        an in-flight draft transfer.
         """
+        if req_id is not None and req_id.startswith("draft:"):
+            self._unregister_draft_plan(uuid)
+            return
         first_error: Optional[RuntimeError] = None
         for engine in (self._engine, self._swa_engine):
             if engine is None:
@@ -1619,21 +1722,27 @@ class RaidenKVManager(
         if first_error is not None:
             raise first_error
 
-    def _reap_stale_plan(self, uuid: int, room: int, fut) -> None:
+    def _reap_stale_plan(
+        self, uuid: int, room: int, fut, *, draft: bool = False
+    ) -> None:
         """Waits out a parked plan's copy, then drops the plan.
 
         The request that parked it is already failed and may be the last one
         served, so reclaiming cannot ride on another request's poll.
         """
+        entry = (uuid, room, fut, "draft") if draft else (uuid, room, fut)
         while True:
             with self._state_lock:
-                if (uuid, room, fut) not in self._stale_plans:
+                if entry not in self._stale_plans:
                     return  # a completion sweep already reclaimed it
                 if fut.is_ready():
-                    self._stale_plans.remove((uuid, room, fut))
+                    self._stale_plans.remove(entry)
                     break
             time.sleep(0.05)
-        self._unregister_plan(uuid)
+        if draft:
+            self._unregister_draft_plan(uuid)
+        else:
+            self._unregister_plan(uuid)
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         with self._status_lock:
@@ -2077,11 +2186,11 @@ class RaidenKVManager(
                 waiting = self._pulling.waiting
                 if waiting is not None and belongs(waiting):
                     self._pulling.forget(waiting)
-            settled_plans = []
+            settled_plans: List[Tuple[str, int]] = []
             plans = (getattr(self, "_reshard_plans", None) or {}).pop(room, {})
             for req_id, uuid in plans.items():
                 if req_id in self._completed_recv or req_id in self._native_failed:
-                    settled_plans.append(uuid)
+                    settled_plans.append((req_id, uuid))
                     continue
                 self._cleared_plans[req_id] = uuid
                 held.add(req_id)
@@ -2156,6 +2265,7 @@ class RaidenKVManager(
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,
+                    self._decode.reshard_draft_swa_sources,
                 ):
                     table.pop(room, None)
                 for table in (
@@ -2174,8 +2284,8 @@ class RaidenKVManager(
                 # well, so clear and publication have one total order.
                 with self.failure_lock:
                     self.failure_records.pop(room, None)
-        for uuid in settled_plans:
-            self._unregister_plan(uuid)
+        for req_id, uuid in settled_plans:
+            self._unregister_plan(uuid, req_id=req_id)
 
 
 class RaidenKVBootstrapServer(CommonKVBootstrapServer):

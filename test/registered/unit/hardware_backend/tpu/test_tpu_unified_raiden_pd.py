@@ -26,7 +26,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardBlocks,
     ReshardChunk,
 )
-from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -510,17 +511,13 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
                 self.assertIn("KV layout mismatch", dec.failure_records[room])
                 abort.assert_called_once()
 
-    def test_unified_spec_draft_reshard_refused_at_init(self):
-        sal = _pool(head_num=2, sal=True, page_size=256)
-        room = 8310
-        dec = self._unified(mgr=self._decode(attn_tp_size=4, page_size=256), pool=sal)
-        dec._draft_kv_caches = (sal.kv_pool.page_buffers()[0],)
-        dec.kv_args.kv_layout = get_kv_layout(sal)
+    def _run_draft_init(self, dec, *, room: int, src_tp: int = 8):
         dec.addr_to_rooms_tracker = defaultdict(set)
-        infos = [{"rank_ip": "127.0.0.1", "rank_port": 44010 + i} for i in range(2)]
+        ratio = src_tp // dec.attn_tp_size
+        infos = [{"rank_ip": "127.0.0.1", "rank_port": 44010 + i} for i in range(ratio)]
 
         def common_init(recv_self, _dp_rank, *, layout=dec.kv_args.kv_layout, bs=infos):
-            recv_self.prefill_info = SimpleNamespace(kv_layout=layout, attn_tp_size=8)
+            recv_self.prefill_info = SimpleNamespace(kv_layout=layout, attn_tp_size=src_tp)
             recv_self.target_pp_ranks = [0]
             recv_self.target_cp_ranks = [0]
             recv_self.bootstrap_infos = bs
@@ -540,11 +537,100 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
             patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
         ):
             recv.init(0)
-        self.assertEqual(recv.conclude_state, KVPoll.Failed)
-        self.assertEqual(dec.check_status(room), KVPoll.Failed)
-        self.assertIn(
-            "speculative draft KV over TpuUnifiedSWAKVPool", dec.failure_records[room]
+        return recv, abort
+
+    def test_unified_spec_draft_reshard_refused_at_init(self):
+        # Direct/head-run unified drafts (SAL + SAL, and SAL target + bf16 token-major draft)
+        # are accepted at init(); landing-draft and landing-target + draft are refused.
+        sal = _pool(head_num=2, dtype=torch.float8_e4m3fn, sal=True, page_size=256)
+        bf16_tm_draft = TpuFusedMHATokenToKVPool(
+            size=4 * 256,
+            page_size=256,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
         )
+        fp8_tm_draft = TpuFusedMHATokenToKVPool(
+            size=4 * 256,
+            page_size=256,
+            dtype=torch.float8_e4m3fn,
+            head_num=2,
+            head_dim=128,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+
+        # 1. Direct/head-run drafts succeed at init().
+        for idx, (draft_buf, draft_sal) in enumerate(
+            (
+                (sal.kv_pool.page_buffers()[0], True),
+                (bf16_tm_draft.get_fused_kv_buffer(0), False),
+            )
+        ):
+            with self.subTest(case="direct", idx=idx):
+                dec = self._unified(
+                    mgr=self._decode(attn_tp_size=4, page_size=256), pool=sal
+                )
+                dec.kv_args.total_kv_head_num = 8
+                dec.kv_args.total_swa_kv_head_num = 8
+                dec._draft_kv_caches = (draft_buf,)
+                dec._draft_kv_head_num = 2
+                dec._draft_seq_along_lane = draft_sal
+                dec.kv_args.kv_layout = get_kv_layout(sal)
+                recv, abort = self._run_draft_init(dec, room=8310 + idx)
+                self.assertIsNone(recv.conclude_state)
+                self.assertEqual(dec.check_status(8310 + idx), KVPoll.WaitingForInput)
+                abort.assert_not_called()
+
+        # 2. Token-major fp8 draft (1 head/prefill -> 2 heads/decode) is refused at init().
+        dec_ld = self._unified(
+            mgr=self._decode(attn_tp_size=4, page_size=256), pool=sal
+        )
+        dec_ld.kv_args.total_kv_head_num = 8
+        dec_ld.kv_args.total_swa_kv_head_num = 8
+        dec_ld._draft_kv_caches = (fp8_tm_draft.get_fused_kv_buffer(0),)
+        dec_ld._draft_kv_head_num = 2
+        dec_ld._draft_seq_along_lane = False
+        dec_ld.kv_args.kv_layout = get_kv_layout(sal)
+        recv, abort = self._run_draft_init(dec_ld, room=8320)
+        self.assertEqual(recv.conclude_state, KVPoll.Failed)
+        self.assertEqual(dec_ld.check_status(8320), KVPoll.Failed)
+        self.assertIn("SEQ_ALONG_LANE", dec_ld.failure_records[8320])
+        self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_ld.failure_records[8320])
+        abort.assert_called_once()
+
+        # 3. Landing-target + direct-draft is refused even when landing arena is enabled.
+        tm_fp8_target = _pool(head_num=2, dtype=torch.float8_e4m3fn, sal=False, page_size=64)
+        bf16_tm_draft_64 = TpuFusedMHATokenToKVPool(
+            size=4 * 64,
+            page_size=64,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        dec_lt = self._unified(
+            mgr=self._decode(attn_tp_size=4, page_size=64), pool=tm_fp8_target
+        )
+        dec_lt.kv_args.total_kv_head_num = 8
+        dec_lt.kv_args.total_swa_kv_head_num = 8
+        dec_lt._draft_kv_caches = (bf16_tm_draft_64.get_fused_kv_buffer(0),)
+        dec_lt._draft_kv_head_num = 2
+        dec_lt._draft_seq_along_lane = False
+        dec_lt._land = SimpleNamespace(arena=SimpleNamespace(capacity=1024))
+        dec_lt.kv_args.kv_layout = get_kv_layout(tm_fp8_target)
+        with tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+            recv, abort = self._run_draft_init(dec_lt, room=8321)
+        self.assertEqual(recv.conclude_state, KVPoll.Failed)
+        self.assertEqual(dec_lt.check_status(8321), KVPoll.Failed)
+        self.assertIn("SEQ_ALONG_LANE", dec_lt.failure_records[8321])
+        self.assertNotIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA=1", dec_lt.failure_records[8321])
         abort.assert_called_once()
 
 

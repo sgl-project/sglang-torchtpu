@@ -672,7 +672,7 @@ class TestReshardHandlerErrorsFailTheRoom(unittest.TestCase):
         self.assertNotIn(OTHER_ROOM, mgr.failure_records)
 
     def test_closing_path_error_fails_the_room_and_sends_no_ready(self):
-        def make_geometry(src_tp, dst_tp, *, swa=False):
+        def make_geometry(src_tp, dst_tp, *, group="full", total_kv_heads=None):
             raise IndexError("tuple index out of range")
 
         for swa in (False, True):
@@ -1398,7 +1398,7 @@ class TestReceiverInitRefusals(unittest.TestCase):
             _state_kv_caches=(object(),),
             _state_engine=object(),
             _swa_kv_caches=[],
-            _reshard_layers=lambda swa: [],
+            _reshard_layers=lambda group="full": [],
             _make_geometry=lambda *args, **kwargs: None,
             _state_rows_from_state_indices=lambda state_indices: [],
             kv_args=SimpleNamespace(page_size=64, kv_layout=None),
@@ -1561,7 +1561,7 @@ class TestDecodeBoundsViolationFailsTheRoom(unittest.TestCase):
         self.assertFalse(armed)
         mgr._check_reshard_bounds.assert_called_once()
         self.assertEqual(mgr._check_reshard_bounds.call_args.args[1:], (8, 4))
-        self.assertEqual(mgr._check_reshard_bounds.call_args.kwargs, {"swa": True})
+        self.assertEqual(mgr._check_reshard_bounds.call_args.kwargs, {"group": "swa"})
         self._assert_failed(mgr, mgr._swa_engine)
 
 

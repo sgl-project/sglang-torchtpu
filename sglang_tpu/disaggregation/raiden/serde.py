@@ -239,6 +239,12 @@ class ReshardReq(WireMessage, omit_defaults=True):
     # Whether the decode runs with the KV offload to decode DRAM switched on;
     # the prefill fails the room when the switch is on on either side.
     kv_offload: bool = False
+    # Unified-target speculative draft push metadata (omitted when unused).
+    draft_push_endpoint: str = ""
+    decode_draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    decode_draft_kv_head_num: int = 0
+    decode_draft_seq_along_lane: Optional[bool] = None
+    decode_draft_is_swa: Optional[bool] = None
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -247,6 +253,7 @@ class ReshardReq(WireMessage, omit_defaults=True):
             raise ValueError(
                 f"invalid dst_attn_tp: expected >= 1, got {self.dst_attn_tp}"
             )
+        require_non_negative(self.decode_draft_kv_head_num, "decode_draft_kv_head_num")
 
 
 class ReshardBlocks(WireMessage):
@@ -259,6 +266,7 @@ class ReshardBlocks(WireMessage):
     aux_blob: bytes
     prefill_swa_blocks: list[int]
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    prefill_draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

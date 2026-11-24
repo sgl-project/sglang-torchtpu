@@ -298,13 +298,6 @@ class RaidenReceiverMixin:
                     f"state yet (got {len(bootstrap_infos)} prefill sources for "
                     "one decode rank); use equal attention TP on prefill and decode."
                 )
-            if self._draft_engine is not None:
-                raise NotImplementedError(
-                    "Raiden push resharding does not support speculative draft KV "
-                    f"over TpuUnifiedSWAKVPool yet (got {len(bootstrap_infos)} "
-                    "prefill sources for one decode rank); use equal attention TP "
-                    "on prefill and decode."
-                )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
             # head-slice strided into the wider decode block. The plan stages
@@ -324,21 +317,37 @@ class RaidenReceiverMixin:
                     "SGLANG_TPU_RAIDEN_STAGING_LAYERS=0 on prefill and decode to "
                     "keep full mirrors."
                 )
-            if not local_blocks and not (
-                self._unified_swa_pool is not None and local_swa_blocks
+            if (
+                not local_blocks
+                and not (self._unified_swa_pool is not None and local_swa_blocks)
+                and not (
+                    self._draft_engine is not None
+                    and self._draft_is_swa
+                    and local_draft_swa_blocks
+                )
             ):
-                # Full prefix-cache hit: decode already holds every page,
-                # nothing to receive. A hybrid model's sliding-window pages sit
-                # inside that prefix, so its engine has nothing to receive
-                # either -- mark both so is_recv_done can settle.
+                # Full prefix-cache hit: nothing to receive on any engine.
                 with self._state_lock:
                     self._completed_recv.add(str(room))
                     if self._swa_engine is not None:
                         self._completed_recv.add(self._swa_req_id(room))
+                    if self._draft_engine is not None:
+                        self._completed_recv.add(self._draft_req_id(room))
+                    self._decode.final_seen.add(room)
                 return
-            self._register_reshard_request(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
-            )
+            if local_draft_swa_blocks:
+                self._register_reshard_request(
+                    room,
+                    local_blocks,
+                    local_swa_blocks,
+                    aux_index,
+                    bootstrap_infos,
+                    local_draft_swa_blocks=local_draft_swa_blocks,
+                )
+            else:
+                self._register_reshard_request(
+                    room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                )
             self.update_status(room, KVPoll.WaitingForInput)
             return
         with self._state_lock:
@@ -429,21 +438,21 @@ class RaidenReceiverMixin:
             for rid in (key, *self._paired_reads(key))
         )
 
-    def _settled_cleared_plans_locked(self) -> List[int]:
-        """Plan uuids of cleared rooms whose push the engine has now settled.
+    def _settled_cleared_plans_locked(self) -> List[Tuple[str, int]]:
+        """(req_id, uuid) pairs of cleared rooms whose push has now settled.
 
         Their completion bookkeeping is dropped here, as nothing else will
         read it; the caller unregisters the plans outside the lock.
         """
-        uuids = []
+        settled: List[Tuple[str, int]] = []
         for req_id, uuid in list(self._cleared_plans.items()):
             if req_id in self._completed_recv or req_id in self._native_failed:
                 del self._cleared_plans[req_id]
                 self._completed_recv.discard(req_id)
                 self._failed.discard(req_id)
                 self._native_failed.discard(req_id)
-                uuids.append(uuid)
-        return uuids
+                settled.append((req_id, uuid))
+        return settled
 
     def _release_pull_slots_locked(self) -> None:
         """Hand back the staging of reads that have settled."""
@@ -1063,6 +1072,8 @@ class RaidenReceiverMixin:
         local_swa_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
+        *,
+        local_draft_swa_blocks: Sequence[int] = (),
     ) -> None:
         # bootstrap_infos is ordered by the decode->prefill target_tp_ranks
         # (range(r*ratio, (r+1)*ratio)); ratio == number of prefill sources.
@@ -1077,6 +1088,8 @@ class RaidenReceiverMixin:
         swa_push_endpoint = (
             self._swa_engine.transfer_address if self._swa_engine is not None else ""
         )
+        has_draft = self._draft_engine is not None
+        draft_push_endpoint = self._draft_engine.transfer_address if has_draft else ""
         ready_endpoints = [
             _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             for info in bootstrap_infos
@@ -1085,6 +1098,7 @@ class RaidenReceiverMixin:
             self._decode.reshard_meta[room] = dict(
                 local_blocks=list(local_blocks),
                 local_swa_blocks=list(local_swa_blocks or []),
+                local_draft_swa_blocks=list(local_draft_swa_blocks or []),
                 source_ranks=list(source_ranks),
                 src_attn_tp=int(src_attn_tp),
                 aux_index=aux_index,
@@ -1092,6 +1106,7 @@ class RaidenReceiverMixin:
             )
             self._decode.reshard_sources[room] = {}
             self._decode.reshard_swa_sources[room] = {}
+            self._decode.reshard_draft_swa_sources[room] = {}
             now = time.time()
             if self._land is not None:
                 self._land.started[room] = now
@@ -1109,6 +1124,13 @@ class RaidenReceiverMixin:
             decode_swa_blocks=list(local_swa_blocks or []),
             swa_push_endpoint=swa_push_endpoint,
             kv_offload=self.dram_offload_channel is not None,
+            draft_push_endpoint=draft_push_endpoint,
+            decode_draft_swa_blocks=list(local_draft_swa_blocks or []),
+            decode_draft_kv_head_num=int(self._draft_kv_head_num) if has_draft else 0,
+            decode_draft_seq_along_lane=(
+                bool(self._draft_seq_along_lane) if has_draft else None
+            ),
+            decode_draft_is_swa=bool(self._draft_is_swa) if has_draft else None,
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
@@ -1212,7 +1234,7 @@ class RaidenReceiverMixin:
         sources lands in scratch. Without an arena, today's geometry."""
         geom = (
             self._make_geometry(
-                src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size, swa=True
+                src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size, group="swa"
             )
             if swa
             else self._make_geometry(src_attn_tp, self.attn_tp_size)
@@ -1498,6 +1520,9 @@ class RaidenReceiverMixin:
             self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
                 prefill_swa_blocks
             )
+            self._decode.reshard_draft_swa_sources.setdefault(room, {})[src_rank] = (
+                req.prefill_draft_swa_blocks
+            )
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}
@@ -1731,7 +1756,7 @@ class RaidenReceiverMixin:
                 live_tokens=[self.kv_args.page_size] * n,
                 scratch_block_ids=swa_scratch,
             )
-            self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size, swa=True)
+            self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size, group="swa")
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
             error = RuntimeError(f"SWA: cannot stage plan {room}: {e}")
@@ -1766,7 +1791,7 @@ class RaidenReceiverMixin:
         if not sources:
             return True
         try:
-            geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
+            geom = self._make_geometry(src_attn_tp, self.attn_tp_size, group="swa")
         except Exception as e:
             error = RuntimeError(f"SWA: cannot stage plan {room}: {e}")
             error.__cause__ = e
@@ -1823,6 +1848,103 @@ class RaidenReceiverMixin:
             paired[p_rank] = pages[-n_swa:]
         return paired
 
+    def _rollback_reshard_draft_plan(self, room: int) -> None:
+        draft_req_id = self._draft_req_id(room)
+        with self._state_lock:
+            plans = self._reshard_plans.get(room)
+            if plans is not None:
+                plans.pop(draft_req_id, None)
+            self._cleared_plans.pop(draft_req_id, None)
+        self._unregister_draft_plan(room)
+
+    def _register_reshard_draft_receiver(
+        self,
+        *,
+        room: int,
+        src_attn_tp: int,
+        local_blocks: List[int],
+        local_draft_swa_blocks: List[int],
+        sources_map: Dict[int, List[int]],
+        draft_swa_sources_map: Dict[int, List[int]],
+    ) -> Tuple[bool, bool]:
+        if self._draft_engine is None:
+            return True, False
+        dst_blocks = local_draft_swa_blocks if self._draft_is_swa else local_blocks
+        src_map = draft_swa_sources_map if self._draft_is_swa else sources_map
+        n_draft = len(dst_blocks)
+        if not n_draft:
+            with self._state_lock:
+                self._completed_recv.add(self._draft_req_id(room))
+            return True, False
+        sources: List[Tuple[int, List[int]]] = []
+        for p_rank in sorted(sources_map):
+            pages = src_map.get(p_rank, [])
+            if len(pages) < n_draft:
+                reason = (
+                    f"Raiden reshard draft receive: source rank {p_rank} sent "
+                    f"{len(pages)} draft pages, decode needs {n_draft}"
+                )
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                with self._state_lock:
+                    self._failed.add(str(room))
+                    self.record_failure(room, reason)
+                return False, False
+            sources.append((p_rank, pages[-n_draft:]))
+
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+        )
+
+        try:
+            geom = self._make_geometry(
+                src_attn_tp=src_attn_tp,
+                dst_attn_tp=self.attn_tp_size,
+                group="draft",
+                total_kv_heads=self._draft_kv_head_num * self.attn_tp_size,
+            )
+            req = build_receiver_request(
+                pb2,
+                uuid=room,
+                req_id=self._draft_req_id(room),
+                peer=self._draft_engine.transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=dst_blocks,
+                live_tokens=[self.kv_args.page_size] * n_draft,
+            )
+            self._check_reshard_bounds(
+                req, src_attn_tp, self.attn_tp_size, group="draft"
+            )
+            self._draft_engine.register_active_plan(room, req, is_sender=False)
+        except Exception as e:
+            error = RuntimeError(f"draft: cannot stage plan {room}: {e}")
+            error.__cause__ = e
+            self._fail_reshard_room(room=room, error=error)
+            return False, False
+        with self._state_lock:
+            live = room in self._decode.reshard_meta and room not in self._aborted
+            if live:
+                self._reshard_plans.setdefault(room, {})[
+                    self._draft_req_id(room)
+                ] = room
+        if not live:
+            self._unregister_draft_plan(room)
+            return False, False
+        logger.info(
+            "raiden reshard draft receive room=%s decode_rank=%d sources=%d "
+            "pages=%d layers=%d swa=%s",
+            room,
+            self.attn_tp_rank,
+            len(sources),
+            n_draft,
+            len(self._draft_kv_caches),
+            self._draft_is_swa,
+        )
+        return True, True
+
     def _register_receiver_and_signal(self, room: int) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
@@ -1837,10 +1959,14 @@ class RaidenReceiverMixin:
             meta = self._decode.reshard_meta[room]
             local_blocks = list(meta["local_blocks"])
             local_swa_blocks = list(meta.get("local_swa_blocks") or [])
+            local_draft_swa_blocks = list(meta.get("local_draft_swa_blocks") or [])
             src_attn_tp = meta["src_attn_tp"]
             ready_endpoints = list(meta["ready_endpoints"])
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
+            draft_swa_sources_map = dict(
+                self._decode.reshard_draft_swa_sources.get(room, {})
+            )
 
         if (
             self._land is not None or self._swa_land is not None
@@ -1887,10 +2013,23 @@ class RaidenReceiverMixin:
             )
             if unified_swa_sources is None:
                 return
+        # Arm the draft receive before READY goes out or local_blocks is sliced.
+        draft_ok, draft_registered = self._register_reshard_draft_receiver(
+            room=room,
+            src_attn_tp=src_attn_tp,
+            local_blocks=local_blocks,
+            local_draft_swa_blocks=local_draft_swa_blocks,
+            sources_map=sources_map,
+            draft_swa_sources_map=draft_swa_sources_map,
+        )
+        if not draft_ok:
+            return
 
         try:
             geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
         except Exception as e:
+            if draft_registered:
+                self._rollback_reshard_draft_plan(room)
             self._fail_reshard_plan_build(room, str(room), e)
             return
         n = len(local_blocks)
@@ -1909,14 +2048,18 @@ class RaidenReceiverMixin:
                 unified_swa_sources is not None and bool(local_swa_blocks)
             )
             with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    return  # cleared while the complement was computed
-                # The closing read is owed from the moment the room can look
-                # complete: it is recorded before _final_seen so completion
-                # can never be inferred while its registration is pending.
-                if has_closing_blocks:
-                    self._decode.chunk_reads.setdefault(room, []).append(str(room))
-                self._decode.final_seen.add(room)
+                cleared = room not in self._decode.reshard_meta
+                if not cleared:
+                    # The closing read is owed from the moment the room can look
+                    # complete: it is recorded before _final_seen so completion
+                    # can never be inferred while its registration is pending.
+                    if has_closing_blocks:
+                        self._decode.chunk_reads.setdefault(room, []).append(str(room))
+                    self._decode.final_seen.add(room)
+            if cleared:
+                if draft_registered:
+                    self._rollback_reshard_draft_plan(room)
+                return
             if not has_closing_blocks:
                 for endpoint in ready_endpoints:
                     payload = ReshardReady(room=room).to_frames()
@@ -1967,6 +2110,8 @@ class RaidenReceiverMixin:
                 live_tokens=live,
             )
         except Exception as e:
+            if draft_registered:
+                self._rollback_reshard_draft_plan(room)
             self._fail_reshard_plan_build(room, str(room), e)
             return
         # register_active_plan (dst_mem_type=HBM) arms the completion barrier from
@@ -1988,7 +2133,7 @@ class RaidenReceiverMixin:
         ready_payload = ReshardReady(
             room=room, pages=missing if self.chunked_transfer else []
         ).to_frames()
-        self._publish_reshard_plan(
+        published = self._publish_reshard_plan(
             room,
             str(room),
             room,
@@ -1997,6 +2142,8 @@ class RaidenReceiverMixin:
             ready_endpoints,
             record_read=not self.chunked_transfer,
         )
+        if not published and draft_registered:
+            self._rollback_reshard_draft_plan(room)
 
     def _resolve_landing_closing_swa(
         self,
@@ -2247,7 +2394,7 @@ class RaidenReceiverMixin:
                 swa_geom = self._make_geometry(
                     src_attn_tp=src_attn_tp,
                     dst_attn_tp=self.attn_tp_size,
-                    swa=True,
+                    group="swa",
                 )
             if not self._stage_reshard_swa_plan(
                 room=room,
