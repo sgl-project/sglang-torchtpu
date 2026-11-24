@@ -3,8 +3,8 @@
 
 The hook, its refusals, the padding seam and the per-step input builders run
 in torch everywhere. Tests that need JAX, torch_tpu's Pallas adapter, the FL2VA
-checkpoint (``MINIMAX_H3_CHECKPOINT``, default /mnt/workspace/MiniMax-H3/FL2VA)
-or a libtpu compile-only topology skip without them:
+checkpoint (a directory in ``MINIMAX_H3_CHECKPOINT``) or a libtpu compile-only
+topology skip without them:
 
 - the packer against ``reference.pack_weights`` on two real blocks, bitwise;
 - the AdaLN tables against each real block's ``adaln_proj``, bitwise;
@@ -15,7 +15,8 @@ or a libtpu compile-only topology skip without them:
   blocks against sglang's eager blocks on the same inputs, within the bf16
   floor (two processes: ``--real-stage1 DIR`` builds sglang's side and the
   hook's operands, ``--real-stage2 DIR`` runs the kernel);
-- one program for every benchmark prompt length at the 1344x768x124 shape.
+- one program for every prompt length of a 21-prompt benchmark set at
+  1344x768x124.
 """
 
 import contextlib
@@ -31,6 +32,11 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
 import torch
@@ -72,7 +78,7 @@ def _real_kernel_side(directory: str, devices: int = 4) -> dict:
     interpret = pltpu.InterpretParams(detect_races=False, dma_execution_mode="on_wait")
     # The serving tiling with 128-row phase A and C tiles: two a device here
     # (the kernel does not trace a device with a single phase A row tile, a
-    # case no benchmark row count reaches).
+    # case no 1344x768x124 row count reaches).
     tiling = dataclasses.replace(op.STACK_TILING, qkv_rows=128, mlp_rows=128)
     fn = op.sharded_stack(
         mesh, ref.Config(layers=len(meta["layers"])), tiling, interpret
@@ -131,17 +137,22 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The CPU image has no JAX or checkpoint: only the torch-only tests run there.
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+# The real-block tests need MINIMAX_H3_CHECKPOINT and skip without it.
+register_tpu_ci(
+    est_time=150,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
 )
 
-# The CPU gate installs python/ only; an installed sglang_tpu still wins.
+# sglang_tpu from the checkout where it is not installed.
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
@@ -150,38 +161,41 @@ from sglang_tpu.multimodal_gen.h3_megakernel import hook, pack  # noqa: E402
 
 _HAS_JAX = importlib.util.find_spec("jax") is not None
 _HAS_TORCH_TPU = importlib.util.find_spec("torch_tpu") is not None
-_CKPT = os.environ.get("MINIMAX_H3_CHECKPOINT", "/mnt/workspace/MiniMax-H3/FL2VA")
+_CKPT = os.environ.get("MINIMAX_H3_CHECKPOINT", "")
 _TRANSFORMER = os.path.join(_CKPT, "transformer")
-_HAS_CKPT = os.path.isfile(os.path.join(_TRANSFORMER, "model.safetensors.index.json"))
+_HAS_CKPT = bool(_CKPT) and os.path.isfile(
+    os.path.join(_TRANSFORMER, "model.safetensors.index.json")
+)
 _BF16 = torch.bfloat16
 # Two real blocks: 35's softmax runs at a fixed max (its norms bound it), 36's
 # online (FL2VA proves every layer but 36, 37 and 43-49).
 _REAL_LAYERS = (35, 36)
 _FL2VA_ONLINE = [36, 37, 43, 44, 45, 46, 47, 48, 49]
-# Text tokens of a benchmark prompt set: its 20 measured prompts and its warmup
-# (FL2VA tokenizer, no special tokens): 36-47 tokens, 9 distinct counts.
+# Text tokens of a 21-prompt benchmark set at 1344x768x124: its 20 measured
+# prompts and its warmup (FL2VA tokenizer, no special tokens): 36-47 tokens,
+# 9 distinct counts.
 _SPEC_TEXT_TOKENS = {
-    "ceramic-wheel": 47,
-    "paper-fold": 40,
-    "wind-chimes": 40,
-    "coffee-grinder": 39,
-    "dog-shake": 43,
-    "zipper-close": 40,
-    "rolling-ball": 45,
-    "paint-brush": 41,
-    "kettle-pour": 39,
-    "candle-light": 37,
-    "book-pages": 39,
-    "basketball-bounce": 39,
-    "window-rain": 38,
-    "leaves-rake": 40,
-    "sewing-machine": 36,
-    "ping-pong": 38,
-    "umbrella-open": 40,
-    "shoe-laces": 40,
-    "ice-cubes": 39,
-    "station-clock": 38,
-    "warmup-only": 39,
+    "prompt-01": 47,
+    "prompt-02": 40,
+    "prompt-03": 40,
+    "prompt-04": 39,
+    "prompt-05": 43,
+    "prompt-06": 40,
+    "prompt-07": 45,
+    "prompt-08": 41,
+    "prompt-09": 39,
+    "prompt-10": 37,
+    "prompt-11": 39,
+    "prompt-12": 39,
+    "prompt-13": 38,
+    "prompt-14": 40,
+    "prompt-15": 36,
+    "prompt-16": 38,
+    "prompt-17": 40,
+    "prompt-18": 40,
+    "prompt-19": 39,
+    "prompt-20": 38,
+    "warmup": 39,
 }
 # 1344x768, 124 frames at 24 fps: 37 latent frames of 48x84, 207 audio frames.
 _SPEC_SHAPE = dict(latent_t=37, latent_h=48, latent_w=84, audio_t=207)
@@ -355,12 +369,12 @@ def _spec_layout(text_len: int):
 
 
 class TestMegakernelPadding(CustomTestCase):
-    """E5's seam: the kernel's row count for every packed builder."""
+    """The padding seam: the kernel's row count for every packed builder."""
 
     @unittest.skipUnless(_HAS_JAX, "needs JAX (tiling.padded_rows)")
-    def test_benchmark_rows_a_device(self):
-        # All 21 benchmark prompts (37,746-37,757 live rows) share one padded row
-        # count per device count: the original kernel's padded_rows rule (8: 4,992 a device,
+    def test_1344x768x124_rows_a_device(self):
+        # All 21 prompts (37,746-37,757 live rows) share one padded row
+        # count per device count: the kernel's padded_rows rule (8: 4,992 a device,
         # not 512-alignment's 4,736 = 37 x 128, whose query tiles would be
         # 128 rows), or the override when a request fits it.
         config = pack.config_from_arch(MiniMaxH3DiTArchConfig(), 50)
@@ -389,7 +403,7 @@ class TestMegakernelPadding(CustomTestCase):
                 self.assertTrue((packed["img_position_ids"][used:] == 0).all())
                 self.assertTrue((packed["token_tags"][used:] == -1).all())
             for text, ref in default.items():
-                packed = layouts["sewing-machine" if text == 36 else "ceramic-wheel"]
+                packed = layouts["prompt-15" if text == 36 else "prompt-01"]
                 used = int(ref["cu_seqlens"][1])
                 torch.testing.assert_close(
                     packed["img_position_ids"][:used], ref["img_position_ids"][:used]
@@ -585,7 +599,6 @@ def _installed(run_full_loop=None):
     cls = dit.MiniMaxH3DiTModel
     names = (
         "post_load_weights",
-        "forward",
         "validate_weight_update_source",
         "validate_lora_layers",
     )
@@ -862,23 +875,6 @@ class TestMegakernelRefusals(CustomTestCase):
             self.assertIsNone(hook.unsupported_reason(self.model))
         with _support(), structured.override(True), knob.override("block_q=4096"):
             self.assertIsNone(hook.unsupported_reason(self.model))
-
-    @unittest.skipUnless(_HAS_JAX, "needs JAX (tiling.fit)")
-    def test_vouch_margin_must_be_finite_and_not_negative(self):
-        vouch = tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH
-        margin = tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN
-        for value in (-0.5, float("inf"), float("nan")):
-            with _support(), vouch.override(True), margin.override(value):
-                self.assertIn(
-                    "SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN",
-                    hook.unsupported_reason(self.model),
-                )
-            # Read only with vouching on.
-            with _support(), margin.override(value):
-                self.assertIsNone(hook.unsupported_reason(self.model))
-        for value in (0.0, 1.1):
-            with _support(), vouch.override(True), margin.override(value):
-                self.assertIsNone(hook.unsupported_reason(self.model))
 
     def test_refusal_or_failing_check_leaves_the_blocks(self):
         # A rank whose check raises still joins the vote, as a refusal.
@@ -1168,41 +1164,6 @@ class TestMegakernelHook(CustomTestCase):
             run(stage, batch("r4", enable_spectrum=True), None)
             self.assertEqual(loop_mock.call_count, 3)
 
-    def test_dump_saves_each_requests_first_forward(self):
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            set_forward_context,
-        )
-
-        arch = _arch(heads=2)
-        model = _tiny_model(arch)
-        kwargs = _forward_kwargs(arch)
-        with tempfile.TemporaryDirectory() as root:
-            with (
-                tpu_envs.SGLANG_TPU_DEBUG_H3_DUMP_DIR.override(root),
-                tpu_envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.override(False),
-                _installed() as cls,
-            ):
-                self.assertTrue(hook.requested())
-                # Dump-only: the weights stay; nothing is packed.
-                model.post_load_weights()
-                self.assertFalse(hook.is_packed(model))
-                batch = SimpleNamespace(
-                    request_id="req/1", is_warmup=False, enable_spectrum=False
-                )
-                with torch.no_grad():
-                    for step in range(2):
-                        with set_forward_context(step, None, forward_batch=batch):
-                            video, audio = cls.forward(model, **kwargs)
-            (name,) = os.listdir(root)
-            self.assertEqual(name, "h3_torch_req_1_step00.pt")
-            data = torch.load(os.path.join(root, name))
-        self.assertEqual(data["meta"]["request_id"], "req/1")
-        self.assertEqual(data["meta"]["step"], 0)
-        for key in ("x", "audio_x", "unique_timesteps", "prompt_embeds", "cu_seqlens"):
-            self.assertIn(key, data)
-        self.assertEqual(data["video"].shape, video.shape)
-        self.assertEqual(data["audio"].shape, audio.shape)
-
     def test_host_waves_fit_free_memory(self):
         # 8 ranks on one host, 65 GB each, 400 GB free: 4 at a time.
         infos = [("host", 65 << 30, 400 << 30)] * 8
@@ -1285,8 +1246,8 @@ def _vouched_fake_op(record: list, layers: int, heads: int):
     return op
 
 
-# The benchmark runner's reading of the per-request line
-# (runner/cells.py LOG_CONTRACT["h3"]["op_calls"]).
+# A log reader's pattern for the per-request line (a benchmark runner counts
+# the op calls of each request with it).
 _OP_CALLS = (
     r"MiniMax H3 megakernel: request (?P<rid>\S+) ran the block-stack op "
     r"(?P<calls>\d+) times(?P<warmup> \(warmup\))?"
@@ -1382,9 +1343,7 @@ class TestVouchedHeads(CustomTestCase):
         self.assertFalse(tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH.get())
         self.assertIsNone(hook._vouch_margin())
         with tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH.override(True):
-            self.assertEqual(hook._vouch_margin(), 1.1)
-            with tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN.override(0.0):
-                self.assertEqual(hook._vouch_margin(), 0.0)
+            self.assertEqual(hook._vouch_margin(), hook.VOUCH_MARGIN)
         # Without a margin the stack calls the plain op and keeps nothing.
         op = MagicMock(return_value="rows")
         stack = self._stack(op, margin=None)
@@ -1521,7 +1480,7 @@ class TestVouchedHeads(CustomTestCase):
 
 
 def _spec_used(text_len: int) -> int:
-    """An benchmark prompt's live rows: 37,296 video, 414 audio, its text."""
+    """A 1344x768x124 prompt's live rows: 37,296 video, 414 audio, its text."""
     return 37_296 + 414 + text_len
 
 
@@ -1611,7 +1570,7 @@ class TestStaticStructureOption(CustomTestCase):
                 )
 
     def test_static_structure_is_the_first_live_length_of_its_structure(self):
-        # Against a linear scan, around the benchmark live lengths and across
+        # Against a linear scan, around the benchmark's live lengths and across
         # query and key tile edges, at each row count; and at 18,944 rows on 2
         # devices, whose 2,368-row key tiles start structures inside a 128-row
         # step (no static structure runs there).
@@ -2047,8 +2006,8 @@ class TestKernelLevers(CustomTestCase):
     def test_lean_cut_keeps_every_spec_prompt_on_one_structure(self):
         # lean_cut's halving boundary (1,024 keys into a 2,048-key tile, or
         # 1,920 into a 2,560-key one of 1,280-key sub-blocks) is a multiple of
-        # 128 rows, so the structure classes are the plain ones: every benchmark
-        # prompt still passes one static structure, whose cut tile's last
+        # 128 rows, so the structure classes are the plain ones: every
+        # benchmark prompt still passes one static structure, whose cut tile's last
         # real sub-block runs half its keys.
         from sglang_tpu.multimodal_gen.h3_megakernel import kernel
         from sglang_tpu.multimodal_gen.h3_megakernel import tiling as tl
@@ -2414,8 +2373,8 @@ class TestOpCall(CustomTestCase):
                 fixed_max=17.0,
             ),
         )
-        # The tiling: the original drivers' bounds (padding) plus the shipped
-        # verify_kwargs (the call), the weights in the kernel's order.
+        # The tiling: the padding bounds plus the tuned MLP tiling (the
+        # call), the weights in the kernel's order.
         self.assertEqual(
             (op.ROWS_TILING.sub_rows, op.ROWS_TILING.stage_slots),
             (640, 24),
@@ -2426,23 +2385,23 @@ class TestOpCall(CustomTestCase):
         )
         self.assertEqual(op.STACK_TILING.qkv_rows, 704)
 
-    def test_benchmark_tiles_match_the_ds_tiling(self):
-        # At every benchmark row count the call's tiles are those of the original kernel's
-        # shipped tiling (drivers' bounds + verify_kwargs); the 704-row QKV
+    def test_1344x768x124_tiles_match_the_tuned_tiling(self):
+        # At every 1344x768x124 row count the call's tiles are those of the
+        # tuned tiling (padding bounds + MLP tiling); the 704-row QKV
         # bound only keeps 768-row tiles (over VMEM with 24 staging slots)
         # off other shapes.
         import dataclasses
 
         op = op_module()
         config = pack.config_from_arch(MiniMaxH3DiTArchConfig(), 50)
-        ds = dataclasses.replace(op.ROWS_TILING, mlp_rows=640, chunk_rows=80)
+        tuned = dataclasses.replace(op.ROWS_TILING, mlp_rows=640, chunk_rows=80)
         for rows, devices in ((4992, 8), (4864, 8), (9600, 4), (18944, 2), (19456, 2)):
             self.assertEqual(
                 op.STACK_TILING.fit(config, rows, devices),
-                ds.fit(config, rows, devices),
+                tuned.fit(config, rows, devices),
                 (rows, devices),
             )
-        self.assertEqual(ds.fit(config, 2304, 8).qkv_rows, 768)
+        self.assertEqual(tuned.fit(config, 2304, 8).qkv_rows, 768)
         self.assertEqual(op.STACK_TILING.fit(config, 2304, 8).qkv_rows, 576)
         self.assertEqual(tuple(op.kernel._WEIGHT_ORDER), pack.WEIGHT_ORDER)
         self.assertEqual(pack.TABLE_LANES, op.ref.TABLE_LANES)
@@ -2826,7 +2785,7 @@ def _capture_op(config, devices: int, mesh, **options):
 
 
 def _meta_operands(config, rows: int, text_len: int):
-    """Rank 0's op arguments for an benchmark prompt (meta tensors, the hook's
+    """Rank 0's op arguments for a 1344x768x124 prompt (meta tensors, the hook's
     own builders): shapes and dtypes only."""
     _init_parallel()
     arch = MiniMaxH3DiTArchConfig()
@@ -3322,7 +3281,7 @@ class TestOneProgramForEveryPrompt(CustomTestCase):
         "needs libtpu's compile-only tpu7x topology and "
         "H3_MEGAKERNEL_LOWERING_TESTS=1 (about a minute)",
     )
-    def test_lowers_for_tpu7x_at_the_benchmark_shape(self):
+    def test_lowers_for_tpu7x_at_1344x768x124(self):
         # The export torch_tpu runs on the worker (pallas_jax_op), at 4,992
         # rows a device on 8 tpu7x devices: the live length is the program's
         # [1] int32 argument, not a constant.

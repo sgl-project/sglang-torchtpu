@@ -32,8 +32,9 @@ torch only:
   lever reaches only the op's build and the static structure's cut tile;
 - with the option set on some ranks only, every rank leaves the kernel off;
 - off, the replicated path's calls exactly; on one rank, a no-op;
-- with the FL2VA checkpoint (``MINIMAX_H3_CHECKPOINT``), the tables of four
-  real blocks' projections at H3's shapes, sharded 2, 3, 4 and 8 ways.
+- with the FL2VA checkpoint (a directory in ``MINIMAX_H3_CHECKPOINT``), the
+  tables of four real blocks' projections at H3's shapes, sharded 2, 3, 4 and
+  8 ways.
 """
 
 import contextlib
@@ -49,6 +50,11 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -74,17 +80,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Five multi-process runs (2, 4 and 8 ranks; failures on 2 and 4), up to about
 # two minutes each on 4 cores.
-register_cpu_ci(est_time=300, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=300,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
 )
-# The CPU gate installs python/ only; an installed sglang_tpu still wins.
+# sglang_tpu from the checkout where it is not installed.
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
@@ -92,9 +103,11 @@ from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
 from sglang_tpu.multimodal_gen.h3_megakernel import hook, pack  # noqa: E402
 
 _HAS_JAX = importlib.util.find_spec("jax") is not None
-_CKPT = os.environ.get("MINIMAX_H3_CHECKPOINT", "/mnt/workspace/MiniMax-H3/FL2VA")
+_CKPT = os.environ.get("MINIMAX_H3_CHECKPOINT", "")
 _TRANSFORMER = os.path.join(_CKPT, "transformer")
-_HAS_CKPT = os.path.isfile(os.path.join(_TRANSFORMER, "model.safetensors.index.json"))
+_HAS_CKPT = bool(_CKPT) and os.path.isfile(
+    os.path.join(_TRANSFORMER, "model.safetensors.index.json")
+)
 _BF16 = torch.bfloat16
 _SHARD = tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SHARD_ADALN
 # The tiny arch's tile widths (pack.tile_widths imports JAX).
@@ -1147,6 +1160,14 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _gloo_barrier(group=None, async_op=False, device_ids=None):
+    """torch.distributed.barrier without the accelerator lookup: the barrier
+    calls torch._C._get_accelerator(), which on a TPU host starts torch_tpu,
+    and these gloo-only ranks have no TPU launch environment. A one-element
+    all-reduce over the group is the same barrier."""
+    torch.distributed.all_reduce(torch.zeros(1), group=group)
+
+
 def _rank_main(rank: int, world: int, port: int, directory: str, cases: list):
     """One rank: sglang's groups over gloo (Ulysses over the whole world), then
     each case; the results so far go to ``<directory>/<rank>.json`` after
@@ -1159,6 +1180,7 @@ def _rank_main(rank: int, world: int, port: int, directory: str, cases: list):
         MASTER_PORT=str(port),
     )
     torch.set_num_threads(1)
+    torch.distributed.barrier = _gloo_barrier
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=1, sp_size=world, ulysses_degree=world, dist_timeout=_DIST_TIMEOUT_S
     )

@@ -149,27 +149,23 @@ class TpuEnvs:
     # H3 megakernel: shape the kernel's loops from each request's live length
     # on the host (kernel.stack static_structure): the narrowed last query tile
     # and cut key tile, and with no query tile of padding the dense walk. One
-    # program serves every live length of a loop structure (all 21 benchmark
-    # prompts share one), at the row counts checked for the 1344x768x124 request
-    # (h3_megakernel/op.py STRUCTURED_SHAPES); other row counts keep the
-    # generic walk. Also pads to 19,456 rows a device at 2 devices where
+    # program serves every live length of a loop structure (the 21 prompts of
+    # a 1344x768x124 benchmark set share one), at the row counts checked for
+    # that request (h3_megakernel/op.py STRUCTURED_SHAPES); other row counts
+    # keep the generic walk. Also pads to 19,456 rows a device at 2 devices where
     # padded_rows gives 18,944 (512-row query tiles) and drops the phase C
     # down-weight prefetch at 4 devices (VMEM headroom at 9,600 rows). Unset:
     # a traced live length takes the generic walk.
     SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE = EnvBool(False)
     # H3 megakernel: from a request's second denoise step on, also run at a
     # fixed max the heads of the layers the norm weights leave online whose
-    # q/k peaks in that request's previous step clear the fixed-max bound by
-    # SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN. The op checks each step's own
-    # peaks on device and recomputes a step whose tried heads exceed the bound
-    # with the proven layers only, so every step's result is the fixed-max
-    # softmax inside its bound or the proven-only one. The heads are kept per
-    # request only; a request's first step runs the proven layers.
+    # q/k peaks in that request's previous step clear the fixed-max bound by a
+    # margin of 1.1 (h3_megakernel/hook.py VOUCH_MARGIN). The op checks each
+    # step's own peaks on device and recomputes a step whose tried heads exceed
+    # the bound with the proven layers only, so every step's result is the
+    # fixed-max softmax inside its bound or the proven-only one. The heads are
+    # kept per request only; a request's first step runs the proven layers.
     SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH = EnvBool(False)
-    # Margin on the previous step's bound for the heads a step tries (1.1, as
-    # the original JAX implementation). Any value >= 0 keeps every step exact; a lower one
-    # only adds recomputed steps (0 tries every head: a check of the redo path).
-    SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN = EnvFloat(1.1)
     # H3 megakernel: each rank keeps the AdaLN projections (adaln_proj) of a
     # contiguous ceil(blocks / ranks) of the blocks and frees the other blocks'
     # at load: of H3's 24.2 GiB a rank, 12.1 / 6.3 / 3.4 GiB stay at 2 / 4 / 8
@@ -180,13 +176,6 @@ class TpuEnvs:
     # the all-gather on the device at startup). Every rank must set it (set on
     # some ranks only, the kernel stays off); a no-op on one rank.
     SGLANG_TPU_OPT_H3_MEGAKERNEL_SHARD_ADALN = EnvBool(False)
-    # H3 megakernel: project every denoise step's AdaLN tables of a request in
-    # one GEMM a block when the denoise loop has staged its timesteps
-    # (MiniMaxH3DiTModel.prepare_adaln_plans), instead of re-reading each
-    # block's adaln_proj weights at every step; within a request only. Exact
-    # only: the first batch of each row count is compared bit for bit with the
-    # per-step projections on the device and turned off on any difference.
-    SGLANG_TPU_OPT_H3_MEGAKERNEL_ADALN_PRECOMPUTE = EnvBool(False)
     # H3 megakernel kernel levers of the static-structure calls (with
     # SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE), each at the row counts
     # h3_megakernel/op.py LEVER_SHAPES lists; other calls are unchanged.
@@ -242,12 +231,6 @@ class TpuEnvs:
     # TILING_FIELDS. Bounds that change the key sub-blocks or the query tiles
     # change rounding; a tiling over VMEM fails at compile. Unset: none.
     SGLANG_TPU_OPT_H3_MEGAKERNEL_TILING = EnvStr(None)
-    # Debug: save the inputs and velocity outputs of each H3 request's first
-    # STEPS DiT forwards (world rank 0) as .pt files in this directory, from the
-    # megakernel or (with it off) from sglang's blocks, for teacher-forced
-    # comparisons. Never set in measured runs.
-    SGLANG_TPU_DEBUG_H3_DUMP_DIR = EnvStr(None)
-    SGLANG_TPU_DEBUG_H3_DUMP_STEPS = EnvInt(1)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

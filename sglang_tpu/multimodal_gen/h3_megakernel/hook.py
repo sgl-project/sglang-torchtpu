@@ -39,13 +39,7 @@ Runtime patch, tracked debt:
   tables and one all-gather over the sequence-parallel group (every rank)
   puts all of them in block order: the replicated path's tables bit for bit
   for an AdaLN input that is the same on every rank (checked on the device
-  at startup, on a fixed input). With
-  ``SGLANG_TPU_OPT_H3_MEGAKERNEL_ADALN_PRECOMPUTE=1`` the stack projects every
-  step's AdaLN rows of a request in one GEMM a block when the denoise loop
-  stages its timesteps (``MiniMaxH3DiTModel.prepare_adaln_plans``) and builds
-  each step's tables from them (the step found by its timesteps tensor), if
-  the first batch of each row count gave the per-step projections' bits. The
-  kernel lever flags
+  at startup, on a fixed input). The kernel lever flags
   (SGLANG_TPU_OPT_H3_MEGAKERNEL_LEAN_CUT, _SPLIT_ITEMS, _EPILOGUE_CHUNKS,
   _WIDE_KV, _WIDE_KV_ONLINE) shape the structured calls at
   ``op.LEVER_SHAPES``' row counts.
@@ -60,13 +54,10 @@ import dataclasses
 import functools
 import logging
 import math
-import os
-import re
 import weakref
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from sglang_tpu.envs import envs
@@ -87,19 +78,15 @@ _BOUND_SLACK = 1.025
 _SHARD_VOTE = (
     "asks for sharded AdaLN projections (SGLANG_TPU_OPT_H3_MEGAKERNEL_SHARD_ADALN)"
 )
+# Margin on a request's previous step's q/k bound for the heads a vouched
+# step tries at a fixed max (SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH). Any value
+# >= 0 keeps every step exact; a lower one only adds recomputed steps.
+VOUCH_MARGIN = 1.1
 
 
 def requested() -> bool:
-    """The hook is installed for the kernel or for DiT dumps (debug)."""
-    return (
-        envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get()
-        or envs.SGLANG_TPU_DEBUG_H3_DUMP_DIR.get() is not None
-    )
-
-
-def _dump_only() -> bool:
-    """Dumps without the kernel: sglang's blocks run, the hook only saves."""
-    return not envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get()
+    """The hook is installed for the kernel."""
+    return envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get()
 
 
 def _structured() -> bool:
@@ -181,34 +168,12 @@ def _shard_adaln() -> bool:
     return envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SHARD_ADALN.get()
 
 
-def _precompute_adaln() -> bool:
-    """Every step's AdaLN projections of a request in one GEMM a block."""
-    return envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_ADALN_PRECOMPUTE.get()
-
-
-# Rows a step of a batched AdaLN projection -> whether it gave this rank's
-# blocks the per-step projections' bits at every step (checked once each).
-_ADALN_BATCH_EXACT: dict[int, bool] = {}
-
-
-def _adaln_input(model, unique_timesteps: torch.Tensor) -> torch.Tensor:
-    """``MiniMaxH3DiTModel.forward``'s AdaLN input for a step's timesteps."""
-    t_emb = model._time_embedding(unique_timesteps.view(-1))
-    return nn.functional.silu(t_emb).to(torch.bfloat16)
-
-
-def _step_rows(proj, rows: torch.Tensor, start: int, count: int, adaln_input):
-    """A block's projection of one step from its batched rows: what
-    ``proj(adaln_input)`` returns (TP 1, as the support check requires)."""
-    return proj.split_output(rows[start : start + count])
-
-
 def _vouch_margin() -> float | None:
     """The margin of the vouched heads (``SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH``),
     or None: the proven layers only."""
     if not envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH.get():
         return None
-    return float(envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN.get())
+    return VOUCH_MARGIN
 
 
 def proven_layers(q_norm: torch.Tensor, k_norm: torch.Tensor, config) -> list[int]:
@@ -362,12 +327,6 @@ def unsupported_reason(model) -> str | None:
             _tiling_overrides()
         except ValueError as error:
             return f"SGLANG_TPU_OPT_H3_MEGAKERNEL_TILING: {error}"
-    margin = _vouch_margin()
-    if margin is not None and not (math.isfinite(margin) and margin >= 0):
-        return (
-            f"SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH_MARGIN={margin}: needs a finite "
-            "margin >= 0"
-        )
     return None
 
 
@@ -808,11 +767,6 @@ class H3MegakernelStack(nn.Module):
         self.calls = 0
         self.vouch_margin = vouch_margin
         self._vouching: _Vouching | None = None
-        # A request's batched AdaLN rows (precompute_adaln): this rank's blocks'
-        # projections of every step's rows, and each step's (first row, rows)
-        # by the id of its timesteps tensor; the step of the next forward.
-        self._adaln_batch = None
-        self._adaln_step: tuple[int, int] | None = None
 
     def _fresh_vouching(self, request_id) -> _Vouching:
         """No heads to try yet: the proven layers only."""
@@ -827,7 +781,6 @@ class H3MegakernelStack(nn.Module):
         """A request's denoise loop starts: whatever an earlier one left is
         dropped, and its first step runs the proven layers only."""
         self._vouching = None
-        self._adaln_batch, self._adaln_step = None, None
         if self.vouch_margin is not None:
             self._vouching = self._fresh_vouching(request_id)
 
@@ -836,7 +789,6 @@ class H3MegakernelStack(nn.Module):
         max beyond the proven layers), read from device once, or None
         without vouching; its vouched heads are dropped."""
         vouching, self._vouching = self._vouching, None
-        self._adaln_batch, self._adaln_step = None, None
         if vouching is None:
             return None
         try:
@@ -860,54 +812,6 @@ class H3MegakernelStack(nn.Module):
             )
         return vouching
 
-    def precompute_adaln(self, model, step_timesteps) -> None:
-        """A request's AdaLN projections of every step at once: one GEMM a
-        block of this rank's over the steps' stacked AdaLN inputs, each
-        computed as ``MiniMaxH3DiTModel.forward`` computes it (a step has one
-        row a unique timestep: H3's first step, at t = 0 for video and audio,
-        has one). Kept only if the batch gives every step the per-step
-        projection's bits: the first batch of each pattern of step rows is
-        checked on the device, one host read."""
-        self._adaln_batch, self._adaln_step = None, None
-        if not step_timesteps or not self.adaln:
-            return
-        inputs = [_adaln_input(model, t) for t in step_timesteps]
-        counts = [x.shape[0] for x in inputs]
-        starts = [sum(counts[:step]) for step in range(len(counts))]
-        exact = _ADALN_BATCH_EXACT.get(tuple(counts))
-        if exact is False:
-            return
-        stacked = torch.cat(inputs)
-        batch = [proj.project_local(stacked) for proj in self.adaln]
-        if exact is None:
-            differ = stacked.new_zeros((), dtype=torch.int64)
-            for proj, rows in zip(self.adaln, batch):
-                for start, x in zip(starts, inputs):
-                    one = proj.project_local(x)
-                    differ += (rows[start : start + x.shape[0]] != one).sum()
-            differ = int(differ)
-            exact = _ADALN_BATCH_EXACT[tuple(counts)] = differ == 0
-            (logger.info if exact else logger.warning)(
-                "MiniMax H3 megakernel: AdaLN projections of %d steps (%d rows) "
-                "in one GEMM a block: %s (rank %d)",
-                len(inputs),
-                stacked.shape[0],
-                "bitwise the per-step projections, kept"
-                if exact
-                else f"{differ} elements differ from the per-step projections; "
-                "per-step for these steps",
-                dist.get_rank() if dist.is_initialized() else 0,
-            )
-        if exact:
-            rows = zip(step_timesteps, starts, counts)
-            self._adaln_batch = (batch, {id(t): (a, n) for t, a, n in rows})
-
-    def adaln_step(self, unique_timesteps) -> None:
-        """The next forward is the batched plan's step of this timesteps
-        tensor (``forward_kwargs`` passes the plan's own), or no step of it."""
-        batch = self._adaln_batch
-        self._adaln_step = None if batch is None else batch[1].get(id(unique_timesteps))
-
     def packed_bytes(self) -> int:
         return sum(
             getattr(self, name).numel() * getattr(self, name).element_size()
@@ -925,17 +829,11 @@ class H3MegakernelStack(nn.Module):
         every rank all-gathers the tables here on every call, the same
         collective in the same place on all of them."""
         shard = self.adaln_shard
-        projs, step, self._adaln_step = self.adaln, self._adaln_step, None
-        if step is not None and self._adaln_batch is not None:
-            projs = [
-                functools.partial(_step_rows, proj, rows, *step)
-                for proj, rows in zip(self.adaln, self._adaln_batch[0])
-            ]
         if shard is None:
-            tables = pack.adaln_tables(projs, adaln_input)
+            tables = pack.adaln_tables(self.adaln, adaln_input)
         else:
             tables = pack.sharded_adaln_tables(
-                projs,
+                self.adaln,
                 adaln_input,
                 per_rank=shard.per_rank,
                 layers=shard.layers,
@@ -1313,59 +1211,6 @@ def _vouch_summary(tally: tuple[int, int] | None, calls: int) -> str:
     )
 
 
-_dump_counts: dict = {}
-
-
-def _maybe_dump(model, kwargs: dict, out) -> None:
-    """Debug (SGLANG_TPU_DEBUG_H3_DUMP_DIR): save a request's first DiT
-    forwards' inputs and velocities from world rank 0."""
-    root = envs.SGLANG_TPU_DEBUG_H3_DUMP_DIR.get()
-    if not root:
-        return
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_world_rank,
-    )
-    from sglang.multimodal_gen.runtime.managers.forward_context import (
-        get_forward_context_or_none,
-    )
-
-    if get_world_rank() != 0:
-        return
-    context = get_forward_context_or_none()
-    batch = context.forward_batch if context is not None else None
-    request = _request_id(batch) if batch is not None else "none"
-    step = _dump_counts.get(request, 0)
-    _dump_counts[request] = step + 1
-    if step >= envs.SGLANG_TPU_DEBUG_H3_DUMP_STEPS.get():
-        return
-    data = {
-        name: kwargs[name].detach().float().cpu()
-        for name in ("x", "audio_x", "unique_timesteps", "prompt_embeds")
-        if isinstance(kwargs.get(name), torch.Tensor)
-    }
-    data["video"], data["audio"] = (t.detach().float().cpu() for t in out)
-    psp = kwargs.get("packed_seq_params")
-    cu_seqlens = (
-        psp.get("cu_seqlens_q")
-        if isinstance(psp, dict)
-        else getattr(psp, "cu_seqlens_q", None)
-    )
-    if isinstance(cu_seqlens, torch.Tensor):
-        data["cu_seqlens"] = cu_seqlens.detach().cpu()
-    data["meta"] = {
-        "tag": "mk" if is_packed(model) else "torch",
-        "request_id": request,
-        "step": step,
-        "timestep": None if context is None else context.current_timestep,
-        "warmup": bool(getattr(batch, "is_warmup", False)),
-    }
-    os.makedirs(root, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", request)[:80]
-    path = os.path.join(root, f"h3_{data['meta']['tag']}_{safe}_step{step:02d}.pt")
-    torch.save(data, path)
-    logger.warning("MiniMax H3 megakernel debug: dumped %s", path)
-
-
 def _packed_error(what: str) -> ValueError:
     return ValueError(
         "MiniMax H3 megakernel packed the DiT blocks' weights at load; "
@@ -1386,8 +1231,7 @@ def _refuse_when_packed(method, what: str):
 
 def install() -> None:
     """Route ``MiniMaxH3DiTModel``'s block stack through the kernel when every
-    rank can run it (decided after the weights load); with the dump directory
-    set, save each request's first DiT forwards."""
+    rank can run it (decided after the weights load)."""
     from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
     from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
         LoRAPipeline,
@@ -1400,34 +1244,14 @@ def install() -> None:
     if getattr(cls, "_tpu_h3_megakernel_installed", False):
         return
     post_load_weights = cls.post_load_weights
-    torch_forward = cls.forward
-    prepare_adaln_plans = cls.prepare_adaln_plans
     reject_lora = LoRAPipeline._reject_lora_on_packed_weights
     run_full_loop = MiniMaxH3DenoisingStage._run_full_loop
 
     @functools.wraps(post_load_weights)
     def _post_load_weights(self) -> None:
         post_load_weights(self)
-        if not _dump_only():
+        if envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get():
             enable(self)
-
-    @functools.wraps(torch_forward)
-    def _forward(self, **kwargs):
-        stack = self.__dict__.get(_STATE)
-        if isinstance(stack, H3MegakernelStack):
-            stack.adaln_step(kwargs.get("unique_timesteps"))
-        out = torch_forward(self, **kwargs)
-        _maybe_dump(self, kwargs, out)
-        return out
-
-    @functools.wraps(prepare_adaln_plans)
-    def _prepare_adaln_plans(self, step_timesteps):
-        # Every step's timesteps are staged: the stack's batched AdaLN rows.
-        slots = prepare_adaln_plans(self, step_timesteps)
-        stack = self.__dict__.get(_STATE)
-        if slots is None and isinstance(stack, H3MegakernelStack):
-            stack.precompute_adaln(self, step_timesteps)
-        return slots
 
     @functools.wraps(reject_lora)
     def _reject_lora_on_packed_weights(self) -> None:
@@ -1472,10 +1296,6 @@ def install() -> None:
             )
 
     cls.post_load_weights = _post_load_weights
-    if envs.SGLANG_TPU_DEBUG_H3_DUMP_DIR.get() or _precompute_adaln():
-        cls.forward = _forward
-    if _precompute_adaln():
-        cls.prepare_adaln_plans = _prepare_adaln_plans
     cls.validate_weight_update_source = _refuse_when_packed(
         cls.validate_weight_update_source, "weight updates"
     )
