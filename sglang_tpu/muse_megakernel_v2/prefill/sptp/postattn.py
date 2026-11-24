@@ -185,14 +185,21 @@ def oproj_a2a_call(
     stream, smalls, wo, wrouter) -> oproj_call's outputs.
 
     Every rank DMAs rows [d * Ts, (d + 1) * Ts) to rank d's VMEM at the start; the o proj
-    walks wo by K block (one source rank's heads) from its own block on (then the
-    order the peers send in), so each block's
+    walks wo by K block (one source rank's heads) from its own block on (nearest
+    sources first), so each block's
     matmul runs while later blocks land. Each source block keeps its own row scale (applied to
     its partial product): no requant, one e4m3 rounding of the gated output instead of two.
     la: sends in flight ahead of the receivers' use (7: all at the start)."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
-    if H % tn or Ts % rc or Ts % min(_ROUTER_ROWS, Ts) or H != tp * qd or qd % _KC:
+    if (
+        H % tn
+        or Ts % rc
+        or Ts % min(_ROUTER_ROWS, Ts)
+        or H != tp * qd
+        or qd % _KC
+        or tp & (tp - 1)
+    ):
         raise ValueError(f"o proj tiles {tn} / {rc} do not fit H {H} Ts {Ts}")
 
     def kernel(
@@ -202,8 +209,10 @@ def oproj_a2a_call(
     ):  # fmt: skip
         r = pl.program_id(0)
         me = lm[1]
-        # rank m sends to m + 1 first, m + 2 next, ...: receive from m - 1 first
-        src = jax.lax.rem(me + tp - r, tp)
+        # step r takes source m ^ r: own block, the partner core, then the other chips' cores
+        # nearest first (2 x 2 chips, 2 cores each: chip ^ 3 is the diagonal, two hops); rank m
+        # sends to m ^ 1, m ^ 2, ... in the same order
+        src = jnp.bitwise_xor(me, r)
         wr_cp = pltpu.make_async_copy(wr_hbm.at[lm[0]], wr, sem.at[1])
 
         def sends(d):
@@ -238,7 +247,7 @@ def oproj_a2a_call(
             for cp in locals_(me):
                 cp.start()
             for k in range(1, min(la, tp - 1) + 1):
-                for cp in sends(jax.lax.rem(me + k, tp)):
+                for cp in sends(jnp.bitwise_xor(me, k)):
                     cp.start()
             wr_cp.start()
             big[...] = jnp.zeros((Ts, H), _F32)
@@ -248,7 +257,7 @@ def oproj_a2a_call(
             # every block late on links all the sends share
             @pl.when(jnp.logical_and(r >= 1, r + la <= tp - 1))
             def _():
-                for cp in sends(jax.lax.rem(me + r + la, tp)):
+                for cp in sends(jnp.bitwise_xor(me, r + la)):
                     cp.start()
 
         with _scope("pa_a2a_wait"):
@@ -298,7 +307,7 @@ def oproj_a2a_call(
             )
             ep.route(gq, f8_hbm, sem.at[0], wr, wr_cp, E, ids_ref, tw_ref)
             for k in range(1, tp):
-                d = jax.lax.rem(me + k, tp)
+                d = jnp.bitwise_xor(me, k)
                 for cp in sends(d):
                     cp.wait_send()
 
@@ -313,7 +322,7 @@ def oproj_a2a_call(
         anyspec,
         pl.BlockSpec((None, SMALL_ROWS, H), lambda r, lm: (lm[0], 0, 0)),
         pl.BlockSpec(
-            (None, qd, H), lambda r, lm: (lm[0], jax.lax.rem(lm[1] + tp - r, tp), 0)
+            (None, qd, H), lambda r, lm: (lm[0], jnp.bitwise_xor(lm[1], r), 0)
         ),
         anyspec,
     ]
