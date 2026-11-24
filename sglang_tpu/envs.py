@@ -729,6 +729,12 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_Q8_IN_GMM1 = EnvInt(0)
     # With Q8_IN_GMM1: q8 blocks of 8 rows whose row maxima come from a sublane tree (same bytes).
     SGLANG_TPU_FUSED_RS_Q8_TREE = EnvBool(False)
+    # Fused-RS expert TP: the first N row gathers of tile g + 1 are issued inside GMM1(g)'s
+    # straight-line code (co-issued with the matmul) instead of in a scalar loop before it.
+    SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1 = EnvInt(0)
+    # Pair exchange metadata: each tile's per-owner row counts as one 0/1 matmul over the
+    # tile boundaries instead of a cumsum over every local row and a gather (same integers).
+    SGLANG_TPU_FUSED_RS_PAIR_MXU_COUNTS = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

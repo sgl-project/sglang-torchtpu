@@ -559,6 +559,7 @@ def kernel_main_fused_rs(
     skip_row_mask: bool = False,  # rows outside the tile stay unzeroed (never sent)
     q8_in_gmm1: int = 0,  # leading q8 blocks per forwarded run of tile g - 2 done in GMM1(g)
     q8_tree: bool = False,  # q8 blocks of 8 rows, row maxima by a sublane tree
+    gather_in_gmm1: int = 0,  # first rows of tile g + 1's gather issued inside GMM1(g)
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -1059,6 +1060,8 @@ def kernel_main_fused_rs(
             _gm_id=0,
             _n_id=n_id,
         )
+        if gather_in_gmm1 and n_id == 0 and k_id == 0:
+            _gather_prefix(gm_id + 1)
         if q8_in_gmm1 and n_id == 0 and k_id == 0:
             # Straight-line code in the bucket branch: co-issues with the matmul (no shared
             # refs). Tiles 0 and 1 recompute tile 0's blocks from a stale ring; GMM1(2)
@@ -1192,6 +1195,58 @@ def kernel_main_fused_rs(
         return n
 
     q8_rows = 8 if q8_tree else _Q8_ROWS
+
+    _gather_div = top_k if pack_indices else 1
+    _sls_g = pltpu.get_tpu_info().get_sublane_tiling(hidden_states_ref.dtype)
+
+    def _gather_prefix(g):
+        """Unconditional gathers of tile g's first gather_in_gmm1 rows (no control flow).
+
+        Rows past the tile land past its rows in the buffer (indices clamped); the wait
+        covers them. Past the last tile they are drained after the loop.
+        """
+        m_s = metadata_ref.gm_id_to_m_offset[g]
+        dst0 = m_s % _sls_g
+        last = lhs_indices_ref.shape[0] - 1
+        for i in range(gather_in_gmm1):
+            src_row = lhs_indices_ref[jnp.minimum(m_s + i, last)] // _gather_div
+            pltpu.make_async_copy(
+                src_ref=hidden_states_ref.at[pl.ds(src_row, 1), :, :],
+                dst_ref=gathered_lhs_2x_ref.at[g % 2, pl.ds(dst0 + i, 1), :, :],
+                sem=gather_sem_ref.at[g % 2],
+            ).start()
+
+    def _gather_rest(g):
+        m_s = metadata_ref.gm_id_to_m_offset[g]
+        n = metadata_ref.gm_id_to_m_offset[g + 1] - m_s
+        dst0 = m_s % _sls_g
+        u = row_loop_unroll
+
+        def _row(i, c):
+            src_row = lhs_indices_ref[m_s + i] // _gather_div
+            pltpu.make_async_copy(
+                src_ref=hidden_states_ref.at[pl.ds(src_row, 1), :, :],
+                dst_ref=gathered_lhs_2x_ref.at[g % 2, pl.ds(dst0 + i, 1), :, :],
+                sem=gather_sem_ref.at[g % 2],
+            ).start()
+            return c
+
+        def _blk(b, c):
+            for j in range(u):
+                _row(gather_in_gmm1 + b * u + j, c)
+            return c
+
+        nb = jnp.maximum(n - gather_in_gmm1, 0) // u
+        lax.fori_loop(0, nb, _blk, 0)
+        lax.fori_loop(gather_in_gmm1 + nb * u, n, _row, 0)
+
+    def _gather_wait(g, rows):
+        dst0 = metadata_ref.gm_id_to_m_offset[g] % _sls_g
+        pltpu.make_async_copy(
+            src_ref=gathered_lhs_2x_ref.at[g % 2, pl.ds(dst0, rows), :, :],
+            dst_ref=gathered_lhs_2x_ref.at[g % 2, pl.ds(dst0, rows), :, :],
+            sem=gather_sem_ref.at[g % 2],
+        ).wait()
 
     def _q8_rows16(stg, ring_slot, r):
         rows = pl.ds(r, _Q8_ROWS)
@@ -1815,19 +1870,28 @@ def kernel_main_fused_rs(
                     unroll=row_loop_unroll,
                 )
 
-            @jax.named_scope("dma_gather_prefetch")
-            @pl.when(gm_id + 1 < local_num_gm)
-            def _():
-                dma_gather_gm_start(
-                    hidden_states_ref,
-                    gathered_lhs_2x_ref.at[1 - sem_id],
-                    lhs_indices_ref,
-                    gather_sem_ref.at[1 - sem_id],
-                    gm_id + 1,
-                    metadata_ref,
-                    divisor=_gather_divisor,
-                    unroll=row_loop_unroll,
-                )
+            if gather_in_gmm1:
+
+                @jax.named_scope("dma_gather_rest")
+                @pl.when(gm_id + 1 < local_num_gm)
+                def _():
+                    _gather_rest(gm_id + 1)
+
+            else:
+
+                @jax.named_scope("dma_gather_prefetch")
+                @pl.when(gm_id + 1 < local_num_gm)
+                def _():
+                    dma_gather_gm_start(
+                        hidden_states_ref,
+                        gathered_lhs_2x_ref.at[1 - sem_id],
+                        lhs_indices_ref,
+                        gather_sem_ref.at[1 - sem_id],
+                        gm_id + 1,
+                        metadata_ref,
+                        divisor=_gather_divisor,
+                        unroll=row_loop_unroll,
+                    )
 
             # --- Weight DMA (overlapped with gather) ---
             # w1 prologue: load first num_w1_bufs tiles (gm==0 only;
@@ -1912,12 +1976,24 @@ def kernel_main_fused_rs(
                         start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
 
             # Wait for gather (weight DMAs running in parallel).
-            dma_gather_gm_wait(
-                gathered_lhs_2x_ref.at[sem_id],
-                gather_sem_ref.at[sem_id],
-                gm_id,
-                metadata_ref,
-            )
+            if gather_in_gmm1:
+                _n_rows = (
+                    metadata_ref.gm_id_to_m_offset[gm_id + 1]
+                    - metadata_ref.gm_id_to_m_offset[gm_id]
+                )
+                _gather_wait(
+                    gm_id,
+                    jnp.where(
+                        gm_id == 0, _n_rows, jnp.maximum(_n_rows, gather_in_gmm1)
+                    ),
+                )
+            else:
+                dma_gather_gm_wait(
+                    gathered_lhs_2x_ref.at[sem_id],
+                    gather_sem_ref.at[sem_id],
+                    gm_id,
+                    metadata_ref,
+                )
 
             # Pick the smallest row-bucket >= this tile's real rows (capped at
             # tile_m), then dispatch each matmul over that bucket via lax.switch.
@@ -2289,6 +2365,12 @@ def kernel_main_fused_rs(
         return _
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
+    if gather_in_gmm1:
+        # GMM1 of the last tile gathered the first rows of a tile that does not exist
+        @pl.when(local_num_gm > 0)
+        def _():
+            _gather_wait(local_num_gm, gather_in_gmm1)
+
     if pair_exchange and q8_in_gmm1:
 
         @pl.when(local_num_gm > 1)
@@ -2578,6 +2660,7 @@ def _pair_exchange_metadata(
         "lean_epilogue",
         "q8_in_gmm1",
         "q8_tree",
+        "gather_in_gmm1",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2622,6 +2705,7 @@ def gmm_v2_fused_rs(
     lean_epilogue: bool = False,
     q8_in_gmm1: int = 0,
     q8_tree: bool = False,
+    gather_in_gmm1: int = 0,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3301,6 +3385,12 @@ def gmm_v2_fused_rs(
             raise ValueError("q8_in_gmm1 needs the e4m3 pair path")
         kernel_kwargs["q8_in_gmm1"] = q8_in_gmm1
         kernel_kwargs["q8_tree"] = q8_tree
+    if gather_in_gmm1:
+        if not expert_tp or gather_in_gmm1 > tile_m - 16:
+            raise ValueError(
+                f"gather_in_gmm1={gather_in_gmm1} needs expert TP, <= tile_m - 16"
+            )
+        kernel_kwargs["gather_in_gmm1"] = gather_in_gmm1
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1

@@ -477,6 +477,9 @@ def moe_gmm_local_rs_nodedup(
     lean_epilogue = pair_fp8_rows and tpu_envs.SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE.get()
     q8_in_gmm1 = tpu_envs.SGLANG_TPU_FUSED_RS_Q8_IN_GMM1.get() if pair_fp8_rows else 0
     q8_tree = bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_Q8_TREE.get()
+    gather_in_gmm1 = (
+        tpu_envs.SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1.get() if expert_tp else 0
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -518,6 +521,7 @@ def moe_gmm_local_rs_nodedup(
         lean_epilogue=lean_epilogue,
         q8_in_gmm1=q8_in_gmm1,
         q8_tree=q8_tree,
+        gather_in_gmm1=gather_in_gmm1,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
