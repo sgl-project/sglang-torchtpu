@@ -1057,6 +1057,62 @@ def test_xor1_callsite_split_moe_and_chunk_b2_lowering():
     assert "xor1_xytorus_ag_tp8" in hlo_moe3 and "partition_id" not in hlo_moe3
 
 
+def test_tp16_ccs_fuse_ag_a1_nonzero_raises_loudly():
+    """Verify #2833 §1: TP=16 rejects CCS_FUSE_AG_A1 != 0 loudly in from_model and _ops."""
+    import types
+
+    from sglang.srt.configs.muse_spark import MuseSparkTextConfig
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels.reference import QUERY_SCALE
+
+    cfg = MuseSparkTextConfig(
+        hidden_size=8192,
+        moe_intermediate_size=4096,
+        num_local_experts=256,
+        num_experts_per_tok=8,
+        num_attention_heads=128,
+        num_key_value_heads=16,
+        head_dim=64,
+    )
+    cfg.qk_scale_factor = QUERY_SCALE
+    parallel = types.SimpleNamespace(
+        tp_size=16, attn_tp_size=16, moe_ep_size=16, attn_dcp_size=1
+    )
+    fake_model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            pp_group=types.SimpleNamespace(world_size=1), layers=[]
+        ),
+        text_config=cfg,
+    )
+
+    for bad_val in ("1", "2", "3"):
+        with (
+            mock.patch.dict(
+                os.environ, {"SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1": bad_val}
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel", return_value=parallel
+            ),
+        ):
+            with pytest.raises(ValueError, match="CCS_FUSE_AG_A1 != 0"):
+                integration.MusePrefillKernels.from_model(fake_model)
+
+    fake_mesh = types.SimpleNamespace(shape={"model": 16})
+    with mock.patch(
+        "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=fake_mesh
+    ):
+        with pytest.raises(ValueError, match="CCS_FUSE_AG_A1 != 0"):
+            integration._ops(
+                h_q_local=8,
+                h_kv_local=1,
+                a1_variant="v6",
+                a3_variant="v16",
+                fused_glue=False,
+                head_norm_eps=1e-8,
+                ccs_fuse_ag_a1=1,
+            )
+
+
 def test_xor1_nan_poisoned_scratch_interpret_parity():
     """Verify TP=8 xy and TP=16 flat/xyz xor1 AG kernels have 0 NaN leaks under NaN-poisoned scratch."""
     jax = pytest.importorskip("jax")
