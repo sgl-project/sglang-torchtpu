@@ -70,6 +70,16 @@ def route_top_k(c: PFConfig, ffn, wrouter, sm):
     return ids, w / (jnp.sum(w, axis=1, keepdims=True) + c.router_eps) * c.route_scale
 
 
+def _rms_fp8_rows(x, eps: float, w):
+    """_fp8_rows(_rms(x, eps) * w) with the row amax taken in the rms pass: rms scales a row by
+    one positive factor, so amax = rsqrt(ms + eps) * max|x * w| (two passes over x, not three)."""
+    x32 = x.astype(_F32)
+    r = jax.lax.rsqrt(jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + eps)
+    m = jnp.max(jnp.abs(x32 * w), axis=-1, keepdims=True)
+    s = jnp.maximum(m * r, 1e-30) / 448.0
+    return (x32 * (r / s) * w).astype(jnp.float8_e4m3fn), s
+
+
 def n_expert_refs(c: PFConfig) -> int:
     """prefill/tp's expert operands: (w13, s13, w2, s2) per expert unit."""
     return plan.n_expert_refs(c)
@@ -89,6 +99,17 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
+    # SPTP_RMS_QUANT_3PASS=1: rms, then a separate amax pass, then the cast
+    fused_rq = (
+        not DEBUG_BF16_ACTIVATIONS
+        and os.environ.get("SPTP_RMS_QUANT_3PASS", "0") != "1"
+    )
+
+    def rms_q8(x, w):
+        return (
+            _rms_fp8_rows(x, c.rms_eps, w) if fused_rq else q8(_rms(x, c.rms_eps) * w)
+        )
+
     # SPTP_OGATE_MXU_NORM=1: the o gate head norm as MXU dots (measured 0.8 ms / chunk slower
     # than XLA's 3-D norm with its relayout copy)
     ogate_mxu = os.environ.get("SPTP_OGATE_MXU_NORM", "0") == "1"
@@ -148,7 +169,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         for l in range(L):
             sm = smalls[l]
             with _scope("sp_in_norm"):
-                a8, a_s = q8(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
+                a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
             if n_xag > 1 and not xla_qkvg:
                 with _scope("sp_xag_qkvg"):
                     sub = Ts // n_xag
@@ -204,11 +225,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
                 ids, tw = router(c, ffn.astype(_BF16), wrouter[l], sm)
             with _scope("sp_pool"):
-                f8, f_s = q8(ffn)
+                if fused_rq:
+                    f8, f_s = rms_q8(stream, small_row(sm, "pre_ffn_w"))
+                else:
+                    f8, f_s = q8(ffn)
                 pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
-                xe8, xs = q8(
-                    _rms(pooled, c.rms_eps) * small_row(sm, "pre_expert_w")[:, :He]
-                )
+                xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
             with _scope("sp_xe_ag"):
                 xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
                 ids_all, tw_all = ag(ids, axis), ag(tw, axis)
