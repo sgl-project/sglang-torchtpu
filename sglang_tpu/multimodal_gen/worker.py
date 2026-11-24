@@ -18,6 +18,11 @@ def install_runtime_patches() -> None:
     rope.install()
     minimax_h3.install()
 
+    from sglang_tpu.multimodal_gen.wan_megakernel import hook as wan_megakernel
+
+    if wan_megakernel.requested():
+        wan_megakernel.install()
+
 
 def configure_compile_cache() -> None:
     """Scope persisted torch.compile artifacts to what FX graphs cannot see.

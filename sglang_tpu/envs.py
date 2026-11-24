@@ -129,6 +129,57 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # Wan2.2-A14B: every transformer block of a DiT forward in one Pallas kernel
+    # (multimodal_gen/wan_megakernel); False keeps sglang's blocks.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL = EnvBool(False)
+    # Its QKV, output, cross-q and MLP projections as fp8 W8A8 (per-column
+    # weight and per-row activation scales); False keeps them bf16.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_FP8 = EnvBool(False)
+    # Wan megakernel: the fixed softmax's QK^T from e4m3 q and k (see
+    # wan_megakernel/tiling.py Tiling.fp8_qk). Off: bf16 QK^T.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_FP8_QK = EnvBool(False)
+    # Wan megakernel: build each shape's per-step constants once (the tiling,
+    # the op and the real-row count on the device, uploaded without waiting),
+    # so a denoising step makes no host-to-device copy. Off: the count is
+    # uploaded every step by a blocking copy, which returns only once the TPU
+    # queue has drained. Same kernel inputs either way.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_STEP_CONSTANTS = EnvBool(False)
+    # Wan megakernel (bf16): where the attention items check the softmax row-sum
+    # floor (wan_megakernel/tiling.py Tiling.floor_guard): "shared" (the same
+    # checks and reruns, the check's code far from the fixed path: 6.8% slower a
+    # forward) or "rowfix" (rowfix sums only, as before the fixed-path floor;
+    # diagnostics). Unset: "inline".
+    SGLANG_TPU_WAN_MEGAKERNEL_FLOOR_GUARD = EnvStr(None)
+    # Wan megakernel code layout, each the same bits (wan_megakernel/tiling.py):
+    # ONLINE_ONE_LOOP walks the online softmax's key tiles, the edge tile included,
+    # in one loop of masked sub-blocks, so the attention item loop fits one
+    # instruction overlay (each item otherwise reloads the fixed path's overlay);
+    # PIPELINED_EPILOGUES (bf16) runs each phase C projection tile's and MLP up
+    # tile's epilogue in the next tile's step; SKIP_BOUNDS_CHECKS compiles the
+    # kernel without Mosaic's DMA bounds checks (traps on an out-of-bounds copy,
+    # scalar work at every copy). Off: the current layout and checks.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_ONLINE_ONE_LOOP = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_PIPELINED_EPILOGUES = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_BOUNDS_CHECKS = EnvBool(False)
+    # Debug: save the inputs and output of the first DiT forwards (SP rank 0 of
+    # each CFG rank, timestep >= MIN_T, CALLS a model) as .pt files in this
+    # directory, from the megakernel or (with it off) from sglang's blocks.
+    SGLANG_TPU_DEBUG_WAN_DUMP_DIR = EnvStr(None)
+    SGLANG_TPU_DEBUG_WAN_DUMP_CALLS = EnvInt(2)
+    SGLANG_TPU_DEBUG_WAN_DUMP_MIN_T = EnvFloat(0.0)
+    # Debug: append per-forward block-stack residual statistics (norms, change
+    # against the previous step's residual) as JSON lines to this path prefix
+    # (one file a rank); calibration data for step caching.
+    SGLANG_TPU_DEBUG_WAN_CACHE_STATS = EnvStr(None)
+    # With SGLANG_TPU_DEBUG_WAN_CACHE_STATS: also save this many evenly spaced rows
+    # of each forward's residual (one fp16 .npy a forward and rank) for offline
+    # step-plan search.
+    SGLANG_TPU_DEBUG_WAN_CACHE_ROWS = EnvInt(0)
+    # Step caching for the Wan megakernel, "steps=i,j,...": only the listed
+    # denoising steps (and the last) run the kernel; the others reuse their
+    # expert's last block-stack residual (see wan_megakernel/hook.py). Unset:
+    # every step runs the kernel.
+    SGLANG_TPU_WAN_STEP_CACHE = EnvStr(None)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
