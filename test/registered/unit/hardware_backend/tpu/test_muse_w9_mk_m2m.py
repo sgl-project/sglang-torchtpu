@@ -984,10 +984,10 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
         devs = jax.devices("cpu")
         mesh8 = Mesh(np.array(devs[:8]), ("model",))
         B, TP, H, HE = 64, 8, 2048, 1024
-        ps8, sw8, pps8 = 128, 512, 18
+        ps8, sw8, pps8 = 512, 2048, 6
         npages8 = B * pps8 + 4
-        # Pin Mixed short rows (`64..1536`, 1..4 pages in `seq < 4` prologue & steady) alongside 4/5-page `2044..2049` (#3144).
-        _mix_kvl = (64, 130, 260, 390, 512, 1024, 1536, 2044, 2045, 2046, 2047, 2048, 2049)
+        # Pin Mixed short rows (`64..1536`, 1..4 pages in `seq < 4` prologue & steady) alongside 4/5-page `w_tot=2560` (`2556..2561`) (#3144/#3206).
+        _mix_kvl = (64, 130, 260, 513, 1024, 1536, 2048, 2556, 2557, 2558, 2559, 2560, 2561)
         kvl8_np = np.array([_mix_kvl[i % len(_mix_kvl)] for i in range(B)], dtype=np.int32)
         cuq8 = jnp.arange(B + 1, dtype=jnp.int32)
         cukv8 = jnp.arange(B + 1, dtype=jnp.int32) * (pps8 * ps8)
@@ -1069,7 +1069,7 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
                 interpret=nan_ip,
             )
 
-        for kvl_case in (kvl8_np, np.array([2044 + (i % 6) for i in range(B)], dtype=np.int32)):
+        for kvl_case in (kvl8_np, np.array([2556 + (i % 6) for i in range(B)], dtype=np.int32)):
             kv8_c = _poison_kv_pool(rng, npages8, ps8, ps8, kvl_case, pg8_np, sw8, False)
             kv8_r = jnp.repeat(kv8_c[None], TP, axis=0).reshape(TP * npages8, ps8, 1, 4, 128)
             args8 = (
@@ -1096,10 +1096,12 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
         # 2. TP=16 `m2m_rep_jax` (`nq8=True`) with `0x7F` poisoned in lanes `64..127` EVEN ON VALID TOKENS!
         mesh16 = Mesh(np.array(devs[:16]), ("model",))
         B16, H16, HE16 = 16, 4096, 2048
-        kvl16_np = kvl8_np[:B16]
+        ps16, sw16, pps16 = 128, 512, 18
+        _mix16 = (64, 130, 260, 390, 512, 1024, 1536, 2044, 2045, 2046, 2047, 2048, 2049)
+        kvl16_np = np.array([_mix16[i % len(_mix16)] for i in range(B16)], dtype=np.int32)
         cuq16 = jnp.arange(B16 + 1, dtype=jnp.int32)
-        cukv16 = jnp.arange(B16 + 1, dtype=jnp.int32) * (pps8 * ps8)
-        pg16_np = np.arange(B16 * pps8, dtype=np.int32)
+        cukv16 = jnp.arange(B16 + 1, dtype=jnp.int32) * (pps16 * ps16)
+        pg16_np = np.arange(B16 * pps16, dtype=np.int32)
         dst16 = jnp.array([B16, B16, B16], dtype=jnp.int32)
         st16 = jnp.asarray(rng.normal(0, 0.1, (B16, H16)).astype(np.float32))
         moe16 = jnp.asarray(rng.normal(0, 0.1, (B16, HE16)).astype(np.float32), dtype=jnp.bfloat16)
@@ -1133,17 +1135,17 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
         out_sp16 = (P(), P(), P(), P("model"))
 
         for d2 in (False, True):
-            phys_r = ps8 // 2 if d2 else ps8
-            npages16 = B16 * pps8 + 4
-            kv16_b = _poison_kv_pool(rng, npages16, phys_r, ps8, kvl16_np, pg16_np, sw8, d2)
+            phys_r = ps16 // 2 if d2 else ps16
+            npages16 = B16 * pps16 + 4
+            kv16_b = _poison_kv_pool(rng, npages16, phys_r, ps16, kvl16_np, pg16_np, sw16, d2)
             u8_clean = np.array(lax.bitcast_convert_type(kv16_b, jnp.uint8), copy=True)
             u8_poison = np.array(u8_clean, copy=True)
             u8_poison[:, :, :, :, 64:] = 0x7F
             for b in range(B16):
                 kvl = int(kvl16_np[b])
-                for tok in range(max(kvl - 1 - (sw8 - 1), 0), kvl - 1):
-                    pg_s = pg16_np[b * pps8 + (tok // ps8)]
-                    r = ((tok % ps8) // 2) if d2 else (tok % ps8)
+                for tok in range(max(kvl - 1 - (sw16 - 1), 0), kvl - 1):
+                    pg_s = pg16_np[b * pps16 + (tok // ps16)]
+                    r = ((tok % ps16) // 2) if d2 else (tok % ps16)
                     u8_clean[pg_s, r, 0, :, 64:] = 0
             kv16_clean = jnp.repeat(
                 lax.bitcast_convert_type(jnp.asarray(u8_clean), jnp.float8_e4m3fn)[None], 16, axis=0
@@ -1154,7 +1156,7 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
 
             def _run16(kv_arg, nq8_flag, _d2=d2):
                 fn = lambda *a: m2m_rep_jax(
-                    *a, world_size=16, sharded_moe_in=False, sliding_window=sw8,
+                    *a, world_size=16, sharded_moe_in=False, sliding_window=sw16,
                     kv_pack_dense2=_d2, nq8=nq8_flag, mp5_uniform=nq8_flag, u32_vmask=nq8_flag,
                     interpret=nan_ip,
                 )
@@ -1173,8 +1175,8 @@ def test_w9_m2m_v5_mp5_tp2wpost_and_tp16_nq8_subproc():
             np.testing.assert_array_equal(np.asarray(c16_ei, dtype=np.float32), np.asarray(r16_ei, dtype=np.float32))
             for b in range(B16):
                 pos = int(kvl16_np[b]) - 1
-                pg_s = int(pg16_np[b * pps8 + (pos // ps8)])
-                r_in = ((pos % ps8) // 2) if d2 else (pos % ps8)
+                pg_s = int(pg16_np[b * pps16 + (pos // ps16)])
+                r_in = ((pos % ps16) // 2) if d2 else (pos % ps16)
                 np.testing.assert_array_equal(
                     np.asarray(lax.bitcast_convert_type(c16_kv[pg_s, r_in, :, :, :64], jnp.uint8)),
                     np.asarray(lax.bitcast_convert_type(r16_kv[pg_s, r_in, :, :, :64], jnp.uint8)),

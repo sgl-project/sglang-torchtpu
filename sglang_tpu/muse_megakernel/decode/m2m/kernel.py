@@ -674,12 +674,17 @@ def _run_in_vmem_rpad_and_gate(
             else (k_col < rel_end)
         )
         s_all = jnp.where(valid_s, s_all, _MASK_LOGIT)
+        use_early_pbf16 = pv_bf16 and w_tot >= 2560
         m = jnp.maximum(
             s_new_eff, _broadcast_minor_128(jnp.max(s_all, axis=1, keepdims=True))
         )
-        p_all = jnp.exp2((s_all - _broadcast_minor_128_any(m, w_tot)) * exp2_sc_eff)
+        m_sub = m[:, :1] if use_early_pbf16 else _broadcast_minor_128_any(m, w_tot)
+        p_all = jnp.exp2((s_all - m_sub) * exp2_sc_eff)
         p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
         l_sum = _broadcast_minor_128(jnp.sum(p_all, axis=1, keepdims=True)) + p_new
+        if use_early_pbf16:
+            p_dot = p_all.astype(jnp.bfloat16)
+            del p_all
         v_row_idx = lax.broadcasted_iota(jnp.int32, (w_tot, 128), 0)
         if kv_pack_dense2:
             # _load_bkv_fp8_chunk(d2) returns [even_rows, odd_rows] stacked along axis 0!
@@ -732,7 +737,8 @@ def _run_in_vmem_rpad_and_gate(
                 interpret_mode=interpret_mode,
             )
             v_all = _mask_v_fp8_vregs(v_all, valid_v)
-        p_dot = p_all.astype(jnp.bfloat16) if pv_bf16 else p_all
+        if not use_early_pbf16:
+            p_dot = p_all.astype(jnp.bfloat16) if pv_bf16 else p_all
         pv = jnp.matmul(p_dot, v_all, preferred_element_type=jnp.float32)
         if v_scale_val != 1.0:
             pv = pv * v_scale_val
