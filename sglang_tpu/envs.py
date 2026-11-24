@@ -135,7 +135,11 @@ class TpuEnvs:
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
     # MiniMax-H3 decode stage (multimodal_gen/minimax_h3_decode.py), each off by
-    # default. FLAT_DECODE: deal every (clip, tile) unit of a video decode over the
+    # default. With DECODE_BATCH above 1, BLOCK_COMPILE, FP32_PROJECTIONS or a
+    # Pallas ViT option (FLASH_ATTENTION, PALLAS_LINEAR, FUSED_LINEARS,
+    # SPLIT_WEIGHTS), each rank logs one status line a decode: decoder-call
+    # sizes, calls free memory cut, fallbacks, its peak memory.
+    # FLAT_DECODE: deal every (clip, tile) unit of a video decode over the
     # decode group in one list and gather the outputs in waves of about a clip
     # (instead of each clip's tiles in turn); the stock code assembles the
     # gathered units, so the frames are bit-identical.
@@ -176,24 +180,8 @@ class TpuEnvs:
     # Moves rounding (matmul shapes), so it needs the decoder-equivalence check;
     # with it, a unit's rounding also depends on which units share its call, so
     # schedule knobs that are exact without it (FLAT_DECODE, the audio wave
-    # sizes) move rounding too (not with H3_VAE_BATCH_INVARIANT).
+    # sizes) move rounding too.
     SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH = EnvInt(0)
-    # torch.compile the whole ViT decoder of the video VAE (embedding, every
-    # block, output projection; static shapes, fullgraph): one program a
-    # decoder-call batch size. Takes the place of BLOCK_COMPILE (the blocks
-    # stay uncompiled inside it). A failed compiled call reruns eagerly; if
-    # that works the compile is dropped. Moves rounding within the
-    # fp16-autocast decode, so it needs the decoder-equivalence check.
-    SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE = EnvBool(False)
-    # Run the H3 video VAE's ViT attention on fp32 copies of its fp16 q/k/v
-    # (exact casts) outside autocast, its output rounded back to fp16:
-    # torch_tpu has a flash attention path for fp32 and bf16 inputs and none
-    # for fp16, which writes each [32, 1797, 1797] score matrix out (~1 ms of
-    # the ~2 ms a block takes at 1344x768). Moves rounding; at least as precise
-    # as the fp16 attention only if the flash kernel's matmuls run at HIGH or
-    # HIGHEST, so it needs the decoder check against an fp32 decode
-    # (SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE).
-    SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION = EnvBool(False)
     # Run the H3 video VAE's ViT input and output projections (x_embedder,
     # proj_out) outside autocast, in fp32, as the released decoder does: its
     # torch.autocast("cuda", enabled=False) has a CUDA-only equivalent in
@@ -202,19 +190,6 @@ class TpuEnvs:
     # linears a unit, ~0.1 ms on TPU at HIGHEST); needs the decoder check
     # against an fp32 decode.
     SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS = EnvBool(False)
-    # Run the H3 video VAE's ViT block linears (to_qkv, to_out, w1, w2) under
-    # the decode's fp16 autocast as four bf16 MXU passes with float32
-    # accumulation: each fp16 operand split exactly into a bf16 high and low
-    # part (the weights once, on the device at the first decode, +4 bytes a
-    # weight: ~9 GiB a device for H3, not made, with a warning, unless they fit
-    # under the request's memory peak), every product hi*hi + hi*lo + lo*hi +
-    # lo*lo kept, the fp16 bias added in float32 and the sum rounded to fp16
-    # once: an fp16 matmul with float32 accumulation, as cuBLAS runs the
-    # released decode. Today's TPU fp16 linear is already three bf16 passes
-    # (XLA, HIGH/HIGHEST; activations as unpacked f32 vregs) but rounds the
-    # product to fp16 before adding the bias, so this raises precision and
-    # adds a pass; it needs the decoder check against fp32 and a timing A/B.
-    SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL = EnvBool(False)
     # Run the H3 video VAE's ViT attention, inside a decode with fp16 q/k/v,
     # as a Pallas flash kernel (multimodal_gen/minimax_h3_vae_attention.py)
     # instead of torch_tpu's fp16 SDPA, which has no flash path and writes
@@ -226,9 +201,8 @@ class TpuEnvs:
     # SDPA (which rounds scores and probabilities to fp16). Used only for a
     # decoder whose q/k norms are parameter-free RMSNorms over 64-wide heads
     # (scores then lie in [-8, 8], the kernel's fixed softmax shift); stock
-    # SDPA otherwise. Takes the place of H3_VAE_FP32_ATTENTION. Moves
-    # rounding, so it needs the decoder check against an fp32 decode
-    # (SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE).
+    # SDPA otherwise. Moves rounding, so it needs the decoder check against an
+    # fp32 decode.
     SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION = EnvBool(False)
     # Run the H3 video VAE's ViT block linears (to_qkv, to_out, w1, w2), inside
     # a decode under fp16 autocast, as a Pallas kernel
@@ -237,9 +211,8 @@ class TpuEnvs:
     # in VMEM, runs hi*hi + hi*lo + lo*hi on the MXU (XLA's three passes; no
     # extra memory, no packed-fp32 activation stream), adds the bias in
     # float32 and rounds to fp16 once: at least as precise as today's fp16
-    # linear, which rounds the product to fp16 before its bias add. Takes the
-    # place of H3_VAE_FP16_SPLIT_MATMUL. Moves rounding, so it needs the
-    # decoder check against an fp32 decode (SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE).
+    # linear, which rounds the product to fp16 before its bias add. Moves
+    # rounding, so it needs the decoder check against an fp32 decode.
     SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR = EnvBool(False)
     # With H3_VAE_PALLAS_LINEAR and H3_VAE_FLASH_ATTENTION, run each H3 ViT
     # decoder block as five custom calls (multimodal_gen/minimax_h3_vae_fused.py
@@ -249,7 +222,7 @@ class TpuEnvs:
     # (one copy); w2 also as bf16 hi + lo (2.4 GB) where a decode stage's
     # peak leaves room, else split in the kernel (the same output).
     # At least as precise, but it moves rounding, so it needs the decoder
-    # check against an fp32 decode (SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE).
+    # check against an fp32 decode.
     SGLANG_TPU_OPT_H3_VAE_FUSED_LINEARS = EnvBool(False)
     # With H3_VAE_FUSED_LINEARS, hand the fused kernels to_qkv's, w1's and w2's
     # weights as their exact bf16 hi + lo instead of splitting fp16 bits on
@@ -257,20 +230,6 @@ class TpuEnvs:
     # decode stage's peak leaves room, else split in each block program before
     # its kernels (one block's copies at a time). The same output.
     SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS = EnvBool(False)
-    # With H3_VAE_SPLIT_WEIGHTS, where the weights are split in each block
-    # program (no room under the stage's peak, e.g. at 1 chip): hold them split
-    # through each clip's (or gather wave's) decoder calls instead, freed
-    # before its gather; w1's (4.8 GB), then w2's and to_qkv's, as many as the
-    # free memory beside the calls covers at the process's first clip. The
-    # same output.
-    SGLANG_TPU_OPT_H3_VAE_CLIP_SPLIT = EnvBool(False)
-    # Run the H3 video VAE decoder call's post_quant_conv, x_embedder, norm_out
-    # and proj_out unit by unit when a call holds several units
-    # (H3_VAE_DECODE_BATCH): with H3_VAE_FUSED_LINEARS, whose blocks round a
-    # unit alike in any batch, a unit's frames then do not depend on the units
-    # sharing its calls, so the schedule knobs (FLAT_DECODE, the audio wave
-    # sizes) are exact again. Moves rounding at batch sizes above 1.
-    SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT = EnvBool(False)
     # With H3_VAE_FUSED_LINEARS: how the fused kernels cut their grids,
     # "kernel[@units]:field=value,...;..." (kernels qkv, out, gate, w2: the
     # minimax_h3_vae_fused.Launch fields, e.g. blocks, tn, weight_buffers;
@@ -278,31 +237,6 @@ class TpuEnvs:
     # leaves every output element's arithmetic as it is: the same frames.
     # Empty: the kernels' defaults.
     SGLANG_TPU_OPT_H3_VAE_FUSED_LAUNCH = EnvStr(None)
-    # Debug: synchronize the device around the H3 decode's parts (audio, unit
-    # waves, gathers, mp4 writer) and log their times on every rank. Never in
-    # measured runs. (With any of BLOCK_COMPILE, DECODE_BATCH, DECODE_COMPILE,
-    # the FP32 flags or this one, each rank also logs a status line a decode:
-    # decoder-call sizes, calls free memory cut, fallbacks, its peak memory.)
-    SGLANG_TPU_DEBUG_H3_DECODE_TIMING = EnvBool(False)
-    # Debug: the output rank saves each H3 request's saved frames (uint8, as the
-    # mp4 writer gets them) and waveform as .npy files in this directory, for
-    # decoder-equivalence checks. ~400 MB a request; never in measured runs.
-    SGLANG_TPU_DEBUG_H3_FRAMES_DIR = EnvStr(None)
-    # Debug: on a worker's first H3 decode stage call, log the relative error
-    # against a float64 host reference of an fp16 linear under fp16 autocast
-    # (the decoder's block linears), of an fp32 linear, of the ViT attention on
-    # fp16 q/k/v (the stock path), on fp32 copies (H3_VAE_FP32_ATTENTION) and
-    # as fp32 matmuls (H3_VAE_FP32_DECODE). A few seconds of host math, once;
-    # never in measured runs.
-    SGLANG_TPU_DEBUG_H3_PRECISION_CHECK = EnvBool(False)
-    # Debug: decode H3 videos in fp32, the reference for decoder checks (what
-    # --component-precisions.video_vae fp32 does, plus the ViT attention as
-    # fp32 matmuls instead of a flash kernel): no autocast, and the loader
-    # keeps the decoder's block weights fp32 from the checkpoint (+4.5 GiB a
-    # device at 1344x768). Set at server start: block weights an earlier fp16
-    # decode rounded are decoded as fp32 copies of the fp16 values, with a
-    # warning. Never in measured runs.
-    SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE = EnvBool(False)
     # Kimi-K3: run attention-residual aggregation for decode-sized batches as
     # one Pallas kernel (pending add + mix + out norm) instead of the torch
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not

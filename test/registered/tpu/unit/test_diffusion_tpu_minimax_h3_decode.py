@@ -9,7 +9,6 @@ import contextlib
 import copy
 import filecmp
 import functools
-import math
 import os
 import re
 import sys
@@ -21,13 +20,18 @@ import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime import distributed as sgl_distributed
 from sglang.multimodal_gen.runtime.entrypoints import utils as entry_utils
 from sglang.multimodal_gen.runtime.managers import gpu_worker
@@ -52,15 +56,20 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=300, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=400,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
 )
-# The CPU gate installs python/ only; an installed sglang_tpu still wins.
+# sglang_tpu from the checkout where it is not installed.
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
@@ -469,7 +478,7 @@ class TestPlanWaves(CustomTestCase):
                         list(range(wave.start + rank, wave.stop, world)),
                     )
 
-    def test_benchmark_shape_deals_25_units_at_most(self):
+    def test_1344x768x124_deals_25_units_at_most(self):
         # 1344x768x124: 7 clips x 28 tiles over 8 ranks (stock: 7 x 4 = 28).
         waves = hd.plan_waves(196, 28, 8)
         totals = [sum(w.counts[r] for w in waves) for r in range(8)]
@@ -644,7 +653,7 @@ class TestFlatDecode(CustomTestCase):
                         f"{shape} world={world} rank={rank}",
                     )
 
-    def test_benchmark_geometry(self):
+    def test_1344x768x124_geometry(self):
         # 1344x768x124: latent 37 x 48 x 84 gives 7 clips x 4x7 tiles = 196 units
         # of one shape (planned only: eight decoded copies do not fit a CPU test).
         z = torch.zeros(1, 24, 37, 48, 84)
@@ -902,51 +911,6 @@ class TestDecodeStage(CustomTestCase):
             True, "flat.mp4", flags=dict(SGLANG_TPU_ENABLE_H3_VAE_FLAT_DECODE=True)
         )
         self._assert_same_as_stock(run)
-
-    def test_debug_timing_logs_each_rank(self):
-        with patch.object(hd.logger, "info") as info:
-            run = self._run_world(
-                True,
-                "timing.mp4",
-                flags={**_ALL_ON, "SGLANG_TPU_DEBUG_H3_DECODE_TIMING": True},
-            )
-        self._assert_same_as_stock(run)
-        lines = [call.args[0] for call in info.call_args_list]
-        self.assertEqual(sum("decode timing" in line for line in lines), self.world)
-        self.assertEqual(sum("streamed mp4" in line for line in lines), 1)
-
-    def test_debug_frame_dump_holds_the_saved_frames(self):
-        import numpy as np
-
-        dump = tempfile.mkdtemp(prefix="h3dec_frames_")
-        run = self._run_world(
-            True, "dump.mp4", flags={**_ALL_ON, "SGLANG_TPU_DEBUG_H3_FRAMES_DIR": dump}
-        )
-        self._assert_same_as_stock(run)
-        self.assertEqual(
-            sorted(os.listdir(dump)),
-            [
-                "req_audio.npy",
-                "req_audio_latents.npy",
-                "req_frames.npy",
-                "req_latents.npy",
-            ],
-        )
-        self.assertTrue(
-            np.array_equal(
-                np.load(os.path.join(dump, "req_latents.npy")), self.latents.numpy()
-            )
-        )
-        stock = self.stock.outputs[0][0]
-        frames = np.stack(entry_utils._sample_to_uint8_frames(stock.output[0]))
-        self.assertTrue(
-            np.array_equal(np.load(os.path.join(dump, "req_frames.npy")), frames)
-        )
-        self.assertTrue(
-            np.array_equal(
-                np.load(os.path.join(dump, "req_audio.npy")), stock.audio[0].numpy()
-            )
-        )
 
     def test_cropped_canvas_streams_the_cropped_frames(self):
         # A target canvas smaller than the decoded one: the stage crops, so must the stream.
@@ -1242,7 +1206,7 @@ class _CallLog:
             return self(vae, z)
 
         if self.wrapped:
-            decode = hd._eager_on_decoder_compile_failure(decode)
+            decode = hd._routed_decode(decode)
         return patch.object(MiniMaxH3VideoVAE, "decode", decode)
 
 
@@ -1314,7 +1278,7 @@ class TestUnitCalls(_BatchCase):
                 self.assertEqual(self._calls(14, 4)[2], sizes, free)
             self.assertEqual(warning.call_count, int(max(sizes) < 4), free)
 
-    def test_unit_bytes_at_the_benchmark_unit(self):
+    def test_unit_bytes_at_the_1344x768_unit(self):
         # The released decoder: 36 blocks, 32 heads x 64, gated FFN 2 x 8192.
         decoder = SimpleNamespace(
             num_register_tokens=4,
@@ -1545,87 +1509,11 @@ class TestBatchedDecode(_BatchCase):
             self.assertLess(float((batched - singles).abs().max()), tolerance)
 
 
-class TestDecoderCompile(_BatchCase):
+class TestBlockCompileFallbacks(_BatchCase):
     def setUp(self):
         super().setUp()
-        hd._compiled_decoders.clear()
         hd._compiled_vaes.clear()
         torch._dynamo.reset()
-
-    def test_decoder_traces_as_one_graph_at_each_batch(self):
-        import torch._dynamo as dynamo
-
-        vae = _tiny_video_vae(num_layers=2)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        for batch in (1, 3):
-            dynamo.reset()
-            z = torch.randn(batch, 24, 7, 16, 16)
-            with torch.no_grad(), torch.autocast("cpu", dtype=torch.float16):
-                explained = dynamo.explain(vae.decoder)(z)
-            self.assertEqual(explained.graph_count, 1, explained.break_reasons)
-            self.assertEqual(explained.graph_break_count, 0)
-
-    def test_compiled_decoder_decodes_each_batch_and_supersedes_blocks(self):
-        torch.manual_seed(16)
-        vae = _tiny_video_vae(num_layers=2)
-        units = torch.randn(3, 24, 7, 16, 16)
-        with torch.no_grad():
-            reference = [vae.decode(units[:b]) for b in (1, 3)]
-        self.assertEqual(
-            hd.compile_decoder_blocks(
-                vae, {"backend": "aot_eager", "dynamic": False, "fullgraph": True}
-            ),
-            2,
-        )
-        self.assertTrue(
-            hd.compile_decoder(
-                vae, {"backend": "aot_eager", "dynamic": False, "fullgraph": True}
-            )
-        )
-        self.assertFalse(hd.compile_decoder(vae))  # once a VAE
-        self.assertIsNotNone(vae.decoder._compiled_call_impl)
-        self.assertTrue(
-            all(b._compiled_call_impl is None for b in vae.decoder.transformer_blocks)
-        )
-        with torch.no_grad():
-            for b, expected in zip((1, 3), reference):
-                self.assertTrue(torch.equal(vae.decode(units[:b]), expected), b)
-        # Block compile is off for a VAE whose decoder is compiled.
-        other = _tiny_video_vae(num_layers=2)
-        hd._compiled_decoders.add(id(other))
-        self.assertEqual(hd.compile_decoder_blocks(other), 0)
-
-    def test_compile_failure_decodes_eagerly_and_drops_the_compile(self):
-        torch.manual_seed(17)
-        z = torch.randn(2, 24, 7, 16, 16)
-        vae = _tiny_video_vae(num_layers=2)
-        with torch.no_grad():
-            reference = vae.decode(z)
-
-        def broken_backend(gm, example_inputs):
-            raise RuntimeError("planted compile failure")
-
-        hd.compile_decoder(
-            vae, {"backend": broken_backend, "dynamic": False, "fullgraph": True}
-        )
-        with patch.object(hd.logger, "warning") as warning, torch.no_grad():
-            self.assertTrue(torch.equal(vae.decode(z), reference))
-        self.assertIsNone(vae.decoder._compiled_call_impl)
-        self.assertEqual(warning.call_count, 1)
-
-    def test_failure_that_also_fails_eagerly_keeps_the_compile(self):
-        vae = _tiny_video_vae(num_layers=2)
-        compiled = object()
-        vae.decoder._compiled_call_impl = compiled
-
-        def failing(self_, z):
-            raise MemoryError("planted out of memory")
-
-        guarded = hd._eager_on_decoder_compile_failure(failing)
-        with self.assertRaises(MemoryError):
-            guarded(vae, torch.zeros(1, 24, 7, 16, 16))
-        self.assertIs(vae.decoder._compiled_call_impl, compiled)
-        vae.decoder._compiled_call_impl = None
 
     def test_block_failure_that_also_fails_eagerly_keeps_the_block_compiles(self):
         """A batched call that runs out of memory both through the compiled
@@ -1681,133 +1569,21 @@ class TestDecoderCompile(_BatchCase):
         for block in blocks:
             block._compiled_call_impl = None
 
-    def test_layerwise_offloaded_decoder_is_not_compiled(self):
-        vae = _tiny_video_vae()
-        with patch(
-            "sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload.is_layerwise_offloaded_module",
-            return_value=True,
-        ):
-            self.assertFalse(hd.compile_decoder(vae))
-        self.assertIsNone(getattr(vae.decoder, "_compiled_call_impl", None))
-
-    def test_stage_selects_one_compile(self):
+    def test_stage_compiles_the_blocks_with_the_flag(self):
         stage = SimpleNamespace(video_vae=object())
-        for flags, decoder, blocks in (
-            ({}, 0, 0),
-            ({"SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE": True}, 0, 1),
-            ({"SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE": True}, 1, 0),
-            (
-                {
-                    "SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE": True,
-                    "SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE": True,
-                },
-                1,
-                0,
-            ),
+        for flags, blocks in (
+            ({}, 0),
+            ({"SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE": True}, 1),
         ):
             with (
                 _flags(**flags),
-                patch.object(hd, "compile_decoder") as whole,
                 patch.object(hd, "compile_decoder_blocks") as per_block,
                 patch.object(hd, "_new_request", side_effect=RuntimeError("stop")),
             ):
                 forward = hd._decode_stage_forward(lambda *a: None)
                 with self.assertRaises(RuntimeError):
                     forward(stage, None, None)
-            self.assertEqual(
-                (whole.call_count, per_block.call_count), (decoder, blocks)
-            )
-
-
-class TestFp32Attention(CustomTestCase):
-    def setUp(self):
-        torch.set_num_threads(1)
-
-    def tearDown(self):
-        hd.refresh_fp32_attention()
-
-    def _qkv(self, dtype):
-        torch.manual_seed(19)
-        # The H3 attention's [batch, tokens, heads, head_dim] layout.
-        return [torch.randn(2, 37, 4, 64).to(dtype) for _ in range(3)]
-
-    def test_fp16_attention_runs_on_fp32_copies_outside_autocast(self):
-        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
-            attention,
-        )
-
-        stock = hd._stock["sdpa"]
-        q, k, v = self._qkv(torch.float16)
-        with torch.no_grad():
-            with torch.autocast("cpu", enabled=False):
-                exact = stock(q.float(), k.float(), v.float()).to(torch.float16)
-            with torch.autocast("cpu", dtype=torch.float16):
-                fp16 = stock(q, k, v)
-                with _flags(SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION=True):
-                    self.assertTrue(hd.refresh_fp32_attention())
-                    ours = attention._sdpa_attention(q, k, v)
-                self.assertFalse(hd.refresh_fp32_attention())
-                off = attention._sdpa_attention(q, k, v)
-        self.assertEqual(ours.dtype, torch.float16)
-        self.assertTrue(torch.equal(ours, exact))
-        self.assertFalse(torch.equal(exact, fp16))  # the paths differ here
-        self.assertTrue(torch.equal(off, fp16))
-
-    def test_other_dtypes_keep_the_stock_attention(self):
-        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
-            attention,
-        )
-
-        with _flags(SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION=True), torch.no_grad():
-            hd.refresh_fp32_attention()
-            for dtype in (torch.bfloat16, torch.float32):
-                q, k, v = self._qkv(dtype)
-                self.assertTrue(
-                    torch.equal(
-                        attention._sdpa_attention(q, k, v), hd._stock["sdpa"](q, k, v)
-                    )
-                )
-
-    def test_block_traces_as_one_graph_and_decodes_closer_to_fp32(self):
-        import torch._dynamo as dynamo
-
-        vae = _tiny_video_vae(num_layers=2)
-        torch.manual_seed(20)
-        z = torch.randn(1, 24, 7, 16, 16)
-        with torch.no_grad():
-            reference = vae.decode(z)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        outs = {}
-        for on in (False, True):
-            with _flags(SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION=on):
-                hd.refresh_fp32_attention()
-                with torch.no_grad(), torch.autocast("cpu", dtype=torch.float16):
-                    outs[on] = vae.decode(z)
-                    if on:
-                        dynamo.reset()
-                        block = vae.decoder.transformer_blocks[0]
-                        ids = torch.zeros(1, 69, 3)
-                        explained = dynamo.explain(block)(
-                            torch.randn(1, 69, 32), vae.decoder.pos_embed(ids)
-                        )
-                        self.assertEqual(explained.graph_count, 1)
-                        self.assertEqual(explained.graph_break_count, 0)
-        self.assertFalse(torch.equal(outs[True], outs[False]))
-        error = {on: float((outs[on] - reference).abs().max()) for on in outs}
-        self.assertLess(error[True], 0.05)
-        self.assertLessEqual(error[True], error[False] * 1.5)
-
-    def test_stage_reads_the_flag_each_call(self):
-        stage = SimpleNamespace(video_vae=None)
-        forward = hd._decode_stage_forward(lambda *a: None)
-        for on in (True, False):
-            with (
-                _flags(SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION=on),
-                patch.object(hd, "_new_request", side_effect=RuntimeError("stop")),
-            ):
-                with self.assertRaises(RuntimeError):
-                    forward(stage, None, None)
-            self.assertIs(hd._fp32_attention, on)
+            self.assertEqual(per_block.call_count, blocks)
 
 
 class TestFp32Projections(CustomTestCase):
@@ -1902,135 +1678,6 @@ class TestFp32Projections(CustomTestCase):
             self.assertIs(hd._fp32_projections, on)
 
 
-class TestFp32Reference(CustomTestCase):
-    """SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE: the fp32 decode decoder checks
-    hold candidates against (the runner cannot set --component-precisions)."""
-
-    @classmethod
-    def setUpClass(cls):
-        torch.set_num_threads(1)
-        cls.video_vae = _tiny_video_vae(num_layers=2)
-        cls.audio_vae = _tiny_audio_vae()
-        torch.manual_seed(24)
-        # 2 clips of one tile each.
-        cls.latents = torch.randn(1, 24, 12, 16, 16)
-        cls.audio_latents = torch.randn(2, 32, 9)
-
-    def tearDown(self):
-        hd.refresh_precision_flags()
-
-    def _forward(self, precision, flag, vae=None):
-        server_args = _server_args(precision)
-        vae = vae if vae is not None else copy.deepcopy(self.video_vae)
-        stage = _stage(server_args, vae, copy.deepcopy(self.audio_vae))
-        batch = _batch(self.latents, self.audio_latents, None, save_output=False)
-        with (
-            _flags(SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE=flag),
-            patch.object(hd, "matmul_attention", wraps=hd.matmul_attention) as matmul,
-            patch.object(hd.logger, "info"),
-        ):
-            output = stage.forward(batch, server_args)
-        return output.output, vae, matmul.call_count
-
-    def test_precision_lookup(self):
-        server_args = _server_args("bf16")
-        for flag, name, expected in (
-            (False, "video_vae", torch.bfloat16),
-            (True, "video_vae", torch.float32),
-            (False, "vae", torch.float16),
-            (True, "vae", torch.float16),
-        ):
-            with _flags(SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE=flag):
-                self.assertEqual(
-                    decoding.resolve_decode_precision(server_args, name),
-                    expected,
-                    (flag, name),
-                )
-
-    def test_stage_decodes_in_fp32_with_matmul_attention(self):
-        reference, vae, matmuls = self._forward("bf16", True)
-        # No autocast: the block weights were never rounded to the autocast dtype.
-        self.assertIsNone(vae.decoder._autocast_linear_dtype)
-        self.assertEqual(
-            vae.decoder.transformer_blocks[0].ff.w1.weight.dtype, torch.float32
-        )
-        # The attention ran as fp32 matmuls: 2 blocks a decoder call, 2 clips.
-        self.assertEqual(matmuls, 4)
-        stock32, _, stock_matmuls = self._forward("fp32", False)
-        self.assertEqual(stock_matmuls, 0)
-        self.assertLess(float((reference - stock32).abs().max()), 1e-5)
-        autocast, rounded, _ = self._forward("bf16", False)
-        self.assertEqual(rounded.decoder._autocast_linear_dtype, torch.bfloat16)
-        self.assertGreater(float((reference - autocast).abs().max()), 1e-3)
-        # A decoder whose block weights an autocast decode rounded decodes
-        # them as fp32 copies of the rounded values, with one warning.
-        hd._warned.discard("fp32-reference-rounded")
-        with patch.object(hd.logger, "warning") as warning:
-            from_rounded, held, _ = self._forward("bf16", True, vae=rounded)
-        self.assertEqual(warning.call_count, 1)
-        self.assertIn("held in", warning.call_args.args[0])
-        self.assertEqual(
-            held.decoder.transformer_blocks[0].ff.w1.weight.dtype, torch.float32
-        )
-        self.assertEqual(
-            held.decoder.transformer_blocks[0].ff.w1.bias.dtype, torch.float32
-        )
-        expected = copy.deepcopy(self.video_vae)
-        with torch.no_grad():
-            for name in ("to_qkv", "to_out"):
-                for block in expected.decoder.transformer_blocks:
-                    linear = getattr(block.attn, name)
-                    linear.weight.copy_(linear.weight.bfloat16().float())
-                    linear.bias.copy_(linear.bias.bfloat16().float())
-            for name in ("w1", "w2"):
-                for block in expected.decoder.transformer_blocks:
-                    linear = getattr(block.ff, name)
-                    linear.weight.copy_(linear.weight.bfloat16().float())
-                    linear.bias.copy_(linear.bias.bfloat16().float())
-        rounded32, _, _ = self._forward("bf16", True, vae=expected)
-        self.assertTrue(torch.equal(from_rounded, rounded32))
-
-    def test_loader_keeps_fp32_block_weights_with_the_flag(self):
-        from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
-        from sglang.multimodal_gen.runtime.utils import precision
-
-        server_args = SimpleNamespace(
-            component_precisions={},
-            pipeline_config=SimpleNamespace(
-                vae_decode_precision="fp16", vae_precision="fp32"
-            ),
-            disable_autocast=False,
-        )
-        with patch.object(
-            precision.current_platform, "is_amp_supported", return_value=True
-        ):
-            for flag, expected in ((False, torch.float16), (True, torch.float32)):
-                vae = copy.deepcopy(self.video_vae)
-                with (
-                    _flags(SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE=flag),
-                    patch.object(vae_loader.logger, "info"),
-                ):
-                    vae_loader._hold_decoder_weights_in_decode_dtype(
-                        vae, server_args, "video_vae"
-                    )
-                linear = vae.decoder.transformer_blocks[1].attn.to_qkv
-                self.assertEqual(linear.weight.dtype, expected, flag)
-                # Other components keep the stock lookup.
-                self.assertEqual(
-                    vae_loader.resolve_decode_precision(server_args, "vae"),
-                    torch.float16,
-                )
-
-    def test_matmul_attention_matches_sdpa(self):
-        torch.manual_seed(26)
-        q, k, v = (torch.randn(2, 37, 4, 64, dtype=torch.float64) for _ in range(3))
-        self.assertTrue(
-            torch.allclose(
-                hd.matmul_attention(q, k, v), hd._stock["sdpa"](q, k, v), atol=1e-12
-            )
-        )
-
-
 def _fp16_product(x, weight, bias):
     """An fp16 matmul with float32 accumulation: exact products, float32 sums,
     the fp16 bias added in float32, one rounding to fp16 (cuBLAS addmm)."""
@@ -2047,411 +1694,12 @@ def _all_fp16() -> torch.Tensor:
     )
 
 
-class TestFp16SplitMatmul(CustomTestCase):
-    """SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL: the ViT block linears as three
-    bf16 passes over exact hi/lo splits of their fp16 operands."""
-
-    def setUp(self):
-        torch.set_num_threads(2)
-
-    def tearDown(self):
-        hd.refresh_precision_flags()
-
-    def test_split_is_exact_for_every_fp16_value(self):
-        values = _all_fp16()
-        hi, lo = hd.split_fp16(values)
-        self.assertEqual((hi.dtype, lo.dtype), (torch.bfloat16, torch.bfloat16))
-        finite = torch.isfinite(values)
-        self.assertTrue(
-            torch.equal((hi.double() + lo.double())[finite], values.double()[finite])
-        )
-        # hi is the bf16 rounding; lo carries the rest (subnormals included).
-        self.assertTrue(torch.equal(hi[finite], values[finite].to(torch.bfloat16)))
-        subnormal = finite & (values != 0) & (values.abs() < 2.0**-14)
-        self.assertEqual(int(subnormal.sum()), 2 * 1023)
-        # Subnormals with more than 8 significant bits need their low part too.
-        self.assertTrue(
-            torch.equal(
-                (hi.double() + lo.double())[subnormal], values.double()[subnormal]
-            )
-        )
-        self.assertGreater(int(lo[subnormal].count_nonzero()), 0)
-        # Some normal values need a non-zero low part; none overflows.
-        self.assertGreater(int(lo[finite].count_nonzero()), 50000)
-        self.assertTrue(bool(torch.isfinite(hi[finite]).all()))
-        inf = torch.isinf(values)
-        self.assertTrue(torch.equal(hi[inf].float(), values[inf].float()))
-        self.assertTrue(bool((lo[inf] == 0).all()))
-        nan = torch.isnan(values)
-        self.assertTrue(bool(torch.isnan(hi[nan]).all() & torch.isnan(lo[nan]).all()))
-        with self.assertRaises(TypeError):
-            hd.split_fp16(values.float())
-
-    @staticmethod
-    def _allowed(x, weight, out):
-        """|difference| allowed between two fp16 products with exact products
-        that differ only in float32 summation order: one fp16 step of the
-        result plus twice the float32 sum bound (K + 4) * 2**-24 * sum |x w|.
-        A dropped lo*lo (up to 2**-16 |x w| a product) can exceed it."""
-        magnitude = torch.matmul(x.float().abs(), weight.float().abs().t())
-        step = (out.float().abs() * 2.0**-10).clamp_min(2.0**-24)
-        return step + magnitude * 2 * (x.shape[-1] + 4) * 2.0**-24
-
-    def _operands(self, rows=37, inner=96, outer=48, seed=40):
-        generator = torch.Generator().manual_seed(seed)
-        x = (torch.randn(rows, inner, generator=generator) * 3).to(torch.float16)
-        weight = (torch.randn(outer, inner, generator=generator) * 0.05).half()
-        bias = (torch.randn(outer, generator=generator) * 0.1).to(torch.float16)
-        # Subnormal and large magnitudes, as fp16 activations can hold them.
-        x[0, :8] = torch.tensor(
-            [2.0**-24, -(2.0**-20), 6e-5, 65504, -65504, 0, -0.0, 1]
-        )
-        return x, weight, bias
-
-    def test_split_product_is_an_fp16_product(self):
-        x, weight, bias = self._operands()
-        split = hd.fp16_split_linear(x, *hd.split_fp16(weight), bias)
-        self.assertEqual(split.dtype, torch.float16)
-        exact = torch.matmul(x.double(), weight.double().t()) + bias.double()
-        fp16 = _fp16_product(x, weight, bias)
-        finite = torch.isfinite(exact.half())
-        # Every value is within the float32-order allowance of the fp16
-        # product, nearly all equal to it, and as close to the exact one.
-        diff = (split.float() - fp16.float()).abs()[finite]
-        self.assertTrue(bool((diff <= self._allowed(x, weight, fp16)[finite]).all()))
-        self.assertGreater(float((split == fp16)[finite].float().mean()), 0.99)
-
-        def error(out):
-            return float(
-                (out.double()[finite] - exact[finite]).norm() / exact[finite].norm()
-            )
-
-        self.assertLessEqual(error(split), error(fp16) * (1 + 1e-6))
-        # The batched shape is the same product row by row.
-        stacked = hd.fp16_split_linear(
-            torch.stack([x, x.flip(0)]), *hd.split_fp16(weight), bias
-        )
-        self.assertTrue(torch.equal(stacked[0], split))
-        # Without a bias.
-        nobias = hd.fp16_split_linear(x, *hd.split_fp16(weight), None)
-        self.assertTrue(
-            torch.equal(nobias, hd._split_linear_torch(x, *hd.split_fp16(weight), None))
-        )
-
-    def test_low_product_is_kept(self):
-        # Real activations put lo*lo above the fp16 half-step of 0.2-1.7% of
-        # the decoder linears' outputs (cancelling sums): the product keeps it.
-        x, weight, bias = self._operands(rows=64, inner=512, outer=64, seed=41)
-        x = x[1:]  # without the extreme-value row
-        _, xl = hd.split_fp16(x)
-        _, wl = hd.split_fp16(weight)
-        low = torch.matmul(xl.double(), wl.double().t())
-        exact = torch.matmul(x.double(), weight.double().t()) + bias.double()
-        half_step = (exact.half().double().abs() * 2.0**-11).clamp_min(2.0**-25)
-        self.assertGreater(float((low.abs() > half_step).double().mean()), 0)
-        split = hd.fp16_split_linear(x, *hd.split_fp16(weight), bias)
-        fp16 = _fp16_product(x, weight, bias)
-        diff = (split.float() - fp16.float()).abs()
-        self.assertTrue(bool((diff <= self._allowed(x, weight, fp16)).all()))
-        self.assertGreater(float((split == fp16).float().mean()), 0.99)
-
-    def test_infinite_and_nan_inputs_match_the_fp16_product(self):
-        x, weight, bias = self._operands(seed=42)
-        x[3, 5] = float("inf")
-        x[4, 6] = float("-inf")
-        x[5, 7] = float("nan")
-        split = hd.fp16_split_linear(x, *hd.split_fp16(weight), bias)
-        fp16 = _fp16_product(x, weight, bias)
-        for row in (3, 4, 5):
-            self.assertTrue(
-                torch.equal(torch.isnan(split[row]), torch.isnan(fp16[row])), row
-            )
-            self.assertTrue(
-                torch.equal(
-                    split[row][~torch.isnan(split[row])],
-                    fp16[row][~torch.isnan(fp16[row])],
-                ),
-                row,
-            )
-        self.assertTrue(bool(torch.isinf(split[3]).any()))
-
-    def test_jax_product_matches_the_torch_one(self):
-        try:
-            import jax
-            import jax.numpy as jnp
-        except ImportError:
-            self.skipTest("jax is not installed")
-        x, weight, bias = self._operands(rows=40, inner=256, outer=72, seed=43)
-        x[2, 3] = float("inf")
-        hi, lo = hd.split_fp16(weight)
-
-        def to_jax(t):
-            dtype = {torch.float16: jnp.float16, torch.bfloat16: jnp.bfloat16}[t.dtype]
-            return jnp.asarray(t.float().numpy()).astype(dtype)
-
-        with jax.default_device(jax.devices("cpu")[0]):
-            out = hd._split_linear_jax(to_jax(x), to_jax(hi), to_jax(lo), to_jax(bias))
-        self.assertEqual(out.dtype, jnp.float16)
-        out = torch.from_numpy(jax.numpy.asarray(out, dtype=jnp.float32).__array__())
-        torch_out = hd._split_linear_torch(x, hi, lo, bias).float()
-        both = ~torch.isnan(torch_out)
-        self.assertTrue(torch.equal(torch.isnan(out), ~both))
-        finite = both & torch.isfinite(torch_out)
-        self.assertTrue(torch.equal(out[both & ~finite], torch_out[both & ~finite]))
-        allowed = self._allowed(x.masked_fill(torch.isinf(x), 0), weight, torch_out)
-        self.assertTrue(
-            bool(((out - torch_out).abs()[finite] <= allowed[finite]).all())
-        )
-        self.assertGreater(float((out == torch_out)[both].float().mean()), 0.99)
-        # Both keep every product: they agree with the fp16 product.
-        fp16 = _fp16_product(x.masked_fill(torch.isinf(x), 0), weight, bias).float()
-        rows = torch.isinf(x).any(-1, keepdim=True).expand_as(fp16)
-        self.assertGreater(float((out == fp16)[~rows].float().mean()), 0.99)
-
-    def _decode(self, vae, z, on, dtype=torch.float16, autocast=True, count=True):
-        # The call count needs a mock, which compiled code cannot trace.
-        counter = (
-            patch.object(hd, "fp16_split_linear", wraps=hd.fp16_split_linear)
-            if count
-            else contextlib.nullcontext(None)
-        )
-        with _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=on):
-            hd.refresh_precision_flags()
-            with (
-                counter as split,
-                torch.no_grad(),
-                torch.autocast("cpu", dtype=dtype, enabled=autocast),
-            ):
-                output = vae.decode(z)
-        hd.refresh_precision_flags()
-        return output, None if split is None else split.call_count
-
-    def test_decode_runs_split_linears_under_fp16_autocast_only(self):
-        torch.manual_seed(44)
-        z = torch.randn(1, 24, 7, 16, 16)
-        vae = _tiny_video_vae(num_layers=2)
-        with torch.no_grad():
-            reference = vae.decode(z)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        stock, stock_calls = self._decode(vae, z, False)
-        split, split_calls = self._decode(vae, z, True)
-        self.assertEqual(stock_calls, 0)
-        self.assertEqual(split_calls, 8)  # 4 linears a block, 2 blocks
-        self.assertFalse(hd._split_active)
-        self.assertFalse(torch.equal(split, stock))
-
-        def mse(out):
-            return float((out - reference).pow(2).mean())
-
-        self.assertLess(mse(split), 1.05 * mse(stock))
-        self.assertLess(float((split - stock).abs().max()), 1e-2)
-        # The split linear is the block's fp16 product, input for input.
-        block = vae.decoder.transformer_blocks[0]
-        seen = {}
-        handle = block.ff.w2.register_forward_hook(
-            lambda m, i, o: seen.__setitem__("w2", (i[0], o))
-        )
-        try:
-            self._decode(vae, z, True)
-        finally:
-            handle.remove()
-        inputs, output = seen["w2"]
-        self.assertEqual(output.dtype, torch.float16)
-        expected = hd._split_linear_torch(
-            inputs.reshape(-1, inputs.shape[-1]).half(),
-            block.ff.w2.h3_weight_hi,
-            block.ff.w2.h3_weight_lo,
-            block.ff.w2.bias,
-        )
-        self.assertTrue(torch.equal(output.reshape(expected.shape), expected))
-        # bf16 autocast and no autocast keep the stock linears.
-        bf16, calls = self._decode(vae, z, True, dtype=torch.bfloat16)
-        self.assertEqual(calls, 0)
-        self.assertTrue(
-            torch.equal(bf16, self._decode(vae, z, False, torch.bfloat16)[0])
-        )
-        # Without autocast (the fp32 reference decode) neither.
-        with _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=True):
-            hd.refresh_precision_flags()
-            self.assertFalse(hd._split_wanted(vae, z))
-            with torch.autocast("cpu", dtype=torch.float16):
-                self.assertTrue(hd._split_wanted(vae, z))
-            with torch.autocast("cpu", dtype=torch.bfloat16):
-                self.assertFalse(hd._split_wanted(vae, z))
-            # An fp16 autocast dtype alone, autocast off: no split.
-            previous = torch.get_autocast_dtype("cpu")
-            torch.set_autocast_dtype("cpu", torch.float16)
-            try:
-                self.assertFalse(hd._split_wanted(vae, z))
-            finally:
-                torch.set_autocast_dtype("cpu", previous)
-        hd.refresh_precision_flags()
-
-    def test_weights_split_once_and_again_when_they_change(self):
-        vae = _tiny_video_vae(num_layers=2)
-        linears = hd._block_linears(vae.decoder)
-        # fp32 weights are not split.
-        self.assertEqual(hd.prepare_split_weights(vae), 0)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        with patch.object(hd, "split_fp16", wraps=hd.split_fp16) as split:
-            self.assertEqual(hd.prepare_split_weights(vae), 8)
-            self.assertEqual(split.call_count, 8)
-            self.assertEqual(hd.prepare_split_weights(vae), 8)
-            self.assertEqual(split.call_count, 8)  # kept
-            hi = linears[2].h3_weight_hi
-            with torch.no_grad():
-                linears[2].weight.mul_(2)
-            self.assertEqual(hd.prepare_split_weights(vae), 8)
-            self.assertEqual(split.call_count, 9)  # only the changed one
-        self.assertIs(linears[2].h3_weight_hi, hi)  # refilled in place
-        self.assertTrue(
-            torch.equal(
-                linears[2].h3_weight_hi.double() + linears[2].h3_weight_lo.double(),
-                linears[2].weight.double(),
-            )
-        )
-        # Not part of the checkpoint.
-        self.assertFalse(any("h3_weight" in key for key in vae.state_dict()))
-        # Cast buffers are not trusted.
-        linears[0].h3_weight_hi.data = linears[0].h3_weight_hi.float()
-        self.assertEqual(hd.prepare_split_weights(vae), 8)
-        self.assertEqual(linears[0].h3_weight_hi.dtype, torch.bfloat16)
-        # A non-finite weight keeps the stock path for its linear.
-        hd._warned.discard("split-nonfinite")
-        with torch.no_grad():
-            linears[1].weight[0, 0] = float("inf")
-        with patch.object(hd.logger, "warning") as warning:
-            self.assertEqual(hd.prepare_split_weights(vae), 7)
-        self.assertEqual(warning.call_count, 1)
-        self.assertNotIn("h3_weight_hi", linears[1]._buffers)
-
-    def test_no_split_when_memory_is_short_or_weights_offload(self):
-        vae = _tiny_video_vae(num_layers=1)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        hd._warned.discard("split-memory")
-        with (
-            patch.object(hd, "free_device_bytes", return_value=1 << 30),
-            patch.object(hd.logger, "warning") as warning,
-        ):
-            self.assertEqual(hd.prepare_split_weights(vae), 0)
-        self.assertIn("split matmul", warning.call_args.args[0])
-        with patch(
-            "sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload.is_layerwise_offloaded_module",
-            return_value=True,
-        ):
-            self.assertEqual(hd.prepare_split_weights(vae), 0)
-        # Free now but not under the request's peak (the next denoise).
-        with (
-            patch.object(hd, "free_device_bytes", return_value=64 << 30),
-            patch.object(hd, "peak_headroom_bytes", return_value=2 << 30),
-        ):
-            self.assertEqual(hd.prepare_split_weights(vae), 0)
-        with (
-            patch.object(hd, "free_device_bytes", return_value=64 << 30),
-            patch.object(hd, "peak_headroom_bytes", return_value=32 << 30),
-        ):
-            self.assertEqual(hd.prepare_split_weights(vae), 4)
-        self.assertIsNone(hd.peak_headroom_bytes(torch.device("cpu")))
-
-    def test_composes_with_block_compile_decoder_compile_and_batches(self):
-        import torch._dynamo as dynamo
-
-        torch.manual_seed(45)
-        z = torch.randn(2, 24, 7, 16, 16)
-        vae = _tiny_video_vae(num_layers=2)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        eager, _ = self._decode(vae, z, True)
-        with _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=True):
-            hd.refresh_precision_flags()
-            hd._split_active = True
-            try:
-                dynamo.reset()
-                with torch.no_grad(), torch.autocast("cpu", dtype=torch.float16):
-                    explained = dynamo.explain(vae.decoder)(z)
-                self.assertEqual(explained.graph_count, 1, explained.break_reasons)
-                self.assertEqual(explained.graph_break_count, 0)
-            finally:
-                hd._split_active = False
-        dynamo.reset()
-        # Block compile: the compiled blocks run the split linears.
-        hd._compiled_vaes.discard(id(vae))
-        hd.compile_decoder_blocks(
-            vae, {"backend": "aot_eager", "dynamic": False, "fullgraph": True}
-        )
-        compiled, _ = self._decode(vae, z, True, count=False)
-        self._assert_rounding_close(compiled, eager)
-        for block in vae.decoder.transformer_blocks:
-            self.assertIsNotNone(block._compiled_call_impl)
-            block._compiled_call_impl = None
-        dynamo.reset()
-        # Whole-decoder compile.
-        hd._compiled_decoders.discard(id(vae))
-        hd.compile_decoder(
-            vae, {"backend": "aot_eager", "dynamic": False, "fullgraph": True}
-        )
-        compiled, _ = self._decode(vae, z, True, count=False)
-        self._assert_rounding_close(compiled, eager)
-        self.assertIsNotNone(vae.decoder._compiled_call_impl)
-        vae.decoder._compiled_call_impl = None
-        dynamo.reset()
-        # Batched decode (SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH): units in one call.
-        per_unit = torch.cat(
-            [self._decode(vae, z[k : k + 1], True)[0] for k in range(2)]
-        )
-        self._assert_rounding_close(per_unit, eager)
-        with _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=True):
-            hd.refresh_precision_flags()
-            with torch.no_grad(), torch.autocast("cpu", dtype=torch.float16):
-                calls = list(hd._unit_calls(vae, [z[0:1], z[1:2]], 2))
-        self.assertEqual([int(out.shape[0]) for _, out in calls], [2])
-        self._assert_rounding_close(calls[0][1], eager)
-
-    def _assert_rounding_close(self, a, b):
-        """Two decodes that differ only in float32 summation order."""
-        self.assertLess(float((a - b).abs().max()), 2e-3)
-        self.assertGreater(float((a == b).float().mean()), 0.5)
-
-    def test_stage_reads_the_flag_each_call(self):
-        stage = SimpleNamespace(video_vae=None)
-        forward = hd._decode_stage_forward(lambda *a: None)
-        for on in (True, False):
-            with (
-                _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=on),
-                patch.object(hd, "_new_request", side_effect=RuntimeError("stop")),
-            ):
-                with self.assertRaises(RuntimeError):
-                    forward(stage, None, None)
-            self.assertIs(hd._fp16_split, on)
-
-    def test_stage_decodes_with_the_split_linears(self):
-        torch.manual_seed(46)
-        latents = torch.randn(1, 24, 12, 16, 16)
-        audio_latents = torch.randn(2, 32, 9)
-        outputs = {}
-        for on in (False, True):
-            server_args = _server_args("fp16")
-            vae = _tiny_video_vae(num_layers=2)
-            stage = _stage(server_args, vae, _tiny_audio_vae())
-            batch = _batch(latents, audio_latents, None, save_output=False)
-            with (
-                _flags(SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=on),
-                patch.object(
-                    hd, "fp16_split_linear", wraps=hd.fp16_split_linear
-                ) as split,
-                patch.object(hd.logger, "info"),
-            ):
-                outputs[on] = stage.forward(batch, server_args).output
-            # 2 clips of one tile: 2 decoder calls of 8 linears.
-            self.assertEqual(split.call_count, 16 if on else 0)
-        self.assertFalse(torch.equal(outputs[True], outputs[False]))
-        self.assertLess(float((outputs[True] - outputs[False]).abs().max()), 1e-2)
-
-
 def _probe_qkv(batch=1, tokens=1797, heads=4, seed=0):
     """fp16 q/k/v in the ViT attention's [batch, tokens, heads, 64] layout:
-    seed 0 at the default shape draws the precision check's inputs; other
-    seeds draw decoder-like ones (q/k RMS-normalized per head as the H3
-    decoder's parameter-free RMSNorm leaves them, correlated across heads)."""
+    seed 0 at the default shape draws the TPU precision probe's plain normal
+    inputs (after its linear operands); other seeds draw decoder-like ones
+    (q/k RMS-normalized per head as the H3 decoder's parameter-free RMSNorm
+    leaves them, correlated across heads)."""
     generator = torch.Generator().manual_seed(seed)
 
     def randn(*shape):
@@ -2481,7 +1729,7 @@ def _tpu_fp16_attention(q, k, v):
     """torch_tpu's fp16 SDPA (math path) as its roundings: scores to fp16,
     s - max to fp16, float32 exp and sum, P to fp16, P V to fp16 (the exact
     sums of each rounded operand). Reproduces the TPU precision probe's
-    6.63e-4 on the precision check's inputs."""
+    6.63e-4 on _probe_qkv's seed-0 inputs."""
 
     def r16(t):
         return t.half().double()
@@ -2711,13 +1959,8 @@ class TestFlashAttention(CustomTestCase):
                 )
             self.assertFalse(hd.flash_attention_fits(q, k, v.float()))
             self.assertFalse(hd.flash_attention_fits(q, k[:, :32], v[:, :32]))
-            # It takes the place of the fp32-copy attention.
-            with _flags(SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION=True):
-                hd.refresh_fp32_attention()
-                self.assertTrue(torch.equal(attention._sdpa_attention(q, k, v), flash))
         finally:
             hd._flash_active = False
-            hd.refresh_fp32_attention()
 
     def _decode(self, vae, z, on, autocast=True, count=True):
         # The call count needs a mock, which compiled code cannot trace.
@@ -2767,7 +2010,7 @@ class TestFlashAttention(CustomTestCase):
         # Outside a decode (the encoder, other modules): stock.
         self.assertFalse(hd._flash_active)
 
-    def test_composes_with_block_compile_decoder_compile_and_batches(self):
+    def test_composes_with_block_compile_and_batches(self):
         import torch._dynamo as dynamo
 
         torch.manual_seed(48)
@@ -2811,13 +2054,6 @@ class TestFlashAttention(CustomTestCase):
         for block in vae.decoder.transformer_blocks:
             self.assertIsNotNone(block._compiled_call_impl)
             block._compiled_call_impl = None
-        dynamo.reset()
-        hd._compiled_decoders.discard(id(vae))
-        hd.compile_decoder(vae, compile_kwargs)
-        compiled, _ = self._decode(vae, z, True, count=False)
-        self._assert_rounding_close(compiled, eager)
-        self.assertIsNotNone(vae.decoder._compiled_call_impl)
-        vae.decoder._compiled_call_impl = None
         dynamo.reset()
         # Batched decoder calls (SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH).
         per_unit = torch.cat(
@@ -2913,7 +2149,7 @@ class TestPallasLinear(CustomTestCase):
 
     @staticmethod
     def _operands(rows, inner, outer, seed):
-        """Decoder-like fp16 operands, seed 0 the precision check's."""
+        """Decoder-like fp16 operands; seed 0 the TPU precision probe's."""
         generator = torch.Generator().manual_seed(seed)
 
         def randn(*shape):
@@ -3014,7 +2250,6 @@ class TestPallasLinear(CustomTestCase):
         with (
             _flags(**flags),
             patch.object(hd, "pallas_linear", wraps=hd.pallas_linear) as pallas,
-            patch.object(hd, "fp16_split_linear", wraps=hd.fp16_split_linear) as split,
             patch.object(hd.logger, "info"),
         ):
             hd.refresh_precision_flags()
@@ -3022,7 +2257,7 @@ class TestPallasLinear(CustomTestCase):
                 output = vae.decode(z)
         hd.refresh_precision_flags()
         self.assertFalse(hd._linear_active)
-        return output, pallas.call_count, split.call_count
+        return output, pallas.call_count
 
     def test_decode_routes_the_block_linears_under_fp16_autocast_only(self):
         torch.manual_seed(50)
@@ -3033,9 +2268,9 @@ class TestPallasLinear(CustomTestCase):
             reference = vae.decode(z)
         vae.decoder.prepare_autocast_linear_weights(torch.float16)
         on = dict(SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR=True)
-        stock, calls, _ = self._decode(vae, z, {})
+        stock, calls = self._decode(vae, z, {})
         self.assertEqual(calls, 0)
-        ours, calls, _ = self._decode(vae, z, on)
+        ours, calls = self._decode(vae, z, on)
         self.assertEqual(calls, 8)  # 4 linears a block, 2 blocks
         self.assertFalse(torch.equal(ours, stock))
         self.assertLess(float((ours - stock).abs().max()), 1e-2)
@@ -3043,19 +2278,13 @@ class TestPallasLinear(CustomTestCase):
             float((ours - reference).pow(2).mean()),
             1.05 * float((stock - reference).pow(2).mean()),
         )
-        # It takes the place of the split matmul.
-        both, calls, split_calls = self._decode(
-            vae, z, dict(on, SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL=True)
-        )
-        self.assertEqual((calls, split_calls), (8, 0))
-        self.assertTrue(torch.equal(both, ours))
         # bf16 autocast keeps the stock linears; so does a decoder whose
         # widths are not multiples of 256 (it runs, unrouted).
-        _, calls, _ = self._decode(vae, z, on, dtype=torch.bfloat16)
+        _, calls = self._decode(vae, z, on, dtype=torch.bfloat16)
         self.assertEqual(calls, 0)
         narrow = _tiny_video_vae(num_layers=2)
         narrow.decoder.prepare_autocast_linear_weights(torch.float16)
-        narrow_on, calls, _ = self._decode(narrow, z, on)
+        narrow_on, calls = self._decode(narrow, z, on)
         self.assertEqual(calls, 0)
         self.assertTrue(torch.equal(narrow_on, self._decode(narrow, z, {})[0]))
         with _flags(**on):
@@ -3154,9 +2383,8 @@ class TestFusedLinears(CustomTestCase):
         torch.set_num_threads(4)
 
     def tearDown(self):
-        hd._fused_ops = hd._stage_room = hd._clip_groups = None
+        hd._fused_ops = hd._stage_room = None
         hd._flash_decoders.clear()
-        hd._warned.discard("clip-split")
         hd.refresh_precision_flags()
 
     def test_operands_are_held_in_buffers_of_their_own(self):
@@ -3184,96 +2412,35 @@ class TestFusedLinears(CustomTestCase):
             rows = 8 if m is qkv else 1
             self.assertTrue(torch.equal(bits.view(torch.float16), bias.view(rows, -1)))
 
-    def test_clip_split_holds_weights_through_a_clips_calls(self):
-        """CLIP_SPLIT: weights left int16 under the stage peak are held split
-        through each clip's calls (w1's where w2's do not fit as well, fixed
-        at the first clip), dropped after them; a clip short of memory holds
-        none. The same frames throughout."""
-        torch.manual_seed(65)
-        z = torch.randn(1, 24, 12, 32, 40)  # 2 clips x 3x3 tiles
-        vae = _tiny_video_vae(num_layers=2, dim_head=64, heads=4)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        blocks = vae.decoder.transformer_blocks
-        w1, w2 = (
-            sum(4 * getattr(b.ff, n).weight.numel() for b in blocks)
-            for n in ("w1", "w2")
+    def test_weight_split_is_exact_for_every_fp16_value(self):
+        values = _all_fp16()
+        hi, lo = hd.split_fp16(values)
+        self.assertEqual((hi.dtype, lo.dtype), (torch.bfloat16, torch.bfloat16))
+        finite = torch.isfinite(values)
+        self.assertTrue(
+            torch.equal((hi.double() + lo.double())[finite], values.double()[finite])
         )
-        flags = dict(
-            _FUSED_FLAGS,
-            SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS=True,
-            SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH=2,
-        )
-        stock, seen, unit = hd.fused_block, set(), 1 << 20
-
-        def spy(block, h, rope):
-            seen.add(
-                (block.ff.w1.h3_weight_bits.dim(), block.ff.w2.h3_weight_bits.dim())
+        # hi is the bf16 rounding; lo carries the rest (subnormals included).
+        self.assertTrue(torch.equal(hi[finite], values[finite].to(torch.bfloat16)))
+        subnormal = finite & (values != 0) & (values.abs() < 2.0**-14)
+        self.assertEqual(int(subnormal.sum()), 2 * 1023)
+        # Subnormals with more than 8 significant bits need their low part too.
+        self.assertTrue(
+            torch.equal(
+                (hi.double() + lo.double())[subnormal], values.double()[subnormal]
             )
-            return stock(block, h, rope)
-
-        def decode(free, clip_split=True):
-            seen.clear()
-            with (
-                _flags(**flags, SGLANG_TPU_OPT_H3_VAE_CLIP_SPLIT=clip_split),
-                patch.object(hd, "peak_headroom_bytes", return_value=1 << 30),
-                patch.object(hd, "free_device_bytes", return_value=free),
-                patch.object(hd, "unit_call_bytes", return_value=unit),
-                patch.object(hd, "fused_block", side_effect=spy),
-                patch.object(hd, "_split_held", wraps=hd._split_held) as split,
-                patch.object(hd.logger, "info"),
-            ):
-                hd.refresh_precision_flags()
-                with torch.no_grad(), torch.autocast("cpu", dtype=torch.float16):
-                    output = vae.decode_temporal(z)
-            hd.refresh_precision_flags()
-            return output, seen.copy(), split.call_count
-
-        reference, held, _ = decode(1 << 40, clip_split=False)
-        self.assertEqual(held, {(2, 2)})  # split in each block program
-        int16 = [b.ff.w1.h3_weight_bits for b in blocks]
-        # Room beside a call of 2 units for w1's hi/lo, not for w2's too.
-        free = hd.DECODE_BATCH_RESERVE_BYTES + 2 * unit + w1 + w2 // 2
-        output, held, splits = decode(free)
-        self.assertEqual((held, hd._clip_groups), ({(3, 2)}, 1))
-        self.assertEqual(splits, 2 * len(blocks))  # once a clip, not a call
-        self.assertTrue(torch.equal(output, reference))
-        for block, bits in zip(blocks, int16):  # dropped after each clip
-            self.assertIs(block.ff.w1.h3_weight_bits, bits)
-        output, held, _ = decode(free - w1)  # a clip short of w1's hi/lo
-        self.assertEqual((held, hd._clip_groups), ({(2, 2)}, 1))
-        self.assertTrue(torch.equal(output, reference))
-        self.assertEqual(decode(1 << 40)[1], {(3, 2)})  # w1 only, as at the first
-
-    def test_batch_invariant_decode_gives_a_unit_its_frames_in_any_batch(self):
-        torch.manual_seed(64)
-        vae = _tiny_video_vae(num_layers=2, dim_head=64, heads=4)
-        vae.decoder.prepare_autocast_linear_weights(torch.float16)
-        units = [torch.randn(1, 24, 7, 16, 16) for _ in range(3)]
-        decoder, batches = vae.decoder, []
-
-        def recorded(forward):
-            def record(x, *args, **kwargs):
-                batches.append(x.shape[0])
-                return forward(x, *args, **kwargs)
-
-            return record
-
-        for m in (
-            vae.post_quant_conv,
-            decoder.x_embedder,
-            decoder.norm_out,
-            decoder.proj_out,
-        ):
-            m.forward = recorded(m.forward)
-        flags = dict(_FUSED_FLAGS, SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT=True)
-        alone = torch.cat([self._decode(vae, unit, flags)[0] for unit in units])
-        batched, calls = self._decode(vae, torch.cat(units), flags)
-        self.assertEqual(calls, 2)  # fused, one call a block
-        self.assertTrue(torch.equal(batched, alone))
-        self.assertEqual(set(batches), {1})
-        batches.clear()
-        self._decode(vae, torch.cat(units), _FUSED_FLAGS)  # off: the whole batch
-        self.assertEqual(set(batches), {3})
+        )
+        self.assertGreater(int(lo[subnormal].count_nonzero()), 0)
+        # Some normal values need a non-zero low part; none overflows.
+        self.assertGreater(int(lo[finite].count_nonzero()), 50000)
+        self.assertTrue(bool(torch.isfinite(hi[finite]).all()))
+        inf = torch.isinf(values)
+        self.assertTrue(torch.equal(hi[inf].float(), values[inf].float()))
+        self.assertTrue(bool((lo[inf] == 0).all()))
+        nan = torch.isnan(values)
+        self.assertTrue(bool(torch.isnan(hi[nan]).all() & torch.isnan(lo[nan]).all()))
+        with self.assertRaises(TypeError):
+            hd.split_fp16(values.float())
 
     @torch.no_grad()
     def test_kernels_match_the_torch_arithmetic(self):
@@ -3341,7 +2508,10 @@ class TestFusedLinears(CustomTestCase):
         self.assertTrue(torch.equal(split_gate, bits))
         want = hd._fused_gate_torch(*gate).view(torch.float16)[:, :300].float()
         diff = (bits.view(torch.float16)[:, :300].float() - want).abs()
-        self.assertTrue(bool((diff <= want.abs() * 2.0**-10 + 1e-6).all()))  # one step
+        # One fp16 step, plus the f32 summation-order difference near zero:
+        # torch's CPU kernels sum in an order that depends on the vector width
+        # (AVX2, AVX-512), which moves a sum near zero by about 1e-6.
+        self.assertTrue(bool((diff <= want.abs() * 2.0**-10 + 4e-6).all()))  # one step
         w2 = (ff.w2.h3_weight_bits, ff.w2.h3_bias_bits, block.scale2.view(1, -1))
         out = kernel(vf.fused_residual, bits, *w2, h)
         close(out - h, hd._fused_residual_torch(bits, *w2, h) - h, 1e-5)
@@ -3350,7 +2520,7 @@ class TestFusedLinears(CustomTestCase):
         _, block, h, rope = _fused_block(tokens=304)
         reference = copy.deepcopy(block).double()
         for linear in (block.attn.to_qkv, block.attn.to_out, block.ff.w1, block.ff.w2):
-            linear.forward = types.MethodType(hd._split_linear_forward, linear)
+            linear.forward = types.MethodType(hd._pallas_linear_forward, linear)
         with torch.no_grad():
             exact = reference(h.double(), tuple(t.double() for t in rope)) - h.double()
             hd._linear_active = hd._flash_active = True
@@ -3718,86 +2888,6 @@ class TestFusedLaunches(CustomTestCase):
             self.assertEqual(vf._launch("qkv", 4), vf.Launch(pieces=2))
 
 
-class TestPrecisionCheck(CustomTestCase):
-    def setUp(self):
-        torch.set_num_threads(2)
-        hd._checked.clear()
-
-    def tearDown(self):
-        hd._checked.clear()
-
-    def test_errors_against_float64_on_cpu(self):
-        with patch.object(hd.logger, "info") as info:
-            result = hd.precision_check(torch.device("cpu"))
-        self.assertEqual(
-            set(result),
-            {
-                "linear_fp16",
-                "linear_fp32",
-                "attention_fp16",
-                "attention_fp32",
-                "attention_fp32_matmul",
-                "linear_fp16_split",
-                "attention_flash",
-                "linear_pallas",
-            },
-        )
-        # fp16 results carry fp16 rounding (~3e-4); the fp32 paths do not.
-        self.assertLess(result["linear_fp16"], 2e-3)
-        self.assertGreater(result["linear_fp16"], 1e-5)
-        self.assertLess(result["attention_fp16"], 2e-3)
-        self.assertLess(result["linear_fp32"], 1e-5)
-        self.assertLess(result["attention_fp32"], 1e-5)
-        self.assertLess(result["attention_fp32_matmul"], 1e-5)
-        # The split keeps the fp16 linear's precision (one rounding, as the
-        # CPU fp16 linear).
-        self.assertLess(result["linear_fp16_split"], 1.01 * result["linear_fp16"])
-        self.assertGreater(result["linear_fp16_split"], 0.99 * result["linear_fp16"])
-        # The flash attention rounds once to fp16 (2.08e-4 here, the exact
-        # result rounded); CPU's fp16 SDPA lands at ~2.9e-4.
-        self.assertLess(result["attention_flash"], 2.2e-4)
-        self.assertGreater(result["attention_flash"], 1.5e-4)
-        self.assertLessEqual(result["attention_flash"], result["attention_fp16"])
-        # The Pallas linear's three products and one rounding: the CPU fp16
-        # linear's precision (the TPU fp16 linear: 2.66e-4).
-        self.assertLess(result["linear_pallas"], 1.0001 * result["linear_fp16"])
-        self.assertGreater(result["linear_pallas"], 0.99 * result["linear_fp16"])
-        self.assertEqual(info.call_count, 1)
-        self.assertIn("precision check", info.call_args.args[0])
-        self.assertEqual(info.call_args.kwargs, hd._ALL_RANKS)
-
-    def test_failed_flash_attention_reports_nan(self):
-        with (
-            patch.object(hd, "flash_attention", side_effect=RuntimeError("planted")),
-            patch.object(hd.logger, "info"),
-            patch.object(hd.logger, "warning") as warning,
-        ):
-            result = hd.precision_check(torch.device("cpu"))
-        self.assertTrue(math.isnan(result["attention_flash"]))
-        self.assertLess(result["attention_fp16"], 2e-3)
-        self.assertIn("planted", " ".join(_messages(warning)))
-
-    def test_stage_runs_it_once_when_asked(self):
-        stage = SimpleNamespace(video_vae=None)
-        batch = SimpleNamespace(latents=torch.zeros(1))
-        forward = hd._decode_stage_forward(lambda *a: None)
-        calls = []
-
-        def check(device):
-            calls.append(device)
-            hd._checked.append({})
-
-        for flag in (False, True, True):
-            with (
-                _flags(SGLANG_TPU_DEBUG_H3_PRECISION_CHECK=flag),
-                patch.object(hd, "precision_check", side_effect=check),
-                patch.object(hd, "_new_request", side_effect=RuntimeError("stop")),
-            ):
-                with self.assertRaises(RuntimeError):
-                    forward(stage, batch, None)
-        self.assertEqual(calls, [torch.device("cpu")])
-
-
 class TestBatchedDecodeStage(_BatchCase):
     """The stage forward with batched decodes against the stock one, 4 ranks,
     both on the batch-invariant stand-in decoder (so frames must match)."""
@@ -3937,11 +3027,7 @@ class TestBatchedDecodeStage(_BatchCase):
         ):
             hd.logger.info("control: the logger's default keeps main-process lines")
             run = self._run(
-                {
-                    **_ALL_ON,
-                    "SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH": 4,
-                    "SGLANG_TPU_DEBUG_H3_DECODE_TIMING": True,
-                },
+                {**_ALL_ON, "SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH": 4},
                 "ranks.mp4",
                 log,
             )
@@ -3950,7 +3036,6 @@ class TestBatchedDecodeStage(_BatchCase):
         self.assertFalse(any(m.startswith("control:") for m in messages))
         rows = _status_rows(messages)
         self.assertEqual(sorted(rows), list(range(self.world)))
-        self.assertEqual(sum("decode timing" in m for m in messages), self.world)
         self.assertTrue(any("first call of" in m for m in messages))
         self.assertTrue(any("decoding unit by unit" in m for m in messages))
         failed = [r for r in rows.values() if "batched call of" in r["fallbacks"]]
@@ -4012,7 +3097,7 @@ class TestRankStatus(_BatchCase):
         status.saw_free(5 << 30)
         status.saw_free(None)
         status.saw_free(7 << 30)
-        status.events.append("compiled ViT decoder dropped (planted)")
+        status.events.append("compiled ViT decoder blocks dropped (planted)")
         with (
             _flags(SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH=4),
             patch.object(hd.logger, "info") as info,
@@ -4025,7 +3110,9 @@ class TestRankStatus(_BatchCase):
         self.assertEqual((row["units"], row["calls"]), ("12", [1, 4, 4, 3]))
         self.assertEqual((row["cap"], row["cuts"], row["cut"]), ("4", "1", "4->3"))
         self.assertEqual(row["free"], "5.00 GiB")
-        self.assertEqual(row["fallbacks"], "compiled ViT decoder dropped (planted)")
+        self.assertEqual(
+            row["fallbacks"], "compiled ViT decoder blocks dropped (planted)"
+        )
         self.assertEqual(row["peak"], "1024 MiB reserved, 512 MiB allocated")
 
     def test_stage_logs_a_status_line_only_with_decoder_flags(self):
@@ -4048,17 +3135,11 @@ class TestRankStatus(_BatchCase):
             ({"SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH": 1}, False),
             ({"SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH": 4}, True),
             ({"SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE": True}, True),
-            ({"SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE": True}, True),
-            ({"SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION": True}, True),
             ({"SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS": True}, True),
-            ({"SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE": True}, True),
-            ({"SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL": True}, True),
             ({"SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION": True}, True),
-            ({"SGLANG_TPU_DEBUG_H3_DECODE_TIMING": True}, True),
         ):
             with (
                 _flags(**flags),
-                patch.object(hd, "compile_decoder"),
                 patch.object(hd, "compile_decoder_blocks"),
                 patch.object(hd.logger, "info") as info,
             ):
@@ -4087,9 +3168,6 @@ class TestRankStatus(_BatchCase):
     def test_one_off_lines_reach_every_rank(self):
         torch._dynamo.reset()
         hd._compiled_vaes.clear()
-        hd._compiled_decoders.clear()
-        checked = list(hd._checked)
-        hd._checked.clear()
 
         def broken_backend(gm, example_inputs):
             raise RuntimeError("planted compile failure")
@@ -4106,22 +3184,14 @@ class TestRankStatus(_BatchCase):
                 blocks = _tiny_video_vae()
                 hd.compile_decoder_blocks(blocks, broken)
                 blocks.decode(z)
-                whole = _tiny_video_vae()
-                hd.compile_decoder(whole, broken)
-                whole.decode(z)
-                hd.precision_check(torch.device("cpu"))
                 hd._warn_once("memory", "planted memory line")
         finally:
-            hd._checked[:] = checked
             torch._dynamo.reset()
         messages = [record.getMessage() for record in logs.records]
         self.assertFalse(any(m.startswith("control:") for m in messages))
         for expected in (
             "compiling 1 ViT decoder blocks",
             "compiled ViT decoder block failed",
-            "compiling the ViT decoder",
-            "compiled ViT decoder failed",
-            "precision check",
             "planted memory line",
         ):
             self.assertTrue(any(expected in m for m in messages), expected)
@@ -4133,12 +3203,7 @@ class TestInstall(CustomTestCase):
         for name, value in (
             ("SGLANG_TPU_ENABLE_H3_STREAM_SAVE", True),
             ("SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH", 4),
-            ("SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE", True),
-            ("SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION", True),
-            ("SGLANG_TPU_DEBUG_H3_PRECISION_CHECK", True),
             ("SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS", True),
-            ("SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE", True),
-            ("SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL", True),
             ("SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION", True),
         ):
             with _flags(**{name: value}):

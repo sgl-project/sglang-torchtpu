@@ -35,33 +35,13 @@ Runtime patch, tracked debt:
       unit in eager mode): the same tiles, assembly, blend and fp16 autocast,
       only the matmul shapes change, so rounding moves. A call takes only as
       many units as the device's free memory covers;
-  (6) the whole ViT decoder is torch.compiled instead of (4): one program a
-      decoder-call batch size (static shapes), eager again if a compiled call
-      raises. Rounding moves as in (4);
-  (7) the ViT attention runs on fp32 copies of its fp16 q/k/v outside autocast
-      (torch_tpu has a flash attention path for fp32 and bf16 inputs, none for
-      fp16, whose path writes every [heads, tokens, tokens] score matrix out),
-      its output rounded back to fp16. Rounding moves; the attention is at
-      least as precise as the fp16 one only if the kernel's matmuls run at
-      HIGH or HIGHEST, so it is gated on a decode against fp32;
-  (8) the ViT decoder's input and output projections (x_embedder, proj_out)
+  (6) the ViT decoder's input and output projections (x_embedder, proj_out)
       run outside autocast on any device, as the released decoder runs them
       (``torch.autocast("cuda", enabled=False)``): sglang's
       ``_cuda_autocast_disabled`` turns autocast off for CUDA tensors only, so
       on TPU both run with fp16 operands. Moves the decode toward the released
       precision, so it is gated on a decode against fp32;
-  (9) debug: the video decode runs in fp32 (no autocast, the loader keeps the
-      block weights fp32, the ViT attention as fp32 matmuls), the reference
-      those decoder checks hold candidates against;
-  (10) the ViT block linears run under the fp16 autocast as four bf16 MXU
-      passes with float32 accumulation (:func:`fp16_split_linear`): fp16
-      operands split exactly into bf16 high and low parts, the weights once on
-      the device (:func:`prepare_split_weights`), every product kept, the bias
-      added in float32 and the sum rounded to fp16 once (an fp16 matmul with
-      float32 accumulation, as cuBLAS runs the released decode; today's TPU
-      fp16 linear rounds the product before its bias add). Rounding moves, so
-      it is gated on a decode against fp32;
-  (11) the ViT attention runs, inside a decode with fp16 q/k/v and a decoder
+  (7) the ViT attention runs, inside a decode with fp16 q/k/v and a decoder
       whose q/k norms are parameter-free RMSNorms over 64-wide heads, as a
       Pallas flash kernel (minimax_h3_vae_attention: scores kept in VMEM,
       the three bf16 products of an fp16 dot left in float32, a float32
@@ -69,24 +49,21 @@ Runtime patch, tracked debt:
       fp16 rounding) instead of torch_tpu's fp16 SDPA (no flash path; it
       writes and rounds every score). Rounding moves, at least as precise as
       the fp16 SDPA; gated on a decode against fp32;
-  (12) the ViT block linears run under the fp16 autocast as a Pallas kernel
+  (8) the ViT block linears run under the fp16 autocast as a Pallas kernel
       (minimax_h3_vae_linear: fp16 activations and weights split exactly
       into bf16 hi + lo in VMEM, XLA's three MXU products, the bias added in
       float32, one fp16 rounding) instead of XLA's fp16 dot, which streams
       the activations as unpacked fp32 rows and rounds before the bias add.
-      Takes the place of (10); rounding moves, at least as precise as
-      today's fp16 linear; gated on a decode against fp32;
-  (13) with (11) and (12), each ViT block runs as five custom calls
+      Rounding moves, at least as precise as today's fp16 linear; gated on a
+      decode against fp32;
+  (9) with (7) and (8), each ViT block runs as five custom calls
       (minimax_h3_vae_fused and the flash kernel) with its norms, RoPE,
       gating and residual adds inside, over int16 copies of the block
       weights that the fp16 weights then view (w2 also as bf16 hi + lo,
       2.4 GB, where a decode stage leaves room) and a residual stream padded
       to 1,800 tokens a unit; one fp16 rounding a block where the stock
-      block has 13; gated on a decode against fp32;
-  (14) with (5), the decoder call's ops outside the ViT blocks run unit by
-      unit, so with (13), whose blocks round a unit alike in any batch, a
-      unit's frames do not depend on the units sharing its calls.
-  With any of (4)-(14), each rank logs one status line a stage call: its
+      block has 13; gated on a decode against fp32.
+  With any of (4)-(9), each rank logs one status line a stage call: its
   decoder-call sizes, the calls free memory cut, fallbacks, and its peak.
   While installed, the stage's own encode-while-decoding (sglang#41819) stays
   off: the mp4 is written by (3), or after the decode by the worker's save.
@@ -97,12 +74,9 @@ Runtime patch, tracked debt:
   can overlap the video decode, VAEs have a platform compile path and batch
   their tiles within a memory budget, the mp4 writer takes frames as they are
   decoded, the H3 decoder disables autocast for its projections on every
-  device, the loader resolves a decode precision the debug decode can
-  override, XLA streams fp16 dot operands as packed bf16 parts (or the
-  split matmul's TPU A/B shows no gain), torch_tpu has an fp16 flash SDPA
-  at least as precise as its fp16 math path, XLA's fp16 dot runs at bf16
-  MXU speed with one rounding, and XLA fuses the ViT block's norms, RoPE
-  and residual adds into its linears.
+  device, torch_tpu has an fp16 flash SDPA at least as precise as its fp16
+  math path, XLA's fp16 dot runs at bf16 MXU speed with one rounding, and
+  XLA fuses the ViT block's norms, RoPE and residual adds into its linears.
 """
 
 from __future__ import annotations
@@ -115,7 +89,6 @@ import math
 import os
 import queue
 import threading
-import time
 import types
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -135,20 +108,12 @@ _FLAGS = (
     "SGLANG_TPU_ENABLE_H3_AUDIO_FIRST",
     "SGLANG_TPU_ENABLE_H3_STREAM_SAVE",
     "SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE",
-    "SGLANG_TPU_DEBUG_H3_FRAMES_DIR",
     "SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH",
-    "SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE",
-    "SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION",
-    "SGLANG_TPU_DEBUG_H3_PRECISION_CHECK",
     "SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS",
-    "SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE",
-    "SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL",
     "SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION",
     "SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR",
     "SGLANG_TPU_OPT_H3_VAE_FUSED_LINEARS",
     "SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS",
-    "SGLANG_TPU_OPT_H3_VAE_CLIP_SPLIT",
-    "SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT",
 )
 
 # Keyword arguments that make the logger print on every rank: its info and
@@ -173,7 +138,6 @@ def install() -> None:
     global _installed
     if _installed:
         return
-    from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
     from sglang.multimodal_gen.runtime.managers import gpu_worker
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
         MiniMaxH3VideoVAE,
@@ -201,15 +165,13 @@ def install() -> None:
     _stock["block_forward"] = base_module.TransformerBlock.forward
     _stock["save_outputs"] = gpu_worker.save_outputs
     _stock["projection_autocast"] = vae_vit._cuda_autocast_disabled
-    _stock["resolve_decode_precision"] = decoding.resolve_decode_precision
-    _stock["loader_decode_precision"] = vae_loader.resolve_decode_precision
     _stock["streamed_video_output_path"] = decoding.streamed_video_output_path
 
     MiniMaxH3VideoVAE.decode_temporal = _flat_decode_temporal(_stock["decode_temporal"])
     MiniMaxH3VideoVAE._run_tile_tasks = _batched_run_tile_tasks(
         _stock["run_tile_tasks"]
     )
-    MiniMaxH3VideoVAE.decode = _eager_on_decoder_compile_failure(_stock["vae_decode"])
+    MiniMaxH3VideoVAE.decode = _routed_decode(_stock["vae_decode"])
     MiniMaxH3DecodingStage.forward = _decode_stage_forward(_stock["forward"])
     decoding.streamed_video_output_path = _no_stage_stream(
         _stock["streamed_video_output_path"]
@@ -220,27 +182,18 @@ def install() -> None:
     )
     base_module.TransformerBlock.forward = _fused_block_forward(_stock["block_forward"])
     gpu_worker.save_outputs = _save_outputs(_stock["save_outputs"])
-    vae_attention._sdpa_attention = _sdpa_in_fp32(_stock["sdpa"])
+    vae_attention._sdpa_attention = _flash_sdpa(_stock["sdpa"])
     vae_vit._cuda_autocast_disabled = _projection_autocast(
         _stock["projection_autocast"]
-    )
-    decoding.resolve_decode_precision = _reference_decode_precision(
-        _stock["resolve_decode_precision"]
-    )
-    # The loader rounds the decoder's block weights to the decode dtype at load
-    # through its own binding; the fp32 reference needs them fp32.
-    vae_loader.resolve_decode_precision = _reference_decode_precision(
-        _stock["loader_decode_precision"]
     )
     refresh_precision_flags()
     _installed = True
     logger.info(
         "MiniMax H3 decode: flat unit schedule %s, audio first %s (%d units a rank "
         "in the audio wave, %d on the audio owner), streamed mp4 save %s, ViT "
-        "block compile %s, %d units a decoder call, ViT decoder compile %s, fp32 "
-        "ViT attention %s, fp32 ViT projections %s, fp16 split matmul %s, flash "
-        "ViT attention %s, Pallas ViT linears %s, fused ViT blocks %s, split "
-        "ViT weights %s (a clip at a time %s), batch-invariant decode %s%s",
+        "block compile %s, %d units a decoder call, fp32 ViT projections %s, "
+        "flash ViT attention %s, Pallas ViT linears %s, fused ViT blocks %s, "
+        "split ViT weights %s",
         _on("SGLANG_TPU_ENABLE_H3_VAE_FLAT_DECODE"),
         _on("SGLANG_TPU_ENABLE_H3_AUDIO_FIRST"),
         tpu_envs.SGLANG_TPU_OPT_H3_AUDIO_WAVE_UNITS.get(),
@@ -248,17 +201,11 @@ def install() -> None:
         _on("SGLANG_TPU_ENABLE_H3_STREAM_SAVE"),
         _on("SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE"),
         decode_batch_units(),
-        _on("SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE"),
-        "on" if _fp32_attention else "off",
         "on" if _fp32_projections else "off",
-        "on" if _fp16_split else "off",
         "on" if _flash_attention else "off",
         "on" if _pallas_linear else "off",
         "on" if _fused_linears else "off",
         "on" if _split_weights else "off",
-        "on" if _clip_split else "off",
-        "on" if _batch_invariant else "off",
-        "; debug: fp32 reference decode" if _fp32_reference else "",
         **_ALL_RANKS,
     )
 
@@ -441,7 +388,6 @@ def run_flat_decode(
     *,
     after_first_unit: Callable[[], None] | None = None,
     on_clip: Callable[[int, torch.Tensor, bool], None] | None = None,
-    timing: _Timing | None = None,
     batch: int = 1,
 ) -> torch.Tensor:
     """Decode this rank's units wave by wave and replay the stock assembly.
@@ -499,28 +445,19 @@ def run_flat_decode(
         owners = wave.owners()
         mine = [wave.start + i for i, owner in enumerate(owners) if owner == rank]
         width = max(wave.counts)
-        # Weights a wave's calls hold split are freed before its gather (and
-        # are not held around the audio decode).
         audio = index == 0 and after_first_unit is not None
-        scope = contextlib.nullcontext() if audio else _clip_scope()
         if batch > 1:
-            with scope:
-                stacked = decode_wave_batched(index, mine, width)
-            if timing is not None:
-                timing.mark(f"wave{index}_units{len(mine)}")
+            stacked = decode_wave_batched(index, mine, width)
             gathered = all_gather(stacked)
             del stacked
         else:
             local = []
-            with scope:
-                for k, unit in enumerate(mine):
-                    local.append(vae.decode(plan.units[unit]))
-                    if k == 0 and audio:
-                        after_first_unit()
+            for k, unit in enumerate(mine):
+                local.append(vae.decode(plan.units[unit]))
+                if k == 0 and audio:
+                    after_first_unit()
             if index == 0 and not mine and after_first_unit is not None:
                 after_first_unit()
-            if timing is not None:
-                timing.mark(f"wave{index}_units{len(mine)}")
             if local:
                 template[:] = local[:1]
             if not template:
@@ -542,8 +479,6 @@ def run_flat_decode(
             ]
             for k, unit in enumerate(src_units):
                 results[unit] = tensors[k]
-        if timing is not None:
-            timing.mark(f"wave{index}_gather")
 
     def gather_through(stop: int) -> None:
         while state["wave"] < len(waves) and waves[state["wave"]].start < stop:
@@ -634,7 +569,6 @@ def _flat_decode_temporal(decode_temporal):
                 _decode_audio_first, request, output_frames
             )
             on_clip = _ClipStream(self, request, output_frames)
-        timing = request.timing if request is not None else None
         group = get_decode_parallel_group_coordinator()
         return run_flat_decode(
             self,
@@ -647,7 +581,6 @@ def _flat_decode_temporal(decode_temporal):
             lambda tensor: group.all_gather(tensor, separate_tensors=True),
             after_first_unit=after_first_unit,
             on_clip=on_clip,
-            timing=timing,
             batch=decode_batch_units(),
         )
 
@@ -740,18 +673,12 @@ def _status_wanted() -> bool:
     change the video decoder's calls, compile or precision)."""
     return (
         int(tpu_envs.SGLANG_TPU_OPT_H3_VAE_DECODE_BATCH.get() or 0) > 1
-        or tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE.get()
         or tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE.get()
-        or tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION.get()
         or tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS.get()
-        or tpu_envs.SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE.get()
-        or tpu_envs.SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL.get()
         or tpu_envs.SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION.get()
         or tpu_envs.SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR.get()
         or tpu_envs.SGLANG_TPU_OPT_H3_VAE_FUSED_LINEARS.get()
         or tpu_envs.SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS.get()
-        or tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT.get()
-        or tpu_envs.SGLANG_TPU_DEBUG_H3_DECODE_TIMING.get()
     )
 
 
@@ -951,7 +878,6 @@ def _batched_run_tile_tasks(run_tile_tasks):
     """tiled_decode's local tiles through :func:`_unit_calls` (stock schedule)."""
 
     @functools.wraps(run_tile_tasks)
-    @_clip_scope()  # the clip's decoder calls
     def run_tile_tasks_batched(
         self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch=1
     ):
@@ -998,7 +924,6 @@ class _Request:
     audio_payload: dict | None = None
     audio_error: BaseException | None = None
     save: StreamedSave | None = None
-    timing: _Timing | None = None
 
 
 _REQUEST: contextvars.ContextVar[_Request | None] = contextvars.ContextVar(
@@ -1089,8 +1014,6 @@ def _new_request(stage, batch, server_args) -> _Request | None:
     request = _Request(stage, batch, server_args, audio_latent, audio_rank)
     if tpu_envs.SGLANG_TPU_ENABLE_H3_STREAM_SAVE.get():
         request.stream_path = _stream_path(batch)
-    if tpu_envs.SGLANG_TPU_DEBUG_H3_DECODE_TIMING.get():
-        request.timing = _Timing(batch.request_id)
     return request
 
 
@@ -1117,8 +1040,6 @@ def _decode_audio_first(request: _Request, num_frames: int) -> None:
         _start_stream(request, num_frames)
         return
     request.audio_ran = True
-    if request.timing is not None:
-        request.timing.mark("audio_start")
     try:
         # Outside the video decode the audio runs without autocast.
         with (
@@ -1131,8 +1052,6 @@ def _decode_audio_first(request: _Request, num_frames: int) -> None:
     except Exception as exc:
         request.audio_error = exc
         return
-    if request.timing is not None:
-        request.timing.mark("audio_end")
     _start_stream(request, num_frames)
 
 
@@ -1182,13 +1101,7 @@ def _decode_stage_forward(forward):
     @functools.wraps(forward)
     def decode_stage_forward(self, batch, server_args):
         refresh_precision_flags()
-        if _fp32_reference:
-            hold_fp32_reference_weights(self.video_vae)
-        if tpu_envs.SGLANG_TPU_DEBUG_H3_PRECISION_CHECK.get() and not _checked:
-            precision_check(batch.latents.device)
-        if tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_DECODE_COMPILE.get():
-            compile_decoder(self.video_vae)
-        elif tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE.get():
+        if tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_BLOCK_COMPILE.get():
             compile_decoder_blocks(self.video_vae)
         request = _new_request(self, batch, server_args)
         status = None
@@ -1208,15 +1121,10 @@ def _decode_stage_forward(forward):
         finally:
             _STATUS.reset(status_token)
             _REQUEST.reset(token)
-            if request is not None and request.timing is not None:
-                request.timing.log()
             if status is not None:
                 _log_status(status, batch)
             if _fused_linears:
                 _note_stage_room(self.video_vae)
-        dump_dir = tpu_envs.SGLANG_TPU_DEBUG_H3_FRAMES_DIR.get()
-        if dump_dir and not batch.is_warmup:
-            _dump_frames(dump_dir, batch, output)
         return output
 
     decode_stage_forward.__wrapped_for_tpu__ = True
@@ -1239,30 +1147,6 @@ def _log_status(status: DecodeStatus, batch) -> None:
         logger.warning(
             "MiniMax H3 decode status line failed", exc_info=True, **_ALL_RANKS
         )
-
-
-def _dump_frames(dump_dir: str, batch, output) -> None:
-    """Debug: the stage's input latents, and the frames the save would encode
-    and the waveform, as .npy files (output rank)."""
-    import numpy as np
-
-    from sglang.multimodal_gen.runtime.distributed import (
-        get_replica_group,
-        model_parallel_is_initialized,
-    )
-    from sglang.multimodal_gen.runtime.entrypoints.utils import _sample_to_uint8_frames
-
-    if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
-        return
-    os.makedirs(dump_dir, exist_ok=True)
-    arrays = {
-        "latents": batch.latents.float().cpu().numpy(),
-        "audio_latents": batch.audio_latents.float().cpu().numpy(),
-        "frames": np.stack(_sample_to_uint8_frames(output.output[0])),
-        "audio": output.audio[0].float().cpu().numpy(),
-    }
-    for name, array in arrays.items():
-        np.save(os.path.join(dump_dir, f"{batch.request_id}_{name}.npy"), array)
 
 
 # ---------------------------------------------------------------------------
@@ -1385,7 +1269,6 @@ class _QueuedFrames(list):
         self._iterated = False
         self._head: Any = None
         self.yielded = 0
-        self.first_frame_s: float | None = None
 
     def __len__(self) -> int:
         return self._num_frames
@@ -1416,8 +1299,6 @@ class _QueuedFrames(list):
             for frame in frames:
                 if self.yielded == self._num_frames:
                     raise RuntimeError("MiniMax H3 streamed more frames than planned")
-                if self.first_frame_s is None:
-                    self.first_frame_s = time.perf_counter()
                 self.yielded += 1
                 yield frame
 
@@ -1447,8 +1328,6 @@ class StreamedSave:
         )
         self._fps = fps
         self.error: BaseException | None = None
-        self.start_s = time.perf_counter()
-        self.done_s: float | None = None
         self._done = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="minimax-h3-mp4", daemon=True
@@ -1486,7 +1365,6 @@ class StreamedSave:
             self.error = exc
         finally:
             self._audio = None
-            self.done_s = time.perf_counter()
             self._done.set()
 
     def wait(self, timeout: float | None = None) -> bool:
@@ -1567,17 +1445,7 @@ def _save_outputs(save_outputs):
             path = build_output_path(0)
             save = _SAVES.pop(path, None)
             if save is not None:
-                waited = time.perf_counter()
                 if save.wait(STREAM_SAVE_TIMEOUT_S):
-                    if tpu_envs.SGLANG_TPU_DEBUG_H3_DECODE_TIMING.get():
-                        logger.info(
-                            "MiniMax H3 streamed mp4: first frame %.3f s and done "
-                            "%.3f s after the audio; the save waited %.3f s",
-                            (save.frames.first_frame_s or save.start_s) - save.start_s,
-                            save.done_s - save.start_s,
-                            time.perf_counter() - waited,
-                            **_ALL_RANKS,
-                        )
                     return [path]
                 logger.warning(
                     "MiniMax H3 streamed mp4 save failed (%s); saving again",
@@ -1607,7 +1475,7 @@ def compile_decoder_blocks(vae, compile_kwargs: dict | None = None) -> int:
     )
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if vae is None or id(vae) in _compiled_vaes or id(vae) in _compiled_decoders:
+    if vae is None or id(vae) in _compiled_vaes:
         return 0
     _compiled_vaes.add(id(vae))
     # Layerwise offload swaps block weights under hooks a compiled block bakes in.
@@ -1670,69 +1538,27 @@ def _eager_on_compile_failure(forward_transformer_blocks):
 
 
 # ---------------------------------------------------------------------------
-# Whole ViT decoder compile
+# Decoder calls: Pallas routing and the rank's status
 # ---------------------------------------------------------------------------
 
-_compiled_decoders: set[int] = set()
 
-
-def compile_decoder(vae, compile_kwargs: dict | None = None) -> bool:
-    """torch.compile ``vae``'s ViT decoder once (one program a batch size).
-
-    Takes the place of :func:`compile_decoder_blocks`: compiled blocks are
-    reset to eager so the decoder's program holds every block itself.
-    """
-    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-        is_layerwise_offloaded_module,
-    )
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
-    if vae is None or id(vae) in _compiled_decoders:
-        return False
-    _compiled_decoders.add(id(vae))
-    # Layerwise offload swaps block weights under hooks a compiled graph bakes in.
-    if is_layerwise_offloaded_module(vae):
-        return False
-    if compile_kwargs is None:
-        compile_kwargs = {
-            "backend": current_platform.get_compile_backend(),
-            "dynamic": False,
-            "fullgraph": True,
-        }
-    for block in vae.decoder.transformer_blocks:
-        block._compiled_call_impl = None
-    vae.decoder.compile(**compile_kwargs)
-    logger.info(
-        "MiniMax H3 video VAE: compiling the ViT decoder (%d blocks), one program "
-        "a decoder-call batch size",
-        len(vae.decoder.transformer_blocks),
-        **_ALL_RANKS,
-    )
-    return True
-
-
-def _eager_on_decoder_compile_failure(decode):
-    """``vae.decode``: records each call's units in the rank's status; a failed
-    call through the compiled decoder reruns eagerly, and the compile is
-    dropped only if that rerun works."""
+def _routed_decode(decode):
+    """``vae.decode``: routes the call's ViT attention, block linears and
+    blocks to the Pallas paths its flags select, and records the call's units
+    in the rank's status."""
 
     @functools.wraps(decode)
-    def guarded(self, z):
-        global _split_active, _flash_active, _linear_active, _fused_active
-        if _batch_invariant:
-            _units_alone(self)
+    def routed(self, z):
+        global _flash_active, _linear_active, _fused_active
         linear = _linear_wanted(self, z)
-        active = not linear and _split_wanted(self, z)
         flash = _flash_wanted(self, z)
         fused = _fused_wanted(self, z, linear, flash)
-        previous, _split_active = _split_active, active
         previous_flash, _flash_active = _flash_active, flash
         previous_linear, _linear_active = _linear_active, linear
         previous_fused, _fused_active = _fused_active, fused
         try:
-            output = _decode_once(decode, self, z)
+            output = decode(self, z)
         finally:
-            _split_active = previous
             _flash_active = previous_flash
             _linear_active = previous_linear
             _fused_active = previous_fused
@@ -1741,143 +1567,50 @@ def _eager_on_decoder_compile_failure(decode):
             status.calls.append(int(z.shape[0]))
         return output
 
-    guarded.__wrapped_for_tpu__ = True
-    return guarded
-
-
-def _unit_by_unit(forward):
-    """A module's forward on each unit of a decoder call in turn when the call
-    holds several and BATCH_INVARIANT is on: the op then rounds a unit as in a
-    call of its own (an XLA dot, norm or conv may round by the batch's shape)."""
-
-    @functools.wraps(forward)
-    def unit_by_unit(x, *args, **kwargs):
-        if not _batch_invariant or x.dim() < 2 or x.shape[0] < 2:
-            return forward(x, *args, **kwargs)
-        units = [forward(x[k : k + 1], *args, **kwargs) for k in range(x.shape[0])]
-        return torch.cat(units)
-
-    unit_by_unit.unit_by_unit = True
-    return unit_by_unit
-
-
-def _units_alone(vae) -> None:
-    """The decoder call's ops outside the ViT blocks that see its batch
-    (post_quant_conv, x_embedder, norm_out, proj_out) run unit by unit
-    (:func:`_unit_by_unit`); patched on the modules once a VAE."""
-    decoder = getattr(vae, "decoder", None)
-    modules = [
-        getattr(decoder, n, None) for n in ("x_embedder", "norm_out", "proj_out")
-    ]
-    for module in (getattr(vae, "post_quant_conv", None), *modules):
-        if module is not None and not hasattr(module.forward, "unit_by_unit"):
-            module.forward = _unit_by_unit(module.forward)
-
-
-def _decode_once(decode, vae, z):
-    decoder = vae.decoder
-    compiled = getattr(decoder, "_compiled_call_impl", None)
-    if compiled is None:
-        return decode(vae, z)
-    error = None
-    try:
-        return decode(vae, z)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-    # Outside the handler: the failed call's tensors are released first.
-    decoder._compiled_call_impl = None
-    try:
-        output = decode(vae, z)
-    except Exception:
-        # Eager fails too (e.g. out of memory): not the compile's fault.
-        decoder._compiled_call_impl = compiled
-        _event(f"compiled ViT decoder failed ({error}), eager too")
-        raise
-    _event(f"compiled ViT decoder dropped ({error})")
-    logger.warning(
-        "MiniMax H3 compiled ViT decoder failed (%s); decoding eagerly",
-        error,
-        **_ALL_RANKS,
-    )
-    return output
+    routed.__wrapped_for_tpu__ = True
+    return routed
 
 
 # ---------------------------------------------------------------------------
-# Decoder precision: fp32 ViT attention, fp32 projections, fp32 reference
+# Decoder precision: fp32 projections, flash ViT attention
 # ---------------------------------------------------------------------------
 
 # The precision flags as of the current decode stage call (module constants to
 # compiled code, which reads no environment):
-# SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION,
-_fp32_attention = False
 # SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS,
 _fp32_projections = False
-# SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE,
-_fp32_reference = False
-# SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL,
-_fp16_split = False
 # SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION,
 _flash_attention = False
 # SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR,
 _pallas_linear = False
 # SGLANG_TPU_OPT_H3_VAE_FUSED_LINEARS,
 _fused_linears = False
-# SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS,
+# SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS.
 _split_weights = False
-# SGLANG_TPU_OPT_H3_VAE_CLIP_SPLIT,
-_clip_split = False
-# SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT.
-_batch_invariant = False
-
-
-def refresh_fp32_attention() -> bool:
-    global _fp32_attention
-    _fp32_attention = bool(tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_FP32_ATTENTION.get())
-    return _fp32_attention
 
 
 def refresh_precision_flags() -> None:
-    global _fp32_projections, _fp32_reference, _fp16_split, _flash_attention
-    global _pallas_linear, _fused_linears, _split_weights, _clip_split
-    global _batch_invariant
-    refresh_fp32_attention()
+    global _fp32_projections, _flash_attention, _pallas_linear, _fused_linears
+    global _split_weights
     _fp32_projections = bool(tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_FP32_PROJECTIONS.get())
-    _fp32_reference = bool(tpu_envs.SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE.get())
-    _fp16_split = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL.get())
     _flash_attention = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION.get())
     _pallas_linear = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR.get())
     _fused_linears = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_FUSED_LINEARS.get())
     _split_weights = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_SPLIT_WEIGHTS.get())
-    _clip_split = bool(tpu_envs.SGLANG_TPU_OPT_H3_VAE_CLIP_SPLIT.get())
-    _batch_invariant = bool(tpu_envs.SGLANG_TPU_ENABLE_H3_VAE_BATCH_INVARIANT.get())
 
 
-def matmul_attention(query, key, value):
-    """softmax(q k^T / sqrt(d)) v as two explicit matmuls in the inputs' dtype,
-    in the ViT attention's [batch, tokens, heads, head_dim] layout."""
-    q, k, v = (t.transpose(1, 2) for t in (query, key, value))
-    scores = torch.matmul(q, k.transpose(-1, -2)) * (q.shape[-1] ** -0.5)
-    return torch.matmul(torch.softmax(scores, dim=-1), v).transpose(1, 2)
+def _flash_sdpa(sdpa):
+    """The ViT attention: the flash kernel inside a decode that routes it, on
+    q/k/v it takes; the stock SDPA otherwise."""
 
-
-def _sdpa_in_fp32(sdpa):
     @functools.wraps(sdpa)
-    def sdpa_in_fp32(query, key, value):
-        if _fp32_reference and query.dtype == torch.float32:
-            # The reference decode leans on fp32 matmuls only, whose precision
-            # the precision check measures, not on a flash kernel's.
-            return matmul_attention(query, key, value)
+    def flash_sdpa(query, key, value):
         if _flash_active and flash_attention_fits(query, key, value):
             return flash_attention(query, key, value)
-        if not _fp32_attention or query.dtype != torch.float16:
-            return sdpa(query, key, value)
-        # Autocast would cast the fp32 copies back to fp16.
-        with torch.autocast(device_type=query.device.type, enabled=False):
-            output = sdpa(query.float(), key.float(), value.float())
-        return output.to(query.dtype)
+        return sdpa(query, key, value)
 
-    sdpa_in_fp32.__wrapped_for_tpu__ = True
-    return sdpa_in_fp32
+    flash_sdpa.__wrapped_for_tpu__ = True
+    return flash_sdpa
 
 
 def _projection_autocast(cuda_autocast_disabled):
@@ -1895,24 +1628,6 @@ def _projection_autocast(cuda_autocast_disabled):
     return projection_autocast
 
 
-def _reference_decode_precision(resolve_decode_precision):
-    """The decode stage's precision lookup: fp32 for the video VAE with
-    SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE (no autocast, so the decoder's block
-    weights are never cast to fp16 either)."""
-
-    @functools.wraps(resolve_decode_precision)
-    def reference_decode_precision(server_args, component_name="vae", **kwargs):
-        if (
-            component_name == "video_vae"
-            and tpu_envs.SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE.get()
-        ):
-            return torch.float32
-        return resolve_decode_precision(server_args, component_name, **kwargs)
-
-    reference_decode_precision.__wrapped_for_tpu__ = True
-    return reference_decode_precision
-
-
 def _block_linears(decoder) -> list:
     blocks = getattr(decoder, "transformer_blocks", None) or []
     return [
@@ -1920,306 +1635,6 @@ def _block_linears(decoder) -> list:
         for block in blocks
         for linear in (block.attn.to_qkv, block.attn.to_out, block.ff.w1, block.ff.w2)
     ]
-
-
-def hold_fp32_reference_weights(vae) -> int:
-    """Make the decoder's block linears fp32 for the fp32 reference decode.
-
-    The loader keeps them fp32 when the flag is set at server start (its
-    precision lookup is wrapped). Weights an earlier load or decode already
-    rounded to fp16/bf16 cannot be recovered: those are cast to fp32 from
-    their rounded values (one warning), so the decode runs instead of failing
-    on a float32 input against an fp16 weight. Returns the linears cast.
-    """
-    decoder = getattr(vae, "decoder", None)
-    rounded = [
-        linear
-        for linear in _block_linears(decoder)
-        if linear.weight.dtype != torch.float32
-    ]
-    if not rounded:
-        _info_once(
-            "fp32-reference-weights",
-            "MiniMax H3 fp32 reference decode: decoder block weights are fp32",
-        )
-        return 0
-    held = rounded[0].weight.dtype
-    with torch.no_grad():
-        for linear in rounded:
-            _drop_split(linear)
-            linear.to(dtype=torch.float32)
-    decoder._autocast_linear_dtype = None
-    _warn_once(
-        "fp32-reference-rounded",
-        "MiniMax H3 fp32 reference decode: %d decoder block linears were held "
-        "in %s before it (set SGLANG_TPU_DEBUG_H3_VAE_FP32_DECODE at server "
-        "start); decoding them as fp32 copies of the rounded weights",
-        len(rounded),
-        held,
-    )
-    return len(rounded)
-
-
-def _info_once(key: str, message: str, *args) -> None:
-    if key not in _warned:
-        _warned.add(key)
-        logger.info(message, *args, **_ALL_RANKS)
-
-
-# ---------------------------------------------------------------------------
-# fp16-faithful split matmul for the ViT decoder's block linears
-# ---------------------------------------------------------------------------
-
-# True while a vae.decode runs under fp16 autocast with the split flag on: the
-# block linears read it at call time (a constant to compiled code, guarded).
-_split_active = False
-# Device bytes kept free beyond the split weights when they are made.
-SPLIT_RESERVE_BYTES = 4 << 30
-# The TPU op (minimax_h3_split_linear.op()) once registered.
-_split_op = None
-
-
-def split_fp16(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """An fp16 tensor as bf16 (hi, lo) with ``hi + lo == t`` exactly.
-
-    hi is t rounded to bf16 (8 significant bits; bf16 covers fp16's whole
-    exponent range, its subnormals included, so no value under- or
-    overflows); lo = t - hi has at most 4 significant bits and is exact in
-    float32 and in bf16. An infinity gives (inf, 0) (not inf - inf), a NaN
-    (nan, nan).
-    """
-    if t.dtype != torch.float16:
-        raise TypeError(f"split_fp16 takes fp16, got {t.dtype}")
-    hi = t.to(torch.bfloat16)
-    lo = t.float() - hi.float()
-    lo = torch.where(torch.isinf(t), torch.zeros_like(lo), lo)
-    return hi, lo.to(torch.bfloat16)
-
-
-def _split_linear_torch(x16, weight_hi, weight_lo, bias):
-    """The split product as float32 matmuls of the bf16 parts (each product is
-    exact in float32, as on the MXU), off TPU."""
-    with torch.autocast(device_type=x16.device.type, enabled=False):
-        hi, lo = split_fp16(x16)
-        # An infinite input's cross term is 0 (as in its fp16 product), not inf * 0.
-        hi_cross = torch.where(torch.isinf(x16), torch.zeros_like(hi), hi)
-        acc = torch.matmul(hi.float(), weight_hi.float().t())
-        acc = acc + torch.matmul(hi_cross.float(), weight_lo.float().t())
-        acc = acc + torch.matmul(lo.float(), weight_hi.float().t())
-        acc = acc + torch.matmul(lo.float(), weight_lo.float().t())
-        if bias is not None:
-            acc = acc + bias.float()
-        return acc.to(torch.float16)
-
-
-def _split_linear_jax(x, weight_hi, weight_lo, bias):
-    """The JAX function the TPU op runs (minimax_h3_split_linear)."""
-    from sglang_tpu.multimodal_gen import minimax_h3_split_linear
-
-    return minimax_h3_split_linear.split_linear_jax(x, weight_hi, weight_lo, bias)
-
-
-def _split_linear_op():
-    """The TPU op, registered once; prepare_split_weights registers it before
-    any compiled region calls it (which then reads ``_split_op``)."""
-    global _split_op
-    if _split_op is None:
-        from sglang_tpu.multimodal_gen import minimax_h3_split_linear
-
-        _split_op = minimax_h3_split_linear.op()
-    return _split_op
-
-
-def fp16_split_linear(x, weight_hi, weight_lo, bias):
-    """``F.linear`` under fp16 autocast with fp16 weight ``hi + lo``.
-
-    The input is rounded to fp16 as autocast rounds it, multiplied as
-    hi*hi + hi*lo + lo*hi + lo*lo (every product exact, as in an fp16 matmul)
-    with float32 accumulation, the fp16 bias is added in float32 and the
-    result rounded to fp16 once. On TPU a JAX op (four bf16 MXU passes);
-    elsewhere float32 matmuls of the same parts.
-    """
-    shape = x.shape
-    x16 = x.reshape(-1, shape[-1]).to(torch.float16)
-    if x16.device.type == "tpu":
-        if bias is None:
-            bias = torch.zeros(
-                weight_hi.shape[0], dtype=torch.float16, device=x16.device
-            )
-        split_op = _split_op if _split_op is not None else _split_linear_op()
-        out = split_op(x16, weight_hi, weight_lo, bias.to(torch.float16))
-    else:
-        out = _split_linear_torch(x16, weight_hi, weight_lo, bias)
-    return out.reshape(*shape[:-1], out.shape[-1])
-
-
-def _split_key(weight: torch.Tensor) -> tuple:
-    return (
-        weight.data_ptr(),
-        weight._version,
-        weight.device,
-        weight.dtype,
-        tuple(weight.shape),
-    )
-
-
-def _split_current(linear) -> bool:
-    hi = getattr(linear, "h3_weight_hi", None)
-    return (
-        hi is not None
-        and hi.dtype == torch.bfloat16
-        and linear.h3_weight_lo.dtype == torch.bfloat16
-        and getattr(linear, "_h3_split_key", None) == _split_key(linear.weight)
-    )
-
-
-def _split_reusable(linear) -> bool:
-    """Whether the linear's split buffers can take a new split in place."""
-    weight = linear.weight
-    buffers = [linear._buffers.get(n) for n in ("h3_weight_hi", "h3_weight_lo")]
-    return all(
-        b is not None
-        and b.dtype == torch.bfloat16
-        and b.shape == weight.shape
-        and b.device == weight.device
-        for b in buffers
-    )
-
-
-def _drop_split(linear) -> None:
-    for name in ("h3_weight_hi", "h3_weight_lo"):
-        linear._buffers.pop(name, None)
-    linear.__dict__.pop("_h3_split_key", None)
-
-
-def _split_linear_forward(self, x):
-    """A decoder block linear: the Pallas linear or the split product while a
-    vae.decode runs under fp16 autocast with its flag on, the stock
-    ``nn.Linear`` otherwise."""
-    if _linear_active and pallas_linear_fits(x, self.weight):
-        return pallas_linear(x, self.weight, self.bias)
-    if _split_active and getattr(self, "h3_weight_hi", None) is not None:
-        return fp16_split_linear(x, self.h3_weight_hi, self.h3_weight_lo, self.bias)
-    return torch.nn.Linear.forward(self, x)
-
-
-def prepare_split_weights(vae) -> int:
-    """Split each fp16 block linear weight of ``vae``'s ViT decoder into bf16
-    hi/lo buffers once (kept until the weight changes); the linears with a
-    current split. None is made for a layerwise-offloaded VAE, a non-fp16 or
-    non-finite weight, or while the device's free memory is short."""
-    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-        is_layerwise_offloaded_module,
-    )
-
-    decoder = getattr(vae, "decoder", None)
-    linears = _block_linears(decoder)
-    if not linears or is_layerwise_offloaded_module(vae):
-        return 0
-    # Called on every vae.decode: unchanged weights and splits (same storage,
-    # no in-place write, buffers not moved or cast) answer from the memo.
-    keys = _split_memo_keys(linears)
-    memo = decoder.__dict__.get("_h3_split_memo")
-    if memo is not None and memo[0] == keys:
-        return memo[1]
-    stale = [linear for linear in linears if not _split_current(linear)]
-    splittable = [linear for linear in stale if linear.weight.dtype == torch.float16]
-    for linear in stale:
-        if linear.weight.dtype != torch.float16:
-            _drop_split(linear)
-    fresh = [linear for linear in splittable if not _split_reusable(linear)]
-    short = False
-    if fresh:
-        need = sum(4 * linear.weight.numel() for linear in fresh)
-        # The weights stay through the next request's denoise: they must fit
-        # under this request's peak so far as well as in today's free memory.
-        room = [
-            b
-            for b in (
-                free_device_bytes(fresh[0].weight.device),
-                peak_headroom_bytes(fresh[0].weight.device),
-            )
-            if b is not None
-        ]
-        free = min(room) if room else None
-        if free is not None and free < need + SPLIT_RESERVE_BYTES:
-            _warn_once(
-                "split-memory",
-                "MiniMax H3 fp16 split matmul: %.2f GiB free (under the "
-                "request's peak), the split weights need %.2f GiB plus a %.0f "
-                "GiB reserve; decoding with the stock fp16 linears",
-                free / 2**30,
-                need / 2**30,
-                SPLIT_RESERVE_BYTES / 2**30,
-            )
-            splittable = [linear for linear in splittable if linear not in fresh]
-            for linear in fresh:
-                _drop_split(linear)
-            short = True
-    if splittable and splittable[0].weight.device.type == "tpu":
-        # Registered here, outside any compiled region that will call it.
-        _split_linear_op()
-    made = 0
-    with torch.no_grad():
-        for linear in splittable:
-            weight = linear.weight.detach()
-            if not bool(torch.isfinite(weight).all()):
-                _drop_split(linear)
-                _warn_once(
-                    "split-nonfinite",
-                    "MiniMax H3 fp16 split matmul: a decoder weight is not "
-                    "finite; that linear keeps the stock fp16 path",
-                )
-                continue
-            hi, lo = split_fp16(weight)
-            if _split_reusable(linear):
-                # Same buffers (a compiled block keeps its inputs), new values.
-                linear.h3_weight_hi.copy_(hi)
-                linear.h3_weight_lo.copy_(lo)
-            else:
-                linear.register_buffer("h3_weight_hi", hi, persistent=False)
-                linear.register_buffer("h3_weight_lo", lo, persistent=False)
-            linear._h3_split_key = _split_key(linear.weight)
-            if "forward" not in linear.__dict__:
-                linear.forward = types.MethodType(_split_linear_forward, linear)
-            made += 1
-    if made:
-        _info_once(
-            f"split-made-{id(vae)}",
-            "MiniMax H3 fp16 split matmul: %d decoder block linears split into "
-            "bf16 hi/lo (%.2f GiB) on %s",
-            made,
-            sum(4 * linear.weight.numel() for linear in splittable) / 2**30,
-            linears[0].weight.device,
-        )
-    count = sum(1 for linear in linears if _split_current(linear))
-    # A split memory refused is tried again on the next call.
-    decoder.__dict__["_h3_split_memo"] = (
-        None if short else (_split_memo_keys(linears), count)
-    )
-    return count
-
-
-def _split_memo_keys(linears) -> tuple:
-    keys = []
-    for linear in linears:
-        weight, hi = linear.weight, linear._buffers.get("h3_weight_hi")
-        keys.append((weight.data_ptr(), weight._version, weight.dtype))
-        keys.append(None if hi is None else (hi.data_ptr(), hi._version, hi.dtype))
-    return tuple(keys)
-
-
-def _split_wanted(vae, z) -> bool:
-    """Whether this vae.decode runs the split product (flag on, fp16 autocast
-    on the latent's device), making the split weights on first use."""
-    if not _fp16_split or not isinstance(z, torch.Tensor):
-        return False
-    device_type = z.device.type
-    if not torch.is_autocast_enabled(device_type):
-        return False
-    if torch.get_autocast_dtype(device_type) != torch.float16:
-        return False
-    return prepare_split_weights(vae) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -2248,10 +1663,18 @@ def _linear_wanted(vae, z) -> bool:
     linears = _block_linears(getattr(vae, "decoder", None))
     for linear in linears:
         if "forward" not in linear.__dict__:
-            linear.forward = types.MethodType(_split_linear_forward, linear)
+            linear.forward = types.MethodType(_pallas_linear_forward, linear)
     if linears and device_type == "tpu" and _linear_op is None:
         _pallas_linear_op()
     return bool(linears)
+
+
+def _pallas_linear_forward(self, x):
+    """A decoder block linear: the Pallas linear while a vae.decode runs
+    under fp16 autocast with its flag on, the stock ``nn.Linear`` otherwise."""
+    if _linear_active and pallas_linear_fits(x, self.weight):
+        return pallas_linear(x, self.weight, self.bias)
+    return torch.nn.Linear.forward(self, x)
 
 
 def _pallas_linear_op():
@@ -2492,14 +1915,8 @@ _fused_ops = None
 # The least headroom under a decode stage's reserved peak seen so far, with w2
 # unsplit (:func:`_note_stage_room`); None until a stage ran on a device.
 _stage_room = None
-# While one clip's (or gather wave's) decoder calls run (:func:`_clip_scope`):
-# [decided, (linear, its int16 bits, their bf16 hi/lo), ...]; else None.
-_CLIP_HELD: contextvars.ContextVar[list | None] = contextvars.ContextVar(
-    "minimax_h3_clip_held", default=None
-)
-# How many of the (w1, w2, to_qkv) weight groups a clip holds split, set at
-# the process's first clip (the compiled block programs follow it).
-_clip_groups: int | None = None
+# Device bytes kept free beyond the weights held split when they are made.
+SPLIT_RESERVE_BYTES = 4 << 30
 # Token rows of the fused calls, a multiple of 8: the TPU's default layout of a
 # [batch, rows, width] activation is then Mosaic's (1,797 tokens: 1,800 rows).
 FUSED_ROW_MULTIPLE = 8
@@ -2607,10 +2024,6 @@ def _hold_fused_operands(vae, z) -> bool:
                 from torch_tpu._internal.sync.sync import synchronize
 
                 synchronize([m.h3_weight_bits, m.h3_bias_bits], wait=False)
-    held = _CLIP_HELD.get()
-    if held is not None and not held[0]:
-        held[0] = True
-        _split_for_clip(vae, z, blocks, held)
     # One block's copies inside its program: room beside the batched call.
     block = 4 * sum(m.weight.numel() for m in targets) // len(blocks)
     free = free_device_bytes(device)
@@ -2633,69 +2046,21 @@ def _split_torch(bits):
         return torch.stack(split_fp16(bits.view(torch.float16)))
 
 
-@contextlib.contextmanager
-def _clip_scope():
-    """One clip's (or gather wave's) decoder calls: with CLIP_SPLIT the first
-    fused one may hold weights split for the rest (:func:`_split_for_clip`);
-    they are dropped here, before the clip's gather and assembly."""
-    held = [False]
-    token = _CLIP_HELD.set(held)
-    try:
-        yield
-    finally:
-        _CLIP_HELD.reset(token)
-        for m, bits, pair in held[1:]:
-            if m.h3_weight_bits is pair:
-                m.register_buffer("h3_weight_bits", bits, persistent=False)
+def split_fp16(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """An fp16 tensor as bf16 (hi, lo) with ``hi + lo == t`` exactly.
 
-
-def _split_for_clip(vae, z, blocks, held: list) -> None:
-    """At a clip's first fused decoder call: the SPLIT_WEIGHTS targets left
-    int16 (no room under the stage's peak) held as bf16 hi/lo for the clip's
-    calls, so each block program does not split them again. Groups w1, w2,
-    to_qkv in turn, as many as fit beside the calls at the process's first
-    clip; a later clip short of those holds none (the block programs split
-    them). The split kernel's output either way: the same frames."""
-    global _clip_groups
-    if not (_clip_split and _split_weights) or _batch_failed:
-        return
-    groups = [
-        [m for m in linears if m.h3_weight_bits.dim() == 2]
-        for linears in (
-            [b.ff.w1 for b in blocks],
-            [b.ff.w2 for b in blocks],
-            [b.attn.to_qkv for b in blocks],
-        )
-    ]
-    free = free_device_bytes(z.device)
-    if not any(groups) or free is None:
-        return
-    sizes = [sum(4 * m.weight.numel() for m in g) for g in groups]
-    need = decode_batch_units() * unit_call_bytes(vae, z) + DECODE_BATCH_RESERVE_BYTES
-
-    def fits(count: int) -> bool:
-        return free - sum(sizes[:count]) >= need
-
-    if _clip_groups is None:
-        _clip_groups = 0
-        while _clip_groups < len(groups) and fits(_clip_groups + 1):
-            _clip_groups += 1
-        _info_once(
-            "clip-split",
-            "MiniMax H3 fused ViT blocks: each clip's decoder calls hold %s "
-            "weights split (%.2f GiB; %.2f GiB free before the first)",
-            "/".join(("w1", "w2", "to_qkv")[:_clip_groups]) or "no",
-            sum(sizes[:_clip_groups]) / 2**30,
-            free / 2**30,
-        )
-    if not fits(_clip_groups):
-        _event(f"clip split skipped ({free / 2**30:.2f} GiB free)")
-        return
-    for m in (m for g in groups[:_clip_groups] for m in g):
-        bits = m.h3_weight_bits
-        pair = _split_held(bits)
-        m.register_buffer("h3_weight_bits", pair, persistent=False)
-        held.append((m, bits, pair))
+    hi is t rounded to bf16 (8 significant bits; bf16 covers fp16's whole
+    exponent range, its subnormals included, so no value under- or
+    overflows); lo = t - hi has at most 4 significant bits and is exact in
+    float32 and in bf16. An infinity gives (inf, 0) (not inf - inf), a NaN
+    (nan, nan).
+    """
+    if t.dtype != torch.float16:
+        raise TypeError(f"split_fp16 takes fp16, got {t.dtype}")
+    hi = t.to(torch.bfloat16)
+    lo = t.float() - hi.float()
+    lo = torch.where(torch.isinf(t), torch.zeros_like(lo), lo)
+    return hi, lo.to(torch.bfloat16)
 
 
 def _note_stage_room(vae) -> None:
@@ -2916,151 +2281,3 @@ def _padded_for_fused_blocks(forward_transformer_blocks):
 
     padded.__wrapped_for_tpu__ = True
     return padded
-
-
-# ---------------------------------------------------------------------------
-# Debug: precision of the decoder's fp16 matmuls and attention on the device
-# ---------------------------------------------------------------------------
-
-_checked: list[dict] = []
-
-
-def precision_check(device: torch.device) -> dict:
-    """Relative L2 errors against a float64 host reference, logged once.
-
-    linear_fp16: an fp16 linear under fp16 autocast (the decoder's block
-    linears); linear_fp32: an fp32 linear outside autocast (FP32_PROJECTIONS
-    and the fp32 reference decode); attention_fp16: the ViT attention on fp16
-    q/k/v under autocast (the stock path); attention_fp32: on fp32 copies
-    outside autocast (the FP32_ATTENTION path, before its rounding to fp16);
-    attention_fp32_matmul: as explicit fp32 matmuls (the fp32 reference
-    decode); linear_fp16_split: the fp16 linear as :func:`fp16_split_linear`
-    (SGLANG_TPU_OPT_H3_VAE_FP16_SPLIT_MATMUL); attention_flash: the ViT
-    attention on fp16 q/k/v as :func:`flash_attention`
-    (SGLANG_TPU_OPT_H3_VAE_FLASH_ATTENTION; on TPU the Pallas kernel);
-    linear_pallas: the fp16 linear as :func:`pallas_linear`
-    (SGLANG_TPU_OPT_H3_VAE_PALLAS_LINEAR; on TPU the Pallas kernel). fp16
-    rounding of a result alone is ~3e-4, a bf16 pass gives ~2e-3, three bf16
-    passes ~1e-5; fp32 is ~1e-7.
-    """
-    generator = torch.Generator().manual_seed(0)
-
-    def randn(*shape):
-        return torch.randn(*shape, generator=generator).to(torch.float16)
-
-    def error(result, reference):
-        result = result.detach().double().cpu()
-        return float((result - reference).norm() / reference.norm())
-
-    x, weight, bias = randn(512, 2048), randn(1024, 2048) * 0.02, randn(1024)
-    q, k, v = (randn(1, 1797, 4, 64) for _ in range(3))
-    sdpa = _stock.get("sdpa")
-    if sdpa is None:
-        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
-            attention,
-        )
-
-        sdpa = attention._sdpa_attention
-    with torch.no_grad():
-        linear_ref = torch.nn.functional.linear(
-            x.double(), weight.double(), bias.double()
-        )
-        attention_ref = sdpa(q.double(), k.double(), v.double())
-        on = [t.to(device) for t in (x, weight, bias, q, k, v)]
-        with torch.autocast(device_type=device.type, dtype=torch.float16):
-            linear = torch.nn.functional.linear(on[0], on[1].float(), on[2].float())
-            attention16 = sdpa(*on[3:])
-        with torch.autocast(device_type=device.type, enabled=False):
-            linear32 = torch.nn.functional.linear(*(t.float() for t in on[:3]))
-            attention32 = sdpa(*(t.float() for t in on[3:]))
-            attention32_matmul = matmul_attention(*(t.float() for t in on[3:]))
-            if device.type == "tpu":
-                _split_linear_op()
-            linear_split = fp16_split_linear(on[0], *split_fp16(on[1]), on[2])
-            try:
-                attention_flash = flash_attention(*on[3:])
-            except Exception as exc:
-                # A debug line must not take the decode down: report NaN.
-                logger.warning(
-                    "MiniMax H3 precision check: flash attention failed (%s: %s)",
-                    type(exc).__name__,
-                    exc,
-                    **_ALL_RANKS,
-                )
-                attention_flash = torch.full_like(on[3], float("nan"))
-            try:
-                linear_pallas = pallas_linear(*on[:3])
-            except Exception as exc:
-                logger.warning(
-                    "MiniMax H3 precision check: Pallas linear failed (%s: %s)",
-                    type(exc).__name__,
-                    exc,
-                    **_ALL_RANKS,
-                )
-                linear_pallas = torch.full_like(linear32, float("nan"))
-        result = {
-            "linear_fp16": error(linear, linear_ref),
-            "linear_fp32": error(linear32, linear_ref),
-            "attention_fp16": error(attention16, attention_ref),
-            "attention_fp32": error(attention32, attention_ref),
-            "attention_fp32_matmul": error(attention32_matmul, attention_ref),
-            "linear_fp16_split": error(linear_split, linear_ref),
-            "attention_flash": error(attention_flash, attention_ref),
-            "linear_pallas": error(linear_pallas, linear_ref),
-        }
-    _checked.append(result)
-    logger.info(
-        "MiniMax H3 precision check on %s, relative L2 error against float64: fp16 "
-        "linear %.3g, fp32 linear %.3g, fp16 attention %.3g, fp32-copy attention "
-        "%.3g, fp32 matmul attention %.3g, fp16 split linear %.3g, flash "
-        "attention %.3g, Pallas linear %.3g",
-        device,
-        result["linear_fp16"],
-        result["linear_fp32"],
-        result["attention_fp16"],
-        result["attention_fp32"],
-        result["attention_fp32_matmul"],
-        result["linear_fp16_split"],
-        result["attention_flash"],
-        result["linear_pallas"],
-        **_ALL_RANKS,
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Debug timing
-# ---------------------------------------------------------------------------
-
-
-class _Timing:
-    """Synchronized marks of one rank's decode (SGLANG_TPU_DEBUG_H3_DECODE_TIMING)."""
-
-    def __init__(self, request_id: str | None):
-        self.request_id = request_id
-        self.start = time.perf_counter()
-        self.marks: list[tuple[str, float]] = []
-
-    def mark(self, name: str) -> None:
-        if torch.accelerator.current_accelerator() is not None:
-            torch.accelerator.synchronize()
-        self.marks.append((name, time.perf_counter()))
-
-    def log(self) -> None:
-        from sglang.multimodal_gen.runtime.distributed import (
-            get_decode_parallel_rank,
-            model_parallel_is_initialized,
-        )
-
-        rank = get_decode_parallel_rank() if model_parallel_is_initialized() else 0
-        last, parts = self.start, []
-        for name, at in self.marks:
-            parts.append(f"{name} {at - last:.3f}")
-            last = at
-        logger.info(
-            "MiniMax H3 decode timing, request %s, decode rank %d: %s",
-            self.request_id,
-            rank,
-            ", ".join(parts),
-            **_ALL_RANKS,
-        )

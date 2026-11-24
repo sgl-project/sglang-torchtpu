@@ -379,15 +379,17 @@ def _gate_body(
     k, (tm, tn), gr = x_ref.shape[-1], outs[0].shape, launch.granule
     chunks = _chunks(k)
     _first_column(x_ref, xh_ref, xl_ref, nw_ref, r_ref, eps)
-    bg, bu = (decode_fp16(b[...].astype(jnp.int32)) for b in (bg_ref, bu_ref))
+    gate_bias, up_bias = (
+        decode_fp16(b[...].astype(jnp.int32)) for b in (bg_ref, bu_ref)
+    )
     for n0 in range(0, tn, gr):
         cols = slice(n0, n0 + gr)
         gate = [_weight_parts(wg_ref, cols, chunk) for chunk in chunks]
         up = [_weight_parts(wu_ref, cols, chunk) for chunk in chunks]
         for rows in _pieces(tm, k, n0 + gr == tn, launch.pieces):
             r = _row_scale(r_ref, rows, gr)
-            g = _sums(xh_ref, xl_ref, rows, chunks, gate) * r + bg[:, cols]
-            u = _sums(xh_ref, xl_ref, rows, chunks, up) * r + bu[:, cols]
+            g = _sums(xh_ref, xl_ref, rows, chunks, gate) * r + gate_bias[:, cols]
+            u = _sums(xh_ref, xl_ref, rows, chunks, up) * r + up_bias[:, cols]
             if len(outs) == 2:
                 outs[0][rows, cols], outs[1][rows, cols] = g, u
             else:
