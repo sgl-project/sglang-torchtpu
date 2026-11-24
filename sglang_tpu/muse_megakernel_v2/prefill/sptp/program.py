@@ -82,11 +82,13 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
     mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
     qkvg_tile = int(os.environ.get("SPTP_QKVG_TILE", str(QKVG_TILE)))
-    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm) for r in (True, False)}
+    kc = int(os.environ.get("SPTP_QKVG_KC", "512"))
+    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm, kc) for r in (True, False)}
     # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
     # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
     n_xag = int(os.environ.get("SPTP_XAG_CHUNKS", str(XAG_CHUNKS)))
-    qkvg_c = {r: qkvg_call(c, XAG_TILE, r, mxu_norm) for r in (True, False)}
+    xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
+    qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc) for r in (True, False)}
 
     def forward(
         meta,
@@ -125,13 +127,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 with _scope("sp_xag_qkvg"):
                     sub = Ts // n_xag
                     out = None
+                    # every row's scale in one small AG (a scale gather per chunk paid a wait each)
+                    s_all = ag(a_s, axis)
                     for i in range(n_xag):
                         rs = slice(i * sub, (i + 1) * sub)
                         out = qkvg_c[c.use_rope(l)].chunk(
                             i,
                             n_xag,
                             ag(a8[rs], axis),
-                            ag(a_s[rs], axis),
+                            s_all,
                             wqkvg[l],
                             sm,
                             rope_rows,
