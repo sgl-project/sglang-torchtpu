@@ -1233,6 +1233,150 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             upd_sw_u8 = _fp8_to_u8(upd_sw_cache)
             np.testing.assert_array_equal(upd_sw_u8[1, :96, 0, :2, :64], valid_sw_u8)
 
+            # 4. #3029 §1 & §2 + #3033 §1:
+            #    (a) TP=8 nod2 stock MIXED 0.0-ULP bitwise identity (`_mixed_zero_kv_tail=True` vs `False`) on finite inputs!
+            for num_q_tok in (1, 128):
+                for klen in (1, 615):
+                    q_tp8_np = (rng.standard_normal((num_q_tok, 16, 64)) * 0.5).astype(np.float32)
+                    kv_tp8_u8 = _rand_fp8_u8(rng, (num_q_tok, 1, 4, 128), scale=0.4)
+                    cache_tp8_u8 = _rand_fp8_u8(rng, (8, page_size, 1, 4, 128), scale=0.4)
+                    npg_8 = (klen + page_size - 1) // page_size
+                    kl_8 = jnp.array([klen, 0, 0, 0], dtype=jnp.int32)
+                    pi_8 = jnp.array([1 + p for p in range(npg_8)] + [0] * (16 - npg_8), dtype=jnp.int32)
+                    out_zt1, kv_zt1 = rpa_v3_mod.ragged_paged_attention(
+                        _pack_q_tp8_5d(q_tp8_np),
+                        _u8_to_fp8(kv_tp8_u8),
+                        None,
+                        _u8_to_fp8(cache_tp8_u8),
+                        kl_8,
+                        pi_8,
+                        cq_1,
+                        ckv_1,
+                        dist_1,
+                        None,
+                        None,
+                        sm_scale=sm_scale,
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        _skip_decode=True,
+                        _prepared_inputs=True,
+                        _fused_out_pack=2,
+                        _mixed_zero_kv_tail=True,
+                        _interpret=interp,
+                    )
+                    out_zt0, kv_zt0 = rpa_v3_mod.ragged_paged_attention(
+                        _pack_q_tp8_5d(q_tp8_np),
+                        _u8_to_fp8(kv_tp8_u8),
+                        None,
+                        _u8_to_fp8(cache_tp8_u8),
+                        kl_8,
+                        pi_8,
+                        cq_1,
+                        ckv_1,
+                        dist_1,
+                        None,
+                        None,
+                        sm_scale=sm_scale,
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        _skip_decode=True,
+                        _prepared_inputs=True,
+                        _fused_out_pack=2,
+                        _mixed_zero_kv_tail=False,
+                        _interpret=interp,
+                    )
+                    np.testing.assert_array_equal(np.asarray(out_zt1.astype(jnp.float32)), np.asarray(out_zt0.astype(jnp.float32)))
+                    np.testing.assert_array_equal(_fp8_to_u8(kv_zt1), _fp8_to_u8(kv_zt0))
+
+            #    (b) TP=16 padded-RPAm (`T=128 -> 256`) vs unpadded-RPAm (`T=256` with non-zero garbage in `[128:256]`) is 0.0-ULP!
+            #    (c) #3033 §1: real JAX array call fails loudly with AssertionError if `jax_rpa` returns non-tuple!
+            with patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                    "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                },
+                clear=False,
+            ):
+                q_256_np = (rng.standard_normal((256, 8, 64)) * 2.0).astype(np.float32)
+                kv_256_u8 = _rand_fp8_u8(rng, (256, 1, 4, 128), scale=1.0)
+                cache_p_u8 = np.full((8, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+                cache_p_u8[1:3, :, 0, :2, :64] = _rand_fp8_u8(rng, (2, page_size, 2, 64), scale=0.4)
+                kl_p = jnp.array([615, 0, 0, 0], dtype=jnp.int32)
+                pi_p = jnp.array([1, 2, 0, 0] + [0] * 12, dtype=jnp.int32)
+                out_pad128, kv_pad128 = rpa_wrap_mod._invoke_v3_kernel(
+                    functools.partial(rpa_v3_mod.ragged_paged_attention, _interpret=interp),
+                    queries=_pack_q_tp16_5d(q_256_np[:128]),
+                    keys=_u8_to_fp8(kv_256_u8[:128]),
+                    values=None,
+                    kv_cache_fused=_u8_to_fp8(cache_p_u8),
+                    kv_lens=kl_p,
+                    page_indices=pi_p,
+                    cu_q_lens=cq_1,
+                    cu_kv_lens=ckv_1,
+                    distribution=dist_1,
+                    attention_sink=None,
+                    sm_scale=sm_scale,
+                    sliding_window=None,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+                out_unpad256, kv_unpad256 = rpa_wrap_mod._invoke_v3_kernel(
+                    functools.partial(rpa_v3_mod.ragged_paged_attention, _interpret=interp),
+                    queries=_pack_q_tp16_5d(q_256_np),
+                    keys=_u8_to_fp8(kv_256_u8),
+                    values=None,
+                    kv_cache_fused=_u8_to_fp8(cache_p_u8),
+                    kv_lens=kl_p,
+                    page_indices=pi_p,
+                    cu_q_lens=cq_1,
+                    cu_kv_lens=ckv_1,
+                    distribution=dist_1,
+                    attention_sink=None,
+                    sm_scale=sm_scale,
+                    sliding_window=None,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(out_pad128.astype(jnp.float32)),
+                    np.asarray(out_unpad256[:128].astype(jnp.float32)),
+                )
+                np.testing.assert_array_equal(_fp8_to_u8(kv_pad128), _fp8_to_u8(kv_unpad256))
+
+                with self.assertRaises(AssertionError):
+                    rpa_wrap_mod._invoke_v3_kernel(
+                        lambda *a, **kw: None,
+                        queries=_pack_q_tp16_5d(q_256_np[:128]),
+                        keys=_u8_to_fp8(kv_256_u8[:128]),
+                        values=None,
+                        kv_cache_fused=_u8_to_fp8(cache_p_u8),
+                        kv_lens=kl_p,
+                        page_indices=pi_p,
+                        cu_q_lens=cq_1,
+                        cu_kv_lens=ckv_1,
+                        distribution=dist_1,
+                        attention_sink=None,
+                        sm_scale=sm_scale,
+                        sliding_window=None,
+                        soft_cap=None,
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        prepared_inputs=True,
+                        skip_decode=True,
+                        a3_out_layout=-2,
+                    )
+
     def test_tpu7x_mosaic_exports_w9_mk128_tp8_and_tp16(self):
         try:
             from jax._src import tpu_info as _tpu_info  # noqa: F401

@@ -6522,6 +6522,7 @@ def get_vmem_limit():
         "_sliding_window_chunk_skip",
         "_decode_window_aligned_kv",
         "_decode_zero_kv_tail",
+        "_mixed_zero_kv_tail",
         "_decode_ring",
         "_decode_probe",
         "_prefill_opts",
@@ -6582,6 +6583,8 @@ def ragged_paged_attention(
     # Private: DECODE zeroes the KV buffer rows past each sequence's length once
     # per block instead of selecting V per compute chunk. Same output.
     _decode_zero_kv_tail: bool = False,
+    # Private: MIXED non-stationary_q nod2 zeroes KV buffer rows past kv_len (True by default).
+    _mixed_zero_kv_tail: bool = True,
     # Private: DECODE keeps this many sequences' q/KV buffers (ring - 1 fetches
     # ahead) when each sequence is one KV block; 0 keeps the two-slot pipeline.
     _decode_ring: int = 0,
@@ -7222,7 +7225,8 @@ def ragged_paged_attention(
             (
                 (_decode_zero_kv_tail and case == RpaCase.DECODE)
                 or (
-                    case == RpaCase.MIXED
+                    _mixed_zero_kv_tail
+                    and case == RpaCase.MIXED
                     and not use_stationary_q
                     and not _kv_pack_dense2
                 )
