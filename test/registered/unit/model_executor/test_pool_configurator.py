@@ -1832,15 +1832,25 @@ class TestDflashDraftKvBudget(CustomTestCase):
             8,
         )
 
-    # Hybrid-SWA target: 16 full + 16 SWA layers of 1 KiB/token, window 256.
+    # Target: 32 layers of 1 KiB/token, 16 full + 16 SWA unless a case says
+    # otherwise, window 256.
     _TARGET_CELL = 16 * 1024
     _SWA_RATIO = 0.25
     # Five draft layers of 1 KiB/token.
     _DRAFT_CELL = 5 * 1024
+    _WINDOW_ONLY = ("sliding_attention",) * 5
 
-    def _draft_kv_budget(self, *, declares_swa, layer_types, sliding_window):
-        """The target's per-full-token charge, and the bytes its pools plus the
-        draft runner's own pool allocate out of the budget."""
+    def _draft_kv_budget(
+        self,
+        *,
+        layer_types=_WINDOW_ONLY,
+        declares_swa=True,
+        sliding_window=256,
+        target_full_layers=16,
+        **publish,
+    ):
+        """The target's per-full-token charge, the budget, and the bytes the
+        target's pools plus the draft runner's own pool allocate out of it."""
         import torch
 
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -1853,6 +1863,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         available, page_size = 200_000_000, 16
+        publish.update(swa_full_tokens_ratio=self._SWA_RATIO, page_size=page_size)
         layer_ids = {
             kind: [i for i, t in enumerate(layer_types) if t == kind]
             for kind in ("full_attention", "sliding_attention")
@@ -1863,19 +1874,17 @@ class TestDflashDraftKvBudget(CustomTestCase):
             is_hybrid_swa=declares_swa,
             full_attention_layer_ids=layer_ids["full_attention"],
             swa_attention_layer_ids=layer_ids["sliding_attention"],
-            swa_full_tokens_ratio=self._SWA_RATIO,
-            page_size=page_size,
+            **publish,
         )
         draft.model_config.hf_config.layer_types = layer_types
         draft.model_config.hf_config.sliding_window = sliding_window
         target = _make_model_runner(
             self,
             is_hybrid_swa=True,
-            full_attention_layer_ids=list(range(16)),
-            swa_attention_layer_ids=list(range(16, 32)),
+            full_attention_layer_ids=list(range(target_full_layers)),
+            swa_attention_layer_ids=list(range(target_full_layers, 32)),
             sliding_window_size=255,
-            swa_full_tokens_ratio=self._SWA_RATIO,
-            page_size=page_size,
+            **publish,
         )
         target.spec_algorithm.is_dflash_family.return_value = True
         target.spec_aux_config = SpecAuxHiddenStateConfig(
@@ -1934,31 +1943,42 @@ class TestDflashDraftKvBudget(CustomTestCase):
     def test_window_only_draft_reserves_what_its_pool_allocates(self):
         """A draft whose config declares every layer sliding-window gets a pool of
         SWA-token rows; charging it per full token left that HBM unused."""
-        _, available, allocated = self._draft_kv_budget(
-            declares_swa=True,
-            layer_types=["sliding_attention"] * 5,
-            sliding_window=256,
-        )
-        self.assertLessEqual(allocated, available)
-        self.assertGreater(allocated / available, 0.99)
+        for name, layout in (
+            ("hybrid_target", {}),
+            ("all_swa_target", dict(target_full_layers=0)),
+            # Each of the 9 pipeline slots pins a 512-token chunk in the SWA pool.
+            (
+                "pipeline_chunks",
+                dict(
+                    pp_size=8,
+                    pp_async_batch_depth=1,
+                    chunked_prefill_size=512,
+                    disable_overlap_schedule=True,
+                ),
+            ),
+        ):
+            with self.subTest(name):
+                _, available, allocated = self._draft_kv_budget(**layout)
+                self.assertLessEqual(allocated, available)
+                self.assertGreater(allocated / available, 0.99)
 
     def test_other_drafts_keep_the_per_full_token_charge(self):
         per_full_token = (
             self._TARGET_CELL + self._SWA_RATIO * self._TARGET_CELL + self._DRAFT_CELL
         )
-        sliding = ["sliding_attention"] * 5
-        for name, declares_swa, layer_types, sliding_window in (
+        for name, case in (
             # Undeclared, its runner allocates one row per full token.
-            ("undeclared", False, sliding, 256),
-            ("one_full_layer", True, sliding[:4] + ["full_attention"], 256),
-            ("window_wider_than_target", True, sliding, 512),
+            ("undeclared", dict(declares_swa=False)),
+            (
+                "one_full_layer",
+                dict(layer_types=self._WINDOW_ONLY[:4] + ("full_attention",)),
+            ),
+            ("window_wider_than_target", dict(sliding_window=512)),
+            # The unified solve prices the draft from its per-full-token term.
+            ("unified_memory", dict(enable_unified_memory=True)),
         ):
             with self.subTest(name):
-                cell_size, available, allocated = self._draft_kv_budget(
-                    declares_swa=declares_swa,
-                    layer_types=layer_types,
-                    sliding_window=sliding_window,
-                )
+                cell_size, available, allocated = self._draft_kv_budget(**case)
                 self.assertEqual(cell_size, per_full_token)
                 self.assertLessEqual(allocated, available)
 

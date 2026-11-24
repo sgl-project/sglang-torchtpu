@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import ceil_align, ceil_div
 from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
+from sglang.srt.utils.log_utils import print_warning_once
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -228,7 +229,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator, *, is_swa: bool = False) -
 
 def _dflash_draft_is_window_only(kvc: KVCacheConfigurator) -> bool:
     """Whether the DFLASH draft config declares every layer sliding-window, so
-    its runner builds only an SWA sub-pool, one row per target SWA token."""
+    its runner builds only an SWA sub-pool on the target's SWA ids."""
     # The unified-memory solve prices the draft per full token only.
     if (
         not _charges_dflash_draft_kv_per_token(kvc)
@@ -247,16 +248,15 @@ def _dflash_draft_is_window_only(kvc: KVCacheConfigurator) -> bool:
         get_dflash_attention_sliding_window_size,
     )
 
-    # The draft reads its window from slots the target's SWA eviction frees
-    # outside the target's own window.
+    # The target's SWA eviction keeps only the target's window, so a wider draft
+    # window is an unsupported layout; it keeps the per-full-token charge.
     draft_window = get_dflash_attention_sliding_window_size(draft.hf_config)
     target_window = kvc.sliding_window_size
     if draft_window is None or target_window is None or draft_window > target_window:
-        logger.warning(
-            "DFLASH draft window %s does not fit the target's sliding window %s; "
-            "reserving its KV per full token.",
-            draft_window,
-            target_window,
+        print_warning_once(
+            f"The DFLASH draft declares every layer sliding-window, but its window "
+            f"({draft_window}) is not within the target's ({target_window}); "
+            "reserving its KV per full token."
         )
         return False
     return True
