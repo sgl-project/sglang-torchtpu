@@ -38,7 +38,12 @@ from sglang_tpu.multimodal_gen import qwen_image21, worker
 
 # Whole node, not chips=1: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 # The stock builder, even if a worker init already installed the patches.
 _STOCK_BUILD_LAYOUT = inspect.unwrap(stage.build_layout)
