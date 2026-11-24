@@ -181,6 +181,7 @@ def oproj_a2a_call(
     la: int = 7,
     pool_tn: int = 0,
     ns: int = 2,
+    order: tuple = (),
 ):
     """oproj_call with the gated-output a2a inside: (lyr_me [2] i32 (layer, rank), g8 [T, qd]
     e4m3 (this rank's heads of every row, token major), gs [1, T] f32 (their row scales),
@@ -195,7 +196,8 @@ def oproj_a2a_call(
     pool_tn > 0: pool_call's steps (wpool [L, H, He] after wrouter, column blocks of pool_tn)
     follow in this kernel (the pool input stays in VMEM, wpool's first block loads under the
     epilogue); outputs (stream, ids, tw, xe8 [Ts, He] e4m3, xs [1, Ts] f32).
-    ns: stream row chunks in flight + 1; the first ns - 1 load under the last o proj steps."""
+    ns: stream row chunks in flight + 1; the first ns - 1 load under the last o proj steps.
+    order: step r takes source m ^ order[r] (default r: partner core, then chip ^ 1, ^ 2, ^ 3)."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
     if (
@@ -207,6 +209,19 @@ def oproj_a2a_call(
         or tp & (tp - 1)
     ):
         raise ValueError(f"o proj tiles {tn} / {rc} do not fit H {H} Ts {Ts}")
+
+    order = tuple(order) or tuple(range(tp))
+    if sorted(order) != list(range(tp)) or order[0] != 0:
+        raise ValueError(
+            f"source order {order} is not a permutation of 0..{tp - 1} from 0"
+        )
+
+    def peer_xor(r):
+        # order[r] for a traced step r
+        x = jnp.int32(0)
+        for k, v in enumerate(order):
+            x = jnp.where(r == k, v, x)
+        return x
 
     fuse = pool_tn > 0
     He = c.expert_hidden
@@ -235,7 +250,7 @@ def oproj_a2a_call(
         # step r takes source m ^ r: own block, the partner core, then the other chips' cores
         # nearest first (2 x 2 chips, 2 cores each: chip ^ 3 is the diagonal, two hops); rank m
         # sends to m ^ 1, m ^ 2, ... in the same order
-        src = jnp.bitwise_xor(me, r)
+        src = jnp.bitwise_xor(me, peer_xor(r))
         wr_cp = pltpu.make_async_copy(wr_hbm.at[lm[0]], wr, sem.at[1])
 
         def sends(d):
@@ -260,7 +275,7 @@ def oproj_a2a_call(
 
         def wo_cp(step, slot):
             # wo's K block of step's source, by hand: the first one loads under the barrier
-            k0 = pl.multiple_of(jnp.bitwise_xor(me, step) * qd, qd)
+            k0 = pl.multiple_of(jnp.bitwise_xor(me, peer_xor(step)) * qd, qd)
             return pltpu.make_async_copy(
                 wo_hbm.at[lm[0], pl.ds(k0, qd)], wbuf.at[slot], wsem.at[slot]
             )
@@ -279,7 +294,7 @@ def oproj_a2a_call(
                     )
                 pl.semaphore_wait(bar, tp)
             for k in range(1, min(la, tp - 1) + 1):
-                for cp in sends(jnp.bitwise_xor(me, k)):
+                for cp in sends(jnp.bitwise_xor(me, order[k])):
                     cp.start()
             wo_cp(1, 1).start()
             wr_cp.start()
@@ -293,7 +308,7 @@ def oproj_a2a_call(
             # every block late on links all the sends share
             @pl.when(jnp.logical_and(r >= 1, r + la <= tp - 1))
             def _():
-                for cp in sends(jnp.bitwise_xor(me, r + la)):
+                for cp in sends(jnp.bitwise_xor(me, peer_xor(r + la))):
                     cp.start()
 
         @pl.when(r < tp)
@@ -353,7 +368,7 @@ def oproj_a2a_call(
             )
             ep.route(gq, f8_hbm, sem.at[0], wr, wr_cp, E, ids_ref, tw_ref)
             for k in range(1, tp):
-                d = jnp.bitwise_xor(me, k)
+                d = jnp.bitwise_xor(me, order[k])
                 for cp in sends(d):
                     cp.wait_send()
 
@@ -443,7 +458,7 @@ def oproj_a2a_call(
             grid_spec=grid_spec,
             out_shape=tuple(out_shape),
             compiler_params=params,
-            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}",
+            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}_o{''.join(map(str, order))}",
         )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool)
 
     return call
