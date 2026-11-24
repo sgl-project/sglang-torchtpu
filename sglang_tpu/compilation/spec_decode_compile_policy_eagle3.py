@@ -1061,8 +1061,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def make_verify_spec_info(self) -> EagleVerifyInput:
+    def make_verify_spec_info(self, *, width: int | None = None) -> EagleVerifyInput:
         """Build an EagleVerifyInput for TARGET_VERIFY precompilation."""
+        assert width in (None, self.draft_token_num), width
         return EagleVerifyInput.create_idle_input(
             topk=self.speculative_eagle_topk,
             spec_steps=self.speculative_num_steps,

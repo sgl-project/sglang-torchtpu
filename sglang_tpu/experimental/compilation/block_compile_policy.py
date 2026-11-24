@@ -26,6 +26,7 @@ from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental.speculative.verify_width import verify_width_table
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,14 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
     [r, m, ..., m] (the drafter's block_width rows) and never runs EXTEND.
     """
+
+    def target_verify_widths(self) -> tuple[int, ...]:
+        # Shared with TpuBlockSpecWorker.verify_widths, which validates the table.
+        assert self.b_bucketer is not None
+        table = verify_width_table(self.draft_token_num)
+        if table is None:
+            return (self.draft_token_num,)
+        return table.reachable_widths(self.b_bucketer.buckets)
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.

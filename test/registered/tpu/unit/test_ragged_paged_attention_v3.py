@@ -408,6 +408,23 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         inputs = self._build_inputs([(19, 3), (37, 5)], noncontiguous_pages=True)
         self._run_and_compare(inputs, distribution=(2, 2, 2), decode_query_size=4)
 
+    def test_ragged_verify_mixed_tiles_bounded_by_window(self):
+        """A ragged verify (1..8 rows per request, some crossing pages) on MIXED with
+        decode-shaped tiles matches the reference."""
+        import jax.numpy as jnp
+
+        for kv_dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
+            with self.subTest(kv_dtype=kv_dtype):
+                inputs = self._build_inputs(
+                    [(20, 4), (33, 1), (41, 8), (9, 6)],
+                    num_kv_heads=2,
+                    noncontiguous_pages=True,
+                    kv_dtype=kv_dtype,
+                    k_scale=0.5,
+                    v_scale=0.25,
+                )
+                self._run_and_compare(inputs, distribution=(0, 0, 4), mixed_max_q_len=8)
+
     def test_decode_query_size_features_and_causality(self):
         """The decode route keeps masks, sinks, live cache, and inactive rows."""
         import jax.numpy as jnp

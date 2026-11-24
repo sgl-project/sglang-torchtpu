@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -148,6 +149,7 @@ from sglang_tpu.mamba_pool import (
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.spec_op_precompile import precompile_spec_v2_ops
 from sglang_tpu.top_k import register_tpu_top_k_ops
 
 if TYPE_CHECKING:
@@ -261,6 +263,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
         # Filled per batch bucket once the target compile policy exists.
         self._all_drafts: dict[int, torch.Tensor] = {}
+        # Per (batch bucket, verify width) below the full width.
+        self._narrow_drafts: dict[tuple[int, int], torch.Tensor] = {}
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
         if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE not in (
@@ -274,8 +278,8 @@ class TpuSpecWorker(BaseSpecWorker):
         # real-draft-token commits the draft's real tokens and the target's greedy bonus,
         # so the output is model text (reasoning/tool parsers see real output).
         self._simulate_real_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
-        # Filled per batch bucket in init_cuda_graphs when simulating.
-        self._simulated_drafts: dict[int, torch.Tensor] = {}
+        # Filled per (batch bucket, verify width) in init_cuda_graphs when simulating.
+        self._simulated_drafts: dict[tuple[int, int], torch.Tensor] = {}
         self._simulated_bonus: dict[int, torch.Tensor] = {}
         # Per (batch bucket, forced num_correct_drafts).
         self._simulated_correct: dict[tuple[int, int], torch.Tensor] = {}
@@ -421,6 +425,15 @@ class TpuSpecWorker(BaseSpecWorker):
             )
             for padded_bs in self._b_bucketer().buckets
         }
+        self._narrow_drafts = {
+            (padded_bs, width): torch.full(
+                (padded_bs,), width - 1, dtype=torch.int32, device=self.device
+            )
+            for padded_bs in self._b_bucketer().buckets
+            for width in self.verify_widths()
+            if width != self.num_verify_rows
+        }
+        self._warmup_spec_ops_at_narrow_widths()
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
@@ -438,10 +451,11 @@ class TpuSpecWorker(BaseSpecWorker):
             # never baked into a program).
             buckets = self._b_bucketer().buckets
             self._simulated_drafts = {
-                pbs: torch.full(
-                    (pbs, self.num_drafts), _SIMULATED_TOKEN, dtype=torch.int64
+                (pbs, width): torch.full(
+                    (pbs, width - 1), _SIMULATED_TOKEN, dtype=torch.int64
                 ).to(self.device)
                 for pbs in buckets
+                for width in self.verify_widths()
             }
             self._simulated_bonus = {
                 pbs: torch.full((pbs,), _SIMULATED_TOKEN, dtype=torch.int64).to(
@@ -471,6 +485,42 @@ class TpuSpecWorker(BaseSpecWorker):
     def verify_widths(self) -> Sequence[int]:
         """Active widths to warm; adaptive workers override with every reachable width."""
         return (self.num_verify_rows,)
+
+    def num_verify_drafts(self, padded_bs: int, width: int) -> torch.Tensor:
+        """[padded_bs] int32 drafts each row verifies at width."""
+        if width == self.num_verify_rows:
+            return self._all_drafts[padded_bs]
+        return self._narrow_drafts[(padded_bs, width)]
+
+    def _warmup_spec_ops_at_narrow_widths(self) -> None:
+        """The shared spec-op grid at every width but the full one, which the scheduler warms."""
+        narrow = [w for w in self.verify_widths() if w != self.num_verify_rows]
+        if not narrow:
+            return
+        draft_runner = self._draft_worker.draft_runner
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(draft_runner)
+        assert hidden_size is not None and hidden_dtype is not None
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        for width in narrow:
+            precompile_spec_v2_ops(
+                device=torch.device(self.device),
+                physical_batch_buckets=self._b_bucketer().buckets,
+                num_verify_tokens=width,
+                vocab_size=vocab_size,
+                # The block drafts share the target head, as Scheduler.precompile_tpu_spec_ops reads.
+                draft_vocab_size=draft_runner.model.config.vocab_size,
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
+
+    def verify_width_for(self, padded_bs: int) -> int:
+        """Verify rows per request at a decode batch bucket, one of verify_widths().
+
+        A host choice from the bucket alone, so DP-attention ranks, which agree on
+        the bucket, agree on the width.
+        """
+        del padded_bs
+        return self.num_verify_rows
 
     def _warmup_logical_bs_ops(
         self, *, batch_sizes: Sequence[int] | None = None
@@ -761,8 +811,9 @@ class TpuSpecWorker(BaseSpecWorker):
         """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
         draft_tokens = draft_result.draft_tokens
         state = bucket.state
+        width = draft_tokens.shape[1] + 1
         if self._simulate_acc_len > 0 and self._simulate_real_tokens:
-            forced_correct, _, _ = self._simulated_accept(draft_tokens.shape[0])
+            forced_correct, _, _ = self._simulated_accept(draft_tokens.shape[0], width)
             if logits_output.has_next_token_global_top_k:
                 target_argmax = logits_output.next_token_global_top_k_token_ids[:, 0]
             else:
@@ -783,7 +834,7 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         if self._simulate_acc_len > 0:
             num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
-                draft_tokens.shape[0]
+                draft_tokens.shape[0], width
             )
             return finalize_accept(
                 draft_tokens,
@@ -792,7 +843,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 state.seq_lens,
                 bucket.live_mask,
             )
-        num_rows = draft_tokens.shape[0] * self.num_verify_rows
+        num_rows = draft_tokens.shape[0] * width
         if logits_output.has_next_token_global_top_k:
             top_logits = logits_output.next_token_global_top_k_logits
             top_ids = logits_output.next_token_global_top_k_token_ids
@@ -897,17 +948,17 @@ class TpuSpecWorker(BaseSpecWorker):
         return accept
 
     def _simulated_accept(
-        self, padded_bs: int
+        self, padded_bs: int, width: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forced num_correct_drafts, bonus_tokens and draft_tokens, all _SIMULATED_TOKEN."""
         # Host CPU RNG, seeded alike on every rank, as in apply_dflash_simulated_acceptance.
         commit_len = sample_simulated_acc_len(
-            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.num_verify_rows
+            self._simulate_acc_len, SIMULATE_ACC_METHOD, width
         )
         return (
             self._simulated_correct[(padded_bs, commit_len - 1)],
             self._simulated_bonus[padded_bs],
-            self._simulated_drafts[padded_bs],
+            self._simulated_drafts[(padded_bs, width)],
         )
 
     def step(
@@ -923,7 +974,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             bucket.state.seq_lens,
-            self.num_verify_rows,
+            self.verify_width_for(bucket.state.seq_lens.shape[0]),
         )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
@@ -1022,7 +1073,7 @@ class TpuSpecWorker(BaseSpecWorker):
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
-            batch, self.num_verify_rows, padded_bs
+            batch, self.verify_width_for(padded_bs), padded_bs
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
         committed, logits_output, accept = self.step(
@@ -1139,7 +1190,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             state.seq_lens,
-            self.num_verify_rows,
+            self.verify_width_for(padded_bs),
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
@@ -1668,16 +1719,17 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
         batch.out_cache_loc = rows.flat_cache_locs
+        width = rows.cache_locs.shape[1]
         with self._bucket_view(
             batch,
             bucket_state=bucket_state,
             verify_input=verify_input,
-            host_kv_rows=self.num_verify_rows,
+            host_kv_rows=width,
         ) as view:
-            return self._prepare_verify_forward_batch(view, spec_info)
+            return self._prepare_verify_forward_batch(view, spec_info, width=width)
 
     def _prepare_verify_forward_batch(
-        self, batch: ScheduleBatch, spec_info: SpecInput
+        self, batch: ScheduleBatch, spec_info: SpecInput, *, width: int
     ) -> ForwardBatch:
         # The window already owns the verify slots (batch.out_cache_loc), so this
         # never calls a verify input's prepare_for_verify, which may allocate.
@@ -1702,7 +1754,7 @@ class TpuSpecWorker(BaseSpecWorker):
             forward_batch,
             runner=self.target_worker.model_runner,
             num_tokens=num_rows,
-            bs=num_rows // self.num_verify_rows,
+            bs=num_rows // width,
             mode=ForwardMode.TARGET_VERIFY,
         )
         graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
@@ -1763,7 +1815,8 @@ class TpuSpecWorker(BaseSpecWorker):
         # The scheduler relays and accounts per live request, so cut the bucket rows here.
         next_token_ids, accept_lens = self._live_result_rows(accept, bs)
         new_seq_lens = next_state.seq_lens[:bs]
-        logits_output.trim_next_token_outputs(bs * self.num_verify_rows)
+        width = accept.accept_tokens.shape[1]
+        logits_output.trim_next_token_outputs(bs * width)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
@@ -1778,7 +1831,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 )
             ),
             can_run_cuda_graph=False,
-            speculative_num_draft_tokens=self.num_verify_rows,
+            speculative_num_draft_tokens=width,
             new_seq_lens=new_seq_lens,
         )
 

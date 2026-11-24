@@ -631,11 +631,12 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-    def make_verify_spec_info(self) -> DFlashVerifyInput:
+    def make_verify_spec_info(self, *, width: int | None = None) -> DFlashVerifyInput:
         """Create dummy DFlash verify input metadata for TARGET_VERIFY compilation.
 
         Returns:
-          DFlashVerifyInput with CaptureHiddenMode.FULL.
+          DFlashVerifyInput with CaptureHiddenMode.FULL, width rows per request
+          (draft_token_num by default).
         """
         return DFlashVerifyInput(
             draft_token=torch.empty(
@@ -644,7 +645,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             positions=torch.empty(
                 0, device=self.model_runner.device, dtype=torch.int64
             ),
-            draft_token_num=self.draft_token_num,
+            draft_token_num=self.draft_token_num if width is None else width,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
@@ -791,20 +792,21 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 "b_bucketer must be initialized before precompiling draft verify."
             )
         bs_buckets = list(self.b_bucketer.buckets)
-        draft_token_num = self.draft_token_num
+        widths = self.draft_commit_widths()
         target_hidden_size = self.dflash_target_hidden_size
         device = self.model_runner.device
         dtype = self.model_runner.dtype
         cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.TARGET_VERIFY)
         logger.info(
-            "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d)",
+            "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, widths=%s)",
             self.algo_label,
-            len(bs_buckets),
+            len(widths) * len(bs_buckets),
             bs_buckets,
-            draft_token_num,
+            list(widths),
         )
 
-        def run(bs: int) -> str:
+        def run(shape: tuple[int, int]) -> str:
+            draft_token_num, bs = shape
             num_tokens = bs * draft_token_num
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
@@ -825,7 +827,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             return f"bs={bs}, tokens={num_tokens}"
 
         self._precompile_shapes(
-            f"{self.algo_label} DRAFT APPEND KV (VERIFY)", bs_buckets, run
+            f"{self.algo_label} DRAFT APPEND KV (VERIFY)",
+            [(width, bs) for width in widths for bs in bs_buckets],
+            run,
         )
 
     def _precompile_draft_append_kv_extend(self) -> None:
