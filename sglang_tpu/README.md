@@ -302,7 +302,8 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe, the embedding built
-  with shapes that do not move with the prompt length); worker init also
+  with shapes that do not move with the prompt length) and, opt-in, `wan_vae.py`
+  (a float32 matmul precision for the Wan VAE decode only); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 
