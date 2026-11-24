@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import pkgutil
 import subprocess
 import sys
@@ -156,9 +157,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
     def test_step_selects_rows_before_drafting_and_commits_after_verification(self):
         worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = None
         worker.num_verify_rows = 8
         worker._target_has_linear_attn = True
         worker._verify_width_table = None
+        worker._scheduled_caps = False
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=SimpleNamespace(shape=(4,)))
@@ -1769,6 +1772,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 worker._sampled_drafts = True
                 worker._scheduled_caps = False
                 worker._compact = False
+                worker._adaptive_width = None
                 worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
                 worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
                 worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
@@ -1808,6 +1812,401 @@ class TestVerifyWidthTable(CustomTestCase):
         for spec in ("", "1:9", "1:1", "0:4", "1:4,1:6", "4", "a:b"):
             with self.subTest(spec=spec), self.assertRaises(ValueError):
                 parse_verify_width_table(spec, max_width=8)
+
+
+def _geometric_outcomes(hazard, num_verify_drafts, num_reqs):
+    """Accepted-draft counts of num_reqs requests whose every draft survives with hazard."""
+    counts = [
+        round(num_reqs * hazard**c * (1 - hazard)) for c in range(num_verify_drafts)
+    ]
+    counts.append(num_reqs - sum(counts))
+    return [c for c, n in enumerate(counts) for _ in range(n)]
+
+
+class TestAdaptiveVerifyWidth(CustomTestCase):
+    def test_survival_censors_requests_that_verified_every_draft(self):
+        """A request that accepted all k verified drafts is censored at k: it says
+        nothing about position k + 1, while one that failed at c + 1 <= k counts as
+        a failure there. Treating censoring as failure would underrate deep drafts."""
+        from sglang_tpu.experimental.speculative.verify_width import DraftSurvival
+
+        survival = DraftSurvival(4, memory=float("inf"), decay=0.0, prior_weight=0.0)
+        # (accepted, verified): censored at 2, failed at 1, failed at 2.
+        survival.record([2, 0, 1], [2, 2, 4])
+        hazards = survival.hazards()
+        self.assertAlmostEqual(hazards[0], 2 / 3)
+        self.assertAlmostEqual(hazards[1], 1 / 2)
+        # Nobody was at risk at 3 or 4: they take the pooled survival (3 of 5).
+        self.assertAlmostEqual(hazards[2], 3 / 5)
+        self.assertAlmostEqual(survival.tokens_per_req(3), 1 + 2 / 3 + 1 / 3)
+        # All-accepted requests verified at a narrow width never lower the survival.
+        survival = DraftSurvival(4, memory=float("inf"), decay=0.0, prior_weight=0.0)
+        survival.record([3] * 8, [3] * 8)
+        self.assertEqual(survival.hazards(), [1.0] * 4)
+
+    def test_choice_follows_traffic_shift_without_rerunning_widths(self):
+        """Acceptance is one live profile fed by whichever width runs, so after
+        traffic turns easy again a narrow bucket goes back to the wide width without
+        re-measuring it; comparing per-width token EMAs from different times would
+        keep the stale low-acceptance estimate and stay narrow."""
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        policy = AdaptiveVerifyWidth(
+            (4, 8), num_drafts=7, window_steps=4, explore_every=10**6
+        )
+        identity = lambda width: width  # noqa: E731
+        step_seconds = {4: 1.0, 8: 1.3}
+
+        def run(hazard, windows):
+            widths = []
+            for _ in range(windows * 4):
+                width = policy.width_for_step(64, agree=identity)
+                widths.append(width)
+                policy.record(
+                    64,
+                    width,
+                    num_correct_drafts=_geometric_outcomes(hazard, width - 1, 1024),
+                    num_verify_drafts=[width - 1] * 1024,
+                    seconds=step_seconds[width],
+                )
+            return widths
+
+        # Easy traffic: 8 predicts 5.7 tokens / 1.3 s against 4's 3.4 / 1.0 s.
+        self.assertEqual(run(0.9, 6)[-1], 8)
+        # Hard traffic, long enough for any per-width estimate to settle: 8
+        # predicts 2.0 / 1.3 s against 4's 1.9 / 1.0 s.
+        self.assertEqual(run(0.5, 12)[-16:], [4] * 16)
+        # Easy again: width 4 only observes positions 1..3, yet the choice returns to 8.
+        widths = run(0.9, 12)
+        self.assertEqual(widths[-1], 8)
+        first_wide = widths.index(8)
+        self.assertEqual(set(widths[:first_wide]), {4})
+
+    def test_ranks_agree_once_per_window(self):
+        """agree() runs only at window starts (one broadcast per window, same steps on
+        every rank) and the width holds within a window; candidates are tried first,
+        then the best predicted goodput wins, with every explore_every-th window
+        revisiting the others round robin."""
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        policy = AdaptiveVerifyWidth(
+            (4, 6, 8), num_drafts=7, window_steps=2, explore_every=4
+        )
+        agreed = []
+        agree = lambda width: agreed.append(width) or width  # noqa: E731
+        # Width 6 has the best tokens per second at survival 0.8.
+        step_seconds = {4: 1.0, 6: 1.1, 8: 1.6}
+        widths = []
+        for _ in range(24):
+            width = policy.width_for_step(64, agree=agree)
+            widths.append(width)
+            policy.record(
+                64,
+                width,
+                num_correct_drafts=_geometric_outcomes(0.8, width - 1, 1000),
+                num_verify_drafts=[width - 1] * 1000,
+                seconds=step_seconds[width],
+            )
+        self.assertEqual(len(agreed), 12)
+        self.assertEqual(widths, [w for w in agreed for _ in range(2)])
+        self.assertEqual(widths[:6], [4, 4, 6, 6, 8, 8])
+        self.assertEqual(policy.best(64), 6)
+        # Windows 3..11: best except the explore windows 4 and 8 (round robin 4, 8).
+        self.assertEqual(agreed[3:], [6, 4, 6, 6, 6, 8, 6, 6, 6])
+        # Another bucket has no step times yet, so it scores nothing.
+        self.assertEqual(policy.best(16), 8)
+
+    def test_switches_only_for_a_clear_margin(self):
+        """A settled width stays unless another beats it by switch_margin, so step-time
+        noise does not flip the bucket between near-equal widths."""
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        policy = AdaptiveVerifyWidth(
+            (6, 8),
+            num_drafts=7,
+            window_steps=1,
+            explore_every=1000,
+            switch_margin=0.03,
+        )
+        identity = lambda width: width  # noqa: E731
+        for _ in range(2):
+            width = policy.width_for_step(64, agree=identity)
+            policy.record(
+                64,
+                width,
+                num_correct_drafts=[width - 1] * 4,
+                num_verify_drafts=[width - 1] * 4,
+                seconds=1.0,
+            )
+        # Every draft accepted: 8 commits 8 tokens per step to 6's 6.
+        self.assertEqual(policy.width_for_step(64, agree=identity), 8)
+        policy._seconds[(64, 6)] = 6 / 8 / 1.02  # 2% better: stay
+        self.assertEqual(policy.width_for_step(64, agree=identity), 8)
+        policy._seconds[(64, 6)] = 6 / 8 / 1.05  # 5% better: switch
+        self.assertEqual(policy.width_for_step(64, agree=identity), 6)
+
+    def test_stray_pairing_with_a_collected_result_does_not_crash(self):
+        """Completions pair with steps by batch size; if that lands on a caps step whose
+        result was already collected, the worker keeps serving and drops the acceptance."""
+        import weakref
+
+        from sglang_tpu.experimental.speculative.block_spec_worker import _PendingStep
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = MagicMock()
+        worker._pending_steps = collections.deque(maxlen=16)
+        worker._last_completion = None
+        worker._extend_ct = 0
+
+        class _Result:
+            cap_lens = None
+
+        gone = _Result()
+        worker._pending_steps.append(
+            _PendingStep(bucket=4, width=4, bs=3, extend_ct=0, result=weakref.ref(gone))
+        )
+        del gone
+        worker.on_verify_complete_cpu([1, 2, 0], batch_size=3)
+        kwargs = worker._adaptive_width.record.call_args.kwargs
+        self.assertEqual(
+            (kwargs["num_correct_drafts"], kwargs["num_verify_drafts"]), ([], [])
+        )
+
+    def test_seeded_bucket_skips_trials_and_learns_the_offset(self):
+        """A profiled bucket starts at its predicted best width, without a trial window
+        per candidate. The profile times only the verify forward; the offset learned
+        from the width that runs (draft, host work) prices the others, so a width
+        that never ran is judged on profile + offset, not on the bare profile."""
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        policy = AdaptiveVerifyWidth(
+            (4, 6, 8), num_drafts=7, window_steps=2, explore_every=4
+        )
+        # Verify forward only; every real step also pays 1.0 s that no width changes.
+        profile = {4: 0.1, 6: 0.2, 8: 0.3}
+        policy.seed({(64, w): s for w, s in profile.items()})
+        self.assertTrue(policy.seeded(64))
+        self.assertFalse(policy.seeded(16))
+        agreed = []
+        agree = lambda width: agreed.append(width) or width  # noqa: E731
+        for _ in range(24):
+            width = policy.width_for_step(64, agree=agree)
+            policy.record(
+                64,
+                width,
+                num_correct_drafts=_geometric_outcomes(0.8, width - 1, 1000),
+                num_verify_drafts=[width - 1] * 1000,
+                seconds=profile[width] + 1.0,
+            )
+        # No trial windows: the widest width starts (nothing scores before any
+        # acceptance), and its steps teach the 1.0 s offset. On the bare profile 4
+        # would win (2.95 tokens / 0.1 s against 8's 4.16 / 0.3 s); with the offset 8
+        # does (4.16 / 1.3 s against 2.95 / 1.1 s), so the bucket stays at 8.
+        tokens = {w: policy.tokens_per_req(w) for w in profile}
+        self.assertGreater(tokens[4] / profile[4], tokens[8] / profile[8])
+        self.assertEqual(agreed, [8] * 12)
+        self.assertAlmostEqual(policy.step_seconds(64, 4), 1.1)
+        self.assertAlmostEqual(policy.step_seconds(64, 6), 1.2)
+        # Seeded buckets explore 4x less often (every 16th window): none in these 12.
+
+    def test_profile_verify_widths_seeds_rank0_timings(self):
+        """Every rank seeds rank 0's profile, so TP ranks rank widths alike."""
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = AdaptiveVerifyWidth((4, 8), num_drafts=7)
+        worker._bucket_sizes = lambda: [8, 16]
+        worker._scheduled_caps = worker._compact = False
+        worker.num_verify_rows = 8
+        policy = MagicMock(spec=TpuBlockSpecDecodeCompilePolicyMixin)
+        policy.profile_target_verify.return_value = {"local": 1.0}
+        worker._compile_policy = lambda: policy
+        rank0 = {(8, 4): 0.1, (8, 8): 0.2, (16, 4): 0.3, (16, 8): 0.4}
+        worker._tp_group = SimpleNamespace(
+            broadcast_object=MagicMock(return_value=rank0), rank_in_group=1
+        )
+        worker._profile_verify_widths()
+        policy.profile_target_verify.assert_called_once_with(
+            [(8, 4), (8, 8), (16, 4), (16, 8)]
+        )
+        worker._tp_group.broadcast_object.assert_called_once_with({"local": 1.0}, src=0)
+        self.assertTrue(worker._adaptive_width.seeded(8))
+        self.assertAlmostEqual(worker._adaptive_width.step_seconds(16, 8), 0.4)
+
+    def test_cap_accept_profiles_only_the_full_window(self):
+        """cap-accept verifies the full window at every budget, so the profile times
+        that one forward and prices every candidate with it, rather than compiling
+        narrow forwards serving never runs and crediting them with savings."""
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = AdaptiveVerifyWidth((4, 8), num_drafts=7)
+        worker._bucket_sizes = lambda: [8]
+        worker._scheduled_caps, worker._compact = True, False
+        worker.num_verify_rows = 8
+        policy = MagicMock(spec=TpuBlockSpecDecodeCompilePolicyMixin)
+        policy.profile_target_verify.return_value = {(8, 8): 0.2}
+        worker._compile_policy = lambda: policy
+        worker._tp_group = SimpleNamespace(
+            broadcast_object=lambda obj, src: obj, rank_in_group=1
+        )
+        worker._profile_verify_widths()
+        policy.profile_target_verify.assert_called_once_with([(8, 8)])
+        self.assertEqual(
+            [worker._adaptive_width.step_seconds(8, w) for w in (4, 8)], [0.2, 0.2]
+        )
+
+    def test_survival_first_batch_above_memory(self):
+        """A first batch with more at-risk requests than `memory` has no history to
+        scale down; it must not divide by the zero historical weight."""
+        from sglang_tpu.experimental.speculative.verify_width import DraftSurvival
+
+        survival = DraftSurvival(4, memory=1024.0, decay=0.03, prior_weight=32.0)
+        survival.record([1] * 1025, [3] * 1025)
+        self.assertIsNotNone(survival.tokens_per_req(4))
+
+    def test_profile_target_verify_times_warmed_shapes(self):
+        """Each (bucket, width) runs its warmed TARGET_VERIFY shape (bucket x width
+        tokens at that width's spec info); the first run is dropped as one-off host
+        work and the fastest of the rest kept."""
+        from sglang_tpu.experimental.compilation import block_compile_policy
+
+        runs = []
+        fake = SimpleNamespace(
+            target_verify_logits_output_modes=lambda: ("full", "top_k"),
+            make_verify_spec_info=lambda *, width: f"spec{width}",
+            _run_one=lambda **kwargs: runs.append(kwargs),
+        )
+        # perf_counter pairs per run: durations 9, 3, 2, 4 then 8, 5, 6, 7.
+        ticks = []
+        for duration in (9, 3, 2, 4, 8, 5, 6, 7):
+            ticks += [0.0, float(duration)]
+        with patch.object(block_compile_policy.time, "perf_counter", side_effect=ticks):
+            profile = block_compile_policy.TpuBlockSpecDecodeCompilePolicyMixin.profile_target_verify(
+                fake, [(8, 4), (16, 6)], repeats=3
+            )
+        self.assertEqual(profile, {(8, 4): 2.0, (16, 6): 5.0})
+        self.assertEqual(
+            [(r["num_tokens"], r["bs"], r["spec_info"]) for r in runs[::4]],
+            [(32, 8, "spec4"), (96, 16, "spec6")],
+        )
+        self.assertEqual({r["logits_output_mode"] for r in runs}, {"top_k"})
+
+    def test_unmeasured_step_times_do_not_score(self):
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        policy = AdaptiveVerifyWidth((4, 8), num_drafts=7)
+        policy.record(8, 4, num_correct_drafts=[1], num_verify_drafts=[3], seconds=None)
+        self.assertIsNotNone(policy.tokens_per_req(4))
+        self.assertIsNone(policy.goodput(8, 4))
+        self.assertEqual(policy.best(8), 8)
+
+    @staticmethod
+    def _adaptive_worker():
+        from sglang_tpu.experimental.speculative.verify_width import (
+            AdaptiveVerifyWidth,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = AdaptiveVerifyWidth(
+            (4, 8), num_drafts=7, window_steps=100
+        )
+        worker._tp_group = SimpleNamespace(
+            broadcast_object=lambda obj, src: obj, rank_in_group=1
+        )
+        worker._step_width = 8
+        worker._pending_steps = collections.deque(maxlen=16)
+        worker._extend_ct = 0
+        worker._last_completion = None
+        worker._step_caps = None
+        recorded = []
+        worker._adaptive_width.record = lambda *a, **kw: recorded.append((a, kw))
+        return worker, recorded
+
+    def test_worker_attributes_completions_to_their_steps(self):
+        """Completions pop dispatched steps in order, skipping unreported ones by batch
+        size; an interval spanning a prefill does not count as a step time, including
+        a prefill dispatched after the step but before its result (overlap schedule)."""
+        worker, recorded = self._adaptive_worker()
+        clock = iter([10.0, 10.5, 11.0, 11.5])
+        with patch("time.perf_counter", lambda: next(clock)):
+            worker.begin_decode_step(16, 9)
+            worker.begin_decode_step(16, 9)
+            worker.on_verify_complete_cpu([2] * 9, batch_size=9)
+            worker.on_verify_complete_cpu([1] * 9, batch_size=9)
+            worker._extend_ct += 1  # a prefill between the second and third step
+            worker.begin_decode_step(16, 9)
+            worker.begin_decode_step(16, 7)
+            # The third step's result went unreported; the fourth (bs 7) is next.
+            worker.on_verify_complete_cpu([3] * 7, batch_size=7)
+            # Dispatched before a prefill, reported after it: the interval holds the
+            # prefill's host work, so it does not count either.
+            worker.begin_decode_step(16, 7)
+            worker._extend_ct += 1
+            worker.on_verify_complete_cpu([3] * 7, batch_size=7)
+        self.assertEqual(
+            [
+                (a, kw["num_correct_drafts"], kw["num_verify_drafts"], kw["seconds"])
+                for a, kw in recorded
+            ],
+            [
+                ((16, 4), [2] * 9, [3] * 9, None),
+                ((16, 4), [1] * 9, [3] * 9, 0.5),
+                ((16, 4), [3] * 7, [3] * 7, None),
+                ((16, 4), [3] * 7, [3] * 7, None),
+            ],
+        )
+
+    def test_scheduled_caps_reach_the_policy(self):
+        """Per-request caps live on device; the decode result carries the live rows'
+        cap_lens (root + caps) through the scheduler's async result copy, so the
+        policy sees each request's verified drafts without a worker-side D2H."""
+        worker, recorded = self._adaptive_worker()
+        caps = torch.tensor([2, 0, 5, 0], dtype=torch.int32)  # bucket 4, bs 3
+
+        class Result:  # GenerationBatchResult stand-in; weak-referenceable
+            cap_lens = None
+
+        def pack(self, **kw):
+            del self, kw
+            return Result()
+
+        no_state = dict(next_state=None, logits_output=None, accept=None)
+        with patch.object(base_spec_worker.TpuSpecWorker, "_pack_decode_result", pack):
+            worker.begin_decode_step(4, 3)
+            worker._step_caps = caps  # draft() scheduled them
+            result = worker._pack_decode_result(bs=3, **no_state)
+            # A step without scheduled caps leaves cap_lens unset.
+            worker.begin_decode_step(4, 3)
+            plain = worker._pack_decode_result(bs=3, **no_state)
+        self.assertEqual(result.cap_lens.dtype, torch.int32)
+        self.assertEqual(result.cap_lens.tolist(), [3, 1, 6])
+        self.assertIsNone(plain.cap_lens)
+        worker.on_verify_complete_cpu([1, 0, 5], batch_size=3)
+        worker.on_verify_complete_cpu([1, 0, 3], batch_size=3)
+        self.assertEqual(
+            [kw["num_verify_drafts"] for _, kw in recorded], [[2, 0, 5], [3, 3, 3]]
+        )
 
 
 class TestNarrowVerify(CustomTestCase):
@@ -1886,6 +2285,7 @@ class TestNarrowVerify(CustomTestCase):
         """cap-accept verifies full width but caps each request, greedy and sampled alike."""
         bs, gamma = 4, 7
         worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = None
         worker.num_verify_rows = gamma + 1
         worker.num_drafts = gamma
         worker._scheduled_caps = True
@@ -1978,6 +2378,7 @@ class TestNarrowVerify(CustomTestCase):
         )
 
         worker = object.__new__(TpuBlockSpecWorker)
+        worker._adaptive_width = None
         worker.num_verify_rows = width
         worker.num_drafts = gamma
         worker._scheduled_caps = True
