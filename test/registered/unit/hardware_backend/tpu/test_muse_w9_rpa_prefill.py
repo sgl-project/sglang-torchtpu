@@ -743,6 +743,13 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                     cos_fp8 = float(np.sum(got_fp8 * ref) / (np.linalg.norm(got_fp8) * np.linalg.norm(ref)))
                     self.assertGreater(cos_fp8, 0.998)
 
+        # Case C (#2756/#2760 Unified `nod2` regression): when `1 <= (kv_len % 256) <= 128`
+        # (odd `cdiv(kv_len, 128)`), `_up_partial` MUST zero `2 * cdiv(kv_len, 256)` halves
+        # in VMEM so dirty `NaN` VMEM bits from prior decode kernels never hit `0.0 * NaN = NaN`!
+        src_rpa = (_REPO_ROOT / "sglang_tpu/attention/pallas/ragged_paged_attention_v3.py").read_text(encoding="utf-8")
+        self.assertIn("h_lim = 2 * cdiv(valid_keys, 256)", src_rpa)
+        self.assertNotIn("h_lim = cdiv(valid_keys, 128)", src_rpa)
+
     def test_tpu7x_mosaic_exports_w9_mk128_tp8_and_tp16(self):
         try:
             from jax._src import tpu_info as _tpu_info  # noqa: F401

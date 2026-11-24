@@ -902,7 +902,12 @@ def _stationary_q_v2_process(
         @pl.when(valid_keys < bkv_sz)
         def _up_partial():
             if use_mk128:
-                h_lim = cdiv(valid_keys, 128)
+                # Must unpack BOTH 128-row halves of every touched 256-key slice
+                # (`2 * cdiv(valid_keys, 256)`), because `_run_slice_range` evaluates
+                # `s_hi = cdiv(valid_keys, 256)` full 256-key slices (`2 * s_hi` halves)
+                # and `0.0 * NaN = NaN` if the odd second half retains dirty VMEM bits
+                # from prior Unified decode kernels!
+                h_lim = 2 * cdiv(valid_keys, 256)
 
                 @pl.loop(0, h_lim, unroll=False)
                 def _up_one_mk(h_loc):
