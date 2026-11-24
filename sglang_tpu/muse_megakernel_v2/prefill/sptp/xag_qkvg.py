@@ -8,6 +8,8 @@ qkvg overlapped only partly). Tile j holds rows [j * seg, (j + 1) * seg) of ever
 The layer's wqkvg stays in VMEM for the whole kernel (one HBM read per layer, not per chunk).
 """
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -166,6 +168,7 @@ def xag_qkvg_call(
     exact_cast: bool = False,
     gate4: bool = False,
     w_start: int = 0,
+    m_split: int = 1,
 ):
     """(layer [1] i32, x8 [Ts, H] e4m3 own rows, xs [T, 1] f32 every row's scale, rope [T, 2 hd]
     f32, stacked wqkvg [L, H, nq] e4m3 and smalls [L, 16, H] f32) -> (q, kv [T, 2 kvd], gate
@@ -372,21 +375,42 @@ def xag_qkvg_call(
                 for cp in in_loads(j):
                     cp.wait()
             sm = sm_v[...]
-            with _scope("qk_dot"):
-                acc = None
-                for k0 in range(0, H, kc):
-                    part = jnp.dot(
-                        pad[s, :, k0 : k0 + kc],
-                        w_v[k0 : k0 + kc, :],
-                        preferred_element_type=jnp.float32,
-                    )
-                    acc = part if acc is None else acc + part
-                xs = gathered_scales(s) if fuse_norm and not dbg_xs else xs_v[b]
-                qkvg = acc * xs * small_row(sm, "wqkvg_s")[:, :nq]
-            with _scope("qk_epilogue"):
-                epi = qkv_epilogue if mxu_norm else qkv_from_proj
-                epi = qkv_epilogue_split if split_epi else epi
-                q, kv, g = epi(c, qkvg, rope_v[b] if rope else None)
+            xs_all = gathered_scales(s) if fuse_norm and not dbg_xs else xs_v[b]
+            epi = qkv_epilogue if mxu_norm else qkv_from_proj
+            epi = qkv_epilogue_split if split_epi else epi
+            hm = tm // m_split
+            outs = []
+            # m_split > 1: row halves in one block, so a half's epilogue (VPU) can overlap the
+            # next half's dot (MXU)
+            # (trace regions are scheduling barriers: one region around the split halves)
+            sc = (lambda n: contextlib.nullcontext()) if m_split > 1 else _scope
+            with _scope("qk_dotepi") if m_split > 1 else contextlib.nullcontext():
+                for h in range(m_split):
+                    r0 = h * hm
+                    with sc("qk_dot"):
+                        acc = None
+                        for k0 in range(0, H, kc):
+                            part = jnp.dot(
+                                pad[s, r0 : r0 + hm, k0 : k0 + kc],
+                                w_v[k0 : k0 + kc, :],
+                                preferred_element_type=jnp.float32,
+                            )
+                            acc = part if acc is None else acc + part
+                        qkvg = (
+                            acc
+                            * xs_all[r0 : r0 + hm]
+                            * small_row(sm, "wqkvg_s")[:, :nq]
+                        )
+                    with sc("qk_epilogue"):
+                        outs.append(
+                            epi(c, qkvg, rope_v[b, r0 : r0 + hm] if rope else None)
+                        )
+            if m_split == 1:
+                q, kv, g = outs[0]
+            else:
+                q, kv, g = (
+                    jnp.concatenate([o[i] for o in outs], axis=0) for i in range(3)
+                )
 
             # out buffers are double-buffered: tile j - 2's writes must have drained
             @pl.when(j >= 2)
@@ -437,7 +461,7 @@ def xag_qkvg_call(
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     q_shape = (kvh, T, gq, 128) if q_rpa else (T, qd)
     name = (
-        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}"
+        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}"
         f"{'_mxun' if mxu_norm else ''}{'_qrpa' if q_rpa else ''}{'_norm' if fuse_norm else ''}"
     )
 
