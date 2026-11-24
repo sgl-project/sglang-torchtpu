@@ -23,7 +23,7 @@
 
 import dataclasses
 import functools
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -49,6 +49,46 @@ def _scale_quantized_partial(partial, lhs_scale, rhs_scale, *, scales_dtype):
     if rhs_scale is not None:
         scaled = scaled * rhs_scale.astype(scales_dtype)
     return scaled.astype(partial.dtype)
+
+
+def _quantize_lhs_block(block_lhs, lhs_q_dtype, dtype_max):
+    """Per-row quantization of one lhs block -> (quantized values, per-row scale).
+
+    ``prequantize_lhs_fp8`` must run exactly these ops to stay bit-identical.
+    """
+    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+
+    # If block_scale=0, it will cause division by zero and return either
+    # NaN or Inf. Since this can cause numeric issue when downcasting to
+    # quantized value, we convert them into 0.
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    # Convert lhs into quantized dtype.
+    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+    return block_lhs_q, block_scale
+
+
+# One 32-bit word holds the fp8 bytes of 4 columns, one per 128-lane quarter of a quant
+# block: packing is shifts and lane-aligned slices, and a row gathers as plain words.
+PREQUANT_BLOCK = 512
+PREQUANT_SCALE_LANES = 128
+
+
+def _pack_fp8_block(block_q):
+    """Pack fp8 [rows, 512] -> u32 [rows, 128] (cols j, +128, +256, +384 per word)."""
+    u = pltpu.bitcast(block_q, jnp.uint8).astype(jnp.uint32)
+    word = u[:, 0:128]
+    for i in range(1, 4):
+        word = word | (u[:, 128 * i : 128 * (i + 1)] << (8 * i))
+    return word
+
+
+def _unpack_fp8_block(words, q_dtype):
+    """Inverse of ``_pack_fp8_block``: u32 [rows, 128] -> fp8 [rows, 512]."""
+    parts = [
+        pltpu.bitcast((words >> (8 * i)).astype(jnp.uint8), q_dtype) for i in range(4)
+    ]
+    return jnp.concatenate(parts, axis=1)
 
 
 # Util.
@@ -238,6 +278,15 @@ class FusedWeightsRef:
 RhsRef = WeightsRef | FusedWeightsRef
 
 
+class PrequantLhsRef(NamedTuple):
+    """An lhs already quantized by ``prequantize_lhs_fp8`` (arrays, specs or refs)."""
+
+    # u32 [size_m, size_k // 4], the fp8 container (see _pack_fp8_block).
+    data: Any
+    # f32 [size_m, 128]; lane b holds quant block b's scale (a bf16 value).
+    scale: Any
+
+
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
     tile_m: int
@@ -323,6 +372,8 @@ class InputConfigs:
     # rhs_scale given as [G, num_blocks, N] instead of [G, num_blocks, 1, N]: a caller holding
     # 3-D scales then skips the unit-dim relayout copy (it pads each (1, N) tile 8x).
     scale_3d: bool = False
+    # lhs only: the lhs arrives quantized (PrequantLhsRef) instead of in ``dtype``.
+    prequant: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -478,10 +529,22 @@ def generate_block_specs(
     index_map = IndexMaps(metadata_ref, cfgs)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
-    lhs_block_spec = pl.BlockSpec(
-        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k),
-        index_map.lhs_index_map,
-    )
+    if cfgs.lhs_cfgs.prequant:
+        lhs_block_spec = PrequantLhsRef(
+            data=pl.BlockSpec(
+                (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k // 4),
+                index_map.lhs_index_map,
+            ),
+            scale=pl.BlockSpec(
+                (bounded_slice_gm, cfgs.dims.size_lhs_sublane, PREQUANT_SCALE_LANES),
+                lambda n_id, gm_id, k_id: index_map.lhs_index_map(n_id, gm_id, 0),
+            ),
+        )
+    else:
+        lhs_block_spec = pl.BlockSpec(
+            (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k),
+            index_map.lhs_index_map,
+        )
 
     rhs_block_spec = create_rhs_spec(index_map, cfgs)
 
@@ -533,7 +596,12 @@ def inner_kernel(
     """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
+        prequant = cfgs.lhs_cfgs.prequant
+        if prequant:
+            tiled_lhs = tiled_lhs_ref.data.reshape(-1, cfgs.tiles.tile_k // 4)[...]
+            tiled_lhs_scale = tiled_lhs_ref.scale.reshape(-1, PREQUANT_SCALE_LANES)[...]
+        else:
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
         num_quant_blocks_per_tile_k = cfgs.num_quant_blocks_per_tile_k
         # When rhs is packed (quantized dtype packed into uint32), unpack it
         # back to the original dtype using pltpu.bitcast which operates on K
@@ -669,20 +737,23 @@ def inner_kernel(
                             * rs[..., start_n:end_n].astype(scales_dtype)
                         ).astype(acc_ref.dtype)
                         continue
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    if prequant:
+                        # tile_k == size_k (make_gmm_configs), so start_k is global.
+                        b = start_k // q_block_size
+                        w0 = b * (q_block_size // 4)
+                        block_lhs_q = _unpack_fp8_block(
+                            tiled_lhs[:, w0 : w0 + q_block_size // 4], lhs_q_dtype
+                        )
+                        block_scale = tiled_lhs_scale[:, b : b + 1]
+                    else:
+                        block_lhs = tiled_lhs[:, start_k:end_k]
 
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                        # Perform lhs quantization. Note that for every block_lhs,
+                        # same computation will be performed tiles_n//mxu_size times.
+                        # But we can let compiler perform CSE and avoid recomputation.
+                        block_lhs_q, block_scale = _quantize_lhs_block(
+                            block_lhs, lhs_q_dtype, dtype_max
+                        )
 
                     block_acc = jnp.matmul(
                         block_lhs_q,
@@ -1089,7 +1160,17 @@ def kernel_main(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    if cfgs.lhs_cfgs.prequant:
+        lhs_in = PrequantLhsRef(
+            data=lhs_ref.data.reshape(
+                -1, cfgs.dims.size_lhs_sublane, lhs_ref.data.shape[-1]
+            ),
+            scale=lhs_ref.scale.reshape(
+                -1, cfgs.dims.size_lhs_sublane, lhs_ref.scale.shape[-1]
+            ),
+        )
+    else:
+        lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     if cfgs.fuse_act is not None:
@@ -1345,6 +1426,7 @@ def validate_inputs(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_prequant: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
@@ -1361,7 +1443,11 @@ def validate_inputs(
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
-    assert lhs.shape == (size_m, size_k)
+    if lhs_prequant:
+        assert lhs.dtype in (jnp.uint32, jnp.int32), lhs.dtype
+        assert lhs.shape == (size_m, size_k // 4), (lhs.shape, size_k)
+    else:
+        assert lhs.shape == (size_m, size_k)
     assert rhs.shape == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
@@ -1376,7 +1462,8 @@ def validate_inputs(
 
     assert group_offset.shape == (1,)
 
-    size_lhs_sublane = lhs_sublane_tiling(lhs.dtype)
+    # A pre-quantized lhs keeps the bf16 row tiling of the activations it came from.
+    size_lhs_sublane = lhs_sublane_tiling(jnp.bfloat16 if lhs_prequant else lhs.dtype)
     size_lhs_sublane = min(size_lhs_sublane, size_m)
     if fuse_act is not None:
         assert size_n % 2 == 0, (
@@ -1450,6 +1537,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+        + ("-pq" if cfgs.lhs_cfgs.prequant else "")
     )
 
 
@@ -1473,6 +1561,7 @@ def make_gmm_configs(
     dequantize_rhs: bool = False,
     requantize_rhs: bool = False,
     lhs_scale_per_row: bool = False,
+    lhs_prequant: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1486,6 +1575,7 @@ def make_gmm_configs(
         fuse_act,
         packed_fp4=packed_fp4,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_prequant=lhs_prequant,
     )
 
     if rhs_scale is not None:
@@ -1620,6 +1710,21 @@ def make_gmm_configs(
     ):
         lhs_quant_block_size = min(lhs_quant_block_size, block_size)
 
+    if lhs_prequant and (
+        lhs_q_dtype != jnp.float8_e4m3fn.dtype
+        or row_scale
+        or requantize_rhs
+        or dequantize_rhs
+        or packed_fp4
+        or lhs_quant_block_size != PREQUANT_BLOCK
+        or dims.size_k % PREQUANT_BLOCK
+        or dims.size_k // PREQUANT_BLOCK > PREQUANT_SCALE_LANES
+    ):
+        raise ValueError(
+            "A pre-quantized lhs needs an fp8 rhs whose quant blocks are multiples "
+            f"of {PREQUANT_BLOCK} and a plain per-block activation quantization"
+        )
+
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
         # Input quantization involves reading all elements in a block to compute
@@ -1627,8 +1732,9 @@ def make_gmm_configs(
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
         quant_block_size=dims.size_k if row_scale else lhs_quant_block_size,
-        dtype=lhs.dtype,
+        dtype=jnp.bfloat16.dtype if lhs_prequant else lhs.dtype,
         row_scale=row_scale,
+        prequant=lhs_prequant,
     )
     # For block quantization (num_blocks > 1), rhs block size must be a
     # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
@@ -1692,6 +1798,13 @@ def make_gmm_configs(
     if requantize_rhs and tiles.tile_k % min(lhs_quant_block_size, dims.size_k):
         raise ValueError(
             "INT4-to-FP8 tile_k must preserve activation quantization groups"
+        )
+
+    if lhs_prequant and tiles.tile_k != dims.size_k:
+        # The kernel indexes the scale lanes with the in-tile block id.
+        raise ValueError(
+            f"A pre-quantized lhs needs tile_k == size_k ({dims.size_k}), got "
+            f"{tiles.tile_k}"
         )
 
     return GmmConfigs(
@@ -1763,6 +1876,7 @@ def gmm_v2(
     dequantize_rhs: bool = False,
     rhs_channel_scale: jax.Array | None = None,
     lhs_scale_per_row: bool = False,
+    lhs_scale: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1781,6 +1895,10 @@ def gmm_v2(
             [size_group, 1, out_size]; rhs_scale must contain FP32 group-32 scales
             divided by these multipliers. Additive rhs_bias is unsupported in
             this mode. Weights stay packed INT4 in HBM.
+        lhs_scale: Optional f32 [size_m, 128]. When given, ``lhs`` is the u32
+            [size_m, size_k // 4] fp8 container of ``prequantize_lhs_fp8`` and these are
+            its per-512-block scales: the kernel skips the activation quantization and
+            computes exactly what it would have computed from the bf16 rows.
         lhs_scale_per_row: Optional. Quantize lhs with one scale per row over each K tile
             instead of per 512 columns: each rhs block's partial then takes only its rhs scale
             and the row scale multiplies once per tile (fewer VALU ops on block-scaled rhs).
@@ -1838,6 +1956,7 @@ def gmm_v2(
         dequantize_rhs=dequantize_rhs,
         requantize_rhs=requantize_rhs,
         lhs_scale_per_row=lhs_scale_per_row,
+        lhs_prequant=lhs_scale is not None,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1905,13 +2024,19 @@ def gmm_v2(
         bias=rhs_bias,
     )
 
+    lhs_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if lhs_scale is not None:
+        assert lhs_scale.shape == (dims.size_m, PREQUANT_SCALE_LANES), lhs_scale.shape
+        lhs = PrequantLhsRef(data=lhs, scale=lhs_scale.astype(jnp.float32))
+        lhs_spec = PrequantLhsRef(data=lhs_spec, scale=lhs_spec)
+
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                lhs_spec,
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
@@ -1929,3 +2054,97 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:, : dims.size_n]
+
+
+def prequant_supported(
+    size_m: int,
+    rhs: jax.Array,
+    rhs_scale: jax.Array | None,
+    num_lhs_groups: int,
+    *,
+    tile_info: TileSizes | TileFn = calculate_tiling,
+    fuse_act: str | None = None,
+    out_dtype: jnp.dtype | None = jnp.bfloat16,
+) -> bool:
+    """Whether ``gmm_v2(lhs_scale=...)`` runs this GMM (trace-time, no device work).
+
+    Builds the configs a pre-quantized lhs of ``size_m`` rows would get: fp8 rhs with
+    quant blocks of a multiple of 512, fp8 activation support, and a tiling whose
+    tile_k covers K (the kernel reads every block scale of a row from one tile).
+    """
+    if rhs_scale is None or rhs.dtype != jnp.float8_e4m3fn:
+        return False
+    size_k = rhs.shape[1]
+    if size_k % PREQUANT_BLOCK:
+        return False
+    try:
+        make_gmm_configs(
+            jax.ShapeDtypeStruct((size_m, size_k // 4), jnp.uint32),
+            rhs,
+            rhs_scale,
+            None,
+            jax.ShapeDtypeStruct((num_lhs_groups,), jnp.int32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            tile_info=tile_info,
+            vmem_limit_bytes=default_vmem_limit_bytes(),
+            out_dtype=out_dtype,
+            acc_dtype=None,
+            maybe_quantize_lhs=True,
+            zero_initialize=False,
+            fuse_act=fuse_act,
+            lhs_prequant=True,
+        )
+    except (ValueError, AssertionError, NotImplementedError):
+        return False
+    return True
+
+
+def _prequantize_kernel(x_ref, q_ref, s_ref, *, q_dtype):
+    x = x_ref[...]
+    rows, size_k = x.shape
+    dtype_max = float(jnp.finfo(q_dtype).max)
+    lane = lax.broadcasted_iota(jnp.int32, (rows, PREQUANT_SCALE_LANES), 1)
+    scales = jnp.zeros((rows, PREQUANT_SCALE_LANES), jnp.float32)
+    for b in range(size_k // PREQUANT_BLOCK):
+        block_q, block_scale = _quantize_lhs_block(
+            x[:, b * PREQUANT_BLOCK : (b + 1) * PREQUANT_BLOCK], q_dtype, dtype_max
+        )
+        w0 = b * (PREQUANT_BLOCK // 4)
+        q_ref[:, w0 : w0 + PREQUANT_BLOCK // 4] = _pack_fp8_block(block_q)
+        scales = jnp.where(lane == b, block_scale.astype(jnp.float32), scales)
+    s_ref[...] = scales
+
+
+_PREQUANT_TILE_M = 256
+
+
+@jax.jit
+def prequantize_lhs_fp8(x: jax.Array):
+    """Quantize bf16 activations [M, K] once per row for ``gmm_v2(lhs_scale=...)``.
+
+    Same per-row, per-512-column fp8 e4m3 quantization as the GMM's in-kernel one
+    (``_quantize_lhs_block``), so quantizing before a row gather gives bit-identical GMM
+    results while the gather moves half the bytes and the GMM skips the quantization.
+
+    Returns (u32 [M, K // 4] fp8 container, f32 [M, 128] scales in lanes 0..K/512-1).
+    """
+    m, size_k = x.shape
+    assert x.dtype == jnp.bfloat16, x.dtype
+    assert size_k % PREQUANT_BLOCK == 0, size_k
+    assert size_k // PREQUANT_BLOCK <= PREQUANT_SCALE_LANES, size_k
+    tile_m = min(_PREQUANT_TILE_M, m)
+    return pl.pallas_call(
+        functools.partial(_prequantize_kernel, q_dtype=jnp.float8_e4m3fn),
+        out_shape=(
+            jax.ShapeDtypeStruct((m, size_k // 4), jnp.uint32),
+            jax.ShapeDtypeStruct((m, PREQUANT_SCALE_LANES), jnp.float32),
+        ),
+        grid=(pl.cdiv(m, tile_m),),
+        in_specs=[pl.BlockSpec((tile_m, size_k), lambda i: (i, 0))],
+        out_specs=(
+            pl.BlockSpec((tile_m, size_k // 4), lambda i: (i, 0)),
+            pl.BlockSpec((tile_m, PREQUANT_SCALE_LANES), lambda i: (i, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name="prequantize_lhs_fp8",
+    )(x)
