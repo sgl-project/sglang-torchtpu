@@ -264,6 +264,11 @@ def true_on_policy_input_logprobs(
             logits_metadata,
             use_logits_buffer=False,
         )
+    if input_logprob_indices.shape[0] == 0:
+        result.token_logprobs = torch.empty(
+            (0,), dtype=torch.float32, device=pruned_states.device
+        )
+        return result, sampled_logits
     targets = logits_metadata.extend_input_logprob_token_ids_gpu.to(torch.int32)
     token_logprobs = []
     # The chunk only bounds the [rows, vocab] logits.

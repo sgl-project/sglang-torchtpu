@@ -210,6 +210,27 @@ class TrueOnPolicyTestCase(CustomTestCase):
         self.assertEqual(resp.status_code, 400, resp.text)
         self.assertIn("refused: a custom logit processor", resp.text)
 
+    def assert_empty_input_logprobs_succeeds(self):
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(self.model_path)
+        prompt = tok.encode(PROMPTS[0])
+        max_new_tokens = 4
+        sampling = {
+            "temperature": 0.0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        }
+        cases = (
+            {"input_ids": prompt, "logprob_start_len": len(prompt)},
+            {"input_ids": prompt[:1]},
+        )
+        for payload in cases:
+            out = self._generate(**payload, sampling_params=sampling)
+            self.assertEqual(
+                len(out["meta_info"]["output_token_logprobs"]), max_new_tokens
+            )
+
 
 if __name__ == "__main__":
     # Nothing is collected here; the model files subclass TrueOnPolicyTestCase.

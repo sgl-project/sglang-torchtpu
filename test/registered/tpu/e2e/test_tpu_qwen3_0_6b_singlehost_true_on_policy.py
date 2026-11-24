@@ -34,6 +34,9 @@ class TestTpuQwen306bSinglehostTrueOnPolicy(TrueOnPolicyTestCase):
     def test_custom_logit_processor_is_refused(self):
         self.assert_custom_logit_processor_is_refused()
 
+    def test_empty_input_logprobs_succeeds(self):
+        self.assert_empty_input_logprobs_succeeds()
+
 
 if __name__ == "__main__":
     unittest.main()
