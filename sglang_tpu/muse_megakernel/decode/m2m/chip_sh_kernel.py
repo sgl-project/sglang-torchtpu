@@ -14,6 +14,7 @@ in-kernel overlapped 5D `kv_cache` scatter, and deferred Phase-3 weight DMAs):
 # PEP 563 must stay off so cpu_export_jax_op sees concrete jax.Array annotations.
 
 import functools
+import inspect
 
 from sglang_tpu.attention.pallas.util import align_to
 from sglang_tpu.kernels.decode_collective_bridges import (
@@ -30,6 +31,7 @@ from sglang_tpu.kernels.decode_collective_bridges import (
 from sglang_tpu.kernels.decode_collective_bridges_w8 import (
     _ag_chip_sharded_half_col_xor1,
     _as_2d_f32,
+    _as_dot_scale_f32,
     _dot_fp8_w8_slice_to_ref,
     _fold_cols_to_128,
     _pallas_call_maybe_interpret,
@@ -45,6 +47,13 @@ from sglang_tpu.muse_megakernel.decode.m2m.kernel import (
     _prologue_prefetch_kv_pages,
     _run_in_vmem_qkv_epilogue_any,
     _run_in_vmem_rpad_and_gate,
+)
+
+_POST_CORE_KW_TOK_D2D2 = (
+    inspect.signature(_run_chip_sharded_post_fast_core)
+    .parameters["tok_d2d2_send"]
+    .kind
+    == inspect.Parameter.KEYWORD_ONLY
 )
 
 
@@ -110,6 +119,7 @@ def _run_chip_sharded_b1_from_vmem_core(
     pre_exp_scale_input: bool,
     need_wait_barrier: bool = False,
     distribution_ref=None,
+    fast_b1: bool = True,
 ) -> None:
     """In-VMEM R1 chip-sharded Bridge-1b (`TP=8` & `TP=16`) consuming resident `s_buf` + `gated_ref`."""
     import jax.numpy as jnp
@@ -117,7 +127,7 @@ def _run_chip_sharded_b1_from_vmem_core(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    rows = gated_ref.shape[0]
+    rows, o_in = gated_ref.shape
     r_pair, hidden = s_buf.shape
     two_pair = 2 * r_pair
     four_pair = 4 * r_pair
@@ -157,9 +167,19 @@ def _run_chip_sharded_b1_from_vmem_core(
     own_pre_c0 = pl.multiple_of(side * pre_pair_cols, 128)
     other_pre_c0 = pl.multiple_of(other_side * pre_pair_cols, 128)
 
-    _dma_wait(wo_buf.at[0], wo_sem.at[0])
+    wo_0 = (
+        wo_buf.at[pl.ds(0, o_in), pl.ds(0, half)]
+        if wo_buf.ndim == 2
+        else wo_buf.at[0]
+    )
+    wo_1 = (
+        wo_buf.at[pl.ds(o_in, o_in), pl.ds(0, half)]
+        if wo_buf.ndim == 2
+        else wo_buf.at[1]
+    )
+    _dma_wait(wo_0, wo_sem.at[0])
     _dot_fp8_scaled_to_ref(
-        gated_ref, wo_buf.at[0], wo_scale_ref, other_c0, send_half, 0,
+        gated_ref, wo_0, wo_scale_ref, other_c0, send_half, 0,
         rows=rows, n_cols=half,
     )
 
@@ -171,9 +191,9 @@ def _run_chip_sharded_b1_from_vmem_core(
     )
     op_c1a.start()
 
-    _dma_wait(wo_buf.at[1], wo_sem.at[1])
+    _dma_wait(wo_1, wo_sem.at[1])
     _dot_fp8_scaled_to_ref(
-        gated_ref, wo_buf.at[1], wo_scale_ref, own_c0, own_half, 0,
+        gated_ref, wo_1, wo_scale_ref, own_c0, own_half, 0,
         rows=rows, n_cols=half,
     )
     op_c1a.wait()
@@ -409,7 +429,73 @@ def _run_chip_sharded_b1_from_vmem_core(
     )
     op_c1c.start()
 
-    if r_pair <= 32:
+    if r_pair == 16:
+        c_blk = min(half, 1024)
+        own_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        own_chunks = []
+        for c0 in range(0, half, c_blk):
+            bf = my_pair_bf16[:, pl.ds(c0, c_blk)].astype(jnp.float32)
+            own_chunks.append(bf)
+            own_sq = own_sq + _fold_cols_to_128(bf * bf)
+        op_c1c.wait()
+        oth_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        oth_chunks = []
+        for c0 in range(0, half, c_blk):
+            bf = recv_pair_bf16[:, pl.ds(c0, c_blk)].astype(jnp.float32)
+            oth_chunks.append(bf)
+            oth_sq = oth_sq + _fold_cols_to_128(bf * bf)
+        pa_sq = own_sq + oth_sq
+        inv_pa = lax.rsqrt(
+            jnp.sum(pa_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
+            + jnp.float32(pa_eps)
+        )
+        pff_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        ns_own_list = []
+        ns_oth_list = []
+        for idx_c, c0 in enumerate(range(0, half, c_blk)):
+            c_own = pl.ds(pl.multiple_of(own_c0 + c0, 128), c_blk)
+            c_oth = pl.ds(pl.multiple_of(other_c0 + c0, 128), c_blk)
+            ns_own = (
+                pa_alpha_ref[0:1, c_own] * s_buf[:, c_own]
+                + pa_beta_ref[0:1, c_own] * (own_chunks[idx_c] * inv_pa)
+            )
+            ns_oth = (
+                pa_alpha_ref[0:1, c_oth] * s_buf[:, c_oth]
+                + pa_beta_ref[0:1, c_oth] * (oth_chunks[idx_c] * inv_pa)
+            )
+            s_buf[:, c_own] = ns_own
+            s_buf[:, c_oth] = ns_oth
+            ns_own_list.append(ns_own)
+            ns_oth_list.append(ns_oth)
+            v_own = ns_own * pre_ff_gain_ref[0:1, c_own] if pre_ff_scale_input else ns_own
+            v_oth = ns_oth * pre_ff_gain_ref[0:1, c_oth] if pre_ff_scale_input else ns_oth
+            pff_sq = pff_sq + _fold_cols_to_128(v_own * v_own + v_oth * v_oth)
+        pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
+        inv_pff = lax.rsqrt(
+            jnp.sum(pff_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
+            + jnp.float32(pre_ff_eps)
+        )
+        for idx_c, c0 in enumerate(range(0, half, c_blk)):
+            c_own = pl.ds(pl.multiple_of(own_c0 + c0, 128), c_blk)
+            c_oth = pl.ds(pl.multiple_of(other_c0 + c0, 128), c_blk)
+            go = pre_ff_gain_ref[0:1, c_own]
+            gt = pre_ff_gain_ref[0:1, c_oth]
+            ro = (
+                (ns_own_list[idx_c] * go) * inv_pff
+                if pre_ff_scale_input
+                else (ns_own_list[idx_c] * inv_pff) * go
+            )
+            rt = (
+                (ns_oth_list[idx_c] * gt) * inv_pff
+                if pre_ff_scale_input
+                else (ns_oth_list[idx_c] * inv_pff) * gt
+            )
+            if not is_r16:
+                router_pair_buf[:, c_own] = ro
+                router_pair_buf[:, c_oth] = rt
+            ffn_pair_buf[:, c_own] = ro.astype(jnp.bfloat16)
+            ffn_pair_buf[:, c_oth] = rt.astype(jnp.bfloat16)
+    elif r_pair <= 32:
         c_blk = min(half, 1024 if r_pair <= 16 else 512)
         h_blk = min(hidden, 1024 if r_pair <= 16 else 512)
         own_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
@@ -568,6 +654,135 @@ def _run_chip_sharded_b1_from_vmem_core(
         _llo_fence(distribution_ref, _run_wpre_pair_dot)
     else:
         _run_wpre_pair_dot()
+
+    if fast_b1 and r_pair <= 32:
+        p_blk = min(pre_pair_cols, 1024 if r_pair <= 16 else 512)
+        own_pre_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        for c0 in range(0, pre_pair_cols, p_blk):
+            c_l = pl.ds(c0, p_blk)
+            c_own = pl.ds(pl.multiple_of(own_pre_c0 + c0, 128), p_blk)
+            xf = pre_my_half[:, c_l].astype(jnp.float32)
+            if pre_exp_scale_input:
+                xf = xf * pre_exp_gain_ref[0:1, c_own]
+            own_pre_sq = own_pre_sq + _fold_cols_to_128(xf * xf)
+        sq_pair_pre_buf[...] = own_pre_sq
+        op_sq = pltpu.make_async_remote_copy(
+            sq_pair_pre_buf,
+            sq_pair_pa_buf,
+            pre_send.at[0],
+            pre_recv.at[0],
+            device_id=(mate,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        op_sq.start()
+        op_sq.wait()
+        mate_pre_sq = sq_pair_pa_buf[...]
+        is_even_c = side == jnp.int32(0)
+        pre_sq = lax.select(is_even_c, own_pre_sq, mate_pre_sq) + lax.select(
+            is_even_c, mate_pre_sq, own_pre_sq
+        )
+        inv = lax.rsqrt(
+            jnp.sum(pre_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
+            + jnp.float32(pre_exp_eps)
+        )
+        rs_g = pl.ds(chip_r0, r_pair)
+        for c0 in range(0, pre_pair_cols, p_blk):
+            c_l = pl.ds(c0, p_blk)
+            c_own = pl.ds(pl.multiple_of(own_pre_c0 + c0, 128), p_blk)
+            x_own = pre_my_half[:, c_l].astype(jnp.float32)
+            g_own = pre_exp_gain_ref[0:1, c_own]
+            y_own = (
+                (x_own * g_own) * inv
+                if pre_exp_scale_input
+                else (x_own * inv) * g_own
+            )
+            if r_pair == 8:
+                exp_3d_buf[chip, :, c_own] = y_own.astype(out_expert_in_ref.dtype)
+            else:
+                out_expert_in_ref[rs_g, c_own] = y_own.astype(out_expert_in_ref.dtype)
+
+        ag_exp_ops = []
+        c_own_half = pl.ds(own_pre_c0, pre_pair_cols)
+        c_oth_half = pl.ds(other_pre_c0, pre_pair_cols)
+        for d in range(1, n_chips):
+            peer = me ^ jnp.int32(d << 1)
+            src_e = (
+                exp_3d_buf.at[chip, :, c_own_half]
+                if r_pair == 8
+                else out_expert_in_ref.at[rs_g, c_own_half]
+            )
+            op_e = pltpu.make_async_remote_copy(
+                src_e,
+                src_e,
+                ag_exp_send.at[d - 1],
+                ag_exp_recv.at[d - 1],
+                device_id=(peer,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op_e.start()
+            ag_exp_ops.append(op_e)
+
+        _dma_wait(w_router_buf, w_router_sem.at[0])
+        rmul = jnp.float32(router_multiplier)
+        r_lhs = ffn_pair_buf if is_r16 else router_pair_buf
+        if r_pair <= 64 and n_exp == 256:
+            lg = jnp.dot(
+                r_lhs[...], w_router_buf[...], preferred_element_type=jnp.float32
+            )
+            out_router_logits_ref[rs_g, :] = lg * rmul
+        else:
+            for ce in range(0, n_exp, _DOT_TN):
+                c_sl = pl.ds(ce, _DOT_TN)
+                lg = jnp.dot(
+                    r_lhs[...],
+                    w_router_buf[:, c_sl],
+                    preferred_element_type=jnp.float32,
+                )
+                out_router_logits_ref[rs_g, c_sl] = lg * rmul
+
+        ag_log_ops = []
+        for d in range(1, n_chips):
+            peer = me ^ jnp.int32(d << 1)
+            op_l = pltpu.make_async_remote_copy(
+                out_router_logits_ref.at[rs_g, :],
+                out_router_logits_ref.at[rs_g, :],
+                ag_log_send.at[d - 1],
+                ag_log_recv.at[d - 1],
+                device_id=(peer,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op_l.start()
+            ag_log_ops.append(op_l)
+
+        for op in ag_exp_ops:
+            op.wait()
+        if r_pair == 8:
+            e_w = min(pre_pair_cols, 512)
+            for p in range(n_chips // 2):
+                r16 = pl.ds(16 * p, 16)
+                for c0 in range(0, pre_pair_cols, e_w):
+                    c_own_s = pl.ds(pl.multiple_of(own_pre_c0 + c0, 128), e_w)
+                    out_expert_in_ref[r16, c_own_s] = jnp.concatenate(
+                        [
+                            exp_3d_buf[2 * p, :, c_own_s],
+                            exp_3d_buf[2 * p + 1, :, c_own_s],
+                        ],
+                        axis=0,
+                    )
+        op_exp_d2d = pltpu.make_async_remote_copy(
+            out_expert_in_ref.at[:, c_own_half],
+            out_expert_in_ref.at[:, c_own_half],
+            c1c_send.at[0],
+            c1c_recv.at[0],
+            device_id=(mate,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        op_exp_d2d.start()
+        for op in ag_log_ops:
+            op.wait()
+        op_exp_d2d.wait()
+        _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+        return
 
     op_pre = pltpu.make_async_remote_copy(
         pre_my_half, pre_mate_half, pre_send.at[0], pre_recv.at[0],
@@ -791,6 +1006,10 @@ def _m2m_chip_sh_kernel(
     has_rope: bool,
     interpret_mode: bool,
     unroll_quad: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    fast_b1: bool = True,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -908,8 +1127,10 @@ def _m2m_chip_sh_kernel(
     rows = (world_size // 2) * r_pair
     half = hidden // 2
     post_cols = w_post_hbm.shape[1]
+    is_tp2_wpost = 2 * post_cols == hidden
     qkv_cols = next_w_qkv_hbm.shape[1]
     gate_cols = next_w_gate_hbm.shape[1]
+    o_in = wo_hbm.shape[0]
     phys_page_rows = (
         kv_cache_ro_hbm.shape[2] if kv_cache_ro_hbm.ndim == 6 else kv_cache_ro_hbm.shape[1]
     )
@@ -921,7 +1142,11 @@ def _m2m_chip_sh_kernel(
     own_c0 = pl.multiple_of(side * half, 128)
     other_c0 = pl.multiple_of(other_side * half, 128)
 
-    w_post_buf = slab_b.at[pl.ds(0, w_post_hbm.shape[0]), pl.ds(0, post_cols)]
+    w_post_buf = (
+        wo_buf.at[pl.ds(0, w_post_hbm.shape[0]), pl.ds(0, post_cols)]
+        if is_tp2_wpost
+        else slab_b.at[pl.ds(0, w_post_hbm.shape[0]), pl.ds(0, post_cols)]
+    )
     w_qkv_buf = slab_a.at[:, pl.ds(0, qkv_cols)]
     w_gate_buf = slab_b.at[:, pl.ds(0, gate_cols)]
 
@@ -944,6 +1169,12 @@ def _m2m_chip_sh_kernel(
         num_slots=bkv_vmem_ref.shape[0],
     )
 
+    _post_tok_pos = () if _POST_CORE_KW_TOK_D2D2 else (in_d2d2_send, in_d2d2_recv)
+    _post_tok_kw = (
+        {"tok_d2d2_send": in_d2d2_send, "tok_d2d2_recv": in_d2d2_recv}
+        if _POST_CORE_KW_TOK_D2D2
+        else {}
+    )
     _llo_fence(
         distribution_ref,
         lambda: _run_chip_sharded_post_fast_core(
@@ -969,6 +1200,7 @@ def _m2m_chip_sh_kernel(
             tok_s1_recv,
             ici_grp_a_send,
             ici_grp_a_recv,
+            *_post_tok_pos,
             post_d2d_send,
             post_d2d_recv,
             ici_grp_b_send,
@@ -982,13 +1214,15 @@ def _m2m_chip_sh_kernel(
             next_in_scale_input=next_in_scale_input,
             round_stream_bf16_for_norm=False,
             on_stream_updated_fn=None,
+            out_next_full_ref=next_in_vmem if r_pair >= 16 else None,
+            **_post_tok_kw,
         ),
     )
 
     pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, w_post_gate_sem.at[0]).start()
 
     _ag_chip_sharded_half_col_xor1(
-        next_in_pair,
+        next_in_pair if r_pair == 8 else None,
         next_in_vmem,
         ici_grp_a_send,
         ici_grp_a_recv,
@@ -998,6 +1232,8 @@ def _m2m_chip_sh_kernel(
         world_size=world_size,
         ag_3d_buf=ag_exp_3d_buf,
         during_d2d2_fn=lambda: _dma_wait(w_qkv_buf, w_qkv_pre_sem.at[0]),
+        r_pair_in=r_pair,
+        copy_local_from_pair=(r_pair == 8),
     )
 
     _llo_fence(
@@ -1034,11 +1270,21 @@ def _m2m_chip_sh_kernel(
     )
 
     def _start_wo_chip():
+        wo_0 = (
+            wo_buf.at[pl.ds(0, o_in), pl.ds(0, half)]
+            if wo_buf.ndim == 2
+            else wo_buf.at[0]
+        )
+        wo_1 = (
+            wo_buf.at[pl.ds(o_in, o_in), pl.ds(0, half)]
+            if wo_buf.ndim == 2
+            else wo_buf.at[1]
+        )
         pltpu.make_async_copy(
-            wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
+            wo_hbm.at[:, pl.ds(other_c0, half)], wo_0, wo_sem.at[0]
         ).start()
         pltpu.make_async_copy(
-            wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
+            wo_hbm.at[:, pl.ds(own_c0, half)], wo_1, wo_sem.at[1]
         ).start()
 
     _run_in_vmem_rpad_and_gate(
@@ -1074,9 +1320,13 @@ def _m2m_chip_sh_kernel(
         on_rpad_kv_done_fn=_start_wo_chip,
         init_sv_vmem_ref=init_sv_vmem_ref,
         unroll_quad=unroll_quad,
+        mp5_uniform=mp5_uniform,
+        nq8=nq8,
+        u32_vmask=u32_vmask,
     )
 
-    pltpu.make_async_copy(w_pre_pair_hbm, slab_a, w_qkv_pre_sem.at[0]).start()
+    w_pre_pair_buf = slab_a.at[:, pl.ds(0, w_pre_pair_hbm.shape[1])]
+    pltpu.make_async_copy(w_pre_pair_hbm, w_pre_pair_buf, w_qkv_pre_sem.at[0]).start()
     pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
     eff_send_half = moe_full_buf if moe_full_buf.shape == (rows, half) else send_half
@@ -1089,7 +1339,7 @@ def _m2m_chip_sh_kernel(
         pa_alpha_ref,
         pa_beta_ref,
         pre_ff_gain_ref,
-        slab_a,
+        w_pre_pair_buf,
         w_qkv_pre_sem,
         w_pre_pair_scale_ref,
         w_router_buf,
@@ -1141,6 +1391,7 @@ def _m2m_chip_sh_kernel(
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=False,
         distribution_ref=distribution_ref,
+        fast_b1=fast_b1,
     )
 
 
@@ -1170,6 +1421,10 @@ def _l0_a2m_chip_sh_kernel(
     has_rope: bool,
     interpret_mode: bool,
     unroll_quad: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    fast_b1: bool = True,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -1366,9 +1621,14 @@ def _l0_a2m_chip_sh_kernel(
         interpret_mode=interpret_mode,
         on_rpad_kv_done_fn=_start_wo_l0_chip,
         init_sv_vmem_ref=init_sv_vmem_ref,
+        unroll_quad=unroll_quad,
+        mp5_uniform=mp5_uniform,
+        nq8=nq8,
+        u32_vmask=u32_vmask,
     )
 
-    pltpu.make_async_copy(w_pre_pair_hbm, slab_a, w_qkv_pre_sem.at[0]).start()
+    w_pre_pair_buf = slab_a.at[:, pl.ds(0, w_pre_pair_hbm.shape[1])]
+    pltpu.make_async_copy(w_pre_pair_hbm, w_pre_pair_buf, w_qkv_pre_sem.at[0]).start()
     pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
     _dma_wait(s_buf, s_in_sem.at[0])
@@ -1382,7 +1642,7 @@ def _l0_a2m_chip_sh_kernel(
         pa_alpha_ref,
         pa_beta_ref,
         pre_ff_gain_ref,
-        slab_a,
+        w_pre_pair_buf,
         w_qkv_pre_sem,
         w_pre_pair_scale_ref,
         w_router_buf,
@@ -1434,6 +1694,7 @@ def _l0_a2m_chip_sh_kernel(
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=True,
         distribution_ref=distribution_ref,
+        fast_b1=fast_b1,
     )
 
 
@@ -1491,6 +1752,12 @@ def m2m_chip_sh_jax(
     collective_id: int = _M2M_CID_BASE + 4,
     interpret: bool = False,
     unroll_quad: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    fast_b1: bool = True,
+    vmem_kvw: bool = True,
+    defer_kv_write: bool = False,
 ):
     """Per-layer R1 chip-sharded `M2M` (`l >= 1`, `stream_chip [B//(TP//2), 8192]`, `TP in (8, 16)`)."""
     import jax
@@ -1517,6 +1784,11 @@ def m2m_chip_sh_jax(
     q_cols = half // 2
     post_cols = w_post_w8k.shape[1]
     pair_cols = 2 * post_cols
+    is_tp2_wpost = pair_cols == hidden
+    if post_cols % 128 != 0 or (post_cols * world_size != hidden and not is_tp2_wpost):
+        raise ValueError(
+            f"Unsupported m2m_chip_sh w_post={w_post_w8k.shape}, hidden={hidden}, world_size={world_size}"
+        )
     qkv_cols = next_w_qkv_w8k.shape[1]
     gate_cols = next_w_gate_w8k.shape[1]
     o_in = wo_w8k.shape[0]
@@ -1527,7 +1799,12 @@ def m2m_chip_sh_jax(
     use_xy = world_size == 8 and r_pair >= 16
     has_rope = cos_sin is not None
     b_pad32 = align_to(rows, 32)
-    can_alias_send = sharded_moe_in and k_in == half
+    can_alias_send = (not is_tp2_wpost) and sharded_moe_in and k_in == half
+    moe_full_sh = (
+        ((r_pair, k_in) if (sharded_moe_in or r_pair == 8) else (8, 128))
+        if is_tp2_wpost
+        else ((rows, k_in) if sharded_moe_in else (8, 128))
+    )
 
     phys_page_rows = (
         kv_cache_ro.shape[2] if kv_cache_ro.ndim == 6 else kv_cache_ro.shape[1]
@@ -1558,28 +1835,32 @@ def m2m_chip_sh_jax(
     )
     out_specs = (h_sp, v_sp, v_sp, v_sp)
 
+    q_rows_vmem = 8 if (nq8 and gate_cols <= 512) else 16
     scratch_shapes = [
-        vmem((hidden, pre_pair_cols), next_w_qkv_w8k.dtype),  # slab_a
-        vmem((hidden, max(post_cols, gate_cols)), next_w_gate_w8k.dtype),  # slab_b
-        vmem((2, o_in, half), wo_w8k.dtype),  # wo_buf
+        vmem((hidden, max(qkv_cols, pre_pair_cols)), next_w_qkv_w8k.dtype),  # slab_a
+        vmem((hidden, gate_cols if is_tp2_wpost else max(post_cols, gate_cols)), next_w_gate_w8k.dtype),  # slab_b
+        vmem(
+            (max(k_in, 2 * o_in), max(post_cols, half)) if is_tp2_wpost else (2, o_in, half),
+            wo_w8k.dtype,
+        ),  # wo_buf (reused for w_post_buf in Phase 1 when is_tp2_wpost!)
         vmem((hidden, n_exp), w_router_km.dtype),  # w_router_buf
         vmem((_NUM_KV_SLOTS, max_ring_pages, phys_page_rows, 1, 4, 128), kv_cache_ro.dtype),
         vmem((r_pair, hidden), jnp.float32),  # s_buf
-        vmem((r_pair, hidden), jnp.bfloat16),  # next_in_pair
+        vmem((8, hidden) if r_pair == 8 else (8, 128), jnp.bfloat16),  # next_in_pair
         vmem((rows, hidden), jnp.bfloat16),  # next_in_vmem
         vmem((rows, qkv_cols), jnp.bfloat16),  # qkv_vmem
-        vmem((rows, 16, 128), jnp.bfloat16),  # q_vmem_ref
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),  # q_vmem_ref
         vmem((b_pad32, 1, 4, 128), kv_cache_ro.dtype),  # kv_merged_vmem_ref
-        vmem((rows, 16, 128), jnp.bfloat16),  # o_vmem_ref
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),  # o_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gate_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gated_vmem_ref
         vmem((in_r, k_in) if sharded_moe_in else (8, 128), jnp.bfloat16),  # mate_tok_buf
-        vmem((rows, k_in) if sharded_moe_in else (8, 128), jnp.bfloat16),  # moe_full_buf
-        vmem((rows, post_cols), jnp.bfloat16),  # post_shard
-        vmem((rows, post_cols), jnp.bfloat16),  # mate_post_shard
-        vmem((rows, pair_cols), jnp.bfloat16),  # chip_cols_buf
+        vmem(moe_full_sh, jnp.bfloat16),  # moe_full_buf
+        vmem((8, 128) if is_tp2_wpost else (rows, post_cols), jnp.bfloat16),  # post_shard
+        vmem((r_pair, half) if (is_tp2_wpost or r_pair >= 16) else (rows, post_cols), jnp.bfloat16),  # mate_post_shard
+        vmem((r_pair, half) if (is_tp2_wpost or r_pair >= 16) else (rows, pair_cols), jnp.bfloat16),  # chip_cols_buf
         vmem((r_pair, hidden), jnp.bfloat16),  # post_pair_full (reused as ffn_pair_buf!)
-        vmem((n_chips, 8, pair_cols) if r_pair == 8 else (8, 128), jnp.bfloat16),  # cols_3d_buf
+        vmem((n_chips, 8, pair_cols) if (r_pair == 8 and not is_tp2_wpost) else (8, 128), jnp.bfloat16),  # cols_3d_buf
         vmem((n_chips, 8, max(half, h_pre)) if r_pair == 8 else (8, 128), jnp.bfloat16),  # ag_exp_3d_buf
         vmem((8, 128) if can_alias_send else (rows, half), jnp.bfloat16),  # send_half
         vmem((rows, half), jnp.bfloat16),  # mate_recv
@@ -1603,9 +1884,9 @@ def m2m_chip_sh_jax(
         vmem((r_pair, 128), jnp.float32),  # sq_pair_pa_buf
         vmem((8, 128) if is_r16 else (r_pair, hidden), jnp.float32),  # router_pair_buf
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),  # pre_my_half
-        vmem((r_pair, pre_pair_cols), jnp.bfloat16),  # pre_mate_half
+        vmem((8, 128) if (fast_b1 and r_pair <= 32) else (r_pair, pre_pair_cols), jnp.bfloat16),  # pre_mate_half
         vmem((r_pair, 128), jnp.float32),  # sq_pair_pre_buf
-        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),  # init_sv_vmem_ref
+        vmem((2, b_pad32 if sliding_window is None else 1, q_rows_vmem, 128), jnp.float32),  # init_sv_vmem_ref
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),  # rpa_smem_ref
         # Semaphores (`46` on TP=8, `56` on TP=16 — strictly < 64!):
         sem((1,)),  # w_post_gate_sem
@@ -1647,7 +1928,7 @@ def m2m_chip_sh_jax(
     )
     cp = pltpu.CompilerParams(
         dimension_semantics=("arbitrary",),
-        vmem_limit_bytes=60 * 1024**2,
+        vmem_limit_bytes=(62 if (is_tp2_wpost and not is_r16) else 60) * 1024**2,
         collective_id=collective_id,
         disable_bounds_checks=True,
     )
@@ -1660,8 +1941,9 @@ def m2m_chip_sh_jax(
     sw_tag = f"sw{sliding_window}" if sliding_window is not None else f"full{max_ring_pages}p"
     d2_tag = "d2" if kv_pack_dense2 else "nod2"
     sh_tag = "sh" if sharded_moe_in else "full"
+    wp_tag = "_tp2wp" if is_tp2_wpost else ""
     name = (
-        f"muse_m2m_chip_tp{world_size}_b{rows}_{sh_tag}_{sw_tag}_{d2_tag}_"
+        f"muse_m2m_chip_tp{world_size}_b{rows}_{sh_tag}{wp_tag}_{sw_tag}_{d2_tag}_"
         f"{'rope' if has_rope else 'nope'}"
     )
 
@@ -1692,6 +1974,10 @@ def m2m_chip_sh_jax(
             has_rope=has_rope,
             interpret_mode=is_interpret,
             unroll_quad=bool(unroll_quad),
+            mp5_uniform=bool(mp5_uniform),
+            nq8=bool(nq8),
+            u32_vmask=bool(u32_vmask),
+            fast_b1=bool(fast_b1),
         ),
         interpret=interpret,
         grid_spec=grid_spec,
@@ -1707,27 +1993,29 @@ def m2m_chip_sh_jax(
         stream_chip.astype(jnp.float32),
         moe_out.astype(jnp.bfloat16),
         w_post_w8k,
-        _as_2d_f32(s_post, post_cols),
+        _as_dot_scale_f32(s_post, post_cols),
         _as_2d_f32(post_ff_gain, hidden),
         _as_2d_f32(pf_alpha, hidden),
         _as_2d_f32(pf_beta, hidden),
         _as_2d_f32(next_in_gain, hidden),
         next_w_qkv_w8k,
-        _as_2d_f32(next_s_qkv, qkv_cols),
+        _as_dot_scale_f32(next_s_qkv, qkv_cols),
         next_w_gate_w8k,
-        _as_2d_f32(next_s_gate, gate_cols),
+        _as_dot_scale_f32(next_s_gate, gate_cols),
         *rope_args,
         kv_ro_arg,
         wo_w8k,
-        _as_2d_f32(wo_scale, hidden),
+        _as_dot_scale_f32(wo_scale, hidden),
         _as_2d_f32(pa_alpha, hidden),
         _as_2d_f32(pa_beta, hidden),
         _as_2d_f32(pre_ff_gain, hidden),
         w_pre_pair_w8k,
-        _as_2d_f32(w_pre_pair_scale, pre_pair_cols),
+        _as_dot_scale_f32(w_pre_pair_scale, pre_pair_cols),
         w_router_km,
         _as_2d_f32(pre_exp_gain, h_pre),
     )
+    if defer_kv_write:
+        return st_out, logits_out, exp_in_out, kvw_rows_out
     kv_cache_out = _kvw_1layer_jax(
         kv_lens,
         page_indices,
@@ -1740,6 +2028,7 @@ def m2m_chip_sh_jax(
         layer_num_in_bundle=int(layer_num_in_bundle),
         layer_offset_in_bundle=int(layer_offset_in_bundle),
         interpret=interpret,
+        vmem_kvw=bool(vmem_kvw),
     )
     return st_out, logits_out, exp_in_out, kv_cache_out
 
@@ -1786,6 +2075,13 @@ def l0_a2m_chip_sh_jax(
     pre_exp_scale_input: bool = False,
     collective_id: int = _M2M_CID_BASE + 5,
     interpret: bool = False,
+    unroll_quad: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    fast_b1: bool = True,
+    vmem_kvw: bool = True,
+    defer_kv_write: bool = False,
 ):
     """Layer-0 fused R1 chip-sharded `A2M` (`stream_chip [B//(TP//2), 8192]`, `TP in (8, 16)`)."""
     import jax
@@ -1844,17 +2140,18 @@ def l0_a2m_chip_sh_jax(
     )
     out_specs = (h_sp, v_sp, v_sp, v_sp)
 
+    q_rows_vmem = 8 if (nq8 and gate_cols <= 512) else 16
     scratch_shapes = [
-        vmem((hidden, pre_pair_cols), w_qkv_w8k.dtype),
+        vmem((hidden, max(qkv_cols, pre_pair_cols)), w_qkv_w8k.dtype),
         vmem((hidden, gate_cols), w_gate_w8k.dtype),
         vmem((2, o_in, half), wo_w8k.dtype),
         vmem((hidden, n_exp), w_router_km.dtype),
         vmem((_NUM_KV_SLOTS, max_ring_pages, phys_page_rows, 1, 4, 128), kv_cache_ro.dtype),
         vmem((r_pair, hidden), jnp.float32),
         vmem((rows, qkv_cols), jnp.bfloat16),
-        vmem((rows, 16, 128), jnp.bfloat16),
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),
         vmem((b_pad32, 1, 4, 128), kv_cache_ro.dtype),
-        vmem((rows, 16, 128), jnp.bfloat16),
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, half), jnp.bfloat16),
@@ -1880,10 +2177,10 @@ def l0_a2m_chip_sh_jax(
         vmem((r_pair, hidden), jnp.bfloat16),
         vmem((8, 128) if is_r16 else (r_pair, hidden), jnp.float32),
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),
-        vmem((r_pair, pre_pair_cols), jnp.bfloat16),
+        vmem((8, 128) if (fast_b1 and r_pair <= 32) else (r_pair, pre_pair_cols), jnp.bfloat16),
         vmem((r_pair, 128), jnp.float32),
         vmem((n_chips, 8, h_pre) if r_pair == 8 else (8, 128), jnp.bfloat16),
-        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),
+        vmem((2, b_pad32 if sliding_window is None else 1, q_rows_vmem, 128), jnp.float32),
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),
         sem((1,)),
         sem((1,)),
@@ -1955,6 +2252,10 @@ def l0_a2m_chip_sh_jax(
             has_rope=has_rope,
             interpret_mode=is_interpret,
             unroll_quad=bool(unroll_quad),
+            mp5_uniform=bool(mp5_uniform),
+            nq8=bool(nq8),
+            u32_vmask=bool(u32_vmask),
+            fast_b1=bool(fast_b1),
         ),
         interpret=interpret,
         grid_spec=grid_spec,
@@ -1970,21 +2271,23 @@ def l0_a2m_chip_sh_jax(
         stream_chip.astype(jnp.float32),
         attn_in.astype(jnp.bfloat16),
         w_qkv_w8k,
-        _as_2d_f32(s_qkv, qkv_cols),
+        _as_dot_scale_f32(s_qkv, qkv_cols),
         w_gate_w8k,
-        _as_2d_f32(s_gate, gate_cols),
+        _as_dot_scale_f32(s_gate, gate_cols),
         *rope_args,
         kv_ro_arg,
         wo_w8k,
-        _as_2d_f32(wo_scale, hidden),
+        _as_dot_scale_f32(wo_scale, hidden),
         _as_2d_f32(pa_alpha, hidden),
         _as_2d_f32(pa_beta, hidden),
         _as_2d_f32(pre_ff_gain, hidden),
         w_pre_pair_w8k,
-        _as_2d_f32(w_pre_pair_scale, pre_pair_cols),
+        _as_dot_scale_f32(w_pre_pair_scale, pre_pair_cols),
         w_router_km,
         _as_2d_f32(pre_exp_gain, h_pre),
     )
+    if defer_kv_write:
+        return st_out, logits_out, exp_in_out, kvw_rows_out
     kv_cache_out = _kvw_1layer_jax(
         kv_lens,
         page_indices,
@@ -1997,5 +2300,6 @@ def l0_a2m_chip_sh_jax(
         layer_num_in_bundle=int(layer_num_in_bundle),
         layer_offset_in_bundle=int(layer_offset_in_bundle),
         interpret=interpret,
+        vmem_kvw=bool(vmem_kvw),
     )
     return st_out, logits_out, exp_in_out, kv_cache_out

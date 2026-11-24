@@ -1922,23 +1922,25 @@ def maybe_forward_m2m_decode(
     has_shared_prefix = getattr(md, "decode_shared_prefix_pages", None) is not None
 
     layer_meta: list[tuple] = []
+    pool_obj = backend.token_to_kv_pool
     for l_idx in range(model.start_layer, model.end_layer):
         lyr = model.layers[l_idx]
         sa = lyr.self_attn
         mlp = lyr.mlp
+        has_wpost = "_w7_wpost_w8k" in mlp._buffers or (
+            chip_sharded_stream and "_w9_wpost_pair_w8k" in mlp._buffers
+        )
         if (
             "_w7_wqkv_w8k" not in sa._buffers
             or "_w7_wgate_w8k" not in sa._buffers
             or sa._o_proj_w8k is None
-            or "_w7_wpost_w8k" not in mlp._buffers
+            or not has_wpost
             or "_w7_wrouter_km" not in mlp._buffers
             or (need_pair_w and "_w8_wpre_pair_w8k" not in mlp._buffers)
             or (not need_pair_w and "_w7_wpre_w8k" not in mlp._buffers)
         ):
             return None
-        kv_buf, kv_l_idx = _fused_kv_operands(
-            backend.token_to_kv_pool, sa.attn.layer_id
-        )
+        kv_buf, kv_l_idx = _fused_kv_operands(pool_obj, sa.attn.layer_id)
         if kv_l_idx is not None or kv_buf.ndim != 5:
             return None
         sw_raw = getattr(sa.attn, "sliding_window_size", None)
@@ -1949,19 +1951,26 @@ def maybe_forward_m2m_decode(
         else:
             sw = None
         is_swa = sw is not None
+        sub_pool = (
+            getattr(pool_obj, "swa_kv_pool" if is_swa else "full_kv_pool", None)
+            if pool_obj is not None
+            else None
+        )
+        lyr_dense2 = (
+            bool(sub_pool.kv_pack_dense2)
+            if sub_pool is not None and hasattr(sub_pool, "kv_pack_dense2")
+            else dense2
+        )
         pg_idx = _contig(backend._layer_page_indices(sa.attn.layer_id, is_swa_layer=is_swa))
         dist = _contig(backend._layer_distribution(is_swa_layer=is_swa))
         phys_rows = int(kv_buf.shape[1])
-        page_size = phys_rows * 2 if dense2 else phys_rows
+        page_size = phys_rows * 2 if lyr_dense2 else phys_rows
         pages_per_seq = int(pg_idx.shape[0]) // max(1, int(kv_lens.shape[0]))
         per_seq_cap = pages_per_seq * page_size
         m2m_ok = is_swa or (per_seq_cap <= max_full_ctx and not has_shared_prefix)
-        layer_meta.append((lyr, sa, mlp, kv_buf, sw, pg_idx, dist, m2m_ok))
+        layer_meta.append((lyr, sa, mlp, kv_buf, sw, pg_idx, dist, lyr_dense2, m2m_ok))
 
     if not any(m[-1] for m in layer_meta):
-        return None
-    # Guard TP=8 R1 (`chip_sharded_stream`) >4K workloads (`w_pg >= 5` SWA fallback, #2838):
-    if tp == 8 and chip_sharded_stream and any(not m[-1] for m in layer_meta):
         return None
 
     if cos_sin_step is None and getattr(model.rotary_emb, "cos_sin_pairs", None) is not None:
@@ -1971,7 +1980,7 @@ def maybe_forward_m2m_decode(
     cs_kw = {"cos_sin_step": cos_sin_step} if cos_sin_step is not None else {}
 
     # Step 1: Layer-0 Attention -> MoE(0) inputs (in-place overlapped KV scatter!)
-    lyr0, sa0, mlp0, kv0, sw0, pg0, dist0, m2m0 = layer_meta[0]
+    lyr0, sa0, mlp0, kv0, sw0, pg0, dist0, d2_0, m2m0 = layer_meta[0]
     if carried_attn_input is not None:
         attn_in0 = _contig(carried_attn_input)
     else:
@@ -2028,7 +2037,7 @@ def maybe_forward_m2m_decode(
             sw_val0,
             k_sc0,
             v_sc0,
-            dense2,
+            d2_0,
             float(lyr0.post_attention_layernorm.eps),
             float(lyr0.pre_feedforward_layernorm.eps),
             bool(lyr0.pre_feedforward_layernorm.scale_input),
@@ -2070,7 +2079,7 @@ def maybe_forward_m2m_decode(
     # Step 2: Inter-layer MoE(i) -> M2M(i -> i+1) relay across all 62 layers
     n_layers = len(layer_meta)
     for i in range(n_layers):
-        lyr, sa, mlp, _kv_i, _sw_i, _pg_i, _dist_i, _m2m_i = layer_meta[i]
+        lyr, sa, mlp, _kv_i, _sw_i, _pg_i, _dist_i, _d2_i, _m2m_i = layer_meta[i]
         can_sh_fn = getattr(mlp, "can_return_sharded_moe_out", None)
         has_sh_op = (
             bool(can_sh_fn(n_tok, decode=True))
@@ -2097,8 +2106,14 @@ def maybe_forward_m2m_decode(
         post_ff_gain = lyr.post_feedforward_layernorm.gain()
         pf_a = lyr.post_feedforward_residual_gate.alpha
         pf_b = lyr.post_feedforward_residual_gate.beta
-        w_post = mlp._buffers["_w7_wpost_w8k"]
-        s_post = mlp._buffers["_w7_spost"]
+        if chip_sharded_stream:
+            w_post = mlp._buffers.get(
+                "_w9_wpost_pair_w8k", mlp._buffers.get("_w7_wpost_w8k")
+            )
+            s_post = mlp._buffers.get("_w9_spost_pair", mlp._buffers.get("_w7_spost"))
+        else:
+            w_post = mlp._buffers["_w7_wpost_w8k"]
+            s_post = mlp._buffers["_w7_spost"]
 
         if i + 1 == n_layers:
             fin_gain = model.norm.gain()
@@ -2155,7 +2170,7 @@ def maybe_forward_m2m_decode(
                 )
             return final_hidden
 
-        n_lyr, n_sa, n_mlp, n_kv, n_sw, n_pg, n_dist, n_m2m = layer_meta[i + 1]
+        n_lyr, n_sa, n_mlp, n_kv, n_sw, n_pg, n_dist, n_d2, n_m2m = layer_meta[i + 1]
         next_in_gain = n_lyr.input_layernorm.gain()
         n_has_rope = n_sa.rotary_emb is not None
         n_r16 = n_mlp._buffers["_w7_wrouter_km"].dtype == torch.bfloat16
@@ -2230,7 +2245,7 @@ def maybe_forward_m2m_decode(
                 n_sw_val,
                 n_k_sc,
                 n_v_sc,
-                dense2,
+                n_d2,
                 float(n_lyr.post_attention_layernorm.eps),
                 float(n_lyr.pre_feedforward_layernorm.eps),
                 bool(n_lyr.pre_feedforward_layernorm.scale_input),

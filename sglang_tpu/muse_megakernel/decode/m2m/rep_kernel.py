@@ -35,6 +35,7 @@ from sglang_tpu.kernels.decode_collective_bridges import (
     _wait_barrier,
 )
 from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+    _as_dot_scale_f32,
     _pallas_call_maybe_interpret,
 )
 from sglang_tpu.muse_megakernel.decode.m2m.kernel import (
@@ -640,6 +641,9 @@ def _m2m_rep_kernel(
     pre_exp_scale_input: bool,
     has_rope: bool,
     interpret_mode: bool,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -928,6 +932,9 @@ def _m2m_rep_kernel(
         interpret_mode=interpret_mode,
         on_rpad_kv_done_fn=_start_wo_rep,
         init_sv_vmem_ref=init_sv_vmem_ref,
+        mp5_uniform=mp5_uniform,
+        nq8=nq8,
+        u32_vmask=u32_vmask,
     )
 
     pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
@@ -1021,6 +1028,9 @@ def _l0_a2m_rep_kernel(
     pre_exp_scale_input: bool,
     has_rope: bool,
     interpret_mode: bool,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
 ) -> None:
     import jax.numpy as jnp
     from jax import lax
@@ -1213,6 +1223,9 @@ def _l0_a2m_rep_kernel(
         interpret_mode=interpret_mode,
         on_rpad_kv_done_fn=_start_wo_l0_rep,
         init_sv_vmem_ref=init_sv_vmem_ref,
+        mp5_uniform=mp5_uniform,
+        nq8=nq8,
+        u32_vmask=u32_vmask,
     )
 
     pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_qkv_pre_sem.at[0]).start()
@@ -1331,6 +1344,11 @@ def m2m_rep_jax(
     pre_exp_scale_input: bool = False,
     collective_id: int = _M2M_CID_BASE + 2,
     interpret: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    vmem_kvw: bool = True,
+    defer_kv_write: bool = False,
 ):
     """Per-layer `M2M` (`l >= 1`, replicated stream, `TP in (8, 16)`)."""
     import jax
@@ -1341,8 +1359,8 @@ def m2m_rep_jax(
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Unsupported world_size={world_size}")
     rows, hidden = stream.shape
-    if rows < 8 or rows > 128 or rows % 8 != 0:
-        raise ValueError(f"Unsupported m2m_rep rows={rows}")
+    if rows < 8 or rows > 128 or rows % 8 != 0 or hidden % (world_size * _COL_STRIP) != 0:
+        raise ValueError(f"Unsupported m2m_rep shape={stream.shape}, world_size={world_size}")
     if sharded_moe_in and moe_out.shape[0] * world_size != rows:
         raise ValueError(f"sharded_moe_in shape mismatch: {moe_out.shape} vs rows={rows}")
 
@@ -1399,6 +1417,7 @@ def m2m_rep_jax(
     )
     out_specs = (h_sp, v_sp, v_sp, v_sp)
 
+    q_rows_vmem = 8 if (nq8 and gate_cols <= 512) else 16
     scratch_shapes = [
         vmem((hidden, max(qkv_cols, pre_cols)), next_w_qkv_w8k.dtype),  # slab_a
         vmem((hidden, max(post_cols, gate_cols)), next_w_gate_w8k.dtype),  # slab_b
@@ -1408,9 +1427,9 @@ def m2m_rep_jax(
         vmem((rows, hidden), jnp.float32),  # s_buf
         vmem((rows, hidden), jnp.bfloat16),  # next_in_vmem / ffn_vmem
         vmem((rows, qkv_cols), jnp.bfloat16),  # qkv_vmem
-        vmem((rows, 16, 128), jnp.bfloat16),  # q_vmem_ref
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),  # q_vmem_ref
         vmem((b_pad32, 1, 4, 128), kv_cache_ro.dtype),  # kv_merged_vmem_ref
-        vmem((rows, 16, 128), jnp.bfloat16),  # o_vmem_ref
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),  # o_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gate_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gated_vmem_ref
         vmem((rows, post_cols), jnp.bfloat16),  # post_shard
@@ -1429,7 +1448,7 @@ def m2m_rep_jax(
         vmem((rows, pre_cols), jnp.bfloat16),  # pre_shard
         vmem((8, 128) if reuse_pre_ab else (buf_rows, h_pre), jnp.bfloat16),
         vmem((8, 128) if (reuse_pre_ab or use_halfrow) else (buf_rows, h_pre), jnp.bfloat16),
-        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),  # init_sv_vmem_ref
+        vmem((2, b_pad32 if sliding_window is None else 1, q_rows_vmem, 128), jnp.float32),  # init_sv_vmem_ref
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),  # rpa_smem_ref
         sem((1,)),  # w_post_gate_sem
         sem((1,)),  # w_qkv_pre_sem
@@ -1504,6 +1523,9 @@ def m2m_rep_jax(
             pre_exp_scale_input=bool(pre_exp_scale_input),
             has_rope=has_rope,
             interpret_mode=is_interpret,
+            mp5_uniform=bool(mp5_uniform),
+            nq8=bool(nq8),
+            u32_vmask=bool(u32_vmask),
         ),
         interpret=interpret,
         grid_spec=grid_spec,
@@ -1519,27 +1541,29 @@ def m2m_rep_jax(
         stream.astype(jnp.float32),
         moe_out.astype(jnp.bfloat16),
         w_post_w8k,
-        _as_2d_f32_row(s_post, post_cols),
+        _as_dot_scale_f32(s_post, post_cols),
         _as_2d_f32_row(post_ff_gain, hidden),
         _as_2d_f32_row(pf_alpha, hidden),
         _as_2d_f32_row(pf_beta, hidden),
         _as_2d_f32_row(next_in_gain, hidden),
         next_w_qkv_w8k,
-        _as_2d_f32_row(next_s_qkv, qkv_cols),
+        _as_dot_scale_f32(next_s_qkv, qkv_cols),
         next_w_gate_w8k,
-        _as_2d_f32_row(next_s_gate, gate_cols),
+        _as_dot_scale_f32(next_s_gate, gate_cols),
         *rope_args,
         kv_ro_arg,
         wo_w8k,
-        _as_2d_f32_row(wo_scale, hidden),
+        _as_dot_scale_f32(wo_scale, hidden),
         _as_2d_f32_row(pa_alpha, hidden),
         _as_2d_f32_row(pa_beta, hidden),
         _as_2d_f32_row(pre_ff_gain, hidden),
         w_pre_w8k,
-        _as_2d_f32_row(w_pre_scale, pre_cols),
+        _as_dot_scale_f32(w_pre_scale, pre_cols),
         w_router_km,
         _as_2d_f32_row(pre_exp_gain, h_pre),
     )
+    if defer_kv_write:
+        return st_out, logits_out, exp_in_out, kvw_rows_out
     kv_cache_out = _kvw_1layer_jax(
         kv_lens,
         page_indices,
@@ -1552,6 +1576,7 @@ def m2m_rep_jax(
         layer_num_in_bundle=int(layer_num_in_bundle),
         layer_offset_in_bundle=int(layer_offset_in_bundle),
         interpret=interpret,
+        vmem_kvw=bool(vmem_kvw),
     )
     return st_out, logits_out, exp_in_out, kv_cache_out
 
@@ -1598,6 +1623,11 @@ def l0_a2m_rep_jax(
     pre_exp_scale_input: bool = False,
     collective_id: int = _M2M_CID_BASE + 3,
     interpret: bool = False,
+    mp5_uniform: bool = True,
+    nq8: bool = True,
+    u32_vmask: bool = True,
+    vmem_kvw: bool = True,
+    defer_kv_write: bool = False,
 ):
     """Layer-0 fused `A2M` (`TP in (8, 16)`, replicated stream)."""
     import jax
@@ -1608,8 +1638,8 @@ def l0_a2m_rep_jax(
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Unsupported world_size={world_size}")
     rows, hidden = stream.shape
-    if rows < 8 or rows > 128 or rows % 8 != 0:
-        raise ValueError(f"Unsupported l0_a2m_rep rows={rows}")
+    if rows < 8 or rows > 128 or rows % 8 != 0 or hidden % (world_size * _COL_STRIP) != 0:
+        raise ValueError(f"Unsupported l0_a2m_rep shape={stream.shape}, world_size={world_size}")
 
     half = hidden // 2
     chunk = hidden // world_size
@@ -1661,6 +1691,7 @@ def l0_a2m_rep_jax(
     )
     out_specs = (h_sp, v_sp, v_sp, v_sp)
 
+    q_rows_vmem = 8 if (nq8 and gate_cols <= 512) else 16
     scratch_shapes = [
         vmem((hidden, max(qkv_cols, pre_cols)), w_qkv_w8k.dtype),
         vmem((hidden, gate_cols), w_gate_w8k.dtype),
@@ -1670,9 +1701,9 @@ def l0_a2m_rep_jax(
         vmem((rows, hidden), jnp.float32),
         vmem((rows, hidden), jnp.bfloat16),
         vmem((rows, qkv_cols), jnp.bfloat16),
-        vmem((rows, 16, 128), jnp.bfloat16),
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),
         vmem((b_pad32, 1, 4, 128), kv_cache_ro.dtype),
-        vmem((rows, 16, 128), jnp.bfloat16),
+        vmem((rows, q_rows_vmem, 128), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((8, 128) if is_r16 else ((bm_g, hidden) if tile_r32 else (rows, hidden)), jnp.float32),
@@ -1686,7 +1717,7 @@ def l0_a2m_rep_jax(
         vmem((rows, pre_cols), jnp.bfloat16),
         vmem((8, 128) if reuse_pre_ab else (buf_rows, h_pre), jnp.bfloat16),
         vmem((8, 128) if (reuse_pre_ab or use_halfrow) else (buf_rows, h_pre), jnp.bfloat16),
-        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),
+        vmem((2, b_pad32 if sliding_window is None else 1, q_rows_vmem, 128), jnp.float32),
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),
         sem((1,)),
         sem((1,)),
@@ -1755,6 +1786,9 @@ def l0_a2m_rep_jax(
             pre_exp_scale_input=bool(pre_exp_scale_input),
             has_rope=has_rope,
             interpret_mode=is_interpret,
+            mp5_uniform=bool(mp5_uniform),
+            nq8=bool(nq8),
+            u32_vmask=bool(u32_vmask),
         ),
         interpret=interpret,
         grid_spec=grid_spec,
@@ -1770,21 +1804,23 @@ def l0_a2m_rep_jax(
         stream.astype(jnp.float32),
         attn_in.astype(jnp.bfloat16),
         w_qkv_w8k,
-        _as_2d_f32_row(s_qkv, qkv_cols),
+        _as_dot_scale_f32(s_qkv, qkv_cols),
         w_gate_w8k,
-        _as_2d_f32_row(s_gate, gate_cols),
+        _as_dot_scale_f32(s_gate, gate_cols),
         *rope_args,
         kv_ro_arg,
         wo_w8k,
-        _as_2d_f32_row(wo_scale, hidden),
+        _as_dot_scale_f32(wo_scale, hidden),
         _as_2d_f32_row(pa_alpha, hidden),
         _as_2d_f32_row(pa_beta, hidden),
         _as_2d_f32_row(pre_ff_gain, hidden),
         w_pre_w8k,
-        _as_2d_f32_row(w_pre_scale, pre_cols),
+        _as_dot_scale_f32(w_pre_scale, pre_cols),
         w_router_km,
         _as_2d_f32_row(pre_exp_gain, h_pre),
     )
+    if defer_kv_write:
+        return st_out, logits_out, exp_in_out, kvw_rows_out
     kv_cache_out = _kvw_1layer_jax(
         kv_lens,
         page_indices,
@@ -1797,5 +1833,6 @@ def l0_a2m_rep_jax(
         layer_num_in_bundle=int(layer_num_in_bundle),
         layer_offset_in_bundle=int(layer_offset_in_bundle),
         interpret=interpret,
+        vmem_kvw=bool(vmem_kvw),
     )
     return st_out, logits_out, exp_in_out, kv_cache_out
