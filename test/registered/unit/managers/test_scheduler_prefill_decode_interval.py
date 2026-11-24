@@ -32,12 +32,17 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_scheduler(
-    *, interval: int, min_bs: int, require_mlp_sync: bool = False
+    *,
+    interval: int,
+    min_bs: int,
+    require_mlp_sync: bool = False,
+    below_min_bs: int = 0,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_decode_interval = interval
     scheduler._prefill_decode_interval_remaining = 0
     scheduler.prefill_decode_interval_min_bs = min_bs
+    scheduler.prefill_decode_interval_below_min_bs = below_min_bs
     scheduler.require_mlp_sync = require_mlp_sync
     return scheduler
 
@@ -84,6 +89,42 @@ class TestPrefillDecodeIntervalMinBs(unittest.TestCase):
         self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(8)))
         self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(5)))
         self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)
+
+
+def _deferred_rounds(scheduler: Scheduler, running_batch) -> int:
+    rounds = 0
+    while scheduler._should_defer_prefill(running_batch):
+        rounds += 1
+    return rounds
+
+
+class TestPrefillDecodeIntervalBelowMinBs(unittest.TestCase):
+    def test_small_batch_defers_below_min_bs_rounds_after_every_prefill(self):
+        scheduler = _make_scheduler(interval=6, min_bs=3, below_min_bs=2)
+        for _ in range(2):
+            _arm(scheduler)
+            self.assertEqual(_deferred_rounds(scheduler, _make_running_batch(2)), 2)
+            self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)
+
+    def test_batch_at_min_bs_keeps_the_full_interval(self):
+        scheduler = _make_scheduler(interval=6, min_bs=3, below_min_bs=2)
+        _arm(scheduler)
+
+        self.assertEqual(_deferred_rounds(scheduler, _make_running_batch(3)), 6)
+
+    def test_shrinking_batch_counts_rounds_from_the_prefill(self):
+        scheduler = _make_scheduler(interval=6, min_bs=3, below_min_bs=2)
+        _arm(scheduler)
+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(4)))
+        # One round has run since the prefill, so a shrunken batch waits one more.
+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(2)))
+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(2)))
+
+        _arm(scheduler)
+        for _ in range(3):
+            self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(4)))
+        # Past the below-min-bs rounds, shrinking ends the interval at once.
+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(2)))
 
 
 class TestPrefillDecodeIntervalNothingDecodes(unittest.TestCase):
@@ -186,10 +227,15 @@ class _DecodingBatch:
         pass
 
 
-def _make_dp_rank(group, *, min_bs, delayer, waiting=0) -> Scheduler:
+def _make_dp_rank(group, *, min_bs, delayer, waiting=0, below_min_bs=0) -> Scheduler:
     """A DP-attention rank whose prefill planning only talks to the delayer:
     with `waiting` requests it asks to prefill and admits when allowed."""
-    s = _make_scheduler(interval=2, min_bs=min_bs, require_mlp_sync=True)
+    s = _make_scheduler(
+        interval=2,
+        min_bs=min_bs,
+        require_mlp_sync=True,
+        below_min_bs=below_min_bs,
+    )
     s.scheduler_stage_metrics = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.process_pending_chunked_abort = Mock()
@@ -283,6 +329,19 @@ class TestPrefillDecodeIntervalMinBsCollectives(CustomTestCase):
         # Rank 0 defers, rank 1 is below min-bs and plans a prefill.
         ranks[0]._get_new_batch_prefill_raw.assert_not_called()
         ranks[1]._get_new_batch_prefill_raw.assert_called_once()
+        self.assertEqual(self.group.log[0], ["prefill_delayer", "mlp_sync"])
+        self.assertEqual(self.group.log[1], ["prefill_delayer", "mlp_sync"])
+
+    def test_rank_below_min_bs_still_deferring_joins_the_delayer_gather(self):
+        ranks = [
+            _make_dp_rank(self.group, min_bs=2, delayer=self._delayer(), below_min_bs=1)
+            for _ in range(2)
+        ]
+        self._run_round_after_extend(ranks, running_sizes=[3, 1])
+
+        # Rank 1 is below min-bs but still inside its below-min-bs round.
+        for s in ranks:
+            s._get_new_batch_prefill_raw.assert_not_called()
         self.assertEqual(self.group.log[0], ["prefill_delayer", "mlp_sync"])
         self.assertEqual(self.group.log[1], ["prefill_delayer", "mlp_sync"])
 
