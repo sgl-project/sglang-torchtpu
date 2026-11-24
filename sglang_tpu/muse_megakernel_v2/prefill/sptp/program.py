@@ -249,6 +249,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
     pa_fp = int(os.environ.get("SPTP_PA_FUSE_POOL", "0")) if pa_a2a else 0
+    # SPTP_PA_NS=n: stream chunks the residual keeps in flight + 1 (prefetched under the o proj)
+    pa_ns = int(os.environ.get("SPTP_PA_NS", "2"))
 
     def forward(
         meta,
@@ -414,6 +416,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             pa_rc,
                             pa_la,
                             pa_fp,
+                            pa_ns,
                         )
                         args = (
                             l,

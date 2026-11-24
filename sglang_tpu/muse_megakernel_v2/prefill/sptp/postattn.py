@@ -180,6 +180,7 @@ def oproj_a2a_call(
     rc: int = 64,
     la: int = 7,
     pool_tn: int = 0,
+    ns: int = 2,
 ):
     """oproj_call with the gated-output a2a inside: (lyr_me [2] i32 (layer, rank), g8 [T, qd]
     e4m3 (this rank's heads of every row, token major), gs [1, T] f32 (their row scales),
@@ -193,7 +194,8 @@ def oproj_a2a_call(
     la: sends in flight ahead of the receivers' use (7: all at the start).
     pool_tn > 0: pool_call's steps (wpool [L, H, He] after wrouter, column blocks of pool_tn)
     follow in this kernel (the pool input stays in VMEM, wpool's first block loads under the
-    epilogue); outputs (stream, ids, tw, xe8 [Ts, He] e4m3, xs [1, Ts] f32)."""
+    epilogue); outputs (stream, ids, tw, xe8 [Ts, He] e4m3, xs [1, Ts] f32).
+    ns: stream row chunks in flight + 1; the first ns - 1 load under the last o proj steps."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
     if (
@@ -407,7 +409,7 @@ def oproj_a2a_call(
         vmem((tp, 1, Ts), _F32),
         vmem((Ts, H), _F32),
         vmem((H, E), _BF16),
-        vmem((2, rc, H), _F32),
+        vmem((ns, rc, H), _F32),
         vmem((2, rc, H), _F32),
         vmem((Ts, 1), _F32),
         dma((2,)),
@@ -415,7 +417,7 @@ def oproj_a2a_call(
         dma((tp,)),
         dma((tp,)),
         dma((tp,)),
-        dma((2,)),
+        dma((ns,)),
         dma((2,)),
     ]
     scratch += [vmem((2, qd, H), _FP8), dma((2,))]
@@ -441,7 +443,7 @@ def oproj_a2a_call(
             grid_spec=grid_spec,
             out_shape=tuple(out_shape),
             compiler_params=params,
-            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}",
+            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}",
         )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool)
 
     return call
@@ -469,7 +471,9 @@ class _Epilogue:
         )
 
     def prefetch(self):
-        self.cp_in(0, 0).start()
+        """The first sbuf slots - 1 stream chunks (the loop keeps that many in flight)."""
+        for i in range(min(self.sbuf.shape[0] - 1, self.n_rc)):
+            self.cp_in(i, i).start()
 
     def residual(self, gq, fs_ref, o_rows, sso_rows):
         """o_rows(rows) -> o [rc, H] f32; sso_rows(rows) -> its row sums of squares [rc, 1]."""
@@ -480,15 +484,17 @@ class _Epilogue:
         beta = _row(sm, "attn_beta", 0, H)
         wf = _row(sm, "pre_ffn_w", 0, H)
 
+        ns = self.sbuf.shape[0]
+
         def body(i, carry):
             slot = i % 2
             rows = pl.ds(pl.multiple_of(i * rc, rc), rc)
 
-            @pl.when(i + 1 < n_rc)
+            @pl.when(i + ns - 1 < n_rc)
             def _():
-                self.cp_in(i + 1, 1 - slot).start()
+                self.cp_in(i + ns - 1, (i + ns - 1) % ns).start()
 
-            self.cp_in(i, slot).wait()
+            self.cp_in(i, i % ns).wait()
 
             @pl.when(i >= 2)
             def _():
@@ -496,7 +502,7 @@ class _Epilogue:
 
             o = o_rows(rows)
             ro = jax.lax.rsqrt(sso_rows(rows) * (1.0 / H) + c.post_eps)
-            new = alpha * self.sbuf[slot] + beta * (o * ro).astype(_BF16).astype(_F32)
+            new = alpha * self.sbuf[i % ns] + beta * (o * ro).astype(_BF16).astype(_F32)
             self.obuf[slot] = new
             self.cp_out(i, slot).start()
             r = jax.lax.rsqrt(jnp.mean(new * new, axis=1, keepdims=True) + c.rms_eps)
