@@ -215,7 +215,7 @@ TRANS_B_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 def below_or_on_diag(r, r_blk_size, c, c_blk_size):
     # A block is considered below or on diagonal as long as the bottom left
     # corner of the block is below or on diagonal.
-    return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)
+    return ((r + 1) * r_blk_size - 1) >= (c * c_blk_size)
 
 
 def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
@@ -531,7 +531,7 @@ def _flash_attention_impl(
                 should_run,
                 q_seq_index,
                 lax.select(
-                    q_seq_index == (q_seq_len // block_q) - 1, 0, q_seq_index + 1
+                    q_seq_index == pl.cdiv(q_seq_len, block_q) - 1, 0, q_seq_index + 1
                 ),
             )
             next_kv_index = lax.select(should_run, kv_seq_index, 0)
