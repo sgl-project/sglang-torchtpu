@@ -42,6 +42,7 @@ from sglang_tpu.kv_mxint8 import cache_bytes_per_token as mxint8_cache_bytes_per
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
     _cdiv,
 )
 from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
@@ -399,6 +400,11 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             **extra_kwargs,
         )
         self.land_arena_blocks = self.kv_pool.land_arena_blocks
+        self.disagg_kv_layout: Optional[str] = (
+            TpuSeqAlongLaneKVPool.disagg_kv_layout
+            if isinstance(self.kv_pool, TpuSeqAlongLaneKVPool)
+            else None
+        )
         if "kv_layout" in extra_kwargs:
             self.kv_layout = extra_kwargs["kv_layout"]
         self._swa_copy_kwargs = (

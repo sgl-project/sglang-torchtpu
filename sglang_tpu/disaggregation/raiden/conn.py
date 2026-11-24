@@ -107,7 +107,6 @@ from sglang_tpu.disaggregation.raiden.serde import (
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
 from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 if TYPE_CHECKING:
@@ -417,27 +416,14 @@ class RaidenKVManager(
                 f"{dst_attn_tp} on decode. Run both at equal attention TP or "
                 "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
             )
-        # A regular SEQ_ALONG_LANE pool reshards at unequal TP: KVLayoutGeometry
-        # moves each head as one whole per-head run (byte replays over real pool
-        # pages in test_tpu_reshard_layout.py). A SEQ_ALONG_LANE pool inside
-        # TpuUnifiedSWAKVPool has no such replay, so it stays refused here,
-        # whether get_raiden_kv_caches flagged it or only its type shows it.
-        unified_seq_along_lane = self._unified_swa_pool is not None and (
-            self._seq_along_lane
-            or isinstance(
-                getattr(self._unified_swa_pool, "kv_pool", None),
-                TpuSeqAlongLaneKVPool,
-            )
-        )
-        if (len(tensor.shape) != _FUSED_KV_RANK or unified_seq_along_lane) and (
+        if len(tensor.shape) != _FUSED_KV_RANK and (
             src_attn_tp != dst_attn_tp or len(tensor.shape) < _FUSED_KV_RANK
         ):
             raise ValueError(
                 "Raiden push resharding requires 5D token-major fused KV tensors, "
                 f"got {len(tensor.shape)}D shape {tuple(tensor.shape)} for "
                 f"attention TP {src_attn_tp} on prefill and {dst_attn_tp} on decode. "
-                "Run both at equal attention TP for blocked MXINT8 or "
-                "seq-along-lane KV layouts."
+                "Run both at equal attention TP for blocked MXINT8."
             )
         # Distinct model kv-head counts (model_config.get_total_num_kv_heads()
         # and get_total_swa_num_kv_heads()), set on both the prefill and decode
