@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import ast
+import functools
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -574,15 +575,82 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             kw_tp16_full = _call_invoke(q_tp16_prep, k_tp8, None, c_tp16, kl, SimpleNamespace(shape=(64 * 36,)), sw=None, prepared=True, d2=False, a3_out=-2)
             self.assertIn("mk128", kw_tp16_full["_prefill_opts"])
             self.assertIn("tp16_sq", kw_tp16_full["_prefill_opts"])
-            # Sub-256 `L61_PRUNE=1` (`T=128`) falls back cleanly to `_fused_out_pack = -2` -> `(128, 512)`!
+            # Sub-256 TP=16 (`L61_PRUNE=1` `T=128` & `1/1K` `T=128`, #2981/#2982/#2990) pads
+            # `(queries, keys, values)` to `256` -> `f32` `RPAm` (`tp16_sq`, `_a3_out_layout=True`)
+            # and slices `out_final[:orig_num_q_tokens]`, while Guard A keeps `TP=8` & `skip_decode=False` untouched!
             from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import prepare_head_packed_outputs
 
             q_tp16_l61 = SimpleNamespace(ndim=5, shape=(1, 128, 4, 2, 128), dtype="bfloat16")
             kw_l61 = _call_invoke(q_tp16_l61, k_tp8, None, c_tp16, kl, pi_swa, sw=None, prepared=True, d2=False, a3_out=-2)
-            self.assertEqual(kw_l61.get("_fused_out_pack"), -2)
+            self.assertIn("tp16_sq", kw_l61["_prefill_opts"])
+            self.assertIn("stationary_q_m0_ring_fuse", kw_l61["_prefill_opts"])
+            self.assertTrue(kw_l61.get("_a3_out_layout"))
+            self.assertEqual(kw_l61["m_block_sizes"][0], 256)
+            with patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES": "512,4096,512,512",
+                    "SGLANG_TPU_RPA_V3_STATIONARY_Q_BLOCK_SIZES_SW": "256,2048,256,512",
+                },
+                clear=False,
+            ):
+                kw_l61_blk = _call_invoke(
+                    q_tp16_l61, k_tp8, None, c_tp16, kl, pi_swa, sw=None, prepared=True, d2=False, a3_out=-2
+                )
+                self.assertEqual(kw_l61_blk["m_block_sizes"], (256, 4096, 256, 512))
             self.assertEqual(rpa_mod._prepared_a3_layout_spec(-2).out_head_pack, 2)
             out_l61 = prepare_head_packed_outputs(jnp.ones((1, 128, 4, 2, 128), jnp.bfloat16), -2, 8, 128)
             self.assertEqual(out_l61.shape, (128, 512))
+
+            # Guard A (#2990 §3): TP=8 `T=128` and `skip_decode=False` unprepared decode fallback stay unpadded!
+            q_tp8_l61 = SimpleNamespace(ndim=5, shape=(1, 128, 8, 2, 128), dtype="bfloat16")
+            kw_tp8_l61 = _call_invoke(q_tp8_l61, k_tp8, None, c_d2, kl, pi_swa, sw=None, prepared=True, d2=True, a3_out=2)
+            self.assertEqual(kw_tp8_l61.get("_fused_out_pack"), 2)
+            self.assertNotIn("stationary_q_m0_ring_fuse", kw_tp8_l61.get("_prefill_opts", frozenset()))
+            q_tp16_dec_fb = SimpleNamespace(ndim=3, shape=(64, 8, 64), dtype="bfloat16")
+            k_tp16_dec_fb = SimpleNamespace(shape=(64, 1, 64))
+            kw_dec_fb = _call_invoke(
+                q_tp16_dec_fb, k_tp16_dec_fb, k_tp16_dec_fb, c_tp16, kl, pi_swa, sw=None, prepared=False, skip_decode=False
+            )
+            self.assertNotIn("tp16_sq", kw_dec_fb.get("_prefill_opts", frozenset()))
+
+            # Guard B & C (#2990 §3): real JAX arrays pad `queries`, `keys`, and `values` to 256 and slice tuple `out_final[:T]`!
+            seen_shapes = {}
+
+            def _fake_rpa_shapes(q, k, v, c, kl_, pi_, cq_, ckv_, dist_, *args, **kwargs):
+                seen_shapes["q"] = q.shape
+                seen_shapes["k"] = None if k is None else k.shape
+                seen_shapes["v"] = None if v is None else v.shape
+                out_256 = (
+                    jnp.ones((256, 512), jnp.bfloat16)
+                    if kwargs.get("_a3_out_layout")
+                    else jnp.ones((256, 8, 64), jnp.bfloat16)
+                )
+                return out_256, c
+
+            out_u, c_u = rpa_mod._invoke_v3_kernel(
+                _fake_rpa_shapes,
+                queries=jnp.zeros((128, 8, 64), jnp.bfloat16),
+                keys=jnp.zeros((128, 1, 64), jnp.float8_e4m3fn),
+                values=jnp.zeros((128, 1, 64), jnp.float8_e4m3fn),
+                kv_cache_fused=jnp.zeros((16, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                kv_lens=jnp.zeros((8,), jnp.int32),
+                page_indices=jnp.zeros((64,), jnp.int32),
+                cu_q_lens=jnp.zeros((9,), jnp.int32),
+                cu_kv_lens=jnp.zeros((9,), jnp.int32),
+                distribution=jnp.zeros((3,), jnp.int32),
+                attention_sink=None,
+                sm_scale=0.125,
+                sliding_window=None,
+                soft_cap=None,
+                k_scale=1.0,
+                v_scale=1.0,
+                prepared_inputs=False,
+                skip_decode=True,
+            )
+            self.assertEqual(seen_shapes, {"q": (256, 8, 64), "k": (256, 1, 64), "v": (256, 1, 64)})
+            self.assertEqual(out_u.shape, (128, 8, 64))
+            self.assertEqual(c_u.shape, (16, 512, 1, 4, 128))
 
         # 4. Verify TP=16 unprepared routes to `tp16_sq` by default (#2390 fix), while
         #    kill-switch (`TP16_STATIONARY_Q=0`) or explicit `TP16_NATIVE_PREFILL=1` disables it cleanly.
@@ -892,6 +960,279 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                             self.assertGreater(cos, 0.999)
                             q_off += sl
 
+    def test_tp16_sub256_pad_and_stock_mixed_zero_tail_fail_to_pass(self):
+        """Deterministic FAIL->PASS interpret gate (#2942, #2981, #2982, #2983, #2990) on TP=16 nod2:
+        - `num_q_tokens in {1, 7, 128, 255}` (prepared `L61_PRUNE` and unprepared `1/1K`)
+        - `kv_len in {1, 104, 615, 1023}` (`kv_len % 512 in {1, 104, 511}`)
+        - Verifies:
+          1. Legacy unmasked/bf16 stock MIXED FAILS deterministically on `0x7F` unused lanes & un-normalized V overflow (#2390).
+          2. `_invoke_v3_kernel` (`<256 -> 256` pad into `f32` `RPAm`) PASSES with `0` NaNs/Infs, `cos > 0.999`,
+             and bit-exact `0` KV writes outside active `cu_q_lens` slots.
+          3. Patched `stock MIXED` (`zero_kv_tail` + `@pl.when(sz > 0)` + `valid_lane_dim`) ALSO PASSES `0x7F` KV poison
+             and preserves multi-`bq` `sliding_window` KV cache writes without clobbering `update_sz`.
+        """
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch required for attention_pallas_rpa_v3._invoke_v3_kernel")
+
+        import sglang_tpu.attention.pallas.ragged_paged_attention_v3 as rpa_v3_mod
+        import sglang_tpu.attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        rng = np.random.default_rng(20261125)
+        interp = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+        sm_scale = 0.125
+        page_size = 512
+        pps = 4
+
+        with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+            # 1. Deterministic FAIL before fix:
+            # (a) Unmasked lanes 64..127 (`_fused_out_pack=1` bypassing `valid_lane_dim=64`) on `0x7F` TP=16 KV cache -> NaN!
+            q_fail_np = (rng.standard_normal((128, 8, 64)) * 0.5).astype(np.float32)
+            kv_fail_u8 = np.full((128, 1, 4, 128), 0x7F, dtype=np.uint8)
+            kv_fail_u8[0, 0, :2, :64] = _rand_fp8_u8(rng, (2, 64), scale=0.4)
+            cache_fail_u8 = np.full((8, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            kl_1 = jnp.array([1, 0, 0, 0], dtype=jnp.int32)
+            pi_1 = jnp.array([1, 0, 0, 0] + [0] * 12, dtype=jnp.int32)
+            cq_1 = jnp.array([0, 1, 1, 1, 1], dtype=jnp.int32)
+            ckv_1 = jnp.arange(5, dtype=jnp.int32) * (pps * page_size)
+            dist_1 = jnp.array([0, 0, 1], dtype=jnp.int32)
+            out_legacy_lanes, _ = rpa_v3_mod.ragged_paged_attention(
+                _pack_q_tp16_5d(q_fail_np),
+                _u8_to_fp8(kv_fail_u8),
+                None,
+                _u8_to_fp8(cache_fail_u8),
+                kl_1,
+                pi_1,
+                cq_1,
+                ckv_1,
+                dist_1,
+                None,
+                None,
+                sm_scale=sm_scale,
+                k_scale=1.0,
+                v_scale=1.0,
+                _skip_decode=True,
+                _prepared_inputs=True,
+                _fused_out_pack=1,
+                _interpret=interp,
+            )
+            self.assertTrue(
+                np.isnan(np.asarray(out_legacy_lanes[:1].astype(jnp.float32))).any(),
+                "Expected legacy unmasked lanes 64..127 in stock MIXED to produce NaN on 0x7F KV cache",
+            )
+
+            # (b) Verify patched `stock MIXED` (`_fused_out_pack=-2` -> `valid_lane_dim=64` + `zero_kv_tail`)
+            #     AND `_invoke_v3_kernel` (`<256 -> 256` `f32` `RPAm`) BOTH cure that exact `0x7F` KV cache NaN!
+            out_patched_mixed, _ = rpa_v3_mod.ragged_paged_attention(
+                _pack_q_tp16_5d(q_fail_np),
+                _u8_to_fp8(kv_fail_u8),
+                None,
+                _u8_to_fp8(cache_fail_u8),
+                kl_1,
+                pi_1,
+                cq_1,
+                ckv_1,
+                dist_1,
+                None,
+                None,
+                sm_scale=sm_scale,
+                k_scale=1.0,
+                v_scale=1.0,
+                _skip_decode=True,
+                _prepared_inputs=True,
+                _fused_out_pack=-2,
+                _interpret=interp,
+            )
+            got_patched_mixed = np.asarray(out_patched_mixed[:1].astype(jnp.float32))
+            self.assertEqual(out_patched_mixed.shape, (128, 512))
+            self.assertFalse(np.isnan(got_patched_mixed).any())
+            self.assertFalse(np.isinf(got_patched_mixed).any())
+
+            with patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                    "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                },
+                clear=False,
+            ):
+                out_rpam_cure, _ = rpa_wrap_mod._invoke_v3_kernel(
+                    functools.partial(rpa_v3_mod.ragged_paged_attention, _interpret=interp),
+                    queries=_pack_q_tp16_5d(q_fail_np),
+                    keys=_u8_to_fp8(kv_fail_u8),
+                    values=None,
+                    kv_cache_fused=_u8_to_fp8(cache_fail_u8),
+                    kv_lens=kl_1,
+                    page_indices=pi_1,
+                    cu_q_lens=cq_1,
+                    cu_kv_lens=ckv_1,
+                    distribution=dist_1,
+                    attention_sink=None,
+                    sm_scale=sm_scale,
+                    sliding_window=None,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+                got_rpam_cure = np.asarray(out_rpam_cure[:1].astype(jnp.float32))
+                self.assertEqual(out_rpam_cure.shape, (128, 512))
+                self.assertFalse(np.isnan(got_rpam_cure).any())
+                self.assertFalse(np.isinf(got_rpam_cure).any())
+                np.testing.assert_allclose(got_rpam_cure, got_patched_mixed, rtol=3e-2, atol=3e-2)
+
+            # 2. Full matrix PASS after fix: `num_q_tokens in {1, 7, 128, 255}` x `kv_len % 512 in {1, 104, 511}`
+            #    + strict bit-exact ZERO extra KV writes check!
+            with patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                    "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                    "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                },
+                clear=False,
+            ):
+                for num_q_tok, is_prep in ((1, True), (7, False), (128, True), (128, False), (255, True)):
+                    for klen in (1, 104, 511, 615):
+                        with self.subTest(num_q_tokens=num_q_tok, prepared=is_prep, kv_len=klen):
+                            q_f32 = (rng.standard_normal((num_q_tok, 8, 64)) * 0.5).astype(np.float32)
+                            cache_u8 = np.full((8, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+                            npg = (klen + page_size - 1) // page_size
+                            pref_len = klen - 1
+                            rem = pref_len
+                            k_all = np.zeros((klen, 1, 64), dtype=np.float32)
+                            v_all = np.zeros((klen, 1, 64), dtype=np.float32)
+                            off_t = 0
+                            for p_off in range(npg):
+                                pg_id = 1 + p_off
+                                n_in_pg = min(rem, page_size)
+                                if n_in_pg > 0:
+                                    kv_pg_u8 = _rand_fp8_u8(rng, (n_in_pg, 2, 64), scale=0.4)
+                                    cache_u8[pg_id, :n_in_pg, 0, :2, :64] = kv_pg_u8
+                                    kv_pg_f32 = np.asarray(_u8_to_fp8(kv_pg_u8).astype(jnp.float32))
+                                    k_all[off_t : off_t + n_in_pg, 0, :] = kv_pg_f32[:, 0, :]
+                                    v_all[off_t : off_t + n_in_pg, 0, :] = kv_pg_f32[:, 1, :]
+                                    off_t += n_in_pg
+                                    rem -= n_in_pg
+
+                            new_kv_u8 = _rand_fp8_u8(rng, (2, 64), scale=0.4)
+                            new_kv_f32 = np.asarray(_u8_to_fp8(new_kv_u8).astype(jnp.float32))
+                            k_all[klen - 1, 0, :] = new_kv_f32[0]
+                            v_all[klen - 1, 0, :] = new_kv_f32[1]
+
+                            if is_prep:
+                                q_in = _pack_q_tp16_5d(q_f32)
+                                kv_buf_u8 = np.full((num_q_tok, 1, 4, 128), 0x7F, dtype=np.uint8)
+                                kv_buf_u8[0, 0, :2, :64] = new_kv_u8
+                                kv_buf_u8[0, 0, :2, 64:] = 0
+                                kv_buf_u8[0, 0, 2:, :] = 0
+                                k_in = _u8_to_fp8(kv_buf_u8)
+                                v_in = None
+                                a3_arg = -2
+                            else:
+                                q_in = jnp.asarray(q_f32, dtype=jnp.bfloat16)
+                                k_buf_u8 = np.full((num_q_tok, 1, 64), 0x7F, dtype=np.uint8)
+                                v_buf_u8 = np.full((num_q_tok, 1, 64), 0x7F, dtype=np.uint8)
+                                k_buf_u8[0, 0, :] = new_kv_u8[0]
+                                v_buf_u8[0, 0, :] = new_kv_u8[1]
+                                k_in = _u8_to_fp8(k_buf_u8)
+                                v_in = _u8_to_fp8(v_buf_u8)
+                                a3_arg = 0
+
+                            kl_arr = jnp.array([klen, 0, 0, 0], dtype=jnp.int32)
+                            pi_list = [1 + p for p in range(npg)] + [0] * (16 - npg)
+                            pi_arr = jnp.array(pi_list, dtype=jnp.int32)
+
+                            out_res, updated_cache = rpa_wrap_mod._invoke_v3_kernel(
+                                functools.partial(rpa_v3_mod.ragged_paged_attention, _interpret=interp),
+                                queries=q_in,
+                                keys=k_in,
+                                values=v_in,
+                                kv_cache_fused=_u8_to_fp8(cache_u8),
+                                kv_lens=kl_arr,
+                                page_indices=pi_arr,
+                                cu_q_lens=cq_1,
+                                cu_kv_lens=ckv_1,
+                                distribution=dist_1,
+                                attention_sink=None,
+                                sm_scale=sm_scale,
+                                sliding_window=None,
+                                soft_cap=None,
+                                k_scale=1.0,
+                                v_scale=1.0,
+                                prepared_inputs=is_prep,
+                                skip_decode=True,
+                                a3_out_layout=a3_arg,
+                            )
+                            got = np.asarray(out_res.astype(jnp.float32)).reshape(num_q_tok, 512)
+                            self.assertFalse(np.isnan(got).any(), f"NaN in {num_q_tok=} {is_prep=} {klen=}")
+                            self.assertFalse(np.isinf(got).any(), f"Inf in {num_q_tok=} {is_prep=} {klen=}")
+                            ref = _ref_attention_gqa(
+                                q_f32[:1],
+                                k_all,
+                                v_all,
+                                q_first=klen - 1,
+                                kv_len=klen,
+                                sm_scale=sm_scale,
+                                sliding_window=None,
+                            )
+                            cos = float(np.sum(got[:1] * ref) / (np.linalg.norm(got[:1]) * np.linalg.norm(ref)))
+                            self.assertGreater(cos, 0.998)
+
+                            # Gate (#2983): assert padded Q rows caused ZERO extra KV writes!
+                            upd_u8 = _fp8_to_u8(updated_cache)
+                            target_pg = 1 + (klen - 1) // page_size
+                            target_row = (klen - 1) % page_size
+                            for pg_chk in range(8):
+                                if pg_chk != target_pg:
+                                    np.testing.assert_array_equal(upd_u8[pg_chk], cache_u8[pg_chk])
+                                else:
+                                    np.testing.assert_array_equal(upd_u8[pg_chk, :target_row], cache_u8[pg_chk, :target_row])
+                                    np.testing.assert_array_equal(
+                                        upd_u8[pg_chk, target_row + 1 :], cache_u8[pg_chk, target_row + 1 :]
+                                    )
+                                    np.testing.assert_array_equal(upd_u8[pg_chk, target_row, 0, :2, :64], new_kv_u8)
+
+            # 3. Defense-in-depth (`stock MIXED` with `zero_kv_tail` + `@pl.when(sz > 0)` + `valid_lane_dim`):
+            #    Verify BOTH `0x7F` unused lanes AND multi-`bq` `sliding_window` (`q_len=96 > bq_sz=32`) KV writes!
+            q_sw_f32 = (rng.standard_normal((128, 8, 64)) * 0.5).astype(np.float32)
+            kv_sw_u8 = np.full((128, 1, 4, 128), 0x7F, dtype=np.uint8)
+            valid_sw_u8 = _rand_fp8_u8(rng, (96, 2, 64), scale=0.4)
+            kv_sw_u8[:96, 0, :2, :64] = valid_sw_u8
+            cache_sw_u8 = np.full((8, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            out_sw_mixed, upd_sw_cache = rpa_v3_mod.ragged_paged_attention(
+                _pack_q_tp16_5d(q_sw_f32),
+                _u8_to_fp8(kv_sw_u8),
+                None,
+                _u8_to_fp8(cache_sw_u8),
+                jnp.array([96, 0, 0, 0], dtype=jnp.int32),
+                jnp.array([1, 0, 0, 0] + [0] * 12, dtype=jnp.int32),
+                jnp.array([0, 96, 96, 96, 96], dtype=jnp.int32),
+                ckv_1,
+                dist_1,
+                None,
+                None,
+                sm_scale=sm_scale,
+                sliding_window=64,
+                k_scale=1.0,
+                v_scale=1.0,
+                m_block_sizes=(32, 512, 32, 512),
+                _skip_decode=True,
+                _prepared_inputs=True,
+                _fused_out_pack=-2,
+                _interpret=interp,
+            )
+            got_sw_mixed = np.asarray(out_sw_mixed[:96].astype(jnp.float32))
+            self.assertFalse(np.isnan(got_sw_mixed).any())
+            upd_sw_u8 = _fp8_to_u8(upd_sw_cache)
+            np.testing.assert_array_equal(upd_sw_u8[1, :96, 0, :2, :64], valid_sw_u8)
+
     def test_tpu7x_mosaic_exports_w9_mk128_tp8_and_tp16(self):
         try:
             from jax._src import tpu_info as _tpu_info  # noqa: F401
@@ -982,6 +1323,31 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                         )
                         self.assertEqual(exported.out_avals[0].shape, (t_tok, qh, 64))
                     self.assertIn("RPAm", exported.mlir_module())
+
+            # Also verify TPU7x Mosaic export of defense-in-depth `stock MIXED` `-zt` (#2942 / #2982)!
+            with self.subTest(export="tp16_stock_mixed_zt_p512"):
+                c_sd = jax.ShapeDtypeStruct((2048, 512, 1, 4, 128), jnp.float8_e4m3fn)
+                kl_sd = jax.ShapeDtypeStruct((64,), jnp.int32)
+                pi_sd = jax.ShapeDtypeStruct((64 * 36,), jnp.int32)
+                cq_sd = jax.ShapeDtypeStruct((65,), jnp.int32)
+                ckv_sd = jax.ShapeDtypeStruct((65,), jnp.int32)
+                d_sd = jax.ShapeDtypeStruct((3,), jnp.int32)
+                exp_zt = jax_export.export(
+                    jax.jit(
+                        lambda q, kv, c, kl, pi, cq, ckv, d: ragged_paged_attention(
+                            q, kv, None, c, kl, pi, cq, ckv, d, None, None,
+                            sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            _fused_out_pack=-2, _prepared_inputs=True, _skip_decode=True,
+                        )
+                    ),
+                    platforms=["tpu"],
+                )(
+                    jax.ShapeDtypeStruct((1, 128, 4, 2, 128), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((128, 1, 4, 128), jnp.float8_e4m3fn),
+                    c_sd, kl_sd, pi_sd, cq_sd, ckv_sd, d_sd,
+                )
+                self.assertEqual(exp_zt.out_avals[0].shape, (128, 512))
+                self.assertIn("-zt", exp_zt.mlir_module())
 
 
 if __name__ == "__main__":

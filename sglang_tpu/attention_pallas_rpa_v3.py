@@ -346,6 +346,49 @@ def _invoke_v3_kernel(
         or (allow_tp16_sq and is_tp16_sq_shape)
         or is_tp16_legacy_native
     )
+    eff_skip_decode = bool(
+        skip_decode
+        or (
+            is_prepared
+            and not skip_mixed
+            and envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get()
+        )
+    )
+    orig_num_q_tokens = num_q_tokens
+    pad_short_tp16_sq = bool(
+        eff_skip_decode
+        and not skip_mixed
+        and decode_query_size == 1
+        and prefill_mode in _STATIONARY_Q_MODES
+        and 0 < num_q_tokens < 256
+        and allow_tp16_sq
+        and is_tp16_sq_shape
+        and soft_cap is None
+        and attention_sink is None
+    )
+    if pad_short_tp16_sq:
+        pad_tok = 256 - orig_num_q_tokens
+        if hasattr(queries, "__getitem__") and not isinstance(
+            getattr(queries, "dtype", None), str
+        ):
+            import jax.numpy as jnp
+
+            if is_prepared:
+                queries = jnp.pad(
+                    queries, ((0, 0), (0, pad_tok), (0, 0), (0, 0), (0, 0))
+                )
+            else:
+                queries = jnp.pad(queries, ((0, pad_tok), (0, 0), (0, 0)))
+            if keys is not None and hasattr(keys, "__getitem__"):
+                keys = jnp.pad(
+                    keys, ((0, pad_tok), *((0, 0) for _ in range(keys.ndim - 1)))
+                )
+            if values is not None and hasattr(values, "__getitem__"):
+                values = jnp.pad(
+                    values,
+                    ((0, pad_tok), *((0, 0) for _ in range(values.ndim - 1))),
+                )
+        num_q_tokens = 256
     use_stationary_q_prefill = (
         not skip_mixed
         and prefill_mode in _STATIONARY_Q_MODES
@@ -366,6 +409,13 @@ def _invoke_v3_kernel(
             if (sq_blocks_env is not None and sq_blocks_sw_env is not None)
             else None
         )
+        if stationary_q_blocks and pad_short_tp16_sq and stationary_q_blocks[0] > 256:
+            stationary_q_blocks = (
+                256,
+                stationary_q_blocks[1],
+                min(stationary_q_blocks[2], 256),
+                *stationary_q_blocks[3:],
+            )
         per_seq_kv_capacity = 0
         if (
             page_indices is not None
@@ -605,11 +655,7 @@ def _invoke_v3_kernel(
             )
             if env.get()
         }
-    if skip_decode or (
-        is_prepared
-        and not skip_mixed
-        and envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get()
-    ):
+    if eff_skip_decode:
         extra["_skip_decode"] = True
     if skip_mixed:
         extra["_skip_mixed"] = True
@@ -669,7 +715,7 @@ def _invoke_v3_kernel(
         )
         tile = jnp.where(eligible, jnp.where(live % 2048 == 0, 2, 1), 0)
         lp_bkv_csz = max(256, logical_page_size)
-        return jax.lax.switch(
+        res = jax.lax.switch(
             tile,
             (
                 run,
@@ -677,7 +723,18 @@ def _invoke_v3_kernel(
                 functools.partial(run, m_block_sizes=(2048, 4096, 2048, lp_bkv_csz)),
             ),
         )
-    return run()
+    else:
+        res = run()
+    if pad_short_tp16_sq and isinstance(res, tuple) and len(res) == 2:
+        out_final, updated_kv = res
+        if hasattr(out_final, "__getitem__") and hasattr(out_final, "ndim"):
+            out_final = (
+                out_final[:, :orig_num_q_tokens]
+                if out_final.ndim == 5
+                else out_final[:orig_num_q_tokens]
+            )
+        return out_final, updated_kv
+    return res
 
 
 RPA_V3_SPEC = RpaKernelSpec(
