@@ -89,8 +89,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
-    # SPTP_OGATE_XLA_NORM=1: the 3-D head norm (relayout copies) instead of the MXU one
-    ogate_mxu = os.environ.get("SPTP_OGATE_XLA_NORM", "0") != "1"
+    # SPTP_OGATE_MXU_NORM=1: the o gate head norm as MXU dots (measured 0.8 ms / chunk slower
+    # than XLA's 3-D norm with its relayout copy)
+    ogate_mxu = os.environ.get("SPTP_OGATE_MXU_NORM", "0") == "1"
     # SPTP_A2A_U8=1: the gated output a2a as bytes (prefill/spep) instead of e4m3 itself
     a2a_u8 = os.environ.get("SPTP_A2A_U8", "0") == "1"
 
