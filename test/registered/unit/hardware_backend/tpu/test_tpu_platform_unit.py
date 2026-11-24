@@ -1053,6 +1053,27 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             with self.subTest(backend=backend):
                 self._assert_refused("(?i)dcp[-_ ]comm", dcp_comm_backend=backend)
 
+    def test_sparse_mla_refuses_what_its_dcp_path_lacks(self):
+        sparse = dict(attention_backend="pallas_tpu_mla_sparse", kv_cache_dtype="fp8")
+        self._validate(self._args(enable_return_indexer_topk=False, **sparse))
+        # Head-parallel prefill runs without the indexer token split; it must start.
+        self._validate(
+            self._args(enable_return_indexer_topk=False, **sparse),
+            env={"SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL": "1"},
+        )
+        for env in (
+            "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL",
+            "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT",
+        ):
+            with self.subTest(env=env), self.assertRaisesRegex(ValueError, env):
+                self._validate(
+                    self._args(enable_return_indexer_topk=False, **sparse),
+                    env={env: "1"},
+                )
+        self._assert_refused(
+            "(?i)return-indexer-topk", enable_return_indexer_topk=True, **sparse
+        )
+
     def test_accepts_a_replicated_q_projection(self):
         # GQA layers project the group's query heads directly and skip the
         # per-layer head gather.

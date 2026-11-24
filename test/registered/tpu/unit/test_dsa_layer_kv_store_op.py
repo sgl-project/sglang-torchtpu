@@ -203,6 +203,8 @@ def _backend(step, *, qblock_prefill):
         _zero_rope=step.zero_rope,
         _topk=_TOPK,
         _attn_split_world=0,
+        _dcp=1,
+        _dcp_gathers_prefill=False,
         raw_ring_pages_cnt=0,
     )
     for name in (

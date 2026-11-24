@@ -265,6 +265,7 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             kv_cache_quant_dtype=FP8,
             _op=op,
             _prefill_op=None,
+            _dcp=1,
             # A model with rope: the op gets both caches.
             _zero_rope=False,
             # _mla_kernel_args passes these through, so names stand in for them.
@@ -335,6 +336,8 @@ class TestSparseIndexerKvLens(CustomTestCase):
 
     def _backend(self):
         backend = SimpleNamespace(
+            _dcp=1,
+            _dcp_gathers_prefill=False,
             _index_topk_op=MagicMock(),
             _topk=4,
             _kpool_width=8,
