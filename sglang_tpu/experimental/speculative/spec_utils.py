@@ -35,14 +35,14 @@ def pad_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
 
 
 def padded_h2d(rows_cpu: torch.Tensor, rows: int, device: str) -> torch.Tensor:
-    """Zero-pad host rows to rows (a batch bucket) in pinned memory, then upload."""
+    """Zero-pad host rows to a batch bucket and upload asynchronously when pinned."""
     padded = torch.zeros(
         (rows, *rows_cpu.shape[1:]),
         dtype=rows_cpu.dtype,
         pin_memory=is_pin_memory_available(device),
     )
     padded[: rows_cpu.shape[0]] = rows_cpu
-    return padded.to(device, non_blocking=True)
+    return padded.to(device, non_blocking=padded.is_pinned())
 
 
 @contextlib.contextmanager
