@@ -71,13 +71,77 @@ def _fp8_rows(x):
     return (x / s).astype(_FP8), s
 
 
-def build_forward(c: PFConfig, axis: str = "model"):
-    """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
-    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
+def ag(x, axis: str = "model"):
+    """Every rank's rows of x, in rank order."""
+    return jax.lax.all_gather(x, axis, axis=0, tiled=True)
+
+
+def to_owner(x, tp: int, axis: str = "model"):
+    """[T, d] (this rank's heads of every row) -> [T / tp, tp, d]: own rows, every rank's
+    heads in rank order. e4m3 travels as bytes."""
+    b = jax.lax.bitcast_convert_type(x, jnp.uint8) if x.dtype == _FP8 else x
+    b = jax.lax.all_to_all(b, axis, 0, 0, tiled=True).reshape(tp, x.shape[0] // tp, -1)
+    b = b.transpose(1, 0, 2)
+    return jax.lax.bitcast_convert_type(b, _FP8) if x.dtype == _FP8 else b
+
+
+def dense(x8, xs, w, sm, name: str, n: int):
+    """e4m3 rows (row scales xs) @ an e4m3 K-major slab, times its per-output-channel
+    scales -> f32."""
+    y = jnp.dot(x8, w, preferred_element_type=_F32)
+    return y * xs * small_row(sm, name + "_s")[:, :n]
+
+
+def attention(c: PFConfig, l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
     from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
+
+    T, hd, kvd = c.rows, c.head_dim, c.kv_dim
+    is_global = l in c.global_layers
+    return ragged_paged_attention(
+        # bf16 q: the prefill RPA's transposed / ones-V tiles take no e4m3 q
+        q.astype(_BF16).reshape(T, c.q_heads, hd),
+        kvs[:, :kvd].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
+        kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
+        kv_pool,
+        kv_lens,
+        pf if is_global else psw,
+        cu_q,
+        dist,
+        sm_scale=c.attn_scale,
+        sliding_window=None if is_global else c.window,
+        k_scale=1.0,
+        v_scale=1.0,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        # old batched RPA: the default reads SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS; the program
+        # normalizes each head itself, so never double-normalize inside RPA.
+        out_head_norm_eps=None,
+    )
+
+
+def route(c: PFConfig, ffn, wrouter, sm):
+    """(ids, weights) [rows, top_k] of the given rows: sigmoid scores, top-k of the biased ones."""
+    ep = wrouter.shape[1]
+    sc = jax.nn.sigmoid(
+        jnp.dot(ffn, wrouter, preferred_element_type=_F32) * c.router_mult
+    )
+    ids, _ = _topk_iter(sc + small_row(sm, "expert_bias")[:, :ep], c.top_k)
+    ids = jnp.concatenate(ids, axis=1)
+    w = jnp.take_along_axis(sc, ids, axis=1)
+    return ids, w / (jnp.sum(w, axis=1, keepdims=True) + c.router_eps) * c.route_scale
+
+
+def residual(c: PFConfig, stream, sm, name: str, delta):
+    return small_row(sm, name + "_alpha") * stream + small_row(
+        sm, name + "_beta"
+    ) * _bf(_rms(delta, c.post_eps))
+
+
+def build_forward(c: PFConfig, axis: str = "model"):
+    """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
+    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
     from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
     c.validate()
@@ -104,58 +168,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # transfer to hide (R=16: 1 chunk 0.48 vs 4 chunks 0.72 ms/layer; R=32 / 64: 4 chunks win)
     expert_tiles = (64,) + EXPERT_TILES[1:] if T <= 1024 else EXPERT_TILES
     n_chunks = 1 if T <= 16 else N_CHUNKS
-
-    def ag(x):
-        return jax.lax.all_gather(x, axis, axis=0, tiled=True)
-
-    def to_owner(x):
-        """[T, d] (this rank's heads of every row) -> [Ts, tp, d]: own rows, every rank's
-        heads in rank order. e4m3 travels as bytes."""
-        b = jax.lax.bitcast_convert_type(x, jnp.uint8) if x.dtype == _FP8 else x
-        b = jax.lax.all_to_all(b, axis, 0, 0, tiled=True).reshape(tp, Ts, -1)
-        b = b.transpose(1, 0, 2)
-        return jax.lax.bitcast_convert_type(b, _FP8) if x.dtype == _FP8 else b
-
-    def dense(x8, xs, w, sm, name: str, n: int):
-        """e4m3 rows (row scales xs) @ an e4m3 K-major slab, times its per-output-channel
-        scales -> f32."""
-        y = jnp.dot(x8, w, preferred_element_type=_F32)
-        return y * xs * small_row(sm, name + "_s")[:, :n]
-
-    def attention(l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
-        is_global = l in c.global_layers
-        return ragged_paged_attention(
-            # bf16 q: the prefill RPA's transposed / ones-V tiles take no e4m3 q
-            q.astype(_BF16).reshape(T, c.q_heads, hd),
-            kvs[:, :kvd].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
-            kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
-            kv_pool,
-            kv_lens,
-            pf if is_global else psw,
-            cu_q,
-            dist,
-            sm_scale=c.attn_scale,
-            sliding_window=None if is_global else c.window,
-            k_scale=1.0,
-            v_scale=1.0,
-            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-            # old batched RPA: the default reads SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS; the program
-            # normalizes each head itself, so never double-normalize inside RPA.
-            out_head_norm_eps=None,
-        )
-
-    def route(ffn, wrouter, sm):
-        """(ids, weights) [Ts, top_k] of own rows: sigmoid scores, top-k of the biased ones."""
-        ep = wrouter.shape[1]
-        sc = jax.nn.sigmoid(
-            jnp.dot(ffn, wrouter, preferred_element_type=_F32) * c.router_mult
-        )
-        ids, _ = _topk_iter(sc + small_row(sm, "expert_bias")[:, :ep], K)
-        ids = jnp.concatenate(ids, axis=1)
-        w = jnp.take_along_axis(sc, ids, axis=1)
-        return ids, w / (
-            jnp.sum(w, axis=1, keepdims=True) + c.router_eps
-        ) * c.route_scale
 
     def expert_ffn(kind: str, x, group_sizes, w13, s13, w2, s2, group_offset, lo, hi):
         """silu(x @ gate) * (x @ up) @ w2 over rows grouped by local expert -> bf16 [cap, He].
@@ -199,7 +211,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         # by global expert: rank, then local expert
         order = jnp.argsort(flat, stable=True)
         sorted_ids = flat[order]
-        pln = a2a.plan(ag(_counts(sorted_ids, G)[None]), me, tp, El, n_chunks)
+        pln = a2a.plan(ag(_counts(sorted_ids, G)[None], axis), me, tp, El, n_chunks)
         rows = a2a.padded_rows(pln, sorted_ids)
         me1 = me.reshape(1)
         # padded send row -> own row; padding rows read row 0 and are never read back
@@ -247,11 +259,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
         ynorm = _rms(y.astype(_F32) * post, c.post_eps)
         return jnp.sum(ynorm * tw[:, :, None], axis=1)
 
-    def residual(stream, sm, name: str, delta):
-        return small_row(sm, name + "_alpha") * stream + small_row(
-            sm, name + "_beta"
-        ) * _bf(_rms(delta, c.post_eps))
-
     def forward(
         meta,
         pos,
@@ -282,20 +289,22 @@ def build_forward(c: PFConfig, axis: str = "model"):
         for l in range(L):
             sm = smalls[l]
             a8, a_s = _fp8_rows(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
-            qkvg = dense(ag(a8), ag(a_s), wqkvg[l], sm, "wqkvg", c.qkvg_dim)
+            qkvg = dense(ag(a8, axis), ag(a_s, axis), wqkvg[l], sm, "wqkvg", c.qkvg_dim)
             q, kvs, gate = qkv_from_proj(
                 c, qkvg, rope_rows if c.use_rope(l) else None, xla=True
             )
-            o, kv[l] = attention(l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
+            o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
             g8, g_s = _fp8_rows(jax.nn.sigmoid(gate.astype(_F32)) * attn)
             # own rows' every head, then the o-proj on the whole wo: no partial sums
-            g = (to_owner(g8).astype(_F32) * to_owner(g_s)).reshape(Ts, tp * qd)
+            g = (to_owner(g8, tp, axis).astype(_F32) * to_owner(g_s, tp, axis)).reshape(
+                Ts, tp * qd
+            )
             g8, g_s = _fp8_rows(g)
-            stream = residual(stream, sm, "attn", dense(g8, g_s, wo[l], sm, "wo", H))
+            stream = residual(c, stream, sm, "attn", dense(g8, g_s, wo[l], sm, "wo", H))
 
             ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
-            ids, tw = route(ffn.astype(_BF16), wrouter[l], sm)
+            ids, tw = route(c, ffn.astype(_BF16), wrouter[l], sm)
             f8, f_s = _fp8_rows(ffn)
             pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
             xe8, xs = _fp8_rows(
@@ -305,12 +314,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
             # bf16: the unpool output feeds the post-FFN norm
             f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
             stream = residual(
-                stream, sm, "ffn", f.astype(_F32) * small_row(sm, "post_ffn_w")
+                c, stream, sm, "ffn", f.astype(_F32) * small_row(sm, "post_ffn_w")
             )
             if l in c.capture_layers:
                 aux.append(stream.astype(_BF16))
         hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
         aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
-        return (ag(hidden), ag(aux_out), *kv)
+        return (ag(hidden, axis), ag(aux_out, axis), *kv)
 
     return forward
