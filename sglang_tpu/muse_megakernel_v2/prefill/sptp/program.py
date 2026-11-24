@@ -148,6 +148,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     gq = c.q_heads // c.kv_heads
     # SPTP_GLOBAL_COUNTS=1: the MoE counts every rank's slots itself
     local_counts = os.environ.get("SPTP_GLOBAL_COUNTS", "0") != "1"
+    # SPTP_SEPARATE_SMALL_AG=1: ids, tw, xe scales and counts in separate gathers
+    pack_small = os.environ.get("SPTP_SEPARATE_SMALL_AG", "0") != "1"
     # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (its 64-lane head relayouts and f32 MXU head
     # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
     ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
@@ -314,11 +316,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
                 xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
             with _scope("sp_xe_ag"):
-                if xe_pallas:
-                    xe = dequant(ag(xe8, axis), ag(xs, axis))
-                else:
-                    xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
-                ids_all, tw_all = ag(ids, axis), ag(tw, axis)
                 counts = None
                 if local_counts:
                     # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
@@ -333,7 +330,42 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         ),
                         axis=0,
                     )
-                    counts = jnp.sum(ag(own[None], axis), axis=0)
+                if pack_small and local_counts and not xe_pallas:
+                    # ids, tw, xe row scales and the counts in one int32 AG (four small gathers
+                    # each paid a wait)
+                    K = c.top_k
+                    width = 2 * K + 1
+                    cw = -(-c.n_experts // width)
+                    head = jnp.concatenate(
+                        [
+                            ids.astype(jnp.int32),
+                            jax.lax.bitcast_convert_type(tw.astype(_F32), jnp.int32),
+                            jax.lax.bitcast_convert_type(xs.astype(_F32), jnp.int32),
+                        ],
+                        axis=1,
+                    )
+                    tail = jnp.pad(own, (0, cw * width - c.n_experts)).reshape(
+                        cw, width
+                    )
+                    g = ag(
+                        jnp.concatenate([head, tail], axis=0)[None], axis
+                    )  # [tp, Ts+cw, w]
+                    rows_g = g[:, :Ts].reshape(T, width)
+                    ids_all = rows_g[:, :K]
+                    tw_all = jax.lax.bitcast_convert_type(rows_g[:, K : 2 * K], _F32)
+                    xs_all = jax.lax.bitcast_convert_type(rows_g[:, 2 * K :], _F32)
+                    counts = jnp.sum(
+                        g[:, Ts:].reshape(tp, -1)[:, : c.n_experts], axis=0
+                    )
+                    xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
+                else:
+                    if xe_pallas:
+                        xe = dequant(ag(xe8, axis), ag(xs, axis))
+                    else:
+                        xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
+                    ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                    if local_counts:
+                        counts = jnp.sum(ag(own[None], axis), axis=0)
             with _scope("sp_moe"):
                 y = fused_rs_moe(
                     c,
