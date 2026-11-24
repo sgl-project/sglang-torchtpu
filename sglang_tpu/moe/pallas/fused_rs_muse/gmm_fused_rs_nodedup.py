@@ -57,6 +57,7 @@ _FP4_PACK = 8
 # SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES applies from here up; same bound as the
 # row-bucket gate (no buckets at prefill M), so decode tiles are never touched.
 _PREFILL_TILES_MIN_SIZE_M = 16384
+_PREFILL_TM256_MIN_SIZE_M = 32768
 _LOCAL_ROWS_ALIGN = 128
 
 
@@ -593,6 +594,12 @@ def _select_fused_rs_block_sizes(
                 f"{prefill_tiles!r}"
             )
         tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = parsed
+        if size_m < _PREFILL_TM256_MIN_SIZE_M and tile_m > 128:
+            # At 16K <= M < 32K (<= 96 rows/expert avg across 256 experts), tile_m=256
+            # gets almost zero 256-row weight-unpack reuse while inflating <=64-row
+            # experts to >=128 rows (+12.8% dynamic bundles, +35.9% gather/RS rows).
+            # Stepping tile_m down to 128 keeps full-N (4096, 4096) wla=2 ping-pong.
+            tile_m = 128
     prefill_fp8_tiles = envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_FP8_GMM_TILES.get()
     if (
         prefill_fp8_tiles
@@ -2427,7 +2434,8 @@ def kernel_main_fused_rs(
         if not M_BUCKETS or M_BUCKETS[-1] != tile_m:
             M_BUCKETS = sorted(set(M_BUCKETS) | {tile_m})
     elif dims.size_m >= 16384 and _prefill_rb_mode == 4:
-        M_BUCKETS = [b for b in (128, 256) if _sls_b <= b <= tile_m]
+        _rb4_set = (32, 64, 128) if tile_m <= 128 else (128, 256)
+        M_BUCKETS = [b for b in _rb4_set if _sls_b <= b <= tile_m]
         if not M_BUCKETS or M_BUCKETS[-1] != tile_m:
             M_BUCKETS = sorted(set(M_BUCKETS) | {tile_m})
     else:

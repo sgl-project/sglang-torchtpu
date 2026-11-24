@@ -3377,3 +3377,67 @@ def test_w9_cand5_wla2_pingpong_nan_interpret_zero_ulp_and_lowering(num_w2_bufs:
         assert "-wla2" in hlo and "-pql4" in hlo and "-g2a6" in hlo
         jax.clear_caches()
 
+
+def test_w9_cand6_m16k_tm128_stepdown_and_rb4_buckets():
+    """Verify PREFILL_GMM_TILES='256,...' steps down to tm=128 at M=16K..24K while keeping tm=256 at M>=32K."""
+    import jax.numpy as jnp
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _PREFILL_TILES_MIN_SIZE_M,
+        _PREFILL_TM256_MIN_SIZE_M,
+        _select_fused_rs_block_sizes,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    assert _PREFILL_TILES_MIN_SIZE_M == 16384
+    assert _PREFILL_TM256_MIN_SIZE_M == 32768
+
+    def _query(m: int) -> tuple[int, ...]:
+        bs = _select_fused_rs_block_sizes(
+            size_m=m,
+            size_k1=4096,
+            size_n1=8192,
+            size_k2=4096,
+            size_n2=4096,
+            size_group=32,
+            size_lhs_group=32,
+            ep_size=8,
+            out_dtype=jnp.bfloat16,
+            w1_dtype=jnp.float4_e2m1fn,
+            w2_dtype=jnp.float4_e2m1fn,
+            is_quantized=True,
+            quant_block_size=512,
+            act_fn="silu",
+            fp8_direct_write=False,
+        )
+        return (
+            bs.tile_m,
+            bs.tile_k1,
+            bs.tile_n1,
+            bs.tile_k2,
+            bs.tile_n2,
+            bs.num_w1_bufs,
+            bs.num_w2_bufs,
+        )
+
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "256,4096,4096,4096,4096,2,1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "2",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+            },
+        ),
+    ):
+        for m_small in (1024, 4096, 8192):
+            bs_small = _query(m_small)
+            assert bs_small[0] in (64, 128), (m_small, bs_small)
+        for m_mid in (16384, 24576):
+            assert _query(m_mid) == (128, 4096, 4096, 4096, 4096, 2, 1)
+        for m_large in (32768, 65536, 131072):
+            assert _query(m_large) == (256, 4096, 4096, 4096, 4096, 2, 1)
+
+
