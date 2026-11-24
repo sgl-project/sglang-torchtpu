@@ -2244,6 +2244,7 @@ def maybe_forward_m2m_decode(
         if chip_sharded_stream:
             tp16_epi_ok = tp == 16 and bool(
                 getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI", None)
+                is not None
                 and tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get()
             )
             use_epi = (
@@ -2428,6 +2429,7 @@ def maybe_forward_m2m_decode(
         else:
             tp16_epi_ok = tp == 16 and bool(
                 getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI", None)
+                is not None
                 and tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get()
             )
             use_epi = (

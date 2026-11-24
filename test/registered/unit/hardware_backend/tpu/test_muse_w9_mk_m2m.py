@@ -684,3 +684,183 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "SUBPROC_M2M_OK" in proc.stdout
+
+
+def test_maybe_forward_m2m_decode_tp16_qkv_epi_env_get():
+    """Verify #2951/#2953/#2960: maybe_forward_m2m_decode on TP=16 exercises L2246 & L2430 safely."""
+    import os
+    from types import SimpleNamespace
+    from unittest import mock
+    import torch
+
+    from sglang_tpu.muse_megakernel.decode.m2m import ops as m2m_ops
+
+    def _make_norm():
+        return SimpleNamespace(gain=lambda: torch.ones(1), eps=1e-5, scale_input=True)
+
+    def _make_gate():
+        return SimpleNamespace(alpha=torch.ones(1), beta=torch.ones(1))
+
+    def _make_layer(is_swa: bool):
+        sa = SimpleNamespace(
+            _buffers={
+                "_w7_wqkv_w8k": torch.empty(0),
+                "_w7_sqkv": torch.empty(0),
+                "_w7_wgate_w8k": torch.empty(0),
+                "_w7_sgate": torch.empty(0),
+            },
+            _o_proj_w8k=torch.empty(0),
+            _o_proj_scale=torch.empty(0),
+            o_proj=SimpleNamespace(),
+            rotary_emb=None,
+            norm_eps=1e-5,
+            query_scale=1.0,
+            decode_qkv_epilogue=True,
+            attn=SimpleNamespace(
+                layer_id=0 if is_swa else 1,
+                sliding_window_size=2047 if is_swa else None,
+                scaling=1.0,
+                k_scale_float=1.0,
+                v_scale_float=1.0,
+            ),
+            __call__=None,
+        )
+
+        def _sa_call(*args, **kwargs):
+            return torch.zeros((64, 64), dtype=torch.bfloat16)
+
+        sa = mock.MagicMock(wraps=sa)
+        sa.side_effect = _sa_call
+        sa._buffers = {
+            "_w7_wqkv_w8k": torch.empty(0),
+            "_w7_sqkv": torch.empty(0),
+            "_w7_wgate_w8k": torch.empty(0),
+            "_w7_sgate": torch.empty(0),
+        }
+        sa._o_proj_w8k = torch.empty(0)
+        sa._o_proj_scale = torch.empty(0)
+        sa.o_proj = SimpleNamespace()
+        sa.rotary_emb = None
+        sa.norm_eps = 1e-5
+        sa.query_scale = 1.0
+        sa.decode_qkv_epilogue = True
+        sa.attn = SimpleNamespace(
+            layer_id=0 if is_swa else 1,
+            sliding_window_size=2047 if is_swa else None,
+            scaling=1.0,
+            k_scale_float=1.0,
+            v_scale_float=1.0,
+        )
+
+        def _mlp_call(*args, **kwargs):
+            return torch.zeros((64, 64), dtype=torch.bfloat16)
+
+        mlp = mock.MagicMock()
+        mlp.side_effect = _mlp_call
+        mlp._buffers = {
+            "_w7_wpost_w8k": torch.empty(0),
+            "_w7_spost": torch.empty(0),
+            "_w7_wrouter_km": torch.empty(0, dtype=torch.bfloat16),
+            "_w7_wpre_w8k": torch.empty(0),
+            "_w7_spre": torch.empty(0),
+            "_w8_wpre_pair_w8k": torch.empty(0),
+            "_w8_spre_pair": torch.empty(0),
+        }
+        mlp.__dict__["_fused_decode_sharded_op"] = object()
+        mlp.router_multiplier = 1.0
+        mlp.pre_expert_norm = _make_norm()
+        lyr_ns = SimpleNamespace(
+            self_attn=sa,
+            mlp=mlp,
+            input_layernorm=_make_norm(),
+            post_attention_layernorm=_make_norm(),
+            post_attention_residual_gate=_make_gate(),
+            pre_feedforward_layernorm=_make_norm(),
+            post_feedforward_layernorm=_make_norm(),
+            post_feedforward_residual_gate=_make_gate(),
+            _w8_bridge_qkv_epi=True,
+        )
+        return lyr_ns
+
+    kv_buf = torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn)
+    backend = SimpleNamespace(
+        forward_metadata=SimpleNamespace(
+            decode_query_size=1,
+            cp_write_segments=None,
+            cu_q_lens=torch.zeros(65, dtype=torch.int32),
+            cu_kv_lens=torch.zeros(65, dtype=torch.int32),
+            decode_shared_prefix_pages=None,
+        ),
+        _dcp=1,
+        kv_cache_quant_dtype=torch.float8_e4m3fn,
+        _kv_pack_dense2=False,
+        token_to_kv_pool=SimpleNamespace(),
+        _kv_lens=lambda fb: torch.ones(64, dtype=torch.int32),
+        _layer_page_indices=lambda lid, is_swa_layer: torch.zeros(
+            64 * (5 if is_swa_layer else 64), dtype=torch.int32
+        ),
+        _layer_distribution=lambda is_swa_layer: torch.tensor([0, 0, 64], dtype=torch.int32),
+    )
+
+    for chip_sh in (True, False):
+        for epi_flag in ("0", "1"):
+            lyr0 = _make_layer(is_swa=True)
+            lyr1 = _make_layer(is_swa=False)
+            model = SimpleNamespace(
+                pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+                layers_to_capture=[],
+                start_layer=0,
+                end_layer=2,
+                layers=[lyr0, lyr1],
+                norm=_make_norm(),
+                rotary_emb=SimpleNamespace(cos_sin_pairs=None),
+                _decode_col_bridges=3,
+            )
+            seen: list[str] = []
+
+            def _rec(tag, n_out):
+                def _fn(*args, **kwargs):
+                    seen.append(tag)
+                    return tuple(torch.zeros((64, 64), dtype=torch.bfloat16) for _ in range(n_out))
+
+                return _fn
+
+            stream_rows = 8 if chip_sh else 64
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_TPU_MUSE_MK_M2M_MAX_FULL_CTX": "4096",
+                        "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI": epi_flag,
+                    },
+                ),
+                mock.patch("sglang_tpu.attention_pallas_rpa_base._fused_kv_operands", return_value=(kv_buf, None)),
+                mock.patch("sglang_tpu.decode_qkv_epilogue_tpu._resolve_decode_attn_backend", return_value=backend),
+                mock.patch("sglang_tpu.models.muse_spark._layer_tp_size", return_value=16),
+                mock.patch.object(m2m_ops, "get_l0_a2m_chip_sh_op", side_effect=lambda *a, **kw: _rec("l0", 3)),
+                mock.patch.object(m2m_ops, "get_l0_a2m_rep_op", side_effect=lambda *a, **kw: _rec("l0", 3)),
+                mock.patch.object(m2m_ops, "get_moe_to_attn_chip_sharded_bridge_op", side_effect=lambda *a, **kw: _rec("b2_sh_epi" if kw.get("fuse_qkv_epi") else "b2_sh", 4 if kw.get("fuse_qkv_epi") else 3)),
+                mock.patch.object(m2m_ops, "get_moe_to_attn_qkv_epi_bridge_op", side_effect=lambda *a, **kw: _rec("b2_rep_epi", 4)),
+                mock.patch.object(m2m_ops, "get_moe_to_attn_bridge_op", side_effect=lambda *a, **kw: _rec("b2_rep", 3)),
+                mock.patch.object(m2m_ops, "get_attn_to_moe_chip_sharded_bridge_op", side_effect=lambda *a, **kw: _rec("b1_sh", 3)),
+                mock.patch.object(m2m_ops, "get_attn_to_moe_bridge_op", side_effect=lambda *a, **kw: _rec("b1_rep", 3)),
+                mock.patch.object(m2m_ops, "get_moe_post_chip_sharded_final_norm_op", side_effect=lambda *a, **kw: lambda *x: torch.zeros((64, 64), dtype=torch.bfloat16)),
+                mock.patch.object(m2m_ops, "get_moe_post_ag_final_norm_op", side_effect=lambda *a, **kw: lambda *x: torch.zeros((64, 64), dtype=torch.bfloat16)),
+            ):
+                out = m2m_ops.maybe_forward_m2m_decode(
+                    model,
+                    positions=torch.zeros(64, dtype=torch.int32),
+                    stream=torch.zeros((stream_rows, 64), dtype=torch.float32),
+                    carried_attn_input=torch.zeros((64, 64), dtype=torch.bfloat16),
+                    cos_sin_step=None,
+                    forward_batch=SimpleNamespace(),
+                    tok_sharded_stream=False,
+                    chip_sharded_stream=chip_sh,
+                )
+            assert out is not None and out.shape == (64, 64)
+            expected_b2 = (
+                ("b2_sh_epi" if epi_flag == "1" else "b2_sh")
+                if chip_sh
+                else ("b2_rep_epi" if epi_flag == "1" else "b2_rep")
+            )
+            assert expected_b2 in seen, (chip_sh, epi_flag, seen)
