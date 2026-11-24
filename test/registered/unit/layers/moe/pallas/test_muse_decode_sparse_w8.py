@@ -486,6 +486,8 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             "jax.experimental",
             "jax.experimental.pallas",
             "jax.experimental.pallas.tpu",
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing",
+            "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse_v2",
         )
         for mn in mock_names:
             saved_mods[mn] = sys.modules.get(mn)
@@ -2289,6 +2291,229 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 self.assertGreater(
                     comp_dyn.memory_analysis().generated_code_size_in_bytes, 0
                 )
+
+    def test_w9_dflash_verify_b256_b384_route_fast_w4a8_free_and_ep16(self):
+        """Verify ROUTE_FAST B>=256 parity, VERIFY FREE/MIN_P, LHS_FP8/TM128, and EP=16 B=256/384 lowering."""
+        import dataclasses
+        from functools import partial
+        import os
+        from unittest import mock
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.experimental.topologies import get_topology_desc
+        from jax.sharding import Mesh, PartitionSpec as P
+        import numpy as np
+
+        from sglang_tpu.moe.pallas.fused_rs_muse import (
+            fused_decode_routing as rt_mod,
+            fused_decode_sparse as v1_mod,
+            fused_decode_sparse_v2 as v2_mod,
+        )
+
+        # 1. Verify-scaled FREE + MIN_P_TOPK + LHS_FP8 + TILE_M128 config resolution.
+        verify_env = {
+            "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS": "10:0.20:1",
+            "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK": "0.84",
+            "SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS": "off",
+            "SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK": "0.0",
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128": "1",
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST": "1",
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN": "2",
+            "SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "1",
+        }
+        with mock.patch.dict(os.environ, verify_env, clear=False):
+            cfg64 = v1_mod.default_sparse_decode_config(64, 8, 512)
+            self.assertEqual(cfg64.free_max_rows, 10)
+            self.assertAlmostEqual(cfg64.min_p_topk, 0.84)
+            self.assertFalse(cfg64.lhs_fp8)
+            self.assertEqual(cfg64.tile_m, 32)
+
+            cfg256 = v1_mod.default_sparse_decode_config(256, 16, 512)
+            self.assertEqual(cfg256.free_max_rows, 0)
+            self.assertAlmostEqual(cfg256.min_p_topk, 0.0)
+            self.assertTrue(cfg256.lhs_fp8)
+            self.assertEqual(cfg256.tile_m, 128)
+            self.assertEqual(cfg256.m_buckets, (16, 32, 64, 128))
+            self.assertTrue(cfg256.pair_rs)
+            self.assertTrue(cfg256.bridge_ag)
+
+            cfg_fp8_256 = v1_mod.default_fp8_sparse_decode_config(256, 16)
+            self.assertEqual(cfg_fp8_256.free_max_rows, 0)
+            self.assertAlmostEqual(cfg_fp8_256.min_p_topk, 0.0)
+            self.assertTrue(cfg_fp8_256.pair_rs)
+            self.assertTrue(cfg_fp8_256.bridge_ag)
+
+            cfg_v2_256 = v2_mod.default_sparse_decode_v2_config(256, 8, 512)
+            self.assertEqual(cfg_v2_256.routing_prune.free_expert_rows, 0)
+            self.assertEqual(cfg_v2_256.routing_prune.cum_mass, 0.0)
+
+        explicit_verify_env = {
+            "SGLANG_TPU_MUSE_DECODE_FREE_EXPERT_ROWS": "10:0.20:1",
+            "SGLANG_TPU_MUSE_DECODE_MIN_P_TOPK": "0.84",
+            "SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS": "24:0.19:2",
+            "SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK": "0.88",
+        }
+        with mock.patch.dict(os.environ, explicit_verify_env, clear=False):
+            cfg_exp = v1_mod.default_sparse_decode_config(256, 8, 512)
+            self.assertEqual(cfg_exp.free_max_rows, 24)
+            self.assertAlmostEqual(cfg_exp.free_max_w, 0.19)
+            self.assertEqual(cfg_exp.free_min_slot, 2)
+            self.assertAlmostEqual(cfg_exp.min_p_topk, 0.88)
+
+        # 2. Bit-exact CPU InterpretParams(detect_races=True, uninitialized_memory='nan')
+        #    for ROUTE_FAST B in (256, 384) vs legacy rb=32 across free=0 and free=20.
+        interp = pltpu.InterpretParams(
+            detect_races=True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        )
+        rng = np.random.default_rng(2026)
+
+        def _run_route_probe(batch_sz: int, ep: int, use_fast: bool, free_rows: int, lg_np, bi_np, rep_np):
+            e_local = 256 // ep
+            r_slots = len(rep_np)
+            max_exec = e_local + r_slots
+            shapes = rt_mod.routing_scratch_shapes(batch_sz, max_exec, topk=8, num_experts=256)
+
+            def _kern2(lg_r, bi_r, rp_r, out_cnt, out_pk, *sc_refs):
+                scr = rt_mod.RoutingScratch(*sc_refs[:-1])
+                sem = sc_refs[-1]
+                cands = tuple(rp_r[i] for i in range(r_slots))
+                rt_mod.route_topk_and_counts_in_kernel(
+                    lg_r,
+                    bi_r,
+                    scr,
+                    sem,
+                    my_owner=jnp.int32(1),
+                    e_per_owner=e_local,
+                    holder_cand_eids=cands,
+                    min_p_topk=0.82,
+                    free_max_rows=free_rows,
+                    free_max_w=0.20,
+                    free_min_slot=1,
+                    route_chunk_rows=32,
+                    route_rb16_mode=0,
+                    route_fast=use_fast,
+                )
+                out_cnt[...] = scr.counts_smem[0:1, :]
+                out_pk[...] = scr.route_pack_smem[...]
+
+            res_cnt, res_pk = pl.pallas_call(
+                _kern2,
+                out_shape=(
+                    jax.ShapeDtypeStruct((1, 256), jnp.int32),
+                    jax.ShapeDtypeStruct((batch_sz, 128), jnp.int32),
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    grid=(1,),
+                    in_specs=(
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                    ),
+                    out_specs=(
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                        pl.BlockSpec(memory_space=pltpu.SMEM),
+                    ),
+                    scratch_shapes=tuple(list(shapes) + [pltpu.SemaphoreType.DMA]),
+                ),
+                interpret=interp,
+            )(jnp.asarray(lg_np), jnp.asarray(bi_np), jnp.asarray(rep_np, jnp.int32))
+            return np.asarray(res_cnt), np.asarray(res_pk)
+
+        bi_np = rng.normal(0.0, 0.2, size=(1, 256)).astype(np.float32)
+        rep_np = np.array([5, 42, -1, 120, 201, -1, 88, 250], dtype=np.int32)
+        for batch_sz, ep in ((256, 8), (384, 16)):
+            lg_np = rng.normal(0.0, 1.8, size=(batch_sz, 256)).astype(np.float32)
+            lg_np[-2:, :] = np.nan
+            for free_rows in (0, 20):
+                c_ref, p_ref = _run_route_probe(batch_sz, ep, False, free_rows, lg_np, bi_np, rep_np)
+                c_fast, p_fast = _run_route_probe(batch_sz, ep, True, free_rows, lg_np, bi_np, rep_np)
+                self.assertTrue(
+                    np.array_equal(c_ref, c_fast),
+                    f"counts mismatch B={batch_sz}, EP={ep}, free={free_rows}",
+                )
+                self.assertTrue(
+                    np.array_equal(p_ref[:, :24], p_fast[:, :24]),
+                    f"route_pack mismatch B={batch_sz}, EP={ep}, free={free_rows}",
+                )
+
+        # 3. Offline TPU7x Mosaic lowering for EP=8 B=256 (LHS_FP8 + TM128) and
+        #    EP=16 B=256/384 (PAIR_RS + return_sharded=True, incl. rows_per_rank=24).
+        for topo_str, ep, batches in (
+            ("tpu7x:2x2x1", 8, (256,)),
+            ("tpu7x:2x2x2", 16, (256, 384)),
+        ):
+            tpu_devs = get_topology_desc(topo_str, platform="tpu").devices
+            if len(tpu_devs) < ep:
+                continue
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            e_loc = 256 // ep
+            h, r_slots = 4096, 8
+            for batch_sz in batches:
+                shapes_v = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((batch_sz, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((batch_sz, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_loc, h, 8192), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_loc, h // 512, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_loc, 4096, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_loc, 4096 // 512, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((r_slots, h, 8192), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((r_slots, h // 512, 8192), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((r_slots, 4096, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((r_slots, 4096 // 512, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4, ep * r_slots), jnp.int32),
+                )
+                base_cfg = v1_mod.default_sparse_decode_config(batch_sz, ep, 512)
+                for tm128 in ((False, True) if batch_sz == 256 else (False,)):
+                    cfg_v = dataclasses.replace(
+                        base_cfg,
+                        tile_m=128 if tm128 else 64,
+                        m_buckets=(16, 32, 64, 128) if tm128 else (16, 32, 64),
+                        lhs_fp8=True,
+                        route_fast=True,
+                        fast_plan=2,
+                        unroll_strips=True,
+                        fast_gs=True,
+                        static_holder_mask=True,
+                        pair_rs=(ep == 16),
+                        bridge_ag=True,
+                    )
+                    sm_v = jax.jit(
+                        jax.shard_map(
+                            partial(
+                                v1_mod.fused_decode_sparse_from_logits,
+                                ep=ep,
+                                return_sharded=True,
+                                replica_cost_mode="tiles",
+                                config=cfg_v,
+                            ),
+                            mesh=mesh,
+                            in_specs=(P(),) * len(shapes_v),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    )
+                    comp_v = sm_v.trace(*shapes_v).lower(lowering_platforms=("tpu",)).compile()
+                    self.assertIn("tpu_custom_call", comp_v.as_text())
+                    self.assertGreater(
+                        comp_v.memory_analysis().generated_code_size_in_bytes, 0
+                    )
 
 
 if __name__ == "__main__":
