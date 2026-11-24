@@ -281,7 +281,9 @@ def _gather_heights_on_two_ranks(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-def _decode_wan_latents_chunked(decoder, z: torch.Tensor, chunk_frames=1) -> torch.Tensor:
+def _decode_wan_latents_chunked(
+    decoder, z: torch.Tensor, chunk_frames=1
+) -> torch.Tensor:
     """The decode loop of AutoencoderKLWan.decode over ``decoder``: frame 0 alone, then
     ``chunk_frames`` latent frames a call."""
     num_convs = sum(isinstance(m, WanCausalConv3d) for m in decoder.modules())
