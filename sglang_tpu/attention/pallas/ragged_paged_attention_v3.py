@@ -7410,6 +7410,14 @@ def ragged_paged_attention(
         )
     )
     if _decode_out_norm_eps is not None and out_final.ndim == 2:
+        if (
+            _decode_gate_in_values
+            and values is not None
+            and values.ndim == 2
+            and out_final.shape[-1] == 2 * values.shape[-1]
+        ):
+            # TP=16 prepared QKV_EPI packs 8x64 heads into the low 512 columns.
+            out_final = out_final[:, : values.shape[-1]]
         hd = actual_head_dim // max(abs(_fused_out_pack), 1)
         heads_f = out_final.reshape(out_final.shape[0], -1, hd).astype(jnp.float32)
         inv_r = lax.rsqrt(

@@ -1163,8 +1163,11 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             and md.cp_write_segments is None
             and self.kv_cache_quant_dtype == torch.float8_e4m3fn
             and not getattr(layer, "is_cross_attention", False)
-            and getattr(layer, "tp_q_head_num", 0) == 16
-            and getattr(layer, "tp_k_head_num", 0) == 2
+            and (
+                getattr(layer, "tp_q_head_num", 0),
+                getattr(layer, "tp_k_head_num", 0),
+            )
+            in ((16, 2), (8, 1))
             and getattr(layer, "qk_head_dim", 0) == 64
             and getattr(layer, "v_head_dim", 0) == 64
             and not getattr(layer, "logit_cap", 0)
@@ -1215,6 +1218,11 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         if capture_mode is not None and capture_mode.is_full():
             out = _zero_inactive_rpa_rows(out, md.active_num_tokens)
+        expected_out_cols = layer.tp_q_head_num * layer.v_head_dim
+        if out.ndim == 2 and out.shape[-1] == 2 * expected_out_cols:
+            out = out[:, :expected_out_cols]
+        elif out.ndim == 3 and out.shape[1] == 2 * layer.tp_q_head_num:
+            out = out[:, : layer.tp_q_head_num, :]
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
         if out.shape[-1] != layer.qk_head_dim:
             out = _unpack_out_heads(

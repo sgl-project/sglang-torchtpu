@@ -1458,6 +1458,275 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     self.assertIn("-tp16", hlo)
                     self.assertIn(exp_sub, hlo)
 
+    def test_cand4_hoistkv_full_only_u4flat_and_w7auto_dyn2ku_nan_poisoned(self):
+        """hoistkv stays Full-only, u4flat runs SWA 1/1K cleanly, and dyn2ku covers 5K..8K without NaNs."""
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            parse_decode_fast_config,
+            run_decode_fast_rpa,
+        )
+
+        # hoistkv must apply only to Full layers (sliding_window is None), never SWA.
+        cfg_full = parse_decode_fast_config(
+            "w8,hoistkv,dyn2ku",
+            sliding_window=None,
+            pages_per_seq=20,
+            page_size=512,
+        )
+        cfg_swa = parse_decode_fast_config(
+            "w8,hoistkv,u4flat",
+            sliding_window=2048,
+            pages_per_seq=4,
+            page_size=512,
+        )
+        self.assertTrue(cfg_full.hoist_new_kv)
+        self.assertTrue(cfg_full.dyn2k_unroll)
+        self.assertEqual(cfg_full.loop_kind, "w7auto")
+        self.assertFalse(cfg_swa.hoist_new_kv)
+        self.assertTrue(cfg_swa.u4_flat)
+        self.assertEqual(cfg_swa.loop_kind, "swabatch")
+
+        rng = np.random.default_rng(20264)
+        ps = 512
+        # 0x7F NaN-poisoned Full w7auto + dyn2ku across <=5K, 5K..8K (4x2K), and >8K on nod2 & d2.
+        lens_full = [17, 512, 1024, 1025, 4096, 5120, 5121, 6144, 7500, 8192, 8193, 9000]
+        bs_f, pps_f = len(lens_full), 20
+        stock_u8 = np.full((bs_f * pps_f + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        stock_u8[:, :, 0, :2, :] = _rand_fp8_u8(rng, (bs_f * pps_f + 8, ps, 2, 128))
+        d2_u8 = _pack_stock_cache_to_dense2_u8(stock_u8, ps)
+        q_f = jnp.asarray((rng.standard_normal((bs_f, 16, 128)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        k_f = _u8_to_fp8(_rand_fp8_u8(rng, (bs_f, 1, 128)))
+        v_f = _u8_to_fp8(_rand_fp8_u8(rng, (bs_f, 1, 128)))
+        pi_f = jnp.arange(bs_f * pps_f, dtype=jnp.int32)
+        cuq_f = jnp.arange(bs_f + 1, dtype=jnp.int32)
+        cukv_f = jnp.arange(bs_f + 1, dtype=jnp.int32) * (pps_f * ps)
+        dist_f = jnp.asarray([bs_f, bs_f, bs_f], dtype=jnp.int32)
+        kvl_f = jnp.asarray(lens_full, dtype=jnp.int32)
+        for d2, cache_u8 in ((False, stock_u8), (True, d2_u8)):
+            with self.subTest(d2=d2):
+                kvc = _u8_to_fp8(cache_u8)
+                o_ref, _ = run_decode_fast_rpa(
+                    q_f, k_f, v_f, kvc, kvl_f, pi_f, cuq_f, cukv_f, dist_f,
+                    sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8", kv_pack_dense2=d2, interpret=True,
+                )
+                o_opt, _ = run_decode_fast_rpa(
+                    q_f, k_f, v_f, kvc, kvl_f, pi_f, cuq_f, cukv_f, dist_f,
+                    sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8,hoistkv,dyn2ku", kv_pack_dense2=d2, interpret=True,
+                )
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_opt, dtype=np.float32))))
+                self.assertGreater(_cosine(np.asarray(o_opt), np.asarray(o_ref)), 0.9999)
+
+        # 0x7F NaN-poisoned u4flat SWA 1/1K parity (1p, 2p, mixed).
+        for tag, lens_s in (
+            ("swa_1p", [512] * 16),
+            ("swa_900", [900] * 16),
+            ("swa_mix", [10, 512, 513, 900, 1024, 1025, 1800, 2048] * 2),
+        ):
+            with self.subTest(u4flat=tag):
+                bs_s, pps_s = len(lens_s), 6
+                s_u8 = np.full((bs_s * pps_s + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                s_u8[:, :, 0, :2, :] = _rand_fp8_u8(rng, (bs_s * pps_s + 8, ps, 2, 128))
+                kvc_s = _u8_to_fp8(s_u8)
+                q_s = jnp.asarray((rng.standard_normal((bs_s, 16, 128)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+                k_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_s, 1, 128)))
+                v_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_s, 1, 128)))
+                pi_s = jnp.arange(bs_s * pps_s, dtype=jnp.int32)
+                cuq_s = jnp.arange(bs_s + 1, dtype=jnp.int32)
+                cukv_s = jnp.arange(bs_s + 1, dtype=jnp.int32) * (pps_s * ps)
+                dist_s = jnp.asarray([bs_s, bs_s, bs_s], dtype=jnp.int32)
+                kvl_s = jnp.asarray(lens_s, dtype=jnp.int32)
+                o_b, _ = run_decode_fast_rpa(
+                    q_s, k_s, v_s, kvc_s, kvl_s, pi_s, cuq_s, cukv_s, dist_s,
+                    sm_scale=128 ** -0.5, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8", interpret=True,
+                )
+                o_u, _ = run_decode_fast_rpa(
+                    q_s, k_s, v_s, kvc_s, kvl_s, pi_s, cuq_s, cukv_s, dist_s,
+                    sm_scale=128 ** -0.5, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8,u4flat", interpret=True,
+                )
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_u, dtype=np.float32))))
+                self.assertGreater(_cosine(np.asarray(o_u), np.asarray(o_b)), 0.99995)
+
+    def test_cand4_tp16_prepared_qkv_epi_in_kernel_pack2_nan_poisoned_and_export(self):
+        """TP=16 QKV_EPI (8, 1) prepared inputs unlock in_kernel_pack2 [B, 512] across SWA/Full/Shared16."""
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            can_use_decode_fast,
+            run_decode_fast_rpa,
+        )
+
+        # Verify TP=16 (8, 1) relaxation in can_forward_decode_prepared.
+        impl = TpuPallasRpaV3AttnBackend.__new__(TpuPallasRpaV3AttnBackend)
+        impl._dcp = 1
+        impl._decode_prepared_op = object()
+        impl.kv_cache_quant_dtype = torch.float8_e4m3fn
+        impl.forward_metadata = types.SimpleNamespace(
+            decode_query_size=1,
+            cp_write_segments=None,
+            kv_pack_dense2=False,
+        )
+        fb = types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(
+                is_decode=lambda: True,
+                is_target_verify=lambda: False,
+            )
+        )
+        layer_tp16 = types.SimpleNamespace(
+            is_cross_attention=False,
+            tp_q_head_num=8,
+            tp_k_head_num=1,
+            qk_head_dim=64,
+            v_head_dim=64,
+            logit_cap=0,
+        )
+        layer_bad = types.SimpleNamespace(
+            is_cross_attention=False,
+            tp_q_head_num=4,
+            tp_k_head_num=1,
+            qk_head_dim=64,
+            v_head_dim=64,
+            logit_cap=0,
+        )
+        self.assertTrue(impl.can_forward_decode_prepared(layer_tp16, fb))
+        self.assertFalse(impl.can_forward_decode_prepared(layer_bad, fb))
+
+        # Verify forward_decode_prepared handles both 2D [B, 1024] and 3D [B, 16, 128] fallback outputs.
+        impl.forward_metadata.active_num_tokens = 4
+        impl.forward_metadata.cu_q_lens = torch.zeros((5,), dtype=torch.int32)
+        impl.forward_metadata.cu_kv_lens = torch.zeros((5,), dtype=torch.int32)
+        impl._kv_lens = lambda _fb: torch.ones((4,), dtype=torch.int32)
+        impl._layer_page_indices = lambda _lid, is_swa_layer=False: torch.zeros((4,), dtype=torch.int32)
+        impl._layer_distribution = lambda is_swa_layer=False: torch.tensor([4, 4, 4], dtype=torch.int32)
+        impl.token_to_kv_pool = types.SimpleNamespace(get_fused_kv_buffer=lambda _lid: (torch.zeros((1,)), 0))
+        layer_tp16.layer_id = 0
+        layer_tp16.sliding_window_size = None
+        layer_tp16.k_scale_float = 1.0
+        layer_tp16.v_scale_float = 1.0
+        layer_tp16.scaling = 64 ** -0.5
+        q_dummy = torch.zeros((1, 4, 8, 2, 128), dtype=torch.bfloat16)
+        kv_dummy = torch.zeros((4, 1, 4, 128), dtype=torch.bfloat16)
+        with (
+            patch("sglang_tpu.attention_pallas_rpa_v3._fused_kv_operands", return_value=(torch.zeros((1,)), 0)),
+            patch("sglang_tpu.attention_pallas_rpa_v3._unpack_out_heads", side_effect=lambda x, _p, d: x[..., :d]),
+        ):
+            impl._decode_prepared_op = lambda *a, **kw: torch.ones((4, 1024), dtype=torch.bfloat16)
+            self.assertEqual(tuple(impl.forward_decode_prepared(q_dummy, kv_dummy, layer_tp16, fb).shape), (4, 512))
+            impl._decode_prepared_op = lambda *a, **kw: torch.ones((4, 16, 128), dtype=torch.bfloat16)
+            self.assertEqual(tuple(impl.forward_decode_prepared(q_dummy, kv_dummy, layer_tp16, fb).shape), (4, 512))
+
+        rng = np.random.default_rng(20265)
+        ps = 512
+        for tag, lens, pps, sw, mode, sh_grp in (
+            ("tp16_swa", [512, 900, 1025, 1, 513, 1024, 200, 777] * 2, 4, 2048, "tp16", 0),
+            ("tp16_full_8k1k", [17, 512, 1500, 4096, 5120, 6144, 8192, 8500] * 2, 20, None, "tp16,hoistkv,dyn2ku", 0),
+            ("tp16_shared16", [1025] * 16, 4, None, "shared16_host", 16),
+        ):
+            with self.subTest(tp16_prepared=tag):
+                bs = len(lens)
+                s_u8 = np.full((bs * pps + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                s_u8[:, :, 0, :2, :] = 0
+                s_u8[:, :, 0, 0, :64] = _rand_fp8_u8(rng, (bs * pps + 8, ps, 64))
+                s_u8[:, :, 0, 1, :64] = _rand_fp8_u8(rng, (bs * pps + 8, ps, 64))
+                pi_np = (
+                    np.broadcast_to(np.arange(pps, dtype=np.int32), (bs, pps)).copy()
+                    if sh_grp
+                    else np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+                )
+                for s in range(bs):
+                    old_l = int(lens[s]) - 1
+                    lp = old_l // ps
+                    rem = old_l % ps
+                    s_u8[pi_np[s, lp], rem:, 0, :2, :] = 0x7F
+                    if lp + 1 < pps:
+                        s_u8[pi_np[s, lp + 1 :], :, 0, :2, :] = 0x7F
+                kvc = _u8_to_fp8(s_u8)
+                q16 = jnp.asarray((rng.standard_normal((bs, 8, 64)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+                k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+                v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+                gate = jnp.asarray((rng.standard_normal((bs, 512)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+                q_prep = jnp.pad(q16, ((0, 0), (0, 8), (0, 64))).reshape(1, bs, 8, 2, 128)
+                kv_prep = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs, 1, 4, 128)
+                kvl = jnp.asarray(lens, dtype=jnp.int32)
+                pi = jnp.asarray(pi_np.ravel(), dtype=jnp.int32)
+                cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+                cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+                dist = jnp.asarray([bs, bs, bs], dtype=jnp.int32)
+                shp = jnp.asarray([(lens[0] - 1) // ps], dtype=jnp.int32) if sh_grp else None
+                self.assertTrue(
+                    can_use_decode_fast(
+                        mode_str=mode, q=q_prep, kv_cache_fused=kvc, out_dtype=jnp.bfloat16,
+                        decode_query_size=1, custom_mask=None, attention_sink=None, soft_cap=None,
+                        xai_temperature_len=None, q_scale=None, actual_num_q_heads=16,
+                        actual_num_kv_heads=1, actual_head_dim=128, sliding_window=sw,
+                        pages_per_seq=pps, pure_unpacked_decode=False, kv_pack_dense2=False,
+                        need_fused_post=True,
+                    )
+                )
+                o_ref, _ = run_decode_fast_rpa(
+                    q16, k16, v16, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=64 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                    mode_str="shared16_host" if sh_grp else "tp16",
+                    fused_out_pack=1, prepared_inputs=False, interpret=True, shared_pages=shp,
+                )
+                xf = np.asarray(o_ref, dtype=np.float32)
+                inv = 1.0 / np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + 1e-6)
+                out_ref = jnp.asarray(xf * inv, dtype=jnp.bfloat16).reshape(-1, 512) * jax.nn.sigmoid(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+                o_prep, _ = run_decode_fast_rpa(
+                    q_prep, kv_prep, None, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=64 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode, fused_out_pack=2, prepared_inputs=True,
+                    gate=gate, out_norm_eps=1e-6, interpret=True, shared_pages=shp,
+                )
+                self.assertEqual(o_prep.shape, (bs, 512))
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_prep, dtype=np.float32))))
+                self.assertGreater(_cosine(np.asarray(o_prep), np.asarray(out_ref)), 0.99995)
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import ragged_paged_attention
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag, pps, sw, mode in (
+                ("tp16_epi_swa", 4, 2048, "tp16,u4flat"),
+                ("tp16_epi_8k1k", 20, None, "tp16,w8,hoistkv,dyn2ku"),
+            ):
+                with self.subTest(export=tag):
+                    bs = 64
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q, kv, g, c, kl, pi, cq, ckv, d, _sw=sw, _m=mode: ragged_paged_attention(
+                                q, kv, g, c, kl, pi, cq, ckv, d,
+                                None, None, sm_scale=64 ** -0.5, sliding_window=_sw,
+                                k_scale=1.0, v_scale=1.0, decode_query_size=1,
+                                _fused_out_pack=2, _prepared_inputs=True, _skip_mixed=True,
+                                _decode_fast=_m, _decode_out_norm_eps=1e-6,
+                                _decode_gate_in_values=True, _kv_pack_dense2=False,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, bs, 8, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs, 512), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((1024, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs * pps,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("RPAd_fast", hlo)
+                    self.assertIn("-pk2-onorm-gate", hlo)
+                    self.assertIn("-tp16", hlo)
+
 
 if __name__ == "__main__":
     unittest.main()
