@@ -47,45 +47,15 @@ class Tiling:
     cross_keys: tuple[int, ...] = (64, 128, 256)
     # Cross-attention heads a step of a K2/V2 head group's loop (1, 2, 4 or 8).
     # Phase C's row-tile loop holds the loops of every key count, so it grows with
-    # this: Wan2.2-A14B at 4 is ~30K bundles (bf16; ~27K W8A8), under the ~32K a
-    # hot loop's body fits one instruction overlay in; at 8 (no step loop) ~43K.
+    # this: Wan2.2-A14B at 4 is ~30K bundles, under the ~32K a hot loop's body
+    # fits one instruction overlay in; at 8 (no step loop) ~43K.
     cross_step: int = 4
-    # W8A8: the QKV, output, cross-q and MLP projections in e4m3 (per-column
-    # weight scales, per-row activation scales), f32 accumulation; attention,
-    # norms and residuals unchanged. Off: every matrix bf16.
-    fp8: bool = False
-    # fp8 QK^T: the fixed softmax (the path ~98% of attention tiles take) computes its
-    # scores from e4m3 copies of q and k (one scale a query tile, one a head, f32
-    # accumulation) in a software-pipelined loop over 256-lane query chunks. QK^T
-    # contracts head_dim 128 over a 256-deep MXU, so in bf16 it holds the MXU at half
-    # rate; e4m3 doubles that. PV, the other softmax paths and everything else keep
-    # their precision.
-    fp8_qk: bool = False
-    # fp8 QK^T: query lanes a chunk of the pipelined fixed loop (divides block_q).
-    qk8_chunk: int = 256
-    # bf16 row-sum floor (kernel.ROW_FLOOR): where the phase B item code checks it.
-    # "shared": one check after the fixed or rowfix path (code far from the fixed
-    # path: 556.8 ms against 521.4 a 480p forward on tpu7x). "inline" (default): the same
-    # check and the same reruns, laid out so the fixed path (~98% of items) runs
-    # one contiguous span of code: its check sits at the end of the fixed branch,
-    # and rowfix and the rerun sit in one branch it skips. "rowfix": rowfix sums
-    # only (the kernel before the fixed-path floor; not exact for a real row whose
-    # best score is under about -80). The fp8 tilings ignore it.
-    floor_guard: str = "inline"
-    # The online softmax walks every key tile, the edge tile included, in one loop
-    # of masked sub-blocks (the edge tile's code; the mask keeps every key of a full
-    # tile), instead of an unrolled full-tile loop and the edge loop. The attention
-    # item loop, every softmax path included, then fits one instruction overlay
-    # (Wan2.2-A14B at 832x480: ~58K bundles in one, instead of ~79K over six, where
-    # each item leaves the fixed path's overlay for the item's end and reloads it).
-    # The same sub-block updates in the same order: the same bits.
-    online_one_loop: bool = False
-    # bf16: each streamed phase C projection (output, cross q, cross output) and
-    # MLP up projection hands its tile's epilogue to the next tile's step, in that
-    # step's basic block after its matmul is issued, so the epilogue runs under the
-    # MXU stream instead of after the tile's last matmul; a tile's step only rounds
+    # Each streamed phase C projection (output, cross q, cross output) and MLP up
+    # projection hands its tile's epilogue to the next tile's step, in that step's
+    # basic block after its matmul is issued, so the epilogue runs under the MXU
+    # stream instead of after the tile's last matmul; a tile's step only rounds
     # its result into a [mlp_rows, cols] bf16 buffer (the cross q into its place).
-    # The same values: the same bits. The fp8 tilings ignore it.
+    # The same values: the same bits.
     pipelined_epilogues: bool = False
     # Mosaic's DMA bounds checks (a trap on an out-of-bounds copy, scalar work at
     # every copy the kernel starts or waits). Off: the same copies without them.
@@ -94,11 +64,8 @@ class Tiling:
 
     def opt_suffix(self) -> str:
         """The op name's mark of the exact layout options in effect."""
-        pipe = self.pipelined_epilogues and not self.fp8
-        return (
-            ("_o1" if self.online_one_loop else "")
-            + ("_pe" if pipe else "")
-            + ("" if self.dma_bounds_checks else "_nb")
+        return ("_pe" if self.pipelined_epilogues else "") + (
+            "" if self.dma_bounds_checks else "_nb"
         )
 
     def row_unit(self) -> int:
@@ -147,43 +114,21 @@ class Tiling:
             "weight_splits must divide the weight tiles' rows",
         )
         need(self.mlp_mode in ("acc", "twopass"), f"mlp_mode {self.mlp_mode}")
-        need(not self.fp8 or self.mlp_mode == "twopass", "fp8 needs mlp_mode twopass")
-        need(not self.fp8 or ffn >= hidden, "fp8 stages n3 in h: needs ffn >= hidden")
-        need(
-            not self.fp8
-            or (
-                self.qkv_rows % 32 == 0
-                and self.mlp_rows % 32 == 0
-                and self.chunk_rows % 32 == 0
-            ),
-            "fp8 row tiles and chunks must be multiples of 32 (e4m3 VMEM tiles)",
-        )
-        need(
-            not self.fp8_qk
-            or (self.qk8_chunk % 128 == 0 and self.block_q % self.qk8_chunk == 0),
-            "qk8_chunk must be a multiple of 128 dividing block_q",
-        )
         need(
             all(nk > 0 and nk % 16 == 0 for nk in self.cross_keys)
             and list(self.cross_keys) == sorted(set(self.cross_keys)),
             "cross_keys must be ascending multiples of 16 (bf16 K/V row tiles)",
         )
         need(self.cross_step in (1, 2, 4, 8), "cross_step must be 1, 2, 4 or 8")
-        need(
-            self.floor_guard in ("shared", "inline", "rowfix"),
-            f"floor_guard {self.floor_guard!r}",
-        )
         # Phase B holds the most VMEM: the f32 [sub_kv, block_q] score block, the
         # query, output and staging buffers a query row, the key/value tiles and
         # small vectors (matches Mosaic's count on v7x to ~0.1 MiB, e.g. 69.4 MiB
-        # at 19456 / 512 / 512, which fails to compile); fp8 QK^T adds the e4m3 query
-        # and key tiles.
+        # at 19456 / 512 / 512, which fails to compile).
         phase_b = (
             4 * self.sub_kv * self.block_q
             + 1632 * self.block_q
             + 1024 * self.block_kv
             + (680 << 10)
-            + (128 * (self.block_q + self.block_kv) if self.fp8_qk else 0)
         )
         need(
             phase_b <= self.vmem_limit_bytes - (4 << 20),
@@ -196,27 +141,23 @@ class Tiling:
             "down_cols must divide the hidden size",
         )
         # Phases C and C2. C: a, n2 / a2 / n3, x for two row tiles (the next one's
-        # prefetched), the weight ring, two K2/V2 head groups and fp8's quantized
-        # input. C2: h [mlp_rows, ffn], beside pass 1's up ring (fp8: 4 slots, n3 in
-        # e4m3 and two pre-activation tiles; bf16: 2 slots and n3, which stays
-        # through pass 2 to take the next row tile's) or pass 2's down ring, x tiles
-        # and fp8's h in e4m3. A [rows, 1] f32 column takes 512 bytes a row. With
-        # the f32 layer vectors, the cross keys' weights and GEMM_VMEM_EXTRA this
-        # matches Mosaic's count on v7x for phase C to ~0.1 MiB (58.7 MiB for W8A8
-        # at 1024-row tiles) and overestimates bf16 C2 by ~3 MiB.
-        tc, wb = self.mlp_rows, 1 if self.fp8 else 2
+        # prefetched), the weight ring and two K2/V2 head groups. C2: h [mlp_rows,
+        # ffn], beside pass 1's up ring (2 slots) and n3, which stays through pass 2
+        # to take the next row tile's, or pass 2's down ring and x tiles. A
+        # [rows, 1] f32 column takes 512 bytes a row. With the f32 layer vectors,
+        # the cross keys' weights and GEMM_VMEM_EXTRA this matches Mosaic's count
+        # on v7x for phase C to ~0.1 MiB and overestimates C2 by ~3 MiB.
+        tc = self.mlp_rows
         row = 2 * tc * hidden
         group = next(c for c in (8, 4, 2, 1) if heads % c == 0)
-        q8 = tc * hidden + 512 * tc if self.fp8 else 0
-        # pipelined_epilogues (bf16): a rounded [mlp_rows, cols] tile in phase C and
-        # in C2's first pass.
-        stage = 2 * tc * self.cols if self.pipelined_epilogues and not self.fp8 else 0
+        # pipelined_epilogues: a rounded [mlp_rows, cols] tile in phase C and in
+        # C2's first pass.
+        stage = 2 * tc * self.cols if self.pipelined_epilogues else 0
         phase_c = (
             4 * row
-            + 2 * hidden * self.cols * wb
+            + 4 * hidden * self.cols
             + 8 * group * text_len * (hidden // heads)
             + 512 * tc
-            + q8
             + stage
         )
         if self.mlp_mode == "acc":
@@ -224,20 +165,15 @@ class Tiling:
             phase_c2 = 0
         else:
             h = 2 * tc * ffn
-            down = 2 * ffn * self.down_cols * wb + 6 * tc * self.down_cols
-            if self.fp8:
-                up = 4 * hidden * self.cols + q8 + 4 * tc * self.cols
-                down += tc * ffn + 512 * tc
-            else:
-                up = 4 * hidden * self.cols + row + stage
-                down += row
+            down = 4 * ffn * self.down_cols + 6 * tc * self.down_cols + row
+            up = 4 * hidden * self.cols + row + stage
             phase_c2 = h + max(up, down)
         key_weights = 512 * max(
             [nk for nk in self.cross_keys if nk < text_len], default=8
         )
         gemm = (
             max(phase_c, phase_c2)
-            + 4 * (19 * hidden + 2 * ffn)
+            + 4 * (12 * hidden + ffn)
             + key_weights
             + GEMM_VMEM_EXTRA
         )
@@ -252,24 +188,19 @@ class Tiling:
 # 1024 over 20480 rows a device: 60.8; 9728 / 1024 / 512 over 19456 rows: 57.7,
 # the difference being the 5% more rows), larger query tiles cost more (19456 /
 # 512 / 256: 59.0) and so do larger key-tile steps (9728 / 2048 / 512: 58.5).
-# With fp8 QK^T the fixed loop works in 256-lane query chunks, and 2048-key tiles of
-# 512-key blocks are fastest (720p fixed loop: 1.06 MXU-bound bundles a score vreg vs
-# 1.25 with 1024-key blocks and 1.14 with 1024-key tiles).
 MAX_BLOCK_Q = 10240
 MAX_STEP_SCORES = 10240 * 1024  # block_q x block_kv
-MAX_STEP_SCORES_QK8 = 10240 * 2048
 
 
 def _attention_tiles(rows: int, devices: int, base: Tiling) -> Tiling:
     """The largest query tile dividing ``rows`` (up to MAX_BLOCK_Q), then the
-    largest key tile whose steps stay within MAX_STEP_SCORES (fp8 QK^T: 512-key
-    blocks of tiles within MAX_STEP_SCORES_QK8)."""
+    largest key tile whose steps stay within MAX_STEP_SCORES."""
     bq = max(d for d in range(512, min(rows, MAX_BLOCK_Q) + 1, 512) if rows % d == 0)
     total = rows * devices
-    cap = MAX_STEP_SCORES_QK8 if base.fp8_qk else MAX_STEP_SCORES
-    bkv = next(k for k in (2048, 1024, 512) if total % k == 0 and bq * k <= cap)
-    sub = min(bkv // 2, 512) if base.fp8_qk else bkv // 2
-    return dataclasses.replace(base, block_q=bq, block_kv=bkv, sub_kv=sub)
+    bkv = next(
+        k for k in (2048, 1024, 512) if total % k == 0 and bq * k <= MAX_STEP_SCORES
+    )
+    return dataclasses.replace(base, block_q=bq, block_kv=bkv, sub_kv=bkv // 2)
 
 
 def for_tokens(

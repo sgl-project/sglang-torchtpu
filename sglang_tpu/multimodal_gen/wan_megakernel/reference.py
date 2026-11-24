@@ -273,21 +273,7 @@ def stack_layers(layers: list[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray
 
 
 def _round(x: jax.Array, mode: str) -> jax.Array:
-    return x.astype(BF16).astype(F32) if mode in ("bf16", "fp8") else x
-
-
-FP8_MAX = 448.0
-# Scales are ``max|x| * FP8_INV`` (an f32 constant): XLA turns ``/ 448`` into this
-# product while torch divides, so writing the product keeps both packers bit-equal.
-FP8_INV = float(np.float32(1.0) / np.float32(FP8_MAX))
-
-
-def _fp8(x: jax.Array, axis: int) -> jax.Array:
-    """``x`` through e4m3 with one scale per slice along ``axis`` (``max|x| / 448``)."""
-    amax = jnp.max(jnp.abs(x), axis=axis, keepdims=True)
-    scale = jnp.where(amax > 0, amax * FP8_INV, 1.0)
-    q = jnp.clip(x / scale, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn).astype(F32)
-    return q * scale
+    return x.astype(BF16).astype(F32) if mode == "bf16" else x
 
 
 def layer_norm(x: jax.Array, eps: float) -> jax.Array:
@@ -358,17 +344,9 @@ def block(
 ):
     """One block on ``x [S, H]``; ``e [6, H]`` f32 modulation rows, ``k2, v2
     [T_ctx, H]``, ``cos, sin [S, D]`` (``rope_tables``), ``w`` one layer of
-    ``pack_layer``. Rows from ``keys`` on are padding: masked as keys.
-    ``mode="fp8"``: bf16 rounding with the six projections in e4m3 (activation
-    rows and weight columns scaled to 448), the kernel's ``fp8`` tiling."""
+    ``pack_layer``. Rows from ``keys`` on are padding: masked as keys."""
     h, heads, d = cfg.hidden, cfg.heads, cfg.head_dim
     r = lambda v: _round(v, mode)  # noqa: E731
-    if mode == "fp8":
-
-        def _mm(a, wt):  # noqa: F811 - the e4m3 product
-            return jnp.dot(_fp8(a, 1), _fp8(wt.astype(F32), 0), precision="highest")
-    else:
-        _mm = globals()["_mm"]
     x = r(x.astype(F32))
     e = e.astype(F32)
     n1 = r(layer_norm(x, cfg.eps) * (1.0 + e[SCALE]) + e[SHIFT])
@@ -418,4 +396,4 @@ def stack(
     for i in range(n):
         w = {k: v[i] for k, v in weights.items()}
         x = block(x, e[i], k2[i], v2[i], cos, sin, w, cfg, keys=keys, mode=mode)
-    return x.astype(BF16) if mode in ("bf16", "fp8") else x
+    return x.astype(BF16) if mode == "bf16" else x

@@ -60,26 +60,15 @@ LOG2E = math.log2(math.e)
 # (bound_row - 80)) <= 2^80. Either is exact unless a row's largest weights are
 # lost to underflow (fixed: a real row whose best score is under about -80, its
 # products p v 2^-17 under 2^-126; rowfix: a bound loose by over ~160), which a
-# row sum under 2^-80 flags: then the tile reruns with a running max (the fp8
-# tilings, error-bounded rather than exact, check the rowfix sums only).
+# row sum under 2^-80 flags: then the tile reruns with a running max.
 FIXED_BOUND = 109.0
 V_SCALE = 2.0**-17
-# fp8 fixed softmax: the edge tile runs in the full-tile loop with its rows past the
-# last real key zeroed (score 0, weight exactly 1, value 0), and their count comes off
-# the row sums after the loop. An item whose smallest real-row sum is under ZP_GUARD
-# reruns as rowfix (above it, the subtraction's relative error stays under 2^-12).
-ZP_GUARD = 2.0
-# W8A8 projections: each weight tile's matmul in this many row parts (when the rows
-# split into whole 32-row e4m3 tiles), so a part's result pops and scaling run under
-# the next part's matmuls instead of all after the tile's last one.
-GEMM_PARTS = 4
 ROW_HEADROOM, ROW_FLOOR = 80.0, 2.0**-80
 # Squared norms summed on the MXU from bf16-rounded squares: relative error
 # under 2^-8 (2^-9 a term, summed); this factor keeps them upper bounds.
 NORM_SLACK = 1.0 + 2.0**-6
 
-# One f32 row of each layer's vectors (``pack_kernel_weights``): name -> length. The
-# s* rows are the fp8 weights' per-column scales (1 for bf16 weights).
+# One f32 row of each layer's vectors (``pack_kernel_weights``): name -> length.
 _VEC_ORDER = (
     "bqkv",
     "qn",
@@ -92,43 +81,17 @@ _VEC_ORDER = (
     "bo2",
     "b2",
     "b1",
-    "sqkv",
-    "so",
-    "sq2",
-    "so2",
-    "s2",
-    "s1",
 )
-FP8 = jnp.float8_e4m3fn
-FP8_MAX, FP8_INV = ref.FP8_MAX, ref.FP8_INV
-# fp8 QK^T (Tiling.fp8_qk): the fixed softmax's scores from e4m3 copies of q and k,
-# f32 accumulation. Rounding to e4m3 grows each |element| by at most 2^-4, so the
-# score bound gains this factor.
-QK8_SLACK = (1.0 + 2.0**-4) ** 2
 
 
 def _vec_layout(cfg: ref.Config) -> dict[str, tuple[int, int]]:
-    sizes = {
-        "bqkv": 3 * cfg.hidden,
-        "b1": cfg.ffn,
-        "sqkv": 3 * cfg.hidden,
-        "s1": cfg.ffn,
-    }
+    sizes = {"bqkv": 3 * cfg.hidden, "b1": cfg.ffn}
     out, at = {}, 0
     for name in _VEC_ORDER:
         n = sizes.get(name, cfg.hidden)
         out[name] = (at, n)
         at += n
     return out
-
-
-def quantize_columns(w) -> tuple[Any, Any]:
-    """``[..., K, N]`` -> e4m3 weights and their ``[..., 1, N]`` f32 column scales
-    (``max |w[:, n]| / 448``; a zero column keeps scale 1)."""
-    w = jnp.asarray(w, F32)
-    amax = jnp.max(jnp.abs(w), axis=-2, keepdims=True)
-    scale = jnp.where(amax > 0, amax * FP8_INV, 1.0)
-    return jnp.clip(w / scale, -FP8_MAX, FP8_MAX).astype(FP8), scale
 
 
 def pack_kernel_weights(
@@ -138,35 +101,18 @@ def pack_kernel_weights(
 
     Column-tiled projections become ``[L, N/cols, H, cols]`` (each tile contiguous),
     the MLP down projection ``[L, F/cols, cols, H]`` (or ``[L, H/down_cols, F,
-    down_cols]`` for ``mlp_mode="twopass"``), and the per-layer vectors one ``[L, 1,
-    V]`` f32 row each (``_vec_layout``). ``tiling.fp8``: the matrices are e4m3 with
-    per-column scales in the vectors' s* rows (else bf16 and scales 1).
+    down_cols]`` for ``mlp_mode="twopass"``), all bf16, and the per-layer vectors
+    one ``[L, 1, V]`` f32 row each (``_vec_layout``).
     """
     t = tiling.cols
     L = stacked["wqkv"].shape[0]
-    stacked = dict(stacked)
-    scales = {}
-    for name, sname in (
-        ("wqkv", "sqkv"),
-        ("wo", "so"),
-        ("wq2", "sq2"),
-        ("wo2", "so2"),
-        ("w1", "s1"),
-        ("w2", "s2"),
-    ):
-        if tiling.fp8:
-            stacked[name], sc = quantize_columns(stacked[name])
-            scales[sname] = sc.reshape(L, 1, -1)
-        else:
-            scales[sname] = jnp.ones((L, 1, jnp.asarray(stacked[name]).shape[-1]), F32)
-    wdt = FP8 if tiling.fp8 else BF16
 
     def cols(w):
-        w = jnp.asarray(w, wdt)
+        w = jnp.asarray(w, BF16)
         k, n = w.shape[1], w.shape[2]
         return w.reshape(L, k, n // t, t).transpose(0, 2, 1, 3)
 
-    w2 = jnp.asarray(stacked["w2"], wdt)
+    w2 = jnp.asarray(stacked["w2"], BF16)
     if tiling.mlp_mode == "twopass":  # [L, H/TD, F, TD] output-column tiles
         td = tiling.down_cols
         w2_tiles = w2.reshape(L, cfg.ffn, cfg.hidden // td, td).transpose(0, 2, 1, 3)
@@ -180,12 +126,7 @@ def pack_kernel_weights(
         "w1": cols(stacked["w1"]),
         "w2": w2_tiles,
         "vecs": jnp.concatenate(
-            [
-                (scales[n] if n in scales else jnp.asarray(stacked[n], F32)).reshape(
-                    L, 1, -1
-                )
-                for n in _VEC_ORDER
-            ],
+            [jnp.asarray(stacked[n], F32).reshape(L, 1, -1) for n in _VEC_ORDER],
             axis=2,
         ),
     }
@@ -202,16 +143,15 @@ def kernel_weight_shapes(
     t, H, F, L = tiling.cols, cfg.hidden, cfg.ffn, layers
     td = tiling.down_cols
     nv = sum(n for _, n in _vec_layout(cfg).values())
-    wdt = FP8 if tiling.fp8 else BF16
     return {
-        "wqkv": ((L, 3 * H // t, H, t), wdt),
-        "wo": ((L, H // t, H, t), wdt),
-        "wq2": ((L, H // t, H, t), wdt),
-        "wo2": ((L, H // t, H, t), wdt),
-        "w1": ((L, F // t, H, t), wdt),
+        "wqkv": ((L, 3 * H // t, H, t), BF16),
+        "wo": ((L, H // t, H, t), BF16),
+        "wq2": ((L, H // t, H, t), BF16),
+        "wo2": ((L, H // t, H, t), BF16),
+        "w1": ((L, F // t, H, t), BF16),
         "w2": (
             (L, H // td, F, td) if tiling.mlp_mode == "twopass" else (L, F // t, t, H),
-            wdt,
+            BF16,
         ),
         "vecs": ((L, 1, nv), F32),
     }
@@ -222,12 +162,6 @@ def cross_counts(tiling: Tiling, text_len: int) -> tuple[int, ...]:
     ``tiling.cross_keys`` below the text length (any other count attends to every
     text row)."""
     return tuple(nk for nk in tiling.cross_keys if nk < text_len)
-
-
-def inline_floor(tiling: Tiling) -> bool:
-    """A bf16 tiling with ``floor_guard="inline"`` (the fp8 tilings ignore it):
-    the kernel then takes one more scratch, the SMEM flag of its row-sum check."""
-    return tiling.floor_guard == "inline" and not (tiling.fp8 or tiling.fp8_qk)
 
 
 def _stream(tiles: int, fetch, body) -> None:
@@ -316,7 +250,7 @@ def _kernel(
     attn_recv,
     loc_sem,
     kmax_recv,
-    *extra,  # floor_flag: SMEM [1] int32, with inline_floor(tiling) only
+    floor_flag,  # SMEM [1] int32: an attention item's row-sum floor check (phase B)
     cfg: ref.Config,
     tiling: Tiling,
     axis: str | None,
@@ -326,7 +260,6 @@ def _kernel(
     trace: int = 0,
 ):
     del x_in
-    (floor_flag,) = extra if inline_floor(tiling) else (None,)
     H, D, heads, F = cfg.hidden, cfg.head_dim, cfg.heads, cfg.ffn
     P = devices
     LH = heads // P  # heads I own
@@ -444,38 +377,6 @@ def _kernel(
     def rope(v, cos, sin):
         return v * cos + pltpu.roll(v, D // 2, 1) * sin
 
-    fp8 = tiling.fp8
-    WDT = FP8 if fp8 else BF16
-
-    def quantize_rows(src, q, sc, rows, start=0):
-        """fp8: e4m3 rows of ``src`` (bf16 values) into ``q`` and their f32 scales
-        (``max |row| / 448``) into ``sc [rows, 1]``, by chunks."""
-
-        def one(rs):
-            v = src[rs, :].astype(F32)
-            amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
-            sc[rs, :] = jnp.where(amax > 0, amax * FP8_INV, 1.0)
-            q[rs, :] = jnp.clip(
-                v * (FP8_MAX / jnp.maximum(amax, 1e-30)), -FP8_MAX, FP8_MAX
-            ).astype(FP8)
-
-        for_chunks(rows, one)
-
-    def qdot(a, w, a_scale, w_scale):
-        """``a @ w`` in f32; fp8 operands carry row and column scales (W8A8: in
-        GEMM_PARTS row parts)."""
-        if not fp8:
-            return jnp.dot(a, w, preferred_element_type=F32)
-        parts = GEMM_PARTS if a.shape[0] % (GEMM_PARTS * 32) == 0 else 1
-        h = a.shape[0] // parts
-        ys = [
-            jnp.dot(a[i * h : (i + 1) * h], w, preferred_element_type=F32)
-            * a_scale[i * h : (i + 1) * h]
-            * w_scale
-            for i in range(parts)
-        ]
-        return ys[0] if parts == 1 else jnp.concatenate(ys, axis=0)
-
     # ------------------------------------------------------------ phase A
     def phase_a(layer, parity):
         TA = tiling.qkv_rows
@@ -525,8 +426,6 @@ def _kernel(
             wsem,
             kpeak,
             kpk_sem,
-            n8,
-            sa,
             fac,
         ):
             class _Tile:
@@ -625,8 +524,6 @@ def _kernel(
                 rounding, so it is exact."""
                 if "qkv" in skip:
                     acc = jnp.zeros((TA, TN), F32)
-                elif fp8:
-                    acc = qdot(n8[...], ring[slot], sa[...], vec("sqkv", g * TN, TN))
                 else:
                     acc = jnp.dot(nbuf[...], ring[slot], preferred_element_type=F32)
                 acc = acc + vec("bqkv", g * TN, TN)
@@ -659,8 +556,6 @@ def _kernel(
 
                 with scope("A.ln1", 2):
                     for_chunks(TA, norm1)
-                    if fp8:
-                        quantize_rows(nbuf, n8, sa, TA)
                 sumsq[...] = jnp.zeros(sumsq.shape, F32)
                 cc.wait()
                 cs.wait()
@@ -797,14 +692,12 @@ def _kernel(
                 (QS, 2, 2)
             ),  # q, k sends per row-tile slot: remote, local
             pltpu.SemaphoreType.DMA((VS, 2)),  # v sends per staging slot
-            pltpu.VMEM((2, H, TN), WDT),  # weight ring
+            pltpu.VMEM((2, H, TN), BF16),  # weight ring
             pltpu.SemaphoreType.DMA((2, NS)),
             pltpu.VMEM(
                 (8, 128), F32
             ),  # per-head largest squared key norm (lane = head)
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.VMEM((TA, H) if fp8 else (32, 128), FP8),  # fp8: n1 in e4m3
-            pltpu.VMEM((TA, 1) if fp8 else (8, 1), F32),  # its row scales
             pltpu.VMEM((TA, D), F32),  # q's or k's RMSNorm factor, lane-broadcast
         )
 
@@ -815,7 +708,6 @@ def _kernel(
         full_tiles = valid // BKV  # key tiles of real rows only
         has_edge = valid % BKV != 0
         n_all = full_tiles + has_edge.astype(jnp.int32)
-        edge_real = valid - full_tiles * BKV  # real keys of the edge tile
         if (
             P > 1 and not bulk
         ):  # every peer's q, k, v of my heads (my own rows' copies were waited)
@@ -838,9 +730,7 @@ def _kernel(
                     )
                     pl.when(o != me)(remote.wait_send if wait_only else remote.start)
 
-        def scoped(
-            qd, k, v, m_run, l_run, o_run, mrow, kall, stage, bsem, osem, q8, k8
-        ):
+        def scoped(qd, k, v, m_run, l_run, o_run, mrow, kall, stage, bsem, osem):
             ones8 = jnp.ones((8, D), BF16)
 
             def kv_fetch(lh, j, slot):
@@ -912,59 +802,11 @@ def _kernel(
                     vs, p_.astype(BF16), FIRST, preferred_element_type=F32
                 )
 
-            NQ = tiling.qk8_chunk
-
-            def fixed_tile_qk8(slot):
-                """The fixed softmax over key tile ``slot`` with e4m3 q and k: query chunks of
-                NQ lanes outer, key blocks of SUB inner, the next chunk's QK^T issued before
-                this chunk's exp and PV (a software pipeline the scheduler keeps: fp8 QK^T on
-                one MXU, PV on the other), V^T once a key block, the chunk's PV summed in
-                the MXU result buffer and one o/l update a chunk."""
-                kinv = mrow[1:2, 1:2]  # [1, 1]: 448 / max|k| of the head (set by item)
-                k8[...] = jnp.clip(
-                    k[slot].astype(F32) * kinv, -FP8_MAX, FP8_MAX
-                ).astype(FP8)
-                sc = mrow[1:2, 0:1]  # [1, 1]: scale_l2 / (qinv kinv)
-                kop, qop = k8, q8
-                vts = {}
-                chunks = [
-                    (st, c0) for c0 in range(0, BQ, NQ) for st in range(0, BKV, SUB)
-                ]
-
-                def qk(st, c0):
-                    return (
-                        lax.dot_general(
-                            kop[pl.ds(st, SUB), :],
-                            qop[pl.ds(c0, NQ), :],
-                            LAST,
-                            preferred_element_type=F32,
-                        )
-                        * sc
-                    )
-
-                s_cur = qk(*chunks[0])
-                acc = lacc = None
-                for i, (st, c0) in enumerate(chunks):
-                    s_nxt = qk(*chunks[i + 1]) if i + 1 < len(chunks) else None
-                    p_ = jnp.exp2(s_cur)
-                    ls = jnp.sum(p_, axis=0, keepdims=True)
-                    if st not in vts:
-                        vts[st] = v[slot, pl.ds(st, SUB), :].T
-                    d_ = jnp.dot(vts[st], p_.astype(BF16), preferred_element_type=F32)
-                    acc = d_ if st == 0 else acc + d_
-                    lacc = ls if st == 0 else lacc + ls
-                    if st + SUB == BKV:
-                        o_run[:, pl.ds(c0, NQ)] += acc
-                        l_run[0:1, pl.ds(c0, NQ)] += lacc
-                    s_cur = s_nxt
-
             def attend(lh, variant, q, m0):
                 """The key tiles of real rows only against the query tile in ``q``, one
                 softmax variant, from a fresh state whose running max is ``m0`` (the
                 fixed or per-row offset: the state is then exactly an online one).
-                Starts the edge tile's copy; ``edge`` finishes it, except in the fp8
-                fixed loop, which runs the edge tile itself with its padding keys
-                zeroed and their count taken off the row sums."""
+                Starts the edge tile's copy; ``edge`` finishes it."""
                 m_run[0:1, :] = m0
                 l_run[...] = jnp.zeros(l_run.shape, F32)
                 o_run[...] = jnp.zeros(o_run.shape, F32)
@@ -981,25 +823,7 @@ def _kernel(
                         for c in kv_fetch(lh, j + 1, 1 - slot):
                             c.start()
 
-                    if variant == "fixed" and tiling.fp8_qk:
-
-                        @pl.when(j == full_tiles)
-                        def _zero_pad():  # the edge tile: keys from edge_real on to 0
-                            krow = lax.broadcasted_iota(jnp.int32, (BKV, D), 0)
-                            keep = krow < edge_real
-                            k[slot] = jnp.where(keep, k[slot], jnp.zeros((), BF16))
-                            v[slot] = jnp.where(keep, v[slot], jnp.zeros((), BF16))
-
-                        fixed_tile_qk8(slot)
-                    elif variant == "online" and tiling.online_one_loop:
-                        # every tile, the edge one included, as edge() runs it
-                        def sub(i, c):
-                            st = pl.multiple_of(i * SUB, SUB)
-                            update(slot, st, variant, j * BKV + st, q)
-                            return c
-
-                        lax.fori_loop(0, BKV // SUB, sub, None)
-                    elif variant == "online" and BKV > 2 * SUB:
+                    if variant == "online" and BKV > 2 * SUB:
                         # rolled: the online body (a few tiles in a thousand) stays small
                         def sub(i, c):
                             update(slot, pl.multiple_of(i * SUB, SUB), variant, None, q)
@@ -1011,17 +835,7 @@ def _kernel(
                             update(slot, st, variant, None, q)
                     return carry
 
-                if variant == "fixed" and tiling.fp8_qk:
-                    lax.fori_loop(0, n_all, step, None)
-
-                    @pl.when(has_edge)
-                    def _uncount():  # each zeroed key added 2^0 = 1 to every row sum
-                        l_run[0:1, :] = l_run[0:1, :] - (BKV - edge_real).astype(F32)
-
-                elif variant == "online" and tiling.online_one_loop:
-                    lax.fori_loop(0, n_all, step, None)
-                else:
-                    lax.fori_loop(0, full_tiles, step, None)
+                lax.fori_loop(0, full_tiles, step, None)
 
             def edge_wait(lh):
                 for c in kv_fetch(lh, full_tiles, full_tiles % 2):
@@ -1029,9 +843,7 @@ def _kernel(
 
             def edge(lh, q, variant):
                 """The tile holding the last real row, masked keys weighing 0, in the
-                variant of the state before it (online_one_loop: attend ran it)."""
-                if variant == "online" and tiling.online_one_loop:
-                    return
+                variant of the state before it."""
 
                 @pl.when(has_edge)
                 def _():
@@ -1087,41 +899,29 @@ def _kernel(
                 )
                 bound_row = jnp.sqrt(qsq[0:1, :] * kmax_s) * scale_l2
                 bound = jnp.max(bound_row)
-                if tiling.fp8_qk:
-                    # e4m3 copies for the fixed path: one scale a query tile and one a head,
-                    # from the squared-norm bounds (every |element| <= the largest row norm).
-                    qn = jnp.sqrt(jnp.max(qsq[0:1, :], axis=1, keepdims=True))  # [1, 1]
-                    kn = jnp.sqrt(kmax_s)  # [1, 1]
-                    qinv = FP8_MAX / jnp.maximum(qn, 1e-30)
-                    kinv = FP8_MAX / jnp.maximum(kn, 1e-30)
-                    q8[...] = jnp.clip(
-                        q[...].astype(F32) * qinv, -FP8_MAX, FP8_MAX
-                    ).astype(FP8)
-                    lane1 = lax.broadcasted_iota(jnp.int32, (1, BQ), 1)
-                    mrow[1:2, :] = jnp.where(
-                        lane1 == 0,
-                        scale_l2 / (qinv * kinv),
-                        jnp.where(lane1 == 1, kinv, 0.0),
-                    )
-                    # fp8 rounding grows each |element| by at most 2^-4 (2^-3 relative spacing).
-                    bound = bound * QK8_SLACK
-
                 if "attn" in skip:
                     l_run[...] = jnp.ones(l_run.shape, F32)
                     o_run[...] = jnp.zeros(o_run.shape, F32)
-                elif softmax == "auto" and inline_floor(tiling):
-                    # The "shared" floor's checks and reruns (below), laid out so the
-                    # fixed path runs one span of code: its check ends the fixed
-                    # branch, and rowfix and the rerun sit in one branch it skips.
-                    # floor_flag carries the check out of the branch that made it.
+                elif softmax == "auto":
+                    # A row whose sum is under ROW_FLOOR may have lost its largest
+                    # weights to underflow: the item reruns with a running max.
+                    # Fixed: a real row whose best score is under about -80 sums
+                    # under the floor (its products p v 2^-17 can flush to zero);
+                    # padding rows do not count. Rowfix: every row, as its own guard
+                    # (a padding row's sum can underflow to 0, and 0/0 would reach
+                    # the next layer's masked keys). Laid out so the fixed path
+                    # (~98% of items) runs one span of code: its check ends the
+                    # fixed branch, and rowfix and the rerun sit in one branch it
+                    # skips. floor_flag carries the check out of the branch that
+                    # made it.
                     fixed_ok = bound <= FIXED_BOUND
 
                     @pl.when(fixed_ok)
                     def _fixed():
                         attend(lh, "fixed", q, jnp.zeros(bound_row.shape, F32))
                         edge(lh, q, "fixed")
-                        # Real rows only (as below: padding rows' fixed sums are >=
-                        # 2^-109 a key, their outputs finite).
+                        # Real rows only: padding rows' fixed sums are >= 2^-109 a
+                        # key, their outputs finite.
                         qrow = lax.broadcasted_iota(jnp.int32, (1, BQ), 1) + qt * BQ
                         lmin = jnp.min(
                             jnp.where(qrow < valid, l_run[0:1, :], ROW_FLOOR)
@@ -1150,65 +950,6 @@ def _kernel(
                             )
                             edge(lh, q, "online")
 
-                elif softmax == "auto":
-                    fixed_ok = bound <= FIXED_BOUND
-                    rowfix_floor_only = (
-                        fp8 or tiling.fp8_qk or tiling.floor_guard == "rowfix"
-                    )
-
-                    def floor_guard(rows=None):
-                        """A row whose sum is under ROW_FLOOR may have lost its largest
-                        weights to underflow: rerun the item with a running max.
-                        ``rows`` ([1, BQ] bool): the rows whose sums count (all if
-                        None)."""
-                        lsum = l_run[0:1, :]
-                        if rows is not None:
-                            lsum = jnp.where(rows, lsum, ROW_FLOOR)
-                        lmin = jnp.min(lsum)
-
-                        @pl.when(jnp.logical_not(lmin >= ROW_FLOOR))
-                        def _online():
-                            attend(
-                                lh, "online", q, jnp.full(bound_row.shape, _MASK, F32)
-                            )
-                            edge(lh, q, "online")
-
-                    @pl.when(fixed_ok)
-                    def _fixed():
-                        attend(lh, "fixed", q, jnp.zeros(bound_row.shape, F32))
-                        if not tiling.fp8_qk:
-                            edge(lh, q, "fixed")
-
-                    # Also a NaN bound: the guarded path. fp8: also a zero-padded edge
-                    # tile with a real row's corrected sum under ZP_GUARD.
-                    redo = jnp.bool_(False)
-                    if tiling.fp8_qk:
-                        qrow = lax.broadcasted_iota(jnp.int32, (1, BQ), 1) + qt * BQ
-                        lsum = jnp.where(qrow < valid, l_run[0:1, :], ZP_GUARD)
-                        redo = (
-                            fixed_ok
-                            & has_edge
-                            & jnp.logical_not(jnp.min(lsum) >= ZP_GUARD)
-                        )
-
-                    @pl.when(jnp.logical_not(fixed_ok) | redo)
-                    def _rowfix():
-                        mrow[0:1, :] = bound_row - ROW_HEADROOM
-                        attend(lh, "rowfix", q, mrow[0:1, :])
-                        edge(lh, q, "rowfix")
-                        if rowfix_floor_only:
-                            floor_guard()
-
-                    if not rowfix_floor_only:
-                        # The floor after either path, one rerun site. Fixed: a real
-                        # row whose best score is under about -80 sums under the floor
-                        # (its products p v 2^-17 can flush to zero); padding rows do
-                        # not count (each of their fixed weights is >= 2^-109, so their
-                        # outputs stay finite). Rowfix: every row, as its own guard (a
-                        # padding row's sum can underflow to 0, and 0/0 would reach the
-                        # next layer's masked keys).
-                        qrow = lax.broadcasted_iota(jnp.int32, (1, BQ), 1) + qt * BQ
-                        floor_guard(jnp.logical_not(fixed_ok) | (qrow < valid))
                 else:  # forced (tests): the caller vouches for the bounds
                     mrow[0:1, :] = bound_row - ROW_HEADROOM
                     m0 = {
@@ -1217,8 +958,7 @@ def _kernel(
                         "online": jnp.full(bound_row.shape, _MASK, F32),
                     }[softmax]
                     attend(lh, softmax, q, m0)
-                    if not (softmax == "fixed" and tiling.fp8_qk):
-                        edge(lh, q, softmax)
+                    edge(lh, q, softmax)
 
                 slot = it % 2
 
@@ -1279,9 +1019,6 @@ def _kernel(
             pltpu.SemaphoreType.DMA(
                 (2, 2)
             ),  # output sends per stage slot: remote, local
-            # fp8 QK^T: this item's query tile and the key tile in e4m3
-            pltpu.VMEM((BQ, D) if tiling.fp8_qk else (32, D), FP8),
-            pltpu.VMEM((BKV, D) if tiling.fp8_qk else (32, D), FP8),
         )
 
     # ------------------------------------------------------------ phase C
@@ -1297,7 +1034,7 @@ def _kernel(
         twopass = tiling.mlp_mode == "twopass"
         cross = "cross" not in skip
         mlp_acc = not twopass and "mlp" not in skip
-        pipe = tiling.pipelined_epilogues and not fp8
+        pipe = tiling.pipelined_epilogues
 
         def scoped(
             abuf,
@@ -1313,8 +1050,6 @@ def _kernel(
             ring_rows,
             wsem,
             wsem_rows,
-            q8,
-            qs,
             *stage,  # pipelined_epilogues: o and o2 between their steps
         ):
             ostage = stage[0] if pipe else None
@@ -1384,22 +1119,15 @@ def _kernel(
             # Every stream's tile 0 goes into slot 0, started once the previous
             # stream's loop is done (both slots free): a LayerNorm, the cross-
             # attention or a row tile's end lies between, longer than the copy.
-            def proj(w_ref, src, epilogue, sname, split=None):
+            def proj(w_ref, src, epilogue, split=None):
                 """``epilogue(i, cols, src @ W tile i [TC, TN] f32)`` over H/TN tiles,
-                tile 0 already started (fp8: ``src`` quantized into ``q8``/``qs``
-                first, ``sname`` the weight's column scales). pipelined_epilogues:
-                ``split = (produce, consume)``, the epilogue as ``produce(i, cols, y)``
-                and ``consume(i, cols)`` (``_stream_pipelined``)."""
-                if fp8:
-                    quantize_rows(src, q8, qs, TC)
+                tile 0 already started. pipelined_epilogues: ``split = (produce,
+                consume)``, the epilogue as ``produce(i, cols, y)`` and ``consume(i,
+                cols)`` (``_stream_pipelined``)."""
 
                 def matmul(i, slot):
                     if "cproj" in skip:
                         return jnp.zeros((TC, TN), F32)
-                    if fp8:
-                        return qdot(
-                            q8[...], ring[slot], qs[...], vec(sname, i * TN, TN)
-                        )
                     return jnp.dot(src[...], ring[slot], preferred_element_type=F32)
 
                 def body(i, slot):
@@ -1450,7 +1178,7 @@ def _kernel(
                     ).astype(BF16)
 
                 with scope("C.wo", 2):
-                    proj(wo_ref, abuf, ep_o, "so", (round_out("bo"), o_add))
+                    proj(wo_ref, abuf, ep_o, (round_out("bo"), o_add))
                 start(weights(wq2_ref)(0, 0))
 
                 # The previous row tile's write-backs, waited only now: its x slot
@@ -1486,7 +1214,7 @@ def _kernel(
                     sumsq[...] += jnp.sum(qf * qf, axis=1, keepdims=True)
 
                 with scope("C.wq2", 2):
-                    proj(wq2_ref, nbuf, ep_q2, "sq2", (q2_store, q2_sumsq))
+                    proj(wq2_ref, nbuf, ep_q2, (q2_store, q2_sumsq))
                 start(weights(wo2_ref)(0, 0))
                 factor = lax.rsqrt(sumsq[...] / H + eps)
 
@@ -1561,7 +1289,7 @@ def _kernel(
                     xv[:, cols] = (xv[:, cols].astype(F32) + o2).astype(BF16)
 
                 with scope("C.wo2", 2):
-                    proj(wo2_ref, nbuf, ep_o2, "so2", (round_out("bo2"), o2_add))
+                    proj(wo2_ref, nbuf, ep_o2, (round_out("bo2"), o2_add))
                 if mlp_acc:
                     start(fetch_f(0, 0))
                 else:
@@ -1642,14 +1370,10 @@ def _kernel(
             pltpu.VMEM((TC, 1), F32),
             # attention rows, x in, x out, n3 out, K2 slots, V2 slots
             pltpu.SemaphoreType.DMA((8,)),
-            pltpu.VMEM((2, H, TN), WDT),  # weight ring
-            pltpu.VMEM((1, 8, 128) if twopass else (2, TN, H), WDT),  # MLP down ring
+            pltpu.VMEM((2, H, TN), BF16),  # weight ring
+            pltpu.VMEM((1, 8, 128) if twopass else (2, TN, H), BF16),  # MLP down ring
             pltpu.SemaphoreType.DMA((2, NS)),
             pltpu.SemaphoreType.DMA((2, NS)),
-            pltpu.VMEM(
-                (TC, H) if fp8 else (32, 128), FP8
-            ),  # fp8: a projection's input in e4m3
-            pltpu.VMEM((TC, 1) if fp8 else (8, 1), F32),  # its row scales
             *([pltpu.VMEM((TC, TN), BF16)] if pipe else []),
         )
         if twopass:
@@ -1661,54 +1385,36 @@ def _kernel(
         projection and GELU of every column into ``h [TC, F]``, pass 2 the down
         projection in ``down_cols``-wide output tiles (the whole ``F`` contraction in
         one dot, no accumulator), each with its gated residual. A row tile's n3 is
-        read during the previous one's pass 2: bf16 into its own buffer, fp8 into
-        h's first H columns, which are dead from pass 2's quantization of h until
-        pass 1 has quantized n3."""
+        read into its own buffer during the previous one's pass 2."""
         if "mlp" in skip:
             return
         TC = tiling.mlp_rows
         TD = tiling.down_cols
         tiles = R // TC
         nf, nd = F // TN, H // TD
-        # fp8: the up projection two tiles a step from a 4-slot weight ring (both
-        # tiles waited at the top), so a tile's GELU rides under the next tile's
-        # MXU stream; a step is one scheduling block: GELU of the previous step's
-        # b, mm a, GELU a, mm b (~6.1K simulated cycles a tile instead of ~7.0K).
-        # bf16's 4-slot ring does not fit VMEM beside n3 and h at 1024-row tiles;
-        # it keeps the 2-slot stream.
-        pairs = fp8
-        # pipelined_epilogues (bf16): a tile's GELU in the next tile's step, its
+        # pipelined_epilogues: a tile's GELU in the next tile's step, its
         # pre-activation waiting in hs[0] (_stream_pipelined).
-        pipe = tiling.pipelined_epilogues and not fp8
-        US = 4 if pairs else 2  # up-projection weight ring slots
+        pipe = tiling.pipelined_epilogues
+        US = 2  # up-projection weight ring slots
 
         def outer(hfull, n3v, c2sem):
-            n3_src = hfull.at[:, pl.ds(0, H)] if fp8 else n3v
-
             def n3_in(t):
                 return copy(
                     n3_hbm.at[pl.ds(pl.multiple_of(t * TC, TC), TC)],
-                    n3_src,
+                    n3v,
                     c2sem.at[0],
                 )
 
             def row_tile(t, carry):
                 r0 = pl.multiple_of(t * TC, TC)
 
-                def pass1(ring1, wsem1, n38, s3, hs):
+                def pass1(ring1, wsem1, hs):
                     def w1_tile(f, slot):
                         return wcopies(w1_ref.at[layer, f], ring1, slot, wsem1)
 
                     def up(f, slot):
                         """bf16(n3 W1_f + b1_f)."""
-                        if fp8:
-                            hp = qdot(
-                                n38[...], ring1[slot], s3[...], vec("s1", f * TN, TN)
-                            )
-                        else:
-                            hp = jnp.dot(
-                                n3v[...], ring1[slot], preferred_element_type=F32
-                            )
+                        hp = jnp.dot(n3v[...], ring1[slot], preferred_element_type=F32)
                         return (hp + vec("b1", f * TN, TN)).astype(BF16)
 
                     def gelu(f, hp):
@@ -1716,15 +1422,9 @@ def _kernel(
                             hp.astype(F32)
                         ).astype(BF16)
 
-                    def tile(f):
-                        return w1_tile(f, f % US)
-
-                    # The first weight tiles load during n3's wait and quantization.
-                    for f in range(min(US if pairs else 1, nf)):
-                        start(tile(f))
+                    # The first weight tile loads during n3's wait.
+                    start(w1_tile(0, 0))
                     n3_in(t).wait()
-                    if fp8:
-                        quantize_rows(n3_src, n38, s3, TC)
                     if pipe:
 
                         def up_out(f, slot):
@@ -1735,46 +1435,14 @@ def _kernel(
                                 nf, w1_tile, up_out, lambda f: gelu(f, hs[0])
                             )
                         return
-                    if not pairs:
-                        with scope("C2.up", 2):
-                            _stream(
-                                nf,
-                                w1_tile,
-                                lambda f, slot: gelu(f, up(f, slot)),
-                            )
-                        return
-
                     with scope("C2.up", 2):
-                        # Tile 0 alone (its GELU in the first step), then tiles (a, b)
-                        # = (2j + 1, 2j + 2) a step; hs[1] carries b's pre-activation
-                        # to the next step.
-                        wait(tile(0))
-                        hs[1] = up(0, 0)
-                        if nf > US:
-                            start(tile(US))
+                        _stream(
+                            nf,
+                            w1_tile,
+                            lambda f, slot: gelu(f, up(f, slot)),
+                        )
 
-                        def step(j, carry):
-                            a = 2 * j + 1
-                            b = a + 1
-                            wait(tile(a) + tile(b))
-                            gelu(a - 1, hs[1])
-                            hs[0] = up(a, a % US)
-                            gelu(a, hs[0])
-                            hs[1] = up(b, b % US)
-                            for f in (a, b):  # into the slots just read
-                                pl.when(f + US < nf)(lambda f=f: start(tile(f + US)))
-                            return carry
-
-                        lax.fori_loop(0, (nf - 1) // 2, step, None)
-                        if nf % 2:
-                            gelu(nf - 1, hs[1])
-                        else:  # the last tile alone
-                            wait(tile(nf - 1))
-                            gelu(nf - 2, hs[1])
-                            hs[0] = up(nf - 1, (nf - 1) % US)
-                            gelu(nf - 1, hs[0])
-
-                def pass2(ring2, wsem2, xt, xsem, h8, sh):
+                def pass2(ring2, wsem2, xt, xsem):
                     def xcopy(j, out):
                         """Output tile ``j``'s x columns between HBM and x slot ``j % 3``
                         (in, or back out once updated)."""
@@ -1792,11 +1460,9 @@ def _kernel(
                             xcopy(j, False)
                         ]
 
-                    start(fetch(0))  # fp8: during h's quantization
-                    if fp8:
-                        quantize_rows(hfull, h8, sh, TC)
-                    # n3's buffer is free (bf16) or h's first columns dead (fp8): the
-                    # next row tile's n3, waited in its pass 1.
+                    start(fetch(0))
+                    # n3's buffer is free: the next row tile's n3, waited in its
+                    # pass 1.
                     pl.when(t + 1 < tiles)(n3_in(t + 1).start)
 
                     def down(j, carry):
@@ -1812,14 +1478,9 @@ def _kernel(
                             for c in fetch(j + 1):
                                 c.start()
 
-                        if fp8:
-                            y = qdot(
-                                h8[...], ring2[j % 2], sh[...], vec("s2", j * TD, TD)
-                            )
-                        else:
-                            y = jnp.dot(
-                                hfull[...], ring2[j % 2], preferred_element_type=F32
-                            )
+                        y = jnp.dot(
+                            hfull[...], ring2[j % 2], preferred_element_type=F32
+                        )
                         cols = pl.ds(pl.multiple_of(j * TD, TD), TD)
                         f_ = (y + vec("b2", j * TD, TD)).astype(BF16).astype(F32)
                         xs = j % 3
@@ -1838,24 +1499,17 @@ def _kernel(
 
                 pl.run_scoped(
                     pass1,
-                    pltpu.VMEM((US, H, TN), WDT),
+                    pltpu.VMEM((US, H, TN), BF16),
                     pltpu.SemaphoreType.DMA((US, NS)),
-                    pltpu.VMEM((TC, H) if fp8 else (32, 128), FP8),
-                    pltpu.VMEM((TC, 1) if fp8 else (8, 1), F32),
-                    # pairs: pre-activations of a step's tiles a and b (pipe: one)
-                    pltpu.VMEM(
-                        (2, TC, TN) if pairs else (1, TC, TN) if pipe else (1, 16, 128),
-                        BF16,
-                    ),
+                    # pipe: the pre-activation waiting for its GELU
+                    pltpu.VMEM((1, TC, TN) if pipe else (1, 16, 128), BF16),
                 )
                 pl.run_scoped(
                     pass2,
-                    pltpu.VMEM((2, F, TD), WDT),
+                    pltpu.VMEM((2, F, TD), BF16),
                     pltpu.SemaphoreType.DMA((2, NS)),
                     pltpu.VMEM((3, TC, TD), BF16),
                     pltpu.SemaphoreType.DMA((3, 2)),
-                    pltpu.VMEM((TC, F) if fp8 else (32, 128), FP8),
-                    pltpu.VMEM((TC, 1) if fp8 else (8, 1), F32),
                 )
                 return carry
 
@@ -1865,7 +1519,7 @@ def _kernel(
         pl.run_scoped(
             outer,
             pltpu.VMEM((TC, F), BF16),
-            pltpu.VMEM((32, 128) if fp8 else (TC, H), BF16),  # bf16: n3
+            pltpu.VMEM((TC, H), BF16),  # n3
             pltpu.SemaphoreType.DMA((1,)),
         )
 
@@ -2023,7 +1677,7 @@ def stack(
                 pltpu.SemaphoreType.DMA((1,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((1,)),  # key peaks receive
-                *([pltpu.SMEM((1,), jnp.int32)] if inline_floor(tiling) else []),
+                pltpu.SMEM((1,), jnp.int32),  # phase B's row-sum floor flag
             ],
         ),
         input_output_aliases={1: 0},

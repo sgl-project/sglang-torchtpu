@@ -23,8 +23,6 @@ from sglang_tpu.multimodal_gen.wan_megakernel import reference as ref
 from sglang_tpu.multimodal_gen.wan_megakernel.tiling import Tiling
 
 AXES = ("cfg", "sp")
-# bf16 op names of the non-default row-sum floor layouts (Tiling.floor_guard).
-_FLOOR_SUFFIX = {"shared": "", "inline": "_fi", "rowfix": "_fr"}
 
 
 def local_stack(
@@ -130,8 +128,6 @@ def build_stack_op(cfg: ref.Config, cfg_ranks: int, sp: int, tiling: Tiling):
     return cpu_export_jax_op(
         f"sglang_tpu_pallas::wan_stack_cfg{cfg_ranks}_sp{sp}_L{cfg.layers}"
         f"_q{tiling.block_q}_kv{tiling.block_kv}_s{tiling.sub_kv}_r{tiling.qkv_rows}x{tiling.mlp_rows}"
-        f"{'_w8' if tiling.fp8 else ''}{'_qk8' if tiling.fp8_qk else ''}"
-        f"{_FLOOR_SUFFIX[tiling.floor_guard] if not (tiling.fp8 or tiling.fp8_qk) else ''}"
         f"{tiling.opt_suffix()}",
         stack,
         mesh=mesh,

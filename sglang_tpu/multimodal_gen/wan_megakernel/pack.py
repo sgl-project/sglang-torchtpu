@@ -17,7 +17,7 @@ from sglang_tpu.multimodal_gen.wan_megakernel import reference as ref
 
 # Kernel operand order (kernel.KERNEL_WEIGHTS).
 WEIGHT_ORDER = ("wqkv", "wo", "wq2", "wo2", "w1", "w2", "vecs")
-# kernel._VEC_ORDER: one f32 row of a layer's vectors (s*: fp8 column scales).
+# kernel._VEC_ORDER: one f32 row of a layer's vectors.
 VEC_ORDER = (
     "bqkv",
     "qn",
@@ -30,14 +30,7 @@ VEC_ORDER = (
     "bo2",
     "b2",
     "b1",
-    "sqkv",
-    "so",
-    "sq2",
-    "so2",
-    "s2",
-    "s1",
 )
-FP8_MAX, FP8_INV = ref.FP8_MAX, ref.FP8_INV
 
 
 def config_from_model(model) -> ref.Config:
@@ -65,23 +58,12 @@ def _cols(w: torch.Tensor, t: int) -> torch.Tensor:
     return w.reshape(out // t, t, inp).permute(0, 2, 1)
 
 
-def _quantize_out_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[out, in]`` -> e4m3 rows (one per output column of ``w.T``) and their f32
-    scales ``max |row| / 448`` (``kernel.quantize_columns`` on the transpose)."""
-    wf = w.float()
-    amax = wf.abs().amax(dim=1, keepdim=True)
-    scale = torch.where(amax > 0, amax * FP8_INV, torch.ones_like(amax))
-    q = (wf / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return q, scale.reshape(-1)
-
-
 def _layer_tensors(
     blk: nn.Module,
     cfg: ref.Config,
     t: int,
     order: torch.Tensor,
     down_cols: int | None = None,
-    fp8: bool = False,
 ) -> dict[str, torch.Tensor]:
     """One block's kernel arrays (views where possible), from its parameters."""
     H = cfg.hidden
@@ -95,21 +77,6 @@ def _layer_tensors(
         "w1": blk.ffn.fc_in.weight,
         "w2": blk.ffn.fc_out.weight,
     }
-    scales = {}
-    for name, sname in (
-        ("wqkv", "sqkv"),
-        ("wo", "so"),
-        ("wq2", "sq2"),
-        ("wo2", "so2"),
-        ("w1", "s1"),
-        ("w2", "s2"),
-    ):
-        if fp8:
-            mats[name], scales[sname] = _quantize_out_rows(mats[name])
-        else:
-            scales[sname] = torch.ones(
-                mats[name].shape[0], dtype=torch.float32, device=mats[name].device
-            )
     return {
         "wqkv": _cols(mats["wqkv"], t),
         "wo": _cols(mats["wo"], t),
@@ -141,11 +108,6 @@ def _layer_tensors(
                 blk.ffn.fc_out.bias,
                 blk.ffn.fc_in.bias,
             ]
-        )
-        .float()
-        .reshape(1, -1),
-        "svecs": torch.cat(
-            [scales[n] for n in ("sqkv", "so", "sq2", "so2", "s2", "s1")]
         )
         .float()
         .reshape(1, -1),
@@ -184,7 +146,6 @@ def pack_blocks(
     free_originals: bool = True,
     stage_on_host: bool = True,
     down_cols: int | None = None,
-    fp8: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Stack the blocks' weights in the kernel's layout on their device.
 
@@ -200,14 +161,11 @@ def pack_blocks(
             b.to("cpu")
         _sync(device)
     host_order = _qk_order(cfg, blocks[0].to_q.weight.device)
-    first = _layer_tensors(blocks[0], cfg, cols, host_order, down_cols, fp8)
-    first["vecs"] = torch.cat([first["vecs"], first.pop("svecs")], dim=1)
+    first = _layer_tensors(blocks[0], cfg, cols, host_order, down_cols)
     packed = {
         name: torch.empty(
             (len(blocks), *t.shape),
-            dtype=torch.float32
-            if name == "vecs"
-            else (torch.float8_e4m3fn if fp8 else torch.bfloat16),
+            dtype=torch.float32 if name == "vecs" else torch.bfloat16,
             device=device,
         )
         for name, t in first.items()
@@ -216,8 +174,7 @@ def pack_blocks(
         if i == 0:
             layer = first
         else:
-            layer = _layer_tensors(b, cfg, cols, host_order, down_cols, fp8)
-            layer["vecs"] = torch.cat([layer["vecs"], layer.pop("svecs")], dim=1)
+            layer = _layer_tensors(b, cfg, cols, host_order, down_cols)
         for name, t in layer.items():
             packed[name][i].copy_(t.contiguous().to(packed[name].dtype))
         del layer

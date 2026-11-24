@@ -15,12 +15,22 @@ import types
 import unittest
 import unittest.mock
 
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=400, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=200,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
@@ -362,10 +372,12 @@ class TestKernelInterpret(CustomTestCase):
     def test_large_scores_fall_back(self):
         self._run(qk_scale=3.0)
 
-    def test_fixed_floor_guard(self):
+    def test_floor_guard(self):
         """The fixed path's sums are floored like rowfix's: a real row under ROW_FLOOR
         reruns its item with a running max (the output is the online path's, bit for
-        bit), padding rows do not count, and normal sums leave the fixed output as is."""
+        bit), padding rows do not count, and normal sums leave the fixed output as is.
+        On the rowfix path every row counts: a padding row whose sum underflows to 0
+        reruns its item instead of leaving 0 / 0 for the next layer's keys."""
         tiling = _tiling()
         with self.subTest("normal sums: the fixed output"):
             case = _case(qk_scale=0.25)
@@ -390,71 +402,23 @@ class TestKernelInterpret(CustomTestCase):
             # What the floor prevents: the fixed path loses most of its products.
             fixed = _interpret(case, tiling, "fixed")
             self.assertGreater(_rel(fixed, gold, valid), 10 * ref_err)
-
-    def test_floor_guard_layouts(self):
-        """Tiling.floor_guard "inline" runs the "shared" floor's checks and reruns in
-        another code layout: the same output bit for bit on every path. "rowfix"
-        (rowfix sums only, the kernel before the fixed-path floor) matches it
-        except where the fixed floor reruns, where it keeps the fixed output."""
-        tiling = dataclasses.replace(_tiling(), floor_guard="shared")
-        inline = dataclasses.replace(tiling, floor_guard="inline")
-        rowfix = dataclasses.replace(tiling, floor_guard="rowfix")
-        cases = {
-            "fixed": _case(qk_scale=0.25),
-            "fixed, tiny padding-row sums": _case(
-                craft=_padding_rows_far, rope=False, e_rows={ref.SHIFT: 0.0}
-            ),
-            "fixed, tiny real-row sums: online rerun": _case(
-                rows=512, craft=_all_rows_far, rope=False, e_rows={ref.GATE: 50.0}
-            ),
-            "rowfix": _case(qk_scale=3.0),
-            "rowfix, tiny sums: online rerun": _case(
+        with self.subTest("a zero rowfix sum in a padding row: the online rerun"):
+            case = _case(
                 craft=_padding_rows_rowfix_far, rope=False, e_rows={ref.SHIFT: 0.0}
-            ),
-        }
-        for name, case in cases.items():
-            with self.subTest(name):
-                shared = _interpret(case, tiling)
-                self.assertTrue(np.isfinite(shared).all())
-                np.testing.assert_array_equal(_interpret(case, inline), shared)
-                # Each case takes the path its name says.
-                if name == "fixed, tiny real-row sums: online rerun":
-                    np.testing.assert_array_equal(
-                        shared, _interpret(case, tiling, "online")
-                    )
-                    np.testing.assert_array_equal(
-                        _interpret(case, rowfix), _interpret(case, tiling, "fixed")
-                    )
-                    continue
-                np.testing.assert_array_equal(_interpret(case, rowfix), shared)
-                if name.startswith("fixed"):  # no rerun: the fixed output
-                    np.testing.assert_array_equal(
-                        shared, _interpret(case, tiling, "fixed")
-                    )
-                elif name == "rowfix":
-                    self.assertFalse(
-                        np.array_equal(shared, _interpret(case, tiling, "fixed"))
-                    )
-                else:  # rowfix alone leaves the padding row's 0 / 0
-                    self.assertFalse(
-                        np.isfinite(_interpret(case, tiling, "rowfix")).all()
-                    )
+            )
+            self.assertTrue(np.isfinite(_interpret(case, tiling)).all())
+            self.assertFalse(np.isfinite(_interpret(case, tiling, "rowfix")).all())
 
     def test_layout_options(self):
-        """Tiling.online_one_loop and pipelined_epilogues lay the same arithmetic
-        out differently: on every softmax path the output is the default layout's
-        bit for bit. 128-column weight tiles: four tiles a phase C projection and
-        eight MLP up tiles, so the pipelined streams reach their steady state."""
+        """Tiling.pipelined_epilogues lays the same arithmetic out differently: on
+        every softmax path the output is the default layout's bit for bit.
+        128-column weight tiles: four tiles a phase C projection and eight MLP up
+        tiles, so the pipelined streams reach their steady state."""
         base = dataclasses.replace(_tiling(), cols=128)
         options = (
-            {"online_one_loop": True},
             {"pipelined_epilogues": True},
             # (interpret mode always checks bounds: dma_bounds_checks rides along)
-            {
-                "online_one_loop": True,
-                "pipelined_epilogues": True,
-                "dma_bounds_checks": False,
-            },
+            {"pipelined_epilogues": True, "dma_bounds_checks": False},
         )
         cases = {
             "fixed": _case(qk_scale=0.25),
@@ -470,15 +434,6 @@ class TestKernelInterpret(CustomTestCase):
                 with self.subTest(name, **opts):
                     got = _interpret(case, dataclasses.replace(base, **opts))
                     np.testing.assert_array_equal(got, want)
-        # The online loop itself, forced on every item, over 2 x 256-key tiles: a
-        # full tile and the edge tile (6 padding rows), and two full tiles.
-        one = dataclasses.replace(base, online_one_loop=True)
-        for pad in (6, 0):
-            case = _case(qk_scale=0.25, rows=512, valid_pad=pad)
-            with self.subTest(online_pad=pad):
-                np.testing.assert_array_equal(
-                    _interpret(case, one, "online"), _interpret(case, base, "online")
-                )
 
     def test_pipelined_epilogues_dma_orders(self):
         """The pipelined streams with one and with several tiles a stream (cols 512:
@@ -597,102 +552,6 @@ class TestKernelInterpret(CustomTestCase):
             with self.subTest(dma=dma):
                 self._run(tiling=tiling, dma=dma)
 
-    def test_fp8_qk(self):
-        """e4m3 QK^T in the pipelined fixed loop (2 query tiles of 2 chunks, a full key
-        tile of 2 blocks plus the edge tile, zero-padded in the same loop): its error is
-        a few times bf16 rounding, and the tiles that fall back (rowfix, online) keep
-        bf16 scores."""
-        tiling = dataclasses.replace(
-            _tiling("twopass"), block_q=256, qk8_chunk=128, fp8_qk=True
-        )
-        for softmax, qk_scale in (("fixed", 0.5), ("auto", 1.0), ("auto", 3.0)):
-            with self.subTest(softmax=softmax, qk_scale=qk_scale):
-                self._run(
-                    softmax=softmax,
-                    qk_scale=qk_scale,
-                    tiling=tiling,
-                    rows=512,
-                    err_factor=3.0,
-                    want_tol=6e-3,
-                )
-
-    def test_fp8_qk_edge_guard(self):
-        """The fixed loop runs the edge tile zero-padded; a real row's sum under
-        ZP_GUARD reruns the item as rowfix. Guard tripped everywhere (every item here
-        has an edge tile): the output is the bf16 kernel's with every item on the
-        rowfix path (FIXED_BOUND below every bound), bit for bit."""
-        tiling = dataclasses.replace(_tiling("twopass"), block_q=256, qk8_chunk=128)
-        with unittest.mock.patch.object(mk, "FIXED_BOUND", -1.0):
-            rowfix, _ = self._run(tiling=tiling, rows=512)
-        with unittest.mock.patch.object(mk, "ZP_GUARD", 1e30):
-            got, _ = self._run(
-                tiling=dataclasses.replace(tiling, fp8_qk=True), rows=512
-            )
-        np.testing.assert_array_equal(got, rowfix)
-
-    def test_fp8(self):
-        """W8A8 kernel == the fp8 reference (same quantization), up to rounding. The
-        up projection's paired steps run with an even and an odd tile count (7 tiles
-        from the 4-slot ring, so tiles 5 and 6 are refilled inside a step, 4 row
-        tiles), in both DMA orders."""
-        for layers, ffn, mlp_rows, dma in (
-            (2, 1024, 128, "on_wait"),
-            (1, 1792, 64, "on_wait"),
-            (1, 1792, 64, "eager"),
-        ):
-            with self.subTest(ffn=ffn, dma=dma):
-                self._fp8(layers, ffn, mlp_rows, dma)
-
-    def _fp8(self, layers, ffn, mlp_rows, dma):
-        cfg, st, x, e, k2, v2, cos, sin, valid, _, gold = _case(layers=layers, ffn=ffn)
-        w = {k: jnp.asarray(v) for k, v in st.items()}
-        want = np.asarray(
-            ref.stack(
-                x.astype(jnp.float32),
-                e,
-                k2,
-                v2,
-                cos,
-                sin,
-                w,
-                cfg,
-                keys=valid,
-                mode="fp8",
-            ).astype(jnp.float32)
-        )
-        tiling = dataclasses.replace(_tiling("twopass"), fp8=True, mlp_rows=mlp_rows)
-        kw = mk.pack_kernel_weights(st, cfg, tiling)
-        e8 = jnp.concatenate(
-            [e, jnp.zeros((cfg.layers, 2, cfg.hidden), jnp.float32)], axis=1
-        )
-
-        def heads_major(t):
-            return (
-                t.reshape(cfg.layers, cfg.text_len, cfg.heads, cfg.head_dim)
-                .transpose(0, 2, 1, 3)
-                .astype(jnp.bfloat16)
-            )
-
-        interp = pltpu.InterpretParams(detect_races=True, dma_execution_mode=dma)
-        got = np.asarray(
-            mk.stack(
-                x,
-                e8,
-                heads_major(k2),
-                heads_major(v2),
-                cos,
-                sin,
-                kw,
-                valid,
-                cfg=cfg,
-                tiling=tiling,
-                interpret=interp,
-            ).astype(jnp.float32)
-        )
-        self.assertFalse(_races_found())
-        err, ref_err = _rel(got, gold, valid), _rel(want, gold, valid)
-        self.assertLess(err, 1.1 * ref_err + 1e-4, (err, ref_err))
-
 
 @unittest.skipUnless(_HAS_JAX, _SKIP)
 class TestKernelInterpretMultiDevice(CustomTestCase):
@@ -701,12 +560,6 @@ class TestKernelInterpretMultiDevice(CustomTestCase):
         A zero-padded prompt, with each device's own cross keys: 64 on device 0, 128
         on device 1 (one kernel, a code path a device), its heads in steps of two."""
         self._two_devices({}, valid_pad=6, err_factor=1.1)
-
-    def test_two_devices_fp8_qk(self):
-        """fp8 QK^T over two devices, 296 real rows of 512: a full key tile, then the
-        edge tile's 40 real keys zero-padded in the pipelined loop."""
-        over = dict(block_q=256, qk8_chunk=128, fp8_qk=True)
-        self._two_devices(over, valid_pad=216, err_factor=3.0)
 
     def _two_devices(self, tiling_over, valid_pad, err_factor):
         """Two layers over two devices of 256 rows, ``_tiling()`` (cross_step 2) with
@@ -723,13 +576,13 @@ class TestKernelInterpretMultiDevice(CustomTestCase):
             except Exception:  # only the helpers below are needed here
                 for name in ("sglang", "sglang.test", "sglang.test.ci"):
                     sys.modules.setdefault(name, types.ModuleType(name))
-                ci = types.ModuleType("sglang.test.ci.ci_register"); ci.register_cpu_ci = lambda **k: None
+                ci = types.ModuleType("sglang.test.ci.ci_register"); ci.register_tpu_ci = lambda **k: None
                 tu = types.ModuleType("sglang.test.test_utils"); tu.CustomTestCase = unittest.TestCase
                 sys.modules["sglang.test.ci.ci_register"], sys.modules["sglang.test.test_utils"] = ci, tu
             import numpy as np, jax, jax.numpy as jnp
             from jax.experimental.pallas import tpu as pltpu
             from jax.sharding import Mesh, PartitionSpec as P
-            import test_tpu_wan_megakernel as t
+            import test_diffusion_tpu_wan_megakernel as t
             from sglang_tpu.multimodal_gen.wan_megakernel import kernel as mk
             cfg, st, x, e, k2, v2, cos, sin, valid, want, gold = t._case(
                 layers=2, devices=2, text_len=256, text_real=40, valid_pad={valid_pad!r})
@@ -838,8 +691,8 @@ class TestPack(CustomTestCase):
             for r in raws
         ]
         st = ref.stack_layers([ref.pack_layer(r, cfg) for r in raws16])
-        for mode, fp8 in (("acc", False), ("twopass", False), ("twopass", True)):
-            tiling = dataclasses.replace(_tiling(mode), fp8=fp8)
+        for mode in ("acc", "twopass"):
+            tiling = _tiling(mode)
             got = pack.pack_blocks(
                 model,
                 cfg,
@@ -847,17 +700,14 @@ class TestPack(CustomTestCase):
                 free_originals=False,
                 stage_on_host=False,
                 down_cols=tiling.down_cols if mode == "twopass" else None,
-                fp8=fp8,
             )
             want = mk.pack_kernel_weights(st, cfg, tiling)
             for name in pack.WEIGHT_ORDER:
-                with self.subTest(mode=mode, fp8=fp8, name=name):
+                with self.subTest(mode=mode, name=name):
                     a = got[name].float().numpy()
                     b = np.asarray(jnp.asarray(want[name]).astype(jnp.float32))
                     self.assertEqual(a.shape, b.shape)
-                    np.testing.assert_array_equal(
-                        a, b
-                    )  # fp8 too: codes and scales bit-equal
+                    np.testing.assert_array_equal(a, b)
         np.testing.assert_array_equal(
             pack.modulation_tables(model).numpy(), st["table"]
         )
@@ -934,12 +784,15 @@ class TestCrossKeys(CustomTestCase):
 class TestTiling(CustomTestCase):
     def test_production_shape(self):
         Tiling().check(8192, 4, 5120, 13824, 40)
-        opts = Tiling(online_one_loop=True, pipelined_epilogues=True)
-        for devices in (4, 2, 1):  # 4 / 2 / 1 chips (staging fits VMEM)
+        opts = Tiling(pipelined_epilogues=True)
+        for devices in (4, 2, 1):  # 4 / 2 / 1 chips (the staging tile fits VMEM)
             opts.check(32768 // devices, devices, 5120, 13824, 40)
-        self.assertEqual(opts.opt_suffix(), "_o1_pe")
+        self.assertEqual(opts.opt_suffix(), "_pe")
         self.assertEqual(Tiling(dma_bounds_checks=False).opt_suffix(), "_nb")
-        self.assertEqual(Tiling(fp8=True, pipelined_epilogues=True).opt_suffix(), "")
+        self.assertEqual(
+            Tiling(pipelined_epilogues=True, dma_bounds_checks=False).opt_suffix(),
+            "_pe_nb",
+        )
 
     def test_for_tokens(self):
         """Rows a device and attention tiles a token count runs with."""
@@ -960,10 +813,12 @@ class TestTiling(CustomTestCase):
         }
         for (tokens, devices), want in cases.items():
             with self.subTest(tokens=tokens, devices=devices):
-                tiling, rows = for_tokens(tokens, devices, Tiling(fp8=True))
+                tiling, rows = for_tokens(
+                    tokens, devices, Tiling(pipelined_epilogues=True)
+                )
                 got = (rows, tiling.block_q, tiling.block_kv, tiling.sub_kv)
                 self.assertEqual(got, want)
-                self.assertTrue(tiling.fp8)
+                self.assertTrue(tiling.pipelined_epilogues)
                 self.assertGreaterEqual(rows * devices, tokens)
                 tiling.check(rows, devices, 5120, 13824, 40)
 
@@ -983,10 +838,6 @@ class TestTiling(CustomTestCase):
                 Tiling(cross_keys=counts).check(8192, 4, 5120, 13824, 40)
         with self.assertRaises(ValueError):
             Tiling(cross_step=3).check(8192, 4, 5120, 13824, 40)
-        for guard in ("shared", "inline", "rowfix"):
-            Tiling(floor_guard=guard).check(8192, 4, 5120, 13824, 40)
-        with self.assertRaises(ValueError):
-            Tiling(floor_guard="fixed").check(8192, 4, 5120, 13824, 40)
 
 
 if __name__ == "__main__":
