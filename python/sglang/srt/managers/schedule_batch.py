@@ -1430,7 +1430,7 @@ class Req(ReqDllmMixin):
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 _VOCAB_BOUNDARY_NAN_COUNT[0] += 1
                 cnt = _VOCAB_BOUNDARY_NAN_COUNT[0]
-                if cnt <= 8 or (cnt & (cnt - 1)) == 0:
+                if cnt <= 64 or (cnt & (cnt - 1)) == 0:
                     logger.warning(
                         "Out-of-vocab / NaN token_id=%d (0x%X, vocab_size=%s) on req rid=%s "
                         "prompt_len=%d output_offset=%d (occurrence #%d); finishing request early.",

@@ -294,10 +294,16 @@ def can_use_muse_decode_qkv_epilogue(
         forward_batch.forward_mode.is_target_verify()
         and tpu_envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
     )
+    valid_qkv_cols = qkv.ndim == 2 and (
+        qkv.shape[1] == 1280
+        or (
+            qkv.shape[1] == 640
+            and bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
+        )
+    )
     if (
         not (forward_batch.forward_mode.is_decode() or verify_ok)
-        or qkv.ndim != 2
-        or qkv.shape[1] != 1280
+        or not valid_qkv_cols
         or qkv.shape[0] > max_tokens
         or qkv.dtype != torch.bfloat16
     ):

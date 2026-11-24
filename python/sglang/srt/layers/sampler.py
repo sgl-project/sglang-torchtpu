@@ -190,6 +190,15 @@ class Sampler(nn.Module):
         _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
         _trace_e2e_sampler("preprocess_returned")
+        tpu_nan_rows = (
+            torch.isnan(logits).any(dim=-1)
+            if (
+                logits.device.type == "tpu"
+                and logits.numel() > 0
+                and not envs.SGLANG_SANITIZE_NAN_LOGITS.get()
+            )
+            else None
+        )
         target_logprobs = None
         if logprob_logits is not None:
             logprob_logits = self._preprocess_logits(logprob_logits, sampling_info)
@@ -359,6 +368,15 @@ class Sampler(nn.Module):
                     sampling_mask_capture,
                     sampling_support_logprobs_capture_indices,
                 )
+
+        if tpu_nan_rows is not None:
+            # Preserve 0x7FFFFFFF NaN sentinel parity with TpuSampler (0 host syncs)
+            # instead of letting XLA argmax silently alias NaN logit rows to token_id 0.
+            batch_next_token_ids = torch.where(
+                tpu_nan_rows,
+                torch.full_like(batch_next_token_ids, 0x7FFFFFFF),
+                batch_next_token_ids,
+            )
 
         _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids

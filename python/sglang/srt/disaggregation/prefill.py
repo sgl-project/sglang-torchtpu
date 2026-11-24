@@ -1237,6 +1237,28 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
+                if next_token_id < 0 or (
+                    req.vocab_size is not None and next_token_id >= req.vocab_size
+                ):
+                    from sglang.srt.managers.schedule_batch import (
+                        _VOCAB_BOUNDARY_NAN_COUNT,
+                    )
+
+                    _VOCAB_BOUNDARY_NAN_COUNT[0] += 1
+                    cnt = _VOCAB_BOUNDARY_NAN_COUNT[0]
+                    if cnt <= 64 or (cnt & (cnt - 1)) == 0:
+                        logger.warning(
+                            "Out-of-vocab / NaN token_id=%d (0x%X, vocab_size=%s) on req rid=%s "
+                            "prompt_len=%d output_offset=0 (occurrence #%d); clamping prefill token.",
+                            next_token_id,
+                            next_token_id & 0xFFFFFFFF,
+                            req.vocab_size,
+                            getattr(req, "rid", None),
+                            len(getattr(req, "origin_input_ids", ()) or ()),
+                            cnt,
+                        )
+                    eos_ids = getattr(req, "eos_token_ids", None)
+                    next_token_id = next(iter(eos_ids)) if eos_ids else 0
                 req.output_ids.append(next_token_id)
                 if req.grammar is not None:
                     try:

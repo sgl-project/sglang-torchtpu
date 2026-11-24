@@ -1478,6 +1478,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
+    # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across
+    # chip_b2, W8 Bridge 2b, L0 dual_qkv_epi_gate, and standalone decode_qkv_epilogue.
+    SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI = EnvBool(False)
     # Wave-8 fuse final L61 model.norm into Bridge 2a and skip dead final stream HBM store.
     SGLANG_TPU_MUSE_DECODE_FUSE_FINAL_NORM = EnvBool(False)
     # Wave-8 Pallas owner-row gather / token-shard RS + RMSNorm replacing VocabParallelEmbedding AR.

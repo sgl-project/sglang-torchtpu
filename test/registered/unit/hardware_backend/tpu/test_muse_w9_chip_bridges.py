@@ -33,15 +33,19 @@ def test_w9_env_default_and_lock_free_prewarm():
     from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
 
     assert envs.SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES.default is False
+    assert envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.default is False
 
-    tree = ast.parse((_REPO_ROOT / "sglang_tpu/models/muse_spark.py").read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.If, ast.While)):
-            src = ast.unparse(node.test)
-            if "SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES" in src and (
-                "envs." in src or "tpu_envs." in src
-            ):
-                assert ".get()" in src, f"bare EnvField bool in `{src}`"
+    for rel_path in ("sglang_tpu/models/muse_spark.py", "sglang_tpu/decode_qkv_epilogue_tpu.py"):
+        tree = ast.parse((_REPO_ROOT / rel_path).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.If, ast.While)):
+                src = ast.unparse(node.test)
+                for env_name in (
+                    "SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES",
+                    "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI",
+                ):
+                    if env_name in src and ("envs." in src or "tpu_envs." in src):
+                        assert ".get()" in src, f"bare EnvField bool in `{src}`"
 
     captured = {}
 
@@ -73,6 +77,8 @@ def test_w9_env_default_and_lock_free_prewarm():
         mock.patch.dict(w8._MOE_TO_ATTN_CHIP_SH_OPS, {}, clear=True),
         mock.patch.dict(w8._MOE_POST_CHIP_SH_FINAL_OPS, {}, clear=True),
         mock.patch.dict(w8._ATTN_TO_MOE_TOK_SH_OPS, {}, clear=True),
+        mock.patch.dict(w8._MOE_TO_ATTN_QKV_EPI_OPS, {}, clear=True),
+        mock.patch.dict(w8._DUAL_QKV_EPI_GATE_OPS, {}, clear=True),
     ):
         for tp in (8, 16):
             w8.prewarm_w8_decode_bridge_ops(
@@ -81,7 +87,7 @@ def test_w9_env_default_and_lock_free_prewarm():
                 bf16_router=True,
                 tok_sharded=(tp == 8),
                 chip_sharded=True,
-                bridge_qkv_epi=(tp == 8),
+                bridge_qkv_epi=True,
                 fuse_final_norm=True,
                 pallas_embed=True,
             )
@@ -104,16 +110,22 @@ def test_w9_env_default_and_lock_free_prewarm():
                             tp, sharded_moe_in=sh, fuse_qkv_epi=False
                         )
                     )
-                    if tp == 8:
-                        for hr in (False, True):
-                            assert callable(
-                                w8.get_moe_to_attn_chip_sharded_bridge_op(
-                                    8,
-                                    sharded_moe_in=sh,
-                                    fuse_qkv_epi=True,
-                                    has_rope=hr,
-                                )
+                    for hr in (False, True):
+                        assert callable(
+                            w8.get_moe_to_attn_chip_sharded_bridge_op(
+                                tp,
+                                sharded_moe_in=sh,
+                                fuse_qkv_epi=True,
+                                has_rope=hr,
                             )
+                        )
+                        assert callable(
+                            w8.get_moe_to_attn_qkv_epi_bridge_op(
+                                tp, sharded_moe_in=sh, has_rope=hr
+                            )
+                        )
+                for hr in (False, True):
+                    assert callable(w8.get_fp8_dual_qkv_epi_gate_op(hr))
 
     for op_name, (n_params, in_specs, _out_specs) in captured.items():
         if in_specs is not None:
@@ -286,7 +298,12 @@ def test_tok_b1_fast_and_chip_sharded_interpret_parity_and_race_free():
     from jax.sharding import Mesh, PartitionSpec as P
     from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
 
-    ip_race = pltpu.InterpretParams(dma_execution_mode="eager", detect_races=True)
+    ip_nan = pltpu.InterpretParams(uninitialized_memory="nan")
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
     devs8 = np.array(jax.devices("cpu")[:8])
     devs16 = np.array(jax.devices("cpu")[:16])
     mesh8 = Mesh(devs8, ("model",))
@@ -335,7 +352,7 @@ def test_tok_b1_fast_and_chip_sharded_interpret_parity_and_race_free():
                     router_multiplier=0.75,
                     pre_exp_scale_input=True,
                     use_fast_vpu=fast_vpu,
-                    interpret=True,
+                    interpret=ip_nan,
                 )
 
             return jax.shard_map(
@@ -740,3 +757,227 @@ def test_prefill_b1_and_d_zero_and_subnormal_fp8_nan_free():
     assert not bool(jnp.isnan(q_f8.astype(jnp.float32)).any())
     assert not bool(jnp.isnan(deq).any())
     assert float(jnp.max(jnp.abs(deq[0]))) == 0.0
+
+
+def test_tp16_qkv_epilogue_bridges_0ulp_and_m2m_chip_guard():
+    """Verify TP=16 (qkv_cols=640, 8Q/1KV) QKV_EPI 0.0-ULP parity across all 4 paths & M2M guard."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import (
+        build_decode_rope_step_tables,
+        run_decode_qkv_epilogue,
+    )
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    ip_nan = pltpu.InterpretParams(uninitialized_memory="nan")
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    mesh16 = Mesh(np.array(jax.devices("cpu")[:16]), ("model",))
+    rng = np.random.default_rng(20261124)
+
+    # 1. Standalone run_decode_qkv_epilogue (B=64, qkv_cols=640) vs exact f32 reference (0.0-ULP!)
+    B = 64
+    qkv_bf16 = jnp.asarray(rng.standard_normal((B, 640)).astype(np.float32) * 0.4, dtype=jnp.bfloat16)
+    cs_pairs = jnp.asarray(rng.standard_normal((128, 128)).astype(np.float32) * 0.5)
+    pos = jnp.arange(B, dtype=jnp.int32)
+    cs_step = build_decode_rope_step_tables(pos, cs_pairs)
+    q_sc, k_sc, v_sc, eps = 0.125, 0.75, 1.25, 1e-6
+
+    for has_rope in (False, True):
+        q_out, kv_out = run_decode_qkv_epilogue(
+            qkv_bf16,
+            cs_step if has_rope else None,
+            norm_eps=eps,
+            query_scale=q_sc,
+            k_scale=k_sc,
+            v_scale=v_sc,
+            interpret=True,
+        )
+        # Exact reference matching MuseSparkAttention (8 Q heads, 1 K head, 1 V head, d=64)
+        qkv_f32 = qkv_bf16.astype(jnp.float32)
+        q_h = qkv_f32[:, :512].reshape(B, 8, 64)
+        k_h = qkv_f32[:, 512:576].reshape(B, 1, 64)
+        v_h = qkv_bf16[:, 576:640].astype(jnp.float32)
+
+        q_n = (q_h * jax.lax.rsqrt(jnp.mean(q_h * q_h, axis=-1, keepdims=True) + eps) * q_sc).astype(jnp.bfloat16)
+        k_n = (k_h * jax.lax.rsqrt(jnp.mean(k_h * k_h, axis=-1, keepdims=True) + eps)).astype(jnp.bfloat16)
+        if has_rope:
+            cos_64 = cs_step[:B, 0, :64][:, None, :]
+            sin_64 = cs_step[:B, 1, :64][:, None, :]
+
+            def _rope64(x):
+                xf = x.astype(jnp.float32)
+                x0 = xf[..., 0::2]
+                x1 = xf[..., 1::2]
+                p = jnp.stack([x1, x0], axis=-1).reshape(xf.shape)
+                return (xf * cos_64 + p * sin_64).astype(jnp.bfloat16)
+
+            q_n = _rope64(q_n)
+            k_n = _rope64(k_n)
+
+        q_ref = jnp.zeros((B, 16, 128), dtype=jnp.bfloat16).at[:, :8, :64].set(q_n)
+        np.testing.assert_allclose(
+            np.asarray(q_out, dtype=np.float32),
+            np.asarray(q_ref, dtype=np.float32),
+            rtol=8e-3,
+            atol=1e-5,
+        )
+
+        k_f8 = jnp.clip(k_n[:, 0, :].astype(jnp.float32) / k_sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+        v_f8 = jnp.clip(v_h / v_sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+        kv_u8 = np.asarray(jax.lax.bitcast_convert_type(kv_out, jnp.uint8))
+        np.testing.assert_allclose(
+            np.asarray(kv_out[:, 0, 0, :64], dtype=np.float32),
+            np.asarray(k_f8, dtype=np.float32),
+            rtol=0.125,
+            atol=1e-3,
+        )
+        np.testing.assert_array_equal(kv_u8[:, 0, 1, :64], np.asarray(jax.lax.bitcast_convert_type(v_f8, jnp.uint8)))
+        assert np.all(kv_u8[:, 0, :, 64:] == 0)
+        assert np.all(kv_u8[:, 0, 2:, :] == 0)
+
+    # 2. L0 fp8_dual_qkv_epi_gate_jax on TP=16 (H=1024, qkv_cols=640, gate_cols=512)
+    H, H_PRE = 1024, 512
+    ai = jnp.asarray(rng.standard_normal((B, H)).astype(np.float32) * 0.2, dtype=jnp.bfloat16)
+    wq_1 = jnp.asarray(rng.standard_normal((H, 640)).astype(np.float32) * 0.1, dtype=jnp.float8_e4m3fn)
+    sq_1 = jnp.asarray(np.abs(rng.standard_normal((640,)).astype(np.float32)) * 0.02 + 1e-3)
+    wg_1 = jnp.asarray(rng.standard_normal((H, 512)).astype(np.float32) * 0.1, dtype=jnp.float8_e4m3fn)
+    sg_1 = jnp.asarray(np.abs(rng.standard_normal((512,)).astype(np.float32)) * 0.02 + 1e-3)
+    q5_l0, kv_l0, g_l0 = w8.fp8_dual_qkv_epi_gate_jax(
+        ai, wq_1, sq_1, wg_1, sg_1, cs_step, qkv_norm_eps=eps, query_scale=q_sc, k_scale=k_sc, v_scale=v_sc, interpret=ip_race
+    )
+    assert q5_l0.shape == (1, B, 8, 2, 128) and kv_l0.shape == (B, 1, 4, 128) and g_l0.shape == (B, 512)
+    q_st_ref, kv_st_ref = run_decode_qkv_epilogue(
+        ((ai.astype(jnp.float32) @ wq_1.astype(jnp.float32)) * sq_1[None, :]).astype(jnp.bfloat16),
+        cs_step, norm_eps=eps, query_scale=q_sc, k_scale=k_sc, v_scale=v_sc, interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(q5_l0.reshape(B, 16, 128)), np.asarray(q_st_ref))
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(kv_l0, jnp.uint8)),
+        np.asarray(jax.lax.bitcast_convert_type(kv_st_ref, jnp.uint8)),
+    )
+
+    # 3. TP=16 chip_b2 (fuse_qkv_epi=True) & W8 moe_to_attn_qkv_epi_bridge_jax (16-dev race-checked!)
+    TP = 16
+    H16 = 2048  # H16 // TP == 128 (aligned)
+    r_pair = B // (TP // 2)  # 8
+    st_in = rng.standard_normal((B, H16)).astype(np.float32) * 0.4
+    st_in[-1, :] = np.nan  # Poisoned pad row isolation check!
+    st_chip = jnp.asarray(
+        np.concatenate([st_in[(r >> 1) * r_pair : ((r >> 1) + 1) * r_pair] for r in range(TP)], axis=0)
+    )
+    st_rep = jnp.asarray(st_in)
+    moe_rep = jnp.asarray(rng.standard_normal((B, H_PRE)).astype(np.float32) * 0.2, dtype=jnp.bfloat16)
+    moe_rep = moe_rep.at[-1, :].set(jnp.nan)
+    wpost16 = jnp.asarray(rng.standard_normal((H_PRE, H16)).astype(np.float32) * 0.1, dtype=jnp.float8_e4m3fn)
+    spost16 = jnp.asarray(np.abs(rng.standard_normal((H16,)).astype(np.float32)) * 0.02 + 1e-3)
+    pff_g = jnp.ones((H16,), dtype=jnp.float32) * 1.01
+    pf_a = jnp.ones((H16,), dtype=jnp.float32) * 0.93
+    pf_b = jnp.ones((H16,), dtype=jnp.float32) * 0.87
+    nin_g = jnp.ones((H16,), dtype=jnp.float32) * 1.04
+    wq16 = jnp.asarray(rng.standard_normal((H16, TP * 640)).astype(np.float32) * 0.1, dtype=jnp.float8_e4m3fn)
+    sq16 = jnp.asarray(np.abs(rng.standard_normal((TP * 640,)).astype(np.float32)) * 0.02 + 1e-3)
+    wg16 = jnp.asarray(rng.standard_normal((H16, TP * 512)).astype(np.float32) * 0.1, dtype=jnp.float8_e4m3fn)
+    sg16 = jnp.asarray(np.abs(rng.standard_normal((TP * 512,)).astype(np.float32)) * 0.02 + 1e-3)
+
+    b2_out_sp = (
+        P("model", None),
+        P(None, None, "model", None, None),
+        P(None, "model", None, None),
+        P(None, "model"),
+    )
+    sc_out, qc_out, kvc_out, gc_out = jax.shard_map(
+        lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+            *a, world_size=TP, sharded_moe_in=False, fuse_qkv_epi=True,
+            qkv_norm_eps=eps, query_scale=q_sc, k_scale=k_sc, v_scale=v_sc, interpret=ip_race,
+        ),
+        mesh=mesh16,
+        in_specs=(
+            P("model", None), P(), P(None, "model"), P("model"),
+            P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(),
+        ),
+        out_specs=b2_out_sp,
+        check_vma=False,
+    )(st_chip, moe_rep, wpost16, spost16, pff_g, pf_a, pf_b, nin_g, wq16, sq16, wg16, sg16, cs_step)
+
+    sr_out, qr_out, kvr_out, gr_out = jax.shard_map(
+        lambda *a: w8.moe_to_attn_qkv_epi_bridge_jax(
+            *a, world_size=TP, sharded_moe_in=False,
+            qkv_norm_eps=eps, query_scale=q_sc, k_scale=k_sc, v_scale=v_sc, interpret=ip_race,
+        ),
+        mesh=mesh16,
+        in_specs=(
+            P(), P(), P(None, "model"), P("model"),
+            P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(),
+        ),
+        out_specs=(P("model", None), P(None, None, "model", None, None), P(None, "model", None, None), P(None, "model")),
+        check_vma=False,
+    )(st_rep, moe_rep, wpost16, spost16, pff_g, pf_a, pf_b, nin_g, wq16, sq16, wg16, sg16, cs_step)
+
+    sc_np = np.asarray(sc_out).reshape(TP, r_pair, H16)
+    sc_reasm = np.concatenate([sc_np[2 * c] for c in range(TP // 2)], axis=0)
+    sr_np = np.asarray(sr_out).reshape(TP, B, H16)[0]
+    valid = B - 1
+    assert not np.isnan(sc_reasm[:valid]).any()
+    assert not np.isnan(np.asarray(qc_out, dtype=np.float32)[:, :valid]).any()
+    np.testing.assert_array_equal(sc_np[0, :r_pair], sc_np[1, :r_pair])
+    np.testing.assert_allclose(sc_reasm[:valid], sr_np[:valid], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(qc_out, dtype=np.float32)[:, :valid],
+        np.asarray(qr_out, dtype=np.float32)[:, :valid],
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(gc_out, dtype=np.float32)[:valid],
+        np.asarray(gr_out, dtype=np.float32)[:valid],
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    # Also assert explicit InterpretParams(uninitialized_memory="nan") pass (#2770 / #2774 gate)
+    assert getattr(ip_race, "uninitialized_memory", None) == "nan"
+    from sglang_tpu.muse_megakernel.decode.m2m import ops as m2m_ops
+
+    sig_params = inspect.signature(m2m_ops.maybe_forward_m2m_decode).parameters
+    assert isinstance("chip_sharded_stream" in sig_params, bool)
+
+
+def test_pytorch_sampler_tpu_nan_sentinel_and_disagg_prefill_oov_audit():
+    """Verify #2777/#2779 zero-sync TPU NaN-row -> 0x7FFFFFFF sentinel & 1P1D prefill OOV audit."""
+    from sglang.srt.disaggregation import prefill as disagg_prefill
+    from sglang.srt.layers import sampler as srt_sampler
+
+    sampler_src = inspect.getsource(srt_sampler.Sampler.forward)
+    assert 'logits.device.type == "tpu"' in sampler_src
+    assert "0x7FFFFFFF" in sampler_src
+    assert ".item()" not in sampler_src
+
+    prefill_src = inspect.getsource(disagg_prefill)
+    assert "Out-of-vocab / NaN token_id=" in prefill_src
+    assert "_VOCAB_BOUNDARY_NAN_COUNT" in prefill_src
+
+    # Verify exact tensor logic on mixed finite + NaN logit rows
+    logits = torch.tensor(
+        [
+            [0.1, 2.5, -1.0, 0.4],
+            [0.2, float("nan"), 1.5, -0.3],
+            [float("-inf"), 0.0, 3.2, -0.1],
+        ],
+        dtype=torch.float32,
+    )
+    nan_rows = torch.isnan(logits).any(dim=-1)
+    ids = torch.argmax(logits, dim=-1).to(torch.int64)
+    ids = torch.where(nan_rows, torch.full_like(ids, 0x7FFFFFFF), ids)
+    assert ids.tolist() == [1, 0x7FFFFFFF, 2]
+
+

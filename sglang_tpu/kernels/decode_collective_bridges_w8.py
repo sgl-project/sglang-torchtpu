@@ -290,6 +290,52 @@ def _run_in_vmem_qkv_epilogue(
             kv_out_u32_ref[rs] = kv_u32
 
 
+def _run_in_vmem_qkv_epilogue_dispatch(
+    qkv_2d_ref,
+    cos_sin_vmem_ref,
+    q_out_vmem_ref,
+    kv_out_vmem_ref,
+    *,
+    norm_eps: float,
+    query_scale: float,
+    k_scale: float,
+    v_scale: float,
+    has_rope: bool,
+    interpret_mode: bool,
+) -> None:
+    """Dispatch `TP=8` (`qkv_cols=1280`) directly and `TP=16` (`qkv_cols=640`) via shared M2M epilogue."""
+    if qkv_2d_ref.shape[1] == 1280:
+        _run_in_vmem_qkv_epilogue(
+            qkv_2d_ref,
+            cos_sin_vmem_ref,
+            q_out_vmem_ref,
+            kv_out_vmem_ref,
+            norm_eps=norm_eps,
+            query_scale=query_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            has_rope=has_rope,
+            interpret_mode=interpret_mode,
+        )
+        return
+    from sglang_tpu.muse_megakernel.decode.m2m.kernel import (
+        _run_in_vmem_qkv_epilogue_any,
+    )
+
+    _run_in_vmem_qkv_epilogue_any(
+        qkv_2d_ref,
+        cos_sin_vmem_ref,
+        q_out_vmem_ref,
+        kv_out_vmem_ref,
+        norm_eps=norm_eps,
+        query_scale=query_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        has_rope=has_rope,
+        interpret_mode=interpret_mode,
+    )
+
+
 # =============================================================================
 # 2. L0 Fused Dual QKV+Gate + QKV/RoPE Epilogue & L61 Final Norm Sub-Bridge
 # =============================================================================
@@ -326,8 +372,8 @@ def _fp8_dual_qkv_epi_gate_kernel(
         attn_in_ref, w_qkv_buf, s_qkv_ref, 0, qkv_vmem, 0,
         rows=rows, n_cols=w_qkv_hbm.shape[1],
     )
-    # Overlap VPU QKV RMSNorm + RoPE + KV FP8 quant underneath 8-MiB W_gate HBM DMA!
-    _run_in_vmem_qkv_epilogue(
+    # Overlap VPU QKV RMSNorm + RoPE + KV FP8 quant underneath W_gate HBM DMA!
+    _run_in_vmem_qkv_epilogue_dispatch(
         qkv_vmem,
         cos_sin_ref,
         out_q_ref,
@@ -371,8 +417,7 @@ def fp8_dual_qkv_epi_gate_jax(
     gk, gate_cols = w_gate_w8k.shape
     if (
         not (rows == 8 or (16 <= rows <= 384 and rows % 16 == 0))
-        or qkv_cols != 1280
-        or gate_cols != 1024
+        or (qkv_cols, gate_cols) not in ((1280, 1024), (640, 512))
         or qk != hidden
         or gk != hidden
     ):
@@ -981,7 +1026,7 @@ def _moe_to_attn_qkv_epi_bridge_kernel(
             rows=rows, n_cols=qkv_cols,
         )
 
-    _run_in_vmem_qkv_epilogue(
+    _run_in_vmem_qkv_epilogue_dispatch(
         qkv_vmem,
         cos_sin_ref,
         out_next_q_ref,
@@ -1047,9 +1092,9 @@ def moe_to_attn_qkv_epi_bridge_jax(
     _, qkv_cols = next_w_qkv_w8k.shape
     _, gate_cols = next_w_gate_w8k.shape
     if (
-        not (rows == 8 or (16 <= rows <= 384 and rows % 16 == 0))
-        or qkv_cols != 1280
-        or gate_cols != 1024
+        world_size not in SUPPORTED_WORLD_SIZES
+        or not (rows == 8 or (16 <= rows <= 384 and rows % 16 == 0))
+        or (qkv_cols, gate_cols) != ((1280, 1024) if world_size == 8 else (640, 512))
     ):
         raise ValueError("Unsupported moe_to_attn_qkv_epi shapes")
     has_rope = cos_sin_step is not None
@@ -6184,7 +6229,7 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
         rows=rows, n_cols=qkv_cols,
     )
     if fuse_qkv_epi:
-        _run_in_vmem_qkv_epilogue(
+        _run_in_vmem_qkv_epilogue_dispatch(
             qkv_vmem,
             cos_sin_ref,
             out_qkv_or_q_ref,
@@ -6241,8 +6286,6 @@ def moe_to_attn_chip_sharded_bridge_jax(
 
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Chip-sharded Bridge 2b requires world_size in (8, 16), got {world_size}")
-    if fuse_qkv_epi and world_size != 8:
-        raise ValueError(f"fuse_qkv_epi requires world_size=8, got {world_size}")
     n_chips = world_size // 2
     r_pair, hidden = stream_chip.shape
     rows = n_chips * r_pair
@@ -6714,8 +6757,8 @@ def get_moe_post_ag_final_norm_op(
 def get_moe_to_attn_qkv_epi_bridge_op(
     world_size: int, *, sharded_moe_in: bool = False, has_rope: bool = True
 ) -> Callable:
-    if world_size != 8:
-        raise ValueError(f"Fused QKV epilogue Bridge 2b requires world_size=8, got {world_size}")
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(f"Fused QKV epilogue Bridge 2b requires world_size in (8, 16), got {world_size}")
     nbs3 = _qepi_norm_before_s3_enabled()
     key = (int(world_size), bool(sharded_moe_in), bool(has_rope), nbs3)
     op = _MOE_TO_ATTN_QKV_EPI_OPS.get(key)
@@ -7518,8 +7561,6 @@ def get_moe_to_attn_chip_sharded_bridge_op(
 ) -> Callable:
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Chip-sharded Bridge 2b requires world_size in (8, 16), got {world_size}")
-    if fuse_qkv_epi and world_size != 8:
-        raise ValueError(f"fuse_qkv_epi requires world_size=8, got {world_size}")
     eff_rope = bool(fuse_qkv_epi and has_rope)
     key = (int(world_size), bool(sharded_moe_in), bool(fuse_qkv_epi), eff_rope)
     op = _MOE_TO_ATTN_CHIP_SH_OPS.get(key)
@@ -7869,7 +7910,7 @@ def prewarm_w8_decode_bridge_ops(
     if fuse_final_norm and mode in (2, 3, 4, 5, 6):
         for sh in (False, True):
             get_moe_post_ag_final_norm_op(world_size, sharded_moe_in=sh)
-    if bridge_qkv_epi and world_size == 8 and mode in (2, 3, 5):
+    if bridge_qkv_epi and world_size in SUPPORTED_WORLD_SIZES and mode in (2, 3, 5):
         for r_flag in (False, True):
             get_fp8_dual_qkv_epi_gate_op(r_flag)
             for sh in (False, True):
@@ -7911,7 +7952,7 @@ def prewarm_w8_decode_bridge_ops(
                 get_moe_to_attn_chip_sharded_bridge_op(
                     world_size, sharded_moe_in=sh, fuse_qkv_epi=False
                 )
-                if bridge_qkv_epi and world_size == 8:
+                if bridge_qkv_epi:
                     for r_flag in (False, True):
                         get_moe_to_attn_chip_sharded_bridge_op(
                             world_size,

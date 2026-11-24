@@ -149,11 +149,16 @@ def _can_use_bridge_qkv_epi(
         if allow_small_qkv_epi
         else (32 <= n_tok <= max_tok and n_tok % 32 == 0)
     )
+    qkv_dim = attn_mod.q_size + 2 * attn_mod.kv_size
+    valid_qkv_geom = (qkv_dim == 1280 and attn_mod.q_size == 1024) or (
+        qkv_dim == 640
+        and attn_mod.q_size == 512
+        and bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
+    )
     if (
         not getattr(attn_mod, "decode_qkv_epilogue", False)
         or not (forward_batch.forward_mode.is_decode() or verify_ok)
-        or (attn_mod.q_size + 2 * attn_mod.kv_size) != 1280
-        or attn_mod.q_size != 1024
+        or not valid_qkv_geom
         or not valid_qkv_tok
     ):
         return False
@@ -3913,7 +3918,13 @@ class MuseSparkDecoderLayer(nn.Module):
                 assert post_ff_gain is not None
                 use_qkv_epi = (
                     b2_kind == 3
-                    and tp == 8
+                    and (
+                        tp == 8
+                        or (
+                            tp == 16
+                            and bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
+                        )
+                    )
                     and bool(self.__dict__.get("_w8_bridge_qkv_epi", False))
                     and _can_use_bridge_qkv_epi(
                         n_tok,
@@ -4905,7 +4916,10 @@ class MuseSparkTextModel(nn.Module):
             and n_tok_in <= br_max_tok
             and n_tok_in in chip_sh_batches
             and (self.end_layer - 1) not in self._capture_slots_by_layer
-            and not bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False))
+            and (
+                not bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False))
+                or bool(self.__dict__.get("_w9_m2m_supports_chip_sh", False))
+            )
             and int(os.environ.get("WORLD_SIZE", str(chip_sh_tp))) == chip_sh_tp
         )
         tok_sh_batches = self.__dict__.get("_w8_tok_sharded_batches", (64, 128))
@@ -5143,6 +5157,11 @@ class MuseSparkTextModel(nn.Module):
                 maybe_forward_m2m_decode,
             )
 
+            m2m_extra_kw = (
+                {"chip_sharded_stream": use_chip_sharded_relay}
+                if bool(self.__dict__.get("_w9_m2m_supports_chip_sh", False))
+                else {}
+            )
             m2m_hidden = maybe_forward_m2m_decode(
                 self,
                 positions=positions,
@@ -5151,6 +5170,7 @@ class MuseSparkTextModel(nn.Module):
                 cos_sin_step=cos_sin_step,
                 forward_batch=forward_batch,
                 tok_sharded_stream=use_tok_sharded_relay,
+                **m2m_extra_kw,
             )
             if m2m_hidden is not None:
                 return m2m_hidden
@@ -5794,11 +5814,29 @@ class MuseSparkForConditionalGeneration(nn.Module):
         chip_sharded = bool(
             _env_get("SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES", False)
         )
+        m2m_enabled = bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False))
+        m2m_supports_chip_sh = False
+        if chip_sharded and m2m_enabled:
+            try:
+                import inspect as _insp
+                from sglang_tpu.muse_megakernel.decode.m2m.ops import (
+                    maybe_forward_m2m_decode as _m2m_fn,
+                )
+
+                m2m_supports_chip_sh = (
+                    "chip_sharded_stream" in _insp.signature(_m2m_fn).parameters
+                )
+            except Exception:
+                m2m_supports_chip_sh = False
+            if not m2m_supports_chip_sh:
+                # Until M2M exposes chip_sharded_stream, keep tok_sharded active for M2M (#2698).
+                chip_sharded = False
         tok_sharded = (
             bool(_env_get("SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES", False))
             and not chip_sharded
         )
         bridge_qkv_epi = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI", False))
+        tp16_qkv_epi = bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
         fuse_final_norm = bool(
             _env_get("SGLANG_TPU_MUSE_DECODE_FUSE_FINAL_NORM", False)
         )
@@ -5917,6 +5955,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
         # On TP=8, B=32 (r_pair=8) keeps the faster 50.0 us/L W7+W8 path (vs 52.7 us/L 3D bf16 pack),
         # while B>=64 (r_pair>=16) wins by -3.45 us/L (-0.21 ms/step) on Ghostfish silicon.
         chip_sh_batches = (64, 128, 256, 384) if warm_tp in SUPPORTED_WORLD_SIZES else ()
+        eff_bridge_qkv_epi = bridge_qkv_epi and (warm_tp == 8 or tp16_qkv_epi)
         prewarm_ok = warm_tp in SUPPORTED_WORLD_SIZES and dist_ok
         if prewarm_ok:
             if (tok_sharded and all_tok_sh_ready) or (
@@ -5935,17 +5974,26 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 bf16_router=router_bf16,
                 tok_sharded=tok_sharded and all_tok_sh_ready,
                 chip_sharded=chip_sharded and all_chip_sh_ready,
-                bridge_qkv_epi=bridge_qkv_epi,
+                bridge_qkv_epi=eff_bridge_qkv_epi,
                 fuse_final_norm=fuse_final_norm,
                 pallas_embed=can_pallas_emb,
             )
-            if bool(_env_get("SGLANG_TPU_MUSE_MK_M2M", False)):
+            if m2m_enabled:
+                import inspect as _insp_pw
                 from sglang_tpu.muse_megakernel.decode.m2m.ops import (
                     prewarm_m2m_decode_ops,
                 )
 
+                m2m_pw_kw = (
+                    {"chip_sharded": chip_sharded and all_chip_sh_ready}
+                    if "chip_sharded"
+                    in _insp_pw.signature(prewarm_m2m_decode_ops).parameters
+                    else {}
+                )
                 prewarm_m2m_decode_ops(
-                    warm_tp, tok_sharded=tok_sharded and all_tok_sh_ready
+                    warm_tp,
+                    tok_sharded=tok_sharded and all_tok_sh_ready,
+                    **m2m_pw_kw,
                 )
             fuse_b1_tk = bool(
                 _env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE1_FUSE_TOPK", False)
@@ -5969,11 +6017,12 @@ class MuseSparkForConditionalGeneration(nn.Module):
 
         # Gate all Wave-8 / Wave-9 runtime dispatch flags on prewarm_ok so forward() can NEVER
         # trigger lazy cpu_export_jax_op inside torch.compile (#1454).
-        qkv_epi_ready = prewarm_ok and bridge_qkv_epi
+        qkv_epi_ready = prewarm_ok and eff_bridge_qkv_epi
         for layer_idx in range(self.start_layer, self.end_layer):
             lyr = self.model.layers[layer_idx]
             lyr._w8_bridge_qkv_epi = qkv_epi_ready
             lyr.self_attn._w8_bridge_qkv_epi = qkv_epi_ready
+        self.model._w9_m2m_supports_chip_sh = m2m_supports_chip_sh
         self.model._w8_fuse_final_norm = (
             prewarm_ok and fuse_final_norm and (mode in (2, 3, 4, 5, 6))
         )

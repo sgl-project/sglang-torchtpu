@@ -135,8 +135,11 @@ def _decode_qkv_epilogue_kernel(
             sin_s128 = None
 
         z_bf16 = jnp.zeros((tile_r, 128), jnp.bfloat16)
-        # Process 8 Q pairs -> 16 packed Q heads in [B_pad32, 16, 128]
-        for p_idx in range(8):
+        z_u8 = jnp.zeros((tile_r, 128), jnp.uint8)
+        is_tp8 = qkv_vmem_ref.shape[1] == 10
+        n_q_pairs = 8 if is_tp8 else 4
+        # Process 8 Q pairs (TP=8) or 4 Q pairs + 8 zero heads (TP=16) -> [B_pad32, 16, 128]
+        for p_idx in range(n_q_pairs):
             qp = qkv_vmem_ref[pl.ds(b0, tile_r), p_idx, :]
             qp = norm_pair(qp, query_scale)
             if has_rope:
@@ -152,19 +155,30 @@ def _decode_qkv_epilogue_kernel(
                 h_odd = jnp.where(mask_lo, z_bf16, qp)
             q_out_vmem_ref[pl.ds(b0, tile_r), 2 * p_idx, :] = h_even
             q_out_vmem_ref[pl.ds(b0, tile_r), 2 * p_idx + 1, :] = h_odd
+        if not is_tp8:
+            for h_idx in range(8, 16):
+                q_out_vmem_ref[pl.ds(b0, tile_r), h_idx, :] = z_bf16
 
-        # K (pair 8) + V (pair 9) -> fp8 quant + merge_kv [tile_r, 1, 4, 128]
-        kp = qkv_vmem_ref[pl.ds(b0, tile_r), 8, :]
-        vp = qkv_vmem_ref[pl.ds(b0, tile_r), 9, :]
-        kp = norm_pair(kp, 1.0)
-        if has_rope:
-            kp = rope_pair(kp, cos_128, sin_s128)
-
-        k_u8 = quant_fp8_u8(kp, inv_k_scale)
-        v_u8 = quant_fp8_u8(vp, inv_v_scale)
+        if is_tp8:
+            # K (pair 8) + V (pair 9) -> fp8 quant + merge_kv [tile_r, 1, 4, 128]
+            kp = qkv_vmem_ref[pl.ds(b0, tile_r), 8, :]
+            vp = qkv_vmem_ref[pl.ds(b0, tile_r), 9, :]
+            kp = norm_pair(kp, 1.0)
+            if has_rope:
+                kp = rope_pair(kp, cos_128, sin_s128)
+            k_u8 = quant_fp8_u8(kp, inv_k_scale)
+            v_u8 = quant_fp8_u8(vp, inv_v_scale)
+        else:
+            # TP=16: 1 K head (0:64) + 1 V head (64:128) in pair 4 -> low 64 lanes
+            kv_128 = qkv_vmem_ref[pl.ds(b0, tile_r), 4, :]
+            kp = norm_pair(kv_128, 1.0)
+            if has_rope:
+                kp = rope_pair(kp, cos_128, sin_s128)
+            vp = _roll_lanes(kv_128, 64, interpret_mode=interpret_mode)
+            k_u8 = jnp.where(mask_lo, quant_fp8_u8(kp, inv_k_scale), z_u8)
+            v_u8 = jnp.where(mask_lo, quant_fp8_u8(vp, inv_v_scale), z_u8)
         kv_u32 = k_u8.astype(jnp.uint32) | (v_u8.astype(jnp.uint32) << 8)
         if interpret_mode:
-            z_u8 = jnp.zeros((tile_r, 128), jnp.uint8)
             packed_u8 = jnp.stack([k_u8, v_u8, z_u8, z_u8], axis=1)[:, None, :, :]
             kv_out_vmem_ref[pl.ds(b0, tile_r)] = lax.bitcast_convert_type(
                 packed_u8, jnp.float8_e4m3fn
@@ -175,7 +189,7 @@ def _decode_qkv_epilogue_kernel(
 
 
 def run_decode_qkv_epilogue(
-    qkv: jax.Array,  # bf16[B, 1280]
+    qkv: jax.Array,  # bf16[B, 1280] (TP=8) or bf16[B, 640] (TP=16)
     cos_sin_step: jax.Array | None = None,  # f32[B_pad32, 2, 128] or None
     *,
     norm_eps: float = 1e-6,
@@ -186,9 +200,10 @@ def run_decode_qkv_epilogue(
 ) -> tuple[jax.Array, jax.Array]:
     """Runs fused decode QKV epilogue -> ``(q_packed [B, 16, 128], kv_merged [B_pad32, 1, 4, 128])``."""
     b_tok = qkv.shape[0]
-    assert qkv.shape[1] == 1280 and qkv.dtype == jnp.bfloat16
+    assert qkv.shape[1] in (640, 1280) and qkv.dtype == jnp.bfloat16
     b_pad = align_to(max(b_tok, 1), 32)
-    qkv_3d = qkv.reshape(b_tok, 10, 128)
+    n_pairs = qkv.shape[1] // 128
+    qkv_3d = qkv.reshape(b_tok, n_pairs, 128)
     if b_tok < b_pad:
         qkv_3d = jnp.pad(qkv_3d, ((0, b_pad - b_tok), (0, 0), (0, 0)))
 
