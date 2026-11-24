@@ -146,6 +146,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
+    # SPTP_GLOBAL_COUNTS=1: the MoE counts every rank's slots itself
+    local_counts = os.environ.get("SPTP_GLOBAL_COUNTS", "0") != "1"
     # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (its 64-lane head relayouts and f32 MXU head
     # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
     ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
@@ -317,6 +319,21 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 else:
                     xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
                 ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                counts = None
+                if local_counts:
+                    # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
+                    # count over every rank's slots, 1/tp of the compares); out-of-range ids
+                    # count as expert 0, as the MoE routes them
+                    ids_c = jnp.where((ids >= 0) & (ids < c.n_experts), ids, 0).reshape(
+                        -1
+                    )
+                    own = jnp.sum(
+                        (ids_c[:, None] == jnp.arange(c.n_experts)[None, :]).astype(
+                            jnp.int32
+                        ),
+                        axis=0,
+                    )
+                    counts = jnp.sum(ag(own[None], axis), axis=0)
             with _scope("sp_moe"):
                 y = fused_rs_moe(
                     c,
@@ -331,6 +348,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     axis,
                     # ids / tw are all-gathered: equal on every rank, no rank-0 broadcast
                     skip_routing_psum=True,
+                    group_sizes=counts,
                 )
             with _scope("sp_unpool"):
                 u8, u_s = q8(y.astype(_F32))

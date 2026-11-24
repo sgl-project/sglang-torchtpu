@@ -43,6 +43,7 @@ def fused_rs_moe(
     smalls_l,
     axis: str = "model",
     skip_routing_psum: bool | None = None,
+    group_sizes=None,
 ):
     """The expert-TP fused-RS MoE of layer l: xe [T, He] bf16 and routing of every row ->
     y [T / tp, He] bf16 of this rank's token block (post-expert norm and top-k sum applied)."""
@@ -81,6 +82,7 @@ def fused_rs_moe(
         expert_tp=True,
         fp4_w4a16=l in c.w4a16_layers,
         skip_routing_psum=skip_routing_psum,
+        group_sizes=group_sizes,
     )
 
 

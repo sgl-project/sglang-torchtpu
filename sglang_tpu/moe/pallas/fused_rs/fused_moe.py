@@ -102,7 +102,7 @@ def _stable_argsort_ids(ids: jax.Array, num_ids: int) -> jax.Array:
     return jnp.sort(key) & ((1 << bits) - 1)
 
 
-def _compute_rs_routing(topk_indices, *, num_experts, topk):
+def _compute_rs_routing(topk_indices, *, num_experts, topk, group_sizes=None):
     """Inline routing for the RS path.
 
     Computes:
@@ -125,11 +125,12 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
     """
     topk_indices_flat = topk_indices.flatten()
     topk_argsort_indices = _stable_argsort_ids(topk_indices_flat, num_experts)
-    expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
-    group_sizes = jnp.sum(
-        (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
-        axis=0,
-    )
+    if group_sizes is None:
+        expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
+        group_sizes = jnp.sum(
+            (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
+            axis=0,
+        )
     lhs_indices = topk_argsort_indices // topk
     topk_slot_indices = topk_argsort_indices % topk
     output_indices = lhs_indices
@@ -137,7 +138,12 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
 
 
 def _compute_expert_tp_routing(
-    topk_indices: jax.Array, *, num_experts: int, topk: int, ep_size: int
+    topk_indices: jax.Array,
+    *,
+    num_experts: int,
+    topk: int,
+    ep_size: int,
+    group_sizes: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Expert-TP routing over virtual experts ``shard * E + expert``.
 
@@ -148,7 +154,7 @@ def _compute_expert_tp_routing(
     rows over ``ep_size`` times as many experts.
     """
     lhs_real, group_sizes_real, _, slot_real = _compute_rs_routing(
-        topk_indices, num_experts=num_experts, topk=topk
+        topk_indices, num_experts=num_experts, topk=topk, group_sizes=group_sizes
     )
     real_order = lhs_real * topk + slot_real  # flat (token, slot), expert-sorted
     shards = jnp.arange(ep_size, dtype=jnp.int32)
@@ -280,6 +286,7 @@ def moe_gmm_local_rs_nodedup(
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
     skip_routing_psum: bool | None = None,
+    group_sizes: jax.Array | None = None,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -372,6 +379,9 @@ def moe_gmm_local_rs_nodedup(
                 num_experts=num_local_experts,
                 topk=topk,
                 ep_size=ep_size,
+                # the caller's per-expert counts of topk_indices (sequence-parallel callers
+                # count their own rows and all-gather the counts)
+                group_sizes=group_sizes,
             )
         )
     else:
