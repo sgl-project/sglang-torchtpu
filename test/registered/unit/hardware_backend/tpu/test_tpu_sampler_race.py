@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -6,7 +7,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.sampler import sampling_from_probs_torch
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang_tpu.sampler import sample_exponential_race
+from sglang_tpu.sampler import TpuSampler, sample_exponential_race
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -71,6 +72,66 @@ class TestExponentialRaceSampler(unittest.TestCase):
         draws = sample_exponential_race(torch.zeros(2, 8))
         self.assertEqual(tuple(draws.shape), (2,))
         self.assertTrue(bool(((draws >= 0) & (draws < 8)).all()))
+
+
+class TestTokenSynchronizationContract(unittest.TestCase):
+    def test_grammar_broadcast_preserves_input_alias_and_dtype(self):
+        from torch_tpu._internal import execution_mode
+
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                tokens = torch.tensor([91, 92, 93, 94], dtype=dtype)
+                alias = tokens
+
+                def receive(wire, src):
+                    self.assertEqual(wire.dtype, dtype)
+                    self.assertEqual(
+                        execution_mode.eager_mode, execution_mode.EagerMode.DEFER_NEVER
+                    )
+                    self.assertEqual(src, 0)
+                    wire.copy_(torch.tensor([7, 8, 9, 10], dtype=torch.int32))
+
+                group = SimpleNamespace(broadcast=Mock(side_effect=receive))
+                with (
+                    patch(
+                        "sglang_tpu.sampler.get_parallel",
+                        return_value=SimpleNamespace(tp_group=group),
+                    ),
+                    patch(
+                        "sglang_tpu.sampler.is_dp_attention_enabled", return_value=False
+                    ),
+                ):
+                    with execution_mode.set_eager_mode(
+                        execution_mode.EagerMode.DEFER_AND_FUSE
+                    ):
+                        TpuSampler._sync_token_ids_across_tp(
+                            None, tokens, SimpleNamespace(grammars=[object()])
+                        )
+                        self.assertEqual(
+                            execution_mode.eager_mode,
+                            execution_mode.EagerMode.DEFER_AND_FUSE,
+                        )
+                group.broadcast.assert_called_once()
+                self.assertIs(alias, tokens)
+                self.assertEqual(tokens.dtype, dtype)
+                self.assertEqual(alias.tolist(), [7, 8, 9, 10])
+
+    def test_grammar_only_dp_sync_remains_disabled(self):
+        tokens = torch.tensor([7], dtype=torch.int64)
+        group = SimpleNamespace(broadcast=Mock())
+        with (
+            patch("sglang_tpu.sampler.SYNC_TOKEN_IDS_ACROSS_TP", False),
+            patch(
+                "sglang_tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(attn_tp_group=group),
+            ),
+            patch("sglang_tpu.sampler.is_dp_attention_enabled", return_value=True),
+        ):
+            TpuSampler._sync_token_ids_across_tp(
+                None, tokens, SimpleNamespace(grammars=[object()])
+            )
+        group.broadcast.assert_not_called()
+        self.assertEqual(tokens.tolist(), [7])
 
 
 if __name__ == "__main__":

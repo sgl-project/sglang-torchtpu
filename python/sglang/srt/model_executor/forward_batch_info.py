@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.req_types import MultimodalInputs
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -589,6 +590,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attention_kv_len_lower_bound: Optional[int] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
+    # Host-only ownership tokens. Public rids may be reused after completion;
+    # each request/attempt owns a distinct handle object even if values match.
+    cache_request_handles: Optional[List[CacheRequestHandle]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -1109,6 +1113,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 and batch.sampling_info.has_watermark_candidates
                 else None
             ),
+            cache_request_handles=[req.cache_request_handle for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
