@@ -44,7 +44,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
 
     Outstanding work is the unscheduled tokens of waiting and partial
     requests plus the chunks launched into the pipeline whose results have
-    not come back. A lone prompt still splits into one chunk per stage; under
+    not come back. A lone prompt splits into ``spread`` chunks per stage; under
     load the chunks grow with the work already in flight. Every stage runs
     every chunk, so a costly chunk already in the pipeline lengthens the
     pipeline's fill and drain; under the lockstep wave the slowest forward of

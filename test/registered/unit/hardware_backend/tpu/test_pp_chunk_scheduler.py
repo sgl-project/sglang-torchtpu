@@ -100,6 +100,7 @@ def adder(model=None):
 def scheduler(
     waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0, spread=1.0
 ):
+    # Spread 1 (one step per stage), not the shipped default 2, unless a test passes it.
     return NS(
         _tpu_pp_chunk_cost=cost(),
         _tpu_pp_chunk_spread=spread,
