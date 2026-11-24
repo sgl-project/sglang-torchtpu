@@ -156,6 +156,94 @@ class TestMhcKernel(unittest.TestCase):
         self.assertClose(post, ref_post, 1e-5)
         self.assertClose(comb, ref_comb, 1e-5)
 
+    def test_scattered_slice_views_match_torch_path(self):
+        # Sequence-parallel prefill slices residual/x/gates via tensor_split
+        # (non-zero offsets, partial tails, empty_like buffers), eager and compiled.
+        norm = dict(out_norm_weight=tpu(self.norm_weight), out_norm_eps=RMS_EPS)
+        params = self.kernel_params()
+        tp = 8
+
+        for total_tokens, compiled in ((8192, False), (1597, True)):
+            full_res = torch.randn(
+                total_tokens, HC * HIDDEN, generator=self.gen
+            ).bfloat16()
+            full_out = torch.randn(total_tokens, HIDDEN, generator=self.gen).bfloat16()
+            full_ref_in, full_ref_comb, full_ref_post, _ = hc_pre(
+                full_res, *self.params(), **SITE
+            )
+            tpu_full = (
+                tpu(full_res),
+                tpu(full_out),
+                tpu(full_ref_post),
+                tpu(full_ref_comb),
+            )
+
+            for rank in (0, 1, 7):
+                with self.subTest(
+                    total_tokens=total_tokens, rank=rank, compiled=compiled
+                ):
+
+                    def run_rank(r_full, o_full, p_full, c_full, rk=rank):
+                        r, o, p, c = (
+                            t.tensor_split(tp)[rk]
+                            for t in (r_full, o_full, p_full, c_full)
+                        )
+                        o_empty = torch.empty_like(o)
+                        o_empty.copy_(o)
+                        li, cb, pt, f1 = kernel.hc_pre(
+                            x=r, **params, **KERNEL_SITE, hc_norm_weight=None, **norm
+                        )
+                        seam = kernel.hc_post_pre(
+                            x=o,
+                            residual=r,
+                            h_post=p,
+                            h_res=c,
+                            **params,
+                            **KERNEL_SITE,
+                            **norm,
+                        )
+                        last = kernel.hc_post(
+                            x=o_empty, residual=r, h_post=p, h_res=c, hc_mult=HC
+                        )
+                        return li, cb, pt, f1, seam, last
+
+                    fn = (
+                        torch.compile(
+                            run_rank, backend="tpu", fullgraph=True, dynamic=False
+                        )
+                        if compiled
+                        else run_rank
+                    )
+                    layer_in, comb, post, fused, seam, last = fn(*tpu_full)
+
+                    res_cpu, out_cpu, ref_in, ref_post, ref_comb = (
+                        t.tensor_split(tp)[rank]
+                        for t in (
+                            full_res,
+                            full_out,
+                            full_ref_in,
+                            full_ref_post,
+                            full_ref_comb,
+                        )
+                    )
+                    ref_res = hc_post(out_cpu, res_cpu, ref_post, ref_comb, hc_mult=HC)
+                    ref_in2, ref_comb2, ref_post2, _ = hc_pre(
+                        ref_res, *self.params(), **SITE
+                    )
+
+                    self.assertTrue(fused)
+                    self.assertIsNotNone(seam)
+                    layer_in2, new_res, comb2, post2, fused2 = seam
+                    self.assertTrue(fused2)
+                    self.assertClose(layer_in, self.ref_norm(ref_in), 4e-3)
+                    self.assertClose(post, ref_post, 1e-5)
+                    self.assertClose(comb, ref_comb, 1e-5)
+                    self.assertClose(new_res, ref_res, 4e-3)
+                    self.assertClose(layer_in2, self.ref_norm(ref_in2), 4e-3)
+                    self.assertClose(post2, ref_post2, 1e-4)
+                    self.assertClose(comb2, ref_comb2, 1e-4)
+                    self.assertClose(last, ref_res, 4e-3)
+
     def test_unsupported_sites_take_the_torch_path(self):
         res = tpu(torch.randn(4, HC * HIDDEN, generator=self.gen).bfloat16())
         self.assertFalse(supports_mhc_site(res.cpu(), HC))
