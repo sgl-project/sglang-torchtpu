@@ -28,6 +28,7 @@ def test_w9_m2m_env_defaults_and_ast_safety():
     for rel in (
         "sglang_tpu/muse_megakernel/decode/m2m/kernel.py",
         "sglang_tpu/muse_megakernel/decode/m2m/rep_kernel.py",
+        "sglang_tpu/muse_megakernel/decode/m2m/chip_sh_kernel.py",
         "sglang_tpu/muse_megakernel/decode/m2m/ops.py",
     ):
         src_txt = (_REPO_ROOT / rel).read_text()
@@ -73,6 +74,8 @@ def test_w9_m2m_in_specs_and_prewarm_lock_free():
         mock.patch("sglang_tpu.decode_qkv_epilogue_tpu.get_decode_rope_step_op", return_value=lambda *a: None),
         mock.patch.dict(m2m_ops._M2M_TOK_OPS, {}, clear=True),
         mock.patch.dict(m2m_ops._L0_TOK_OPS, {}, clear=True),
+        mock.patch.dict(m2m_ops._M2M_CHIP_OPS, {}, clear=True),
+        mock.patch.dict(m2m_ops._L0_CHIP_OPS, {}, clear=True),
         mock.patch.dict(m2m_ops._M2M_REP_OPS, {}, clear=True),
         mock.patch.dict(m2m_ops._L0_REP_OPS, {}, clear=True),
     ):
@@ -86,12 +89,16 @@ def test_w9_m2m_in_specs_and_prewarm_lock_free():
                     assert callable(m2m_ops.get_m2m_tok_sh_tp8_op(has_rope=r_flag, bf16_router=r16))
                     for tp in (8, 16):
                         assert callable(m2m_ops.get_l0_a2m_rep_op(tp, has_rope=r_flag, bf16_router=r16))
+                        assert callable(m2m_ops.get_l0_a2m_chip_sh_op(tp, has_rope=r_flag, bf16_router=r16))
                         for sh in (False, True):
                             assert callable(
                                 m2m_ops.get_m2m_rep_op(tp, sharded_moe_in=sh, has_rope=r_flag, bf16_router=r16)
                             )
+                            assert callable(
+                                m2m_ops.get_m2m_chip_sh_op(tp, sharded_moe_in=sh, has_rope=r_flag, bf16_router=r16)
+                            )
 
-    assert len(captured) == 4 + 4 + 2 * (4 + 8)
+    assert len(captured) == 4 + 4 + 2 * (4 + 8 + 4 + 8)
     for op_name, (n_params, in_specs, out_specs) in captured.items():
         assert in_specs is not None and len(in_specs) == n_params, (
             f"{op_name}: len(in_specs)={len(in_specs)} != n_params={n_params}"
@@ -314,12 +321,16 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
 
         from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
         from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+            attn_to_moe_chip_sharded_bridge_jax,
             attn_to_moe_tok_sharded_bridge_jax,
+            moe_to_attn_chip_sharded_bridge_jax,
             moe_to_attn_tok_sharded_bridge_jax,
         )
         from sglang_tpu.muse_megakernel.decode.m2m import (
             kv_write_batch_jax,
+            l0_a2m_chip_sh_jax,
             l0_a2m_rep_jax,
+            m2m_chip_sh_jax,
             m2m_rep_jax,
             m2m_tok_sh_tp8_jax,
         )
@@ -331,8 +342,16 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
         phys_rows, page_size = 256, 512
         n_pages_seq = 5
         num_pages = B * n_pages_seq + 4
-        kv_init = jax.device_put(
+        # Inject 0x7F (float8_e4m3fn NaN!) into unused pages (pg 0 and tail pages) to prove VREG V-sanitizer NaN immunity!
+        kv_raw_u8 = jax.lax.bitcast_convert_type(
             jnp.asarray(rng.normal(0, 0.2, (TP, num_pages, phys_rows, 1, 4, 128)).astype(np.float32), dtype=jnp.float8_e4m3fn),
+            jnp.uint8,
+        )
+        kv_raw_np = np.array(kv_raw_u8, copy=True)
+        kv_raw_np[:, 0, :, :, :, :] = 0x7F
+        kv_raw_np[:, 1 + 4, :, :, :, :] = 0x7F  # seq 0 unused page 4 filled with 0x7F NaN!
+        kv_init = jax.device_put(
+            jax.lax.bitcast_convert_type(jnp.asarray(kv_raw_np), jnp.float8_e4m3fn),
             NamedSharding(mesh8, P("model")),
         )
         n_act = 6
@@ -394,12 +413,18 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             )
             return st_f, lg, ei, kvu[None]
 
+        from jax.experimental.pallas import tpu as pltpu
+        nan_interp = pltpu.InterpretParams(
+            detect_races=False, uninitialized_memory="nan"
+        )
+
         def _cand(*a):
             st_f, lg, ei, kvu = m2m_tok_sh_tp8_jax(
                 *a[23:], *a[:13], a[13][0], *a[14:19], a[19][0], a[20][0], a[21], a[22],
                 world_size=TP, post_ff_eps=1e-5, post_ff_scale_input=True,
                 query_scale=1.25, sm_scale=0.125, sliding_window=2048,
-                kv_pack_dense2=True, pa_eps=1e-8, router_multiplier=1.5, interpret=True,
+                kv_pack_dense2=True, pa_eps=1e-8, router_multiplier=1.5,
+                interpret=nan_interp,
             )
             return st_f, lg, ei, kvu[None]
 
@@ -414,7 +439,111 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
             np.asarray(jax.lax.bitcast_convert_type(r_kv, jnp.uint8)),
         )
 
-        # Verify tpu7x:2x2x2 TP=16 AOT compiles with 0 inter-kernel KV HLO copies!
+        # Also verify R1 chip-sharded M2M (`[B // 4, 8192]`) 0-ULP bit-exact parity (with 0x7F NaNs in KV cache)!
+        st_chip = jax.device_put(
+            jnp.asarray(np.repeat(rng.normal(0, 0.1, (4, B // 4, H)).astype(np.float32), 2, axis=0).reshape(TP * (B // 4), H)),
+            NamedSharding(mesh8, P("model", None)),
+        )
+        def _ref_chip(*a):
+            st_m, q5, kvm, g_o = moe_to_attn_chip_sharded_bridge_jax(
+                *a[:13], world_size=TP, sharded_moe_in=True, post_ff_eps=1e-5, post_ff_scale_input=True,
+                fuse_qkv_epi=True, query_scale=1.25, k_scale=1.0, v_scale=1.0, interpret=True,
+            )
+            gd, kvu = run_decode_fast_rpa(
+                q5, kvm, None, a[13][0], *a[23:], sm_scale=0.125, sliding_window=2048,
+                k_scale=1.0, v_scale=1.0, mode_str="w8,pbf16,noz,batchfull",
+                fused_out_pack=2, prepared_inputs=True, gate=g_o, out_norm_eps=1e-5,
+                kv_pack_dense2=True, interpret=True,
+            )
+            st_f, lg, ei = attn_to_moe_chip_sharded_bridge_jax(
+                st_m, gd, *a[14:19], a[19][0], a[20][0], a[21], a[22],
+                world_size=TP, pa_eps=1e-8, router_multiplier=1.5, interpret=True,
+            )
+            return st_f, lg, ei, kvu[None]
+
+        def _cand_chip(*a):
+            st_f, lg, ei, kvu = m2m_chip_sh_jax(
+                *a[23:], *a[:13], a[13][0], *a[14:19], a[19][0], a[20][0], a[21], a[22],
+                world_size=TP, sharded_moe_in=True, post_ff_eps=1e-5, post_ff_scale_input=True,
+                query_scale=1.25, sm_scale=0.125, sliding_window=2048,
+                kv_pack_dense2=True, pa_eps=1e-8, router_multiplier=1.5,
+                interpret=nan_interp,
+            )
+            return st_f, lg, ei, kvu[None]
+
+        args_chip = (st_chip, *args[1:])
+        rc_st, rc_lg, rc_ei, rc_kv = jax.jit(jax.shard_map(_ref_chip, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_chip)
+        cc_st, cc_lg, cc_ei, cc_kv = jax.jit(jax.shard_map(_cand_chip, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_chip)
+        assert not np.isnan(np.asarray(cc_st)).any() and not np.isnan(np.asarray(cc_ei, dtype=np.float32)).any()
+        np.testing.assert_array_equal(np.asarray(cc_st), np.asarray(rc_st))
+        np.testing.assert_array_equal(np.asarray(cc_lg), np.asarray(rc_lg))
+        np.testing.assert_array_equal(np.asarray(cc_ei, dtype=np.float32), np.asarray(rc_ei, dtype=np.float32))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(cc_kv, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(rc_kv, jnp.uint8)),
+        )
+
+        # Also exercise `_fast_uniform_path` (`n_act == 64`, `w_pg == 2`, 4-seq static-slot `@pl.loop(0, 15)`)!
+        kvl_u = jnp.asarray(520 + (np.arange(B, dtype=np.int32) * 7) % 480)
+        cuq_u = jnp.arange(B + 1, dtype=np.int32)
+        dst_u = jnp.array([B, B, B], dtype=jnp.int32)
+        args_u = (*args_chip[:23], kvl_u, pgi, cuq_u, cukv, dst_u)
+        ru_st, ru_lg, ru_ei, ru_kv = jax.jit(jax.shard_map(_ref_chip, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_u)
+        cu_st, cu_lg, cu_ei, cu_kv = jax.jit(jax.shard_map(_cand_chip, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_u)
+        assert not np.isnan(np.asarray(cu_st)).any() and not np.isnan(np.asarray(cu_ei, dtype=np.float32)).any()
+        np.testing.assert_array_equal(np.asarray(cu_st), np.asarray(ru_st))
+        np.testing.assert_array_equal(np.asarray(cu_lg), np.asarray(ru_lg))
+        np.testing.assert_array_equal(np.asarray(cu_ei, dtype=np.float32), np.asarray(ru_ei, dtype=np.float32))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(cu_kv, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ru_kv, jnp.uint8)),
+        )
+
+        # Also verify `nod2` Full-attention (`sliding_window=None`, `hoistkv`) with `uninitialized_memory="nan"`!
+        kv_nod2 = jax.device_put(
+            jax.lax.bitcast_convert_type(jnp.asarray(kv_raw_np), jnp.float8_e4m3fn),
+            NamedSharding(mesh8, P("model")),
+        )
+        cukv_nod2 = jnp.arange(B + 1, dtype=jnp.int32) * (n_pages_seq * phys_rows)
+        kvl_nod2 = jnp.asarray([1, 2, 3, 257, 512, 769] + [0] * (B - n_act), dtype=jnp.int32)
+        args_nod2 = (*args_chip[:13], kv_nod2, *args_chip[14:23], kvl_nod2, pgi, cuq, cukv_nod2, dst)
+        def _ref_nod2(*a):
+            st_m, q5, kvm, g_o = moe_to_attn_chip_sharded_bridge_jax(
+                *a[:13], world_size=TP, sharded_moe_in=True, post_ff_eps=1e-5, post_ff_scale_input=True,
+                fuse_qkv_epi=True, query_scale=1.25, k_scale=1.0, v_scale=1.0, interpret=True,
+            )
+            gd, kvu = run_decode_fast_rpa(
+                q5, kvm, None, a[13][0], *a[23:], sm_scale=0.125, sliding_window=None,
+                k_scale=1.0, v_scale=1.0, mode_str="w8,pbf16,noz,batchfull",
+                fused_out_pack=2, prepared_inputs=True, gate=g_o, out_norm_eps=1e-5,
+                kv_pack_dense2=False, interpret=True,
+            )
+            st_f, lg, ei = attn_to_moe_chip_sharded_bridge_jax(
+                st_m, gd, *a[14:19], a[19][0], a[20][0], a[21], a[22],
+                world_size=TP, pa_eps=1e-8, router_multiplier=1.5, interpret=True,
+            )
+            return st_f, lg, ei, kvu[None]
+        def _cand_nod2(*a):
+            st_f, lg, ei, kvu = m2m_chip_sh_jax(
+                *a[23:], *a[:13], a[13][0], *a[14:19], a[19][0], a[20][0], a[21], a[22],
+                world_size=TP, sharded_moe_in=True, post_ff_eps=1e-5, post_ff_scale_input=True,
+                query_scale=1.25, sm_scale=0.125, sliding_window=None,
+                kv_pack_dense2=False, pa_eps=1e-8, router_multiplier=1.5,
+                interpret=nan_interp,
+            )
+            return st_f, lg, ei, kvu[None]
+        rn_st, rn_lg, rn_ei, rn_kv = jax.jit(jax.shard_map(_ref_nod2, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_nod2)
+        cn_st, cn_lg, cn_ei, cn_kv = jax.jit(jax.shard_map(_cand_nod2, mesh=mesh8, in_specs=in_sp, out_specs=out_sp, check_vma=False))(*args_nod2)
+        assert not np.isnan(np.asarray(cn_st)).any() and not np.isnan(np.asarray(cn_ei, dtype=np.float32)).any()
+        np.testing.assert_array_equal(np.asarray(cn_st), np.asarray(rn_st))
+        np.testing.assert_array_equal(np.asarray(cn_lg), np.asarray(rn_lg))
+        np.testing.assert_array_equal(np.asarray(cn_ei, dtype=np.float32), np.asarray(rn_ei, dtype=np.float32))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(cn_kv, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(rn_kv, jnp.uint8)),
+        )
+
+        # Verify tpu7x:2x2x2 TP=16 AOT compiles with ZERO KV HLO copies (`0` `copy.*body_refs`)!
         dev16 = get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
         tmesh16 = Mesh(np.array(sorted(dev16, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
         sp_kv16 = P("model", None, None, None, None)
@@ -448,8 +577,9 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
         comp = jax.jit(step16, donate_argnums=(27,), out_shardings=(NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, P()), NamedSharding(tmesh16, sp_kv16))).lower(*a16).compile()
         hlo = comp.as_text()
         kv_copies = [ln for ln in hlo.splitlines() if " copy(" in ln and "[256,512,1,4,128]" in ln]
-        # At most 2 entry/exit boundary layout copies across 2 chained layers (0 inter-kernel copies!)
-        assert len(kv_copies) <= 2, f"Expected <= 2 boundary copies across 2 layers, got {len(kv_copies)}"
+        body_ref_copies = [ln for ln in hlo.splitlines() if " copy(" in ln and "body_refs" in ln]
+        assert len(kv_copies) == 0, f"Expected ZERO KV pool copies across 2 layers, got {len(kv_copies)}: {kv_copies}"
+        assert len(body_ref_copies) == 0, f"Expected ZERO body_refs copies, got {body_ref_copies}"
 
         # Also verify ops.py TorchTPU StableHLO export (_jax_placeholders + wrapped.exported) end-to-end!
         from unittest import mock
@@ -527,7 +657,7 @@ def test_w9_m2m_tp8_and_tp16_interpret_and_aot_subproc():
         env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=480,
         check=False,
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

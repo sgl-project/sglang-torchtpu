@@ -31,6 +31,7 @@ from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
     _load_new_kv_1row_f32,
     _load_new_kv_1row_u16,
     _roll_lanes_fast,
+    _u8_to_fp8,
 )
 from sglang_tpu.attention.pallas.util import align_to, cdiv
 from sglang_tpu.kernels.decode_collective_bridges import (
@@ -207,8 +208,8 @@ def _run_in_vmem_rpad_and_gate(
     distribution_ref,
     q_vmem_ref,  # bf16[B, 16, 128]
     kv_merged_vmem_ref,  # fp8[B_pad32, 1, 4, 128]
-    kv_cache_ro_hbm,  # fp8[num_pages, phys_page_rows, 1, 4, 128]
-    kv_cache_out_hbm,  # aliased HBM output (in-place overlapped scatter!)
+    kv_cache_ro_hbm,  # fp8[num_pages, phys_page_rows, 1, 4, 128] (read-only inside M2M!)
+    out_kvw_rows_ref,  # VMEM output fp8[B, 1, 4, 128] scattered by _kvw_1layer_jax (0 HLO copies!)
     bkv_vmem_ref,  # fp8[num_slots, max_ring_pages, phys_page_rows, 1, 4, 128]
     o_vmem_ref,  # bf16[B, 16, 128]
     next_in_vmem,  # bf16[B, 8192]
@@ -217,10 +218,8 @@ def _run_in_vmem_rpad_and_gate(
     next_s_gate_ref,  # f32[1, 1024]
     gate_vmem_ref,  # bf16[B, 1024]
     gated_vmem_ref,  # bf16[B, 1024]
-    kvw_rows_vmem_ref,  # fp8[B, 1, 4, 128]
     rpa_smem_ref,  # i32[2 + 2 * num_slots]
     bkv_sems,
-    kvw_out_sem,
     *,
     sm_scale: float,
     sliding_window: int | None,
@@ -234,8 +233,10 @@ def _run_in_vmem_rpad_and_gate(
     pv_bf16: bool = True,
     interpret_mode: bool = False,
     on_rpad_kv_done_fn=None,
+    init_sv_vmem_ref=None,
+    unroll_quad: bool = False,
 ) -> None:
-    """In-VMEM single-token `RPAd` (`4`-seq quad + static fetch + overlapped KV write) + `W_gate`."""
+    """In-VMEM single-token `RPAd` (`4`-seq unrolled quad + VREG V-san + hoisted new-KV) + `W_gate`."""
     import jax
     import jax.numpy as jnp
     from jax import lax
@@ -272,6 +273,39 @@ def _run_in_vmem_rpad_and_gate(
             page_size=page_size,
             num_slots=num_slots,
         )
+
+    if init_sv_vmem_ref is not None and sliding_window is None:
+        b_pad = kv_merged_vmem_ref.shape[0]
+        step_b = 32 if max_num_tokens >= 32 else max_num_tokens
+        for b0 in range(0, max_num_tokens, step_b):
+            cur_b = min(step_b, max_num_tokens - b0)
+            if cur_b <= 0:
+                break
+            if interpret_mode:
+                blk = kv_merged_vmem_ref[pl.ds(b0, step_b)].reshape(step_b, 4, 128)
+                u8 = lax.bitcast_convert_type(blk, jnp.uint8)
+                u32 = u8[:, 0, :].astype(jnp.uint32) | (
+                    u8[:, 1, :].astype(jnp.uint32) << 8
+                )
+            else:
+                u32_ref = kv_merged_vmem_ref.bitcast(jnp.uint32).reshape(b_pad, 128)
+                u32 = u32_ref[pl.ds(b0, step_b)]
+            k_f32 = _u8_to_fp8(
+                u32.astype(jnp.uint8), interpret_mode=interpret_mode
+            ).astype(jnp.float32)
+            v_f32 = (
+                _u8_to_fp8(
+                    (u32 >> 8).astype(jnp.uint8), interpret_mode=interpret_mode
+                ).astype(jnp.float32)
+                * v_scale_val
+            )
+            q_blk = q_vmem_ref[pl.ds(b0, cur_b)].astype(jnp.float32)
+            s_blk = _broadcast_minor_128(
+                jnp.sum(q_blk * k_f32[:cur_b, None, :], axis=2, keepdims=True)
+            )
+            v_blk = jnp.broadcast_to(v_f32[:cur_b, None, :], (cur_b, 16, 128))
+            init_sv_vmem_ref[0, pl.ds(b0, cur_b)] = s_blk
+            init_sv_vmem_ref[1, pl.ds(b0, cur_b)] = v_blk
 
     first_inactive_row = cu_q_lens_ref[n_active]
 
@@ -314,189 +348,28 @@ def _run_in_vmem_rpad_and_gate(
         )
         return u32_ref[pg_idx]
 
-    def _set_page_u32(slot, pg_idx, val_u32):
+    def _mask_v_fp8_vregs(v_f8, valid_mask):
         if interpret_mode:
-            if kv_pack_dense2:
-                b0 = val_u32.astype(jnp.uint8)
-                b1 = (val_u32 >> 8).astype(jnp.uint8)
-                b2 = (val_u32 >> 16).astype(jnp.uint8)
-                b3 = (val_u32 >> 24).astype(jnp.uint8)
-                packed = jnp.stack([b0, b1, b2, b3], axis=1)[:, None, :, :]
-            else:
-                k_u8 = val_u32.astype(jnp.uint8)
-                v_u8 = (val_u32 >> 8).astype(jnp.uint8)
-                z_u8 = jnp.zeros((phys_page_rows, 128), jnp.uint8)
-                packed = jnp.stack([k_u8, v_u8, z_u8, z_u8], axis=1)[:, None, :, :]
-            bkv_vmem_ref[slot, pg_idx] = lax.bitcast_convert_type(
-                packed, jnp.float8_e4m3fn
+            v_u8 = lax.bitcast_convert_type(v_f8, jnp.uint8)
+            return lax.bitcast_convert_type(
+                jnp.where(valid_mask, v_u8, jnp.uint8(0)), jnp.float8_e4m3fn
             )
-            return
-        u32_ref = (
-            bkv_vmem_ref.bitcast(jnp.uint32)
-            .at[slot]
-            .reshape(max_ring_pages, phys_page_rows, 128)
+        v_u8 = pltpu.bitcast(v_f8, jnp.uint8)
+        return pltpu.bitcast(
+            jnp.where(valid_mask, v_u8, jnp.uint8(0)), jnp.float8_e4m3fn
         )
-        u32_ref[pg_idx] = val_u32
 
-    def _mask_slice_u32(blk_u32, off_r: int, n_rows: int, lo, hi):
-        r_pg = off_r + lax.broadcasted_iota(jnp.int32, (n_rows, 128), 0)
+    if not kv_pack_dense2:
+        if out_kvw_rows_ref is not kv_merged_vmem_ref:
+            out_kvw_rows_ref[...] = kv_merged_vmem_ref[pl.ds(0, max_num_tokens)]
+    else:
+        out_kvw_rows_ref[...] = jnp.zeros_like(out_kvw_rows_ref[...])
+
+    def _record_kv_write_uncond(seq, q_row, _w_cur, kv_len, slot, prev_loc_tok):
+        """Stage 512B `dense2` pair row into `out_kvw_rows_ref[q_row]` (`nod2` is 0-op!)."""
         if not kv_pack_dense2:
-            return jnp.where(
-                (r_pg >= lo) & (r_pg < hi),
-                blk_u32,
-                jnp.zeros((n_rows, 128), jnp.uint32),
-            )
-        e_idx = 2 * r_pg
-        o_idx = e_idx + 1
-        e_m = jnp.where(
-            (e_idx >= lo) & (e_idx < hi), jnp.uint32(0x0000FFFF), jnp.uint32(0)
-        )
-        o_m = jnp.where(
-            (o_idx >= lo) & (o_idx < hi), jnp.uint32(0xFFFF0000), jnp.uint32(0)
-        )
-        return blk_u32 & (e_m | o_m)
-
-    def _sanitize_page_u32(slot, pg_idx, lo, hi):
-        if interpret_mode or phys_page_rows <= 128:
-            _set_page_u32(
-                slot,
-                pg_idx,
-                _mask_slice_u32(
-                    _get_page_u32(slot, pg_idx), 0, phys_page_rows, lo, hi
-                ),
-            )
             return
-        u32_flat = (
-            bkv_vmem_ref.bitcast(jnp.uint32)
-            .at[slot]
-            .reshape(max_ring_pages * phys_page_rows, 128)
-        )
-        base_r = pg_idx * phys_page_rows
-        for sub_i in range(phys_page_rows // 128):
-            row_off = sub_i * 128
-            src_off = pl.multiple_of(base_r + row_off, 128)
-            blk = u32_flat[pl.ds(src_off, 128)]
-            u32_flat[pl.ds(src_off, 128)] = _mask_slice_u32(
-                blk, row_off, 128, lo, hi
-            )
-
-    def _zero_pages_u32(slot, start_pg, end_pg: int):
-        if interpret_mode:
-            z_f8 = jnp.zeros_like(bkv_vmem_ref[0, 0])
-            lax.fori_loop(
-                start_pg,
-                end_pg,
-                lambda p_i, _: bkv_vmem_ref.__setitem__((slot, p_i), z_f8),
-                None,
-            )
-            return
-        if end_pg <= 8:
-            if phys_page_rows <= 128:
-                z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
-                for p_i in range(end_pg):
-
-                    @pl.when(p_i >= start_pg)
-                    def _(p_i=p_i):
-                        _set_page_u32(slot, p_i, z_pg)
-
-                return
-            u32_flat = (
-                bkv_vmem_ref.bitcast(jnp.uint32)
-                .at[slot]
-                .reshape(max_ring_pages * phys_page_rows, 128)
-            )
-            n_subs = phys_page_rows // 128
-            z_128 = jnp.zeros((128, 128), jnp.uint32)
-            for p_i in range(end_pg):
-
-                @pl.when(p_i >= start_pg)
-                def _(p_i=p_i):
-                    for sub_i in range(n_subs):
-                        s_i = p_i * n_subs + sub_i
-                        u32_flat[pl.ds(pl.multiple_of(s_i * 128, 128), 128)] = z_128
-
-            return
-        if phys_page_rows <= 128:
-            z_pg = jnp.zeros((phys_page_rows, 128), jnp.uint32)
-            lax.fori_loop(
-                start_pg,
-                end_pg,
-                lambda p_i, _: _set_page_u32(slot, p_i, z_pg),
-                None,
-            )
-            return
-        u32_flat = (
-            bkv_vmem_ref.bitcast(jnp.uint32)
-            .at[slot]
-            .reshape(max_ring_pages * phys_page_rows, 128)
-        )
-        n_subs = phys_page_rows // 128
-        z_128 = jnp.zeros((128, 128), jnp.uint32)
-        lax.fori_loop(
-            start_pg * n_subs,
-            end_pg * n_subs,
-            lambda s_i, _: u32_flat.__setitem__(
-                pl.ds(pl.multiple_of(s_i * 128, 128), 128), z_128
-            ),
-            None,
-        )
-
-    def _sanitize_slot_lazy(
-        slot, rel_first, rel_end, active_pages: int, *, skip_lazy_zero: bool = False
-    ):
-        n_pg = (rel_end + page_size - 1) // page_size
-        last_p = (
-            0
-            if active_pages == 1
-            else jnp.clip(n_pg - 1, 0, active_pages - 1)
-        )
-        if sliding_window is not None and active_pages * page_size >= sliding_window:
-            _sanitize_page_u32(slot, 0, rel_first, rel_end)
-        if not skip_lazy_zero:
-            hwm_b0 = rpa_smem_ref[2 + slot]
-            start_b0 = jnp.maximum(n_pg, hwm_b0)
-
-            @pl.when(start_b0 < active_pages)
-            def _lazy_zero():
-                _zero_pages_u32(slot, start_b0, active_pages)
-
-            rpa_smem_ref[2 + slot] = jnp.maximum(
-                hwm_b0, jnp.maximum(n_pg, active_pages)
-            )
-        last_lo = jnp.where(last_p == 0, rel_first, 0)
-        last_hi = jnp.clip(rel_end - last_p * page_size, 0, page_size)
-        _sanitize_page_u32(slot, last_p, last_lo, last_hi)
-
-    def _issue_kv_row_dma(w_cur, raw_pg, eff_pg, r_in_pg):
-        if kv_cache_out_hbm.ndim == 6:
-            dst_sl = kv_cache_out_hbm.at[
-                raw_pg, layer_offset_in_bundle, pl.ds(r_in_pg, 1)
-            ]
-        else:
-            dst_sl = kv_cache_out_hbm.at[eff_pg, pl.ds(r_in_pg, 1)]
-        pltpu.make_async_copy(
-            kvw_rows_vmem_ref.at[pl.ds(w_cur, 1)],
-            dst_sl,
-            kvw_out_sem.at[0],
-        ).start()
-
-    def _record_kv_write_uncond(seq, q_row, w_cur, kv_len, slot, prev_loc_tok):
-        """Branchless 512B KV row stage + overlapped HBM scatter (used when `active` is guaranteed)."""
-        seq_base = cdiv(cu_kv_lens_ref[seq], page_size)
         pos = kv_len - 1
-        pg_off = seq_base + (pos // page_size)
-        raw_pg = page_indices_ref[jnp.minimum(pg_off, num_page_indices - 1)]
-        eff_pg = (
-            raw_pg * layer_num_in_bundle + layer_offset_in_bundle
-            if layer_num_in_bundle > 1
-            else raw_pg
-        )
-        if not kv_pack_dense2:
-            r_in_pg = pos % page_size
-            kvw_rows_vmem_ref[pl.ds(w_cur, 1)] = kv_merged_vmem_ref[pl.ds(q_row, 1)]
-            _issue_kv_row_dma(w_cur, raw_pg, eff_pg, r_in_pg)
-            return
-
         pair_r = (pos % page_size) // 2
         u16_new = _load_new_kv_1row_u16(
             kv_merged_vmem_ref, q_row, interpret_mode=interpret_mode
@@ -547,26 +420,25 @@ def _run_in_vmem_rpad_and_gate(
                 jnp.stack([b0, b1, b2, b3], axis=1)[:, None, :, :],
                 jnp.float8_e4m3fn,
             )
-            kvw_rows_vmem_ref[pl.ds(w_cur, 1)] = row_f8
+            out_kvw_rows_ref[pl.ds(q_row, 1)] = row_f8
         else:
-            aligned8 = (w_cur // 8) * 8
-            sub8 = w_cur - aligned8
-            u32_w = kvw_rows_vmem_ref.bitcast(jnp.uint32).reshape(-1, 128)
+            aligned8 = (q_row // 8) * 8
+            sub8 = q_row - aligned8
+            u32_w = out_kvw_rows_ref.bitcast(jnp.uint32).reshape(-1, 128)
             cur8 = u32_w[pl.ds(pl.multiple_of(aligned8, 8), 8)]
             r_io = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
             u32_w[pl.ds(pl.multiple_of(aligned8, 8), 8)] = jnp.where(
                 r_io == sub8, jnp.broadcast_to(packed_1x128, (8, 128)), cur8
             )
-        _issue_kv_row_dma(w_cur, raw_pg, eff_pg, pair_r)
 
     def _record_kv_write(seq, q_row, active, kv_len, slot, prev_loc_tok):
-        """Stage 512B KV row in VMEM (with VMEM RMW on odd `dense2`) & start overlapped HBM scatter."""
+        """Stage 512B `dense2` pair row in `out_kvw_rows_ref` when `active` (`nod2` is 0-op!)."""
+        if not kv_pack_dense2:
+            return
 
         @pl.when(active)
         def _():
-            w_cur = rpa_smem_ref[0]
-            rpa_smem_ref[0] = w_cur + 1
-            _record_kv_write_uncond(seq, q_row, w_cur, kv_len, slot, prev_loc_tok)
+            _record_kv_write_uncond(seq, q_row, q_row, kv_len, slot, prev_loc_tok)
 
     def _compute_seq(
         slot,
@@ -575,25 +447,24 @@ def _run_in_vmem_rpad_and_gate(
         rel_first,
         rel_end,
         n_slot_pages: int,
-        *,
-        skip_lazy_zero: bool = False,
     ):
-        k_new_f32, v_new_f32 = _load_new_kv_1row_f32(
-            kv_merged_vmem_ref, q_row, interpret_mode=interpret_mode
-        )
-        q_f32 = q_bf16.astype(jnp.float32)
-        s_new = _broadcast_minor_128(
-            jnp.sum(
-                q_f32 * jnp.broadcast_to(k_new_f32, (16, 128)),
-                axis=1,
-                keepdims=True,
+        if init_sv_vmem_ref is not None and sliding_window is None:
+            s_new = init_sv_vmem_ref[0, q_row]
+            acc0 = init_sv_vmem_ref[1, q_row]
+        else:
+            k_new_f32, v_new_f32 = _load_new_kv_1row_f32(
+                kv_merged_vmem_ref, q_row, interpret_mode=interpret_mode
             )
-        )
-        acc0 = jnp.broadcast_to(v_new_f32, (16, 128)) * v_scale_val
+            q_f32 = q_bf16.astype(jnp.float32)
+            s_new = _broadcast_minor_128(
+                jnp.sum(
+                    q_f32 * jnp.broadcast_to(k_new_f32, (16, 128)),
+                    axis=1,
+                    keepdims=True,
+                )
+            )
+            acc0 = jnp.broadcast_to(v_new_f32, (16, 128)) * v_scale_val
         w_tot = n_slot_pages * page_size
-        _sanitize_slot_lazy(
-            slot, rel_first, rel_end, n_slot_pages, skip_lazy_zero=skip_lazy_zero
-        )
 
         if kv_pack_dense2 and w_tot >= 512 and (w_tot % 256 == 0):
             half_w = w_tot // 2
@@ -645,6 +516,21 @@ def _run_in_vmem_rpad_and_gate(
                 page_size=page_size,
                 interpret_mode=interpret_mode,
             )
+            r_hw = lax.broadcasted_iota(jnp.int32, (half_w, 128), 0)
+            r_ve = 2 * r_hw
+            r_vo = r_ve + 1
+            valid_ve = (
+                (r_ve >= rel_first) & (r_ve < rel_end)
+                if sliding_window is not None
+                else (r_ve < rel_end)
+            )
+            valid_vo = (
+                (r_vo >= rel_first) & (r_vo < rel_end)
+                if sliding_window is not None
+                else (r_vo < rel_end)
+            )
+            v_e = _mask_v_fp8_vregs(v_e, valid_ve)
+            v_o = _mask_v_fp8_vregs(v_o, valid_vo)
             pe_dot = p_e.astype(jnp.bfloat16) if pv_bf16 else p_e
             po_dot = p_o.astype(jnp.bfloat16) if pv_bf16 else p_o
             pv = jnp.matmul(pe_dot, v_e, preferred_element_type=jnp.float32) + jnp.matmul(
@@ -691,6 +577,23 @@ def _run_in_vmem_rpad_and_gate(
             kv_pack_dense2=kv_pack_dense2,
             interpret_mode=interpret_mode,
         )
+        v_row_idx = lax.broadcasted_iota(jnp.int32, (w_tot, 128), 0)
+        if kv_pack_dense2:
+            # _load_bkv_fp8_chunk(d2) returns [even_rows, odd_rows] stacked along axis 0!
+            half_w_c = w_tot // 2
+            v_tok_idx = jnp.where(
+                v_row_idx < half_w_c,
+                2 * v_row_idx,
+                2 * (v_row_idx - half_w_c) + 1,
+            )
+        else:
+            v_tok_idx = v_row_idx
+        valid_v = (
+            (v_tok_idx >= rel_first) & (v_tok_idx < rel_end)
+            if sliding_window is not None
+            else (v_tok_idx < rel_end)
+        )
+        v_all = _mask_v_fp8_vregs(v_all, valid_v)
         p_dot = p_all.astype(jnp.bfloat16) if pv_bf16 else p_all
         pv = jnp.matmul(p_dot, v_all, preferred_element_type=jnp.float32)
         if v_scale_val != 1.0:
@@ -717,14 +620,30 @@ def _run_in_vmem_rpad_and_gate(
         )
 
     init_bounds = (jnp.int32(0), jnp.int32(1 << 29), jnp.bool_(True))
-    if max_num_seqs <= 64:
+    if max_num_seqs <= 128:
         max_re_b, min_re_b, all_act_b = init_bounds
+        q_prev = cu_q_lens_ref[0]
+        kv_prev = cu_kv_lens_ref[0]
         for s_i in range(max_num_seqs):
             in_b_s = s_i < n_active
-            nx_mx, nx_mn, nx_aa = _scan_bounds(s_i, (max_re_b, min_re_b, all_act_b))
-            max_re_b = jnp.where(in_b_s, nx_mx, max_re_b)
-            min_re_b = jnp.where(in_b_s, nx_mn, min_re_b)
-            all_act_b = jnp.where(in_b_s, nx_aa, jnp.bool_(False))
+            q_next = cu_q_lens_ref[s_i + 1]
+            kv_next = cu_kv_lens_ref[s_i + 1]
+            kvl_s = kv_lens_ref[s_i]
+            act_s = (q_next - q_prev == 1) & (kv_next > kv_prev) & (kvl_s > 0)
+            q_prev = q_next
+            kv_prev = kv_next
+            cache_s = kvl_s - jnp.int32(1)
+            if sliding_window is not None:
+                fk_s = jnp.maximum(
+                    cache_s - jnp.int32(sliding_window - 1), jnp.int32(0)
+                )
+                bs_s = (fk_s // page_size) * page_size
+            else:
+                bs_s = jnp.int32(0)
+            re_s = jnp.where(act_s, jnp.maximum(cache_s - bs_s, jnp.int32(0)), jnp.int32(0))
+            max_re_b = jnp.where(in_b_s & act_s, jnp.maximum(max_re_b, re_s), max_re_b)
+            min_re_b = jnp.where(in_b_s & act_s, jnp.minimum(min_re_b, re_s), min_re_b)
+            all_act_b = jnp.where(in_b_s, all_act_b & act_s, jnp.bool_(False))
     else:
         max_re_b, min_re_b, all_act_b = lax.fori_loop(
             0, n_active, _scan_bounds, init_bounds
@@ -750,10 +669,9 @@ def _run_in_vmem_rpad_and_gate(
 
             @pl.when(is_fast_uniform)
             def _fast_uniform_path():
-                def _consume_fast(seq):
-                    slot = seq & jnp.int32(3)
-                    dst = bkv_vmem_ref.at[slot, pl.ds(0, w_pg)]
-                    pltpu.make_async_copy(dst, dst, bkv_sems.at[slot]).wait()
+                def _consume_slot_static(seq, slot_c: int):
+                    dst = bkv_vmem_ref.at[slot_c, pl.ds(0, w_pg)]
+                    pltpu.make_async_copy(dst, dst, bkv_sems.at[slot_c]).wait()
                     kvl = kv_lens_ref[seq]
                     cache_kv = kvl - jnp.int32(1)
                     if sliding_window is not None:
@@ -766,22 +684,17 @@ def _run_in_vmem_rpad_and_gate(
                         bs = jnp.int32(0)
                     rf = fk - bs
                     re = cache_kv - bs
-                    _record_kv_write_uncond(seq, seq, seq, kvl, slot, re - 1)
+                    _record_kv_write_uncond(seq, seq, seq, kvl, slot_c, re - 1)
                     o_vmem_ref[seq] = _compute_seq(
-                        slot,
+                        slot_c,
                         q_vmem_ref[seq],
                         seq,
                         rf,
                         re,
                         w_pg,
-                        skip_lazy_zero=True,
                     )
 
-                @pl.loop(0, max_num_seqs - 4)
-                def _steady_step(seq):
-                    slot = seq & jnp.int32(3)
-                    _consume_fast(seq)
-                    fut_seq = seq + 4
+                def _prefetch_slot_static(fut_seq, slot_c: int):
                     kvl_f = kv_lens_ref[fut_seq]
                     cache_kv_f = kvl_f - jnp.int32(1)
                     bs_f = (
@@ -804,13 +717,107 @@ def _run_in_vmem_rpad_and_gate(
                         pg = page_indices_ref[pg_idx]
                         pltpu.make_async_copy(
                             kv_cache_ro_hbm.at[pl.ds(pg, 1)],
-                            bkv_vmem_ref.at[slot, pl.ds(i, 1)],
-                            bkv_sems.at[slot],
+                            bkv_vmem_ref.at[slot_c, pl.ds(i, 1)],
+                            bkv_sems.at[slot_c],
                         ).start()
 
-                @pl.loop(max_num_seqs - 4, max_num_seqs)
-                def _drain_step(seq):
-                    _consume_fast(seq)
+                if unroll_quad and w_pg <= 2:
+                    n_quads = max_num_seqs // 4
+
+                    @pl.loop(0, n_quads - 1)
+                    def _quad_steady(q_idx):
+                        base_seq = q_idx * 4
+                        for slot_c in range(4):
+                            seq_c = base_seq + slot_c
+                            _consume_slot_static(seq_c, slot_c)
+                            _prefetch_slot_static(seq_c + 4, slot_c)
+
+                    tail_base = max_num_seqs - 4
+                    for slot_c in range(4):
+                        _consume_slot_static(tail_base + slot_c, slot_c)
+                else:
+
+                    @pl.loop(0, max_num_seqs - 4)
+                    def _steady_step(seq):
+                        slot = seq & jnp.int32(3)
+                        dst = bkv_vmem_ref.at[slot, pl.ds(0, w_pg)]
+                        pltpu.make_async_copy(dst, dst, bkv_sems.at[slot]).wait()
+                        kvl = kv_lens_ref[seq]
+                        cache_kv = kvl - jnp.int32(1)
+                        if sliding_window is not None:
+                            fk = jnp.maximum(
+                                cache_kv - jnp.int32(sliding_window - 1),
+                                jnp.int32(0),
+                            )
+                            bs = (fk // page_size) * page_size
+                        else:
+                            fk = jnp.int32(0)
+                            bs = jnp.int32(0)
+                        rf = fk - bs
+                        re = cache_kv - bs
+                        _record_kv_write_uncond(seq, seq, seq, kvl, slot, re - 1)
+                        o_vmem_ref[seq] = _compute_seq(
+                            slot,
+                            q_vmem_ref[seq],
+                            seq,
+                            rf,
+                            re,
+                            w_pg,
+                        )
+                        fut_seq = seq + 4
+                        kvl_f = kv_lens_ref[fut_seq]
+                        cache_kv_f = kvl_f - jnp.int32(1)
+                        bs_f = (
+                            (
+                                jnp.maximum(
+                                    cache_kv_f - jnp.int32(sliding_window - 1),
+                                    jnp.int32(0),
+                                )
+                                // page_size
+                            )
+                            * page_size
+                            if sliding_window is not None
+                            else jnp.int32(0)
+                        )
+                        pg_base_f = cdiv(cu_kv_lens_ref[fut_seq], page_size) + (
+                            bs_f // page_size
+                        )
+                        for i in range(w_pg):
+                            pg_idx = jnp.minimum(pg_base_f + i, num_page_indices - 1)
+                            pg = page_indices_ref[pg_idx]
+                            pltpu.make_async_copy(
+                                kv_cache_ro_hbm.at[pl.ds(pg, 1)],
+                                bkv_vmem_ref.at[slot, pl.ds(i, 1)],
+                                bkv_sems.at[slot],
+                            ).start()
+
+                    @pl.loop(max_num_seqs - 4, max_num_seqs)
+                    def _drain_step(seq):
+                        slot = seq & jnp.int32(3)
+                        dst = bkv_vmem_ref.at[slot, pl.ds(0, w_pg)]
+                        pltpu.make_async_copy(dst, dst, bkv_sems.at[slot]).wait()
+                        kvl = kv_lens_ref[seq]
+                        cache_kv = kvl - jnp.int32(1)
+                        if sliding_window is not None:
+                            fk = jnp.maximum(
+                                cache_kv - jnp.int32(sliding_window - 1),
+                                jnp.int32(0),
+                            )
+                            bs = (fk // page_size) * page_size
+                        else:
+                            fk = jnp.int32(0)
+                            bs = jnp.int32(0)
+                        rf = fk - bs
+                        re = cache_kv - bs
+                        _record_kv_write_uncond(seq, seq, seq, kvl, slot, re - 1)
+                        o_vmem_ref[seq] = _compute_seq(
+                            slot,
+                            q_vmem_ref[seq],
+                            seq,
+                            rf,
+                            re,
+                            w_pg,
+                        )
 
                 rpa_smem_ref[0] = jnp.int32(max_num_seqs)
 
@@ -1290,6 +1297,7 @@ def _run_tok_sharded_b1_from_vmem_core(
     pre_exp_eps: float,
     pre_exp_scale_input: bool,
     need_wait_barrier: bool = False,
+    distribution_ref=None,
 ) -> None:
     """Factored Bridge-1b core taking `s_buf` and `gated_vmem_ref` directly in VMEM."""
     import jax.numpy as jnp
@@ -1674,19 +1682,26 @@ def _run_tok_sharded_b1_from_vmem_core(
             )
 
     _dma_wait(w_pre_pair_buf, w_pre_sem.at[0])
-    _dot_fp8_w8_slice_to_ref(
-        ffn_pair_buf,
-        0,
-        w_pre_pair_buf,
-        w_pre_pair_scale_ref,
-        0,
-        pre_my_half,
-        0,
-        0,
-        n_r=r_pair,
-        n_cols=pre_pair_cols,
-        align=16,
-    )
+
+    def _run_wpre_pair_dot():
+        _dot_fp8_w8_slice_to_ref(
+            ffn_pair_buf,
+            0,
+            w_pre_pair_buf,
+            w_pre_pair_scale_ref,
+            0,
+            pre_my_half,
+            0,
+            0,
+            n_r=r_pair,
+            n_cols=pre_pair_cols,
+            align=16,
+        )
+
+    if distribution_ref is not None:
+        _llo_fence(distribution_ref, _run_wpre_pair_dot)
+    else:
+        _run_wpre_pair_dot()
 
     op_pre = pltpu.make_async_remote_copy(
         pre_my_half,
@@ -1924,11 +1939,11 @@ def _m2m_tok_sh_tp8_kernel(
     pre_exp_gain_ref = body_refs[idx + 9]
     idx += 10
 
-    # Outputs (4 — `out_kv_cache_hbm` aliases `kv_cache_ro_hbm` with 0 HLO copies!):
+    # Outputs (4 — `out_kvw_rows_ref` is scattered in-place by `_kvw_1layer_jax` with 0 HLO copies!):
     out_stream_shard_hbm = body_refs[idx]
     out_router_logits_ref = body_refs[idx + 1]
     out_expert_in_ref = body_refs[idx + 2]
-    out_kv_cache_hbm = body_refs[idx + 3]
+    out_kvw_rows_ref = body_refs[idx + 3]
     idx += 4
 
     # Weight & KV ring slabs:
@@ -1950,35 +1965,35 @@ def _m2m_tok_sh_tp8_kernel(
     o_vmem_ref = body_refs[idx + 7]
     gate_vmem_ref = body_refs[idx + 8]
     gated_vmem_ref = body_refs[idx + 9]
-    kvw_rows_vmem = body_refs[idx + 10]
-    mate_tok_buf = body_refs[idx + 11]
-    moe_full_buf = body_refs[idx + 12]
-    post_shard = body_refs[idx + 13]
-    mate_post_shard = body_refs[idx + 14]
-    chip_cols_buf = body_refs[idx + 15]
-    post_pair_full = body_refs[idx + 16]
-    send_half = body_refs[idx + 17]
-    mate_recv = body_refs[idx + 18]
-    own_half = body_refs[idx + 19]
-    rs_a_recv = body_refs[idx + 20]
-    rs_b_recv = body_refs[idx + 21]
-    d2d_my_tok = body_refs[idx + 22]
-    d2d_send_tok = body_refs[idx + 23]
-    d2d_recv_tok = body_refs[idx + 24]
-    sq_tok_buf = body_refs[idx + 25]
-    ffn_my_tok = body_refs[idx + 26]
-    ffn_mate_tok = body_refs[idx + 27]
-    ffn_pair_buf = body_refs[idx + 28]
-    router_my_tok = body_refs[idx + 29]
-    router_mate_tok = body_refs[idx + 30]
-    router_pair_buf = body_refs[idx + 31]
-    pre_my_half = body_refs[idx + 32]
-    pre_mate_half = body_refs[idx + 33]
-    sq_pair_buf = body_refs[idx + 34]
+    mate_tok_buf = body_refs[idx + 10]
+    moe_full_buf = body_refs[idx + 11]
+    post_shard = body_refs[idx + 12]
+    mate_post_shard = body_refs[idx + 13]
+    chip_cols_buf = body_refs[idx + 14]
+    post_pair_full = body_refs[idx + 15]
+    send_half = body_refs[idx + 16]
+    mate_recv = body_refs[idx + 17]
+    own_half = body_refs[idx + 18]
+    rs_a_recv = body_refs[idx + 19]
+    rs_b_recv = body_refs[idx + 20]
+    d2d_my_tok = body_refs[idx + 21]
+    d2d_send_tok = body_refs[idx + 22]
+    d2d_recv_tok = body_refs[idx + 23]
+    sq_tok_buf = body_refs[idx + 24]
+    ffn_my_tok = body_refs[idx + 25]
+    ffn_mate_tok = body_refs[idx + 26]
+    ffn_pair_buf = body_refs[idx + 27]
+    router_my_tok = body_refs[idx + 28]
+    router_mate_tok = body_refs[idx + 29]
+    router_pair_buf = body_refs[idx + 30]
+    pre_my_half = body_refs[idx + 31]
+    pre_mate_half = body_refs[idx + 32]
+    sq_pair_buf = body_refs[idx + 33]
+    init_sv_vmem_ref = body_refs[idx + 34]
     rpa_smem_ref = body_refs[idx + 35]
     idx += 36
 
-    # Semaphores (`<= 44` total DMA semaphores; causally ordered reuse across b2 -> b1):
+    # Semaphores (`<= 42` total DMA semaphores; causally ordered reuse across b2 -> b1):
     w_post_sem = body_refs[idx]
     w_qkv_sem = body_refs[idx + 1]
     w_gate_sem = body_refs[idx + 2]
@@ -1988,25 +2003,24 @@ def _m2m_tok_sh_tp8_kernel(
     s_in_sem = body_refs[idx + 6]
     s_out_sem = body_refs[idx + 7]
     bkv_sems = body_refs[idx + 8]
-    kvw_out_sem = body_refs[idx + 9]
-    d2d_a_send = body_refs[idx + 10]
-    d2d_a_recv = body_refs[idx + 11]
-    d2d_b_send = body_refs[idx + 12]
-    d2d_b_recv = body_refs[idx + 13]
-    d2d_c_send = body_refs[idx + 14]
-    d2d_c_recv = body_refs[idx + 15]
-    d2d_d_send = body_refs[idx + 16]
-    d2d_d_recv = body_refs[idx + 17]
-    ici_a_send = body_refs[idx + 18]
-    ici_a_recv = body_refs[idx + 19]
-    ici_b_send = body_refs[idx + 20]
-    ici_b_recv = body_refs[idx + 21]
-    ici_c_send = body_refs[idx + 22]
-    ici_c_recv = body_refs[idx + 23]
-    rs1_send = body_refs[idx + 24]
-    rs1_recv = body_refs[idx + 25]
-    rs2_send = body_refs[idx + 26]
-    rs2_recv = body_refs[idx + 27]
+    d2d_a_send = body_refs[idx + 9]
+    d2d_a_recv = body_refs[idx + 10]
+    d2d_b_send = body_refs[idx + 11]
+    d2d_b_recv = body_refs[idx + 12]
+    d2d_c_send = body_refs[idx + 13]
+    d2d_c_recv = body_refs[idx + 14]
+    d2d_d_send = body_refs[idx + 15]
+    d2d_d_recv = body_refs[idx + 16]
+    ici_a_send = body_refs[idx + 17]
+    ici_a_recv = body_refs[idx + 18]
+    ici_b_send = body_refs[idx + 19]
+    ici_b_recv = body_refs[idx + 20]
+    ici_c_send = body_refs[idx + 21]
+    ici_c_recv = body_refs[idx + 22]
+    rs1_send = body_refs[idx + 23]
+    rs1_recv = body_refs[idx + 24]
+    rs2_send = body_refs[idx + 25]
+    rs2_recv = body_refs[idx + 26]
 
     r_tok = moe_out_ref.shape[0]
     rows = world_size * r_tok
@@ -2119,11 +2133,16 @@ def _m2m_tok_sh_tp8_kernel(
         ),
     )
 
+    eff_kv_merged_ref = (
+        out_kvw_rows_ref
+        if (not kv_pack_dense2 and rows == kv_merged_vmem_ref.shape[0])
+        else kv_merged_vmem_ref
+    )
     _run_in_vmem_qkv_epilogue_any(
         qkv_vmem,
         cos_sin_ref,
         q_vmem_ref,
-        kv_merged_vmem_ref.at[pl.ds(0, rows)],
+        eff_kv_merged_ref.at[pl.ds(0, rows)],
         norm_eps=qkv_norm_eps,
         query_scale=query_scale,
         k_scale=k_scale,
@@ -2149,9 +2168,9 @@ def _m2m_tok_sh_tp8_kernel(
         cu_kv_lens_ref,
         distribution_ref,
         q_vmem_ref,
-        kv_merged_vmem_ref,
+        eff_kv_merged_ref,
         kv_cache_ro_hbm,
-        out_kv_cache_hbm,
+        out_kvw_rows_ref,
         bkv_vmem_ref,
         o_vmem_ref,
         next_in_vmem,
@@ -2160,10 +2179,8 @@ def _m2m_tok_sh_tp8_kernel(
         next_s_gate_ref,
         gate_vmem_ref,
         gated_vmem_ref,
-        kvw_rows_vmem,
         rpa_smem_ref,
         bkv_sems,
-        kvw_out_sem,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         k_scale=k_scale,
@@ -2175,6 +2192,7 @@ def _m2m_tok_sh_tp8_kernel(
         early_prefetched=True,
         interpret_mode=interpret_mode,
         on_rpad_kv_done_fn=_start_wo_after_kv,
+        init_sv_vmem_ref=init_sv_vmem_ref,
     )
 
     # Stream `W_pre_pair (16 MiB)` + `W_router (4 MiB)` under `Wo` dot + 3-hop ICI RS (~16 us window)!
@@ -2252,13 +2270,8 @@ def _m2m_tok_sh_tp8_kernel(
         pre_exp_eps=pre_exp_eps,
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=False,
+        distribution_ref=distribution_ref,
     )
-    w_tot_cnt = rpa_smem_ref[0]
-
-    @pl.when(w_tot_cnt > 0)
-    def _wait_kv_scatter():
-        src_kv = kvw_rows_vmem.at[pl.ds(0, w_tot_cnt)]
-        pltpu.make_async_copy(src_kv, src_kv, kvw_out_sem.at[0]).wait()
 
 
 def _l0_a2m_tok_sh_tp8_kernel(
@@ -2321,7 +2334,7 @@ def _l0_a2m_tok_sh_tp8_kernel(
     out_stream_shard_hbm = body_refs[idx]
     out_router_logits_ref = body_refs[idx + 1]
     out_expert_in_ref = body_refs[idx + 2]
-    out_kv_cache_hbm = body_refs[idx + 3]
+    out_kvw_rows_ref = body_refs[idx + 3]
     idx += 4
 
     slab_a = body_refs[idx]
@@ -2336,25 +2349,25 @@ def _l0_a2m_tok_sh_tp8_kernel(
     o_vmem_ref = body_refs[idx + 9]
     gate_vmem_ref = body_refs[idx + 10]
     gated_vmem_ref = body_refs[idx + 11]
-    kvw_rows_vmem = body_refs[idx + 12]
-    send_half = body_refs[idx + 13]
-    mate_recv = body_refs[idx + 14]
-    own_half = body_refs[idx + 15]
-    rs_a_recv = body_refs[idx + 16]
-    rs_b_recv = body_refs[idx + 17]
-    d2d_my_tok = body_refs[idx + 18]
-    d2d_send_tok = body_refs[idx + 19]
-    d2d_recv_tok = body_refs[idx + 20]
-    sq_tok_buf = body_refs[idx + 21]
-    ffn_my_tok = body_refs[idx + 22]
-    ffn_mate_tok = body_refs[idx + 23]
-    ffn_pair_buf = body_refs[idx + 24]
-    router_my_tok = body_refs[idx + 25]
-    router_mate_tok = body_refs[idx + 26]
-    router_pair_buf = body_refs[idx + 27]
-    pre_my_half = body_refs[idx + 28]
-    pre_mate_half = body_refs[idx + 29]
-    sq_pair_buf = body_refs[idx + 30]
+    send_half = body_refs[idx + 12]
+    mate_recv = body_refs[idx + 13]
+    own_half = body_refs[idx + 14]
+    rs_a_recv = body_refs[idx + 15]
+    rs_b_recv = body_refs[idx + 16]
+    d2d_my_tok = body_refs[idx + 17]
+    d2d_send_tok = body_refs[idx + 18]
+    d2d_recv_tok = body_refs[idx + 19]
+    sq_tok_buf = body_refs[idx + 20]
+    ffn_my_tok = body_refs[idx + 21]
+    ffn_mate_tok = body_refs[idx + 22]
+    ffn_pair_buf = body_refs[idx + 23]
+    router_my_tok = body_refs[idx + 24]
+    router_mate_tok = body_refs[idx + 25]
+    router_pair_buf = body_refs[idx + 26]
+    pre_my_half = body_refs[idx + 27]
+    pre_mate_half = body_refs[idx + 28]
+    sq_pair_buf = body_refs[idx + 29]
+    init_sv_vmem_ref = body_refs[idx + 30]
     rpa_smem_ref = body_refs[idx + 31]
     idx += 32
 
@@ -2366,25 +2379,24 @@ def _l0_a2m_tok_sh_tp8_kernel(
     s_in_sem = body_refs[idx + 5]
     s_out_sem = body_refs[idx + 6]
     bkv_sems = body_refs[idx + 7]
-    kvw_out_sem = body_refs[idx + 8]
-    c1a_send = body_refs[idx + 9]
-    c1a_recv = body_refs[idx + 10]
-    rs1_send = body_refs[idx + 11]
-    rs1_recv = body_refs[idx + 12]
-    rs2_send = body_refs[idx + 13]
-    rs2_recv = body_refs[idx + 14]
-    c1c_send = body_refs[idx + 15]
-    c1c_recv = body_refs[idx + 16]
-    pair_send = body_refs[idx + 17]
-    pair_recv = body_refs[idx + 18]
-    rpair_send = body_refs[idx + 19]
-    rpair_recv = body_refs[idx + 20]
-    pre_send = body_refs[idx + 21]
-    pre_recv = body_refs[idx + 22]
-    ag_exp_send = body_refs[idx + 23]
-    ag_exp_recv = body_refs[idx + 24]
-    ag_log_send = body_refs[idx + 25]
-    ag_log_recv = body_refs[idx + 26]
+    c1a_send = body_refs[idx + 8]
+    c1a_recv = body_refs[idx + 9]
+    rs1_send = body_refs[idx + 10]
+    rs1_recv = body_refs[idx + 11]
+    rs2_send = body_refs[idx + 12]
+    rs2_recv = body_refs[idx + 13]
+    c1c_send = body_refs[idx + 14]
+    c1c_recv = body_refs[idx + 15]
+    pair_send = body_refs[idx + 16]
+    pair_recv = body_refs[idx + 17]
+    rpair_send = body_refs[idx + 18]
+    rpair_recv = body_refs[idx + 19]
+    pre_send = body_refs[idx + 20]
+    pre_recv = body_refs[idx + 21]
+    ag_exp_send = body_refs[idx + 22]
+    ag_exp_recv = body_refs[idx + 23]
+    ag_log_send = body_refs[idx + 24]
+    ag_log_recv = body_refs[idx + 25]
 
     rows = attn_in_ref.shape[0]
     qkv_cols = w_qkv_hbm.shape[1]
@@ -2437,11 +2449,16 @@ def _l0_a2m_tok_sh_tp8_kernel(
         ),
     )
 
+    eff_kv_merged_ref = (
+        out_kvw_rows_ref
+        if (not kv_pack_dense2 and rows == kv_merged_vmem_ref.shape[0])
+        else kv_merged_vmem_ref
+    )
     _run_in_vmem_qkv_epilogue_any(
         qkv_vmem,
         cos_sin_ref,
         q_vmem_ref,
-        kv_merged_vmem_ref.at[pl.ds(0, rows)],
+        eff_kv_merged_ref.at[pl.ds(0, rows)],
         norm_eps=qkv_norm_eps,
         query_scale=query_scale,
         k_scale=k_scale,
@@ -2466,9 +2483,9 @@ def _l0_a2m_tok_sh_tp8_kernel(
         cu_kv_lens_ref,
         distribution_ref,
         q_vmem_ref,
-        kv_merged_vmem_ref,
+        eff_kv_merged_ref,
         kv_cache_ro_hbm,
-        out_kv_cache_hbm,
+        out_kvw_rows_ref,
         bkv_vmem_ref,
         o_vmem_ref,
         attn_in_ref,
@@ -2477,10 +2494,8 @@ def _l0_a2m_tok_sh_tp8_kernel(
         s_gate_ref,
         gate_vmem_ref,
         gated_vmem_ref,
-        kvw_rows_vmem,
         rpa_smem_ref,
         bkv_sems,
-        kvw_out_sem,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         k_scale=k_scale,
@@ -2492,6 +2507,7 @@ def _l0_a2m_tok_sh_tp8_kernel(
         early_prefetched=True,
         interpret_mode=interpret_mode,
         on_rpad_kv_done_fn=_start_wo_l0,
+        init_sv_vmem_ref=init_sv_vmem_ref,
     )
 
     pltpu.make_async_copy(w_pre_pair_hbm, slab_a, w_pre_sem.at[0]).start()
@@ -2563,13 +2579,203 @@ def _l0_a2m_tok_sh_tp8_kernel(
         pre_exp_eps=pre_exp_eps,
         pre_exp_scale_input=pre_exp_scale_input,
         need_wait_barrier=True,
+        distribution_ref=distribution_ref,
     )
-    w_tot_cnt = rpa_smem_ref[0]
 
-    @pl.when(w_tot_cnt > 0)
-    def _wait_kv_scatter():
-        src_kv = kvw_rows_vmem.at[pl.ds(0, w_tot_cnt)]
-        pltpu.make_async_copy(src_kv, src_kv, kvw_out_sem.at[0]).wait()
+
+def _kvw_1layer_jax(
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    cu_kv_lens,
+    distribution,
+    kvw_rows,
+    kv_cache_ro,
+    *,
+    kv_pack_dense2: bool,
+    layer_num_in_bundle: int = 1,
+    layer_offset_in_bundle: int = 0,
+    interpret: bool = False,
+):
+    """Zero-copy 1-layer KV scatter (`collective_id=None` so XLA aliases `kv_cache_ro` in-place!)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    is_interpret = bool(interpret)
+    rows = kvw_rows.shape[0]
+    max_num_seqs = kv_lens.shape[0]
+    num_page_indices = page_indices.shape[0]
+    phys_page_rows = (
+        kv_cache_ro.shape[2] if kv_cache_ro.ndim == 6 else kv_cache_ro.shape[1]
+    )
+    page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
+
+    def _kvw_1layer_kernel(
+        kv_lens_ref,
+        page_indices_ref,
+        cu_q_lens_ref,
+        cu_kv_lens_ref,
+        distribution_ref,
+        kvw_rows_hbm,
+        _kv_in_hbm,
+        kv_out_hbm,
+        w_cnt_smem_ref,
+        sems,
+    ):
+        def _dst_slice(seq, kvl):
+            seq_base = cdiv(cu_kv_lens_ref[seq], page_size)
+            pos = kvl - jnp.int32(1)
+            pg_off = seq_base + (pos // page_size)
+            raw_pg = page_indices_ref[jnp.minimum(pg_off, num_page_indices - 1)]
+            r_in_pg = (
+                ((pos % page_size) // 2) if kv_pack_dense2 else (pos % page_size)
+            )
+            if kv_out_hbm.ndim == 6:
+                return kv_out_hbm.at[
+                    raw_pg, layer_offset_in_bundle, pl.ds(r_in_pg, 1)
+                ]
+            eff_pg = (
+                raw_pg * layer_num_in_bundle + layer_offset_in_bundle
+                if layer_num_in_bundle > 1
+                else raw_pg
+            )
+            return kv_out_hbm.at[eff_pg, pl.ds(r_in_pg, 1)]
+
+        n_active = jnp.clip(distribution_ref[0], 0, max_num_seqs)
+        if not is_interpret and max_num_seqs == rows and rows <= 128:
+            q_prev = cu_q_lens_ref[0]
+            kv_prev = cu_kv_lens_ref[0]
+            all_act = (n_active == max_num_seqs) & (q_prev == jnp.int32(0))
+            for s_i in range(max_num_seqs):
+                q_next = cu_q_lens_ref[s_i + 1]
+                kv_next = cu_kv_lens_ref[s_i + 1]
+                kvl_s = kv_lens_ref[s_i]
+                act_s = (q_next - q_prev == 1) & (kv_next > kv_prev) & (kvl_s > 0)
+                all_act = all_act & act_s
+                q_prev = q_next
+                kv_prev = kv_next
+
+            @pl.when(all_act)
+            def _fast_all():
+                for seq in range(rows):
+                    pltpu.make_async_copy(
+                        kvw_rows_hbm.at[pl.ds(seq, 1)],
+                        _dst_slice(seq, kv_lens_ref[seq]),
+                        sems.at[0],
+                    ).start()
+                src_all = kvw_rows_hbm.at[pl.ds(0, rows)]
+                pltpu.make_async_copy(src_all, src_all, sems.at[0]).wait()
+
+            @pl.when(~all_act)
+            def _partial():
+                w_cnt_smem_ref[0] = jnp.int32(0)
+
+                @pl.loop(0, n_active)
+                def _step(seq):
+                    q_s = cu_q_lens_ref[seq]
+                    q_e = cu_q_lens_ref[seq + 1]
+                    kvl = kv_lens_ref[seq]
+                    act = (
+                        (q_e - q_s == 1)
+                        & (cu_kv_lens_ref[seq + 1] > cu_kv_lens_ref[seq])
+                        & (kvl > 0)
+                    )
+
+                    @pl.when(act)
+                    def _():
+                        w_cnt_smem_ref[0] = w_cnt_smem_ref[0] + jnp.int32(1)
+                        pltpu.make_async_copy(
+                            kvw_rows_hbm.at[pl.ds(q_s, 1)],
+                            _dst_slice(seq, kvl),
+                            sems.at[0],
+                        ).start()
+
+                w_cnt = w_cnt_smem_ref[0]
+
+                @pl.when(w_cnt > 0)
+                def _():
+                    src_w = kvw_rows_hbm.at[pl.ds(0, w_cnt)]
+                    pltpu.make_async_copy(src_w, src_w, sems.at[0]).wait()
+
+            return
+
+        w_cnt_smem_ref[0] = jnp.int32(0)
+
+        @pl.loop(0, n_active)
+        def _step_any(seq):
+            q_s = cu_q_lens_ref[seq]
+            q_e = cu_q_lens_ref[seq + 1]
+            kvl = kv_lens_ref[seq]
+            act = (
+                (q_e - q_s == 1)
+                & (cu_kv_lens_ref[seq + 1] > cu_kv_lens_ref[seq])
+                & (kvl > 0)
+            )
+
+            @pl.when(act)
+            def _():
+                w_cnt_smem_ref[0] = w_cnt_smem_ref[0] + jnp.int32(1)
+                pltpu.make_async_copy(
+                    kvw_rows_hbm.at[pl.ds(q_s, 1)],
+                    _dst_slice(seq, kvl),
+                    sems.at[0],
+                ).start()
+
+        w_cnt = w_cnt_smem_ref[0]
+
+        @pl.when(w_cnt > 0)
+        def _():
+            src_w = kvw_rows_hbm.at[pl.ds(0, w_cnt)]
+            pltpu.make_async_copy(src_w, src_w, sems.at[0]).wait()
+
+    h_sp = pl.BlockSpec(memory_space=pltpu.HBM)
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=5,
+        in_specs=[h_sp, h_sp],
+        out_specs=h_sp,
+        grid=(1,),
+        scratch_shapes=[pltpu.SMEM((2,), jnp.int32), pltpu.SemaphoreType.DMA((1,))],
+    )
+    out_shape = (
+        jax.ShapeDtypeStruct(kv_cache_ro.shape, kv_cache_ro.dtype)
+        if is_interpret
+        else pltpu.HBM(kv_cache_ro.shape, kv_cache_ro.dtype)
+    )
+    cp = pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",),
+        vmem_limit_bytes=4 * 1024**2,
+        disable_bounds_checks=True,
+    )
+    kvw_arg = (
+        kvw_rows
+        if is_interpret
+        else pltpu.with_memory_space_constraint(kvw_rows, pltpu.HBM)
+    )
+    kv_arg = (
+        kv_cache_ro
+        if is_interpret
+        else pltpu.with_memory_space_constraint(kv_cache_ro, pltpu.HBM)
+    )
+    d2_tag = "d2" if kv_pack_dense2 else "nod2"
+    return _pallas_call_maybe_interpret(
+        _kvw_1layer_kernel,
+        interpret=interpret,
+        grid_spec=grid_spec,
+        out_shape=out_shape,
+        input_output_aliases={6: 0},
+        compiler_params=cp,
+        name=f"muse_m2m_kvw1_b{rows}_{d2_tag}",
+    )(
+        kv_lens.astype(jnp.int32),
+        page_indices.astype(jnp.int32),
+        cu_q_lens.astype(jnp.int32),
+        cu_kv_lens.astype(jnp.int32),
+        distribution.astype(jnp.int32),
+        kvw_arg,
+        kv_arg,
+    )
 
 
 def m2m_tok_sh_tp8_jax(
@@ -2706,19 +2912,14 @@ def m2m_tok_sh_tp8_jax(
         ]
     )
 
-    kv_out_sd = (
-        jax.ShapeDtypeStruct(kv_cache_ro.shape, kv_cache_ro.dtype)
-        if interpret
-        else pltpu.HBM(kv_cache_ro.shape, kv_cache_ro.dtype)
-    )
+    is_interpret = bool(interpret)
     out_shape = (
         jax.ShapeDtypeStruct((r_tok, hidden), jnp.float32),
         jax.ShapeDtypeStruct((rows, n_exp), jnp.float32),
         jax.ShapeDtypeStruct((rows, h_pre), jnp.bfloat16),
-        kv_out_sd,
+        jax.ShapeDtypeStruct((rows, 1, 4, 128), kv_cache_ro.dtype),
     )
-    out_specs = (h_sp, v_sp, v_sp, h_sp)
-    kv_in_idx = 5 + 12 + (1 if has_rope else 0)
+    out_specs = (h_sp, v_sp, v_sp, v_sp)
 
     scratch_shapes = [
         # 5 weight + KV ring slabs:
@@ -2730,7 +2931,7 @@ def m2m_tok_sh_tp8_jax(
             (_NUM_KV_SLOTS, max_ring_pages, phys_page_rows, 1, 4, 128),
             kv_cache_ro.dtype,
         ),
-        # 36 activation + SMEM scratches:
+        # 35 activation + SMEM scratches:
         vmem((r_tok, hidden), jnp.float32),  # s_buf
         vmem((r_tok, hidden), jnp.bfloat16),  # next_in_my_tok
         vmem((r_tok, half), jnp.bfloat16),  # next_in_mate_half
@@ -2741,7 +2942,6 @@ def m2m_tok_sh_tp8_jax(
         vmem((rows, 16, 128), jnp.bfloat16),  # o_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gate_vmem_ref
         vmem((rows, gate_cols), jnp.bfloat16),  # gated_vmem_ref
-        vmem((rows, 1, 4, 128), kv_cache_ro.dtype),  # kvw_rows_vmem
         vmem((r_tok, w_post_w8k.shape[0]), jnp.bfloat16),  # mate_tok_buf
         vmem((rows, w_post_w8k.shape[0]), jnp.bfloat16),  # moe_full_buf
         vmem((rows, post_cols), jnp.bfloat16),  # post_shard
@@ -2768,8 +2968,9 @@ def m2m_tok_sh_tp8_jax(
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),  # pre_my_half
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),  # pre_mate_half
         vmem((r_pair, 128), jnp.float32),  # sq_pair_buf
+        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),  # init_sv_vmem_ref
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),  # rpa_smem_ref
-        # 28 semaphore groups (43 total DMA semaphores < 64 limit!):
+        # 27 semaphore groups (42 total DMA semaphores < 64 limit!):
         sem((1,)),  # w_post_sem (reused as pre_send in Phase 3)
         sem((1,)),  # w_qkv_sem (reused as pre_recv in Phase 3)
         sem((1,)),  # w_gate_sem
@@ -2779,7 +2980,6 @@ def m2m_tok_sh_tp8_jax(
         sem((1,)),  # s_in_sem
         sem((1,)),  # s_out_sem
         sem((_NUM_KV_SLOTS,)),  # bkv_sems
-        sem((1,)),  # kvw_out_sem
         sem((1,)),  # d2d_a_send
         sem((1,)),  # d2d_a_recv
         sem((1,)),  # d2d_b_send
@@ -2817,14 +3017,14 @@ def m2m_tok_sh_tp8_jax(
     rope_args = (cos_sin.astype(jnp.float32),) if has_rope else ()
     kv_ro_arg = (
         kv_cache_ro
-        if interpret
+        if is_interpret
         else pltpu.with_memory_space_constraint(kv_cache_ro, pltpu.HBM)
     )
     sw_tag = f"sw{sliding_window}" if sliding_window is not None else f"full{max_ring_pages}p"
     d2_tag = "d2" if kv_pack_dense2 else "nod2"
     name = f"muse_m2m_tp8_b{rows}_{sw_tag}_{d2_tag}_{'rope' if has_rope else 'nope'}"
 
-    st_out, logits_out, exp_in_out, kv_cache_out = _pallas_call_maybe_interpret(
+    st_out, logits_out, exp_in_out, kvw_rows_out = _pallas_call_maybe_interpret(
         functools.partial(
             _m2m_tok_sh_tp8_kernel,
             world_size=world_size,
@@ -2848,12 +3048,11 @@ def m2m_tok_sh_tp8_jax(
             pre_exp_eps=float(pre_exp_eps),
             pre_exp_scale_input=bool(pre_exp_scale_input),
             has_rope=has_rope,
-            interpret_mode=interpret,
+            interpret_mode=is_interpret,
         ),
         interpret=interpret,
         grid_spec=grid_spec,
         out_shape=out_shape,
-        input_output_aliases={kv_in_idx: 3},
         compiler_params=cp,
         name=name,
     )(
@@ -2885,6 +3084,19 @@ def m2m_tok_sh_tp8_jax(
         _as_2d_f32(w_pre_pair_scale, pre_pair_cols),
         w_router_km,
         _as_2d_f32(pre_exp_gain, h_pre),
+    )
+    kv_cache_out = _kvw_1layer_jax(
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        kvw_rows_out,
+        kv_cache_ro,
+        kv_pack_dense2=bool(kv_pack_dense2),
+        layer_num_in_bundle=int(layer_num_in_bundle),
+        layer_offset_in_bundle=int(layer_offset_in_bundle),
+        interpret=interpret,
     )
     return st_out, logits_out, exp_in_out, kv_cache_out
 
@@ -2985,19 +3197,14 @@ def l0_a2m_tok_sh_tp8_jax(
         in_specs.append(v_sp)
     in_specs.extend([h_sp, h_sp, v_sp, v_sp, v_sp, v_sp, h_sp, v_sp, h_sp, v_sp])
 
-    kv_out_sd = (
-        jax.ShapeDtypeStruct(kv_cache_ro.shape, kv_cache_ro.dtype)
-        if interpret
-        else pltpu.HBM(kv_cache_ro.shape, kv_cache_ro.dtype)
-    )
+    is_interpret = bool(interpret)
     out_shape = (
         jax.ShapeDtypeStruct((r_tok, hidden), jnp.float32),
         jax.ShapeDtypeStruct((rows, n_exp), jnp.float32),
         jax.ShapeDtypeStruct((rows, h_pre), jnp.bfloat16),
-        kv_out_sd,
+        jax.ShapeDtypeStruct((rows, 1, 4, 128), kv_cache_ro.dtype),
     )
-    out_specs = (h_sp, v_sp, v_sp, h_sp)
-    kv_in_idx = 5 + 6 + (1 if has_rope else 0)
+    out_specs = (h_sp, v_sp, v_sp, v_sp)
 
     scratch_shapes = [
         vmem((hidden, pre_pair_cols), w_qkv_w8k.dtype),
@@ -3015,7 +3222,6 @@ def l0_a2m_tok_sh_tp8_jax(
         vmem((rows, 16, 128), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
         vmem((rows, gate_cols), jnp.bfloat16),
-        vmem((rows, 1, 4, 128), kv_cache_ro.dtype),
         vmem((rows, half), jnp.bfloat16),
         vmem((rows, half), jnp.bfloat16),
         vmem((rows, half), jnp.bfloat16),
@@ -3034,6 +3240,7 @@ def l0_a2m_tok_sh_tp8_jax(
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),
         vmem((r_pair, pre_pair_cols), jnp.bfloat16),
         vmem((r_pair, 128), jnp.float32),
+        vmem((2, b_pad32 if sliding_window is None else 1, 16, 128), jnp.float32),
         smem((2 + 2 * _NUM_KV_SLOTS,), jnp.int32),
         sem((1,)),
         sem((1,)),
@@ -3043,7 +3250,6 @@ def l0_a2m_tok_sh_tp8_jax(
         sem((1,)),
         sem((1,)),
         sem((_NUM_KV_SLOTS,)),
-        sem((1,)),
         sem((1,)),
         sem((1,)),
         sem((3,)),
@@ -3080,14 +3286,14 @@ def l0_a2m_tok_sh_tp8_jax(
     rope_args = (cos_sin.astype(jnp.float32),) if has_rope else ()
     kv_ro_arg = (
         kv_cache_ro
-        if interpret
+        if is_interpret
         else pltpu.with_memory_space_constraint(kv_cache_ro, pltpu.HBM)
     )
     sw_tag = f"sw{sliding_window}" if sliding_window is not None else f"full{max_ring_pages}p"
     d2_tag = "d2" if kv_pack_dense2 else "nod2"
     name = f"muse_l0_a2m_tp8_b{rows}_{sw_tag}_{d2_tag}_{'rope' if has_rope else 'nope'}"
 
-    st_out, logits_out, exp_in_out, kv_cache_out = _pallas_call_maybe_interpret(
+    st_out, logits_out, exp_in_out, kvw_rows_out = _pallas_call_maybe_interpret(
         functools.partial(
             _l0_a2m_tok_sh_tp8_kernel,
             world_size=world_size,
@@ -3107,12 +3313,11 @@ def l0_a2m_tok_sh_tp8_jax(
             pre_exp_eps=float(pre_exp_eps),
             pre_exp_scale_input=bool(pre_exp_scale_input),
             has_rope=has_rope,
-            interpret_mode=interpret,
+            interpret_mode=is_interpret,
         ),
         interpret=interpret,
         grid_spec=grid_spec,
         out_shape=out_shape,
-        input_output_aliases={kv_in_idx: 3},
         compiler_params=cp,
         name=name,
     )(
@@ -3138,6 +3343,19 @@ def l0_a2m_tok_sh_tp8_jax(
         _as_2d_f32(w_pre_pair_scale, pre_pair_cols),
         w_router_km,
         _as_2d_f32(pre_exp_gain, h_pre),
+    )
+    kv_cache_out = _kvw_1layer_jax(
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        kvw_rows_out,
+        kv_cache_ro,
+        kv_pack_dense2=bool(kv_pack_dense2),
+        layer_num_in_bundle=int(layer_num_in_bundle),
+        layer_offset_in_bundle=int(layer_offset_in_bundle),
+        interpret=interpret,
     )
     return st_out, logits_out, exp_in_out, kv_cache_out
 

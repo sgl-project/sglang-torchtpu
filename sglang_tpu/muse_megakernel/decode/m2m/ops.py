@@ -17,11 +17,18 @@ from sglang_tpu.kernels.decode_collective_bridges import (
     get_moe_to_attn_bridge_op,
 )
 from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+    get_attn_to_moe_chip_sharded_bridge_op,
     get_attn_to_moe_tok_sharded_bridge_op,
     get_moe_post_ag_final_norm_op,
+    get_moe_post_chip_sharded_final_norm_op,
     get_moe_post_tok_sharded_final_norm_op,
+    get_moe_to_attn_chip_sharded_bridge_op,
     get_moe_to_attn_qkv_epi_bridge_op,
     get_moe_to_attn_tok_sharded_bridge_op,
+)
+from sglang_tpu.muse_megakernel.decode.m2m.chip_sh_kernel import (
+    l0_a2m_chip_sh_jax,
+    m2m_chip_sh_jax,
 )
 from sglang_tpu.muse_megakernel.decode.m2m.kernel import (
     kv_write_batch_jax,
@@ -36,6 +43,8 @@ from sglang_tpu.muse_megakernel.decode.m2m.rep_kernel import (
 _M2M_LOCK = Lock()
 _M2M_TOK_OPS: dict[tuple[bool, bool], Callable] = {}
 _L0_TOK_OPS: dict[tuple[bool, bool], Callable] = {}
+_M2M_CHIP_OPS: dict[tuple[int, bool, bool, bool], Callable] = {}
+_L0_CHIP_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _M2M_REP_OPS: dict[tuple[int, bool, bool, bool], Callable] = {}
 _L0_REP_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _KVW_CALLABLES: dict[tuple, object] = {}
@@ -1210,6 +1219,534 @@ def get_l0_a2m_rep_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> 
     return op
 
 
+def get_m2m_chip_sh_op(
+    world_size: int, *, sharded_moe_in: bool, has_rope: bool, bf16_router: bool
+) -> Callable:
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(f"Unsupported world_size={world_size}")
+    key = (int(world_size), bool(sharded_moe_in), bool(has_rope), bool(bf16_router))
+    op = _M2M_CHIP_OPS.get(key)
+    if op is not None:
+        return op
+    with _M2M_LOCK:
+        op = _M2M_CHIP_OPS.get(key)
+        if op is not None:
+            return op
+        import jax
+        from jax.sharding import PartitionSpec as P
+
+        mesh = _get_tp_mesh(world_size)
+        moe_sp = P("model", None) if sharded_moe_in else P()
+        pre_specs = (
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
+            P("model", None),
+            moe_sp,
+            P(None, "model"),
+            P("model"),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(None, "model"),
+            P("model"),
+        )
+        post_specs = (
+            P("model"),
+            P("model", None),
+            P("model"),
+            P(),
+            P(),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(),
+            P(),
+        )
+        out_specs = (P("model", None), P(), P(), P("model"))
+        sh_tag = "sh" if sharded_moe_in else "full"
+        r_tag = "rope" if has_rope else "nope"
+        rt_tag = "r16" if bf16_router else "r32"
+        n_scalars = 17
+
+        if has_rope:
+            t_specs = (*pre_specs, P(), *post_specs)
+            in_specs = (*t_specs, *([None] * n_scalars))
+
+            def _wrapped_r(
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                stream_chip: jax.Array,
+                moe_out: jax.Array,
+                w_post_w8k: jax.Array,
+                s_post: jax.Array,
+                post_ff_gain: jax.Array,
+                pf_alpha: jax.Array,
+                pf_beta: jax.Array,
+                next_in_gain: jax.Array,
+                next_w_qkv_w8k: jax.Array,
+                next_s_qkv: jax.Array,
+                next_w_gate_w8k: jax.Array,
+                next_s_gate: jax.Array,
+                cos_sin_step: jax.Array,
+                kv_cache_ro: jax.Array,
+                wo_w8k: jax.Array,
+                wo_scale: jax.Array,
+                pa_alpha: jax.Array,
+                pa_beta: jax.Array,
+                pre_ff_gain: jax.Array,
+                w_pre_pair_w8k: jax.Array,
+                w_pre_pair_scale: jax.Array,
+                w_router_km: jax.Array,
+                pre_exp_gain: jax.Array,
+                post_ff_eps: float,
+                post_ff_scale_input: bool,
+                next_in_eps: float,
+                next_in_scale_input: bool,
+                qkv_norm_eps: float,
+                query_scale: float,
+                sm_scale: float,
+                sliding_window_val: int,
+                k_scale: float,
+                v_scale: float,
+                kv_pack_dense2: bool,
+                pa_eps: float,
+                pre_ff_eps: float,
+                pre_ff_scale_input: bool,
+                router_multiplier: float,
+                pre_exp_eps: float,
+                pre_exp_scale_input: bool,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                sw = sliding_window_val if sliding_window_val > 0 else None
+                fn = functools.partial(
+                    m2m_chip_sh_jax,
+                    world_size=world_size,
+                    sharded_moe_in=bool(sharded_moe_in),
+                    post_ff_eps=float(post_ff_eps),
+                    post_ff_scale_input=bool(post_ff_scale_input),
+                    next_in_eps=float(next_in_eps),
+                    next_in_scale_input=bool(next_in_scale_input),
+                    qkv_norm_eps=float(qkv_norm_eps),
+                    query_scale=float(query_scale),
+                    sm_scale=float(sm_scale),
+                    sliding_window=sw,
+                    k_scale=float(k_scale),
+                    v_scale=float(v_scale),
+                    kv_pack_dense2=bool(kv_pack_dense2),
+                    pa_eps=float(pa_eps),
+                    pre_ff_eps=float(pre_ff_eps),
+                    pre_ff_scale_input=bool(pre_ff_scale_input),
+                    router_multiplier=float(router_multiplier),
+                    pre_exp_eps=float(pre_exp_eps),
+                    pre_exp_scale_input=bool(pre_exp_scale_input),
+                )
+                return jax.shard_map(
+                    fn, mesh=mesh, in_specs=t_specs, out_specs=out_specs, check_vma=False
+                )(
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    stream_chip,
+                    moe_out,
+                    w_post_w8k,
+                    s_post,
+                    post_ff_gain,
+                    pf_alpha,
+                    pf_beta,
+                    next_in_gain,
+                    next_w_qkv_w8k,
+                    next_s_qkv,
+                    next_w_gate_w8k,
+                    next_s_gate,
+                    cos_sin_step,
+                    kv_cache_ro,
+                    wo_w8k,
+                    wo_scale,
+                    pa_alpha,
+                    pa_beta,
+                    pre_ff_gain,
+                    w_pre_pair_w8k,
+                    w_pre_pair_scale,
+                    w_router_km,
+                    pre_exp_gain,
+                )
+
+            op = _cpu_export_m2m_op(
+                f"sglang_tpu_pallas::muse_w9_m2m_chip_{sh_tag}_{r_tag}_{rt_tag}_tp{world_size}",
+                _wrapped_r,
+                mesh=mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=out_specs,
+            )
+        else:
+            t_specs = (*pre_specs, *post_specs)
+            in_specs = (*t_specs, *([None] * n_scalars))
+
+            def _wrapped_n(
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                stream_chip: jax.Array,
+                moe_out: jax.Array,
+                w_post_w8k: jax.Array,
+                s_post: jax.Array,
+                post_ff_gain: jax.Array,
+                pf_alpha: jax.Array,
+                pf_beta: jax.Array,
+                next_in_gain: jax.Array,
+                next_w_qkv_w8k: jax.Array,
+                next_s_qkv: jax.Array,
+                next_w_gate_w8k: jax.Array,
+                next_s_gate: jax.Array,
+                kv_cache_ro: jax.Array,
+                wo_w8k: jax.Array,
+                wo_scale: jax.Array,
+                pa_alpha: jax.Array,
+                pa_beta: jax.Array,
+                pre_ff_gain: jax.Array,
+                w_pre_pair_w8k: jax.Array,
+                w_pre_pair_scale: jax.Array,
+                w_router_km: jax.Array,
+                pre_exp_gain: jax.Array,
+                post_ff_eps: float,
+                post_ff_scale_input: bool,
+                next_in_eps: float,
+                next_in_scale_input: bool,
+                qkv_norm_eps: float,
+                query_scale: float,
+                sm_scale: float,
+                sliding_window_val: int,
+                k_scale: float,
+                v_scale: float,
+                kv_pack_dense2: bool,
+                pa_eps: float,
+                pre_ff_eps: float,
+                pre_ff_scale_input: bool,
+                router_multiplier: float,
+                pre_exp_eps: float,
+                pre_exp_scale_input: bool,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                sw = sliding_window_val if sliding_window_val > 0 else None
+
+                def _local(*t_args):
+                    return m2m_chip_sh_jax(
+                        *t_args[:17],
+                        None,
+                        *t_args[17:],
+                        world_size=world_size,
+                        sharded_moe_in=bool(sharded_moe_in),
+                        post_ff_eps=float(post_ff_eps),
+                        post_ff_scale_input=bool(post_ff_scale_input),
+                        next_in_eps=float(next_in_eps),
+                        next_in_scale_input=bool(next_in_scale_input),
+                        qkv_norm_eps=float(qkv_norm_eps),
+                        query_scale=float(query_scale),
+                        sm_scale=float(sm_scale),
+                        sliding_window=sw,
+                        k_scale=float(k_scale),
+                        v_scale=float(v_scale),
+                        kv_pack_dense2=bool(kv_pack_dense2),
+                        pa_eps=float(pa_eps),
+                        pre_ff_eps=float(pre_ff_eps),
+                        pre_ff_scale_input=bool(pre_ff_scale_input),
+                        router_multiplier=float(router_multiplier),
+                        pre_exp_eps=float(pre_exp_eps),
+                        pre_exp_scale_input=bool(pre_exp_scale_input),
+                    )
+
+                return jax.shard_map(
+                    _local, mesh=mesh, in_specs=t_specs, out_specs=out_specs, check_vma=False
+                )(
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    stream_chip,
+                    moe_out,
+                    w_post_w8k,
+                    s_post,
+                    post_ff_gain,
+                    pf_alpha,
+                    pf_beta,
+                    next_in_gain,
+                    next_w_qkv_w8k,
+                    next_s_qkv,
+                    next_w_gate_w8k,
+                    next_s_gate,
+                    kv_cache_ro,
+                    wo_w8k,
+                    wo_scale,
+                    pa_alpha,
+                    pa_beta,
+                    pre_ff_gain,
+                    w_pre_pair_w8k,
+                    w_pre_pair_scale,
+                    w_router_km,
+                    pre_exp_gain,
+                )
+
+            op = _cpu_export_m2m_op(
+                f"sglang_tpu_pallas::muse_w9_m2m_chip_{sh_tag}_{r_tag}_{rt_tag}_tp{world_size}",
+                _wrapped_n,
+                mesh=mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=out_specs,
+            )
+        _M2M_CHIP_OPS[key] = op
+    return op
+
+
+def get_l0_a2m_chip_sh_op(world_size: int, *, has_rope: bool, bf16_router: bool) -> Callable:
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(f"Unsupported world_size={world_size}")
+    key = (int(world_size), bool(has_rope), bool(bf16_router))
+    op = _L0_CHIP_OPS.get(key)
+    if op is not None:
+        return op
+    with _M2M_LOCK:
+        op = _L0_CHIP_OPS.get(key)
+        if op is not None:
+            return op
+        import jax
+        from jax.sharding import PartitionSpec as P
+
+        mesh = _get_tp_mesh(world_size)
+        pre_specs = (
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
+            P("model", None),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(None, "model"),
+            P("model"),
+        )
+        post_specs = (
+            P("model"),
+            P("model", None),
+            P("model"),
+            P(),
+            P(),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(),
+            P(),
+        )
+        out_specs = (P("model", None), P(), P(), P("model"))
+        r_tag = "rope" if has_rope else "nope"
+        rt_tag = "r16" if bf16_router else "r32"
+        n_scalars = 13
+
+        if has_rope:
+            t_specs = (*pre_specs, P(), *post_specs)
+            in_specs = (*t_specs, *([None] * n_scalars))
+
+            def _wrapped_r(
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                stream_chip: jax.Array,
+                attn_in: jax.Array,
+                w_qkv_w8k: jax.Array,
+                s_qkv: jax.Array,
+                w_gate_w8k: jax.Array,
+                s_gate: jax.Array,
+                cos_sin_step: jax.Array,
+                kv_cache_ro: jax.Array,
+                wo_w8k: jax.Array,
+                wo_scale: jax.Array,
+                pa_alpha: jax.Array,
+                pa_beta: jax.Array,
+                pre_ff_gain: jax.Array,
+                w_pre_pair_w8k: jax.Array,
+                w_pre_pair_scale: jax.Array,
+                w_router_km: jax.Array,
+                pre_exp_gain: jax.Array,
+                qkv_norm_eps: float,
+                query_scale: float,
+                sm_scale: float,
+                sliding_window_val: int,
+                k_scale: float,
+                v_scale: float,
+                kv_pack_dense2: bool,
+                pa_eps: float,
+                pre_ff_eps: float,
+                pre_ff_scale_input: bool,
+                router_multiplier: float,
+                pre_exp_eps: float,
+                pre_exp_scale_input: bool,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                sw = sliding_window_val if sliding_window_val > 0 else None
+                fn = functools.partial(
+                    l0_a2m_chip_sh_jax,
+                    world_size=world_size,
+                    qkv_norm_eps=float(qkv_norm_eps),
+                    query_scale=float(query_scale),
+                    sm_scale=float(sm_scale),
+                    sliding_window=sw,
+                    k_scale=float(k_scale),
+                    v_scale=float(v_scale),
+                    kv_pack_dense2=bool(kv_pack_dense2),
+                    pa_eps=float(pa_eps),
+                    pre_ff_eps=float(pre_ff_eps),
+                    pre_ff_scale_input=bool(pre_ff_scale_input),
+                    router_multiplier=float(router_multiplier),
+                    pre_exp_eps=float(pre_exp_eps),
+                    pre_exp_scale_input=bool(pre_exp_scale_input),
+                )
+                return jax.shard_map(
+                    fn, mesh=mesh, in_specs=t_specs, out_specs=out_specs, check_vma=False
+                )(
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    stream_chip,
+                    attn_in,
+                    w_qkv_w8k,
+                    s_qkv,
+                    w_gate_w8k,
+                    s_gate,
+                    cos_sin_step,
+                    kv_cache_ro,
+                    wo_w8k,
+                    wo_scale,
+                    pa_alpha,
+                    pa_beta,
+                    pre_ff_gain,
+                    w_pre_pair_w8k,
+                    w_pre_pair_scale,
+                    w_router_km,
+                    pre_exp_gain,
+                )
+
+            op = _cpu_export_m2m_op(
+                f"sglang_tpu_pallas::muse_w9_l0_a2m_chip_{r_tag}_{rt_tag}_tp{world_size}",
+                _wrapped_r,
+                mesh=mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=out_specs,
+            )
+        else:
+            t_specs = (*pre_specs, *post_specs)
+            in_specs = (*t_specs, *([None] * n_scalars))
+
+            def _wrapped_n(
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                stream_chip: jax.Array,
+                attn_in: jax.Array,
+                w_qkv_w8k: jax.Array,
+                s_qkv: jax.Array,
+                w_gate_w8k: jax.Array,
+                s_gate: jax.Array,
+                kv_cache_ro: jax.Array,
+                wo_w8k: jax.Array,
+                wo_scale: jax.Array,
+                pa_alpha: jax.Array,
+                pa_beta: jax.Array,
+                pre_ff_gain: jax.Array,
+                w_pre_pair_w8k: jax.Array,
+                w_pre_pair_scale: jax.Array,
+                w_router_km: jax.Array,
+                pre_exp_gain: jax.Array,
+                qkv_norm_eps: float,
+                query_scale: float,
+                sm_scale: float,
+                sliding_window_val: int,
+                k_scale: float,
+                v_scale: float,
+                kv_pack_dense2: bool,
+                pa_eps: float,
+                pre_ff_eps: float,
+                pre_ff_scale_input: bool,
+                router_multiplier: float,
+                pre_exp_eps: float,
+                pre_exp_scale_input: bool,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                sw = sliding_window_val if sliding_window_val > 0 else None
+
+                def _local(*t_args):
+                    return l0_a2m_chip_sh_jax(
+                        *t_args[:11],
+                        None,
+                        *t_args[11:],
+                        world_size=world_size,
+                        qkv_norm_eps=float(qkv_norm_eps),
+                        query_scale=float(query_scale),
+                        sm_scale=float(sm_scale),
+                        sliding_window=sw,
+                        k_scale=float(k_scale),
+                        v_scale=float(v_scale),
+                        kv_pack_dense2=bool(kv_pack_dense2),
+                        pa_eps=float(pa_eps),
+                        pre_ff_eps=float(pre_ff_eps),
+                        pre_ff_scale_input=bool(pre_ff_scale_input),
+                        router_multiplier=float(router_multiplier),
+                        pre_exp_eps=float(pre_exp_eps),
+                        pre_exp_scale_input=bool(pre_exp_scale_input),
+                    )
+
+                return jax.shard_map(
+                    _local, mesh=mesh, in_specs=t_specs, out_specs=out_specs, check_vma=False
+                )(
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    stream_chip,
+                    attn_in,
+                    w_qkv_w8k,
+                    s_qkv,
+                    w_gate_w8k,
+                    s_gate,
+                    kv_cache_ro,
+                    wo_w8k,
+                    wo_scale,
+                    pa_alpha,
+                    pa_beta,
+                    pre_ff_gain,
+                    w_pre_pair_w8k,
+                    w_pre_pair_scale,
+                    w_router_km,
+                    pre_exp_gain,
+                )
+
+            op = _cpu_export_m2m_op(
+                f"sglang_tpu_pallas::muse_w9_l0_a2m_chip_{r_tag}_{rt_tag}_tp{world_size}",
+                _wrapped_n,
+                mesh=mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=out_specs,
+            )
+        _L0_CHIP_OPS[key] = op
+    return op
+
+
 def _build_kvw_callable(n_layers: int, n_bufs: int, layer_to_buf_idx: tuple[int, ...]):
     key = (n_layers, n_bufs, layer_to_buf_idx)
     cached = _KVW_CALLABLES.get(key)
@@ -1283,7 +1820,9 @@ def register_m2m_kv_write_op() -> None:
         _KVW_REGISTERED.append(True)
 
 
-def prewarm_m2m_decode_ops(world_size: int, *, tok_sharded: bool = False) -> None:
+def prewarm_m2m_decode_ops(
+    world_size: int, *, tok_sharded: bool = False, chip_sharded: bool = True
+) -> None:
     """Eagerly register all M2M custom ops outside `torch.compile` (zero Dynamo lock risk!)."""
     if world_size not in SUPPORTED_WORLD_SIZES:
         return
@@ -1298,6 +1837,12 @@ def prewarm_m2m_decode_ops(world_size: int, *, tok_sharded: bool = False) -> Non
                 get_m2m_rep_op(
                     world_size, sharded_moe_in=sh, has_rope=r_flag, bf16_router=r16
                 )
+            if chip_sharded:
+                get_l0_a2m_chip_sh_op(world_size, has_rope=r_flag, bf16_router=r16)
+                for sh in (False, True):
+                    get_m2m_chip_sh_op(
+                        world_size, sharded_moe_in=sh, has_rope=r_flag, bf16_router=r16
+                    )
             if world_size == 8 and tok_sharded:
                 get_l0_a2m_tok_sh_tp8_op(has_rope=r_flag, bf16_router=r16)
                 get_m2m_tok_sh_tp8_op(has_rope=r_flag, bf16_router=r16)
@@ -1312,6 +1857,7 @@ def maybe_forward_m2m_decode(
     cos_sin_step: Optional[torch.Tensor],
     forward_batch,
     tok_sharded_stream: bool,
+    chip_sharded_stream: bool = False,
 ) -> Optional[torch.Tensor]:
     """Execute per-layer `M2M` decode across SWA (all ctx) & Full (`<= max_full_ctx`) layers."""
     if (
@@ -1345,15 +1891,27 @@ def maybe_forward_m2m_decode(
     n_tok = int(positions.shape[0])
     layer0 = model.layers[model.start_layer]
     tp = _layer_tp_size(layer0.self_attn.o_proj)
-    expected_stream_rows = (n_tok // tp) if tok_sharded_stream else n_tok
-    if (
-        tp not in (8, 16)
-        or n_tok not in (16, 32, 64, 128)
-        or int(stream.shape[0]) != expected_stream_rows
-    ):
+    if tp not in (8, 16) or n_tok not in (16, 32, 64, 128):
+        return None
+    if not chip_sharded_stream and not tok_sharded_stream:
+        if int(stream.shape[0]) * (tp // 2) == n_tok:
+            chip_sharded_stream = True
+    if tok_sharded_stream and chip_sharded_stream:
+        return None
+    expected_stream_rows = (
+        (n_tok // tp)
+        if tok_sharded_stream
+        else ((n_tok // (tp // 2)) if chip_sharded_stream else n_tok)
+    )
+    if int(stream.shape[0]) != expected_stream_rows:
         return None
     if tok_sharded_stream and (tp != 8 or n_tok not in (64, 128)):
         return None
+    if chip_sharded_stream and n_tok not in (64, 128):
+        return None
+    if (tok_sharded_stream or chip_sharded_stream) and carried_attn_input is None:
+        return None
+    need_pair_w = tok_sharded_stream or chip_sharded_stream
 
     # Verify all layers carry prepared Bridge-1b/2b FP8 buffers and 5D non-bundle KV pools.
     kv_lens = _contig(backend._kv_lens(forward_batch))
@@ -1374,8 +1932,8 @@ def maybe_forward_m2m_decode(
             or sa._o_proj_w8k is None
             or "_w7_wpost_w8k" not in mlp._buffers
             or "_w7_wrouter_km" not in mlp._buffers
-            or (tok_sharded_stream and "_w8_wpre_pair_w8k" not in mlp._buffers)
-            or (not tok_sharded_stream and "_w7_wpre_w8k" not in mlp._buffers)
+            or (need_pair_w and "_w8_wpre_pair_w8k" not in mlp._buffers)
+            or (not need_pair_w and "_w7_wpre_w8k" not in mlp._buffers)
         ):
             return None
         kv_buf, kv_l_idx = _fused_kv_operands(
@@ -1428,132 +1986,83 @@ def maybe_forward_m2m_decode(
 
     if m2m0:
         sw_val0 = int(sw0) if sw0 is not None else -1
-        if tok_sharded_stream:
+        cs_t0 = (_contig(cos_sin_step),) if has_rope0 else ()
+        if chip_sharded_stream:
+            l0_op = get_l0_a2m_chip_sh_op(tp, has_rope=has_rope0, bf16_router=r16_0)
+            w_pre0, s_pre0 = mlp0._buffers["_w8_wpre_pair_w8k"], mlp0._buffers["_w8_spre_pair"]
+        elif tok_sharded_stream:
             l0_op = get_l0_a2m_tok_sh_tp8_op(has_rope=has_rope0, bf16_router=r16_0)
-            cs_t0 = (_contig(cos_sin_step),) if has_rope0 else ()
-            stream, scaled_logits, expert_in = l0_op(
-                kv_lens,
-                pg0,
-                cu_q,
-                cu_kv,
-                dist0,
-                stream,
-                attn_in0,
-                sa0._buffers["_w7_wqkv_w8k"],
-                sa0._buffers["_w7_sqkv"],
-                sa0._buffers["_w7_wgate_w8k"],
-                sa0._buffers["_w7_sgate"],
-                *cs_t0,
-                kv0,
-                sa0._o_proj_w8k,
-                sa0._o_proj_scale,
-                pa_a0,
-                pa_b0,
-                pff_g0,
-                mlp0._buffers["_w8_wpre_pair_w8k"],
-                mlp0._buffers["_w8_spre_pair"],
-                mlp0._buffers["_w7_wrouter_km"],
-                peg_0,
-                float(sa0.norm_eps),
-                float(sa0.query_scale),
-                float(sa0.attn.scaling),
-                sw_val0,
-                k_sc0,
-                v_sc0,
-                dense2,
-                float(lyr0.post_attention_layernorm.eps),
-                float(lyr0.pre_feedforward_layernorm.eps),
-                bool(lyr0.pre_feedforward_layernorm.scale_input),
-                float(mlp0.router_multiplier),
-                float(mlp0.pre_expert_norm.eps),
-                bool(mlp0.pre_expert_norm.scale_input),
-            )
+            w_pre0, s_pre0 = mlp0._buffers["_w8_wpre_pair_w8k"], mlp0._buffers["_w8_spre_pair"]
         else:
             l0_op = get_l0_a2m_rep_op(tp, has_rope=has_rope0, bf16_router=r16_0)
-            cs_t0 = (_contig(cos_sin_step),) if has_rope0 else ()
-            stream, scaled_logits, expert_in = l0_op(
-                kv_lens,
-                pg0,
-                cu_q,
-                cu_kv,
-                dist0,
-                stream,
-                attn_in0,
-                sa0._buffers["_w7_wqkv_w8k"],
-                sa0._buffers["_w7_sqkv"],
-                sa0._buffers["_w7_wgate_w8k"],
-                sa0._buffers["_w7_sgate"],
-                *cs_t0,
-                kv0,
-                sa0._o_proj_w8k,
-                sa0._o_proj_scale,
-                pa_a0,
-                pa_b0,
-                pff_g0,
-                mlp0._buffers["_w7_wpre_w8k"],
-                mlp0._buffers["_w7_spre"],
-                mlp0._buffers["_w7_wrouter_km"],
-                peg_0,
-                float(sa0.norm_eps),
-                float(sa0.query_scale),
-                float(sa0.attn.scaling),
-                sw_val0,
-                k_sc0,
-                v_sc0,
-                dense2,
-                float(lyr0.post_attention_layernorm.eps),
-                float(lyr0.pre_feedforward_layernorm.eps),
-                bool(lyr0.pre_feedforward_layernorm.scale_input),
-                float(mlp0.router_multiplier),
-                float(mlp0.pre_expert_norm.eps),
-                bool(mlp0.pre_expert_norm.scale_input),
-            )
+            w_pre0, s_pre0 = mlp0._buffers["_w7_wpre_w8k"], mlp0._buffers["_w7_spre"]
+        stream, scaled_logits, expert_in = l0_op(
+            kv_lens,
+            pg0,
+            cu_q,
+            cu_kv,
+            dist0,
+            stream,
+            attn_in0,
+            sa0._buffers["_w7_wqkv_w8k"],
+            sa0._buffers["_w7_sqkv"],
+            sa0._buffers["_w7_wgate_w8k"],
+            sa0._buffers["_w7_sgate"],
+            *cs_t0,
+            kv0,
+            sa0._o_proj_w8k,
+            sa0._o_proj_scale,
+            pa_a0,
+            pa_b0,
+            pff_g0,
+            w_pre0,
+            s_pre0,
+            mlp0._buffers["_w7_wrouter_km"],
+            peg_0,
+            float(sa0.norm_eps),
+            float(sa0.query_scale),
+            float(sa0.attn.scaling),
+            sw_val0,
+            k_sc0,
+            v_sc0,
+            dense2,
+            float(lyr0.post_attention_layernorm.eps),
+            float(lyr0.pre_feedforward_layernorm.eps),
+            bool(lyr0.pre_feedforward_layernorm.scale_input),
+            float(mlp0.router_multiplier),
+            float(mlp0.pre_expert_norm.eps),
+            bool(mlp0.pre_expert_norm.scale_input),
+        )
     else:
         gated0 = sa0(positions, attn_in0, forward_batch, return_gated_attn=True, **cs_kw)
-        if tok_sharded_stream:
-            stream, scaled_logits, expert_in = get_attn_to_moe_tok_sharded_bridge_op(
-                tp, bf16_router=r16_0
-            )(
-                stream,
-                gated0,
-                sa0._o_proj_w8k,
-                sa0._o_proj_scale,
-                pa_a0,
-                pa_b0,
-                pff_g0,
-                mlp0._buffers["_w8_wpre_pair_w8k"],
-                mlp0._buffers["_w8_spre_pair"],
-                mlp0._buffers["_w7_wrouter_km"],
-                peg_0,
-                float(lyr0.post_attention_layernorm.eps),
-                float(lyr0.pre_feedforward_layernorm.eps),
-                bool(lyr0.pre_feedforward_layernorm.scale_input),
-                float(mlp0.router_multiplier),
-                float(mlp0.pre_expert_norm.eps),
-                bool(mlp0.pre_expert_norm.scale_input),
-            )
+        if chip_sharded_stream:
+            b1_0_op = get_attn_to_moe_chip_sharded_bridge_op(tp, bf16_router=r16_0)
+            w_pre0, s_pre0 = mlp0._buffers["_w8_wpre_pair_w8k"], mlp0._buffers["_w8_spre_pair"]
+        elif tok_sharded_stream:
+            b1_0_op = get_attn_to_moe_tok_sharded_bridge_op(tp, bf16_router=r16_0)
+            w_pre0, s_pre0 = mlp0._buffers["_w8_wpre_pair_w8k"], mlp0._buffers["_w8_spre_pair"]
         else:
-            stream, scaled_logits, expert_in = get_attn_to_moe_bridge_op(
-                tp, bf16_router=r16_0
-            )(
-                stream,
-                gated0,
-                sa0._o_proj_w8k,
-                sa0._o_proj_scale,
-                pa_a0,
-                pa_b0,
-                pff_g0,
-                mlp0._buffers["_w7_wpre_w8k"],
-                mlp0._buffers["_w7_spre"],
-                mlp0._buffers["_w7_wrouter_km"],
-                peg_0,
-                float(lyr0.post_attention_layernorm.eps),
-                float(lyr0.pre_feedforward_layernorm.eps),
-                bool(lyr0.pre_feedforward_layernorm.scale_input),
-                float(mlp0.router_multiplier),
-                float(mlp0.pre_expert_norm.eps),
-                bool(mlp0.pre_expert_norm.scale_input),
-            )
+            b1_0_op = get_attn_to_moe_bridge_op(tp, bf16_router=r16_0)
+            w_pre0, s_pre0 = mlp0._buffers["_w7_wpre_w8k"], mlp0._buffers["_w7_spre"]
+        stream, scaled_logits, expert_in = b1_0_op(
+            stream,
+            gated0,
+            sa0._o_proj_w8k,
+            sa0._o_proj_scale,
+            pa_a0,
+            pa_b0,
+            pff_g0,
+            w_pre0,
+            s_pre0,
+            mlp0._buffers["_w7_wrouter_km"],
+            peg_0,
+            float(lyr0.post_attention_layernorm.eps),
+            float(lyr0.pre_feedforward_layernorm.eps),
+            bool(lyr0.pre_feedforward_layernorm.scale_input),
+            float(mlp0.router_multiplier),
+            float(mlp0.pre_expert_norm.eps),
+            bool(mlp0.pre_expert_norm.scale_input),
+        )
 
     # Step 2: Inter-layer MoE(i) -> M2M(i -> i+1) relay across all 62 layers
     n_layers = len(layer_meta)
@@ -1590,7 +2099,24 @@ def maybe_forward_m2m_decode(
 
         if i + 1 == n_layers:
             fin_gain = model.norm.gain()
-            if tok_sharded_stream:
+            if chip_sharded_stream:
+                final_hidden = get_moe_post_chip_sharded_final_norm_op(
+                    tp, sharded_moe_in=sharded_in, return_stream_too=False
+                )(
+                    stream,
+                    moe_out,
+                    w_post,
+                    s_post,
+                    post_ff_gain,
+                    pf_a,
+                    pf_b,
+                    fin_gain,
+                    float(lyr.post_feedforward_layernorm.eps),
+                    bool(lyr.post_feedforward_layernorm.scale_input),
+                    float(model.norm.eps),
+                    bool(model.norm.scale_input),
+                )
+            elif tok_sharded_stream:
                 final_hidden = get_moe_post_tok_sharded_final_norm_op(
                     tp, return_stream_too=False
                 )(
@@ -1640,65 +2166,94 @@ def maybe_forward_m2m_decode(
         if n_m2m:
             n_sw_val = int(n_sw) if n_sw is not None else -1
             cs_tn = (_contig(cos_sin_step),) if n_has_rope else ()
-            if tok_sharded_stream:
-                m2m_op = get_m2m_tok_sh_tp8_op(has_rope=n_has_rope, bf16_router=n_r16)
-                stream, scaled_logits, expert_in = m2m_op(
-                    kv_lens,
-                    n_pg,
-                    cu_q,
-                    cu_kv,
-                    n_dist,
-                    stream,
-                    moe_out,
-                    w_post,
-                    s_post,
-                    post_ff_gain,
-                    pf_a,
-                    pf_b,
-                    next_in_gain,
-                    n_sa._buffers["_w7_wqkv_w8k"],
-                    n_sa._buffers["_w7_sqkv"],
-                    n_sa._buffers["_w7_wgate_w8k"],
-                    n_sa._buffers["_w7_sgate"],
-                    *cs_tn,
-                    n_kv,
-                    n_sa._o_proj_w8k,
-                    n_sa._o_proj_scale,
-                    n_pa_a,
-                    n_pa_b,
-                    n_pff_g,
+            if chip_sharded_stream:
+                m2m_op = get_m2m_chip_sh_op(
+                    tp, sharded_moe_in=sharded_in, has_rope=n_has_rope, bf16_router=n_r16
+                )
+                n_wpre, n_spre = (
                     n_mlp._buffers["_w8_wpre_pair_w8k"],
                     n_mlp._buffers["_w8_spre_pair"],
-                    n_mlp._buffers["_w7_wrouter_km"],
-                    n_peg,
-                    float(lyr.post_feedforward_layernorm.eps),
-                    bool(lyr.post_feedforward_layernorm.scale_input),
-                    float(n_lyr.input_layernorm.eps),
-                    bool(n_lyr.input_layernorm.scale_input),
-                    float(n_sa.norm_eps),
-                    float(n_sa.query_scale),
-                    float(n_sa.attn.scaling),
-                    n_sw_val,
-                    n_k_sc,
-                    n_v_sc,
-                    dense2,
-                    float(n_lyr.post_attention_layernorm.eps),
-                    float(n_lyr.pre_feedforward_layernorm.eps),
-                    bool(n_lyr.pre_feedforward_layernorm.scale_input),
-                    float(n_mlp.router_multiplier),
-                    float(n_mlp.pre_expert_norm.eps),
-                    bool(n_mlp.pre_expert_norm.scale_input),
+                )
+            elif tok_sharded_stream:
+                m2m_op = get_m2m_tok_sh_tp8_op(has_rope=n_has_rope, bf16_router=n_r16)
+                n_wpre, n_spre = (
+                    n_mlp._buffers["_w8_wpre_pair_w8k"],
+                    n_mlp._buffers["_w8_spre_pair"],
                 )
             else:
                 m2m_op = get_m2m_rep_op(
                     tp, sharded_moe_in=sharded_in, has_rope=n_has_rope, bf16_router=n_r16
                 )
-                stream, scaled_logits, expert_in = m2m_op(
-                    kv_lens,
-                    n_pg,
-                    cu_q,
-                    cu_kv,
-                    n_dist,
+                n_wpre, n_spre = (
+                    n_mlp._buffers["_w7_wpre_w8k"],
+                    n_mlp._buffers["_w7_spre"],
+                )
+            stream, scaled_logits, expert_in = m2m_op(
+                kv_lens,
+                n_pg,
+                cu_q,
+                cu_kv,
+                n_dist,
+                stream,
+                moe_out,
+                w_post,
+                s_post,
+                post_ff_gain,
+                pf_a,
+                pf_b,
+                next_in_gain,
+                n_sa._buffers["_w7_wqkv_w8k"],
+                n_sa._buffers["_w7_sqkv"],
+                n_sa._buffers["_w7_wgate_w8k"],
+                n_sa._buffers["_w7_sgate"],
+                *cs_tn,
+                n_kv,
+                n_sa._o_proj_w8k,
+                n_sa._o_proj_scale,
+                n_pa_a,
+                n_pa_b,
+                n_pff_g,
+                n_wpre,
+                n_spre,
+                n_mlp._buffers["_w7_wrouter_km"],
+                n_peg,
+                float(lyr.post_feedforward_layernorm.eps),
+                bool(lyr.post_feedforward_layernorm.scale_input),
+                float(n_lyr.input_layernorm.eps),
+                bool(n_lyr.input_layernorm.scale_input),
+                float(n_sa.norm_eps),
+                float(n_sa.query_scale),
+                float(n_sa.attn.scaling),
+                n_sw_val,
+                n_k_sc,
+                n_v_sc,
+                dense2,
+                float(n_lyr.post_attention_layernorm.eps),
+                float(n_lyr.pre_feedforward_layernorm.eps),
+                bool(n_lyr.pre_feedforward_layernorm.scale_input),
+                float(n_mlp.router_multiplier),
+                float(n_mlp.pre_expert_norm.eps),
+                bool(n_mlp.pre_expert_norm.scale_input),
+            )
+            continue
+
+        # Long-context Full layer (`streamdyn` / `shared16`): run standalone b2 -> RPAd -> b1!
+        if chip_sharded_stream:
+            tp16_epi_ok = tp == 16 and bool(
+                getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI", None)
+                and tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get()
+            )
+            use_epi = (
+                (tp == 8 or tp16_epi_ok)
+                and bool(lyr.__dict__.get("_w8_bridge_qkv_epi", False))
+                and n_sa.decode_qkv_epilogue
+            )
+            if use_epi:
+                epi_op = get_moe_to_attn_chip_sharded_bridge_op(
+                    tp, sharded_moe_in=sharded_in, fuse_qkv_epi=True, has_rope=n_has_rope
+                )
+                cs_t = (_contig(cos_sin_step),) if n_has_rope else ()
+                stream, nq5, nkv, ng = epi_op(
                     stream,
                     moe_out,
                     w_post,
@@ -1711,39 +2266,76 @@ def maybe_forward_m2m_decode(
                     n_sa._buffers["_w7_sqkv"],
                     n_sa._buffers["_w7_wgate_w8k"],
                     n_sa._buffers["_w7_sgate"],
-                    *cs_tn,
-                    n_kv,
-                    n_sa._o_proj_w8k,
-                    n_sa._o_proj_scale,
-                    n_pa_a,
-                    n_pa_b,
-                    n_pff_g,
-                    n_mlp._buffers["_w7_wpre_w8k"],
-                    n_mlp._buffers["_w7_spre"],
-                    n_mlp._buffers["_w7_wrouter_km"],
-                    n_peg,
+                    *cs_t,
                     float(lyr.post_feedforward_layernorm.eps),
                     bool(lyr.post_feedforward_layernorm.scale_input),
                     float(n_lyr.input_layernorm.eps),
                     bool(n_lyr.input_layernorm.scale_input),
                     float(n_sa.norm_eps),
                     float(n_sa.query_scale),
-                    float(n_sa.attn.scaling),
-                    n_sw_val,
                     n_k_sc,
                     n_v_sc,
-                    dense2,
-                    float(n_lyr.post_attention_layernorm.eps),
-                    float(n_lyr.pre_feedforward_layernorm.eps),
-                    bool(n_lyr.pre_feedforward_layernorm.scale_input),
-                    float(n_mlp.router_multiplier),
-                    float(n_mlp.pre_expert_norm.eps),
-                    bool(n_mlp.pre_expert_norm.scale_input),
                 )
-            continue
-
-        # Long-context Full layer (`streamdyn` / `shared16`): run standalone b2 -> RPAd -> b1!
-        if tok_sharded_stream:
+                n_gated = n_sa(
+                    positions,
+                    None,
+                    forward_batch,
+                    precomputed_prepared_qkvg=(nq5, nkv, ng),
+                    return_gated_attn=True,
+                    **cs_kw,
+                )
+            else:
+                b2_op = get_moe_to_attn_chip_sharded_bridge_op(
+                    tp, sharded_moe_in=sharded_in, fuse_qkv_epi=False
+                )
+                stream, nqkv, ng = b2_op(
+                    stream,
+                    moe_out,
+                    w_post,
+                    s_post,
+                    post_ff_gain,
+                    pf_a,
+                    pf_b,
+                    next_in_gain,
+                    n_sa._buffers["_w7_wqkv_w8k"],
+                    n_sa._buffers["_w7_sqkv"],
+                    n_sa._buffers["_w7_wgate_w8k"],
+                    n_sa._buffers["_w7_sgate"],
+                    float(lyr.post_feedforward_layernorm.eps),
+                    bool(lyr.post_feedforward_layernorm.scale_input),
+                    float(n_lyr.input_layernorm.eps),
+                    bool(n_lyr.input_layernorm.scale_input),
+                )
+                n_gated = n_sa(
+                    positions,
+                    None,
+                    forward_batch,
+                    precomputed_qkv_gate=(nqkv, ng),
+                    return_gated_attn=True,
+                    **cs_kw,
+                )
+            stream, scaled_logits, expert_in = get_attn_to_moe_chip_sharded_bridge_op(
+                tp, bf16_router=n_r16
+            )(
+                stream,
+                n_gated,
+                n_sa._o_proj_w8k,
+                n_sa._o_proj_scale,
+                n_pa_a,
+                n_pa_b,
+                n_pff_g,
+                n_mlp._buffers["_w8_wpre_pair_w8k"],
+                n_mlp._buffers["_w8_spre_pair"],
+                n_mlp._buffers["_w7_wrouter_km"],
+                n_peg,
+                float(n_lyr.post_attention_layernorm.eps),
+                float(n_lyr.pre_feedforward_layernorm.eps),
+                bool(n_lyr.pre_feedforward_layernorm.scale_input),
+                float(n_mlp.router_multiplier),
+                float(n_mlp.pre_expert_norm.eps),
+                bool(n_mlp.pre_expert_norm.scale_input),
+            )
+        elif tok_sharded_stream:
             use_epi = bool(lyr.__dict__.get("_w8_bridge_qkv_epi", False)) and n_sa.decode_qkv_epilogue
             if use_epi:
                 epi_op = get_moe_to_attn_tok_sharded_bridge_op(
@@ -1831,8 +2423,12 @@ def maybe_forward_m2m_decode(
                 bool(n_mlp.pre_expert_norm.scale_input),
             )
         else:
+            tp16_epi_ok = tp == 16 and bool(
+                getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI", None)
+                and tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get()
+            )
             use_epi = (
-                tp == 8
+                (tp == 8 or tp16_epi_ok)
                 and bool(lyr.__dict__.get("_w8_bridge_qkv_epi", False))
                 and n_sa.decode_qkv_epilogue
             )
