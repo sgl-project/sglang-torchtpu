@@ -8,6 +8,7 @@ sink, no lse, no context parallel, causal) by its helpers; it duplicates the wra
 assembly, so a shared seam would replace it if the layout is adopted."""
 
 import dataclasses
+import functools
 import math
 
 import jax
@@ -34,6 +35,11 @@ def new_kv(k, v, page_size: int):
     return kv.reshape(tp, 2 * hkv, dk // pack, pack).transpose(1, 2, 3, 0)
 
 
+# jitted like the wrapper: one lowered computation per (heads, window) instead of a Mosaic
+# compile per layer (inlined: ~530 s vs ~140 s for the 62-layer program)
+@functools.partial(
+    jax.jit, static_argnames=("num_q_heads", "sm_scale", "sliding_window")
+)
 def rpa_prepared(
     q_hbm,
     k,
