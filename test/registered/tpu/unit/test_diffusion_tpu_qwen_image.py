@@ -49,7 +49,12 @@ from sglang_tpu.multimodal_gen import qwen_image, worker
 
 # Whole node, not chips=1: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit")
+register_tpu_ci(
+    est_time=90,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _T2I = [(1, 4, 4)]
 _EDIT = [(1, 4, 4), (1, 2, 3)]  # the noisy image, then one condition image
