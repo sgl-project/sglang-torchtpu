@@ -4,6 +4,7 @@ scheduler drives, and the decode transfer consensus over it."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
 import torch
@@ -53,21 +54,16 @@ def _check_aux_capture_relay(model: nn.Module) -> None:
 
 def _check_buffered_supported(scheduler: Scheduler) -> None:
     """Raise for configurations whose forwards pad to a shape a stage cannot
-    derive from its own batch, which the buffered hand-off's receives must know first."""
-    from sglang.srt.layers.cp.base import get_cp_strategy
+    derive from its own batch, which the buffered hand-off's receives must
+    know first. Context-parallel stages derive their local rows per batch
+    (pp_forward_rows); DP attention pads to a shape agreed across ranks."""
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
-    unsupported = []
     if is_dp_attention_enabled():
-        unsupported.append("DP attention")
-    if get_cp_strategy() is not None:
-        unsupported.append("prefill context parallelism")
-    if unsupported:
         raise NotImplementedError(
-            "SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF does not support "
-            f"{' or '.join(unsupported)}: their forwards pad to a shape agreed "
-            "with other ranks, which a stage cannot size its receive for. Unset "
-            "it to use the lockstep wave."
+            "SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF does not support DP attention: "
+            "its forwards pad to a shape agreed with other ranks, which a stage "
+            "cannot size its receive for. Unset it to use the lockstep wave."
         )
 
 
@@ -170,12 +166,32 @@ def buffered_handoff_reserve_bytes(
     )
 
 
+def _cp_extend(batch: ScheduleBatch) -> bool:
+    """Whether ``batch`` runs the context-parallel forward, as is_cp_active
+    decides it for the ForwardBatch built from it."""
+    from sglang.srt.layers.cp.base import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is None or not batch.forward_mode.is_context_parallel_extend():
+        return False
+    if batch.input_ids is None or batch.extend_lens is None:
+        return False
+    view = SimpleNamespace(
+        forward_mode=batch.forward_mode, extend_seq_lens_cpu=batch.extend_lens
+    )
+    return bool(strategy.can_apply(int(batch.input_ids.shape[0]), view))
+
+
 def pp_forward_rows(scheduler: Scheduler, batch: ScheduleBatch) -> int:
     """The padded token count of the forward ``batch`` runs, as the compiled
     forward pads it (DecoderTpuCompilePolicy.prepare_forward_batch); every
     stage derives the same count from the same batch."""
     policy = scheduler.tp_worker.model_runner.compile_policy
     real_b = len(batch.reqs)
+    if _cp_extend(batch):
+        # Each rank of a context-parallel stage runs, and hands on, its local
+        # rows; every rank pads them to the same bucket.
+        return policy.cp_forward_rows(list(batch.extend_lens))
     if batch.forward_mode.is_decode() and batch.spec_info is None:
         real_q = real_b
     elif batch.input_ids is not None:
