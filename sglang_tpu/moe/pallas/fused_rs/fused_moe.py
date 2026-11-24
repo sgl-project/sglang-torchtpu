@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+    PairFp8Out,
     _select_fused_rs_block_sizes,
 )
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
@@ -146,7 +147,8 @@ def _compute_expert_tp_routing(
 
 
 def _pair_post_combine(
-    recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
+    recv: jax.Array
+    | PairFp8Out,  # [blocks * chunk * topk, ...] receive blocks, owned-row rank order
     topk_indices: jax.Array,  # [num_tokens, topk], replicated
     topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
     post_expert_norm_weight: jax.Array | None,
@@ -178,18 +180,20 @@ def _pair_post_combine(
         flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
         token = flat // topk - my_id * chunk_size
         weight = topk_weights.astype(jnp.float32)[token, flat % topk]
-    out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    q8 = isinstance(recv, PairFp8Out)
+    recv_bf16 = recv.bf16_blocks if q8 else recv
+    out_dtype = jnp.result_type(recv_bf16.dtype, topk_weights.dtype)
     if (
         fused_scatter
         and post_expert_norm_weight is not None
-        and recv.ndim == 3
+        and recv_bf16.ndim == 3
         and rows % 8 == 0
         and chunk_size >= 8
         and chunk_size % 8 == 0
         and chunk_size <= 1024
     ):
         return pair_post_combine_scatter(
-            recv,
+            recv_bf16,
             post_expert_norm_weight,
             weight,
             token,
@@ -197,7 +201,11 @@ def _pair_post_combine(
             chunk_size=chunk_size,
             eps=1e-8,
             out_dtype=out_dtype,
+            recv_q8=recv.q8_blocks if q8 else None,
+            recv_q8_scale=recv.q8_scales if q8 else None,
         )
+    if q8:
+        raise ValueError("e4m3 pair sums need the fused scatter combine")
     if post_expert_norm_weight is not None and recv.ndim == 3:
         weighted = pair_post_combine(
             recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
@@ -425,6 +433,11 @@ def moe_gmm_local_rs_nodedup(
         and not fp8_direct_write
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
     )
+    w4a8_rows = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_W4A8_ROWS.get()
+    gmm2_fold = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_FOLD.get()
+    gmm1_fold = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM1_FOLD.get()
+    pair_fp8_rows = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS.get()
+    pair_sum_bf16 = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16.get()
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -458,6 +471,11 @@ def moe_gmm_local_rs_nodedup(
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
         pair_exchange=pair_exchange,
+        pair_fp8_rows=pair_fp8_rows,
+        w4a8_rows=w4a8_rows,
+        gmm2_fold=gmm2_fold,
+        gmm1_fold=gmm1_fold,
+        pair_sum_bf16=pair_sum_bf16,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16

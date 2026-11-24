@@ -134,37 +134,57 @@ def _pair_combine_scatter_kernel(
     x_hbm_ref,
     gain_ref,
     w_ref,
-    o_hbm_ref,
-    x_buf_ref,
-    acc_ref,
-    row_buf_ref,
-    in_sem,
-    out_sem,
-    *,
+    *refs,
     num_steps: int,
     rb: int,
     out_b: int,
     chunk_size: int,
     blocks: int,
     eps: float,
+    q8_blocks: int = 0,
 ):
-    """Pallas kernel: block sum + RMSNorm + top-k weight + VMEM scatter-add."""
+    """Pallas kernel: block sum + RMSNorm + top-k weight + VMEM scatter-add.
+
+    q8_blocks > 0: that many more blocks arrive as e4m3 rows with f32 row scales.
+    """
+    if q8_blocks:
+        (
+            q8_hbm_ref,
+            qs_hbm_ref,
+            o_hbm_ref,
+            x_buf_ref,
+            q8_buf_ref,
+            qs_buf_ref,
+            acc_ref,
+            row_buf_ref,
+            in_sem,
+            out_sem,
+        ) = refs
+    else:
+        o_hbm_ref, x_buf_ref, acc_ref, row_buf_ref, in_sem, out_sem = refs
     h1, h2 = x_hbm_ref.shape[2], x_hbm_ref.shape[3]
     hidden = h1 * h2
 
+    def _copies(slot, step):
+        rows = pl.ds(step * rb, rb)
+        pairs = [(x_hbm_ref.at[:, rows, :, :], x_buf_ref.at[slot])]
+        if q8_blocks:
+            pairs += [
+                (q8_hbm_ref.at[:, rows, :, :], q8_buf_ref.at[slot]),
+                (qs_hbm_ref.at[:, rows, :], qs_buf_ref.at[slot]),
+            ]
+        return [
+            pltpu.make_async_copy(src_ref=src, dst_ref=dst, sem=in_sem.at[slot])
+            for src, dst in pairs
+        ]
+
     def _start_in(slot, step):
-        pltpu.make_async_copy(
-            src_ref=x_hbm_ref.at[:, pl.ds(step * rb, rb), :, :],
-            dst_ref=x_buf_ref.at[slot],
-            sem=in_sem.at[slot],
-        ).start()
+        for c in _copies(slot, step):
+            c.start()
 
     def _wait_in(slot):
-        pltpu.make_async_copy(
-            src_ref=x_buf_ref.at[slot],
-            dst_ref=x_buf_ref.at[slot],
-            sem=in_sem.at[slot],
-        ).wait()
+        for c in _copies(slot, 0):
+            c.wait()
 
     _start_in(0, 0)
     if num_steps > 1:
@@ -184,6 +204,9 @@ def _pair_combine_scatter_kernel(
         acc = x_buf_ref[slot, 0].astype(jnp.float32)
         for e in range(1, blocks):
             acc = acc + x_buf_ref[slot, e].astype(jnp.float32)
+        for e in range(q8_blocks):
+            scale = qs_buf_ref[slot, e][:, :1]
+            acc = acc + q8_buf_ref[slot, e].astype(jnp.float32) * scale[:, :, None]
 
         @pl.when(step + 2 < num_steps)
         def _():
@@ -243,10 +266,15 @@ def pair_post_combine_scatter(
     eps: float,
     out_dtype: jnp.dtype,
     rows_per_block: int = 128,
+    recv_q8: jax.Array | None = None,  # [q8_blocks * rows, H1, H2] e4m3 receive blocks
+    recv_q8_scale: jax.Array | None = None,  # [q8_blocks * rows, 128] f32 row scales
 ) -> jax.Array:
     """[chunk_size, H1 * H2]: block sum, RMS norm, top-k weight, scatter-add."""
     h1, h2 = recv.shape[1:]
     blocks = recv.shape[0] // rows
+    q8_blocks = 0 if recv_q8 is None else recv_q8.shape[0] // rows
+    if (recv_q8 is None) != (recv_q8_scale is None):
+        raise ValueError("recv_q8 and recv_q8_scale come together")
     rb = min(rows_per_block, rows)
     while rows % rb or rb % 8:
         rb //= 2
@@ -259,6 +287,21 @@ def pair_post_combine_scatter(
     gain = (post_norm_weight.astype(jnp.float32) + 1.0).reshape(h1, h2)
     w = jnp.broadcast_to(rank_weight.astype(jnp.float32)[:, None], (rows, 128))
     tok = rank_token.astype(jnp.int32)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    in_specs = [hbm, vmem, vmem]
+    args = [tok, x, gain, w]
+    q8_scratch = []
+    if q8_blocks:
+        in_specs += [hbm, hbm]
+        args += [
+            recv_q8.reshape(q8_blocks, rows, h1, h2),
+            recv_q8_scale.reshape(q8_blocks, rows, recv_q8_scale.shape[-1]),
+        ]
+        q8_scratch = [
+            pltpu.VMEM((2, q8_blocks, rb, h1, h2), recv_q8.dtype),
+            pltpu.VMEM((2, q8_blocks, rb, recv_q8_scale.shape[-1]), jnp.float32),
+        ]
     out = pl.pallas_call(
         functools.partial(
             _pair_combine_scatter_kernel,
@@ -268,18 +311,16 @@ def pair_post_combine_scatter(
             chunk_size=chunk_size,
             blocks=blocks,
             eps=eps,
+            q8_blocks=q8_blocks,
         ),
         out_shape=jax.ShapeDtypeStruct((chunk_size, h1, h2), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            in_specs=in_specs,
+            out_specs=hbm,
             scratch_shapes=[
                 pltpu.VMEM((2, blocks, rb, h1, h2), recv.dtype),
+                *q8_scratch,
                 pltpu.VMEM((chunk_size, h1, h2), jnp.float32),
                 pltpu.VMEM((rb, h1, h2), out_dtype),
                 pltpu.SemaphoreType.DMA((2,)),
@@ -290,6 +331,7 @@ def pair_post_combine_scatter(
             vmem_limit_bytes=vmem_limit,
             disable_bounds_checks=True,
         ),
-        name=f"pair_post_combine_scatter-C_{chunk_size}-R_{rows}",
-    )(tok, x, gain, w)
+        name=f"pair_post_combine_scatter-C_{chunk_size}-R_{rows}"
+        + (f"-q8_{q8_blocks}" if q8_blocks else ""),
+    )(*args)
     return out.reshape(chunk_size, h1 * h2)

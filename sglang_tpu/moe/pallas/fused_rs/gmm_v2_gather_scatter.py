@@ -108,6 +108,8 @@ class InputConfigs:
     has_scale: bool = False
     packing: int = 1
     num_quant_blocks: int = 1
+    # lhs only: one quant scale per row over the whole tile K (EP gmm_v2 style).
+    row_scale: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -431,6 +433,21 @@ def inner_kernel(
             apply_rhs_scale_after_matmul = cfgs.rhs_cfgs.has_scale and (
                 rhs_scale_matches_lhs_block
             )
+            row_scale = cfgs.lhs_cfgs.row_scale
+            if row_scale:
+                if not (is_first_k_step and is_last_k_step):
+                    raise ValueError("row-scaled lhs needs the whole K in one tile")
+                q_max = float(jnp.finfo(cfgs.lhs_cfgs.quant_dtype).max)
+                row_s = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True) / q_max
+                row_s_inv = jnp.where(row_s == 0, 0, 1 / row_s)
+                lhs_src = (tiled_lhs * row_s_inv).astype(cfgs.lhs_cfgs.quant_dtype)
+            else:
+                lhs_src = tiled_lhs
+
+            def _row_rescale(acc_n):
+                if not row_scale:
+                    return acc_n
+                return acc_n * row_s.astype(acc_n.dtype)
 
             # Without n outer loop, result of quantized matmul becomes available only
             # at the last iteration of the loop. This means [tile_m, tile_n] value
@@ -492,7 +509,19 @@ def inner_kernel(
                 else:
                     block_rhs_for_quant = _to_bf16(block_rhs)
 
-                if fp8_activation_quant:
+                lhs_scale = None
+                if row_scale:
+                    block_lhs_for_matmul = block_lhs
+                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                        block_rhs_for_matmul, rhs_online_scale = _online_quantize(
+                            block_rhs_for_quant,
+                            axis=0,
+                            quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                        )
+                    else:
+                        block_rhs_for_matmul = block_rhs
+                        rhs_online_scale = None
+                elif fp8_activation_quant:
                     block_lhs_for_matmul, lhs_scale = _online_quantize(
                         block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
                     )
@@ -519,7 +548,8 @@ def inner_kernel(
                 ).astype(acc_ref.dtype)
 
                 if fp8_activation_quant:
-                    block_acc *= lhs_scale.astype(acc_ref.dtype)
+                    if lhs_scale is not None:
+                        block_acc *= lhs_scale.astype(acc_ref.dtype)
                     if rhs_online_scale is not None:
                         block_acc *= rhs_online_scale.astype(acc_ref.dtype)
 
@@ -559,7 +589,7 @@ def inner_kernel(
                             ]
                             for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                                 end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                                block_lhs = tiled_lhs[:, start_k:end_k]
+                                block_lhs = lhs_src[:, start_k:end_k]
                                 for c in range(n_grp):
                                     sn = g_col + c * mxu_size
                                     accs[c] += _quant_col_step(
@@ -567,6 +597,7 @@ def inner_kernel(
                                     )
                             grp_outs = []
                             for acc_n in accs:
+                                acc_n = _row_rescale(acc_n)
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
@@ -586,7 +617,7 @@ def inner_kernel(
                                     end_k = min(
                                         cfgs.tiles.tile_k, start_k + q_block_size
                                     )
-                                    block_lhs = tiled_lhs[:, start_k:end_k]
+                                    block_lhs = lhs_src[:, start_k:end_k]
                                     acc_n += _quant_col_step(
                                         block_lhs,
                                         start_k,
@@ -594,6 +625,7 @@ def inner_kernel(
                                         start_n,
                                         start_n + mxu_size,
                                     )
+                                acc_n = _row_rescale(acc_n)
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
@@ -615,10 +647,10 @@ def inner_kernel(
 
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    block_lhs = lhs_src[:, start_k:end_k]
                     acc_n += _quant_col_step(block_lhs, start_k, end_k, start_n, end_n)
 
-                acc_list.append(acc_n)
+                acc_list.append(_row_rescale(acc_n))
             acc = jnp.concatenate(acc_list, axis=1)
 
         if not is_first_k_step:

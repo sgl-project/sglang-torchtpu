@@ -698,6 +698,23 @@ class TpuEnvs:
     # of this rank's own (token, slot) pairs instead of argsorting every row and gathering back.
     # Same arrays (bit-identical).
     SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS = EnvBool(False)
+    # Pair exchange: cross-chip pair sums travel as e4m3 with one f32 scale per row
+    # (~0.56x the bf16 ICI bytes; numerics change).
+    SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS = EnvBool(False)
+    # Expert-TP W4A16 fused-RS: quantize both GMM inputs to e4m3 with one scale per
+    # row, as the EP gmm_v2 path does (W4A8; numerics change).
+    SGLANG_TPU_FUSED_RS_W4A8_ROWS = EnvBool(False)
+    # Fused-RS W4A16 GMM2: fold the block scales into the bf16 weights and run K as
+    # one dot (one more bf16 rounding of the scaled weights).
+    SGLANG_TPU_FUSED_RS_GMM2_FOLD = EnvBool(False)
+    # The same for GMM1 (K = hidden as one dot instead of one dot per 256-row block).
+    SGLANG_TPU_FUSED_RS_GMM1_FOLD = EnvBool(False)
+    # Fused-RS: extra row buckets (comma list, multiples of the sublane tiling) added
+    # to the power-of-two buckets; exact.
+    SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr(None)
+    # Pair exchange: add the sibling's partial in bf16, 8 rows per op, instead of
+    # per row in f32.
+    SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16 = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

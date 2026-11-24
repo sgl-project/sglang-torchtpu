@@ -19,6 +19,7 @@ Key design principles:
 import dataclasses
 import functools
 import os
+from typing import NamedTuple
 
 import jax
 import jax.experimental.pallas as pl
@@ -53,6 +54,19 @@ from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
 # Ring slots for the sibling's partial tiles in pair exchange; a sender waits for
 # a credit before reusing a slot, so 2 is enough for the cores' lockstep tiles.
 _PAIR_RING = 2
+# row amax maps a bit under e4m3's 448 so the bf16-rounded scale cannot overflow it
+_Q8_TARGET = 440.0
+# rows per e4m3 pair-sum block: one reduce -> scale -> store chain per block
+_Q8_ROWS = 16
+
+
+class PairFp8Out(NamedTuple):
+    """Pair-exchange receive blocks with e4m3 cross-chip pair sums."""
+
+    bf16_blocks: jax.Array  # [2 * rows, N2 // NL, NL]: own and sibling partials
+    q8_blocks: jax.Array  # [(chips - 1) * rows, N2 // NL, NL] e4m3 pair sums
+    q8_scales: jax.Array  # [(chips - 1) * rows, NL] f32 row scales (lanes equal)
+
 
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)
@@ -535,6 +549,11 @@ def kernel_main_fused_rs(
     pair_fp8_inv_scale: float = 1.0,
     pair_send_fp8_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL) e4m3: partials to the sibling
     pair_self_count_ref=None,  # SMEM (1,): pieces sent to self (ablations)
+    pair_q8_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL) e4m3: cross-chip pair sums
+    pair_qs_ref=None,  # VMEM (staging_slots, tile_m, NL) f32: their row scales
+    out_q8_ref=None,  # HBM (3 * rows, N2//NL, NL) e4m3: cross-chip receive blocks
+    out_qs_ref=None,  # HBM (3 * rows, NL) f32: their row scales
+    pair_sum_bf16: bool = False,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -1114,6 +1133,14 @@ def kernel_main_fused_rs(
         # instruction memory
         keep = {int(b) for b in only.split(",") if b}
         M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
+    if (extra := tpu_envs.SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS.get()) is not None:
+        add = {int(b) for b in extra.split(",") if b}
+        if any(b % _sls_b or b > tile_m for b in add):
+            raise ValueError(
+                f"extra row buckets {sorted(add)} must be multiples of {_sls_b} "
+                f"and <= tile_m {tile_m}"
+            )
+        M_BUCKETS = sorted(set(M_BUCKETS) | add)
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
@@ -1209,16 +1236,21 @@ def kernel_main_fused_rs(
         num_chips = ep_size // 2
         rows_per_block = out_buf_ref.shape[0] // (num_chips + 1)
 
-        if (
+        fast_pair = (
             _fast_issue
             and _fwd_psum
             and not _no_psum
             and pair_fp8_ref is None
             and pair_send_fp8_ref is None
-        ):
+        )
+        if pair_q8_ref is not None and not fast_pair:
+            raise ValueError("e4m3 pair sums need the fast-issue pair path")
+        if fast_pair:
             my_core = my_id % 2
             base = pair_meta_base + g * ep_size
             lens = [group_start_ref[base + d] for d in range(ep_size)]
+            if pair_q8_ref is not None:
+                rows_per_block = out_buf_ref.shape[0] // 2
 
             def _src_off_fast(d):
                 acc = jnp.int32(0)
@@ -1232,6 +1264,31 @@ def kernel_main_fused_rs(
                     + pair_ring_ref[ring_slot, r].astype(jnp.float32)
                 ).astype(pair_sum_ref.dtype)
 
+            def _psum_rows(r, n):
+                rows = pl.ds(r, n)
+                if pair_q8_ref is None:
+                    if pair_sum_bf16 and n > 1:
+                        pair_sum_ref[stg, rows] = (
+                            scatter_staging_3x_ref[stg, rows]
+                            + pair_ring_ref[ring_slot, rows]
+                        )
+                    else:
+                        for u in range(n):
+                            _psum_one(r + u)
+                    return
+                # bf16 pair sum (the bf16 path's rounding), then e4m3 with a row scale
+                x = scatter_staging_3x_ref[stg, rows] + pair_ring_ref[ring_slot, rows]
+                # sublanes first: the n rows' lane maxima share one vreg for the lane reduce
+                amax = jnp.max(jnp.max(jnp.abs(x), axis=1), axis=1, keepdims=True)
+                amax = amax.astype(jnp.float32)
+                inv = jnp.where(amax == 0, 0.0, _Q8_TARGET / amax).astype(x.dtype)
+                pair_q8_ref[stg, rows] = (x * inv[:, :, None]).astype(pair_q8_ref.dtype)
+                inv = inv.astype(jnp.float32)
+                pair_qs_ref[stg, rows, :] = jnp.broadcast_to(
+                    jnp.where(inv == 0, 0.0, 1.0 / inv), (n, pair_qs_ref.shape[-1])
+                )
+
+            psum_batch = 8 if pair_sum_bf16 else 1
             sent = jnp.int32(0)
             # Issue local/sibling DMAs BEFORE waiting on the sibling ring slot.
             for d, block in ((my_id, 0), (jnp.bitwise_xor(my_id, 1), 1)):
@@ -1276,6 +1333,16 @@ def kernel_main_fused_rs(
                 ]
                 src_off = _src_off_fast(d)
                 dst0 = block * rows_per_block + rank
+                if pair_q8_ref is not None:
+                    # the whole run in 16-row blocks, the last one clamped into the tile:
+                    # a row recomputed by an overlapping block gets the same bytes
+                    def _q8_block(i, c, r_run=row0 + src_off):
+                        r = jnp.minimum(r_run + i * _Q8_ROWS, tile_m - _Q8_ROWS)
+                        _psum_rows(r, _Q8_ROWS)
+                        return c
+
+                    n_blocks = (run_len + _Q8_ROWS - 1) // _Q8_ROWS
+                    lax.fori_loop(0, n_blocks, _q8_block, 0)
                 off = jnp.int32(0)
                 for b in pair_pieces:
                     has = (run_len & b) != 0
@@ -1283,20 +1350,46 @@ def kernel_main_fused_rs(
                     @pl.when(has)
                     def _(b=b, off=off, d=d, dst0=dst0, src_off=src_off):
                         r_base = row0 + src_off + off
-                        if b <= 8:
+                        if pair_q8_ref is not None:
+                            pass
+                        elif b < 8:
                             for u in range(b):
-                                _psum_one(r_base + u)
+                                _psum_rows(r_base + u, 1)
+                        elif b == 8:
+                            _psum_rows(r_base, psum_batch)
+                            for u in range(psum_batch, 8):
+                                _psum_rows(r_base + u, 1)
                         else:
 
                             def _psum8(k8, c, r_base=r_base):
-                                for u in range(8):
-                                    _psum_one(r_base + k8 * 8 + u)
+                                r8 = r_base + k8 * 8
+                                for u in range(0, 8, psum_batch):
+                                    _psum_rows(r8 + u, psum_batch)
                                 return c
 
                             lax.fori_loop(0, b // 8, _psum8, 0)
+                        if pair_q8_ref is None:
+                            pltpu.make_async_remote_copy(
+                                src_ref=pair_sum_ref.at[stg, pl.ds(r_base, b), :, :],
+                                dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                                send_sem=send_sems_ref.at[stg],
+                                recv_sem=recv_sem_ref.at[0],
+                                device_id={ep_axis_name: d},
+                                device_id_type=pltpu.DeviceIdType.MESH,
+                            ).start()
+                            return
+                        q_dst = dst0 + off - 2 * rows_per_block
                         pltpu.make_async_remote_copy(
-                            src_ref=pair_sum_ref.at[stg, pl.ds(r_base, b), :, :],
-                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                            src_ref=pair_q8_ref.at[stg, pl.ds(r_base, b), :, :],
+                            dst_ref=out_q8_ref.at[pl.ds(q_dst, b), :, :],
+                            send_sem=send_sems_ref.at[stg],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: d},
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+                        pltpu.make_async_remote_copy(
+                            src_ref=pair_qs_ref.at[stg, pl.ds(r_base, b), :],
+                            dst_ref=out_qs_ref.at[pl.ds(q_dst, b), :],
                             send_sem=send_sems_ref.at[stg],
                             recv_sem=recv_sem_ref.at[0],
                             device_id={ep_axis_name: d},
@@ -1304,7 +1397,9 @@ def kernel_main_fused_rs(
                         ).start()
 
                     off = off + jnp.where(has, b, 0)
-                    sent = sent + has.astype(jnp.int32)
+                    sent = sent + has.astype(jnp.int32) * (
+                        1 if pair_q8_ref is None else 2
+                    )
 
             if not _no_ring:
                 pl.semaphore_signal(
@@ -2241,6 +2336,11 @@ def _pair_exchange_metadata(
         "staging_slots",
         "pair_exchange",
         "fp4_w4a16",
+        "pair_fp8_rows",
+        "w4a8_rows",
+        "gmm2_fold",
+        "gmm1_fold",
+        "pair_sum_bf16",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2277,8 +2377,18 @@ def gmm_v2_fused_rs(
     staging_slots: int = 3,
     pair_exchange: bool = False,
     fp4_w4a16: bool = False,
-) -> jax.Array:
+    pair_fp8_rows: bool = False,
+    w4a8_rows: bool = False,
+    gmm2_fold: bool = False,
+    gmm1_fold: bool = False,
+    pair_sum_bf16: bool = False,
+) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
+
+    pair_fp8_rows (pair exchange): cross-chip pair sums travel as e4m3 with a row
+    scale; returns PairFp8Out. w4a8_rows (fp4_w4a16): both GMM inputs become e4m3
+    with one scale per row. gmm2_fold (fp4_w4a16): GMM2 folds its block scales into
+    the weights and runs K as one dot; gmm1_fold does the same for GMM1.
 
     fp4_w4a16: block-256 fp4 experts take bf16 rows, each block's scale applied after its
     dot (requantized NVFP4), instead of fp8-quantized rows.
@@ -2567,6 +2677,13 @@ def gmm_v2_fused_rs(
             f"{rhs2_quant_block_size}, lhs blocks {lhs1_quant_block_size} / "
             f"{lhs2_quant_block_size}"
         )
+    if (w4a8_rows or gmm2_fold or gmm1_fold) and not fp4_w4a16:
+        raise ValueError("w4a8_rows / gmm*_fold modify the fp4_w4a16 path")
+    if gmm2_fold:
+        lhs2_quant_block_size = size_k2
+    if gmm1_fold:
+        lhs1_quant_block_size = tile_k1
+    row_lhs_dtype = jnp.float8_e4m3fn.dtype if w4a8_rows else None
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -2586,10 +2703,11 @@ def gmm_v2_fused_rs(
                 and get_maybe_quantize_lhs(
                     w1.dtype, rhs1_quant_block_size, lhs1_quant_block_size
                 )
-                else None
+                else row_lhs_dtype
             ),
             quant_block_size=lhs1_quant_block_size,
             dtype=out_dtype,
+            row_scale=w4a8_rows,
         ),
         rhs_cfgs=InputConfigs(
             quant_dtype=w1.dtype if is_quantized else None,
@@ -2624,10 +2742,11 @@ def gmm_v2_fused_rs(
                 and get_maybe_quantize_lhs(
                     w2.dtype, rhs2_quant_block_size, lhs2_quant_block_size
                 )
-                else None
+                else row_lhs_dtype
             ),
             quant_block_size=lhs2_quant_block_size,
             dtype=out_dtype,
+            row_scale=w4a8_rows,
         ),
         rhs_cfgs=InputConfigs(
             quant_dtype=w2.dtype if is_quantized else None,
@@ -2847,6 +2966,15 @@ def gmm_v2_fused_rs(
 
     pair_meta_base = pair_meta_stride = 0
     num_pair_blocks = ep_size // 2 + 1
+    if pair_fp8_rows and not (
+        pair_exchange
+        and tiled_output
+        and aligned_n2 == size_n2
+        and not fp8_direct_write
+    ):
+        raise ValueError(
+            "pair_fp8_rows needs pair exchange with the tiled, unpadded output"
+        )
     if pair_exchange:
         group_start, pair_meta_base, pair_meta_stride = _pair_exchange_metadata(
             group_start,
@@ -2858,7 +2986,8 @@ def gmm_v2_fused_rs(
             chunk_size=chunk_size,
             ep_size=ep_size,
             num_slots=max_num_gm_static,
-            num_blocks=num_pair_blocks,
+            # each cross-chip piece also carries its row scales
+            num_blocks=num_pair_blocks + (ep_size // 2 - 1 if pair_fp8_rows else 0),
         )
         out_buf_init = jax.ShapeDtypeStruct(
             (num_pair_blocks * chunk_size * (top_k // ep_size), n2_cols, num_lanes),
@@ -2917,6 +3046,8 @@ def gmm_v2_fused_rs(
         pair_meta_base=pair_meta_base,
         pair_meta_stride=pair_meta_stride,
     )
+    if pair_sum_bf16:
+        kernel_kwargs["pair_sum_bf16"] = True
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1
@@ -2969,14 +3100,18 @@ def gmm_v2_fused_rs(
     if pair_exchange:
         # Appended after the base scratch; passed by keyword since the fp8 refs
         # occupy the optional positional slots.
+        # e4m3 pair sums replace the bf16 pair-sum staging
+        pair_sum_slots = (1, _sls_out) if pair_fp8_rows else (staging_slots, tile_m)
         scratch_shapes = scratch_shapes + [
             pltpu.VMEM((_PAIR_RING, tile_m, n2_cols, num_lanes), out_dtype),
-            pltpu.VMEM((staging_slots, tile_m, n2_cols, num_lanes), out_dtype),
+            pltpu.VMEM((*pair_sum_slots, n2_cols, num_lanes), out_dtype),
             pltpu.SemaphoreType.REGULAR((_PAIR_RING,)),
             pltpu.SemaphoreType.REGULAR((1,)),
         ]
 
         pair_fp8_mode = os.environ.get("MUSE_FUSED_RS_PAIR_FP8", "0")
+        if pair_fp8_rows and pair_fp8_mode != "0":
+            raise ValueError("MUSE_FUSED_RS_PAIR_FP8 and pair_fp8_rows are exclusive")
         pair_fp8 = pair_fp8_mode in ("1", "2")
         pair_send_fp8 = pair_fp8_mode == "2"
         if pair_send_fp8:
@@ -3001,10 +3136,23 @@ def gmm_v2_fused_rs(
         self_ablate = bool(_abl & {"self", "selfx", "selfp", "selfsib", "nocomm"})
         if self_ablate:
             scratch_shapes = scratch_shapes + [pltpu.SMEM((1,), jnp.int32)]
+        if pair_fp8_rows:
+            scratch_shapes = scratch_shapes + [
+                pltpu.VMEM(
+                    (staging_slots, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn
+                ),
+                pltpu.VMEM((staging_slots, tile_m, num_lanes), jnp.float32),
+            ]
 
         def kernel_fn(*refs, _base=kernel_fn):
             refs = list(refs)
             extra = {}
+            if pair_fp8_rows:
+                extra["pair_qs_ref"] = refs.pop()
+                extra["pair_q8_ref"] = refs.pop()
+                # refs: 9 scalar prefetch + 7 inputs, then out_buf, out_q8, out_qs.
+                extra["out_q8_ref"] = refs.pop(17)
+                extra["out_qs_ref"] = refs.pop(17)
             if self_ablate:
                 extra["pair_self_count_ref"] = refs.pop()
             if pair_fp8:
@@ -3057,6 +3205,31 @@ def gmm_v2_fused_rs(
             if tiled_output and aligned_n2 == size_n2:
                 return result
             return result.reshape(result.shape[0], aligned_n2)[:, :size_n2]
+
+        if pair_fp8_rows:
+            rows_per_block = out_buf_init.shape[0] // num_pair_blocks
+            q8_rows = (num_pair_blocks - 2) * rows_per_block
+            bf16_blocks, q8_blocks, q8_scales = pl.pallas_call(
+                kernel_fn,
+                out_shape=(
+                    jax.ShapeDtypeStruct(
+                        (2 * rows_per_block, n2_cols, num_lanes), out_dtype
+                    ),
+                    jax.ShapeDtypeStruct(
+                        (q8_rows, n2_cols, num_lanes), jnp.float8_e4m3fn
+                    ),
+                    jax.ShapeDtypeStruct((q8_rows, num_lanes), jnp.float32),
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=9,
+                    in_specs=in_specs,
+                    out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
+                    scratch_shapes=scratch_shapes,
+                ),
+                compiler_params=compiler_params,
+                name=pallas_name + "-pairq8",
+            )(*pallas_inputs)
+            return PairFp8Out(bf16_blocks, q8_blocks, q8_scales)
 
     result = pl.pallas_call(
         kernel_fn,
