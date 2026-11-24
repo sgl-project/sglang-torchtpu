@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import published_topology
 from sglang_tpu import pp_chunk_scheduler, pp_profile
 from sglang_tpu.pp_chunk_scheduler import (
@@ -447,23 +447,29 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
             profile_and_install_cost_model(scheduler)
 
 
-def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
-    """The devices of a multi-device stage must size chunks alike even when
-    they time the profile differently; diverging sizes deadlock the stage."""
+def _profile_ms(rank, tokens, prefix):
+    # Ranks 0, 1 form stage 0 and ranks 2, 3 stage 1; odd ranks time slower.
+    return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
+
+
+def _install_profiled_models(monkeypatch, *, ms, spread=1.0):
+    """Run profile_and_install_cost_model once per rank of a PP2 x TP2 world
+    whose gather returns every rank's precomputed report."""
     points = [(2048, 0), (2048, 2048), (4096, 0), (4096, 4096)]
-
-    def ms(rank, tokens, prefix):
-        # Ranks 0, 1 form stage 0 and ranks 2, 3 stage 1; odd ranks time slower.
-        return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
-
-    env = {rank: (True, 0.1, 1.0) for rank in range(4)}
-    reports = {
-        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None) for rank in range(4)
-    }
+    env = {rank: (True, 0.1, spread) for rank in range(4)}
+    reports = [
+        (rank // 2, [(t, p, ms(rank, t, p)) for t, p in points], None)
+        for rank in range(4)
+    ]
+    current = {"rank": 0}
 
     def all_gather_object(out, obj, group):
-        # Each rank sends its env first, then its profile.
-        out[:] = [(env if len(obj) == 3 else reports)[rank] for rank in group]
+        # Each rank sends its env first, then its own stage and the times it measured.
+        if isinstance(obj[0], bool):
+            out[:] = [env[rank] for rank in group]
+            return
+        assert obj == reports[current["rank"]]
+        out[:] = reports
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
@@ -479,6 +485,7 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
     )
     models = []
     for rank in range(4):
+        current["rank"] = rank
         policy = NS(
             t_bucketer=NS(buckets=[2048, 4096]),
             _run_one=lambda rank=rank, **kw: ms(
@@ -493,9 +500,28 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
             pp_group=NS(cpu_group=(rank % 2, rank % 2 + 2)),
             world_group=NS(world_size=4, cpu_group=(0, 1, 2, 3)),
         )
-        profile_and_install_cost_model(scheduler)
+        tp_rank = rank % 2
+        with get_parallel().override(
+            pp_size=2,
+            pp_rank=rank // 2,
+            tp_size=2,
+            tp_rank=tp_rank,
+            attn_tp_size=2,
+            attn_tp_rank=tp_rank,
+            moe_tp_size=2,
+            moe_tp_rank=tp_rank,
+        ):
+            profile_and_install_cost_model(scheduler)
         models.append(scheduler._tpu_pp_chunk_cost)
-        assert scheduler._tpu_pp_chunk_spread == 1.0
+        assert scheduler._tpu_pp_chunk_spread == spread
+    return NS(models=models, scheduler=scheduler, policy=policy, env=env)
+
+
+def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
+    """The devices of a multi-device stage must size chunks alike even when
+    they time the profile differently; diverging sizes deadlock the stage."""
+    run = _install_profiled_models(monkeypatch, ms=_profile_ms)
+    models, scheduler, policy, env = run.models, run.scheduler, run.policy, run.env
     assert all(model == models[0] for model in models)
     # One rank's bad or differing value fails every rank after the gather,
     # instead of leaving the others waiting in it.
@@ -515,6 +541,11 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         with pytest.raises(ValueError, match=match):
             profile_and_install_cost_model(scheduler)
     assert not calls
+
+
+def test_agreed_spread_is_installed(monkeypatch):
+    """Every rank installs the spread the ranks agreed on, not the default."""
+    _install_profiled_models(monkeypatch, ms=_profile_ms, spread=2.0)
 
 
 @pytest.mark.parametrize("flags", [(True, False), (False, True)])
@@ -561,6 +592,31 @@ def test_dynamic_chunks_off_on_every_rank_skips_profiling(monkeypatch):
     assert [dynamic for dynamic, _, _ in gathered] == [False]
     runner.compile_policy._run_one.assert_not_called()
     assert "_tpu_pp_chunk_cost" not in vars(scheduler)
+
+
+def test_a_delayed_device_does_not_inflate_its_stage(monkeypatch):
+    """A device of a stage timed slow on the host must not set the stage's
+    cost: the devices of a stage run each step together."""
+
+    def even(rank, tokens, prefix):
+        return _profile_ms(rank - rank % 2, tokens, prefix)
+
+    models = _install_profiled_models(monkeypatch, ms=_profile_ms).models
+    assert models[0] == _install_profiled_models(monkeypatch, ms=even).models[0]
+
+
+def test_a_slow_stage_still_sets_the_cost(monkeypatch):
+    """Both devices of a slow stage time it slow, so that stage bounds the
+    shared cost curve."""
+
+    def slow_stage(rank, tokens, prefix):
+        return (2 if rank >= 2 else 1) * _profile_ms(0, tokens, prefix)
+
+    def stage_one(rank, tokens, prefix):
+        return 2 * _profile_ms(0, tokens, prefix)
+
+    models = _install_profiled_models(monkeypatch, ms=slow_stage).models
+    assert models[0] == _install_profiled_models(monkeypatch, ms=stage_one).models[0]
 
 
 if __name__ == "__main__":

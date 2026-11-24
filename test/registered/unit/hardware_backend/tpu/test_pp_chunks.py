@@ -13,6 +13,7 @@ from sglang_tpu.pp_chunks import (
     longest_prompt,
     pipeline_prefill_is_chunked,
     profile_points,
+    stage_min_samples,
     uses_dynamic_chunks,
 )
 
@@ -123,6 +124,20 @@ def test_fit_rejects_negative_slack_empty_input_and_mismatched_ladders():
         StepCostModel.fit([], 0.1, 4096)
     with pytest.raises(ValueError, match="different token buckets"):
         StepCostModel.fit([_stage(), [(16384, 0, 190.0)]], 0.1, 4096)
+
+
+def test_stage_samples_keep_the_fastest_rank_and_reject_unequal_points():
+    stage_one = [(4096, 0, 50.0), (8192, 0, 120.0)]
+    assert stage_min_samples(
+        [
+            (1, stage_one),
+            (0, [(4096, 0, 30.0), (8192, 0, 90.0)]),
+            (0, [(4096, 0, 40.0), (8192, 0, 80.0)]),
+            (1, stage_one),
+        ]
+    ) == [[(4096, 0, 30.0), (8192, 0, 80.0)], stage_one]
+    with pytest.raises(ValueError, match="stage 0 timed different points"):
+        stage_min_samples([(0, [(4096, 0, 30.0)]), (0, [(8192, 0, 80.0)])])
 
 
 def test_step_time_adds_the_causal_term_of_each_chunk():
