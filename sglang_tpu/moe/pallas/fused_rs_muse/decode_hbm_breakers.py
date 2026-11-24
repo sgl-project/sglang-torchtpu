@@ -252,6 +252,47 @@ def scale_free_expert_for_batch(
     return scaled, eff_min_slot
 
 
+def resolve_free_and_min_p_for_batch(
+    batch_size: int,
+    *,
+    min_p_topk: float,
+    free_rows: int,
+    free_max_w: float,
+    free_min_slot: int,
+    parse_free_spec_fn,
+    scale_mode: str | None = None,
+) -> tuple[float, int, float, int]:
+    """Resolve ``(min_p_topk, free_rows, free_max_w, free_min_slot)`` for ``batch_size``.
+
+    For verify batches (``batch_size >= 128``), honors optional
+    ``SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK`` (``>= 0.0`` overrides; ``0.0``
+    disables pruning on verify while leaving ``B <= 64`` untouched) and
+    ``SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS`` (``"off"`` disables FREE on
+    verify; ``"rows[:max_w[:min_slot]]"`` sets verify-specific thresholds directly).
+    """
+    eff_min_p = min_p_topk
+    eff_rows = free_rows
+    eff_max_w = free_max_w
+    eff_min_slot = free_min_slot
+    if batch_size >= 128:
+        v_min_p = float(_env_raw("SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK", -1.0))
+        if v_min_p >= 0.0:
+            eff_min_p = max(0.0, v_min_p)
+        v_free_raw = str(
+            _env_raw("SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS", "")
+        ).strip()
+        if v_free_raw:
+            if v_free_raw.lower() in ("0", "false", "no", "off", "none"):
+                return eff_min_p, 0, eff_max_w, eff_min_slot
+            parsed_rows, parsed_max_w, parsed_min_slot = parse_free_spec_fn(v_free_raw)
+            return eff_min_p, parsed_rows, parsed_max_w, parsed_min_slot
+
+    scaled_rows, scaled_min_slot = scale_free_expert_for_batch(
+        eff_rows, eff_min_slot, batch_size, mode=scale_mode
+    )
+    return eff_min_p, scaled_rows, eff_max_w, scaled_min_slot
+
+
 def read_sparse_v2_env_overrides() -> SparseV2EnvOverrides:
     """Read granular ``SparseDecodeV2Config`` overrides from environment."""
     m_bkt_str = str(_env_raw("SGLANG_TPU_MUSE_KERNEL_DECODE_M_BUCKETS", ""))

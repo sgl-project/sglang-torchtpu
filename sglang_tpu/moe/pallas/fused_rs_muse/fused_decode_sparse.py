@@ -33,7 +33,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
-    scale_free_expert_for_batch,
+    resolve_free_and_min_p_for_batch,
 )
 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
     DenseRoutingScratch,
@@ -213,6 +213,27 @@ def _read_spec_prime_fast_knobs() -> tuple[bool, int]:
     return sp_fast, home_slot
 
 
+def _read_verify_w4a8_knobs() -> tuple[bool, bool]:
+    import os
+
+    lhs_fp8 = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8", False)
+    tm128 = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128", False)
+    try:
+        from sglang_tpu.envs import envs
+
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8") is None:
+            e_lf = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8", None)
+            if e_lf is not None:
+                lhs_fp8 = bool(e_lf.get())
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128") is None:
+            e_tm = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128", None)
+            if e_tm is not None:
+                tm128 = bool(e_tm.get())
+    except Exception:
+        pass
+    return lhs_fp8, tm128
+
+
 def _read_sparse_env_overrides() -> (
     tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int, int, str]
 ):
@@ -334,10 +355,18 @@ def default_sparse_decode_config(
         if (spec_eff > 0 and 0 <= spec_home_slot < (_E_TOTAL // ep))
         else ()
     )
-    free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
-        free_rows, free_min_slot, batch_size
+    min_p_eff, free_rows_eff, free_max_w_eff, free_min_slot_eff = (
+        resolve_free_and_min_p_for_batch(
+            batch_size,
+            min_p_topk=min_p_topk,
+            free_rows=free_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            parse_free_spec_fn=parse_free_expert_rows_spec,
+        )
     )
     fast_gs = _read_fast_gs_knob()
+    use_verify_lhs_fp8, use_verify_tm128 = _read_verify_w4a8_knobs()
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
         nc_split512=nc_split512,
@@ -348,9 +377,9 @@ def default_sparse_decode_config(
         fast_plan=fast_plan,
         fast_gs=fast_gs,
         spec_home_slots=spec_home_slots,
-        min_p_topk=min_p_topk,
+        min_p_topk=min_p_eff,
         free_max_rows=free_rows_eff,
-        free_max_w=free_max_w,
+        free_max_w=free_max_w_eff,
         free_min_slot=free_min_slot_eff,
     )
     if scale_block == 16:
@@ -432,15 +461,17 @@ def default_sparse_decode_config(
             fast_b64_epi_pro=(fast_b64 >= 1),
             **route_kw,
         )
+    use_v_tm128 = use_verify_tm128 and batch_size >= 256
     return SparseDecodeConfig(
         row_mode="sparse",
         weight_mode="half_n",
-        tile_m=64,
-        m_buckets=(16, 32, 64),
+        tile_m=128 if use_v_tm128 else 64,
+        m_buckets=(16, 32, 64, 128) if use_v_tm128 else (16, 32, 64),
         loop32_in_tile=False,
         k16_blockdiag_rows=(),
         k256_strip_mode=eff_strip,
         k256_dual_mode="hybrid",
+        lhs_fp8=use_verify_lhs_fp8 and batch_size >= 256,
         rs_wire_bf16=True,
         pair_rs=use_pair_rs,
         bridge_ag=(ep == 8) or use_ep16_bridge_ag,
@@ -450,6 +481,17 @@ def default_sparse_decode_config(
         spec_prime_parts=spec_eff,
         **route_kw,
     )
+
+
+def _write_sharded_owner_out(output_ref, owner_3d, rows_per_rank: int) -> None:
+    if rows_per_rank >= 8 and rows_per_rank % 8 == 0:
+        step_r = 16 if (rows_per_rank % 16 == 0) else 8
+        for r0 in range(0, rows_per_rank, step_r):
+            output_ref[pl.ds(r0, step_r), :] = owner_3d[
+                pl.ds(r0, step_r), :, :
+            ].reshape(step_r, _H)
+    else:
+        output_ref[...] = owner_3d[...].reshape(rows_per_rank, _H)
 
 
 def _pad_rows_to(arr: jax.Array, rows: int) -> jax.Array:
@@ -505,7 +547,7 @@ def _prequant_lhs_k256(x_src_ref, lhs_fp8_ref, lhs_sc_ref, m_rows: int) -> None:
         xf = x_src_ref[pl.ds(0, read_m), pl.ds(c0, _KC)].astype(jnp.float32)
         amax = jnp.max(jnp.abs(xf), axis=1, keepdims=True)
         sc = jnp.maximum(amax, 1e-12) * (1.0 / 448.0)
-        xq = (xf / sc).astype(jnp.float8_e4m3fn)
+        xq = jnp.clip(xf / sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
         lhs_fp8_ref[pl.ds(0, fp8_m), pl.ds(c0, _KC)] = _pad_rows_to(xq, fp8_m)
         lhs_sc_ref[pl.ds(0, read_m), pl.ds(b_id * 128, 128)] = jnp.broadcast_to(
             sc, (read_m, 128)
@@ -3625,7 +3667,7 @@ def _sparse_decode_kernel(
                     pl.ds(r0, cast_step), :, :
                 ].astype(jnp.bfloat16)
         else:
-            cast_rc = min(batch_size, 8)
+            cast_rc = 16 if (cfg.fast_gs and batch_size >= 128) else min(batch_size, 8)
 
             def _cast_rs_chunk(ci, _):
                 r0 = ci * cast_rc
@@ -3801,13 +3843,7 @@ def _sparse_decode_kernel(
         return
 
     if return_sharded:
-        if rows_per_rank >= 16:
-            for r0 in range(0, rows_per_rank, 16):
-                output_ref[pl.ds(r0, 16), :] = owner_3d[
-                    pl.ds(r0, 16), :, :
-                ].reshape(16, _H)
-        else:
-            output_ref[...] = owner_3d[...].reshape(rows_per_rank, _H)
+        _write_sharded_owner_out(output_ref, owner_3d, rows_per_rank)
     elif cfg.bridge_ag:
         # 8A. 2-Stage Chip-Hierarchical Bridge All-Gather (halves off-chip ICI!).
         num_chips = ep // 2
@@ -4403,13 +4439,20 @@ def default_fp8_sparse_decode_config(
         and (batch_size >= 32 or pair_rs_ov >= 2)
     )
     fp8_bridge_ag = (ep == 8) or (fp8_pair_rs and ep == 16)
-    free_rows_eff, free_min_slot_eff = scale_free_expert_for_batch(
-        free_rows, free_min_slot, batch_size
+    min_p_eff, free_rows_eff, free_max_w_eff, free_min_slot_eff = (
+        resolve_free_and_min_p_for_batch(
+            batch_size,
+            min_p_topk=min_p_topk,
+            free_rows=free_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            parse_free_spec_fn=parse_free_expert_rows_spec,
+        )
     )
     route_kw = dict(
-        min_p_topk=min_p_topk,
+        min_p_topk=min_p_eff,
         free_max_rows=free_rows_eff,
-        free_max_w=free_max_w,
+        free_max_w=free_max_w_eff,
         free_min_slot=free_min_slot_eff,
         route_rb16_mode=route_rb16_mode,
         route_fast=route_fast,
@@ -5321,7 +5364,7 @@ def _sparse_fp8_decode_kernel(
         xf = x_bf16.astype(jnp.float32)
         amax = jnp.max(jnp.abs(xf), axis=1, keepdims=True)
         sc = jnp.maximum(amax, 1e-12) * (1.0 / 448.0)
-        xq = (xf / sc).astype(jnp.float8_e4m3fn)
+        xq = jnp.clip(xf / sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
         return _pad_rows_to(xq, max(32, m_rows)), sc
 
     def _dot_k2_slice(
@@ -6294,13 +6337,7 @@ def _sparse_fp8_decode_kernel(
                     _op.wait_send()
 
     if return_sharded:
-        if rows_per_rank >= 16:
-            for r0 in range(0, rows_per_rank, 16):
-                output_ref[pl.ds(r0, 16), :] = owner_3d[
-                    pl.ds(r0, 16), :, :
-                ].reshape(16, _H)
-        else:
-            output_ref[...] = owner_3d[...].reshape(rows_per_rank, _H)
+        _write_sharded_owner_out(output_ref, owner_3d, rows_per_rank)
     elif cfg.bridge_ag:
         num_chips = ep // 2
         my_chip = me >> 1

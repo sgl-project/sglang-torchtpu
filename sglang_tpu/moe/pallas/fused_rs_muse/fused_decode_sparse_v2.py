@@ -44,6 +44,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
     DecodeRoutingPruneConfig,
     read_sparse_v2_env_overrides,
+    resolve_free_and_min_p_for_batch,
     route_dense_and_counts_v2_in_kernel,
     route_topk_and_counts_v2_in_kernel,
     scale_free_expert_for_batch,
@@ -59,6 +60,7 @@ from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
     extract_my_holder_candidates_smem,
     extract_my_holder_candidates_tuple,
     pack_active_tokens_smem,
+    parse_free_expert_rows_spec,
     route_dense_and_counts_in_kernel,
     route_topk_and_counts_in_kernel,
     routing_scratch_shapes,
@@ -214,15 +216,27 @@ def _apply_v2_env_overrides(
     spec_eff = ov.spec_prime_parts if batch_size <= 128 else 0
     lhs_fp8 = base.lhs_fp8 or (ov.lhs_fp8 and scale_block >= 256)
     prune = ov.routing_prune
-    if prune.free_expert_rows > 0:
-        f_rows_eff, f_rank_eff = scale_free_expert_for_batch(
-            prune.free_expert_rows, prune.free_min_rank, batch_size
-        )
-        prune = dataclasses.replace(
-            prune,
-            free_expert_rows=f_rows_eff,
-            free_min_rank=max(1, min(7, f_rank_eff)),
-        )
+    raw_mp = prune.cum_mass if prune.cum_mass > 0.0 else prune.min_p
+    eff_mp, f_rows_eff, f_max_w_eff, f_rank_eff = resolve_free_and_min_p_for_batch(
+        batch_size,
+        min_p_topk=raw_mp,
+        free_rows=prune.free_expert_rows,
+        free_max_w=prune.free_max_weight,
+        free_min_slot=prune.free_min_rank,
+        parse_free_spec_fn=parse_free_expert_rows_spec,
+    )
+    if eff_mp >= 0.5:
+        eff_min_p, eff_cum = 0.0, min(1.0, eff_mp)
+    else:
+        eff_min_p, eff_cum = eff_mp, 0.0
+    prune = dataclasses.replace(
+        prune,
+        min_p=eff_min_p,
+        cum_mass=eff_cum,
+        free_expert_rows=f_rows_eff,
+        free_max_weight=f_max_w_eff,
+        free_min_rank=max(1, min(7, f_rank_eff)),
+    )
 
     return dataclasses.replace(
         base,

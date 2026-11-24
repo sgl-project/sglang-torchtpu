@@ -585,6 +585,10 @@ class TpuEnvs:
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT = EnvInt(-1)
+    # Opt-in DFlash verify (B >= 128) routing-pruning & W4A8/tile overrides ("" / -1 / False = inherit decode):
+    SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS = EnvStr("")
+    SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK = EnvFloat(-1.0)
+    SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)

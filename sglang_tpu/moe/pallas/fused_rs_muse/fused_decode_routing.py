@@ -657,42 +657,50 @@ def _route_vertical_lane_parallel(
     free_max_w: float = 0.06,
     free_min_slot: int = 5,
 ) -> None:
-    """Zero-cross-lane-butterfly, 0.0-ULP bit-exact VPU router for B <= 128, E == 256.
+    """Zero-cross-lane-butterfly, 0.0-ULP bit-exact VPU router for E == 256.
 
-    Transposes ``[B, 256]`` -> ``[256, 128]`` via square ``128x128`` XLU hardware
-    ``vxpose`` so tokens ``0..B-1`` sit in independent lanes ``0..B-1`` and all
-    ``32`` per-token reductions execute as pure vertical ``axis=0`` elementwise
-    ``vmax``/``vmin``/``vadd`` with zero cross-lane swizzles and zero ``fori_loop``
-    ``sbr`` drains.
+    Processes ``128``-token vertical strips (single pass for ``B <= 128`` or
+    ``free_max_rows <= 0``; 2-pass global count + mask when ``B > 128`` and
+    ``free_max_rows > 0``). Transposes ``[<=128, 256]`` -> ``[256, 128]`` via
+    square ``128x128`` XLU hardware ``vxpose`` so tokens sit in independent lanes
+    with zero cross-lane swizzles and zero ``fori_loop`` ``sbr`` drains.
     """
     batch_size, num_experts = logits_ref.shape
     first = my_owner * e_per_owner
     last_excl = first + e_per_owner
     bias_row = bias_ref[...].reshape(1, num_experts).astype(jnp.float32)
     neg_inf = jnp.float32(-jnp.inf)
+    e_base = lax.broadcasted_iota(jnp.int32, (64, 128), 0)
+    row16 = lax.broadcasted_iota(jnp.int32, (16, 128), 0)
+    first_T = jnp.broadcast_to(first, (1, 128))
+    last_excl_T = jnp.broadcast_to(last_excl, (1, 128))
+    rep_T = tuple(
+        jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (1, 128))
+        for eid in holder_cand_eids
+    )
 
-    def _load_256x128(add_bias: bool) -> tuple[jax.Array, jax.Array]:
+    def _load_256x128(t0: int, chunk_rows: int, add_bias: bool) -> tuple[jax.Array, jax.Array]:
         pad_v = neg_inf if add_bias else jnp.float32(0.0)
-        if batch_size <= 64:
-            lg_r = logits_ref[:, :].astype(jnp.float32)
+        if chunk_rows <= 64:
+            lg_r = logits_ref[pl.ds(t0, chunk_rows), :].astype(jnp.float32)
             lg_c = jnp.where(jnp.isnan(lg_r), neg_inf, lg_r)
             val = 1.0 / (1.0 + jnp.exp(-lg_c))
             if add_bias:
                 val = val + bias_row
-            if batch_size < 128:
+            if chunk_rows < 128:
                 val = jnp.concatenate(
                     [
                         val,
                         jnp.full(
-                            (128 - batch_size, num_experts), pad_v, jnp.float32
+                            (128 - chunk_rows, num_experts), pad_v, jnp.float32
                         ),
                     ],
                     axis=0,
                 )
         else:
-            lg0 = logits_ref[pl.ds(0, 64), :].astype(jnp.float32)
+            lg0 = logits_ref[pl.ds(t0, 64), :].astype(jnp.float32)
             v0 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg0), neg_inf, lg0)))
-            lg1 = logits_ref[pl.ds(64, 64), :].astype(jnp.float32)
+            lg1 = logits_ref[pl.ds(t0 + 64, 64), :].astype(jnp.float32)
             v1 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg1), neg_inf, lg1)))
             if add_bias:
                 v0 = v0 + bias_row
@@ -700,157 +708,146 @@ def _route_vertical_lane_parallel(
             val = jnp.concatenate([v0, v1], axis=0)
         return jnp.transpose(val[:, :128]), jnp.transpose(val[:, 128:])
 
-    ct_lo, ct_hi = _load_256x128(True)
-    c0, c1 = ct_lo[:64, :], ct_lo[64:, :]
-    c2, c3 = ct_hi[:64, :], ct_hi[64:, :]
-    del ct_lo, ct_hi
-    e_base = lax.broadcasted_iota(jnp.int32, (64, 128), 0)
-
-    slot_bests: list[jax.Array] = []
-    for _ in range(topk):
-        p0 = jnp.max(c0, axis=0, keepdims=True)
-        p1 = jnp.max(c1, axis=0, keepdims=True)
-        p2 = jnp.max(c2, axis=0, keepdims=True)
-        p3 = jnp.max(c3, axis=0, keepdims=True)
-        peak = jnp.maximum(jnp.maximum(p0, p1), jnp.maximum(p2, p3))
-
-        b0 = jnp.min(jnp.where(c0 == peak, e_base, num_experts), axis=0, keepdims=True)
-        b1 = jnp.min(jnp.where(c1 == peak, e_base + 64, num_experts), axis=0, keepdims=True)
-        b2 = jnp.min(jnp.where(c2 == peak, e_base + 128, num_experts), axis=0, keepdims=True)
-        b3 = jnp.min(jnp.where(c3 == peak, e_base + 192, num_experts), axis=0, keepdims=True)
-        best = jnp.minimum(jnp.minimum(b0, b1), jnp.minimum(b2, b3))
-        slot_bests.append(best)
-
-        c0 = jnp.where(e_base == best, neg_inf, c0)
-        c1 = jnp.where((e_base + 64) == best, neg_inf, c1)
-        c2 = jnp.where((e_base + 128) == best, neg_inf, c2)
-        c3 = jnp.where((e_base + 192) == best, neg_inf, c3)
-    del c0, c1, c2, c3
-
-    st_lo, st_hi = _load_256x128(False)
-    s0, s1 = st_lo[:64, :], st_lo[64:, :]
-    slot_ws = [
-        jnp.sum(
-            jnp.where(e_base == b, s0, 0.0)
-            + jnp.where((e_base + 64) == b, s1, 0.0),
+    def _sum_mask_chunk(m0, m1, m2, m3, chunk_rows: int) -> jax.Array:
+        lo = jnp.sum(
+            jnp.transpose(jnp.concatenate([m0, m1], axis=0).astype(jnp.int32))[
+                :chunk_rows, :
+            ],
             axis=0,
             keepdims=True,
         )
-        for b in slot_bests
-    ]
-    del st_lo, s0, s1
-    s2, s3 = st_hi[:64, :], st_hi[64:, :]
-    slot_ws = [
-        w
-        + jnp.sum(
-            jnp.where((e_base + 128) == b, s2, 0.0)
-            + jnp.where((e_base + 192) == b, s3, 0.0),
+        hi = jnp.sum(
+            jnp.transpose(jnp.concatenate([m2, m3], axis=0).astype(jnp.int32))[
+                :chunk_rows, :
+            ],
             axis=0,
             keepdims=True,
         )
-        for w, b in zip(slot_ws, slot_bests)
-    ]
-    del st_hi, s2, s3
+        return jnp.concatenate([lo, hi], axis=1)
 
-    w_sum8 = sum(slot_ws) + route_eps
-    if min_p_topk <= 0.0:
-        keep_flags = [w_s > 0.0 for w_s in slot_ws]
-    elif min_p_topk < 0.5:
-        keep_flags = [
-            (w_s > 0.0)
-            if s == 0
-            else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
-            for s, w_s in enumerate(slot_ws)
+    def _score_vertical_chunk(t0: int, chunk_rows: int):
+        ct_lo, ct_hi = _load_256x128(t0, chunk_rows, True)
+        c0, c1 = ct_lo[:64, :], ct_lo[64:, :]
+        c2, c3 = ct_hi[:64, :], ct_hi[64:, :]
+        del ct_lo, ct_hi
+
+        slot_bests: list[jax.Array] = []
+        for _ in range(topk):
+            p0 = jnp.max(c0, axis=0, keepdims=True)
+            p1 = jnp.max(c1, axis=0, keepdims=True)
+            p2 = jnp.max(c2, axis=0, keepdims=True)
+            p3 = jnp.max(c3, axis=0, keepdims=True)
+            peak = jnp.maximum(jnp.maximum(p0, p1), jnp.maximum(p2, p3))
+
+            b0 = jnp.min(jnp.where(c0 == peak, e_base, num_experts), axis=0, keepdims=True)
+            b1 = jnp.min(jnp.where(c1 == peak, e_base + 64, num_experts), axis=0, keepdims=True)
+            b2 = jnp.min(jnp.where(c2 == peak, e_base + 128, num_experts), axis=0, keepdims=True)
+            b3 = jnp.min(jnp.where(c3 == peak, e_base + 192, num_experts), axis=0, keepdims=True)
+            best = jnp.minimum(jnp.minimum(b0, b1), jnp.minimum(b2, b3))
+            slot_bests.append(best)
+
+            c0 = jnp.where(e_base == best, neg_inf, c0)
+            c1 = jnp.where((e_base + 64) == best, neg_inf, c1)
+            c2 = jnp.where((e_base + 128) == best, neg_inf, c2)
+            c3 = jnp.where((e_base + 192) == best, neg_inf, c3)
+        del c0, c1, c2, c3
+
+        st_lo, st_hi = _load_256x128(t0, chunk_rows, False)
+        s0, s1 = st_lo[:64, :], st_lo[64:, :]
+        slot_ws = [
+            jnp.sum(
+                jnp.where(e_base == b, s0, 0.0)
+                + jnp.where((e_base + 64) == b, s1, 0.0),
+                axis=0,
+                keepdims=True,
+            )
+            for b in slot_bests
         ]
-    elif min_p_topk >= 1.0:
-        k_cap = max(1, min(topk, int(min_p_topk)))
-        keep_flags = [
-            (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
-            for s, w_s in enumerate(slot_ws)
+        del st_lo, s0, s1
+        s2, s3 = st_hi[:64, :], st_hi[64:, :]
+        slot_ws = [
+            w
+            + jnp.sum(
+                jnp.where((e_base + 128) == b, s2, 0.0)
+                + jnp.where((e_base + 192) == b, s3, 0.0),
+                axis=0,
+                keepdims=True,
+            )
+            for w, b in zip(slot_ws, slot_bests)
         ]
-    else:
-        keep_flags = []
-        cum_p = jnp.zeros_like(w_sum8)
-        for s, w_s in enumerate(slot_ws):
-            keep_s = (
+        del st_hi, s2, s3
+
+        w_sum8 = sum(slot_ws) + route_eps
+        if min_p_topk <= 0.0:
+            keep_flags = [w_s > 0.0 for w_s in slot_ws]
+        elif min_p_topk < 0.5:
+            keep_flags = [
                 (w_s > 0.0)
                 if s == 0
-                else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
-            )
-            keep_flags.append(keep_s)
-            cum_p = cum_p + (w_s / w_sum8)
+                else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
+                for s, w_s in enumerate(slot_ws)
+            ]
+        elif min_p_topk >= 1.0:
+            k_cap = max(1, min(topk, int(min_p_topk)))
+            keep_flags = [
+                (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
+                for s, w_s in enumerate(slot_ws)
+            ]
+        else:
+            keep_flags = []
+            cum_p = jnp.zeros_like(w_sum8)
+            for s, w_s in enumerate(slot_ws):
+                keep_s = (
+                    (w_s > 0.0)
+                    if s == 0
+                    else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
+                )
+                keep_flags.append(keep_s)
+                cum_p = cum_p + (w_s / w_sum8)
 
-    if free_max_rows > 0:
-        drop_flags = _droppable_flags_for_chunk(
-            slot_ws,
-            keep_flags,
-            route_eps=route_eps,
-            free_max_w=free_max_w,
-            free_min_slot=free_min_slot,
-        )
         ht0 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht1 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht2 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht3 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        dt0 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        dt1 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        dt2 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        dt3 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        for b_T, k_T, d_T in zip(slot_bests, keep_flags, drop_flags):
+        if free_max_rows > 0:
+            drop_flags = _droppable_flags_for_chunk(
+                slot_ws,
+                keep_flags,
+                route_eps=route_eps,
+                free_max_w=free_max_w,
+                free_min_slot=free_min_slot,
+            )
+            dt0 = jnp.zeros((64, 128), dtype=jnp.bool_)
+            dt1 = jnp.zeros((64, 128), dtype=jnp.bool_)
+            dt2 = jnp.zeros((64, 128), dtype=jnp.bool_)
+            dt3 = jnp.zeros((64, 128), dtype=jnp.bool_)
+            for b_T, k_T, d_T in zip(slot_bests, keep_flags, drop_flags):
+                bk_T = jnp.where(k_T, b_T, jnp.int32(-1))
+                ht0 = ht0 | (e_base == bk_T)
+                ht1 = ht1 | ((e_base + 64) == bk_T)
+                ht2 = ht2 | ((e_base + 128) == bk_T)
+                ht3 = ht3 | ((e_base + 192) == bk_T)
+                bd_T = jnp.where(d_T, b_T, jnp.int32(-1))
+                dt0 = dt0 | (e_base == bd_T)
+                dt1 = dt1 | ((e_base + 64) == bd_T)
+                dt2 = dt2 | ((e_base + 128) == bd_T)
+                dt3 = dt3 | ((e_base + 192) == bd_T)
+            tot_chunk = _sum_mask_chunk(ht0, ht1, ht2, ht3, chunk_rows)
+            drp_chunk = _sum_mask_chunk(dt0, dt1, dt2, dt3, chunk_rows)
+            del ht0, ht1, ht2, ht3, dt0, dt1, dt2, dt3
+            return slot_bests, slot_ws, keep_flags, drop_flags, tot_chunk, drp_chunk
+
+        for b_T, k_T in zip(slot_bests, keep_flags):
             bk_T = jnp.where(k_T, b_T, jnp.int32(-1))
             ht0 = ht0 | (e_base == bk_T)
             ht1 = ht1 | ((e_base + 64) == bk_T)
             ht2 = ht2 | ((e_base + 128) == bk_T)
             ht3 = ht3 | ((e_base + 192) == bk_T)
-            bd_T = jnp.where(d_T, b_T, jnp.int32(-1))
-            dt0 = dt0 | (e_base == bd_T)
-            dt1 = dt1 | ((e_base + 64) == bd_T)
-            dt2 = dt2 | ((e_base + 128) == bd_T)
-            dt3 = dt3 | ((e_base + 192) == bd_T)
-        tot_lo = jnp.sum(
-            jnp.transpose(jnp.concatenate([ht0, ht1], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del ht0, ht1
-        tot_hi = jnp.sum(
-            jnp.transpose(jnp.concatenate([ht2, ht3], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del ht2, ht3
-        drp_lo_s = jnp.sum(
-            jnp.transpose(jnp.concatenate([dt0, dt1], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del dt0, dt1
-        drp_hi_s = jnp.sum(
-            jnp.transpose(jnp.concatenate([dt2, dt3], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del dt2, dt3
-        tot_all = jnp.concatenate([tot_lo, tot_hi], axis=1)
-        drp_all = jnp.concatenate([drp_lo_s, drp_hi_s], axis=1)
-        fmask = (
-            (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
-        )
-        counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
-        fm_lo = jnp.transpose(
-            jnp.broadcast_to(fmask[:, :128].astype(jnp.int32), (128, 128))
-        ) != 0
-        fm_hi = jnp.transpose(
-            jnp.broadcast_to(fmask[:, 128:].astype(jnp.int32), (128, 128))
-        ) != 0
+        tot_chunk = _sum_mask_chunk(ht0, ht1, ht2, ht3, chunk_rows)
+        del ht0, ht1, ht2, ht3
+        return slot_bests, slot_ws, keep_flags, None, tot_chunk, None
+
+    def _apply_fmask_to_chunk(slot_bests, keep_flags, drop_flags, fm_lo, fm_hi):
         eff_min_s = max(1, int(free_min_slot))
         for s in range(eff_min_s, topk):
             b_T = slot_bests[s]
@@ -863,79 +860,96 @@ def _route_vertical_lane_parallel(
                 keepdims=True,
             )
             keep_flags[s] = keep_flags[s] & (~(drop_flags[s] & freed_T))
-    else:
-        ht0 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        ht1 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        ht2 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        ht3 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        for b_T, k_T in zip(slot_bests, keep_flags):
-            bk_T = jnp.where(k_T, b_T, jnp.int32(-1))
-            ht0 = ht0 | (e_base == bk_T)
-            ht1 = ht1 | ((e_base + 64) == bk_T)
-            ht2 = ht2 | ((e_base + 128) == bk_T)
-            ht3 = ht3 | ((e_base + 192) == bk_T)
-        tot_lo = jnp.sum(
-            jnp.transpose(jnp.concatenate([ht0, ht1], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del ht0, ht1
-        tot_hi = jnp.sum(
-            jnp.transpose(jnp.concatenate([ht2, ht3], axis=0).astype(jnp.int32))[
-                :batch_size, :
-            ],
-            axis=0,
-            keepdims=True,
-        )
-        del ht2, ht3
-        counts_acc = jnp.concatenate([tot_lo, tot_hi], axis=1)
 
-    w_sum_T = jnp.zeros((1, 128), dtype=jnp.float32)
-    for w_T, k_T in zip(slot_ws, keep_flags):
-        w_sum_T = w_sum_T + jnp.where(k_T, w_T, 0.0)
+    def _pack_vertical_chunk(t0: int, chunk_rows: int, slot_bests, slot_ws, keep_flags):
+        w_sum_T = jnp.zeros((1, 128), dtype=jnp.float32)
+        for w_T, k_T in zip(slot_ws, keep_flags):
+            w_sum_T = w_sum_T + jnp.where(k_T, w_T, 0.0)
 
-    row16 = lax.broadcasted_iota(jnp.int32, (16, 128), 0)
-    pack_ids_T = jnp.zeros((16, 128), dtype=jnp.int32)
-    w_loc_raw_T = jnp.zeros((16, 128), dtype=jnp.float32)
-    loc_cnt_T = jnp.zeros((1, 128), dtype=jnp.int32)
-    first_T = jnp.broadcast_to(first, (1, 128))
-    last_excl_T = jnp.broadcast_to(last_excl, (1, 128))
-    rep_T = tuple(
-        jnp.broadcast_to(jnp.where(eid >= 0, eid, jnp.int32(-1)), (1, 128))
-        for eid in holder_cand_eids
-    )
+        pack_ids_T = jnp.zeros((16, 128), dtype=jnp.int32)
+        w_loc_raw_T = jnp.zeros((16, 128), dtype=jnp.float32)
+        loc_cnt_T = jnp.zeros((1, 128), dtype=jnp.int32)
 
-    for b_T, w_T, k_T in zip(slot_bests, slot_ws, keep_flags):
-        cand_T = jnp.where(
-            (b_T >= first_T) & (b_T < last_excl_T),
-            b_T - first_T,
-            jnp.int32(-1),
-        )
-        for r_slot, rv in enumerate(rep_T):
+        for b_T, w_T, k_T in zip(slot_bests, slot_ws, keep_flags):
             cand_T = jnp.where(
-                b_T == rv, jnp.int32(e_per_owner + r_slot), cand_T
+                (b_T >= first_T) & (b_T < last_excl_T),
+                b_T - first_T,
+                jnp.int32(-1),
             )
-        is_cand_T = k_T & (cand_T >= 0)
-        id_row = jnp.int32(1) + loc_cnt_T
-        pack_ids_T = jnp.where(is_cand_T & (row16 == id_row), cand_T, pack_ids_T)
-        w_loc_raw_T = jnp.where(
-            is_cand_T & (row16 == loc_cnt_T), w_T, w_loc_raw_T
-        )
-        loc_cnt_T = loc_cnt_T + is_cand_T.astype(jnp.int32)
+            for r_slot, rv in enumerate(rep_T):
+                cand_T = jnp.where(
+                    b_T == rv, jnp.int32(e_per_owner + r_slot), cand_T
+                )
+            is_cand_T = k_T & (cand_T >= 0)
+            id_row = jnp.int32(1) + loc_cnt_T
+            pack_ids_T = jnp.where(is_cand_T & (row16 == id_row), cand_T, pack_ids_T)
+            w_loc_raw_T = jnp.where(
+                is_cand_T & (row16 == loc_cnt_T), w_T, w_loc_raw_T
+            )
+            loc_cnt_T = loc_cnt_T + is_cand_T.astype(jnp.int32)
 
-    pack_ids_T = jnp.where(row16 == 0, loc_cnt_T, pack_ids_T)
-    w_loc_norm_T = w_loc_raw_T / (w_sum_T + route_eps)
-    if route_scale != 1.0:
-        w_loc_norm_T = w_loc_norm_T * route_scale
-    w_bits_T = lax.bitcast_convert_type(w_loc_norm_T, jnp.int32)
-    full_pack_T = jnp.concatenate(
-        [pack_ids_T, w_bits_T, jnp.zeros((96, 128), dtype=jnp.int32)], axis=0
-    )
-    scratch.route_pack_vmem[pl.ds(0, batch_size), :] = jnp.transpose(full_pack_T)[
-        :batch_size, :
-    ]
+        pack_ids_T = jnp.where(row16 == 0, loc_cnt_T, pack_ids_T)
+        w_loc_norm_T = w_loc_raw_T / (w_sum_T + route_eps)
+        if route_scale != 1.0:
+            w_loc_norm_T = w_loc_norm_T * route_scale
+        w_bits_T = lax.bitcast_convert_type(w_loc_norm_T, jnp.int32)
+        full_pack_T = jnp.concatenate(
+            [pack_ids_T, w_bits_T, jnp.zeros((96, 128), dtype=jnp.int32)], axis=0
+        )
+        scratch.route_pack_vmem[pl.ds(t0, chunk_rows), :] = jnp.transpose(full_pack_T)[
+            :chunk_rows, :
+        ]
+
+    def _compute_free_masks(tot_all, drp_all):
+        fmask = (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+        counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
+        fm_lo = jnp.transpose(
+            jnp.broadcast_to(fmask[:, :128].astype(jnp.int32), (128, 128))
+        ) != 0
+        fm_hi = jnp.transpose(
+            jnp.broadcast_to(fmask[:, 128:].astype(jnp.int32), (128, 128))
+        ) != 0
+        return counts_acc, fm_lo, fm_hi
+
+    if batch_size <= 128:
+        s_bests, s_ws, k_flags, d_flags, tot_all, drp_all = _score_vertical_chunk(
+            0, batch_size
+        )
+        if free_max_rows > 0:
+            counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
+            _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
+        else:
+            counts_acc = tot_all
+        _pack_vertical_chunk(0, batch_size, s_bests, s_ws, k_flags)
+    else:
+        chunks = [
+            (t0, min(128, batch_size - t0)) for t0 in range(0, batch_size, 128)
+        ]
+        tot_all = jnp.zeros((1, num_experts), dtype=jnp.int32)
+        drp_all = (
+            jnp.zeros((1, num_experts), dtype=jnp.int32)
+            if free_max_rows > 0
+            else None
+        )
+        for t0, c_rows in chunks:
+            s_bests, s_ws, k_flags, _, tot_c, drp_c = _score_vertical_chunk(
+                t0, c_rows
+            )
+            tot_all = tot_all + tot_c
+            if free_max_rows > 0:
+                drp_all = drp_all + drp_c
+            else:
+                _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
+        if free_max_rows > 0:
+            counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
+            for t0, c_rows in chunks:
+                s_bests, s_ws, k_flags, d_flags, _, _ = _score_vertical_chunk(
+                    t0, c_rows
+                )
+                _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
+                _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
+        else:
+            counts_acc = tot_all
 
     if precompute_owner_loads:
         from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
@@ -1013,9 +1027,10 @@ def route_topk_and_counts_in_kernel(
     use_rfast = _read_route_fast_flag() if route_fast is None else bool(route_fast)
     if (
         use_rfast
+        and batch_size >= 8
         and (
-            (batch_size >= 8 and batch_size <= 64 and batch_size % 8 == 0)
-            or batch_size == 128
+            (batch_size <= 64 and batch_size % 8 == 0)
+            or (batch_size % 64 == 0)
         )
         and num_experts == 256
     ):
