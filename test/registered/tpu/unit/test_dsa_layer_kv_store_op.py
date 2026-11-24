@@ -214,6 +214,7 @@ def _backend(step, *, qblock_prefill):
         "_attention_split_rows",
         "_raw_ring_args",
         "_latents_for_store",
+        "_dcp_gathered",
     ):
         setattr(
             backend,

@@ -1471,7 +1471,10 @@ class TpuSpecWorker(BaseSpecWorker):
                 compact_rows = torch.zeros((bs,), dtype=torch.int64).to(self.device)
                 # Extend stashes its [:bs] tokens sampled at the cap rows.
                 cap_tokens = torch.zeros((cap,), dtype=torch.int64, device=self.device)
-                for bonus_tokens in (compact_rows, cap_tokens[:bs]):
+                # An extend batch never has more rows than the extend cap
+                # (prefill_max_requests can sit below max_running_requests).
+                extend_tokens = (compact_rows, cap_tokens[:bs]) if bs <= cap else ()
+                for bonus_tokens in extend_tokens:
                     relays.append(
                         (bonus_tokens, compact_rows, self.make_dummy_carry(bs))
                     )

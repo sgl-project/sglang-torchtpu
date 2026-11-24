@@ -183,6 +183,10 @@ class TpuEnvs:
     # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
     # sums. Only changes anything with more than one host.
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # Speculative decoding under DCP (sparse MLA backend, experimental spec
+    # worker): target verify runs on the sharded decode path, and the draft
+    # keeps an unsharded KV pool. False refuses the combination at startup.
+    SGLANG_TPU_DCP_SPEC_VERIFY = EnvBool(False)
     # Sparse MLA DCP: merge the group's DSA top-k by a score threshold, so only
     # scores cross the group and no rank gathers another rank's indices; the
     # index-gathering merge costs ~1 ms per DSA layer at 64 rows on tpu7x.
@@ -198,6 +202,9 @@ class TpuEnvs:
     # token reads its history there instead of gathering it at every chunk.
     # Each slot holds max-context latents and index keys; 0 gathers always.
     SGLANG_TPU_DCP_PREFILL_SCRATCH = EnvInt(0)
+    # Gathered sparse MLA DCP prefill: compile only the scratch and full-history
+    # gather buckets, not the power-of-4 ones below the cap.
+    SGLANG_TPU_DCP_PREFILL_GATHER_CAP_ONLY = EnvBool(False)
     # Gathered sparse MLA DCP prefill: gather the group's pages with a DMA
     # all-gather (kernels/dcp_group_all_gather.py) instead of the zero-padded
     # all-reduce, which sends dcp_size times the payload.
