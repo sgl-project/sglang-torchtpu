@@ -83,6 +83,7 @@ def test_w9_env_default_and_lock_free_prewarm():
         mock.patch.dict(w8._ATTN_TO_MOE_CHIP_SH_OPS, {}, clear=True),
         mock.patch.dict(w8._MOE_TO_ATTN_CHIP_SH_OPS, {}, clear=True),
         mock.patch.dict(w8._MOE_POST_CHIP_SH_FINAL_OPS, {}, clear=True),
+        mock.patch.dict(w8._AG_CHIP_CAP_OPS, {}, clear=True),
         mock.patch.dict(w8._ATTN_TO_MOE_TOK_SH_OPS, {}, clear=True),
         mock.patch.dict(w8._MOE_TO_ATTN_QKV_EPI_OPS, {}, clear=True),
         mock.patch.dict(w8._DUAL_QKV_EPI_GATE_OPS, {}, clear=True),
@@ -101,6 +102,7 @@ def test_w9_env_default_and_lock_free_prewarm():
         with mock.patch.object(w8, "_W8_LOCK", _ExplodingLock()):
             assert callable(w8.get_decode_vocab_embed_chip_sharded_op(8))
             for tp in (8, 16):
+                assert callable(w8.get_ag_chip_sharded_capture_op(tp))
                 for r16 in (False, True):
                     assert callable(
                         w8.get_attn_to_moe_chip_sharded_bridge_op(tp, bf16_router=r16)
@@ -1208,6 +1210,655 @@ def test_w95_stacked_chip_bridges_and_tp2_wpost_0ulp_race_free():
             h1_np = np.asarray(h_fn1).reshape(TP, B_cur, H)
             assert not np.isnan(h1_np[0, :valid].astype(np.float32)).any()
             np.testing.assert_array_equal(h1_np[:, :valid], h0_np[:, :valid])
+
+
+def test_muse_spark_chip_sharded_dflash_batched_capture_and_tp16_tp2_wpost_prep():
+    """Verify TP=16 TP2_WPOST weight prep, batched DFlash capture AG, & VERIFY_BRIDGE_LIFT."""
+    from sglang.srt.configs.muse_spark import MuseSparkTextConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.models.muse_spark import MuseSparkDecoderLayer, MuseSparkTextModel
+    from test.registered.unit.hardware_backend.tpu.test_muse_w7_col_proj import (
+        _make_dummy_layer,
+        _make_norm,
+    )
+
+    # 1. VERIFY_BRIDGE_LIFT automatically enables _decode_fuse_target_verify
+    cfg_small = MuseSparkTextConfig(
+        vocab_size=256,
+        hidden_size=512,
+        intermediate_size=1024,
+        moe_intermediate_size=256,
+        moe_hidden_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=16,
+        num_key_value_heads=2,
+        head_dim=128,
+        num_experts=16,
+        num_experts_per_tok=2,
+        layer_types=["full_attention"],
+        layer_rope_theta=[10000.0],
+        rms_norm_eps=1e-5,
+        post_norm_eps=1e-8,
+        residual_gate_temperature=1.0,
+    )
+    with (
+        mock.patch("sglang_tpu.models.muse_spark.MuseSparkAttention", return_value=torch.nn.Identity()),
+        mock.patch("sglang_tpu.models.muse_spark.MuseSparkMoE", return_value=torch.nn.Identity()),
+    ):
+        assert (
+            MuseSparkDecoderLayer(cfg_small, 0, None, None, "l")._decode_fuse_target_verify
+            is False
+        )
+        with tpu_envs.SGLANG_TPU_MUSE_VERIFY_BRIDGE_LIFT.override(True):
+            assert (
+                MuseSparkDecoderLayer(cfg_small, 0, None, None, "l")._decode_fuse_target_verify
+                is True
+            )
+
+    # 2. TP=16 TP2_WPOST=1 prepares _w9_wpost_pair_w8k [H_PRE, H//2] & _w9_spost_pair [H//2]
+    H_p, H_PRE_p, TP16 = 4096, 512, 16
+    post_cols = H_p // TP16
+    wpost_ranks = [
+        torch.randn((post_cols, H_PRE_p), dtype=torch.bfloat16) * 0.02 for _ in range(TP16)
+    ]
+
+    def _fake_ag(tensor, dim=-1):
+        del dim
+        if tensor.ndim == 2 and tensor.shape[0] == H_PRE_p and tensor.shape[1] == post_cols:
+            return wpost_full_q
+        return spost_full_s
+
+    for rank in (0, 1):
+        moe_r = _make_dummy_layer(3, H=H_p, H_PRE=H_PRE_p, tp_size=TP16).mlp
+        moe_r.post_expert_proj.weight = torch.nn.Parameter(wpost_ranks[rank], requires_grad=False)
+        from sglang_tpu.kernels.decode_collective_bridges import quantize_weight_fp8_k_major
+
+        q_list, s_list = zip(*(quantize_weight_fp8_k_major(w) for w in wpost_ranks))
+        wpost_full_q = torch.cat(q_list, dim=1)
+        spost_full_s = torch.cat(s_list, dim=1)
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch(
+                "sglang_tpu.models.muse_spark.get_parallel",
+                return_value=types.SimpleNamespace(tp_rank=rank, tp_size=TP16, attn_cp_size=1),
+            ),
+            mock.patch(
+                "sglang_tpu.models.muse_spark.tensor_model_parallel_all_gather",
+                side_effect=_fake_ag,
+            ),
+        ):
+            pre_ok, post_ok = moe_r.prepare_w7_moe_bridges(
+                do_pre=False,
+                do_post=True,
+                chip_sharded=True,
+                tp2_wpost=True,
+            )
+        assert not pre_ok and post_ok
+        assert "_w9_wpost_pair_w8k" in moe_r._buffers
+        assert tuple(moe_r._buffers["_w9_wpost_pair_w8k"].shape) == (H_PRE_p, H_p // 2)
+        assert tuple(moe_r._buffers["_w9_spost_pair"].shape) == (H_p // 2,)
+        side = rank & 1
+        torch.testing.assert_close(
+            moe_r._buffers["_w9_wpost_pair_w8k"].float(),
+            wpost_full_q[:, side * (H_p // 2) : (side + 1) * (H_p // 2)].float(),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    # 3. MuseSparkTextModel.forward batched DFlash capture AG (1 call total, 0 per-layer AG!)
+    H_c, H_PRE_c = 1024, 512
+    backend = types.SimpleNamespace(
+        can_forward_decode_prepared=lambda *_: False,
+        forward_decode_prepared_gated=lambda q, kv, g, *_: g.clone(),
+    )
+    fb = types.SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        attn_backend=backend,
+        return_logprob=False,
+        capture_hidden_mode=None,
+        token_indices_to_pool=None,
+        multi_item_delimiter_indices=None,
+        extend_seq_lens=None,
+    )
+    for tp, B in ((8, 256), (16, 64)):
+        r_pair = B // (tp // 2)
+        model = object.__new__(MuseSparkTextModel)
+        torch.nn.Module.__init__(model)
+        model.config = types.SimpleNamespace(hidden_size=H_c, rms_norm_eps=1e-5)
+        model.pp_group = types.SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        model.start_layer = 0
+        model.end_layer = 3
+        model._set_layers_to_capture([0, 1])
+        model.prefill_kernels = None
+        model.rotary_emb = types.SimpleNamespace(cos_sin_pairs=None)
+        layers = []
+        for idx in range(3):
+            lyr = _make_dummy_layer(3, H=H_c, H_PRE=H_PRE_c)
+            lyr.self_attn.o_proj.tp_size = tp
+            lyr.mlp.tp_size = tp
+            lyr.self_attn.qkv_proj.weight = torch.nn.Parameter(
+                torch.randn(1280 // (tp // 8), H_c, dtype=torch.bfloat16) * 0.02,
+                requires_grad=False,
+            )
+            lyr.self_attn.gate_proj.weight = torch.nn.Parameter(
+                torch.randn(1024 // (tp // 8), H_c, dtype=torch.bfloat16) * 0.02,
+                requires_grad=False,
+            )
+            lyr.self_attn.o_proj.weight = torch.nn.Parameter(
+                torch.randn(H_c, 1024 // (tp // 8), dtype=torch.bfloat16) * 0.02,
+                requires_grad=False,
+            )
+            lyr.self_attn._o_proj_w8k = None
+            assert lyr.self_attn.prepare_w7_qkv_gate_fp8()
+            assert lyr.self_attn.prepare_w7_o_proj_fp8()
+            lyr.mlp.register_buffer(
+                "_w8_wpre_pair_w8k",
+                torch.zeros((H_c, H_PRE_c // 2), dtype=torch.float8_e4m3fn),
+                persistent=False,
+            )
+            lyr.mlp.register_buffer(
+                "_w8_spre_pair",
+                torch.ones((H_PRE_c // 2,), dtype=torch.float32),
+                persistent=False,
+            )
+            lyr.self_attn.forward = lambda pos, ai, fb_, **kw: torch.zeros(
+                (B, 1024 // (tp // 8)), dtype=torch.bfloat16
+            )
+            lyr.mlp.can_return_sharded_moe_out = lambda n_t, *, decode: True
+            lyr.mlp.forward = (
+                lambda fh, ri, *, decode, return_unprojected_moe_out, return_sharded_moe_out, **kw: (
+                    torch.zeros(
+                        (B // tp if return_sharded_moe_out else B, H_PRE_c),
+                        dtype=torch.bfloat16,
+                    )
+                )
+            )
+            layers.append(lyr)
+        model.layers = torch.nn.ModuleList(layers)
+        model.norm = _make_norm(H_c)
+        model._decode_norm_layout = 0
+        model._decode_col_bridges = 3
+        model._w9_chip_sharded_bridges = True
+        model._w9_all_layers_chip_sharded_ready = True
+        model._w9_chip_sharded_batches = (64, 128, 256, 384)
+        model._w9_chip_sharded_tp = tp
+        model._w8_pallas_embed_enabled = False
+        model._w8_pallas_embed_tp = 0
+
+        cap_op_calls = []
+        xla_ag_calls = []
+
+        def _fake_cap_op(local_cat):
+            cap_op_calls.append(tuple(local_cat.shape))
+            return local_cat.repeat(tp // 2, 1)
+
+        def _fake_xla_ag(t, dim=0):
+            xla_ag_calls.append((dim, tuple(t.shape)))
+            return t.repeat(tp, 1)
+
+        def _fake_b1(st, *_rest):
+            return (
+                st + 1.0,
+                torch.zeros((B, 256), dtype=torch.float32),
+                torch.zeros((B, H_PRE_c), dtype=torch.bfloat16),
+            )
+
+        def _fake_b2(st, *_rest):
+            return (
+                st + 2.0,
+                torch.zeros((B, 1280 // (tp // 8)), dtype=torch.bfloat16),
+                torch.zeros((B, 1024 // (tp // 8)), dtype=torch.bfloat16),
+            )
+
+        def _fake_fn(st, *_rest):
+            return torch.ones((B, H_c), dtype=torch.bfloat16)
+
+        embeds = torch.randn(B, H_c, dtype=torch.bfloat16)
+        pos = torch.arange(B, dtype=torch.int32)
+        with (
+            mock.patch.dict(os.environ, {"WORLD_SIZE": str(tp)}),
+            mock.patch(
+                "sglang_tpu.models.muse_spark.get_parallel",
+                return_value=types.SimpleNamespace(tp_rank=3, tp_size=tp, attn_cp_size=1),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_forward",
+                return_value=types.SimpleNamespace(sp_active=False),
+            ),
+            mock.patch(
+                "sglang_tpu.models.muse_spark.tensor_model_parallel_all_gather",
+                side_effect=_fake_xla_ag,
+            ),
+            mock.patch(
+                "sglang_tpu.kernels.decode_collective_bridges_w8.get_ag_chip_sharded_capture_op",
+                return_value=_fake_cap_op,
+            ),
+            mock.patch(
+                "sglang_tpu.kernels.decode_collective_bridges_w8.get_attn_to_moe_chip_sharded_bridge_op",
+                return_value=_fake_b1,
+            ),
+            mock.patch(
+                "sglang_tpu.kernels.decode_collective_bridges_w8.get_moe_to_attn_chip_sharded_bridge_op",
+                return_value=_fake_b2,
+            ),
+            mock.patch(
+                "sglang_tpu.kernels.decode_collective_bridges_w8.get_moe_post_chip_sharded_final_norm_op",
+                return_value=_fake_fn,
+            ),
+        ):
+            hid, aux = model.forward(
+                torch.zeros((B,), dtype=torch.int32), pos, fb, input_embeds=embeds
+            )
+            assert hid.shape == (B, H_c)
+            assert aux.shape == (B, 2 * H_c)
+            assert cap_op_calls == [(r_pair, 2 * H_c)]
+            assert xla_ag_calls == []
+
+            # Fallback path: 1 batched XLA AG (no per-layer AG) when VMEM > 48 MiB or half_cols % ag_w != 0
+            cap_op_calls.clear()
+            n_fb = 80 if (tp == 8 and B == 256) else 3
+            model._set_layers_to_capture([0] * n_fb)
+            hid2, aux2 = model.forward(
+                torch.zeros((B,), dtype=torch.int32), pos, fb, input_embeds=embeds
+            )
+            assert hid2.shape == (B, H_c)
+            assert aux2.shape == (B, n_fb * H_c)
+            assert cap_op_calls == []
+            assert xla_ag_calls == [(0, (r_pair, n_fb * H_c))]
+
+    # 4. _prepare_decode_collective_bridges selects r_pair >= 16: (64..384) on TP=8 & (128..384) on TP=16
+    from sglang_tpu.models.muse_spark import MuseSparkForConditionalGeneration
+
+    for warm_tp, exp_batches in ((8, (64, 128, 256, 384)), (16, (128, 256, 384))):
+        outer = object.__new__(MuseSparkForConditionalGeneration)
+        torch.nn.Module.__init__(outer)
+        inner = object.__new__(MuseSparkTextModel)
+        torch.nn.Module.__init__(inner)
+        inner.start_layer = 0
+        inner.end_layer = 1
+        lyr_w = _make_dummy_layer(3, H=1024, H_PRE=512, tp_size=warm_tp)
+        lyr_w._w8_bridge_qkv_epi = False
+        lyr_w.self_attn._o_proj_w8k = torch.zeros((128, 128), dtype=torch.float8_e4m3fn)
+        lyr_w.mlp.register_buffer("_w8_wpre_pair_w8k", torch.zeros((1024, 256), dtype=torch.float8_e4m3fn), persistent=False)
+        lyr_w.mlp.register_buffer("_w7_wrouter_km", torch.zeros((1024, 256), dtype=torch.bfloat16), persistent=False)
+        lyr_w.mlp.register_buffer("_w7_wpost_w8k", torch.zeros((512, 128), dtype=torch.float8_e4m3fn), persistent=False)
+        lyr_w.prepare_w7_o_proj_fp8 = lambda **kw: None
+        lyr_w.self_attn.prepare_w7_o_proj_fp8 = lambda **kw: True
+        lyr_w.self_attn.prepare_w7_qkv_gate_fp8 = lambda **kw: True
+        lyr_w.mlp.prepare_w7_moe_bridges = lambda **kw: (True, True)
+        inner.layers = torch.nn.ModuleList([lyr_w])
+        inner.embed_tokens = types.SimpleNamespace(weight=None, shard_indices=None)
+        inner.prefill_kernels = None
+        outer.model = inner
+        with (
+            tpu_envs.SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES.override(True),
+            tpu_envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.override(True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=warm_tp),
+            mock.patch(
+                "sglang_tpu.models.muse_spark.get_parallel",
+                return_value=types.SimpleNamespace(tp_rank=0, tp_size=warm_tp, attn_cp_size=1),
+            ),
+            mock.patch(
+                "sglang_tpu.fused_rs_sequence_parallel.get_fused_moe_sequence_parallel_plan",
+                return_value=(False,),
+            ),
+            mock.patch("sglang_tpu.rank_local._slice_op", return_value=None),
+            mock.patch("sglang_tpu.kernels.decode_collective_bridges.prewarm_decode_collective_bridge_ops"),
+            mock.patch("sglang_tpu.kernels.decode_collective_bridges_w8.prewarm_w8_decode_bridge_ops"),
+        ):
+            outer._prepare_decode_collective_bridges(3)
+        assert inner._w9_chip_sharded_batches == exp_batches
+
+
+def test_w9_chip_loop32_c512_tp16_tp2_wpost_and_capture_ag_interpret():
+    """Verify loop32_c512 (B=256 TP=8), TP=16 TP2_WPOST=1, & capture AG under eager interpret + detect_races."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    mesh8 = Mesh(np.array(jax.devices("cpu")[:8]), ("model",))
+    mesh16 = Mesh(np.array(jax.devices("cpu")[:16]), ("model",))
+    rng = np.random.default_rng(20261126)
+
+    # 1. TP=8, B=256 (r_pair=64 > 32, rows=256 > 128) loop32_c512 (512-col strips) on B1/B2/FN
+    B8, H8, H_PRE8, qkv8, gate8 = 256, 2048, 2048, 1280, 512
+    valid8 = B8 - 1
+    st8 = (rng.standard_normal((B8, H8)) * 0.5).astype(np.float32)
+    st8[-1, :] = np.nan
+    ga8 = (rng.standard_normal((B8, H8)) * 0.2).astype(np.float32)
+    ga8[-1, :] = np.nan
+    ga8_bf16 = jnp.asarray(ga8, dtype=jnp.bfloat16)
+    st8_stacked = jnp.asarray(
+        np.concatenate([st8[(r >> 1) * 64 : ((r >> 1) + 1) * 64] for r in range(8)], axis=0)
+    )
+    wo8 = jnp.asarray((rng.standard_normal((H8, H8)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    wos8 = (np.abs(rng.standard_normal((H8,))) * 0.02 + 1e-3).astype(np.float32)
+    pa_a8 = (np.ones((H8,)) * 0.95).astype(np.float32)
+    pa_b8 = (np.ones((H8,)) * 0.85).astype(np.float32)
+    pfg8 = (np.ones((H8,)) * 1.05).astype(np.float32)
+    wpre8 = jnp.asarray((rng.standard_normal((H8, H_PRE8)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    spre8 = (np.abs(rng.standard_normal((H_PRE8,))) * 0.02 + 1e-3).astype(np.float32)
+    wpre_pair8 = jnp.concatenate(
+        [wpre8[:, : H_PRE8 // 2] if (r & 1) == 0 else wpre8[:, H_PRE8 // 2 :] for r in range(8)],
+        axis=1,
+    )
+    spre_pair8 = np.concatenate(
+        [spre8[: H_PRE8 // 2] if (r & 1) == 0 else spre8[H_PRE8 // 2 :] for r in range(8)],
+        axis=0,
+    )
+    wr8 = jnp.asarray((rng.standard_normal((H8, 256)) * 0.04).astype(np.float32), dtype=jnp.bfloat16)
+    peg8 = (np.ones((H_PRE8,)) * 1.1).astype(np.float32)
+
+    st8_b1, lg8_b1, ex8_b1 = jax.shard_map(
+        lambda *a: w8.attn_to_moe_chip_sharded_bridge_jax(
+            *a,
+            world_size=8,
+            pa_eps=1e-6,
+            pre_ff_eps=1e-5,
+            pre_ff_scale_input=False,
+            router_multiplier=0.5,
+            pre_exp_eps=1e-5,
+            pre_exp_scale_input=False,
+            interpret=ip_race,
+        ),
+        mesh=mesh8,
+        in_specs=(
+            P("model", None),
+            P(None, "model"),
+            P("model", None),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(None, "model"),
+            P("model"),
+            P(),
+            P(),
+        ),
+        out_specs=(P("model", None), P("model", None), P("model", None)),
+        check_vma=False,
+    )(
+        st8_stacked,
+        ga8_bf16,
+        wo8,
+        jnp.asarray(wos8),
+        jnp.asarray(pa_a8),
+        jnp.asarray(pa_b8),
+        jnp.asarray(pfg8),
+        wpre_pair8,
+        jnp.asarray(spre_pair8),
+        wr8,
+        jnp.asarray(peg8),
+    )
+
+    attn_ref8 = np.asarray(ga8_bf16, dtype=np.float32) @ (
+        np.asarray(wo8, dtype=np.float32) * wos8.reshape(1, -1)
+    )
+    st_ref8 = pa_a8.reshape(1, -1) * st8 + pa_b8.reshape(1, -1) * _rms_norm_np(
+        attn_ref8, np.ones((H8,), dtype=np.float32), 1e-6, False
+    )
+    ffn_ref8 = _rms_norm_np(st_ref8, pfg8, 1e-5, False)
+    lg_ref8 = (ffn_ref8 @ np.asarray(wr8, dtype=np.float32)) * 0.5
+    ex_ref8 = _rms_norm_np(
+        ffn_ref8 @ (np.asarray(wpre8, dtype=np.float32) * spre8.reshape(1, -1)), peg8, 1e-5, False
+    )
+
+    st8_np = np.asarray(st8_b1).reshape(8, 64, H8)
+    st8_reasm = np.concatenate([st8_np[2 * c] for c in range(4)], axis=0)
+    lg8_np = np.asarray(lg8_b1).reshape(8, B8, 256)
+    ex8_np = np.asarray(ex8_b1, dtype=np.float32).reshape(8, B8, H_PRE8)
+    assert not np.isnan(st8_reasm[:valid8]).any()
+    np.testing.assert_array_equal(st8_np[0, :64], st8_np[1, :64])
+    for r in (2, 4, 6):
+        np.testing.assert_array_equal(lg8_np[0, :valid8], lg8_np[r, :valid8])
+    for r in (3, 5, 7):
+        np.testing.assert_array_equal(lg8_np[1, :valid8], lg8_np[r, :valid8])
+    np.testing.assert_allclose(lg8_np[0, :valid8], lg8_np[7, :valid8], rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(st8_reasm[:valid8], st_ref8[:valid8], rtol=2e-2, atol=4e-2)
+    np.testing.assert_allclose(lg8_np[0, :valid8], lg_ref8[:valid8], rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(ex8_np[0, :valid8], ex_ref8[:valid8], rtol=2e-2, atol=5e-2)
+
+    moe8_np = (rng.standard_normal((B8, H_PRE8)) * 0.3).astype(np.float32)
+    moe8_np[-1, :] = np.nan
+    moe8_bf16 = jnp.asarray(moe8_np, dtype=jnp.bfloat16)
+    wpost8 = jnp.asarray((rng.standard_normal((H_PRE8, H8)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    spost8 = jnp.asarray((np.abs(rng.standard_normal((H8,))) * 0.02 + 1e-3).astype(np.float32))
+    wpost_tp2_8 = jnp.concatenate(
+        [wpost8[:, : H8 // 2] if (r & 1) == 0 else wpost8[:, H8 // 2 :] for r in range(8)],
+        axis=1,
+    )
+    spost_tp2_8 = jnp.concatenate(
+        [spost8[: H8 // 2] if (r & 1) == 0 else spost8[H8 // 2 :] for r in range(8)],
+        axis=0,
+    )
+    wq8 = jnp.asarray((rng.standard_normal((H8, 8 * qkv8)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    sq8 = jnp.asarray((np.abs(rng.standard_normal((8 * qkv8,))) * 0.02 + 1e-3).astype(np.float32))
+    wg8 = jnp.asarray((rng.standard_normal((H8, 8 * gate8)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    sg8 = jnp.asarray((np.abs(rng.standard_normal((8 * gate8,))) * 0.02 + 1e-3).astype(np.float32))
+    cs8 = build_decode_rope_step_tables(
+        jnp.arange(B8, dtype=jnp.int32),
+        jnp.asarray(rng.standard_normal((B8, 128)).astype(np.float32) * 0.5),
+    )
+
+    def _run_b2_8(wp_arg, sp_arg):
+        return jax.shard_map(
+            lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+                *a,
+                world_size=8,
+                sharded_moe_in=True,
+                post_ff_eps=1e-5,
+                post_ff_scale_input=True,
+                next_in_eps=1e-5,
+                next_in_scale_input=False,
+                fuse_qkv_epi=True,
+                qkv_norm_eps=1e-6,
+                query_scale=0.125,
+                k_scale=0.75,
+                v_scale=1.25,
+                interpret=ip_race,
+            ),
+            mesh=mesh8,
+            in_specs=(
+                P("model", None),
+                P("model", None),
+                P(None, "model"),
+                P("model"),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(None, "model"),
+                P("model"),
+                P(None, "model"),
+                P("model"),
+                P(),
+            ),
+            out_specs=(
+                P("model", None),
+                P(None, None, "model", None, None),
+                P(None, "model", None, None),
+                P(None, "model"),
+            ),
+            check_vma=False,
+        )(
+            st8_b1,
+            moe8_bf16,
+            wp_arg,
+            sp_arg,
+            jnp.asarray(pfg8),
+            jnp.asarray(pa_a8),
+            jnp.asarray(pa_b8),
+            jnp.asarray(pa_a8),
+            wq8,
+            sq8,
+            wg8,
+            sg8,
+            cs8,
+        )
+
+    st2_0, q2_0, kv2_0, g2_0 = _run_b2_8(wpost8, spost8)
+    st2_1, q2_1, kv2_1, g2_1 = _run_b2_8(wpost_tp2_8, spost_tp2_8)
+    st2_0_r = np.concatenate([np.asarray(st2_0).reshape(8, 64, H8)[2 * c] for c in range(4)], axis=0)
+    st2_1_r = np.concatenate([np.asarray(st2_1).reshape(8, 64, H8)[2 * c] for c in range(4)], axis=0)
+    assert not np.isnan(st2_1_r[:valid8]).any()
+    np.testing.assert_array_equal(st2_1_r[:valid8], st2_0_r[:valid8])
+    np.testing.assert_array_equal(np.asarray(q2_1)[:, :valid8], np.asarray(q2_0)[:, :valid8])
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(kv2_1, jnp.uint8))[:valid8],
+        np.asarray(jax.lax.bitcast_convert_type(kv2_0, jnp.uint8))[:valid8],
+    )
+    np.testing.assert_array_equal(np.asarray(g2_1)[:valid8], np.asarray(g2_0)[:valid8])
+
+    # 2. TP=16 TP2_WPOST=1 vs TP2_WPOST=0 on B=64 (r_pair=8, sharded_moe_in=False) & B=256 (r_pair=32, sharded=True)
+    H16, H_PRE16, qkv16, gate16 = 4096, 1024, 512, 512
+    wpost16 = jnp.asarray((rng.standard_normal((H_PRE16, H16)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    spost16 = jnp.asarray((np.abs(rng.standard_normal((H16,))) * 0.02 + 1e-3).astype(np.float32))
+    wpost_tp2_16 = jnp.concatenate(
+        [wpost16[:, : H16 // 2] if (r & 1) == 0 else wpost16[:, H16 // 2 :] for r in range(16)],
+        axis=1,
+    )
+    spost_tp2_16 = jnp.concatenate(
+        [spost16[: H16 // 2] if (r & 1) == 0 else spost16[H16 // 2 :] for r in range(16)],
+        axis=0,
+    )
+    g16 = jnp.asarray((np.ones((H16,)) * 1.03).astype(np.float32))
+    a16 = jnp.asarray((np.ones((H16,)) * 0.92).astype(np.float32))
+    b16 = jnp.asarray((np.ones((H16,)) * 0.88).astype(np.float32))
+    wq16 = jnp.asarray((rng.standard_normal((H16, 16 * qkv16)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    sq16 = jnp.asarray((np.abs(rng.standard_normal((16 * qkv16,))) * 0.02 + 1e-3).astype(np.float32))
+    wg16 = jnp.asarray((rng.standard_normal((H16, 16 * gate16)) * 0.04).astype(np.float32), dtype=jnp.float8_e4m3fn)
+    sg16 = jnp.asarray((np.abs(rng.standard_normal((16 * gate16,))) * 0.02 + 1e-3).astype(np.float32))
+
+    for B16, sh16 in ((64, False), (256, True)):
+        r_pair16 = B16 // 8
+        valid16 = B16 - 1
+        st16_in = (rng.standard_normal((B16, H16)) * 0.5).astype(np.float32)
+        st16_in[-1, :] = np.nan
+        st16_st = jnp.asarray(
+            np.concatenate([st16_in[(r >> 1) * r_pair16 : ((r >> 1) + 1) * r_pair16] for r in range(16)], axis=0)
+        )
+        moe16_np = (rng.standard_normal((B16, H_PRE16)) * 0.3).astype(np.float32)
+        moe16_np[-1, :] = np.nan
+        moe16_bf16 = jnp.asarray(moe16_np, dtype=jnp.bfloat16)
+
+        def _run_b2_16(wp_arg, sp_arg):
+            return jax.shard_map(
+                lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+                    *a,
+                    world_size=16,
+                    sharded_moe_in=sh16,
+                    post_ff_eps=1e-5,
+                    post_ff_scale_input=True,
+                    next_in_eps=1e-5,
+                    next_in_scale_input=False,
+                    fuse_qkv_epi=False,
+                    interpret=ip_race,
+                ),
+                mesh=mesh16,
+                in_specs=(
+                    P("model", None),
+                    P("model", None) if sh16 else P(),
+                    P(None, "model"),
+                    P("model"),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(None, "model"),
+                    P("model"),
+                    P(None, "model"),
+                    P("model"),
+                    None,
+                ),
+                out_specs=(P("model", None), P(None, "model"), P(None, "model")),
+                check_vma=False,
+            )(st16_st, moe16_bf16, wp_arg, sp_arg, g16, a16, b16, g16, wq16, sq16, wg16, sg16, None)
+
+        s16_0, q16_0, g16_0 = _run_b2_16(wpost16, spost16)
+        s16_1, q16_1, g16_1 = _run_b2_16(wpost_tp2_16, spost_tp2_16)
+        s16_0_r = np.concatenate([np.asarray(s16_0).reshape(16, r_pair16, H16)[2 * c] for c in range(8)], axis=0)
+        s16_1_r = np.concatenate([np.asarray(s16_1).reshape(16, r_pair16, H16)[2 * c] for c in range(8)], axis=0)
+        assert not np.isnan(s16_1_r[:valid16]).any()
+        np.testing.assert_array_equal(s16_1_r[:valid16], s16_0_r[:valid16])
+        np.testing.assert_array_equal(np.asarray(q16_1)[:valid16], np.asarray(q16_0)[:valid16])
+        np.testing.assert_array_equal(np.asarray(g16_1)[:valid16], np.asarray(g16_0)[:valid16])
+
+        def _run_fn_16(wp_arg, sp_arg):
+            return jax.shard_map(
+                lambda *a: w8.moe_post_chip_sharded_final_norm_jax(
+                    *a,
+                    world_size=16,
+                    sharded_moe_in=sh16,
+                    post_ff_eps=1e-5,
+                    post_ff_scale_input=True,
+                    final_eps=1e-5,
+                    final_scale_input=False,
+                    return_stream_too=True,
+                    interpret=ip_race,
+                ),
+                mesh=mesh16,
+                in_specs=(
+                    P("model", None),
+                    P("model", None) if sh16 else P(),
+                    P(None, "model"),
+                    P("model"),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                ),
+                out_specs=(P("model", None), P("model", None)),
+                check_vma=False,
+            )(st16_st, moe16_bf16, wp_arg, sp_arg, g16, a16, b16, g16)
+
+        stf0, hf0 = _run_fn_16(wpost16, spost16)
+        stf1, hf1 = _run_fn_16(wpost_tp2_16, spost_tp2_16)
+        stf0_r = np.concatenate([np.asarray(stf0).reshape(16, r_pair16, H16)[2 * c] for c in range(8)], axis=0)
+        stf1_r = np.concatenate([np.asarray(stf1).reshape(16, r_pair16, H16)[2 * c] for c in range(8)], axis=0)
+        np.testing.assert_array_equal(stf1_r[:valid16], stf0_r[:valid16])
+        np.testing.assert_array_equal(
+            np.asarray(hf1).reshape(16, B16, H16)[:, :valid16],
+            np.asarray(hf0).reshape(16, B16, H16)[:, :valid16],
+        )
+
+    # 3. ag_chip_sharded_capture_jax 0.0-ULP bit-exact parity across TP=8 B=256 & TP=16 B=64/256 (w/ NaN tail row!)
+    for tp, mesh, B_cap, K_H in ((8, mesh8, 256, 4096), (16, mesh16, 64, 4096), (16, mesh16, 256, 2048)):
+        n_chips = tp // 2
+        r_p = B_cap // n_chips
+        cap_np = (rng.standard_normal((B_cap, K_H)) * 0.5).astype(np.float32)
+        cap_np[-1, :] = np.nan
+        cap_full = jnp.asarray(cap_np, dtype=jnp.bfloat16)
+        cap_stacked = jnp.concatenate(
+            [cap_full[(r >> 1) * r_p : ((r >> 1) + 1) * r_p] for r in range(tp)], axis=0
+        )
+        cap_out = jax.shard_map(
+            lambda x: w8.ag_chip_sharded_capture_jax(x, world_size=tp, interpret=ip_race),
+            mesh=mesh,
+            in_specs=(P("model", None),),
+            out_specs=P("model", None),
+            check_vma=False,
+        )(cap_stacked)
+        cap_out_np = np.asarray(cap_out).reshape(tp, B_cap, K_H)
+        cap_ref_np = np.asarray(cap_full)
+        valid_cap = B_cap - 1
+        for r in range(tp):
+            assert not np.isnan(np.asarray(cap_out_np[r, :valid_cap], dtype=np.float32)).any()
+            np.testing.assert_array_equal(cap_out_np[r, :valid_cap], cap_ref_np[:valid_cap])
+
 
 
 
