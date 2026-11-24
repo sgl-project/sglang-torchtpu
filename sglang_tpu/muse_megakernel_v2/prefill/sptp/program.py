@@ -41,6 +41,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     _heads_rms_mxu,
     dequant_rows_call,
+    o_gate_call,
     qkvg_call,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
@@ -145,6 +146,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
+    # SPTP_OGATE_XLA=1: the o gate in XLA on the RPA layout (layout copies) instead of the kernel
+    ogate_kernel = q_rpa and os.environ.get("SPTP_OGATE_XLA", "0") != "1"
+    o_gate = o_gate_call(c)
     # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
     aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
     # SPTP_XE_PALLAS_DEQUANT=1: row-major Pallas xe dequant (measured 171.1 vs 169.7 ms / chunk
@@ -238,33 +242,46 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     sm_scale=c.attn_scale,
                     sliding_window=None if is_global else c.window,
                 )
-                with _scope("sp_o_gate"):
-                    # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
-                    o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
-                    o4 = o4 * jax.lax.rsqrt(
-                        jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
-                    )
-                    g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
-                    a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
-                    g_s = (
-                        jnp.maximum(
-                            jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
-                        ).reshape(T, 1)
-                        / 448.0
-                    )
-                    g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
-                with _scope("sp_o_a2a"):
-                    g8 = jax.lax.all_to_all(
-                        g8.reshape(c.kv_heads, tp, Ts, gq, hd), axis, 1, 1, tiled=True
-                    )
-                    g_s = to_owner(g_s, tp, axis)
-                with _scope("sp_o_proj"):
-                    # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
-                    a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
-                        Ts, tp, 1, 1, 1
-                    )
-                    g8, g_s = q8(a.reshape(Ts, tp * qd))
-                    o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                if ogate_kernel:
+                    with _scope("sp_o_gate"):
+                        g8, g_s = o_gate(o, gate)
+                    with _scope("sp_o_a2a"):
+                        g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                    with _scope("sp_o_proj"):
+                        g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                else:
+                    with _scope("sp_o_gate"):
+                        # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
+                        o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
+                        o4 = o4 * jax.lax.rsqrt(
+                            jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
+                        a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                        g_s = (
+                            jnp.maximum(
+                                jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
+                            ).reshape(T, 1)
+                            / 448.0
+                        )
+                        g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
+                    with _scope("sp_o_a2a"):
+                        g8 = jax.lax.all_to_all(
+                            g8.reshape(c.kv_heads, tp, Ts, gq, hd),
+                            axis,
+                            1,
+                            1,
+                            tiled=True,
+                        )
+                        g_s = to_owner(g_s, tp, axis)
+                    with _scope("sp_o_proj"):
+                        # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
+                        a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
+                            Ts, tp, 1, 1, 1
+                        )
+                        g8, g_s = q8(a.reshape(Ts, tp * qd))
+                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
             else:
                 o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
                 with _scope("sp_o_gate"):

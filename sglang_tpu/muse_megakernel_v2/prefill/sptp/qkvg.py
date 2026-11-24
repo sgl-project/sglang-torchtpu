@@ -211,3 +211,56 @@ def dequant_rows_call(rows: int, cols: int, tm: int = 512):
         )(x8, s)
 
     return call
+
+
+def o_gate_call(c: PFConfig, tm: int = 256):
+    """(o [Hkv, T, G / 2, 2, 128] bf16 raw batched-RPA output, gate [T, qd] bf16) ->
+    (e4m3 [T, qd], f32 [T, 1] row scale) of sigmoid(gate) * head_rms(o), token-major for the
+    row a2a; XLA spent ~2.9 ms / chunk of layout copies on this between the RPA and the a2a."""
+    T, qd, hd = c.rows, c.q_dim, c.head_dim
+    hkv, gq = c.kv_heads, c.q_heads // c.kv_heads
+    w = gq * hd
+    if T % tm:
+        raise ValueError(f"{T} rows do not tile by {tm}")
+
+    def kernel(o_ref, g_ref, x_ref, s_ref):
+        # 0/1 dot: each head's first hd of 128 lanes -> dense [tm, G * hd] (exact for bf16)
+        unpad = (
+            jax.lax.broadcasted_iota(jnp.int32, (gq * 128, w), 0)
+            == jax.lax.broadcasted_iota(jnp.int32, (gq * 128, w), 1) // hd * 128
+            + jax.lax.broadcasted_iota(jnp.int32, (gq * 128, w), 1) % hd
+        ).astype(jnp.bfloat16)
+        parts = []
+        for k in range(hkv):
+            ok = o_ref[k].reshape(tm, gq * 128)
+            parts.append(jnp.dot(ok, unpad, preferred_element_type=jnp.float32))
+        o = jnp.concatenate(parts, axis=1)
+        a = jax.nn.sigmoid(g_ref[...].astype(jnp.float32)) * _heads_rms_mxu(
+            o, c.q_heads, hd, c.rms_eps
+        )
+        s = jnp.maximum(jnp.max(jnp.abs(a), axis=1, keepdims=True), 1e-30) / 448.0
+        x_ref[...] = (a / s).astype(jnp.float8_e4m3fn)
+        s_ref[...] = s
+
+    def call(o, gate):
+        o4 = o.reshape(hkv, T, gq, 128)
+        return pl.pallas_call(
+            kernel,
+            grid=(T // tm,),
+            in_specs=[
+                pl.BlockSpec((hkv, tm, gq, 128), lambda i: (0, i, 0, 0)),
+                pl.BlockSpec((tm, qd), lambda i: (i, 0)),
+            ],
+            out_specs=(
+                pl.BlockSpec((tm, qd), lambda i: (i, 0)),
+                pl.BlockSpec((tm, 1), lambda i: (i, 0)),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct((T, qd), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((T, 1), jnp.float32),
+            ),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name=f"muse_sptp_o_gate_t{T}_m{tm}",
+        )(o4, gate)
+
+    return call
