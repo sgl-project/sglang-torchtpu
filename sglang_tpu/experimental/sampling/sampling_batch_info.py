@@ -8,7 +8,7 @@ from typing import Callable
 import torch
 
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _PARAM_FILLS = {
     "temperatures": 1.0,

@@ -43,12 +43,28 @@ def _bailing_vl_decoder_policy() -> type[CompilePolicy]:
     return BailingVLDecoderTpuCompilePolicy
 
 
+def _deepseek_v4_decoder_policy() -> type[CompilePolicy]:
+    from sglang_tpu.models.deepseek_v41.compile_policy import (
+        DeepseekV4DecoderTpuCompilePolicy,
+    )
+
+    return DeepseekV4DecoderTpuCompilePolicy
+
+
 def _kimi_k3_vision_policy() -> type[CompilePolicy]:
     from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
         KimiK3VisionTpuCompilePolicy,
     )
 
     return KimiK3VisionTpuCompilePolicy
+
+
+def _glm5_next_vision_policy() -> type[CompilePolicy]:
+    from sglang_tpu.graph_runner.glm5_next_vit_tpu_compile_runner import (
+        Glm5NextVisionTpuCompilePolicy,
+    )
+
+    return Glm5NextVisionTpuCompilePolicy
 
 
 CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
@@ -73,6 +89,21 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         class_name="BailingMoeV3VLModel",
         policy=_bailing_vl_decoder_policy,
     ),
+    # DeepSeek-V4 and V4.1 share this class. The policy pads like the generic
+    # whole-model fallback, then stages host Engram rows (Engram models) and,
+    # under attention DP, the token embedding before attention planning.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.deepseek_v4",
+        class_name="DeepseekV4ForCausalLM",
+        policy=_deepseek_v4_decoder_policy,
+    ),
+    # The DSpark draft bundled with V4/V4.1 embeds with the target's table, so it
+    # needs the same DP embedding staging.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.deepseek_v4_dspark",
+        class_name="DeepseekV4ForCausalLMDSpark",
+        policy=_deepseek_v4_decoder_policy,
+    ),
     # Kimi-K3's vision encoder. Its layer loop runs on the TPU runner the
     # plugin attaches as graph_runners (sglang_tpu.hooks.kimi_k3_vision); this
     # compiles that runner per padded patch bucket. The language model carries
@@ -81,6 +112,20 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         module="sglang.srt.models.kimi_k3_vl",
         class_name="MoonViT3dEncoder",
         policy=_kimi_k3_vision_policy,
+    ),
+    # GLM-5.3-Flash's vision encoder. Its block loop and 2x2 patch merger run
+    # on the TPU runner attached by sglang_tpu.hooks.glm5_next_vision. Unless
+    # mm_config.language_model_only or --enable-dp-attention is set,
+    # compile_glm5_next_decoder_only attaches _Glm5NextLanguageModel on
+    # model.language_model with Glm5NextVLDecoderTpuCompilePolicy (covering
+    # both standard multimodal and EPD language-only servers); under
+    # --language-model-only it annotates the whole model with
+    # Glm5NextDecoderTpuCompilePolicy, and under --enable-dp-attention both
+    # boundaries decline, keeping TpuGraphRunner's whole-model fallback.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.glm5_next",
+        class_name="Glm5NextVisionModel",
+        policy=_glm5_next_vision_policy,
     ),
 )
 

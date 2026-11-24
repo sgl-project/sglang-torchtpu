@@ -17,7 +17,8 @@ from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pipeline_final_chunks
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
@@ -36,7 +37,7 @@ def _req(sender, n_input, extend_end, pool_idx=0, **fields):
     return SimpleNamespace(
         disagg_kv_sender=sender,
         origin_input_ids=list(range(n_input)),
-        extend_range=SimpleNamespace(end=extend_end),
+        extend_end=extend_end,
         kv=SimpleNamespace(req_pool_idx=pool_idx),
         **fields,
     )

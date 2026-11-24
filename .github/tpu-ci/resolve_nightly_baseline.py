@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the latest nightly run on main: extracts its container image digest and job-level pass/fail results."""
+"""Resolve the latest completed scheduled nightly run on main: extracts its container image digest and job-level pass/fail results."""
 
 from __future__ import annotations
 
@@ -37,7 +37,12 @@ def resolve_baseline(
     branch: str = "main",
     workflow_file: str = "nightly-test-tpu.yml",
 ) -> dict:
-    runs_path = f"repos/{repo}/actions/workflows/{workflow_file}/runs?branch={branch}&per_page=10"
+    # Completed scheduled runs only: a run in progress has only some job results,
+    # and a manual dispatch can be a partial run or build another ref.
+    runs_path = (
+        f"repos/{repo}/actions/workflows/{workflow_file}/runs"
+        f"?branch={branch}&event=schedule&status=completed&per_page=10"
+    )
     runs_raw = _gh_api(runs_path, token).decode("utf-8")
     data = json.loads(runs_raw)
     runs = data.get("workflow_runs", [])

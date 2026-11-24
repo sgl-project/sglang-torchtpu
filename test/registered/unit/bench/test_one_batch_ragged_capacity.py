@@ -1,6 +1,7 @@
 """Unit tests for the one-batch KV-capacity skip with ragged --input-len-list batches."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.benchmark import one_batch_server
@@ -69,7 +70,9 @@ class TestRaggedTokenCapacity(CustomTestCase):
                     ),
                     patch.object(one_batch_server, "run_one_case") as run_case,
                 ):
-                    one_batch_server.run_benchmark_internal(None, bench)
+                    one_batch_server.run_benchmark_internal(
+                        SimpleNamespace(admin_api_key=None), bench
+                    )
                 warmup_batches = {
                     call.kwargs["batch_size"]
                     for call in run_case.call_args_list

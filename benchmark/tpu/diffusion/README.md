@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `pika_h3_flex.sh` | `Pika-Labs/Pika-H3-Flex` | 8 | Ulysses 8, LoRA adapters unmerged |
 | `qwen_image21.sh` | `Qwen/Qwen-Image-2.1` | 1 or 8 | Ulysses = cores (32 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
@@ -39,6 +40,9 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| Pika-H3-Flex | T2VA 1344x768, 5 s, 6 steps | 8 | 11.2 s | 1.14 s | 3.2 s | 83.4 GiB |
+| Pika-H3-Flex | FL2VA 1344x768 (first frame), 5 s, 6 steps | 8 | 12.0 s | 1.29 s | 3.2 s | 84.1 GiB |
+| Pika-H3-Flex | Ref2VA 1344x768 (2 images, video with audio), 5 s, 6 steps | 8 | 57.5 s | 5.65 s | 3.2 s | 93.0 GiB |
 | Qwen-Image-2.1 | T2I 1024x1024, 40 steps | 8 | 1.31 s | 0.026 s | 0.16 s | 35.7 GB |
 | Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 1 | 24.2 s | | | 93.6 GB |
 | Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 8 | 5.19 s | 0.103 s | 0.59 s | 86.0 GB |
@@ -66,6 +70,17 @@ LTX-2 (`ltx2.sh`):
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x720", "num_frames": 121, "num_inference_steps": 40, "guidance_scale": 4.0, "seed": 42
+}'
+```
+
+Pika-H3-Flex (`pika_h3_flex.sh`) takes MiniMax-H3's video request with its six steps (the default); `fl2va` adds
+a `keyframe` image condition, and `ref2va` needs `--model-variant ref2va` and `reference` conditions:
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "A street musician plays an acoustic guitar on a busy sidewalk at dusk, people walking past under warm city lights",
+  "task": "t2va", "conditions": [], "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
+  "num_inference_steps": 6, "seed": 42
 }'
 ```
 

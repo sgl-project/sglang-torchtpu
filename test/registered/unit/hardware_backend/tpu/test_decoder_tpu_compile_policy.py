@@ -32,18 +32,18 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
     LogitsOutputMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -54,7 +54,10 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
-from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    run_eagle_verify,
+)
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
@@ -434,6 +437,7 @@ class _HybridKVPool(HybridLinearKVPool):
 
 class _HybridReqPool(HybridReqToTokenPool):
     def __init__(self, mamba_pool: TpuMambaPool):  # skips allocation
+        self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = mamba_pool
 
 
@@ -602,6 +606,44 @@ class TestHybridLinearDirectCompile(CustomTestCase):
         )
 
         self.assertIs(policy.get_direct_compile_kv_pool(), full_kv_pool)
+
+    def test_kv_pool_lifts_topk_capture_buffers(self):
+        """Routed-experts / indexer capture writes process-global buffers in forward.
+
+        Unless direct_compile carries them as mutable state, tracing leaves a
+        placeholder write in the live buffer and the first read after a forward fails.
+        """
+        full_kv_pool = _FullKVPool(2)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = full_kv_pool
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        experts = SimpleNamespace(device_cache=SimpleNamespace(buffer=torch.zeros(3)))
+        indexer = SimpleNamespace(device_cache=SimpleNamespace(buffer=torch.zeros(4)))
+        module = "sglang_tpu.compilation.decoder_compile_policy"
+
+        with (
+            patch(f"{module}.get_global_experts_capturer", return_value=experts),
+            patch(f"{module}.get_global_indexer_capturer", return_value=indexer),
+        ):
+            kv_pool = policy.get_direct_compile_kv_pool()
+        expected = [
+            *full_kv_pool.get_state(),
+            experts.device_cache.buffer,
+            indexer.device_cache.buffer,
+        ]
+        self.assertEqual(
+            [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+        )
+        replacement = [torch.empty_like(t) for t in expected]
+        kv_pool.set_state(replacement)
+        self.assertEqual(
+            [id(t) for t in full_kv_pool.get_state()],
+            [id(t) for t in replacement[:4]],
+        )
+        self.assertIs(experts.device_cache.buffer, replacement[4])
+        self.assertIs(indexer.device_cache.buffer, replacement[5])
 
     def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
         """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
@@ -2224,6 +2266,27 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(args[2].batch_size, 4)
         self.assertTrue(args[2].attn_tp_sequence_sharded)
         mr.prepare_dummy_forward_batch.assert_called_once_with(args[2])
+
+    def test_run_one_publishes_the_moe_bound_like_serving(self):
+        # ModelRunner._forward_raw publishes the batch's MoE padded-row bound
+        # getter; TopK guards on it being set, so warmup must publish it too.
+        from sglang.srt.model_executor.forward_context import get_forward_context
+
+        mr = _model_runner()
+        seen = {}
+
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            ctx = get_forward_context()
+            seen["attn_backend"] = ctx.attn_backend
+            seen["bound"] = ctx.moe_num_token_non_padded
+            seen["batch"] = forward_batch
+
+        mr.model.forward = MagicMock(side_effect=forward)
+        policy = _make_policy(mr)
+        policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+        self.assertIs(seen["attn_backend"], mr.attn_backend)
+        self.assertIsNotNone(seen["bound"])
+        self.assertIs(seen["bound"].__self__, seen["batch"])
 
     def test_run_one_uses_no_grad_not_inference_mode(self):
         mr = _model_runner()
@@ -4382,6 +4445,7 @@ def _make_batch(temperature):
         forward_mode=ForwardMode.TARGET_VERIFY,
         has_grammar=False,
         return_logprob=False,
+        hisparse_coordinator=None,
         seq_lens=torch.full((BS,), 16, dtype=torch.int32),
         sampling_info=SimpleNamespace(
             temperatures=torch.full((BS, 1), temperature or 1.0),
@@ -4469,12 +4533,18 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
                     )
                 )
                 target_worker = SimpleNamespace(
-                    model_runner=SimpleNamespace(compile_policy=policy),
+                    model_runner=SimpleNamespace(
+                        compile_policy=policy,
+                        watermark_state=None,
+                        attn_backend=SimpleNamespace(verify_mask=None),
+                        canary_manager=None,
+                    ),
                     forward_batch_generation=MagicMock(
                         return_value=SimpleNamespace(
                             logits_output=logits_output,
                             routed_experts_output=None,
                             indexer_topk_output=None,
+                            kv_weight_version_record=None,
                         )
                     ),
                 )
@@ -4496,6 +4566,7 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
                 ):
                     result = run_eagle_verify(
                         batch,
+                        speculative_runtime_hooks=STOCK_SPECULATIVE_RUNTIME_HOOKS,
                         target_worker=target_worker,
                         req_to_token_pool=None,
                         token_to_kv_pool_allocator=SimpleNamespace(
@@ -4724,7 +4795,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
             0, VOCAB_SIZE, (LOGICAL_TOKENS,), dtype=verify_input.draft_token.dtype
         )
 
-        logits_output = SimpleNamespace(next_token_logits=logits)
+        logits_output = LogitsProcessorOutput(next_token_logits=logits)
         torch.manual_seed(0)
         with _serving_stubs():
             predict, accept_lens, accept_index = eagle_sample(
@@ -4760,7 +4831,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         """The same verify with no padding at all, as the reference answer."""
         batch = _make_batch(temperature)
         verify_input = _make_verify_input(deferred=False)
-        logits_output = SimpleNamespace(next_token_logits=_accepting_logits())
+        logits_output = LogitsProcessorOutput(next_token_logits=_accepting_logits())
         self.assertIsNone(
             _policy().prepare_spec_verify(
                 batch, verify_input, logits_output.next_token_logits
@@ -4828,7 +4899,7 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
             result = eagle_sample(
                 verify_input,
                 batch,
-                SimpleNamespace(next_token_logits=logits),
+                LogitsProcessorOutput(next_token_logits=logits),
                 None,
             )
 

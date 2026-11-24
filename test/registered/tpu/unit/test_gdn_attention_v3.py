@@ -1649,13 +1649,15 @@ class TestGDNTileSelection(CustomTestCase):
             dummy_arr_dt = jnp.dtype(jnp.float32)
             dummy_out_dt = jnp.dtype(jnp.bfloat16)
 
-            for n_kq, n_v, tile_sz, is_decode, w_sz, rec_dt in (
-                (2, 8, 8, True, 1, jnp.float32),
-                (2, 8, 8, True, 4, jnp.float32),
-                (8, 32, 4, True, 1, jnp.float32),
-                (16, 64, 2, True, 1, jnp.bfloat16),
-                (2, 8, 128, False, 1, jnp.float32),
-                (16, 64, 64, False, 1, jnp.float32),
+            for n_kq, n_v, tile_sz, is_decode, w_sz, rec_dt, out_bufs in (
+                (2, 8, 8, True, 1, jnp.float32, 2),
+                (2, 8, 8, True, 4, jnp.float32, 2),
+                (8, 32, 4, True, 1, jnp.float32, 2),
+                (16, 64, 2, True, 1, jnp.bfloat16, 2),
+                # Single-buffered state outputs (attention-DP KDA verify).
+                (64, 64, 1, True, 4, jnp.float32, 1),
+                (2, 8, 128, False, 1, jnp.float32, 2),
+                (16, 64, 64, False, 1, jnp.float32, 2),
             ):
                 dim = 2 * n_kq * d_k + n_v * d_v
                 aligned_dim = tiling.align_to(dim, num_lanes)
@@ -1679,6 +1681,7 @@ class TestGDNTileSelection(CustomTestCase):
                     kq_head_dim=d_k,
                     v_head_dim=d_v,
                     num_buffers=2,
+                    state_out_buffers=out_bufs,
                     window_size=w_sz,
                     attention_mode=config.AttentionMode.GDN,
                 )
@@ -1736,6 +1739,7 @@ class TestGDNTileSelection(CustomTestCase):
                     is_decode=is_decode,
                     window_size=w_sz,
                     attention_mode=config.AttentionMode.GDN,
+                    state_out_buffers=out_bufs,
                 )
                 self.assertEqual(vmem_declared, total_declared)
 

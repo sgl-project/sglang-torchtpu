@@ -15,7 +15,8 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -309,7 +310,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         kept, trimmed = outputs(), outputs()
         with patch(
-            "sglang_tpu.experimental.sampling.sampling_batch_info.is_host_padded",
+            "sglang_tpu.hooks.experimental_spec.is_host_padded",
             side_effect=lambda info: info is batch.sampling_info,
         ):
             keep_host_padded_extend_outputs(trim, batch, kept)
@@ -978,7 +979,10 @@ def _publish_topk(*, forward_mode, spec_info, topk, reuse_dsa_topk_indices=False
     )
     share = IndexTopKShareState.from_mtp_carry(forward_batch)
     share.update(topk)
-    share.publish()
+    # The draft ModelRunner forward provides this context; the seed export
+    # resolves the attention backend through it.
+    with forward_context(ForwardContext(attn_backend=SimpleNamespace())):
+        share.publish()
 
 
 def _capture_layout(spec_info):

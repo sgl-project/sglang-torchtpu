@@ -1,3 +1,4 @@
+import functools
 import inspect
 import threading
 from collections.abc import Callable
@@ -21,8 +22,13 @@ def argnums(function: Callable, *names: str) -> tuple[int, ...]:
     return tuple(parameters.index(name) for name in names)
 
 
+@functools.lru_cache(maxsize=1)
 def get_torch_tpu_device_kind() -> str:
-    """Return physical TPU hardware metadata."""
+    """Return physical TPU hardware metadata.
+
+    Cached: torch_tpu reads it from sysfs (~0.35 ms), and the attention
+    metadata path asks for it on every forward.
+    """
     from torch_tpu._internal.utils.hardware import get_tpu_device_name
 
     return get_tpu_device_name()
@@ -32,6 +38,28 @@ def get_pallas_tpu_device_kind() -> str:
     """Return the physical device spelling expected by JAX Pallas."""
     device_kind = get_torch_tpu_device_kind()
     return _PALLAS_DEVICE_KIND_BY_TORCHTPU.get(device_kind, device_kind)
+
+
+def get_tpu_info_or_none():
+    """Target metadata on TPU or during CPU export; None on an untargeted CPU.
+
+    JAX's default backend describes the tracing host, not the lowering target.
+    Use the same Pallas metadata as tiling and lowering, including an abstract
+    TPU mesh or ``tpu_info_for_cpu_export``. Do not cache across those contexts.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        # Pallas rejects a CPU/GPU device without a TPU target context.
+        return None
+
+
+def get_tpu_generation() -> int:
+    """The lowering target's generation, or -1 without a TPU target."""
+    info = get_tpu_info_or_none()
+    return -1 if info is None else info.generation
 
 
 @contextmanager

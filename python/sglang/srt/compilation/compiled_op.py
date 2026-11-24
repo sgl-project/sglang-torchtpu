@@ -11,10 +11,10 @@ from typing import Any
 import torch
 from torch.utils._pytree import tree_flatten, tree_leaves, tree_map
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import is_tpu
-from sglang.utils import LazyImport
+from sglang.srt.utils.device import is_tpu
 
 current_warmup_queue = LazyImport(
     "sglang_tpu.compilation.warmup_queue", "current_warmup_queue"

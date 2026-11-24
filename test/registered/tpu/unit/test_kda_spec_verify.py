@@ -24,16 +24,19 @@ except Exception:  # pragma: no cover - non-TPU host
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
-# GLM-5.3-Flash KDA per TP8 rank: 8 heads of 128, short conv 4, bounded gate.
-N_V, D, K, LOWER = 8, 128, 4, -5.0
-DIM = 3 * N_V * D
+# GLM-5.3-Flash KDA: heads of 128, short conv 4, bounded gate. A TP8 rank runs
+# 8 of the 64 heads; an attention-DP rank runs all 64.
+D, K, LOWER = 128, 4, -5.0
+TP8_HEADS, DP_HEADS = 8, 64
 
 
 @unittest.skipUnless(_HAS_TPU, "requires a JAX TPU backend")
 class TestKdaSpecVerify(CustomTestCase):
-    def _kernel(self, num_spec_tokens, batched_only=True):
+    def _kernel(self, n_v, num_spec_tokens, batched_only=True):
         from sglang_tpu.attention.pallas.gdn import wrapper
         from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+
+        dim = 3 * n_v * D
 
         def run(qkv, b, a, conv, rec, packed, qsl, idx, dist, seq_lens, offsets):
             return wrapper.fused_conv1d_gdn(
@@ -42,17 +45,17 @@ class TestKdaSpecVerify(CustomTestCase):
                 a,
                 conv,
                 rec,
-                jnp.zeros((DIM, 1, K), jnp.float32),
+                jnp.zeros((dim, 1, K), jnp.float32),
                 None,
-                jnp.zeros((N_V,), jnp.float32),
-                jnp.zeros((N_V, D), jnp.float32),
+                jnp.zeros((n_v,), jnp.float32),
+                jnp.zeros((n_v, D), jnp.float32),
                 qsl,
                 idx,
                 dist,
                 seq_lens,
                 offsets,
-                n_kq=N_V,
-                n_v=N_V,
+                n_kq=n_v,
+                n_v=n_v,
                 d_k=D,
                 d_v=D,
                 kernel_size=K,
@@ -66,28 +69,40 @@ class TestKdaSpecVerify(CustomTestCase):
         return jax.jit(run)
 
     def test_window_checkpoints_match_sequential_decode(self):
+        self._check_window_against_decode(n_v=TP8_HEADS, window=8, read_offsets=[3, 0])
+
+    def test_dp_rank_verify_window_fits_vmem(self):
+        """A 64-head verify window must compile and match sequential decode.
+
+        An attention-DP rank runs every KDA head, so each window checkpoint is a
+        4 MiB f32 state; holding all of them at once exceeded the scoped VMEM
+        limit at compile time (sgl-project/sglang-torchtpu#2053).
+        """
+        self._check_window_against_decode(n_v=DP_HEADS, window=4, read_offsets=[2, 0])
+
+    def _check_window_against_decode(self, *, n_v, window, read_offsets):
         from sglang_tpu.kda_layout import (
             kda_packed_weights_shape,
         )
 
-        window, context = 8, 20
-        read_offsets = [3, 0]
+        dim = 3 * n_v * D
+        context = 20
         bs = len(read_offsets)
         rng = np.random.default_rng(7)
         # Group g owns slots [g * window, (g + 1) * window); group 0 is null.
         slots = (bs + 1) * window
         bases = [(s + 1) * window for s in range(bs)]
-        conv = rng.normal(size=(slots, K - 1, DIM)).astype(np.float32)
-        rec = (0.1 * rng.normal(size=(slots, N_V, D, D))).astype(np.float32)
-        rows, width = kda_packed_weights_shape(K, DIM, N_V, D)
+        conv = rng.normal(size=(slots, K - 1, dim)).astype(np.float32)
+        rec = (0.1 * rng.normal(size=(slots, n_v, D, D))).astype(np.float32)
+        rows, width = kda_packed_weights_shape(K, dim, n_v, D)
         packed = (0.3 * rng.normal(size=(rows, width))).astype(np.float32)
         tokens = bs * window
-        qkv = (0.5 * rng.normal(size=(tokens, DIM))).astype(np.float32)
-        b = rng.normal(size=(tokens, N_V)).astype(np.float32)
-        a = rng.normal(size=(tokens, N_V * D)).astype(np.float32)
+        qkv = (0.5 * rng.normal(size=(tokens, dim))).astype(np.float32)
+        b = rng.normal(size=(tokens, n_v)).astype(np.float32)
+        a = rng.normal(size=(tokens, n_v * D)).astype(np.float32)
         bf = lambda x: jnp.asarray(x).astype(jnp.bfloat16)  # noqa: E731
 
-        verify = self._kernel(window - 1)
+        verify = self._kernel(n_v, window - 1)
         (new_conv, new_rec), out = verify(
             bf(qkv),
             bf(b),
@@ -103,7 +118,7 @@ class TestKdaSpecVerify(CustomTestCase):
         )
         new_conv, new_rec, out = map(np.asarray, (new_conv, new_rec, out))
 
-        decode = self._kernel(0)
+        decode = self._kernel(n_v, 0)
         touched = set()
         for s, (base, off) in enumerate(zip(bases, read_offsets)):
             # A two-slot pool (null + this sequence) seeded from the read slot.

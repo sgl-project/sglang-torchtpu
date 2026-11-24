@@ -442,8 +442,17 @@ class StateOutBufferedRef(BaseBufferedRef):
                     dst_ref.at[pl.ds(track_idx, track_size)],
                     sem,
                 ).start()
+        if self.buffer_count == 1:
+            # The pipeline runs the next tile's body before waiting on this
+            # copy-out, so a single window must drain now (as jax's own
+            # single-buffered outputs do with a sync copy).
+            self._wait_copies(grid_indices)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.buffer_count > 1:
+            self._wait_copies(grid_indices)
+
+    def _wait_copies(self, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
@@ -739,6 +748,8 @@ def create_allocs(
             "Compact external state outputs do not support checkpoint "
             f"windows, got window_size={cfg.window_size}."
         )
+    if cfg.state_out_buffers != cfg.num_buffers and cfg.state_plan is not None:
+        raise ValueError("state_out_buffers applies to dense states only.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -833,17 +844,24 @@ def create_allocs(
         )
         state_out_partial = functools.partial(
             StateOutBufferedRef.output,
-            buffer_count=pipeline_mode.buffer_count,
+            buffer_count=cfg.state_out_buffers,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
         )
+        state_out_mode = pl.Buffered(
+            buffer_count=cfg.state_out_buffers, use_lookahead=False
+        )
         conv_out_alloc = state_out_partial(
-            spec=block_spec_partial(block_shape=conv_out_shape),
+            spec=block_spec_partial(
+                block_shape=conv_out_shape, pipeline_mode=state_out_mode
+            ),
             dtype_or_type=conv_state_ref,
         )
         recurrent_out_alloc = state_out_partial(
-            spec=block_spec_partial(block_shape=recurrent_out_shape),
+            spec=block_spec_partial(
+                block_shape=recurrent_out_shape, pipeline_mode=state_out_mode
+            ),
             dtype_or_type=recurrent_state_ref,
         )
     else:

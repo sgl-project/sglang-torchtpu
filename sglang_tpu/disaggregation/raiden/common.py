@@ -14,7 +14,11 @@ from typing import Any, Callable, List, Optional, Sequence
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from sglang.srt.mem_cache.memory_pool import (
+    BLOCK_MAJOR,
+    HybridLinearKVPool,
+    KVCache,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.pool_spans import _BLOCK_MAJOR_KV_RANK
@@ -32,12 +36,11 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4SWAKVPool,
 )
 from sglang_tpu.kv_pool import (
-    TpuBlockMajorMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
     TpuSplitMLATokenToKVPool,
 )
 from sglang_tpu.mamba_pool import TpuMambaPool
-from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool, _DraftSwaSidecar
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -50,12 +53,13 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
-PORTS_PER_RANK = 6
+# Ports each rank reserves: control+data for full, SWA, state, and unified draft.
+PORTS_PER_RANK = 8
 SWA_PORT_OFFSET = 2
 STATE_PORT_OFFSET = 4
+DRAFT_PORT_OFFSET = 6
 
-# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
+# Base of the per-rank control ports (`base + 8*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
@@ -103,6 +107,10 @@ class RaidenKVCacheGroups:
     write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
     # Shared-buffer Full+SWA pool: SWA rides on the single full engine via companion pages.
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    # Separate homogeneous draft KV tensor group when the target uses TpuUnifiedSWAKVPool.
+    draft: List[torch.Tensor] = field(default_factory=list)
+    draft_is_swa: bool = False
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
 
@@ -139,25 +147,40 @@ def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
     return PER_LAYER_KV_LAYOUT
 
 
+def _is_block_major(pool) -> bool:
+    # Duck-typed test doubles, which are not KVCaches, are layer-major.
+    return isinstance(pool, KVCache) and pool.kv_pool_layout() == BLOCK_MAJOR
+
+
 def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
     """One bundle per page namespace for a block-major pool, else None.
 
     The bundle row holds every layer of a page, so it is registered whole; its
-    strided per-layer ``kv_buffer`` views are never registered.
+    strided per-layer ``kv_buffer`` views are never registered. An SWA pool is
+    block-major when both its sub-pools are; one block-major sub-pool next to a
+    layer-major one is refused.
     """
-    if isinstance(pool, TpuBlockMajorMHATokenToKVPool):
-        groups = RaidenKVCacheGroups(
-            full=pool.page_buffers(), swa=[], full_layer_ids=[pool.start_layer]
+    if isinstance(pool, SWAKVPool) and _is_block_major(
+        pool.full_kv_pool
+    ) != _is_block_major(pool.swa_kv_pool):
+        raise ValueError(
+            "an SWA pool's full and SWA sub-pools must both be block-major or "
+            "both layer-major"
         )
-    elif isinstance(pool, SWAKVPool) and isinstance(
-        pool.full_kv_pool, TpuBlockMajorMHATokenToKVPool
-    ):
+    if _is_block_major(pool):
+        has_layers = pool.layer_num > 0
+        groups = RaidenKVCacheGroups(
+            full=pool.page_buffers() if has_layers else [],
+            swa=[],
+            full_layer_ids=[pool.start_layer] if has_layers else [],
+        )
+    elif isinstance(pool, SWAKVPool) and _is_block_major(pool.full_kv_pool):
         mapping = pool.layers_mapping
         full_ids = sorted(layer for layer, (_, swa) in mapping.items() if not swa)
         swa_ids = sorted(layer for layer, (_, swa) in mapping.items() if swa)
         groups = RaidenKVCacheGroups(
-            full=pool.full_kv_pool.page_buffers(),
-            swa=pool.swa_kv_pool.page_buffers(),
+            full=pool.full_kv_pool.page_buffers() if full_ids else [],
+            swa=pool.swa_kv_pool.page_buffers() if swa_ids else [],
             full_layer_ids=full_ids[:1],
             swa_layer_ids=swa_ids[:1],
         )
@@ -302,13 +325,30 @@ def get_raiden_kv_caches(
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
+    draft: List[torch.Tensor] = []
+    draft_is_swa = False
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
-        num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
-        full.extend(draft_groups.full)
-        swa.extend(draft_groups.swa)
-        full_ids.extend(draft_groups.full_layer_ids)
-        swa_ids.extend(draft_groups.swa_layer_ids)
+        if groups.unified_swa_pool is not None:
+            if draft_groups.full and draft_groups.swa:
+                raise RuntimeError(
+                    "Raiden does not support mixed full/SWA draft KV pools on "
+                    "TpuUnifiedSWAKVPool."
+                )
+            draft_is_swa = bool(draft_groups.swa)
+            draft = list(draft_groups.swa if draft_is_swa else draft_groups.full)
+            draft_swa_sidecar = groups.unified_swa_pool.draft_swa_sidecar
+            _assert_root_buffers("unified draft KV", draft)
+        else:
+            num_draft_full, num_draft_swa = (
+                len(draft_groups.full),
+                len(draft_groups.swa),
+            )
+            full.extend(draft_groups.full)
+            swa.extend(draft_groups.swa)
+            full_ids.extend(draft_groups.full_layer_ids)
+            swa_ids.extend(draft_groups.swa_layer_ids)
         full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
@@ -343,7 +383,12 @@ def get_raiden_kv_caches(
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
 
-    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
+    for name, group in (
+        ("full KV", full),
+        ("SWA KV", swa),
+        ("GDN state", state),
+        ("unified draft KV", draft),
+    ):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
             raise RuntimeError(
@@ -367,5 +412,8 @@ def get_raiden_kv_caches(
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
+        draft=draft,
+        draft_is_swa=draft_is_swa,
+        draft_swa_sidecar=draft_swa_sidecar,
         seq_along_lane=seq_along_lane,
     )

@@ -14,6 +14,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import BLOCK_MAJOR
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
@@ -301,6 +302,28 @@ class TestBlockMajorRaidenGroups(CustomTestCase):
         self.assertEqual(
             [pool["tag"] for pool in pool_manifest(later)], ["fa.l9+2", "swa.l8+2"]
         )
+
+    def test_any_block_major_pool_registers_its_page_buffers(self):
+        class OneTensorPool(TpuFusedMHATokenToKVPool):
+            def kv_pool_layout(self):
+                return BLOCK_MAJOR
+
+            def _create_buffers(self):
+                super()._create_buffers()
+                self.pages = torch.stack(self.kv_buffer, dim=1)
+
+            def page_buffers(self):
+                return [self.pages]
+
+        pool = _make_pool(OneTensorPool)
+        groups = get_raiden_kv_caches(pool)
+        self.assertEqual(len(groups.full), 1)
+        self.assertIs(groups.full[0], pool.pages)
+        # A block-major sub-pool next to a layer-major one is refused.
+        mixed = _swa_pool(TpuFusedMHATokenToKVPool)
+        mixed.swa_kv_pool.kv_pool_layout = lambda: BLOCK_MAJOR
+        with self.assertRaisesRegex(ValueError, "must both be block-major"):
+            get_raiden_kv_caches(mixed)
 
     def test_layer_major_pool_is_unchanged(self):
         fused = _make_pool(TpuFusedMHATokenToKVPool)

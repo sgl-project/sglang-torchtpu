@@ -67,7 +67,7 @@ class FinalChunks:
             for index, req in enumerate(batch.reqs)
             # Health checks carry a fake sender with no Raiden room.
             if isinstance(req.disagg_kv_sender, RaidenKVSender)
-            and req.extend_range.end >= len(req.origin_input_ids)
+            and req.extend_end >= len(req.origin_input_ids)
         ]
         if not finals:
             return

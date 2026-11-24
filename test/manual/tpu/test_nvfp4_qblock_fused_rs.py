@@ -138,13 +138,20 @@ def main() -> None:
     ap.add_argument("--tokens", default="16,256,2048")
     args = ap.parse_args()
     dist.init_process_group(backend="tpu_dist")
+    from sglang_tpu.compile_cache import add_tpu_kernel_inputs_to_compile_cache_key
+
+    # The fused-RS env flags change the kernels inside the custom op; key the
+    # torch.compile cache on them, as serving does.
+    add_tpu_kernel_inputs_to_compile_cache_key()
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == 8, f"TP8 expert TP, got {world} ranks"
 
     from sglang_tpu.fp4_moe import prepare_tpu_nvfp4_moe_weights, qblock_layout
     from sglang_tpu.moe.pallas import fused_moe_rs_op
     from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
-    from sglang_tpu.muse_megakernel.expert_requant import requant_tpu_nvfp4_experts
+    from sglang_tpu.muse_megakernel.common.expert_requant import (
+        requant_tpu_nvfp4_experts,
+    )
 
     device = torch.device("tpu")
     layer = _checkpoint_layer(rank)

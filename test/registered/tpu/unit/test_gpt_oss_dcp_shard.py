@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,11 +84,15 @@ class TestGptOssDcpShard(CustomTestCase):
         for attn_tp_rank in range(ATTN_TP_SIZE):
             with self.subTest(attn_tp_rank=attn_tp_rank):
                 attn = _build_attention(attn_tp_rank, self.DCP)
-                self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE // self.DCP)
-                self.assertEqual(attn.qkv_proj.kv_tp_rank, attn_tp_rank // self.DCP)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group),
+                    (attn_tp_rank // self.DCP, ATTN_TP_SIZE // self.DCP),
+                )
                 # Q keeps the full attention-TP split.
-                self.assertEqual(attn.qkv_proj.tp_size, ATTN_TP_SIZE)
-                self.assertEqual(attn.qkv_proj.tp_rank, attn_tp_rank)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.tp_group),
+                    (attn_tp_rank, ATTN_TP_SIZE),
+                )
 
     def test_local_head_counts(self):
         attn = _build_attention(3, self.DCP)
@@ -127,14 +132,18 @@ class TestGptOssDcpShard(CustomTestCase):
         for attn_tp_rank in (0, 7):
             with self.subTest(attn_tp_rank=attn_tp_rank):
                 attn = _build_attention(attn_tp_rank, 1)
-                self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE)
-                self.assertEqual(attn.qkv_proj.kv_tp_rank, attn_tp_rank)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group),
+                    (attn_tp_rank, ATTN_TP_SIZE),
+                )
                 self.assertEqual(attn.num_kv_heads, TOTAL_NUM_KV_HEADS // ATTN_TP_SIZE)
 
     def test_sliding_window_layers_shard_the_same_way(self):
         attn = _build_attention(2, self.DCP, layer_type="sliding_attention")
-        self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE // self.DCP)
-        self.assertEqual(attn.qkv_proj.kv_tp_rank, 1)
+        self.assertEqual(
+            get_group_rank_size(attn.qkv_proj.kv_tp_group),
+            (1, ATTN_TP_SIZE // self.DCP),
+        )
 
 
 if __name__ == "__main__":
