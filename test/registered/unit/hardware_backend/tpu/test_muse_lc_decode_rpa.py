@@ -1756,6 +1756,138 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     self.assertIn("-pk2-onorm-gate", hlo)
                     self.assertIn("-tp16", hlo)
 
+    def test_cand4_tp16_backend_init_pack1_and_fake_impl_shapes(self):
+        """Backend __init__ builds _decode_prepared* ops for pack==1 (1KV d=64), FakeTensor matches [B, 512]."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+        from sglang_tpu.envs import envs
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        ctx_override = get_context().override_server_args(
+            speculative_num_draft_tokens=None,
+            speculative_algorithm=None,
+            speculative_num_steps=None,
+            speculative_eagle_topk=1,
+            page_size=512,
+        )
+        ctx_override.install()
+        self.addCleanup(ctx_override.restore)
+
+        def _make_runner(kv_pack_heads: int, head_dim: int):
+            pool = TpuFusedMHATokenToKVPool.__new__(TpuFusedMHATokenToKVPool)
+            pool.kv_pack_heads = kv_pack_heads
+            pool.head_num = 1
+            pool.head_dim = head_dim
+            pool.kv_pack_dense2 = False
+            server_args = types.SimpleNamespace(
+                speculative_num_draft_tokens=None,
+                speculative_algorithm=None,
+                speculative_num_steps=None,
+                speculative_eagle_topk=1,
+                page_size=512,
+            )
+            return types.SimpleNamespace(
+                device=torch.device("cpu"),
+                page_size=512,
+                model_config=types.SimpleNamespace(
+                    context_len=2048,
+                    hf_text_config=types.SimpleNamespace(rms_norm_eps=1e-6),
+                ),
+                server_args=server_args,
+                req_to_token_pool=types.SimpleNamespace(
+                    req_to_token=torch.zeros(1, 2056, dtype=torch.int32)
+                ),
+                token_to_kv_pool=pool,
+                is_hybrid_swa=False,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                is_draft_worker=False,
+                spec_algorithm=types.SimpleNamespace(is_none=lambda: True),
+            )
+
+        orig_custom_op = torch.library.custom_op
+
+        def _cpu_custom_op(*args, **kwargs):
+            kwargs["device_types"] = None
+            return orig_custom_op(*args, **kwargs)
+
+        with (
+            patch("torch.library.custom_op", side_effect=_cpu_custom_op),
+            envs.SGLANG_TPU_MUSE_DECODE_QKV_EPILOGUE.override(True),
+            envs.SGLANG_TPU_MUSE_DECODE_ATTN_GATE_FUSE.override(True),
+            envs.SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE.override(""),
+            envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.override(False),
+            envs.SGLANG_TPU_RPA_V3_PREFILL_FUSED_OUT.override(False),
+        ):
+            be_tp16 = TpuPallasRpaV3AttnBackend(_make_runner(kv_pack_heads=1, head_dim=64))
+            self.assertIsNotNone(be_tp16._decode_prepared_op)
+            self.assertIsNotNone(be_tp16._decode_prepared_gated_op)
+
+            be_tp8 = TpuPallasRpaV3AttnBackend(_make_runner(kv_pack_heads=2, head_dim=128))
+            self.assertIsNotNone(be_tp8._decode_prepared_op)
+            self.assertIsNotNone(be_tp8._decode_prepared_gated_op)
+
+            with FakeTensorMode():
+                bs = 64
+                dev = "meta"
+                q_prep = torch.empty((1, bs, 8, 2, 128), dtype=torch.bfloat16, device=dev)
+                kv_prep = torch.empty((bs, 1, 4, 128), dtype=torch.float8_e4m3fn, device=dev)
+                kvc = torch.empty((128, 512, 1, 4, 128), dtype=torch.float8_e4m3fn, device=dev)
+                kvl = torch.empty((bs,), dtype=torch.int32, device=dev)
+                pi = torch.empty((bs * 4,), dtype=torch.int32, device=dev)
+                cuq = torch.empty((bs + 1,), dtype=torch.int32, device=dev)
+                cukv = torch.empty((bs + 1,), dtype=torch.int32, device=dev)
+                dist = torch.empty((3,), dtype=torch.int32, device=dev)
+                gate_512 = torch.empty((bs, 512), dtype=torch.bfloat16, device=dev)
+                gate_1024 = torch.empty((bs, 1024), dtype=torch.bfloat16, device=dev)
+
+                out16_u = be_tp16._decode_prepared_op(
+                    q_prep, kv_prep, kv_prep, kvc, kvl, pi, cuq, cukv, dist,
+                    None, 0.125, None, None, 1.0, 1.0, 1, None, True, None,
+                )
+                out16_g = be_tp16._decode_prepared_gated_op(
+                    q_prep, kv_prep, gate_512, kvc, kvl, pi, cuq, cukv, dist,
+                    None, 0.125, None, None, 1.0, 1.0, 1, None, True, None,
+                )
+                out8_u = be_tp8._decode_prepared_op(
+                    q_prep, kv_prep, kv_prep, kvc, kvl, pi, cuq, cukv, dist,
+                    None, 0.125, None, None, 1.0, 1.0, 1, None, True, None,
+                )
+                out8_g = be_tp8._decode_prepared_gated_op(
+                    q_prep, kv_prep, gate_1024, kvc, kvl, pi, cuq, cukv, dist,
+                    None, 0.125, None, None, 1.0, 1.0, 1, None, True, None,
+                )
+                self.assertEqual(tuple(out16_u.shape), (bs, 512))
+                self.assertEqual(tuple(out16_g.shape), (bs, 512))
+                self.assertEqual(tuple(out8_u.shape), (bs, 16, 128))
+                self.assertEqual(tuple(out8_g.shape), (bs, 1024))
+
+        # Verify ungated force_native_tp16=True on shared16_host returns (bs, 512) cleanly.
+        rng = np.random.default_rng(20266)
+        bs_sh, pps_sh, ps_sh = 16, 4, 512
+        s_u8 = np.full((bs_sh * pps_sh + 8, ps_sh, 1, 4, 128), 0x7F, dtype=np.uint8)
+        s_u8[:, :, 0, :2, :] = 0
+        s_u8[:, :, 0, 0, :64] = _rand_fp8_u8(rng, (bs_sh * pps_sh + 8, ps_sh, 64))
+        s_u8[:, :, 0, 1, :64] = _rand_fp8_u8(rng, (bs_sh * pps_sh + 8, ps_sh, 64))
+        kvc_sh = _u8_to_fp8(s_u8)
+        q16 = jnp.asarray((rng.standard_normal((bs_sh, 8, 64)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 64)))
+        v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 64)))
+        q_p = jnp.pad(q16, ((0, 0), (0, 8), (0, 64))).reshape(1, bs_sh, 8, 2, 128)
+        kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs_sh, 1, 4, 128)
+        pi_sh = jnp.asarray(np.broadcast_to(np.arange(pps_sh, dtype=np.int32), (bs_sh, pps_sh)).ravel(), dtype=jnp.int32)
+        o_sh, _ = run_decode_fast_rpa(
+            q_p, kv_p, None, kvc_sh, jnp.full((bs_sh,), 1025, dtype=jnp.int32), pi_sh,
+            jnp.arange(bs_sh + 1, dtype=jnp.int32), jnp.arange(bs_sh + 1, dtype=jnp.int32) * (pps_sh * ps_sh),
+            jnp.asarray([bs_sh, bs_sh, bs_sh], dtype=jnp.int32),
+            sm_scale=64 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="shared16_host", fused_out_pack=2, prepared_inputs=True,
+            force_native_tp16=True, interpret=True, shared_pages=jnp.asarray([2], dtype=jnp.int32),
+        )
+        self.assertEqual(o_sh.shape, (bs_sh, 512))
+        self.assertTrue(np.all(np.isfinite(np.asarray(o_sh, dtype=np.float32))))
+
 
 if __name__ == "__main__":
     unittest.main()

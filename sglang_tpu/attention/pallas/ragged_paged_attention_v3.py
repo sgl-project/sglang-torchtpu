@@ -6562,6 +6562,8 @@ def ragged_paged_attention(
     # Private: optional fused post-RPA per-head RMSNorm eps & gate_in_values for decode.
     _decode_out_norm_eps: float | None = None,
     _decode_gate_in_values: bool = False,
+    # Private: TP=16 prepared QKV_EPI path (8Q/1KV, d=64) returning 512 cols.
+    _decode_tp16_prepared: bool = False,
     # Private: dense 2-tokens-per-u32 KV cache packing (phys page rows = page_size // 2).
     _kv_pack_dense2: bool = False,
     # Private: Pallas interpret configuration (e.g. pltpu.InterpretParams(uninitialized_memory="nan")).
@@ -6743,6 +6745,7 @@ def ragged_paged_attention(
                 probe=_decode_probe,
                 shared_pages=shared_pages,
                 kv_pack_dense2=_kv_pack_dense2,
+                force_native_tp16=_decode_tp16_prepared,
             )
 
     if _prepared_inputs:
@@ -7409,15 +7412,18 @@ def ragged_paged_attention(
             )
         )
     )
-    if _decode_out_norm_eps is not None and out_final.ndim == 2:
-        if (
+    if out_final.ndim == 2 and (
+        (_decode_tp16_prepared and out_final.shape[-1] == 1024)
+        or (
             _decode_gate_in_values
             and values is not None
             and values.ndim == 2
             and out_final.shape[-1] == 2 * values.shape[-1]
-        ):
-            # TP=16 prepared QKV_EPI packs 8x64 heads into the low 512 columns.
-            out_final = out_final[:, : values.shape[-1]]
+        )
+    ):
+        # TP=16 prepared QKV_EPI packs 8x64 heads into the low 512 columns.
+        out_final = out_final[:, : (512 if _decode_tp16_prepared else values.shape[-1])]
+    if _decode_out_norm_eps is not None and out_final.ndim == 2:
         hd = actual_head_dim // max(abs(_fused_out_pack), 1)
         heads_f = out_final.reshape(out_final.shape[0], -1, hd).astype(jnp.float32)
         inv_r = lax.rsqrt(

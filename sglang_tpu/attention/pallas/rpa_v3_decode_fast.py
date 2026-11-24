@@ -3356,13 +3356,15 @@ def run_decode_fast_rpa(
     probe: str | None = None,
     interpret: bool = False,
     shared_pages=None,
+    force_native_tp16: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Executes the dedicated Ghostfish decode RPA kernel and formats outputs."""
     raw_mode = mode_str.strip().lower() if mode_str else ""
     raw_toks = set(raw_mode.replace(",", "_").replace("-", "_").split("_"))
     has_gate = gate is not None
     native_tp16 = (
-        "tp16" in raw_toks
+        force_native_tp16
+        or "tp16" in raw_toks
         or (has_gate and gate.ndim == 2 and gate.shape[-1] == 512)
         or (
             raw_mode == "shared16_host"
@@ -3666,7 +3668,10 @@ def run_decode_fast_rpa(
         if in_kernel_pack2:
             return o_out, updated_cache
         if native_tp16:
-            return o_out[:, :8, :64], updated_cache
+            o8 = o_out[:, :8, :64]
+            return (
+                o8.reshape(b_tokens, 512) if fused_out_pack == 2 else o8
+            ), updated_cache
         if fused_out_pack == 1:
             return o_out, updated_cache
         if fused_out_pack == 2:

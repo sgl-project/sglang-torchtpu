@@ -547,6 +547,8 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         *args,
         **kwargs,
     ):
+        if spec.keep_values_when_prepared and values is not None and values.ndim == 2:
+            return torch.empty_like(values)
         if spec.prepared_inputs:
             kv_heads, num_tokens, rows, packing, head_dim = queries.shape
             queries = queries.new_empty(num_tokens, kv_heads * rows * packing, head_dim)

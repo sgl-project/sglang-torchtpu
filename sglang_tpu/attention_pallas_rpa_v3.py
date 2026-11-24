@@ -99,8 +99,9 @@ def _pool_is_tp16_sq_64(pool) -> bool:
         if isinstance(pool, SWAKVPool)
         else (pool,)
     )
-    return all(
+    return bool(pools) and all(
         isinstance(p, TpuFusedMHATokenToKVPool)
+        and getattr(p, "kv_pack_heads", 1) == 1
         and getattr(p, "head_num", 0) == 1
         and getattr(p, "head_dim", 0) == 64
         for p in pools
@@ -134,6 +135,7 @@ def _invoke_v3_kernel(
     skip_mixed=False,
     decode_out_norm_eps=None,
     decode_gate_in_values=False,
+    decode_tp16_prepared=False,
     kv_pack_dense2=False,
 ):
     extra = {}
@@ -626,6 +628,8 @@ def _invoke_v3_kernel(
         extra["_decode_out_norm_eps"] = float(decode_out_norm_eps)
     if decode_gate_in_values:
         extra["_decode_gate_in_values"] = True
+    if decode_tp16_prepared:
+        extra["_decode_tp16_prepared"] = True
     run = functools.partial(
         jax_rpa,
         queries,
@@ -759,6 +763,18 @@ def _decode_gated_spec(spec: RpaKernelSpec, norm_eps: float) -> RpaKernelSpec:
     )
 
 
+def _tp16_prepared_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
+    """TP=16 (8Q/1KV, d=64) prepared decode ``spec`` returning 512 output columns."""
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_tp16_sq",
+        invoke_kernel=functools.partial(
+            spec.invoke_kernel, decode_tp16_prepared=True
+        ),
+        out_head_pack=4,
+    )
+
+
 def _import_muse_batched_kernel():
     from sglang_tpu.attention.pallas.batched_rpa_muse.wrapper import (
         ragged_paged_attention,
@@ -885,17 +901,25 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         decode_gate_fuse_env = getattr(
             envs, "SGLANG_TPU_MUSE_DECODE_ATTN_GATE_FUSE", None
         )
+        is_tp16_sq_pool = _pool_is_tp16_sq_64(self.token_to_kv_pool)
+        dec_pack = 2 if is_tp16_sq_pool else pack
         if (
             self._dcp == 1
-            and pack > 1
+            and (pack > 1 or is_tp16_sq_pool)
             and decode_qkv_epi_env is not None
             and decode_qkv_epi_env.get()
         ):
             dec_prep_spec = (
-                _fused_out_spec(pack)
-                if (self._fused_out_op is not None or want_decode_fused_out)
+                _fused_out_spec(dec_pack)
+                if (
+                    self._fused_out_op is not None
+                    or want_decode_fused_out
+                    or is_tp16_sq_pool
+                )
                 else RPA_V3_SPEC
             )
+            if is_tp16_sq_pool:
+                dec_prep_spec = _tp16_prepared_spec(dec_prep_spec)
             self._decode_prepared_op = _build_pallas_kernel_op(
                 _prepared_spec(_skip_mixed_spec(dec_prep_spec))
             )
@@ -905,9 +929,12 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
                         model_runner.model_config.hf_text_config, "rms_norm_eps", 1e-5
                     )
                 )
+                gated_base = _fused_out_spec(dec_pack)
+                if is_tp16_sq_pool:
+                    gated_base = _tp16_prepared_spec(gated_base)
                 self._decode_prepared_gated_op = _build_pallas_kernel_op(
                     _decode_gated_spec(
-                        _prepared_spec(_skip_mixed_spec(_fused_out_spec(pack))),
+                        _prepared_spec(_skip_mixed_spec(gated_base)),
                         norm_eps,
                     )
                 )
