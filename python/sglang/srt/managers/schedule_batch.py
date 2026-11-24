@@ -1121,8 +1121,9 @@ class Req(ReqDllmMixin):
         return False
 
     def next_output_finishes_by_length(self) -> bool:
-        # Whether committing one more output token reaches max_new_tokens
-        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+        # Whether steps already in flight reach max_new_tokens.
+        steps = max(1, self.inflight_steps)
+        return len(self.output_ids) + steps >= self.sampling_params.max_new_tokens
 
     @property
     def extend_len(self) -> int:

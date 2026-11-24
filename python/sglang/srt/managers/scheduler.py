@@ -1485,6 +1485,7 @@ class Scheduler(
         ] = deque()
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
+        self._num_continuous_decode_steps = self._resolve_num_continuous_decode_steps()
         self.forward_ct = 0
         self.recompile_stance_set = False
         self.health_monitor = SchedulerHealthMonitor(
@@ -2169,6 +2170,17 @@ class Scheduler(
             and is_muse_spark_architecture(architectures[0])
         )
 
+    def _resolve_num_continuous_decode_steps(self) -> int:
+        try:
+            steps = get_schedule().num_continuous_decode_steps
+        except ValueError:
+            steps = getattr(
+                getattr(self, "server_args", None),
+                "num_continuous_decode_steps",
+                1,
+            )
+        return max(1, int(steps or 1))
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
         self.tpu_async_copy_worker = None
@@ -2284,7 +2296,10 @@ class Scheduler(
                 "using async D2H copy worker to preserve overlap scheduling."
             )
 
-        self.batch_record_buf = [None] * 2
+        num_continuous_decode_steps = self._resolve_num_continuous_decode_steps()
+        self._num_continuous_decode_steps = num_continuous_decode_steps
+        ring_depth = max(2, num_continuous_decode_steps + 1)
+        self.batch_record_buf = [None] * ring_depth
         self.batch_record_ct = 0
 
     def _uses_tpu_dma_hicache(self) -> bool:
@@ -2795,7 +2810,8 @@ class Scheduler(
                 self.last_batch
             )
             if process_last_batch_early:
-                pop_and_process()
+                while self.result_queue:
+                    pop_and_process()
                 # Opportunistic flush at the early-processing sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free. A
@@ -2829,7 +2845,9 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not process_last_batch_early:
-                    pop_and_process()
+                    keep = 1 if batch is not None else 0
+                    while len(self.result_queue) > keep:
+                        pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -2843,6 +2861,127 @@ class Scheduler(
             self.last_batch = batch
 
             self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+            num_continuous_steps = getattr(self, "_num_continuous_decode_steps", 1)
+            if isinstance(num_continuous_steps, int) and num_continuous_steps > 1:
+                Scheduler._run_continuous_decode_burst(self, batch)
+
+    def _can_continue_decode_burst(
+        self,
+        batch: Optional[ScheduleBatch],
+        burst_steps: int,
+        *,
+        is_disagg_decode: bool = False,
+    ) -> bool:
+        max_steps = getattr(self, "_num_continuous_decode_steps", 1)
+        if not isinstance(max_steps, int) or burst_steps >= max_steps:
+            return False
+        if (
+            not self.is_generation
+            or self.gracefully_exit
+            or self.pause_state.paused
+            or not self.spec_algorithm.is_none()
+            or self.require_mlp_sync
+            or get_parallel().pp_size != 1
+            or get_exec().mamba.enable_mamba_extra_buffer
+            or self.dllm_config is not None
+            or self.enable_hisparse
+            or self.uocr_runtime is not None
+            or self.decode_offload_manager is not None
+            or self.chunked_req is not None
+            or len(self.waiting_queue) > 0
+        ):
+            return False
+        if is_disagg_decode and (
+            len(self.disagg_decode_prealloc_queue.queue) > 0
+            or len(getattr(self.disagg_decode_prealloc_queue, "retracted_queue", ()))
+            > 0
+            or len(self.disagg_decode_transfer_queue.queue) > 0
+        ):
+            return False
+        if (
+            batch is None
+            or not batch.forward_mode.is_decode()
+            or batch.is_prefill_only
+            or batch.has_grammar
+        ):
+            return False
+        running_batch = self.running_batch
+        if running_batch.is_empty() or running_batch.is_prefill_only:
+            return False
+        sampling_info = getattr(running_batch, "sampling_info", None)
+        penalizer = (
+            getattr(sampling_info, "penalizer_orchestrator", None)
+            if sampling_info is not None
+            else None
+        )
+        if penalizer is not None and getattr(penalizer, "is_required", False):
+            return False
+        return all(
+            r.beam_group is None
+            and r.grammar is None
+            and not r.return_sampling_mask
+            and r.to_finish is None
+            and not r.finished()
+            and not getattr(r, "_tpu_piggybacked_prefill", False)
+            for r in running_batch.reqs
+        )
+
+    def _next_continuous_decode_batch(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        finishing_reqs = self._reqs_finishing_inflight(running_batch)
+        if finishing_reqs:
+            running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
+            running_batch.batch_is_full = False
+        if running_batch.is_empty():
+            running_batch.batch_is_full = False
+            return None
+        if not running_batch.check_decode_mem() or (
+            TEST_RETRACT and (self.forward_ct + 1) % TEST_RETRACT_INTERVAL == 0
+        ):
+            # Yield back to the outer loop so queued results drain before retraction.
+            return None
+        self.new_token_ratio_tracker.decay_step()
+        running_batch.prepare_for_decode()
+        decode_batch = self.ngram_embedding_manager.prepare_for_forward(
+            running_batch, chunked_req=None
+        )
+        if decode_batch:
+            set_schedule_time_batch(decode_batch)
+        return decode_batch
+
+    def _run_continuous_decode_burst(
+        self,
+        batch: Optional[ScheduleBatch],
+        *,
+        is_disagg_decode: bool = False,
+    ) -> Optional[ScheduleBatch]:
+        burst_steps = 1
+        while self._can_continue_decode_burst(
+            batch, burst_steps, is_disagg_decode=is_disagg_decode
+        ):
+            decode_batch = self._next_continuous_decode_batch(self.running_batch)
+            if decode_batch is None:
+                break
+            self.increment_scheduler_iterations()
+            self.cur_batch_for_debug = decode_batch
+            if is_disagg_decode:
+                self._flush_staging_scatters()
+            if self.kv_free_fence is not None:
+                self.kv_free_fence.on_batch_formed()
+            batch_result = self.run_batch(decode_batch)
+            self._apply_war_barrier()
+            self.result_queue.append((decode_batch.copy(), batch_result))
+            if self.kv_free_fence is not None:
+                self.kv_free_fence.on_forward_launched(batch_result)
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result, decode_batch)
+            self.last_batch = decode_batch
+            batch = decode_batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
+            burst_steps += 1
+        return batch
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
@@ -5993,7 +6132,7 @@ class Scheduler(
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
         attr_names = self._schedule_batch_attr_names(batch)
         attr_snapshot = [getattr(batch, name, None) for name in attr_names]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_ct = (self.batch_record_ct + 1) % len(self.batch_record_buf)
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
@@ -6221,14 +6360,8 @@ class Scheduler(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
-                            elif self.tpu_async_copy_worker is not None:
-                                self.tpu_async_copy_worker.submit(
-                                    batch_result,
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
-                                )
                             else:
-                                self._copy_result_to_cpu(batch_result, batch)
+                                self._submit_result_copy_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
 
@@ -6570,6 +6703,21 @@ class Scheduler(
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
 
+    def _submit_result_copy_to_cpu(
+        self, batch_result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        tpu_async_copy_worker = getattr(self, "tpu_async_copy_worker", None)
+        if tpu_async_copy_worker is not None:
+            if getattr(batch_result, "copy_done", None) is None:
+                batch_result.copy_done = self.device_module.Event()
+            tpu_async_copy_worker.submit(
+                batch_result,
+                return_logprob=batch.return_logprob,
+                return_hidden_states=batch.return_hidden_states,
+            )
+        else:
+            self._copy_result_to_cpu(batch_result, batch)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -6588,7 +6736,7 @@ class Scheduler(
                 cur_batch, batch_result.future_indices, batch_result
             )
 
-        self._copy_result_to_cpu(batch_result, cur_batch)
+        self._submit_result_copy_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -7278,8 +7426,13 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
-        if self.enable_continuous_input_polling and self.result_queue:
-            # Polling can run intake before the newest queued batch becomes last_batch.
+        num_continuous_steps = getattr(self, "_num_continuous_decode_steps", 1)
+        if (
+            self.enable_continuous_input_polling
+            or (isinstance(num_continuous_steps, int) and num_continuous_steps > 1)
+        ) and self.result_queue:
+            # Polling or continuous decode can leave batches in result_queue
+            # beyond running_batch/last_batch.
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
@@ -7352,15 +7505,20 @@ class Scheduler(
             self._publish_paused_state()
             return
 
-        if self.enable_overlap and self.last_batch:
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and (req := self.chunked_req) is not None
-            ):
-                # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+        if self.enable_overlap and (self.last_batch or self.result_queue):
+            chunked_req = (
+                self.chunked_req
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else None
+            )
+            while self.result_queue:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                if chunked_req is not None and tmp_batch.forward_mode.is_extend():
+                    # Retract skips the chunk step that sets this result's KV send boundary.
+                    chunked_req.tmp_end_idx = min(
+                        chunked_req.extend_end, len(chunked_req.origin_input_ids)
+                    )
+                self.process_batch_result(tmp_batch, tmp_result)
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.

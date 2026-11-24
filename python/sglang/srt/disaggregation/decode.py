@@ -4272,6 +4272,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        self.enable_skip_finishing_decode = True
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         defer_prealloc = (
@@ -4304,7 +4305,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self.last_batch
             )
             if process_last_batch_early:
-                pop_and_process()
+                while self.result_queue:
+                    pop_and_process()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -4340,7 +4342,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not process_last_batch_early:
-                    pop_and_process()
+                    keep = 1 if batch is not None else 0
+                    while len(self.result_queue) > keep:
+                        pop_and_process()
             elif batch is None:
                 self.on_idle()
 
@@ -4351,6 +4355,18 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
             self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+            num_continuous_steps = getattr(self, "_num_continuous_decode_steps", 1)
+            if (
+                not prealloc_deferred
+                and isinstance(num_continuous_steps, int)
+                and num_continuous_steps > 1
+            ):
+                from sglang.srt.managers.scheduler import Scheduler
+
+                Scheduler._run_continuous_decode_burst(
+                    self, batch, is_disagg_decode=True
+                )
 
     def _flush_staging_scatters(self: Scheduler) -> None:
         handler = self.disagg_decode_transfer_queue.staging_handler
