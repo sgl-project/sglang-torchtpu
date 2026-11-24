@@ -288,7 +288,9 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
             orig_pc = pl.pallas_call
 
             def _mosaic_interp(*args, **kwargs):
-                kwargs["interpret"] = pltpu.InterpretParams(detect_races=True)
+                kwargs["interpret"] = pltpu.InterpretParams(
+                    detect_races=True, uninitialized_memory="nan"
+                )
                 return orig_pc(*args, **kwargs)
 
             rng128 = np.random.default_rng(128)
@@ -521,7 +523,9 @@ def test_ccs_fuse_ag_a1_mode3_in_kernel_lowering():
             orig_pc = pl.pallas_call
 
             def _mosaic_interp(*args, **kwargs):
-                kwargs["interpret"] = pltpu.InterpretParams(detect_races=True)
+                kwargs["interpret"] = pltpu.InterpretParams(
+                    detect_races=True, uninitialized_memory="nan"
+                )
                 return orig_pc(*args, **kwargs)
 
             mesh16 = Mesh(np.array(devs[:16]), ("model",))
@@ -983,6 +987,67 @@ def test_d_with_next_in_gather_split_keeps_sparsecore_ag_unless_opted_in():
         False, {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "3"}
     )
     assert "xor1_xytorus_ag_tp8" in hlo_unsplit
+
+
+def test_xor1_nan_poisoned_scratch_interpret_parity():
+    """Verify TP=8 xy and TP=16 flat/xyz xor1 AG kernels have 0 NaN leaks under NaN-poisoned scratch."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
+
+    devs = jax.devices()
+    if len(devs) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    orig_pc = pl.pallas_call
+
+    def _nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return orig_pc(*args, **kwargs)
+
+    cases = [(8, "3", 128)]
+    if len(devs) >= 16:
+        cases.extend([(16, "2", 128), (16, "3", 128)])
+
+    rng = np.random.default_rng(2770)
+    for tp_d, mode_val, rows in cases:
+        mesh = Mesh(np.array(devs[:tp_d]), ("model",))
+        x_np = (rng.standard_normal((tp_d, rows, 128)) * 0.5).astype(np.float32)
+        x_j = jax.device_put(
+            jnp.asarray(x_np, dtype=jnp.bfloat16),
+            NamedSharding(mesh, P("model", None, None)),
+        )
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": mode_val}),
+            mock.patch.object(pl, "pallas_call", _nan_interp),
+        ):
+            out = jax.jit(
+                jax.shard_map(
+                    lambda s: xor1_bridge_all_gather(
+                        s[0], axis_name="model", tiled=False
+                    )[None],
+                    mesh=mesh,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )(x_j)
+        out_u16 = np.asarray(out.view(jnp.uint16))
+        ref_u16 = np.asarray(x_j.view(jnp.uint16))
+        assert not np.any(np.isnan(np.asarray(out, dtype=np.float32)))
+        for r in range(tp_d):
+            np.testing.assert_array_equal(out_u16[r], ref_u16)
+
 
 
 
