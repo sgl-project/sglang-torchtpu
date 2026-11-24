@@ -41,6 +41,14 @@ from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     fused_rs_moe,
 )
 
+# Numerics debugging only: bf16 activations (scale 1) where the program quantizes rows to e4m3,
+# to separate layout bugs from e4m3 rounding. The recipe sets it at build time.
+DEBUG_BF16_ACTIVATIONS = False
+
+
+def _bf16_rows(x):
+    return x.astype(_BF16), jnp.ones((x.shape[0], 1), _F32)
+
 
 def n_expert_refs(c: PFConfig) -> int:
     """prefill/tp's expert operands: (w13, s13, w2, s2) per expert unit."""
@@ -60,6 +68,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         raise ValueError(f"{T} rows: rows / tp must be a multiple of 8")
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
+    q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
 
     def forward(
         meta,
@@ -93,9 +102,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         for l in range(L):
             sm = smalls[l]
             with _scope("sp_in_norm"):
-                a8, a_s = _fp8_rows(
-                    _rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w")
-                )
+                a8, a_s = q8(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
             with _scope("sp_x_ag"):
                 a8, a_s = ag(a8, axis), ag(a_s, axis)
             with _scope("sp_qkvg"):
@@ -106,12 +113,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
             o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             with _scope("sp_o_gate"):
                 attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
-                g8, g_s = _fp8_rows(jax.nn.sigmoid(gate.astype(_F32)) * attn)
+                g8, g_s = q8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
             with _scope("sp_o_a2a"):
                 g8, g_s = to_owner(g8, tp, axis), to_owner(g_s, tp, axis)
             # own rows' every head, then the o proj on the whole wo: no partial sums
             with _scope("sp_o_proj"):
-                g8, g_s = _fp8_rows((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
                 o_own = dense(g8, g_s, wo[l], sm, "wo", H)
             with _scope("sp_attn_res"):
                 stream = residual(c, stream, sm, "attn", o_own)
@@ -119,9 +126,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
                 ids, tw = route(c, ffn.astype(_BF16), wrouter[l], sm)
             with _scope("sp_pool"):
-                f8, f_s = _fp8_rows(ffn)
+                f8, f_s = q8(ffn)
                 pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
-                xe8, xs = _fp8_rows(
+                xe8, xs = q8(
                     _rms(pooled, c.rms_eps) * small_row(sm, "pre_expert_w")[:, :He]
                 )
             with _scope("sp_xe_ag"):
@@ -141,7 +148,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     axis,
                 )
             with _scope("sp_unpool"):
-                u8, u_s = _fp8_rows(y.astype(_F32))
+                u8, u_s = q8(y.astype(_F32))
                 # bf16: the unpool output feeds the post-FFN norm
                 f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
             with _scope("sp_ffn_res"):
