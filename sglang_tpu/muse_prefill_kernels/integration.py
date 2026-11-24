@@ -2562,6 +2562,24 @@ class MusePrefillKernels(torch.nn.Module):
             )
             if tp_rank == 0:
                 threading.Thread(target=self._log_debug_stats, daemon=True).start()
+        if self.nan_trap:
+            self.register_buffer(
+                "nan_trap_first",
+                torch.full((4,), -1, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "nan_trap_last",
+                torch.full((4,), -1, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "nan_trap_count",
+                torch.zeros(1, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            self._nan_trap_seen = 0
+            self._nan_trap_armed_logged = False
         torch.accelerator.synchronize()
         logger.info(
             "Muse prefill kernels: layers [%d, %d), A1 %s%s%s, A3 %s%s, fused glue %s, "
@@ -4459,8 +4477,6 @@ class MusePrefillKernels(torch.nn.Module):
         if trap_ctx is None or not trap_ctx["records"]:
             return
         packed = torch.stack(trap_ctx["records"])
-        if torch.compiler.is_compiling():
-            return
         from sglang_tpu.compilation.direct_compile import insert_callback
 
         if insert_callback(
@@ -4469,10 +4485,77 @@ class MusePrefillKernels(torch.nn.Module):
             callback_factory=_make_nan_trap_callback,
         ):
             return
+        if torch.compiler.is_compiling():
+            if hasattr(self, "nan_trap_count"):
+                bad_mask = packed[:, 2] > 0
+                n_bad_recs = bad_mask.sum(dtype=torch.int32)
+                has_bad = n_bad_recs > 0
+                first_idx = bad_mask.to(torch.int32).argmax().reshape(1)
+                rev_idx = (
+                    packed.shape[0]
+                    - 1
+                    - torch.flip(bad_mask, (0,)).to(torch.int32).argmax()
+                ).reshape(1)
+                first_row = packed.index_select(0, first_idx).squeeze(0)
+                last_row = packed.index_select(0, rev_idx).squeeze(0)
+                self.nan_trap_first.copy_(
+                    torch.where(has_bad, first_row, self.nan_trap_first)
+                )
+                self.nan_trap_last.copy_(
+                    torch.where(has_bad, last_row, self.nan_trap_last)
+                )
+                self.nan_trap_count.add_(n_bad_recs.reshape(1))
+            return
         self._consume_nan_trap(packed)
+
+    def flush_nan_trap_host(self) -> None:
+        if not getattr(self, "nan_trap", False) or not hasattr(self, "nan_trap_count"):
+            return
+        if not getattr(self, "_nan_trap_armed_logged", False):
+            self._nan_trap_armed_logged = True
+            if self.tp_rank == 0:
+                logger.info("MUSE_NAN_TRAP armed (rank=0, compiled buffer mode)")
+        count = int(self.nan_trap_count.cpu()[0])
+        seen = getattr(self, "_nan_trap_seen", 0)
+        if count == seen:
+            return
+        self._nan_trap_seen = count
+        first = [int(x) for x in self.nan_trap_first.cpu().tolist()]
+        last = [int(x) for x in self.nan_trap_last.cpu().tolist()]
+        self.last_nan_trap = [first] if first == last else [first, last]
+        stage_name = (
+            _NAN_TRAP_STAGE_NAMES[first[1]]
+            if 0 <= first[1] < len(_NAN_TRAP_STAGE_NAMES)
+            else str(first[1])
+        )
+        last_stage = (
+            _NAN_TRAP_STAGE_NAMES[last[1]]
+            if 0 <= last[1] < len(_NAN_TRAP_STAGE_NAMES)
+            else str(last[1])
+        )
+        logger.error(
+            "MUSE_NAN_TRAP rank=%d first=(layer=%d stage=%s n_bad=%d first_tok=%d) "
+            "last=(layer=%d stage=%s n_bad=%d first_tok=%d) total_bad_stages=%d",
+            self.tp_rank,
+            first[0],
+            stage_name,
+            first[2],
+            first[3],
+            last[0],
+            last_stage,
+            last[2],
+            last[3],
+            count - seen,
+        )
 
     def _consume_nan_trap(self, report: torch.Tensor) -> None:
         arr = report.detach().cpu()
+        if not getattr(self, "_nan_trap_armed_logged", False):
+            self._nan_trap_armed_logged = True
+            if self.tp_rank == 0:
+                logger.info(
+                    "MUSE_NAN_TRAP armed (rank=0, %d checkpoints)", int(arr.shape[0])
+                )
         bad = arr[arr[:, 2] > 0]
         self.last_nan_trap = bad.tolist()
         if bad.numel() == 0:

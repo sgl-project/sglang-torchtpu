@@ -1148,9 +1148,12 @@ class CompiledForwardShim:
 
         checker = self._recompilation_checker
         if checker is None:
-            return self._forward(
-                fn, input_ids, positions, forward_batch, *args, **kwargs
-            )
+            try:
+                return self._forward(
+                    fn, input_ids, positions, forward_batch, *args, **kwargs
+                )
+            finally:
+                self._flush_prefill_nan_trap(fn, forward_batch)
         # Read at entry: the padded shapes are what the graph compiled for.
         pad_q = int(forward_batch.input_ids.shape[0])
         pad_b = int(forward_batch.seq_lens.shape[0])
@@ -1159,11 +1162,22 @@ class CompiledForwardShim:
                 fn, input_ids, positions, forward_batch, *args, **kwargs
             )
         finally:
+            self._flush_prefill_nan_trap(fn, forward_batch)
             checker.check(
                 context_fn=lambda: self._describe_forward(
                     forward_batch, pad_q=pad_q, pad_b=pad_b
                 )
             )
+
+    def _flush_prefill_nan_trap(self, fn: Callable[..., Any], forward_batch: Any) -> None:
+        if fn is not self.fn or not forward_batch.forward_mode.is_extend():
+            return
+        model_runner = self.policy.model_runner
+        model = getattr(model_runner, "model", None) if model_runner is not None else None
+        inner = getattr(model, "model", None)
+        pk = getattr(inner, "prefill_kernels", None)
+        if pk is not None and getattr(pk, "nan_trap", False):
+            pk.flush_nan_trap_host()
 
     def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
         # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).

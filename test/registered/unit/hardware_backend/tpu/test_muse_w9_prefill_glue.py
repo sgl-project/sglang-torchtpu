@@ -1343,9 +1343,15 @@ def test_muse_nan_trap_optin_stage_and_pad_isolation():
         ctx2, 19, 4, ((shard_bad, 0),), ctx2["shard_real"], ctx2["shard_orig"]
     )
 
-    # Verify insert_callback registration + _make_nan_trap_callback binding + error logging.
-    with _collect_callbacks() as cbs:
-        pk._emit_nan_trap(ctx2)
+    # Verify insert_callback registration + _make_nan_trap_callback binding + error logging
+    # even while torch.compiler.is_compiling() is True (as direct_compile sets it during trace).
+    prev_compiling = torch.compiler._is_compiling_flag
+    torch.compiler._is_compiling_flag = True
+    try:
+        with _collect_callbacks() as cbs:
+            pk._emit_nan_trap(ctx2)
+    finally:
+        torch.compiler._is_compiling_flag = prev_compiling
     assert len(cbs) == 1
     assert cbs[0].callback_factory is integration._make_nan_trap_callback
     fake_model = types.SimpleNamespace(prefill_kernels=pk)
@@ -1355,6 +1361,45 @@ def test_muse_nan_trap_optin_stage_and_pad_isolation():
     assert pk.last_nan_trap == [[19, 2, 1, 98], [19, 4, 1, 50]]
     err_log.assert_called_once()
     assert "MUSE_NAN_TRAP" in err_log.call_args.args[0]
+
+    # Verify torch.compile path (_is_compiling_flag=True without _collect_callbacks):
+    # buffer latch + CompiledForwardShim._flush_prefill_nan_trap -> flush_nan_trap_host().
+    from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
+
+    pk.nan_trap_first = torch.full((4,), -1, dtype=torch.int32)
+    pk.nan_trap_last = torch.full((4,), -1, dtype=torch.int32)
+    pk.nan_trap_count = torch.zeros(1, dtype=torch.int32)
+    pk._nan_trap_seen = 0
+    pk._nan_trap_armed_logged = False
+    pk.last_nan_trap = []
+
+    prev_compiling = torch.compiler._is_compiling_flag
+    torch.compiler._is_compiling_flag = True
+    try:
+        pk._emit_nan_trap(ctx)  # pad-only: count stays 0
+        pk._emit_nan_trap(ctx2)  # real NaN: latches [19, 2, 1, 98] and [19, 4, 1, 50]
+    finally:
+        torch.compiler._is_compiling_flag = prev_compiling
+
+    assert int(pk.nan_trap_count[0]) == 2
+    shim = CompiledForwardShim.__new__(CompiledForwardShim)
+    shim.fn = lambda *a, **kw: None
+    shim.policy = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(
+            model=types.SimpleNamespace(model=types.SimpleNamespace(prefill_kernels=pk))
+        )
+    )
+    ext_fb = types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(is_extend=lambda: True)
+    )
+    with mock.patch.object(integration.logger, "error") as err_log:
+        shim._flush_prefill_nan_trap(shim.fn, ext_fb)
+        # Subsequent clean batch does not duplicate error log.
+        shim._flush_prefill_nan_trap(shim.fn, ext_fb)
+    assert pk.last_nan_trap == [[19, 2, 1, 98], [19, 4, 1, 50]]
+    err_log.assert_called_once()
+    assert "MUSE_NAN_TRAP" in err_log.call_args.args[0]
+
 
 
 
