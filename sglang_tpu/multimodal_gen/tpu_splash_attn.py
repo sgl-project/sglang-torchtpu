@@ -49,6 +49,7 @@ _logged_sdpa_fallbacks: set[tuple] = set()
 _FLASH_OP = None
 _FLASH_RING_OP = None
 _FLASH_LIVE_LENGTH_OP = None
+_FLASH_LIVE_LENGTH_PARTS_OP = None
 _SPLASH_MHA_OP = None
 _OPS_LOCK = threading.Lock()
 _resolved_mode_logged = False
@@ -285,6 +286,8 @@ def _flash_call(
     rows_in: bool = False,
     lazy_offset: bool = False,
     block_sizes: tuple[int, int, int] | None = None,
+    cost_estimate=None,
+    parts_in: tuple[int, int] | None = None,
 ):
     """``pallas_call`` of the flash kernel over ``[rows, S, D]`` arrays.
 
@@ -298,12 +301,23 @@ def _flash_call(
     - ``runtime_kv``: a leading int32 ``[row offset, real keys]`` input read at
       run time: KV rows shift by ``offset`` and only their first ``real keys``
       keys count. A rank-dependent shard choice then compiles one program.
-    - ``rows_in``: q/k/v and the output are ``[S, rows * D]``, row ``h`` the
-      ``h``-th ``D``-wide column block, read in place (no transposes).
+    - ``rows_in`` (``runtime_kv`` only; q and KV are one sequence): q/k/v and
+      the output are ``[S, rows * D]``, row ``h`` the ``h``-th ``D``-wide
+      column block, read in place (no transposes). Query rows from the real
+      key count on are padding and output zeros.
     - ``lazy_offset`` (``rows_in`` and ``runtime_kv`` only): the live-length
       kernel without a per-chunk running max (``live_kernel``).
     - ``block_sizes``: ``(block_q, block_kv, block_kv_compute)`` instead of the
       autotuned ones.
+    - ``cost_estimate``: a ``pl.CostEstimate`` for XLA's scheduler, which
+      otherwise sees the kernel as free and keeps no collective in flight
+      across it.
+    - ``parts_in = (col, shard_rows)`` (``rows_in`` only): q, k and v are one
+      ``[W, P, shard_rows, D]`` array, passed three times, whose sequence row
+      ``w * shard_rows + r`` of head ``h`` is ``[w, col + 3h + (0, 1, 2), r]``
+      for (q, k, v) (e.g. a Ulysses exchange buffer, read in place: every
+      block stays one contiguous run). The output is ``[W, rows, shard_rows,
+      D]``. Blocks must divide ``shard_rows``.
     """
     import jax
     import jax.numpy as jnp
@@ -321,8 +335,12 @@ def _flash_call(
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     if rows_in and (return_lse or resume):
         raise ValueError("rows_in takes neither return_lse nor resume")
-    if lazy_offset and not (rows_in and runtime_kv):
-        raise ValueError("lazy_offset needs rows_in and runtime_kv")
+    if rows_in and not runtime_kv:
+        raise ValueError("rows_in needs runtime_kv")
+    if lazy_offset and not rows_in:
+        raise ValueError("lazy_offset needs rows_in")
+    if parts_in is not None and not rows_in:
+        raise ValueError("parts_in needs rows_in")
     block_q, block_kv, block_kv_compute = block_sizes or _autotune_block_sizes(
         q_seq, kv_seq, head_dim, vmem_capacity_bytes, carry_bytes_per_q_row
     )
@@ -335,6 +353,14 @@ def _flash_call(
         (block_q, block_kv, block_kv_compute),
         " (live length)" if rows_in else " (ring)" if runtime_kv else "",
     )
+
+    def store_output(o_ref, out, kv_info_ref):
+        if rows_in:
+            rows = pl.program_id(1) * block_q + lax.broadcasted_iota(
+                jnp.int32, out.shape, 0
+            )
+            out = jnp.where(rows < kv_info_ref[1], out, jnp.zeros_like(out))
+        o_ref[...] = out
 
     def kernel(*refs):
         if runtime_kv:
@@ -460,7 +486,8 @@ def _flash_call(
             # l is replicated across the sublanes; tile it to the [D, block_q]
             # scratch and write the [block_q, D] output tile.
             l_inv = jnp.tile(1.0 / l_safe, (head_dim // NUM_SUBLANES, 1))
-            o_ref[...] = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+            out = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+            store_output(o_ref, out, kv_info_ref if runtime_kv else None)
             if return_lse:
                 lse_ref[...] = jnp.where(
                     l > 0, m_scratch_ref[...] + jnp.log2(l_safe), _MASK_VALUE
@@ -715,12 +742,28 @@ def _flash_call(
             l = l_scratch_ref[...]
             l_safe = jnp.where(l > 0, l, 1.0)
             l_inv = jnp.tile(1.0 / l_safe, (head_dim // NUM_SUBLANES, 1))
-            o_ref[...] = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+            out = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+            store_output(o_ref, out, kv_info_ref)
+
+    if parts_in is not None:
+        parts_col, shard_rows = parts_in
+        if shard_rows % block_q or shard_rows % block_kv:
+            raise ValueError(
+                f"blocks {block_q}/{block_kv} must divide {shard_rows} shard rows"
+            )
+        q_per_shard, kv_per_shard = shard_rows // block_q, shard_rows // block_kv
 
     def q_index(h, i, j, *_):
+        if parts_in is not None:
+            return (i // q_per_shard, parts_col + 3 * h, i % q_per_shard, 0)
         return (i, h) if rows_in else (h, i, 0)
 
-    def kv_index(h, i, j, *scalars):
+    def out_index(h, i, j, *_):
+        if parts_in is not None:
+            return (i // q_per_shard, h, i % q_per_shard, 0)
+        return (i, h) if rows_in else (h, i, 0)
+
+    def kv_index(h, i, j, *scalars, part):
         row = (h // heads) * kv_heads + (h % heads) // q_heads_per_kv_head
         if scalars:
             # Blocks past the last real key skip compute; repeating the last
@@ -728,6 +771,8 @@ def _flash_call(
             real = jnp.minimum(scalars[0][1], kv_seq)
             last = jnp.maximum((real + block_kv - 1) // block_kv - 1, 0)
             row, j = row + scalars[0][0], jnp.minimum(j, last)
+        if parts_in is not None:
+            return (j // kv_per_shard, parts_col + 3 * row + part, j % kv_per_shard, 0)
         return (j, row) if rows_in else (row, j, 0)
 
     def lse_index(h, i, j, *_):
@@ -735,21 +780,27 @@ def _flash_call(
 
     q_block = (block_q, head_dim) if rows_in else (None, block_q, head_dim)
     kv_block = (block_kv, head_dim) if rows_in else (None, block_kv, head_dim)
+    if parts_in is not None:
+        q_block = (None, None, block_q, head_dim)
+        kv_block = (None, None, block_kv, head_dim)
     in_specs = [
         pl.BlockSpec(q_block, q_index),
-        pl.BlockSpec(kv_block, kv_index),
-        pl.BlockSpec(kv_block, kv_index),
+        pl.BlockSpec(kv_block, functools.partial(kv_index, part=1)),
+        pl.BlockSpec(kv_block, functools.partial(kv_index, part=2)),
     ]
     if resume:
         in_specs += [
             pl.BlockSpec((None, block_q, head_dim), q_index),
             pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index),
         ]
-    out_specs = pl.BlockSpec(q_block, q_index)
-    out_shape = jax.ShapeDtypeStruct(
-        (q_seq, num_rows * head_dim) if rows_in else (num_rows, q_seq, head_dim),
-        out_dtype,
-    )
+    out_specs = pl.BlockSpec(q_block, out_index)
+    if parts_in is not None:
+        out_dims = (q_seq // shard_rows, num_rows, shard_rows, head_dim)
+    elif rows_in:
+        out_dims = (q_seq, num_rows * head_dim)
+    else:
+        out_dims = (num_rows, q_seq, head_dim)
+    out_shape = jax.ShapeDtypeStruct(out_dims, out_dtype)
     if return_lse:
         out_specs = [out_specs, pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index)]
         out_shape = [
@@ -803,6 +854,7 @@ def _flash_call(
             compiler_params=compiler_params,
             out_shape=out_shape,
             name=name,
+            cost_estimate=cost_estimate,
         )
     return pl.pallas_call(
         kernel,
@@ -913,6 +965,68 @@ def _live_length_kernel(q_seq: int, kv_seq: int):
     return (block_q, kv_block, kv_block), True, rows
 
 
+def _live_length_cost(q_seq: int, kv_seq: int, head_dim: int, num_heads: int):
+    """Every key live (the upper bound): with it XLA's scheduler overlaps
+    collectives, such as the next Ulysses head group's exchange, with the
+    kernel."""
+    from jax.experimental import pallas as pl
+
+    return pl.CostEstimate(
+        flops=4 * q_seq * kv_seq * head_dim * num_heads,
+        transcendentals=q_seq * kv_seq * num_heads,
+        bytes_accessed=2 * 4 * q_seq * head_dim * num_heads,
+    )
+
+
+def _live_length_parts_fit(shards: int, shard_rows: int) -> bool:
+    """Whether :func:`_flash_attention_live_length_parts` takes ``shards``
+    runs of ``shard_rows`` rows: the live-length kernel runs over exactly
+    those rows (no padding) and its blocks tile each run."""
+    seq = shards * shard_rows
+    blocks, _, rows = _live_length_kernel(seq, seq)
+    return (
+        blocks is not None
+        and rows == seq
+        and shard_rows % blocks[0] == 0
+        and shard_rows % blocks[1] == 0
+    )
+
+
+def _flash_attention_live_length_parts(qkv, live, scale, num_heads, col):
+    """:func:`_flash_attention_live_length` reading q|k|v from one array.
+
+    ``qkv`` is ``[W, P, R, 128]`` with sequence row ``w * R + r``; head ``h``'s
+    q, k and v are parts ``col + 3h``, ``col + 3h + 1`` and ``col + 3h + 2``
+    (e.g. a Ulysses exchange buffer, read in place). Returns ``[W, num_heads,
+    R, 128]``. Needs :func:`_live_length_parts_fit` of ``(W, R)``.
+    """
+    import jax.numpy as jnp
+
+    shards, _, shard_rows, head_dim = qkv.shape
+    seq = shards * shard_rows
+    if not _live_length_parts_fit(shards, shard_rows):
+        raise ValueError(f"{shards} x {shard_rows} rows do not fit the kernel blocks")
+    blocks, lazy_offset, _ = _live_length_kernel(seq, seq)
+    call = _flash_call(
+        seq,
+        seq,
+        head_dim,
+        scale,
+        num_rows=num_heads,
+        heads=num_heads,
+        kv_heads=num_heads,
+        out_dtype=qkv.dtype,
+        runtime_kv=True,
+        rows_in=True,
+        lazy_offset=lazy_offset,
+        block_sizes=blocks,
+        cost_estimate=_live_length_cost(seq, seq, head_dim, num_heads),
+        parts_in=(col, shard_rows),
+    )
+    live = jnp.minimum(live.astype(jnp.int32).reshape(1), seq)
+    return call(jnp.concatenate([jnp.zeros_like(live), live]), qkv, qkv, qkv)
+
+
 def _flash_attention_live_length(q, k, v, live, scale, num_heads):
     """Flash attention over one packed sequence's ``[S, H * D]`` rows whose
     rows from ``live`` (int32 ``[1]``) on are padding.
@@ -944,12 +1058,12 @@ def _flash_attention_live_length(q, k, v, live, scale, num_heads):
         rows_in=True,
         lazy_offset=lazy_offset,
         block_sizes=blocks,
+        cost_estimate=_live_length_cost(q_seq, kv_seq, head_dim, num_heads),
     )
     # At most seq: the zero rows a padded call adds never count as keys.
     live = jnp.minimum(live.astype(jnp.int32).reshape(1), seq)
-    out = call(jnp.concatenate([jnp.zeros_like(live), live]), q, k, v)[:seq]
-    rows = jnp.arange(seq, dtype=jnp.int32)[:, None]
-    return jnp.where(rows < live[0], out, jnp.zeros_like(out))
+    out = call(jnp.concatenate([jnp.zeros_like(live), live]), q, k, v)
+    return out if q_seq == seq else out[:seq]
 
 
 def _splash_mha(q, k, v, scale, is_causal):
@@ -1024,6 +1138,7 @@ def _register_ops() -> None:
     instead of retrying a half-registered ``torch.library`` op.
     """
     global _FLASH_OP, _FLASH_RING_OP, _FLASH_LIVE_LENGTH_OP, _SPLASH_MHA_OP
+    global _FLASH_LIVE_LENGTH_PARTS_OP
     global _SPLASH_AVAILABLE
     if _FLASH_OP is not None or _SPLASH_AVAILABLE is False:
         return
@@ -1063,6 +1178,17 @@ def _register_ops() -> None:
             ) -> jax.Array:
                 return _flash_attention_live_length(q, k, v, live, scale, num_heads)
 
+            def flash_live_length_parts(
+                qkv: jax.Array,
+                live: jax.Array,
+                scale: float,
+                num_heads: int,
+                col: int,
+            ) -> jax.Array:
+                return _flash_attention_live_length_parts(
+                    qkv, live, scale, num_heads, col
+                )
+
             def splash_mha(
                 q: jax.Array, k: jax.Array, v: jax.Array, scale: float, is_causal: bool
             ) -> jax.Array:
@@ -1084,6 +1210,10 @@ def _register_ops() -> None:
             def flash_live_length_fake(q, k, v, live, scale, num_heads):
                 return q.new_empty(q.shape)
 
+            def flash_live_length_parts_fake(qkv, live, scale, num_heads, col):
+                shards, _, shard_rows, head_dim = qkv.shape
+                return qkv.new_empty((shards, num_heads, shard_rows, head_dim))
+
             def splash_mha_fake(q, k, v, scale, is_causal):
                 return q.new_empty(q.shape)
 
@@ -1104,6 +1234,11 @@ def _register_ops() -> None:
                 flash_live_length,
             )
             flash_live_length_op.register_fake(flash_live_length_fake)
+            flash_live_length_parts_op = cpu_export_jax_op(
+                "sglang_tpu_pallas::diffusion_flash_attention_live_length_parts",
+                flash_live_length_parts,
+            )
+            flash_live_length_parts_op.register_fake(flash_live_length_parts_fake)
         except Exception as exc:
             logger.warning(
                 "TPU Pallas splash attention ops failed to register (%s); using SDPA.",
@@ -1114,6 +1249,7 @@ def _register_ops() -> None:
         _SPLASH_MHA_OP = splash_mha_op
         _FLASH_RING_OP = flash_ring_op
         _FLASH_LIVE_LENGTH_OP = flash_live_length_op
+        _FLASH_LIVE_LENGTH_PARTS_OP = flash_live_length_parts_op
         _FLASH_OP = flash_op
 
 

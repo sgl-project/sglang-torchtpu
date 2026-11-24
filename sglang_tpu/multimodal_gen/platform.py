@@ -103,6 +103,9 @@ class TpuOOTPlatform(TpuPlatform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
+        # Before the base class initializes the device, when libtpu reads
+        # LIBTPU_INIT_ARGS (its env dump lists these flags).
+        worker.apply_libtpu_flags()
         super()._init_worker_process()
         # The torch_tpu backend compiles static shapes only. The out-of-tree
         # compile path leaves dynamic=None, so keep a recompile for a new shape
