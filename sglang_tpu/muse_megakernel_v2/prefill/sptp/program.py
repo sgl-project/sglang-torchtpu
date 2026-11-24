@@ -58,6 +58,18 @@ def _bf16_rows(x):
     return x.astype(_BF16), jnp.ones((x.shape[0], 1), _F32)
 
 
+def route_top_k(c: PFConfig, ffn, wrouter, sm):
+    """prefill/spep's route with XLA's TopK instead of top_k argmax rounds: the same picks (ties
+    to the lower id) and order."""
+    ep = wrouter.shape[1]
+    sc = jax.nn.sigmoid(
+        jnp.dot(ffn, wrouter, preferred_element_type=_F32) * c.router_mult
+    )
+    _, ids = jax.lax.top_k(sc + small_row(sm, "expert_bias")[:, :ep], c.top_k)
+    w = jnp.take_along_axis(sc, ids, axis=1)
+    return ids, w / (jnp.sum(w, axis=1, keepdims=True) + c.router_eps) * c.route_scale
+
+
 def n_expert_refs(c: PFConfig) -> int:
     """prefill/tp's expert operands: (w13, s13, w2, s2) per expert unit."""
     return plan.n_expert_refs(c)
@@ -77,6 +89,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
+    # SPTP_ROUTE_ITER=1: spep's top-k argmax rounds
+    router = route if os.environ.get("SPTP_ROUTE_ITER", "0") == "1" else route_top_k
     # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
     xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
     # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
@@ -171,7 +185,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 stream = residual(c, stream, sm, "attn", o_own)
             with _scope("sp_router"):
                 ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
-                ids, tw = route(c, ffn.astype(_BF16), wrouter[l], sm)
+                ids, tw = router(c, ffn.astype(_BF16), wrouter[l], sm)
             with _scope("sp_pool"):
                 f8, f_s = q8(ffn)
                 pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
