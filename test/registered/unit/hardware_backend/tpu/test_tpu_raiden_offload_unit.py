@@ -34,8 +34,8 @@ from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     KVClassType,
     TransferBackend,
 )
@@ -307,12 +307,16 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_kv_args_include_raiden_metadata(self):
         captured = {}
 
+        # Plain pools: one token KV view each, the pool itself.
+        plain_router = SimpleNamespace(wrapped_view=lambda: None)
+
         class _KVPool:
             page_size = 128
             head_num = 4
             start_layer = 0
             layer_num = 1
             buffers = [torch.empty(3, 4)]
+            layer_router = plain_router
 
             def get_contiguous_buf_infos(self):
                 return [11], [22], [33]
@@ -324,6 +328,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             start_layer = 0
             layer_num = 1
             buffers = [torch.empty(3, 4)]
+            layer_router = plain_router
+            rows_are_dcp_collapsed = False
 
             def get_contiguous_buf_infos(self):
                 return [44], [55], [66]
@@ -362,6 +368,16 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
         queue.token_to_kv_pool = _KVPool()
         queue.draft_token_to_kv_pool = _DraftKVPool()
+        # PD registers through the static storage over the request table and
+        # allocator (`kv_storage_of`).
+        queue.req_to_token_pool = SimpleNamespace()
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            storage=None,
+            state=None,
+            get_kvcache=lambda: queue.token_to_kv_pool,
+            window_pool_names=lambda: (),
+        )
+        queue.draft_kv_ring = None
         queue.metadata_buffers = SimpleNamespace(
             get_buf_infos=Mock(return_value=([], [], []))
         )
@@ -570,6 +586,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr.failure_lock = threading.Lock()
                 mgr.request_status = {}
                 mgr._state_lock = threading.Lock()
+                mgr._drain_lock = threading.Lock()
                 mgr._status_lock = threading.Lock()
                 mgr._announce_lock = threading.Lock()
                 mgr._read_leases = {}
@@ -624,6 +641,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.kv_args = Mock(state_types=[StateType.SWA])
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._read_leases = {}
@@ -678,6 +696,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
@@ -719,6 +738,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
         mgr._dynamic_host_staging = True
@@ -809,6 +829,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = None
@@ -846,6 +867,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock() if swa_limit is not None else None
@@ -1154,6 +1176,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock()
@@ -1242,6 +1265,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.start_read = Mock(return_value=0)
@@ -1950,6 +1974,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
@@ -2121,6 +2146,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
@@ -2790,6 +2816,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._decode = None
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -2827,6 +2854,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._decode = DecodeState()
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._aborted = {}
         mgr._send_reads = {}

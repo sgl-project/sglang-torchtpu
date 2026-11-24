@@ -116,6 +116,12 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
               - 'python/sglang/multimodal_gen/runtime/models/encoders/minimax_h3_qwen3vl.py'
               - 'python/sglang/multimodal_gen/test/unit/test_minimax_h3_encoder_device.py'
+              # Pika-H3-Flex core files behind its TPU recipe and nightly test (unmerged LoRA in the DiT
+              # blocks, ref2va's vision grids).
+              - 'python/sglang/multimodal_gen/runtime/layers/lora/linear.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines/minimax_h3_pipeline.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/denoise_loop.py'
+              - 'python/sglang/multimodal_gen/runtime/models/encoders/qwen3vl_vision.py'
               - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
               # Shared diffusion files behind the TPU-only platform hooks (SPMD-safe

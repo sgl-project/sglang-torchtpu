@@ -9,11 +9,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers import scheduler as scheduler_module
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components import (
     batch_result_processor as processor_module,
@@ -27,6 +23,11 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.mm_feature_releaser import (
     MMFeatureReleaser,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -182,6 +183,7 @@ class TestSchedulerHooks(CustomTestCase):
             mm_inputs, _ = _mm_inputs(1)
             return SimpleNamespace(
                 finished=lambda: finished,
+                finished_reason=None,
                 multimodal_inputs=mm_inputs,
                 session=session,
             )
@@ -195,7 +197,8 @@ class TestSchedulerHooks(CustomTestCase):
         running_inputs = running.multimodal_inputs
 
         Scheduler._maybe_clear_mm_inputs(
-            SimpleNamespace(), SimpleNamespace(reqs=[done, in_session, running])
+            Scheduler.__new__(Scheduler),
+            SimpleNamespace(reqs=[done, in_session, running]),
         )
 
         self.assertIsNone(done.multimodal_inputs)
@@ -207,13 +210,12 @@ class TestSchedulerHooks(CustomTestCase):
         processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=None,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=MagicMock(),
             hisparse_coordinator=None,
             req_to_token_pool=None,
+            kv_weight_version_tracker=None,
             decode_offload_manager=None,
             metrics_collector=None,
             metrics_reporter=MagicMock(),
@@ -222,7 +224,10 @@ class TestSchedulerHooks(CustomTestCase):
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             beam_coordinator=MagicMock(),
+            request_retirer=MagicMock(),
             abort_request=lambda *args, **kwargs: None,
+            still_in_batch=lambda req: True,
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
         batch = SimpleNamespace(mamba_track_mask_cpu=None)
 
@@ -243,14 +248,12 @@ class TestSchedulerHooks(CustomTestCase):
         done, done_refs = finished_req(session=None)
         in_session, session_refs = finished_req(session=object())
 
-        with (
-            get_context().override_server_args(),
-            patch.object(processor_module, "release_kv_cache") as release_kv_cache,
-        ):
+        result = SimpleNamespace(num_correct_drafts_per_req_cpu=None)
+        with get_context().override_server_args():
             for req in (done, in_session):
-                processor._handle_finish_state_updated_req(req, batch, None, 0, None)
+                processor._handle_finish_state_updated_req(req, batch, result, 0, None)
 
-        self.assertEqual(release_kv_cache.call_count, 2)
+        self.assertEqual(processor.request_retirer.release.call_count, 2)
         self.assertIsNone(done.multimodal_inputs.mm_items[0].feature)
         self.assertEqual(len(self.releaser._pending), 1)
         self.assertEqual(_alive(done_refs), 1)
@@ -265,6 +268,8 @@ class TestSchedulerHooks(CustomTestCase):
         self.releaser.release(mm_inputs)
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
+            dp_attn_adapter=MagicMock(),
+            deferred_responses=MagicMock(),
             admit_deferred_health_probes=MagicMock(side_effect=_Stop),
         )
 
@@ -279,6 +284,7 @@ class TestSchedulerHooks(CustomTestCase):
         # Frozen dataclass: set only the fields read before the copy wait.
         object.__setattr__(processor, "is_generation", True)
         object.__setattr__(processor, "token_to_kv_pool_allocator", MagicMock())
+        object.__setattr__(processor, "still_in_batch", lambda req: True)
         methods = (
             processor.process_batch_result_prefill,
             processor.process_batch_result_decode,
@@ -299,7 +305,10 @@ class TestSchedulerHooks(CustomTestCase):
                         query=lambda: ready, synchronize=synchronize
                     )
                     with self.assertRaises(_Stop):
-                        method(None, SimpleNamespace(copy_done=copy_done))
+                        method(
+                            SimpleNamespace(reqs=[]),
+                            SimpleNamespace(copy_done=copy_done),
+                        )
 
                     self.assertEqual(observed, [parked_at_wait])
 

@@ -742,11 +742,10 @@ class K3MegakernelRuntime:
             x0 = F.pad(x0, (0, 0, 0, rows - t)) if t < rows else x0[:rows]
             blk = self.variants[variant].block
             x0 = x0.reshape(rows // blk, blk, -1) if blk else x0[:, None]
-        pools = backend.req_to_token_pool
         kv_pool = backend.token_to_kv_pool
         state = {}
         for k, layer in enumerate(self.kda_layers):
-            cache = pools.mamba2_layer_cache(layer)
+            cache = lin._layer_state(layer)
             state[f"kda_conv_{k}"] = cache.conv[0]
             state[f"kda_rec_{k}"] = cache.temporal
         if self.own_pools:

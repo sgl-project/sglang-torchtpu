@@ -38,6 +38,10 @@ from typing import (
 import msgspec
 import zmq
 
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    HostPageMetadata,
+    discard_host_page_metadata,
+)
 from sglang_tpu.disaggregation.raiden import sender as raiden_sender
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -90,6 +94,8 @@ class PrefixRegistration(msgspec.Struct, frozen=True):
     endpoint: str = ""
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    page_metadata: List[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: List[bytes] = msgspec.field(default_factory=list)
 
     @property
     def refused(self) -> bool:
@@ -138,6 +144,7 @@ class DramOffloadChannel:
         # The HiCache host pools whose pages move, (full, sliding window or
         # None), bound by the L2 extension.
         self._host_pools: Tuple[Any, Any] = (None, None)
+        self._host_metadata: Tuple[Any, Any] = (None, None)
         # This engine's native host reads by request id, as source or as
         # destination: None while raiden may still read or write the pages,
         # then whether the read succeeded. A room's reads outlive its cleanup
@@ -192,9 +199,30 @@ class DramOffloadChannel:
 
     # ----- native host reads, shared by recall and push -------------------------
 
-    def bind_host_pools(self, full: Any, swa: Any = None) -> None:
+    def bind_host_pools(
+        self, full: Any, swa: Any = None, *, retain_metadata: bool = True
+    ) -> None:
         with self._lock:
             self._host_pools = (full, swa)
+            self._host_metadata = (
+                HostPageMetadata(full, retain=retain_metadata),
+                HostPageMetadata(swa, retain=retain_metadata),
+            )
+
+    def export_host_metadata(
+        self, pages: List[int], *, swa: bool = False
+    ) -> List[bytes]:
+        return self._host_metadata[swa].export(pages) if pages else []
+
+    def restore_host_metadata(
+        self, pages: List[int], rows: List[bytes], *, swa: bool = False
+    ) -> None:
+        if pages or rows:
+            self._host_metadata[swa].restore(pages, rows)
+
+    def clear_host_metadata(self) -> None:
+        for table in self._host_metadata:
+            table.clear()
 
     def host_control_address(self, *, swa: bool = False) -> str:
         """Where a peer reads this engine's registered host pages from."""
@@ -241,6 +269,7 @@ class DramOffloadChannel:
                 return False
             transfer = self._host_pools[swa].transfer
             try:
+                discard_host_page_metadata(self._host_pools[swa], local)
                 transfer.start_read(req_id, uuid, endpoint, remote, local)
             except Exception as exc:  # noqa: BLE001 - the caller gives the read up
                 logger.warning("Cannot start host read %s: %s", req_id, exc)
@@ -404,6 +433,8 @@ class DramOffloadChannel:
                     endpoint=ready.endpoint,
                     swa_uuid=ready.swa_uuid,
                     swa_endpoint=ready.swa_endpoint,
+                    page_metadata=ready.page_metadata,
+                    swa_page_metadata=ready.swa_page_metadata,
                 )
 
     # ----- recall, decode side (decode_dram_prefix_offerer.DecodeDramPrefixOfferer) ---------------
@@ -477,6 +508,8 @@ class DramOffloadChannel:
                 endpoint=registration.endpoint,
                 swa_uuid=registration.swa_uuid,
                 swa_endpoint=registration.swa_endpoint,
+                page_metadata=registration.page_metadata,
+                swa_page_metadata=registration.swa_page_metadata,
             ),
         )
 
@@ -488,11 +521,21 @@ class DramOffloadChannel:
         fails. The prefill reads from the host pools' own control endpoints."""
         # Independent prefills share a decoder's native UUID map; zero means
         # no transfer, as in _announce_chunk.
+        try:
+            metadata = self.export_host_metadata(pages)
+            swa_metadata = self.export_host_metadata(swa_pages, swa=True)
+        except Exception:  # noqa: BLE001 - refuse the recall without registering reads
+            logger.exception("Cannot export prefix host metadata for room %s", room)
+            return PrefixRegistration()
         uuid = secrets.randbelow((1 << 63) - 1) + 1
         if not self._register_host_read_locked(self.prefix_req_id(room), uuid, pages):
             return PrefixRegistration()
         if not swa_pages:
-            return PrefixRegistration(uuid=uuid, endpoint=self.host_control_address())
+            return PrefixRegistration(
+                uuid=uuid,
+                endpoint=self.host_control_address(),
+                page_metadata=metadata,
+            )
         # The full pages' registration stays owned by its native read when the
         # window's is refused: raiden cannot withdraw it.
         swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
@@ -505,6 +548,8 @@ class DramOffloadChannel:
             endpoint=self.host_control_address(),
             swa_uuid=swa_uuid,
             swa_endpoint=self.host_control_address(swa=True),
+            page_metadata=metadata,
+            swa_page_metadata=swa_metadata,
         )
 
     # ----- push (prefill_dram_victim_pusher.py, decode_dram_victim_receiver.py) ------------------------
@@ -526,6 +571,8 @@ class DramOffloadChannel:
         extra_key: Optional[str],
         cache_salt: Optional[str],
         swa_blocks: Sequence[int] = (),
+        page_metadata: Sequence[bytes] = (),
+        swa_page_metadata: Sequence[bytes] = (),
     ) -> bool:
         """Offer registered host pages for decode to pull into its host pools.
         A message that cannot be sent is a declined push."""
@@ -547,6 +594,8 @@ class DramOffloadChannel:
                 swa_address=self.host_control_address(swa=True) if swa_blocks else "",
                 extra_key=extra_key,
                 cache_salt=cache_salt,
+                page_metadata=list(page_metadata),
+                swa_page_metadata=list(swa_page_metadata),
             ),
         )
 

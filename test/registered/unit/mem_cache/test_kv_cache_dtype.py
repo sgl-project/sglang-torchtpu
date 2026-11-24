@@ -22,9 +22,7 @@ class TestKVCacheDtype(unittest.TestCase):
             ):
                 resolved = configure_kv_cache_dtype(
                     server_args_kv_cache_dtype="mxint8",
-                    model=SimpleNamespace(
-                        quant_config=SimpleNamespace(kv_cache_quant_algo=quant_algo)
-                    ),
+                    quant_config=SimpleNamespace(kv_cache_quant_algo=quant_algo),
                     model_dtype=torch.bfloat16,
                     is_draft_worker=True,
                     is_dflash=False,
@@ -36,7 +34,7 @@ class TestKVCacheDtype(unittest.TestCase):
     def test_target_ignores_draft_override(self):
         resolved = configure_kv_cache_dtype(
             server_args_kv_cache_dtype="mxint8",
-            model=None,
+            quant_config=None,
             model_dtype=torch.bfloat16,
             is_draft_worker=False,
             is_dflash=False,
@@ -55,7 +53,7 @@ class TestKVCacheDtype(unittest.TestCase):
             ):
                 configure_kv_cache_dtype(
                     server_args_kv_cache_dtype="mxint8",
-                    model=None,
+                    quant_config=None,
                     model_dtype=model_dtype,
                     is_draft_worker=False,
                     is_dflash=False,
@@ -65,7 +63,7 @@ class TestKVCacheDtype(unittest.TestCase):
     def test_dflash_fa4_uses_unquantized_draft_cache(self):
         resolved = configure_kv_cache_dtype(
             server_args_kv_cache_dtype="mxint8",
-            model=None,
+            quant_config=None,
             model_dtype=torch.bfloat16,
             is_draft_worker=True,
             is_dflash=True,

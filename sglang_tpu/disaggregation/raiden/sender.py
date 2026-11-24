@@ -14,7 +14,7 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
@@ -44,6 +44,31 @@ from sglang_tpu.disaggregation.raiden.serde import (
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
+# Optional per-page tag source (e.g. a KV integrity checker): called with
+# ("kv" | "swa", the room's page ids) when BLOCKS is built, after the prefill's
+# last chunk was processed; returns one fixed-size record per page, or b"".
+_PAGE_TAG_SOURCE: Optional[Callable[[str, List[int]], bytes]] = None
+
+
+def set_page_tag_source(source: Optional[Callable[[str, List[int]], bytes]]) -> None:
+    """Register the source of the per-page tags BLOCKS carries."""
+    global _PAGE_TAG_SOURCE
+    _PAGE_TAG_SOURCE = source
+
+
+def page_tag_fields(blocks: List[int], swa_blocks: List[int]) -> dict:
+    """The page tag fields of a room's BLOCKS: none without a registered source,
+    so the message keeps the wire format of a sender without tags."""
+    if _PAGE_TAG_SOURCE is None:
+        return {}
+    fields = {"page_tags": _PAGE_TAG_SOURCE("kv", blocks)}
+    if swa_blocks:
+        fields["swa_page_tags"] = _PAGE_TAG_SOURCE("swa", swa_blocks)
+        # The window pages are the request's last pages.
+        fields["swa_page_tags_first"] = max(0, len(blocks) - len(swa_blocks))
+    return fields
+
 
 # Send errors whose cause belongs to one peer, so they cost that peer's room
 # rather than the engine. An errno not listed here is assumed engine-wide
@@ -231,6 +256,7 @@ class RaidenSenderMixin:
         block_ids: List[int],
         swa_block_ids: Optional[List[int]] = None,
         state_block_ids: Optional[List[int]] = None,
+        draft_swa_block_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         """Records a chunk's pages and returns its start index in the request.
 
@@ -250,6 +276,10 @@ class RaidenSenderMixin:
                 listed.update(block_ids)
                 if swa_block_ids is not None:
                     self._prefill.send_swa_blocks[room] = list(swa_block_ids)
+                if draft_swa_block_ids is not None:
+                    self._prefill.send_draft_swa_blocks[room] = list(
+                        draft_swa_block_ids
+                    )
                 if state_block_ids is not None:
                     self._prefill.send_state_rows[room] = list(state_block_ids)
                 return start
@@ -650,10 +680,16 @@ class RaidenSenderMixin:
                     self._state_engine is not None
                     and room not in self._prefill.send_state_rows
                 )
+                or (
+                    self._draft_engine is not None
+                    and self._draft_is_swa
+                    and room not in self._prefill.send_draft_swa_blocks
+                )
                 or room not in self._prefill.decode_addr
             ):
                 return
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            draft_swa_blocks = list(self._prefill.send_draft_swa_blocks.get(room, []))
             state_rows = list(self._prefill.send_state_rows.get(room, []))
             blocks = list(self._prefill.send_blocks[room])
             addr = self._prefill.decode_addr[room]
@@ -666,6 +702,19 @@ class RaidenSenderMixin:
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)
         swa_read_blocks = whole_pull_registration(swa_blocks, decode_swa_pages)
+        draft_read_blocks: List[int] = []
+        if self._draft_engine is not None:
+            if self._draft_is_swa:
+                decode_draft_swa_pages = (
+                    decode_swa_pages // self._unified_swa_pool.layout.num_swa_groups
+                    if self._unified_swa_pool is not None
+                    else decode_swa_pages
+                )
+                draft_read_blocks = whole_pull_registration(
+                    draft_swa_blocks, decode_draft_swa_pages
+                )
+            else:
+                draft_read_blocks = whole_pull_registration(blocks, decode_pages)
         if self._unified_swa_pool is not None:
             read_blocks = read_blocks + swa_read_blocks
             swa_read_blocks = []
@@ -692,6 +741,14 @@ class RaidenSenderMixin:
                     room,
                     swa_read_blocks,
                 )
+            if self._draft_engine is not None and draft_read_blocks:
+                self._register_sender_read(
+                    room,
+                    self._draft_engine,
+                    self._draft_req_id(room),
+                    room,
+                    draft_read_blocks,
+                )
             if read_blocks:
                 self._register_sender_read(
                     room, self._ensure_engine(), str(room), room, read_blocks
@@ -713,6 +770,9 @@ class RaidenSenderMixin:
                 state_endpoint=self.state_raiden_endpoint or "",
                 state_meta=state_meta,
                 kv_layout=self.kv_layout,
+                draft_endpoint=self.draft_raiden_endpoint or "",
+                draft_swa_blocks=draft_swa_blocks,
+                **page_tag_fields(blocks, swa_blocks),
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
@@ -736,12 +796,20 @@ class RaidenSenderMixin:
                 self._completed_send.add(str(room))
             if self._swa_engine is not None and not swa_read_blocks:
                 self._completed_send.add(self._swa_req_id(room))
+            if self._draft_engine is not None and not draft_read_blocks:
+                self._completed_send.add(self._draft_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
         if self._state_engine is not None:
             raise NotImplementedError(
                 "Raiden push resharding does not move GDN (linear-attention) "
                 "state yet; use equal attention TP on prefill and decode."
+            )
+        if self._draft_engine is not None:
+            raise NotImplementedError(
+                "Raiden push resharding does not support speculative draft KV "
+                "over TpuUnifiedSWAKVPool yet; use equal attention TP on "
+                "prefill and decode."
             )
         req = ReshardReq.from_frames(msg)
         if self._bounded_staging:
@@ -1402,6 +1470,11 @@ class RaidenKVSender(CommonKVSender):
             if state_indices is not None
             else None
         )
+        draft_swa_blocks = (
+            self.kv_mgr._draft_swa_blocks_from_state_indices(state_indices)
+            if state_indices is not None
+            else None
+        )
         state_rows = (
             self.kv_mgr._state_rows_from_state_indices(state_indices)
             if state_indices is not None
@@ -1413,6 +1486,7 @@ class RaidenKVSender(CommonKVSender):
             blocks,
             swa_block_ids=swa_blocks,
             state_block_ids=state_rows,
+            draft_swa_block_ids=draft_swa_blocks,
         )
         if start is None:
             return  # aborted while this chunk was being computed

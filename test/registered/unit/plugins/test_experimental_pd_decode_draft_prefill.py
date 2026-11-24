@@ -295,6 +295,7 @@ class TestOverlongPromptAbort(CustomTestCase):
         req = SimpleNamespace(
             rid="r", origin_input_ids=[0] * prompt_len, return_logprob=False
         )
+        req.finish_outside_step = lambda reason: setattr(req, "finished_reason", reason)
         prompt_cap = None if cap is None else (lambda: cap)
         with patch.object(pd_draft_prefill, "_pd_draft_prompt_cap", prompt_cap):
             rejected = reject_overlong_pd_draft_prompt(

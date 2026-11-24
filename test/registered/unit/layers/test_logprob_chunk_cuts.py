@@ -16,7 +16,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.logprob_processor import input_logprob_chunk_bounds
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import CpuDefaultDeviceMixin, score_input_logprobs
 from sglang.test.test_utils import CustomTestCase

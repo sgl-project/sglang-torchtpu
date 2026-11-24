@@ -10,7 +10,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.arg_groups import mamba_hook, overrides
-from sglang.srt.configs import KimiLinearConfig, Qwen3NextConfig
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.mem_cache import kv_cache_builder as builder
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase

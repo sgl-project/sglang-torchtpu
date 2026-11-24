@@ -12,8 +12,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
-from sglang.utils import LazyImport
 from sglang_tpu.envs import envs
 
 logger = logging.getLogger(__name__)

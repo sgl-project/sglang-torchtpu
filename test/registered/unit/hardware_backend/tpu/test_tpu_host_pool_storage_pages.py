@@ -241,14 +241,20 @@ class TestTpuHostPoolStoragePages(CustomTestCase):
         }
         self.assertEqual(len(tags), 3)
         self.assertEqual(
-            storage_model_name("org/model", tm_bf16),
-            f"org/model-{tm_bf16.storage_format_tag}",
+            storage_model_name("org/model", tm_bf16, torch.bfloat16),
+            f"org/model-{tm_bf16.storage_format_tag}-dtype_bfloat16",
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            tm_store = _file_backend(tmp, storage_model_name("org/model", tm_bf16))
-            sal_store = _file_backend(tmp, storage_model_name("org/model", sal_bf16))
-            fp8_store = _file_backend(tmp, storage_model_name("org/model", tm_fp8))
+            tm_store = _file_backend(
+                tmp, storage_model_name("org/model", tm_bf16, torch.bfloat16)
+            )
+            sal_store = _file_backend(
+                tmp, storage_model_name("org/model", sal_bf16, torch.bfloat16)
+            )
+            fp8_store = _file_backend(
+                tmp, storage_model_name("org/model", tm_fp8, torch.float8_e4m3fn)
+            )
             untagged_store = _file_backend(tmp, "org/model")
 
             _fill_page(tm_bf16, 0, seed=17)

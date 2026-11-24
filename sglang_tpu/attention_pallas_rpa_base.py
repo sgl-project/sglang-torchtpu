@@ -156,6 +156,9 @@ class PallasForwardMetadata:
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
+    # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
+    # i32[max_num_seqs]  first ring page of each row's request slot
+    raw_page_base: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:

@@ -10,6 +10,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
@@ -23,6 +24,17 @@ _STATIC_FP8_GEMV_OP: Callable | None = None
 _STATIC_FP8_GEMV_VW_OP: Callable | None = None
 # Plain bool, not a None check on the op: Dynamo traces the eligibility check.
 _STATIC_FP8_GEMV_READY = False
+
+
+def _layer_tp_rank(layer: Module) -> int:
+    """The layer's rank in the group it shards over: parallel linear layers
+    keep that group, not a rank; a bare module may carry ``tp_rank``."""
+    tp_rank = getattr(layer, "tp_rank", None)
+    if tp_rank is not None:
+        return tp_rank
+    if hasattr(layer, "tp_group"):
+        return get_group_rank_size(layer.tp_group)[0]
+    return get_parallel().tp_rank
 
 
 def compute_tpu_fp8_linear_scale_shape(
@@ -43,9 +55,7 @@ def compute_tpu_fp8_linear_scale_shape(
         output_size != output_size_per_partition
         or input_size != input_size_per_partition
     ):
-        tp_rank = getattr(layer, "tp_rank", None)
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
+        tp_rank = _layer_tp_rank(layer)
     else:
         tp_rank = 0
 
@@ -90,19 +100,13 @@ def _requantize_tpu_block_fp8_to_channelwise(
     tp_rank = getattr(layer, "tpu_fp8_output_tp_rank", None)
     if tp_rank is None:
         if getattr(layer, "output_size", out_size) != out_size:
-            raw_tp_rank = getattr(layer, "tp_rank", None)
-            if raw_tp_rank is None:
-                raw_tp_rank = get_parallel().tp_rank
-            tp_rank = raw_tp_rank
+            tp_rank = _layer_tp_rank(layer)
         else:
             tp_rank = 0
     input_offset = getattr(layer, "tpu_fp8_input_offset", None)
     if input_offset is None:
         if getattr(layer, "input_size", in_size) != in_size:
-            raw_tp_rank = getattr(layer, "tp_rank", None)
-            if raw_tp_rank is None:
-                raw_tp_rank = get_parallel().tp_rank
-            input_offset = raw_tp_rank * in_size
+            input_offset = _layer_tp_rank(layer) * in_size
         else:
             input_offset = 0
 

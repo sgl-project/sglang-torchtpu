@@ -18,6 +18,9 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 class TestUnquantGlobalRouting(CustomTestCase):
     def test_sparse_core_permute_gathers_full_sorted_range(self):
+        """With the EP counting route off (it needs real JAX; covered on TPU by
+        test_fused_moe_dense_route.py), the SparseCore permute gathers the full
+        sorted range."""
         module_name = "sglang_tpu.moe.pallas.fused_moe_op"
         torch_tpu = ModuleType("torch_tpu")
         torch_tpu_internal = ModuleType("torch_tpu._internal")
@@ -81,6 +84,9 @@ class TestUnquantGlobalRouting(CustomTestCase):
         )
         with (
             patch.dict(sys.modules, fake_modules),
+            fused_moe_op.tpu_envs.SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE.override(
+                False
+            ),
             self.assertRaises(GatherCalled),
         ):
             fused_moe_op._fused_moe_jax(

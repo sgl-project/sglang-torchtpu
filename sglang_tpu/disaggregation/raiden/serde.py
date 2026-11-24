@@ -131,6 +131,8 @@ class PrefixReady(WireMessage, omit_defaults=True):
     # full-only models and on a refusal.
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -163,6 +165,8 @@ class VictimPush(WireMessage, omit_defaults=True):
     swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
+    page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
 
 class VictimAck(WireMessage):
@@ -174,7 +178,7 @@ class VictimAck(WireMessage):
     stored: bool
 
 
-class Blocks(WireMessage):
+class Blocks(WireMessage, omit_defaults=True):
     """Return symmetric-TP KV block locations and auxiliary data."""
 
     TAG: ClassVar[bytes] = MessageTag.BLOCKS
@@ -190,9 +194,21 @@ class Blocks(WireMessage):
     # Optional opaque host state metadata (e.g., DSV4 ring shifts).
     state_meta: bytes = b""
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    # Optional unified-target speculative draft endpoint and compact SWA page ids.
+    draft_endpoint: str = ""
+    draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    # Optional per-page tags from a registered page tag source (e.g. a KV checker):
+    # one fixed-size record per page of ``blocks``, then per page of
+    # ``swa_blocks``, which start at request page ``swa_page_tags_first``.
+    # omit_defaults leaves them off the wire when empty, so an older decode
+    # still reads a message without tags.
+    page_tags: bytes = b""
+    swa_page_tags: bytes = b""
+    swa_page_tags_first: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+        require_non_negative(self.swa_page_tags_first, "swa_page_tags_first")
 
 
 class Chunk(WireMessage):

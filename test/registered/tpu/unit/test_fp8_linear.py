@@ -33,6 +33,8 @@ class _FakeBlockFp8Config:
     weight_block_size = [128, 128]
     is_checkpoint_fp8_serialized = True
     use_mxfp8 = False
+    # QuantizationConfig's default: no per-config MXFP8 conversion override.
+    convert_mxfp8_to_block_fp8 = None
 
 
 class TestTpuFp8Linear(CustomTestCase):

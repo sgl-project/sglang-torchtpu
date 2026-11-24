@@ -659,9 +659,12 @@ torch==2.11.0+cpu
     #   peft
     #   sentence-transformers
     #   timm
+    #   torchaudio
     #   torchvision
     #   xgrammar
 torchao==0.9.0+cpu
+    # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
+torchaudio==2.11.0+cpu
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 torchvision==0.26.0+cpu
     # via

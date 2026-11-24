@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch

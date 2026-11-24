@@ -44,7 +44,7 @@ from __future__ import annotations
 import heapq
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
@@ -75,9 +76,11 @@ logger = logging.getLogger(__name__)
 _COPY_AHEAD_CHUNKS = 4
 # Stands in for the chunk when chunked prefill is off.
 _DEFAULT_CHUNK_TOKENS = 4096
-# The SWA eviction order gets 1/_SWA_WINDOW_DIVISOR of the window. Arbitrary
-# starting point; no measurement behind it yet.
+# The SWA eviction order gets 1/_SWA_WINDOW_DIVISOR of the window when no
+# dedicated SWA copy-ahead budget is configured.
 _SWA_WINDOW_DIVISOR = 4
+# Default independent SWA copy-ahead budget on the unified KV pool.
+_DEFAULT_UNIFIED_SWA_COPY_AHEAD_TOKENS = 131072
 
 
 def resolve_copy_ahead_tokens(
@@ -94,12 +97,32 @@ def resolve_copy_ahead_tokens(
     return -(-tokens // page_size) * page_size
 
 
+def resolve_swa_copy_ahead_tokens(
+    *, is_unified_pool: bool, page_size: int
+) -> Optional[int]:
+    tokens = tpu_envs.SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS.get()
+    if tokens is None:
+        if not is_unified_pool:
+            return None
+        tokens = _DEFAULT_UNIFIED_SWA_COPY_AHEAD_TOKENS
+    if tokens <= 0:
+        return 0
+    return -(-tokens // page_size) * page_size
+
+
 class WriteBackCopyAhead:
     """Keeps the eviction frontier of a write_back unified cache copied to host."""
 
-    def __init__(self, *, cache: UnifiedRadixCache, copy_ahead_tokens: int) -> None:
+    def __init__(
+        self,
+        *,
+        cache: UnifiedRadixCache,
+        copy_ahead_tokens: int,
+        swa_copy_ahead_tokens: Optional[int] = None,
+    ) -> None:
         self._cache = cache
         self.copy_ahead_tokens = copy_ahead_tokens
+        self.swa_copy_ahead_tokens = swa_copy_ahead_tokens
         # ack id (= node id) -> tokens of a window copy not yet acked.
         self._pending: dict[int, int] = {}
         # The pending copies the SWA order issued; each order has its own cap
@@ -168,15 +191,20 @@ class WriteBackCopyAhead:
         # Before the walk, so this step's copies can take the freed host slots.
         self._release_host_locks(window=None)
         core: UnifiedTreeCore = cache.tree_core
-        # The SWA order gets a reserved share: the Full order alone fills the
-        # window whenever many leaves are evictable.
-        swa_share = 0
+        # The SWA order gets either its own configured share or a reserved
+        # fraction of the Full window whenever many leaves are evictable.
+        full_cap = self.copy_ahead_tokens
+        swa_cap = 0
         if cache.is_swa_enabled and core.has_swa_host_pool:
-            swa_share = self.copy_ahead_tokens // _SWA_WINDOW_DIVISOR
+            if self.swa_copy_ahead_tokens is None:
+                swa_cap = self.copy_ahead_tokens // _SWA_WINDOW_DIVISOR
+                full_cap = self.copy_ahead_tokens - swa_cap
+            else:
+                swa_cap = self.swa_copy_ahead_tokens
         self._prune_acked()
         window: set[int] = set()
         # Copies in flight are locked, so neither walk sees them: subtract them.
-        self._caps = {False: self.copy_ahead_tokens - swa_share, True: swa_share}
+        self._caps = {False: full_cap, True: swa_cap}
         full_budget = self._caps[False] - self._inflight(swa=False)
         if full_budget > 0:
             self._cover_full(core=core, budget=full_budget, window=window)
@@ -379,8 +407,22 @@ def attach_copy_ahead(
             "HiCache write_back copy-ahead off: evictions back up synchronously."
         )
         return
+    from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+    is_unified = isinstance(
+        cache.token_to_kv_pool_allocator, TpuUnifiedSWATokenToKVPoolAllocator
+    )
+    swa_copy_ahead_tokens = (
+        resolve_swa_copy_ahead_tokens(
+            is_unified_pool=is_unified, page_size=cache.page_size
+        )
+        if cache.is_swa_enabled
+        else None
+    )
     cache._write_back_copy_ahead = WriteBackCopyAhead(
-        cache=cache, copy_ahead_tokens=copy_ahead_tokens
+        cache=cache,
+        copy_ahead_tokens=copy_ahead_tokens,
+        swa_copy_ahead_tokens=swa_copy_ahead_tokens,
     )
     logger.info(
         "HiCache write_back copy-ahead: %d tokens copied to host ahead of eviction.",
@@ -389,7 +431,11 @@ def attach_copy_ahead(
 
 
 def evict_with_copy_ahead(
-    cache: UnifiedRadixCache, params: EvictParams, available_size_targets=None
+    cache: UnifiedRadixCache,
+    params: EvictParams,
+    *,
+    demand: Optional[dict[ComponentType, int]] = None,
+    satisfied: Optional[Callable[[], bool]] = None,
 ) -> EvictResult:
     if cache.disable:
         return EvictResult()
@@ -397,23 +443,26 @@ def evict_with_copy_ahead(
     tracker = {ct: 0 for ct in cache.tree_components}
     request_by_type = cache._evict_request_by_type(params)
     cache._evict_components(
-        request_by_type, tracker, available_size_targets=available_size_targets
+        request_by_type, tracker, demand=demand, satisfied=satisfied
     )
     # Short behind window copies' locks would retract a request: wait for them
     # once and walk again with the same request (the tracker is cumulative).
     copy_ahead = cache._write_back_copy_ahead
     if copy_ahead.pending_node_ids and _is_short(
-        cache, request_by_type, tracker, available_size_targets
+        cache, request_by_type, tracker, demand, satisfied
     ):
         copy_ahead.wait_for_acks(window_acks=copy_ahead.pending_node_ids)
         cache._evict_components(
-            request_by_type, tracker, available_size_targets=available_size_targets
+            request_by_type, tracker, demand=demand, satisfied=satisfied
         )
     cache.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
     return EvictResult(
         num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
-        swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
-        mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
+        mamba_num_evicted=tracker.get(cache.slot_id(TREE_STATE), 0),
+        window_num_tokens_evicted={
+            name: tracker.get(ct, 0)
+            for ct, name in cache._window_sub_pools_by_slot().items()
+        },
     )
 
 
@@ -421,17 +470,21 @@ def _is_short(
     cache: UnifiedRadixCache,
     request_by_type: dict[ComponentType, int],
     tracker: dict[ComponentType, int],
-    available_size_targets,
+    demand: Optional[dict[ComponentType, int]],
+    satisfied: Optional[Callable[[], bool]],
 ) -> bool:
+    if satisfied is not None and satisfied():
+        return False
     for component_type in cache.tree_components:
         requested = request_by_type.get(component_type, 0)
         if requested <= 0 or tracker.get(component_type, 0) >= requested:
             continue
-        target = (available_size_targets or {}).get(component_type)
-        if target is not None:
-            target_component, target_size = target
-            if cache._component_available_size(target_component) >= target_size:
-                continue
+        if (
+            demand is not None
+            and component_type in demand
+            and cache._pool_available(component_type) >= demand[component_type]
+        ):
+            continue
         return True
     return False
 
@@ -458,10 +511,12 @@ def install(cache_cls: Optional[type] = None) -> None:
             cache=self, chunked_prefill_size=server_args.chunked_prefill_size
         )
 
-    def _evict(self, params: EvictParams, available_size_targets=None) -> EvictResult:
+    def _evict(
+        self, params: EvictParams, *, demand=None, satisfied=None
+    ) -> EvictResult:
         if self._write_back_copy_ahead is None:
-            return orig_evict(self, params, available_size_targets)
-        return evict_with_copy_ahead(self, params, available_size_targets)
+            return orig_evict(self, params, demand=demand, satisfied=satisfied)
+        return evict_with_copy_ahead(self, params, demand=demand, satisfied=satisfied)
 
     def check_hicache_events(self):
         orig_check_hicache_events(self)

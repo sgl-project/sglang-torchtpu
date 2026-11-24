@@ -42,11 +42,8 @@ from sglang.srt.managers.mm_utils import (  # noqa: E402
     ShmPointerMMData,
     wrap_shm_features,
 )
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalProcessorOutput  # noqa: E402
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.managers.scheduler_components import node_fanout  # noqa: E402
 from sglang.srt.managers.scheduler_components.node_fanout import (  # noqa: E402
     node_fanout_enabled,
@@ -54,6 +51,7 @@ from sglang.srt.managers.scheduler_components.node_fanout import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils import broadcast_pyobj  # noqa: E402
 
@@ -92,8 +90,9 @@ def _receiver() -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
+        rust_server_mode=False,
     )
 
 
@@ -110,6 +109,7 @@ def _run_rank(rank: int, init_file: str) -> None:
         receiver = _receiver()
         parallel = SimpleNamespace(
             attn_dp_enabled=False,
+            num_dp_ranks=1,
             tp_size=WORLD,
             pp_size=1,
             nnodes=NNODES,
@@ -380,6 +380,7 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
             ({"pp_size": 2}, False, "1", False, "pp_size == 1"),
             ({"tp_size": 3}, False, "1", False, "divisible by nnodes"),
             ({"attn_dp_enabled": True}, False, "1", False, "DP attention"),
+            ({"num_dp_ranks": 4}, False, "1", False, "DP replicas"),
             ({}, True, "1", False, "tokenizer initialization"),
             # A prior rejected configuration must not cache the decision.
             ({}, False, "1", True, None),
@@ -388,7 +389,13 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
             with self.subTest(
                 overrides=overrides, skip_tokenizer=skip_tokenizer, flag=flag
             ):
-                config = dict(nnodes=2, tp_size=4, pp_size=1, attn_dp_enabled=False)
+                config = dict(
+                    nnodes=2,
+                    tp_size=4,
+                    pp_size=1,
+                    attn_dp_enabled=False,
+                    num_dp_ranks=1,
+                )
                 config.update(overrides)
                 with (
                     patch.dict(os.environ),
@@ -402,7 +409,7 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
                             skip_tokenizer_init=skip_tokenizer
                         ),
                     ),
-                    patch("sglang.srt.utils.common.logger.warning") as warning,
+                    patch("sglang.srt.utils.log_utils.logger.warning") as warning,
                 ):
                     if flag is None:
                         os.environ.pop(
@@ -463,7 +470,7 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
                         side_effect=lambda reqs: reqs,
                     ),
                     patch.object(node_fanout.dist, "new_group") as new_group,
-                    patch("sglang.srt.utils.common.logger.warning") as warning,
+                    patch("sglang.srt.utils.log_utils.logger.warning") as warning,
                 ):
                     receiver = _receiver()
                     for _ in range(2):

@@ -104,7 +104,7 @@ def _apply(args):
     with (
         patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env,
         patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=SimpleNamespace(architectures=["GptOssForCausalLM"]),
         ),
     ):
@@ -264,6 +264,7 @@ def _compat_cfg(**overrides):
         speculative_algorithm="EAGLE3",
         disable_overlap_schedule=True,
         enable_multi_layer_eagle=False,
+        scheduler_recv_interval=1,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

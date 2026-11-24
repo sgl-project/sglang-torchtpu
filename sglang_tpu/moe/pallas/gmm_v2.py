@@ -36,6 +36,13 @@ from sglang_tpu.envs import envs
 _FP32_MOE_SCALES = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()
 
 
+def _block_scale(ref, b_id: int):
+    """[1, tn] scales of quant block b_id from a [blocks, 1, tn] or 3-D [blocks, tn] block."""
+    if len(ref.shape) == 2:
+        return ref[pl.ds(b_id, 1), :]
+    return ref[..., b_id, :, :]
+
+
 def _scale_quantized_partial(partial, lhs_scale, rhs_scale, *, scales_dtype):
     """Apply scales without changing dot-result rounding or accumulator dtype."""
     scaled = partial.astype(scales_dtype) * lhs_scale.astype(scales_dtype)
@@ -111,8 +118,11 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
         case "silu_and_mul_clamp":
             return silu_and_mul_clamp(acc_gate, acc_up)
         case str() if fuse_act.startswith("silu_and_mul_clamp:"):
-            _, limit = fuse_act.split(":")
-            return silu_and_mul_clamp(acc_gate, acc_up, limit=float(limit))
+            limit = float(fuse_act.split(":")[1])
+            # SiLU in f32 whatever the accumulator dtype, as moe_stream does.
+            gate = jnp.minimum(acc_gate, limit)
+            up = jnp.clip(acc_up, -limit, limit)
+            return (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(acc.dtype)
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
@@ -168,7 +178,7 @@ class WeightsRef:
 
     def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
-        s = self.scale[..., b_id, :, :]
+        s = _block_scale(self.scale, b_id)
         if scale_block_n != 1:
             s = jnp.repeat(s, scale_block_n, axis=-1)
         return s
@@ -210,8 +220,8 @@ class FusedWeightsRef:
 
     def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
-        s = self.gate.scale[..., b_id, :, :]
-        s_up = self.up.scale[..., b_id, :, :]
+        s = _block_scale(self.gate.scale, b_id)
+        s_up = _block_scale(self.up.scale, b_id)
         if scale_block_n != 1:
             s = jnp.repeat(s, scale_block_n, axis=-1)
             s_up = jnp.repeat(s_up, scale_block_n, axis=-1)
@@ -307,6 +317,12 @@ class InputConfigs:
     scale_dtype: jnp.dtype | None = None
     dequantize_in_vmem: bool = False
     requantize_in_vmem: bool = False
+    # lhs only: one quantization scale per row over the whole tile_k; each rhs block's partial
+    # then takes only its rhs scale, and the row scale multiplies once per tile.
+    row_scale: bool = False
+    # rhs_scale given as [G, num_blocks, N] instead of [G, num_blocks, 1, N]: a caller holding
+    # 3-D scales then skips the unit-dim relayout copy (it pads each (1, N) tile 8x).
+    scale_3d: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,6 +396,10 @@ class IndexMaps:
         b_tile_id = b_id // self.cfgs.num_quant_blocks_per_tile_k
         return (group_id, b_tile_id, 0, offset + n_id)
 
+    def rhs_scale_index_map_3d(self, n_id, gm_id, k_id, *, offset: int = 0):
+        g, b, _, n = self.rhs_scale_index_map(n_id, gm_id, k_id, offset=offset)
+        return (g, b, n)
+
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -422,15 +442,21 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
             scale_tile_n = 128
         else:
             scale_tile_n = pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n)
-        rhs_scale_spec = pl.BlockSpec(
-            (
-                None,
-                cfgs.num_quant_blocks_per_tile_k,
-                1,
-                scale_tile_n,
-            ),
-            index_map.rhs_scale_index_map,
-        )
+        if cfgs.rhs_cfgs.scale_3d:
+            rhs_scale_spec = pl.BlockSpec(
+                (None, cfgs.num_quant_blocks_per_tile_k, scale_tile_n),
+                index_map.rhs_scale_index_map_3d,
+            )
+        else:
+            rhs_scale_spec = pl.BlockSpec(
+                (
+                    None,
+                    cfgs.num_quant_blocks_per_tile_k,
+                    1,
+                    scale_tile_n,
+                ),
+                index_map.rhs_scale_index_map,
+            )
 
     rhs_block_spec = WeightsRef(
         weight=rhs_weight_spec,
@@ -612,15 +638,38 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_cols = tiled_rhs.shape[1]
+            row_scale = cfgs.lhs_cfgs.row_scale
+            k_step = q_block_size
+            scales_dtype = jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
+            if row_scale:
+                # one scale per row over the tile's K: partials need only their rhs scale
+                row_abs_max = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True)
+                row_s = row_abs_max / dtype_max
+                row_s_inv = jnp.where(row_s == 0, 0, 1 / row_s)
+                lhs_q_all = (tiled_lhs * row_s_inv).astype(lhs_q_dtype)
+                k_step = cfgs.rhs_cfgs.quant_block_size
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
                 col_size = end_n - start_n
 
                 acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                for start_k in range(0, cfgs.tiles.tile_k, k_step):
+                    end_k = min(cfgs.tiles.tile_k, start_k + k_step)
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+                    if row_scale:
+                        block_acc = jnp.matmul(
+                            lhs_q_all[:, start_k:end_k],
+                            block_rhs,
+                            preferred_element_type=preferred_element_type,
+                        ).astype(acc_ref.dtype)
+                        b_id = start_k // cfgs.rhs_cfgs.quant_block_size
+                        rs = tiled_rhs_ref.get_scale(b_id, cfgs.rhs_cfgs.scale_block_n)
+                        acc_n += (
+                            block_acc.astype(scales_dtype)
+                            * rs[..., start_n:end_n].astype(scales_dtype)
+                        ).astype(acc_ref.dtype)
+                        continue
+                    block_lhs = tiled_lhs[:, start_k:end_k]
 
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
@@ -654,10 +703,12 @@ def inner_kernel(
                         block_acc,
                         block_scale,
                         rhs_scale,
-                        scales_dtype=(
-                            jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
-                        ),
+                        scales_dtype=scales_dtype,
                     )
+                if row_scale:
+                    acc_n = (
+                        acc_n.astype(scales_dtype) * row_s.astype(scales_dtype)
+                    ).astype(acc_ref.dtype)
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
 
@@ -1316,8 +1367,11 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape[:3] == (size_group, num_quant_blocks, 1)
-        assert size_n % rhs_scale.shape[3] == 0
+        if rhs_scale.ndim == 3:
+            assert rhs_scale.shape[:2] == (size_group, num_quant_blocks)
+        else:
+            assert rhs_scale.shape[:3] == (size_group, num_quant_blocks, 1)
+        assert size_n % rhs_scale.shape[-1] == 0
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
@@ -1418,6 +1472,7 @@ def make_gmm_configs(
     rhs_quant_dtype: jnp.dtype | None = None,
     dequantize_rhs: bool = False,
     requantize_rhs: bool = False,
+    lhs_scale_per_row: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1441,12 +1496,12 @@ def make_gmm_configs(
         elif rhs_quant_dtype is None:
             rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
-        scale_size_n = rhs_scale.shape[3]
+        scale_size_n = rhs_scale.shape[-1]
         block_size = dims.size_k // num_blocks
-        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+        if rhs_scale.shape[-1] != rhs.shape[2] and rhs_scale.shape[-1] % 128 == 0:
             scale_block_n = 128
         else:
-            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+            scale_block_n = rhs.shape[2] // rhs_scale.shape[-1]
         if fuse_act is not None:
             assert dims.size_n % scale_block_n == 0, (
                 f"fused activation requires the gate/up boundary "
@@ -1494,7 +1549,10 @@ def make_gmm_configs(
         scale_dtype=rhs_scale.dtype if has_scale else None,
         dequantize_in_vmem=dequantize_rhs,
         requantize_in_vmem=requantize_rhs,
+        scale_3d=has_scale and rhs_scale.ndim == 3,
     )
+    if requantize_rhs and has_scale and rhs_scale.ndim == 3:
+        raise ValueError("requantize_in_vmem reads [G, blocks, 1, N] scales; got 3-D")
 
     if requantize_rhs:
         if dequantize_rhs or packed_fp4:
@@ -1551,7 +1609,15 @@ def make_gmm_configs(
             "Packed FP4 GMM requires TPU FP8 activation quantization support."
         )
 
-    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
+    row_scale = lhs_scale_per_row and lhs_q_dtype is not None and not requantize_rhs
+    if row_scale and rhs_scale is None:
+        raise ValueError("lhs_scale_per_row needs a block-scaled rhs (rhs_scale)")
+    if (
+        lhs_q_dtype is not None
+        and num_blocks > 1
+        and not requantize_rhs
+        and not row_scale
+    ):
         lhs_quant_block_size = min(lhs_quant_block_size, block_size)
 
     lhs_cfgs = InputConfigs(
@@ -1560,13 +1626,19 @@ def make_gmm_configs(
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
-        quant_block_size=lhs_quant_block_size,
+        quant_block_size=dims.size_k if row_scale else lhs_quant_block_size,
         dtype=lhs.dtype,
+        row_scale=row_scale,
     )
     # For block quantization (num_blocks > 1), rhs block size must be a
     # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
     # is always safe because a single scale covers the full contracting dim.
-    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
+    if (
+        lhs_q_dtype is not None
+        and num_blocks > 1
+        and not requantize_rhs
+        and not row_scale
+    ):
         assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
             "Unsupported quantization configuration: rhs_quant_block_size must "
             "be a multiple of lhs_quant_block_size for block quantization. Got "
@@ -1667,6 +1739,7 @@ def get_metadata(cfgs: GmmConfigs):
         "packed_fp4",
         "rhs_quant_dtype",
         "dequantize_rhs",
+        "lhs_scale_per_row",
     ]
 )
 def gmm_v2(
@@ -1689,6 +1762,7 @@ def gmm_v2(
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
     dequantize_rhs: bool = False,
     rhs_channel_scale: jax.Array | None = None,
+    lhs_scale_per_row: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1700,12 +1774,16 @@ def gmm_v2(
         lhs: lhs with shape [size_m, size_k].
         rhs: rhs with shape [size_group, size_k, size_n].
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
-        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
+        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size], or 3-D
+            [size_group, num_blocks, out_size] (no relayout copy of the unit dim).
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         rhs_channel_scale: Opt-in INT4-to-FP8 compute. Per-channel multipliers
             [size_group, 1, out_size]; rhs_scale must contain FP32 group-32 scales
             divided by these multipliers. Additive rhs_bias is unsupported in
             this mode. Weights stay packed INT4 in HBM.
+        lhs_scale_per_row: Optional. Quantize lhs with one scale per row over each K tile
+            instead of per 512 columns: each rhs block's partial then takes only its rhs scale
+            and the row scale multiplies once per tile (fewer VALU ops on block-scaled rhs).
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
@@ -1759,6 +1837,7 @@ def gmm_v2(
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_rhs,
         requantize_rhs=requantize_rhs,
+        lhs_scale_per_row=lhs_scale_per_row,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

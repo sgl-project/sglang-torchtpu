@@ -172,7 +172,7 @@ class TpuMambaPool(MambaPool):
             self.window_start = None
             state_slots = size + 1
             self.checkpoint_read_offsets = None
-        if enable_linear_replayssm:
+        if enable_linear_replayssm or kwargs.get("enable_linear_replayssm_spec"):
             raise NotImplementedError(
                 "GDN ReplaySSM ring buffers are not supported on the TPU GDN "
                 "state pool yet."
@@ -217,6 +217,7 @@ class TpuMambaPool(MambaPool):
         self.replayssm_spec_fold = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
+        self.replayssm_request_ring = False
 
         # ssm (recurrent) fp32 is NOT a TPU-specific choice: mainline defaults
         # the ssm state to fp32 too (mamba_utils.get_mamba2_state_dtype), since

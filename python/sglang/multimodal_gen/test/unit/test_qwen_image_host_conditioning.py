@@ -2,7 +2,7 @@
 
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -75,6 +75,9 @@ class TestQwenImageHostConditioning(unittest.TestCase):
                 video_token_id=8,
                 vision_start_token_id=6,
             )
+        )
+        model._get_text_rope_index = MethodType(
+            Qwen2_5_VLModel._get_text_rope_index, model
         )
         inputs = {"input_ids": torch.arange(10).view(2, 5), "attention_mask": _MASK}
         want, _ = Qwen2_5_VLModel.get_rope_index(

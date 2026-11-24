@@ -137,6 +137,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
     pipe = RaidenPoolTransfer.__new__(RaidenPoolTransfer)
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
+        _drain_lock=threading.Lock(),
         _aborted={},
         _norm_req_id=lambda value: value.removeprefix("resharded_transfer_"),
         _require_frames=Mock(),
@@ -793,6 +794,7 @@ class TestPipelineLifetimes(unittest.TestCase):
                 manager._pipeline_init_lock = threading.Lock()
                 manager._pipeline = pipe
                 manager._state_lock = threading.Lock()
+                manager._drain_lock = threading.Lock()
                 manager._status_lock = threading.Lock()
                 manager._aborted = {}
                 manager._failed = set()

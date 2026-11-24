@@ -31,6 +31,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         fp8_direct_write: bool = False,
         layers: int = 1,
         skewed_routing: bool = False,
+        invalid_ids: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[4]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
@@ -41,6 +42,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
                 "--layers",
                 str(layers),
                 *(["--skewed-routing"] if skewed_routing else []),
+                *(["--invalid-ids"] if invalid_ids else []),
             ]
         )
         command = "\n".join(
@@ -103,14 +105,19 @@ class TestFp8FusedRsKernel(CustomTestCase):
             result.stdout.count(f"skewed_routing={skewed_routing}"),
             8,
         )
+        self.assertEqual(result.stdout.count(f"invalid_ids={invalid_ids}"), 8)
 
     def test_compiled_tp8_kernel_matches_reference(self):
+        """Also feeds expert ids >= 8: they must count as weight 0, not hang the kernel."""
         # Every other case runs with post_expert_norm=False.
         for post_expert_norm in sweep((False, True), (True,)):
             with self.subTest(post_expert_norm=post_expert_norm):
                 # Exercise the M=2048 boundary used by Qwen3 at 256 tokens.
                 self._run_compiled_tp8_kernel(
-                    post_expert_norm=post_expert_norm, tokens=256, topk=8
+                    post_expert_norm=post_expert_norm,
+                    tokens=256,
+                    topk=8,
+                    invalid_ids=True,
                 )
 
     @unittest.skipUnless(full_matrix(), "block512 and direct-write pad rows too")
