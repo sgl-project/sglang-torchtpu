@@ -1732,7 +1732,12 @@ def pallas_fused_b1_b2_wpool_quant(
             for m0 in range(0, bm, 32):
                 inv_m = inv_fp8[m0 : m0 + 32, :]
                 q_parts = [
-                    (u_scratch_ref[m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048] * inv_m)
+                    jnp.clip(
+                        u_scratch_ref[m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048]
+                        * inv_m,
+                        -448.0,
+                        448.0,
+                    )
                     .astype(jnp.float8_e4m3fn)
                     .reshape(32, 16, LANE)
                     for kh in range(he_dim // 2048)

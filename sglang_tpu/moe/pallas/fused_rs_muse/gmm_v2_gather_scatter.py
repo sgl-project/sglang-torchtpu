@@ -608,9 +608,13 @@ def inner_kernel(
                 amax_bf16 = jnp.max(jnp.abs(block_bf16), axis=axis, keepdims=True)
             amax_f32 = amax_bf16.astype(jnp.float32)
             inv_scale_bf16 = jnp.where(
-                amax_f32 == 0, jnp.zeros_like(amax_f32), dtype_max / amax_f32
+                amax_f32 == 0,
+                jnp.zeros_like(amax_f32),
+                dtype_max / jnp.maximum(amax_f32, jnp.float32(1e-30)),
             ).astype(jnp.bfloat16)
-            block_q = (block_bf16 * inv_scale_bf16).astype(quant_dtype)
+            block_q = jnp.clip(
+                block_bf16 * inv_scale_bf16, -dtype_max, dtype_max
+            ).astype(quant_dtype)
             block_scale = jnp.where(
                 amax_f32 == 0, jnp.zeros_like(amax_f32), amax_f32 * (1.0 / dtype_max)
             )
@@ -790,7 +794,7 @@ def inner_kernel(
                                 _inv_m = jnp.where(
                                     _amax_m == 0,
                                     jnp.zeros_like(_amax_m),
-                                    _dt_max / _amax_m,
+                                    _dt_max / jnp.maximum(_amax_m, jnp.float32(1e-30)),
                                 ).astype(jnp.bfloat16)
                                 _sc_m = jnp.where(
                                     _amax_m == 0,
@@ -827,7 +831,7 @@ def inner_kernel(
                             _inv_m = jnp.where(
                                 _amax_m == 0,
                                 jnp.zeros_like(_amax_m),
-                                _dt_max / _amax_m,
+                                _dt_max / jnp.maximum(_amax_m, jnp.float32(1e-30)),
                             ).astype(jnp.bfloat16)
                             _sc_m = jnp.where(
                                 _amax_m == 0,
@@ -869,7 +873,7 @@ def inner_kernel(
                     _otf_inv_scale_bf16 = jnp.where(
                         _amax_f32 == 0,
                         jnp.zeros_like(_amax_f32),
-                        _dt_max / _amax_f32,
+                        _dt_max / jnp.maximum(_amax_f32, jnp.float32(1e-30)),
                     ).astype(jnp.bfloat16)
                     _sc_f32 = jnp.where(
                         _amax_f32 == 0,

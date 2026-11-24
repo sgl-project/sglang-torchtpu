@@ -693,7 +693,9 @@ def run_eo3_expert_batch(
                 inv_rms_s = (
                     jax.lax.rsqrt(var + 1e-8) * jnp.float32(static_fp8_rs_scale)
                 ).astype(out_dtype)
-                raw_out = (y_bf16 * inv_rms_s).astype(jnp.float8_e4m3fn)
+                raw_out = jnp.clip(y_bf16 * inv_rms_s, -448.0, 448.0).astype(
+                    jnp.float8_e4m3fn
+                )
             else:
                 raw_out = y_bf16 * jax.lax.rsqrt(var + 1e-8).astype(out_dtype)
         else:

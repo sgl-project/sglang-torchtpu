@@ -3662,5 +3662,135 @@ def test_w9_cand6_wla1_qb512_nan_interpret_and_lowering():
         assert "-wla1" in hlo and "-pql4" in hlo and "-g2a6" in hlo
 
 
+def test_w9_cand6_fp8_clip_max_scale_and_subnormal_nan_free():
+    """Verify clamped dynamic FP8 casts produce 0 NaNs/Infs on max-scale & subnormal+zero inputs."""
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _quant_lhs_fp8_block,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+        quantize_2d_lhs_tile_to_fp8,
+        quantize_3d_lhs_tile_to_fp8,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b2 import (
+        pallas_fused_b1_b2_wpool_quant,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _convert_both_halves_fp8_gmm_layout,
+    )
+
+    real_pallas_call = pl.pallas_call
+
+    def _interpret_pallas(*args, **kwargs):
+        if kwargs.get("interpret") is None or isinstance(kwargs.get("interpret"), bool):
+            kwargs["interpret"] = pltpu.InterpretParams(
+                detect_races=False,
+                uninitialized_memory="nan",
+                dma_execution_mode="eager",
+            )
+        return real_pallas_call(*args, **kwargs)
+
+    # 1. Pure-JAX _quant_lhs_fp8_block on max-scale, subnormal+zero, and zero rows:
+    x_edge_np = np.zeros((32, 4096), dtype=np.float32)
+    x_edge_np[0, :] = 1e35  # max-scale bf16
+    x_edge_np[1, :10] = 1e-37  # subnormal/tiny bf16 mixed with 0.0 -> would +Inf * 0.0 = NaN unguarded
+    x_edge_np[2, 0] = -1e35
+    x_edge_j = jnp.asarray(x_edge_np, jnp.bfloat16)
+    q_blk, sc_blk = _quant_lhs_fp8_block(x_edge_j)
+    q_blk_f32 = np.asarray(q_blk.astype(jnp.float32))
+    assert np.isfinite(q_blk_f32).all() and np.isfinite(np.asarray(sc_blk)).all()
+    assert np.max(np.abs(q_blk_f32)) <= 448.0
+
+    with patch.object(pl, "pallas_call", _interpret_pallas):
+        # 2. _convert_both_halves_fp8_gmm_layout (pipeline.py) with max-scale & tiny-scale int8 rows:
+        ep_sz, half_tok, h_dim = 2, 128, 512
+        i8_0 = np.zeros((ep_sz, half_tok, h_dim), dtype=np.int8)
+        i8_0[0, 0, :64] = 127
+        i8_0[0, 1, 0] = 1
+        i8_0[0, 2, :] = -127
+        i8_1 = i8_0.copy()
+        sc_0 = np.ones((ep_sz, half_tok), dtype=np.float32)
+        sc_0[0, 0] = 1e34  # max-scale bf16
+        sc_0[0, 1] = 1e-37  # subnormal+zero edge
+        sc_0[0, 2] = 65504.0
+        sc_0[0, 3] = 0.0
+        sc_1 = sc_0.copy()
+        fp8_out, sc_out = _convert_both_halves_fp8_gmm_layout(
+            jnp.asarray(i8_0, jnp.int8),
+            jnp.asarray(sc_0, jnp.bfloat16),
+            jnp.asarray(i8_1, jnp.int8),
+            jnp.asarray(sc_1, jnp.bfloat16),
+        )
+        fp8_f32 = np.asarray(fp8_out.astype(jnp.float32))
+        assert np.isfinite(fp8_f32).all() and np.isfinite(np.asarray(sc_out)).all()
+        assert np.max(np.abs(fp8_f32)) <= 448.0
+
+        # 3. quantize_3d_lhs_tile_to_fp8 & quantize_2d_lhs_tile_to_fp8 (prefill_gmm_opts.py):
+        x_tile_3d = jnp.asarray(x_edge_np.reshape(32, 4096 // 128, 128), jnp.bfloat16)
+        x_tile_2d = jnp.asarray(x_edge_np, jnp.bfloat16)
+
+        def _run_pq_helpers(in3d, in2d):
+            def _k(r3, r2, out3, out2, s3, s2):
+                quantize_3d_lhs_tile_to_fp8(r3, out3, s3, tile_m=32, tile_k=4096)
+                quantize_2d_lhs_tile_to_fp8(r2, out2, s2, tile_m=32, tile_k=4096)
+
+            return pl.pallas_call(
+                _k,
+                out_shape=(
+                    jax.ShapeDtypeStruct((32, 4096), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((32, 4096), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((32, 128), jnp.float32),
+                    jax.ShapeDtypeStruct((32, 128), jnp.float32),
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                    out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+                ),
+                name="test_pq_clip",
+            )(in3d, in2d)
+
+        o3, o2, s3, s2 = _run_pq_helpers(x_tile_3d, x_tile_2d)
+        for arr in (o3, o2):
+            af = np.asarray(arr.astype(jnp.float32))
+            assert np.isfinite(af).all() and np.max(np.abs(af)) <= 448.0
+        assert np.isfinite(np.asarray(s3)).all() and np.isfinite(np.asarray(s2)).all()
+
+        # 4. pallas_fused_b1_b2_wpool_quant(..., emit_fp8_gmm=True) (kernel_b2.py):
+        bm, H_b, HE_b, E_b = 128, 8192, 4096, 256
+        a_b = np.zeros((bm, H_b), dtype=np.float32)
+        s_b = np.zeros((bm, H_b), dtype=np.float32)
+        a_b[0, :64] = 1e35
+        a_b[1, 0] = 1e-37
+        s_b[2, :] = 65504.0
+        pe_w = np.zeros((HE_b,), dtype=np.float32)
+        pe_w[0] = 1e34  # force post-pre_expert_norm u_scratch_ref into max-scale bf16
+        fp8_b2, sc_b2, *_ = pallas_fused_b1_b2_wpool_quant(
+            jnp.asarray(a_b, jnp.bfloat16),
+            jnp.asarray(s_b, jnp.float32),
+            jnp.ones((H_b,), jnp.float32),
+            jnp.ones((H_b,), jnp.float32),
+            jnp.zeros((H_b,), jnp.bfloat16),
+            jnp.zeros((H_b, E_b), jnp.float32),
+            jnp.zeros((E_b,), jnp.float32),
+            jnp.ones((H_b, HE_b), jnp.float8_e4m3fn),
+            jnp.ones((HE_b,), jnp.float32),
+            jnp.asarray(pe_w, jnp.bfloat16),
+            router_mode="bf16_hilo",
+            emit_fp8_gmm=True,
+        )
+        fp8_b2_f32 = np.asarray(fp8_b2.astype(jnp.float32))
+        assert np.isfinite(fp8_b2_f32).all() and np.isfinite(np.asarray(sc_b2)).all()
+        assert np.max(np.abs(fp8_b2_f32)) <= 448.0
+
+
+
 
 

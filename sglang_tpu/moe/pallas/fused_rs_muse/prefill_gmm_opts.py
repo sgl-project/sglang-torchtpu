@@ -1228,7 +1228,11 @@ def expand_fp4_strip_to_scaled_fp8(
 
     col_max = jnp.max(jnp.abs(s_all), axis=0, keepdims=True)
     col_c = col_max * jnp.float32(_FP4_MAX / _FP8_E4M3_MAX)
-    inv_col_c = jnp.where(col_c == 0.0, jnp.zeros_like(col_c), jnp.float32(1.0) / col_c)
+    inv_col_c = jnp.where(
+        col_c == 0.0,
+        jnp.zeros_like(col_c),
+        jnp.float32(1.0) / jnp.maximum(col_c, jnp.float32(1e-30)),
+    )
     rel_s_bf16 = (s_all * inv_col_c).astype(jnp.bfloat16)
 
     k_chunk = 256 if rhs_qbs >= 256 else 64
@@ -1248,9 +1252,9 @@ def expand_fp4_strip_to_scaled_fp8(
             w_scaled = (
                 w_bf16.reshape(groups_per_chunk, rhs_qbs, col_size) * s_grp[:, None, :]
             ).reshape(k_chunk, col_size)
-        w_strip_fp8_ref[pl.ds(rk0, k_chunk), pl.ds(0, col_size)] = w_scaled.astype(
-            jnp.float8_e4m3fn
-        )
+        w_strip_fp8_ref[pl.ds(rk0, k_chunk), pl.ds(0, col_size)] = jnp.clip(
+            w_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        ).astype(jnp.float8_e4m3fn)
 
     return col_c
 
@@ -1343,7 +1347,7 @@ def quantize_3d_lhs_tile_to_fp8(
             inv_m = jnp.where(
                 amax_m == 0.0,
                 jnp.zeros_like(amax_m),
-                jnp.float32(_FP8_E4M3_MAX) / amax_m,
+                jnp.float32(_FP8_E4M3_MAX) / jnp.maximum(amax_m, jnp.float32(1e-30)),
             ).astype(jnp.bfloat16)
             sc_m = jnp.where(
                 amax_m == 0.0,
@@ -1366,15 +1370,17 @@ def quantize_3d_lhs_tile_to_fp8(
             jnp.float32
         )
         inv_m = jnp.where(
-            amax_m == 0.0, jnp.zeros_like(amax_m), jnp.float32(_FP8_E4M3_MAX) / amax_m
+            amax_m == 0.0,
+            jnp.zeros_like(amax_m),
+            jnp.float32(_FP8_E4M3_MAX) / jnp.maximum(amax_m, jnp.float32(1e-30)),
         ).astype(jnp.bfloat16)
         sc_m = jnp.where(
             amax_m == 0.0,
             jnp.zeros_like(amax_m),
             amax_m * jnp.float32(1.0 / _FP8_E4M3_MAX),
         )
-        dst_fp8_ref[pl.ds(m0, m_ch), pl.ds(0, tile_k)] = (
-            blk.reshape(m_ch, tile_k) * inv_m
+        dst_fp8_ref[pl.ds(m0, m_ch), pl.ds(0, tile_k)] = jnp.clip(
+            blk.reshape(m_ch, tile_k) * inv_m, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
         ).astype(jnp.float8_e4m3fn)
         _write_scale(m0, m_ch, sc_m)
 
@@ -1398,7 +1404,9 @@ def quantize_2d_lhs_tile_to_fp8(
         lmax_bf16 = m128 if lmax_bf16 is None else jnp.maximum(lmax_bf16, m128)
     amax_f32 = jnp.max(lmax_bf16, axis=1, keepdims=True).astype(jnp.float32)
     inv_sc = jnp.where(
-        amax_f32 == 0.0, jnp.zeros_like(amax_f32), jnp.float32(_FP8_E4M3_MAX) / amax_f32
+        amax_f32 == 0.0,
+        jnp.zeros_like(amax_f32),
+        jnp.float32(_FP8_E4M3_MAX) / jnp.maximum(amax_f32, jnp.float32(1e-30)),
     ).astype(jnp.bfloat16)
     sc_f32 = jnp.where(
         amax_f32 == 0.0,
@@ -1410,9 +1418,9 @@ def quantize_2d_lhs_tile_to_fp8(
     )
     for k0 in range(0, tile_k, 256):
         b2 = lhs_2d_ref[pl.ds(0, tile_m), pl.ds(k0, 256)].astype(jnp.bfloat16)
-        dst_fp8_ref[pl.ds(0, tile_m), pl.ds(k0, 256)] = (b2 * inv_sc).astype(
-            jnp.float8_e4m3fn
-        )
+        dst_fp8_ref[pl.ds(0, tile_m), pl.ds(k0, 256)] = jnp.clip(
+            b2 * inv_sc, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        ).astype(jnp.float8_e4m3fn)
 
 
 def compute_pair_gmm1_n_tile_strip_major(

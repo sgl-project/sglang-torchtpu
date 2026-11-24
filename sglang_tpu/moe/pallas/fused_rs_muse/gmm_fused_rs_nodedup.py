@@ -100,10 +100,12 @@ def _quant_lhs_fp8_block(x_bf16: jax.Array) -> tuple[jax.Array, jax.Array]:
         amax_f32 = jnp.max(lane_max, axis=1, keepdims=True).astype(jnp.float32)
     else:
         amax_f32 = jnp.max(jnp.abs(x_bf16), axis=1, keepdims=True).astype(jnp.float32)
-    inv_sc = jnp.where(amax_f32 == 0.0, 0.0, jnp.float32(448.0) / amax_f32).astype(
-        jnp.bfloat16
-    )
-    x_fp8 = (x_bf16 * inv_sc).astype(jnp.float8_e4m3fn)
+    inv_sc = jnp.where(
+        amax_f32 == 0.0,
+        0.0,
+        jnp.float32(448.0) / jnp.maximum(amax_f32, jnp.float32(1e-30)),
+    ).astype(jnp.bfloat16)
+    x_fp8 = jnp.clip(x_bf16 * inv_sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
     x_sc = jnp.where(amax_f32 == 0.0, 0.0, amax_f32 * jnp.float32(1.0 / 448.0))
     return x_fp8, x_sc
 
@@ -2546,7 +2548,9 @@ def kernel_main_fused_rs(
                 inv_rms_s = (
                     jax.lax.rsqrt(var + 1e-8) * jnp.float32(static_fp8_rs_scale)
                 ).astype(out_dtype)
-                raw_out = (y_bf16 * inv_rms_s).astype(jnp.float8_e4m3fn)
+                raw_out = jnp.clip(y_bf16 * inv_rms_s, -448.0, 448.0).astype(
+                    jnp.float8_e4m3fn
+                )
             else:
                 raw_out = y_bf16 * jax.lax.rsqrt(var + 1e-8).astype(out_dtype)
         else:
@@ -2569,7 +2573,9 @@ def kernel_main_fused_rs(
                 inv_rms_s = (
                     jax.lax.rsqrt(var + 1e-8) * jnp.float32(static_fp8_rs_scale)
                 ).astype(out_dtype)
-                raw_out = (y_bf16 * inv_rms_s).astype(jnp.float8_e4m3fn)
+                raw_out = jnp.clip(y_bf16 * inv_rms_s, -448.0, 448.0).astype(
+                    jnp.float8_e4m3fn
+                )
             else:
                 raw_out = y_bf16 * jax.lax.rsqrt(var + 1e-8).astype(out_dtype)
         else:

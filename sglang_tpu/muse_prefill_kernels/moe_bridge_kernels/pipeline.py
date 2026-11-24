@@ -261,7 +261,9 @@ def _convert_both_halves_fp8_gmm_layout(
                 for c_blk in range(hidden_sz // 256):
                     c0, c1 = c_blk * 256, (c_blk + 1) * 256
                     val = i8_ref[0, r0:r1, c0:c1].astype(jnp.bfloat16) * sc_128x1
-                    q_fp8 = (val * inv_fp8).astype(jnp.float8_e4m3fn)
+                    q_fp8 = jnp.clip(val * inv_fp8, -448.0, 448.0).astype(
+                        jnp.float8_e4m3fn
+                    )
                     fp8_out_ref[0, half_idx, r0:r1, c0 // lane_w : c1 // lane_w, :] = (
                         q_fp8.reshape(lane_w, 2, lane_w)
                     )
