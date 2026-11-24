@@ -659,9 +659,11 @@ class TextEncodingStage(ConditionEncodingStage):
                 if attention_mask is not None:
                     encoder_forward_kwargs["attention_mask"] = attention_mask
                 if position_ids is not None:
-                    encoder_forward_kwargs["position_ids"] = position_ids.to(
-                        target_device
-                    )
+                    # same container as the other inputs, so it uploads like them
+                    encoder_forward_kwargs["position_ids"] = upload_without_sync(
+                        type(host_inputs)({"position_ids": position_ids}),
+                        target_device,
+                    )["position_ids"]
                 if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                     encoder_forward_kwargs["use_cache"] = False
                 self._begin_text_encoder_use(i)
