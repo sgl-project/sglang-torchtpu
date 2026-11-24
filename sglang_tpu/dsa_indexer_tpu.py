@@ -339,11 +339,11 @@ def indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
-    key, _ = indexer.wk(x)
-    key = indexer.k_norm(key)
+    key = _project_index_key(indexer, x)
 
     # Only the first rope_dim dimensions of each vector are rotated; a NoPE
-    # indexer (Kimi-K3.1) has no rotary embedding at all.
+    # indexer (Kimi-K3.1) has no rotary embedding at all. index_key mirrors
+    # this for the key alone; keep the two in step.
     if not indexer.skip_rope:
         rope_dim = indexer.rope_head_dim
         q_rope, k_rope = indexer.rotary_emb(
@@ -367,8 +367,34 @@ def indexer_forward(
         key=key,
         head_weights=head_weights,
         weight_scale=weight_scale,
-        key_store=_key_store_mode(indexer, x.shape[0]),
+        key_store=key_store_mode(indexer, x.shape[0]),
     )
+
+
+def _project_index_key(indexer: "Indexer", x: torch.Tensor) -> torch.Tensor:
+    """The indexer's key before rope, ``[num_tokens, index_head_dim]``."""
+    key, _ = indexer.wk(x)
+    return indexer.k_norm(key)
+
+
+def index_key(
+    indexer: "Indexer", *, x: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """The key ``indexer_forward`` stores for each token, without its query side.
+
+    For a writer that fills the index-key cache without scoring: same
+    projection, same rotary module and the same rotated columns, so the key
+    matches the one ``indexer_forward`` hands ``index_topk``.
+    """
+    key = _project_index_key(indexer, x)
+    if indexer.skip_rope:
+        return key
+    rope_dim = indexer.rope_head_dim
+    k_rope = key[..., :rope_dim]
+    # The rotary module ropes a query and a key in one call. A copy stands in
+    # for the query: aliasing the key would rotate it twice if rope is in place.
+    _, k_rope = indexer.rotary_emb(positions, k_rope.clone(), k_rope)
+    return torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
 
 
 # Batches up to this many tokens store their index keys with the Pallas
@@ -377,7 +403,7 @@ def indexer_forward(
 _PALLAS_KEY_STORE_MAX_TOKENS = 16
 
 
-def _key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
+def key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
     """The ``key_store`` of ``dsa_indexer_step`` for this layer and batch."""
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -388,6 +414,19 @@ def _key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
     ):
         return "xla"
     return "pallas"
+
+
+def pooled_index_key_and_gate(
+    indexer: "IndexerKPool", x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pooled indexer's raw record inputs: the key (no rope) and the
+    compression gate, each ``[num_tokens, index_head_dim]``.
+
+    ``kpool_indexer_forward`` stores them; any other writer of the pooled
+    caches must store the same.
+    """
+    gate = torch.nn.functional.linear(x, indexer.index_kpool_compress_gate)
+    return _project_index_key(indexer, x), gate
 
 
 def build_dsa_kpool_topk_op():
@@ -769,9 +808,7 @@ def kpool_indexer_forward(
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
-    key, _ = indexer.wk(x)
-    key = indexer.k_norm(key)
-    gate = torch.nn.functional.linear(x, indexer.index_kpool_compress_gate)
+    key, gate = pooled_index_key_and_gate(indexer, x)
     head_weights, _ = indexer.weights_proj(x.float())
     return backend.index_topk_kpool(
         forward_batch=forward_batch,

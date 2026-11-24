@@ -51,24 +51,15 @@ forward_tpu_dsv4_hash_topk_torch, forward_tpu_dsv4_hash_topk
        static-shape torch.where padded-token masking upstream.
 
 tpu_dsv4_silu_and_mul_clamp
-  Why: sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp dispatches to sgl_kernel
-       on XPU or a CUDA JIT kernel otherwise, which cannot compile or run on TPU.
-  How: AROUND sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp and
-       sglang.srt.models.deepseek_v2.silu_and_mul_clamp computes clamped SwiGLU
+  Why: sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp
+       dispatches to sgl_kernel on XPU or a CUDA JIT kernel otherwise, which
+       cannot compile or run on TPU.
+  How: AROUND sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp
+       and sglang.srt.models.deepseek_v2.silu_and_mul_clamp computes clamped SwiGLU
        in float32 PyTorch ops and copies the result into output.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
   Remove when: silu_and_mul_clamp is converted to a BaseFusedOp with a
        forward_native fallback.
-
-tpu_dsv4_current_mhc_post_fusion
-  Why: sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion reads a
-       ContextVar that causes a Dynamo graph break under torch.compile(fullgraph=True)
-       on TPU, and CUDA/HIP stream-overlap MHC post-fusion is unused on TPU.
-  How: AROUND sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion
-       returns None when torch.compiler.is_compiling().
-  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
-  Remove when: current_mhc_post_fusion is marked constant or skipped when
-       compiling without MHC post-fusion enabled.
 
 disable_tpu_dsv4_wo_a_fp8_gemm, get_tpu_dsv4_kernel_num_heads,
 skip_tpu_dsv4_prewarm_mhc_kernels
@@ -94,6 +85,18 @@ tpu_dsv4_get_last_loc
   How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
   Upstream PR or issue: not filed.
   Remove when: get_last_loc dispatches on the tensor device, not backend names.
+
+allow_tpu_dsv4_kv_pool
+  Why: sglang#35594 rejects an out-of-tree platform before
+       KVCacheConfigurator._build_dsv4_kv_pool, since get_kv_pool_cls has no
+       DeepSeek-V4 kind. TPU registers as out-of-tree and builds that pool in
+       build_tpu_dsv4_kv_pool, which the check never lets run.
+  How: AROUND KVCacheConfigurator._build_token_to_kv_pool lifts only the
+       "the DeepSeek-V4 KV pool" check for the call; every other subsystem the
+       builder guards still raises.
+  Upstream PR or issue: not filed.
+  Remove when: get_kv_pool_cls takes a DeepSeek-V4 kind and the TPU platform
+       supplies its pool through it.
 """
 
 from __future__ import annotations
@@ -102,6 +105,22 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
+
+# Must match the subsystem KVCacheConfigurator._build_token_to_kv_pool passes.
+_DSV4_POOL_SUBSYSTEM = "the DeepSeek-V4 KV pool"
+
+
+def allow_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+    reject = kvc_mod.reject_out_of_tree_path
+
+    def reject_except_dsv4_pool(platform, *, subsystem):
+        if subsystem != _DSV4_POOL_SUBSYSTEM:
+            reject(platform, subsystem=subsystem)
+
+    with patch.object(kvc_mod, "reject_out_of_tree_path", reject_except_dsv4_pool):
+        return original(kvc, *args, **kwargs)
 
 
 def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
@@ -112,8 +131,24 @@ def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
         pool = original(kvc, *args, **kwargs)
     req_to_token_pool = kwargs["req_to_token_pool"]
     if not kvc.is_draft_worker and not pool._unified_kv:
-        req_to_token_pool.register_on_alloc_rows(pool.clear_c4_req_states)
+        chain_on_alloc_rows(req_to_token_pool, pool.clear_c4_req_states)
     return pool
+
+
+def chain_on_alloc_rows(req_to_token_pool, hook) -> None:
+    """Run ``hook`` after the row-allocation hook the core pool build registered
+    (its C4 ring and request-window resets), if any: the pool takes one hook."""
+    core = req_to_token_pool._on_alloc_rows
+    if core is None:
+        req_to_token_pool.register_on_alloc_rows(hook)
+        return
+
+    def both(rows):
+        core(rows)
+        hook(rows)
+
+    req_to_token_pool._on_alloc_rows = None
+    req_to_token_pool.register_on_alloc_rows(both)
 
 
 def get_tpu_dsv4_bytes_per_swa_token(original, configurator) -> float:
@@ -191,7 +226,7 @@ def forward_tpu_dsv4_compressor(
 def forward_tpu_dsv4_hash_topk_torch(
     original, topk_layer, router_logits: torch.Tensor, input_ids: torch.Tensor
 ):
-    if topk_layer.num_fused_shared_experts == 1:
+    if topk_layer.num_shared_topk_slots == 1:
         topk_weights, topk_ids = original(topk_layer, router_logits, input_ids)
         return topk_weights.to(torch.float32), topk_ids
     from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
@@ -267,12 +302,6 @@ def tpu_dsv4_silu_and_mul_clamp(
         min=-limit, max=limit
     )
     output.copy_(res.to(output.dtype))
-
-
-def tpu_dsv4_current_mhc_post_fusion(original):
-    if torch.compiler.is_compiling():
-        return None
-    return original()
 
 
 def disable_tpu_dsv4_wo_a_fp8_gemm(original, quant_config) -> bool:
@@ -375,6 +404,11 @@ def hook_specs():
     dsv4 = "sglang.srt.models.deepseek_v4"
     return [
         (
+            f"{kvc}._build_token_to_kv_pool",
+            allow_tpu_dsv4_kv_pool,
+            HookType.AROUND,
+        ),
+        (
             f"{kvc}._build_dsv4_kv_pool",
             build_tpu_dsv4_kv_pool,
             HookType.AROUND,
@@ -420,18 +454,13 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp",
+            "sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp",
             tpu_dsv4_silu_and_mul_clamp,
             HookType.AROUND,
         ),
         (
             "sglang.srt.models.deepseek_v2.silu_and_mul_clamp",
             tpu_dsv4_silu_and_mul_clamp,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion",
-            tpu_dsv4_current_mhc_post_fusion,
             HookType.AROUND,
         ),
         (

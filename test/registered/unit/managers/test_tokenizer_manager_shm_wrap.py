@@ -75,6 +75,9 @@ class TestSendOneRequestShmWrap(CustomTestCase):
         tm._dispatch_to_scheduler = MagicMock()
         tm._mark_state_dispatched = MagicMock()
         tm.encoder_dispatch_ready = {}
+        tm.rid_to_state = {}
+        tm.positional_embeds_transport = MagicMock()
+        tm.canary_info_hook = None
         tokenized = MagicMock()
         off_loop = AsyncMock(side_effect=lambda obj, force=False: obj)
         with (

@@ -237,6 +237,12 @@ class _BatchedPenalizer(abc.ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot seed a token history")
 
+    def _vocab_tokens(self, tokens: list) -> list:
+        # A history can start with a multimodal pad value (MM_PAD_SHIFT_VALUE + hash),
+        # which has no column in the [rows, vocab_size] state; skip any id outside it.
+        vocab_size = self.orchestrator.vocab_size
+        return [t for t in tokens if 0 <= t < vocab_size]
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return

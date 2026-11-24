@@ -13,9 +13,14 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,6 +106,10 @@ def _prefill_manager():
     mgr._superseded_sender_reads = set()
     mgr._timeout_s = 120.0
     mgr._reshard_pushes_pending = {}
+    mgr._staging_outstanding = {}
+    mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_poisoned_rooms = set()
+    mgr.defer_decode_allocation = False
     mgr.attn_tp_rank = 0
     mgr._send_multipart_locked = Mock()
     mgr._message_handlers = {
@@ -727,6 +736,7 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=0),
             pending_bootstrap=True,
             time_stats=Mock(),
+            owner_list=None,
         )
 
     def _queue(self, reqs):
@@ -741,7 +751,8 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(page_size=32),
         )
         queue.ensure_metadata_buffer = Mock(return_value=True)
-        queue.queue = list(reqs)
+        queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
+        move(reqs, queue.queue)
         return queue
 
     def _pop(self, queue):
@@ -761,7 +772,7 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
                 ),
             ),
         ):
-            return queue.pop_bootstrapped()
+            return queue.move_bootstrapped(IndexedReqList(ListKind.WAITING))
 
     def test_only_the_decode_requested_request_is_released(self):
         mgr = _gate_manager()
@@ -773,13 +784,13 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
 
         mgr._dispatch(PullReq(OTHER_ROOM, "10.0.0.2", 5555, 2).to_frames())
         self.assertEqual(self._pop(queue), [second])
-        self.assertEqual(queue.queue, [first])
+        self.assertEqual(list(queue.queue), [first])
         self.assertTrue(first.pending_bootstrap)
         self.assertFalse(second.pending_bootstrap)
 
         mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 2).to_frames())
         self.assertEqual(self._pop(queue), [first])
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue), [])
         self.assertFalse(first.pending_bootstrap)
 
 
@@ -2027,6 +2038,7 @@ class TestNodeFailureSkipsClearedRooms(unittest.TestCase):
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {}
         mgr.prefill_info_table = {}
+        mgr.heartbeat_failures = {}
         mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
         mgr.request_status = {ROOM: KVPoll.Transferring}
         mgr.failure_records = {}

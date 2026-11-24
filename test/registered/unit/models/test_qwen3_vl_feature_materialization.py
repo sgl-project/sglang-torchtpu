@@ -7,18 +7,18 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
+)
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -73,7 +73,9 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 get_context().override_server_args(mm_enable_dp_encoder=True),
             ):
                 processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-                processor.mm_feature_transport = transport
+                processor._feature_transport = MultimodalFeatureTransport(
+                    transport, base_gpu_id=0, skip_mm_pool=True
+                )
                 processor.model_type = "qwen3_vl"
                 items = [
                     MultimodalDataItem(modality=Modality.IMAGE),
@@ -101,7 +103,9 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
     def test_processor_does_not_defer_cpu_transport(self):
         with get_context().override_server_args(mm_enable_dp_encoder=True):
             processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-            processor.mm_feature_transport = "cpu"
+            processor._feature_transport = MultimodalFeatureTransport(
+                "cpu", base_gpu_id=0, skip_mm_pool=True
+            )
             processor.model_type = "qwen3_vl"
             item = MultimodalDataItem(modality=Modality.IMAGE)
 
@@ -114,7 +118,9 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
     def test_processor_defers_cuda_ipc_for_single_tp_qwen3_vl(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-        processor.mm_feature_transport = "cuda_ipc"
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
         processor.model_type = "qwen3_vl"
         item = MultimodalDataItem(modality=Modality.IMAGE)
 
@@ -341,7 +347,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
                 self.assertIs(output, encoded)
                 items[0].reconstruct.assert_not_called()
-                items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
+                items[1].reconstruct.assert_called_once_with(0)
                 materialize.assert_called_once_with(
                     [items[1].feature],
                     device=visual.device,

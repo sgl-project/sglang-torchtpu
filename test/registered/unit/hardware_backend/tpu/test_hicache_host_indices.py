@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -38,6 +39,7 @@ def _controller(allocator, cls=TpuDMAHybridCacheController):
     controller = object.__new__(cls)
     controller.mem_pool_device_allocator = allocator
     controller.device = allocator.device
+    controller.kv_storage = None
     controller.load_queue = []
     return controller
 
@@ -109,6 +111,66 @@ class TestHiCacheHostIndices(CustomTestCase):
             (indices.numel(), indices.dtype, indices.device.type),
             (0, torch.int64, "meta"),
         )
+
+    def test_caller_owned_destinations_and_anchor_are_preserved(self):
+        controller = _controller(_allocator())
+        controller._alloc_load_kv_indices = Mock(side_effect=AssertionError)
+        controller.mem_pool_device_allocator.free = Mock(side_effect=AssertionError)
+        owned = torch.arange(4, 8, dtype=torch.int32)
+        anchor = torch.arange(12, 16, dtype=torch.int32)
+        host = torch.arange(4)
+        extra = [PoolTransfer(name=PoolName.SWA)]
+        controller._resolve_device_transfers = Mock(return_value=None)
+        self.assertIsNone(
+            controller.load(
+                host, extra_pools=extra, device_indices=owned, anchor_indices=anchor
+            )
+        )
+        self.assertFalse(controller.load_queue)
+        controller._resolve_device_transfers.assert_called_once_with(
+            extra, kv_device_indices=anchor, kv_host_indices=host
+        )
+        controller._resolve_device_transfers.return_value = extra
+        self.assertIs(
+            controller.load(
+                host, extra_pools=extra, device_indices=owned, anchor_indices=anchor
+            ),
+            owned,
+        )
+        self.assertIs(controller.load_queue[0].device_indices, owned)
+
+    def test_storage_owner_allocation_and_rollback_bypass_plain_hook(self):
+        controller = _controller(_allocator())
+        controller._alloc_load_kv_indices = Mock(side_effect=AssertionError)
+        owned = torch.arange(4, 8, dtype=torch.int32)
+        failed = torch.arange(8, 12, dtype=torch.int32)
+        take, give_back = Mock(side_effect=[owned, failed, None]), Mock()
+        controller.kv_storage = SimpleNamespace(
+            owner_load_alloc=Mock(return_value=(take, give_back))
+        )
+        self.assertIs(controller.load(torch.arange(4)), owned)
+        take.assert_called_once_with(4)
+        give_back.assert_not_called()
+        controller._resolve_device_transfers = Mock(return_value=None)
+        self.assertIsNone(
+            controller.load(
+                torch.arange(4), extra_pools=[PoolTransfer(name=PoolName.SWA)]
+            )
+        )
+        give_back.assert_called_once_with(failed)
+        self.assertIsNone(controller.load(torch.arange(4)))
+        give_back.assert_called_once_with(failed)
+        self.assertEqual(len(controller.load_queue), 1)
+
+    def test_page_interleave_keeps_cyclic_placement(self):
+        allocator = object.__new__(PageInterleavePoolAllocator)
+        allocator.device, allocator.page_size = "meta", 4
+        expected = torch.empty(8, dtype=torch.int32, device="meta")
+        allocator.alloc_cyclic = Mock(return_value=expected)
+        controller = _controller(allocator, HybridCacheController)
+        controller._alloc_load_kv_indices = Mock(side_effect=AssertionError)
+        self.assertIs(controller.load(torch.arange(20, 28)), expected)
+        allocator.alloc_cyclic.assert_called_once_with(start_class=5, need_size=8)
 
     def test_side_pool_and_wrapped_allocators_keep_old_contract(self):
         allocator = _allocator()

@@ -24,11 +24,12 @@ from torch import nn
 
 import sglang.kernels.fused_op as fo
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.sampling import OutputTopK
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
 _CUDA = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
@@ -38,18 +39,83 @@ _CPU = PlatformInfo()
 @pytest.fixture(autouse=True)
 def _reset_global_state():
     saved_oot = {k: dict(v) for k, v in BaseFusedOp._oot_forward_registry.items()}
+    saved_compile = {
+        k: dict(v) for k, v in BaseFusedOp._oot_compile_forward_registry.items()
+    }
     yield
     fo.set_fused_op_backend(None)
     fo.disable_fused_op_trace()
     fo.clear_fused_op_trace()
     BaseFusedOp._oot_forward_registry.clear()
     BaseFusedOp._oot_forward_registry.update(saved_oot)
+    BaseFusedOp._oot_compile_forward_registry.clear()
+    BaseFusedOp._oot_compile_forward_registry.update(saved_compile)
 
 
 def _mock_platform(monkeypatch, *, key="", info=_CPU, oot_key=None):
     monkeypatch.setattr(fo, "_platform_key", lambda: key)
     monkeypatch.setattr(fo, "_platform", lambda: info)
     monkeypatch.setattr(fo, "_oot_dispatch_key", lambda: oot_key)
+
+
+@pytest.fixture
+def _compiler_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
+class _OotTensorOp(BaseFusedOp):
+    """Return different tensor values to identify the selected implementation.
+
+    Plugin functions are defined outside this class, so the tests also check
+    that dispatch and compilation work without platform-specific methods.
+    """
+
+    op = "test.oot_tensor"
+
+    def __init__(self):
+        super().__init__()
+        self.offset = 1
+
+    def forward_native(self, x, *, scale=1):
+        return x * scale - self.offset
+
+
+class _KeepOotDispatch(_OotTensorOp):
+    def _torch_compile_forward(self, num_tokens):
+        return None
+
+
+def forward_myplat(self, x, *, scale=1):
+    return x * scale + self.offset
+
+
+def forward_myplat_compile(self, x, *, scale=1):
+    return x * scale + 2 * self.offset
+
+
+def forward_myplat_graph_break(self, x, *, scale=1):
+    y = x * scale
+    torch._dynamo.graph_break()
+    return y + 2 * self.offset
+
+
+class _OotModel(nn.Module):
+    def __init__(self, op):
+        super().__init__()
+        self.op = op
+
+    def forward(self, x):
+        return self.op(x, scale=2) * 3
+
+
+class _OotModelWithBreak(_OotModel):
+    def forward(self, x):
+        y = self.op(x, scale=2)
+        torch._dynamo.graph_break()
+        return y * 3
 
 
 class _AllPlatformsOp(BaseFusedOp):
@@ -74,6 +140,9 @@ class _AllPlatformsOp(BaseFusedOp):
 
     def forward_musa(self, x):
         return "musa"
+
+    def forward_mlu(self, x):
+        return "mlu"
 
     def forward_cpu(self, x):
         return "cpu"
@@ -154,6 +223,7 @@ def test_is_standard_nn_module(monkeypatch):
         ("npu", "npu"),
         ("xpu", "xpu"),
         ("musa", "musa"),
+        ("mlu", "mlu"),
         ("cpu", "cpu"),
         ("", "native"),
     ],
@@ -172,6 +242,7 @@ def test_platform_forward_dispatch(monkeypatch, key, expect):
         # NameError; ops opt in with an explicit forward_musa instead.
         ("musa", "native"),
         ("npu", "native"),  # no NPU path -> native
+        ("mlu", "native"),  # no MLU path -> native
         ("cpu", "native"),
         ("cuda", "cuda"),
     ],
@@ -268,22 +339,25 @@ def test_forced_global_falls_back_when_unimplemented(monkeypatch):
         op(torch.zeros(1), backend=KernelBackend.JIT)
 
 
-def test_forced_global_beats_platform_and_oot(monkeypatch):
-    _mock_platform(monkeypatch, key="", oot_key="myplat")
+@pytest.mark.parametrize("oot_key", [None, "cuda"])
+def test_forced_global_beats_platform_and_oot(monkeypatch, oot_key):
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA, oot_key=oot_key)
     BaseFusedOp.register_oot_forward(
-        _CudaOnlyPlatformOp, lambda self, x: "oot", "myplat"
+        _BackendAndPlatformOp, lambda self, x: "oot", "cuda"
     )
-    op = _CudaOnlyPlatformOp()
+    op = _BackendAndPlatformOp()
     fo.set_fused_op_backend(KernelBackend.TORCH)
     assert op(torch.zeros(1)) == "native"
     fo.set_fused_op_backend(None)
     assert op(torch.zeros(1)) == "oot"
+    assert op(torch.zeros(1), backend=KernelBackend.TORCH) == "native"
 
 
 # --- OOT platform overrides ----------------------------------------------------
 
 
-def test_oot_registered_forward_wins_over_method(monkeypatch):
+@pytest.mark.parametrize("oot_key", [None, "myplat"])
+def test_oot_registered_forward_wins_over_method(monkeypatch, oot_key):
     class _OotOp(BaseFusedOp):
         op = "test.oot"
 
@@ -293,18 +367,17 @@ def test_oot_registered_forward_wins_over_method(monkeypatch):
         def forward_myplat(self, x):
             return "method"
 
-    _mock_platform(monkeypatch, oot_key="myplat")
+    _mock_platform(monkeypatch, key="myplat", oot_key=oot_key)
     assert _OotOp()(torch.zeros(1)) == "method"  # forward_<key> lookup
 
     BaseFusedOp.register_oot_forward(_OotOp, lambda self, x: "registered", "myplat")
     assert _OotOp()(torch.zeros(1)) == "registered"  # registry beats method
 
 
-def test_oot_registration_is_exact_type(monkeypatch):
-    _mock_platform(monkeypatch, oot_key="myplat")
-    BaseFusedOp.register_oot_forward(
-        _CudaOnlyPlatformOp, lambda self, x: "oot", "myplat"
-    )
+@pytest.mark.parametrize("oot_key", [None, "cuda"])
+def test_oot_registration_is_exact_type(monkeypatch, oot_key):
+    _mock_platform(monkeypatch, key="cuda", oot_key=oot_key)
+    BaseFusedOp.register_oot_forward(_CudaOnlyPlatformOp, lambda self, x: "oot", "cuda")
 
     class _Sub(_CudaOnlyPlatformOp):
         pass
@@ -312,7 +385,32 @@ def test_oot_registration_is_exact_type(monkeypatch):
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == "oot"
     # Subclasses do not inherit the registered forward (pre-existing
     # MultiPlatformOp semantics: lookup is by exact type).
-    assert _Sub()(torch.zeros(1)) == "native"
+    assert _Sub()(torch.zeros(1)) == "cuda"
+
+
+@pytest.mark.parametrize("oot_key", [None, "myplat"])
+def test_output_topk_compiles_on_first_call_and_preserves_dispatch(
+    monkeypatch, oot_key
+):
+    _mock_platform(monkeypatch, key="myplat", oot_key=oot_key)
+    monkeypatch.setattr(fo, "_forced_backend", fo._UNRESOLVED)
+
+    def plugin_forward(op, values, k):
+        top_values, indices = values.topk(k, dim=-1)
+        return top_values + 1, indices
+
+    BaseFusedOp.register_oot_forward(OutputTopK, plugin_forward, "myplat")
+    op = OutputTopK()
+    values = torch.arange(17, dtype=torch.float32).reshape(1, -1)
+    expected = values.topk(3, dim=-1)
+    compiled = torch.compile(op, backend="eager", fullgraph=True)
+    actual = compiled(values, 3)
+    torch.testing.assert_close(actual[0], expected.values + 1)
+    torch.testing.assert_close(actual[1], expected.indices)
+    op.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(op(values, 3)[0], expected.values + 1)
+    op.leave_torch_compile()
+    torch.testing.assert_close(op(values, 3)[0], expected.values + 1)
 
 
 def test_oot_falls_back_to_native(monkeypatch):
@@ -325,7 +423,31 @@ def test_oot_registered_fn_is_bound(monkeypatch):
     BaseFusedOp.register_oot_forward(
         _CudaOnlyPlatformOp, lambda self, x: type(self).__name__, "myplat"
     )
+    fo.enable_fused_op_trace()
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == "_CudaOnlyPlatformOp"
+    assert fo.get_fused_op_trace()[0].backend == "<lambda>"
+
+
+def test_oot_registered_bound_method_receives_op_instance(monkeypatch, _compiler_state):
+    """A shared bound method uses the op's state in eager and compile modes."""
+    _mock_platform(monkeypatch, oot_key="myplat")
+    donor = _OotTensorOp()
+    donor.offset = 9
+    BaseFusedOp.register_oot_forward(_OotTensorOp, donor.forward_native, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, donor.forward_native, "myplat"
+    )
+    op = _OotTensorOp()
+    op.offset = 3
+    x = torch.tensor([1.0, 2.0])
+    torch.testing.assert_close(op(x), x - 3)
+    op.enter_torch_compile(num_tokens=1)
+    try:
+        compiled = torch.compile(_OotModel(op).forward, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(x), (x * 2 - 3) * 3)
+    finally:
+        op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x - 3)
 
 
 # --- dispatch caching + per-call gates ------------------------------------------
@@ -382,6 +504,243 @@ def test_backend_eligible_override_gates_per_call(monkeypatch):
 
 
 # --- torch.compile protocol -----------------------------------------------------
+
+
+@pytest.mark.parametrize("op_cls", [_OotTensorOp, _KeepOotDispatch])
+@pytest.mark.parametrize("warmed", [False, True])
+def test_oot_compile_registration_roundtrip(monkeypatch, op_cls, warmed):
+    """A registered compile function wins over the subclass selection method.
+
+    Leaving compile mode restores the previous eager function, including an
+    instance whose eager function had not yet been selected.
+    """
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(op_cls, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(op_cls, forward_myplat_compile, "myplat")
+    op = op_cls()
+    x = torch.tensor([1.0, 2.0, 3.0])
+    if warmed:
+        torch.testing.assert_close(op(x), x + 1)
+    for _ in range(2):
+        original = op._forward_method
+        op.enter_torch_compile(num_tokens=1)
+        assert op.is_torch_compile
+        torch.testing.assert_close(op(x, scale=2), x * 2 + 2)
+        op.enter_torch_compile(num_tokens=16)
+        torch.testing.assert_close(op(x, scale=2), x * 2 + 2)
+        op.leave_torch_compile()
+        assert not op.is_torch_compile
+        assert op._forward_method is original
+        op.leave_torch_compile()
+        torch.testing.assert_close(op(x), x + 1)
+
+
+def test_oot_compile_registration_is_exact_type(monkeypatch):
+    class _Sub(_OotTensorOp):
+        pass
+
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_compile, "myplat"
+    )
+    x = torch.tensor([1.0, 2.0])
+    parent, child = _OotTensorOp(), _Sub()
+    parent.enter_torch_compile(num_tokens=1)
+    child.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(parent(x), x + 2)
+    torch.testing.assert_close(child(x), x - 1)
+    child.leave_torch_compile()
+    # Compile-only registration is independent of eager registration.
+    _Sub.register_oot_compile_forward(_Sub, forward_myplat_compile, "myplat")
+    child.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(child(x), x + 2)
+    child.leave_torch_compile()
+    torch.testing.assert_close(child(x), x - 1)
+
+
+def test_in_tree_compile_ignores_oot_registry(monkeypatch):
+    _mock_platform(monkeypatch, key="cuda")
+    BaseFusedOp.register_oot_compile_forward(
+        _AllPlatformsOp, lambda self, x: "oot-compile", "cuda"
+    )
+    op = _AllPlatformsOp()
+    x = torch.zeros(1)
+    assert op(x) == "cuda"
+    op.enter_torch_compile(num_tokens=1)
+    assert op(x) == "native"
+    op.leave_torch_compile()
+    assert op(x) == "cuda"
+
+
+def test_oot_compile_registration_requires_active_key(monkeypatch):
+    _mock_platform(monkeypatch, oot_key="other")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_compile, "myplat"
+    )
+    op = _OotTensorOp()
+    x = torch.tensor([1.0, 2.0])
+    op.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(op(x), x - 1)
+    op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x - 1)
+
+
+@pytest.mark.parametrize("warmed", [False, True])
+def test_oot_eager_registration_preserves_compile_fallback(monkeypatch, warmed):
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    op = _OotTensorOp()
+    x = torch.tensor([1.0, 2.0])
+    if warmed:
+        torch.testing.assert_close(op(x), x + 1)
+    op.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(op(x), x - 1)
+    op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x + 1)
+
+
+def test_oot_compile_respects_explicit_and_forced_backends(monkeypatch):
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_compile, "myplat"
+    )
+    op = _OotTensorOp()
+    x = torch.tensor([1.0, 2.0])
+    op.enter_torch_compile(num_tokens=1)
+    torch.testing.assert_close(op(x), x + 2)
+    torch.testing.assert_close(op(x, backend=KernelBackend.TORCH), x - 1)
+    fo.set_fused_op_backend(KernelBackend.TORCH)
+    torch.testing.assert_close(op(x), x - 1)
+    fo.set_fused_op_backend(None)
+    op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x + 1)
+
+
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+@pytest.mark.parametrize("caching_precompile", [False, True])
+@pytest.mark.parametrize("warmed", [False, True])
+def test_oot_outer_torch_compile(
+    monkeypatch, _compiler_state, backend, fullgraph, caching_precompile, warmed
+):
+    """Compile registered functions that are not methods on the op class.
+
+    Also cover saving compiler guards after eager execution has selected a
+    function that must be restored when compilation finishes.
+    """
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_KeepOotDispatch, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _KeepOotDispatch, forward_myplat_compile, "myplat"
+    )
+    op = _KeepOotDispatch()
+    assert not hasattr(op, "forward_myplat")
+    assert not hasattr(op, "forward_myplat_compile")
+    x = torch.tensor([1.0, 2.0, 3.0])
+    if warmed:
+        torch.testing.assert_close(op(x), x + 1)
+    original = op._forward_method
+    op.enter_torch_compile(num_tokens=1)
+    try:
+        with torch._dynamo.config.patch(caching_precompile=caching_precompile):
+            compiled = torch.compile(
+                _OotModel(op).forward, backend=backend, fullgraph=fullgraph
+            )
+            for values in (x, x + 10):
+                torch.testing.assert_close(compiled(values), (values * 2 + 2) * 3)
+    finally:
+        op.leave_torch_compile()
+    assert op._forward_method is original
+    torch.testing.assert_close(op(x), x + 1)
+
+
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.parametrize("caching_precompile", [False, True])
+def test_oot_compile_with_outer_graph_break(
+    monkeypatch, _compiler_state, backend, caching_precompile
+):
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_compile, "myplat"
+    )
+    op = _OotTensorOp()
+    x = torch.tensor([1.0, 2.0, 3.0])
+    torch.testing.assert_close(op(x), x + 1)
+    op.enter_torch_compile(num_tokens=1)
+    try:
+        with torch._dynamo.config.patch(caching_precompile=caching_precompile):
+            compiled = torch.compile(
+                _OotModelWithBreak(op).forward, backend=backend, fullgraph=False
+            )
+            for values in (x, x + 10):
+                torch.testing.assert_close(compiled(values), (values * 2 + 2) * 3)
+    finally:
+        op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x + 1)
+
+
+@pytest.mark.parametrize("fullgraph", [False, True])
+@pytest.mark.parametrize("caching_precompile", [False, True])
+def test_oot_compile_registration_preserves_tracing_errors(
+    monkeypatch, _compiler_state, fullgraph, caching_precompile
+):
+    """A graph break inside the registered function still fails with fullgraph=True."""
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_graph_break, "myplat"
+    )
+    op = _OotTensorOp()
+    x = torch.tensor([1.0, 2.0, 3.0])
+    torch.testing.assert_close(op(x), x + 1)
+    original = op._forward_method
+    op.enter_torch_compile(num_tokens=1)
+    try:
+        with torch._dynamo.config.patch(caching_precompile=caching_precompile):
+            compiled = torch.compile(
+                _OotModel(op).forward, backend="eager", fullgraph=fullgraph
+            )
+            if fullgraph:
+                with pytest.raises(torch._dynamo.exc.Unsupported, match="graph_break"):
+                    compiled(x)
+            else:
+                torch.testing.assert_close(compiled(x), (x * 2 + 2) * 3)
+    finally:
+        op.leave_torch_compile()
+    assert op._forward_method is original
+    torch.testing.assert_close(op(x), x + 1)
+
+
+@pytest.mark.parametrize("warmed", [False, True])
+def test_oot_eager_forward_survives_guard_serialization(
+    monkeypatch, _compiler_state, warmed
+):
+    """Saving compiler guards must work when compilation uses the eager function.
+
+    A function registered outside the op class may have no matching attribute
+    on that class. Binding it directly to the op makes guard serialization
+    fail when Dynamo looks it up by name. Enable precompile caching to check
+    this lookup, which ordinary backend="eager" tracing does not exercise.
+    """
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_KeepOotDispatch, forward_myplat, "myplat")
+    op = _KeepOotDispatch()
+    x = torch.tensor([1.0, 2.0, 3.0])
+    if warmed:
+        torch.testing.assert_close(op(x), x + 1)
+    op.enter_torch_compile(num_tokens=8)
+    try:
+        with torch._dynamo.config.patch(caching_precompile=True):
+            compiled = torch.compile(
+                _OotModel(op).forward, backend="eager", fullgraph=True
+            )
+            torch.testing.assert_close(compiled(x), (x * 2 + 1) * 3)
+    finally:
+        op.leave_torch_compile()
+    torch.testing.assert_close(op(x), x + 1)
 
 
 def test_enter_leave_torch_compile_roundtrip(monkeypatch):
@@ -445,6 +804,26 @@ def test_fused_moe_compile_hook_is_bs1_only():
 # --- tracing --------------------------------------------------------------------
 
 
+def test_oot_registered_functions_preserve_trace_labels(monkeypatch):
+    _mock_platform(monkeypatch, oot_key="myplat")
+    BaseFusedOp.register_oot_forward(_OotTensorOp, forward_myplat, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, forward_myplat_compile, "myplat"
+    )
+    op = _OotTensorOp()
+    x = torch.zeros(2, 3)
+    fo.enable_fused_op_trace()
+    op(x)
+    op.enter_torch_compile(num_tokens=1)
+    op(x)
+    op.leave_torch_compile()
+    op(x)
+    records = fo.get_fused_op_trace()
+    assert [rec.backend for rec in records] == ["myplat", "myplat_compile", "myplat"]
+    assert all(rec.op == op.op for rec in records)
+    assert all(rec.tensor_args == ("torch.float32[2, 3]",) for rec in records)
+
+
 def test_trace_labels_explicit_backend(monkeypatch):
     _mock_platform(monkeypatch, key="cuda", info=_CUDA)
     op = _CudaOnlyPlatformOp()
@@ -459,7 +838,7 @@ def test_trace_labels_explicit_backend(monkeypatch):
 
 
 def test_deprecated_alias_contract(monkeypatch):
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     assert issubclass(MultiPlatformOp, BaseFusedOp)
 
@@ -489,7 +868,7 @@ def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
     """Old MultiPlatformOp defined per-platform default methods (hip/musa ->
     cuda, npu/xpu/cpu -> native); plugin code may call them directly, and a
     subclass without forward_cuda must still raise on CUDA like before."""
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)

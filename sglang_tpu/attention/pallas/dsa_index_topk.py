@@ -162,6 +162,31 @@ def _scatter_whole_rows(
     return cache_k.at[page, row].set(rows, mode="drop", unique_indices=True)
 
 
+def store_index_keys(
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
+    key: jax.Array,  # float[max_num_tokens, index_head_dim]
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    *,
+    key_store: str = "xla",
+) -> jax.Array:
+    """Quantize this step's index keys to FP8 and store them; return the cache.
+
+    ``key_store`` picks the writer as in ``dsa_indexer_step``. This is the
+    indexer step's store: any other writer of this cache must call it.
+    """
+    if key_store == "xla":
+        k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
+        return _store_keys(
+            cache_k, k_fp8, k_scale_byte, kv_lens, page_indices, cu_q_lens, distribution
+        )
+    return store_keys_pallas(
+        cache_k, key, kv_lens, page_indices, cu_q_lens, distribution
+    )
+
+
 def dsa_indexer_step(
     query: jax.Array,  # float[max_num_tokens, index_n_heads, index_head_dim]
     key: jax.Array,  # float[max_num_tokens, index_head_dim]
@@ -215,15 +240,15 @@ def dsa_indexer_step(
     * ``cache_k``: the cache with this step's keys stored.
     """
     q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
-    if key_store == "xla":
-        k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
-        cache_k = _store_keys(
-            cache_k, k_fp8, k_scale_byte, kv_lens, page_indices, cu_q_lens, distribution
-        )
-    else:
-        cache_k = store_keys_pallas(
-            cache_k, key, kv_lens, page_indices, cu_q_lens, distribution
-        )
+    cache_k = store_index_keys(
+        cache_k,
+        key,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        key_store=key_store,
+    )
 
     # The kernel reads each key's scale from the cache. It has no input for the
     # query's scale, so multiply that into the head weight instead.

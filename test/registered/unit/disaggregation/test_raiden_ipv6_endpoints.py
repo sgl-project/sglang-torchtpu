@@ -24,7 +24,7 @@ from unittest.mock import Mock, patch
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, _tcp_endpoint

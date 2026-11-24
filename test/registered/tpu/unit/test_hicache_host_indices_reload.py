@@ -76,6 +76,7 @@ class TestHiCacheHostIndicesReload(CustomTestCase):
 
         controller = object.__new__(TpuDMAHybridCacheController)
         controller.mem_pool_device_allocator = allocator
+        controller.kv_storage = None
         controller.mem_pool_device = pool
         controller.mem_pool_host = group
         controller.device = device

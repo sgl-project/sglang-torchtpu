@@ -9,6 +9,7 @@ target's page ids. These tests pin what P/D registers for that layout.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -16,6 +17,7 @@ from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStat
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.utils import build_kv_layer_ids, setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
@@ -69,6 +71,17 @@ def _hybrid_pool(target: TpuSplitMLATokenToKVPool) -> HybridLinearKVPool:
     }
     pool.use_dsa = True
     return pool
+
+
+def _static_storage(pool, draft=None) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(
+        None,
+        allocator,
+        draft_token_to_kv_pool=draft,
+        num_hidden_layers=NUM_HIDDEN_LAYERS,
+    )
 
 
 def _kind_major(pool: TpuSplitMLATokenToKVPool, *kinds: str) -> list[torch.Tensor]:
@@ -132,7 +145,7 @@ class TestHybridSplitMLARaidenPD(CustomTestCase):
 
     def test_state_kv_args_carry_only_kda_state(self):
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, self.pool, self.draft)
+        setup_state_kv_args(kv_args, _static_storage(self.pool, self.draft), self.draft)
 
         self.assertEqual(kv_args.state_types, [StateType.MAMBA])
         ptrs, _, _ = self.pool.mamba_pool.get_contiguous_buf_infos()
@@ -148,6 +161,7 @@ class TestHybridSplitMLARaidenPD(CustomTestCase):
             draft_token_to_kv_pool=self.draft,
             num_draft_entries=len(draft_ptrs),
             num_hidden_layers=NUM_HIDDEN_LAYERS,
+            storage=_static_storage(self.pool, self.draft),
         )
 
         self.assertEqual(len(layer_ids), len(target_ptrs) + len(draft_ptrs))

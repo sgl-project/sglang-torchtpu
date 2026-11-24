@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResult
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu import hooks
 from sglang_tpu.compilation.encoder_compile_policy import (

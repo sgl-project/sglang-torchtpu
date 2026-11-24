@@ -11,7 +11,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    _to_unit_range,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     mova,
 )
@@ -333,6 +336,30 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
                 with self.subTest(vae=type(config).__name__):
                     vae = _ArchConfigVAE(config)
                     self.assertEqual(decoding.decode_uses_every_rank(vae), expected)
+
+
+class TestToUnitRange(unittest.TestCase):
+    def test_in_place_matches_out_of_place(self):
+        image = torch.tensor([-1.5, -1.0, 0.0, 1.0, 1.5])
+        expected = (image / 2 + 0.5).clamp(0, 1)
+
+        result = _to_unit_range(image.clone(), in_place=True)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_in_place_mutates_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image, in_place=True)
+
+        self.assertIs(result, image)
+        torch.testing.assert_close(image, torch.tensor([0.0, 0.5, 1.0]))
+
+    def test_default_does_not_mutate_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image)
+
+        self.assertIsNot(result, image)
+        torch.testing.assert_close(image, torch.tensor([-1.0, 0.0, 1.0]))
 
 
 if __name__ == "__main__":

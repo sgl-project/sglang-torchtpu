@@ -11,7 +11,7 @@ from llguidance import LLTokenizer, grammar_from
 
 from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo

@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang_tpu.host_upload import upload
 from sglang_tpu.mm_embedding import (
     MultimodalEmbedding,
     PaddedEmbedding,
@@ -73,12 +74,15 @@ def _scatter_mm_rows(
     *,
     merge_rows: Callable = merge_mm_rows,
 ) -> None:
+    # The indices and mask are host-built and this runs right after the
+    # encoder launch: a blocking upload would hold the host until the encoder
+    # finished, and the TPU would then idle while the host caught up.
     dest.copy_(
         merge_rows(
             dest,
             src.to(device=dest.device, dtype=dest.dtype),
-            indices.to(dest.device),
-            mask.to(dest.device),
+            upload(indices, dest.device),
+            upload(mask, dest.device),
         )
     )
 

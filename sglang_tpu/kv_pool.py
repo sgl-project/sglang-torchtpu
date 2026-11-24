@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool import (
+    BLOCK_MAJOR,
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
@@ -319,6 +320,29 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+
+    def get_device_pool_infos(self):
+        """Name this pool's KV layers for HiCache host assembly.
+
+        No upstream buffer info describes the fused pages, and the TPU host
+        pool is built from this pool itself (``get_device_pool_kv_host_cls``),
+        so ``buffer_info`` is None rather than the K/V-buffer description
+        ``MHATokenToKVPool`` builds from buffers this pool does not have.
+        """
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=None,
+            ),
+        )
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
@@ -345,15 +369,17 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # Buffer creation / accessors
     # ------------------------------------------------------------------ #
 
-    def _create_buffers(self):
-        kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
-        shape = (
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
             self.num_blocks,
             self.page_size,
-            kv_heads_packed,
+            self.num_kv_heads_x2 // self.kv_packing,
             self.kv_packing,
             self.padded_head_dim,
         )
+
+    def _create_buffers(self):
+        shape = self._buffer_shape()
         logger.info(
             "Allocating fused TPU KV buffers: layers=%d, shape per layer=%s, dtype=%s",
             self.layer_num,
@@ -631,6 +657,31 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
 
+class TpuFlywheelKVPool(TpuFusedMHATokenToKVPool):
+    """The fused pool with its packing axis merged, for --attention-backend flywheel:
+    [num_blocks, page_size, num_kv_heads_x2, head_dim], flywheel's cache layout.
+
+    Same bytes and K/V interleave as the 5D buffer. At head_dim 256 the 5D
+    buffer's TPU tiling differs from the 4D view the kernels take, so every call
+    would relayout the whole layer buffer; this shape needs none.
+    """
+
+    KV_LAYOUT_NAME = "token-major-flywheel"
+
+    def _buffer_shape(self) -> tuple[int, ...]:
+        return (
+            self.num_blocks,
+            self.page_size,
+            self.num_kv_heads_x2,
+            self.padded_head_dim,
+        )
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_blocks, page_size, kv_heads_x2, hd = buf.shape
+        return buf.view(n_blocks * page_size, kv_heads_x2, hd)
+
+
 class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     """MHA KV pool in the SEQ_ALONG_LANE layout the batched-RPA kernel reads.
 
@@ -848,6 +899,9 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
     # raiden moves a bundle row by its dim-0 block id; torch_tpu's host pool
     # reads the pool layer by layer, which the bundle does not offer.
     kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
+
+    def kv_pool_layout(self) -> str:
+        return BLOCK_MAJOR
 
     def _create_buffers(self):
         kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
@@ -1117,6 +1171,9 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             dtype=torch.uint64,
             device=self.device,
         )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
         self._finalize_allocation_log(size)
 
     # ------------------------------------------------------------------ #
@@ -1369,6 +1426,9 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
         # page 0 is never a real page.
         self.num_pages = self.size // self.page_size + 1
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
 
         self._create_buffers()
         self._finalize_allocation_log(size)

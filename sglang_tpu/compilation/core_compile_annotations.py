@@ -116,12 +116,12 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
     # GLM-5.3-Flash's vision encoder. Its block loop and 2x2 patch merger run
     # on the TPU runner attached by sglang_tpu.hooks.glm5_next_vision. Unless
     # mm_config.language_model_only or --enable-dp-attention is set,
-    # compile_glm5_next_decoder_only annotates model.model (Glm5NextModel) with
-    # Qwen3VLDecoderTpuCompilePolicy (covering both standard multimodal and EPD
-    # language-only servers); under --language-model-only it annotates the
-    # whole model with Glm5NextDecoderTpuCompilePolicy, and under
-    # --enable-dp-attention both boundaries decline, keeping TpuGraphRunner's
-    # whole-model fallback.
+    # compile_glm5_next_decoder_only attaches _Glm5NextLanguageModel on
+    # model.language_model with Glm5NextVLDecoderTpuCompilePolicy (covering
+    # both standard multimodal and EPD language-only servers); under
+    # --language-model-only it annotates the whole model with
+    # Glm5NextDecoderTpuCompilePolicy, and under --enable-dp-attention both
+    # boundaries decline, keeping TpuGraphRunner's whole-model fallback.
     _CoreCompileBoundary(
         module="sglang.srt.models.glm5_next",
         class_name="Glm5NextVisionModel",

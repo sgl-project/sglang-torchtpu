@@ -55,18 +55,22 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     """Pack and stage this rank's Engram rows on the host via ``coordinator``."""
     padded_tokens = input_ids.shape[0]
     device = input_ids.device
+    engram_host.move_hasher_to_host(hasher)
     # DSpark verify commits wait here, after the next draft is dispatched; both
     # paths below read or write hasher.history.
     engram_host.flush_engram_commits(hasher)
+    staged_result = None
     if coordinator.started:
-        staged, uploads, num_cols = coordinator.stage_all(padded_tokens)
-    else:
-        engram_host.move_hasher_to_host(hasher)
+        staged_result = coordinator.stage_all(
+            padded_tokens, forward_batch=forward_batch
+        )
+    elif forward_batch.forward_mode.is_target_verify():
+        staged_result = coordinator.stage_verify(input_ids, forward_batch)
+    if staged_result is None:
         with torch.no_grad():
             hash_ids = engram_host.host_hash_ids(hasher, input_ids, forward_batch)
-        staged, uploads, num_cols = coordinator.stage_from_hashes(
-            hash_ids, padded_tokens
-        )
+        staged_result = coordinator.stage_from_hashes(hash_ids, padded_tokens)
+    staged, uploads, num_cols = staged_result
     forward_batch.tpu_engram_staged = staged
     forward_batch.tpu_engram_local_ids = engram_host.local_row_ids(
         padded_tokens, len(staged), num_cols, device

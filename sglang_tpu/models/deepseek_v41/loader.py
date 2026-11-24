@@ -19,6 +19,7 @@ from sglang_tpu._logging import get_logger
 from sglang_tpu.ep_local_expert_reader import local_expert_id
 from sglang_tpu.ep_weight_shard import INDEX_NAME, EPLocalRunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.engram_row_reader import (
+    engram_row_ranges,
     is_engram_table,
     iter_row_tables,
 )
@@ -65,6 +66,7 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
     def _split_kept(
         self, *, kept: frozenset[str], shard_of: Mapping[str, str]
     ) -> tuple[frozenset[str], Iterator[tuple[str, torch.Tensor]]]:
+        from sglang.srt.layers.engram import EngramLayout
         from sglang.srt.runtime_context import get_parallel
 
         tables = frozenset(name for name in kept if is_engram_table(name))
@@ -74,13 +76,20 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             if name not in tables and not name.startswith(_MTP_PREFIX)
         )
         parallel = get_parallel()
-        rows = iter_row_tables(
-            shard_of=shard_of,
-            names=tables,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+        # The model's own layout (DeepseekV4Model.engram_layout), so each rank reads
+        # exactly the rows its EngramEmbedding holds.
+        layout = EngramLayout.from_config(self._primary_model_config.hf_config)
+        row_ranges = (
+            engram_row_ranges(
+                tables,
+                layout=layout,
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
+            )
+            if tables
+            else {}
         )
-        return streamed, rows
+        return streamed, iter_row_tables(shard_of=shard_of, row_ranges=row_ranges)
 
     def _draft_weights(self, source):
         """The bundled DSpark draft reads only ``mtp.*`` tensors (its loader drops

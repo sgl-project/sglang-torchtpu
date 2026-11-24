@@ -6,6 +6,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -15,7 +16,8 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 
@@ -31,7 +33,10 @@ class TpuDraftWorker(ABC):
 
     def __init__(self, target_runner: ModelRunner) -> None:
         self._target_runner = target_runner
-        self._owns_attention = self._draft_owns_attention()
+        # Resolved here, in the target scope, as EAGLEWorkerV2 resolves its own.
+        self.parallel_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(tp_execution=self._draft_tp_execution())
+        )
         model_config = ModelConfig.from_server_args(
             target_runner.server_args,
             model_path=get_spec().speculative_draft_model_path,
@@ -52,11 +57,11 @@ class TpuDraftWorker(ABC):
                 is_draft_worker=True,
             )
 
-    def _draft_owns_attention(self) -> bool:
+    def _draft_tp_execution(self) -> DraftTPExecution:
         """Runs before the draft ModelRunner exists, so it reads only config."""
         # Under DP attention the draft runs inside its rank's attention-TP group, as
         # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
-        return get_parallel().attn_dp_enabled
+        return DraftTPExecution.SINGLE_GROUP
 
     @contextlib.contextmanager
     def draft_context(self) -> Iterator[None]:
@@ -64,7 +69,7 @@ class TpuDraftWorker(ABC):
         # Under PP the one-layer draft lives on the last stage only, as if PP were off.
         with (
             draft_pp_context(),
-            draft_tp_context(self._owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):

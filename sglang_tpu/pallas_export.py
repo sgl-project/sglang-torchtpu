@@ -1,3 +1,4 @@
+import functools
 import inspect
 import threading
 from collections.abc import Callable
@@ -21,8 +22,13 @@ def argnums(function: Callable, *names: str) -> tuple[int, ...]:
     return tuple(parameters.index(name) for name in names)
 
 
+@functools.lru_cache(maxsize=1)
 def get_torch_tpu_device_kind() -> str:
-    """Return physical TPU hardware metadata."""
+    """Return physical TPU hardware metadata.
+
+    Cached: torch_tpu reads it from sysfs (~0.35 ms), and the attention
+    metadata path asks for it on every forward.
+    """
     from torch_tpu._internal.utils.hardware import get_tpu_device_name
 
     return get_tpu_device_name()

@@ -1,117 +1,126 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest import mock
 
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import apply_split_rotary_emb
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
 )
+from sglang.test.test_utils import CustomTestCase
 
-_CONFIG = "sglang.multimodal_gen.configs.pipeline_configs.ltx_2"
 
+class TestLTX2SPPaddingMask(CustomTestCase):
+    KEY = "sp_valid_len"
 
-def _shard(fn, latents, *, rank, world_size=4, **batch_kwargs):
-    batch = SimpleNamespace(**batch_kwargs)
-    with (
-        patch(f"{_CONFIG}.get_sp_world_size", return_value=world_size),
-        patch(f"{_CONFIG}.get_sp_parallel_rank", return_value=rank),
+    def _build(
+        self, valid, *, seq_len, batch_size=2, has_padding=True, quality="lossless"
     ):
-        fn(batch, latents)
-    return batch
-
-
-def _video_self_attention_mask(batch, *, seq_len, batch_size):
-    return LTX2DenoisingStage._build_ltx2_sp_self_attention_mask(
-        batch,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        key="sp_video_valid_token_count",
-        padded_key="sp_video_padded",
-        device=torch.device("cpu"),
-    )
-
-
-class TestLtx2SpPaddingMask(unittest.TestCase):
-    def test_video_sharding_records_global_padding_on_every_rank(self):
-        config = LTX2PipelineConfig()
-        tokens_per_frame = 4 * 4
-        height = width = 4 * config.vae_scale_factor
-        for frames, padded in ((16, False), (17, True)):
-            latents = torch.zeros(1, frames * tokens_per_frame, 8)
-            for rank in range(4):
-                with self.subTest(frames=frames, rank=rank):
-                    batch = _shard(
-                        config.shard_latents_for_sp,
-                        latents,
-                        rank=rank,
-                        height=height,
-                        width=width,
-                    )
-                    self.assertIs(batch.sp_video_padded, padded)
-
-    def test_audio_sharding_records_global_padding_on_every_rank(self):
-        config = LTX2PipelineConfig()
-        for frames, padded in ((128, False), (126, True)):
-            for rank in range(4):
-                with self.subTest(frames=frames, rank=rank):
-                    batch = _shard(
-                        config.shard_audio_latents_for_sp,
-                        torch.zeros(1, frames, 8),
-                        rank=rank,
-                    )
-                    self.assertIs(batch.sp_audio_padded, padded)
-
-    def test_mixed_padding_masks_only_the_padded_stream(self):
-        cpu = torch.device("cpu")
-        for video_padded in (False, True):
-            audio_padded = not video_padded
-            with self.subTest(video_padded=video_padded):
-                batch = SimpleNamespace(
-                    sp_video_valid_token_count=6 if video_padded else 8,
-                    sp_video_padded=video_padded,
-                    sp_audio_valid_token_count=3 if audio_padded else 4,
-                    sp_audio_padded=audio_padded,
-                )
-                video, audio, a2v, v2a = (
-                    LTX2DenoisingStage._build_ltx2_sp_attention_masks(
-                        batch,
-                        video_seq_len=8,
-                        audio_seq_len=4,
-                        batch_size=2,
-                        video_device=cpu,
-                        audio_device=cpu,
-                    )
-                )
-                padded, unpadded = (video, audio) if video_padded else (audio, video)
-                self.assertIsNone(unpadded)
-                self.assertIsNotNone(padded)
-                self.assertFalse(bool(padded[:, -1].any()))
-                # Cross-attention takes its key stream's mask.
-                self.assertIs(a2v, audio)
-                self.assertIs(v2a, video)
-
-    def test_unpadded_sp_shards_skip_the_self_attention_mask(self):
-        batch = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=False)
-        self.assertIsNone(_video_self_attention_mask(batch, seq_len=8, batch_size=2))
-
-    def test_padded_sp_shards_keep_the_mask_on_full_ranks(self):
-        # A full rank still builds its all-true mask when another rank is padded,
-        # so every rank takes the masked path.
-        full = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=True)
-        tail = SimpleNamespace(sp_video_valid_token_count=5, sp_video_padded=True)
-        self.assertTrue(_video_self_attention_mask(full, seq_len=8, batch_size=1).all())
-        self.assertEqual(
-            _video_self_attention_mask(tail, seq_len=8, batch_size=1).tolist(),
-            [[True] * 5 + [False] * 3],
+        batch = SimpleNamespace(
+            quality=quality, **({self.KEY: valid} if valid is not None else {})
+        )
+        return LTX2DenoisingStage._build_ltx2_sp_padding_mask(
+            batch,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            key=self.KEY,
+            has_padding=has_padding,
+            device=torch.device("cpu"),
         )
 
-    def test_shards_without_the_padding_flag_keep_the_mask(self):
-        batch = SimpleNamespace(sp_video_valid_token_count=8)
-        mask = _video_self_attention_mask(batch, seq_len=8, batch_size=1)
-        self.assertTrue(mask.all())
+    def test_missing_valid_returns_none(self):
+        # Attribute absent on the batch -> no mask.
+        self.assertIsNone(self._build(None, seq_len=8))
+
+    def test_no_padding_returns_none(self):
+        # valid == seq_len: an all-True mask would be a no-op, so return None
+        # to keep the fused (unmasked) attention path.
+        self.assertIsNone(self._build(8, seq_len=8, has_padding=False))
+
+    def test_exact_no_padding_preserves_reference_mask(self):
+        mask = self._build(8, seq_len=8, has_padding=False, quality="exact")
+        self.assertTrue(torch.equal(mask, torch.ones(2, 8, dtype=torch.bool)))
+
+    def test_high_no_padding_returns_none(self):
+        self.assertIsNone(self._build(8, seq_len=8, has_padding=False, quality="high"))
+
+    def test_valid_greater_than_seq_len_returns_none(self):
+        # Defensive: valid > seq_len still means no padding.
+        self.assertIsNone(self._build(12, seq_len=8, has_padding=False))
+
+    def test_padding_returns_real_mask(self):
+        mask = self._build(5, seq_len=8, batch_size=2)
+        self.assertIsNotNone(mask)
+        self.assertEqual(mask.shape, (2, 8))
+        self.assertEqual(mask.dtype, torch.bool)
+        expected = torch.tensor([True] * 5 + [False] * 3, dtype=torch.bool)
+        for row in mask:
+            self.assertTrue(torch.equal(row, expected))
+
+    def test_zero_valid_returns_all_false_mask(self):
+        mask = self._build(0, seq_len=4, batch_size=1)
+        self.assertIsNotNone(mask)
+        self.assertEqual(mask.shape, (1, 4))
+        self.assertFalse(mask.any().item())
+
+    def test_sharding_keeps_mask_presence_consistent_across_ranks(self):
+        config = LTX2PipelineConfig()
+        target = "sglang.multimodal_gen.configs.pipeline_configs.ltx_2"
+        for modality in ("video", "audio"):
+            for world_size in (2, 4):
+                for frames in (1, 7, 8):
+                    with self.subTest(
+                        modality=modality, world_size=world_size, frames=frames
+                    ):
+                        masks = []
+                        for rank in range(world_size):
+                            batch = Req(
+                                height=config.vae_scale_factor * config.patch_size,
+                                width=config.vae_scale_factor * config.patch_size * 2,
+                            )
+                            tokens_per_frame = 2 if modality == "video" else 1
+                            latents = torch.ones(1, frames * tokens_per_frame, 4)
+                            with (
+                                mock.patch(
+                                    f"{target}.get_sp_world_size",
+                                    return_value=world_size,
+                                ),
+                                mock.patch(
+                                    f"{target}.get_sp_parallel_rank", return_value=rank
+                                ),
+                            ):
+                                shard, did_shard = (
+                                    config.shard_latents_for_sp(batch, latents)
+                                    if modality == "video"
+                                    else config.shard_audio_latents_for_sp(
+                                        batch, latents
+                                    )
+                                )
+                            self.assertTrue(did_shard)
+                            mask = LTX2DenoisingStage._build_ltx2_sp_padding_mask(
+                                batch,
+                                seq_len=shard.shape[1],
+                                batch_size=1,
+                                key=f"sp_{modality}_valid_token_count",
+                                has_padding=vars(batch)[f"sp_{modality}_has_padding"],
+                                device=shard.device,
+                            )
+                            masks.append(mask)
+                            if frames % world_size:
+                                self.assertIsNotNone(mask)
+                                self.assertTrue(
+                                    torch.equal(mask, shard[:, :, 0].bool())
+                                )
+                            else:
+                                self.assertIsNone(mask)
+                        if frames % world_size:
+                            gathered = torch.cat(masks, dim=1)
+                            self.assertEqual(
+                                gathered.sum().item(), frames * tokens_per_frame
+                            )
 
 
 class TestLtx2SplitRotaryEmb(unittest.TestCase):

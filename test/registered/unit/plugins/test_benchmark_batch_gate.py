@@ -199,14 +199,14 @@ def scheduler_classes(monkeypatch):
         "sglang.srt.disaggregation.decode": NS(
             SchedulerDisaggregationDecodeMixin=Mixin
         ),
-        "sglang.srt.disaggregation.utils": NS(DisaggregationMode=Mode),
+        "sglang.srt.disaggregation.mode": NS(DisaggregationMode=Mode),
         "sglang.srt.managers.schedule_batch": NS(NextBatchPlan=NS, ScheduleBatch=NS),
         "sglang.srt.managers.scheduler": NS(Scheduler=Scheduler),
         "sglang.srt.runtime_context": NS(
             get_parallel=lambda: NS(
                 dp_size=1, pp_size=1, attn_dp_size=1, attn_cp_size=1
             ),
-            get_disagg=lambda: NS(disaggregation_decode_host_receive_threshold=0),
+            get_disagg=lambda: NS(disaggregation_decode_host_receive_threshold=1.0),
         ),
         "sglang_tpu.envs": NS(
             envs=NS(

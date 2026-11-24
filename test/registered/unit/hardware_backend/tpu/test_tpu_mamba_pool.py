@@ -366,10 +366,15 @@ class TestTpuMambaPool(CustomTestCase):
                 buffers[0][1] = 8
                 reqs[0].kv.mamba_next_track_idx = None
                 reqs[0].kv.mamba_ping_pong_track_buffer = None
+                # No slot: the host-ID path marks it -1; the device gather
+                # sends it to the reserved slot 0, which nothing reads.
+                no_slot = -1 if allocator_device == "cpu" else 0
                 with patch("torch.tensor", side_effect=unpinned_tensor):
                     for positions in (None, [1, 1]):
                         set_mamba_track_indices_from_reqs(batch, positions)
-                        self.assertEqual(batch.mamba_track_indices.tolist(), [-1, 10])
+                        self.assertEqual(
+                            batch.mamba_track_indices.tolist(), [no_slot, 10]
+                        )
                 reqs[0].kv.mamba_next_track_idx = 0
                 reqs[0].kv.mamba_ping_pong_track_buffer = buffers[0]
 

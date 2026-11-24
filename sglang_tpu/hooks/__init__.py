@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.arg_groups.choices import add_attention_backend_choices
 from sglang.srt.plugins.hook_registry import HookType
 from sglang_tpu.hooks.all_gather_via_all_reduce import (
     gather_and_crop_vocab,
@@ -45,11 +46,13 @@ from sglang_tpu.hooks.encoder import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm5_next_vision import (
+    attach_glm5_next_nextn_multimodal_forward,
     attach_glm5_next_vision_runner,
     compile_glm5_next_decoder_only,
     defer_host_staged_mm_feature_move,
     encode_glm5_next_vision_on_host,
     encode_with_glm5_next_vision_runner,
+    forward_glm5_next_multimodal,
 )
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
@@ -95,6 +98,8 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
+from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -123,7 +128,7 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
 
 HOOKS: list[tuple] = [
     (
-        "sglang.srt.utils.common.set_gpu_proc_affinity",
+        "sglang.srt.utils.process.set_gpu_proc_affinity",
         bind_rank_cpu_set,
         HookType.AROUND,
     ),
@@ -284,6 +289,11 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.forward",
+        forward_glm5_next_multimodal,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_image_feature",
         encode_glm5_next_vision_on_host,
         HookType.AROUND,
@@ -301,6 +311,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next_nextn.Glm5NextForConditionalGenerationNextN.__init__",
+        attach_glm5_next_nextn_multimodal_forward,
         HookType.AFTER,
     ),
     (
@@ -443,6 +458,16 @@ HOOKS: list[tuple] = [
         _select_tpu_ep_local_runai_loader,
         HookType.AFTER,
     ),
+    (
+        "sglang.srt.managers.row_select.select_rows",
+        select_kept_rows,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.row_select.concat_rows",
+        concat_merged_rows,
+        HookType.AROUND,
+    ),
 ]
 
 HOOKS.extend(dsv4_hooks())
@@ -488,6 +513,9 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    # Before the launcher parses --attention-backend; the backend itself is
+    # registered with the worker's init_backend.
+    add_attention_backend_choices(["flywheel"])
     register_tpu_dsv4_resolution_hooks()
     register_unified_hicache_strategy()
 

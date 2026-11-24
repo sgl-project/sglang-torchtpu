@@ -22,21 +22,20 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Mapping, Optional, Sequence, Tuple
 from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
-from sglang.srt.mem_cache import dsv41_request_window as core_request_window
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.mem_cache.kv.memory import request_window as core_request_window
 from sglang.srt.mem_cache.memory_pool import get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import ceil_div
@@ -321,6 +320,35 @@ def _check_dsv41_pool_supported(
             raise ValueError(f"DSV41TPUTokenToKVPool does not support {feature}")
 
 
+class _DSV41TPURequestWindowMemory:
+    """Built by the core pool constructor in place of ``RequestWindowMemory``:
+    the window is a ``DSV41TPURequestWindow`` over the pool's own SWA buffers."""
+
+    def __init__(self, pool, spec, *, dtype, device, enable_memory_saver=False):
+        def make_window_pool(size, layers):
+            return pool._make_kv_pool(
+                size=size,
+                page_size=spec.page_size,
+                dtype=dtype,
+                layer_num=layers,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=spec.page_size,
+            )
+
+        self.view = DSV41TPURequestWindow(
+            make_window_pool,
+            num_slots=spec.num_slots,
+            layers=spec.layers,
+            page_size=spec.page_size,
+            capacity=spec.capacity,
+            workspace_rows=spec.workspace_rows,
+        )
+
+    def reset_rows(self, rows) -> None:
+        self.view.reset(rows)
+
+
 class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """DeepSeek-V4.1 TPU pool: core control plane, Pallas-shaped buffers."""
 
@@ -361,7 +389,11 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         self.full_to_swa_index_mapping = None
         # Under encoder replay the core constructor builds its request window,
         # looked up at call time, instead of a paged SWA pool.
-        with patch.object(core_request_window, "RequestWindow", DSV41TPURequestWindow):
+        with patch.object(
+            core_request_window,
+            "RequestWindowMemory",
+            partial(_DSV41TPURequestWindowMemory, self),
+        ):
             super().__init__(
                 compression_ratios=list(compression_ratios),
                 layer_num=layer_num,
@@ -380,9 +412,7 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         assert not self._swa_pool_pending, "the core pool built no SWA pool"
         if self.swa_req_ring_size is not None:
             # The attention backend builds the draft's SWA table on the host.
-            self.swa_req_ring_valid_from = torch.zeros(
-                self.num_req_slots, dtype=torch.int64
-            )
+            self.swa_valid_from = torch.zeros(self.num_req_slots, dtype=torch.int64)
         if self.request_window is not None:
             swa_storage = "request window"
         elif self.swa_req_ring_size is not None:
@@ -500,11 +530,14 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         enable_memory_saver: bool,
         force_fp4: bool = False,
         global_page_size: Optional[int] = None,
+        index_k_page8: bool = False,
     ) -> DSV41TPUIndexerPool:
         # The core page size (DSV41_INDEX_PAGE_SIZE) and fp4 choice are CUDA
         # DeepGEMM limits; the TPU kernels read packed FP8 pages of 128 records.
         del page_size, dtype, global_page_size
         assert force_fp4, "only the ratio-1/2 indexer pool exists on TPU V4.1"
+        # The page-8 index-K layout is a HIP (AITER) kernel option.
+        assert not index_k_page8, "the page-8 index-K pool is HIP-only"
         # The core sizes it (full_size + page_size) // ratio slots.
         ratio = (self.full_size + self.page_size) // size
         assert ratio in LOW_RATIOS and size * ratio == self.full_size + self.page_size
@@ -531,8 +564,8 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # Kernel buffer accessors (absolute layer ids)
     # ------------------------------------------------------------------ #
 
-    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
-        self.swa_req_ring_valid_from[slots.cpu()] = valid_from.cpu()
+    def set_swa_valid_from(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+        self.swa_valid_from[slots.cpu()] = valid_from.cpu()
 
     def swa_ring_rows(
         self,
@@ -654,6 +687,7 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
     for a V4.1 model and reset ratio-2 pair state whenever a request slot is
     (re)allocated. Other DeepSeek-V4 models fall through to ``original``."""
     import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+    from sglang_tpu.hooks.dsv4 import chain_on_alloc_rows
 
     # Keyed on the target's ratios, so a V4.1 draft worker gets this pool too.
     if not uses_dsv41_pool(kvc.model_config.compress_ratios):
@@ -664,7 +698,7 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
         pool = core_build(kvc, *args, **kwargs)
     # The draft pool has only ratio-0 layers and shares this req pool.
     if not kvc.is_draft_worker:
-        kwargs["req_to_token_pool"].register_on_alloc_rows(pool.clear_request_slots)
+        chain_on_alloc_rows(kwargs["req_to_token_pool"], pool.clear_request_slots)
     return pool
 
 

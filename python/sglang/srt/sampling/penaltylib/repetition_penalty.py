@@ -3,7 +3,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils import get_compiler_backend, is_npu
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _is_npu = is_npu()
 
@@ -101,7 +101,7 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         device = self.orchestrator.device
         for row, toks in zip(rows, tokens):
             mask = torch.zeros(self.orchestrator.vocab_size, dtype=torch.bool)
-            mask[torch.tensor(toks, dtype=torch.int64)] = True
+            mask[torch.tensor(self._vocab_tokens(toks), dtype=torch.int64)] = True
             index = torch.tensor([row], dtype=torch.int64, device=device)
             current = self.cumulated_repetition_penalties.index_select(0, index)
             seeded = torch.where(

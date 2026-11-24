@@ -108,7 +108,7 @@ def install():
     if size == 0:
         return
     from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.runtime_context import get_disagg, get_parallel
@@ -145,7 +145,7 @@ def install():
                     )
                     or self.enable_decode_hicache
                     or self.enable_hisparse
-                    or get_disagg().disaggregation_decode_host_receive_threshold > 0
+                    or get_disagg().disaggregation_decode_host_receive_threshold < 1
                     or min(self.req_to_token_pool.size, self.max_running_requests)
                     < size
                 ):
