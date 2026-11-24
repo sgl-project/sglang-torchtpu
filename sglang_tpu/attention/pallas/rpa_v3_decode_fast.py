@@ -1292,14 +1292,33 @@ def _decode_fast_kernel(
         )
         base_r = pg_idx * phys_page_rows
         n_subs = phys_page_rows // 128
+        iota_128 = lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+        if not kv_pack_dense2:
+            z_128 = jnp.zeros((128, 128), jnp.uint32)
+            for sub_i in range(n_subs):
+                row_off = sub_i * 128
+                src_off = pl.multiple_of(base_r + row_off, 128)
+                blk = u32_flat[pl.ds(src_off, 128)]
+                cond = (iota_128 >= (lo - row_off)) & (iota_128 < (hi - row_off))
+                u32_flat[pl.ds(src_off, 128)] = jnp.where(cond, blk, z_128)
+            return
 
+        e_base = 2 * iota_128
+        o_base = e_base + 1
         for sub_i in range(n_subs):
             row_off = sub_i * 128
+            tok_off = 2 * row_off
             src_off = pl.multiple_of(base_r + row_off, 128)
             blk = u32_flat[pl.ds(src_off, 128)]
-            u32_flat[pl.ds(src_off, 128)] = _mask_slice_u32(
-                blk, row_off, 128, lo, hi
+            lo_loc = lo - tok_off
+            hi_loc = hi - tok_off
+            e_m = jnp.where(
+                (e_base >= lo_loc) & (e_base < hi_loc), jnp.uint32(0x0000FFFF), jnp.uint32(0)
             )
+            o_m = jnp.where(
+                (o_base >= lo_loc) & (o_base < hi_loc), jnp.uint32(0xFFFF0000), jnp.uint32(0)
+            )
+            u32_flat[pl.ds(src_off, 128)] = blk & (e_m | o_m)
 
     def _zero_pages_u32(slot, start_pg, end_pg):
         if interpret_mode:
@@ -1640,6 +1659,21 @@ def _decode_fast_kernel(
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
             p_pgs = jnp.sum(p_all.reshape(q_rows, n_slot_pages, page_size), axis=1)
             l_sum = _broadcast_minor_128(jnp.sum(p_pgs, axis=1, keepdims=True)) + p_new
+        elif cfg.fold_128:
+            m = jnp.maximum(
+                s_new_eff,
+                _broadcast_minor_128(
+                    jnp.max(_fold128_op(s_all, jnp.maximum), axis=1, keepdims=True)
+                ),
+            )
+            p_all = jnp.exp2((s_all - m[:, :1]) * exp2_sc_eff)
+            p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
+            l_sum = (
+                _broadcast_minor_128(
+                    jnp.sum(_fold128_op(p_all, jnp.add), axis=1, keepdims=True)
+                )
+                + p_new
+            )
         else:
             m = jnp.maximum(
                 s_new_eff, _broadcast_minor_128(jnp.max(s_all, axis=1, keepdims=True))
@@ -1647,11 +1681,11 @@ def _decode_fast_kernel(
             p_all = jnp.exp2((s_all - _broadcast_minor_128_any(m, w_tot)) * exp2_sc_eff)
             p_new = jnp.exp2((s_new_eff - m) * exp2_sc_eff)
             l_sum = _broadcast_minor_128(jnp.sum(p_all, axis=1, keepdims=True)) + p_new
+        p_dot = p_all.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_all
         if v_early is None:
             v_all = _bkv_fp8_chunk(slot, 0, w_tot, kind="v")
         else:
             v_all = v_early
-        p_dot = p_all.astype(jnp.bfloat16) if (cfg.pv_bf16 or cfg.fp8_dots) else p_all
         pv = jnp.matmul(p_dot, v_all, preferred_element_type=jnp.float32)
         if v_scale is not None and v_scale_val != 1.0:
             pv = pv * v_scale_val
