@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -72,6 +73,7 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
     WanDistAttentionBlock,
     WanEncoder3d,
+    decode_chunk_bounds,
     feat_idx,
     first_chunk,
     forward_context,
@@ -277,6 +279,84 @@ def _gather_heights_on_two_ranks(rank: int, rendezvous: str) -> None:
         assert gather_height_sizes(x, parallel_group=group) == [3, 2]
     finally:
         dist.destroy_process_group()
+
+
+def _decode_wan_latents_chunked(decoder, z: torch.Tensor, chunk_frames=1) -> torch.Tensor:
+    """The decode loop of AutoencoderKLWan.decode over ``decoder``: frame 0 alone, then
+    ``chunk_frames`` latent frames a call."""
+    num_convs = sum(isinstance(m, WanCausalConv3d) for m in decoder.modules())
+    outputs = []
+    with forward_context(feat_cache_arg=[None] * num_convs, feat_idx_arg=0):
+        for i, (start, end) in enumerate(decode_chunk_bounds(z.shape[2], chunk_frames)):
+            feat_idx.set(0)
+            first_chunk.set(i == 0)
+            outputs.append(decoder(z[:, :, start:end]))
+    return torch.cat(outputs, dim=2)
+
+
+def _tiny_wan_decoder(is_residual):
+    return WanDecoder3d(
+        dim=8,
+        z_dim=4,
+        dim_mult=(1, 2, 2),
+        num_res_blocks=1,
+        attn_scales=(),
+        temperal_upsample=(True, False),
+        out_channels=3,
+        is_residual=is_residual,
+    ).eval()
+
+
+class TestWanChunkedDecode(unittest.TestCase):
+    def test_chunk_bounds_keep_frame_zero_alone(self):
+        self.assertEqual(decode_chunk_bounds(4, 1), [(0, 1), (1, 2), (2, 3), (3, 4)])
+        self.assertEqual(decode_chunk_bounds(4, 0), decode_chunk_bounds(4, 1))
+        self.assertEqual(
+            decode_chunk_bounds(21, 5), [(0, 1), (1, 6), (6, 11), (11, 16), (16, 21)]
+        )
+        self.assertEqual(decode_chunk_bounds(7, 4), [(0, 1), (1, 5), (5, 7)])
+        self.assertEqual(decode_chunk_bounds(1, 5), [(0, 1)])
+
+    def test_chunked_decode_matches_per_frame_decode(self):
+        """Wan2.1 and Wan2.2 (residual up blocks) decoders: chunks of 2, 4 and 5
+        latent frames decode the per-frame video up to f32 rounding."""
+        z = torch.randn(1, 4, 6, 10, 6, generator=torch.Generator().manual_seed(3))
+        for is_residual in (False, True):
+            torch.manual_seed(0)
+            decoder = _tiny_wan_decoder(is_residual)
+            with torch.no_grad():
+                expected = _decode_wan_latents_chunked(decoder, z)
+                for chunk_frames in (2, 4, 5):
+                    with self.subTest(is_residual=is_residual, chunk=chunk_frames):
+                        actual = _decode_wan_latents_chunked(decoder, z, chunk_frames)
+                        torch.testing.assert_close(actual, expected)
+
+    def test_vae_decode_reads_the_chunk_env(self):
+        config = WanVAEConfig()
+        arch = config.arch_config
+        arch.base_dim, arch.z_dim, arch.dim_mult = 8, 4, (1, 2, 2)
+        arch.num_res_blocks, arch.temperal_downsample = 1, (False, True)
+        config.load_encoder = False
+        torch.manual_seed(0)
+        vae = AutoencoderKLWan(config).eval()
+        z = torch.randn(1, 4, 6, 4, 4, generator=torch.Generator().manual_seed(4))
+        calls = []
+        decoder_forward = vae.decoder.forward
+
+        def counting_forward(x):
+            calls.append(x.shape[2])
+            return decoder_forward(x)
+
+        outputs = {}
+        with patch.object(vae.decoder, "forward", counting_forward), torch.no_grad():
+            for chunk in ("1", "5"):
+                env = {"SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES": chunk}
+                with patch.dict(os.environ, env):
+                    outputs[chunk] = vae.decode(z)
+        self.assertEqual(calls, [1] * 6 + [1, 5])
+        # One temporal and two spatial 2x upsamples: 1 + 5 * 2 frames.
+        self.assertEqual(outputs["5"].shape, (1, 3, 11, 16, 16))
+        torch.testing.assert_close(outputs["5"], outputs["1"])
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):

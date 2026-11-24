@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     is_auto_parallel_decode_mode,
@@ -49,8 +50,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    pin_spatial_parallel_decode,
     spatial_parallel_decode_disabled,
     split_for_parallel_decode,
+    tensor_split_sizes,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
@@ -61,6 +64,13 @@ from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils import is_gfx1250_supported
+from sglang.multimodal_gen.runtime.utils.decode_stream import emit_decoded_chunk
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_kwargs,
+)
+
+logger = init_logger(__name__)
 
 if (
     current_platform.is_cuda()
@@ -87,10 +97,56 @@ else:
 
 CACHE_T = 2
 
-is_first_frame = contextvars.ContextVar("is_first_frame", default=False)
-feat_cache = contextvars.ContextVar("feat_cache", default=None)
-feat_idx = contextvars.ContextVar("feat_idx", default=0)
-first_chunk = contextvars.ContextVar("first_chunk", default=None)
+
+class _DecodeVar:
+    """A ``contextvars.ContextVar`` that a torch.compile'd decoder call can trace.
+
+    Dynamo cannot trace ``ContextVar.get``/``set``, so every cached conv would
+    end the graph. Inside :func:`traceable_decode_vars` the value is a plain
+    attribute, which dynamo traces (writes replay after the graph); outside it
+    this is the ContextVar.
+    """
+
+    def __init__(self, name: str, default) -> None:
+        self._var = contextvars.ContextVar(name, default=default)
+        self._plain = False
+        self._value = default
+
+    def get(self):
+        return self._value if self._plain else self._var.get()
+
+    def set(self, value):
+        if self._plain:
+            self._value = value
+            return None
+        return self._var.set(value)
+
+    def reset(self, token) -> None:
+        self._var.reset(token)
+
+
+is_first_frame = _DecodeVar("is_first_frame", default=False)
+feat_cache = _DecodeVar("feat_cache", default=None)
+feat_idx = _DecodeVar("feat_idx", default=0)
+first_chunk = _DecodeVar("first_chunk", default=None)
+_DECODE_VARS = (is_first_frame, feat_cache, feat_idx, first_chunk)
+
+
+@contextmanager
+def traceable_decode_vars():
+    """Hold this context's decode vars as plain attributes for one decoder
+    call, then write them back. The attributes are process-wide: one thread
+    at a time may be inside."""
+    for var in _DECODE_VARS:
+        var._value = var._var.get()
+        var._plain = True
+    try:
+        yield
+    finally:
+        for var in _DECODE_VARS:
+            var._plain = False
+            var._var.set(var._value)
+            var._value = None
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
@@ -870,9 +926,13 @@ class WanAttentionBlock(nn.Module):
             if self.parallel_group is not None
             else get_decode_parallel_rank()
         )
-        rows = torch.tensor_split(torch.arange(x.shape[-2]), self.world_size)[rank]
-        first = int(rows[0]) if rows.numel() else 0
-        return attention_block_forward(self, x, rows=(first, rows.numel())).contiguous()
+        # The rows of torch.tensor_split(torch.arange(height), world_size)[rank],
+        # as plain ints: int() of a tensor row makes the slice start
+        # data-dependent, which a torch.compile'd decoder call cannot trace.
+        sizes = tensor_split_sizes(x.shape[-2], self.world_size)
+        count = sizes[rank]
+        first = sum(sizes[:rank]) if count else 0
+        return attention_block_forward(self, x, rows=(first, count)).contiguous()
 
 
 class WanMidBlock(nn.Module):
@@ -1590,6 +1650,21 @@ def unpatchify(x, patch_size):
     return x
 
 
+def decode_chunk_bounds(num_frames: int, chunk_frames: int) -> list[tuple[int, int]]:
+    """Latent-frame ranges, one per decoder call: frame 0 alone, then
+    ``chunk_frames`` frames per call.
+
+    Frame 0 must be a call of its own: the temporal upsamples skip their time
+    conv on the first call and the residual shortcut trims it there
+    (``first_chunk``). After it the causal caches hold exactly the frames a
+    longer call needs, so every chunking decodes the same video up to rounding.
+    """
+    step = max(1, chunk_frames)
+    return [(0, min(1, num_frames))] + [
+        (start, min(start + step, num_frames)) for start in range(1, num_frames, step)
+    ]
+
+
 class AutoencoderKLWan(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
@@ -1658,9 +1733,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         self.use_feature_cache = config.use_feature_cache
         self._causal_decode_initialized = False
+        # The decoder and its torch.compile wrapper (None after a failed
+        # compiled call); a dict keeps the wrapper out of the submodules.
+        self._compiled_decoder: dict[str, nn.Module] = {}
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
+
+    @property
+    def emits_decoded_chunks(self) -> bool:
+        """decode() hands each temporal chunk to decode_stream.emit_decoded_chunk."""
+        return bool(self.use_feature_cache)
 
     def clear_cache(self) -> None:
 
@@ -1797,10 +1880,30 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
                 ):
                     out_chunks = []
-                    for i in range(iter_):
+                    chunks = decode_chunk_bounds(
+                        iter_, envs.SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES
+                    )
+                    patch_size = self.config.patch_size
+                    for i, (start, end) in enumerate(chunks):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
-                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        out_chunks.append(
+                            self._run_decoder(
+                                x[:, :, start:end, :, :],
+                                # From the third call on every cache slot holds
+                                # CACHE_T frames: one shape per frame size and
+                                # call length.
+                                caches_full=i >= 2,
+                            )
+                        )
+                        # A streaming video save encodes this chunk's frames
+                        # while the next one decodes (no-op without one).
+                        emit_decoded_chunk(
+                            out_chunks[-1],
+                            None
+                            if patch_size is None
+                            else lambda c: unpatchify(c, patch_size=patch_size),
+                        )
                         # with the causal cache these frames are final, and full
                         # height even under spatial-parallel decode
                         if on_frames is not None:
@@ -1830,6 +1933,64 @@ class AutoencoderKLWan(ParallelTiledVAE):
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)
         return out.float().clamp(min=-1.0, max=1.0)
+
+    def _run_decoder(self, x: torch.Tensor, *, caches_full: bool) -> torch.Tensor:
+        """One feature-cached decoder call. With
+        SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE, the calls whose caches
+        are full run compiled and the first two calls stay eager, so a frame
+        size compiles one graph (three with
+        SGLANG_DIFFUSION_WAN_VAE_DECODER_COMPILE_ALL_CALLS, which compiles the
+        first two calls too)."""
+        decoder = self.decoder
+        if (
+            not (caches_full or envs.SGLANG_DIFFUSION_WAN_VAE_DECODER_COMPILE_ALL_CALLS)
+            or not envs.SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE
+            or torch.compiler.is_compiling()
+        ):
+            return decoder(x)
+        entry = self._compiled_decoder
+        if entry.get("decoder") is not decoder:
+            compile_kwargs, mode = resolve_torch_compile_kwargs(
+                "SGLANG_VAE_TORCH_COMPILE_MODE",
+                "SGLANG_TORCH_COMPILE_MODE",
+                default="default",
+                module=decoder,
+            )
+            # A call that does not trace as one graph fails before it runs an
+            # op, so the eager rerun below never repeats a collective of a
+            # spatially sharded decode.
+            compile_kwargs = {**compile_kwargs, "fullgraph": True}
+            logger.info("Compiling the Wan VAE decoder with mode: %s", mode)
+            entry = self._compiled_decoder = {
+                "decoder": decoder,
+                "module": torch.compile(decoder, **compile_kwargs),
+            }
+        if entry["module"] is None:
+            return decoder(x)
+        # A sharded call splits the latent rows as split_for_parallel_decode
+        # does; its gathers take every rank's rows from that split.
+        split_heights = None
+        if (
+            getattr(decoder, "use_parallel_decode", False)
+            and getattr(decoder, "world_size", 1) > 1
+            and not spatial_parallel_decode_disabled()
+        ):
+            split_heights = tensor_split_sizes(x.shape[-2], decoder.world_size)
+        try:
+            with traceable_decode_vars(), pin_spatial_parallel_decode(split_heights):
+                # The frame is a view of the whole latent, at an offset and with
+                # strides that change with the frame and the clip length; TPU
+                # backends guard on both, so the compiled call takes a copy.
+                return entry["module"](x.clone(memory_format=torch.contiguous_format))
+        except Exception:
+            # The cache writes replay only after a compiled call returns, so
+            # the eager call sees the caches this call started from.
+            logger.warning(
+                "Compiled Wan VAE decoder call failed; decoding eagerly from now on",
+                exc_info=True,
+            )
+            entry["module"] = None
+            return decoder(x)
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)

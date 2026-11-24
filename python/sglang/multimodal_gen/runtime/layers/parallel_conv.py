@@ -66,6 +66,11 @@ def fused_causal_conv3d_cat_pad(
 _SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
     "spatial_parallel_decode_disabled", default=False
 )
+# (disabled, split heights) for one torch.compile'd decoder call, which can
+# neither read the ContextVar (dynamo does not trace ContextVar.get) nor
+# exchange heights (int() of a gathered tensor ends the graph). See
+# pin_spatial_parallel_decode.
+_pinned_decode: tuple[bool, tuple[int, ...] | None] | None = None
 
 
 @contextmanager
@@ -78,6 +83,8 @@ def disable_spatial_parallel_decode():
 
 
 def spatial_parallel_decode_disabled() -> bool:
+    if _pinned_decode is not None:
+        return _pinned_decode[0]
     return _SPATIAL_PARALLEL_DECODE_DISABLED.get()
 
 
@@ -87,6 +94,33 @@ def _parallel_rank_and_world_size(
     if parallel_group is not None:
         return parallel_group.rank_in_group, parallel_group.world_size
     return get_decode_parallel_rank(), get_decode_parallel_world_size()
+
+
+def tensor_split_sizes(length: int, parts: int) -> tuple[int, ...]:
+    """Sizes of ``torch.tensor_split`` of ``length`` rows into ``parts``."""
+    base, extra = divmod(length, parts)
+    return tuple(base + (i < extra) for i in range(parts))
+
+
+@contextmanager
+def pin_spatial_parallel_decode(split_heights: tuple[int, ...] | None):
+    """Hold the decode's spatial-parallel state as plain module values for one
+    torch.compile'd decoder call.
+
+    spatial_parallel_decode_disabled() returns its value at entry. With
+    ``split_heights`` (the rows of each decode rank after the decoder's
+    split_for_parallel_decode), gather_height_sizes() derives every rank's
+    height from them instead of gathering: each rank's activation holds the
+    same multiple of its split rows, as in a decoder whose spatial resampling
+    is uniform. The values are process-wide: one thread at a time may be
+    inside.
+    """
+    global _pinned_decode
+    _pinned_decode = (_SPATIAL_PARALLEL_DECODE_DISABLED.get(), split_heights)
+    try:
+        yield
+    finally:
+        _pinned_decode = None
 
 
 def _tensor_pad(x: torch.Tensor, len_to_pad: int, dim: int = -2):
@@ -261,6 +295,15 @@ def gather_height_sizes(
     )
     if world_size <= 1:
         return [x.shape[-2]]
+    if _pinned_decode is not None and _pinned_decode[1] is not None:
+        split_heights = _pinned_decode[1]
+        scale, rest = divmod(x.shape[-2], split_heights[_parallel_rank_and_world_size(parallel_group)[0]])
+        if rest:
+            raise ValueError(
+                f"height {x.shape[-2]} is not a multiple of this rank's split "
+                f"rows ({split_heights})"
+            )
+        return [height * scale for height in split_heights]
     parallel_group = parallel_group or get_decode_parallel_group_coordinator()
     # heights are host metadata: a device gather would make the host wait for
     # every kernel queued before it, idling the GPU while it relaunches
@@ -439,11 +482,12 @@ def _gather_neighbor_halos(
     with the decode group. Fine up to 8-16 ranks next to the convolution;
     revisit (e.g. a neighbour collective_permute) for larger groups.
     """
-    logger.info_once(
-        "Spatially sharded VAE conv without p2p: halos travel by all-gather "
-        "over %d ranks.",
-        world_size,
-    )
+    if not torch.compiler.is_compiling():
+        logger.info_once(
+            "Spatially sharded VAE conv without p2p: halos travel by all-gather "
+            "over %d ranks.",
+            world_size,
+        )
     height_halo_size = top_row.shape[-2]
     edges = decode_group.all_gather(
         torch.cat([top_row, bottom_row], dim=-2).contiguous(),
@@ -607,14 +651,20 @@ def _spatial_parallel_conv_forward(
 ) -> torch.Tensor:
     # Exchange halos (p2p, or an all-gather without p2p).
     # x_padded: concatenated input
-    x_padded, module._halo_recv_top_buf, module._halo_recv_bottom_buf = halo_exchange(
+    # A compiled call receives into buffers of its own: reusing the module's
+    # would make their shapes and strides guards of the graph.
+    compiling = torch.compiler.is_compiling()
+    x_padded, recv_top_buf, recv_bottom_buf = halo_exchange(
         x,
         height_halo_size=module.height_halo_size,
-        recv_top_buf=module._halo_recv_top_buf,
-        recv_bottom_buf=module._halo_recv_bottom_buf,
+        recv_top_buf=None if compiling else module._halo_recv_top_buf,
+        recv_bottom_buf=None if compiling else module._halo_recv_bottom_buf,
         height_pad_mode=height_pad_mode,
         parallel_group=module.parallel_group,
     )
+    if not compiling:
+        module._halo_recv_top_buf = recv_top_buf
+        module._halo_recv_bottom_buf = recv_bottom_buf
     if match_conv3d_format:
         x_padded = _match_conv3d_input_format(x_padded, module.weight)
     if module.height_halo_size == 0:

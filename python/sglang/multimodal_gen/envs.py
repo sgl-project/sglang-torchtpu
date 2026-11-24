@@ -130,6 +130,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS: int = 3
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE: bool = False
+    SGLANG_DIFFUSION_WAN_VAE_DECODER_COMPILE_ALL_CALLS: bool = False
+    SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES: int = 1
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -359,6 +362,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
+    # torch.compile the Wan VAE decoder calls that run with full causal caches
+    # (every call after the second): one graph per frame size, the same math.
+    "SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE"
+    ),
+    # With SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE, compile the first
+    # two decoder calls too, whose caches are still filling: one more graph
+    # each per frame size and call length.
+    "SGLANG_DIFFUSION_WAN_VAE_DECODER_COMPILE_ALL_CALLS": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_VAE_DECODER_COMPILE_ALL_CALLS"
+    ),
+    # Latent frames per Wan VAE decoder call after the first frame, which
+    # decodes alone. Longer calls decode the same video (up to rounding) in
+    # fewer, larger ops; activation memory grows with the chunk. Call shapes
+    # follow the frame count (a shorter last call when the chunk does not
+    # divide the frames after the first), so a warmup covers its own count.
+    "SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES": _lazy_int(
+        "SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES", 1
     ),
     # Kill-switch: keep VAE decoder weights in their checkpoint dtype at load
     # instead of the decode compute dtype the decode stage would round them to
