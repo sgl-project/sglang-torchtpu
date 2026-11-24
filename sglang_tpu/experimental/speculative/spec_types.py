@@ -15,8 +15,34 @@ import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
+
+_PACKED_ADDR_STAGING: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def _get_packed_addressing_staging(
+    padded_bs: int,
+    total_cols: int,
+    device: Any,
+    staging_cache: dict[tuple[int, int, str], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Return a pinned host buffer for packed verify addressing, reusing across steps."""
+    dev_str = str(device)
+    dev_type = getattr(device, "type", dev_str.split(":")[0])
+    pin = is_pin_memory_available(device)
+    cache = staging_cache if staging_cache is not None else (
+        _PACKED_ADDR_STAGING if dev_type != "cpu" else None
+    )
+    if cache is None:
+        return torch.zeros((padded_bs, total_cols), dtype=torch.int64, pin_memory=pin)
+    key = (padded_bs, total_cols, dev_str)
+    buf = cache.get(key)
+    if buf is None:
+        buf = torch.zeros((padded_bs, total_cols), dtype=torch.int64, pin_memory=pin)
+        cache[key] = buf
+    return buf
 
 
 class SpecState(NamedTuple):
@@ -230,6 +256,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         *,
         pack_addressing: bool = False,
         swa_mapping: torch.Tensor | None = None,
+        staging_cache: dict[tuple[int, int, str], torch.Tensor] | None = None,
     ) -> TpuSpecVerifyInput:
         """Convert the algorithm's batch.spec_info; raise for types without a TPU window."""
         draft_input = batch.spec_info
@@ -273,13 +300,17 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             assert candidates is not None
             bs_live, cand_cols = candidates.shape
             total_cols = cand_cols * (2 if swa_mapping is not None else 1) + 1
-            packed_cpu = torch.zeros((padded_bs, total_cols), dtype=torch.int64)
+            packed_cpu = _get_packed_addressing_staging(
+                padded_bs, total_cols, batch.device, staging_cache=staging_cache
+            )
             packed_cpu[:bs_live, :cand_cols] = candidates
             if swa_mapping is not None:
                 packed_cpu[:bs_live, cand_cols : 2 * cand_cols] = swa_mapping[
                     candidates
                 ]
             packed_cpu[:bs_live, -1] = committed_lens
+            if bs_live < padded_bs:
+                packed_cpu[bs_live:].zero_()
             packed_addressing = packed_cpu.to(batch.device, non_blocking=True)
 
         return cls(

@@ -174,6 +174,10 @@ class TpuEnvs:
     # full+SWA select_verify_rows with build_draft_block_inputs into one compiled op,
     # and emit greedy verify_tokens directly inside DFlashDraftModel.forward.
     SGLANG_TPU_DFLASH_FUSE_STEP_OPS = EnvBool(False)
+    # Opt-in v2 step fusion extending DFLASH_FUSE_STEP_OPS: collapse Launch 1
+    # (prepare_dflash_block_step + draft forward) and Launch 3 (accept +
+    # write_draft_kv) into single compiled dispatches on TpuBlockSpecWorker.
+    SGLANG_TPU_DFLASH_FUSE_STEP_OPS_V2 = EnvBool(False)
     # Run all-greedy TARGET_VERIFY and non-speculative DECODE/EXTEND steps with
     # distributed top-k width k=1 (LogitsOutputMode.DISTRIBUTED_GREEDY) instead of 64.
     SGLANG_TPU_SPEC_VERIFY_GREEDY_TOPK1 = EnvBool(False)

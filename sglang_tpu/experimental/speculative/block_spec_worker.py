@@ -43,6 +43,10 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
+    unpack_draft_lattice,
+)
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
@@ -56,13 +60,17 @@ from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftI
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
 )
-from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
+from sglang_tpu.experimental.speculative.draft_forward import (
+    forward_draft_rows,
+    prep_and_draft_rows,
+)
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    build_verify_tokens,
     prepare_dflash_block_step,
     select_verify_rows,
 )
@@ -133,7 +141,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         from sglang_tpu.envs import envs as tpu_envs
 
-        self._fuse_step_ops = tpu_envs.SGLANG_TPU_DFLASH_FUSE_STEP_OPS.get()
+        self._fuse_step_ops_v2 = tpu_envs.SGLANG_TPU_DFLASH_FUSE_STEP_OPS_V2.get()
+        self._fuse_step_ops = (
+            tpu_envs.SGLANG_TPU_DFLASH_FUSE_STEP_OPS.get() or self._fuse_step_ops_v2
+        )
         self._step_timers_enabled = tpu_envs.SGLANG_TPU_SPEC_STEP_TIMERS.get()
         self._step_timer_samples: list[tuple[float, float, float, float, float]] = []
 
@@ -166,9 +177,161 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._warmup_draft_block_inputs()
             if self._sampled_drafts:
                 self._warmup_draft_sampling()
+            if getattr(self, "_fuse_step_ops_v2", False):
+                self._warmup_accept_and_write_draft_kv()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
+
+    def _can_use_fused_prep_and_draft(self) -> bool:
+        return getattr(self, "_fuse_step_ops_v2", False) and isinstance(
+            getattr(self._draft_runner, "compile_policy", None),
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+
+    def _can_use_fused_accept_commit(
+        self,
+        verify_input: TpuSpecVerifyInput,
+        swa_rows: VerifyRows | None,
+    ) -> bool:
+        return (
+            getattr(self, "_fuse_step_ops_v2", False)
+            and verify_input.packed_addressing is not None
+            and not self._target_has_linear_attn
+            and self._simulate_acc_len == 0
+            and isinstance(
+                getattr(self._draft_runner, "compile_policy", None),
+                TpuBlockSpecDecodeCompilePolicyMixin,
+            )
+            and (swa_rows is not None or self._draft_swa_candidates(verify_input) is None)
+        )
+
+    def _prep_and_draft_fused(
+        self,
+        *,
+        bucket: BucketState,
+        verify_input: TpuSpecVerifyInput,
+    ) -> tuple[VerifyRows, VerifyRows | None, DraftResult]:
+        state = bucket.state
+        bs = state.seq_lens.shape[0]
+        assert verify_input.packed_addressing is not None
+        with self._block_draft_worker.draft_context():
+            (
+                rows,
+                swa_rows,
+                block_hidden,
+                graph_draft_tokens,
+                draft_lattice,
+                graph_verify_tokens,
+            ) = prep_and_draft_rows(
+                draft_runner=self._draft_runner,
+                spec_algorithm=self._spec_algorithm,
+                packed_addressing=verify_input.packed_addressing,
+                bonus_tokens=state.bonus_tokens,
+                state_seq_lens=state.seq_lens,
+                live_mask=bucket.live_mask,
+                req_pool_indices=state.req_pool_indices,
+                verify_input=verify_input,
+                num_verify_rows=self.num_verify_rows,
+                mask_token_id=self._mask_token_id,
+                width=self._draft_block_width,
+                has_swa=self._block_draft_worker.full_to_swa is not None,
+                spec_info=self._draft_block_spec_info,
+            )
+        draft_result = self._finish_draft_result(
+            bucket=bucket,
+            bs=bs,
+            block_hidden=block_hidden,
+            graph_draft_tokens=graph_draft_tokens,
+            draft_lattice=draft_lattice,
+            graph_verify_tokens=graph_verify_tokens,
+        )
+        return rows, swa_rows, draft_result
+
+    def _fused_accept_and_commit(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bucket: BucketState,
+        rows: VerifyRows,
+        swa_rows: VerifyRows | None,
+        draft_result: DraftResult,
+        logits_output: LogitsProcessorOutput,
+    ) -> tuple[AcceptResult, CommitResult] | None:
+        if not logits_output.has_next_token_global_top_k:
+            return None
+        state = bucket.state
+        kv_rows = swa_rows if swa_rows is not None else rows
+        target_hidden = logits_output.hidden_states
+        assert target_hidden is not None
+        assert target_hidden.shape[0] == kv_rows.cache_locs.numel(), (
+            "verify hidden must keep the batch bucket rows"
+        )
+        top_logits = logits_output.next_token_global_top_k_logits
+        top_ids = logits_output.next_token_global_top_k_token_ids
+        draft_tokens = draft_result.draft_tokens
+        num_rows = draft_tokens.shape[0] * self.num_verify_rows
+        if bucket.temperatures is None or bucket.top_ks is None:
+            assert top_ids.shape in (
+                (num_rows, TARGET_CANDIDATES),
+                (num_rows, 1),
+            ), top_ids.shape
+            with self._block_draft_worker.draft_context():
+                accept, kv_fence_tail = (
+                    self._block_draft_worker.accept_and_write_draft_kv_greedy_top_k(
+                        top_ids=top_ids,
+                        draft_tokens=draft_tokens,
+                        num_verify_drafts=draft_result.num_verify_drafts,
+                        seq_lens=state.seq_lens,
+                        live_mask=bucket.live_mask,
+                        target_hidden=target_hidden,
+                        positions=kv_rows.flat_positions,
+                        cache_loc=kv_rows.flat_cache_locs,
+                        cache_loc_2d=kv_rows.cache_locs,
+                    )
+                )
+        elif draft_result.draft_candidates is not None and bucket.target_candidates:
+            assert top_ids.shape == (num_rows, TARGET_CANDIDATES), top_ids.shape
+            draft_ids, draft_logits = draft_result.draft_candidates
+            with self._block_draft_worker.draft_context():
+                accept, self._rng_step, kv_fence_tail = (
+                    self._block_draft_worker.accept_and_write_draft_kv_top_k_candidates(
+                        top_logits=top_logits,
+                        top_ids=top_ids,
+                        draft_tokens=draft_tokens,
+                        num_verify_drafts=draft_result.num_verify_drafts,
+                        draft_ids=draft_ids,
+                        draft_logits=draft_logits,
+                        temperatures=bucket.temperatures,
+                        top_ks=bucket.top_ks,
+                        seq_lens=state.seq_lens,
+                        live_mask=bucket.live_mask,
+                        rng_step=self._rng_step,
+                        target_hidden=target_hidden,
+                        positions=kv_rows.flat_positions,
+                        cache_loc=kv_rows.flat_cache_locs,
+                        cache_loc_2d=kv_rows.cache_locs,
+                        block_verification=self._block_verification,
+                    )
+                )
+        else:
+            return None
+        self._check_rank_agreement(accept)
+        ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if ngram.engram_hasher is not None:
+            ngram.update_after_verify(
+                verify_ids_2d=committed_verify_ids(
+                    state.bonus_tokens, accept.accept_tokens
+                ),
+                req_pool_indices=state.req_pool_indices,
+                commit_lens=accept.accept_lens,
+            )
+        next_state = SpecState(
+            bonus_tokens=accept.bonus_tokens,
+            seq_lens=accept.next_seq_lens,
+            req_pool_indices=state.req_pool_indices,
+        )
+        return accept, CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
 
     def step(
         self,
@@ -185,20 +348,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         t0 = time.perf_counter() if self._step_timers_enabled else 0.0
         state = bucket.state
         if verify_input.packed_addressing is not None:
-            rows, swa_rows, draft_inputs = prepare_dflash_block_step(
-                verify_input.packed_addressing,
-                state.bonus_tokens,
-                state.seq_lens,
-                bucket.live_mask,
-                self.num_verify_rows,
-                self._mask_token_id,
-                self._draft_block_width,
-                self._block_draft_worker.full_to_swa is not None,
-            )
-            t1 = time.perf_counter() if self._step_timers_enabled else 0.0
-            draft_result = self._draft_from_inputs(
-                bucket=bucket, draft_inputs=draft_inputs, verify_input=verify_input
-            )
+            if self._can_use_fused_prep_and_draft():
+                rows, swa_rows, draft_result = self._prep_and_draft_fused(
+                    bucket=bucket, verify_input=verify_input
+                )
+                t1 = t0
+            else:
+                rows, swa_rows, draft_inputs = prepare_dflash_block_step(
+                    verify_input.packed_addressing,
+                    state.bonus_tokens,
+                    state.seq_lens,
+                    bucket.live_mask,
+                    self.num_verify_rows,
+                    self._mask_token_id,
+                    self._draft_block_width,
+                    self._block_draft_worker.full_to_swa is not None,
+                )
+                t1 = time.perf_counter() if self._step_timers_enabled else 0.0
+                draft_result = self._draft_from_inputs(
+                    bucket=bucket, draft_inputs=draft_inputs, verify_input=verify_input
+                )
         else:
             rows = select_verify_rows(
                 verify_input.verify_cache_candidates,
@@ -210,31 +379,71 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             t1 = time.perf_counter() if self._step_timers_enabled else 0.0
             draft_result = self.draft(batch, bucket, rows, verify_input)
         t2 = time.perf_counter() if self._step_timers_enabled else 0.0
-        logits_output, accept = self.verify(
-            batch,
-            bucket,
-            rows,
-            draft_result,
-            verify_input,
-            grammar_barrier=grammar_barrier,
-        )
-        t3 = time.perf_counter() if self._step_timers_enabled else 0.0
-        if self._target_has_linear_attn:
-            self._commit_linear_attn_states(
+        fused_commit_done = False
+        if self._can_use_fused_accept_commit(verify_input, swa_rows):
+            verify_tokens = draft_result.verify_tokens
+            if verify_tokens is None:
+                verify_tokens = build_verify_tokens(
+                    state.bonus_tokens, draft_result.draft_tokens
+                )
+            spec_info = self.make_verify_input(
                 batch=batch,
-                accept=accept,
-                pre_verify_lens=state.seq_lens,
-                verify_input=verify_input,
+                verify_tokens=verify_tokens,
+                rows=rows,
             )
-        committed = self.commit(
-            batch,
-            state,
-            rows,
-            verify_input,
-            logits_output,
-            accept,
-            swa_rows=swa_rows,
-        )
+            logits_output = self._forward_target_verify(
+                batch=batch,
+                bucket_state=state,
+                verify_tokens=verify_tokens,
+                rows=rows,
+                verify_input=verify_input,
+                spec_info=spec_info,
+                logits_output_mode=self._verify_logits_output_mode(
+                    bucket, draft_result
+                ),
+            )
+            t3 = time.perf_counter() if self._step_timers_enabled else 0.0
+            fused = self._fused_accept_and_commit(
+                batch=batch,
+                bucket=bucket,
+                rows=rows,
+                swa_rows=swa_rows,
+                draft_result=draft_result,
+                logits_output=logits_output,
+            )
+            if fused is not None:
+                accept, committed = fused
+                fused_commit_done = True
+            else:
+                accept = self._accept(bucket, draft_result, logits_output)
+                self._check_rank_agreement(accept)
+        else:
+            logits_output, accept = self.verify(
+                batch,
+                bucket,
+                rows,
+                draft_result,
+                verify_input,
+                grammar_barrier=grammar_barrier,
+            )
+            t3 = time.perf_counter() if self._step_timers_enabled else 0.0
+        if not fused_commit_done:
+            if self._target_has_linear_attn:
+                self._commit_linear_attn_states(
+                    batch=batch,
+                    accept=accept,
+                    pre_verify_lens=state.seq_lens,
+                    verify_input=verify_input,
+                )
+            committed = self.commit(
+                batch,
+                state,
+                rows,
+                verify_input,
+                logits_output,
+                accept,
+                swa_rows=swa_rows,
+            )
         if self._step_timers_enabled:
             t4 = time.perf_counter()
             self._record_step_timers(t0, t1, t2, t3, t4)
@@ -613,14 +822,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def _unpack_draft_lattice(
         raw_lattice: Any,
     ) -> tuple[DraftLattice | None, torch.Tensor | None]:
-        if (
-            isinstance(raw_lattice, tuple)
-            and len(raw_lattice) == 2
-            and isinstance(raw_lattice[1], torch.Tensor)
-            and raw_lattice[1].ndim == 1
-        ):
-            return raw_lattice[0], raw_lattice[1]
-        return raw_lattice, None
+        return unpack_draft_lattice(raw_lattice)
 
     def _run_draft_block_inputs(
         self,
@@ -801,6 +1003,127 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         self._warmup_candidates_accept(
                             padded_bs, sampled.draft_tokens, sampled.draft_candidates
                         )
+                        self._warmup_accept_and_write_draft_kv_candidates(
+                            padded_bs, sampled.draft_tokens, sampled.draft_candidates
+                        )
+
+    def _warmup_accept_and_write_draft_kv(self) -> None:
+        """Warm fused greedy top-k accept + draft KV write across batch buckets."""
+        if (
+            self._target_has_linear_attn
+            or self._simulate_acc_len > 0
+            or self._verify_top_k_width is None
+            or not isinstance(
+                getattr(self._draft_runner, "compile_policy", None),
+                TpuBlockSpecDecodeCompilePolicyMixin,
+            )
+        ):
+            return
+        compile_policy = self._draft_runner.compile_policy
+        target_hidden_size = compile_policy.dflash_target_hidden_size
+        top_k_width = 1 if self._verify_greedy_topk1 else self._verify_top_k_width
+        with torch.no_grad(), self._block_draft_worker.draft_context():
+            for padded_bs in self._bucket_sizes():
+                num_tokens = padded_bs * self.num_verify_rows
+                self._block_draft_worker.accept_and_write_draft_kv_greedy_top_k(
+                    top_ids=torch.zeros(
+                        (num_tokens, top_k_width), dtype=torch.int32, device=self.device
+                    ),
+                    draft_tokens=torch.zeros(
+                        (padded_bs, self.num_drafts),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    num_verify_drafts=self._all_drafts[padded_bs],
+                    seq_lens=torch.zeros(
+                        (padded_bs,), dtype=torch.int64, device=self.device
+                    ),
+                    live_mask=torch.ones(
+                        (padded_bs,), dtype=torch.bool, device=self.device
+                    ),
+                    target_hidden=torch.zeros(
+                        (num_tokens, target_hidden_size),
+                        dtype=self._draft_runner.dtype,
+                        device=self.device,
+                    ),
+                    positions=torch.zeros(
+                        (num_tokens,), dtype=torch.int64, device=self.device
+                    ),
+                    cache_loc=torch.zeros(
+                        (num_tokens,), dtype=torch.int64, device=self.device
+                    ),
+                    cache_loc_2d=torch.zeros(
+                        (padded_bs, self.num_verify_rows),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                )
+
+    def _warmup_accept_and_write_draft_kv_candidates(
+        self,
+        padded_bs: int,
+        draft_tokens: torch.Tensor,
+        draft_candidates: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        if (
+            not self._fuse_step_ops_v2
+            or self._target_has_linear_attn
+            or self._simulate_acc_len > 0
+            or self._verify_top_k_width is None
+            or not isinstance(
+                getattr(self._draft_runner, "compile_policy", None),
+                TpuBlockSpecDecodeCompilePolicyMixin,
+            )
+        ):
+            return
+        compile_policy = self._draft_runner.compile_policy
+        target_hidden_size = compile_policy.dflash_target_hidden_size
+        num_tokens = padded_bs * self.num_verify_rows
+        temperatures, top_ks, _, _ = self._sampling_param_warmup_args(padded_bs)
+        draft_ids, draft_logits = draft_candidates
+        with torch.no_grad(), self._block_draft_worker.draft_context():
+            self._block_draft_worker.accept_and_write_draft_kv_top_k_candidates(
+                top_logits=torch.zeros(
+                    (num_tokens, TARGET_CANDIDATES),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                top_ids=torch.zeros(
+                    (num_tokens, TARGET_CANDIDATES),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                draft_tokens=draft_tokens,
+                num_verify_drafts=self._all_drafts[padded_bs],
+                draft_ids=draft_ids,
+                draft_logits=draft_logits,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                seq_lens=torch.zeros(
+                    (padded_bs,), dtype=torch.int64, device=self.device
+                ),
+                live_mask=torch.ones(
+                    (padded_bs,), dtype=torch.bool, device=self.device
+                ),
+                rng_step=self._rng_step,
+                target_hidden=torch.zeros(
+                    (num_tokens, target_hidden_size),
+                    dtype=self._draft_runner.dtype,
+                    device=self.device,
+                ),
+                positions=torch.zeros(
+                    (num_tokens,), dtype=torch.int64, device=self.device
+                ),
+                cache_loc=torch.zeros(
+                    (num_tokens,), dtype=torch.int64, device=self.device
+                ),
+                cache_loc_2d=torch.zeros(
+                    (padded_bs, self.num_verify_rows),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                block_verification=self._block_verification,
+            )
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

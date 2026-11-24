@@ -57,6 +57,9 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`IterationIds.write_ids`).
     iteration_ids: Optional[IterationIds] = None
     iteration_cols: Optional[Cols] = None
+    # In-graph [pbs] int32 KV lengths for fused draft passes (read by
+    # BaseTpuPallasRpaAttnBackend._kv_lens instead of forward_metadata.kv_lens).
+    rpa_draft_kv_lens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

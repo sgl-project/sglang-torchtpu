@@ -104,14 +104,13 @@ def pad_state_rows(
     )
 
 
-@compiled_op()
-def select_verify_rows(
+def select_verify_rows_impl(
     verify_cache_candidates: torch.Tensor,
     committed_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     num_rows: int | None = None,
 ) -> VerifyRows:
-    """Select active rows; the worker warms its capacity/width combinations."""
+    """Uncompiled implementation of select_verify_rows for fused graphs."""
     if num_rows is None:
         num_rows = verify_cache_candidates.shape[1] // 2
     cache_locs = select_dflash_verify_cache_locs_tpu(
@@ -124,6 +123,19 @@ def select_verify_rows(
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+    )
+
+
+@compiled_op()
+def select_verify_rows(
+    verify_cache_candidates: torch.Tensor,
+    committed_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_rows: int | None = None,
+) -> VerifyRows:
+    """Select active rows; the worker warms its capacity/width combinations."""
+    return select_verify_rows_impl(
+        verify_cache_candidates, committed_lens, seq_lens, num_rows
     )
 
 
@@ -141,8 +153,7 @@ def verify_tokens_of(
     return torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).reshape(-1)
 
 
-@compiled_op()
-def build_draft_block_inputs(
+def build_draft_block_inputs_impl(
     bonus_tokens: torch.Tensor,
     rows: VerifyRows,
     seq_lens: torch.Tensor,
@@ -150,10 +161,7 @@ def build_draft_block_inputs(
     mask_token_id: int,
     width: int,
 ) -> DraftBlockInputs:
-    """Block-parallel draft inputs [r, m x (width - 1)] over the first width verify rows.
-
-    Model config sets width and mask_token_id, so the owning worker warms this op.
-    """
+    """Uncompiled implementation of build_draft_block_inputs for fused graphs."""
     pbs = bonus_tokens.shape[0]
     mask_tokens = torch.full(
         (pbs, width - 1),
@@ -171,6 +179,53 @@ def build_draft_block_inputs(
 
 
 @compiled_op()
+def build_draft_block_inputs(
+    bonus_tokens: torch.Tensor,
+    rows: VerifyRows,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    mask_token_id: int,
+    width: int,
+) -> DraftBlockInputs:
+    """Block-parallel draft inputs [r, m x (width - 1)] over the first width verify rows.
+
+    Model config sets width and mask_token_id, so the owning worker warms this op.
+    """
+    return build_draft_block_inputs_impl(
+        bonus_tokens, rows, seq_lens, live_mask, mask_token_id, width
+    )
+
+
+def prepare_dflash_block_step_impl(
+    packed_addressing: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    num_verify_rows: int,
+    mask_token_id: int,
+    draft_width: int,
+    has_swa: bool,
+) -> tuple[VerifyRows, VerifyRows | None, DraftBlockInputs]:
+    """Uncompiled implementation of prepare_dflash_block_step for fused graphs."""
+    cand_cols = (packed_addressing.shape[1] - 1) // (2 if has_swa else 1)
+    full_cands = packed_addressing[:, :cand_cols]
+    committed_lens = packed_addressing[:, -1]
+    rows = select_verify_rows_impl(
+        full_cands, committed_lens, seq_lens, num_verify_rows
+    )
+    swa_rows = None
+    if has_swa:
+        swa_cands = packed_addressing[:, cand_cols : 2 * cand_cols]
+        swa_rows = select_verify_rows_impl(
+            swa_cands, committed_lens, seq_lens, num_verify_rows
+        )
+    draft_inputs = build_draft_block_inputs_impl(
+        bonus_tokens, rows, seq_lens, live_mask, mask_token_id, draft_width
+    )
+    return rows, swa_rows, draft_inputs
+
+
+@compiled_op()
 def prepare_dflash_block_step(
     packed_addressing: torch.Tensor,
     bonus_tokens: torch.Tensor,
@@ -183,20 +238,16 @@ def prepare_dflash_block_step(
 ) -> tuple[VerifyRows, VerifyRows | None, DraftBlockInputs]:
     """Unpack [candidates, (swa_candidates), committed_lens] and build both full
     and SWA VerifyRows plus DraftBlockInputs in one compiled program."""
-    cand_cols = (packed_addressing.shape[1] - 1) // (2 if has_swa else 1)
-    full_cands = packed_addressing[:, :cand_cols]
-    committed_lens = packed_addressing[:, -1]
-    rows = select_verify_rows(full_cands, committed_lens, seq_lens, num_verify_rows)
-    swa_rows = None
-    if has_swa:
-        swa_cands = packed_addressing[:, cand_cols : 2 * cand_cols]
-        swa_rows = select_verify_rows(
-            swa_cands, committed_lens, seq_lens, num_verify_rows
-        )
-    draft_inputs = build_draft_block_inputs(
-        bonus_tokens, rows, seq_lens, live_mask, mask_token_id, draft_width
+    return prepare_dflash_block_step_impl(
+        packed_addressing,
+        bonus_tokens,
+        seq_lens,
+        live_mask,
+        num_verify_rows,
+        mask_token_id,
+        draft_width,
+        has_swa,
     )
-    return rows, swa_rows, draft_inputs
 
 
 @compiled_op()
@@ -864,8 +915,7 @@ def accept_candidates_step(
     return accept, rng_step + 1
 
 
-@compiled_op()
-def accept_top_k_candidates_step(
+def accept_top_k_candidates_step_impl(
     top_logits: torch.Tensor,
     top_ids: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -879,7 +929,7 @@ def accept_top_k_candidates_step(
     rng_step: torch.Tensor,
     block_verification: bool,
 ) -> tuple[AcceptResult, torch.Tensor]:
-    """accept_candidates_step on the verify's distributed top-k; the owner warms it."""
+    """Uncompiled implementation of accept_top_k_candidates_step for fused graphs."""
     num_correct, bonus = accept_drafts_candidates(
         top_logits,
         top_ids,
@@ -896,15 +946,46 @@ def accept_top_k_candidates_step(
     return accept, rng_step + 1
 
 
-@compiled_op(warmup=lambda ctx: _greedy_top_k_warmup_args(ctx))
-def accept_greedy_top_k_step(
+@compiled_op()
+def accept_top_k_candidates_step(
+    top_logits: torch.Tensor,
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+    block_verification: bool,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_candidates_step on the verify's distributed top-k; the owner warms it."""
+    return accept_top_k_candidates_step_impl(
+        top_logits,
+        top_ids,
+        draft_tokens,
+        num_verify_drafts,
+        draft_ids,
+        draft_logits,
+        temperatures,
+        top_ks,
+        seq_lens,
+        live_mask,
+        rng_step,
+        block_verification,
+    )
+
+
+def accept_greedy_top_k_step_impl(
     top_ids: torch.Tensor,
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     seq_lens: torch.Tensor,
     live_mask: torch.Tensor,
 ) -> AcceptResult:
-    """accept_greedy_step on the verify's descending top-k ids; the owner warms it."""
+    """Uncompiled implementation of accept_greedy_top_k_step for fused graphs."""
     bs, n = draft_tokens.shape
     # int32 compares and picks: int64 lanes are emulated on TPU.
     target_argmax = top_ids[:, 0].view(bs, n + 1).to(torch.int32)
@@ -917,6 +998,20 @@ def accept_greedy_top_k_step(
         bonus.to(draft_tokens.dtype),
         seq_lens,
         live_mask,
+    )
+
+
+@compiled_op(warmup=lambda ctx: _greedy_top_k_warmup_args(ctx))
+def accept_greedy_top_k_step(
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """accept_greedy_step on the verify's descending top-k ids; the owner warms it."""
+    return accept_greedy_top_k_step_impl(
+        top_ids, draft_tokens, num_verify_drafts, seq_lens, live_mask
     )
 
 

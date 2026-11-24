@@ -23,6 +23,7 @@ from sglang_tpu.experimental.compilation.block_compile_policy import (
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
+from sglang_tpu.experimental.speculative.spec_types import AcceptResult
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 # (step_logits [pbs, V], step_idx) -> sampled [pbs] tokens.
@@ -137,6 +138,9 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             self.model_runner.attn_backend,
             kv_writer=self._write_draft_kv_eager,
             block_width=self.block_width,
+            num_verify_rows=self.num_drafts + 1,
+            mask_token_id=self.mask_token_id,
+            has_swa=self.full_to_swa is not None,
         )
 
     def write_draft_kv(
@@ -162,6 +166,74 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         )
         assert tail is not None
         return tail
+
+    def accept_and_write_draft_kv_greedy_top_k(
+        self,
+        *,
+        top_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        num_verify_drafts: torch.Tensor,
+        seq_lens: torch.Tensor,
+        live_mask: torch.Tensor,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+    ) -> tuple[AcceptResult, torch.Tensor]:
+        """Run fused greedy top-k accept + draft KV write in one compiled dispatch."""
+        return self._compile_policy().accept_and_write_draft_kv_greedy_top_k(
+            top_ids=top_ids,
+            draft_tokens=draft_tokens,
+            num_verify_drafts=num_verify_drafts,
+            seq_lens=seq_lens,
+            live_mask=live_mask,
+            target_hidden=target_hidden,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            kv_writer=self._write_draft_kv_eager,
+        )
+
+    def accept_and_write_draft_kv_top_k_candidates(
+        self,
+        *,
+        top_logits: torch.Tensor,
+        top_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        num_verify_drafts: torch.Tensor,
+        draft_ids: torch.Tensor,
+        draft_logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        seq_lens: torch.Tensor,
+        live_mask: torch.Tensor,
+        rng_step: torch.Tensor,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        block_verification: bool,
+    ) -> tuple[AcceptResult, torch.Tensor, torch.Tensor]:
+        """Run fused sampled candidate top-k accept + draft KV write in one dispatch."""
+        return self._compile_policy().accept_and_write_draft_kv_top_k_candidates(
+            top_logits=top_logits,
+            top_ids=top_ids,
+            draft_tokens=draft_tokens,
+            num_verify_drafts=num_verify_drafts,
+            draft_ids=draft_ids,
+            draft_logits=draft_logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            seq_lens=seq_lens,
+            live_mask=live_mask,
+            rng_step=rng_step,
+            target_hidden=target_hidden,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            block_verification=block_verification,
+            kv_writer=self._write_draft_kv_eager,
+        )
 
     def _write_draft_kv_eager(
         self,
