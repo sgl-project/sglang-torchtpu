@@ -38,6 +38,11 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
+    oproj_a2a_call,
+    oproj_call,
+    pool_call,
+)
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     _heads_rms_mxu,
     dequant_rows_call,
@@ -59,6 +64,8 @@ QKVG_TILE = 256
 # x_norm AG chunks overlapped with the chunked qkvg card, and that card's row tile
 XAG_CHUNKS = 4
 XAG_TILE = 128
+# Pallas barrier id of the post-attention kernel's in-kernel a2a (SPTP_PA_A2A)
+SPTP_PA_COLLECTIVE_ID = 17
 
 
 def _bf16_rows(x):
@@ -216,6 +223,20 @@ def build_forward(c: PFConfig, axis: str = "model"):
         )
         for r in (True, False)
     }
+    # SPTP_POSTATTN=1: requant, o proj, attention residual, router, pool and pre-expert norm of
+    # own rows in two Pallas kernels (sptp/postattn.py)
+    pa = os.environ.get("SPTP_POSTATTN", "0") == "1"
+    if pa and not (q_rpa and fused_rq):
+        raise ValueError("SPTP_POSTATTN needs the q_rpa path and the fused rms quant")
+    pa_tn, pa_tp, pa_rc = (
+        int(os.environ.get(k, d))
+        for k, d in (("SPTP_PA_TN", "512"), ("SPTP_PA_TP", "512"), ("SPTP_PA_RC", "64"))
+    )
+    pa_pool = pool_call(c, pa_tp, pa_rc) if pa else None
+    # SPTP_PA_A2A=1: the gated-output a2a by remote DMA inside the o proj kernel
+    pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "0") == "1"
+    # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
+    pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
 
     def forward(
         meta,
@@ -343,11 +364,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 if ogate_kernel:
                     with _scope("sp_o_gate"):
                         g8, g_s = o_gate(o, gate)
-                    with _scope("sp_o_a2a"):
-                        g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
-                    with _scope("sp_o_proj"):
-                        g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
-                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
                 else:
                     with _scope("sp_o_gate"):
                         # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
@@ -370,6 +386,50 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             amax = jnp.max(jnp.abs(a4), axis=(0, 2, 3))
                         g_s = jnp.maximum(amax, 1e-30).reshape(T, 1) / 448.0
                         g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
+                if pa_a2a:
+                    with _scope("sp_postattn"):
+                        # the token-major [T, qd] gated output (the o gate's layout to come)
+                        g8 = (
+                            g8
+                            if ogate_kernel
+                            else g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                        )
+                        pa_o = oproj_a2a_call(
+                            c,
+                            wrouter.shape[-1],
+                            SPTP_PA_COLLECTIVE_ID,
+                            pa_tn,
+                            pa_rc,
+                            pa_la,
+                        )
+                        stream, ids, tw, f8, f_s = pa_o(
+                            l, me, g8, g_s.reshape(1, T), stream, smalls, wo, wrouter
+                        )
+                        xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                elif pa:
+                    with _scope("sp_o_a2a"):
+                        # the token-major [T, qd] gated output (the o gate's layout to come)
+                        g8 = (
+                            g8
+                            if ogate_kernel
+                            else g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                        )
+                        g8 = jax.lax.all_to_all(g8, axis, 0, 0, tiled=True)
+                        g_s = jax.lax.all_to_all(g_s, axis, 0, 0, tiled=True)
+                        g8, g_s = g8.reshape(tp, Ts, qd), g_s.reshape(tp, Ts, 1)
+                    with _scope("sp_postattn"):
+                        pa_o = oproj_call(c, wrouter.shape[-1], pa_tn, pa_rc)
+                        stream, ids, tw, f8, f_s = pa_o(
+                            l, g8, g_s, stream, smalls, wo, wrouter
+                        )
+                        xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                elif ogate_kernel:
+                    with _scope("sp_o_a2a"):
+                        g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                    with _scope("sp_o_proj"):
+                        g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                else:
                     with _scope("sp_o_a2a"):
                         g8 = jax.lax.all_to_all(
                             g8.reshape(c.kv_heads, tp, Ts, gq, hd),
@@ -402,32 +462,44 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 with _scope("sp_o_proj"):
                     g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
                     o_own = dense(g8, g_s, wo[l], sm, "wo", H)
-            with _scope("sp_attn_res"):
-                stream = residual(c, stream, sm, "attn", o_own)
-            with _scope("sp_router"):
-                ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
-                ids, tw = router(c, ffn.astype(_BF16), wrouter[l], sm)
-            with _scope("sp_pool"):
-                if fused_rq:
-                    f8, f_s = rms_q8(stream, small_row(sm, "pre_ffn_w"))
-                else:
-                    f8, f_s = q8(ffn)
-                pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
-                xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
+            if not pa:
+                with _scope("sp_attn_res"):
+                    stream = residual(c, stream, sm, "attn", o_own)
+                with _scope("sp_router"):
+                    ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
+                    ids, tw = router(c, ffn.astype(_BF16), wrouter[l], sm)
+                with _scope("sp_pool"):
+                    if fused_rq:
+                        f8, f_s = rms_q8(stream, small_row(sm, "pre_ffn_w"))
+                    else:
+                        f8, f_s = q8(ffn)
+                    pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
+                    xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
             with _scope("sp_xe_ag"):
-                if xe_pallas:
-                    xe = dequant(ag(xe8, axis), ag(xs, axis))
+                if pa:
+                    # lane-dense [k, Ts] / [1, Ts] kernel outputs: gather on the row axis
+                    def ag1(x):
+                        return jax.lax.all_gather(x, axis, axis=1, tiled=True)
+
+                    xs_all = ag1(xs).reshape(T, 1)
+                    ids_all, tw_all = ag1(ids).T, ag1(tw).T
+                    ids_own = ids.T
                 else:
-                    xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
-                ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                    xs_all = ag(xs, axis)
+                    ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                    ids_own = ids
+                if xe_pallas:
+                    xe = dequant(ag(xe8, axis), xs_all)
+                else:
+                    xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
                 counts = None
                 if local_counts:
                     # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
                     # count over every rank's slots, 1/tp of the compares); out-of-range ids
                     # count as expert 0, as the MoE routes them
-                    ids_c = jnp.where((ids >= 0) & (ids < c.n_experts), ids, 0).reshape(
-                        -1
-                    )
+                    ids_c = jnp.where(
+                        (ids_own >= 0) & (ids_own < c.n_experts), ids_own, 0
+                    ).reshape(-1)
                     own = jnp.sum(
                         (ids_c[:, None] == jnp.arange(c.n_experts)[None, :]).astype(
                             jnp.int32
