@@ -235,10 +235,6 @@ class TestMuseMegakernelUnifiedKV(CustomTestCase):
     the SWA groups' page tables back to back through swa_group_map."""
 
     def test_maps_match_the_unified_pool_layer_assignment(self):
-        import torch
-
-        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
-        from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
 
         gl = _GEOMETRY.global_layers
         swa_ids = [i for i in range(_LAYERS) if i not in set(gl)]

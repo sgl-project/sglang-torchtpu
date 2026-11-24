@@ -126,9 +126,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         swa_tables = psw.reshape(c.n_swa_groups, -1)
         for l in range(L):
             b = c.layer_kv_buf(l)
-            table = (
-                pf if l in c.global_layers else swa_tables[c.layer_swa_group(l)]
-            )
+            table = pf if l in c.global_layers else swa_tables[c.layer_swa_group(l)]
             o, kv[b] = attention(l, q, kvs, kv[b], kv_lens, table, cu_q, dist)
             lyr = jnp.full((1,), l, jnp.int32)
             x, xe, ids, tw = attn_out(

@@ -23,7 +23,6 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 from sglang.srt.runtime_context import ParallelContext
 from sglang_tpu.envs import dev_int
 from sglang_tpu.envs import envs as tpu_envs
@@ -68,6 +67,7 @@ from sglang_tpu.muse_megakernel.decode.spep.kernel import (
 from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 from sglang_tpu.muse_megakernel.prefill import spep as PF_SP
 from sglang_tpu.muse_megakernel.prefill import tp as PF
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -1334,7 +1334,10 @@ def _swa_window_table(kv_sal: bool, n_page_entries: int, n_swa_groups: int = 1) 
         raise ValueError(f"SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE={mode!r}: auto, 0 or 1")
     if mode == "auto":
         # int32 tables: pages_full plus one pages_swa per SWA page group
-        return kv_sal and (1 + n_swa_groups) * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+        return (
+            kv_sal
+            and (1 + n_swa_groups) * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+        )
     return mode == "1"
 
 
