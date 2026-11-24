@@ -117,6 +117,7 @@ def _is_w7_enabled(mode_str: str) -> bool:
             "ring8k",
             "pps256",
             "pbf16",
+            "pbf16swa",
             "pgred",
             "fp8dp",
             "c4096",
@@ -281,7 +282,9 @@ def parse_decode_fast_config(
     coalesce_dma = False
     in_vmem_pack2 = use_v2
     lazy_slot_zero = (use_w7 or ("noz" in toks_cfg)) and ("nonoz" not in toks_cfg)
-    pv_bf16 = "pbf16" in toks_cfg
+    pv_bf16 = ("pbf16" in toks_cfg) or (
+        sliding_window is not None and "pbf16swa" in toks_cfg
+    )
     page_reduce = "pgred" in toks_cfg
     fp8_dots = "fp8dp" in toks_cfg
     hoist_new_kv = decode_query_size == 1 and sliding_window is None and ("hoistkv" in toks_cfg)

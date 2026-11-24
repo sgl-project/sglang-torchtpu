@@ -2190,13 +2190,27 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         o_pbf, _ = run_decode_fast_rpa(
             q, kn, vn, _u8_to_fp8(s_u8), jnp.asarray(kv_lens_np), pi, cuq, cukv, dist,
             sm_scale=128 ** -0.5, sliding_window=2048, k_scale=1.0, v_scale=1.0,
-            mode_str="w8,g4k,pbf16", kv_pack_dense2=False, interpret=ip,
+            mode_str="w8,g4k,pbf16swa", kv_pack_dense2=False, interpret=ip,
+        )
+        o_full_ref, _ = run_decode_fast_rpa(
+            q, kn, vn, _u8_to_fp8(s_u8), jnp.asarray(kv_lens_np), pi, cuq, cukv, dist,
+            sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="w8,g4k", kv_pack_dense2=False, interpret=ip,
+        )
+        o_full_swa, _ = run_decode_fast_rpa(
+            q, kn, vn, _u8_to_fp8(s_u8), jnp.asarray(kv_lens_np), pi, cuq, cukv, dist,
+            sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="w8,g4k,pbf16swa", kv_pack_dense2=False, interpret=ip,
         )
         a_ref = np.asarray(o_ref, dtype=np.float32)
         a_f128 = np.asarray(o_f128, dtype=np.float32)
         a_pbf = np.asarray(o_pbf, dtype=np.float32)
         self.assertTrue(np.all(np.isfinite(a_ref)))
         self.assertEqual(float(np.max(np.abs(a_f128 - a_ref))), 0.0)
+        self.assertEqual(
+            float(np.max(np.abs(np.asarray(o_full_swa, dtype=np.float32) - np.asarray(o_full_ref, dtype=np.float32)))),
+            0.0,
+        )
         self.assertTrue(np.all(np.isfinite(a_pbf)))
         cos_pbf = float(np.dot(a_pbf.ravel(), a_ref.ravel()) / (np.linalg.norm(a_pbf) * np.linalg.norm(a_ref)))
         self.assertGreater(cos_pbf, 0.99999)
@@ -2217,7 +2231,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     lambda q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
                         q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_,
                         sm_scale=128 ** -0.5, sliding_window=2048, k_scale=1.0, v_scale=1.0,
-                        mode_str="w8,g4k,pbf16", kv_pack_dense2=False,
+                        mode_str="w8,g4k,pbf16swa", kv_pack_dense2=False,
                     )
                 ),
                 platforms=["tpu"],
@@ -2233,6 +2247,28 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 jax.ShapeDtypeStruct((3,), jnp.int32),
             ).mlir_module()
             self.assertIn("RPAd_fast-", hlo)
+            self.assertIn("-pbf16-", hlo)
+            hlo_full = jax_export.export(
+                jax.jit(
+                    lambda q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kn_, vn_, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,g4k,pbf16swa", kv_pack_dense2=False,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((bs_e, 16, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e, 1, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e * pps_e + 16, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertNotIn("-pbf16-", hlo_full)
 
 
 if __name__ == "__main__":
