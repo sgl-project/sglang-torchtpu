@@ -34,16 +34,16 @@ from sglang_tpu.multimodal_gen.h3_megakernel import reference as ref
 from sglang_tpu.multimodal_gen.h3_megakernel import tiling as tl
 
 AXIS = "sp"
-# The original drivers' tiling bounds (e2e_lean --tiling): padded_rows picks the
-# packed row count from these (4,992 rows a device at 8 devices for the
-# 1344x768x124 request).
+# The kernel's tiling bounds for padding: padded_rows picks the packed row
+# count from these (4,992 rows a device at 8 devices for the 1344x768x124
+# request).
 ROWS_TILING = tl.Tiling(sub_rows=640, stage_slots=24, block_kv_compute_online=1024)
-# What the kernel runs with: the drivers' bounds plus the shipped
-# verify_kwargs.json tiling (mlp_rows 640, chunk_rows 80); stack() cuts them
-# down to divide each row count (Tiling.fit). qkv_rows 704: with 24 staging
-# slots a 768-row phase-A tile needs ~69 MiB of the 63.94 MiB of VMEM (the original kernel's
-# 10 s failure at 9,216 rows a device), 704 fits. The benchmark row counts
-# (4,992, 4,864, 9,600, 18,944, 19,456 a device) fit the same tiles either way.
+# What the kernel runs with: those bounds plus the tuned MLP tiling (mlp_rows
+# 640, chunk_rows 80); stack() cuts them down to divide each row count
+# (Tiling.fit). qkv_rows 704: with 24 staging slots a 768-row phase-A tile
+# needs ~69 MiB of the 63.94 MiB of VMEM (a 10 s video at 9,216 rows a
+# device does not compile), 704 fits. The 1344x768x124 row counts (4,992,
+# 4,864, 9,600, 18,944, 19,456 a device) fit the same tiles either way.
 STACK_TILING = dataclasses.replace(
     ROWS_TILING, qkv_rows=704, mlp_rows=640, chunk_rows=80
 )
@@ -72,9 +72,9 @@ STACK_KWARGS = {
     "fixed_max": 17.0,
 }
 # The static-structure option (SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE)
-# runs a static structure at these (devices, rows a device), the benchmark
-# request's (1344x768, 124 frames) row counts it was AOT-checked at (VMEM,
-# loop sizes), and the generic walk at any other.
+# runs a static structure at these (devices, rows a device), the 1344x768x124
+# request's row counts it was AOT-checked at (VMEM, loop sizes), and the
+# generic walk at any other.
 STRUCTURED_SHAPES = frozenset(
     {(8, 4992), (8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
 )
@@ -108,7 +108,7 @@ SHAPE_TILINGS = {(8, 4800): dataclasses.replace(STACK_TILING, split_q_tiles=True
 #   lean_cut: kernel.stack cut_kv_compute (the fixed-max cut tile's last
 #     real sub-block halved; bitwise), at the 2,048-key sub-blocks of 8 x
 #     4,864, 2 x 19,456 and 2 x 19,200 rows (one 1,024-key sub-block for the
-#     benchmark structure) and the 1,280-key ones of 4 x 9,600 and 8 x 4,800
+#     1344x768x124 structure) and the 1,280-key ones of 4 x 9,600 and 8 x 4,800
 #     (640 keys of the cut tile's second).
 #   split_items: split_items (one item loop per query width; bitwise).
 #   epilogue_chunks: epilogue_chunk 64 at the 608- and 480-row phase A
@@ -154,9 +154,7 @@ LEVER_SHAPES = {
         {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
     ),
     "zero_ahead": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "mask_scores": frozenset(
-        {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
-    ),
+    "mask_scores": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
 }
 # lean_cut's smallest sub-block: whole 256-key MXU passes.
 CUT_KV_COMPUTE = 256

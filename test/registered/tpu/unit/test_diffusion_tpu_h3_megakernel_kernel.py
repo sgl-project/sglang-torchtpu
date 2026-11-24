@@ -7,10 +7,8 @@ semaphores and remote copies, against ``reference`` at a small size, in the
 configuration the sglang hook calls: a traced live length, the fixed-max
 softmax only on the layers the norm weights prove, bf16. Multi-device cases run
 in a fresh process with 2 or 4 CPU devices and the race detector; libtpu's
-compile-only client checks that Mosaic lowers it for v7x at H3's widths. The
-fixtures and the reference and tiling tests are the original JAX implementation's
-(tests/runtime/kernels/minimax_h3_{reference,tiling}_test.py). Skipped where
-JAX is unavailable.
+compile-only client checks that Mosaic lowers it for v7x at H3's widths.
+Skipped where JAX is unavailable.
 """
 
 import dataclasses
@@ -22,12 +20,22 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=650, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=1000,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
@@ -306,14 +314,14 @@ def _in_fresh_process(devices, code, timeout):
             for name in ("sglang", "sglang.test", "sglang.test.ci"):
                 sys.modules.setdefault(name, types.ModuleType(name))
             ci = types.ModuleType("sglang.test.ci.ci_register")
-            ci.register_cpu_ci = lambda *a, **k: None
+            ci.register_tpu_ci = lambda *a, **k: None
             tu = types.ModuleType("sglang.test.test_utils")
             tu.CustomTestCase = unittest.TestCase
             sys.modules["sglang.test.ci.ci_register"] = ci
             sys.modules["sglang.test.test_utils"] = tu
         import json, jax
         jax.config.update("jax_platforms", "cpu")
-        import test_tpu_h3_megakernel_kernel as t
+        import test_diffusion_tpu_h3_megakernel_kernel as t
         """
     )
     env = dict(
@@ -471,10 +479,10 @@ class TestTiling(CustomTestCase):
         self.assertEqual(tl.kv_divisor(16 * 2047, 2560), 1424)
         self.assertEqual(tl.kv_divisor(256 * 292, 2560), 2336)
 
-    def test_benchmark_rows_a_core(self):
+    def test_1344x768x124_rows_a_core(self):
         # 1344x768, 124 frames: 37,746-37,757 rows. The tiling the hook runs
-        # (the original JAX implementation's drivers plus ship's mlp_rows and chunk_rows) at
-        # the per-core row counts it pads to; 18,944 at 2 cores (the original kernel's
+        # (the padding bounds plus the tuned mlp_rows and chunk_rows) at
+        # the per-core row counts it pads to; 18,944 at 2 cores (the kernel's
         # padded_rows) takes 512-row query tiles.
         tiling = tl.Tiling(
             sub_rows=640,
@@ -621,7 +629,7 @@ class TestStackInterpretMultiDevice(CustomTestCase):
             print(json.dumps([[*t._errors(got, want), t._same_bits(got, static) and not raced]]))
         """
         # Twelve heads (a 1536-wide attention output into 256 hidden) round
-        # to about twice the bound (as in the original JAX implementation's tests).
+        # to about twice the bound.
         self.assert_runs(_in_fresh_process(4, code, timeout=3600), 1, slack=2)
 
     def test_four_devices_query_tiles_across_devices(self):
@@ -855,7 +863,7 @@ class TestKernelLevers(CustomTestCase):
     """stack's cut_kv_compute and split_items: the same bits as without."""
 
     def test_cut_keys_halve_while_the_real_keys_fit(self):
-        # 2,048-key sub-blocks: the benchmark structure's 769-896 real keys
+        # 2,048-key sub-blocks: the 1344x768x124 structure's 769-896 real keys
         # run 1,024; past 1,024 the sub-block stays whole, under the floor
         # it stops halving.
         self.assertEqual(mk._cut_keys(769, 2048, 256), 1024)

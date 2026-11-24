@@ -37,15 +37,25 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
+# Host-CPU tests: in the TPU image the diffusion platform and JAX would
+# otherwise select the TPU.
+os.environ.setdefault("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1400, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=350,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "diffusion"],
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_HERE, *[os.pardir] * 3))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, *[os.pardir] * 4))
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 if _HERE not in sys.path:
@@ -56,7 +66,7 @@ try:
     import jax.numpy as jnp
 
     # The kernel tests' small model, request and tiling.
-    import test_tpu_h3_megakernel_kernel as kt
+    import test_diffusion_tpu_h3_megakernel_kernel as kt
     from jax import lax
     from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import PartitionSpec as P
@@ -280,14 +290,14 @@ def _in_fresh_process(devices: int, code: str, timeout: int) -> str:
             for name in ("sglang", "sglang.test", "sglang.test.ci"):
                 sys.modules.setdefault(name, types.ModuleType(name))
             ci = types.ModuleType("sglang.test.ci.ci_register")
-            ci.register_cpu_ci = lambda *a, **k: None
+            ci.register_tpu_ci = lambda *a, **k: None
             tu = types.ModuleType("sglang.test.test_utils")
             tu.CustomTestCase = unittest.TestCase
             sys.modules["sglang.test.ci.ci_register"] = ci
             sys.modules["sglang.test.test_utils"] = tu
         import json, jax
         jax.config.update("jax_platforms", "cpu")
-        import test_tpu_h3_megakernel_vouch as t
+        import test_diffusion_tpu_h3_megakernel_vouch as t
         """
     )
     env = dict(
@@ -322,8 +332,8 @@ def _assert_checks(test, checks: dict, config) -> None:
     test.assertEqual(checks["inside_next"], checks["inside_next_want"])
     test.assertEqual(checks["inside_next"], inside)
     test.assertEqual(checks["inside_tally"], [0, config.heads])
-    # As close to the f32 reference as the proven-only kernel (the E7
-    # tests' 1.25x floor ratio): layer 2's ~170-unit scores make its
+    # As close to the f32 reference as the proven-only kernel (within a
+    # 1.25x floor ratio): layer 2's ~170-unit scores make its
     # attention near one-hot, which magnifies any kernel's rounding past the
     # kernel tests' absolute bounds.
     (l2, worst), (proven_l2, proven_worst) = (
