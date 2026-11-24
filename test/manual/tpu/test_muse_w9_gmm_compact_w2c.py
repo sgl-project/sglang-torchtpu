@@ -276,7 +276,7 @@ def _run_two_ntile_gmm1_gmm2_interpret(
                     pltpu.VMEM((2, k2, n2), jnp.float8_e4m3fn),
                 ],
             ),
-            interpret=True,
+            interpret=pltpu.InterpretParams(uninitialized_memory="nan"),
         )
         res = call(
             lhs_3d,
@@ -1211,7 +1211,7 @@ def test_eo3_eo4_w1_fp8_expert_cache_parity_and_mosaic_lowering():
                             pltpu.SMEM((2,), jnp.int32),
                         ],
                     ),
-                    interpret=True,
+                    interpret=pltpu.InterpretParams(uninitialized_memory="nan"),
                 )(
                     x_all,
                     w1_u32,
@@ -1394,7 +1394,7 @@ def test_eo3_eo4_w1_fp8_expert_cache_parity_and_mosaic_lowering():
                             pltpu.SMEM((2,), jnp.int32),
                         ],
                     ),
-                    interpret=True,
+                    interpret=pltpu.InterpretParams(uninitialized_memory="nan"),
                 )(
                     x_all,
                     w1_u32,
@@ -1854,7 +1854,14 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
         fuse_act=None,
     )
 
-    def _run(sw_mode: int, pq_mode: int, packed_u16: bool = False) -> np.ndarray:
+    def _run(
+        sw_mode: int,
+        pq_mode: int,
+        packed_u16: bool = False,
+        num_valid: int | None = None,
+        skip_row_mask: bool = True,
+    ) -> np.ndarray:
+        nv = m_rows if num_valid is None else num_valid
         idx_arg = lhs_idx_u16 if packed_u16 else lhs_idx_perm
 
         def _ker(
@@ -1883,10 +1890,9 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
             m_gid,
             m_off,
         ):
-            pq_sc_r[1, :, :] = jnp.full((m_rows, 128), jnp.nan, dtype=jnp.float32)
             m_gid[0] = jnp.int32(0)
             m_off[0] = jnp.int32(0)
-            m_off[1] = jnp.int32(m_rows)
+            m_off[1] = jnp.int32(nv)
             meta = MetadataRef(gm_id_to_group_id=m_gid, gm_id_to_m_offset=m_off)
             if pq_mode >= 1:
                 fill_pq_lhs_scales_tree(
@@ -1894,8 +1900,8 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
                     sc_smem_r,
                     idx_smem_r,
                     m_st=jnp.int32(0),
-                    m_en=jnp.int32(m_rows),
-                    num_valid=jnp.int32(m_rows),
+                    m_en=jnp.int32(nv),
+                    num_valid=jnp.int32(nv),
                     num_lanes=128,
                     packed_u16_lhs=packed_u16,
                     gather_divisor=1,
@@ -1929,7 +1935,7 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
                     fused_g2_amax_slot=1,
                     prequant_lhs_fp8_ref=pq_fp8_r,
                     prequant_lhs_scale_ref=pq_sc_r,
-                    skip_row_mask=True,
+                    skip_row_mask=skip_row_mask,
                     lhs_3d_vmem_ref=(None if pq_mode >= 1 else x_bf16_r),
                     prequant_lhs_ready=(pq_mode >= 1),
                 )
@@ -1954,7 +1960,7 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
                     prequant_lhs_fp8_ref=pq_fp8_r.at[:, :k2],
                     prequant_lhs_scale_ref=pq_sc_r,
                     pnw_ref=pnw_r,
-                    skip_row_mask=True,
+                    skip_row_mask=skip_row_mask,
                     lhs_2d_vmem_ref=g1_r,
                 )
 
@@ -1993,7 +1999,7 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
                         pltpu.SMEM((2,), jnp.int32),
                     ],
                 ),
-                interpret=True,
+                interpret=pltpu.InterpretParams(uninitialized_memory="nan"),
             )(
                 hs_sc_perm,
                 idx_arg,
@@ -2027,6 +2033,19 @@ def test_w9_pql1_pql2_sw8_nan_poison_interpret_zero_ulp(m_rows: int) -> None:
     ):
         assert np.isfinite(got).all()
         np.testing.assert_array_equal(got, ref)
+
+    # Partial-tile (num_valid < 32 < m_rows) under uninitialized_memory="nan":
+    nv_part = 21
+    ref_part = _run(sw_mode=2, pq_mode=0, num_valid=nv_part, skip_row_mask=False)
+    assert np.isfinite(ref_part).all()
+    assert np.all(ref_part[nv_part:] == 0.0)
+    for pq_m in (1, 3):
+        got_mask = _run(sw_mode=2, pq_mode=pq_m, num_valid=nv_part, skip_row_mask=False)
+        assert np.isfinite(got_mask).all()
+        np.testing.assert_array_equal(got_mask, ref_part)
+        got_nomask = _run(sw_mode=2, pq_mode=pq_m, num_valid=nv_part, skip_row_mask=True)
+        assert np.isfinite(got_nomask[:nv_part]).all()
+        np.testing.assert_array_equal(got_nomask[:nv_part], ref[:nv_part])
 
 
 @pytest.mark.parametrize("borrowed_at_gm0", [False, True])
@@ -2281,7 +2300,9 @@ def test_w9_g2a6_prologue_w_dma_and_split_chipmate_interpret_zero_ulp(
                         pltpu.SemaphoreType.REGULAR((1,)),
                     ],
                 ),
-                interpret=pltpu.InterpretParams(detect_races=True),
+                interpret=pltpu.InterpretParams(
+                    detect_races=True, uninitialized_memory="nan"
+                ),
             )(x_s[0], w1_s[0], w2_s[0])
             return out[None, ...]
 
@@ -2456,6 +2477,7 @@ def test_w9_b1_b2_emit_fp8_gmm_interpret_zero_ulp():
     import jax.numpy as jnp
     import numpy as np
     from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
 
     from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.kernel_b2 import (
         pallas_fused_b1_b2_wpool_quant,
@@ -2464,7 +2486,7 @@ def test_w9_b1_b2_emit_fp8_gmm_interpret_zero_ulp():
     orig_pallas_call = pl.pallas_call
 
     def _interp_pallas_call(*args, **kwargs):
-        kwargs["interpret"] = True
+        kwargs["interpret"] = pltpu.InterpretParams(uninitialized_memory="nan")
         return orig_pallas_call(*args, **kwargs)
 
     rng = np.random.default_rng(20261124)
@@ -2883,7 +2905,7 @@ def test_w9_cand4_eo3_eo4_with_pql4_interpret_zero_ulp_and_lowering():
                             pltpu.SemaphoreType.DMA((2,)),
                         ],
                     ),
-                    interpret=True,
+                    interpret=pltpu.InterpretParams(uninitialized_memory="nan"),
                 )(
                     x_in, row_sc, jnp.asarray(lhs_idx), w1_u32, s1_bf16, w2_u32, s2_bf16,
                     pnw_8, jnp.asarray(e_ids), jnp.asarray(m_offs), gs_g, gs_u, gs_w2,
