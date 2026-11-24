@@ -301,7 +301,8 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   the debt header: `rope.py` (RoPE without stride-2 lane access) and
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
-  skipped, regionally compiled blocks marked spmd-safe); worker init also
+  skipped, regionally compiled blocks marked spmd-safe, the embedding built
+  with shapes that do not move with the prompt length); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 

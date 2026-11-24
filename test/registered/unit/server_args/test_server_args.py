@@ -898,6 +898,26 @@ class TestPrepareServerArgs(CustomTestCase):
                 model_path="dummy", prefill_decode_interval_min_bs=-1
             ).resolve_once()
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-below-min-bs must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                prefill_decode_interval_min_bs=6,
+                prefill_decode_interval_below_min_bs=-1,
+            ).resolve_once()
+
+        # Without a min batch size the below-min-bs rounds would never apply.
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-below-min-bs needs "
+            "--prefill-decode-interval-min-bs > 0",
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval_below_min_bs=8
+            ).resolve_once()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(

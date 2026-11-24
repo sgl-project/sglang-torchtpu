@@ -138,6 +138,11 @@ def main() -> None:
     ap.add_argument("--tokens", default="16,256,2048")
     args = ap.parse_args()
     dist.init_process_group(backend="tpu_dist")
+    from sglang_tpu.compile_cache import add_tpu_kernel_inputs_to_compile_cache_key
+
+    # The fused-RS env flags change the kernels inside the custom op; key the
+    # torch.compile cache on them, as serving does.
+    add_tpu_kernel_inputs_to_compile_cache_key()
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == 8, f"TP8 expert TP, got {world} ranks"
 

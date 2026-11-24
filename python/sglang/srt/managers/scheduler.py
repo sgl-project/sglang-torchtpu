@@ -1506,6 +1506,9 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        self.prefill_decode_interval_below_min_bs = (
+            get_schedule().prefill_decode_interval_below_min_bs
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1563,15 +1566,22 @@ class Scheduler(
         if self._prefill_decode_interval_remaining == 0:
             return False
 
-        # A small running batch admits prefill every round so it can grow;
-        # the interval only protects decode once the batch is large enough.
+        # A small running batch admits prefill after the below-min-bs rounds
+        # (none by default) so it can grow; the full interval only protects
+        # decode once the batch is large enough.
         # With nothing decoding there is no decode to protect, and waiting only
         # idles the GPU between chunks. DP attention keeps the synchronized
         # cadence because peer ranks may still be decoding.
+        # Arming always sets the full interval, so this counts from the last arm.
+        rounds_deferred = (
+            self.prefill_decode_interval - self._prefill_decode_interval_remaining
+        )
+        small_batch_ready = (
+            running_batch.batch_size() < self.prefill_decode_interval_min_bs
+            and rounds_deferred >= self.prefill_decode_interval_below_min_bs
+        )
         nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
-            nothing_decodes and not self.require_mlp_sync
-        ):
+        if small_batch_ready or (nothing_decodes and not self.require_mlp_sync):
             self._prefill_decode_interval_remaining = 0
             return False
 
@@ -1579,8 +1589,8 @@ class Scheduler(
         return True
 
     def _negotiate_prefill_delayer_while_deferring(self) -> None:
-        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
-        # the delayer's all-gather; join it with nothing to prefill.
+        # A DP peer below prefill_decode_interval_min_bs stops deferring sooner and
+        # runs the delayer's all-gather; join it with nothing to prefill.
         if (
             not self.require_mlp_sync
             or self.prefill_decode_interval_min_bs == 0

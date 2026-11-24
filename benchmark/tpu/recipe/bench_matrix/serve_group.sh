@@ -143,7 +143,6 @@ export TP_SIZE EP_SIZE
 export HOST=0.0.0.0         # engines must be reachable across hosts
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
 export SGLANG_RAIDEN_KV_PORT=${SGLANG_RAIDEN_KV_PORT:-$RAIDEN_KV_BASE_PORT}
-export SGLANG_RAIDEN_RESHARD=${SGLANG_RAIDEN_RESHARD:-0}   # symmetric P/D TP
 
 if [[ "$ROLE" == "prefill" ]]; then
     # Prefix caching + KV offload live on the prefill engines, where shared

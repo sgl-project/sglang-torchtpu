@@ -100,7 +100,6 @@ def pd_singlehost_role_configs(
     )
     common["runtime_env"].update(
         SGLANG_RAIDEN_KV_PORT=os.environ.get("SGLANG_RAIDEN_KV_PORT", "31000"),
-        SGLANG_RAIDEN_RESHARD="0",
         LB_PORT=os.environ.get("LB_PORT", "8000"),
         HEALTH_TIMEOUT=os.environ.get("WAIT_SECS", "3600"),
     )
