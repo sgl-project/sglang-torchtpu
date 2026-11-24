@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+"""SP + TP qkvg card as one Pallas kernel: gathered e4m3 rows (row scales) @ this rank's e4m3 wqkvg,
+then the qk head norms, rope and the q / kv / gate split per row tile in VMEM (XLA spends as long
+on relayouts for the 3-D head norm as on the fp8 dot)."""
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
+from sglang_tpu.muse_megakernel_v2.common.consts import small_row
+from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
+
+# fp8 contraction depth per MXU pass (common/dots._fp8_dot)
+_KC = 512
+
+
+def qkvg_call(c: PFConfig, tm: int, rope: bool):
+    """(x8 [T, H] e4m3, xs [T, 1] f32, w [H, nq] e4m3, sm [16, H] f32, rope [T, 2 hd] f32) ->
+    (q [T, qd], kv [T, 2 kvd], gate [T, qd]) bf16; rope False: a NoPE layer (rope unread)."""
+    T, H, nq = c.rows, c.hidden, c.qkvg_dim
+    qd, kvd, hd = c.q_dim, c.kv_dim, c.head_dim
+    if T % tm or H % _KC:
+        raise ValueError(f"{T} rows / hidden {H} do not tile by {tm} / {_KC}")
+
+    def kernel(x_ref, xs_ref, w_ref, sm_ref, rope_ref, q_ref, kv_ref, g_ref):
+        acc = None
+        for k0 in range(0, H, _KC):
+            part = jnp.dot(
+                x_ref[:, k0 : k0 + _KC],
+                w_ref[k0 : k0 + _KC, :],
+                preferred_element_type=jnp.float32,
+            )
+            acc = part if acc is None else acc + part
+        qkvg = acc * xs_ref[...] * small_row(sm_ref[...], "wqkvg_s")[:, :nq]
+        q, kv, g = qkv_from_proj(c, qkvg, rope_ref[...] if rope else None)
+        q_ref[...] = q
+        kv_ref[...] = kv
+        g_ref[...] = g
+
+    rows = lambda w: pl.BlockSpec((tm, w), lambda i: (i, 0))
+    whole = lambda a, b: pl.BlockSpec((a, b), lambda i: (0, 0))
+
+    def call(x8, xs, w, sm, rope_rows):
+        return pl.pallas_call(
+            kernel,
+            grid=(T // tm,),
+            in_specs=[
+                rows(H),
+                rows(1),
+                whole(H, nq),
+                whole(sm.shape[0], H),
+                rows(2 * hd),
+            ],
+            out_specs=(rows(qd), rows(2 * kvd), rows(qd)),
+            out_shape=(
+                jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
+                jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
+                jax.ShapeDtypeStruct((T, qd), jnp.bfloat16),
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
+            ),
+            name=f"muse_sptp_qkvg_t{T}_m{tm}_r{int(rope)}",
+        )(x8, xs, w, sm, rope_rows)
+
+    return call

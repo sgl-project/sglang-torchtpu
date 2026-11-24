@@ -265,6 +265,7 @@ def moe_gmm_local_rs_nodedup(
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
+    skip_routing_psum: bool | None = None,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -303,7 +304,12 @@ def moe_gmm_local_rs_nodedup(
     # it: the JAX prefill program computes the same routing on every rank from
     # the replicated stream, so the output is bit-identical, and it ran without
     # a halt. Re-check in the serving graph before adopting it there.
-    skip_psum = os.environ.get("MUSE_PF_SKIP_ROUTING_PSUM", "0") != "0"
+    # skip_routing_psum: the caller's routing is identical on every rank by construction
+    skip_psum = (
+        os.environ.get("MUSE_PF_SKIP_ROUTING_PSUM", "0") != "0"
+        if skip_routing_psum is None
+        else skip_routing_psum
+    )
     if not sp_enabled and not skip_psum:
         route_source = my_id == 0
         routing = jnp.stack(

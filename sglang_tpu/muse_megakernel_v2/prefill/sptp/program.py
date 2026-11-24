@@ -15,6 +15,8 @@ Weights: wqkvg this rank's heads (as both programs); wo / wpool / wunpool replic
 prefill/spep; experts in prefill/tp's layout (expert units, W4A16 layers).
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -36,6 +38,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import qkvg_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
     fused_rs_moe,
@@ -44,6 +47,8 @@ from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
 # Numerics debugging only: bf16 activations (scale 1) where the program quantizes rows to e4m3,
 # to separate layout bugs from e4m3 rounding. The recipe sets it at build time.
 DEBUG_BF16_ACTIVATIONS = False
+# row tile of the Pallas qkvg card
+QKVG_TILE = 256
 
 
 def _bf16_rows(x):
@@ -69,6 +74,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
+    # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
+    xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
+    qkvg_k = {r: qkvg_call(c, QKVG_TILE, r) for r in (True, False)}
 
     def forward(
         meta,
@@ -106,10 +114,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
             with _scope("sp_x_ag"):
                 a8, a_s = ag(a8, axis), ag(a_s, axis)
             with _scope("sp_qkvg"):
-                qkvg = dense(a8, a_s, wqkvg[l], sm, "wqkvg", c.qkvg_dim)
-                q, kvs, gate = qkv_from_proj(
-                    c, qkvg, rope_rows if c.use_rope(l) else None, xla=True
-                )
+                if xla_qkvg:
+                    qkvg = dense(a8, a_s, wqkvg[l], sm, "wqkvg", c.qkvg_dim)
+                    q, kvs, gate = qkv_from_proj(
+                        c, qkvg, rope_rows if c.use_rope(l) else None, xla=True
+                    )
+                else:
+                    q, kvs, gate = qkvg_k[c.use_rope(l)](
+                        a8, a_s, wqkvg[l], sm, rope_rows
+                    )
             o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             with _scope("sp_o_gate"):
                 attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
@@ -146,6 +159,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     group_offset,
                     sm,
                     axis,
+                    # ids / tw are all-gathered: equal on every rank, no rank-0 broadcast
+                    skip_routing_psum=True,
                 )
             with _scope("sp_unpool"):
                 u8, u_s = q8(y.astype(_F32))
