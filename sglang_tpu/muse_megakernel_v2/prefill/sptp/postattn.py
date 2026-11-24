@@ -215,17 +215,18 @@ def oproj_a2a_call(
     def kernel(lm, *refs):
         if fuse:
             (
-                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_ref, wr_hbm, wp_ref,
+                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm, wp_ref,
                 so_hbm, ids_ref, tw_ref, xe_ref, xs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-                fs_ref, ssq, amx, xsc,
+                wbuf, wsem, fs_ref, ssq, amx, xsc,
             ) = refs  # fmt: skip
             f8_hbm = None
         else:
             (
-                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_ref, wr_hbm,
+                g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm,
                 so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
+                wbuf, wsem,
             ) = refs  # fmt: skip
         r = pl.program_id(0)
         me = lm[1]
@@ -255,8 +256,18 @@ def oproj_a2a_call(
                 pltpu.make_async_copy(gs_hbm.at[:, rows], gsr.at[d], rs.at[d]),
             )
 
+        def wo_cp(step, slot):
+            # wo's K block of step's source, by hand: the first one loads under the barrier
+            k0 = pl.multiple_of(jnp.bitwise_xor(me, step) * qd, qd)
+            return pltpu.make_async_copy(
+                wo_hbm.at[lm[0], pl.ds(k0, qd)], wbuf.at[slot], wsem.at[slot]
+            )
+
         @pl.when(r == 0)
         def _():
+            wo_cp(0, 0).start()
+            for cp in locals_(me):
+                cp.start()
             # every peer is in this kernel (its gq free) before anyone writes into it
             with _scope("pa_barrier"):
                 bar = pltpu.get_barrier_semaphore()
@@ -265,12 +276,15 @@ def oproj_a2a_call(
                         bar, device_id=(p,), device_id_type=pl.DeviceIdType.MESH
                     )
                 pl.semaphore_wait(bar, tp)
-            for cp in locals_(me):
-                cp.start()
             for k in range(1, min(la, tp - 1) + 1):
                 for cp in sends(jnp.bitwise_xor(me, k)):
                     cp.start()
+            wo_cp(1, 1).start()
             wr_cp.start()
+
+        @pl.when(jnp.logical_and(r >= 1, r + 1 < tp))
+        def _():
+            wo_cp(r + 1, (r + 1) % 2).start()
 
         if la < tp - 1:
             # one more send per step, la ahead of its use: a block lands every step instead of
@@ -285,6 +299,8 @@ def oproj_a2a_call(
             with _scope("pa_a2a_wait"):
                 for cp in locals_(src):
                     cp.wait()
+                wo_cp(r, r % 2).wait()
+            wo_ref = wbuf.at[r % 2]
             with _scope("pa_oproj"):
                 # src's row scales as a column
                 g_col = jnp.transpose(jnp.broadcast_to(gsr[src], (8, Ts)))[:, 0:1]
@@ -358,10 +374,7 @@ def oproj_a2a_call(
         anyspec,
         anyspec,
         pl.BlockSpec((None, SMALL_ROWS, H), lambda r, lm: (lm[0], 0, 0)),
-        pl.BlockSpec(
-            (None, qd, H),
-            lambda r, lm: (lm[0], jnp.bitwise_xor(lm[1], jnp.minimum(r, tp - 1)), 0),
-        ),
+        anyspec,
         anyspec,
     ]
     k_top = c.top_k
@@ -405,6 +418,7 @@ def oproj_a2a_call(
         dma((2,)),
         dma((2,)),
     ]
+    scratch += [vmem((2, qd, H), _FP8), dma((2,))]
     if fuse:
         scratch += [vmem((Ts, 1), _F32) for _ in range(4)]
     grid_spec = pltpu.PrefetchScalarGridSpec(
