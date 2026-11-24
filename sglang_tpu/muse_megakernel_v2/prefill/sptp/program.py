@@ -38,7 +38,11 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
-from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import _heads_rms_mxu, qkvg_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
+    _heads_rms_mxu,
+    dequant_rows_call,
+    qkvg_call,
+)
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
@@ -141,6 +145,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
+    # SPTP_XE_XLA_DEQUANT=1: XLA's xe dequant (transposed layout + a conversion copy)
+    xe_pallas = (
+        not DEBUG_BF16_ACTIVATIONS and os.environ.get("SPTP_XE_XLA_DEQUANT", "0") != "1"
+    )
+    dequant = dequant_rows_call(T, He)
 
     def forward(
         meta,
@@ -281,7 +290,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
                 xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
             with _scope("sp_xe_ag"):
-                xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
+                if xe_pallas:
+                    xe = dequant(ag(xe8, axis), ag(xs, axis))
+                else:
+                    xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
                 ids_all, tw_all = ag(ids, axis), ag(tw, axis)
             with _scope("sp_moe"):
                 y = fused_rs_moe(

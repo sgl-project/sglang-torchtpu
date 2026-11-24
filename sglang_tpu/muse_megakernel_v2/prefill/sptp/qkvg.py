@@ -184,3 +184,30 @@ def qkvg_call(
 
     call.chunk = chunk_call
     return call
+
+
+def dequant_rows_call(rows: int, cols: int, tm: int = 512):
+    """(x8 [rows, cols] e4m3, s [rows, 1] f32) -> bf16 x8 * s, written row-major: the fused-RS
+    MoE reads its input in that layout (XLA's dequant fusion picked a transposed one and a
+    layout-conversion copy)."""
+    if rows % tm:
+        raise ValueError(f"{rows} rows do not tile by {tm}")
+
+    def kernel(x_ref, s_ref, o_ref):
+        o_ref[...] = (x_ref[...].astype(jnp.float32) * s_ref[...]).astype(jnp.bfloat16)
+
+    def call(x8, s):
+        return pl.pallas_call(
+            kernel,
+            grid=(rows // tm,),
+            in_specs=[
+                pl.BlockSpec((tm, cols), lambda i: (i, 0)),
+                pl.BlockSpec((tm, 1), lambda i: (i, 0)),
+            ],
+            out_specs=pl.BlockSpec((tm, cols), lambda i: (i, 0)),
+            out_shape=jax.ShapeDtypeStruct((rows, cols), jnp.bfloat16),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name=f"muse_sptp_dequant_t{rows}_c{cols}",
+        )(x8, s)
+
+    return call
