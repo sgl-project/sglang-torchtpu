@@ -147,7 +147,9 @@ def _reference(attn, x, rope, layout):
     CUDA: the window mask on a float32 softmax, the eager branch with Cholesky."""
     q, k, v, softmax_gate, beta, gate_hidden = _core_inputs(attn, x)
     branch, used = attn.hybrid.linear_attention, layout.used
-    q_sm, k_sm = dit._apply_rope_qk(attn.q_norm(q), attn.k_norm(k), *rope)
+    q_sm, k_sm = dit._apply_rope_qk(
+        attn.q_norm(q), attn.k_norm(k), *rope, rotary_emb=attn.rotary_emb
+    )
     mask = window_mask_reference(branch.hybrid, layout, x.device)
     scores = torch.einsum("qhd,khd->hqk", q_sm[:used].float(), k_sm[:used].float())
     scores = (scores * attn.softmax_scale).masked_fill(~mask, float("-inf"))

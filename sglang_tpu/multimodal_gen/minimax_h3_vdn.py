@@ -354,7 +354,11 @@ def _rows_to_window(
     cos_sin, positions = meta.rope_cache_full if ws > 1 else rope_cache
     # out of place: the branch reads the raw q/k
     q_sm, k_sm = _apply_rope_qk(
-        attention.q_norm(q), attention.k_norm(k), cos_sin, positions
+        attention.q_norm(q),
+        attention.k_norm(k),
+        cos_sin,
+        positions,
+        rotary_emb=attention.rotary_emb,
     )
     q_sm, k_sm, v_h = (t.transpose(0, 1).contiguous() for t in (q_sm, k_sm, v))
     scale = attention.softmax_scale
