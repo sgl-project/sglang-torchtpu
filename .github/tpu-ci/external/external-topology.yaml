@@ -94,6 +94,13 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
         pd: {prefill_hosts: 1, decode_hosts: 1}
+      # Unified KV pool twin of the test above; same weights.
+      - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash_unified.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash_unified.py
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_dflash_unified_gsm8k.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_dflash_unified_gsm8k.py
+        pd: {prefill_hosts: 1, decode_hosts: 1}
       # Issue #1867. Reads weights/Muse-Spark-Open-816B-A42B-NVFP4 and the offline GSM8K and
       # MMMU-Pro vision datasets; fronts the pair with the Rust router, capped to shed with 429s.
       - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_overload.py
