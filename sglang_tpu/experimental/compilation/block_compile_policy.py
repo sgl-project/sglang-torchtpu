@@ -10,6 +10,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
     LogitsOutputMode,
 )
@@ -38,6 +39,23 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
     [r, m, ..., m] (the drafter's block_width rows) and never runs EXTEND.
     """
+
+    def _dummy_kv_slot(self) -> int:
+        # DSpark warmups have no allocator-owned KV. Slot 0 masks cache writes
+        # and excludes the dummy request from SWA ring publication. PP timing
+        # reserves actual pages and uses a temporary mapping in request slot 1.
+        if self.model_runner.spec_algorithm.is_dspark() and not hasattr(
+            self, "_pp_profile_slots"
+        ):
+            return 0
+        return super()._dummy_kv_slot()
+
+    def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
+        if self.model_runner.spec_algorithm.is_dspark():
+            # The null row is already zero. For PP timing, set_profile_inputs
+            # installed the allocator-owned pages in the temporary request row.
+            return
+        super()._seed_dummy_req_to_token(forward_batch)
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.

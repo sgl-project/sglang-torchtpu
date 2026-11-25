@@ -9,21 +9,21 @@ import jax.numpy as jnp
 from .cache import gather_csa2_kv_sc
 from .csa2 import csa2
 
-# Measured v7x TP1, 64 heads, page 64, bq 6, DSpark K5 verify buckets (B x 6
-# queries), one CSA2 call, bitwise-equal results: from 97 to 384 rows, 96-row
-# chunks beat one chunk at every bucket, full or with a quarter of the rows
-# padding (144 rows -8.5 %, 192 -2.3 %, 240 -15.5 %, 288 -3.6 %, 336 -16.9 %,
-# 384 -3.7 %). Up to 96 rows one chunk is fastest; 24- and 48-row chunks lose
-# everywhere. 385-512 rows are unmeasured and keep a single chunk.
+# With the FP8 CSA2 kernel on v7x, H64 K5 verify is faster in one gather
+# at these row counts, including when the next layer reuses the gathered KV.
+# 144 rows still benefit from overlapping 96-row chunks with attention.
+_SINGLE_GATHER_H64_ROWS = (192, 288, 384)
 _SMALL_CHUNK = 96
 _SMALL_CHUNK_MAX_TOKENS = 384
 
 
-def csa2_gather_chunk_size(num_tokens: int) -> int:
+def csa2_gather_chunk_size(num_tokens: int, num_heads: int | None = None) -> int:
     # On v7x TP1 with 64 heads, 128-row chunks overlap SC gather with TC
     # attention while retaining full gathered KV for subsequent layers.
     if num_tokens > 512:
         return 128
+    if num_heads == 64 and num_tokens in _SINGLE_GATHER_H64_ROWS:
+        return num_tokens
     if _SMALL_CHUNK < num_tokens <= _SMALL_CHUNK_MAX_TOKENS:
         return _SMALL_CHUNK
     return num_tokens

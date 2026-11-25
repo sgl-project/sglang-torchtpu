@@ -22,7 +22,7 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -740,6 +740,54 @@ class TestTpuGraphRunner(CustomTestCase):
         model = self._annotate(_model_with(forward=MagicMock()))
         runner = TpuGraphRunner(self._runner_for(model))
         self.assertFalse(runner.can_run_graph(MagicMock()))
+
+
+class TestDSparkWarmupCache(CustomTestCase):
+    def test_dspark_warmups_have_no_kv_owner(self):
+        from sglang_tpu.models.deepseek_v41.attention_backend import _token_rows
+
+        table = torch.arange(4 * 256, dtype=torch.int32).reshape(4, 256)
+        table[0].zero_()
+        runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            device="cpu",
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_pages=torch.arange(8, dtype=torch.int32)
+            ),
+        )
+        original = table.clone()
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, runner)
+        policy = object.__new__(cls)
+        policy.model_runner = runner
+        for draft, mode, width in (
+            (False, ForwardMode.TARGET_VERIFY, 6),
+            (False, ForwardMode.EXTEND, 1),
+            (True, ForwardMode.TARGET_VERIFY, 6),
+        ):
+            with self.subTest(draft=draft, mode=mode):
+                policy.is_draft_worker = draft
+                layout = policy._dummy_layout(mode, 2 * width, 2, width)
+                policy._seed_dummy_req_to_token(
+                    SimpleNamespace(forward_mode=mode, input_ids=layout.input_ids)
+                )
+                self.assertTrue(torch.equal(table, original))
+                self.assertEqual(layout.req_pool_indices_cpu.tolist(), [0, 0])
+                _, valid, _ = _token_rows(
+                    torch.tensor([width, width]),
+                    layout.out_cache_loc,
+                    layout.req_pool_indices,
+                    2 * width,
+                )
+                self.assertFalse(valid.any().item())
+
+        # The PP timer populates its own request row with actual allocations.
+        policy._pp_profile_slots = table[1, :6].clone()
+        self.assertEqual(policy._dummy_kv_slot(), 1)
+        policy._seed_dummy_req_to_token(
+            SimpleNamespace(forward_mode=ForwardMode.EXTEND, input_ids=torch.zeros(6))
+        )
+        self.assertTrue(torch.equal(table, original))
 
 
 class TestDraftTorchCompileInstall(CustomTestCase):

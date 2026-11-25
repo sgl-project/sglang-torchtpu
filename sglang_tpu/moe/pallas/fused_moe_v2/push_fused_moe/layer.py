@@ -72,7 +72,6 @@ from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import dedup as _dedup
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.host import (
-    _take_small,
     build_routing_tables_sharded,
     local_sort_activations,
     local_sort_tokens,
@@ -122,13 +121,27 @@ LIGHT_PREPUSH_MIN_SLOTS = 16
 # trace time and applied to a K32Z build on the exchange-table path; every
 # other build, and every bucket not listed, keeps the plain push program.
 # Each option leaves the output bits unchanged.
-# - 512: x_tables and fold_select take the window-rank glue off the pre-kernel
-#   path (a dedup does not pay here: its copies lift the compute+return
-#   bound); hot_visit, run_sems and self_direct are schedule changes.
+# - 96, 192 (DSpark verify): decode_loop sets how the K32Z FFN bodies loop.
+#   A hot expert runs several tall tiles here, and the decode plan's (3, 4)
+#   step from 128 rows measured slower: 96 loops a (9, 10) step from 256 rows,
+#   192 keeps the bodies unrolled.
+# - 384, 512: x_tables and fold_select take the window-rank glue off the
+#   pre-kernel path (a dedup does not pay here: its copies lift the
+#   compute+return bound); hot_visit, run_sems and self_direct are schedule
+#   changes.
 # - 1024: the dedup (x_dedup) cuts the link-bound dispatch
 #   bytes by a quarter; defer_push and early_ship overlap the return with the
 #   next tiles; run_sems, self_direct and x_dup_unroll are schedule changes.
 K32Z_PUSH_RECIPES = {
+    96: {"decode_loop": ((9, 10), 256)},
+    192: {"decode_loop": (0, 0)},
+    384: {
+        "x_tables": True,
+        "fold_select": True,
+        "hot_visit": 16,
+        "run_sems": 8,
+        "self_direct": True,
+    },
     512: {
         "x_tables": True,
         "fold_select": True,
@@ -344,6 +357,9 @@ def fused_ep_moe_push(
       dedup.default_src_cap duplicates). Visits go lightest first on the
       SparseCore, then by local expert id, so every owner is visited before
       its duplicates.
+    - decode_loop=(step, from): the K32Z FFN bodies loop `step` chunks a step
+      from `from` rows up; (0, 0) keeps them unrolled. Without it the build
+      takes host.k32z_roll_plan.
     - defer_push, early_ship: see the push kernel builder.
     - hot_visit=k: each destination's heaviest expert moves to visit
       position k, past the SparseCore positions.
@@ -576,9 +592,7 @@ def fused_ep_moe_push(
         # Outside the dedup buckets the build is the default one.
         x_tables = x_dedup = False
     exchange_slab_rows = bool(
-        _host.push_slab_rows_mode(
-            k32z=k32z_gate_up_bits is not None, t_local=t_local
-        )
+        _host.push_slab_rows_mode(k32z=k32z_gate_up_bits is not None, t_local=t_local)
         and exchange_tables
         and kernel_plan_tables
         and table_kernel
@@ -624,6 +638,13 @@ def fused_ep_moe_push(
         k32z_ffn_roll, k32z_roll_from = _host.k32z_roll_plan(
             ragged_stride, ep, g_local, hidden, inter
         )
+        # The recipe's decode_loop replaces it where this shape divides the
+        # loop step.
+        decode_loop = recipe.get("decode_loop")
+        if decode_loop is not None and (
+            not decode_loop[0] or _host.k32z_step_applies(decode_loop[0], hidden, inter)
+        ):
+            k32z_ffn_roll, k32z_roll_from = decode_loop
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -1227,9 +1248,7 @@ def fused_ep_moe_push(
             if exchange_tables:
                 x_kw = {}
                 if x_tables:
-                    x_kw = dict(
-                        x_tag=x_tag, x_dedup=x_dedup, x_npre=n_pre, x_cap=x_cap
-                    )
+                    x_kw = dict(x_tag=x_tag, x_dedup=x_dedup, x_npre=n_pre, x_cap=x_cap)
                 if exchange_slab_rows:
                     # The plan's slab rows from the kernel too.
                     x_kw = dict(

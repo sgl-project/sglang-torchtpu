@@ -2,6 +2,7 @@
 """CPU tests: the DSV4.1 TPU attention metadata reads the host tensors the compile
 policy uploaded instead of reading the uploads back, and stays bit-identical."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -240,6 +241,47 @@ def test_slot_tables_are_reused_only_when_asked():
         prepare(backend, torch.tensor([3, 2]), reuse=True)
         prepare(backend, torch.tensor([3, 2]))
     assert len(builds) == 3
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
+def test_relabelled_idle_batch_has_no_query_rows(mode):
+    # DP synchronization may represent an idle rank by a physical decode or
+    # extend request in reserved pool slot 0.
+    fb = _extend_batch([0], [6], [0], num_tokens=6)
+    fb.out_cache_loc.zero_()
+    fb.forward_mode = mode
+    md = _metadata(fb)
+    assert md.query_start_loc.tolist() == [0, 0]
+    assert not md.valid.any()
+
+
+@pytest.mark.parametrize("live", [0, 2])
+@pytest.mark.parametrize("width", [5, 6])
+@pytest.mark.parametrize("device_rows", [False, True])
+def test_dspark_bucket_padding_has_no_query_rows(live, width, device_rows):
+    # Both workers build the forward at the physical bucket, including when
+    # another DP rank is busy and the local rank has no requests.
+    slots = [1, 2][:live] + [0] * (4 - live)
+    fb = _verify_batch([8, 40][:live] + [0] * (4 - live), slots, rows=width)
+    fb.req_pool_indices_cpu = fb.req_pool_indices.clone()
+    fb.out_cache_loc[live * width :] = 0
+    fb.seq_lens_cpu[live:] = 0
+    setting = SimpleNamespace(get=lambda: device_rows)
+    with patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", setting):
+        md = ab.build_forward_metadata(
+            fb,
+            req_to_token=_req_to_token(),
+            full_to_swa_index_mapping=None,
+            request_window=None,
+            swa_ring_valid_from=torch.zeros(SLOTS, dtype=torch.int64),
+            max_context_len=MAX_CONTEXT,
+            low_ratios=ab.LOW_RATIOS,
+            device=torch.device("cpu"),
+        )
+    expected = torch.arange(5).clamp_max(live) * width
+    assert md.query_start_loc.tolist() == expected.tolist()
+    assert md.valid.tolist() == [True] * (live * width) + [False] * ((4 - live) * width)
+    assert md.token_rows[live * width :].eq(-1).all()
 
 
 @pytest.mark.parametrize("layout", ["plain", "draft_ring", "request_window"])
@@ -801,3 +843,7 @@ def test_spec_worker_builds_host_rows_only_for_a_consumer():
             assert worker._new_step_host_rows(**kwargs) is None
             idle = torch.zeros(plan.seq_lens.shape, dtype=torch.int64)
             assert worker._new_step_host_rows(**kwargs, seq_lens_cpu=idle) is not None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

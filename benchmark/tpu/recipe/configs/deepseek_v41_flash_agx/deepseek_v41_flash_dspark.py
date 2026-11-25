@@ -78,11 +78,14 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_DP_PROMPT_BACKLOG_ROUTED": "1",
         # Routed experts on fused EP MoE v2 (#2267): local routing, no DP gather
         # or all-reduce of the padded batch. It needs the shared expert on TP1.
-        # Auto dispatch uses push_fused_moe (with overlapped FP8 shared expert)
-        # up to PUSH_MAX_ROWS=1024 and all-gather above.
+        # K32Z experts keep the checkpoint's FP4 codes and per-32 scales
+        # (lossless). "auto" pushes (with overlapped FP8 shared expert) up to
+        # PUSH_MAX_ROWS=1024 rows per rank and all-gathers above; rows without
+        # a tuned push recipe run the plain K32Z program.
         "SGLANG_TPU_DSV41_FUSED_EP": "1",
-        "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH": "auto",
         "SGLANG_SHARED_EXPERT_TP1": "1",
+        "SGLANG_TPU_DSV41_EXPERT_FORMAT": "k32z",
+        "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH": "auto",
         # Per-channel FP8 grouped wo_a contraction (opt-in; ~1.44 GB/rank HBM
         # saved and 2.5-3.4x faster wo_a at decode).
         "SGLANG_TPU_DSV41_WO_A_FP8": "1",

@@ -317,7 +317,13 @@ def _publish_candidate_blocks(
         )
     blocks = block_scores.shape[1]
     cand_k = min(count, blocks)
-    if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
+    if (
+        unordered
+        and blocks >= 2048
+        and blocks % 16 == 0
+        and 0 < cand_k <= 4096
+        and cand_k % 16 == 0
+    ):
         block_lengths = (lengths + block_size - 1) // block_size
         published = _sparsecore_top_k(
             block_scores,
@@ -327,7 +333,7 @@ def _publish_candidate_blocks(
         ).astype(jnp.int32)
     else:
         values, ids = jax.lax.top_k(block_scores, cand_k)
-        published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+        published = _compact_selected(jnp.where(values > -jnp.inf, ids, -1))
     return jnp.pad(published, ((0, 0), (0, count - cand_k)), constant_values=-1)
 
 
@@ -598,22 +604,33 @@ def _select_fp8_indexer_jax(
 
         def sparse():
             if not candidates.shape[1]:
-                return jnp.full(
-                    (q.shape[0], min(topk, width)), -1, jnp.int32
-                ), candidates
+                return (
+                    jnp.full((q.shape[0], min(topk, width)), -1, jnp.int32),
+                    candidates,
+                )
             gathered_candidates = prepare_candidates(
-                banks, page_table, candidates, requests, layout, block_size, width
-            )
-            return _score_and_select_candidates(
-                q,
-                weights,
-                lengths,
-                gathered_candidates,
-                topk,
+                banks,
+                page_table,
+                candidates,
+                requests,
+                layout,
                 block_size,
-                unordered,
                 width,
-            ), candidates
+                ascending=True,
+            )
+            return (
+                _score_and_select_candidates(
+                    q,
+                    weights,
+                    lengths,
+                    gathered_candidates,
+                    topk,
+                    block_size,
+                    unordered,
+                    width,
+                ),
+                candidates,
+            )
 
         return jax.lax.cond(
             jnp.minimum(batch_max.max(), width) <= topk,
@@ -699,12 +716,24 @@ def _select_fp8_indexer_jax(
         # Attention re-sorts the records; skip ID tie-breaks and output sorting.
         unordered=unordered,
     )
-    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
+    # TorchTPU traces on CPU with target TPU metadata. A publishing source
+    # can rank keys and candidate blocks in the same SparseCore pass.
+    export_source = (
+        publish_rows
+        and unordered
+        and candidates.shape[1] == 2048
+        and block_size == 8
+        and topk == 512
+        and padded == tokens
+    )
+    chunk_rows = prefill_chunk_rows or indexer_query_rows(
+        tokens, query_tile, cpu_export=export_source
+    )
     # Decode top-k scans only the blocks that can hold a winner. Publishing
     # layers rank the same SparseCore block maxima for their candidates.
     select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
     block_select = (
-        stream_select
+        (stream_select or (export_source and chunk_rows <= rows))
         and prefill_chunk_rows is None
         and chunk_rows is not None
         and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
@@ -731,7 +760,9 @@ def _select_fp8_indexer_jax(
             query_start_loc=(
                 query_offsets if shared else jnp.clip(query_offsets - start, 0, rows)
             ),
-            max_model_len=capacity if stream_select else width,
+            max_model_len=(
+                capacity if stream_select or (block_select and pipelined) else width
+            ),
             q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
             query_size=query_tile,
             cache_layout=layout,
@@ -786,7 +817,12 @@ def _select_fp8_indexer_jax(
         inverse = jnp.argsort(order)
         return output[inverse][:tokens], published[inverse][:tokens]
 
-    if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
+    if (
+        not (stream_select or block_select)
+        or chunk_rows is None
+        or chunk_rows > rows
+        or padded != tokens
+    ):
         return select_serial()
 
     def select(tile, scores, group):
@@ -963,6 +999,7 @@ def prepare_fp8_candidates(
             PackedFP8Layout(*layout),
             block,
             width,
+            ascending=True,
         )
     )
 

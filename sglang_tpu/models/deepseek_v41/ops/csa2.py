@@ -267,7 +267,7 @@ def _gather_attend_main(
         chunk_size=(
             q.shape[0]
             if extend_tiling and q.shape[0] <= 512
-            else csa2_gather_chunk_size(q.shape[0])
+            else csa2_gather_chunk_size(q.shape[0], q.shape[1])
         ),
         bq=16 if extend_tiling else _bq(q.shape[0]),
         scale=scale,
