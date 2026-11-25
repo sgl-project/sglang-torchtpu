@@ -705,6 +705,21 @@ class TpuEnvs:
     # SGLANG_SHARED_EXPERT_TP1=1 (checked at startup). Read when the plugin
     # hooks are built; False registers nothing.
     SGLANG_TPU_DSV41_FUSED_EP = EnvBool(False)
+    # Fused EP MoE v2: build the routing plan in one Pallas kernel
+    # (moe/pallas/fused_moe_v2/plan_kernel.py) instead of the XLA plan, where the
+    # shape fits it (decode/verify buckets with the sharded plan).
+    SGLANG_TPU_FUSED_EP_V2_PLAN_KERNEL = EnvBool(False)
+    # With the plan kernel on: its tables-only build (routing tables and per-pair
+    # slab rows, slab scatters left to XLA) for shapes past the full build.
+    SGLANG_TPU_FUSED_EP_V2_PLAN_KERNEL_TABLES = EnvBool(False)
+    # Fused EP MoE v2 combine kernel (t_local >= COMBINE_MIN_TOKENS): form each
+    # slot's arrival scale * router weight in SMEM from the scale mirror instead
+    # of an XLA row-scale lookup ahead of it.
+    SGLANG_TPU_FUSED_EP_V2_COMBINE_FUSE_SCALES = EnvBool(False)
+    # Packed-FP4 MoE GMM2 (down projection, gmm_v2): take gmm_v2's VMEM-budgeted
+    # calculate_tiling instead of the tuned-table lookup, which has no float4 entry and
+    # falls back to tk512/tn1280. Same outputs; one K x N step per expert at V4.1's shapes.
+    SGLANG_TPU_FP4_GMM2_CALC_TILING = EnvBool(False)
     # DeepSeek-V4.1 fused EP expert format: "k512" (default) requantizes the
     # checkpoint's block-32 MXFP4 experts to block 512 (dsv4_mxfp4_moe.py);
     # "k32z" converts them losslessly to K32Z operands (dsv4_mxfp4_k32z.py) in

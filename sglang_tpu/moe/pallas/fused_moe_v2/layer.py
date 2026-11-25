@@ -19,6 +19,7 @@ fused_ep_moe_v2 wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
+import logging
 import threading
 from typing import cast
 
@@ -43,6 +44,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     build_routing_tables_sharded,
     expert_visit_list,
     fp4_scale_rows,
+    gather_clamp_bounds,
     k32z_table_geometry,
     local_slab_rows,
     pair_block_hist,
@@ -64,6 +66,12 @@ from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
+from sglang_tpu.moe.pallas.fused_moe_v2.plan_kernel import (
+    PlanShape,
+    plan_kernel_fits,
+    plan_kernel_fits_tables,
+    routing_plan,
+)
 from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import PreprocessTopology
 from sglang_tpu.moe.pallas.fused_moe_v2.router_ops import (
     finalize_normalized_router,
@@ -82,6 +90,38 @@ SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
 # The K32Z build choices (host.k32z_build_plan) a layer hands the kernel
 # builder only where they differ from its defaults.
 _K32Z_PLAN_CHOICES = ("k32z_roll_rungs", "push_from_vmem_rows", "defer_push")
+
+
+# f32 words of the arrival-scale mirror the fused-scale combine may prefetch into
+# SMEM beside its pos / mirror-index / weight tables.
+_FUSE_SCALES_MAX_WORDS = 1 << 17
+
+
+def _combine_fuse_scales(arrival_scales) -> bool:
+    """Whether the combine kernel forms scale * weight itself (opt-in env)."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return (
+        bool(tpu_envs.SGLANG_TPU_FUSED_EP_V2_COMBINE_FUSE_SCALES.get())
+        and arrival_scales.dtype == jnp.float32
+        and arrival_scales.size <= _FUSE_SCALES_MAX_WORDS
+    )
+
+
+def _plan_kernel_tables_enabled() -> bool:
+    """With the plan kernel on: serve shapes past its full build (verify buckets
+    above 64 local tokens) with its tables-only build. Off by default."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return bool(tpu_envs.SGLANG_TPU_FUSED_EP_V2_PLAN_KERNEL_TABLES.get())
+
+
+def _plan_kernel_enabled() -> bool:
+    """Build the routing plan in one
+    Pallas kernel (plan_kernel.py) where the shape fits it. Off by default."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return bool(tpu_envs.SGLANG_TPU_FUSED_EP_V2_PLAN_KERNEL.get())
 
 
 def _apply_scoring_fn(logits, scoring_fn, *, specialize_softplus=False):
@@ -247,6 +287,25 @@ def _combine_arrivals(
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    if (
+        routes is None
+        and combine_step_tokens(t_local)
+        and _combine_fuse_scales(arrival_scales)
+    ):
+        # The kernel forms each slot's scale * router weight in SMEM from the
+        # mirror itself, the same f32 product, so the row-scale lookup and its
+        # gather behind push's SparseCore work drop out. (routes is only set on
+        # a K32Z build, which takes its own fused-scale combine below.)
+        combine = build_combine_kernel(
+            t_local=t_local,
+            topk=topk,
+            hidden=hidden,
+            lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+            fuse_scales=True,
+        )
+        return combine(arrivals, arrival_scales, scl, topk_weights, rows)
     if fuse_scales and combine_step_tokens(t_local) and tile_m <= HIDDEN_LANE_BLOCK:
         # The flat mirror index of (scl >> shift, scl & (tile_m - 1)) is scl
         # itself, which is what the fused lookup reads.
@@ -791,6 +850,72 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import (
+        supports_activation_gather,
+    )
+    from sglang_tpu.moe.pallas.fused_moe_v2.scatter import can_scatter_pair
+
+    use_split_sc = (
+        preprocess_topology is not None
+        and stage == "fused"
+        # K32Z stages and ships its rows exactly as FP4 does.
+        and weight_format in (WeightFormat.FP4, WeightFormat.K32Z)
+        and supports_activation_gather(t_local * hidden)
+        and can_scatter_pair(
+            T * topk,
+            ragged_stride,
+            act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+        )
+    )
+
+    layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
+    plan_shape = PlanShape(
+        ep=ep,
+        e_total=e_total,
+        topk=topk,
+        t_local=t_local,
+        block=block,
+        tile_m=capacity,
+        shard_stride=ragged_stride,
+        scale_at=layout[0],
+        count_at=layout[1],
+        width=layout[2],
+    )
+    # The plan kernel stands in for the sharded XLA plan, not for the
+    # SparseCore pair scatter, which builds the token gather and scale slab
+    # its own way.
+    plan_eligible = (
+        _plan_kernel_enabled()
+        and bool(sharded_plan)
+        and form.quantized_activations
+        and not use_split_sc
+        # FP4 / FP8 builds only: K32Z's mirror geometry and per-call early-ship
+        # row are the XLA plan's.
+        and k32z_gate_up_bits is None
+    )
+    use_plan_kernel = plan_eligible and plan_kernel_fits(plan_shape)
+    if plan_eligible and not use_plan_kernel and _plan_kernel_tables_enabled():
+        # Past the full build: the tables-only build leaves the slab scatters
+        # to the XLA path below.
+        tables_shape = plan_shape._replace(tables_only=True)
+        if plan_kernel_fits_tables(tables_shape):
+            plan_shape, use_plan_kernel = tables_shape, True
+    if _plan_kernel_enabled():
+        # Trace-time record of whether the plan kernel serves this shape, so a
+        # serving log shows its engagement per compiled bucket.
+        logging.getLogger(__name__).info(
+            "fused_moe_v2 plan kernel %s: t_local=%d topk=%d pairs=%d e_total=%d ep=%d",
+            (
+                ("ENGAGED (tables only)" if plan_shape.tables_only else "ENGAGED")
+                if use_plan_kernel
+                else "not used (shape outside its build)"
+            ),
+            t_local,
+            topk,
+            t_local * topk,
+            e_total,
+            ep,
+        )
     k32z_r2 = {}
     if k32z_gate_up_bits is not None:
         # How the K32Z bodies walk their chunks and the large-build choices,
@@ -836,6 +961,7 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        **({"packed_tables": True} if use_plan_kernel else {}),
         **(
             {}
             if k32z_gate_up_bits is None
@@ -853,7 +979,6 @@ def fused_ep_moe_v2(
         **({"gather_unroll": gather_unroll} if gather_unroll else {}),
     )
 
-    layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
     wire_width = _exchange_layout(t_wire, topk, e_total, form.quantized_activations)[-1]
 
     def unpack_operands(scales_gating_biases):
@@ -1058,6 +1183,85 @@ def fused_ep_moe_v2(
         )
         return topk_weights, packed, local_blocks, block_hist, row_routes
 
+    def finish(
+        q_g,
+        kernel_tables,
+        token_gather,
+        scale_slab,
+        expert_rows,
+        slab_base,
+        visit,
+        counts,
+        pos,
+        mirror_pos,
+        topk_weights,
+        row_routes,
+        rank_l,
+        w1_l,
+        w2_l,
+        w1s_l,
+        w2s_l,
+        bias_it,
+        out_dtype,
+        updated_load,
+    ):
+        """Kernel and combine from the routing plan's tables."""
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        # The bias tables are per expert and per output channel on every
+        # weight format, so they take one layout: [G, N].
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
+        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        arrivals, arrival_scales = kfn(
+            kernel_tables,
+            token_gather,
+            expert_rows,
+            slab_base,
+            q_g,
+            scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=visit,
+            counts=counts,
+            rank=rank_l,
+        )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not, so it is selected away:
+        # after the combine, or inside it (fold_select), with the same bits.
+        combined = _combine_arrivals(
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            **({"routes": row_routes} if fold_select else {}),
+            **({"fuse_scales": True} if fuse_scales else {}),
+        )
+        if not fold_select:
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        out = token_layout.restore(combined, ax)
+        return out if updated_load is None else (out, updated_load)
+
+    def step_load(exchange, expert_load_l):
+        """The accumulator plus the step's rows per physical slot in EP-rank
+        order, summed over every source rank: identical on every shard, so
+        the accumulator stays replicated."""
+        if expert_load_l is None:
+            return None
+        rows_by_dest = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total
+        )[2]
+        return expert_load_l + _unpermute_load_to_ep_rank_order(
+            rows_by_dest.sum(axis=0).astype(jnp.int32),
+            g_local=g_local,
+            mesh_ep_ranks=mesh_ep_ranks,
+        )
+
     def compute_local(
         q_g,
         exchange,
@@ -1075,22 +1279,67 @@ def fused_ep_moe_v2(
         expert_load_l=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
+        updated_load = step_load(exchange, expert_load_l)
+        if use_plan_kernel:
+            plan = routing_plan(exchange, rank_l, plan_shape)
+            token_gather, scale_slab = plan.token_gather, plan.scale_slab
+            if plan.slab_rows is not None:
+                # Tables-only build: the two slab scatters of the XLA path, on
+                # the kernel's per-pair slab rows.
+                _, scale_bits_g, _ = _unpack_routing_exchange(
+                    exchange, layout, t_local, topk, e_total
+                )
+                token_of_pair = jnp.repeat(jnp.arange(T, dtype=jnp.int32), topk)
+                lo, hi = gather_clamp_bounds(T)
+                token_gather = jnp.clip(
+                    jnp.zeros((ragged_stride,), jnp.int32)
+                    .at[plan.slab_rows]
+                    .add(token_of_pair, mode="drop"),
+                    jnp.int32(lo),
+                    jnp.int32(hi),
+                )
+                token_gather = jnp.pad(
+                    token_gather, (0, token_gather_window_rows(capacity))
+                )
+                scale_rows = act_scale_slab_rows(ragged_stride)
+                scale_slab = lax.bitcast_convert_type(
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[plan.slab_rows]
+                    .add(jnp.repeat(scale_bits_g, topk), mode="drop"),
+                    jnp.float32,
+                ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            if gather_positions is not None:
+                head = token_gather[:ragged_stride]
+                src = head // t_local
+                head = jnp.asarray(gather_positions, jnp.int32)[src] * t_local + (
+                    head - src * t_local
+                )
+                token_gather = token_gather.at[:ragged_stride].set(head)
+            return finish(
+                q_g,
+                (plan.packed,),
+                token_gather,
+                scale_slab,
+                None,
+                None,
+                None,
+                plan.count_lanes,
+                plan.pos,
+                plan.mirror_pos,
+                topk_weights,
+                row_routes,
+                rank_l,
+                w1_l,
+                w2_l,
+                w1s_l,
+                w2s_l,
+                bias_it,
+                out_dtype,
+                updated_load,
+            )
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
-        )
-        # The step's rows per physical slot in EP-rank order, summed over every
-        # source rank: identical on every shard, so the accumulator stays
-        # replicated.
-        updated_load = (
-            None
-            if expert_load_l is None
-            else expert_load_l
-            + _unpermute_load_to_ep_rank_order(
-                rows_by_dest.sum(axis=0).astype(jnp.int32),
-                g_local=g_local,
-                mesh_ep_ranks=mesh_ep_ranks,
-            )
         )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -1202,11 +1451,6 @@ def fused_ep_moe_v2(
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
-        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
-        # The bias tables are per expert and per output channel on every
-        # weight format, so they take one layout: [G, N].
-        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
-        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
         # The empty experts drop out of the visit list, so an empty
         # expert's weight slab never streams. How MANY are visited is a
         # row of the count table rather than its own reduction, so this
@@ -1242,25 +1486,6 @@ def fused_ep_moe_v2(
                 ep,
             )
             counts = jnp.concatenate([counts, es_row], axis=0)
-        arrivals, arrival_scales = kfn(
-            kernel_tables,
-            token_gather,
-            expert_rows,
-            slab_base,
-            q_g,
-            scale_slab,
-            w1_l,
-            w2_l,
-            w1s_l,
-            w2s_l,
-            w1b_k,
-            w2b_k,
-            recv_rows=recv_rows,
-            visit=visit,
-            counts=counts,
-            rank=rank_l,
-        )
-
         # The destination's own table: one arrival row per selection slot.
         pos = (
             cast(ShardRoutingTables, routing).pos
@@ -1280,41 +1505,28 @@ def fused_ep_moe_v2(
                 (t_local, topk),
             )
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not, so it is selected away:
-        # after the combine, or inside it (fold_select), with the same bits.
-        combined = _combine_arrivals(
-            arrivals,
-            arrival_scales,
+        return finish(
+            q_g,
+            kernel_tables,
+            token_gather,
+            scale_slab,
+            expert_rows,
+            slab_base,
+            visit,
+            counts,
             pos,
             mirror_pos,
             topk_weights,
+            row_routes,
+            rank_l,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            bias_it,
             out_dtype,
-            **({"routes": row_routes} if fold_select else {}),
-            **({"fuse_scales": True} if fuse_scales else {}),
+            updated_load,
         )
-        if not fold_select:
-            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
-        out = token_layout.restore(combined, ax)
-        return out if updated_load is None else (out, updated_load)
-
-    from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import (
-        supports_activation_gather,
-    )
-    from sglang_tpu.moe.pallas.fused_moe_v2.scatter import can_scatter_pair
-
-    use_split_sc = (
-        preprocess_topology is not None
-        and stage == "fused"
-        # K32Z stages and ships its rows exactly as FP4 does.
-        and weight_format in (WeightFormat.FP4, WeightFormat.K32Z)
-        and supports_activation_gather(t_local * hidden)
-        and can_scatter_pair(
-            T * topk,
-            ragged_stride,
-            act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
-        )
-    )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -1498,6 +1710,7 @@ def fused_ep_moe_v2(
         token_layout,
         bool(sharded_plan),
         preprocess_topology if use_split_sc else None,
+        use_plan_kernel,
         x.dtype,
         w1.dtype,
         w2.dtype,

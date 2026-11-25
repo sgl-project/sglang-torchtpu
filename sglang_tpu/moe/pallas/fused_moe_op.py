@@ -266,10 +266,36 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
 
     Every other dtype keeps the kernel's own adaptive ``calculate_tiling``
     unless gmm_v2 was measured at its exact shape (``_tuned_or_calculated``).
+    SGLANG_TPU_FP4_GMM2_CALC_TILING sends packed FP4 to ``calculate_tiling``
+    too: gmm_v2 validates the real K (2x the stored K) before tiling.
     """
     if not w2_packed:
         return _tuned_or_calculated(lhs, w2, w2_scale, num_experts)
+    if tpu_envs.SGLANG_TPU_FP4_GMM2_CALC_TILING.get():
+        from sglang_tpu.moe.pallas.gmm_v2 import calculate_tiling
+
+        _log_gmm2_engaged(lhs, w2)
+        return calculate_tiling
     return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+
+
+_GMM2_ENGAGED_SHAPES: set = set()
+
+
+def _log_gmm2_engaged(lhs, w2):
+    """Once per traced shape: the packed-FP4 GMM2 takes calculate_tiling."""
+    key = (lhs.shape[0], *w2.shape)
+    if key in _GMM2_ENGAGED_SHAPES:
+        return
+    _GMM2_ENGAGED_SHAPES.add(key)
+    logger.info(
+        "kernel engaged: site=gmm2_fp4 rows=%d experts=%d k=%d n=%d "
+        "tiling=calculate_tiling",
+        lhs.shape[0],
+        w2.shape[0],
+        2 * w2.shape[1],
+        w2.shape[2],
+    )
 
 
 def _tuned_or_calculated(lhs, rhs, rhs_scale, num_experts):

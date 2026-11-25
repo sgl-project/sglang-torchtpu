@@ -240,6 +240,20 @@ class TestGmm2TileSource(CustomTestCase):
             w2_packed=w2_packed,
         )
 
+    def test_packed_fp4_takes_calculate_tiling_only_when_enabled(self):
+        """The packed-FP4 switch must not change any other dtype's source."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        default = self._source(jnp.uint8, w2_packed=True)
+        self.assertIsNot(default, gmm_v2.calculate_tiling)
+        with tpu_envs.SGLANG_TPU_FP4_GMM2_CALC_TILING.override(True):
+            self.assertIs(
+                self._source(jnp.uint8, w2_packed=True), gmm_v2.calculate_tiling
+            )
+            self.assertIs(
+                self._source(jnp.bfloat16, w2_packed=False), gmm_v2.calculate_tiling
+            )
+
     def test_bf16_keeps_the_adaptive_kernel_tiling(self):
         self.assertIs(
             self._source(jnp.bfloat16, w2_packed=False), gmm_v2.calculate_tiling
