@@ -73,6 +73,26 @@ so the load holds at most one extra copy of the tensor being converted (0.63 GB
 for w13 at V4.1 Flash size) plus one chunk's temporaries. Steady state: the
 same weight bytes as the gmm layout, plus ~9 MB per layer for the padded scale
 rows.
+
+With ``SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z`` the gmm preparation is deferred to
+this step (``sglang_tpu/dsv4_mxfp4_k32z.py``): eligible layers take the K32Z
+operands, converted losslessly from the checkpoint experts, and every other
+deferred layer gets the gmm layout here. The K32Z codes are relaid out to
+``float4_e2m1fn_x2 [E, K, N/2]`` like the gmm layout's (no padding: N = 2 *
+2304 for w1), and the uint8 shift tables go flat, ``[E * rows, cols]``, built
+on the host and moved to the device like the scales above. Their op is built
+with ``weight_format=K32Z`` at 256-row tiles and 4-bit gate/up shift fields
+(``k32z.SERVING_GATE_UP_BITS``); both are in its name.
+
+``SGLANG_TPU_DSV41_FUSED_EP_DISPATCH`` sets how the op exchanges tokens:
+``all_gather`` (the default), ``push`` (fused_moe_v2's push dispatch with
+``fused_ep.tuned_push_options``) or ``auto``, decided statically per compiled
+shape: push while the token bucket has at most ``fused_ep.PUSH_MAX_ROWS`` rows
+per EP rank, all-gather above.
+Either expert format takes either dispatch. Push and auto are in the op's key
+and name (an all-gather op's are the format's plain ones), so their compiled
+programs never mix. The op calls the kernel's fused stage only, and the shared
+expert stays outside the op as above.
 """
 
 import contextlib
@@ -83,6 +103,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang_tpu import dsv4_mxfp4_k32z as k32z
 from sglang_tpu.models.deepseek_v41 import fused_ep as fe
 
 logger = logging.getLogger(__name__)
@@ -120,9 +141,10 @@ def is_dsv41_fused_ep_enabled() -> bool:
 
 
 def check_dsv41_fused_ep_env() -> None:
-    """Refuse the switch without its prerequisite at startup; the per-layer check
-    would refuse every V4.1 MoE layer only once the weights have loaded."""
+    """Refuse the switches without their prerequisites at startup; the per-layer
+    check would refuse every V4.1 MoE layer only once the weights have loaded."""
     from sglang.srt.environ import envs
+    from sglang_tpu.dsv4_mxfp4_k32z import check_expert_format_env
 
     if is_dsv41_fused_ep_enabled() and not envs.SGLANG_SHARED_EXPERT_TP1.get():
         raise ValueError(
@@ -130,6 +152,27 @@ def check_dsv41_fused_ep_env() -> None:
             "fused EP layers add a replicated shared expert on each rank's own "
             "rows). Set SGLANG_SHARED_EXPERT_TP1=1."
         )
+    check_expert_format_env()
+    dispatch = selected_dispatch()
+    if dispatch != fe.DISPATCH and not is_dsv41_fused_ep_enabled():
+        raise ValueError(
+            f"SGLANG_TPU_DSV41_FUSED_EP_DISPATCH={dispatch} needs "
+            "SGLANG_TPU_DSV41_FUSED_EP=1 (gmm_v2 has no dispatch to choose)."
+        )
+
+
+def selected_dispatch() -> str:
+    """``SGLANG_TPU_DSV41_FUSED_EP_DISPATCH``, validated. Every rank reads the
+    same environment, so every rank builds the same op (a collective)."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    dispatch = str(tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_DISPATCH.get()).strip().lower()
+    if dispatch not in fe.DISPATCHES:
+        raise ValueError(
+            f"SGLANG_TPU_DSV41_FUSED_EP_DISPATCH must be one of {fe.DISPATCHES}, "
+            f"got {dispatch!r}"
+        )
+    return dispatch
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +201,17 @@ def _tag(value: float) -> str:
     return f"{value:.6g}".replace(".", "_").replace("-", "m").replace("+", "p")
 
 
+def _dispatch_tag(dispatch: str, push_max_rows: int) -> str:
+    # All-gather adds no tag: its op names are the plain format names.
+    if dispatch == fe.DISPATCH:
+        return ""
+    if dispatch == fe.DISPATCH_PUSH:
+        return "_push"
+    if dispatch == fe.DISPATCH_AUTO:
+        return f"_auto{int(push_max_rows)}"
+    raise ValueError(f"dispatch must be one of {fe.DISPATCHES}, got {dispatch!r}")
+
+
 def _op_name(
     ep: int,
     topk: int,
@@ -165,14 +219,59 @@ def _op_name(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    expert_format: str = fe.EXPERT_FORMAT_K512,
+    gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
+    dispatch: str = fe.DISPATCH,
+    push_max_rows: int = fe.PUSH_MAX_ROWS,
 ) -> str:
     """One torch custom-op name per closure configuration (the kernel's other
     settings are module constants of fused_ep and part of the name too)."""
-    return (
+    head = (
         f"sglang_tpu_pallas::dsv41_fused_ep_ep{ep}_k{topk}_r{int(renormalize)}"
         f"_s{_tag(routed_scaling_factor)}_i{logical_intermediate_size}"
-        f"_c{fe.CAPACITY}_q{fe.RHS_QB}_{axis_name}"
     )
+    if expert_format == fe.EXPERT_FORMAT_K32Z:
+        head = f"{head}_k32z_g{gate_up_bits}_c{fe.K32Z_CAPACITY}"
+    else:
+        head = f"{head}_c{fe.CAPACITY}_q{fe.RHS_QB}"
+    return f"{head}{_dispatch_tag(dispatch, push_max_rows)}_{axis_name}"
+
+
+def _op_key(
+    ep: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    logical_intermediate_size: int,
+    axis_name: str = _DEFAULT_MESH_AXIS,
+    expert_format: str = fe.EXPERT_FORMAT_K512,
+    gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
+    dispatch: str = fe.DISPATCH,
+    push_max_rows: int = fe.PUSH_MAX_ROWS,
+) -> tuple:
+    """``_build_op``'s arguments, normalized: one key per op (and op name)."""
+    if dispatch not in fe.DISPATCHES:
+        raise ValueError(f"dispatch must be one of {fe.DISPATCHES}, got {dispatch!r}")
+    key = (
+        int(ep),
+        int(topk),
+        bool(renormalize),
+        float(routed_scaling_factor),
+        int(logical_intermediate_size),
+        str(axis_name),
+    )
+    # A K512 all-gather key is these six fields and a K32Z one adds its format
+    # and width; a push or auto key adds both (width 0 for K512) and its
+    # dispatch with auto's bound (0 for push, which has none).
+    if expert_format == fe.EXPERT_FORMAT_K512 and dispatch == fe.DISPATCH:
+        return key
+    if expert_format == fe.EXPERT_FORMAT_K512:
+        gate_up_bits = 0
+    key += (str(expert_format), int(gate_up_bits))
+    if dispatch == fe.DISPATCH:
+        return key
+    bound = int(push_max_rows) if dispatch == fe.DISPATCH_AUTO else 0
+    return key + (str(dispatch), bound)
 
 
 def _make_jax_fn(
@@ -183,6 +282,9 @@ def _make_jax_fn(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str,
+    expert_format: str = fe.EXPERT_FORMAT_K512,
+    dispatch: str = fe.DISPATCH,
+    push_max_rows: int = fe.PUSH_MAX_ROWS,
 ):
     """The exported JAX body, its input and its output partition specs.
 
@@ -203,6 +305,9 @@ def _make_jax_fn(
         logical_intermediate_size=logical_intermediate_size,
         kernel_fn=_KERNEL_FN,
         jit=False,
+        expert_format=expert_format,
+        dispatch=dispatch,
+        push_max_rows=push_max_rows,
     )
 
     def dsv41_fused_ep(
@@ -236,6 +341,10 @@ def _build_op(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    expert_format: str = fe.EXPERT_FORMAT_K512,
+    gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
+    dispatch: str = fe.DISPATCH,
+    push_max_rows: int = fe.PUSH_MAX_ROWS,
 ) -> Callable:
     mesh = _get_mesh(ep, axis_name)
     fn, in_specs, out_specs = _make_jax_fn(
@@ -246,6 +355,9 @@ def _build_op(
         routed_scaling_factor,
         logical_intermediate_size,
         axis_name,
+        expert_format,
+        dispatch,
+        push_max_rows,
     )
     op = _export_op(
         _op_name(
@@ -255,6 +367,10 @@ def _build_op(
             routed_scaling_factor,
             logical_intermediate_size,
             axis_name,
+            expert_format,
+            gate_up_bits,
+            dispatch,
+            push_max_rows,
         ),
         fn,
         mesh=mesh,
@@ -273,14 +389,22 @@ def _get_op(
     routed_scaling_factor: float,
     logical_intermediate_size: int,
     axis_name: str = _DEFAULT_MESH_AXIS,
+    expert_format: str = fe.EXPERT_FORMAT_K512,
+    gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
+    dispatch: str = fe.DISPATCH,
+    push_max_rows: int = fe.PUSH_MAX_ROWS,
 ) -> Callable:
-    key = (
-        int(ep),
-        int(topk),
-        bool(renormalize),
-        float(routed_scaling_factor),
-        int(logical_intermediate_size),
-        str(axis_name),
+    key = _op_key(
+        ep,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        logical_intermediate_size,
+        axis_name,
+        expert_format,
+        gate_up_bits,
+        dispatch,
+        push_max_rows,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -410,6 +534,31 @@ def _convert_scale(experts: torch.nn.Module, name: str, *, k: int) -> torch.Tens
     return flat.to(device)
 
 
+def _flat_shift_table(experts: torch.nn.Module, name: str) -> torch.Tensor:
+    """A K32Z shift table ``[E, rows, cols]`` uint8 -> flat ``[E * rows, cols]``,
+    built on the host and moved to the device as the scales above are."""
+    param = getattr(experts, name)
+    device = param.data.device
+    e, rows, cols = param.data.shape
+    # copy=True: on a CPU parameter .to("cpu") would alias the storage that
+    # _release frees below.
+    flat = param.data.detach().to("cpu", copy=True).reshape(e * rows, cols)
+    _release(param)
+    return flat.to(device)
+
+
+def _convert_k32z_layer(experts: torch.nn.Module, *, gate_up_bits: int):
+    """Checkpoint FP4 experts -> the K32Z kernel operands, one tensor at a time:
+    the lossless K32Z conversion (K-packed codes and shift tables), then the
+    codes relaid out as the gmm layout's are and the tables flattened."""
+    k32z.prepare_tpu_dsv4_mxfp4_k32z_weights(experts, gate_up_bits=gate_up_bits)
+    w1 = _convert_weight(experts, "w13_weight")
+    w2 = _convert_weight(experts, "w2_weight")
+    s1 = _flat_shift_table(experts, "w13_weight_shift")
+    s2 = _flat_shift_table(experts, "w2_weight_shift")
+    return w1, w2, s1, s2
+
+
 # --------------------------------------------------------------------------- #
 # Eligibility.
 # --------------------------------------------------------------------------- #
@@ -506,6 +655,14 @@ def _gmm_fp4_layout(experts, hidden: int, logical: int) -> bool:
     )
 
 
+def _expert_layout_ok(experts, hidden: int, logical: int) -> bool:
+    """The gmm layout, or (SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z) the checkpoint
+    layout the gmm preparation left for this preparation to convert."""
+    if k32z.is_deferred(experts):
+        return k32z.checkpoint_layout_ok(experts, hidden, logical)
+    return _gmm_fp4_layout(experts, hidden, logical)
+
+
 def unmet_layer_requirements(
     moe: torch.nn.Module, *, ep: int, multimodal_enabled: Optional[bool]
 ) -> list[str]:
@@ -526,7 +683,7 @@ def unmet_layer_requirements(
             "FP4 experts prepared for gmm_v2 (SGLANG_DSV4_FP4_EXPERTS=1, "
             "SGLANG_DSV4_FP4_DEQUANT=0)",
             bool(getattr(getattr(experts, "quant_method", None), "is_fp4_expert", 0))
-            and _gmm_fp4_layout(
+            and _expert_layout_ok(
                 experts, int(config.hidden_size), int(config.moe_intermediate_size)
             ),
         ),
@@ -599,6 +756,9 @@ def prepare_moe_layer_for_fused_ep(
             getattr(moe, "layer_id", "?"),
             reason,
         )
+        # K32Z selected: gmm_v2 needs the block-512 layout the gmm preparation
+        # left to this step.
+        k32z.finish_deferred_as_k512(moe.experts)
         return False
     unmet = unmet_layer_requirements(moe, ep=ep, multimodal_enabled=multimodal_enabled)
     if unmet:
@@ -607,27 +767,38 @@ def prepare_moe_layer_for_fused_ep(
             f"{getattr(moe, 'layer_id', '?')} cannot run fused EP: needs "
             + "; ".join(unmet)
         )
-
     config = moe.config
-    key = (
-        int(ep),
-        int(config.num_experts_per_tok),
-        bool(config.norm_topk_prob),
-        float(moe.routed_scaling_factor),
-        int(config.moe_intermediate_size),
+    experts = moe.experts
+    # SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z left the checkpoint experts for this
+    # step: the layer takes the K32Z operands and the K32Z op.
+    to_k32z = k32z.is_deferred(experts)
+    gate_up_bits = k32z.SERVING_GATE_UP_BITS if to_k32z else 0
+    dispatch, push_max_rows = selected_dispatch(), fe.PUSH_MAX_ROWS
+    key = _op_key(
+        ep,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+        moe.routed_scaling_factor,
+        config.moe_intermediate_size,
         _DEFAULT_MESH_AXIS,
+        fe.EXPERT_FORMAT_K32Z if to_k32z else fe.EXPERT_FORMAT_K512,
+        gate_up_bits,
+        dispatch,
+        push_max_rows,
     )
-    # Build the op first (outside Dynamo): a failure leaves the gmm-layout weights.
+    # Build the op first (outside Dynamo): a failure leaves the weights as loaded.
     _get_op(*key)
 
-    experts = moe.experts
-    hidden = int(experts.w13_weight.shape[1]) * 2
-    padded_inter = int(experts.w2_weight.shape[1]) * 2
     device = experts.w13_weight.data.device
-    w1 = _convert_weight(experts, "w13_weight")
-    w2 = _convert_weight(experts, "w2_weight")
-    s1 = _convert_scale(experts, "w13_weight_scale", k=hidden)
-    s2 = _convert_scale(experts, "w2_weight_scale", k=padded_inter)
+    if to_k32z:
+        w1, w2, s1, s2 = _convert_k32z_layer(experts, gate_up_bits=gate_up_bits)
+    else:
+        hidden = int(experts.w13_weight.shape[1]) * 2
+        padded_inter = int(experts.w2_weight.shape[1]) * 2
+        w1 = _convert_weight(experts, "w13_weight")
+        w2 = _convert_weight(experts, "w2_weight")
+        s1 = _convert_scale(experts, "w13_weight_scale", k=hidden)
+        s2 = _convert_scale(experts, "w2_weight_scale", k=padded_inter)
     rank = torch.tensor([[ep_rank]], dtype=torch.int32).to(device)
     for name, tensor in ((W1, w1), (W2, w2), (W1_SCALE, s1), (W2_SCALE, s2)):
         experts.register_buffer(name, tensor, persistent=False)
@@ -653,6 +824,8 @@ def prepare_model_for_dsv41_fused_ep(model: torch.nn.Module) -> int:
             "SGLANG_TPU_DSV41_FUSED_EP: %s has no DeepSeek-V4.1 MoE layer.",
             type(model).__name__,
         )
+        # K32Z selected: FP4 experts outside V4.1 MoE layers keep gmm_v2.
+        k32z.finish_deferred_as_k512(model)
         return 0
 
     from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -685,6 +858,9 @@ def prepare_model_for_dsv41_fused_ep(model: torch.nn.Module) -> int:
             ep_rank,
             len(layers) - len(prepared),
         )
+    # K32Z selected: whatever else still holds deferred checkpoint experts
+    # keeps gmm_v2 and needs its block-512 layout.
+    k32z.finish_deferred_as_k512(model)
     return len(prepared)
 
 

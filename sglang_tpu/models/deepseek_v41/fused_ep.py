@@ -35,6 +35,11 @@ Layout facts:
   padded=True), N]`` (K/512 rounded up to 8 rows, padding rows zero). vLLM
   serves the flat form. ``logical_intermediate_size=2304`` makes the kernel
   skip the padded gate/up columns and w2 rows.
+* K32Z (``expert_format="k32z"``, ``sglang_tpu/dsv4_mxfp4_k32z.py``): the
+  checkpoint's block-32 experts losslessly, no padding (``inter = 2304``):
+  ``w1 [E, H, 2*inter]``, ``w2 [E, inter, H]`` float4 codes and uint8 shift
+  tables flat ``[E * rows, cols]`` (``fused_moe_v2.host.k32z_table_geometry``).
+  The kernel runs 256-row tiles (:data:`K32Z_CAPACITY`).
 * Bridge: a uint8 gmm-layout byte becomes two ``float4_e2m1fn`` elements on
   K. On the host this is a nibble split; in JAX,
   ``lax.bitcast_convert_type(u8, float4_e2m1fn)`` appends a minor axis with
@@ -67,6 +72,19 @@ RHS_QB = 512
 CAPACITY = 128
 ACT_FN = "silu_and_mul_with_clamp"
 DISPATCH = "all_gather"
+# fused_moe_v2's point-to-point dispatch (push_fused_moe), and "auto", which
+# picks one of the two per compiled shape (resolve_dispatch).
+DISPATCH_PUSH = "push"
+DISPATCH_AUTO = "auto"
+DISPATCHES = (DISPATCH, DISPATCH_PUSH, DISPATCH_AUTO)
+# auto's default bound in rows per EP rank. In the layer-3 benchmark at EP8
+# (v7x, K512), push beat all-gather at 8-1024 rows per rank and lost at 2048.
+PUSH_MAX_ROWS = 1024
+# Expert formats (sglang_tpu/dsv4_mxfp4_k32z.py's names): the block-512 gmm
+# preparation, or K32Z, whose kernel runs 256-row tiles.
+EXPERT_FORMAT_K512 = "k512"
+EXPERT_FORMAT_K32Z = "k32z"
+K32Z_CAPACITY = 256
 
 # host.U32_SUBLANE_TILE; repeated so the relayout needs no JAX import.
 _U32_SUBLANE_TILE = 8
@@ -124,6 +142,39 @@ def gmm_scale_to_kernel(
 # --------------------------------------------------------------------------- #
 # The kernel call.
 # --------------------------------------------------------------------------- #
+def tuned_push_options(g_local: int) -> dict:
+    """The tuned push options (the combined options of
+    test_fused_ep_moe_push.py), with dispatch_ahead = the local experts per
+    rank. K32Z builds also get their per-bucket schedule from the push layer."""
+    return dict(
+        sc_prepush=2,
+        tc_exchange=True,
+        onehot_slots=True,
+        tail_barrier=False,
+        hbm_staging=True,
+        dispatch_ahead=g_local,
+        matmul_scale_repeat=True,
+        exchange_row_gather=True,
+        bf16_sort_counts=True,
+        slim_prepush_barrier=True,
+        fused_dispatch_meta=True,
+        table_kernel=True,
+        exchange_tables=True,
+        kernel_plan_tables=True,
+        light_prepush=2,
+        single_barrier=True,
+        early_scale_scatter=2,
+    )
+
+
+def resolve_dispatch(dispatch: str, *, rows_per_rank: int, push_max_rows: int) -> str:
+    """The dispatch one compiled shape runs: "auto" pushes while the bucket has
+    at most ``push_max_rows`` rows per EP rank and all-gathers above."""
+    if dispatch != DISPATCH_AUTO:
+        return dispatch
+    return DISPATCH_PUSH if rows_per_rank <= push_max_rows else DISPATCH
+
+
 def make_fused_ep_moe(
     mesh,
     *,
@@ -132,13 +183,16 @@ def make_fused_ep_moe(
     renormalize: bool = RENORMALIZE,
     routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
     logical_intermediate_size: int | None = LOGICAL_INTER,
-    capacity: int = CAPACITY,
+    capacity: int | None = None,
     rhs_qb: int = RHS_QB,
     act_fn: str = ACT_FN,
     scoring_fn: str = SCORING_FN,
     sharded_plan: bool = True,
     kernel_fn=None,
     jit: bool = True,
+    expert_format: str = EXPERT_FORMAT_K512,
+    dispatch: str = DISPATCH,
+    push_max_rows: int = PUSH_MAX_ROWS,
 ):
     """Return ``(x, gating, w1, w2, w1_scale, w2_scale, score_bias[, rank]) -> out``.
 
@@ -152,17 +206,33 @@ def make_fused_ep_moe(
     Settings mirror vLLM epic/dsv41's V4.1 layer except
     ``preprocess_topology`` (None here; vLLM passes
     ``prepare_moe_preprocessing(mesh)``). Tokens are exchanged with
-    :data:`DISPATCH`. ``rank`` is optional: left out (None), the kernel layer
+    ``dispatch`` (below). ``rank`` is optional: left out (None), the kernel layer
     builds the rank operand itself under a plain ``jax.jit``; a torch_tpu
     export must pass it as an int32 ``[ep, 1]`` operand sharded on the mesh
     axis (see fused_ep_op.py). ``kernel_fn`` replaces ``fused_ep_moe_v2``
     (tests).
+
+    ``expert_format`` "k512" takes the FP4 block-512 operands at ``capacity``
+    (default :data:`CAPACITY`); "k32z" the K32Z operands at ``capacity``
+    (default :data:`K32Z_CAPACITY`), where ``logical_intermediate_size`` can
+    only be the operands' own (they carry no padding).
+
+    ``dispatch`` exchanges the tokens with :data:`DISPATCH` (all-gather, the
+    default), "push" or "auto" (:func:`resolve_dispatch` on each traced
+    shape's rows per EP rank against ``push_max_rows``). A push call uses
+    :func:`tuned_push_options` for the operands' local experts. It runs the
+    kernel's fused stage without the push layer's optional fused shared
+    expert, so the output stays the routed experts alone, as on all-gather.
     """
     import jax
     import jax.numpy as jnp
 
     from sglang_tpu.moe.pallas import fused_moe_v2 as package
 
+    if dispatch not in DISPATCHES:
+        raise ValueError(f"dispatch must be one of {DISPATCHES}, got {dispatch!r}")
+    if dispatch == DISPATCH_AUTO and push_max_rows < 1:
+        raise ValueError(f"push_max_rows must be >= 1, got {push_max_rows}")
     (axis,) = mesh.axis_names
     mesh_ep = mesh.shape[axis]
     if ep is None:
@@ -171,10 +241,27 @@ def make_fused_ep_moe(
         raise ValueError(f"ep={ep} but the mesh axis {axis!r} has {mesh_ep} devices")
     if kernel_fn is None:
         kernel_fn = package.fused_ep_moe_v2
-    weight_format = package.WeightFormat.FP4
+    if expert_format == EXPERT_FORMAT_K512:
+        weight_format = package.WeightFormat.FP4
+        capacity = CAPACITY if capacity is None else capacity
+    elif expert_format == EXPERT_FORMAT_K32Z:
+        weight_format = package.WeightFormat.K32Z
+        capacity = K32Z_CAPACITY if capacity is None else capacity
+    else:
+        raise ValueError(
+            f"expert_format must be {EXPERT_FORMAT_K512!r} or "
+            f"{EXPERT_FORMAT_K32Z!r}, got {expert_format!r}"
+        )
     mesh_ep_ranks = tuple(range(ep))
 
     def moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank=None):
+        # Static per traced shape: x holds every rank's rows.
+        chosen = resolve_dispatch(
+            dispatch, rows_per_rank=x.shape[0] // ep, push_max_rows=push_max_rows
+        )
+        push = {}
+        if chosen == DISPATCH_PUSH:
+            push["push_options"] = tuned_push_options(w1.shape[0] // ep)
         return kernel_fn(
             x,
             w1,
@@ -197,7 +284,8 @@ def make_fused_ep_moe(
             routed_scaling_factor=routed_scaling_factor,
             logical_intermediate_size=logical_intermediate_size,
             preprocess_topology=None,
-            dispatch=DISPATCH,
+            dispatch=chosen,
+            **push,
         )
 
     return jax.jit(moe) if jit else moe

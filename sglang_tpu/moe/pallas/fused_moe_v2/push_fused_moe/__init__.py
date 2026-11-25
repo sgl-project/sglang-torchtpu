@@ -49,5 +49,7 @@ PUSH_OPTIONS = (
     "early_scale_scatter",
     "fuse_metadata",
 )
+# K32Z builds on the exchange-table path also take the per-bucket schedule in
+# layer.K32Z_PUSH_RECIPES; it is chosen by the layer, not passed in.
 
 __all__ = ["PUSH_OPTIONS", "fused_ep_moe_push"]
