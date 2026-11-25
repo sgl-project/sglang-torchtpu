@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     is_auto_parallel_decode_mode,
@@ -1590,6 +1591,21 @@ def unpatchify(x, patch_size):
     return x
 
 
+def decode_chunk_bounds(num_frames: int, chunk_frames: int) -> list[tuple[int, int]]:
+    """Latent-frame ranges, one per decoder call: frame 0 alone, then
+    ``chunk_frames`` frames per call.
+
+    Frame 0 must be a call of its own: the temporal upsamples skip their time
+    conv on the first call and the residual shortcut trims it there
+    (``first_chunk``). After it the causal caches hold exactly the frames a
+    longer call needs, so every chunking decodes the same video up to rounding.
+    """
+    step = max(1, chunk_frames)
+    return [(0, min(1, num_frames))] + [
+        (start, min(start + step, num_frames)) for start in range(1, num_frames, step)
+    ]
+
+
 class AutoencoderKLWan(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
@@ -1797,10 +1813,13 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
                 ):
                     out_chunks = []
-                    for i in range(iter_):
+                    chunks = decode_chunk_bounds(
+                        iter_, envs.SGLANG_DIFFUSION_WAN_VAE_DECODE_CHUNK_FRAMES
+                    )
+                    for i, (start, end) in enumerate(chunks):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
-                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        out_chunks.append(self.decoder(x[:, :, start:end, :, :]))
                         # with the causal cache these frames are final, and full
                         # height even under spatial-parallel decode
                         if on_frames is not None:
