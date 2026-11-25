@@ -4291,7 +4291,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # DSA path on CUDA: dsa fill + page 64
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            override_platform(is_tpu=False),
+            override_platform(is_cuda=True, is_tpu=False),
         ):
             with override_platform(is_npu=False):
                 with override_platform(is_xpu=False):
@@ -4317,7 +4317,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                         _args(dcp_size=2), hf_config
                                     )
                     # HIP without the preshuffle path: page 1
-                    with override_platform(is_hip=True):
+                    with override_platform(is_cuda=False, is_hip=True):
                         with patch(
                             "sglang.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
                             return_value=False,
@@ -4326,10 +4326,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 _deepseek_family_overrides(_args(), None),
                                 {"attention_backend": "dsa", "page_size": 1},
                             )
-        # DSA on TPU: none of the GPU defaults, the operator's page size stands
+                    # MUSA (torch.cuda through torchada, is_cuda false): the GPU defaults
+                    with override_platform(is_cuda=False, is_musa=True):
+                        self.assertEqual(
+                            _deepseek_family_overrides(_args(), None),
+                            {"attention_backend": "dsa", "page_size": 64},
+                        )
+        # DSA off the torch.cuda GPUs (TPU here): none of the GPU defaults, the
+        # operator's page size stands
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            override_platform(is_tpu=True),
+            override_platform(is_cuda=False, is_hip=False, is_musa=False, is_tpu=True),
         ):
             self.assertEqual(
                 _deepseek_family_overrides(
@@ -4340,7 +4347,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # DSA CP (zigzag): the coupled parallel-field declaration
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            override_platform(is_tpu=False),
+            override_platform(is_cuda=True, is_tpu=False),
         ):
             with override_platform(is_npu=False):
                 with override_platform(is_xpu=False):

@@ -23,23 +23,19 @@ def _args(**overrides):
 
 
 class TestKimiK3SpecBackendDefaults(CustomTestCase):
-    def test_non_tpu_pins_cutedsl_verify_backend(self):
+    def test_pins_cutedsl_verify_backend(self):
         args = _args()
-        with override_platform(is_tpu=False, is_sm100=False):
+        with override_platform(is_sm100=False):
             apply_kimi_k3_spec_backend_defaults(args)
         self.assertEqual(
             resolution_result(args, "linear_attn_verify_backend"), "nv_cutedsl"
         )
 
-    def test_tpu_rejects_speculative_decoding(self):
-        """Spec decode on TPU fails at launch."""
-        with override_platform(is_tpu=True, is_sm100=False):
-            with self.assertRaisesRegex(ValueError, "not supported"):
-                apply_kimi_k3_spec_backend_defaults(_args())
-
-    def test_tpu_without_speculative_decoding_is_allowed(self):
-        with override_platform(is_tpu=True, is_sm100=False):
-            apply_kimi_k3_spec_backend_defaults(_args(speculative_algorithm=None))
+    def test_without_speculative_decoding_pins_nothing(self):
+        args = _args(speculative_algorithm=None)
+        with override_platform(is_sm100=False):
+            apply_kimi_k3_spec_backend_defaults(args)
+        self.assertIsNone(resolution_result(args, "linear_attn_verify_backend"))
 
 
 if __name__ == "__main__":

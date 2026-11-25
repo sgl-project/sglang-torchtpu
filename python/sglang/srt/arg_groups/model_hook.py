@@ -306,12 +306,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
-            # TPU resolves DSA in its platform hook (apply_server_args_defaults).
+            # GPUs on the torch.cuda API: CUDA (SAIL reports as CUDA), ROCm, and
+            # MUSA through torchada; other platforms skip these GPU defaults.
             if (
-                not get_platform().is_npu
-                and not get_platform().is_xpu
-                and not get_platform().is_tpu
-            ):  # CUDA or ROCm GPU
+                get_platform().is_cuda
+                or get_platform().is_hip
+                or get_platform().is_musa
+            ):
                 if cfg.enable_prefill_cp:
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:

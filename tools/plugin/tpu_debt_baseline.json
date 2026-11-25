@@ -1,8 +1,5 @@
 {
   "branches": {
-    "python/sglang/srt/arg_groups/kimi_k3_hook.py": 1,
-    "python/sglang/srt/arg_groups/model_hook.py": 1,
-    "python/sglang/srt/arg_groups/model_overrides/deepseek_v2.py": 1,
     "python/sglang/srt/arg_groups/speculative_hook.py": 1,
     "python/sglang/srt/compilation/compiled_op.py": 1,
     "python/sglang/srt/disaggregation/decode.py": 3,
@@ -41,7 +38,7 @@
     "python/sglang/srt/managers/scheduler_components/profiler_manager.py": 5,
     "python/sglang/srt/managers/scheduler_pp_mixin.py": 3,
     "python/sglang/srt/mem_cache/allocation.py": 4,
-    "python/sglang/srt/mem_cache/allocator/swa.py": 10,
+    "python/sglang/srt/mem_cache/allocator/swa.py": 9,
     "python/sglang/srt/mem_cache/kv_cache_builder.py": 1,
     "python/sglang/srt/mem_cache/kv_cache_configurator.py": 3,
     "python/sglang/srt/mem_cache/memory_pool.py": 4,

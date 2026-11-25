@@ -113,12 +113,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
             logger.info("Use dsa attention backend for DeepSeek with DSA.")
-        # TPU keeps the operator's page size; none of the GPU defaults below apply.
-        if (
-            not get_platform().is_npu
-            and not get_platform().is_xpu
-            and not get_platform().is_tpu
-        ):  # CUDA or ROCm GPU
+        # GPUs on the torch.cuda API: CUDA (SAIL reports as CUDA), ROCm, and
+        # MUSA through torchada; other platforms skip these GPU defaults.
+        if get_platform().is_cuda or get_platform().is_hip or get_platform().is_musa:
             if cfg.enable_prefill_cp:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."

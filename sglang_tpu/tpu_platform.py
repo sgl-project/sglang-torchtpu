@@ -2091,3 +2091,7 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+
+# Imported for its side effect: registers the TPU server-argument resolution hooks.
+import sglang_tpu.server_args_resolution  # noqa: E402, F401
