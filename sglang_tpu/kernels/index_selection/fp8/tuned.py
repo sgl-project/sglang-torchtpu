@@ -7,7 +7,6 @@
 import math
 from dataclasses import astuple, dataclass
 
-import jax
 from jax.experimental.pallas import tpu as pltpu
 
 from .cache import PAGE_RECORDS, PAGE_ROWS
@@ -33,13 +32,6 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 10, 4)
-PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 12, 6)
-# Query pairs per gathered-scorer iteration; they share one MXU issue window.
-PACKED_FP8_PREPARED_PAIRS = 2
-
-# v7 H32/D128: fully static prefixes avoid dynamic per-fragment addresses.
-# A 4K step bounds inactive computation while retaining a long scheduling window.
-PACKED_FP8_PREPARED_PREFIX_TOKENS = 4096
 
 # Bound short-output padding to one tile; 4K is the smallest measured choice.
 PACKED_FP8_DENSE_MIN_KEY_TILE = 4096
@@ -61,29 +53,3 @@ def paged_mqa_query_tile(query_size: int, heads: int) -> int:
     """Bound queries by the MXU footprint and head-reduction sublanes."""
     info = pltpu.get_tpu_info()
     return min(query_size, info.num_sublanes, max(1, info.mxu_column_size // heads))
-
-
-def indexer_query_rows(tokens: int, query_tile: int) -> int:
-    """Derive query chunks from query tiles and the SparseCore wave size."""
-    if jax.default_backend() != "tpu":
-        return tokens
-    sc = pltpu.get_tpu_info().sparse_core
-    if sc is None:
-        return tokens
-    wave = math.lcm(query_tile, sc.num_cores * sc.num_subcores)
-    chunk = math.gcd(tokens, wave)
-    return chunk if chunk % query_tile == 0 else tokens
-
-
-def topk_reconstruction_threshold(k: int) -> int:
-    """Bound the live candidate excess proportionally to the output width."""
-    return min(8192, 4 * k)
-
-
-# Rolling SparseCore gather: three buffers overlap reads and writes for 8-token blocks.
-# 64 pages per tile divides tokens * 2 * 2048 candidate blocks over 32 subcores, so the
-# gather output needs no trailing slice; 96 left a sliced 8.25 GiB copy at 2048 tokens.
-PAGED_MQA_GATHER_CONFIG = {(8, 1): (64, 3), (8, 2): (64, 3)}
-
-# (candidate block, physical page, banks): pages per tile and pipeline buffers.
-PAGED_MQA_FRAGMENT_GATHER_CONFIG = {(8, 128, 2): (64, 4)}

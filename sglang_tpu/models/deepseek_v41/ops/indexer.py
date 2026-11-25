@@ -2,8 +2,8 @@
 """Torch ops over the DeepSeek-V4.1 packed FP8 indexer (ratio 1 and 2 layers).
 
 Single bank, one device per process (no mesh). Each op is a
-``cpu_export_jax_op`` over the shared kernels in
-``sglang_tpu.kernels.deepseek_v41.index_selection``. ``write_index_k`` donates
+``cpu_export_jax_op`` over shared FP8 kernels and the V4.1 selection logic in
+``sglang_tpu.models.deepseek_v41.kernels.index_candidates``. ``write_index_k`` donates
 the cache and returns its new value; the caller does ``index_k.copy_(result)``.
 
 Layout (``memory_pool.DSV41TPUTokenToKVPool.get_index_k``): INT32
@@ -26,14 +26,14 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+from sglang_tpu.kernels.index_selection.fp8.cache import (
     PAGE_RECORDS,
     PAGE_ROWS,
     PackedFP8Layout,
     quantize_index_rows,
     write_fp8_records,
 )
-from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+from sglang_tpu.models.deepseek_v41.kernels.index_candidates.selection import (
     prepare_fp8_candidates,
     select_fp8_indexer_jax,
     select_fp8_prepared,

@@ -13,8 +13,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
-from .tuned import (
+from sglang_tpu.kernels.index_selection.fp8.cache import (
+    PAGE_RECORDS,
+    PAGE_ROWS,
+    PackedFP8Layout,
+)
+from sglang_tpu.models.deepseek_v41.kernels.index_candidates.tuned import (
     PAGED_MQA_FRAGMENT_GATHER_CONFIG,
     PAGED_MQA_GATHER_CONFIG,
 )
