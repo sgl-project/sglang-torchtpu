@@ -2935,6 +2935,271 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         jax.ShapeDtypeStruct((3,), jnp.int32),
                     ).mlir_module()
                     self.assertIn("swabatch-mp2-batchfull", hlo)
+
+    def test_cand15_rpad_vmem_core_and_prestarted_dma_parity_and_export(self):
+        """cand_w9_15: _run_rpad_vmem_core + prepare_and_start_rpad_dmas bit-exact parity & AOT."""
+        from jax import export as jax_export
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _run_rpad_vmem_core,
+            parse_decode_fast_config,
+            prepare_and_start_rpad_dmas,
+            run_decode_fast_rpa,
+        )
+
+        cfg_sh = parse_decode_fast_config(
+            "w8,c4096,shared16,q256,pbf16,batchfull,foldcol,noadapt",
+            sliding_window=None,
+            pages_per_seq=528,
+            page_size=512,
+            decode_query_size=1,
+            shared_group=16,
+        )
+        self.assertEqual(cfg_sh.num_slots, 4)
+
+        def _run_fused_caller(
+            q_raw,
+            kv_merged,
+            gate_in,
+            kvc,
+            kvl,
+            pi,
+            cuq,
+            cukv,
+            dist,
+            *,
+            sm_scale: float,
+            sw: int | None,
+            mode_str: str,
+            native_tp16: bool,
+            interpret: bool,
+        ):
+            bs = q_raw.shape[0]
+            pps = pi.shape[0] // bs
+            cfg = parse_decode_fast_config(
+                mode_str,
+                sliding_window=sw,
+                pages_per_seq=pps,
+                page_size=512,
+                decode_query_size=1,
+            )
+            use_tp16_q8 = native_tp16
+            q_rows = 8 if use_tp16_q8 else 16
+            pack2_cols = 512 if native_tp16 else 1024
+            one_block = True if sw is not None else (pps <= cfg.max_ring_pages)
+            use_hoist = cfg.hoist_new_kv
+
+            def _kern(
+                kv_lens_ref,
+                page_indices_ref,
+                cu_q_lens_ref,
+                cu_kv_lens_ref,
+                distribution_ref,
+                q_in_ref,
+                kv_in_ref,
+                gate_in_ref,
+                kv_cache_hbm_ref,
+                o_out_ref,
+                upd_kv_hbm_ref,
+                bkv_vmem_ref,
+                state_vmem_ref,
+                o_vmem_ref,
+                *extra_refs,
+            ):
+                if use_hoist:
+                    init_sv_ref, smem_ref, bkv_sems, cw_sem = extra_refs
+                else:
+                    init_sv_ref = None
+                    smem_ref, bkv_sems, cw_sem = extra_refs
+                pre_state = prepare_and_start_rpad_dmas(
+                    kv_lens_ref=kv_lens_ref,
+                    page_indices_ref=page_indices_ref,
+                    cu_q_lens_ref=cu_q_lens_ref,
+                    cu_kv_lens_ref=cu_kv_lens_ref,
+                    distribution_ref=distribution_ref,
+                    kv_cache_hbm_ref=kv_cache_hbm_ref,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    bkv_sems=bkv_sems,
+                    sliding_window=sw,
+                    cfg=cfg,
+                    one_block_per_seq=one_block,
+                    decode_query_size=1,
+                    kv_pack_dense2=False,
+                    interpret_mode=interpret,
+                )
+                q_ref = q_in_ref.at[:, pl.ds(0, 8), :] if use_tp16_q8 else q_in_ref
+                _run_rpad_vmem_core(
+                    kv_lens_ref=kv_lens_ref,
+                    page_indices_ref=page_indices_ref,
+                    cu_q_lens_ref=cu_q_lens_ref,
+                    cu_kv_lens_ref=cu_kv_lens_ref,
+                    distribution_ref=distribution_ref,
+                    q_vmem_ref=q_ref,
+                    kv_merged_vmem_ref=kv_in_ref,
+                    gate_vmem_ref=gate_in_ref,
+                    kv_cache_hbm_ref=kv_cache_hbm_ref,
+                    o_out_vmem_ref=o_out_ref,
+                    updated_kv_cache_hbm_ref=upd_kv_hbm_ref,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    state_vmem_ref=state_vmem_ref,
+                    o_vmem_ref=o_vmem_ref,
+                    kv_write_vmem_ref=None,
+                    init_sv_vmem_ref=init_sv_ref,
+                    written_cnt_smem_ref=smem_ref,
+                    bkv_sems=bkv_sems,
+                    cache_write_sem=cw_sem,
+                    sm_scale=sm_scale,
+                    sliding_window=sw,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    cfg=cfg,
+                    one_block_per_seq=one_block,
+                    decode_query_size=1,
+                    in_kernel_pack2=True,
+                    has_gate=True,
+                    out_norm_eps=1e-5,
+                    kv_pack_dense2=False,
+                    interpret_mode=interpret,
+                    prestarted_bkv_state=pre_state,
+                )
+
+            scratch = [
+                pltpu.VMEM((cfg.num_slots, cfg.max_ring_pages, 512, 1, 4, 128), kvc.dtype),
+                pltpu.VMEM((3, q_rows, 128), jnp.float32),
+                pltpu.VMEM((bs, q_rows, 128), jnp.bfloat16),
+            ]
+            if use_hoist:
+                scratch.append(pltpu.VMEM((2, bs, q_rows, 128), jnp.float32))
+            scratch.extend([
+                pltpu.SMEM((2 + cfg.num_slots,), jnp.int32),
+                pltpu.SemaphoreType.DMA((cfg.num_slots,)),
+                pltpu.SemaphoreType.DMA((1,)),
+            ])
+            tpu_v = 0 if interpret else 7
+            kw = (
+                {"interpret": pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")}
+                if interpret
+                else {"compiler_params": pltpu.CompilerParams(dimension_semantics=("arbitrary",), disable_bounds_checks=True)}
+            )
+            return pl.pallas_call(
+                _kern,
+                out_shape=[
+                    jax.ShapeDtypeStruct((bs, pack2_cols), jnp.bfloat16),
+                    pltpu.HBM(shape=kvc.shape, dtype=kvc.dtype) if tpu_v >= 7 else jax.ShapeDtypeStruct(shape=kvc.shape, dtype=kvc.dtype),
+                ],
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=5,
+                    in_specs=[
+                        pl.BlockSpec(q_raw.shape, lambda *_: (0, 0, 0), memory_space=pltpu.VMEM),
+                        pl.BlockSpec(kv_merged.shape, lambda *_: (0, 0, 0, 0), memory_space=pltpu.VMEM),
+                        pl.BlockSpec(gate_in.shape, lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                    ],
+                    out_specs=[
+                        pl.BlockSpec((bs, pack2_cols), lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                    ],
+                    grid=(1,),
+                    scratch_shapes=scratch,
+                ),
+                input_output_aliases={8: 1},
+                name=f"fused_c{cfg.chunk_sz}-{cfg.loop_kind}",
+                **kw,
+            )(kvl, pi, cuq, cukv, dist, q_raw, kv_merged, gate_in, kvc)
+
+        rng = np.random.default_rng(1501)
+        bs, ps = 32, 512
+        cases = [
+            ("tp8_1k_swa_mix_n28", 16, 2049, 2, 28, [120, 480, 513, 900, 1024] * 5 + [100, 600, 950] + [1] * 4, "w8,batchfull,g4k,foldcol"),
+            ("tp16_q8_1k_full_mix", 8, None, 2, 32, [64, 300, 512, 750] * 8, "tp16,w8,batchfull,g4k,foldcol"),
+            ("tp8_8k1k_swa_mp5", 16, 2049, 10, 30, [400, 1100, 1800, 2200, 3500, 4500] * 5 + [1, 1], "w8,noadapt,hoistkv,g4k,foldcol"),
+            ("tp8_8k1k_full_w7auto", 16, None, 10, 32, [100, 700, 1500, 2600] * 8, "w8,noadapt,hoistkv,g4k,foldcol"),
+        ]
+        for tag, nq, sw, pps, n_act, lens, mode in cases:
+            with self.subTest(case=tag):
+                s_u8 = np.full((bs * pps + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                pi_np = np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+                rng.shuffle(pi_np.ravel())
+                cols = 64 if nq == 8 else 128
+                for s in range(n_act):
+                    old_l = lens[s] - 1
+                    n_u = (old_l + ps - 1) // ps
+                    for p_o in range(n_u):
+                        pg = int(pi_np[s, p_o])
+                        rh = min(ps, old_l - p_o * ps)
+                        if cols < 128:
+                            s_u8[pg, :rh, 0, :2, cols:] = 0
+                        s_u8[pg, :rh, 0, 0, :cols] = _rand_fp8_u8(rng, (rh, cols))
+                        s_u8[pg, :rh, 0, 1, :cols] = _rand_fp8_u8(rng, (rh, cols))
+                kvc = _u8_to_fp8(s_u8)
+                q16 = jnp.asarray((rng.standard_normal((bs, 8 if nq == 8 else 16, cols)) * 0.4).astype(np.float32), jnp.bfloat16)
+                k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, cols)))
+                v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, cols)))
+                if nq == 8:
+                    q_raw = jnp.pad(q16, ((0, 0), (0, 8), (0, 64)))
+                    kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs, 1, 4, 128)
+                else:
+                    q_raw = q16
+                    kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 0))).reshape(bs, 1, 4, 128)
+                gate = jnp.asarray((rng.standard_normal((bs, nq * 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+                pi = jnp.asarray(pi_np.ravel(), jnp.int32)
+                cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+                cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+                dist = jnp.asarray([n_act, n_act, n_act], jnp.int32)
+                kvl = jnp.asarray(lens, dtype=jnp.int32)
+
+                o_ref, kv_ref = run_decode_fast_rpa(
+                    q_raw.reshape(1, bs, 8, 2, 128), kv_p, None, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=float(cols ** -0.5), sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                    gate=gate, out_norm_eps=1e-5, force_native_tp16=(nq == 8), interpret=True,
+                )
+                o_fused, kv_fused = _run_fused_caller(
+                    q_raw, kv_p, gate, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=float(cols ** -0.5), sw=sw, mode_str=mode, native_tp16=(nq == 8), interpret=True,
+                )
+                self.assertTrue(np.array_equal(np.asarray(o_fused).view(np.uint16), np.asarray(o_ref).view(np.uint16)))
+                self.assertTrue(np.array_equal(np.asarray(kv_fused).view(np.uint8), np.asarray(kv_ref).view(np.uint8)))
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            bs_e = 64
+            for tag_e, nq_e, sw_e, pps_e, mode_e in (
+                ("tp8_swa_1k", 16, 2049, 2, "w8,batchfull,g4k,foldcol"),
+                ("tp16_q8_swa_8k1k", 8, 2049, 5, "tp16,w8,noadapt,hoistkv,g4k,foldcol"),
+                ("tp8_full_8k1k", 16, None, 17, "w8,noadapt,hoistkv,g4k,foldcol"),
+            ):
+                with self.subTest(export=tag_e):
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: _run_fused_caller(
+                                q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_,
+                                sm_scale=(64.0 if nq_e == 8 else 128.0) ** -0.5,
+                                sw=sw_e, mode_str=mode_e, native_tp16=(nq_e == 8), interpret=False,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((bs_e, 16, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e, nq_e * 64), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e * pps_e + 8, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("tpu_custom_call", hlo.lower())
                     self.assertNotIn("swabatch-mp5-noz", hlo)
                     if sw_e is None:
                         self.assertIn("c5120-w7auto", hlo)
