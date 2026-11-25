@@ -114,11 +114,44 @@ def _round_down(x: int, multiple: int) -> int:
 # ``get_tpu_info().vmem_capacity_bytes`` to both the block-size model and
 # Mosaic's ``vmem_limit_bytes``; this default serves CPU-side callers.
 _V7X_VMEM_CAPACITY_BYTES = 64 * 2**20
-# Live-length tiles (packed rows with trailing padding): compile-only tpu7x
-# schedules at 32768 rows, 7 heads are within 2% of the autotuned 4096x2048
-# tiles in a quarter of the instructions.
+# Live-length tiles (packed rows with trailing padding) of the running-max
+# kernel, used below _LIVE_LENGTH_LAZY_MIN_SEQ rows.
 _LIVE_LENGTH_BLOCK_Q = 2048
 _LIVE_LENGTH_BLOCK_KV = 1024
+# Above this many rows and keys the lazy-offset kernel (live_kernel) runs,
+# with query blocks of at most 2048 rows (split evenly) and one 2048-key
+# chunk per grid step. On tpu7x (32768 rows, 7 heads) its fast path is
+# 7.9 ms at 2048x2048 and ~36 ms at 4096x2048 or 3072x2048 once the exact
+# redo path is in the same kernel. At 2048 rows with 220 padding rows it was
+# 0.90-0.95x the running-max kernel.
+_LIVE_LENGTH_LAZY_MIN_SEQ = 2048
+# Up to this many keys the lazy-offset kernel takes 1024-key blocks: with
+# 2048-key blocks, 4096 rows with 220 padding rows ran at 0.97x the
+# running-max kernel (the block holding the last live key is half the work).
+_LIVE_LENGTH_NARROW_MAX_SEQ = 4096
+# Above this many rows, a sequence whose last 2048-key block would hold more
+# than one edge chunk of keys is padded with zero rows to whole 2048-row
+# blocks instead of taking 1024-key blocks: on tpu7x 1.36x vs 1.20x the
+# running-max kernel at S = 37888 and 1.32x vs 1.22x at 17920, the pad copies
+# included; at S <= 7680 the copies cost more than the wider blocks save.
+_LIVE_LENGTH_PAD_MIN_SEQ = 8192
+_LIVE_LENGTH_MAX_BLOCK_Q = 2048
+_LIVE_LENGTH_WIDE_BLOCK_KV = 2048
+# The KV block holding the last live key runs in chunks of this many keys, so a
+# nearly empty edge block costs one small chunk.
+_LIVE_LENGTH_EDGE_CHUNK = 512
+# Live-length softmax offset, log2 units (see live_kernel): after every chunk
+# the offset is rebased by a whole number to about the state's log2-sum-exp
+# plus this headroom, so the state sits at ~2^-20 and probabilities down to
+# 2^-126 (~105 below it) stay normal floats.
+_LIVE_LENGTH_HEADROOM = 20.0
+# A chunk whose probability sum in a query column exceeds this (scores ~89
+# above the state's log2-sum-exp, or inf) is dropped for that column and redone
+# exactly. Sums stay below 2^92, rebase factors above 2^-112 (normal floats).
+_LIVE_LENGTH_SUM_LIMIT = 2.0**80
+# Exact steps (first chunk of a query block, redone chunks) run in sub-chunks
+# of this many keys.
+_LIVE_LENGTH_EXACT_CHUNK = 2048
 # Headroom for buffers the model does not count, chiefly the double-buffered
 # bf16 output block (3.1 MiB at block_q=6400).
 _VMEM_BUDGET_FRACTION = 0.93
@@ -250,6 +283,7 @@ def _flash_call(
     resume: bool = False,
     runtime_kv: bool = False,
     rows_in: bool = False,
+    lazy_offset: bool = False,
     block_sizes: tuple[int, int, int] | None = None,
 ):
     """``pallas_call`` of the flash kernel over ``[rows, S, D]`` arrays.
@@ -266,6 +300,8 @@ def _flash_call(
       keys count. A rank-dependent shard choice then compiles one program.
     - ``rows_in``: q/k/v and the output are ``[S, rows * D]``, row ``h`` the
       ``h``-th ``D``-wide column block, read in place (no transposes).
+    - ``lazy_offset`` (``rows_in`` and ``runtime_kv`` only): the live-length
+      kernel without a per-chunk running max (``live_kernel``).
     - ``block_sizes``: ``(block_q, block_kv, block_kv_compute)`` instead of the
       autotuned ones.
     """
@@ -285,6 +321,8 @@ def _flash_call(
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     if rows_in and (return_lse or resume):
         raise ValueError("rows_in takes neither return_lse nor resume")
+    if lazy_offset and not (rows_in and runtime_kv):
+        raise ValueError("lazy_offset needs rows_in and runtime_kv")
     block_q, block_kv, block_kv_compute = block_sizes or _autotune_block_sizes(
         q_seq, kv_seq, head_dim, vmem_capacity_bytes, carry_bytes_per_q_row
     )
@@ -428,6 +466,257 @@ def _flash_call(
                     l > 0, m_scratch_ref[...] + jnp.log2(l_safe), _MASK_VALUE
                 )
 
+    def live_kernel(
+        kv_info_ref,
+        q_ref,
+        k_ref,
+        v_ref,
+        o_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        o_scratch_ref,
+        redo_scratch_ref,
+        mode_ref,
+    ):
+        """Live-length kernel: a lazily moved softmax offset instead of a
+        per-element running max.
+
+        m_scratch holds an offset, not the running max: a fast chunk adds
+        exp2(scores - offset) straight from the QK result, with no max pass,
+        then rebases the offset to the state's log2-sum-exp plus
+        _LIVE_LENGTH_HEADROOM (a per-column rescale). Exact steps (the first
+        chunk of a query block, redone chunks) do the reference step with
+        offset max(state log2-sum-exp, chunk max) + headroom. Any offset gives
+        the same softmax; it only has to keep terms finite and the largest
+        ones normal. A fast chunk whose sum in a query column exceeds
+        _LIVE_LENGTH_SUM_LIMIT (or is inf: exp2 saturates) adds nothing to
+        that column; the column is flagged in redo_scratch (one row per chunk
+        of the grid step) and the chunk is redone exactly for the flagged
+        columns. After a redo the rest of the query block runs exact
+        (mode_ref). NaN columns (NaN padding queries) are never flagged; the
+        caller zeroes their rows.
+
+        The redo runs in its own region after the fast chunks, reading the
+        flags from VMEM: a redo nested in the fast chunk's region, consuming
+        its values, made the fast path itself ~4x slower on tpu7x.
+        """
+        float32 = jnp.float32
+        sv_dims = (((0,), (0,)), ((), ()))
+        j = pl.program_id(2)
+
+        @pl.when(j == 0)
+        def init():
+            o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+            l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+            m_scratch_ref[...] = jnp.full_like(m_scratch_ref, _MASK_VALUE)
+            mode_ref[0] = 0
+
+        def chunk_inputs(lo, size, real):
+            # Keys lo .. lo + size of the block (static); `real` counts the
+            # live keys from lo (traced) or is None when all are live.
+            k_chunk = k_ref[pl.ds(lo, size), :]
+            v_chunk = v_ref[pl.ds(lo, size), :]
+            qk = lax.dot_general(
+                k_chunk, q_ref[...], NT_DIM_NUMBERS, preferred_element_type=float32
+            )
+            if real is not None:
+                # Rows from `real` on are padding or past the array: drop their
+                # scores and zero their values (they may hold NaN).
+                rows = lax.broadcasted_iota(jnp.int32, (qk.shape[0], 1), 0)
+                qk = jnp.where(rows < real, qk, _MASK_VALUE)
+                v_chunk = jnp.where(rows < real, v_chunk, jnp.zeros_like(v_chunk))
+            return qk, v_chunk
+
+        def exact_update(lo, size, real, redo=None):
+            # Online-softmax steps over sub-chunks of at most
+            # _LIVE_LENGTH_EXACT_CHUNK keys (VMEM: the fast path's score tile
+            # stays allocated). With `redo` ([1, block_q] bool) only those
+            # columns change; the others keep their state.
+            for sub in range(lo, lo + size, _LIVE_LENGTH_EXACT_CHUNK):
+                sub_size = min(_LIVE_LENGTH_EXACT_CHUNK, lo + size - sub)
+                sub_real = None if real is None else real - (sub - lo)
+                exact_step(sub, sub_size, sub_real, redo)
+
+        def exact_step(lo, size, real, redo):
+            qk, v_chunk = chunk_inputs(lo, size, real)
+            m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
+            # The state's own log2-sum-exp relative to its offset: fast chunks
+            # may have left terms far above the offset.
+            pos = l_prev > 0
+            log_l = jnp.log2(jnp.where(pos, l_prev, 1.0))
+            m_curr = qk.max(axis=0)[None, :] * qk_scale
+            # A new max sets offset = max + headroom (the reference kernel's
+            # probabilities times 2^-headroom, same bf16 rounding); otherwise
+            # the offset moves by a whole number (an exact rescale).
+            new_max = jnp.logical_not(pos) | (m_curr >= m_prev + log_l)
+            m_next = jnp.where(
+                new_max,
+                m_curr + _LIVE_LENGTH_HEADROOM,
+                m_prev + jnp.round(log_l) + _LIVE_LENGTH_HEADROOM,
+            )
+            if redo is not None:
+                m_next = jnp.where(redo, m_next, m_prev)
+            s_curr = jnp.exp2(qk * qk_scale - m_next[0:1])
+            if redo is not None:
+                s_curr = jnp.where(redo, s_curr, 0.0)
+            l_curr = s_curr.sum(axis=0, keepdims=True)
+            alpha = jnp.exp2(m_prev - m_next)
+            o_curr = lax.dot_general(
+                v_chunk,
+                s_curr.astype(jnp.bfloat16),
+                sv_dims,
+                preferred_element_type=float32,
+            )
+            o_scratch_ref[:] = alpha[0:1, ...] * o_scratch_ref[:] + o_curr
+            m_scratch_ref[...], l_scratch_ref[...] = m_next, l_curr + alpha * l_prev
+
+        def fast_update(lo, size, real, c):
+            qk, v_chunk = chunk_inputs(lo, size, real)
+            s_curr = jnp.exp2(qk * qk_scale - m_scratch_ref[0:1, :])
+            l_curr = s_curr.sum(axis=0, keepdims=True)
+            o_curr = lax.dot_general(
+                v_chunk,
+                s_curr.astype(jnp.bfloat16),
+                sv_dims,
+                preferred_element_type=float32,
+            )
+            # NaN compares false: a NaN column is never redone.
+            over = l_curr > _LIVE_LENGTH_SUM_LIMIT
+            if q_seq % block_q:
+                # A ragged last query block holds stale VMEM rows past q_seq:
+                # never flag them, or they could switch the whole block to
+                # exact mode (mode_ref) and change the real rows' rounding.
+                cols = pl.program_id(1) * block_q + lax.broadcasted_iota(
+                    jnp.int32, over.shape, 1
+                )
+                over = over & (cols < q_seq)
+            l_next = l_scratch_ref[0:1, :] + jnp.where(over, 0.0, l_curr)
+            o_next = o_scratch_ref[:] + jnp.where(over, 0.0, o_curr)
+            # Rebase the offset to the state's log2-sum-exp plus the headroom
+            # (a per-column rescale, no per-score work): the state is then
+            # 2^-headroom and the next chunk may grow by ~limit + headroom.
+            # The shift is a whole number, so the rescale is exact and the
+            # probabilities keep the bf16 rounding the exact step set up.
+            pos = l_next > 0
+            shift = jnp.where(
+                pos,
+                jnp.round(jnp.log2(jnp.where(pos, l_next, 1.0)))
+                + _LIVE_LENGTH_HEADROOM,
+                0.0,
+            )
+            alpha = jnp.exp2(-shift)
+            o_next = alpha * o_next
+            l_next = alpha * l_next
+            m_next = m_scratch_ref[0:1, :] + shift
+            m_scratch_ref[...] = jnp.broadcast_to(m_next, m_scratch_ref.shape)
+            o_scratch_ref[:] = o_next
+            l_scratch_ref[...] = jnp.broadcast_to(l_next, l_scratch_ref.shape)
+            redo_scratch_ref[c : c + 1, :] = jnp.where(over, 1.0, 0.0)
+
+        def update(lo, size, real, c, first):
+            # `first`: traced bool, the query block's first chunk, or None.
+            # Chunk `c` of the grid step owns redo_scratch row c. Exact for
+            # the first chunk and, once a chunk of this query block was redone
+            # (mode_ref), for the rest of the block: redoing costs a fast plus
+            # an exact pass, so scores that outgrow the offset again and again
+            # (huge logits) fall back to the reference cost, not twice it.
+            exact = mode_ref[0] > 0
+            if first is not None:
+                exact = exact | first
+
+            @pl.when(exact)
+            def _():
+                exact_update(lo, size, real)
+                redo_scratch_ref[c : c + 1, :] = jnp.zeros(
+                    (1, redo_scratch_ref.shape[1]), float32
+                )
+
+            pl.when(jnp.logical_not(exact))(lambda: fast_update(lo, size, real, c))
+
+        def redo_if_flagged(lo, size, real, c):
+            flags = redo_scratch_ref[c : c + 1, :]
+
+            @pl.when(jnp.max(flags) > 0.0)
+            def _():
+                exact_update(lo, size, real, redo=redo_scratch_ref[c : c + 1, :] > 0.0)
+                mode_ref[0] = 1
+
+        def run_chunks(chunks):
+            # chunks: [(lo, size, real, first)]; fast passes, then redos.
+            for c, (lo, size, real, first) in enumerate(chunks):
+                update(lo, size, real, c, first)
+            for c, (lo, size, real, _) in enumerate(chunks):
+                redo_if_flagged(lo, size, real, c)
+
+        # A count past the array would read stale VMEM rows unmasked.
+        real_keys = jnp.minimum(kv_info_ref[1], kv_seq)
+        start = j * block_kv
+        first_block = j == 0
+
+        @pl.when(start + block_kv <= real_keys)
+        def body():
+            run_chunks(
+                [
+                    (lo, block_kv_compute, None, first_block if lo == 0 else None)
+                    for lo in range(0, block_kv, block_kv_compute)
+                ]
+            )
+
+        if kv_seq % block_kv:
+
+            @pl.when((j == grid_width - 1) & (real_keys == kv_seq))
+            def last_body():
+                # The ragged last KV block of an unpadded shard: read only the
+                # keys the array holds.
+                remain = kv_seq - (grid_width - 1) * block_kv
+                first = first_block if grid_width == 1 else None
+                run_chunks(
+                    [
+                        (
+                            lo,
+                            min(block_kv_compute, remain - lo),
+                            None,
+                            first if lo == 0 else None,
+                        )
+                        for lo in range(0, remain, block_kv_compute)
+                    ]
+                )
+
+        # The block holding the last live key masks the rest, in chunks of
+        # edge_chunk keys; chunks past the last live key are skipped.
+        edge_chunk = block_kv_compute
+        if block_kv % _LIVE_LENGTH_EDGE_CHUNK == 0:
+            edge_chunk = min(block_kv_compute, _LIVE_LENGTH_EDGE_CHUNK)
+
+        @pl.when(
+            (start < real_keys) & (start + block_kv > real_keys) & (real_keys < kv_seq)
+        )
+        def edge_body():
+            chunks = [
+                (
+                    lo,
+                    edge_chunk,
+                    real_keys - start - lo,
+                    first_block if lo == 0 else None,
+                )
+                for lo in range(0, block_kv, edge_chunk)
+            ]
+            for c, (lo, size, real, first) in enumerate(chunks):
+                pl.when(start + lo < real_keys)(
+                    functools.partial(update, lo, size, real, c, first)
+                )
+            for c, (lo, size, real, _) in enumerate(chunks):
+                pl.when(start + lo < real_keys)(
+                    functools.partial(redo_if_flagged, lo, size, real, c)
+                )
+
+        @pl.when(j == grid_width - 1)
+        def end():
+            l = l_scratch_ref[...]
+            l_safe = jnp.where(l > 0, l, 1.0)
+            l_inv = jnp.tile(1.0 / l_safe, (head_dim // NUM_SUBLANES, 1))
+            o_ref[...] = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+
     def q_index(h, i, j, *_):
         return (i, h) if rows_in else (h, i, 0)
 
@@ -473,6 +762,19 @@ def _flash_call(
         pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
         pltpu.VMEM((head_dim, block_q), jnp.float32),
     ]
+    if lazy_offset:
+        # Redo flags, one row per chunk of a grid step.
+        chunks_per_step = max(
+            block_kv // block_kv_compute,
+            block_kv // min(block_kv_compute, _LIVE_LENGTH_EDGE_CHUNK),
+        )
+        scratch_shapes += [
+            pltpu.VMEM(
+                (_round_up(chunks_per_step, NUM_SUBLANES), block_q), jnp.float32
+            ),
+            # 1 once a chunk of the query block was redone: exact from then on.
+            pltpu.SMEM((1,), jnp.int32),
+        ]
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel", "parallel", "arbitrary"),
         # Mosaic's LLO scheduler: 56.6 vs 87.4 ms at 75600 tokens, 13.2 vs
@@ -490,7 +792,7 @@ def _flash_call(
     )
     if runtime_kv:
         return pl.pallas_call(
-            kernel,
+            live_kernel if lazy_offset else kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
                 grid=grid,
@@ -579,6 +881,38 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
     return out.reshape(q.shape), lse.reshape(batch, heads, NUM_SUBLANES, q_seq)
 
 
+def _live_length_kernel(q_seq: int, kv_seq: int):
+    """``(block_sizes, lazy_offset, rows)`` of a live-length call: block sizes
+    (None for the autotuned ones), whether the lazy-offset kernel runs, and
+    the row count it runs over (the sequence zero-padded to ``rows``)."""
+    if q_seq <= _LIVE_LENGTH_LAZY_MIN_SEQ or kv_seq <= _LIVE_LENGTH_LAZY_MIN_SEQ:
+        if q_seq >= _LIVE_LENGTH_BLOCK_Q and kv_seq >= _LIVE_LENGTH_BLOCK_KV:
+            blocks = (
+                _LIVE_LENGTH_BLOCK_Q,
+                _LIVE_LENGTH_BLOCK_KV,
+                _LIVE_LENGTH_BLOCK_KV,
+            )
+            return blocks, False, q_seq
+        return None, False, q_seq
+    rows = q_seq
+    kv_block = _LIVE_LENGTH_WIDE_BLOCK_KV
+    if kv_seq <= _LIVE_LENGTH_NARROW_MAX_SEQ:
+        kv_block //= 2
+    if kv_seq % kv_block > _LIVE_LENGTH_EDGE_CHUNK:
+        # A last KV block that runs past the array end and holds more than
+        # one edge chunk of keys ran 2-6x slower on tpu7x once it also held
+        # the last live key (S % 2048 = 1024 or 1536).
+        if q_seq == kv_seq and kv_seq > _LIVE_LENGTH_PAD_MIN_SEQ:
+            rows = kv_seq = _round_up(kv_seq, kv_block)
+        while kv_seq % kv_block > _LIVE_LENGTH_EDGE_CHUNK:
+            kv_block //= 2
+    # Fewest query blocks of at most _LIVE_LENGTH_MAX_BLOCK_Q rows, split
+    # evenly so the ragged last block wastes little.
+    num_q_blocks = -(-rows // _LIVE_LENGTH_MAX_BLOCK_Q)
+    block_q = _round_up(-(-rows // num_q_blocks), 128)
+    return (block_q, kv_block, kv_block), True, rows
+
+
 def _flash_attention_live_length(q, k, v, live, scale, num_heads):
     """Flash attention over one packed sequence's ``[S, H * D]`` rows whose
     rows from ``live`` (int32 ``[1]``) on are padding.
@@ -590,11 +924,13 @@ def _flash_attention_live_length(q, k, v, live, scale, num_heads):
     """
     import jax.numpy as jnp
 
-    q_seq, kv_seq = q.shape[0], k.shape[0]
+    seq, kv_seq = q.shape[0], k.shape[0]
     head_dim = q.shape[1] // num_heads
-    blocks = None
-    if q_seq >= _LIVE_LENGTH_BLOCK_Q and kv_seq >= _LIVE_LENGTH_BLOCK_KV:
-        blocks = (_LIVE_LENGTH_BLOCK_Q, _LIVE_LENGTH_BLOCK_KV, _LIVE_LENGTH_BLOCK_KV)
+    blocks, lazy_offset, q_seq = _live_length_kernel(seq, kv_seq)
+    if q_seq != seq:
+        # Zero rows past the sequence: past the live length, so masked.
+        q, k, v = (jnp.pad(t, ((0, q_seq - seq), (0, 0))) for t in (q, k, v))
+        kv_seq = q_seq
     call = _flash_call(
         q_seq,
         kv_seq,
@@ -606,11 +942,13 @@ def _flash_attention_live_length(q, k, v, live, scale, num_heads):
         out_dtype=q.dtype,
         runtime_kv=True,
         rows_in=True,
+        lazy_offset=lazy_offset,
         block_sizes=blocks,
     )
-    live = live.astype(jnp.int32).reshape(1)
-    out = call(jnp.concatenate([jnp.zeros_like(live), live]), q, k, v)
-    rows = jnp.arange(q_seq, dtype=jnp.int32)[:, None]
+    # At most seq: the zero rows a padded call adds never count as keys.
+    live = jnp.minimum(live.astype(jnp.int32).reshape(1), seq)
+    out = call(jnp.concatenate([jnp.zeros_like(live), live]), q, k, v)[:seq]
+    rows = jnp.arange(seq, dtype=jnp.int32)[:, None]
     return jnp.where(rows < live[0], out, jnp.zeros_like(out))
 
 
