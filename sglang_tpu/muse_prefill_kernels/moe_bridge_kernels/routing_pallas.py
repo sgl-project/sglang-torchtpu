@@ -558,6 +558,22 @@ def pallas_global_local_pos(
     return pos_pad[:, :topk]
 
 
+def resolve_qblock_params(
+    total_elems: int, ep_size: int, quantum: int
+) -> tuple[int, int]:
+    """Return ``(n_blocks, eff_quantum)`` shared by Pallas and XLA ``q_block`` water-filling."""
+    eff_q = min(128, int(quantum)) if int(quantum) > 128 else max(1, int(quantum))
+    if total_elems >= 64 * 1024 and total_elems % 1024 == 0:
+        chunks_8row = total_elems // 1024
+        if chunks_8row <= 256:
+            return chunks_8row, eff_q
+        for cand in (256, 192, 128, 64):
+            if chunks_8row % cand == 0:
+                return cand, eff_q
+    n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
+    return n_blocks, eff_q
+
+
 def pallas_qblock_remap_virtual_ids(
     global_topk_ids: jax.Array,
     my_id: jax.Array,
@@ -573,17 +589,22 @@ def pallas_qblock_remap_virtual_ids(
 
     Eliminates ~45 unfused XLA HLO elementwise/reduction ops (~90 us/layer at R=4) with
     0-ULP bit-exact parity against `remap_zeroglue_virtual_ids(..., mode='q_block')`.
+    Supports `EP=8/16` (`num_base_local in {16, 32}`) and fine `8`-row blocks (`n_blocks<=256`).
     """
     num_replicas = num_local_experts - num_base_local
     t_global = global_topk_ids.shape[0]
     t_local = t_global // ep_size
     total_elems = t_global * topk
-    n_blocks = 64
+    n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     blk_elems = total_elems // n_blocks
-    assert ep_size == 8 and num_base_local == 32 and 1 <= num_replicas <= 8
+    assert ep_size in (8, 16) and num_base_local in (16, 32) and 1 <= num_replicas <= 8
     assert total_elems % (n_blocks * 512) == 0
+    base_shift = num_base_local.bit_length() - 1
+    base_mask = num_base_local - 1
     blks_per_step = 2 if blk_elems == 512 else 1
     assert (blks_per_step * blk_elems) % (8 * LANE) == 0
+    assert not (blks_per_step == 2 and n_blocks > 128)
+    use_two_halves = n_blocks > 128
     n_steps = n_blocks // blks_per_step
     rows_per_step = (blks_per_step * blk_elems) // LANE
     total_rows = total_elems // LANE
@@ -601,20 +622,33 @@ def pallas_qblock_remap_virtual_ids(
         row_128 = lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
         u_128 = (row_128 < lane_128).astype(jnp.bfloat16)
 
-        init_carry = (jnp.zeros((8, LANE), dtype=jnp.int32),) + tuple(
-            jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(num_replicas)
-        )
+        if use_two_halves:
+            init_carry = (jnp.zeros((8, LANE), dtype=jnp.int32),) + tuple(
+                jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(2 * num_replicas)
+            )
+        else:
+            init_carry = (jnp.zeros((8, LANE), dtype=jnp.int32),) + tuple(
+                jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(num_replicas)
+            )
 
         def _pass1(st, carry):
             base_acc = carry[0]
-            bcs = list(carry[1:])
             r0 = pl.multiple_of(st * rows_per_step, 8)
             x = ids_ref[pl.ds(r0, rows_per_step), :]
-            own = lax.shift_right_logical(x, jnp.int32(5))
+            own = lax.shift_right_logical(x, jnp.int32(base_shift))
             is_non_rep = x >= jnp.int32(num_replicas)
             for r in range(ep_size):
                 cnt_r = jnp.sum((is_non_rep & (own == r)).astype(jnp.int32))
                 base_acc = jnp.where(lane_8 == r, base_acc + cnt_r, base_acc)
+            if use_two_halves:
+                bcs_lo = list(carry[1 : 1 + num_replicas])
+                bcs_hi = list(carry[1 + num_replicas :])
+                for k in range(num_replicas):
+                    hk = jnp.sum((x == k).astype(jnp.int32))
+                    bcs_lo[k] = jnp.where(lane_8 == st, hk, bcs_lo[k])
+                    bcs_hi[k] = jnp.where((lane_8 + jnp.int32(128)) == st, hk, bcs_hi[k])
+                return (base_acc, *bcs_lo, *bcs_hi)
+            bcs = list(carry[1:])
             for k in range(num_replicas):
                 mx = (x == k).astype(jnp.int32)
                 if blks_per_step == 1:
@@ -629,32 +663,42 @@ def pallas_qblock_remap_virtual_ids(
 
         done_carry = lax.fori_loop(0, n_steps, _pass1, init_carry)
         base_acc = done_carry[0]
-        bcs = done_carry[1:]
 
         base_r = [
             jnp.max(jnp.sum(jnp.where(lane_8 == r, base_acc, 0), axis=1))
             for r in range(ep_size)
         ]
         cur_t = [
-            lax.div(
-                base_r[r]
-                + jnp.int32(
-                    ((num_base_local - (num_replicas if r == 0 else 0)) * quantum) // 2
-                    + quantum
-                    - 1
-                ),
-                jnp.int32(quantum),
-            )
+            lax.div(base_r[r] + jnp.int32(q_eff - 1), jnp.int32(q_eff))
             for r in range(ep_size)
         ]
 
-        vk_vecs = []
+        def _excl_prefix_128(vec):
+            lo7 = (vec & jnp.int32(127)).astype(jnp.bfloat16)
+            hi7 = lax.shift_right_logical(vec, jnp.int32(7)).astype(jnp.bfloat16)
+            p_lo = jnp.matmul(lo7, u_128, preferred_element_type=jnp.float32).astype(
+                jnp.int32
+            )
+            p_hi = jnp.matmul(hi7, u_128, preferred_element_type=jnp.float32).astype(
+                jnp.int32
+            )
+            return lax.shift_left(p_hi, jnp.int32(7)) + p_lo
+
+        vk_vecs_lo = []
+        vk_vecs_hi = []
         for k in range(num_replicas):
-            bc_k = bcs[k]
-            cnt_k = jnp.max(jnp.sum(bc_k, axis=1))
+            if use_two_halves:
+                bc_lo = done_carry[1 + k]
+                bc_hi = done_carry[1 + num_replicas + k]
+                tot_lo = jnp.max(jnp.sum(bc_lo, axis=1))
+                tot_hi = jnp.max(jnp.sum(bc_hi, axis=1))
+                cnt_k = tot_lo + tot_hi
+            else:
+                bc_k = done_carry[1 + k]
+                cnt_k = jnp.max(jnp.sum(bc_k, axis=1))
             n_blks_k = jnp.where(
                 cnt_k > 0,
-                lax.div(cnt_k + jnp.int32(quantum - 1), jnp.int32(quantum)),
+                lax.div(cnt_k + jnp.int32(q_eff - 1), jnp.int32(q_eff)),
                 jnp.int32(0),
             )
             ord_r = [
@@ -705,43 +749,54 @@ def pallas_qblock_remap_virtual_ids(
                 cum_tq.append(acc_tq)
                 cur_t[i] = cur_t[i] + tq_i
 
-            lo7 = (bc_k & jnp.int32(127)).astype(jnp.bfloat16)
-            hi7 = lax.shift_right_logical(bc_k, jnp.int32(7)).astype(jnp.bfloat16)
-            p_lo = jnp.matmul(lo7, u_128, preferred_element_type=jnp.float32).astype(
-                jnp.int32
-            )
-            p_hi = jnp.matmul(hi7, u_128, preferred_element_type=jnp.float32).astype(
-                jnp.int32
-            )
-            cum_blk = lax.shift_left(p_hi, jnp.int32(7)) + p_lo
-            mid_row = cum_blk + lax.shift_right_logical(bc_k, jnp.int32(1))
-            blk_tile = lax.div(mid_row, jnp.int32(quantum))
-            rk_vec = sum(
-                (blk_tile >= cum_tq[r]).astype(jnp.int32) for r in range(ep_size - 1)
-            )
-            vk_vecs.append(
-                rk_vec * jnp.int32(num_local_experts) + jnp.int32(num_base_local + k)
-            )
+            def _route_blocks(bc_vec, cum_off):
+                cum_blk = _excl_prefix_128(bc_vec) + cum_off
+                mid_row = cum_blk + lax.shift_right_logical(bc_vec, jnp.int32(1))
+                blk_tile = lax.div(mid_row, jnp.int32(q_eff))
+                rk_vec = sum(
+                    (blk_tile >= cum_tq[r]).astype(jnp.int32)
+                    for r in range(ep_size - 1)
+                )
+                return rk_vec * jnp.int32(num_local_experts) + jnp.int32(
+                    num_base_local + k
+                )
+
+            if use_two_halves:
+                vk_vecs_lo.append(_route_blocks(bc_lo, jnp.int32(0)))
+                vk_vecs_hi.append(_route_blocks(bc_hi, tot_lo))
+            else:
+                vk_vecs_lo.append(_route_blocks(bc_k, jnp.int32(0)))
 
         def _pass2(st, dummy):
             r0 = pl.multiple_of(st * rows_per_step, 8)
             x = ids_ref[pl.ds(r0, rows_per_step), :]
-            v = lax.shift_right_logical(x, jnp.int32(5)) * jnp.int32(
+            v = lax.shift_right_logical(x, jnp.int32(base_shift)) * jnp.int32(
                 num_local_experts
-            ) + (x & jnp.int32(31))
+            ) + (x & jnp.int32(base_mask))
             for k in range(num_replicas):
-                if blks_per_step == 1:
+                if use_two_halves:
                     vk_b = jnp.max(
-                        jnp.sum(jnp.where(lane_8 == st, vk_vecs[k], 0), axis=1)
+                        jnp.sum(
+                            jnp.where(lane_8 == st, vk_vecs_lo[k], 0)
+                            + jnp.where(
+                                (lane_8 + jnp.int32(128)) == st, vk_vecs_hi[k], 0
+                            ),
+                            axis=1,
+                        )
+                    )
+                    v = jnp.where(x == k, vk_b, v)
+                elif blks_per_step == 1:
+                    vk_b = jnp.max(
+                        jnp.sum(jnp.where(lane_8 == st, vk_vecs_lo[k], 0), axis=1)
                     )
                     v = jnp.where(x == k, vk_b, v)
                 else:
                     vk_b0 = jnp.max(
-                        jnp.sum(jnp.where(lane_8 == (2 * st), vk_vecs[k], 0), axis=1)
+                        jnp.sum(jnp.where(lane_8 == (2 * st), vk_vecs_lo[k], 0), axis=1)
                     )
                     vk_b1 = jnp.max(
                         jnp.sum(
-                            jnp.where(lane_8 == (2 * st + 1), vk_vecs[k], 0), axis=1
+                            jnp.where(lane_8 == (2 * st + 1), vk_vecs_lo[k], 0), axis=1
                         )
                     )
                     vk_row = jnp.where(row_8 < 4, vk_b0, vk_b1)
@@ -752,6 +807,14 @@ def pallas_qblock_remap_virtual_ids(
         lax.fori_loop(0, n_steps, _pass2, jnp.int32(0))
         my_r0 = pl.multiple_of(me * rows_per_rank, 8)
         v_local_out_ref[:, :] = v_global_out_ref[pl.ds(my_r0, rows_per_rank), :]
+
+    if t_global > 16384:
+        try:
+            vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.94)
+        except Exception:
+            vmem_limit_bytes = 60 * 1024 * 1024
+    else:
+        vmem_limit_bytes = 32 * 1024 * 1024
 
     v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     v_glob_2d, v_loc_2d = pl.pallas_call(
@@ -769,14 +832,10 @@ def pallas_qblock_remap_virtual_ids(
         ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=(
-                int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.94)
-                if t_global > 16384
-                else 32 * 1024 * 1024
-            ),
+            vmem_limit_bytes=vmem_limit_bytes,
         ),
         interpret=interpret,
-        name=f"pallas_qblock_eplb_remap_tg{t_global}_el{num_local_experts}_q{quantum}",
+        name=f"pallas_qblock_eplb_remap_tg{t_global}_ep{ep_size}_el{num_local_experts}_nb{n_blocks}_q{q_eff}",
     )(meta_sp, ids_2d)
 
     return v_glob_2d.reshape(global_topk_ids.shape), v_loc_2d.reshape(t_local, topk)
