@@ -250,7 +250,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
     pa_fp = int(os.environ.get("SPTP_PA_FUSE_POOL", "0")) if pa_a2a else 0
     # SPTP_PA_NS=n: stream chunks the residual keeps in flight + 1 (prefetched under the o proj)
-    pa_ns = int(os.environ.get("SPTP_PA_NS", "2"))
+    pa_ns = int(os.environ.get("SPTP_PA_NS", "4"))
     # SPTP_PA_ORDER=0,1,...: the in-kernel a2a's source order as xor offsets from this rank
     pa_order = tuple(
         int(x) for x in os.environ.get("SPTP_PA_ORDER", "").split(",") if x
