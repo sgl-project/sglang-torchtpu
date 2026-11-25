@@ -264,7 +264,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
     # SPTP_PA_OGATE_TOK=1: the o gate's math laid out token major (o transposed instead of gate)
     pa_gtok = pa_a2a and os.environ.get("SPTP_PA_OGATE_TOK", "0") == "1"
-    pa_head = pa_head and not pa_gtok
+    # SPTP_PA_TMAJ=1: that kernel takes the o gate output as [qd, T] (rows in lanes), the
+    # gate fusion's own layout
+    pa_tmaj = pa_a2a and not pa_gtok and os.environ.get("SPTP_PA_TMAJ", "0") == "1"
+    pa_head = pa_head and not pa_gtok and not pa_tmaj
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head) if pa else None
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
@@ -458,7 +461,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
                     if pa_a2a:
                         with _scope("sp_postattn"):
-                            if pa_head:
+                            if pa_tmaj:
+                                g8 = g8.transpose(0, 2, 3, 1).reshape(qd, T)
+                            elif pa_head:
                                 g8 = g8.reshape(c.kv_heads, T, gq * hd)
                             else:
                                 g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
@@ -473,6 +478,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                 pa_ns,
                                 pa_order,
                                 pa_head,
+                                pa_tmaj,
                             )
                             args = (
                                 l,

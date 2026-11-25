@@ -183,6 +183,7 @@ def oproj_a2a_call(
     ns: int = 2,
     order: tuple = (),
     head: bool = False,
+    tmaj: bool = False,
 ):
     """oproj_call with the gated-output a2a inside: (lyr_me [2] i32 (layer, rank), g8 [T, qd]
     e4m3 (this rank's heads of every row, token major), gs [1, T] f32 (their row scales),
@@ -200,7 +201,10 @@ def oproj_a2a_call(
     ns: stream row chunks in flight + 1; the first ns - 1 load under the last o proj steps.
     order: step r takes source m ^ order[r] (default r: partner core, then chip ^ 1, ^ 2, ^ 3).
     head: g8 in the o gate's head layout [kvh, T, w] (w = qd / kvh, wo's row order within a
-    rank) instead of token major; each send gathers rank d's rows of every head group."""
+    rank) instead of token major; each send gathers rank d's rows of every head group.
+    tmaj: g8 [qd, T] (rows in lanes: the o gate fusion's own layout, no relayout before the
+    kernel); blocks land as [qd, Ts] and the o proj contracts their sublanes (transposed-lhs
+    fp8 dot, measured as fast as the plain one); the pool input gets its own [tp, Ts, qd] buffer."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
     if (
@@ -213,9 +217,14 @@ def oproj_a2a_call(
     ):
         raise ValueError(f"o proj tiles {tn} / {rc} do not fit H {H} Ts {Ts}")
 
+    if head and tmaj:
+        raise ValueError("head and tmaj layouts are exclusive")
     act = (tp, c.kv_heads, Ts, qd // c.kv_heads) if head else (tp, Ts, qd)
-    if act[-1] % _KC:
+    if head and act[-1] % _KC:
         raise ValueError(f"head group width {act[-1]} is not a multiple of {_KC}")
+    f8_shape = act
+    if tmaj:
+        act, f8_shape = (tp, qd, Ts), (tp, Ts, qd)
     order = tuple(order) or tuple(range(tp))
     if sorted(order) != list(range(tp)) or order[0] != 0:
         raise ValueError(
@@ -241,7 +250,7 @@ def oproj_a2a_call(
                 g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm, wp_ref,
                 so_hbm, ids_ref, tw_ref, xe_ref, xs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-                wbuf, wsem, fs_ref, ssq, amx, xsc,
+                wbuf, wsem, fs_ref, ssq, amx, xsc, *f8x,
             ) = refs  # fmt: skip
             f8_hbm = None
         else:
@@ -249,8 +258,10 @@ def oproj_a2a_call(
                 g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm,
                 so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-                wbuf, wsem,
+                wbuf, wsem, *f8x,
             ) = refs  # fmt: skip
+        # the pool input's buffer: gq once the o proj is done, or its own with tmaj
+        f8b = f8x[0] if tmaj else gq
         r = pl.program_id(0)
         me = lm[1]
         # step r takes source m ^ r: own block, the partner core, then the other chips' cores
@@ -261,7 +272,7 @@ def oproj_a2a_call(
 
         def g8_rows(rows):
             # token-major [T, qd] or the head layout [kvh, T, w]: rank d's rows of every group
-            return g8_hbm.at[:, rows] if head else g8_hbm.at[rows]
+            return g8_hbm.at[:, rows] if head or tmaj else g8_hbm.at[rows]
 
         def sends(d):
             rows = pl.ds(pl.multiple_of(d * Ts, Ts), Ts)
@@ -335,11 +346,18 @@ def oproj_a2a_call(
                 def block(n0, first=False):
                     acc = None
                     for k0 in range(0, qd, _KC):
-                        part = jnp.dot(
-                            _kblk(gq, k0, src),
-                            wo_ref[k0 : k0 + _KC, n0 : n0 + tn],
-                            preferred_element_type=_F32,
-                        )
+                        w_k = wo_ref[k0 : k0 + _KC, n0 : n0 + tn]
+                        if tmaj:
+                            part = jax.lax.dot_general(
+                                gq[src, k0 : k0 + _KC, :],
+                                w_k,
+                                (((0,), (0,)), ((), ())),
+                                preferred_element_type=_F32,
+                            )
+                        else:
+                            part = jnp.dot(
+                                _kblk(gq, k0, src), w_k, preferred_element_type=_F32
+                            )
                         acc = part if acc is None else acc + part
                     acc = acc * g_col
                     return acc if first else big[:, n0 : n0 + tn] + acc
@@ -374,9 +392,9 @@ def oproj_a2a_call(
         @pl.when(r == tp - 1)
         def _():
             ep.residual(
-                gq, fs_ref, lambda rows: big[rows, :], lambda rows: sso[rows, :]
+                f8b, fs_ref, lambda rows: big[rows, :], lambda rows: sso[rows, :]
             )
-            ep.route(gq, f8_hbm, sem.at[0], wr, wr_cp, E, ids_ref, tw_ref)
+            ep.route(f8b, f8_hbm, sem.at[0], wr, wr_cp, E, ids_ref, tw_ref)
             for k in range(1, tp):
                 d = jnp.bitwise_xor(me, order[k])
                 for cp in sends(d):
@@ -387,7 +405,7 @@ def oproj_a2a_call(
             @pl.when(r >= tp)
             def _():
                 _pool_step(
-                    c, r - tp, nP, pool_tn, rc, gq, fs_ref, sm_ref, wp_ref, big, ssq,
+                    c, r - tp, nP, pool_tn, rc, f8b, fs_ref, sm_ref, wp_ref, big, ssq,
                     amx, xsc, xe_ref, xs_ref,
                 )  # fmt: skip
 
@@ -425,7 +443,7 @@ def oproj_a2a_call(
     else:
         out_specs += [anyspec, whole(Ts, 1)]
         out_shape += [
-            jax.ShapeDtypeStruct(act, _FP8),
+            jax.ShapeDtypeStruct(f8_shape, _FP8),
             jax.ShapeDtypeStruct((Ts, 1), _F32),
         ]
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
@@ -448,6 +466,8 @@ def oproj_a2a_call(
     scratch += [vmem((2, qd, H), _FP8), dma((2,))]
     if fuse:
         scratch += [vmem((Ts, 1), _F32) for _ in range(4)]
+    if tmaj:
+        scratch.append(vmem(f8_shape, _FP8))
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         grid=(tp + nP,),
@@ -468,7 +488,7 @@ def oproj_a2a_call(
             grid_spec=grid_spec,
             out_shape=tuple(out_shape),
             compiler_params=params,
-            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}_o{''.join(map(str, order))}{'_h' if head else ''}",
+            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}_o{''.join(map(str, order))}{'_h' if head else ''}{'_t' if tmaj else ''}",
         )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool)
 
     return call
