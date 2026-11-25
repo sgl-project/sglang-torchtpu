@@ -55,6 +55,8 @@ _BASE["server_args"].update(
         "speculative_draft_model_path": "RadixArk/Muse-Spark-Open-DFlash2",
         "speculative_num_draft_tokens": DRAFT_TOKENS,
         "scheduler_recv_interval": 8,
+        # Short turns share prefill batches with a long cold prompt, which keeps >= 1024 tokens of each.
+        "prefill_chunk_share_min_tokens": 1024,
         "enable_cache_report": True,
         "enable_metrics": True,
         # HiCache: host pool = 2x device pool, written back on eviction over raiden.
@@ -87,8 +89,6 @@ _BASE["runtime_env"].update(
         "SGLANG_DFLASH_ROW_PARALLEL_FC": "1",
         "SGLANG_DFLASH_CONV_MATMUL_EXPAND": "1",
         "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
-        # Scheduling: short prefills ride along a long one.
-        "SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS": "1024",
         # Checkpoint a long prefill into the radix tree every 128K tokens, not every chunk.
         "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         # Reserve each request's full max_new_tokens at admission: queue, never retract.

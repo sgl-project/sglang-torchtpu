@@ -62,6 +62,29 @@ class _Adder(PrefillAdder):
         return AddReqResult.CONTINUE
 
 
+class _SharingAdder(_Adder):
+    """The chunked request runs a mid-prefill chunk that leaves 1024 tokens of the
+    pass; as in PrefillAdder, a request that would start a second chunked prefill
+    beside it ends admission."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rem_chunk_tokens = 1024
+
+    def add_chunked_req(self, req):
+        self.can_run_list.append(req)
+        return req
+
+    def add_one_req(
+        self, req, has_chunked_req, truncation_align_size, chunk_tokens_cap=None
+    ):
+        if len(req.origin_input_ids) > self.rem_chunk_tokens:
+            return AddReqResult.OTHER
+        self.rem_chunk_tokens -= len(req.origin_input_ids)
+        self.can_run_list.append(req)
+        return AddReqResult.CONTINUE
+
+
 class _ParkingAdder(_Adder):
     """The chunked request finds no budget and stays out of the batch."""
 
@@ -170,6 +193,50 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_chunk_share_passes_over_a_request_too_long_to_join(self):
+        """Under chunk sharing, a request too long for what the continuing chunk
+        leaves keeps its queue place and no longer blocks a shorter one behind it."""
+        from sglang.srt.managers.schedule_policy import SchedulePolicy
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        running = [_Req(holds_row=True), _Req(holds_row=True)]
+        chunk = _Req(holds_row=True)
+        cold, turn = _Req(holds_row=False), _Req(holds_row=False)
+        for req, uncached in ((cold, 200000), (turn, 500)):
+            req.origin_input_ids = [0] * uncached
+            req.output_ids = []
+            req.num_matched_prefix_tokens = 0
+            req.cache_request_handle = None
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, chunk, [cold, turn], _SharingAdder
+        )
+        s.policy = SchedulePolicy(
+            "fcfs",
+            RadixCache.create_simulated(),
+            False,
+            False,
+            False,
+            prefill_chunk_share_min_tokens=1024,
+        )
+        s.policy.calc_priority = lambda waiting, *args, **kwargs: list(waiting)
+        s.policy.continuing_chunk_limit = Mock(return_value=3072)
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None,
+                    running_batch=ScheduleBatch(reqs=running),
+                )
+        self.assertEqual(built.exception.args[0], [chunk, turn])
+        self.assertEqual(list(s.waiting_queue), [cold])
 
     def test_parked_chunk_admits_no_waiting_request(self):
         running = [_Req(holds_row=True)]
