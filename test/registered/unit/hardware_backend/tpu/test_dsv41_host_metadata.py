@@ -243,6 +243,47 @@ def test_slot_tables_are_reused_only_when_asked():
     assert len(builds) == 3
 
 
+@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
+def test_relabelled_idle_batch_has_no_query_rows(mode):
+    # DP synchronization may represent an idle rank by a physical decode or
+    # extend request in reserved pool slot 0.
+    fb = _extend_batch([0], [6], [0], num_tokens=6)
+    fb.out_cache_loc.zero_()
+    fb.forward_mode = mode
+    md = _metadata(fb)
+    assert md.query_start_loc.tolist() == [0, 0]
+    assert not md.valid.any()
+
+
+@pytest.mark.parametrize("live", [0, 2])
+@pytest.mark.parametrize("width", [5, 6])
+@pytest.mark.parametrize("device_rows", [False, True])
+def test_dspark_bucket_padding_has_no_query_rows(live, width, device_rows):
+    # Both workers build the forward at the physical bucket, including when
+    # another DP rank is busy and the local rank has no requests.
+    slots = [1, 2][:live] + [0] * (4 - live)
+    fb = _verify_batch([8, 40][:live] + [0] * (4 - live), slots, rows=width)
+    fb.req_pool_indices_cpu = fb.req_pool_indices.clone()
+    fb.out_cache_loc[live * width :] = 0
+    fb.seq_lens_cpu[live:] = 0
+    setting = SimpleNamespace(get=lambda: device_rows)
+    with patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", setting):
+        md = ab.build_forward_metadata(
+            fb,
+            req_to_token=_req_to_token(),
+            full_to_swa_index_mapping=None,
+            request_window=None,
+            swa_ring_valid_from=torch.zeros(SLOTS, dtype=torch.int64),
+            max_context_len=MAX_CONTEXT,
+            low_ratios=ab.LOW_RATIOS,
+            device=torch.device("cpu"),
+        )
+    expected = torch.arange(5).clamp_max(live) * width
+    assert md.query_start_loc.tolist() == expected.tolist()
+    assert md.valid.tolist() == [True] * (live * width) + [False] * ((4 - live) * width)
+    assert md.token_rows[live * width :].eq(-1).all()
+
+
 @pytest.mark.parametrize("layout", ["plain", "draft_ring", "request_window"])
 def test_device_rows_match_the_host_rows(layout):
     """SGLANG_TPU_SPEC_DEVICE_ROWS builds a spec forward's position-dependent rows
