@@ -171,7 +171,7 @@ def post_ffn_call(
                 y8_v[r0 : r0 + 128] = (yr / s).astype(jnp.float8_e4m3fn)
                 ys_v[r0 : r0 + 128] = s
 
-        def unpool_pass(r0: int, n: int, again: bool):
+        def unpool_pass(r0: int, n: int, again: bool, mid_hook=None):
             """f and the post-FFN inverse rms of own rows [r0, r0 + n), wunpool streamed once;
             again: the last two chunk slots start the next pass's first two chunks."""
 
@@ -191,6 +191,9 @@ def post_ffn_call(
                     @pl.when(cc + 2 >= nc)
                     def _():
                         w_cp(cc + 2 - nc).start()
+
+                if mid_hook is not None:
+                    pl.when(cc == nc // 2)(mid_hook)
 
                 ws = sm_v[0, 13:14, cols]  # wunpool_s
                 pw = sm_v[0, 4:5, cols]  # post_ffn_w
@@ -259,16 +262,23 @@ def post_ffn_call(
                 for t in range(n_pre):
                     res_tile(t, True)
             if two_pass:
-                unpool_pass(ra, Ts - ra, False)
+                # phase-1 sends land during the first half of the second pass, phase 2 during
+                # the rest
+                def relay():
+                    for t in range(n_pre):
+                        col.ag_relay(kp, t)
+
+                unpool_pass(ra, Ts - ra, False, relay)
             dfin = [
                 pltpu.make_async_copy(f_v, f_hbm, fin_sem.at[2]),
                 pltpu.make_async_copy(inv_v, inv_hbm, fin_sem.at[3]),
             ]
             for cp in dfin:
                 cp.start()
-            with _scope("pf_relay"):
-                for t in range(n_pre):
-                    col.ag_relay(kp, t)
+            if not two_pass:
+                with _scope("pf_relay"):
+                    for t in range(n_pre):
+                        col.ag_relay(kp, t)
         elif two_pass:
             # the n_pre tiles' gather runs under the second unpool pass
             with _scope("pf_res"):
