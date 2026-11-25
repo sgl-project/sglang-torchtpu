@@ -960,8 +960,10 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
     def allocated_count(self) -> int:
         return (self.allocated_pages // self._pages_per_id) * self.page_size
 
-    def alloc(self, need_size: int):
-        return self._count_taken_pages(super().alloc, need_size)
+    def alloc(self, need_size: int, *, return_host: bool = False):
+        return self._count_taken_pages(
+            super().alloc, need_size, return_host=return_host
+        )
 
     def alloc_extend(self, *args, **kwargs):
         return self._count_taken_pages(super().alloc_extend, *args, **kwargs)

@@ -19,6 +19,7 @@ thread and returns poll-only future-events, which serve as the acks and feed a
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Callable, List, Optional
 
@@ -38,6 +39,7 @@ from sglang_tpu.kv_free_fence import (
     deferred_dma_read,
 )
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent, TransferEvent
+from sglang_tpu.unified_kv_pool import _SharedPagesAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,21 @@ class TpuDMAHybridCacheController(HybridCacheController):
         super().__init__(*args, **kwargs)
         for entry in self.mem_pool_host.entries:
             _check_kv_page_pool(entry.name)
+            swa_allocator = getattr(
+                self.mem_pool_device_allocator, "swa_attn_allocator", None
+            )
+            # Both split and unified SWA stacks supply these callbacks. They
+            # only allocate reload destinations, whose DMA metadata stays on CPU.
+            if (
+                entry.name == PoolName.SWA
+                and type(swa_allocator)
+                in (TpuPagedTokenToKVPoolAllocator, _SharedPagesAllocator)
+                and entry.device_alloc_fn == swa_allocator.alloc
+                and entry.device_free_fn == swa_allocator.free
+            ):
+                entry.device_alloc_fn = functools.partial(
+                    swa_allocator.alloc, return_host=True
+                )
         # The engine gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
@@ -142,12 +159,16 @@ class TpuDMAHybridCacheController(HybridCacheController):
     # ----- index handling -----------------------------------------------------
 
     def _alloc_load_kv_indices(self, allocator, need_size, extra_pools):
-        # Start with the full-attention, single-pool path. Wrapped allocators
-        # and side-pool mappings retain their existing placement contracts.
-        if (
-            allocator is self.mem_pool_device_allocator
-            and type(allocator) is TpuPagedTokenToKVPoolAllocator
-            and not extra_pools
+        # Full/SWA wrappers allocate the anchor through their full sub-allocator.
+        # Derived sidecars reuse those indices; none require an upload for DMA.
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+        if allocator is full_allocator and type(allocator) in (
+            TpuPagedTokenToKVPoolAllocator,
+            _SharedPagesAllocator,
         ):
             if need_size == 0:
                 return torch.empty((0,), dtype=torch.int64, device="cpu")

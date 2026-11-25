@@ -6,7 +6,7 @@ exercising the real allocator and controller without TPU hardware.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -15,11 +15,18 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import kv_pool_host
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.kv_free_fence import KVFreeFence
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+from sglang_tpu.unified_kv_pool import (
+    AttnLayerSpec,
+    TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -41,6 +48,78 @@ def _controller(allocator, cls=TpuDMAHybridCacheController):
     controller.device = allocator.device
     controller.kv_storage = None
     controller.load_queue = []
+    return controller
+
+
+def _hybrid_controller():
+    # CPU buffers with meta allocation results make either index readback fail.
+    pool = TpuUnifiedSWAKVPool(
+        size=128,
+        page_size=4,
+        dtype=torch.bfloat16,
+        full=AttnLayerSpec(1, 128, [0, 3]),
+        swa=AttnLayerSpec(1, 128, [1, 2, 4, 5, 6]),
+        device="cpu",
+    )
+    with (
+        patch("sglang.srt.mem_cache.allocator.swa._is_tpu", True),
+        patch(
+            "sglang.srt.mem_cache.allocator.swa.current_platform",
+            SimpleNamespace(
+                get_paged_allocator_cls=lambda: TpuPagedTokenToKVPoolAllocator
+            ),
+        ),
+    ):
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=128,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="meta",
+            kvcache=pool,
+            need_sort=False,
+        )
+    controller = _controller(allocator)
+    params = SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        mtp_draft_device_pools=None,
+        page_size=4,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        pp_cache_group=None,
+    )
+    memory = SimpleNamespace(
+        hicache_io_backend="raiden",
+        hicache_ratio=2.0,
+        hicache_size=0,
+        hicache_write_policy="write_through",
+        hicache_host_memory_mode="cache",
+    )
+    with (
+        patch.object(kv_pool_host, "get_memory", return_value=memory),
+        patch.object(
+            kv_pool_host.TpuDMAUnifiedHostKVPool,
+            "build_pair",
+            return_value=(Mock(), Mock()),
+        ),
+        patch.object(
+            HybridCacheController, "create_for_backend", return_value=controller
+        ),
+    ):
+        result = kv_pool_host._TPU_UNIFIED_SWA_STRATEGY.build(
+            cache=SimpleNamespace(
+                token_to_kv_pool_allocator=allocator, evict=Mock(), evict_host=Mock()
+            ),
+            kvcache=pool,
+            params=params,
+            server_args=None,
+            load_cache_event=None,
+        )
+    controller.mem_pool_host = result.host_pool_group
+    controller.mem_pool_device = pool
+    # Skip storage workers but exercise the TPU constructor's callback wiring.
+    with patch.object(HybridCacheController, "__init__", return_value=None):
+        controller.__init__()
     return controller
 
 
@@ -172,21 +251,135 @@ class TestHiCacheHostIndices(CustomTestCase):
         self.assertIs(controller.load(torch.arange(20, 28)), expected)
         allocator.alloc_cyclic.assert_called_once_with(start_class=5, need_size=8)
 
-    def test_side_pool_and_wrapped_allocators_keep_old_contract(self):
+    def test_wrapped_full_allocator_and_derived_sidecar_stay_on_host(self):
         allocator = _allocator()
         controller = _controller(allocator)
-        extra = [PoolTransfer(name=PoolName.SWA)]
+        extra = [PoolTransfer(name=PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
         self.assertEqual(
             controller._alloc_load_kv_indices(allocator, 4, extra).device.type,
-            "meta",
+            "cpu",
         )
         controller.mem_pool_device_allocator = SimpleNamespace(
             full_attn_allocator=allocator
         )
         self.assertEqual(
-            controller._alloc_load_kv_indices(allocator, 4, None).device.type,
-            "meta",
+            controller._alloc_load_kv_indices(allocator, 4, extra).device.type,
+            "cpu",
         )
+
+    def test_unified_full_swa_and_derived_indices_stay_on_host(self):
+        controller = _hybrid_controller()
+        allocator = controller.mem_pool_device_allocator
+        swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
+        draft = PoolTransfer(name=PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)
+        full = controller.load(torch.arange(8), extra_pools=[swa, draft])
+        self.assertEqual(full.device.type, "cpu")
+        self.assertEqual(swa.device_indices.device.type, "cpu")
+        self.assertIs(draft.device_indices, full)
+        self.assertIs(controller.load_queue[0].pool_transfers[0], swa)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 8)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 4)
+        # Five SWA layers over two shared buffers require three physical groups.
+        self.assertEqual(allocator.full_available_size(), 128 - 8 - 3 * 4)
+        allocator.swa_attn_allocator.free(swa.device_indices)
+        allocator.full_attn_allocator.free(full)
+        self.assertEqual(allocator.full_available_size(), 128)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+
+    def test_unified_swa_failure_rolls_back_full_allocation(self):
+        for missing_source in (False, True):
+            with self.subTest(missing_source=missing_source):
+                controller = _hybrid_controller()
+                allocator = controller.mem_pool_device_allocator
+                # Either SWA cannot fit, or a later sidecar cannot resolve its
+                # source after both the Full and SWA allocations succeeded.
+                swa = PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.arange(4 if missing_source else 44),
+                )
+                extra = [swa]
+                if missing_source:
+                    extra.append(
+                        PoolTransfer(
+                            name=PoolName.DRAFT_SWA,
+                            indices_from_pool=PoolName.MAMBA,
+                        )
+                    )
+                self.assertIsNone(controller.load(torch.arange(8), extra_pools=extra))
+                self.assertIsNone(swa.device_indices)
+                self.assertEqual(allocator.full_available_size(), 128)
+                self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+                self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+                self.assertFalse(controller.load_queue)
+
+    def test_unified_default_allocation_keeps_device_contract(self):
+        allocator = _hybrid_controller().mem_pool_device_allocator
+        self.assertEqual(allocator.full_attn_allocator.alloc(4).device.type, "meta")
+        self.assertEqual(allocator.swa_attn_allocator.alloc(4).device.type, "meta")
+
+    def test_split_swa_reload_and_custom_callback_fallback(self):
+        class LegacyAllocator(TpuPagedTokenToKVPoolAllocator):
+            def alloc(self, need_size):
+                return super().alloc(need_size)
+
+        for kind in ("plain", "custom", "legacy"):
+            with self.subTest(kind=kind):
+                full, swa = _allocator(), _allocator()
+                if kind == "legacy":
+                    swa = LegacyAllocator(
+                        size=32,
+                        page_size=4,
+                        dtype=torch.bfloat16,
+                        device="meta",
+                        kvcache=None,
+                        need_sort=False,
+                    )
+                allocator = SimpleNamespace(
+                    device="meta",
+                    full_attn_allocator=full,
+                    swa_attn_allocator=swa,
+                    kv_free_fence=None,
+                )
+                controller = _controller(allocator)
+                controller.mem_pool_device = Mock()
+                allocate = (
+                    Mock(side_effect=lambda n: swa.alloc(n))
+                    if kind == "custom"
+                    else swa.alloc
+                )
+                entry = PoolEntry(
+                    PoolName.SWA,
+                    Mock(),
+                    Mock(),
+                    lambda x: x,
+                    device_alloc_fn=allocate,
+                    device_free_fn=swa.free,
+                )
+                controller.mem_pool_host = HostPoolGroup(
+                    [
+                        PoolEntry(
+                            PoolName.KV,
+                            Mock(),
+                            Mock(),
+                            lambda x: x,
+                            is_primary_index_anchor=True,
+                        ),
+                        entry,
+                    ]
+                )
+                with patch.object(HybridCacheController, "__init__", return_value=None):
+                    controller.__init__()
+                if kind != "plain":
+                    self.assertIs(entry.device_alloc_fn, allocate)
+                    self.assertEqual(entry.device_alloc_fn(4).device.type, "meta")
+                else:
+                    transfer = PoolTransfer(
+                        name=PoolName.SWA, host_indices=torch.arange(4)
+                    )
+                    indices = controller.load(torch.arange(8), extra_pools=[transfer])
+                    self.assertEqual(indices.device.type, "cpu")
+                    self.assertEqual(transfer.device_indices.device.type, "cpu")
 
     def test_reuse_of_inflight_pages_still_waits(self):
         allocator = _allocator(size=8)
