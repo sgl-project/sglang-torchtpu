@@ -22,6 +22,7 @@ from sglang_tpu.models.deepseek_v41.engram_row_reader import (
     engram_row_ranges,
     is_engram_table,
     iter_row_tables,
+    shared_table_rows,
 )
 
 logger = get_logger(__name__)
@@ -45,6 +46,12 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
     _plans_without_expert_range = True
     # The model being loaded; its Engram layout sets each table's row ranges.
     _hf_config = None
+    # The model being loaded; its shared Engram host tables take rows in place.
+    _model = None
+
+    def _get_all_weights(self, model_config, model):
+        self._model = model
+        yield from super()._get_all_weights(model_config, model)
 
     def _get_weights_iterator(self, source):
         self._hf_config = source.model_config.hf_config
@@ -84,7 +91,8 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             tp_rank=parallel.tp_rank,
             tp_size=parallel.tp_size,
         )
-        rows = iter_row_tables(shard_of=shard_of, ranges=ranges)
+        shared = None if self._model is None else shared_table_rows(self._model, ranges)
+        rows = iter_row_tables(shard_of=shard_of, ranges=ranges, shared=shared)
         return streamed, rows
 
     def _draft_weights(self, source):

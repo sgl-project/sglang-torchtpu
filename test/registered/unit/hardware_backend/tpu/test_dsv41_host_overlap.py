@@ -2410,6 +2410,93 @@ def test_engram_row_reader_loads_each_ranks_rows(monkeypatch, tmp_path):
         )
 
 
+def test_engram_child_fills_shared_host_table_in_place(monkeypatch, tmp_path):
+    """Regression: the shared (per_node) host table is filled by the row-reader
+    child process writing into the table's memfd. Each rank's rows must land at
+    its own offsets with the checkpoint's bytes, and the empty blocks the loader
+    yields must pass load_local_rows and mark the table loaded."""
+    from safetensors.torch import save_file
+    from torch import nn
+
+    from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+    from sglang.srt.arg_groups.engram_config import (
+        EngramConfig,
+        EngramLookup,
+        EngramPlacement,
+        EngramReplication,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers import engram
+    from sglang_tpu.models.deepseek_v41 import engram_row_reader as reader
+
+    weight = torch.arange(12 * 128, dtype=torch.float32).remainder(200)
+    weight = weight.view(12, 128).to(torch.float8_e4m3fn)
+    blocks = 128 // FP8_BLOCK_SIZE
+    scale = torch.arange(12 * blocks, dtype=torch.float32).remainder(20).exp2()
+    scale = scale.view(12, blocks).to(torch.float8_e8m0fnu)
+    names = ("layers.1.engram.embed.weight", "layers.1.engram.embed.scale")
+    path = str(tmp_path / "model-00001.safetensors")
+    save_file(dict(zip(names, (weight, scale))), path)
+
+    group = SimpleNamespace(
+        rank_in_group=0, barrier=lambda: None, broadcast_object=lambda obj, src: obj
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(engram, "_page_cache_dropped", True)
+    config = EngramConfig(
+        placement=EngramPlacement.CPU,
+        replication=EngramReplication.PER_NODE,
+        lookup=EngramLookup.ALL_REDUCE,
+    )
+    monkeypatch.setattr(engram, "resolve_engram_config", lambda columns: config)
+    layout = engram.EngramLayout.from_config(_ENGRAM_CONFIG)
+    for tp_rank in range(2):
+        monkeypatch.setattr(
+            engram,
+            "get_parallel",
+            lambda: SimpleNamespace(tp_size=2, tp_rank=tp_rank, tp_group=group),
+        )
+        embedding = engram.EngramEmbedding.__new__(engram.EngramEmbedding)
+        with (
+            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(True),
+            envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.override("shared"),
+        ):
+            hooks.tpu_dsv41_engram_embed_init(
+                engram.EngramEmbedding.__init__,
+                embedding,
+                layout.num_embeddings[0],
+                layout.head_dim,
+                1,
+                column_bounds=layout.column_bounds(0),
+            )
+        model = nn.Module()
+        model.model = nn.Module()
+        model.model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        model.model.layers[1].engram = nn.Module()
+        model.model.layers[1].engram.embed = embedding
+
+        ranges = reader.engram_row_ranges(
+            names, _ENGRAM_CONFIG, tp_rank=tp_rank, tp_size=2
+        )
+        shared = reader.shared_table_rows(model, ranges)
+        assert shared is not None
+        embedding.host_table.dirty = False
+        for name, block in reader.iter_row_tables(
+            shard_of=dict.fromkeys(names, path), ranges=ranges, shared=shared
+        ):
+            assert block.shape[0] == 0
+            param = embedding.weight if name == names[0] else embedding.scale
+            reader.load_local_rows(None, embedding, param, block)
+        owned = slice(embedding.row_start, embedding.row_start + embedding.rows)
+        assert torch.equal(
+            embedding.weight[owned].view(torch.uint8), weight[owned].view(torch.uint8)
+        )
+        assert torch.equal(
+            embedding.scale[owned].view(torch.uint8), scale[owned].view(torch.uint8)
+        )
+        assert embedding.host_table.dirty
+
+
 def test_encoder_replay_validation_leaves_decoder_replay_off():
     """Regression: the TPU encoder-replay hook runs the V4.1 validator as CUDA,
     which defaults decoder SWA replay on; the TPU attention backend has none,

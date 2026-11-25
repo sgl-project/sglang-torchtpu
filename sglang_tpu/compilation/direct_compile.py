@@ -11,7 +11,7 @@ import types
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Protocol
 
@@ -54,6 +54,7 @@ from sglang_tpu.compilation.spmd_compiler import (
     load_serialized_executable,
     serialize_executable,
 )
+from sglang_tpu.compilation.tensor_rebind import rebind_tensor
 from sglang_tpu.compilation.warmup_queue import (
     current_lowered_graph_store,
     current_warmup_queue,
@@ -948,7 +949,14 @@ class CompiledFunction:
             # Compute liveness after collecting all three kinds of graph roots.
             with dynamo_timed("direct_compile_prune_model_inputs"):
                 live_model_indices = _live_model_input_indices(
-                    result_tensors, graph_inputs, model_input_count
+                    result_tensors,
+                    graph_inputs,
+                    model_input_count,
+                    device_resident=tuple(
+                        index
+                        for index, tensor in enumerate(model_inputs[:model_input_count])
+                        if not _host_resident(tensor)
+                    ),
                 )
             retained_indices = (
                 *live_model_indices,
@@ -1502,6 +1510,12 @@ def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:
     )
 
 
+def _rebind_kv_enabled() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_DIRECT_COMPILE_REBIND_KV.get()
+
+
 @dataclass
 class _CompiledArtifact:
     """Wrap a TorchTPU PJRT executable with input/output/mutation handling."""
@@ -1524,6 +1538,9 @@ class _CompiledArtifact:
     # SPMD consumer before bind(): (model_inputs, flat_inputs) lists its bind
     # closure reads; their model-input entries are released/refreshed in place.
     unbound_inputs: tuple | None = None
+    # Rebind the live KV-pool tensors to their donated outputs instead of copy_.
+    rebind_kv: bool = field(default_factory=_rebind_kv_enabled)
+    logged_rebind: bool = False
 
     def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
@@ -1602,12 +1619,24 @@ class _CompiledArtifact:
                 f"callbacks={len(self.callbacks)}) actual={len(outputs)}"
             )
 
-        # Copy updated KV state back into the live pool tensors.
+        # Hand the updated KV state back to the live pool tensors.
         with torch.no_grad():
-            for tensor, replacement in zip(
-                kv_pool_inputs, outputs[self.output_count :]
-            ):
-                tensor.copy_(replacement)
+            kv_outputs = outputs[self.output_count :]
+            if self.rebind_kv:
+                rebound = sum(
+                    rebind_tensor(tensor, replacement)
+                    for tensor, replacement in zip(kv_pool_inputs, kv_outputs)
+                )
+                if not self.logged_rebind:
+                    self.logged_rebind = True
+                    logger.info(
+                        "[direct_compile] rebound %d of %d KV-pool tensors",
+                        rebound,
+                        len(kv_pool_inputs),
+                    )
+            else:
+                for tensor, replacement in zip(kv_pool_inputs, kv_outputs):
+                    tensor.copy_(replacement)
             mutated_start = self.output_count + len(kv_pool_inputs)
             for path, replacement in zip(
                 self.mutated_input_paths,
@@ -1627,10 +1656,18 @@ class _CompiledArtifact:
         )
 
 
+def _host_resident(tensor: Any) -> bool:
+    """A registered tensor that lives in host memory (e.g. the DSV4.1 host Engram tables, ~92 GB each): no device
+    graph can read it, and lifting it as a graph argument makes XLA place it in HBM."""
+    device = getattr(tensor, "device", None)
+    return device is not None and device.type == "cpu"
+
+
 def _live_model_input_indices(
     result_tensors: list[torch.Tensor],
     graph_inputs: list[torch.Tensor],
     model_input_count: int,
+    device_resident: tuple[int, ...] | None = None,
 ) -> tuple[int, ...]:
     """Find model arguments used by the deferred graph, once per specialization.
 
@@ -1681,14 +1718,66 @@ def _live_model_input_indices(
     except RuntimeError as error:
         if "identified an argument that was not provided" not in str(error):
             raise
-        logger.info(
-            "[direct_compile] retaining all %d model inputs: deferred traversal "
-            "requires an input discarded by MLIR lowering",
+        return _retain_on_missing_input(
+            result_tensors,
+            graph_inputs,
             model_input_count,
+            live_model_indices,
+            device_resident,
+            error,
         )
-        return tuple(range(model_input_count))
     del lowered
     return live_model_indices
+
+
+def _retain_on_missing_input(
+    result_tensors: list[torch.Tensor],
+    graph_inputs: list[torch.Tensor],
+    model_input_count: int,
+    live_model_indices: tuple[int, ...],
+    device_resident: tuple[int, ...] | None,
+    error: Exception,
+) -> tuple[int, ...]:
+    """The model inputs to retain when the live-only input list fails validation.
+
+    Deferred traversal needs an input that lowering discarded. Before retaining
+    every model input, retain every DEVICE-resident one and drop only the
+    host-resident tensors: retaining those put the DSV4.1 host Engram tables
+    (2 x 91.6 GB) into the MK in-graph decode program (in-graph A/B
+    j-2f53d616-de96-470d-99b3: CompileTimeHbmOom, 432 GB of HLO temporaries;
+    the same signature as the direct-r6c 430 GB OOM).
+    """
+    reason = str(error).splitlines()[0][:300] if str(error) else type(error).__name__
+    if device_resident is not None and len(device_resident) < model_input_count:
+        keep = tuple(sorted(set(live_model_indices) | set(device_resident)))
+        compact_inputs = [graph_inputs[index] for index in keep]
+        compact_inputs.extend(graph_inputs[model_input_count:])
+        try:
+            lowered = tpu_torch_compile.build_mlir(result_tensors, compact_inputs)
+        except RuntimeError as retry_error:
+            if "identified an argument that was not provided" not in str(retry_error):
+                raise
+        else:
+            del lowered
+            logger.info(
+                "[direct_compile] retaining %d/%d model inputs: deferred traversal requires "
+                "an input discarded by MLIR lowering (%s); every device-resident input kept, "
+                "%d host-resident dropped",
+                len(keep),
+                model_input_count,
+                reason,
+                model_input_count - len(device_resident),
+            )
+            return keep
+    host = 0 if device_resident is None else model_input_count - len(device_resident)
+    logger.warning(
+        "[direct_compile] retaining all %d model inputs: deferred traversal "
+        "requires an input discarded by MLIR lowering (%s)%s",
+        model_input_count,
+        reason,
+        f"; {host} of them are host-resident" if host else "",
+    )
+    return tuple(range(model_input_count))
 
 
 def _get_path(value: Any, path: tree_util.KeyPath) -> Any:

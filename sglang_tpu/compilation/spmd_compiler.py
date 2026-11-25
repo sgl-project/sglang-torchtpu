@@ -23,7 +23,7 @@ from torch_tpu._internal.distributed import device_mesh
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.graph_identity import canonical, digest
-from sglang_tpu.compilation.shared_compile_cost import estimator_from_env
+from sglang_tpu.compilation.shared_compile_cost import CostProfile, profile_from_env
 
 logger = get_logger(__name__)
 T = TypeVar("T")
@@ -135,9 +135,10 @@ def _prepare_executable(
 class SPMDCompiler:
     """Coordinate shared compilation or graph verification for a warmup queue.
 
-    Sharing assigns each named specialization to one rank: the rank with the
-    least estimated trace work so far under a cost profile
-    (``shared_compile_cost``), else round-robin. Only that rank traces and
+    Sharing assigns each named specialization to one rank: under a cost
+    profile (``shared_compile_cost``), the owner its up-front plan gives a
+    listed graph, else the rank with the least estimated trace work so far;
+    without a profile, round-robin. Only that rank traces and
     compiles it; ``finish`` distributes the executable
     and binds it to every rank's local inputs and callbacks. All ranks must
     enqueue the same keys in the same order.
@@ -162,9 +163,10 @@ class SPMDCompiler:
         self.submissions: dict[str, Submission] = {}
         self.mlirs: dict[str, str] = {}
         self.argument_layouts: dict[str, list[list[int]]] = {}
-        # Trace-cost estimate per graph, or None for round-robin owners.
-        # Verification never assigns owners, so only sharing loads a profile.
-        self._estimate: Callable[[str], float] | None = None
+        # Trace-cost profile, or None for round-robin owners. Verification
+        # never assigns owners, so only sharing loads a profile.
+        self._profile: CostProfile | None = None
+        self._planned_owner: dict[str, int] = {}
         self._estimated_load = [0.0] * self.size
         self.trace_seconds: dict[str, float] = {}
         """Owner-only trace time of each graph this rank traced."""
@@ -181,12 +183,17 @@ class SPMDCompiler:
             return
         runtime = None
         error: str | None = None
-        stage = "load the shared compile cost profile"
+        # Ranks assign owners independently, so they compare profile digests
+        # below; a missing, invalid or differing profile on any rank means
+        # round-robin on every rank, never a failed startup.
+        profile_digest: str | None = None
+        profile_error = ""
         try:
-            # Ranks assign owners independently, so a rank that cannot load the
-            # profile, or loads a different one, must fail every rank below.
-            self._estimate, cost_profile = estimator_from_env()
-            stage = "identify the compiler runtime"
+            self._profile, profile_digest = profile_from_env()
+        except Exception as caught:
+            profile_error = f"{type(caught).__name__}: {caught}"
+        stage = "identify the compiler runtime"
+        try:
             mapping = [int(value) for value in device_mesh.get_device_assignment()]
             runtime = dict(
                 device_assignment=mapping,
@@ -196,21 +203,20 @@ class SPMDCompiler:
                 },
                 XLA_FLAGS=os.environ.get("XLA_FLAGS", ""),
                 LIBTPU_INIT_ARGS=os.environ.get("LIBTPU_INIT_ARGS", ""),
-                cost_profile=cost_profile,
             )
             if len(mapping) != self.world_size:
                 error = "the TPU session and distributed world must have the same size"
         except Exception as caught:
             error = f"cannot {stage}: {type(caught).__name__}: {caught}"
-        records = self.gather((runtime, error))
+        records = self.gather((runtime, error, (profile_digest, profile_error)))
         reasons = [
             f"rank {rank}: {reason}"
-            for rank, (_, reason) in enumerate(records)
+            for rank, (_, reason, _) in enumerate(records)
             if reason is not None
         ]
         if not reasons:
             for field in runtime:
-                values = [peer[field] for peer, _ in records]
+                values = [peer[field] for peer, _, _ in records]
                 if any(value != values[0] for value in values):
                     reasons.append(f"{field} differs across ranks: {values}")
         if reasons:
@@ -218,7 +224,27 @@ class SPMDCompiler:
                 f"Incompatible SPMD compilation configuration: {'; '.join(reasons)}. "
                 "Fix the configuration or remove --use-spmd-compile."
             )
+        self._agree_on_profile([profile for _, _, profile in records])
         self._serializer = ThreadPoolExecutor(thread_name_prefix="tpu-serialize")
+
+    def _agree_on_profile(self, profiles: list[tuple[str | None, str]]) -> None:
+        """Plan owners from the profile every rank loaded identically; else
+        fall back to round-robin on every rank (all ranks see the same list)."""
+        digests = {digest for digest, _ in profiles}
+        if None in digests or len(digests) > 1:
+            if self._profile is not None or any(e for _, e in profiles):
+                problems = [
+                    f"rank {rank}: {error or (digest or 'none')[:12]}"
+                    for rank, (digest, error) in enumerate(profiles)
+                ]
+                logger.warning(
+                    "Shared compile cost profile not usable on every rank; "
+                    "round-robin owners (%s)",
+                    "; ".join(problems),
+                )
+            self._profile = None
+        if self._profile is not None:
+            self._planned_owner, self._estimated_load = self._profile.plan(self.size)
 
     def gather(self, value: T) -> list[T]:
         """Exchange a value with every rank, preserving group-rank order."""
@@ -247,10 +273,12 @@ class SPMDCompiler:
             return
         if graph in self.submissions:
             raise ValueError(f"Duplicate shared TPU graph name: {graph}")
-        if self._estimate is None:
+        if self._profile is None:
             owner = len(self.submissions) % self.size
+        elif graph in self._planned_owner:
+            owner = self._planned_owner[graph]
         else:
-            cost = float(self._estimate(graph))
+            cost = float(self._profile.estimate(graph))
             if not math.isfinite(cost) or cost < 0:
                 raise ValueError(f"Invalid shared TPU graph cost {cost!r}: {graph}")
             owner = min(range(self.size), key=self._estimated_load.__getitem__)

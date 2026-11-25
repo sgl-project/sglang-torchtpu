@@ -37,6 +37,10 @@ class TpuEnvs:
     SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
+    # direct_compile: after a call, point each live KV-pool tensor at its donated
+    # output (`.data`, compilation/tensor_rebind.py) instead of copy_ into it.
+    # Same values; saves the per-tensor copy_ dispatch on the host.
+    SGLANG_TPU_DIRECT_COMPILE_REBIND_KV = EnvBool(False)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.

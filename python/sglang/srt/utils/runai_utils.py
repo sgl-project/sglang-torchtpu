@@ -5,6 +5,7 @@
 import hashlib
 import logging
 import os
+import time
 from pathlib import Path
 
 from sglang.srt.environ import envs
@@ -12,6 +13,43 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
+
+# The object-storage clients give up on a throttled download after about two
+# minutes (google-cloud-storage: 120 s), which failed whole server starts when
+# many servers pulled the same model at once. Metadata pulls retry up to this
+# long in total.
+_METADATA_PULL_DEADLINE_S = 600.0
+_METADATA_PULL_MAX_BACKOFF_S = 60.0
+_TRANSIENT_ERROR_NAMES = frozenset(
+    {
+        "RetryError",
+        "TooManyRequests",
+        "ServiceUnavailable",
+        "InternalServerError",
+        "GatewayTimeout",
+        "BadGateway",
+        "ConnectionError",
+        "Timeout",
+        "ReadTimeout",
+        "ConnectTimeout",
+    }
+)
+_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _is_transient_storage_error(exc: BaseException) -> bool:
+    """A throttling, timeout or server-side failure anywhere in ``exc``'s chain
+    (matched by name and HTTP status, so no storage SDK import is needed)."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ in _TRANSIENT_ERROR_NAMES:
+            return True
+        if any(isinstance(a, int) and a in _TRANSIENT_STATUS for a in exc.args):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 # Design Pattern: Single Metadata Download Before Process Launch
 
@@ -100,18 +138,36 @@ class ObjectStorageModel:
         Downloads the model metadata (excluding heavy weights) and returns
         the local directory path. Safe for concurrent usage by multiple processes
         """
-        with cls(url=model_path) as downloader:
-            downloader.pull_files(
-                ignore_pattern=[
-                    "*.pt",
-                    "*.safetensors",
-                    "*.bin",
-                    "*.tensors",
-                    "*.pth",
-                ],
-            )
-            cache_dir = downloader.dir
-            logger.info(f"Runai Model : {cache_dir}, metadata ready.")
+        deadline = time.monotonic() + _METADATA_PULL_DEADLINE_S
+        backoff = 5.0
+        while True:
+            try:
+                with cls(url=model_path) as downloader:
+                    downloader.pull_files(
+                        ignore_pattern=[
+                            "*.pt",
+                            "*.safetensors",
+                            "*.bin",
+                            "*.tensors",
+                            "*.pth",
+                        ],
+                    )
+                    cache_dir = downloader.dir
+                break
+            except Exception as exc:
+                remaining = deadline - time.monotonic()
+                if not _is_transient_storage_error(exc) or remaining <= backoff:
+                    raise
+                logger.warning(
+                    "Metadata pull for %s failed (%s: %s); retrying in %.0f s",
+                    model_path,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                    backoff,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _METADATA_PULL_MAX_BACKOFF_S)
+        logger.info(f"Runai Model : {cache_dir}, metadata ready.")
         return cache_dir
 
     @classmethod

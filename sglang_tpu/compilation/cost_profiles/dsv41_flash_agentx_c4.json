@@ -1,0 +1,39 @@
+{
+  "schema_version": 2,
+  "default_seconds": 107.23,
+  "families": {
+    "draft/forward": 5.176,
+    "target/forward": 192.573
+  },
+  "graphs": {
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",1,5,null]": 4.502,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",16,80,null]": 6.047,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",2,10,null]": 5.109,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",32,160,null]": 4.606,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",4,20,null]": 4.8,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",64,320,null]": 4.946,
+    "draft/forward:[\"TARGET_VERIFY\",\"NULL\",8,40,null]": 6.224,
+    "target/forward:[\"EXTEND\",\"FULL\",64,1024,\"FULL_VOCAB\",0]": 216.802,
+    "target/forward:[\"EXTEND\",\"FULL\",64,1024,\"FULL_VOCAB\",1024]": 225.38,
+    "target/forward:[\"EXTEND\",\"FULL\",64,1024,\"FULL_VOCAB\",128]": 229.741,
+    "target/forward:[\"EXTEND\",\"FULL\",64,1024,\"FULL_VOCAB\",256]": 235.32,
+    "target/forward:[\"EXTEND\",\"FULL\",64,1024,\"FULL_VOCAB\",512]": 236.135,
+    "target/forward:[\"EXTEND\",\"FULL\",64,2048,\"FULL_VOCAB\",0]": 368.891,
+    "target/forward:[\"EXTEND\",\"FULL\",64,2048,\"FULL_VOCAB\",128]": 373.122,
+    "target/forward:[\"EXTEND\",\"FULL\",64,2048,\"FULL_VOCAB\",2048]": 427.422,
+    "target/forward:[\"EXTEND\",\"FULL\",64,2048,\"FULL_VOCAB\",256]": 389.798,
+    "target/forward:[\"EXTEND\",\"FULL\",64,2048,\"FULL_VOCAB\",512]": 374.76,
+    "target/forward:[\"EXTEND\",\"FULL\",64,512,\"FULL_VOCAB\",0]": 110.466,
+    "target/forward:[\"EXTEND\",\"FULL\",64,512,\"FULL_VOCAB\",128]": 117.823,
+    "target/forward:[\"EXTEND\",\"FULL\",64,512,\"FULL_VOCAB\",256]": 130.202,
+    "target/forward:[\"EXTEND\",\"FULL\",64,512,\"FULL_VOCAB\",512]": 120.346,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",1,6,\"FULL_VOCAB\",null]": 73.235,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",16,96,\"FULL_VOCAB\",null]": 85.803,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",2,12,\"FULL_VOCAB\",null]": 83.835,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",32,192,\"FULL_VOCAB\",null]": 104.939,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",4,24,\"FULL_VOCAB\",null]": 83.601,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",64,384,\"FULL_VOCAB\",null]": 170.591,
+    "target/forward:[\"TARGET_VERIFY\",\"FULL\",8,48,\"FULL_VOCAB\",null]": 85.994
+  },
+  "repeat_fraction": 0.132
+}

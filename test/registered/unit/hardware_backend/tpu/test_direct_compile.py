@@ -37,6 +37,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
 from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.envs import envs as tpu_envs
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -229,6 +230,50 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
         kv_pool=kv_pool,
         **compile_options,
     )
+
+
+class TestPruneFallback(CustomTestCase):
+    """_retain_on_missing_input: when the live-only inputs fail validation, keep every device-resident model input and
+    drop the host-resident ones (dsv41 MK in-graph A/B: the host Engram tables made a 432 GB CompileTimeHbmOom)."""
+
+    def _run(self, required, device_resident):
+        inputs = [torch.zeros(1) for _ in range(8)]
+        calls = []
+
+        def build_mlir(results, given):
+            calls.append(list(given))
+            if not {id(inputs[i]) for i in required} <= {id(x) for x in given}:
+                raise RuntimeError("identified an argument that was not provided")
+            return object()
+
+        error = RuntimeError("identified an argument that was not provided")
+        with patch.object(
+            direct_compile.tpu_torch_compile, "build_mlir", side_effect=build_mlir
+        ):
+            keep = direct_compile._retain_on_missing_input(
+                [], inputs, 6, (0, 1), device_resident, error
+            )
+        return keep, calls, inputs
+
+    def test_drops_host_resident_inputs(self):
+        keep, calls, inputs = self._run(required=(3,), device_resident=(0, 1, 2, 3))
+        self.assertEqual(keep, (0, 1, 2, 3))
+        self.assertEqual(
+            [id(x) for x in calls[-1]], [id(inputs[i]) for i in (0, 1, 2, 3, 6, 7)]
+        )
+
+    def test_retains_all_when_a_host_input_is_required(self):
+        keep, _, _ = self._run(required=(4,), device_resident=(0, 1, 2, 3))
+        self.assertEqual(keep, tuple(range(6)))
+
+    def test_retains_all_without_host_inputs(self):
+        keep, calls, _ = self._run(required=(3,), device_resident=tuple(range(6)))
+        self.assertEqual(keep, tuple(range(6)))
+        self.assertEqual(calls, [])
+
+    def test_host_resident(self):
+        self.assertTrue(direct_compile._host_resident(torch.zeros(1)))
+        self.assertFalse(direct_compile._host_resident(object()))
 
 
 class TestDirectCompile(CustomTestCase):
@@ -1411,6 +1456,13 @@ class TestDirectCompile(CustomTestCase):
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_preserves_all_model_inputs_by_default_on_tpu(self):
         self._check_model_input_pruning_on_tpu()
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_rebound_kv_state_matches_copy_back_on_tpu(self):
+        """The live pool tensor, rebound to the donated output each call, holds
+        the same values across calls and specializations as the copy_ path."""
+        with tpu_envs.SGLANG_TPU_DIRECT_COMPILE_REBIND_KV.override(True):
+            self._check_model_input_pruning_on_tpu(prune_unused_inputs=True)
 
     def _check_model_input_pruning_on_tpu(self, **compile_options):
         prune_unused_inputs = compile_options.get("prune_unused_inputs", False)
