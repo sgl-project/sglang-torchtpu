@@ -264,6 +264,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
     # SPTP_PA_OGATE_TOK=1: the o gate's math laid out token major (o transposed instead of gate)
     pa_gtok = pa_a2a and os.environ.get("SPTP_PA_OGATE_TOK", "0") == "1"
+    if pa_gtok and (xag_gate4 or ogate_kernel):
+        raise ValueError(
+            "SPTP_PA_OGATE_TOK reads the token-major gate: no XAG_GATE4 / OGATE_KERNEL"
+        )
     # SPTP_PA_TMAJ=1: that kernel takes the o gate output as [qd, T] (rows in lanes), the
     # gate fusion's own layout
     pa_tmaj = pa_a2a and not pa_gtok and os.environ.get("SPTP_PA_TMAJ", "0") == "1"
@@ -444,24 +448,47 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             stream, ids, tw, f8, f_s = pa_o(*args)
                             xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
                 else:
-                    with _scope("sp_o_gate"):
-                        # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
-                        o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
-                        o4 = o4 * jax.lax.rsqrt(
-                            jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
-                        )
-                        g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
-                        a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
-                        g_s = (
-                            jnp.maximum(
-                                jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
-                            ).reshape(T, 1)
-                            / 448.0
-                        )
-                        g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
+                    if ogate_kernel:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = o_gate(o, gate)
+                    else:
+                        with _scope("sp_o_gate"):
+                            # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized
+                            # per token
+                            o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
+                                _F32
+                            )
+                            o4 = o4 * jax.lax.rsqrt(
+                                jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
+                            )
+                            if xag_gate4:
+                                g4 = gate[..., :hd]
+                            else:
+                                g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(
+                                    1, 0, 2, 3
+                                )
+                            a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                            if xag_gate4:
+                                # per kv head first: one reduce over (0, 2, 3) with gate4's
+                                # operands fuses into a 10x slower reduction
+                                amax = jnp.max(
+                                    jnp.max(jnp.abs(a4), axis=(2, 3)), axis=0
+                                )
+                            else:
+                                amax = jnp.max(jnp.abs(a4), axis=(0, 2, 3))
+                            g_s = jnp.maximum(amax, 1e-30).reshape(T, 1) / 448.0
+                            g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(
+                                jnp.float8_e4m3fn
+                            )
                     if pa_a2a:
                         with _scope("sp_postattn"):
-                            if pa_tmaj:
+                            if ogate_kernel:
+                                if pa_head or pa_tmaj:
+                                    raise ValueError(
+                                        "SPTP_OGATE_KERNEL writes token-major rows: "
+                                        "SPTP_PA_HEAD=0, SPTP_PA_TMAJ=0"
+                                    )
+                            elif pa_tmaj:
                                 g8 = g8.transpose(0, 2, 3, 1).reshape(qd, T)
                             elif pa_head:
                                 g8 = g8.reshape(c.kv_heads, T, gq * hd)
@@ -498,7 +525,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     elif pa:
                         with _scope("sp_o_a2a"):
                             # the token-major [T, qd] gated output (the o gate's layout to come)
-                            g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                            if not ogate_kernel:
+                                g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
                             g8 = jax.lax.all_to_all(g8, axis, 0, 0, tiled=True)
                             g_s = jax.lax.all_to_all(g_s, axis, 0, 0, tiled=True)
                             g8, g_s = g8.reshape(tp, Ts, qd), g_s.reshape(tp, Ts, 1)
@@ -508,6 +536,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                 l, g8, g_s, stream, smalls, wo, wrouter
                             )
                             xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                    elif ogate_kernel:
+                        with _scope("sp_o_a2a"):
+                            g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                        with _scope("sp_o_proj"):
+                            g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                            o_own = dense(g8, g_s, wo[l], sm, "wo", H)
                     else:
                         with _scope("sp_o_a2a"):
                             g8 = jax.lax.all_to_all(
