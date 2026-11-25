@@ -1194,6 +1194,76 @@ class TestCompiledForwardShim(CustomTestCase):
         shim("ids", "pos", fb, input_embeds=stale_unpadded_embeds)
         compiled.assert_called_once_with("ids", "pos", fb, input_embeds=padded_embeds)
 
+    def test_drops_trailing_default_positional_args_before_compiled_call(self):
+        def forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=None,
+            pp_proxy_tensors=None,
+        ):
+            pass
+
+        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled.__signature__ = inspect.signature(forward)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
+
+        shim("ids", "pos", fb, None)
+        compiled.assert_called_once_with("ids", "pos", fb)
+
+        compiled.reset_mock()
+        shim("ids", "pos", fb, None, None)
+        compiled.assert_called_once_with("ids", "pos", fb)
+
+        compiled.reset_mock()
+        proxy = SimpleNamespace(tensors={})
+        shim("ids", "pos", fb, None, proxy)
+        compiled.assert_called_once_with("ids", "pos", fb, None, proxy)
+
+    def test_syncs_positional_input_embeds_with_padded_forward_batch(self):
+        def forward(input_ids, positions, forward_batch, input_embeds=None):
+            pass
+
+        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled.__signature__ = inspect.signature(forward)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
+        padded_embeds = torch.zeros((8, 16), dtype=torch.bfloat16)
+        fb.input_embeds = padded_embeds
+        stale_unpadded_embeds = torch.zeros((4, 16), dtype=torch.bfloat16)
+
+        shim("ids", "pos", fb, stale_unpadded_embeds)
+        compiled.assert_called_once_with("ids", "pos", fb, padded_embeds)
+
+    def test_dynamo_fail_on_recompile_reuses_3arg_precompile_across_wrapper_calls(self):
+        def inner_backbone(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=None,
+            pp_proxy_tensors=None,
+        ):
+            return input_ids.to(torch.bfloat16).unsqueeze(-1) + positions.to(
+                torch.bfloat16
+            ).unsqueeze(-1)
+
+        compiled = torch.compile(inner_backbone, backend="eager", fullgraph=False)
+        compiled.__signature__ = inspect.signature(inner_backbone)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = self._forward_batch()
+        ids = torch.tensor([3, 5], dtype=torch.int64)
+        pos = torch.tensor([1, 2], dtype=torch.int64)
+
+        ref = shim(ids, pos, fb)
+        with torch.compiler.set_stance("fail_on_recompile"):
+            out_kw = shim(ids, pos, fb, input_embeds=None, pp_proxy_tensors=None)
+            out_pos = shim(ids, pos, fb, None)
+            out_pos2 = shim(ids, pos, fb, None, None)
+        torch.testing.assert_close(ref, out_kw)
+        torch.testing.assert_close(ref, out_pos)
+        torch.testing.assert_close(ref, out_pos2)
+
     def test_no_op_when_real_size_keys_missing(self):
         # Padding hook didn't run (e.g. forward_idle): output passes through.
         out_obj = SimpleNamespace(
