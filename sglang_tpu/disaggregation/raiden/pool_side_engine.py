@@ -49,7 +49,10 @@ import time
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
+from sglang_tpu.disaggregation.raiden.host_pool import (
+    WINDOW_SLOTS_PER_FULL_SLOT,
+    slot_host_bytes,
+)
 from sglang_tpu.disaggregation.raiden.pool_spans import (
     _derived_uuid,
     _new_transfer_state,
@@ -362,17 +365,25 @@ def plan_slots(
     full_tensors: list[Any],
     full_max_blocks: int,
 ) -> tuple[int, int, int]:
-    """(slots, max_blocks, host bytes) of a worker's second engine. A twin and
-    its transfer take a slot on each engine, so it gets one slot per pair the
-    rank's staging budget affords, and the full-attention engine plans with
-    the rest."""
+    """(slots, max_blocks, host bytes) of a worker's second engine. Both
+    engines lease staging pages per transfer and admission charges each
+    transfer its own pages, so a full-attention slot is shared by many short
+    rooms; each second-engine slot is priced with a WINDOW_SLOTS_PER_FULL_SLOT
+    share of a full-attention slot, and the full-attention engine plans with
+    the rest of the rank's budget. Beyond its own first slot, the second
+    engine never takes the budget one full-attention slot needs, since that
+    engine always gets one."""
     max_blocks = family.max_blocks(manager)
+    slot_bytes = slot_host_bytes(tensors, max_blocks)
+    full_slot_bytes = slot_host_bytes(full_tensors, full_max_blocks)
     slots = manager._num_slots(
         tensors,
         max_blocks,
-        paired_slot_bytes=slot_host_bytes(full_tensors, full_max_blocks),
+        paired_slot_bytes=full_slot_bytes // WINDOW_SLOTS_PER_FULL_SLOT,
     )
-    return slots, max_blocks, slots * slot_host_bytes(tensors, max_blocks)
+    spare = manager._rank_budget_bytes() - full_slot_bytes
+    slots = max(1, min(slots, int(spare // max(1, slot_bytes))))
+    return slots, max_blocks, slots * slot_bytes
 
 
 def build(

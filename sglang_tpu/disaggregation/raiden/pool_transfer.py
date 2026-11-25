@@ -332,6 +332,15 @@ class Receive(msgspec.Struct):
     twins: dict[tuple, dict] = {}
 
 
+def _storage_pages(destination: dict | None) -> int:
+    """Staging pages a transfer leases on each storage it touches: a storage is
+    one pool here, so the largest per-pool destination page count (0 without a
+    destination)."""
+    if destination is None:
+        return 0
+    return max(destination["dst_block_counts"], default=0)
+
+
 class StagingPlan(msgspec.Struct, frozen=True):
     slots: int
     mode: str
@@ -415,11 +424,15 @@ class RaidenPoolTransfer:
                 manager, family, family.tensors(groups), self.tensors, self.max_blocks
             )
         staging = self._plan_staging(reserved_bytes=reserved)
+        # Bounded leases seat a transfer in its own pages; full mirrors in a slot.
+        self.page_admission = staging.mode == "leases"
         # A twin's blocks are admitted with its full-attention transfer.
         self.admission = StagingAdmission(
             staging.slots * self.max_blocks,
             side_slots * side_blocks if family is not None else None,
         )
+        # (pages, window pages) arenas producers announced, for one log each.
+        self.producer_arenas: set[tuple] = set()
         self.engine = self._start_engine(
             tensors=self.tensors,
             max_blocks=self.max_blocks,
@@ -826,9 +839,50 @@ class RaidenPoolTransfer:
                 unit=self.unit_fields,
                 **self._worker_fields(),
                 pool_tags=self._pool_tags(),
+                **self._staging_fields(),
                 **fields,
             )
         ).encode()
+
+    def _staging_fields(self) -> dict:
+        """This producer's staging arena per storage, in pages, when a transfer
+        leases only its own pages; whole-slot staging announces none."""
+        if not self.page_admission:
+            return {}
+        return dict(
+            staging_pages=self.admission.capacity,
+            side_staging_pages=self.admission.swa_capacity,
+        )
+
+    def _fit_producer_staging(self, meta: dict) -> None:
+        """Admit no more pages than the producer's arena holds: its sender
+        leases the same pages per storage, and a sender lease that cannot be
+        seated fails the room only at the receive deadline. A producer that
+        announces no arena gets whole-slot charging, at most the capacity
+        other producers set. Lowering capacity under reservations in flight
+        makes new admissions wait until they drain."""
+        admission = self.admission
+        pages = meta.get("staging_pages")
+        side = meta.get("side_staging_pages")
+        if pages is None:
+            self.page_admission = False
+        else:
+            # Capacity is the smallest producer's arena; _admit caps a larger
+            # producer's transfer at it.
+            admission.capacity = min(admission.capacity, int(pages))
+            if side is not None and admission.swa_capacity is not None:
+                admission.swa_capacity = min(admission.swa_capacity, int(side))
+        if (pages, side) not in self.producer_arenas:
+            self.producer_arenas.add((pages, side))
+            logger.info(
+                "Raiden pipeline staging: producer arena %s pages (window %s); "
+                "admitting %d pages (window %s), page admission %s",
+                pages,
+                side,
+                admission.capacity,
+                admission.swa_capacity,
+                self.page_admission,
+            )
 
     def _pool_tags(self) -> list[str]:
         """Every layer tag of this worker, on either engine."""
@@ -1272,6 +1326,7 @@ class RaidenPoolTransfer:
                 )
             if meta.get("part") is None:
                 pool_side_engine.check_agreement(self, meta)
+            self._fit_producer_staging(meta)
             if meta.get("stage"):
                 request.stage[rank] = meta
             elif meta.get("part") is not None:
@@ -1355,7 +1410,12 @@ class RaidenPoolTransfer:
                         )
                 self.done_recv.add(room)
                 return True
-            if not self._admit(room, request, twin=twin is not None):
+            if not self._admit(
+                room,
+                request,
+                pages=_storage_pages(args),
+                twin_pages=_storage_pages(twin),
+            ):
                 return False
             mgr.update_status(room, KVPoll.Transferring)
             ranks = list(range(self._source_workers(sources[0])))
@@ -1437,16 +1497,28 @@ class RaidenPoolTransfer:
             **args,
         )
 
-    def _admit(self, room, request, key: tuple = (), *, twin: bool = False) -> bool:
-        """Reserve host staging for one native transfer of the room and, with
-        ``twin``, for its twin on the second engine. Raiden seats every
-        transfer in its own staging slot, so a room moving early parts or
-        several stage groups holds one reservation per transfer."""
+    def _admit(
+        self, room, request, key: tuple = (), *, pages: int, twin_pages: int = 0
+    ) -> bool:
+        """Reserve host staging for one native transfer of the room: ``pages``
+        per full-attention storage and, for a twin, ``twin_pages`` per storage
+        of the second engine. Bounded leases seat a transfer in exactly its
+        pages; full mirrors seat it in a whole slot. A second engine always
+        stages through bounded leases, so a twin is charged its pages. A room
+        moving early parts or several stage groups holds one reservation per
+        transfer."""
         key = (room, *key) if key else room
         if key in request.admitted_keys:
             return True
-        twin_blocks = self.side.max_blocks if twin else 0
-        if not self.admission.admit(key, self.max_blocks, twin_blocks):
+        admission = self.admission
+        # Capacity is the smallest producer arena: a transfer from a larger
+        # producer that exceeds it is charged all of it and runs alone.
+        full_pages = min(
+            pages if self.page_admission else self.max_blocks, admission.capacity
+        )
+        if admission.swa_capacity is not None:
+            twin_pages = min(twin_pages, admission.swa_capacity)
+        if not admission.admit(key, full_pages, twin_pages):
             return False
         request.admitted_keys.add(key)
         return True
@@ -1491,7 +1563,7 @@ class RaidenPoolTransfer:
                     "Raiden pipeline sources disagree on an early part's pages"
                 )
             start, count = geometries.pop()
-            if not self._admit(room, request, ("p", index)):
+            if not self._admit(room, request, ("p", index), pages=count):
                 return False
             if mgr.attn_tp_rank != 0:
                 part["accepted"] = True
@@ -1568,7 +1640,13 @@ class RaidenPoolTransfer:
             if reason is not None:
                 self._fail_room_held(room, f"group {group}: {reason}")
                 return False
-            if not self._admit(room, request, ("g", group), twin=twin is not None):
+            if not self._admit(
+                room,
+                request,
+                ("g", group),
+                pages=_storage_pages(args),
+                twin_pages=_storage_pages(twin),
+            ):
                 return False
             metas = sorted(metas, key=lambda m: int(m["rank"]))
             pool_side_engine.start_twin(

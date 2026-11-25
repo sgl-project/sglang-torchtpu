@@ -199,6 +199,8 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
     pipe.executor.submit.return_value = concurrent.futures.Future()
     pipe.hbm_mem_type = 2
     pipe.max_blocks = 4
+    pipe.page_admission = True
+    pipe.producer_arenas = set()
     pipe.admission = StagingAdmission(8)
     pipe.sent, pipe.replies, pipe.receives = {}, {}, {}
     pipe.release_requests = {}

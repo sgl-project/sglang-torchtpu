@@ -28,6 +28,7 @@ from sglang_tpu.disaggregation.raiden import pool_side_engine as ps
 from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import (
+    WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
     slot_host_bytes,
 )
@@ -240,6 +241,8 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
         for r in range(mgr.attn_tp_size)
     ]
     t.max_blocks = PRODUCER_BLOCKS["full"]
+    t.page_admission = True
+    t.producer_arenas = set()
     t.admission = StagingAdmission(4 * t.max_blocks, 4 * WINDOW_PAGES)
     t.engine = harness.Engine()
     link = ps.SideLink(
@@ -933,6 +936,56 @@ def test_window_staging_is_admitted_with_the_full_attention_transfer():
     assert ids(w.swa) == [f"swa:{ROOM}", f"swa:{other}"]
 
 
+def test_window_admission_is_bounded_by_the_producer_window_arena():
+    """A producer whose window arena holds one twin bounds the decode's window
+    admission, though the decode's own arena holds two."""
+    w = build_world(tp_size=1)
+    d = w.decodes[0]
+    d.admission = StagingAdmission(d.max_blocks, 2 * WINDOW_PAGES)
+    for s in w.stages:
+        s.admission = StagingAdmission(4 * s.max_blocks, WINDOW_PAGES)
+    w.fa.auto_land = w.swa.auto_land = False
+    other = ROOM + 1
+    for room in (ROOM, other):
+        d.register_decode(room, DST_FULL[:3], DST_SWA, None, w.infos)
+    w.pump()
+    for room in (ROOM, other):
+        for s in w.stages:
+            with s.manager._state_lock:
+                s.manager._prefill.send_blocks[room] = [10, 11, 12]
+                s.manager._prefill.send_swa_blocks[room] = [6, 4]
+            assert s.finalize_send(room, None)
+    w.pump()
+    assert d.admission.swa_capacity == WINDOW_PAGES
+    assert d.maybe_start_pull(ROOM) is True
+    assert d.maybe_start_pull(other) is False  # waits for the producer's window
+
+
+def test_short_rooms_share_one_full_attention_slot():
+    """Bounded staging leases a transfer only its own pages, so two short rooms
+    move together within one max-length full-attention slot instead of the
+    second waiting for the first to land."""
+    w = build_world(tp_size=1)
+    d = w.decodes[0]
+    d.admission = StagingAdmission(d.max_blocks, 2 * WINDOW_PAGES)
+    w.fa.auto_land = w.swa.auto_land = False
+    other = ROOM + 1
+    for room in (ROOM, other):
+        d.register_decode(room, DST_FULL[:3], DST_SWA, None, w.infos)
+    w.pump()
+    for room in (ROOM, other):
+        for s in w.stages:
+            with s.manager._state_lock:
+                s.manager._prefill.send_blocks[room] = [10, 11, 12]
+                s.manager._prefill.send_swa_blocks[room] = [6, 4]
+            assert s.finalize_send(room, None)
+    w.pump()
+    assert d.maybe_start_pull(ROOM) is True
+    assert d.maybe_start_pull(other) is True
+    assert ids(w.fa) == [str(ROOM), str(other)]
+    assert (d.admission.pages(), d.admission.swa_pages()) == (6, 4)
+
+
 def test_twin_coordination_is_retried_while_its_registration_is_missing():
     w = build_world(tp_size=1)
     d = w.decodes[0]
@@ -1159,23 +1212,28 @@ def test_hybrid_worker_builds_a_window_engine_beside_the_full_one():
     assert swa_addr == pipe.side.controller != fa_addr
     assert swa_unit["unit"].job_replica_id == pipe.side.controller
     assert swa_unit["transfer_rank"] == fa_unit["transfer_rank"] == 0
-    # The window engine sizes its slots in pairs with full-attention ones and
-    # takes its staging out of the rank's budget first.
+    # The window engine prices each slot with a WINDOW_SLOTS_PER_FULL_SLOT
+    # share of a full-attention slot and takes its staging out of the rank's
+    # budget first.
     swa_call, fa_call = r.slot_calls
     assert swa_call[1:3] == (3, 1) and fa_call[1] == 64
-    assert swa_call[4] == slot_host_bytes(groups.full, 64)
+    assert swa_call[4] == slot_host_bytes(groups.full, 64) // WINDOW_SLOTS_PER_FULL_SLOT
     assert fa_call[3:] == (4 * slot_host_bytes(groups.swa, 3), 0)
     # A twin's window pages are admitted with its full-attention transfer.
     assert (pipe.admission.capacity, pipe.admission.swa_capacity) == (6 * 64, 4 * 3)
 
 
-@pytest.mark.parametrize("budget_mib, slots", [(128, (7, 7)), (143.75, (8, 7))])
-def test_window_engine_never_has_more_slots_than_the_full_attention_one(
-    budget_mib, slots, monkeypatch
-):
-    """A full-attention slot stages 16 MiB and a window slot 2.25 MiB. 128 MiB
-    affords 7 pairs; 143.75 MiB leaves the full-attention engine one more
-    slot, which early parts use without a twin."""
+@pytest.mark.parametrize(
+    "budget_mib, slots",
+    [(128, (3, 30)), (143.75, (4, 33)), (24, (1, 3)), (20, (1, 1))],
+)
+def test_window_engine_is_priced_by_its_own_pages(budget_mib, slots, monkeypatch):
+    """A full-attention slot stages 16 MiB and a window slot 2.25 MiB. Rooms
+    share full-attention slots by pages, so each window slot is priced with an
+    eighth of a full-attention slot, 2.25 + 2 = 4.25 MiB: 128 MiB affords 30
+    window slots and 3 full-attention slots. Near the minimum, window slots
+    leave room for one full-attention slot: 24 MiB affords 3 window slots,
+    where their price alone would afford 5."""
     monkeypatch.setenv("SGLANG_RAIDEN_HOST_POOL_GB", str(budget_mib / 1024))
     r = _initialize(hybrid_groups(), real_budget=True)
     assert r.error is None
