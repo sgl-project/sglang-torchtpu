@@ -483,6 +483,9 @@ def moe_gmm_local_rs_nodedup(
     pair_send_bucket = (
         bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET.get()
     )
+    pair_src_table = (
+        bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE.get()
+    )
     gather_in_gmm1 = (
         tpu_envs.SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1.get() if expert_tp else 0
     )
@@ -529,6 +532,7 @@ def moe_gmm_local_rs_nodedup(
         q8_tree=q8_tree,
         pair_mask_offsets=pair_mask_offsets,
         pair_send_bucket=pair_send_bucket,
+        pair_src_table=pair_src_table,
         gather_in_gmm1=gather_in_gmm1,
     )
 

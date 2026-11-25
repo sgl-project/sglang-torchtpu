@@ -739,6 +739,9 @@ class TpuEnvs:
     # row bucket, issued at the end of the GMM2 bucket branch (the ring slot is private to
     # the tile; the rows past the tile are never read) instead of power-of-two pieces.
     SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET = EnvBool(False)
+    # With Q8_IN_GMM1: each (tile, owner) run's first row in the tile comes from a table built
+    # with the routing metadata instead of an in-kernel sum over the lower owners' runs.
+    SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

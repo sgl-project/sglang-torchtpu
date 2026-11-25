@@ -561,6 +561,7 @@ def kernel_main_fused_rs(
     q8_tree: bool = False,  # q8 blocks of 8 rows, row maxima by a sublane tree
     pair_mask_offsets: bool = False,  # grouped pair-path DMA sites (see _send_grouped)
     pair_send_bucket: bool = False,  # sibling send: one bucket-sized DMA from GMM2
+    pair_src_table: bool = False,  # run start rows from a metadata table
     gather_in_gmm1: int = 0,  # first rows of tile g + 1's gather issued inside GMM1(g)
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
@@ -1311,6 +1312,13 @@ def kernel_main_fused_rs(
         row0 = metadata_ref.gm_id_to_m_offset[g] % _sls_pair
 
         def src_off(d):
+            if pair_src_table:  # the table holds row0 + the lower owners' rows
+                return (
+                    group_start_ref[
+                        pair_meta_base + 2 * pair_meta_stride + g * ep_size + d
+                    ]
+                    - row0
+                )
             acc = jnp.int32(0)
             for e in range(ep_size):
                 acc = acc + jnp.where(e < d, lens[e], 0)
@@ -2657,6 +2665,8 @@ def _pair_exchange_metadata(
     ep_size: int,
     num_slots: int,
     num_blocks: int,
+    src_table: bool = False,
+    sls: int = 16,
 ) -> tuple[jax.Array, int, int]:
     """Append per-(tile, owner) run lengths and ranks to the local-rows metadata.
 
@@ -2703,6 +2713,13 @@ def _pair_exchange_metadata(
     meta = jnp.concatenate([head, run_len.reshape(-1), run_rank.reshape(-1)]).astype(
         jnp.int32
     )
+    if src_table:  # each run's first row in its tile: row0 + rows of the lower owners
+        start = (
+            (m_offset[:num_slots] % sls)[:, None]
+            + jnp.cumsum(run_len, axis=1)
+            - run_len
+        )
+        meta = jnp.concatenate([meta, start.reshape(-1).astype(jnp.int32)])
     return meta, base, stride
 
 
@@ -2739,6 +2756,7 @@ def _pair_exchange_metadata(
         "q8_tree",
         "pair_mask_offsets",
         "pair_send_bucket",
+        "pair_src_table",
         "gather_in_gmm1",
     ],
 )
@@ -2787,6 +2805,7 @@ def gmm_v2_fused_rs(
     gather_in_gmm1: int = 0,
     pair_mask_offsets: bool = False,
     pair_send_bucket: bool = False,
+    pair_src_table: bool = False,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3393,6 +3412,8 @@ def gmm_v2_fused_rs(
             num_slots=max_num_gm_static,
             # each cross-chip piece also carries its row scales
             num_blocks=num_pair_blocks + (ep_size // 2 - 1 if pair_fp8_rows else 0),
+            src_table=pair_src_table,
+            sls=pltpu.get_tpu_info().get_sublane_tiling(out_dtype),
         )
         out_buf_init = jax.ShapeDtypeStruct(
             (num_pair_blocks * chunk_size * (top_k // ep_size), n2_cols, num_lanes),
@@ -3468,6 +3489,7 @@ def gmm_v2_fused_rs(
         kernel_kwargs["q8_tree"] = q8_tree
         kernel_kwargs["pair_mask_offsets"] = pair_mask_offsets
         kernel_kwargs["pair_send_bucket"] = pair_send_bucket
+        kernel_kwargs["pair_src_table"] = pair_src_table
     if gather_in_gmm1:
         if not expert_tp:
             raise ValueError("gather_in_gmm1 needs expert TP")
