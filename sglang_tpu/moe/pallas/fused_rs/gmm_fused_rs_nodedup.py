@@ -559,6 +559,7 @@ def kernel_main_fused_rs(
     skip_row_mask: bool = False,  # rows outside the tile stay unzeroed (never sent)
     q8_in_gmm1: int = 0,  # leading q8 blocks per forwarded run of tile g - 2 done in GMM1(g)
     q8_tree: bool = False,  # q8 blocks of 8 rows, row maxima by a sublane tree
+    pair_mask_offsets: bool = False,  # grouped pair-path DMA sites (see _send_grouped)
     gather_in_gmm1: int = 0,  # first rows of tile g + 1's gather issued inside GMM1(g)
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
@@ -1354,6 +1355,36 @@ def kernel_main_fused_rs(
 
     stg_of = [None]  # staging slot whose send semaphore the pieces signal
 
+    def _send_grouped(run_len, src, dst, pairs, dev):
+        """_send_pieces for several (src_ref, dst_ref) pairs under one predicate per piece;
+        offsets by masking (largest piece first), pieces >= 64 rows behind one branch."""
+
+        def site(b):
+            off = run_len & ~(2 * b - 1)
+
+            @pl.when((run_len & b) != 0)
+            def _():
+                for s_ref, d_ref in pairs:
+                    pltpu.make_async_remote_copy(
+                        src_ref=s_ref.at[pl.ds(src + off, b)],
+                        dst_ref=d_ref.at[pl.ds(dst + off, b)],
+                        send_sem=send_sems_ref.at[stg_of[0]],
+                        recv_sem=recv_sem_ref.at[0],
+                        device_id={ep_axis_name: dev},
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+        @pl.when(run_len >= 64)
+        def _():
+            for b in pair_pieces:
+                if b >= 64:
+                    site(b)
+
+        for b in pair_pieces:
+            if b < 64:
+                site(b)
+        return _pair_count_pieces(run_len) * len(pairs)
+
     @jax.named_scope("pair_finish_local")
     def _pf_local(g):
         """Tile g's own and sibling runs: one core's partial, straight from staging."""
@@ -1364,6 +1395,15 @@ def kernel_main_fused_rs(
         sent = jnp.int32(0)
         for d, block in ((my_id, 0), (jnp.bitwise_xor(my_id, 1), 1)):
             rank = group_start_ref[pair_meta_base + pair_meta_stride + g * ep_size + d]
+            if pair_mask_offsets:
+                sent = sent + _send_grouped(
+                    group_start_ref[base + d],
+                    row0 + src_off(d),
+                    block * rows_per_block + rank,
+                    [(scatter_staging_3x_ref.at[stg], out_buf_ref)],
+                    d,
+                )
+                continue
             sent = sent + _send_pieces(
                 group_start_ref[base + d],
                 row0 + src_off(d),
@@ -1395,6 +1435,18 @@ def kernel_main_fused_rs(
             block = 1 + (num_chips - k) % num_chips
             rank = group_start_ref[pair_meta_base + pair_meta_stride + g * ep_size + d]
             q_dst = (block - 2) * rows_per_block + rank
+            if pair_mask_offsets:
+                sent = sent + _send_grouped(
+                    n,
+                    r_run,
+                    q_dst,
+                    [
+                        (pair_q8_ref.at[stg], out_q8_ref),
+                        (pair_qs_ref.at[stg], out_qs_ref),
+                    ],
+                    d,
+                )
+                continue
             sent = sent + _send_pieces(
                 n, r_run, q_dst, pair_q8_ref.at[stg], out_q8_ref, d
             )
@@ -2660,6 +2712,7 @@ def _pair_exchange_metadata(
         "lean_epilogue",
         "q8_in_gmm1",
         "q8_tree",
+        "pair_mask_offsets",
         "gather_in_gmm1",
     ],
 )
@@ -2706,6 +2759,7 @@ def gmm_v2_fused_rs(
     q8_in_gmm1: int = 0,
     q8_tree: bool = False,
     gather_in_gmm1: int = 0,
+    pair_mask_offsets: bool = False,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3385,6 +3439,7 @@ def gmm_v2_fused_rs(
             raise ValueError("q8_in_gmm1 needs the e4m3 pair path")
         kernel_kwargs["q8_in_gmm1"] = q8_in_gmm1
         kernel_kwargs["q8_tree"] = q8_tree
+        kernel_kwargs["pair_mask_offsets"] = pair_mask_offsets
     if gather_in_gmm1:
         if not expert_tp:
             raise ValueError("gather_in_gmm1 needs expert TP")

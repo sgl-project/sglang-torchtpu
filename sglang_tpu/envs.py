@@ -732,6 +732,9 @@ class TpuEnvs:
     # Fused-RS expert TP: the first N row gathers of tile g + 1 are issued inside GMM1(g)'s
     # straight-line code (co-issued with the matmul) instead of in a scalar loop before it.
     SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1 = EnvInt(0)
+    # e4m3 pair path: piece offsets by masking the run length (no running sum), the q8 and
+    # scale DMAs of a piece under one predicate, pieces >= 64 rows behind one branch.
+    SGLANG_TPU_FUSED_RS_PAIR_MASK_OFFSETS = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
