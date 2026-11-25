@@ -451,6 +451,13 @@ def direct_all_gather_start(buf, me, tp: int, ssem, rsem):
 def pair_all_gather_start(buf, me, ssem, psem):
     """pair (tp 8): own block to the partner and to the same core of the 3 other chips; the
     wait relays each other chip's block to the partner on arrival. psem[k] counts block k."""
+    fold = pair_all_gather_fold_start(buf, me, ssem, psem)
+    return lambda: fold(None)
+
+
+def pair_all_gather_fold_start(buf, me, ssem, psem):
+    """pair_all_gather_start whose wait takes consume(k), called on each block k once it is in
+    buf[k]: own block first, then the other chips' (direct), the partner's, the relayed ones."""
     topo = Topo(me)
 
     def send(k, peer):
@@ -470,13 +477,21 @@ def pair_all_gather_start(buf, me, ssem, psem):
     for k in far:
         send(me, k)
 
-    def wait():
+    def wait(consume=None):
+        def got(k):
+            if consume is not None:
+                consume(k)
+
+        got(me)
         for k in far:
             arrived(k)
             send(k, topo.partner)
+            got(k)
         arrived(topo.partner)
+        got(topo.partner)
         for k in far:
             arrived(jnp.bitwise_xor(k, 1))
+            got(jnp.bitwise_xor(k, 1))
         _count_wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), 7)
 
     return wait

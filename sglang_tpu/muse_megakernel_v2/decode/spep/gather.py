@@ -19,9 +19,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel_v2.common.coll import (
     _count_wait,
     direct_all_gather_start,
+    pair_all_gather_fold_start,
     pair_all_gather_start,
 )
 from sglang_tpu.muse_megakernel_v2.common.config import MKConfig
@@ -31,6 +33,7 @@ from sglang_tpu.muse_megakernel_v2.common.numerics import _rms
 from sglang_tpu.muse_megakernel_v2.common.packing import _pack_bf16x2, _unpack_bf16x2
 from sglang_tpu.muse_megakernel_v2.decode.spep import route
 from sglang_tpu.muse_megakernel_v2.decode.spep.config import (
+    DN_TK,
     TP_SCRATCH_UNUSED,
     EPPlan,
     ep_buffers,
@@ -39,6 +42,7 @@ from sglang_tpu.muse_megakernel_v2.decode.spep.config import (
     o_bufs,
 )
 from sglang_tpu.muse_megakernel_v2.decode.spep.dense import (
+    _tile_copies,
     stream_matmul,
     stream_prefetch,
 )
@@ -105,9 +109,9 @@ class EPGatherExperts:
             c.hidden_local,
         )
         with _phase("u_rs"):
-            _u_reduce(step)
+            uag_fold = _u_reduce(step)
         with _phase("unpool"):
-            _unpool(step)
+            _unpool(step, uag_fold)
         nsmr = None if step.next_smalls is None else step.next_smalls()
         with _phase("residual"):
             _ffn_residual(step, nsmr)
@@ -188,6 +192,25 @@ def _all_gather_start(c: MKConfig, S: dict, me, buf, ph: int) -> Callable[[], No
     def waited() -> None:
         with _phase(_PH_NAMES[ph] + "_wait"):
             wait()
+
+    return waited
+
+
+def _unpool_fold(c: MKConfig) -> bool:
+    return _pair_ag(c) and tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get()
+
+
+def _all_gather_fold_start(c: MKConfig, S: dict, me, buf, ph: int):
+    """_all_gather_start whose wait takes consume(k) per arrived block (pair collectives)."""
+    assert _pair_ag(c)
+    with _phase(_PH_NAMES[ph]):
+        fold = pair_all_gather_fold_start(
+            buf, me, S["eg_ssems"].at[ph], S["eg_psems"].at[ph]
+        )
+
+    def waited(consume) -> None:
+        with _phase(_PH_NAMES[ph] + "_fold"):
+            fold(consume)
 
     return waited
 
@@ -550,7 +573,7 @@ def _pool(step: EPLayerStep, overlap: Callable[[], None]) -> Callable[[], None]:
     return tail
 
 
-def _u_reduce_pair(step: EPLayerStep) -> None:
+def _u_reduce_pair(step: EPLayerStep):
     """eg_uag as _u_reduce, on a quarter of its cross-chip bytes (paired on chip)."""
     c, S, me = step.c, step.S, step.me
     He = c.expert_hidden
@@ -612,15 +635,17 @@ def _u_reduce_pair(step: EPLayerStep) -> None:
         uag.at[me][rows, :] = _pack_bf16x2(tot)
 
     _for_tiles(c, total)
+    if _unpool_fold(c):
+        return _all_gather_fold_start(c, S, me, uag, PH_UAG)
     _all_gather(c, S, me, uag, PH_UAG)
+    return None
 
 
-def _u_reduce(step: EPLayerStep) -> None:
+def _u_reduce(step: EPLayerStep):
     """eg_uag: u = bf16(sum over ranks of eg_u), column block m summed on rank m, then
-    all-gathered."""
+    all-gathered. Returns the all-gather's fold wait when the unpool folds it, else None."""
     if _pair_ag(step.c):
-        _u_reduce_pair(step)
-        return
+        return _u_reduce_pair(step)
     c, S, me = step.c, step.S, step.me
     tp, He = c.tp, c.expert_hidden
     W = He // tp
@@ -655,8 +680,41 @@ def _u_reduce(step: EPLayerStep) -> None:
     _all_gather(c, S, me, uag, PH_UAG)
 
 
-def _unpool(step: EPLayerStep) -> None:
-    """eg_fag: every owner's H / tp unpool columns of every row (bf16 pairs)."""
+def _unpool_folded(step: EPLayerStep, uag_fold) -> None:
+    """_unpool's matmul over the u all-gather's blocks in arrival order: block d is u's K
+    columns [d * W, (d + 1) * W), rows (d % per_tile) * W of unpool K tile d // per_tile."""
+    c, S, me = step.c, step.S, step.me
+    He, Hl = c.expert_hidden, c.hidden_local
+    W = He // c.tp
+    per_tile = DN_TK // W
+    ring = S["w13"]
+    copy, tiles = _tile_copies(S, step.W["wunpool"], step.layer, He, Hl, me * Hl, Hl)
+    # stream_prefetch (layer_moe) started the first nslot - 1 tiles; each needs its own slot
+    nslot = ring.shape[0]
+    assert len(tiles) <= nslot, (len(tiles), nslot)
+    for t in range(nslot - 1, len(tiles)):
+        copy(t).start()
+    for t in range(len(tiles)):
+        copy(t).wait()
+    uag, acc = S["eg_uag"], []
+
+    def consume(d):
+        x = _unpack_bf16x2(uag[d]).astype(bf16)
+        r0 = pl.multiple_of(jax.lax.rem(d, per_tile) * (W // 4), W // 4)
+        w = pltpu.bitcast(
+            ring.at[jax.lax.div(d, per_tile)][pl.ds(r0, W // 4), pl.ds(0, Hl)],
+            jnp.float8_e4m3fn,
+        )
+        part = jnp.dot(x, w, preferred_element_type=f32)
+        acc.append(part if not acc else acc.pop() + part)
+
+    uag_fold(consume)
+    S["eg_fag"].at[me][...] = _pack_bf16x2(acc[0] * S["eg_sc"][pl.ds(1, 1), :])
+
+
+def _unpool(step: EPLayerStep, uag_fold=None) -> None:
+    """eg_fag: every owner's H / tp unpool columns of every row (bf16 pairs). uag_fold: the u
+    all-gather is still in flight; its blocks are consumed as they land."""
     c, S, smr, me = step.c, step.S, step.smr, step.me
     He, Hl, tp = c.expert_hidden, c.hidden_local, c.tp
     W = He // tp
@@ -666,6 +724,10 @@ def _unpool(step: EPLayerStep) -> None:
         S["eg_sc"].at[pl.ds(1, 1), :],
     )
     uag, fag = S["eg_uag"], S["eg_fag"]
+    if uag_fold is not None:
+        _unpool_folded(step, uag_fold)
+        _all_gather(c, S, me, fag, PH_FAG)
+        return
 
     def x_cols(k0, n):
         return jnp.concatenate(
