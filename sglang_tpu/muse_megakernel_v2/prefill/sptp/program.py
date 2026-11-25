@@ -215,6 +215,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
             exact_cast=os.environ.get("SPTP_XAG_RNE", "0") == "1",
             w_start=int(os.environ.get("SPTP_XAG_WSTART", "0")),
             m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "1")),
+            dma_split=int(os.environ.get("SPTP_XAG_DSPLIT", "1")),
+            n_tail=os.environ.get("SPTP_XAG_NTAIL", "0") == "1",
         )
         for r in (True, False)
     }

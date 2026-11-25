@@ -132,6 +132,51 @@ def _pipeline(stages: tuple, order: tuple, nt: int, gap: int) -> None:
     jax.lax.fori_loop(0, n_it, body, 0)
 
 
+class _Copies:
+    """Several remote copies on one semaphore pair, started and waited together."""
+
+    def __init__(self, cps):
+        self.cps = cps
+
+    def start(self):
+        for cp in self.cps:
+            cp.start()
+
+    def wait_recv(self):
+        for cp in self.cps:
+            cp.wait_recv()
+
+    def wait_send(self):
+        for cp in self.cps:
+            cp.wait_send()
+
+
+class _SplitColl(GridColl):
+    """GridColl whose row-block copies go as n column slices: one DMA stream per block moved
+    a 256 KB block at about half the link rate."""
+
+    def __init__(self, tp, me, sems, n: int, width: int):
+        super().__init__(tp, me, sems)
+        self.n, self.width = n, width
+
+    def _cp(self, kind, slot, src, dst, peer):
+        if self.n == 1 or src.shape[-1] != self.width:
+            return super()._cp(kind, slot, src, dst, peer)
+        w = self.width // self.n
+        return _Copies(
+            [
+                super(_SplitColl, self)._cp(
+                    kind,
+                    slot,
+                    src.at[:, pl.ds(i * w, w)],
+                    dst.at[:, pl.ds(i * w, w)],
+                    peer,
+                )
+                for i in range(self.n)
+            ]
+        )
+
+
 class _RowBlocks:
     """pad [S, tp * seg, W] seen as GridColl's [S, tp] blocks: block (s, r) = rows of rank r."""
 
@@ -171,6 +216,8 @@ def xag_qkvg_call(
     gate4: bool = False,
     w_start: int = 0,
     m_split: int = 1,
+    dma_split: int = 1,
+    n_tail: bool = False,
 ):
     """(layer [1] i32, x8 [Ts, H] e4m3 own rows, xs [T, 1] f32 every row's scale, rope [T, 2 hd]
     f32, stacked wqkvg [L, H, nq] e4m3 and smalls [L, 16, H] f32) -> (q, kv [T, 2 kvd], gate
@@ -231,8 +278,12 @@ def xag_qkvg_call(
         else:
             xin_v, sc_pad, coll_sems = None, None, rest
         me = jax.lax.axis_index(axis).astype(jnp.int32)
-        col = GridColl(
-            tp, me, {k: coll_sems[2 * i : 2 * i + 2] for i, k in enumerate(kinds)}
+        col = _SplitColl(
+            tp,
+            me,
+            {k: coll_sems[2 * i : 2 * i + 2] for i, k in enumerate(kinds)},
+            dma_split,
+            H,
         )
         blocks = _RowBlocks(pad, seg)
         kp = (("x", blocks),) + ((("xsc", sc_pad),) if fuse_norm else ())
@@ -364,6 +415,30 @@ def xag_qkvg_call(
             for cp in in_loads(j):
                 cp.start()
 
+        def kdot(x, w):
+            acc = None
+            for k0 in range(0, H, kc):
+                part = jnp.dot(
+                    x[:, k0 : k0 + kc],
+                    w[k0 : k0 + kc, :],
+                    preferred_element_type=jnp.float32,
+                )
+                acc = part if acc is None else acc + part
+            return acc
+
+        def qk_dot(pad, s, r0, hm):
+            x = pad[s, r0 : r0 + hm, :]
+            if not n_tail:
+                return kdot(x, w_v[...])
+            # the last 256-column block as two row halves: 9 blocks split 5:4 over the 2 MXUs
+            nm = nq - 256
+            head = kdot(x, w_v[:, :nm])
+            h2 = hm // 2
+            tail = jnp.concatenate(
+                [kdot(x[:h2], w_v[:, nm:]), kdot(x[h2:], w_v[:, nm:])], axis=0
+            )
+            return jnp.concatenate([head, tail], axis=1)
+
         def s3(j):
             s, b = j % n_slots, j % 2
 
@@ -390,14 +465,7 @@ def xag_qkvg_call(
                 for h in range(m_split):
                     r0 = h * hm
                     with sc("qk_dot"):
-                        acc = None
-                        for k0 in range(0, H, kc):
-                            part = jnp.dot(
-                                pad[s, r0 : r0 + hm, k0 : k0 + kc],
-                                w_v[k0 : k0 + kc, :],
-                                preferred_element_type=jnp.float32,
-                            )
-                            acc = part if acc is None else acc + part
+                        acc = qk_dot(pad, s, r0, hm)
                         qkvg = (
                             acc
                             * xs_all[r0 : r0 + hm]
@@ -463,7 +531,7 @@ def xag_qkvg_call(
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     q_shape = (kvh, T, gq, 128) if q_rpa else (T, qd)
     name = (
-        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}"
+        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}{f'_ds{dma_split}' if dma_split > 1 else ''}{'_nt' if n_tail else ''}"
         f"{'_mxun' if mxu_norm else ''}{'_qrpa' if q_rpa else ''}{'_norm' if fuse_norm else ''}"
     )
 
