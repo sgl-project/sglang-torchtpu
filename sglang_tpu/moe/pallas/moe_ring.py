@@ -53,9 +53,19 @@ _SLOTS = 4
 # DMAs per expert's w1 / w2 (split along their leading weight dim).
 _W1_CHUNKS = 2
 _W2_CHUNKS = 1
-# Rows per compute tile by expert pair count: up to 8 pairs one 8-row tile, up
-# to 16 one 16-row tile, more in 32-row tiles.
+# Row-tile sizes. The kernel runs one expert on a fixed-size batch of rows (a
+# "row tile"): it gathers the rows routed to that expert into a small buffer and
+# runs both matmuls on it. The buffer shape must be static, so the size is picked
+# from this list by how many rows the expert has:
+#   1-8 rows: one 8-row tile; 9-16 rows: one 16-row tile;
+#   more: ceil(rows / 32) tiles of 32 rows.
+# A tile's unused rows repeat its last real row and are not added to the output.
+# Small tiles matter because a small batch gives most experts only a few rows, so a
+# single large tile would mostly compute padding; the largest size bounds the
+# gather buffers' VMEM. The kernel has one loop per size.
 _TILE_ROWS = (8, 16, 32)
+# Bytes of one VMEM tile: [8, 128] f32, [16, 128] bf16 or [32, 128] fp8.
+_VMEM_TILE_BYTES = 4096
 
 
 def _vmem_need(
@@ -132,10 +142,27 @@ def fit_moe_ring(
     return _vmem_limit(tokens, hidden, n, slots, tile_rows, info) is not None
 
 
-def _route(topk_ids, topk_weights, num_experts):
-    """Expert-major pairs: per expert its pair count and first pair, and per
-    pair (sorted by expert, then slot) its token and f32 routing weight. Ids
-    outside [0, E) are never referenced."""
+def _route(
+    topk_ids: jax.Array, topk_weights: jax.Array, num_experts: int
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Groups the (token, expert) pairs by expert, in XLA, before the kernel.
+
+    Every token has k pairs, one per expert it was routed to. The kernel wants
+    them listed expert by expert, so that one expert's rows are contiguous.
+
+    Args:
+      topk_ids: int [T, k]. Expert id of each pair. Ids outside [0, E) are
+        padding: they are listed after every real pair and never read.
+      topk_weights: [T, k]. Routing weight of each pair.
+      num_experts: E.
+
+    Returns:
+      counts: int32 [E]. Number of pairs of each expert.
+      offsets: int32 [E]. Where each expert's pairs start in the list.
+      tok: int32 [T * k]. Token of each pair, in list order (by expert, then by
+        the pair's original position).
+      wt: f32 [T * k]. Routing weight of each pair, in list order.
+    """
     tokens, k = topk_ids.shape
     p = tokens * k
     ids = topk_ids.reshape(p).astype(jnp.int32)
@@ -162,11 +189,34 @@ def _route(topk_ids, topk_weights, num_experts):
     return counts.astype(jnp.int32), offsets.astype(jnp.int32), tok, wt
 
 
-def _gate_up(xq, xs, w_ref, s_row, *, limit):
-    """gmm_v2's fused GMM1 on pre-quantized rows: per 512-column block an fp8
-    dot rounded to bf16, scaled by the x block scale then the weight scale and
-    summed in bf16; then fused_moe's clamped SiLU. xq [M, H] f32 (fp8 values),
-    xs list of [M, lanes] f32 block scales, w_ref [H, 2n] fp8. Returns [M, n] bf16."""
+def _gate_up(
+    xq: jax.Array,
+    xs: list[jax.Array],
+    w_ref: jax.Array,
+    s_row: jax.Array,
+    *,
+    limit: float | None,
+) -> jax.Array:
+    """First matmul of one expert on one row tile, then the activation.
+
+    Computes x @ w1 the way gmm_v2 does, so the result is bit-identical. The H
+    input columns are split into blocks of _Q_BLOCK (512). Each block's fp8 x
+    fp8 product is rounded to bf16, multiplied by that block's x scale and by
+    the weight's per-column scale, and the blocks are summed in bf16. The 2n
+    outputs are a gate half and an up half; the result is
+    silu(min(gate, limit)) * clip(up, -limit, limit).
+
+    Args:
+      xq: f32 [M, H]. The tile's rows, already quantized to fp8 values.
+      xs: H / 512 arrays, f32 [M, lanes]. Each row's scale for each block,
+        repeated across one lane group.
+      w_ref: VMEM fp8 [H, 2n]. The expert's gate/up weights.
+      s_row: f32 [1, 2n]. Their per-column scales.
+      limit: SiLU clamp limit, or None for no clamp.
+
+    Returns:
+      bf16 [M, n].
+    """
     m, h = xq.shape
     two_n = w_ref.shape[1]
     n = two_n // 2
@@ -193,14 +243,27 @@ def _gate_up(xq, xs, w_ref, s_row, *, limit):
     )
 
 
-def _down(h, w_ref, s_row):
-    """gmm_v2's GMM2 for K <= 512: one quantization block. h [M, n] bf16,
-    w_ref [n, H] fp8. Returns [M, H] bf16."""
+def _down(mid: jax.Array, w_ref: jax.Array, s_row: jax.Array) -> jax.Array:
+    """Second matmul of one expert on one row tile: mid @ w2.
+
+    gmm_v2 quantizes a matmul's input to fp8 with one scale per row per 512
+    columns (its lhs_quant_block_size). Here each row gets a single scale over
+    all n columns, which is the same thing only while n <= 512. fit_moe_ring
+    refuses wider experts, so this is never called with n > 512.
+
+    Args:
+      mid: bf16 [M, n]. Output of _gate_up.
+      w_ref: VMEM fp8 [n, H]. The expert's down weights.
+      s_row: f32 [1, H]. Their per-column scales.
+
+    Returns:
+      bf16 [M, H].
+    """
     sdt = jnp.float32 if _FP32_MOE_SCALES else jnp.bfloat16
-    scale = jnp.max(jnp.abs(h), axis=1, keepdims=True) / _FP8_MAX
+    scale = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / _FP8_MAX
     inv = jnp.where(scale == 0, 0, 1 / scale)
     part = jax.lax.dot_general(
-        (h * inv).astype(jnp.float8_e4m3fn),
+        (mid * inv).astype(jnp.float8_e4m3fn),
         w_ref[...],
         (((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
@@ -277,7 +340,10 @@ def _kernel(
     h1 = h // w1_chunks
     n2 = n // w2_chunks
 
-    def copies(i, slot):
+    def weight_copies(i: int | jax.Array, slot: int | jax.Array) -> list:
+        """The DMAs that copy the i-th hit expert's weights and scales from HBM
+        into ring slot `slot`: w1 in w1_chunks pieces, its scale, w2 in
+        w2_chunks pieces, its scale. Each has its own semaphore."""
         e = active_ref[i]
         out = []
         for c in range(w1_chunks):
@@ -310,12 +376,14 @@ def _kernel(
         )
         return out
 
-    def start(lo, hi):
+    def start_dma(lo: jax.Array | int, hi: jax.Array | int) -> None:
+        """Starts the weight copies of hit experts lo..hi-1 that belong to the
+        first slots - 1 experts (the ones in flight before the loop starts)."""
         for s in range(slots - 1):
 
             @pl.when((s >= lo) & (s < hi))
             def _(s=s):
-                for cp in copies(s, s):
+                for cp in weight_copies(s, s):
                     cp.start()
 
     # Hit experts grouped by pair-count class: class k takes counts in
@@ -337,9 +405,9 @@ def _kernel(
         count = jax.lax.fori_loop(0, num_experts, compact, count)
         ends.append(count)
         if k == 0:
-            start(0, count)
+            start_dma(0, count)
     n_u = count
-    start(ends[0], n_u)
+    start_dma(ends[0], n_u)
 
     # x quantized once, as gmm_v2 quantizes each lhs block (bf16 scale and
     # inverse, no clip), while the first experts' weights are in flight.
@@ -353,8 +421,15 @@ def _kernel(
         xs_ref[b] = jnp.broadcast_to(scale.astype(jnp.float32), (t, lanes))
     acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def tile(slot, base, rem, tm):
-        """Rows [base, base + min(rem, tm)) of the pair list through one expert."""
+    def run_expert_tile(
+        slot: jax.Array, base: jax.Array, rem: jax.Array, tm: int
+    ) -> None:
+        """Runs one row tile of the expert in ring slot `slot`: gathers pairs
+        base .. base + min(rem, tm) - 1 of the pair list into a tm-row buffer,
+        runs gate/up, the activation and down on it, and adds each real row's
+        output times its routing weight into acc_ref. `rem` is how many of the
+        expert's pairs are left from `base`; rows past it repeat the last pair
+        and are not added."""
         for j in range(tm):
             tj = tok_ref[base + jnp.minimum(j, rem - 1)]
             xg_ref[pl.ds(j, 1), :] = xq_ref[pl.ds(tj, 1), :]
@@ -376,29 +451,33 @@ def _kernel(
                 tj = tok_ref[p]
                 acc_ref[pl.ds(tj, 1), :] += y[j : j + 1, :] * wt_ref[p]
 
-    def ring_loop(lo, hi, tm, multi):
+    def ring_loop(lo: jax.Array, hi: jax.Array, tm: int, multi: bool) -> None:
+        """Runs hit experts lo..hi-1, all of one tile size tm. Per expert: start
+        the copies of the expert slots - 1 ahead, wait for this expert's copies,
+        then run its row tiles (several when `multi`, else exactly one)."""
+
         def body(i, carry):
             slot = i % slots
 
             @pl.when(i + slots - 1 < n_u)
             def _():
                 nxt = i + slots - 1
-                for cp in copies(nxt, nxt % slots):
+                for cp in weight_copies(nxt, nxt % slots):
                     cp.start()
 
-            for cp in copies(i, slot):
+            for cp in weight_copies(i, slot):
                 cp.wait()
             e = active_ref[i]
             off, cnt = offsets_ref[e], counts_ref[e]
             if multi:
 
                 def more(r, c2):
-                    tile(slot, off + r * tm, cnt - r * tm, tm)
+                    run_expert_tile(slot, off + r * tm, cnt - r * tm, tm)
                     return c2
 
                 jax.lax.fori_loop(0, pl.cdiv(cnt, tm), more, 0)
             else:
-                tile(slot, off, cnt, tm)
+                run_expert_tile(slot, off, cnt, tm)
             return carry
 
         jax.lax.fori_loop(lo, hi, body, 0)
@@ -425,9 +504,26 @@ def moe_ring(
     w2_chunks: int = _W2_CHUNKS,
     tile_rows: tuple[int, ...] = _TILE_ROWS,
 ) -> jax.Array:
-    """x [T, H] bf16; ids / weights [T, k]; w1 [E, H, 2n] / w2 [E, n, H] FP8
-    with per-channel f32 scales [E, 1, 1, 2n] / [E, 1, 1, H]. Returns [T, H].
-    Ids outside [0, E) contribute nothing."""
+    """The routed-expert output of one MoE call: sum over each token's k experts
+    of weight * expert(x).
+
+    Args:
+      x: bf16 [T, H]. Input rows.
+      topk_ids: int [T, k]. Experts of each token; ids outside [0, E) add nothing.
+      topk_weights: [T, k]. Their routing weights.
+      w1: fp8 [E, H, 2n]. Gate/up weights.
+      w1_scale: f32 [E, 1, 1, 2n]. Their per-column scales.
+      w2: fp8 [E, n, H]. Down weights.
+      w2_scale: f32 [E, 1, 1, H]. Their per-column scales.
+      clamp_limit: SiLU clamp limit, or None.
+      slots: weight ring depth; slots - 1 experts are copied ahead.
+      w1_chunks: DMAs per expert's w1 (split along H).
+      w2_chunks: DMAs per expert's w2 (split along n).
+      tile_rows: row-tile sizes, see _TILE_ROWS.
+
+    Returns:
+      [T, H], x's dtype.
+    """
     tokens, hidden = x.shape
     num_experts, _, two_n = w1.shape
     n = two_n // 2
@@ -481,28 +577,20 @@ def moe_ring(
 
 
 # Cost model: TensorCore cycles per call on tpu7x, for this kernel and for the
-# gmm_v2 path it replaces, from static shapes. The constants are fitted to timed
-# calls over 11 weight shapes (hidden 2048-8192, expert width 128-768, 1-512
-# tokens, routing spread over all experts and over 16), converted to cycles at
-# the 1.9 GHz clock XLA's DMA latency model assumes. The fit reproduces the
-# timings to 8% rms (21% worst) for the ring and 10% rms (24% worst) for gmm_v2.
-_RING_FIXED_CYCLES = 14_140
-_RING_CYCLES_PER_ELEMENT = 0.0813  # per token per hidden column: load, quantize, store
-_RING_CYCLES_PER_PAIR_SQ = 0.0038  # routing compares all (token, expert) pairs pairwise
-_RING_EXPERT_CYCLES = 51  # per distinct expert
-_RING_COPY_BYTES_PER_CYCLE = 1_838  # weights into VMEM, slots - 1 experts in flight
-_RING_TILE_CYCLES = 988  # one row tile through one expert ...
-_RING_TILE_CYCLES_PER_ROW_BYTE = 1.196e-5  # ... plus per row per weight byte
-_GMM_FIXED_CYCLES = 29_640
-_GMM_EXPERT_CYCLES = 1_786  # per distinct expert
-_GMM_CYCLES_PER_BYTE = 4.566e-4  # per weight byte of a distinct expert
-_GMM_CYCLES_PER_ELEMENT = 0.1545  # per token per hidden column
-_GMM_CYCLES_PER_ELEMENT_WIDTH = 8.52e-6  # ... plus per column of expert width
+# gmm_v2 path it replaces, from static shapes. Weight sizes are counted in VMEM
+# tiles (the weights are whole tiles: fit_moe_ring requires lane-aligned
+# widths). The constants are fitted to timed calls over 11 weight shapes
+# (hidden 2048-8192, expert width 128-768, 1-512 tokens, routing spread over all
+# experts and over 16), converted to cycles at the 1.9 GHz clock XLA's DMA
+# latency model assumes. The fit reproduces the timings to 8% rms (21% worst)
+# for the ring and 10% rms (24% worst) for gmm_v2. The per-token terms count
+# rows, not row tiles: rounding the rows up to whole 16-row tiles fitted worse.
 
 
-def _expert_weight_bytes(hidden: int, n: int) -> int:
-    """FP8 bytes of one expert on this rank: w1 [hidden, 2n] + w2 [n, hidden]."""
-    return 3 * hidden * n
+def _expert_weight_tiles(hidden: int, n: int) -> float:
+    """VMEM tiles of one expert's fp8 weights on this rank: w1 [hidden, 2n] +
+    w2 [n, hidden]."""
+    return 3 * hidden * n / _VMEM_TILE_BYTES
 
 
 def _rows_per_expert_pmf(tokens: int, topk: int, num_experts: int) -> list[float]:
@@ -526,21 +614,31 @@ def ring_cost_cycles(
 ) -> float:
     """Modelled cycles of one moe_ring call. Each hit expert costs the longer of
     its weight copy and its row tiles, which overlap."""
-    weight_bytes = _expert_weight_bytes(hidden, n)
-    copy = weight_bytes / _RING_COPY_BYTES_PER_CYCLE
+    fixed_cycles = 14_140
+    cycles_per_element = 0.0813  # per token per hidden column: load, quantize, store
+    cycles_per_pair_sq = 0.0038  # _route compares all (token, expert) pairs pairwise
+    expert_cycles = 51  # per distinct expert
+    copy_tiles_per_cycle = 0.449  # weights into VMEM, slots - 1 experts in flight
+    row_tile_cycles = 988  # one row tile through one expert ...
+    row_tile_cycles_per_row_weight_tile = 0.049  # ... plus per row per weight tile
+
+    weight_tiles = _expert_weight_tiles(hidden, n)
+    copy = weight_tiles / copy_tiles_per_cycle
     per_expert = 0.0
     for c, prob in enumerate(_rows_per_expert_pmf(tokens, topk, num_experts)):
         if c == 0:
             continue
         rows = next((r for r in tile_rows if c <= r), tile_rows[-1])
-        tiles = pl.cdiv(c, rows)
-        tile = _RING_TILE_CYCLES + _RING_TILE_CYCLES_PER_ROW_BYTE * rows * weight_bytes
-        per_expert += prob * (_RING_EXPERT_CYCLES + max(copy, tiles * tile))
+        row_tiles = pl.cdiv(c, rows)
+        one_tile = (
+            row_tile_cycles + row_tile_cycles_per_row_weight_tile * rows * weight_tiles
+        )
+        per_expert += prob * (expert_cycles + max(copy, row_tiles * one_tile))
     pairs = tokens * topk
     return (
-        _RING_FIXED_CYCLES
-        + _RING_CYCLES_PER_ELEMENT * tokens * hidden
-        + _RING_CYCLES_PER_PAIR_SQ * pairs * pairs
+        fixed_cycles
+        + cycles_per_element * tokens * hidden
+        + cycles_per_pair_sq * pairs * pairs
         + num_experts * per_expert
     )
 
@@ -549,14 +647,18 @@ def gmm_cost_cycles(
     tokens: int, topk: int, num_experts: int, hidden: int, n: int
 ) -> float:
     """Modelled cycles of the gmm_v2 path for the same call."""
+    fixed_cycles = 29_640
+    expert_cycles = 1_786  # per distinct expert
+    cycles_per_weight_tile = 1.87  # per VMEM tile of a distinct expert's weights
+    cycles_per_element = 0.1545  # per token per hidden column
+    cycles_per_element_width = 8.52e-6  # ... plus per column of expert width
+
     hit = num_experts * (1.0 - _rows_per_expert_pmf(tokens, topk, num_experts)[0])
     return (
-        _GMM_FIXED_CYCLES
+        fixed_cycles
         + hit
-        * (_GMM_EXPERT_CYCLES + _GMM_CYCLES_PER_BYTE * _expert_weight_bytes(hidden, n))
-        + tokens
-        * hidden
-        * (_GMM_CYCLES_PER_ELEMENT + _GMM_CYCLES_PER_ELEMENT_WIDTH * n)
+        * (expert_cycles + cycles_per_weight_tile * _expert_weight_tiles(hidden, n))
+        + tokens * hidden * (cycles_per_element + cycles_per_element_width * n)
     )
 
 
@@ -568,21 +670,21 @@ def prefers_ring(tokens: int, topk: int, num_experts: int, hidden: int, n: int) 
 
 
 def maybe_moe_ring(
-    hidden_states,
-    w1,
-    w2,
-    topk_weights,
-    topk_ids,
-    w1_scale,
-    w2_scale,
-    w1_bias,
-    w2_bias,
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
     *,
-    activation_name,
-    no_combine,
-    use_group_offset,
-    w_quant_bits,
-):
+    activation_name: str,
+    no_combine: bool,
+    use_group_offset: bool,
+    w_quant_bits: int,
+) -> jax.Array | None:
     """The ring kernel's output for a fused-MoE call it covers, else None.
 
     Covers bf16 tokens with every expert local, unbiased FP8 experts with
