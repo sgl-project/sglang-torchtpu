@@ -745,6 +745,8 @@ class TpuEnvs:
     # direct-write path reads them). Frees size_m x 4 B of SMEM, which at 8192 tokens keeps
     # the fp8-expert call from spilling scalars to HBM.
     SGLANG_TPU_FUSED_RS_PAIR_NO_TOPK_SMEM = EnvBool(False)
+    # Fused-RS expert TP: smallest call (tokens) that uses the sibling pair exchange.
+    SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS = EnvInt(4096)
     # With Q8_IN_GMM1: each (tile, owner) run's first row in the tile comes from a table built
     # with the routing metadata instead of an in-kernel sum over the lower owners' runs.
     SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(False)

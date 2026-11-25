@@ -459,10 +459,10 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
-    # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
+    # Below PAIR_MIN_TOKENS (default 4096) every row goes to its owner as its own DMA.
     pair_exchange = (
         expert_tp
-        and num_tokens >= 4096
+        and num_tokens >= tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS.get()
         and local_rows
         and ep_size % 2 == 0
         and ep_size >= 4
