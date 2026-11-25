@@ -424,6 +424,9 @@ class TpuEnvs:
     # Pipeline-parallel prefill chunking
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
+    # A profiled bucket whose per-token cost sizes the step target; unset sizes it
+    # from the top bucket.
+    SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS = EnvInt(None)
 
     # PD disaggregation tracing
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(

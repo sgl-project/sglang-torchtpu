@@ -87,6 +87,12 @@ def profile_points(
     return points
 
 
+def is_target_ref(tokens: int, buckets: list[int]) -> bool:
+    """Whether ``tokens`` may size the step target: a bucket of at least a
+    quarter step, which keeps the fixed cost counted at most 4 times."""
+    return tokens in buckets and tokens * _PREFIX_PROFILE_MIN_DIVISOR >= buckets[-1]
+
+
 @dataclass
 class StepCostModel:
     """Per-stage step time in ms as a function of the step's shape."""
@@ -106,10 +112,14 @@ class StepCostModel:
         slack: float,
         granularity: int,
         schedule: tuple[int, int, int] | None = None,
+        target_ref_tokens: int | None = None,
     ) -> "StepCostModel":
         """``stage_samples`` holds one list of (tokens, prefix, ms) per
         stage. Every stage yields a ladder and a slope; the model keeps the
-        slowest ladder entry per bucket and the largest slope."""
+        slowest ladder entry per bucket and the largest slope. The target is
+        a prefix-free top-bucket step plus ``slack``; with
+        ``target_ref_tokens``, the step's linear part runs at that bucket's
+        per-token cost, which also counts its fixed cost ``top / ref`` times."""
         if slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
@@ -149,7 +159,16 @@ class StepCostModel:
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
         attn = max(slopes)
         top = buckets[-1]
-        full_step = linear[top] + attn * top * top / 2
+        if target_ref_tokens is None:
+            target_ref_tokens = top
+        elif not is_target_ref(target_ref_tokens, buckets):
+            raise ValueError(
+                f"the chunk target reference {target_ref_tokens} is not a "
+                f"profiled token bucket of at least a quarter step: {buckets}"
+            )
+        full_step = (
+            linear[target_ref_tokens] * (top / target_ref_tokens) + attn * top * top / 2
+        )
         return cls(
             buckets, linear, attn, full_step * (1.0 + slack), int(granularity), schedule
         )

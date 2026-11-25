@@ -118,10 +118,27 @@ def test_fit_slope_ignores_an_offset_on_the_prefix_free_points():
 def test_fit_rejects_negative_slack_empty_input_and_mismatched_ladders():
     with pytest.raises(ValueError, match="slack"):
         StepCostModel.fit([_stage()], -0.1, 4096)
+    for ref in (6144, 16):  # not a bucket; under a quarter step
+        with pytest.raises(ValueError, match="not a profiled token bucket"):
+            StepCostModel.fit([_stage()], 0.1, 4096, target_ref_tokens=ref)
     with pytest.raises(ValueError, match="no stage"):
         StepCostModel.fit([], 0.1, 4096)
     with pytest.raises(ValueError, match="different token buckets"):
         StepCostModel.fit([_stage(), [(16384, 0, 190.0)]], 0.1, 4096)
+
+
+def test_a_target_reference_ignores_speedups_in_larger_buckets():
+    """A speedup confined to the buckets above the reference must not shrink
+    the chunks behind a long prefix, which run below them."""
+
+    def faster(stage):
+        return [(t, p, ms - (20.0 if t > 8192 else 0.0)) for t, p, ms in stage]
+
+    for ref, before, after in ((None, 8192, 4096), (8192, 8192, 8192)):
+        base = StepCostModel.fit([_stage()], 0.1, 4096, target_ref_tokens=ref)
+        fast = StepCostModel.fit([faster(_stage())], 0.1, 4096, target_ref_tokens=ref)
+        assert base.chunk(98304, 16384, 0, 0.0, 0.0) == before
+        assert fast.chunk(98304, 16384, 0, 0.0, 0.0) == after
 
 
 def test_step_time_adds_the_causal_term_of_each_chunk():

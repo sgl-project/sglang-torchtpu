@@ -89,6 +89,7 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_KV_CHANNELS",
         # PP chunk scheduling; the token buckets it picks are graph shapes.
         "SGLANG_TPU_PP_CHUNK_SLACK",
+        "SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS",
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
         # PP buffered hand-off: how many sends a stage queues, on the host.
         "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH",

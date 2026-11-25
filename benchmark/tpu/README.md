@@ -245,7 +245,13 @@ fixed compute-time budget, and by the batched attention kernel's schedule
 capacity, so few requests get small steps and later chunks of a long prompt
 shrink with their attention cost. `SGLANG_TPU_PP_DYNAMIC_CHUNKS=0` keeps
 fixed token budgets; `SGLANG_TPU_PP_CHUNK_SLACK` (default `0.1`) is the slack
-above the profiled full-step time.
+above the profiled full-step time. `SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS`
+names a profiled bucket of at least a quarter of the largest (for example 4096
+with `--chunked-prefill-size 8192`) whose per-token cost sizes that full step
+instead of the top bucket's, so a kernel speedup confined to the larger buckets does not shrink
+the chunks behind long prefixes while it leaves the attention slope alone. It
+counts the bucket's fixed per-step cost `top / ref` times, so it is paired with
+a smaller slack. Startup fails on every rank if the ranks disagree on it.
 
 ## Notes
 
