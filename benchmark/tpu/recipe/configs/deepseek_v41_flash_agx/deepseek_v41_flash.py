@@ -60,6 +60,9 @@ CONFIG["runtime_env"].update(
     {
         "RUNAI_STREAMER_CONCURRENCY": "32",
         "RUNAI_STREAMER_MEMORY_LIMIT": "34359738368",
+        # 64 MiB GCS ranges (default ~8 MiB): ~8x fewer reads per boot against
+        # the bucket's read-request ceiling.
+        "RUNAI_STREAMER_CHUNK_BYTESIZE": "67108864",
         "SGLANG_DSV4_FP4_EXPERTS": "1",
         "SGLANG_DSV4_FP4_DEQUANT": "0",
         "TOKENIZERS_PARALLELISM": "false",

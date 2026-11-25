@@ -92,6 +92,19 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_DSV41_PACKED_METADATA": "1",
         "SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA": "1",
         "SGLANG_TPU_SPEC_DEVICE_ROWS": "1",
+        # direct_compile: rebind the live KV-pool tensors to the forward's donated
+        # outputs instead of copying them back (host saving; bit-identical).
+        "SGLANG_TPU_DIRECT_COMPILE_REBIND_KV": "1",
+        # Skip re-validating prompt ids the server itself rendered (host ingest; exact).
+        "SGLANG_TPU_SKIP_SERVER_PROMPT_VOCAB_CHECK": "1",
+        # DSpark verify attends the request-window SWA rings directly (exact):
+        # products c4 1.032, c32 1.093, c256 1.182.
+        "SGLANG_TPU_DSV41_VERIFY_SWA_RING": "1",
+        # mHC flat stream collapse: sum the four column slices instead of an FP32
+        # [T, 4, D] reduce (bitwise).
+        "SGLANG_TPU_DSV41_MHC_FLAT_COLLAPSE": "1",
+        # Spec device rows: one packed host-to-device copy per metadata build (exact).
+        "SGLANG_TPU_DSV41_PACKED_ROW_UPLOAD": "1",
     }
 )
 
