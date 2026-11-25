@@ -257,9 +257,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
             ("SPTP_PA_RC", "64"),
         )
     )
-    pa_pool = pool_call(c, pa_tp, pa_rc) if pa else None
     # SPTP_PA_A2A=1: the gated-output a2a by remote DMA inside the o proj kernel
     pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "0") == "1"
+    # SPTP_PA_HEAD=0: that kernel takes a token-major [T, qd] copy of the o gate's output
+    # instead of its head layout [Hkv, T, G * d] as is
+    pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
+    pa_pool = pool_call(c, pa_tp, pa_rc, pa_head) if pa else None
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
@@ -421,12 +424,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
                 if pa_a2a:
                     with _scope("sp_postattn"):
-                        # the token-major [T, qd] gated output (the o gate's layout to come)
-                        g8 = (
-                            g8
-                            if ogate_kernel
-                            else g8.transpose(1, 0, 2, 3).reshape(T, qd)
-                        )
+                        if ogate_kernel:
+                            if pa_head:
+                                raise ValueError(
+                                    "SPTP_OGATE_KERNEL writes token-major rows: SPTP_PA_HEAD=0"
+                                )
+                        elif pa_head:
+                            g8 = g8.reshape(c.kv_heads, T, gq * hd)
+                        else:
+                            g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
                         pa_o = oproj_a2a_call(
                             c,
                             wrouter.shape[-1],
@@ -437,6 +443,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             pa_fp,
                             pa_ns,
                             pa_order,
+                            pa_head,
                         )
                         args = (
                             l,
