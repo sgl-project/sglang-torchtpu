@@ -613,21 +613,27 @@ def _ep_counting_route(
     )
 
 
+# Effective TPU7x throughput (GB/s = bytes/ns) and extra launch overhead (us)
+# from per-stage benchmarks across H in {2048, 4096, 7168}. Using TPU7x rates
+# is conservative on slower-HBM SparseCore generations (v5p).
+_RG2_EFF_GBPS = 1400.0  # ragged_gather_v2 (bf16, 4*H B/row, VPU-bound)
+_RG_DATA_EFF_GBPS = 2650.0  # row_gather on fp8 data (2*H B/row, pure DMA)
+_RG_SCALE_EFF_GBPS = 1500.0  # row_gather on f32 scales (1024 B/row)
+_PREQUANT_EFF_GBPS = 1350.0  # prequantize_lhs_fp8 (3*H B/token)
+_PREQUANT_LAUNCH_OVERHEAD_US = 10.6
+_PREQUANT_MIN_GAIN_US = 3.0
+
+
 def _prequant_dispatch_beneficial(
     num_tokens: int, owned_rows: float, hidden_size: int
 ) -> bool:
-    """Cost model for prequantize_lhs_fp8 + 2 row_gathers vs ragged_gather_v2.
-
-    Uses TPU7x per-stage linear fits (in microseconds): ragged_gather_v2
-    (~11.5 + 2.90 * (H / 1024) * R / 1000) vs prequant
-    (~2.0 + 2.15 * (H / 1024) * m / 1000) + row_gather on fp8 data
-    (~11.0 + 0.78 * (H / 1024) * R / 1000) + row_gather on scales
-    (~9.1 + 0.67 * R / 1000). Requires a 3 us margin (> 13.6 us total) over the
-    ~10.6 us extra launch overhead.
-    """
-    h_k = hidden_size / 1024.0
-    gain_us = ((2.12 * h_k - 0.67) * owned_rows - 2.15 * h_k * num_tokens) / 1000.0
-    return gain_us > 13.6
+    """Cost model for prequantize_lhs_fp8 + 2 row_gathers vs ragged_gather_v2."""
+    rg2_us = (4 * hidden_size * owned_rows) / (_RG2_EFF_GBPS * 1e3)
+    rg_data_us = (2 * hidden_size * owned_rows) / (_RG_DATA_EFF_GBPS * 1e3)
+    rg_scale_us = (1024 * owned_rows) / (_RG_SCALE_EFF_GBPS * 1e3)
+    prequant_us = (3 * hidden_size * num_tokens) / (_PREQUANT_EFF_GBPS * 1e3)
+    gain_us = rg2_us - (prequant_us + rg_data_us + rg_scale_us)
+    return gain_us > _PREQUANT_LAUNCH_OVERHEAD_US + _PREQUANT_MIN_GAIN_US
 
 
 def _prequant_dispatch_ok(

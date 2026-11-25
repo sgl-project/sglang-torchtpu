@@ -149,8 +149,8 @@ def _col_chunks(width: int, max_words: int) -> int:
 _MAX_ROW_SUBCHUNKS = 8
 _STREAMS = 2
 # Largest 128-word-aligned column chunk that keeps 2 double-buffered gather
-# streams (2 * 2 * 16 * 768 u32 = 192 KiB) within the 256 KiB SparseCore VMEM
-# limit.
+# streams within SparseCore VMEM across generations (96 KiB on 8-lane gen 5/6
+# and 192 KiB on 16-lane gen 7).
 _MAX_CHUNK_WORDS = 768
 
 
