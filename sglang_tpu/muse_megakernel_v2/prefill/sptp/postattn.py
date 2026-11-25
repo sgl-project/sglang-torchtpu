@@ -858,6 +858,7 @@ def pool_ag_call(
     rc: int = 64,
     flat: bool = False,
     group: tuple = (),
+    n_send: int = 1,
 ):
     """pool_call with the expert input's all-gather inside: (lyr_me [2] i32 (layer, rank), f8,
     fs, smalls, wpool) -> (xe_all [T, He / 128, 128] e4m3 (the fused-RS MoE's tiled lhs layout:
@@ -917,13 +918,22 @@ def pool_ag_call(
             for cp in cps:
                 cp.wait()
             with _scope("pa_xe_send"):
-                for k in range(1, tp):
-                    d = jnp.bitwise_xor(me, k)
-                    for src in (own_x, own_s):
+                sub = Ts // n_send
+                for q in range(n_send):
+                    rq = pl.ds(pl.multiple_of(r0 + q * sub, 32), sub)
+                    for k in range(1, tp):
+                        d = jnp.bitwise_xor(me, k)
+                        src = xa_hbm.at[rq]
                         pltpu.make_async_remote_copy(
                             src, src, ssem, rsem,
                             device_id=(d,), device_id_type=pl.DeviceIdType.MESH,
                         ).start()  # fmt: skip
+                for k in range(1, tp):
+                    d = jnp.bitwise_xor(me, k)
+                    pltpu.make_async_remote_copy(
+                        own_s, own_s, ssem, rsem,
+                        device_id=(d,), device_id_type=pl.DeviceIdType.MESH,
+                    ).start()  # fmt: skip
 
     def whole(*shape):
         return pl.BlockSpec(shape, lambda p, lm: (0,) * len(shape))
@@ -971,7 +981,7 @@ def pool_ag_call(
             ),
             compiler_params=params,
             input_output_aliases={5: 0, 6: 1} if gj else {},
-            name=f"muse_sptp_pa_pool_ag_t{c.rows}_p{tpn}{'_f' if flat else ''}{tag}",
+            name=f"muse_sptp_pa_pool_ag_t{c.rows}_p{tpn}{'_f' if flat else ''}{tag}_s{n_send}",
         )(lm, f8, fs, smalls, wpool, *prev)
 
     return call

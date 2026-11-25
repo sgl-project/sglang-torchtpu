@@ -333,6 +333,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # in its last step, waited for by a small kernel before the MoE); xe_all / xs_all replace
     # the XLA AG of xe8 / xs
     pa_xag = pa_a2a and os.environ.get("SPTP_PA_XE_AG", "0") == "1"
+    # SPTP_PA_XE_AG_SPLIT=n: each peer's rows in n DMAs
+    pa_xag_n = int(os.environ.get("SPTP_PA_XE_AG_SPLIT", "1"))
     if pa_xag and (
         pa_head or xe_n or xe_pallas or os.environ.get("SPTP_PA_FUSE_POOL", "0") != "0"
     ):
@@ -602,7 +604,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             stream, ids, tw, f8, f_s = pa_o(*args)
                             if pa_xag:
                                 xa_out = pool_ag_call(
-                                    c, SPTP_PA_XE_COLLECTIVE_ID, pa_tp, pa_rc
+                                    c,
+                                    SPTP_PA_XE_COLLECTIVE_ID,
+                                    pa_tp,
+                                    pa_rc,
+                                    n_send=pa_xag_n,
                                 )(l, me, f8, f_s, smalls, wpool)
                             else:
                                 xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
@@ -703,6 +709,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                         pa_rc,
                                         pa_tmaj,
                                         grp,
+                                        pa_xag_n,
                                     )
                                     prev = xa_out[:2] if gj else ()
                                     out = pk(l, me, f8, f_s, smalls, wpool, prev=prev)
