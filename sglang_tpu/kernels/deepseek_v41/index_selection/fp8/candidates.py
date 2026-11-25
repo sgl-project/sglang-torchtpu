@@ -14,6 +14,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from sglang_tpu.pallas_export import get_tpu_info_or_none
+
 from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .tuned import (
     PAGED_MQA_FRAGMENT_GATHER_CONFIG,
@@ -136,7 +138,8 @@ def prepare_candidate_metadata(
     sizes = jnp.diff(offsets)
 
     bitmap = None
-    if jax.default_backend() == "tpu" and pltpu.get_tpu_info().sparse_core is not None:
+    target = get_tpu_info_or_none()
+    if target is not None and target.sparse_core is not None:
         bitmap = _bitmap_candidate_blocks(
             candidates,
             pages,

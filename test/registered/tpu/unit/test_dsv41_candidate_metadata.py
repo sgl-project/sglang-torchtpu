@@ -3,7 +3,10 @@
 """FP8 candidate metadata: SparseCore bitmaps against a NumPy reference."""
 
 import os
+import subprocess
 import sys
+from functools import partial
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -169,5 +172,51 @@ def test_publication_ascends(rows, width, count):
         assert np.all(row[live.size :] == -1) and np.all(np.diff(live) > 0)
 
 
+def _export_prepared_candidates():
+    """Trace the registered TorchTPU op's JAX function on its CPU backend."""
+    from jax import export
+
+    from sglang_tpu.models.deepseek_v41.ops.indexer import _prepare_candidates
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    assert jax.default_backend() == "cpu"
+    layout = PackedFP8Layout(4096)
+    prepare = partial(
+        _prepare_candidates,
+        pages=layout.pages,
+        page_stride=layout.page_stride,
+        page_offset=0,
+        page_size=layout.page_size,
+        block_size=BLOCK,
+    )
+    with (
+        patch(
+            "sglang_tpu.pallas_export.get_pallas_tpu_device_kind", return_value="TPU7x"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        ir = export.export(jax.jit(prepare), platforms=("tpu",))(
+            jax.ShapeDtypeStruct((layout.pages * layout.page_stride, 128), jnp.int32),
+            jax.ShapeDtypeStruct((1, 4096), jnp.int32),
+            jax.ShapeDtypeStruct((6, PER_QUERY), jnp.int32),
+            jax.ShapeDtypeStruct((6,), jnp.int32),
+        ).mlir_module()
+    assert "paged_mqa_candidate_metadata" in ir
+    assert "paged_mqa_candidate_gather_direct" in ir
+    # Both supported candidate producers publish ordered rows.
+    assert "stablehlo.sort" not in ir
+
+
+def test_prepared_candidates_cpu_export():
+    subprocess.run(
+        [sys.executable, __file__, "--export-prepared-candidates"],
+        env={**os.environ, "JAX_PLATFORMS": "cpu"},
+        check=True,
+    )
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+    if "--export-prepared-candidates" in sys.argv:
+        _export_prepared_candidates()
+    else:
+        sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
