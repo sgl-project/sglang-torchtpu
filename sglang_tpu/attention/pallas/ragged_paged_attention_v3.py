@@ -431,6 +431,7 @@ def _stationary_q_v2_process(
     )
     use_sw_short_v2 = "sw_short_v2" in prefill_opts
     use_sw_short_fuse = ("sw_short_fuse" in prefill_opts) or use_sw_short_v2
+    use_sw_unalign_fuse = "sw_unalign_fuse" in prefill_opts
     use_sub8_l = "sub8_l" in prefill_opts
     use_la2 = "la2" in prefill_opts
     use_unroll_up = ("unroll_up" in prefill_opts) and not (
@@ -658,7 +659,10 @@ def _stationary_q_v2_process(
                     if n_rep == 1
                     else jnp.concatenate([bias_spec] * n_rep, axis=2)
                 )
-                qk_sc = jnp.where(bs, qk_sc, -jnp.inf)
+                if bs.dtype == jnp.bfloat16:
+                    qk_sc = qk_sc + bs.astype(jnp.float32)
+                else:
+                    qk_sc = jnp.where(bs, qk_sc, -jnp.inf)
             if use_fp8_qkpv_dyn:
                 m_sub = jnp.max(qk_sc.reshape(1, m_rows // 8, 8, w_cols), axis=1)
                 m_col = jnp.max(m_sub, axis=1, keepdims=True)
@@ -732,7 +736,10 @@ def _stationary_q_v2_process(
                     if n_rep == 1
                     else jnp.concatenate([bias_spec] * n_rep, axis=2)
                 )
-                qk = jnp.where(bs, qk, -jnp.inf)
+                if bs.dtype == jnp.bfloat16:
+                    qk = qk + bs
+                else:
+                    qk = jnp.where(bs, qk, -jnp.inf)
             if use_fp8_qkpv_fast:
                 m_sub = jnp.max(qk.reshape(1, m_rows // 8, 8, w_cols), axis=1)
                 m_col = jnp.max(m_sub, axis=1, keepdims=True)
@@ -2199,49 +2206,83 @@ def _stationary_q_v2_process(
                     _pack_pair_out(a0, a1, l0, l1, kv_h_tag * 4),
                 )
 
-        def _run_sw9_fused_qe(s_lo):
-            q_u32_ref = (
+        def _get_bq_u32_ref():
+            return (
                 None
                 if interpret
                 else bq_x2_ref.bitcast(jnp.uint32)
                 .at[bq_sem_idx, 0]
                 .reshape(256 * sq_pairs, 128)
             )
-            t_sl = pl.ds(0, tq_sz)
+
+        def _run_sw_mk128_fused(s_lo, n_slices, bias_specs):
+            q_u32_ref = _get_bq_u32_ref()
+            h_base_sw = 2 * s_lo
+            for kv_h in range(sq_kv_heads):
+                for gp in range(4):
+                    s_pair = kv_h * 4 + gp
+                    u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
+                    pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
+                    if use_fp8_qk_dyn:
+                        q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
+                        q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
+                        qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
+                        qsc_pair = (
+                            jnp.tile(q0_sc8[None, :, :], (1, 16, 1)),
+                            jnp.tile(q1_sc8[None, :, :], (1, 16, 1)),
+                        )
+                    else:
+                        qt_pair = (
+                            pair_q_t[:64, :][None, :, :],
+                            pair_q_t[64:, :][None, :, :],
+                        )
+                        qsc_pair = (None, None)
+                    acc0, l0 = _eval_mk128_head(
+                        kv_h, qt_pair[0], qsc_pair[0], h_base_sw, n_slices, bias_specs
+                    )
+                    acc1, l1 = _eval_mk128_head(
+                        kv_h, qt_pair[1], qsc_pair[1], h_base_sw, n_slices, bias_specs
+                    )
+                    _write_sw9_pair_out(
+                        acc0[0], acc1[0], l0[0], l1[0], s_pair, kv_h
+                    )
+
+        def _sw10_unalign_bias_specs(w_off):
+            q_rel_w = (
+                lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 2) + w_off
+            )
+            k_128 = lax.broadcasted_iota(jnp.int32, (1, 128, tq_sz), 1)
+            k_r0 = (2 * k_128) if kv_pack_dense2 else k_128
+            k_r1 = (2 * k_128 + 1) if kv_pack_dense2 else (k_128 + 128)
+            z_bf16 = jnp.bfloat16(0.0)
+            neg_inf = jnp.bfloat16(-jnp.inf)
+
+            def _pair(c0, c1):
+                return (
+                    jnp.where(c0, z_bf16, neg_inf),
+                    jnp.where(c1, z_bf16, neg_inf),
+                )
+
+            ut_s0 = _pair(q_rel_w <= k_r0, q_rel_w <= k_r1)
+            ut_s1 = _pair(q_rel_w <= (k_r0 + 256), q_rel_w <= (k_r1 + 256))
+            if sliding_window == 2048:
+                lt_s8 = _pair(q_rel_w > k_r0, q_rel_w > k_r1)
+                lt_s9 = _pair(q_rel_w > (k_r0 + 256), q_rel_w > (k_r1 + 256))
+            else:
+                lt_s8 = _pair(q_rel_w >= k_r0, q_rel_w >= k_r1)
+                lt_s9 = _pair(q_rel_w >= (k_r0 + 256), q_rel_w >= (k_r1 + 256))
+            return (ut_s0, ut_s1) + ("none",) * 6 + (lt_s8, lt_s9)
+
+        def _run_sw10_fused_qe(s_lo, w_off):
+            _run_sw_mk128_fused(s_lo, 10, _sw10_unalign_bias_specs(w_off))
+
+        def _run_sw9_fused_qe(s_lo):
             bias_specs = ("ut",) + ("none",) * 7 + ("lt",)
-
             if use_mk128:
-                h_base_sw = 2 * s_lo
-                for kv_h in range(sq_kv_heads):
-                    for gp in range(4):
-                        s_pair = kv_h * 4 + gp
-                        u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
-                        pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
-                        if use_fp8_qk_dyn:
-                            q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
-                            q1_f8, q1_sc8 = _quant_qt_fp8(pair_q_t[64:, :])
-                            qt_pair = (q0_f8[None, :, :], q1_f8[None, :, :])
-                            qsc_pair = (
-                                jnp.tile(q0_sc8[None, :, :], (1, 16, 1)),
-                                jnp.tile(q1_sc8[None, :, :], (1, 16, 1)),
-                            )
-                        else:
-                            qt_pair = (
-                                pair_q_t[:64, :][None, :, :],
-                                pair_q_t[64:, :][None, :, :],
-                            )
-                            qsc_pair = (None, None)
-                        acc0, l0 = _eval_mk128_head(
-                            kv_h, qt_pair[0], qsc_pair[0], h_base_sw, 9, bias_specs
-                        )
-                        acc1, l1 = _eval_mk128_head(
-                            kv_h, qt_pair[1], qsc_pair[1], h_base_sw, 9, bias_specs
-                        )
-                        _write_sw9_pair_out(
-                            acc0[0], acc1[0], l0[0], l1[0], s_pair, kv_h
-                        )
-
+                _run_sw_mk128_fused(s_lo, 9, bias_specs)
                 return
+            q_u32_ref = _get_bq_u32_ref()
+            t_sl = pl.ds(0, tq_sz)
 
             if use_gqa2_vreg or use_gqa4_vreg:
                 pairs_per_grp = 2 if use_gqa4_vreg else 1
@@ -2512,6 +2553,24 @@ def _stationary_q_v2_process(
                         ),
                     ),
                 )
+                sw_left_0 = q_first_0 - _sw_off
+                is_sw10_fast_0 = (
+                    jnp.logical_and(
+                        valid_bq_rows == tq_sz,
+                        jnp.logical_and(
+                            (q_first_0 & 255) != 0,
+                            jnp.logical_and(
+                                (sw_left_0 & 255) != 0,
+                                jnp.logical_and(
+                                    q_first_0 >= 2048,
+                                    q_first_0 + tq_sz <= kv_len,
+                                ),
+                            ),
+                        ),
+                    )
+                    if (use_sw_unalign_fuse and use_mk128)
+                    else jnp.bool_(False)
+                )
                 is_sw_short_0 = (
                     jnp.logical_and(
                         valid_bq_rows == tq_sz,
@@ -2532,6 +2591,15 @@ def _stationary_q_v2_process(
                     s_lo_0 = (q_first_0 - 2048) // 256
                     _run_sw9_fused_qe(s_lo_0)
                     _send_fused_bo()
+
+                if use_sw_unalign_fuse and use_mk128:
+
+                    @pl.when(is_sw10_fast_0)
+                    def _do_fused_sw10():
+                        w_off_0 = sw_left_0 & 255
+                        s_lo_0 = sw_left_0 // 256
+                        _run_sw10_fused_qe(s_lo_0, w_off_0)
+                        _send_fused_bo()
 
                 if use_sw_short_fuse:
 
@@ -2765,7 +2833,14 @@ def _stationary_q_v2_process(
                                     )
                             _send_fused_bo()
 
-                @pl.when(jnp.logical_not(jnp.logical_or(is_sw9_fast_0, is_sw_short_0)))
+                @pl.when(
+                    jnp.logical_not(
+                        jnp.logical_or(
+                            jnp.logical_or(is_sw9_fast_0, is_sw10_fast_0),
+                            is_sw_short_0,
+                        )
+                    )
+                )
                 def _do_unfused_fallback():
                     unpack_bq_to_qt_v2(bq_sem_idx)
                     strip_kv_hi = jnp.minimum(kv_len, q_first_0 + tq_sz)
@@ -7001,6 +7076,7 @@ def ragged_paged_attention(
                 "f32_exp",
                 "prefix_fast",
                 "staged_qo",
+                "sw_unalign_fuse",
                 *_STATIONARY_Q_V2_OPTS,
             }
         use_stationary_q_v2 = bool(
