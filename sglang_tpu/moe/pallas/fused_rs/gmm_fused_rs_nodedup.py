@@ -3345,6 +3345,12 @@ def gmm_v2_fused_rs(
     # 1 MB SMEM. Pack when 2 separate refs would exceed ~960 KB (2 * size_m * 4).
     # That's size_m > 120K (e.g., prefill_16384 with top_k=8 has size_m=131K).
     pack_indices = kernel_size_m > 120_000
+    # pair exchange never reads the top-k slots in the kernel
+    drop_topk = (
+        pair_exchange
+        and not pack_indices
+        and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_NO_TOPK_SMEM.get()
+    )
     if pack_indices:
         # combined = lhs_idx * top_k + topk_slot
         primary_idx_ref = lhs_indices.astype(jnp.int32) * top_k + topk_indices.astype(
@@ -3353,7 +3359,9 @@ def gmm_v2_fused_rs(
         secondary_idx_ref = jnp.zeros((1,), dtype=jnp.int32)  # dummy
     else:
         primary_idx_ref = lhs_indices
-        secondary_idx_ref = topk_indices
+        secondary_idx_ref = (
+            jnp.zeros((1,), dtype=jnp.int32) if drop_topk else topk_indices
+        )
 
     # Expert TP builds the routing metadata ahead of the kernel in XLA and
     # leaves each tile's output writes in flight until its staging slot is reused.
@@ -3376,7 +3384,7 @@ def gmm_v2_fused_rs(
             primary_idx_ref = lax.dynamic_slice_in_dim(
                 primary_idx_ref, local_start, kernel_size_m
             )
-            if not pack_indices:
+            if not pack_indices and not drop_topk:
                 secondary_idx_ref = lax.dynamic_slice_in_dim(
                     secondary_idx_ref, local_start, kernel_size_m
                 )

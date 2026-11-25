@@ -741,6 +741,10 @@ class TpuEnvs:
     # row bucket, issued at the end of the GMM2 bucket branch (the ring slot is private to
     # the tile; the rows past the tile are never read) instead of power-of-two pieces.
     SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET = EnvBool(False)
+    # Fused-RS pair exchange: pass a 1-element dummy for the per-row top-k slots (only the
+    # direct-write path reads them). Frees size_m x 4 B of SMEM, which at 8192 tokens keeps
+    # the fp8-expert call from spilling scalars to HBM.
+    SGLANG_TPU_FUSED_RS_PAIR_NO_TOPK_SMEM = EnvBool(False)
     # With Q8_IN_GMM1: each (tile, owner) run's first row in the tile comes from a table built
     # with the routing metadata instead of an in-kernel sum over the lower owners' runs.
     SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(False)
