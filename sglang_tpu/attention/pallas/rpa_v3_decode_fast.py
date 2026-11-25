@@ -2956,12 +2956,12 @@ def _decode_fast_kernel(
                 def _():
                     init = init_new_token_state(q_vmem_ref[row], row)
                     for j in range(3):
-                        state_vmem_ref[j, pl.ds(i * 16, 16), :] = init[j]
+                        state_vmem_ref[j, pl.ds(i * q_head_rows, q_head_rows), :] = init[j]
 
             @pl.when(shared > 0)
             def _common():
-                q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * 16, 128)
-                active_h = size * 16
+                q = q_vmem_ref[pl.ds(first_row, group), :, :].reshape(group * q_head_rows, 128)
+                active_h = size * q_head_rows
                 if cfg.shared_fp8_qkpv:
                     q_f32 = q.astype(jnp.float32)
                     q_amax = jnp.max(jnp.abs(q_f32), axis=1, keepdims=True)
@@ -3010,7 +3010,7 @@ def _decode_fast_kernel(
 
                     @pl.when(~act)
                     def _():
-                        o_vmem_ref[q_r] = jnp.zeros((16, 128), jnp.bfloat16)
+                        o_vmem_ref[q_r] = jnp.zeros((q_head_rows, 128), jnp.bfloat16)
 
                     @pl.when(act)
                     def _():
@@ -3019,7 +3019,7 @@ def _decode_fast_kernel(
 
                         @pl.when(priv_pgs <= 0)
                         def _only_shared():
-                            lanes = pl.ds(i * 16, 16)
+                            lanes = pl.ds(i * q_head_rows, q_head_rows)
                             o_vmem_ref[q_r] = finalize_out(
                                 state_vmem_ref[1, lanes, :], state_vmem_ref[2, lanes, :]
                             )
@@ -3087,8 +3087,8 @@ def _decode_fast_kernel(
                     packed_le = written_cnt_smem_ref[om + 3]
                     loc_end = packed_le & jnp.int32(0xFFFF)
                     is_last = (packed_le & jnp.int32(1 << 17)) != 0
-                    head_off = (seq_id - first) * 16
-                    lanes = pl.ds(head_off, 16)
+                    head_off = (seq_id - first) * q_head_rows
+                    lanes = pl.ds(head_off, q_head_rows)
 
                     wait_fetch_pages(cur_pg, slot)
                     q_bf16 = q_vmem_ref[q_r]
@@ -3123,9 +3123,9 @@ def _decode_fast_kernel(
 
                     @pl.when(active)
                     def _():
-                        lanes = pl.ds(i * 16, 16)
+                        lanes = pl.ds(i * q_head_rows, q_head_rows)
                         last_slot, last_loc = consume(
-                            q_vmem_ref[row], i * 16, base, shared, end
+                            q_vmem_ref[row], i * q_head_rows, base, shared, end
                         )
                         o_vmem_ref[row] = finalize_out(
                             state_vmem_ref[1, lanes, :], state_vmem_ref[2, lanes, :]
@@ -3134,7 +3134,7 @@ def _decode_fast_kernel(
 
                     @pl.when(~active)
                     def _():
-                        o_vmem_ref[row] = jnp.zeros((16, 128), jnp.bfloat16)
+                        o_vmem_ref[row] = jnp.zeros((q_head_rows, 128), jnp.bfloat16)
     elif cfg.loop_kind == "ring4k":
         meta_base = 2 + num_slots
         written_cnt_smem_ref[1] = 0
@@ -3808,12 +3808,7 @@ def run_decode_fast_rpa(
         shared_group=shared_grp,
         kv_pack_dense2=kv_pack_dense2,
     )
-    use_tp16_q8 = (
-        native_tp16
-        and cfg.shared_group_size == 0
-        and cfg.loop_kind != "shared16"
-        and ("noq8" not in raw_toks)
-    )
+    use_tp16_q8 = native_tp16 and ("noq8" not in raw_toks)
     if prepared_inputs:
         if use_tp16_q8:
             q_3d = q_3d[:, :8, :]
@@ -3940,7 +3935,7 @@ def run_decode_fast_rpa(
             pltpu.VMEM(
                 (
                     3,
-                    (16 * (run_cfg.shared_group_size or 16))
+                    (q_3d.shape[1] * (run_cfg.shared_group_size or 16))
                     if (run_cfg.shared_group_size > 0 or run_cfg.loop_kind == "shared16")
                     else (q_3d.shape[1] * decode_query_size),
                     128,

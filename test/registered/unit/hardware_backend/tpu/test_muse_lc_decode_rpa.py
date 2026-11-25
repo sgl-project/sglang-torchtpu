@@ -2699,6 +2699,107 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             self.assertIn("dq4", hlo_tp16)
             self.assertIn("pbf16", hlo_tp16)
 
+    def test_cand12_tp16_q8_shared16_zero_ulp_and_export(self):
+        """cand_w9_12: TP=16 q8 in shared16 (LC 256K -38.45 us/occ, 0-ULP vs noq8 & TPU v7 export)."""
+        from jax import export as jax_export
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        rng = np.random.default_rng(1208)
+        bs, ps, pps = 16, 512, 8
+        sh_pg = 3
+        lens = [sh_pg * ps + 128] * 12 + [sh_pg * ps + 600, sh_pg * ps + 1, 0, 0]
+        n_act = 14
+        s_u8 = np.full((bs * pps + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        s_u8[:, :, 0, :2, :] = 0
+        s_u8[:, :, 0, 0, :64] = _rand_fp8_u8(rng, (bs * pps + 8, ps, 64))
+        s_u8[:, :, 0, 1, :64] = _rand_fp8_u8(rng, (bs * pps + 8, ps, 64))
+        pi_np = np.zeros((bs, pps), dtype=np.int32)
+        nxt = sh_pg
+        for b_i in range(bs):
+            pi_np[b_i, :sh_pg] = np.arange(sh_pg, dtype=np.int32)
+            pi_np[b_i, sh_pg:] = np.arange(nxt, nxt + (pps - sh_pg), dtype=np.int32)
+            nxt += pps - sh_pg
+        for s in range(bs):
+            if lens[s] <= 0:
+                continue
+            old_l = lens[s] - 1
+            lp = old_l // ps
+            rem = old_l % ps
+            s_u8[pi_np[s, lp], rem:, 0, :2, :] = 0x7F
+            if lp + 1 < pps:
+                s_u8[pi_np[s, lp + 1 :], :, 0, :2, :] = 0x7F
+        kvc = _u8_to_fp8(s_u8)
+        q16 = jnp.asarray((rng.standard_normal((bs, 8, 64)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+        v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 64)))
+        gate = jnp.asarray((rng.standard_normal((bs, 512)) * 0.4).astype(np.float32), dtype=jnp.bfloat16)
+        q_prep = jnp.pad(q16, ((0, 0), (0, 8), (0, 64))).reshape(1, bs, 8, 2, 128)
+        kv_prep = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs, 1, 4, 128)
+        kvl = jnp.asarray(lens, dtype=jnp.int32)
+        pi = jnp.asarray(pi_np.ravel(), dtype=jnp.int32)
+        cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+        cukv = jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps)
+        dist = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
+        shp = jnp.asarray([sh_pg], dtype=jnp.int32)
+
+        o_noq8, kv_noq8 = run_decode_fast_rpa(
+            q_prep, kv_prep, None, kvc, kvl, pi, cuq, cukv, dist,
+            sm_scale=64 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="tp16,noq8,w8,c4096,shared16,q256,pbf16,batchfull,foldcol,noadapt",
+            fused_out_pack=2, prepared_inputs=True, gate=gate, out_norm_eps=1e-6,
+            force_native_tp16=True, shared_pages=shp, interpret=True,
+        )
+        o_q8, kv_q8 = run_decode_fast_rpa(
+            q_prep, kv_prep, None, kvc, kvl, pi, cuq, cukv, dist,
+            sm_scale=64 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="tp16,w8,c4096,shared16,q128,pbf16,batchfull,foldcol,noadapt",
+            fused_out_pack=2, prepared_inputs=True, gate=gate, out_norm_eps=1e-6,
+            force_native_tp16=True, shared_pages=shp, interpret=True,
+        )
+        a_ref = np.asarray(o_noq8[:n_act], dtype=np.float32)
+        a_q8 = np.asarray(o_q8[:n_act], dtype=np.float32)
+        self.assertTrue(np.all(np.isfinite(a_q8)))
+        self.assertEqual(float(np.max(np.abs(a_q8 - a_ref))), 0.0)
+        self.assertTrue(np.array_equal(np.asarray(kv_q8).view(np.uint8), np.asarray(kv_noq8).view(np.uint8)))
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            pps_256k = 544
+            hlo = jax_export.export(
+                jax.jit(
+                    lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_, sp_: run_decode_fast_rpa(
+                        q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=64 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        mode_str="tp16,w8,c4096,shared16,q256,pbf16,batchfull,foldcol,noadapt",
+                        fused_out_pack=2, prepared_inputs=True, gate=g_, out_norm_eps=1e-6,
+                        force_native_tp16=True, shared_pages=sp_,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, bs, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs, 512), jnp.bfloat16),
+                jax.ShapeDtypeStruct((bs * pps_256k + 8, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((bs,), jnp.int32),
+                jax.ShapeDtypeStruct((bs * pps_256k,), jnp.int32),
+                jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((bs + 1,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("shared16", hlo)
+            self.assertIn("-tp16", hlo)
+            self.assertIn("-q8", hlo)
+
 
 if __name__ == "__main__":
     unittest.main()
