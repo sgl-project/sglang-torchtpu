@@ -1165,12 +1165,27 @@ class HostEngramCoordinator:
         self, input_ids: torch.Tensor, forward_batch
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
-        # The draft tokens come back with the queued commits, in one read.
-        (input_ids_cpu,) = flush_engram_commits(self._hasher, also_read=(input_ids,))
+        spec_info = getattr(forward_batch, "spec_info", None)
+        live_seq_lens_cpu = getattr(spec_info, "live_seq_lens_cpu", None)
+        # Batch input_ids (and positions when SGLANG_TPU_SPEC_DEVICE_ROWS skips
+        # live_seq_lens_cpu) with any queued Engram commits in a single D2H read.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and live_seq_lens_cpu is None
+            and isinstance(forward_batch.positions, torch.Tensor)
+            and forward_batch.positions.device.type != "cpu"
+        ):
+            input_ids_cpu, positions_for_host = flush_engram_commits(
+                self._hasher, also_read=(input_ids, forward_batch.positions)
+            )
+        else:
+            (input_ids_cpu,) = flush_engram_commits(
+                self._hasher, also_read=(input_ids,)
+            )
+            positions_for_host = forward_batch.positions
         if not forward_batch.forward_mode.is_target_verify():
             return None
         history = self._hasher.history
-        spec_info = getattr(forward_batch, "spec_info", None)
         # Upstream keeps the ragged layout on the forward batch, not spec_info.
         assert getattr(forward_batch, "ragged_verify_layout", None) is None, (
             "Host Engram stage_verify assumes uniform draft_token_num per request "
@@ -1200,11 +1215,11 @@ class HostEngramCoordinator:
             inputs = verify_inputs_from_host(
                 history,
                 input_ids_cpu,
-                forward_batch.positions,
+                positions_for_host,
                 req_slots,
                 block=block,
                 ngram=self.ngram,
-                live_seq_lens_cpu=getattr(spec_info, "live_seq_lens_cpu", None),
+                live_seq_lens_cpu=live_seq_lens_cpu,
             )
         except (ValueError, IndexError):
             return None

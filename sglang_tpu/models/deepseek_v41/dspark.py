@@ -115,10 +115,30 @@ def greedy_markov_drafts(
     draft_hidden = hidden if model.sample_from_anchor else hidden[:, 1:]
     head = model.markov_head
     vocab = head.vocab_size
+    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
+    if (
+        hidden.device.type == "tpu"
+        and getattr(head, "_tpu_sharded_markov_w2", False)
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.dspark_markov import (
+            sharded_greedy_markov_pallas,
+        )
+
+        x_post_hc = model.collapse_hc_head(draft_hidden.reshape(bs * gamma, -1))
+        x = model.stages[-1].norm(x_post_hc)
+        return sharded_greedy_markov_pallas(
+            x,
+            model.lm_head.weight,
+            head.markov_w1.weight,
+            head.markov_w2.weight,
+            prev,
+            world=int(getattr(head, "_tpu_sharded_markov_world")),
+            vocab=vocab,
+            gamma=gamma,
+        )
     base_logits, _ = model.compute_base_logits(draft_hidden.reshape(bs * gamma, -1))
     w1 = head.markov_w1.weight[:vocab]
     w2 = head.markov_w2.weight[:vocab]
-    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
     if (
         hidden.device.type == "tpu"
         and vocab >= 8
