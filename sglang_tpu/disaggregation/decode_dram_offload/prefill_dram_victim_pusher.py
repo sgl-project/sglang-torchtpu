@@ -331,11 +331,11 @@ class PrefillDramVictimPusher:
                 self._cache, node
             ):
                 continue
-            path = path_tokens(self._cache, node)
-            if pushed_tokens == len(path):
-                continue
             pages = host_pages(self._cache, self._host_pool, node)
             if pages is None:
+                continue
+            path = path_tokens(self._cache, node)
+            if pushed_tokens == len(path):
                 continue
             swa_pages = window_host_pages(
                 self._cache,
