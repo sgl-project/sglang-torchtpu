@@ -22,6 +22,7 @@ sums in expert order rather than top-k order.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +30,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.gmm_v2 import _FP32_MOE_SCALES
+from sglang_tpu.moe.pallas.moe_tp_decode.all_reduce import tiled_bytes
+from sglang_tpu.moe.pallas.moe_tp_decode.kernel import VMEM_FRACTION, VMEM_HEADROOM
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
@@ -42,24 +45,13 @@ _W2_CHUNKS = 1
 # Rows per compute tile by expert pair count: up to 8 pairs one 8-row tile, up
 # to 16 one 16-row tile, more in 32-row tiles (measured per-tile cost 0.9 / 1.1 / 1.4 us).
 _TILE_ROWS = (8, 16, 32)
-_VMEM_HEADROOM = 1.25
-_VMEM_FRACTION = 0.85
-
-
-def _tiled_bytes(shape, dtype, info):
-    itemsize = jnp.dtype(dtype).itemsize
-    sublanes = info.num_sublanes * max(1, 4 // itemsize)
-    *lead, rows, cols = (1, *shape) if len(shape) == 1 else shape
-    rows = pl.cdiv(rows, sublanes) * sublanes
-    cols = pl.cdiv(cols, info.num_lanes) * info.num_lanes
-    out = rows * cols * itemsize
-    for d in lead:
-        out *= d
-    return out
+# Largest token count the kernel takes: the largest one timed, and a bound on the
+# [tokens * k, tokens * k] compare its routing builds.
+_MAX_TOKENS = 512
 
 
 def _vmem_need(t, h, n, slots, tile_rows, info):
-    b = functools.partial(_tiled_bytes, info=info)
+    b = functools.partial(tiled_bytes, info=info)
     nq = h // _Q_BLOCK
     lanes = info.num_lanes
     ring = slots * (
@@ -78,13 +70,28 @@ def _vmem_need(t, h, n, slots, tile_rows, info):
     return ring + rows
 
 
+def _vmem_limit(tokens, hidden, n, slots, tile_rows, info):
+    """The kernel's VMEM limit, by moe_tp_decode's rule: its headroom over the
+    planned bytes, or None when that passes its fraction of the capacity."""
+    limit = int(_vmem_need(tokens, hidden, n, slots, tile_rows, info) * VMEM_HEADROOM)
+    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
+        return None
+    return min(limit, info.vmem_capacity_bytes)
+
+
 def supports(tokens, hidden, two_n, *, slots=_SLOTS, tile_rows=_TILE_ROWS) -> bool:
     info = pltpu.get_tpu_info()
     n = two_n // 2
-    if hidden % _Q_BLOCK or n % info.num_lanes or tokens < 1:
+    # _down quantizes its lhs as one block, which is gmm_v2's rule only for
+    # n <= _Q_BLOCK; wider experts come out 1-3% away from gmm_v2 (measured).
+    if (
+        hidden % _Q_BLOCK
+        or n % info.num_lanes
+        or n > _Q_BLOCK
+        or not 1 <= tokens <= _MAX_TOKENS
+    ):
         return False
-    need = _vmem_need(tokens, hidden, n, slots, tile_rows, info)
-    return need * _VMEM_HEADROOM <= info.vmem_capacity_bytes * _VMEM_FRACTION
+    return _vmem_limit(tokens, hidden, n, slots, tile_rows, info) is not None
 
 
 def _route(topk_ids, topk_weights, num_experts):
@@ -364,8 +371,8 @@ def moe_ring(
     s2 = w2_scale.astype(jnp.float32)
     nq = hidden // _Q_BLOCK
     lanes = info.num_lanes
-    need = _vmem_need(tokens, hidden, n, slots, tile_rows, info)
-    limit = min(int(need * _VMEM_HEADROOM) + (8 << 20), info.vmem_capacity_bytes)
+    limit = _vmem_limit(tokens, hidden, n, slots, tile_rows, info)
+    assert limit is not None, "moe_ring does not fit VMEM; check supports() first"
     nsem = w1_chunks + w2_chunks + 2
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -404,6 +411,75 @@ def moe_ring(
     )(counts, offsets, tok, wt, x, w1, s1, w2, s2)
 
 
+# Cost model: microseconds per call on one tpu7x TensorCore, for this kernel and for
+# the gmm_v2 path it replaces. Fitted to 230 timed calls over 11 weight shapes
+# (hidden 2048-8192, expert width 128-768, 1-512 tokens, spread and concentrated
+# routing); it reproduces them to 8% (ring) and 10% (gmm_v2) rms, 21% / 24% worst.
+_MB = float(1 << 20)
+_RING_FIXED_US = 7.44
+_RING_TOKEN_US = 0.175  # per token, at hidden 4096
+_RING_ROUTE_US = 0.128  # per 1000 token pairs: the routing compares all pairs
+_RING_EXPERT_US = 0.027  # per distinct expert
+_RING_COPY_MB_PER_US = 3.33  # weight bytes into VMEM, three experts in flight
+_RING_TILE_US = 0.52  # one row tile through one expert ...
+_RING_TILE_ROW_MB_US = 0.0066  # ... plus this per row per MB of expert weights
+_GMM_FIXED_US = 15.6
+_GMM_EXPERT_US = 0.94  # per distinct expert
+_GMM_US_PER_MB = 0.252  # per MB of a distinct expert's weights
+_GMM_TOKEN_US = 0.333  # per token, at hidden 4096
+_GMM_TOKEN_WIDTH_US = 0.0047  # per token, at hidden 4096, per 256 of expert width
+
+
+def _rows_per_expert_pmf(tokens, topk, num_experts):
+    """P(an expert is routed c of the tokens), c = 0..tokens, when every token
+    picks topk distinct experts uniformly: what the trace-time choice assumes,
+    since the real routing is only known at run time."""
+    p = min(1.0, topk / num_experts)
+    return [
+        math.comb(tokens, c) * p**c * (1.0 - p) ** (tokens - c)
+        for c in range(tokens + 1)
+    ]
+
+
+def ring_cost_us(tokens, topk, num_experts, hidden, n, tile_rows=_TILE_ROWS) -> float:
+    """Modelled time of one moe_ring call. Each hit expert costs the longer of
+    its weight copy and its row tiles, which overlap."""
+    weight_mb = 3 * hidden * n / _MB  # w1 [hidden, 2n] + w2 [n, hidden], fp8
+    copy = weight_mb / _RING_COPY_MB_PER_US
+    per_expert = 0.0
+    for c, prob in enumerate(_rows_per_expert_pmf(tokens, topk, num_experts)):
+        if c == 0:
+            continue
+        rows = next((r for r in tile_rows if c <= r), tile_rows[-1])
+        tiles = pl.cdiv(c, rows)
+        tile = _RING_TILE_US + _RING_TILE_ROW_MB_US * rows * weight_mb
+        per_expert += prob * (_RING_EXPERT_US + max(copy, tiles * tile))
+    return (
+        _RING_FIXED_US
+        + _RING_TOKEN_US * tokens * hidden / 4096
+        + _RING_ROUTE_US * tokens * tokens / 1000
+        + num_experts * per_expert
+    )
+
+
+def gmm_cost_us(tokens, topk, num_experts, hidden, n) -> float:
+    """Modelled time of the gmm_v2 path for the same call."""
+    weight_mb = 3 * hidden * n / _MB
+    hit = num_experts * (1.0 - _rows_per_expert_pmf(tokens, topk, num_experts)[0])
+    return (
+        _GMM_FIXED_US
+        + hit * (_GMM_EXPERT_US + _GMM_US_PER_MB * weight_mb)
+        + tokens * hidden / 4096 * (_GMM_TOKEN_US + _GMM_TOKEN_WIDTH_US * n / 256)
+    )
+
+
+def prefers_ring(tokens, topk, num_experts, hidden, n) -> bool:
+    """Whether the model puts this call's moe_ring time under its gmm_v2 time."""
+    return ring_cost_us(tokens, topk, num_experts, hidden, n) < gmm_cost_us(
+        tokens, topk, num_experts, hidden, n
+    )
+
+
 def maybe_moe_ring(
     hidden_states,
     w1,
@@ -419,21 +495,19 @@ def maybe_moe_ring(
     no_combine,
     use_group_offset,
     w_quant_bits,
-    min_tokens,
-    max_tokens,
 ):
     """The ring kernel's output for a fused-MoE call it covers, else None.
 
-    Covers min_tokens..max_tokens bf16 tokens with every expert local, unbiased
-    FP8 experts with per-channel scales and the clamped SiLU."""
+    Covers bf16 tokens with every expert local, unbiased FP8 experts with
+    per-channel scales and the clamped SiLU, where the kernel fits VMEM
+    (supports) and the cost model puts it under gmm_v2 (prefers_ring)."""
     if not activation_name.startswith("silu_and_mul_clamp:"):
         return None
     clamp_limit = float(activation_name.split(":", 1)[1])
     tokens, hidden = hidden_states.shape
     num_experts, w1_k, two_n = w1.shape
     if (
-        not min_tokens <= tokens <= max_tokens
-        or no_combine
+        no_combine
         or use_group_offset
         or w_quant_bits
         or w1_bias is not None
@@ -448,6 +522,7 @@ def maybe_moe_ring(
         or w1_scale.shape != (num_experts, 1, 1, two_n)
         or w2_scale.shape != (num_experts, 1, 1, hidden)
         or not supports(tokens, hidden, two_n)
+        or not prefers_ring(tokens, topk_ids.shape[1], num_experts, hidden, two_n // 2)
     ):
         return None
     return moe_ring(

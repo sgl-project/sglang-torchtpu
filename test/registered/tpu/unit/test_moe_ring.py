@@ -52,6 +52,50 @@ class TestMoeRingRoute(CustomTestCase):
             np.testing.assert_array_equal(wt[got], [wts[t, j] for t, j in want])
 
 
+@unittest.skipUnless(_HAS_JAX, "requires JAX and torch_tpu")
+class TestMoeRingCostModel(CustomTestCase):
+    """The trace-time choice between the ring and gmm_v2 (static shapes only)."""
+
+    def test_measured_points(self):
+        from sglang_tpu.moe.pallas.moe_ring import gmm_cost_us, ring_cost_us
+
+        # (tokens, experts, hidden, width) -> measured us (ring, gmm_v2), spread routing.
+        measured = {
+            (2, 288, 4096, 256): (24.6, 47.0),
+            (64, 288, 4096, 256): (235.9, 451.0),
+            (256, 288, 4096, 256): (324.5, 611.1),
+            (64, 288, 4096, 512): (453.6, 554.9),
+            (64, 288, 4096, 128): (186.2, 393.2),
+            (64, 128, 2048, 256): (95.5, 198.1),
+            (64, 96, 8192, 128): (107.3, 262.5),
+        }
+        for (tokens, experts, hidden, n), (ring, gmm) in measured.items():
+            with self.subTest(tokens=tokens, experts=experts, hidden=hidden, n=n):
+                self.assertAlmostEqual(
+                    ring_cost_us(tokens, TOPK, experts, hidden, n) / ring, 1, delta=0.25
+                )
+                self.assertAlmostEqual(
+                    gmm_cost_us(tokens, TOPK, experts, hidden, n) / gmm, 1, delta=0.25
+                )
+
+    def test_prefers_ring_at_decode_sizes(self):
+        from sglang_tpu.moe.pallas.moe_ring import prefers_ring
+
+        for tokens in (1, 2, 8, 32, 64, 128, 256, 512):
+            for hidden, n in ((4096, 256), (4096, 512), (4096, 128), (2048, 256)):
+                with self.subTest(tokens=tokens, hidden=hidden, n=n):
+                    self.assertTrue(prefers_ring(tokens, TOPK, EXPERTS, hidden, n))
+
+    def test_few_experts_many_tokens_prefers_gmm(self):
+        from sglang_tpu.moe.pallas.moe_ring import prefers_ring
+
+        # Every expert gets hundreds of rows: row tiles, not weight bytes, set the
+        # time, and gmm_v2's larger tiles win (measured from about 128 tokens on
+        # 16 experts).
+        self.assertFalse(prefers_ring(512, TOPK, 16, HIDDEN, INTER))
+        self.assertTrue(prefers_ring(16, TOPK, 16, HIDDEN, INTER))
+
+
 @unittest.skipUnless(_HAS_TPU, "requires a JAX TPU backend")
 class TestMoeRing(CustomTestCase):
     @classmethod
@@ -164,7 +208,7 @@ class TestMoeRing(CustomTestCase):
         out = self.ring(x, jnp.full_like(ids, -1), wts)
         np.testing.assert_array_equal(np.asarray(out, np.float32), 0)
 
-    def test_dispatch_behind_flag(self):
+    def test_dispatch(self):
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
@@ -178,19 +222,49 @@ class TestMoeRing(CustomTestCase):
         with mock.patch(
             "sglang_tpu.moe.pallas.moe_ring.moe_ring", wraps=lambda *a, **k: x
         ) as ring:
-            _fused_moe_jax(*args, **call)
+            # No flag: the kernel takes every call it covers and its model prefers.
+            out = _fused_moe_jax(*args, **call)
+            self.assertTrue(ring.called)
+            self.assertIs(out, x)
+            ring.reset_mock()
+            with mock.patch(
+                "sglang_tpu.moe.pallas.moe_ring.prefers_ring", return_value=False
+            ):
+                _fused_moe_jax(*args, **call)
             self.assertFalse(ring.called)
-            with tpu_envs.SGLANG_TPU_ENABLE_MOE_RING_KERNEL.override(True):
-                out = _fused_moe_jax(*args, **call)
-                self.assertTrue(ring.called)
-                self.assertIs(out, x)
-                ring.reset_mock()
-                with tpu_envs.SGLANG_TPU_MOE_RING_MAX_TOKENS.override(16):
-                    _fused_moe_jax(*args, **call)
-                self.assertFalse(ring.called)
-                # Expert parallelism keeps the gmm path.
-                _fused_moe_jax(*args, **call, global_num_experts=2 * EXPERTS)
-                self.assertFalse(ring.called)
+            # Expert parallelism keeps the gmm path.
+            _fused_moe_jax(*args, **call, global_num_experts=2 * EXPERTS)
+            self.assertFalse(ring.called)
+            # One token: the ring, unless the streaming kernel is enabled.
+            one = (
+                x[:1],
+                self.w1,
+                self.w2,
+                wts[:1],
+                ids[:1],
+                self.s1,
+                self.s2,
+                None,
+                None,
+            )
+            _fused_moe_jax(*one, **call)
+            self.assertTrue(ring.called)
+            ring.reset_mock()
+            with tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.override(True):
+                _fused_moe_jax(*one, **call)
+            self.assertFalse(ring.called)
+
+    def test_supports(self):
+        from sglang_tpu.moe.pallas.moe_ring import _MAX_TOKENS, supports
+
+        self.assertTrue(supports(1, HIDDEN, 2 * INTER))
+        self.assertTrue(supports(256, HIDDEN, 2 * INTER))
+        self.assertFalse(supports(_MAX_TOKENS + 1, HIDDEN, 2 * INTER))
+        # Wider than one quantization block: not gmm_v2's down projection.
+        self.assertTrue(supports(16, HIDDEN, 2 * 512))
+        self.assertFalse(supports(16, HIDDEN, 2 * 640))
+        # One EP8 rank's full-width experts are refused.
+        self.assertFalse(supports(16, HIDDEN, 2 * 2048))
 
 
 if __name__ == "__main__":

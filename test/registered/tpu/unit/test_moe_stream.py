@@ -58,11 +58,16 @@ class TestMoeStreamBs1(CustomTestCase):
         return x, ids.reshape(1, TOPK), wts
 
     def routed(self, x, ids, wts):
-        """The route-meta + gmm_v2 path, with the streaming dispatch disabled."""
+        """The route-meta + gmm_v2 path, with the streaming and ring dispatches disabled."""
         from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
-        with mock.patch(
-            "sglang_tpu.moe.pallas.moe_stream.maybe_moe_stream", return_value=None
+        with (
+            mock.patch(
+                "sglang_tpu.moe.pallas.moe_stream.maybe_moe_stream", return_value=None
+            ),
+            mock.patch(
+                "sglang_tpu.moe.pallas.moe_ring.maybe_moe_ring", return_value=None
+            ),
         ):
             return _fused_moe_jax(
                 x,
