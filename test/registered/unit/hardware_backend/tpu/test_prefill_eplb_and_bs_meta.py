@@ -19,6 +19,7 @@ from sglang_tpu.envs import envs
 from sglang_tpu.muse_prefill_kernels.eplb import (
     OnlineEplbController,
     PrefillEplbManager,
+    build_eplb_moe_op,
     compute_eplb_tile_skew_stats,
     compute_zeroglue_eplb_perm,
     is_eligible_eplb_calib_batch,
@@ -1022,6 +1023,62 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
                 )
             valid = local_ids.reshape(-1) < num_e
             np.testing.assert_array_equal(inv.reshape(-1)[valid], ref[valid])
+
+    def test_build_eplb_moe_op_sanitizes_multibucket_causal_chunk_spec(self):
+        import re
+        from jax.sharding import Mesh
+
+        spec = "3072:1024,2048;2048:768,1280;1024:384,640;512:192,320"
+        expected_ccs = "_ccs_3072_1024_2048__2048_768_1280__1024_384_640__512_192_320"
+        devs = jax.devices()[:8]
+        mesh = Mesh(np.array(devs), ("model",))
+        recorded_names = []
+        import sglang_tpu.pallas_jax_op as _pjo
+
+        orig_export = _pjo.cpu_export_jax_op
+
+        def _spy_export(name, *args, **kwargs):
+            recorded_names.append(name)
+            return orig_export(name, *args, **kwargs)
+
+        with (
+            patch(
+                "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh",
+                return_value=mesh,
+            ),
+            patch(
+                "sglang_tpu.pallas_jax_op.cpu_export_jax_op",
+                side_effect=_spy_export,
+            ),
+        ):
+            op_main = build_eplb_moe_op(
+                h_q_local=8,
+                h_kv_local=1,
+                fused_glue=True,
+                eplb_mode="perm",
+                eplb_calib=False,
+                op_extra_tag="_tp8_utest_ccs",
+                causal_chunk_stream=True,
+                causal_chunk_spec=spec,
+            )
+            op_agd = build_eplb_moe_op(
+                h_q_local=8,
+                h_kv_local=1,
+                fused_glue=True,
+                eplb_mode="perm",
+                eplb_calib=False,
+                op_extra_tag=f"_tp8_utest_ccs_agd{expected_ccs}",
+                next_in_gather_rows_fn=lambda ts: ts // 3,
+                causal_chunk_stream=True,
+                causal_chunk_spec=spec,
+            )
+
+        self.assertIsNotNone(op_main)
+        self.assertIsNotNone(op_agd)
+        self.assertEqual(len(recorded_names), 2)
+        for name in recorded_names:
+            self.assertRegex(name, r"^[A-Za-z0-9_]+::[A-Za-z0-9_]+$")
+            self.assertEqual(name.count(expected_ccs), 1, name)
 
 
 if __name__ == "__main__":

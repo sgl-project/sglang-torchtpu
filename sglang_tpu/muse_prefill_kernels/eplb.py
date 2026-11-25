@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -975,7 +976,17 @@ def build_eplb_moe_op(
     spad_sfx = "_spad" if skip_pad_tokens else ""
     cal_sfx = "_cal" if eplb_calib else ""
     ccs_sfx = (
-        "_ccs" + ("_" + causal_chunk_spec.replace(",", "_") if causal_chunk_spec else "")
+        "_ccs"
+        + (
+            "_"
+            + re.sub(
+                r"[^0-9A-Za-z_]",
+                "_",
+                str(causal_chunk_spec).replace(";", "__"),
+            )
+            if causal_chunk_spec
+            else ""
+        )
         if causal_chunk_stream
         else ""
     )
