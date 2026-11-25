@@ -110,13 +110,24 @@ def _e4m3_rne(v):
     return jnp.where(jnp.abs(v) < 2.0**-6, sub, normal)
 
 
-def _pipeline(stages: tuple, order: tuple, nt: int, gap: int) -> None:
+def _pipeline(
+    stages: tuple,
+    order: tuple,
+    nt: int,
+    gap: int,
+    off: int = 0,
+    pre=None,
+    n_pre: int = 0,
+) -> None:
     """common.coll.run_pipeline with a chosen stage order per iteration: stage k runs on tile
     i - k * (1 + gap). Running the DMA relays before the compute gives every relay's sends a
     whole compute to land (run_pipeline's later-stages-first order issues the partner share
     right after the compute that waits for it)."""
     lag = 1 + gap
-    n_it = nt + (len(stages) - 1) * lag
+    n_it = max(nt + (len(stages) - 1) * lag, n_pre)
+    # pre(i), i < n_pre: extra compute in the iterations before the last stage's first tile
+    if pre is not None and n_pre > (len(stages) - 1) * lag:
+        raise ValueError(f"{n_pre} pre tiles do not fit the fill iterations")
 
     def body(i, carry):
         for k in order:
@@ -125,11 +136,28 @@ def _pipeline(stages: tuple, order: tuple, nt: int, gap: int) -> None:
             @pl.when(jnp.logical_and(j >= 0, j < nt))
             def _(st=stages[k], j=j):
                 with _scope(f"pf_{st.__name__}"):
-                    st(j)
+                    st(j + off)
 
+        if pre is not None:
+            pl.when(i < n_pre)(lambda: pre(i))
         return carry
 
     jax.lax.fori_loop(0, n_it, body, 0)
+
+
+class _Multi:
+    """Local copies started and waited together (one tile's loads)."""
+
+    def __init__(self, cps):
+        self.cps = cps
+
+    def start(self):
+        for cp in self.cps:
+            cp.start()
+
+    def wait(self):
+        for cp in self.cps:
+            cp.wait()
 
 
 class _Copies:
@@ -291,6 +319,9 @@ def xag_qkvg_call(
     route: int = 0,
     own_first: bool = False,
     q_strided: bool = False,
+    n_pre: int = 0,
+    wk: int = 1,
+    defer_res: bool = False,
 ):
     """(layer [1] i32, x8 [Ts, H] e4m3 own rows, xs [T, 1] f32 every row's scale, rope [T, 2 hd]
     f32, stacked wqkvg [L, H, nq] e4m3 and smalls [L, 16, H] f32) -> (q, kv [T, 2 kvd], gate
@@ -320,6 +351,18 @@ def xag_qkvg_call(
     # q_strided: q as [Hkv, T * G, 128] (the same bytes as [Hkv, T, G, 128] in HBM): head g of
     # every row goes to rows g, g + G, ... by a sublane-strided f32 store, then one cast, instead
     # of _q_rpa's 0/1 dot and [rows, G, 128] relayout
+    # n_pre: tiles 0..n_pre-1 arrive gathered (post_ffn.py); call (lyr, stream, xg, xsc, rope,
+    # wqkvg, smalls); they are computed in the gather's fill iterations
+    # defer_res (with n_pre): the previous layer's FFN residual of tiles >= n_pre runs here, per
+    # tile before its norm (post_ffn.py defer_res hands over f and the inverse rms); call
+    # (lyr, stream_old, stream_new (pre tiles written; aliased to the 4th output), f, inv, xg,
+    # xsc, rope, wqkvg, smalls) -> (q, kv, gate, stream_new)
+    if defer_res and not n_pre:
+        raise ValueError("defer_res needs n_pre")
+    if wk > 1 and (not n_pre or H % (wk * kc) or n_tail):
+        raise ValueError(f"wk {wk}: needs n_pre and H % (wk * kc) == 0")
+    if n_pre and (not fuse_norm or own_first or dbg_xs or not dma_first or n_pre >= nt):
+        raise ValueError("n_pre needs fuse_norm, dma_first and not own_first / dbg_xs")
     if q_strided and (not q_rpa or own_first or hd != 64):
         raise ValueError("q_strided needs q_rpa, head_dim 64 and not own_first")
     if own_first and (not fuse_norm or dbg_xs or nt < 3 or half % 128 or seg != 32):
@@ -327,8 +370,34 @@ def xag_qkvg_call(
             "own_first needs fuse_norm, seg 32, >= 3 tiles and Ts / 2 % 128 == 0"
         )
 
+    pre_refs = {}
+
     def kernel(lyr, *refs):
-        if fuse_norm and not dbg_xs:
+        if n_pre and defer_res:
+            (
+                x_hbm,
+                _stn_in,
+                pre_refs["f"],
+                pre_refs["inv"],
+                pre_refs["xg"],
+                pre_refs["xsc"],
+                rope_hbm,
+                w_hbm,
+                sm_hbm,
+                q_o,
+                kv_o,
+                g_o,
+                pre_refs["stn"],
+                *rest,
+            ) = refs
+            rest = [q_o, kv_o, g_o] + rest
+            xs_hbm = None
+        elif n_pre:
+            x_hbm, pre_refs["xg"], pre_refs["xsc"], rope_hbm, w_hbm, sm_hbm, *rest = (
+                refs
+            )
+            xs_hbm = None
+        elif fuse_norm and not dbg_xs:
             x_hbm, rope_hbm, w_hbm, sm_hbm, *rest = refs
             xs_hbm = None
         else:
@@ -378,9 +447,36 @@ def xag_qkvg_call(
         else:
             coll_sems = rest
         qs_v = None
+        if defer_res:
+            *coll_sems, fin_v, iv_v, xo_v, smp_v, fsem, st_sem, smp_sem = coll_sems
+        if wk > 1:
+            *coll_sems, wk_sem = coll_sems
+        if n_pre:
+            *coll_sems, pre_v, presc_v, pre_sem = coll_sems
         if q_strided:
             *coll_sems, qs_v = coll_sems
         me = jax.lax.axis_index(axis).astype(jnp.int32)
+
+        def slot_of(j):
+            return (j - n_pre) % n_slots
+
+        def st_write(j):
+            return pltpu.make_async_copy(
+                xo_v.at[j % 2],
+                pre_refs["stn"].at[pl.ds(pl.multiple_of(j * seg, seg), seg)],
+                st_sem.at[j % 2],
+            )
+
+        def pre_loads(i):
+            b = i % 2
+            return [
+                pltpu.make_async_copy(
+                    pre_refs["xg"].at[i], pre_v.at[b], pre_sem.at[0, b]
+                ),
+                pltpu.make_async_copy(
+                    pre_refs["xsc"].at[i], presc_v.at[b], pre_sem.at[1, b]
+                ),
+            ]
 
         def rank_of(p: int):
             return jax.lax.rem(me + p, tp) if own_first else p
@@ -407,10 +503,23 @@ def xag_qkvg_call(
 
         def own_load(j):
             rows = x_hbm.at[pl.ds(pl.multiple_of(j * seg, seg), seg)]
+            if defer_res:
+                rr = pl.ds(pl.multiple_of(j * seg, seg), seg)
+                return _Multi(
+                    [
+                        pltpu.make_async_copy(rows, xin_v.at[j % 2], own_sem.at[j % 2]),
+                        pltpu.make_async_copy(
+                            pre_refs["f"].at[rr], fin_v.at[j % 2], fsem.at[0, j % 2]
+                        ),
+                        pltpu.make_async_copy(
+                            pre_refs["inv"].at[rr], iv_v.at[j % 2], fsem.at[1, j % 2]
+                        ),
+                    ]
+                )
             if fuse_norm:
                 return pltpu.make_async_copy(rows, xin_v.at[j % 2], own_sem.at[j % 2])
             return pltpu.make_async_copy(
-                rows, blocks.at[j % n_slots, me], own_sem.at[j % 2]
+                rows, blocks.at[slot_of(j), me], own_sem.at[j % 2]
             )
 
         def norm_rows(x32):
@@ -457,8 +566,22 @@ def xag_qkvg_call(
 
         def own_norm(j):
             """program._rms_fp8_rows of own tile j into its pad block and scale tile."""
-            s = j % n_slots
+            s = slot_of(j)
             x32 = xin_v[j % 2]
+            if defer_res:
+                # previous layer's FFN residual (spep.residual), then this layer's norm
+                smp = smp_v[...]
+                d = fin_v[j % 2].astype(jnp.float32) * small_row(smp, "post_ffn_w")
+                x32 = small_row(smp, "ffn_alpha") * x32 + small_row(smp, "ffn_beta") * (
+                    (d * iv_v[j % 2]).astype(jnp.bfloat16).astype(jnp.float32)
+                )
+
+                @pl.when(j >= n_pre + 2)
+                def _():
+                    st_write(j - 2).wait()
+
+                xo_v[j % 2] = x32
+                st_write(j).start()
             w = small_row(sm_v[...], "pre_attn_w")
             r = jax.lax.rsqrt(
                 jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + c.rms_eps
@@ -577,11 +700,32 @@ def xag_qkvg_call(
 
         # tile 0's own rows ahead of the 18.9 MB weight copy, which it would queue behind
         w_cps[0].start()
+
+        def smp_cp():
+            return pltpu.make_async_copy(sm_hbm.at[l - 1], smp_v, smp_sem.at[0])
+
+        if defer_res:
+            smp_cp().start()
         if not own_first:
-            own_load(0).start()
+            own_load(n_pre).start()
+        if n_pre:
+            for cp in pre_loads(0) + in_loads(0):
+                cp.start()
         # every peer is in the kernel before anyone writes into its pads
         col.barrier()
-        if w_start == 0:
+        wkr = H // wk
+
+        def wk_cp(i):
+            return pltpu.make_async_copy(
+                w_hbm.at[l, pl.ds(i * wkr, wkr)],
+                w_v.at[pl.ds(i * wkr, wkr)],
+                wk_sem.at[i],
+            )
+
+        if wk > 1:
+            for i in range(wk):
+                wk_cp(i).start()
+        elif w_start == 0:
             w_cps[1].start()
 
         def start_w_at(stage: int, j):
@@ -669,27 +813,31 @@ def xag_qkvg_call(
 
             if fuse_norm:
 
-                @pl.when(j == 0)
+                @pl.when(j == n_pre)
                 def _():
                     w_cps[0].wait()
+                    if defer_res:
+                        smp_cp().wait()
 
                 with _scope("xq_norm"):
                     own_norm(j)
-            col.ag_start(kp, j % n_slots)
+            col.ag_start(kp, slot_of(j))
 
         def s2a(j):
-            col.ag_relay(kp, j % n_slots)
+            col.ag_relay(kp, slot_of(j))
             start_w_at(1, j)
 
         def s2(j):
-            col.ag_to_partner(kp, j % n_slots)
+            col.ag_to_partner(kp, slot_of(j))
             start_w_at(2, j)
             for cp in in_loads(j):
                 cp.start()
 
-        def kdot(x, w):
+        def kdot(x, w, kwait=None):
             acc = None
             for k0 in range(0, H, kc):
+                if kwait is not None and k0 % wkr == 0:
+                    kwait(k0 // wkr)
                 part = jnp.dot(
                     x[:, k0 : k0 + kc],
                     w[k0 : k0 + kc, :],
@@ -698,10 +846,10 @@ def xag_qkvg_call(
                 acc = part if acc is None else acc + part
             return acc
 
-        def qk_dot(pad, s, r0, hm):
-            x = pad[s, r0 : r0 + hm, :]
+        def qk_dot(x_of, r0, hm, kwait=None):
+            x = x_of(r0, hm)
             if not n_tail:
-                return kdot(x, w_v[...])
+                return kdot(x, w_v, kwait)
             # the last 256-column block as two row halves: 9 blocks split 5:4 over the 2 MXUs
             nm = nq - 256
             head = kdot(x, w_v[:, :nm])
@@ -712,9 +860,9 @@ def xag_qkvg_call(
             return jnp.concatenate([head, tail], axis=1)
 
         def s3(j):
-            s, b = j % n_slots, j % 2
+            s, b = slot_of(j), j % 2
 
-            if not own_first:
+            if not own_first and not n_pre:
 
                 @pl.when(j == 0)
                 def _():
@@ -756,6 +904,10 @@ def xag_qkvg_call(
                 for cp in out_writes(j):
                     cp.start()
                 return
+            tile_compute(j, b, lambda r0, n: pad[s, r0 : r0 + n, :], xs_all, sm)
+
+        def tile_compute(j, b, x_of, xs_all, sm, kwait=None):
+            """qkvg, epilogue and the output writes of tile j from rows x_of(r0, n)."""
             epi = qkv_epilogue if mxu_norm else qkv_from_proj
             epi = qkv_epilogue_split if split_epi else epi
             hm = tm // m_split
@@ -768,7 +920,7 @@ def xag_qkvg_call(
                 for h in range(m_split):
                     r0 = h * hm
                     with sc("qk_dot"):
-                        acc = qk_dot(pad, s, r0, hm)
+                        acc = qk_dot(x_of, r0, hm, kwait if h == 0 else None)
                         qkvg = (
                             acc
                             * xs_all[r0 : r0 + hm]
@@ -809,14 +961,53 @@ def xag_qkvg_call(
             for cp in out_writes(j):
                 cp.start()
 
+        def pre(i):
+            """Tile i < n_pre, gathered by the previous layer's post_ffn kernel."""
+            b = i % 2
+
+            if wk == 1:
+
+                @pl.when(i == 0)
+                def _():
+                    w_cps[1].wait()
+
+            @pl.when(i + 1 < n_pre)
+            def _():
+                for cp in pre_loads(i + 1) + in_loads(i + 1):
+                    cp.start()
+
+            with _scope("xq_wait"):
+                for cp in pre_loads(i) + in_loads(i):
+                    cp.wait()
+            sm = sm_v[...]
+            xs_all = tile_scales([presc_v[b, r] for r in range(tp)])
+            x_of = lambda r0, n: pre_v[b, r0 : r0 + n, :]
+            with _scope("qk_pre"):
+                if wk == 1:
+                    tile_compute(i, b, x_of, xs_all, sm)
+                else:
+                    # tile 0 waits for each weight K chunk as its dot reaches it
+                    @pl.when(i == 0)
+                    def _():
+                        tile_compute(i, b, x_of, xs_all, sm, lambda k: wk_cp(k).wait())
+
+                    pl.when(i > 0)(lambda: tile_compute(i, b, x_of, xs_all, sm))
+
         stages = (s1, s2a, s2, s3)
-        if dma_first:
+        if n_pre:
+            _pipeline(
+                stages, (1, 2, 0, 3), nt - n_pre, gap, off=n_pre, pre=pre, n_pre=n_pre
+            )
+        elif dma_first:
             _pipeline(stages, (1, 2, 0, 3), nt, gap)
         else:
             run_pipeline(stages, nt, gap)
         for j in range(max(0, nt - 2), nt) if not dbg_ag_only else ():
             for cp in out_writes(j):
                 cp.wait()
+        if defer_res:
+            for j in range(max(n_pre, nt - 2), nt):
+                st_write(j).wait()
         if own_first and not dbg_ag_only:
             for h in range(2):
                 for cp in own_writes(h):
@@ -862,32 +1053,58 @@ def xag_qkvg_call(
     scratch += [sem((n_slots,)) for _ in range(2 * len(kinds))]
     if q_strided:
         scratch += [vmem((kvh, tm * gq, 128), jnp.float32)]
+    if n_pre:
+        scratch += [
+            vmem((2, tm, H), jnp.float8_e4m3fn),
+            vmem((2, tp, 8, 128), jnp.float32),
+            sem((2, 2)),
+        ]
+    if wk > 1:
+        scratch += [sem((wk,))]
+    if defer_res:
+        scratch += [
+            vmem((2, seg, H), jnp.bfloat16),
+            vmem((2, seg, 1), jnp.float32),
+            vmem((2, seg, H), jnp.float32),
+            vmem((16, H), jnp.float32),
+            sem((2, 2)),
+            sem((2,)),
+            sem((1,)),
+        ]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     q_shape = (kvh, T, gq, 128) if q_rpa else (T, qd)
     q_shape = (kvh, T * gq, 128) if q_strided else q_shape
     name = (
-        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}{f'_ds{dma_split}' if dma_split > 1 else ''}{'_nt' if n_tail else ''}{'_dbgag' if dbg_ag_only else ''}{f'_rt{route}' if route else ''}{'_of' if own_first else ''}{'_qs' if q_strided else ''}"
+        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}{f'_ds{dma_split}' if dma_split > 1 else ''}{'_nt' if n_tail else ''}{'_dbgag' if dbg_ag_only else ''}{f'_rt{route}' if route else ''}{'_of' if own_first else ''}{'_qs' if q_strided else ''}{f'_pre{n_pre}' if n_pre else ''}{f'_wk{wk}' if wk > 1 else ''}{'_dr' if defer_res else ''}"
         f"{'_mxun' if mxu_norm else ''}{'_qrpa' if q_rpa else ''}{'_norm' if fuse_norm else ''}"
     )
 
     def call(lyr, x, *args):
         """(lyr, x8, xs, rope_rows, wqkvg, smalls); fuse_norm: (lyr, stream, rope_rows, ...)."""
-        if x.shape != (Ts, H) or len(args) != (3 if fuse_norm and not dbg_xs else 4):
+        n_args = (
+            (8 if defer_res else 5) if n_pre else (3 if fuse_norm and not dbg_xs else 4)
+        )
+        if x.shape != (Ts, H) or len(args) != n_args:
             raise ValueError(f"own rows {x.shape} / {len(args) + 2} operands")
+        xg_i = 3 if defer_res else 0
+        if n_pre and args[xg_i].shape != (n_pre, tm, H):
+            raise ValueError(f"xg {args[xg_i].shape}: expected ({n_pre}, {tm}, {H})")
         if (not fuse_norm or dbg_xs) and args[0].shape != (T, 1):
             raise ValueError(f"xs {args[0].shape}: expected ({T}, 1)")
+        outs = [
+            jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
+            jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
+            jax.ShapeDtypeStruct((kvh, T, gq, 128) if gate4 else (T, qd), jnp.bfloat16),
+        ]
+        if defer_res:
+            outs.append(jax.ShapeDtypeStruct((Ts, H), jnp.float32))
         return pl.pallas_call(
             kernel,
-            out_shape=(
-                jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
-                jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
-                jax.ShapeDtypeStruct(
-                    (kvh, T, gq, 128) if gate4 else (T, qd), jnp.bfloat16
-                ),
-            ),
+            out_shape=tuple(outs),
+            input_output_aliases={2: 3} if defer_res else {},
             in_specs=[smem] + [hbm] * (len(args) + 1),
-            out_specs=(hbm,) * 3,
+            out_specs=(hbm,) * len(outs),
             scratch_shapes=scratch,
             compiler_params=pltpu.CompilerParams(
                 collective_id=SPTP_XAG_QKVG_COLLECTIVE_ID,

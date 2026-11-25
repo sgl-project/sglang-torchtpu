@@ -43,6 +43,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     to_owner,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.ogate import o_gate_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.post_ffn import post_ffn_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
     oproj_a2a_call,
     oproj_call,
@@ -162,6 +163,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
     # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
     aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
+
+    def capture(x):
+        """A captured stream: gathered at capture time (the AG overlaps the later layers instead
+        of one [T, 5H] AG after the last layer), or own rows for one AG at the end."""
+        return ag(x.astype(_BF16), axis) if aux_early else x.astype(_BF16)
+
     # SPTP_XE_PALLAS_DEQUANT=1: row-major Pallas xe dequant (measured 171.1 vs 169.7 ms / chunk
     # for XLA's fusion + layout copy, which overlap the MoE routing glue)
     xe_pallas = (
@@ -284,6 +291,45 @@ def build_forward(c: PFConfig, axis: str = "model"):
         int(x) for x in os.environ.get("SPTP_PA_ORDER", "").split(",") if x
     )
 
+    # SPTP_XAG_PRE=n (with FUSED and NORM): a Pallas post-FFN card (unpool, FFN residual) that
+    # also norms and gathers the next layer's first n row tiles; that layer's xag_qkvg computes
+    # them while its own gather fills (sptp/post_ffn.py)
+    n_pre = int(os.environ.get("SPTP_XAG_PRE", "0")) if xag_norm else 0
+    # SPTP_POST_DEFER=1: post_ffn finishes only the n_pre tiles' residual; the next xag_qkvg
+    # does the rest per tile in its gather iterations
+    defer_res = bool(n_pre) and os.environ.get("SPTP_POST_DEFER", "0") == "1"
+    if n_pre:
+        xag_pre_k = {
+            r: xag_qkvg_call(
+                c,
+                xag_seg,
+                r,
+                mxu_norm=mxu_norm,
+                kc=int(os.environ.get("SPTP_XAG_KC", str(kc))),
+                q_rpa=q_rpa,
+                gap=xag_gap,
+                fuse_norm=True,
+                axis=axis,
+                split_epi=xag_split_epi,
+                gate4=xag_gate4,
+                m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "1")),
+                q_strided=xag_q_strided,
+                n_pre=n_pre,
+                wk=int(os.environ.get("SPTP_XAG_WK", "1")),
+                defer_res=defer_res,
+            )
+            for r in (True, False)
+        }
+        post_k = post_ffn_call(
+            c,
+            xag_seg,
+            n_pre,
+            ncw=int(os.environ.get("SPTP_POST_NCW", "512")),
+            axis=axis,
+            two_pass=os.environ.get("SPTP_POST_2PASS", "0") == "1",
+            defer_res=defer_res,
+        )
+
     def forward(
         meta,
         pos,
@@ -313,9 +359,38 @@ def build_forward(c: PFConfig, axis: str = "model"):
         # the native decoder streams the bf16-rounded normalized embedding
         stream = _bf(_rms(own, c.rms_eps))
         aux = []
+        # post_ffn's hand-over to the next layer (SPTP_XAG_PRE / SPTP_POST_DEFER)
+        stn = fpf = invpf = xg = xsc = None
         for l in range(L):
             sm = smalls[l]
-            if xag_norm:
+            if defer_res and l > 0:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate, stream = xag_pre_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        stn,
+                        fpf,
+                        invpf,
+                        xg,
+                        xsc,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+                if l - 1 in c.capture_layers:
+                    aux.append(capture(stream))
+            elif n_pre and l > 0:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate = xag_pre_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        xg,
+                        xsc,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+            elif xag_norm:
                 with _scope("sp_xag_qkvg"):
                     dbg = []
                     if xag_norm_dbg:
@@ -640,22 +715,32 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     skip_routing_psum=True,
                     group_sizes=counts,
                 )
-            with _scope("sp_unpool"):
-                u8, u_s = q8(y.astype(_F32))
-                # bf16: the unpool output feeds the post-FFN norm
-                f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
-            with _scope("sp_ffn_res"):
-                stream = residual(
-                    c, stream, sm, "ffn", f.astype(_F32) * small_row(sm, "post_ffn_w")
-                )
-            if l in c.capture_layers:
-                # gathered at capture time: the AG overlaps the later layers instead of one
-                # [T, 5H] AG after the last layer
-                aux.append(
-                    ag(stream.astype(_BF16), axis)
-                    if aux_early
-                    else stream.astype(_BF16)
-                )
+            if defer_res and l + 1 < L:
+                # stream stays the pre-residual one until the next layer's kernel finishes it
+                with _scope("sp_unpool"):
+                    stn, xg, xsc, fpf, invpf = post_k(
+                        jnp.full((1,), l, jnp.int32), y, stream, wunpool, smalls
+                    )
+            elif n_pre and l + 1 < L:
+                with _scope("sp_unpool"):
+                    stream, xg, xsc = post_k(
+                        jnp.full((1,), l, jnp.int32), y, stream, wunpool, smalls
+                    )
+            else:
+                with _scope("sp_unpool"):
+                    u8, u_s = q8(y.astype(_F32))
+                    # bf16: the unpool output feeds the post-FFN norm
+                    f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
+                with _scope("sp_ffn_res"):
+                    stream = residual(
+                        c,
+                        stream,
+                        sm,
+                        "ffn",
+                        f.astype(_F32) * small_row(sm, "post_ffn_w"),
+                    )
+            if l in c.capture_layers and not (defer_res and l + 1 < L):
+                aux.append(capture(stream))
         hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
         aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
         if not aux_early or not aux:
