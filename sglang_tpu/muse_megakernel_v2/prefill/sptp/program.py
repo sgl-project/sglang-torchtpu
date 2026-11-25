@@ -153,8 +153,18 @@ def build_forward(c: PFConfig, axis: str = "model"):
     qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
     # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
-    n_xag = int(os.environ.get("SPTP_XAG_CHUNKS", str(XAG_CHUNKS)))
+    xag_env = os.environ.get("SPTP_XAG_CHUNKS")
+    n_xag = int(xag_env or XAG_CHUNKS)
     xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
+    if n_xag > 1 and Ts % (n_xag * xag_tile):
+        if xag_env:
+            raise ValueError(
+                f"SPTP_XAG_CHUNKS={n_xag}: {Ts} own rows do not split into {n_xag} chunks of "
+                f"{xag_tile}-row tiles"
+            )
+        # the default chunk count, cut to what rows / tp tiles (1: one AG, then qkvg)
+        while n_xag > 1 and Ts % (n_xag * xag_tile):
+            n_xag -= 1
     qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
     gq = c.q_heads // c.kv_heads
     # SPTP_GLOBAL_COUNTS=1: the MoE counts every rank's slots itself
