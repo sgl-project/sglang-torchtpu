@@ -140,3 +140,15 @@ def _workspace_pages(
     col = torch.arange(columns, dtype=first.dtype, device=first.device)[None, :]
     inside = has_rows[:, None] & (col >= low[:, None]) & (col <= high[:, None])
     return torch.where(inside, base_page + offset[:, None] + col - low[:, None], 0)
+
+
+def ring_window_pages(slots: torch.Tensor, columns: int) -> torch.Tensor:
+    """request_window.decode_window_pages as int32 device ops, from device slots."""
+    from sglang_tpu.models.deepseek_v41.request_window import (
+        RESERVED_PAGES,
+        RING_PAGES,
+    )
+
+    logical = torch.arange(columns, dtype=torch.int32, device=slots.device)
+    ring = slots.to(torch.int32)[:, None] * RING_PAGES + RESERVED_PAGES
+    return ring + logical[None, :] % RING_PAGES

@@ -421,6 +421,38 @@ def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows(packed_rows
                 assert not set(ptrs) & batch_ptrs
 
 
+def test_device_ring_table_matches_the_uploaded_one():
+    """The verify ring SWA table built on the device equals the host-built
+    upload: positions across ring wraps and up to the table end, and a padding
+    slot 0 row (an idle DP rank's dummy request)."""
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        ),
+        swa_ring_valid_from=None,
+        max_context_len=4096,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    seq_lens, slots = [4084, 250, 17, 0], [1, 7, 3, 0]
+    builds = {}
+    for device_table in (False, True):
+        flag = SimpleNamespace(get=lambda v=device_table: v)
+        fb = _verify_batch(seq_lens, slots)
+        fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+        with (
+            patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
+            patch.object(tpu_envs, "SGLANG_TPU_DSV41_VERIFY_SWA_RING", on),
+            patch.object(tpu_envs, "SGLANG_TPU_DSV41_DEVICE_RING_TABLE", flag),
+        ):
+            builds[device_table] = ab.build_forward_metadata(fb, **kw)
+    assert builds[True].swa_window_plan is None
+    _assert_same(builds[False], builds[True])
+
+
 def test_device_window_declines_rows_that_may_pass_the_swa_table():
     """The host window builder raises on a row past the SWA table; the device
     build cannot, and such a row would alias the table's last page (two writes

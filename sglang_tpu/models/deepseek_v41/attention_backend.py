@@ -593,6 +593,12 @@ def _attends_ring(forward_batch: ForwardBatch) -> bool:
     return mode.is_target_verify() and tpu_envs.SGLANG_TPU_DSV41_VERIFY_SWA_RING.get()
 
 
+def _device_ring_table() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_DSV41_DEVICE_RING_TABLE.get()
+
+
 def _packed_row_upload() -> bool:
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -781,11 +787,15 @@ def _device_row_metadata(
     }
     window = tables.swa_pages is None
     columns = tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+    ring_columns = 0
     if window and _attends_ring(forward_batch):
         bound = forward_batch.seq_lens_cpu
         if bound is None or int(bound.max()) > columns * SWA_PAGE_TOKENS:
             return None  # a row may pass the SWA table: the host build checks it
-        host["swa_pages"] = decode_window_pages(req_pool_indices, columns)
+        if _device_ring_table():
+            ring_columns = columns
+        else:
+            host["swa_pages"] = decode_window_pages(req_pool_indices, columns)
         window = False
     if window:
         if not _window_fits(
@@ -819,6 +829,7 @@ def _device_row_metadata(
             plan_requests=(
                 getattr(request_window, "plan_requests", None) if window else None
             ),
+            ring_columns=ring_columns,
         )
     if fused:
         submit([*_metadata_leaves(fields), dev["query_start_loc"], dev["swa_minimum"]])
@@ -839,9 +850,11 @@ def _device_row_fields(
     columns: int,
     base_page: int,
     plan_requests: Optional[int] = None,
+    ring_columns: int = 0,
 ) -> Dict[str, object]:
     """The position-dependent metadata fields, as device ops only (no upload,
-    no read), each a tensor of its own like the host build's."""
+    no read), each a tensor of its own like the host build's. ``ring_columns``:
+    build the verify ring SWA table of that width on the device."""
     from sglang_tpu.models.deepseek_v41 import device_rows
 
     # Copies: the host build's fields are graph inputs of their own, not the
@@ -854,6 +867,8 @@ def _device_row_fields(
         req_pool_indices=dev["req_pool_indices"],
     )
     swa_pages, window_plan = dev.get("swa_pages", tables.swa_pages), None
+    if ring_columns:
+        swa_pages = device_rows.ring_window_pages(dev["req_pool_indices"], ring_columns)
     if window:
         swa_pages, window_plan = device_rows.window_pages(
             first=positions.index_select(0, dev["first_row"]),

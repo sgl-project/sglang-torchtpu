@@ -479,6 +479,9 @@ class TpuEnvs:
     SGLANG_TPU_DSV41_SWA_PLAN_TRIM = EnvBool(False)
     # DSV4.1 spec device rows: one host-to-device copy per metadata build.
     SGLANG_TPU_DSV41_PACKED_ROW_UPLOAD = EnvBool(False)
+    # DSV4.1 spec device rows: build the verify SWA ring table on the device
+    # instead of on the host plus an upload ([B, context / 64] int32).
+    SGLANG_TPU_DSV41_DEVICE_RING_TABLE = EnvBool(False)
     # Spec step: build the slot-only attention metadata of the draft and verify
     # forwards before the blocking length read / draft-token read (slot_metadata.py).
     SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)
