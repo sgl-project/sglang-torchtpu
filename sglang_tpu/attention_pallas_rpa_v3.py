@@ -628,6 +628,13 @@ def _invoke_v3_kernel(
                     and "nosw_unalign_fuse" not in raw_all_toks
                 ):
                     prefill_opts.add("sw_unalign_fuse")
+                if (
+                    sliding_window in (2048, 2049)
+                    and "mk128" in prefill_opts
+                    and "nosw2048_fuse" not in raw_all_toks
+                    and "nosw_tail_clamp" not in raw_all_toks
+                ):
+                    prefill_opts.add("sw_tail_clamp")
             else:
                 if "nomk128" not in raw_all_toks:
                     prefill_opts.add("mk128")
@@ -660,6 +667,7 @@ def _invoke_v3_kernel(
             "unroll_up",
             "sw_short_v2",
             "sw_unalign_fuse",
+            "sw_tail_clamp",
             "tp16_sq",
             "sw_short_fuse",
             "tq_unroll",
