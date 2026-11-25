@@ -272,7 +272,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # gate fusion's own layout
     pa_tmaj = pa_a2a and not pa_gtok and os.environ.get("SPTP_PA_TMAJ", "0") == "1"
     pa_head = pa_head and not pa_gtok and not pa_tmaj
-    pa_pool = pool_call(c, pa_tp, pa_rc, pa_head) if pa else None
+    pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel

@@ -224,7 +224,7 @@ def oproj_a2a_call(
         raise ValueError(f"head group width {act[-1]} is not a multiple of {_KC}")
     f8_shape = act
     if tmaj:
-        act, f8_shape = (tp, qd, Ts), (tp, Ts, qd)
+        act, f8_shape = (tp, qd, Ts), (Ts, H)
     order = tuple(order) or tuple(range(tp))
     if sorted(order) != list(range(tp)) or order[0] != 0:
         raise ValueError(
@@ -250,7 +250,7 @@ def oproj_a2a_call(
                 g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm, wp_ref,
                 so_hbm, ids_ref, tw_ref, xe_ref, xs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-                wbuf, wsem, fs_ref, ssq, amx, xsc, *f8x,
+                wbuf, wsem, fs_ref, ssq, amx, xsc,
             ) = refs  # fmt: skip
             f8_hbm = None
         else:
@@ -258,10 +258,11 @@ def oproj_a2a_call(
                 g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm,
                 so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
                 gq, gsr, big, wr, sbuf, obuf, sso, sem, rg, rs, sg, ss_, sin, sout,
-                wbuf, wsem, *f8x,
+                wbuf, wsem,
             ) = refs  # fmt: skip
-        # the pool input's buffer: gq once the o proj is done, or its own with tmaj
-        f8b = f8x[0] if tmaj else gq
+        # the pool input's buffer once the o proj is done: gq, or with tmaj ([qd, Ts] blocks)
+        # wo's first buffer as [Ts, H]
+        f8b = wbuf.at[0, pl.ds(0, Ts)] if tmaj else gq
         r = pl.program_id(0)
         me = lm[1]
         # step r takes source m ^ r: own block, the partner core, then the other chips' cores
@@ -466,8 +467,6 @@ def oproj_a2a_call(
     scratch += [vmem((2, qd, H), _FP8), dma((2,))]
     if fuse:
         scratch += [vmem((Ts, 1), _F32) for _ in range(4)]
-    if tmaj:
-        scratch.append(vmem(f8_shape, _FP8))
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         grid=(tp + nP,),
@@ -497,6 +496,8 @@ def oproj_a2a_call(
 def _kblk(ref, k0, src=None):
     """K columns [k0, k0 + _KC) of an activation buffer by K block: [tp, Ts, qd] or the head
     layout [tp, kvh, Ts, w] (block src, head group k); src: a traced block, k0 within it."""
+    if ref.ndim == 2:
+        return ref[:, k0 : k0 + _KC]
     if ref.ndim == 3:
         b, c0 = divmod(k0, ref.shape[2])
         return ref[b if src is None else src, :, c0 : c0 + _KC]
@@ -508,6 +509,9 @@ def _kblk(ref, k0, src=None):
 
 def _kstore(ref, rows, x):
     """x [rc, H] into an activation buffer's rows, by K block (_kblk's layouts)."""
+    if ref.ndim == 2:
+        ref[rows, :] = x
+        return
     if ref.ndim == 3:
         qd = ref.shape[2]
         for b in range(ref.shape[0]):
@@ -637,7 +641,9 @@ def _top_k(sc, bias, k: int, eps: float, scale: float):
     return ids.astype(jnp.int32), tw
 
 
-def pool_call(c: PFConfig, tpn: int = 512, rc: int = 64, head: bool = False):
+def pool_call(
+    c: PFConfig, tpn: int = 512, rc: int = 64, head: bool = False, flat: bool = False
+):
     """(lyr [1] i32, f8 [tp, Ts, qd] e4m3, fs [Ts, 1] f32, smalls [L, 16, H],
     wpool [L, H, He] e4m3) -> (xe8 [Ts, He] e4m3, xs [1, Ts] f32): pool, pre-expert rms + e4m3."""
     Ts, tp, qd = _dims(c)
@@ -662,7 +668,15 @@ def pool_call(c: PFConfig, tpn: int = 512, rc: int = 64, head: bool = False):
         num_scalar_prefetch=1,
         grid=(nP,),
         in_specs=[
-            whole(*((tp, c.kv_heads, Ts, qd // c.kv_heads) if head else (tp, Ts, qd))),
+            whole(
+                *(
+                    (Ts, H)
+                    if flat
+                    else (tp, c.kv_heads, Ts, qd // c.kv_heads)
+                    if head
+                    else (tp, Ts, qd)
+                )
+            ),
             whole(Ts, 1),
             pl.BlockSpec((None, SMALL_ROWS, H), lambda p, lyr: (lyr[0], 0, 0)),
             pl.BlockSpec((None, H, tpn), lambda p, lyr: (lyr[0], 0, p)),
@@ -688,7 +702,7 @@ def pool_call(c: PFConfig, tpn: int = 512, rc: int = 64, head: bool = False):
                 jax.ShapeDtypeStruct((1, Ts), _F32),
             ),
             compiler_params=params,
-            name=f"muse_sptp_pa_pool_t{c.rows}_p{tpn}{'_h' if head else ''}",
+            name=f"muse_sptp_pa_pool_t{c.rows}_p{tpn}{'_h' if head else ''}{'_f' if flat else ''}",
         )(jnp.full((1,), layer, jnp.int32), f8, fs, smalls, wpool)
 
     return call
