@@ -1086,9 +1086,9 @@ def _ops(
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     mesh = _get_mesh()
-    if mesh.shape[_AXIS] == 16 and ccs_fuse_ag_a1 != 0:
+    if mesh.shape[_AXIS] == 16 and ccs_fuse_ag_a1 not in (0, 3):
         raise ValueError(
-            "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 != 0 is disabled on TP=16 until #2833 is root-caused"
+            "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 not in (0, 3) is disabled on TP=16 until #2833 is root-caused"
         )
     tag = f"q{h_q_local}_kv{h_kv_local}"
     glue = "_fg" if fused_glue else ""
@@ -2625,9 +2625,9 @@ class MusePrefillKernels(torch.nn.Module):
         cfg = model.text_config
         reason = None
         tp = parallel.tp_size
-        if tp == 16 and tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() != 0:
+        if tp == 16 and tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() not in (0, 3):
             raise ValueError(
-                "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 != 0 is disabled on TP=16 until #2833 is root-caused"
+                "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1 not in (0, 3) is disabled on TP=16 until #2833 is root-caused"
             )
         native_tp16 = tp == 16 and tpu_envs.SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL.get()
         ep_tp2_prefill = (

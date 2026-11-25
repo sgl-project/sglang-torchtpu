@@ -1076,168 +1076,77 @@ def _fp4_blockdiag_hoisted_dual_strip(
     return out_g, out_u
 
 
-def _sparse_decode_kernel(
-    *all_refs,
-    ep: int,
-    batch_size: int,
+@dataclasses.dataclass(frozen=True)
+class _WeightDmaOps:
+    """Async HBM->VMEM weight streaming primitives for a sparse decode kernel."""
+
+    w_mode: str
+    issue_spec_prime: object
+    prime_first_exec: object
+    start_s3_part: object
+    wait_s3_part: object
+    start_s3_down: object
+    wait_s3_down: object
+    start_w1_slot: object
+    wait_w1_slot: object
+    start_w2_slot: object
+    wait_w2_slot: object
+    start_w2_1x: object
+    wait_w2_1x: object
+    start_w1_half: object
+    wait_w1_half: object
+    start_w2_half: object
+    wait_w2_half: object
+
+
+@dataclasses.dataclass(frozen=True)
+class MuseSparsePlanResult:
+    """Routing and exec-plan state returned by ``plan_and_prime_muse_sparse_from_vmem``."""
+
+    num_exec: jax.Array
+    spec_slot: jax.Array | None
+    spec_enabled: jax.Array
+    is_dense: bool
+    is_k256: bool
+    w_mode: str
+    use_bd: bool
+    has_replicas: bool
+    use_lhs_fp8: bool
+    use_pair_rs: bool
+    exec_eid_smem: object
+    exec_src_smem: object
+    exec_slot_smem: object
+    dma_ops: _WeightDmaOps
+
+
+def _make_sparse_weight_dma_ops(
+    w1_u32,
+    s1_ref,
+    w2_u32,
+    s2_ref,
+    rep_w1_u32,
+    rep_s1_ref,
+    rep_w2_u32,
+    rep_s2_ref,
+    w1_buf,
+    s1_buf,
+    w2_buf,
+    s2_buf,
+    w1_sem,
+    w2_sem,
+    *,
+    w_mode: str,
     scale_block: int,
-    num_replicas: int,
-    return_sharded: bool,
-    replica_cost_mode: str,
-    ep_axis_name: str,
-    cfg: SparseDecodeConfig,
-    has_spec_slot_arg: bool = False,
-):
-    has_replicas = num_replicas > 0
-    is_k256 = scale_block >= 256
-    is_dense = cfg.row_mode == "dense"
-    w_mode = (
-        "stream3"
-        if (cfg.weight_mode == "stream3_k2" and (_H // scale_block) < 16)
-        else cfg.weight_mode
-    )  # "stream3", "w1_2x_w2_1x", "half_n"
-    use_bd = (not is_dense) and (not is_k256) and bool(cfg.k16_blockdiag_rows)
-    tile_m = cfg.tile_m
-    e_local = _E_TOTAL // ep
-    rows_per_rank = batch_size // ep
+    has_replicas: bool,
+) -> _WeightDmaOps:
+    """Build weight DMA start/wait closures across all streaming schedules."""
+    noop = lambda *a, **kw: None
+    start_s3_part = wait_s3_part = start_s3_down = wait_s3_down = noop
+    start_w1_slot = wait_w1_slot = start_w2_slot = wait_w2_slot = noop
+    start_w2_1x = wait_w2_1x = noop
+    start_w1_half = wait_w1_half = start_w2_half = wait_w2_half = noop
 
-    it = iter(all_refs)
-    rank_ref = next(it)
-    replica_meta_ref = next(it) if has_replicas else None
-    spec_slot_ref = next(it) if has_spec_slot_arg else None
-    logits_ref = next(it)
-    bias_ref = next(it)
-    x_in_ref = next(it)
-    w1_ref = next(it)
-    s1_ref = next(it)
-    w2_ref = next(it)
-    s2_ref = next(it)
-    norm_ref = next(it)
-    if has_replicas:
-        rep_w1_ref = next(it)
-        rep_s1_ref = next(it)
-        rep_w2_ref = next(it)
-        rep_s2_ref = next(it)
-    else:
-        rep_w1_ref = rep_s1_ref = rep_w2_ref = rep_s2_ref = None
-    output_ref = next(it)
-
-    if is_dense:
-        d_scratch = DenseRoutingScratch(
-            *(next(it) for _ in range(len(DenseRoutingScratch._fields)))
-        )
-        r_scratch = None
-    else:
-        r_scratch = RoutingScratch(
-            *(next(it) for _ in range(len(RoutingScratch._fields)))
-        )
-        d_scratch = None
-
-    if has_replicas:
-        owner_load_smem = next(it)
-        moved_flag_smem = next(it)
-        local_suppress_smem = next(it)
-        holder_slot_expert_smem = next(it)
-        holder_cand_smem = (
-            next(it) if (not is_dense and not cfg.static_holder_mask) else None
-        )
-    else:
-        owner_load_smem = moved_flag_smem = None
-        local_suppress_smem = holder_slot_expert_smem = holder_cand_smem = None
-
-    w1_buf = next(it)
-    s1_buf = next(it)
-    w2_buf = next(it)
-    s2_buf = next(it)
-    w1_sem = next(it)
-    w2_sem = next(it)
-    misc_sem = next(it)
-    w1_acc_buf = next(it) if w_mode == "stream3_k2" else None
-
-    use_lhs_fp8 = is_k256 and cfg.lhs_fp8
-    use_bd_fp8 = use_bd and cfg.k16_bd_fp8
-    if is_dense:
-        act_2d_buf = next(it)
-        y_stage_buf = next(it)
-        lhs_fp8_buf = next(it) if use_lhs_fp8 else None
-        lhs_sc_buf = next(it) if use_lhs_fp8 else None
-        gain_f32_buf = next(it)
-        accum_2d = next(it)
-        accum_3d = next(it)
-        fan_3d_buf = next(it) if not return_sharded else None
-        x_3d_buf = io_3d_buf = lhs_2d_buf = masked_x_buf = bd_sc_buf = None
-    else:
-        x_3d_buf = next(it)
-        io_3d_buf = next(it)
-        lhs_2d_buf = next(it)
-        act_2d_buf = next(it)
-        y_stage_buf = next(it)
-        lhs_fp8_buf = next(it) if use_lhs_fp8 else None
-        lhs_sc_buf = next(it) if use_lhs_fp8 else None
-        masked_x_buf = next(it) if use_bd else None
-        bd_sc_buf = next(it) if use_bd_fp8 else None
-        gain_f32_buf = next(it)
-        accum_3d = next(it)
-        accum_2d = None
-        fan_3d_buf = x_3d_buf if not return_sharded else None
-
-    use_pair_rs = cfg.pair_rs and (ep in (8, 16))
-    rs_send_bf16 = next(it) if cfg.rs_wire_bf16 else None
-    if use_pair_rs:
-        rs_pair_recv = next(it)
-        rs_chip_send = next(it)
-        rs_chip_recv = next(it)
-        rs_pair_ssem = next(it)
-        rs_pair_rsem = next(it)
-        rs_chip_ssem = next(it)
-        rs_chip_rsem = next(it)
-        rs_recv_3d = rs_send_sem = rs_recv_sem = None
-    else:
-        rs_recv_3d = next(it)
-        rs_send_sem = next(it)
-        rs_recv_sem = next(it)
-        rs_pair_recv = rs_chip_send = rs_chip_recv = None
-        rs_pair_ssem = rs_pair_rsem = rs_chip_ssem = rs_chip_rsem = None
-    owner_3d = next(it)
-    if not return_sharded:
-        fan_send_sem = next(it)
-        fan_recv_sem = next(it)
-        fan_s2_send_sem = next(it) if cfg.bridge_ag else None
-        fan_s2_recv_sem = next(it) if cfg.bridge_ag else None
-    else:
-        fan_send_sem = fan_recv_sem = fan_s2_send_sem = fan_s2_recv_sem = None
-
-    # 1. Signal entry readiness barrier immediately.
-    barrier_sem = pltpu.get_barrier_semaphore()
-    for dest in range(ep):
-        pl.semaphore_signal(
-            barrier_sem,
-            device_id={ep_axis_name: jnp.int32(dest)},
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-
-    me = rank_ref[0]
-    w1_u32 = w1_ref.bitcast(jnp.uint32)
-    w2_u32 = w2_ref.bitcast(jnp.uint32)
-    if has_replicas:
-        rep_w1_u32 = rep_w1_ref.bitcast(jnp.uint32)
-        rep_w2_u32 = rep_w2_ref.bitcast(jnp.uint32)
-
-    stop_stage = cfg.debug_stop_after
-
-    def _early_exit_finish() -> None:
-        pl.semaphore_wait(barrier_sem, ep)
-        if return_sharded:
-            z_rows = min(rows_per_rank, 16)
-        else:
-            z_rows = 16
-        output_ref[pl.ds(0, z_rows), :] = jnp.zeros(
-            (z_rows, _H), dtype=jnp.bfloat16
-        )
-
-    # --- Weight DMA helpers across all streaming architectures ---
     if w_mode in ("stream3", "stream3_k2"):
-        # stream3: w1_buf (2, 512, 4096) [gate, up]; stream3_k2: w1_buf (2, 256, 8192) [K0, K1]
         half_k_u32 = (_H // 2) // _FP4_PACK
         half_nqb = (_H // scale_block) // 2
 
@@ -1313,8 +1222,7 @@ def _sparse_decode_kernel(
             pltpu.make_async_copy(s2_buf, s2_buf, w2_sem.at[0]).wait()
 
     elif w_mode in ("w1_2x_w2_2x", "w1_2x_w2_1x"):
-        # w1_buf: (2, 512, 8192) full contiguous W1;
-        # w2_buf: (2, 512, 4096) for w1_2x_w2_2x, or (512, 4096) for w1_2x_w2_1x.
+
         def _issue_w1_2x(w_src, s_src, b_idx, slot):
             pltpu.make_async_copy(
                 w_src.at[slot], w1_buf.at[b_idx], w1_sem.at[b_idx]
@@ -1398,7 +1306,6 @@ def _sparse_decode_kernel(
             pltpu.make_async_copy(s2_buf, s2_buf, w2_sem.at[0]).wait()
 
     else:
-        # "half_n"
         half_i = _I // 2
         half_h = _H // 2
 
@@ -1483,7 +1390,362 @@ def _sparse_decode_kernel(
                 s2_buf.at[buf_id], s2_buf.at[buf_id], w2_sem.at[buf_id]
             ).wait()
 
-    # 1B. Optional speculative first-expert HBM->VMEM prime BEFORE VPU routing!
+    def issue_spec_prime(safe_spec_slot, spec_parts: int):
+        if w_mode in ("stream3", "stream3_k2"):
+            _issue_proj(w1_u32, s1_ref, 0, safe_spec_slot)
+            if spec_parts >= 2:
+                _issue_proj(w1_u32, s1_ref, 1, safe_spec_slot)
+            if spec_parts >= 3:
+                _issue_down(w2_u32, s2_ref, safe_spec_slot)
+        elif w_mode == "w1_2x_w2_1x":
+            _issue_w1_2x(w1_u32, s1_ref, 0, safe_spec_slot)
+            if spec_parts >= 3:
+                _issue_w2_1x(w2_u32, s2_ref, safe_spec_slot)
+        elif w_mode == "w1_2x_w2_2x":
+            _issue_w1_2x(w1_u32, s1_ref, 0, safe_spec_slot)
+            if spec_parts >= 3:
+                _issue_w2_2x(w2_u32, s2_ref, 0, safe_spec_slot)
+        else:
+            _issue_w1_hn(w1_u32, s1_ref, 0, safe_spec_slot)
+            if spec_parts >= 2:
+                _issue_w1_hn(w1_u32, s1_ref, 1, safe_spec_slot)
+            if spec_parts >= 3:
+                _issue_w2_hn(w2_u32, s2_ref, 0, safe_spec_slot)
+                _issue_w2_hn(w2_u32, s2_ref, 1, safe_spec_slot)
+
+    def prime_first_exec(
+        num_exec,
+        exec_src_smem,
+        exec_slot_smem,
+        *,
+        do_spec: bool,
+        spec_parts: int,
+        spec_slot,
+        spec_enabled,
+    ):
+        if do_spec and w_mode in ("stream3", "stream3_k2") and spec_parts == 1:
+            spec_hit = (
+                spec_enabled
+                & (num_exec > 0)
+                & (exec_src_smem[0] == 0)
+                & (exec_slot_smem[0] == spec_slot)
+            )
+
+            @pl.when(num_exec > 0)
+            def _prime_s3_p1_down():
+                s0 = exec_src_smem[0]
+                sl0 = exec_slot_smem[0]
+                start_s3_part(1, s0, sl0)
+                start_s3_down(s0, sl0)
+
+            @pl.when(spec_enabled & (~spec_hit))
+            def _drain_s3_p0_miss():
+                wait_s3_part(0)
+
+            @pl.when((~spec_hit) & (num_exec > 0))
+            def _prime_s3_p0_after_miss():
+                start_s3_part(0, exec_src_smem[0], exec_slot_smem[0])
+
+        elif do_spec:
+            spec_hit = (
+                spec_enabled
+                & (num_exec > 0)
+                & (exec_src_smem[0] == 0)
+                & (exec_slot_smem[0] == spec_slot)
+            )
+
+            @pl.when(spec_enabled & (~spec_hit))
+            def _drain_spec_miss():
+                if w_mode in ("stream3", "stream3_k2"):
+                    wait_s3_part(0)
+                    if spec_parts >= 2:
+                        wait_s3_part(1)
+                    if spec_parts >= 3:
+                        wait_s3_down()
+                elif w_mode == "w1_2x_w2_1x":
+                    wait_w1_slot(0)
+                    if spec_parts >= 3:
+                        wait_w2_1x()
+                elif w_mode == "w1_2x_w2_2x":
+                    wait_w1_slot(0)
+                    if spec_parts >= 3:
+                        wait_w2_slot(0)
+                else:
+                    wait_w1_half(0)
+                    if spec_parts >= 2:
+                        wait_w1_half(1)
+                    if spec_parts >= 3:
+                        wait_w2_half(0)
+                        wait_w2_half(1)
+
+            if spec_parts < 3 or w_mode in ("w1_2x_w2_1x", "w1_2x_w2_2x"):
+
+                @pl.when(spec_hit)
+                def _prime_spec_rest():
+                    s0 = exec_src_smem[0]
+                    sl0 = exec_slot_smem[0]
+                    if w_mode in ("stream3", "stream3_k2"):
+                        if spec_parts < 2:
+                            start_s3_part(1, s0, sl0)
+                        start_s3_down(s0, sl0)
+                    elif w_mode == "w1_2x_w2_1x":
+                        if spec_parts < 3:
+                            start_w2_1x(s0, sl0)
+
+                        @pl.when(num_exec >= 2)
+                        def _prime_hit_e1():
+                            start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
+
+                    elif w_mode == "w1_2x_w2_2x":
+                        if spec_parts < 3:
+                            start_w2_slot(0, s0, sl0)
+
+                        @pl.when(num_exec >= 2)
+                        def _prime_hit_e1_2x():
+                            start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
+                            start_w2_slot(1, exec_src_smem[1], exec_slot_smem[1])
+
+                    else:
+                        if spec_parts < 2:
+                            start_w1_half(1, s0, sl0)
+                        start_w2_half(0, s0, sl0)
+                        start_w2_half(1, s0, sl0)
+
+            @pl.when((~spec_hit) & (num_exec > 0))
+            def _prime_after_miss():
+                s0 = exec_src_smem[0]
+                sl0 = exec_slot_smem[0]
+                if w_mode in ("stream3", "stream3_k2"):
+                    start_s3_part(0, s0, sl0)
+                    start_s3_part(1, s0, sl0)
+                    start_s3_down(s0, sl0)
+                elif w_mode == "w1_2x_w2_1x":
+                    start_w1_slot(0, s0, sl0)
+                    start_w2_1x(s0, sl0)
+
+                    @pl.when(num_exec >= 2)
+                    def _prime_miss_e1():
+                        start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
+
+                elif w_mode == "w1_2x_w2_2x":
+                    start_w1_slot(0, s0, sl0)
+                    start_w2_slot(0, s0, sl0)
+
+                    @pl.when(num_exec >= 2)
+                    def _prime_miss_e1_2x():
+                        start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
+                        start_w2_slot(1, exec_src_smem[1], exec_slot_smem[1])
+
+                else:
+                    start_w1_half(0, s0, sl0)
+                    start_w1_half(1, s0, sl0)
+                    start_w2_half(0, s0, sl0)
+                    start_w2_half(1, s0, sl0)
+
+        else:
+
+            @pl.when(num_exec > 0)
+            def _prime_ring():
+                s0 = exec_src_smem[0]
+                sl0 = exec_slot_smem[0]
+                if w_mode in ("stream3", "stream3_k2"):
+                    start_s3_part(0, s0, sl0)
+                    start_s3_part(1, s0, sl0)
+                    start_s3_down(s0, sl0)
+                elif w_mode == "w1_2x_w2_2x":
+                    start_w1_slot(0, s0, sl0)
+                    start_w2_slot(0, s0, sl0)
+
+                    @pl.when(num_exec >= 2)
+                    def _prime_e1_2x():
+                        s1_k = exec_src_smem[1]
+                        sl1_k = exec_slot_smem[1]
+                        start_w1_slot(1, s1_k, sl1_k)
+                        start_w2_slot(1, s1_k, sl1_k)
+
+                elif w_mode == "w1_2x_w2_1x":
+                    start_w1_slot(0, s0, sl0)
+                    start_w2_1x(s0, sl0)
+
+                    @pl.when(num_exec >= 2)
+                    def _prime_e1():
+                        start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
+
+                else:
+                    start_w1_half(0, s0, sl0)
+                    start_w1_half(1, s0, sl0)
+                    start_w2_half(0, s0, sl0)
+                    start_w2_half(1, s0, sl0)
+
+    return _WeightDmaOps(
+        w_mode=w_mode,
+        issue_spec_prime=issue_spec_prime,
+        prime_first_exec=prime_first_exec,
+        start_s3_part=start_s3_part,
+        wait_s3_part=wait_s3_part,
+        start_s3_down=start_s3_down,
+        wait_s3_down=wait_s3_down,
+        start_w1_slot=start_w1_slot,
+        wait_w1_slot=wait_w1_slot,
+        start_w2_slot=start_w2_slot,
+        wait_w2_slot=wait_w2_slot,
+        start_w2_1x=start_w2_1x,
+        wait_w2_1x=wait_w2_1x,
+        start_w1_half=start_w1_half,
+        wait_w1_half=wait_w1_half,
+        start_w2_half=start_w2_half,
+        wait_w2_half=wait_w2_half,
+    )
+
+
+def zero_and_pack_muse_sparse_from_vmem(
+    plan_res: MuseSparsePlanResult,
+    *,
+    r_scratch,
+    accum_3d,
+    io_3d_buf,
+    accum_2d=None,
+    batch_size: int,
+    cfg: SparseDecodeConfig,
+) -> None:
+    """Zero MoE accumulators/staging buffers and scatter packed tokens into SMEM buckets."""
+    tile_m = cfg.tile_m
+    if plan_res.is_dense:
+        for s_col in range(0, _H, 1024):
+            accum_2d[:, pl.ds(s_col, 1024)] = jnp.zeros(
+                (batch_size, 1024), dtype=jnp.float32
+            )
+        return
+
+    if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
+        cfg.fast_gs and batch_size <= 128
+    ):
+        z_chunk = min(batch_size, 32)
+        z_acc = jnp.zeros((z_chunk, 32, 128), dtype=jnp.float32)
+        for r0 in range(0, batch_size, z_chunk):
+            accum_3d[pl.ds(r0, z_chunk), :, :] = z_acc
+        if cfg.fast_gs:
+            accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
+                (1, 32, 128), dtype=jnp.float32
+            )
+        z_io_chunk = min(tile_m, 32)
+        z_io = jnp.zeros((z_io_chunk, 32, 128), dtype=jnp.bfloat16)
+        for r0 in range(0, tile_m, z_io_chunk):
+            io_3d_buf[pl.ds(r0, z_io_chunk), :, :] = z_io
+    else:
+        zero_rc = min(batch_size, 8)
+        zeros_acc = jnp.zeros((zero_rc, 32, 128), dtype=jnp.float32)
+
+        def _zero_acc_chunk(ci, _):
+            accum_3d[pl.ds(ci * zero_rc, zero_rc), :, :] = zeros_acc
+            return _
+
+        lax.fori_loop(0, batch_size // zero_rc, _zero_acc_chunk, jnp.int32(0))
+        if cfg.fast_gs:
+            accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
+                (1, 32, 128), dtype=jnp.float32
+            )
+
+        zeros_io = jnp.zeros((8, 32, 128), dtype=jnp.bfloat16)
+
+        def _zero_io_chunk(ci, _):
+            io_3d_buf[pl.ds(ci * 8, 8), :, :] = zeros_io
+            return _
+
+        lax.fori_loop(0, tile_m // 8, _zero_io_chunk, jnp.int32(0))
+
+    pack_active_tokens_smem(
+        batch_size,
+        r_scratch,
+        has_replicas=plan_res.has_replicas,
+        fast_gs=cfg.fast_gs,
+    )
+
+
+def plan_and_prime_muse_sparse_from_vmem(
+    me,
+    logits_ref,
+    bias_ref,
+    norm_ref,
+    w1_u32,
+    s1_ref,
+    w2_u32,
+    s2_ref,
+    *,
+    d_scratch,
+    r_scratch,
+    w1_buf,
+    s1_buf,
+    w2_buf,
+    s2_buf,
+    w1_sem,
+    w2_sem,
+    misc_sem,
+    gain_f32_buf,
+    accum_3d,
+    io_3d_buf,
+    accum_2d=None,
+    rep_w1_u32=None,
+    rep_s1_ref=None,
+    rep_w2_u32=None,
+    rep_s2_ref=None,
+    replica_meta_ref=None,
+    owner_load_smem=None,
+    moved_flag_smem=None,
+    local_suppress_smem=None,
+    holder_slot_expert_smem=None,
+    holder_cand_smem=None,
+    spec_slot_ref=None,
+    ep: int,
+    batch_size: int,
+    scale_block: int,
+    num_replicas: int,
+    replica_cost_mode: str,
+    cfg: SparseDecodeConfig,
+    stop_stage: str = "",
+    early_exit_fn=None,
+    zero_and_pack: bool = True,
+) -> MuseSparsePlanResult | None:
+    """Phase 1 of VMEM-resident Muse sparse decode: route, plan, prime Expert-0, & optional zero/pack.
+
+    Everything here depends only on ``logits_ref`` (not ``x_in_ref``), so fused
+    ``[chip_b1 + MoE]`` superkernels can invoke this inside ``ag_exp``'s ICI wait
+    and call ``zero_and_pack_muse_sparse_from_vmem`` inside its D2D2 wait.
+    """
+    has_replicas = num_replicas > 0
+    is_k256 = scale_block >= 256
+    is_dense = cfg.row_mode == "dense"
+    w_mode = (
+        "stream3"
+        if (cfg.weight_mode == "stream3_k2" and (_H // scale_block) < 16)
+        else cfg.weight_mode
+    )
+    use_bd = (not is_dense) and (not is_k256) and bool(cfg.k16_blockdiag_rows)
+    use_lhs_fp8 = is_k256 and cfg.lhs_fp8
+    use_pair_rs = cfg.pair_rs and (ep in (8, 16))
+    tile_m = cfg.tile_m
+    e_local = _E_TOTAL // ep
+
+    dma_ops = _make_sparse_weight_dma_ops(
+        w1_u32,
+        s1_ref,
+        w2_u32,
+        s2_ref,
+        rep_w1_u32,
+        rep_s1_ref,
+        rep_w2_u32,
+        rep_s2_ref,
+        w1_buf,
+        s1_buf,
+        w2_buf,
+        s2_buf,
+        w1_sem,
+        w2_sem,
+        w_mode=w_mode,
+        scale_block=scale_block,
+        has_replicas=has_replicas,
+    )
+
     spec_parts = cfg.spec_prime_parts
     do_spec = (
         (spec_parts > 0)
@@ -1527,27 +1789,7 @@ def _sparse_decode_kernel(
 
         @pl.when(spec_enabled)
         def _issue_spec_prime():
-            if w_mode in ("stream3", "stream3_k2"):
-                _issue_proj(w1_u32, s1_ref, 0, safe_spec_slot)
-                if spec_parts >= 2:
-                    _issue_proj(w1_u32, s1_ref, 1, safe_spec_slot)
-                if spec_parts >= 3:
-                    _issue_down(w2_u32, s2_ref, safe_spec_slot)
-            elif w_mode == "w1_2x_w2_1x":
-                _issue_w1_2x(w1_u32, s1_ref, 0, safe_spec_slot)
-                if spec_parts >= 3:
-                    _issue_w2_1x(w2_u32, s2_ref, safe_spec_slot)
-            elif w_mode == "w1_2x_w2_2x":
-                _issue_w1_2x(w1_u32, s1_ref, 0, safe_spec_slot)
-                if spec_parts >= 3:
-                    _issue_w2_2x(w2_u32, s2_ref, 0, safe_spec_slot)
-            else:
-                _issue_w1_hn(w1_u32, s1_ref, 0, safe_spec_slot)
-                if spec_parts >= 2:
-                    _issue_w1_hn(w1_u32, s1_ref, 1, safe_spec_slot)
-                if spec_parts >= 3:
-                    _issue_w2_hn(w2_u32, s2_ref, 0, safe_spec_slot)
-                    _issue_w2_hn(w2_u32, s2_ref, 1, safe_spec_slot)
+            dma_ops.issue_spec_prime(safe_spec_slot, spec_parts)
 
     else:
         spec_slot = None
@@ -1613,10 +1855,11 @@ def _sparse_decode_kernel(
         counts_smem = r_scratch.counts_smem
 
     if stop_stage == "route":
-        _early_exit_finish()
-        return
+        if early_exit_fn is not None:
+            early_exit_fn()
+        return None
 
-    # 3. Fast 32-step SMEM execution plan (home + optional §4.5b replicas).
+    # 3. Fast SMEM execution plan (home + optional §4.5b replicas).
     if has_replicas:
         run_replica_planner_smem(
             me,
@@ -1670,8 +1913,9 @@ def _sparse_decode_kernel(
             )
 
     if stop_stage == "plan":
-        _early_exit_finish()
-        return
+        if early_exit_fn is not None:
+            early_exit_fn()
+        return None
 
     exec_eid_smem = (
         d_scratch.exec_expert_id if is_dense else r_scratch.exec_expert_id
@@ -1684,237 +1928,173 @@ def _sparse_decode_kernel(
     )
 
     # 4. IMMEDIATELY prime weight prefetch ring BEFORE prologue zeroing/packing!
+    if stop_stage != "pack":
+        dma_ops.prime_first_exec(
+            num_exec,
+            exec_src_smem,
+            exec_slot_smem,
+            do_spec=do_spec,
+            spec_parts=spec_parts,
+            spec_slot=spec_slot,
+            spec_enabled=spec_enabled,
+        )
+
+    plan_res = MuseSparsePlanResult(
+        num_exec=num_exec,
+        spec_slot=spec_slot,
+        spec_enabled=spec_enabled,
+        is_dense=is_dense,
+        is_k256=is_k256,
+        w_mode=w_mode,
+        use_bd=use_bd,
+        has_replicas=has_replicas,
+        use_lhs_fp8=use_lhs_fp8,
+        use_pair_rs=use_pair_rs,
+        exec_eid_smem=exec_eid_smem,
+        exec_src_smem=exec_src_smem,
+        exec_slot_smem=exec_slot_smem,
+        dma_ops=dma_ops,
+    )
+    if zero_and_pack:
+        zero_and_pack_muse_sparse_from_vmem(
+            plan_res,
+            r_scratch=r_scratch,
+            accum_3d=accum_3d,
+            io_3d_buf=io_3d_buf,
+            accum_2d=accum_2d,
+            batch_size=batch_size,
+            cfg=cfg,
+        )
     if stop_stage == "pack":
-        pass
-    elif do_spec and w_mode in ("stream3", "stream3_k2") and spec_parts == 1:
-        spec_hit = (
-            spec_enabled
-            & (num_exec > 0)
-            & (exec_src_smem[0] == 0)
-            & (exec_slot_smem[0] == spec_slot)
-        )
+        if early_exit_fn is not None:
+            early_exit_fn()
+        return None
+    return plan_res
 
-        @pl.when(num_exec > 0)
-        def _prime_s3_p1_down():
-            s0 = exec_src_smem[0]
-            sl0 = exec_slot_smem[0]
-            start_s3_part(1, s0, sl0)
-            start_s3_down(s0, sl0)
 
-        @pl.when(spec_enabled & (~spec_hit))
-        def _drain_s3_p0_miss():
-            wait_s3_part(0)
+def run_muse_sparse_experts_and_rs_from_vmem(
+    me,
+    x_in_ref,
+    plan_res: MuseSparsePlanResult,
+    *,
+    d_scratch,
+    r_scratch,
+    w1_buf,
+    s1_buf,
+    w2_buf,
+    s2_buf,
+    w1_acc_buf,
+    x_3d_buf,
+    io_3d_buf,
+    lhs_2d_buf,
+    act_2d_buf,
+    y_stage_buf,
+    lhs_fp8_buf,
+    lhs_sc_buf,
+    masked_x_buf,
+    bd_sc_buf,
+    gain_f32_buf,
+    accum_3d,
+    accum_2d,
+    fan_3d_buf,
+    rs_send_bf16,
+    rs_pair_recv,
+    rs_chip_send,
+    rs_chip_recv,
+    rs_pair_ssem,
+    rs_pair_rsem,
+    rs_chip_ssem,
+    rs_chip_rsem,
+    rs_recv_3d,
+    rs_send_sem,
+    rs_recv_sem,
+    owner_3d,
+    fan_send_sem,
+    fan_recv_sem,
+    fan_s2_send_sem,
+    fan_s2_recv_sem,
+    barrier_sem,
+    output_ref,
+    ep: int,
+    batch_size: int,
+    scale_block: int,
+    return_sharded: bool,
+    ep_axis_name: str,
+    cfg: SparseDecodeConfig,
+    x_is_3d: bool = False,
+    wait_entry_barrier: bool = True,
+    write_output_ref: bool = True,
+    on_experts_done_fn=None,
+    stop_stage: str = "",
+    early_exit_fn=None,
+) -> None:
+    """Phase 2 of VMEM-resident Muse sparse decode: x reshape, expert loop, RS, & fan-out.
 
-        @pl.when((~spec_hit) & (num_exec > 0))
-        def _prime_s3_p0_after_miss():
-            start_s3_part(0, exec_src_smem[0], exec_slot_smem[0])
+    When called inside a ``[chip_b1 + MoE + chip_b2]`` superkernel:
+      - Pass ``x_is_3d=True`` if ``x_3d_buf`` already holds ``[B, 32, 128] bf16``.
+      - Pass ``on_experts_done_fn`` to immediately launch ``chip_b2`` weight DMAs
+        into freed ``w1_buf`` / ``w2_buf`` overlapped with ``PAIR_RS``.
+      - Pass ``return_sharded=True, write_output_ref=False`` to leave the
+        sharded BF16 MoE output directly inside ``owner_3d`` VMEM.
+    """
+    is_dense = plan_res.is_dense
+    is_k256 = plan_res.is_k256
+    w_mode = plan_res.w_mode
+    use_bd = plan_res.use_bd
+    use_lhs_fp8 = plan_res.use_lhs_fp8
+    use_pair_rs = plan_res.use_pair_rs
+    num_exec = plan_res.num_exec
+    exec_eid_smem = plan_res.exec_eid_smem
+    exec_src_smem = plan_res.exec_src_smem
+    exec_slot_smem = plan_res.exec_slot_smem
+    tile_m = cfg.tile_m
+    rows_per_rank = batch_size // ep
 
-    elif do_spec:
-        spec_hit = (
-            spec_enabled
-            & (num_exec > 0)
-            & (exec_src_smem[0] == 0)
-            & (exec_slot_smem[0] == spec_slot)
-        )
+    start_s3_part = plan_res.dma_ops.start_s3_part
+    wait_s3_part = plan_res.dma_ops.wait_s3_part
+    start_s3_down = plan_res.dma_ops.start_s3_down
+    wait_s3_down = plan_res.dma_ops.wait_s3_down
+    start_w1_slot = plan_res.dma_ops.start_w1_slot
+    wait_w1_slot = plan_res.dma_ops.wait_w1_slot
+    start_w2_slot = plan_res.dma_ops.start_w2_slot
+    wait_w2_slot = plan_res.dma_ops.wait_w2_slot
+    start_w2_1x = plan_res.dma_ops.start_w2_1x
+    wait_w2_1x = plan_res.dma_ops.wait_w2_1x
+    start_w1_half = plan_res.dma_ops.start_w1_half
+    wait_w1_half = plan_res.dma_ops.wait_w1_half
+    start_w2_half = plan_res.dma_ops.start_w2_half
+    wait_w2_half = plan_res.dma_ops.wait_w2_half
 
-        @pl.when(spec_enabled & (~spec_hit))
-        def _drain_spec_miss():
-            if w_mode in ("stream3", "stream3_k2"):
-                wait_s3_part(0)
-                if spec_parts >= 2:
-                    wait_s3_part(1)
-                if spec_parts >= 3:
-                    wait_s3_down()
-            elif w_mode == "w1_2x_w2_1x":
-                wait_w1_slot(0)
-                if spec_parts >= 3:
-                    wait_w2_1x()
-            elif w_mode == "w1_2x_w2_2x":
-                wait_w1_slot(0)
-                if spec_parts >= 3:
-                    wait_w2_slot(0)
-            else:
-                wait_w1_half(0)
-                if spec_parts >= 2:
-                    wait_w1_half(1)
-                if spec_parts >= 3:
-                    wait_w2_half(0)
-                    wait_w2_half(1)
-
-        if spec_parts < 3 or w_mode in ("w1_2x_w2_1x", "w1_2x_w2_2x"):
-
-            @pl.when(spec_hit)
-            def _prime_spec_rest():
-                s0 = exec_src_smem[0]
-                sl0 = exec_slot_smem[0]
-                if w_mode in ("stream3", "stream3_k2"):
-                    if spec_parts < 2:
-                        start_s3_part(1, s0, sl0)
-                    start_s3_down(s0, sl0)
-                elif w_mode == "w1_2x_w2_1x":
-                    if spec_parts < 3:
-                        start_w2_1x(s0, sl0)
-
-                    @pl.when(num_exec >= 2)
-                    def _prime_hit_e1():
-                        start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
-
-                elif w_mode == "w1_2x_w2_2x":
-                    if spec_parts < 3:
-                        start_w2_slot(0, s0, sl0)
-
-                    @pl.when(num_exec >= 2)
-                    def _prime_hit_e1_2x():
-                        start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
-                        start_w2_slot(1, exec_src_smem[1], exec_slot_smem[1])
-
-                else:
-                    if spec_parts < 2:
-                        start_w1_half(1, s0, sl0)
-                    start_w2_half(0, s0, sl0)
-                    start_w2_half(1, s0, sl0)
-
-        @pl.when((~spec_hit) & (num_exec > 0))
-        def _prime_after_miss():
-            s0 = exec_src_smem[0]
-            sl0 = exec_slot_smem[0]
-            if w_mode in ("stream3", "stream3_k2"):
-                start_s3_part(0, s0, sl0)
-                start_s3_part(1, s0, sl0)
-                start_s3_down(s0, sl0)
-            elif w_mode == "w1_2x_w2_1x":
-                start_w1_slot(0, s0, sl0)
-                start_w2_1x(s0, sl0)
-
-                @pl.when(num_exec >= 2)
-                def _prime_miss_e1():
-                    start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
-
-            elif w_mode == "w1_2x_w2_2x":
-                start_w1_slot(0, s0, sl0)
-                start_w2_slot(0, s0, sl0)
-
-                @pl.when(num_exec >= 2)
-                def _prime_miss_e1_2x():
-                    start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
-                    start_w2_slot(1, exec_src_smem[1], exec_slot_smem[1])
-
-            else:
-                start_w1_half(0, s0, sl0)
-                start_w1_half(1, s0, sl0)
-                start_w2_half(0, s0, sl0)
-                start_w2_half(1, s0, sl0)
-
-    else:
-
-        @pl.when(num_exec > 0)
-        def _prime_ring():
-            s0 = exec_src_smem[0]
-            sl0 = exec_slot_smem[0]
-            if w_mode in ("stream3", "stream3_k2"):
-                start_s3_part(0, s0, sl0)
-                start_s3_part(1, s0, sl0)
-                start_s3_down(s0, sl0)
-            elif w_mode == "w1_2x_w2_2x":
-                start_w1_slot(0, s0, sl0)
-                start_w2_slot(0, s0, sl0)
-
-                @pl.when(num_exec >= 2)
-                def _prime_e1_2x():
-                    s1_k = exec_src_smem[1]
-                    sl1_k = exec_slot_smem[1]
-                    start_w1_slot(1, s1_k, sl1_k)
-                    start_w2_slot(1, s1_k, sl1_k)
-
-            elif w_mode == "w1_2x_w2_1x":
-                start_w1_slot(0, s0, sl0)
-                start_w2_1x(s0, sl0)
-
-                @pl.when(num_exec >= 2)
-                def _prime_e1():
-                    start_w1_slot(1, exec_src_smem[1], exec_slot_smem[1])
-
-            else:
-                start_w1_half(0, s0, sl0)
-                start_w1_half(1, s0, sl0)
-                start_w2_half(0, s0, sl0)
-                start_w2_half(1, s0, sl0)
-
-    # 5. Overlapped prologue while initial weights stream from HBM.
     if is_dense:
-        # Dense fast-path (zero token pack, zero 3D input copy, zero gather/scatter!).
-        for s_col in range(0, _H, 1024):
-            accum_2d[:, pl.ds(s_col, 1024)] = jnp.zeros(
-                (batch_size, 1024), dtype=jnp.float32
-            )
         if use_lhs_fp8:
             _prequant_lhs_k256(x_in_ref, lhs_fp8_buf, lhs_sc_buf, batch_size)
-    else:
+    elif not x_is_3d:
         if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
             cfg.fast_gs and batch_size <= 128
         ):
-            z_chunk = min(batch_size, 32)
-            z_acc = jnp.zeros((z_chunk, 32, 128), dtype=jnp.float32)
-            for r0 in range(0, batch_size, z_chunk):
-                accum_3d[pl.ds(r0, z_chunk), :, :] = z_acc
-            if cfg.fast_gs:
-                accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
-                    (1, 32, 128), dtype=jnp.float32
-                )
-            z_io_chunk = min(tile_m, 32)
-            z_io = jnp.zeros((z_io_chunk, 32, 128), dtype=jnp.bfloat16)
-            for r0 in range(0, tile_m, z_io_chunk):
-                io_3d_buf[pl.ds(r0, z_io_chunk), :, :] = z_io
             x_chunk = min(batch_size, 32)
             for r0 in range(0, batch_size, x_chunk):
                 for h_idx in range(2):
-                    x_3d_buf[pl.ds(r0, x_chunk), pl.ds(h_idx * 16, 16), :] = x_in_ref[
+                    x_3d_buf[
+                        pl.ds(r0, x_chunk), pl.ds(h_idx * 16, 16), :
+                    ] = x_in_ref[
                         pl.ds(r0, x_chunk), pl.ds(h_idx * 2048, 2048)
                     ].reshape(x_chunk, 16, 128)
         else:
-            zero_rc = min(batch_size, 8)
-            zeros_acc = jnp.zeros((zero_rc, 32, 128), dtype=jnp.float32)
-
-            def _zero_acc_chunk(ci, _):
-                accum_3d[pl.ds(ci * zero_rc, zero_rc), :, :] = zeros_acc
-                return _
-
-            lax.fori_loop(0, batch_size // zero_rc, _zero_acc_chunk, jnp.int32(0))
-            if cfg.fast_gs:
-                accum_3d[pl.ds(batch_size, 1), :, :] = jnp.zeros(
-                    (1, 32, 128), dtype=jnp.float32
-                )
-
-            zeros_io = jnp.zeros((8, 32, 128), dtype=jnp.bfloat16)
-
-            def _zero_io_chunk(ci, _):
-                io_3d_buf[pl.ds(ci * 8, 8), :, :] = zeros_io
-                return _
-
-            lax.fori_loop(0, tile_m // 8, _zero_io_chunk, jnp.int32(0))
-
             x_rc = 16
 
             def _reshape_x_chunk(ci, _):
                 r0 = pl.multiple_of(ci * x_rc, x_rc)
                 for h_idx in range(2):
-                    x_3d_buf[pl.ds(r0, x_rc), pl.ds(h_idx * 16, 16), :] = x_in_ref[
+                    x_3d_buf[
+                        pl.ds(r0, x_rc), pl.ds(h_idx * 16, 16), :
+                    ] = x_in_ref[
                         pl.ds(r0, x_rc), pl.ds(h_idx * 2048, 2048)
                     ].reshape(x_rc, 16, 128)
                 return _
 
             lax.fori_loop(0, batch_size // x_rc, _reshape_x_chunk, jnp.int32(0))
 
-        pack_active_tokens_smem(
-            batch_size,
-            r_scratch,
-            has_replicas=has_replicas,
-            fast_gs=cfg.fast_gs,
-        )
-
-    if stop_stage == "pack":
-        _early_exit_finish()
-        return
 
     # --- Compute strip helpers ---
     @jax.named_scope("gmm1_proj")
@@ -3653,8 +3833,12 @@ def _sparse_decode_kernel(
         lax.fori_loop(0, num_exec, _sparse_expert_body, jnp.int32(0))
 
     if stop_stage == "experts":
-        _early_exit_finish()
+        if early_exit_fn is not None:
+            early_exit_fn()
         return
+
+    if on_experts_done_fn is not None:
+        on_experts_done_fn()
 
     # 7. Contiguous EP-1 multi-row Reduce-Scatter.
     if cfg.rs_wire_bf16:
@@ -3681,7 +3865,8 @@ def _sparse_decode_kernel(
     else:
         rs_src_ref = accum_3d
 
-    pl.semaphore_wait(barrier_sem, ep)
+    if wait_entry_barrier:
+        pl.semaphore_wait(barrier_sem, ep)
 
     if use_pair_rs:
         # 2-stage intra-chip XOR=1 paired Reduce-Scatter: exchanges partner blocks over
@@ -3830,20 +4015,23 @@ def _sparse_decode_kernel(
 
     if stop_stage == "rs":
         _finish_rs_sends()
-
-        if return_sharded:
-            z_rows = min(rows_per_rank, 16)
-        else:
-            z_rows = 16
-        output_ref[pl.ds(0, z_rows), :] = owner_3d[
-            pl.ds(0, min(rows_per_rank, z_rows)), :, :
-        ].reshape(-1, _H)[:z_rows, :] if rows_per_rank >= z_rows else jnp.zeros(
-            (z_rows, _H), dtype=jnp.bfloat16
-        )
+        if write_output_ref and output_ref is not None:
+            if return_sharded:
+                z_rows = min(rows_per_rank, 16)
+            else:
+                z_rows = 16
+            output_ref[pl.ds(0, z_rows), :] = (
+                owner_3d[pl.ds(0, min(rows_per_rank, z_rows)), :, :].reshape(
+                    -1, _H
+                )[:z_rows, :]
+                if rows_per_rank >= z_rows
+                else jnp.zeros((z_rows, _H), dtype=jnp.bfloat16)
+            )
         return
 
     if return_sharded:
-        _write_sharded_owner_out(output_ref, owner_3d, rows_per_rank)
+        if write_output_ref and output_ref is not None:
+            _write_sharded_owner_out(output_ref, owner_3d, rows_per_rank)
     elif cfg.bridge_ag:
         # 8A. 2-Stage Chip-Hierarchical Bridge All-Gather (halves off-chip ICI!).
         num_chips = ep // 2
@@ -3970,6 +4158,632 @@ def _sparse_decode_kernel(
     _finish_rs_sends()
 
 
+def _run_muse_sparse_from_vmem_core(
+    me,
+    logits_ref,
+    bias_ref,
+    x_in_ref,
+    w1_u32,
+    s1_ref,
+    w2_u32,
+    s2_ref,
+    norm_ref,
+    *,
+    d_scratch,
+    r_scratch,
+    w1_buf,
+    s1_buf,
+    w2_buf,
+    s2_buf,
+    w1_sem,
+    w2_sem,
+    misc_sem,
+    w1_acc_buf,
+    x_3d_buf,
+    io_3d_buf,
+    lhs_2d_buf,
+    act_2d_buf,
+    y_stage_buf,
+    lhs_fp8_buf,
+    lhs_sc_buf,
+    masked_x_buf,
+    bd_sc_buf,
+    gain_f32_buf,
+    accum_3d,
+    accum_2d,
+    fan_3d_buf,
+    rs_send_bf16,
+    rs_pair_recv,
+    rs_chip_send,
+    rs_chip_recv,
+    rs_pair_ssem,
+    rs_pair_rsem,
+    rs_chip_ssem,
+    rs_chip_rsem,
+    rs_recv_3d,
+    rs_send_sem,
+    rs_recv_sem,
+    owner_3d,
+    fan_send_sem,
+    fan_recv_sem,
+    fan_s2_send_sem,
+    fan_s2_recv_sem,
+    barrier_sem,
+    output_ref,
+    ep: int,
+    batch_size: int,
+    scale_block: int,
+    num_replicas: int,
+    return_sharded: bool,
+    replica_cost_mode: str,
+    ep_axis_name: str,
+    cfg: SparseDecodeConfig,
+    rep_w1_u32=None,
+    rep_s1_ref=None,
+    rep_w2_u32=None,
+    rep_s2_ref=None,
+    replica_meta_ref=None,
+    owner_load_smem=None,
+    moved_flag_smem=None,
+    local_suppress_smem=None,
+    holder_slot_expert_smem=None,
+    holder_cand_smem=None,
+    spec_slot_ref=None,
+    x_is_3d: bool = False,
+    wait_entry_barrier: bool = True,
+    write_output_ref: bool = True,
+    on_experts_done_fn=None,
+    stop_stage: str = "",
+    early_exit_fn=None,
+) -> None:
+    """Execute complete VMEM-resident Muse sparse decode (Phase 1 plan/prime + Phase 2 experts/RS)."""
+    plan_res = plan_and_prime_muse_sparse_from_vmem(
+        me,
+        logits_ref,
+        bias_ref,
+        norm_ref,
+        w1_u32,
+        s1_ref,
+        w2_u32,
+        s2_ref,
+        d_scratch=d_scratch,
+        r_scratch=r_scratch,
+        w1_buf=w1_buf,
+        s1_buf=s1_buf,
+        w2_buf=w2_buf,
+        s2_buf=s2_buf,
+        w1_sem=w1_sem,
+        w2_sem=w2_sem,
+        misc_sem=misc_sem,
+        gain_f32_buf=gain_f32_buf,
+        accum_3d=accum_3d,
+        io_3d_buf=io_3d_buf,
+        accum_2d=accum_2d,
+        rep_w1_u32=rep_w1_u32,
+        rep_s1_ref=rep_s1_ref,
+        rep_w2_u32=rep_w2_u32,
+        rep_s2_ref=rep_s2_ref,
+        replica_meta_ref=replica_meta_ref,
+        owner_load_smem=owner_load_smem,
+        moved_flag_smem=moved_flag_smem,
+        local_suppress_smem=local_suppress_smem,
+        holder_slot_expert_smem=holder_slot_expert_smem,
+        holder_cand_smem=holder_cand_smem,
+        spec_slot_ref=spec_slot_ref,
+        ep=ep,
+        batch_size=batch_size,
+        scale_block=scale_block,
+        num_replicas=num_replicas,
+        replica_cost_mode=replica_cost_mode,
+        cfg=cfg,
+        stop_stage=stop_stage,
+        early_exit_fn=early_exit_fn,
+        zero_and_pack=True,
+    )
+    if plan_res is None:
+        return
+    run_muse_sparse_experts_and_rs_from_vmem(
+        me,
+        x_in_ref,
+        plan_res,
+        d_scratch=d_scratch,
+        r_scratch=r_scratch,
+        w1_buf=w1_buf,
+        s1_buf=s1_buf,
+        w2_buf=w2_buf,
+        s2_buf=s2_buf,
+        w1_acc_buf=w1_acc_buf,
+        x_3d_buf=x_3d_buf,
+        io_3d_buf=io_3d_buf,
+        lhs_2d_buf=lhs_2d_buf,
+        act_2d_buf=act_2d_buf,
+        y_stage_buf=y_stage_buf,
+        lhs_fp8_buf=lhs_fp8_buf,
+        lhs_sc_buf=lhs_sc_buf,
+        masked_x_buf=masked_x_buf,
+        bd_sc_buf=bd_sc_buf,
+        gain_f32_buf=gain_f32_buf,
+        accum_3d=accum_3d,
+        accum_2d=accum_2d,
+        fan_3d_buf=fan_3d_buf,
+        rs_send_bf16=rs_send_bf16,
+        rs_pair_recv=rs_pair_recv,
+        rs_chip_send=rs_chip_send,
+        rs_chip_recv=rs_chip_recv,
+        rs_pair_ssem=rs_pair_ssem,
+        rs_pair_rsem=rs_pair_rsem,
+        rs_chip_ssem=rs_chip_ssem,
+        rs_chip_rsem=rs_chip_rsem,
+        rs_recv_3d=rs_recv_3d,
+        rs_send_sem=rs_send_sem,
+        rs_recv_sem=rs_recv_sem,
+        owner_3d=owner_3d,
+        fan_send_sem=fan_send_sem,
+        fan_recv_sem=fan_recv_sem,
+        fan_s2_send_sem=fan_s2_send_sem,
+        fan_s2_recv_sem=fan_s2_recv_sem,
+        barrier_sem=barrier_sem,
+        output_ref=output_ref,
+        ep=ep,
+        batch_size=batch_size,
+        scale_block=scale_block,
+        return_sharded=return_sharded,
+        ep_axis_name=ep_axis_name,
+        cfg=cfg,
+        x_is_3d=x_is_3d,
+        wait_entry_barrier=wait_entry_barrier,
+        write_output_ref=write_output_ref,
+        on_experts_done_fn=on_experts_done_fn,
+        stop_stage=stop_stage,
+        early_exit_fn=early_exit_fn,
+    )
+
+
+def _sparse_decode_kernel(
+    *all_refs,
+    ep: int,
+    batch_size: int,
+    scale_block: int,
+    num_replicas: int,
+    return_sharded: bool,
+    replica_cost_mode: str,
+    ep_axis_name: str,
+    cfg: SparseDecodeConfig,
+    has_spec_slot_arg: bool = False,
+):
+    has_replicas = num_replicas > 0
+    is_k256 = scale_block >= 256
+    is_dense = cfg.row_mode == "dense"
+    w_mode = (
+        "stream3"
+        if (cfg.weight_mode == "stream3_k2" and (_H // scale_block) < 16)
+        else cfg.weight_mode
+    )
+    use_bd = (not is_dense) and (not is_k256) and bool(cfg.k16_blockdiag_rows)
+    e_local = _E_TOTAL // ep
+    rows_per_rank = batch_size // ep
+
+    it = iter(all_refs)
+    rank_ref = next(it)
+    replica_meta_ref = next(it) if has_replicas else None
+    spec_slot_ref = next(it) if has_spec_slot_arg else None
+    logits_ref = next(it)
+    bias_ref = next(it)
+    x_in_ref = next(it)
+    w1_ref = next(it)
+    s1_ref = next(it)
+    w2_ref = next(it)
+    s2_ref = next(it)
+    norm_ref = next(it)
+    if has_replicas:
+        rep_w1_ref = next(it)
+        rep_s1_ref = next(it)
+        rep_w2_ref = next(it)
+        rep_s2_ref = next(it)
+    else:
+        rep_w1_ref = rep_s1_ref = rep_w2_ref = rep_s2_ref = None
+    output_ref = next(it)
+
+    if is_dense:
+        d_scratch = DenseRoutingScratch(
+            *(next(it) for _ in range(len(DenseRoutingScratch._fields)))
+        )
+        r_scratch = None
+    else:
+        r_scratch = RoutingScratch(
+            *(next(it) for _ in range(len(RoutingScratch._fields)))
+        )
+        d_scratch = None
+
+    if has_replicas:
+        owner_load_smem = next(it)
+        moved_flag_smem = next(it)
+        local_suppress_smem = next(it)
+        holder_slot_expert_smem = next(it)
+        holder_cand_smem = (
+            next(it) if (not is_dense and not cfg.static_holder_mask) else None
+        )
+    else:
+        owner_load_smem = moved_flag_smem = None
+        local_suppress_smem = holder_slot_expert_smem = holder_cand_smem = None
+
+    w1_buf = next(it)
+    s1_buf = next(it)
+    w2_buf = next(it)
+    s2_buf = next(it)
+    w1_sem = next(it)
+    w2_sem = next(it)
+    misc_sem = next(it)
+    w1_acc_buf = next(it) if w_mode == "stream3_k2" else None
+
+    use_lhs_fp8 = is_k256 and cfg.lhs_fp8
+    use_bd_fp8 = use_bd and cfg.k16_bd_fp8
+    if is_dense:
+        act_2d_buf = next(it)
+        y_stage_buf = next(it)
+        lhs_fp8_buf = next(it) if use_lhs_fp8 else None
+        lhs_sc_buf = next(it) if use_lhs_fp8 else None
+        gain_f32_buf = next(it)
+        accum_2d = next(it)
+        accum_3d = next(it)
+        fan_3d_buf = next(it) if not return_sharded else None
+        x_3d_buf = io_3d_buf = lhs_2d_buf = masked_x_buf = bd_sc_buf = None
+    else:
+        x_3d_buf = next(it)
+        io_3d_buf = next(it)
+        lhs_2d_buf = next(it)
+        act_2d_buf = next(it)
+        y_stage_buf = next(it)
+        lhs_fp8_buf = next(it) if use_lhs_fp8 else None
+        lhs_sc_buf = next(it) if use_lhs_fp8 else None
+        masked_x_buf = next(it) if use_bd else None
+        bd_sc_buf = next(it) if use_bd_fp8 else None
+        gain_f32_buf = next(it)
+        accum_3d = next(it)
+        accum_2d = None
+        fan_3d_buf = x_3d_buf if not return_sharded else None
+
+    use_pair_rs = cfg.pair_rs and (ep in (8, 16))
+    rs_send_bf16 = next(it) if cfg.rs_wire_bf16 else None
+    if use_pair_rs:
+        rs_pair_recv = next(it)
+        rs_chip_send = next(it)
+        rs_chip_recv = next(it)
+        rs_pair_ssem = next(it)
+        rs_pair_rsem = next(it)
+        rs_chip_ssem = next(it)
+        rs_chip_rsem = next(it)
+        rs_recv_3d = rs_send_sem = rs_recv_sem = None
+    else:
+        rs_recv_3d = next(it)
+        rs_send_sem = next(it)
+        rs_recv_sem = next(it)
+        rs_pair_recv = rs_chip_send = rs_chip_recv = None
+        rs_pair_ssem = rs_pair_rsem = rs_chip_ssem = rs_chip_rsem = None
+    owner_3d = next(it)
+    if not return_sharded:
+        fan_send_sem = next(it)
+        fan_recv_sem = next(it)
+        fan_s2_send_sem = next(it) if cfg.bridge_ag else None
+        fan_s2_recv_sem = next(it) if cfg.bridge_ag else None
+    else:
+        fan_send_sem = fan_recv_sem = fan_s2_send_sem = fan_s2_recv_sem = None
+
+    barrier_sem = pltpu.get_barrier_semaphore()
+    for dest in range(ep):
+        pl.semaphore_signal(
+            barrier_sem,
+            device_id={ep_axis_name: jnp.int32(dest)},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    me = rank_ref[0]
+    w1_u32 = w1_ref.bitcast(jnp.uint32)
+    w2_u32 = w2_ref.bitcast(jnp.uint32)
+    rep_w1_u32 = rep_w1_ref.bitcast(jnp.uint32) if has_replicas else None
+    rep_w2_u32 = rep_w2_ref.bitcast(jnp.uint32) if has_replicas else None
+
+    def _early_exit_finish() -> None:
+        pl.semaphore_wait(barrier_sem, ep)
+        z_rows = min(rows_per_rank, 16) if return_sharded else 16
+        output_ref[pl.ds(0, z_rows), :] = jnp.zeros(
+            (z_rows, _H), dtype=jnp.bfloat16
+        )
+
+    _run_muse_sparse_from_vmem_core(
+        me,
+        logits_ref,
+        bias_ref,
+        x_in_ref,
+        w1_u32,
+        s1_ref,
+        w2_u32,
+        s2_ref,
+        norm_ref,
+        d_scratch=d_scratch,
+        r_scratch=r_scratch,
+        w1_buf=w1_buf,
+        s1_buf=s1_buf,
+        w2_buf=w2_buf,
+        s2_buf=s2_buf,
+        w1_sem=w1_sem,
+        w2_sem=w2_sem,
+        misc_sem=misc_sem,
+        w1_acc_buf=w1_acc_buf,
+        x_3d_buf=x_3d_buf,
+        io_3d_buf=io_3d_buf,
+        lhs_2d_buf=lhs_2d_buf,
+        act_2d_buf=act_2d_buf,
+        y_stage_buf=y_stage_buf,
+        lhs_fp8_buf=lhs_fp8_buf,
+        lhs_sc_buf=lhs_sc_buf,
+        masked_x_buf=masked_x_buf,
+        bd_sc_buf=bd_sc_buf,
+        gain_f32_buf=gain_f32_buf,
+        accum_3d=accum_3d,
+        accum_2d=accum_2d,
+        fan_3d_buf=fan_3d_buf,
+        rs_send_bf16=rs_send_bf16,
+        rs_pair_recv=rs_pair_recv,
+        rs_chip_send=rs_chip_send,
+        rs_chip_recv=rs_chip_recv,
+        rs_pair_ssem=rs_pair_ssem,
+        rs_pair_rsem=rs_pair_rsem,
+        rs_chip_ssem=rs_chip_ssem,
+        rs_chip_rsem=rs_chip_rsem,
+        rs_recv_3d=rs_recv_3d,
+        rs_send_sem=rs_send_sem,
+        rs_recv_sem=rs_recv_sem,
+        owner_3d=owner_3d,
+        fan_send_sem=fan_send_sem,
+        fan_recv_sem=fan_recv_sem,
+        fan_s2_send_sem=fan_s2_send_sem,
+        fan_s2_recv_sem=fan_s2_recv_sem,
+        barrier_sem=barrier_sem,
+        output_ref=output_ref,
+        ep=ep,
+        batch_size=batch_size,
+        scale_block=scale_block,
+        num_replicas=num_replicas,
+        return_sharded=return_sharded,
+        replica_cost_mode=replica_cost_mode,
+        ep_axis_name=ep_axis_name,
+        cfg=cfg,
+        rep_w1_u32=rep_w1_u32,
+        rep_s1_ref=rep_s1_ref,
+        rep_w2_u32=rep_w2_u32,
+        rep_s2_ref=rep_s2_ref,
+        replica_meta_ref=replica_meta_ref,
+        owner_load_smem=owner_load_smem,
+        moved_flag_smem=moved_flag_smem,
+        local_suppress_smem=local_suppress_smem,
+        holder_slot_expert_smem=holder_slot_expert_smem,
+        holder_cand_smem=holder_cand_smem,
+        spec_slot_ref=spec_slot_ref,
+        x_is_3d=False,
+        wait_entry_barrier=True,
+        write_output_ref=True,
+        on_experts_done_fn=None,
+        stop_stage=cfg.debug_stop_after,
+        early_exit_fn=_early_exit_finish,
+    )
+
+
+def build_muse_sparse_scratch_shapes(
+    *,
+    ep: int,
+    batch_size: int,
+    scale_block: int,
+    s1_dtype,
+    s2_dtype,
+    num_replicas: int,
+    return_sharded: bool,
+    config: SparseDecodeConfig,
+) -> list:
+    """Build exact Pallas scratch shapes matching ``_sparse_decode_kernel``."""
+    vmem = pltpu.VMEM
+    smem = pltpu.SMEM
+    sem = pltpu.SemaphoreType.DMA
+    e_local = _E_TOTAL // ep
+    has_replicas = num_replicas > 0
+    is_dense = config.row_mode == "dense"
+    max_exec = e_local + num_replicas
+    scratch_shapes: list = []
+    if is_dense:
+        scratch_shapes.extend(
+            dense_routing_scratch_shapes(
+                batch_size, max_exec, num_experts=_E_TOTAL
+            )
+        )
+    else:
+        scratch_shapes.extend(
+            routing_scratch_shapes(
+                batch_size, max_exec, topk=_TOPK, num_experts=_E_TOTAL
+            )
+        )
+
+    if has_replicas:
+        moved_smem_len = 8 if (not is_dense and config.static_holder_mask) else _E_TOTAL
+        scratch_shapes.extend(
+            [
+                smem((ep,), jnp.int32),
+                smem((moved_smem_len,), jnp.int32),
+                smem((e_local,), jnp.int32),
+                smem((num_replicas,), jnp.int32),
+            ]
+        )
+        if not is_dense and not config.static_holder_mask:
+            scratch_shapes.append(smem((num_replicas,), jnp.int32))
+
+    nqb = _H // scale_block
+    w_mode = (
+        "stream3"
+        if (config.weight_mode == "stream3_k2" and nqb < 16)
+        else config.weight_mode
+    )
+    tile_m = config.tile_m
+    if w_mode == "stream3":
+        w1_buf_shape = vmem((2, _H // _FP4_PACK, _I), jnp.uint32)
+        s1_buf_shape = vmem((2, nqb, _I), s1_dtype)
+        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
+        s2_buf_shape = vmem((nqb, _H), s2_dtype)
+        w1_sem_shape = sem((2,))
+        w2_sem_shape = sem((1,))
+    elif w_mode == "stream3_k2":
+        w1_buf_shape = vmem((2, (_H // 2) // _FP4_PACK, _N1), jnp.uint32)
+        s1_buf_shape = vmem((2, nqb // 2, _N1), s1_dtype)
+        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
+        s2_buf_shape = vmem((nqb, _H), s2_dtype)
+        w1_sem_shape = sem((2,))
+        w2_sem_shape = sem((1,))
+    elif w_mode == "w1_2x_w2_2x":
+        w1_buf_shape = vmem((2, _H // _FP4_PACK, _N1), jnp.uint32)
+        s1_buf_shape = vmem((2, nqb, _N1), s1_dtype)
+        w2_buf_shape = vmem((2, _I // _FP4_PACK, _H), jnp.uint32)
+        s2_buf_shape = vmem((2, nqb, _H), s2_dtype)
+        w1_sem_shape = sem((2,))
+        w2_sem_shape = sem((2,))
+    elif w_mode == "w1_2x_w2_1x":
+        w1_buf_shape = vmem((2, _H // _FP4_PACK, _N1), jnp.uint32)
+        s1_buf_shape = vmem((2, nqb, _N1), s1_dtype)
+        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
+        s2_buf_shape = vmem((nqb, _H), s2_dtype)
+        w1_sem_shape = sem((2,))
+        w2_sem_shape = sem((1,))
+    else:
+        w1_buf_shape = vmem((2, _H // _FP4_PACK, _I), jnp.uint32)
+        s1_buf_shape = vmem((2, nqb, _I), s1_dtype)
+        w2_buf_shape = vmem((2, _I // _FP4_PACK, _H // 2), jnp.uint32)
+        s2_buf_shape = vmem((2, nqb, _H // 2), s2_dtype)
+        w1_sem_shape = sem((2,))
+        w2_sem_shape = sem((2,))
+
+    scratch_shapes.extend(
+        [
+            w1_buf_shape,
+            s1_buf_shape,
+            w2_buf_shape,
+            s2_buf_shape,
+            w1_sem_shape,
+            w2_sem_shape,
+            sem((1,)),
+        ]
+    )
+    if w_mode == "stream3_k2":
+        scratch_shapes.append(
+            vmem((batch_size if is_dense else tile_m, _N1), jnp.float32)
+        )
+
+    use_bd = (
+        (not is_dense)
+        and (scale_block == 16)
+        and (w_mode != "stream3_k2")
+        and bool(config.k16_blockdiag_rows)
+    )
+    use_lhs_fp8 = (scale_block >= 256) and config.lhs_fp8
+    y_dtype = jnp.float32 if config.norm_f32_stage else jnp.bfloat16
+    y_stage_rows = (
+        max(16, max(config.m_buckets))
+        if (config.loop32_in_tile and not use_lhs_fp8)
+        else tile_m
+    )
+
+    if is_dense:
+        scratch_shapes.extend(
+            [
+                vmem((batch_size, _I), jnp.bfloat16),
+                vmem((batch_size, _H), y_dtype),
+            ]
+        )
+        if use_lhs_fp8:
+            scratch_shapes.extend(
+                [
+                    vmem((max(32, batch_size), _H), jnp.float8_e4m3fn),
+                    vmem((batch_size, (_H // _KC) * 128), jnp.float32),
+                ]
+            )
+        scratch_shapes.extend(
+            [
+                vmem((1, _H), jnp.float32),
+                vmem((batch_size, _H), jnp.float32),
+                vmem((batch_size, 32, 128), jnp.float32),
+            ]
+        )
+        if not return_sharded:
+            scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
+    else:
+        scratch_shapes.extend(
+            [
+                vmem((batch_size, 32, 128), jnp.bfloat16),
+                vmem((tile_m, 32, 128), jnp.bfloat16),
+                vmem((tile_m, _H), jnp.bfloat16),
+                vmem((tile_m, _I), jnp.bfloat16),
+                vmem((y_stage_rows, _H), y_dtype),
+            ]
+        )
+        if use_lhs_fp8:
+            scratch_shapes.extend(
+                [
+                    vmem((max(32, tile_m), _H), jnp.float8_e4m3fn),
+                    vmem((tile_m, (_H // _KC) * 128), jnp.float32),
+                ]
+            )
+        if use_bd:
+            max_bd = max(config.k16_blockdiag_rows)
+            mx_dtype = jnp.float8_e4m3fn if config.k16_bd_fp8 else jnp.bfloat16
+            mx_rows = (
+                max(32, max_bd * 16) if config.k16_bd_fp8 else (max_bd * 16)
+            )
+            scratch_shapes.append(vmem((mx_rows, _H), mx_dtype))
+            if config.k16_bd_fp8:
+                scratch_shapes.append(
+                    vmem((max_bd * 16, (_H // _KC) * 128), jnp.float32)
+                )
+        accum_rows = (batch_size + 1) if config.fast_gs else batch_size
+        scratch_shapes.extend(
+            [
+                vmem((1, _H), jnp.float32),
+                vmem((accum_rows, 32, 128), jnp.float32),
+            ]
+        )
+
+    rows_per_rank = batch_size // ep
+    use_pair_rs = config.pair_rs and (ep in (8, 16))
+    rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
+    if config.rs_wire_bf16:
+        scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
+    if use_pair_rs:
+        num_chips_rs = ep // 2
+        scratch_shapes.extend(
+            [
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem((num_chips_rs,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
+    else:
+        scratch_shapes.extend(
+            [
+                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
+                sem((ep,)),
+                sem,
+                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+            ]
+        )
+    if not return_sharded:
+        if config.bridge_ag:
+            num_chips = ep // 2
+            scratch_shapes.extend([sem((1 + num_chips,)), sem, sem((num_chips,)), sem])
+        else:
+            scratch_shapes.extend([sem((ep,)), sem])
+    return scratch_shapes
+
+
 def fused_decode_sparse_from_logits(
     rank: jax.Array,
     logits: jax.Array,
@@ -4063,207 +4877,21 @@ def fused_decode_sparse_from_logits(
     norm_2d = norm.reshape(1, _H)
     x_2d = x.reshape(batch_size, _H) if x.ndim == 3 else x
 
-    vmem = pltpu.VMEM
-    smem = pltpu.SMEM
-    sem = pltpu.SemaphoreType.DMA
-    v_spec = pl.BlockSpec(memory_space=vmem)
+    v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     h_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
-    is_dense = config.row_mode == "dense"
-    max_exec = e_local + num_replicas
-    scratch_shapes: list = []
-    if is_dense:
-        scratch_shapes.extend(
-            dense_routing_scratch_shapes(
-                batch_size, max_exec, num_experts=_E_TOTAL
-            )
-        )
-    else:
-        scratch_shapes.extend(
-            routing_scratch_shapes(
-                batch_size, max_exec, topk=_TOPK, num_experts=_E_TOTAL
-            )
-        )
-
-    if has_replicas:
-        moved_smem_len = 8 if (not is_dense and config.static_holder_mask) else _E_TOTAL
-        scratch_shapes.extend(
-            [
-                smem((ep,), jnp.int32),
-                smem((moved_smem_len,), jnp.int32),
-                smem((e_local,), jnp.int32),
-                smem((num_replicas,), jnp.int32),
-            ]
-        )
-        if not is_dense and not config.static_holder_mask:
-            scratch_shapes.append(smem((num_replicas,), jnp.int32))
-
-    nqb = _H // scale_block
-    w_mode = (
-        "stream3"
-        if (config.weight_mode == "stream3_k2" and nqb < 16)
-        else config.weight_mode
-    )
     tile_m = config.tile_m
-    if w_mode == "stream3":
-        w1_buf_shape = vmem((2, _H // _FP4_PACK, _I), jnp.uint32)
-        s1_buf_shape = vmem((2, nqb, _I), s1.dtype)
-        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
-        s2_buf_shape = vmem((nqb, _H), s2.dtype)
-        w1_sem_shape = sem((2,))
-        w2_sem_shape = sem((1,))
-    elif w_mode == "stream3_k2":
-        w1_buf_shape = vmem((2, (_H // 2) // _FP4_PACK, _N1), jnp.uint32)
-        s1_buf_shape = vmem((2, nqb // 2, _N1), s1.dtype)
-        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
-        s2_buf_shape = vmem((nqb, _H), s2.dtype)
-        w1_sem_shape = sem((2,))
-        w2_sem_shape = sem((1,))
-    elif w_mode == "w1_2x_w2_2x":
-        w1_buf_shape = vmem((2, _H // _FP4_PACK, _N1), jnp.uint32)
-        s1_buf_shape = vmem((2, nqb, _N1), s1.dtype)
-        w2_buf_shape = vmem((2, _I // _FP4_PACK, _H), jnp.uint32)
-        s2_buf_shape = vmem((2, nqb, _H), s2.dtype)
-        w1_sem_shape = sem((2,))
-        w2_sem_shape = sem((2,))
-    elif w_mode == "w1_2x_w2_1x":
-        w1_buf_shape = vmem((2, _H // _FP4_PACK, _N1), jnp.uint32)
-        s1_buf_shape = vmem((2, nqb, _N1), s1.dtype)
-        w2_buf_shape = vmem((_I // _FP4_PACK, _H), jnp.uint32)
-        s2_buf_shape = vmem((nqb, _H), s2.dtype)
-        w1_sem_shape = sem((2,))
-        w2_sem_shape = sem((1,))
-    else:
-        w1_buf_shape = vmem((2, _H // _FP4_PACK, _I), jnp.uint32)
-        s1_buf_shape = vmem((2, nqb, _I), s1.dtype)
-        w2_buf_shape = vmem((2, _I // _FP4_PACK, _H // 2), jnp.uint32)
-        s2_buf_shape = vmem((2, nqb, _H // 2), s2.dtype)
-        w1_sem_shape = sem((2,))
-        w2_sem_shape = sem((2,))
-
-    scratch_shapes.extend(
-        [
-            w1_buf_shape,
-            s1_buf_shape,
-            w2_buf_shape,
-            s2_buf_shape,
-            w1_sem_shape,
-            w2_sem_shape,
-            sem((1,)),  # misc_sem for VMEM->SMEM routing DMA
-        ]
-    )
-    if w_mode == "stream3_k2":
-        scratch_shapes.append(
-            vmem((batch_size if is_dense else tile_m, _N1), jnp.float32)
-        )
-
-    use_bd = (
-        (not is_dense)
-        and (scale_block == 16)
-        and (w_mode != "stream3_k2")
-        and bool(config.k16_blockdiag_rows)
-    )
-    use_lhs_fp8 = (scale_block >= 256) and config.lhs_fp8
-    y_dtype = jnp.float32 if config.norm_f32_stage else jnp.bfloat16
-    y_stage_rows = (
-        max(16, max(config.m_buckets))
-        if (config.loop32_in_tile and not use_lhs_fp8)
-        else tile_m
-    )
-
-    if is_dense:
-        scratch_shapes.extend(
-            [
-                vmem((batch_size, _I), jnp.bfloat16),  # act_2d_buf
-                vmem((batch_size, _H), y_dtype),  # y_stage_buf
-            ]
-        )
-        if use_lhs_fp8:
-            scratch_shapes.extend(
-                [
-                    vmem((max(32, batch_size), _H), jnp.float8_e4m3fn),
-                    vmem((batch_size, (_H // _KC) * 128), jnp.float32),
-                ]
-            )
-        scratch_shapes.extend(
-            [
-                vmem((1, _H), jnp.float32),  # gain_f32_buf
-                vmem((batch_size, _H), jnp.float32),  # accum_2d
-                vmem((batch_size, 32, 128), jnp.float32),  # accum_3d
-            ]
-        )
-        if not return_sharded:
-            scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
-    else:
-        scratch_shapes.extend(
-            [
-                vmem((batch_size, 32, 128), jnp.bfloat16),  # x_3d_buf (+ fan_3d_buf)
-                vmem((tile_m, 32, 128), jnp.bfloat16),  # io_3d_buf
-                vmem((tile_m, _H), jnp.bfloat16),  # lhs_2d_buf
-                vmem((tile_m, _I), jnp.bfloat16),  # act_2d_buf
-                vmem((y_stage_rows, _H), y_dtype),  # y_stage_buf
-            ]
-        )
-        if use_lhs_fp8:
-            scratch_shapes.extend(
-                [
-                    vmem((max(32, tile_m), _H), jnp.float8_e4m3fn),
-                    vmem((tile_m, (_H // _KC) * 128), jnp.float32),
-                ]
-            )
-        if use_bd:
-            max_bd = max(config.k16_blockdiag_rows)
-            mx_dtype = jnp.float8_e4m3fn if config.k16_bd_fp8 else jnp.bfloat16
-            mx_rows = (
-                max(32, max_bd * 16) if config.k16_bd_fp8 else (max_bd * 16)
-            )
-            scratch_shapes.append(vmem((mx_rows, _H), mx_dtype))
-            if config.k16_bd_fp8:
-                scratch_shapes.append(
-                    vmem((max_bd * 16, (_H // _KC) * 128), jnp.float32)
-                )
-        accum_rows = (batch_size + 1) if config.fast_gs else batch_size
-        scratch_shapes.extend(
-            [
-                vmem((1, _H), jnp.float32),  # gain_f32_buf
-                vmem((accum_rows, 32, 128), jnp.float32),  # accum_3d (+1 trash row when fast_gs)
-            ]
-        )
-
     rows_per_rank = batch_size // ep
-    use_pair_rs = config.pair_rs and (ep in (8, 16))
-    rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
-    if config.rs_wire_bf16:
-        scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
-    if use_pair_rs:
-        num_chips_rs = ep // 2
-        scratch_shapes.extend(
-            [
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                sem((num_chips_rs,)),
-                sem((num_chips_rs,)),
-                sem((num_chips_rs,)),
-                sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
-            ]
-        )
-    else:
-        scratch_shapes.extend(
-            [
-                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
-                sem((ep,)),
-                sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
-            ]
-        )
-    if not return_sharded:
-        if config.bridge_ag:
-            num_chips = ep // 2
-            scratch_shapes.extend([sem((1 + num_chips,)), sem, sem((num_chips,)), sem])
-        else:
-            scratch_shapes.extend([sem((ep,)), sem])
+    scratch_shapes = build_muse_sparse_scratch_shapes(
+        ep=ep,
+        batch_size=batch_size,
+        scale_block=scale_block,
+        s1_dtype=s1.dtype,
+        s2_dtype=s2.dtype,
+        num_replicas=num_replicas,
+        return_sharded=return_sharded,
+        config=config,
+    )
 
     base_in_specs = (
         v_spec,  # logits

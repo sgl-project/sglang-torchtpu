@@ -2515,6 +2515,685 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         comp_v.memory_analysis().generated_code_size_in_bytes, 0
                     )
 
+    def test_w9_split_vmem_phase_helpers_parity_and_tpu7x_lowering(self):
+        """Verify split VMEM MoE phase helpers match monolithic core bit-exactly and compile on TPU7x."""
+        import dataclasses
+        from functools import partial
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        routing_mod = _load_pkg_module(
+            "fused_decode_routing", _MUSE_DIR / "fused_decode_routing.py"
+        )
+
+        # 1. CPU Pallas InterpretParams(detect_races=True, uninitialized_memory='nan')
+        #    bit-exact parity between monolithic _run_muse_sparse_from_vmem_core and
+        #    split (plan_and_prime(..., zero_and_pack=False) -> zero_and_pack ->
+        #    run_muse_sparse_experts_and_rs_from_vmem(..., x_is_3d=True)).
+        ep = 8
+        batch_size = 64
+        scale_block = 512
+        e_local = 256 // ep
+        h, n1, i_dim = 4096, 8192, 4096
+        base_cfg = v1_mod.default_sparse_decode_config(batch_size, ep, scale_block)
+        cfg = dataclasses.replace(
+            base_cfg,
+            m_buckets=(16, 32),
+            route_chunk_rows=32,
+            static_holder_mask=True,
+            route_fast=True,
+            fast_plan=2,
+            unroll_strips=True,
+            fast_gs=True,
+            pair_rs=True,
+            bridge_ag=True,
+            fast_b64_epi_pro=False,
+            free_max_rows=10,
+            free_max_w=0.20,
+            free_min_slot=1,
+            min_p_topk=0.84,
+            spec_prime_parts=0,
+        )
+
+        interp_kw = {
+            "detect_races": True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        }
+
+        def _unpack_vmem_scratch(refs_iter, num_replicas: int, return_sharded: bool):
+            r_sc = routing_mod.RoutingScratch(
+                *(next(refs_iter) for _ in range(len(routing_mod.RoutingScratch._fields)))
+            )
+            if num_replicas > 0:
+                ol_sm = next(refs_iter)
+                mf_sm = next(refs_iter)
+                ls_sm = next(refs_iter)
+                hs_sm = next(refs_iter)
+            else:
+                ol_sm = mf_sm = ls_sm = hs_sm = None
+            w1_b = next(refs_iter)
+            s1_b = next(refs_iter)
+            w2_b = next(refs_iter)
+            s2_b = next(refs_iter)
+            w1_sm = next(refs_iter)
+            w2_sm = next(refs_iter)
+            misc_sm = next(refs_iter)
+            x_3d_b = next(refs_iter)
+            io_3d_b = next(refs_iter)
+            lhs_2d_b = next(refs_iter)
+            act_2d_b = next(refs_iter)
+            y_st_b = next(refs_iter)
+            gain_b = next(refs_iter)
+            acc_3d = next(refs_iter)
+            rs_send_bf = next(refs_iter) if cfg.rs_wire_bf16 else None
+            rs_p_r = next(refs_iter)
+            rs_c_s = next(refs_iter)
+            rs_c_r = next(refs_iter)
+            rs_p_ss = next(refs_iter)
+            rs_p_rs = next(refs_iter)
+            rs_c_ss = next(refs_iter)
+            rs_c_rs = next(refs_iter)
+            own_3d = next(refs_iter)
+            fan_ss = next(refs_iter) if not return_sharded else None
+            fan_rs = next(refs_iter) if not return_sharded else None
+            fan_s2_ss = next(refs_iter) if (not return_sharded and cfg.bridge_ag) else None
+            fan_s2_rs = next(refs_iter) if (not return_sharded and cfg.bridge_ag) else None
+            return dict(
+                r_scratch=r_sc,
+                owner_load_smem=ol_sm,
+                moved_flag_smem=mf_sm,
+                local_suppress_smem=ls_sm,
+                holder_slot_expert_smem=hs_sm,
+                w1_buf=w1_b,
+                s1_buf=s1_b,
+                w2_buf=w2_b,
+                s2_buf=s2_b,
+                w1_sem=w1_sm,
+                w2_sem=w2_sm,
+                misc_sem=misc_sm,
+                x_3d_buf=x_3d_b,
+                io_3d_buf=io_3d_b,
+                lhs_2d_buf=lhs_2d_b,
+                act_2d_buf=act_2d_b,
+                y_stage_buf=y_st_b,
+                gain_f32_buf=gain_b,
+                accum_3d=acc_3d,
+                rs_send_bf16=rs_send_bf,
+                rs_pair_recv=rs_p_r,
+                rs_chip_send=rs_c_s,
+                rs_chip_recv=rs_c_r,
+                rs_pair_ssem=rs_p_ss,
+                rs_pair_rsem=rs_p_rs,
+                rs_chip_ssem=rs_c_ss,
+                rs_chip_rsem=rs_c_rs,
+                owner_3d=own_3d,
+                fan_send_sem=fan_ss,
+                fan_recv_sem=fan_rs,
+                fan_s2_send_sem=fan_s2_ss,
+                fan_s2_recv_sem=fan_s2_rs,
+            )
+
+        rng = np.random.default_rng(20261125)
+        rank_np = np.array([2], dtype=np.int32)
+        logits_np = rng.normal(0.0, 2.0, size=(batch_size, 256)).astype(np.float32)
+        bias_np = (rng.normal(0.0, 0.2, size=(1, 256))).astype(np.float32)
+        x_np = (rng.normal(0.0, 0.25, size=(batch_size, h))).astype(np.float32)
+        norm_np = (rng.normal(0.0, 0.05, size=(1, h))).astype(np.float32)
+
+        def _make_u32_bank(rows: int):
+            w1_u = jnp.asarray(
+                rng.integers(0, 0x88888888, size=(rows, h // 8, n1), dtype=np.uint32)
+            )
+            w2_u = jnp.asarray(
+                rng.integers(0, 0x88888888, size=(rows, i_dim // 8, h), dtype=np.uint32)
+            )
+            s1_bf = jnp.asarray(
+                rng.uniform(0.05, 0.25, size=(rows, h // scale_block, n1)), jnp.bfloat16
+            )
+            s2_bf = jnp.asarray(
+                rng.uniform(0.05, 0.25, size=(rows, i_dim // scale_block, h)), jnp.bfloat16
+            )
+            return w1_u, s1_bf, w2_u, s2_bf
+
+        w1_j, s1_j, w2_j, s2_j = _make_u32_bank(e_local)
+        rep_w1_j, rep_s1_j, rep_w2_j, rep_s2_j = _make_u32_bank(8)
+        meta_np = np.full((4, ep * 8), -1, dtype=np.int32)
+        meta_np[0, 2 * 8 + 0] = 64
+        meta_np[1, 2 * 8 + 0] = 1
+        meta_np[2, 2 * 8 + 0] = 64
+
+        v_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+        h_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+        for num_replicas in (0, 8):
+            scratch_shapes = v1_mod.build_muse_sparse_scratch_shapes(
+                ep=ep,
+                batch_size=batch_size,
+                scale_block=scale_block,
+                s1_dtype=jnp.bfloat16,
+                s2_dtype=jnp.bfloat16,
+                num_replicas=num_replicas,
+                return_sharded=True,
+                config=cfg,
+            )
+
+            def _run_parity(split_mode: bool):
+                def _kern(*all_refs):
+                    it = iter(all_refs)
+                    rank_r = next(it)
+                    meta_r = next(it) if num_replicas > 0 else None
+                    logits_r = next(it)
+                    bias_r = next(it)
+                    x_r = next(it)
+                    w1_r = next(it)
+                    s1_r = next(it)
+                    w2_r = next(it)
+                    s2_r = next(it)
+                    norm_r = next(it)
+                    if num_replicas > 0:
+                        rw1_r = next(it)
+                        rs1_r = next(it)
+                        rw2_r = next(it)
+                        rs2_r = next(it)
+                    else:
+                        rw1_r = rs1_r = rw2_r = rs2_r = None
+                    out_r = next(it)
+                    sc = _unpack_vmem_scratch(it, num_replicas, return_sharded=True)
+                    me = rank_r[0]
+                    w1_u = w1_r
+                    w2_u = w2_r
+                    rw1_u = rw1_r
+                    rw2_u = rw2_r
+
+                    def _dump_accum():
+                        out_r[...] = sc["accum_3d"][pl.ds(0, batch_size), :, :].reshape(
+                            batch_size, h
+                        ).astype(jnp.bfloat16)
+
+                    if not split_mode:
+                        v1_mod._run_muse_sparse_from_vmem_core(
+                            me,
+                            logits_r,
+                            bias_r,
+                            x_r,
+                            w1_u,
+                            s1_r,
+                            w2_u,
+                            s2_r,
+                            norm_r,
+                            d_scratch=None,
+                            r_scratch=sc["r_scratch"],
+                            w1_buf=sc["w1_buf"],
+                            s1_buf=sc["s1_buf"],
+                            w2_buf=sc["w2_buf"],
+                            s2_buf=sc["s2_buf"],
+                            w1_sem=sc["w1_sem"],
+                            w2_sem=sc["w2_sem"],
+                            misc_sem=sc["misc_sem"],
+                            w1_acc_buf=None,
+                            x_3d_buf=sc["x_3d_buf"],
+                            io_3d_buf=sc["io_3d_buf"],
+                            lhs_2d_buf=sc["lhs_2d_buf"],
+                            act_2d_buf=sc["act_2d_buf"],
+                            y_stage_buf=sc["y_stage_buf"],
+                            lhs_fp8_buf=None,
+                            lhs_sc_buf=None,
+                            masked_x_buf=None,
+                            bd_sc_buf=None,
+                            gain_f32_buf=sc["gain_f32_buf"],
+                            accum_3d=sc["accum_3d"],
+                            accum_2d=None,
+                            fan_3d_buf=None,
+                            rs_send_bf16=sc["rs_send_bf16"],
+                            rs_pair_recv=sc["rs_pair_recv"],
+                            rs_chip_send=sc["rs_chip_send"],
+                            rs_chip_recv=sc["rs_chip_recv"],
+                            rs_pair_ssem=sc["rs_pair_ssem"],
+                            rs_pair_rsem=sc["rs_pair_rsem"],
+                            rs_chip_ssem=sc["rs_chip_ssem"],
+                            rs_chip_rsem=sc["rs_chip_rsem"],
+                            rs_recv_3d=None,
+                            rs_send_sem=None,
+                            rs_recv_sem=None,
+                            owner_3d=sc["owner_3d"],
+                            fan_send_sem=None,
+                            fan_recv_sem=None,
+                            fan_s2_send_sem=None,
+                            fan_s2_recv_sem=None,
+                            barrier_sem=None,
+                            output_ref=out_r,
+                            ep=ep,
+                            batch_size=batch_size,
+                            scale_block=scale_block,
+                            num_replicas=num_replicas,
+                            return_sharded=True,
+                            replica_cost_mode="active",
+                            ep_axis_name="model",
+                            cfg=cfg,
+                            rep_w1_u32=rw1_u,
+                            rep_s1_ref=rs1_r,
+                            rep_w2_u32=rw2_u,
+                            rep_s2_ref=rs2_r,
+                            replica_meta_ref=meta_r,
+                            owner_load_smem=sc["owner_load_smem"],
+                            moved_flag_smem=sc["moved_flag_smem"],
+                            local_suppress_smem=sc["local_suppress_smem"],
+                            holder_slot_expert_smem=sc["holder_slot_expert_smem"],
+                            holder_cand_smem=None,
+                            x_is_3d=False,
+                            wait_entry_barrier=False,
+                            write_output_ref=False,
+                            stop_stage="experts",
+                            early_exit_fn=_dump_accum,
+                        )
+                    else:
+                        plan_res = v1_mod.plan_and_prime_muse_sparse_from_vmem(
+                            me,
+                            logits_r,
+                            bias_r,
+                            norm_r,
+                            w1_u,
+                            s1_r,
+                            w2_u,
+                            s2_r,
+                            d_scratch=None,
+                            r_scratch=sc["r_scratch"],
+                            w1_buf=sc["w1_buf"],
+                            s1_buf=sc["s1_buf"],
+                            w2_buf=sc["w2_buf"],
+                            s2_buf=sc["s2_buf"],
+                            w1_sem=sc["w1_sem"],
+                            w2_sem=sc["w2_sem"],
+                            misc_sem=sc["misc_sem"],
+                            gain_f32_buf=sc["gain_f32_buf"],
+                            accum_3d=sc["accum_3d"],
+                            io_3d_buf=sc["io_3d_buf"],
+                            accum_2d=None,
+                            rep_w1_u32=rw1_u,
+                            rep_s1_ref=rs1_r,
+                            rep_w2_u32=rw2_u,
+                            rep_s2_ref=rs2_r,
+                            replica_meta_ref=meta_r,
+                            owner_load_smem=sc["owner_load_smem"],
+                            moved_flag_smem=sc["moved_flag_smem"],
+                            local_suppress_smem=sc["local_suppress_smem"],
+                            holder_slot_expert_smem=sc["holder_slot_expert_smem"],
+                            holder_cand_smem=None,
+                            ep=ep,
+                            batch_size=batch_size,
+                            scale_block=scale_block,
+                            num_replicas=num_replicas,
+                            replica_cost_mode="active",
+                            cfg=cfg,
+                            zero_and_pack=False,
+                        )
+                        v1_mod.zero_and_pack_muse_sparse_from_vmem(
+                            plan_res,
+                            r_scratch=sc["r_scratch"],
+                            accum_3d=sc["accum_3d"],
+                            io_3d_buf=sc["io_3d_buf"],
+                            accum_2d=None,
+                            batch_size=batch_size,
+                            cfg=cfg,
+                        )
+                        for r0 in range(0, batch_size, 16):
+                            for h_i in range(2):
+                                sc["x_3d_buf"][
+                                    pl.ds(r0, 16), pl.ds(h_i * 16, 16), :
+                                ] = x_r[
+                                    pl.ds(r0, 16), pl.ds(h_i * 2048, 2048)
+                                ].reshape(16, 16, 128)
+                        v1_mod.run_muse_sparse_experts_and_rs_from_vmem(
+                            me,
+                            x_r,
+                            plan_res,
+                            d_scratch=None,
+                            r_scratch=sc["r_scratch"],
+                            w1_buf=sc["w1_buf"],
+                            s1_buf=sc["s1_buf"],
+                            w2_buf=sc["w2_buf"],
+                            s2_buf=sc["s2_buf"],
+                            w1_acc_buf=None,
+                            x_3d_buf=sc["x_3d_buf"],
+                            io_3d_buf=sc["io_3d_buf"],
+                            lhs_2d_buf=sc["lhs_2d_buf"],
+                            act_2d_buf=sc["act_2d_buf"],
+                            y_stage_buf=sc["y_stage_buf"],
+                            lhs_fp8_buf=None,
+                            lhs_sc_buf=None,
+                            masked_x_buf=None,
+                            bd_sc_buf=None,
+                            gain_f32_buf=sc["gain_f32_buf"],
+                            accum_3d=sc["accum_3d"],
+                            accum_2d=None,
+                            fan_3d_buf=None,
+                            rs_send_bf16=sc["rs_send_bf16"],
+                            rs_pair_recv=sc["rs_pair_recv"],
+                            rs_chip_send=sc["rs_chip_send"],
+                            rs_chip_recv=sc["rs_chip_recv"],
+                            rs_pair_ssem=sc["rs_pair_ssem"],
+                            rs_pair_rsem=sc["rs_pair_rsem"],
+                            rs_chip_ssem=sc["rs_chip_ssem"],
+                            rs_chip_rsem=sc["rs_chip_rsem"],
+                            rs_recv_3d=None,
+                            rs_send_sem=None,
+                            rs_recv_sem=None,
+                            owner_3d=sc["owner_3d"],
+                            fan_send_sem=None,
+                            fan_recv_sem=None,
+                            fan_s2_send_sem=None,
+                            fan_s2_recv_sem=None,
+                            barrier_sem=None,
+                            output_ref=out_r,
+                            ep=ep,
+                            batch_size=batch_size,
+                            scale_block=scale_block,
+                            return_sharded=True,
+                            ep_axis_name="model",
+                            cfg=cfg,
+                            x_is_3d=True,
+                            wait_entry_barrier=False,
+                            write_output_ref=False,
+                            stop_stage="experts",
+                            early_exit_fn=_dump_accum,
+                        )
+
+                in_specs = (
+                    (v_spec,) * 3
+                    + (h_spec,) * 4
+                    + (v_spec,)
+                    + ((h_spec,) * 4 if num_replicas > 0 else ())
+                )
+                num_sc_pre = 2 if num_replicas > 0 else 1
+                fn = pl.pallas_call(
+                    _kern,
+                    out_shape=jax.ShapeDtypeStruct((batch_size, h), jnp.bfloat16),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=num_sc_pre,
+                        grid=(1,),
+                        in_specs=in_specs,
+                        out_specs=v_spec,
+                        scratch_shapes=scratch_shapes,
+                    ),
+                    interpret=pltpu.InterpretParams(**interp_kw),
+                )
+                args = (
+                    (
+                        jnp.asarray(rank_np),
+                        jnp.asarray(meta_np),
+                    )
+                    if num_replicas > 0
+                    else (jnp.asarray(rank_np),)
+                ) + (
+                    jnp.asarray(logits_np),
+                    jnp.asarray(bias_np),
+                    jnp.asarray(x_np, jnp.bfloat16),
+                    w1_j,
+                    s1_j,
+                    w2_j,
+                    s2_j,
+                    jnp.asarray(norm_np, jnp.bfloat16),
+                ) + (
+                    (rep_w1_j, rep_s1_j, rep_w2_j, rep_s2_j) if num_replicas > 0 else ()
+                )
+                return np.asarray(fn(*args), dtype=np.float32)
+
+            ref_acc = _run_parity(False)
+            split_acc = _run_parity(True)
+            self.assertGreater(float(np.max(np.abs(ref_acc))), 0.0)
+            self.assertTrue(np.all(np.isfinite(split_acc)))
+            self.assertEqual(
+                float(np.max(np.abs(ref_acc - split_acc))),
+                0.0,
+                f"Split VMEM helpers parity mismatch for num_replicas={num_replicas}",
+            )
+
+        # 2. Offline TPU7x Mosaic compilation for full split flow + on_experts_done_fn
+        #    aliasing into w2_buf + write_output_ref=False -> owner_3d (EP=8 & EP=16).
+        for topo_str, cur_ep in (("tpu7x:2x2x1", 8), ("tpu7x:2x2x2", 16)):
+            tpu_devs = get_topology_desc(topo_str, platform="tpu").devices
+            if len(tpu_devs) < cur_ep:
+                continue
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            cur_eloc = 256 // cur_ep
+            cur_rpr = batch_size // cur_ep
+            cur_cfg = dataclasses.replace(
+                v1_mod.default_sparse_decode_config(batch_size, cur_ep, scale_block),
+                m_buckets=(16, 32),
+                route_chunk_rows=32,
+                static_holder_mask=True,
+                route_fast=True,
+                fast_plan=2,
+                unroll_strips=True,
+                fast_gs=True,
+                pair_rs=True,
+                bridge_ag=True,
+                fast_b64_epi_pro=False,
+            )
+            cur_scratch = v1_mod.build_muse_sparse_scratch_shapes(
+                ep=cur_ep,
+                batch_size=batch_size,
+                scale_block=scale_block,
+                s1_dtype=jnp.bfloat16,
+                s2_dtype=jnp.bfloat16,
+                num_replicas=8,
+                return_sharded=True,
+                config=cur_cfg,
+            )
+            cur_shapes = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((4, cur_ep * 8), jnp.int32),
+                jax.ShapeDtypeStruct((batch_size, 256), jnp.float32),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((batch_size, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((cur_eloc, h, n1), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((cur_eloc, h // scale_block, n1), jnp.bfloat16),
+                jax.ShapeDtypeStruct((cur_eloc, i_dim, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((cur_eloc, i_dim // scale_block, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8, h, n1), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((8, h // scale_block, n1), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8, i_dim, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((8, i_dim // scale_block, h), jnp.bfloat16),
+            )
+
+            def _split_super_ep(*args):
+                def _k(*all_refs):
+                    it = iter(all_refs)
+                    rank_r, meta_r = next(it), next(it)
+                    logits_r, bias_r, x_r = next(it), next(it), next(it)
+                    w1_r, s1_r, w2_r, s2_r, norm_r = (
+                        next(it),
+                        next(it),
+                        next(it),
+                        next(it),
+                        next(it),
+                    )
+                    rw1_r, rs1_r, rw2_r, rs2_r = next(it), next(it), next(it), next(it)
+                    out_r = next(it)
+                    sc = _unpack_vmem_scratch(it, 8, return_sharded=True)
+                    bsem = pltpu.get_barrier_semaphore()
+                    for d in range(cur_ep):
+                        pl.semaphore_signal(
+                            bsem,
+                            device_id={"model": jnp.int32(d)},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        )
+                    me = rank_r[0]
+                    w1_u = w1_r.bitcast(jnp.uint32)
+                    w2_u = w2_r.bitcast(jnp.uint32)
+                    rw1_u = rw1_r.bitcast(jnp.uint32)
+                    rw2_u = rw2_r.bitcast(jnp.uint32)
+                    plan_res = v1_mod.plan_and_prime_muse_sparse_from_vmem(
+                        me,
+                        logits_r,
+                        bias_r,
+                        norm_r,
+                        w1_u,
+                        s1_r,
+                        w2_u,
+                        s2_r,
+                        d_scratch=None,
+                        r_scratch=sc["r_scratch"],
+                        w1_buf=sc["w1_buf"],
+                        s1_buf=sc["s1_buf"],
+                        w2_buf=sc["w2_buf"],
+                        s2_buf=sc["s2_buf"],
+                        w1_sem=sc["w1_sem"],
+                        w2_sem=sc["w2_sem"],
+                        misc_sem=sc["misc_sem"],
+                        gain_f32_buf=sc["gain_f32_buf"],
+                        accum_3d=sc["accum_3d"],
+                        io_3d_buf=sc["io_3d_buf"],
+                        accum_2d=None,
+                        rep_w1_u32=rw1_u,
+                        rep_s1_ref=rs1_r,
+                        rep_w2_u32=rw2_u,
+                        rep_s2_ref=rs2_r,
+                        replica_meta_ref=meta_r,
+                        owner_load_smem=sc["owner_load_smem"],
+                        moved_flag_smem=sc["moved_flag_smem"],
+                        local_suppress_smem=sc["local_suppress_smem"],
+                        holder_slot_expert_smem=sc["holder_slot_expert_smem"],
+                        holder_cand_smem=None,
+                        ep=cur_ep,
+                        batch_size=batch_size,
+                        scale_block=scale_block,
+                        num_replicas=8,
+                        replica_cost_mode="tiles",
+                        cfg=cur_cfg,
+                        zero_and_pack=False,
+                    )
+                    v1_mod.zero_and_pack_muse_sparse_from_vmem(
+                        plan_res,
+                        r_scratch=sc["r_scratch"],
+                        accum_3d=sc["accum_3d"],
+                        io_3d_buf=sc["io_3d_buf"],
+                        accum_2d=None,
+                        batch_size=batch_size,
+                        cfg=cur_cfg,
+                    )
+                    for r0 in range(0, batch_size, 32):
+                        for h_i in range(2):
+                            sc["x_3d_buf"][
+                                pl.ds(r0, 32), pl.ds(h_i * 16, 16), :
+                            ] = x_r[pl.ds(r0, 32), pl.ds(h_i * 2048, 2048)].reshape(
+                                32, 16, 128
+                            )
+
+                    def _on_experts_done():
+                        sc["w2_buf"][:, :128] = jnp.zeros(
+                            (i_dim // 8, 128), dtype=jnp.uint32
+                        )
+
+                    v1_mod.run_muse_sparse_experts_and_rs_from_vmem(
+                        me,
+                        x_r,
+                        plan_res,
+                        d_scratch=None,
+                        r_scratch=sc["r_scratch"],
+                        w1_buf=sc["w1_buf"],
+                        s1_buf=sc["s1_buf"],
+                        w2_buf=sc["w2_buf"],
+                        s2_buf=sc["s2_buf"],
+                        w1_acc_buf=None,
+                        x_3d_buf=sc["x_3d_buf"],
+                        io_3d_buf=sc["io_3d_buf"],
+                        lhs_2d_buf=sc["lhs_2d_buf"],
+                        act_2d_buf=sc["act_2d_buf"],
+                        y_stage_buf=sc["y_stage_buf"],
+                        lhs_fp8_buf=None,
+                        lhs_sc_buf=None,
+                        masked_x_buf=None,
+                        bd_sc_buf=None,
+                        gain_f32_buf=sc["gain_f32_buf"],
+                        accum_3d=sc["accum_3d"],
+                        accum_2d=None,
+                        fan_3d_buf=None,
+                        rs_send_bf16=sc["rs_send_bf16"],
+                        rs_pair_recv=sc["rs_pair_recv"],
+                        rs_chip_send=sc["rs_chip_send"],
+                        rs_chip_recv=sc["rs_chip_recv"],
+                        rs_pair_ssem=sc["rs_pair_ssem"],
+                        rs_pair_rsem=sc["rs_pair_rsem"],
+                        rs_chip_ssem=sc["rs_chip_ssem"],
+                        rs_chip_rsem=sc["rs_chip_rsem"],
+                        rs_recv_3d=None,
+                        rs_send_sem=None,
+                        rs_recv_sem=None,
+                        owner_3d=sc["owner_3d"],
+                        fan_send_sem=None,
+                        fan_recv_sem=None,
+                        fan_s2_send_sem=None,
+                        fan_s2_recv_sem=None,
+                        barrier_sem=bsem,
+                        output_ref=out_r,
+                        ep=cur_ep,
+                        batch_size=batch_size,
+                        scale_block=scale_block,
+                        return_sharded=True,
+                        ep_axis_name="model",
+                        cfg=cur_cfg,
+                        x_is_3d=True,
+                        wait_entry_barrier=True,
+                        write_output_ref=False,
+                        on_experts_done_fn=_on_experts_done,
+                    )
+                    out_r[...] = sc["owner_3d"][...].reshape(cur_rpr, h)
+
+                return pl.pallas_call(
+                    _k,
+                    out_shape=jax.ShapeDtypeStruct((cur_rpr, h), jnp.bfloat16),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=2,
+                        grid=(1,),
+                        in_specs=(
+                            (v_spec,) * 3 + (h_spec,) * 4 + (v_spec,) + (h_spec,) * 4
+                        ),
+                        out_specs=v_spec,
+                        scratch_shapes=cur_scratch,
+                    ),
+                    compiler_params=pltpu.CompilerParams(
+                        vmem_limit_bytes=64 * 1024**2,
+                        collective_id=0,
+                    ),
+                )(*args)
+
+            sm_split = jax.jit(
+                jax.shard_map(
+                    _split_super_ep,
+                    mesh=mesh,
+                    in_specs=(P(),) * len(cur_shapes),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+            )
+            comp_split = sm_split.trace(*cur_shapes).lower(lowering_platforms=("tpu",)).compile()
+            self.assertIn("tpu_custom_call", comp_split.as_text())
+            self.assertGreater(
+                comp_split.memory_analysis().generated_code_size_in_bytes, 0
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

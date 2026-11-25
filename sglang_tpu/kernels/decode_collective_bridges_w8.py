@@ -4984,7 +4984,7 @@ def decode_vocab_embed_chip_sharded_jax(
     )(input_ids.astype(jnp.int32), embed_weight_shard, _as_2d_f32(l0_in_gain, hidden))
 
 
-def _attn_to_moe_chip_sharded_bridge_kernel(
+def _run_chip_b1_vmem_core(
     stream_chip_hbm,
     gated_ref,
     wo_hbm,
@@ -5050,15 +5050,29 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
     router_multiplier: float,
     pre_exp_eps: float,
     pre_exp_scale_input: bool,
+    skip_barrier_signal: bool = False,
+    skip_barrier_wait: bool = False,
+    skip_stream_load: bool = False,
+    skip_stream_store: bool = False,
+    early_router_and_log_ag: bool = False,
+    during_ag_exp_ici_fn=None,
+    during_ag_exp_d2d2_fn=None,
 ) -> None:
-    """Wave-9 Chip-Sharded Bridge 1b (`TP=8` & `TP=16`): 0 `op_pair`/`op_rpair`, 0 concat, 0 `scf.for`!"""
+    """Reusable VMEM-resident Wave-9 chip-sharded Bridge 1b core (`standalone` & `b1+MoE(+b2)`).
+
+    Gain vectors (`pa_alpha`, `pa_beta`, `pre_ff_gain`, `pre_exp_gain`) are `(1, cols) f32` via `_as_2d_f32`;
+    dot scales (`wo_scale`, `w_pre_pair_scale`) follow `_as_dot_scale_f32`. Setting
+    `early_router_and_log_ag=True` finishes `out_router_logits_ref` all-gather before `ag_exp`, so
+    `during_ag_exp_ici_fn` / `during_ag_exp_d2d2_fn` can run routing, planning, and Expert-0 prefetch/unpack
+    while `ag_exp` transfers overlap. Disabling `skip_stream_store` requires valid `out_stream_chip_hbm`/`s_out_sem`.
+    """
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
     rows = gated_ref.shape[0]
-    r_pair = stream_chip_hbm.shape[0]
+    r_pair = s_buf.shape[0]
     two_pair = 2 * r_pair
     four_pair = 4 * r_pair
     hidden = wo_hbm.shape[1]
@@ -5097,14 +5111,16 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
     own_pre_c0 = pl.multiple_of(side * pre_pair_cols, 128)
     other_pre_c0 = pl.multiple_of(other_side * pre_pair_cols, 128)
 
-    _signal_barrier(me, world_size)
+    if not skip_barrier_signal:
+        _signal_barrier(me, world_size)
     pltpu.make_async_copy(
         wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
     ).start()
     pltpu.make_async_copy(
         wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
     ).start()
-    pltpu.make_async_copy(stream_chip_hbm, s_buf, s_in_sem.at[0]).start()
+    if not skip_stream_load:
+        pltpu.make_async_copy(stream_chip_hbm, s_buf, s_in_sem.at[0]).start()
     pltpu.make_async_copy(w_pre_pair_hbm, w_pre_pair_buf, w_pre_sem.at[0]).start()
     pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
@@ -5114,7 +5130,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
         rows=rows, n_cols=half,
     )
 
-    _wait_barrier(world_size)
+    if not skip_barrier_wait:
+        _wait_barrier(world_size)
     op_c1a = pltpu.make_async_remote_copy(
         send_half, mate_recv, c1a_send.at[0], c1a_recv.at[0],
         device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
@@ -5352,7 +5369,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             own_chunks.append(bf)
             own_sq = own_sq + _fold_cols_to_128(bf * bf)
         op_c1c.wait()
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
         oth_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
         oth_chunks = []
         for c0 in range(0, half, c_blk):
@@ -5385,7 +5403,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             v_own = ns_own * pre_ff_gain_ref[0:1, c_own] if pre_ff_scale_input else ns_own
             v_oth = ns_oth * pre_ff_gain_ref[0:1, c_oth] if pre_ff_scale_input else ns_oth
             pff_sq = pff_sq + _fold_cols_to_128(v_own * v_own + v_oth * v_oth)
-        pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
+        if not skip_stream_store:
+            pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
         inv_pff = lax.rsqrt(
             jnp.sum(pff_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
             + jnp.float32(pre_ff_eps)
@@ -5418,7 +5437,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             bf = my_pair_bf16[:, pl.ds(c0, c_blk)].astype(jnp.float32)
             own_sq = own_sq + _fold_cols_to_128(bf * bf)
         op_c1c.wait()
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
         oth_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
         for c0 in range(0, half, c_blk):
             bf = recv_pair_bf16[:, pl.ds(c0, c_blk)].astype(jnp.float32)
@@ -5446,7 +5466,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             v_own = ns_own * pre_ff_gain_ref[0:1, c_own] if pre_ff_scale_input else ns_own
             v_oth = ns_oth * pre_ff_gain_ref[0:1, c_oth] if pre_ff_scale_input else ns_oth
             pff_sq = pff_sq + _fold_cols_to_128(v_own * v_own + v_oth * v_oth)
-        pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
+        if not skip_stream_store:
+            pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
         inv_pff = lax.rsqrt(
             jnp.sum(pff_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
             + jnp.float32(pre_ff_eps)
@@ -5471,7 +5492,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
 
         _fori_strips(r_pair, bm_pair, _own_pa_sq)
         op_c1c.wait()
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
 
         def _finish_pa_and_pre_ffn_pair(r0):
             rs = pl.ds(r0, bm_pair)
@@ -5526,27 +5548,17 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
                 ffn_pair_buf[rs, c_g] = rn.astype(jnp.bfloat16)
 
         _fori_strips(r_pair, bm_pair, _finish_pa_and_pre_ffn_pair)
-        pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
+        if not skip_stream_store:
+            pltpu.make_async_copy(s_buf, out_stream_chip_hbm, s_out_sem.at[0]).start()
 
     # Stage 4: Direct W_pre_pair MXU `[r_pair, 8192] @ [8192, 2048]` (ZERO `op_pair`/`op_rpair`!).
-    _dma_wait(w_pre_pair_buf, w_pre_sem.at[0])
-    _dot_fp8_w8_slice_to_ref(
-        ffn_pair_buf, 0, w_pre_pair_buf, w_pre_pair_scale_ref, 0, pre_my_half, 0, 0,
-        n_r=r_pair, n_cols=pre_pair_cols, align=r_align,
-    )
-
     rmul = jnp.float32(router_multiplier)
     r_lhs = ffn_pair_buf if is_r16 else router_pair_buf
+    ag_log_ops = []
 
-    if r_pair == 8:
-        op_pre = pltpu.make_async_remote_copy(
-            pre_my_half, pre_mate_half, pre_send.at[0], pre_recv.at[0],
-            device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
-        )
-        op_pre.start()
-
+    def _run_router_and_start_log_ag():
         _dma_wait(w_router_buf, w_router_sem.at[0])
-        if n_exp == 256:
+        if r_pair <= 64 and n_exp == 256:
             lg = jnp.dot(r_lhs[...], w_router_buf[...], preferred_element_type=jnp.float32)
             out_router_logits_ref[pl.ds(chip_r0, r_pair), :] = lg * rmul
         else:
@@ -5554,8 +5566,6 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
                 c_sl = pl.ds(ce, _DOT_TN)
                 lg = jnp.dot(r_lhs[...], w_router_buf[:, c_sl], preferred_element_type=jnp.float32)
                 out_router_logits_ref[pl.ds(chip_r0, r_pair), c_sl] = lg * rmul
-
-        ag_log_ops = []
         for d in range(1, n_chips):
             peer = me ^ jnp.int32(d << 1)
             op_l = pltpu.make_async_remote_copy(
@@ -5568,6 +5578,29 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             )
             op_l.start()
             ag_log_ops.append(op_l)
+
+    def _wait_log_ag():
+        for op in ag_log_ops:
+            op.wait()
+
+    if early_router_and_log_ag:
+        _run_router_and_start_log_ag()
+
+    _dma_wait(w_pre_pair_buf, w_pre_sem.at[0])
+    _dot_fp8_w8_slice_to_ref(
+        ffn_pair_buf, 0, w_pre_pair_buf, w_pre_pair_scale_ref, 0, pre_my_half, 0, 0,
+        n_r=r_pair, n_cols=pre_pair_cols, align=r_align,
+    )
+
+    if r_pair == 8:
+        op_pre = pltpu.make_async_remote_copy(
+            pre_my_half, pre_mate_half, pre_send.at[0], pre_recv.at[0],
+            device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
+        )
+        op_pre.start()
+
+        if not early_router_and_log_ag:
+            _run_router_and_start_log_ag()
 
         p_blk = min(pre_pair_cols, 1024)
         own_pre_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
@@ -5605,6 +5638,9 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             exp_3d_buf[chip, :, c_own] = y_own.astype(out_expert_in_ref.dtype)
             exp_3d_buf[chip, :, c_oth] = y_oth.astype(out_expert_in_ref.dtype)
 
+        if early_router_and_log_ag:
+            _wait_log_ag()
+
         ag_exp_ops = []
         for d in range(1, n_chips):
             peer = me ^ jnp.int32(d << 1)
@@ -5618,8 +5654,12 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             )
             op_e.start()
             ag_exp_ops.append(op_e)
-        for op in ag_log_ops:
-            op.wait()
+        if not early_router_and_log_ag:
+            _wait_log_ag()
+        if during_ag_exp_ici_fn is not None:
+            during_ag_exp_ici_fn()
+        if during_ag_exp_d2d2_fn is not None:
+            during_ag_exp_d2d2_fn()
         for op in ag_exp_ops:
             op.wait()
         e_w = min(h_pre, 1024)
@@ -5705,34 +5745,8 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
 
             _fori_strips(r_pair, bm_pair, _own_pre_exp_norm)
 
-        ag_log_ops = []
-
-        def _run_router_and_start_log_ag():
-            _dma_wait(w_router_buf, w_router_sem.at[0])
-            if r_pair <= 64 and n_exp == 256:
-                lg = jnp.dot(r_lhs[...], w_router_buf[...], preferred_element_type=jnp.float32)
-                out_router_logits_ref[pl.ds(chip_r0, r_pair), :] = lg * rmul
-            else:
-                for ce in range(0, n_exp, _DOT_TN):
-                    c_sl = pl.ds(ce, _DOT_TN)
-                    lg = jnp.dot(r_lhs[...], w_router_buf[:, c_sl], preferred_element_type=jnp.float32)
-                    out_router_logits_ref[pl.ds(chip_r0, r_pair), c_sl] = lg * rmul
-            for d in range(1, n_chips):
-                peer = me ^ jnp.int32(d << 1)
-                op_l = pltpu.make_async_remote_copy(
-                    out_router_logits_ref.at[pl.ds(chip_r0, r_pair), :],
-                    out_router_logits_ref.at[pl.ds(chip_r0, r_pair), :],
-                    ag_log_send.at[d - 1],
-                    ag_log_recv.at[d - 1],
-                    device_id=(peer,),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-                op_l.start()
-                ag_log_ops.append(op_l)
-
-        def _wait_log_ag():
-            for op in ag_log_ops:
-                op.wait()
+        if early_router_and_log_ag:
+            _wait_log_ag()
 
         _ag_chip_sharded_half_col_xor1(
             None,
@@ -5743,12 +5757,42 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
             ag_exp_d2d_recv,
             me=me,
             world_size=world_size,
-            during_ici_fn=_run_router_and_start_log_ag,
-            during_d2d2_fn=_wait_log_ag,
+            during_ici_fn=(
+                during_ag_exp_ici_fn
+                if early_router_and_log_ag
+                else _run_router_and_start_log_ag
+            ),
+            during_d2d2_fn=(
+                during_ag_exp_d2d2_fn if early_router_and_log_ag else _wait_log_ag
+            ),
             r_pair_in=r_pair,
             copy_local_from_pair=False,
         )
-    _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+    if not skip_stream_store:
+        _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+
+
+def _attn_to_moe_chip_sharded_bridge_kernel(
+    *args,
+    world_size: int,
+    pa_eps: float,
+    pre_ff_eps: float,
+    pre_ff_scale_input: bool,
+    router_multiplier: float,
+    pre_exp_eps: float,
+    pre_exp_scale_input: bool,
+) -> None:
+    """Wave-9 Chip-Sharded Bridge 1b (`TP=8` & `TP=16`): 0 `op_pair`/`op_rpair`, 0 concat, 0 `scf.for`!"""
+    _run_chip_b1_vmem_core(
+        *args,
+        world_size=world_size,
+        pa_eps=pa_eps,
+        pre_ff_eps=pre_ff_eps,
+        pre_ff_scale_input=pre_ff_scale_input,
+        router_multiplier=router_multiplier,
+        pre_exp_eps=pre_exp_eps,
+        pre_exp_scale_input=pre_exp_scale_input,
+    )
 
 
 def attn_to_moe_chip_sharded_bridge_jax(
@@ -5947,6 +5991,8 @@ def _run_chip_sharded_post_fast_core(
     tok_d2d2_send=None,
     tok_d2d2_recv=None,
     out_next_full_ref=None,
+    skip_barrier_wait: bool = False,
+    skip_stream_load: bool = False,
 ) -> None:
     """Wave-9 chip-sharded `W_post` + `0-scf.for` epilogue (`TP=8` & `TP=16`, sharded or full `moe_out`)."""
     import jax.numpy as jnp
@@ -5971,7 +6017,8 @@ def _run_chip_sharded_post_fast_core(
     chip_r0 = pl.multiple_of(chip * r_pair, r_align)
     is_even = side == jnp.int32(0)
 
-    _wait_barrier(world_size)
+    if not skip_barrier_wait:
+        _wait_barrier(world_size)
     if is_tp2_wpost:
         # Opt-in TP_chip=2 W_post [k_in, H/2]: eliminates BOTH tok_s2 and post_ici inter-chip ICI!
         k_w = min(k_in, 1024 if r_pair <= 16 else 512)
@@ -6018,7 +6065,8 @@ def _run_chip_sharded_post_fast_core(
             device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
         )
         op_pd2d.start()
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
         op_pd2d.wait()
 
         p_w = min(half_h, 1024 if r_pair <= 16 else 512)
@@ -6063,7 +6111,8 @@ def _run_chip_sharded_post_fast_core(
                     )
 
                 def _wait_s_and_wpost():
-                    _dma_wait(s_buf, s_in_sem.at[0])
+                    if not skip_stream_load:
+                        _dma_wait(s_buf, s_in_sem.at[0])
                     _dma_wait(w_post_buf, w_post_sem.at[0])
 
                 _ag_chip_sharded_half_col_xor1(
@@ -6115,7 +6164,8 @@ def _run_chip_sharded_post_fast_core(
                     op.start()
                     ts2_ops.append(op)
 
-                _dma_wait(s_buf, s_in_sem.at[0])
+                if not skip_stream_load:
+                    _dma_wait(s_buf, s_in_sem.at[0])
                 _dma_wait(w_post_buf, w_post_sem.at[0])
                 for op in ts2_ops:
                     op.wait()
@@ -6124,7 +6174,8 @@ def _run_chip_sharded_post_fast_core(
                     rows=rows, n_cols=post_cols,
                 )
         else:
-            _dma_wait(s_buf, s_in_sem.at[0])
+            if not skip_stream_load:
+                _dma_wait(s_buf, s_in_sem.at[0])
             _dma_wait(w_post_buf, w_post_sem.at[0])
             _dot_fp8_scaled_to_ref(
                 moe_out_ref, w_post_buf, s_post_ref, 0, post_shard, 0,
@@ -6410,7 +6461,7 @@ def _run_chip_sharded_post_fast_core(
             on_stream_updated_fn()
 
 
-def _moe_to_attn_chip_sharded_bridge_kernel(
+def _run_chip_b2_vmem_core(
     stream_chip_hbm,
     moe_out_ref,
     w_post_hbm,
@@ -6476,23 +6527,41 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
     v_scale: float,
     has_rope: bool,
     interpret_mode: bool,
+    skip_barrier_signal: bool = False,
+    skip_barrier_wait: bool = False,
+    skip_stream_load: bool = False,
+    skip_stream_store: bool = False,
+    prestarted_w_post_dma: bool = False,
+    prestarted_w_qkv_dma: bool = False,
+    prestarted_w_gate_dma: bool = False,
 ) -> None:
-    """Wave-9 Chip-Sharded Bridge 2b (`TP=8` & `TP=16`, `0` `op_d2d1`, `-50%` `in_ici`, `0` `scf.for`)."""
+    """Reusable VMEM-resident Wave-9 chip-sharded Bridge 2b core (`standalone` & `b1+MoE+b2`).
+
+    Gain vectors (`post_ff_gain`, `pf_alpha`, `pf_beta`, `next_in_gain`) are `(1, cols) f32` via `_as_2d_f32`;
+    dot scales (`s_post`, `next_s_qkv`, `next_s_gate`) follow `_as_dot_scale_f32`. When chained after `b1+MoE`
+    in a single superkernel (`s_buf` already holds live `f32` residual), pass `skip_stream_load=True`,
+    `skip_barrier_signal/wait` as appropriate, and `prestarted_w_*_dma=True` for weights overlapped with `MoE RS`.
+    """
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental.pallas import tpu as pltpu
 
-    r_pair = stream_chip_hbm.shape[0]
+    r_pair = s_buf.shape[0]
     rows = (world_size // 2) * r_pair
-    qkv_cols = next_w_qkv_hbm.shape[1]
-    gate_cols = next_w_gate_hbm.shape[1]
+    qkv_cols = w_qkv_buf.shape[1]
+    gate_cols = w_gate_buf.shape[1]
 
     me = lax.axis_index("model").astype(jnp.int32)
-    _signal_barrier(me, world_size)
-    pltpu.make_async_copy(stream_chip_hbm, s_buf, s_in_sem.at[0]).start()
-    pltpu.make_async_copy(w_post_hbm, w_post_buf, w_post_sem.at[0]).start()
-    pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, w_qkv_sem.at[0]).start()
-    pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, w_gate_sem.at[0]).start()
+    if not skip_barrier_signal:
+        _signal_barrier(me, world_size)
+    if not skip_stream_load:
+        pltpu.make_async_copy(stream_chip_hbm, s_buf, s_in_sem.at[0]).start()
+    if not prestarted_w_post_dma:
+        pltpu.make_async_copy(w_post_hbm, w_post_buf, w_post_sem.at[0]).start()
+    if not prestarted_w_qkv_dma:
+        pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, w_qkv_sem.at[0]).start()
+    if not prestarted_w_gate_dma:
+        pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, w_gate_sem.at[0]).start()
 
     _run_chip_sharded_post_fast_core(
         moe_out_ref, w_post_buf, s_post_ref, s_buf,
@@ -6506,12 +6575,20 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
         post_ff_eps=post_ff_eps, post_ff_scale_input=post_ff_scale_input,
         next_in_eps=next_in_eps, next_in_scale_input=next_in_scale_input,
         round_stream_bf16_for_norm=False,
-        on_stream_updated_fn=lambda: pltpu.make_async_copy(
-            s_buf, out_stream_chip_hbm, s_out_sem.at[0]
-        ).start(),
+        on_stream_updated_fn=(
+            None
+            if skip_stream_store
+            else (
+                lambda: pltpu.make_async_copy(
+                    s_buf, out_stream_chip_hbm, s_out_sem.at[0]
+                ).start()
+            )
+        ),
         tok_d2d2_send=tok_d2d2_send,
         tok_d2d2_recv=tok_d2d2_recv,
         out_next_full_ref=next_in_vmem if r_pair >= 16 else None,
+        skip_barrier_wait=skip_barrier_wait,
+        skip_stream_load=skip_stream_load,
     )
 
     _ag_chip_sharded_half_col_xor1(
@@ -6547,7 +6624,43 @@ def _moe_to_attn_chip_sharded_bridge_kernel(
         next_in_vmem, w_gate_buf, next_s_gate_ref, 0, gate_dst, 0,
         rows=rows, n_cols=gate_cols,
     )
-    _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+    if not skip_stream_store:
+        _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+
+
+def _moe_to_attn_chip_sharded_bridge_kernel(
+    *args,
+    world_size: int,
+    sharded_moe_in: bool,
+    post_ff_eps: float,
+    post_ff_scale_input: bool,
+    next_in_eps: float,
+    next_in_scale_input: bool,
+    fuse_qkv_epi: bool,
+    qkv_norm_eps: float,
+    query_scale: float,
+    k_scale: float,
+    v_scale: float,
+    has_rope: bool,
+    interpret_mode: bool,
+) -> None:
+    """Wave-9 Chip-Sharded Bridge 2b (`TP=8` & `TP=16`, `0` `op_d2d1`, `-50%` `in_ici`, `0` `scf.for`)."""
+    _run_chip_b2_vmem_core(
+        *args,
+        world_size=world_size,
+        sharded_moe_in=sharded_moe_in,
+        post_ff_eps=post_ff_eps,
+        post_ff_scale_input=post_ff_scale_input,
+        next_in_eps=next_in_eps,
+        next_in_scale_input=next_in_scale_input,
+        fuse_qkv_epi=fuse_qkv_epi,
+        qkv_norm_eps=qkv_norm_eps,
+        query_scale=query_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        has_rope=has_rope,
+        interpret_mode=interpret_mode,
+    )
 
 
 def moe_to_attn_chip_sharded_bridge_jax(

@@ -2898,7 +2898,7 @@ def _stationary_q_v2_process(
                             )
 
                 if use_tq_loop and (bq_sz // tq_sz) > 1:
-                    pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_tq_ring)
+                    pl.loop(0, cdiv(valid_bq_rows, tq_sz), unroll=False)(_exec_tq_ring)
                 else:
                     for _tqi in range(bq_sz // tq_sz):
                         _exec_tq_ring(_tqi)
@@ -3017,7 +3017,9 @@ def _stationary_q_v2_process(
                                     )
 
                             if use_tq_loop and (bq_sz // tq_sz) > 1:
-                                pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_prefix_tq)
+                                pl.loop(
+                                    0, cdiv(valid_bq_rows, tq_sz), unroll=False
+                                )(_exec_prefix_tq)
                             else:
                                 for _tqi in range(bq_sz // tq_sz):
                                     _exec_prefix_tq(_tqi)
@@ -3124,7 +3126,9 @@ def _stationary_q_v2_process(
                                     )
 
                     if use_tq_loop and (bq_sz // tq_sz) > 1:
-                        pl.loop(0, bq_sz // tq_sz, unroll=False)(_exec_stream_tq)
+                        pl.loop(
+                            0, cdiv(valid_bq_rows, tq_sz), unroll=False
+                        )(_exec_stream_tq)
                     else:
                         for _tqi in range(bq_sz // tq_sz):
                             _exec_stream_tq(_tqi)

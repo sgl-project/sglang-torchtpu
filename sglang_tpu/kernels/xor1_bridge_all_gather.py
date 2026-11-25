@@ -87,7 +87,7 @@ def xor1_ag_schedule_spec(
         and rows >= 3 * min_row_align
         and (rows % min_row_align == 0)
     ):
-        return "xyz", _xyz_row_splits(rows, min_row_align), (1, 21, 21, 22, 22)
+        return "xyz", _xyz_row_splits(rows, min_row_align), (1, 9, 9, 10, 10)
     num_chips = tp_size // 2
     num_inter = num_chips - 1
     return "flat", (rows,), (1, num_inter, num_inter, num_chips, num_chips)
@@ -289,15 +289,16 @@ def emit_xor1_ag_phases(
 
         def _xyz_s2_inter(me, px, py, pz):
             inter = []
-            sem_i = 3
-            for h_sl, dst_peer, owners in (
-                (parts[0], py, (None, px)),
-                (parts[1], pz, (None, py)),
-                (parts[2], px, (None, pz)),
+            for sem_i, (h_sl, dst_peer, owners) in enumerate(
+                (
+                    (parts[0], py, (None, px)),
+                    (parts[1], pz, (None, py)),
+                    (parts[2], px, (None, pz)),
+                ),
+                start=3,
             ):
                 for owner in owners:
                     inter.append(_slice_inter(sem_i, me, owner, h_sl, dst_peer))
-                    sem_i += 1
             return tuple(inter)
 
         def _xyz_s1_d2d(mate, px, py, pz):
@@ -308,51 +309,36 @@ def emit_xor1_ag_phases(
 
         def _xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz):
             inter = []
-            sem_i = 9
-            for h_sl, dst_peer, owners in (
-                (parts[0], pz, (None, px, py, pxy)),
-                (parts[1], px, (None, py, pz, pyz)),
-                (parts[2], py, (None, pz, px, pxz)),
+            for sem_i, (h_sl, dst_peer, owners) in enumerate(
+                (
+                    (parts[0], pz, (None, px, py, pxy)),
+                    (parts[1], px, (None, py, pz, pyz)),
+                    (parts[2], py, (None, pz, px, pxz)),
+                ),
+                start=6,
             ):
                 for owner in owners:
                     inter.append(_slice_inter(sem_i, me, owner, h_sl, dst_peer))
-                    sem_i += 1
             return tuple(inter)
 
         def _xyz_s2_d2d(mate, px, py, pz, pxy, pxz, pyz):
             return tuple(
-                _slice_d2d(4 + idx, mate, peer, h_sl)
-                for idx, (peer, h_sl) in enumerate(
-                    (
-                        (py, parts[0]),
-                        (pxy, parts[0]),
-                        (pz, parts[1]),
-                        (pyz, parts[1]),
-                        (px, parts[2]),
-                        (pxz, parts[2]),
-                    )
-                )
+                _slice_d2d(4 + idx, mate, peer, parts[idx])
+                for idx, peers in enumerate(((py, pxy), (pz, pyz), (px, pxz)))
+                for peer in peers
             )
 
         def _xyz_s4_ops(mate, px, py, pz, pxy, pxz, pyz, pxyz):
             return tuple(
-                _slice_d2d(10 + idx, mate, peer, h_sl)
-                for idx, (peer, h_sl) in enumerate(
+                _slice_d2d(7 + idx, mate, peer, parts[idx])
+                for idx, peers in enumerate(
                     (
-                        (pz, parts[0]),
-                        (pxz, parts[0]),
-                        (pyz, parts[0]),
-                        (pxyz, parts[0]),
-                        (px, parts[1]),
-                        (pxy, parts[1]),
-                        (pxz, parts[1]),
-                        (pxyz, parts[1]),
-                        (py, parts[2]),
-                        (pyz, parts[2]),
-                        (pxy, parts[2]),
-                        (pxyz, parts[2]),
+                        (pz, pxz, pyz, pxyz),
+                        (px, pxy, pxz, pxyz),
+                        (py, pyz, pxy, pxyz),
                     )
                 )
+                for peer in peers
             )
 
         def _xyz_p1():
@@ -707,10 +693,10 @@ def xor1_bridge_all_gather(
                 out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
                 scratch_shapes=(
                     pltpu.SemaphoreType.DMA((1,)),
-                    pltpu.SemaphoreType.DMA((21,)),
-                    pltpu.SemaphoreType.DMA((21,)),
-                    pltpu.SemaphoreType.DMA((22,)),
-                    pltpu.SemaphoreType.DMA((22,)),
+                    pltpu.SemaphoreType.DMA((9,)),
+                    pltpu.SemaphoreType.DMA((9,)),
+                    pltpu.SemaphoreType.DMA((10,)),
+                    pltpu.SemaphoreType.DMA((10,)),
                 ),
             ),
             compiler_params=pltpu.CompilerParams(
