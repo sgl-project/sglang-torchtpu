@@ -373,7 +373,7 @@ class InputConfigs:
     # 3-D scales then skips the unit-dim relayout copy (it pads each (1, N) tile 8x).
     scale_3d: bool = False
     # lhs only: the lhs arrives quantized (PrequantLhsRef) instead of in ``dtype``.
-    prequant: bool = False
+    lhs_is_quantized: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -529,7 +529,7 @@ def generate_block_specs(
     index_map = IndexMaps(metadata_ref, cfgs)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
-    if cfgs.lhs_cfgs.prequant:
+    if cfgs.lhs_cfgs.lhs_is_quantized:
         lhs_block_spec = PrequantLhsRef(
             data=pl.BlockSpec(
                 (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k // 4),
@@ -596,8 +596,8 @@ def inner_kernel(
     """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
-        prequant = cfgs.lhs_cfgs.prequant
-        if prequant:
+        lhs_is_quantized = cfgs.lhs_cfgs.lhs_is_quantized
+        if lhs_is_quantized:
             tiled_lhs = tiled_lhs_ref.data.reshape(-1, cfgs.tiles.tile_k // 4)[...]
             tiled_lhs_scale = tiled_lhs_ref.scale.reshape(-1, PREQUANT_SCALE_LANES)[...]
         else:
@@ -737,7 +737,7 @@ def inner_kernel(
                             * rs[..., start_n:end_n].astype(scales_dtype)
                         ).astype(acc_ref.dtype)
                         continue
-                    if prequant:
+                    if lhs_is_quantized:
                         # tile_k == size_k (make_gmm_configs), so start_k is global.
                         b = start_k // q_block_size
                         w0 = b * (q_block_size // 4)
@@ -1160,7 +1160,7 @@ def kernel_main(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    if cfgs.lhs_cfgs.prequant:
+    if cfgs.lhs_cfgs.lhs_is_quantized:
         lhs_in = PrequantLhsRef(
             data=lhs_ref.data.reshape(
                 -1, cfgs.dims.size_lhs_sublane, lhs_ref.data.shape[-1]
@@ -1537,7 +1537,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
-        + ("-pq" if cfgs.lhs_cfgs.prequant else "")
+        + ("-pq" if cfgs.lhs_cfgs.lhs_is_quantized else "")
     )
 
 
@@ -1734,7 +1734,7 @@ def make_gmm_configs(
         quant_block_size=dims.size_k if row_scale else lhs_quant_block_size,
         dtype=jnp.bfloat16.dtype if lhs_prequant else lhs.dtype,
         row_scale=row_scale,
-        prequant=lhs_prequant,
+        lhs_is_quantized=lhs_prequant,
     )
     # For block quantization (num_blocks > 1), rhs block size must be a
     # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
@@ -2115,7 +2115,8 @@ def _prequantize_kernel(x_ref, q_ref, s_ref, *, q_dtype):
     s_ref[...] = scales
 
 
-_PREQUANT_TILE_M = 256
+# Row-tiling (M) block size for prequantize_lhs_fp8 VMEM tiles (K quant block is 512).
+_PREQUANT_ROW_TILE = 256
 
 
 @jax.jit
@@ -2132,7 +2133,7 @@ def prequantize_lhs_fp8(x: jax.Array):
     assert x.dtype == jnp.bfloat16, x.dtype
     assert size_k % PREQUANT_BLOCK == 0, size_k
     assert size_k // PREQUANT_BLOCK <= PREQUANT_SCALE_LANES, size_k
-    tile_m = min(_PREQUANT_TILE_M, m)
+    tile_m = min(_PREQUANT_ROW_TILE, m)
     return pl.pallas_call(
         functools.partial(_prequantize_kernel, q_dtype=jnp.float8_e4m3fn),
         out_shape=(

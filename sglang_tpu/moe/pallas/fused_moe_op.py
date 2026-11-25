@@ -52,7 +52,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 
 import logging
 import math
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 from torch_tpu._internal.pallas import jax_op
@@ -613,24 +613,38 @@ def _ep_counting_route(
     )
 
 
+# Minimum routed rows (m * topk) needed to amortize the 3-kernel launch
+# overhead of prequantize_lhs_fp8 + 2 row_gathers over a single ragged_gather_v2.
 _PREQUANT_MIN_ROUTED_ROWS = 2048
 
 
 def _prequant_dispatch_ok(
-    hidden_states,
-    w1,
-    w1_scale,
-    w1_bias,
-    w1_channel_scale,
+    hidden_states: "jax.Array",
+    w1: "jax.Array",
+    w1_scale: Optional["jax.Array"],
+    w1_bias: Optional["jax.Array"],
+    w1_channel_scale: Optional["jax.Array"],
     *,
-    num_rows,
-    num_lhs_groups,
-    tile_info,
-    fuse_act,
-    out_dtype,
+    num_rows: int,
+    num_lhs_groups: int,
+    tile_info: Any,
+    fuse_act: Optional[str],
+    out_dtype: Any,
 ) -> bool:
-    """Whether GMM1 can take a ``prequantize_lhs_fp8`` lhs: fp8 experts with full (not
-    compact) scales and no bias, bf16 activations, and ``gmm_v2.prequant_supported``."""
+    """Whether GMM1 can take a ``prequantize_lhs_fp8`` lhs.
+
+    Args:
+        hidden_states: Token activations ``[m, k]``.
+        w1: First-layer expert weights ``[g, k, 2*n]``.
+        w1_scale: Optional weight scales (must be full, non-compact).
+        w1_bias: Optional weight bias (unsupported by prequant path).
+        w1_channel_scale: Optional channel scale (unsupported by prequant path).
+        num_rows: Total routed rows passed to GMM1 (``m * topk``).
+        num_lhs_groups: Number of expert groups in ``group_sizes``.
+        tile_info: Resolved GMM1 ``TileSizes`` or tiling callable.
+        fuse_act: Fused activation name for GMM1, or None.
+        out_dtype: Preferred output dtype for GMM1.
+    """
     import jax.numpy as jnp
 
     from sglang_tpu.moe.pallas.gmm_v2 import prequant_supported

@@ -22,18 +22,32 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 
 def _row_gather_kernel(
-    *args,
+    in_hbm: jax.Ref,
+    idx_hbm: jax.Ref,
+    out_hbm: jax.Ref,
+    sem: jax.Ref,
+    *,
+    end_hbm: jax.Ref | None = None,
+    end_vmem: jax.Ref | None = None,
     num_row_subchunks: int,
     num_streams: int,
     col_chunks: int,
     exact_rows: int | None,
-    has_gather_end: bool,
 ):
-    if has_gather_end:
-        in_hbm, idx_hbm, end_hbm, out_hbm, end_vmem, sem = args
-    else:
-        in_hbm, idx_hbm, out_hbm, sem = args
-        end_hbm, end_vmem = None, None
+    """Pure-DMA SparseCore row-gather kernel body.
+
+    Args:
+        in_hbm: Input 32-bit table in HBM, shape ``[T, W]``.
+        idx_hbm: Padded int32 row indices in HBM.
+        out_hbm: Output buffer in HBM, shape ``[out_rows, W]``.
+        sem: DMA semaphores, one per concurrent gather stream.
+        end_hbm: Optional dynamic row-count bound ``i32[1]`` in HBM.
+        end_vmem: Scratch VMEM buffer for loading ``end_hbm`` (required with it).
+        num_row_subchunks: Number of ``sc.num_lanes``-row subchunks per outer block.
+        num_streams: Number of concurrent indirect DMA streams per inner step.
+        col_chunks: Number of 128-aligned column chunks across ``W``.
+        exact_rows: True output row count when ``out_hbm`` is unpadded on the tail.
+    """
     sc = pltpu.get_tpu_info().sparse_core
     lanes = sc.num_lanes
     num_cores = lax.axis_size(("core", "subcore"))
@@ -105,6 +119,21 @@ def _row_gather_kernel(
     )(idx_hbm)
 
 
+def _row_gather_bounded_kernel(
+    in_hbm: jax.Ref,
+    idx_hbm: jax.Ref,
+    end_hbm: jax.Ref,
+    out_hbm: jax.Ref,
+    end_vmem: jax.Ref,
+    sem: jax.Ref,
+    **kwargs,
+):
+    """Adapter for ``pl.kernel`` when ``gather_end`` is an operand + scratch."""
+    _row_gather_kernel(
+        in_hbm, idx_hbm, out_hbm, sem, end_hbm=end_hbm, end_vmem=end_vmem, **kwargs
+    )
+
+
 def _col_chunks(width: int, max_words: int) -> int:
     """Fewest 128-aligned column chunks of at most max_words words."""
     for chunks in range(1, width // 128 + 1):
@@ -114,9 +143,12 @@ def _col_chunks(width: int, max_words: int) -> int:
     return width // 128
 
 
-_ROW_SUBCHUNKS = 8
+# Max 16-row (sc.num_lanes) subchunks per outer block per subcore; halves on small
+# gathers to keep padding small.
+_MAX_ROW_SUBCHUNKS = 8
 _STREAMS = 2
-# Bounds one stream buffer to 16 rows x 768 words (two buffers per stream).
+# Fits 2 streams x 2 double-buffers x 16 lanes x 768 u32 = 192 KiB (75% of the
+# 256 KiB SparseCore VMEM floor, 128-word aligned).
 _MAX_CHUNK_WORDS = 768
 
 
@@ -142,7 +174,7 @@ def row_gather(
     lanes = sc.num_lanes
     num_cores = sc.num_cores * sc.num_subcores
     n = indices.shape[0]
-    num_row_subchunks = _ROW_SUBCHUNKS
+    num_row_subchunks = _MAX_ROW_SUBCHUNKS
     num_streams = _STREAMS
     # Small gathers: fewer subchunks per block so the padding stays small.
     while num_row_subchunks > num_streams and n <= lanes * num_cores * (
@@ -173,14 +205,14 @@ def row_gather(
         end_arr = jnp.asarray(gather_end, dtype=jnp.int32).reshape(1)
         kernel_args.append(end_arr)
         scratch_types.insert(0, pltpu.VMEM((16,), jnp.int32))
+    body = _row_gather_bounded_kernel if has_end else _row_gather_kernel
     out = pl.kernel(
         functools.partial(
-            _row_gather_kernel,
+            body,
             num_row_subchunks=num_row_subchunks,
             num_streams=num_streams,
             col_chunks=_col_chunks(width, _MAX_CHUNK_WORDS),
             exact_rows=n if (exact and pad) else None,
-            has_gather_end=has_end,
         ),
         out_type=jax.ShapeDtypeStruct((out_rows, width), x.dtype),
         mesh=mesh,
