@@ -1674,6 +1674,10 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.supports_mamba()
             or req.session_id is not None
             or req.finished()
+            # Keeping prefill chunk windows frees no SWA above cache_protected_len
+            # during prefill, and a deferred chunk never raises it: its SWA would
+            # stay request-owned, out of eviction's reach.
+            or envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.get()
         ):
             return False
         self.advance_unpublished_req(req)

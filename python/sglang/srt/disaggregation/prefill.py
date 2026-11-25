@@ -722,7 +722,15 @@ class SchedulerDisaggregationPrefillMixin:
             # ones the tree also holds; release_kv_cache inserts them later.
             return
 
-        checkpoint_kv_cache(req, cache)
+        # A newly computed chunk before the prompt end is mid-prefill, so a
+        # chunk-insert stride can keep it request-owned; its KV is then sent once a
+        # later insert protects it. A call that computed nothing (the bootstrap
+        # finalize) publishes every chunk the request still holds.
+        end = req.extend_end
+        mid_prefill = (
+            end is not None and end < len(req.origin_input_ids) and req.prefix_len < end
+        )
+        checkpoint_kv_cache(req, cache, mid_prefill=mid_prefill)
 
     def release_prefill_sender(
         self: Scheduler, req: Req, *, abort_sender: bool

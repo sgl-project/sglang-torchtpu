@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import torch
 from swa_cache_world import PAGE, WINDOW, KVWorld
 
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
@@ -74,6 +75,45 @@ class TestDeferChunkInsert(unittest.TestCase):
         self.assertEqual(calls, [("defer", 8192), ("checkpoint", 8192)])
 
 
+def _run_disagg(stride, start, end, prompt_len):
+    req = SimpleNamespace(
+        rid="r",
+        finished=lambda: False,
+        skip_radix_cache_insert=False,
+        pending_bootstrap=False,
+        disagg_kv_sender=None,
+        origin_input_ids=list(range(prompt_len)),
+        prefix_len=start,
+        extend_end=end,
+    )
+    scheduler = SimpleNamespace(tree_cache=_Tree())
+    with envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride):
+        SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
+    return scheduler.tree_cache.calls, req.prefix_len
+
+
+class TestDisaggPrefillChunkInsert(unittest.TestCase):
+    """A disaggregated prefill checkpoints each chunk through
+    checkpoint_disagg_prefill, which marks every chunk before the prompt end
+    mid-prefill."""
+
+    def test_chunk_before_prompt_end_is_deferred(self):
+        calls, prefix_len = _run_disagg(16384, 4096, 8192, prompt_len=20000)
+        self.assertEqual(calls, [("defer", 8192)])
+        self.assertEqual(prefix_len, 8192)
+
+    def test_last_chunk_inserts(self):
+        # [16K, 20000) reaches no 16K multiple but ends the prompt.
+        calls, _ = _run_disagg(16384, 16384, 20000, prompt_len=20000)
+        self.assertEqual(calls, [("checkpoint", 20000)])
+
+    def test_bootstrap_finalize_publishes_held_chunks(self):
+        # Chunks advanced unpublished while bootstrap was pending leave
+        # prefix_len == extend_end; the finalize call must insert them.
+        calls, _ = _run_disagg(16384, 8192, 8192, prompt_len=20000)
+        self.assertEqual(calls, [("checkpoint", 8192)])
+
+
 def _swa_cache(**overrides):
     attrs = dict(
         disable=False,
@@ -114,6 +154,12 @@ class TestUnifiedDeferChunkCheckpoint(unittest.TestCase):
             self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
             cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
             self.assertEqual(req.prefix_len, 0)
+
+    def test_falls_back_when_prefill_chunk_windows_are_kept(self):
+        cache, req = _swa_cache(), _req()
+        with envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.override(True):
+            self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
+        cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
 
 
 def _tokens(seed: int, n: int) -> list[int]:
