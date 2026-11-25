@@ -757,6 +757,26 @@ class HostEngramCoordinator:
         )
         self._prepared_extend_ranges: tuple[list[int], list[int]] | None = None
         self._prefetch: _EngramPrefetch | None = None
+        self._device_verify: Any = None
+        self._device_verify_checked = False
+
+    def get_device_verify(self) -> Any:
+        """Lazily initialize on-device TPU Engram verify when tables fit in HBM."""
+        if not self._device_verify_checked:
+            self._device_verify_checked = True
+            from sglang_tpu.models.deepseek_v41.engram_device import DeviceEngramVerify
+
+            if DeviceEngramVerify.can_enable(self, self._hasher, self.device):
+                dev = DeviceEngramVerify(self, self._hasher, self.device)
+                self._device_verify = dev
+                _DEVICE_VERIFY[self._hasher] = dev
+                logger.info(
+                    "[TPU] DeepSeek-V4.1 on-device Engram verify enabled "
+                    "(%d layers, dim=%d, zero verify D2H/H2D)",
+                    dev.n_layers,
+                    dev.dim,
+                )
+        return self._device_verify
 
     def _next_prompt_prediction(
         self,
@@ -888,6 +908,8 @@ class HostEngramCoordinator:
         )
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=history.device)
         history[slot_tensor] = tail_tensor
+        if self._device_verify is not None:
+            self._device_verify.mark_cpu_history_updated()
         self._history_commit = []
 
     def prepare(
@@ -1554,7 +1576,11 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
         # Engram.forward reads it in target-verify mode; None is equal blocks.
         ragged_verify_layout=getattr(forward_batch, "ragged_verify_layout", None),
     )
-    return hasher(_cpu(input_ids), batch)
+    out = hasher(_cpu(input_ids), batch)
+    dev = _DEVICE_VERIFY.get(hasher)
+    if dev is not None:
+        dev.mark_cpu_history_updated()
+    return out
 
 
 def _padded_history(history, req_pool_indices):
@@ -1604,6 +1630,8 @@ def host_table_without_cuda():
 
 # hasher -> verify commits not yet applied to its host history, oldest first.
 _PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# hasher -> active on-device TPU verify handler (when tables fit in TPU HBM).
+_DEVICE_VERIFY: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def commit_engram_history(
@@ -1654,21 +1682,34 @@ def defer_engram_commit(
     blocks it until the verify finishes; the next reader of the history runs
     after the next draft is dispatched.
     """
+    dev = _DEVICE_VERIFY.get(hasher) if hasher is not None else None
+    if dev is not None:
+        dev.commit_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )
+        return
     commit = (verify_ids_2d, req_pool_indices, commit_lens)
     _PENDING_COMMITS.setdefault(hasher, []).append(commit)
 
 
 def has_pending_engram_commits(hasher) -> bool:
     # Only DSpark verify queues; without a queue the hasher is never weak-referenced.
-    return bool(
-        hasher is not None and _PENDING_COMMITS and _PENDING_COMMITS.get(hasher)
-    )
+    if hasher is None:
+        return False
+    dev = _DEVICE_VERIFY.get(hasher)
+    if dev is not None and dev._dev_ahead:
+        return True
+    return bool(_PENDING_COMMITS and _PENDING_COMMITS.get(hasher))
 
 
 def flush_all_engram_commits() -> None:
     """Apply every hasher's queued verify commits (flush_engram_commits for each)."""
     for hasher in list(_PENDING_COMMITS.keys()):
         flush_engram_commits(hasher)
+    for dev in list(_DEVICE_VERIFY.values()):
+        dev.sync_device_to_cpu_if_needed()
 
 
 def flush_engram_commits(
@@ -1678,6 +1719,9 @@ def flush_engram_commits(
 
     Returns host copies of ``also_read``, read back in the same transfer as the
     commits' device tensors (each separate read waits for the device queue)."""
+    dev = _DEVICE_VERIFY.get(hasher) if hasher is not None else None
+    if dev is not None:
+        dev.sync_device_to_cpu_if_needed()
     pending = []
     if hasher is not None and _PENDING_COMMITS:
         pending = list(_PENDING_COMMITS.pop(hasher, ()))

@@ -61,6 +61,17 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     # paths below read or write hasher.history. A verify flushes in stage_verify,
     # where its draft tokens come back in the same read.
     verify = forward_batch.forward_mode.is_target_verify() and not coordinator.started
+    if verify:
+        dev_verify = coordinator.get_device_verify()
+        if dev_verify is not None:
+            dev_res = dev_verify.stage_verify(input_ids, forward_batch)
+            if dev_res is not None:
+                staged, num_cols = dev_res
+                forward_batch.tpu_engram_staged = staged
+                forward_batch.tpu_engram_local_ids = engram_host.local_row_ids(
+                    padded_tokens, len(staged), num_cols, device
+                )
+                return None
     if not verify:
         engram_host.flush_engram_commits(hasher)
     staged_result = None

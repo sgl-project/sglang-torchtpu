@@ -725,6 +725,10 @@ class TpuEnvs:
     # Fuse vocab-parallel LM head projection with sharded-vocab DSpark Markov
     # argmax (eliminating the [W*T, V/W] BF16 all-to-all and 8x-sharding markov_w2).
     SGLANG_TPU_DSV41_SHARDED_DSPARK_MARKOV = EnvBool(True)
+    # Keep small DeepSeek-V4.1 Engram tables (<= 512 MiB, e.g. V4.1-Flash ~211 MiB)
+    # in TPU HBM for TARGET_VERIFY so verify hashing, history commit, and table
+    # gather run on-device with zero D2H/H2D host stall.
+    SGLANG_TPU_DSV41_DEVICE_ENGRAM_VERIFY = EnvBool(True)
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
