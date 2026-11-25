@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import contextlib
+import math
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
@@ -96,9 +97,22 @@ def adder(model=None):
     return obj
 
 
-def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0):
+def scheduler(
+    waiting,
+    chunked=None,
+    mbs=(),
+    last_mbs=(),
+    matched=0,
+    host=0,
+    tail=0,
+    spread=1.0,
+    chunk_cap=16384,
+):
+    # Spread 1 (one step per stage), not the shipped default 2, unless a test passes it.
     return NS(
         _tpu_pp_chunk_cost=cost(),
+        _tpu_pp_chunk_spread=spread,
+        chunked_prefill_size=chunk_cap,
         waiting_queue=waiting,
         chunked_req=chunked,
         mbs=list(mbs),
@@ -117,6 +131,53 @@ def test_pending_work_splits_lone_prompt_and_preserves_busy_steps():
     assert pending_step_limit(sched) == 4096
     sched.waiting_queue = [req(32768, rid=str(i)) for i in range(8)]
     assert pending_step_limit(sched) == 16384
+
+
+def test_spread_splits_light_load_over_more_steps():
+    assert pending_step_limit(scheduler([req(32768)], spread=2.0)) == 2048
+    # 8 stages x 16K top bucket = 128K; just below it the share is halved.
+    below = [req(16384, rid=str(i)) for i in range(7)] + [req(16000, rid="7")]
+    assert pending_step_limit(scheduler(below)) == 16384
+    assert pending_step_limit(scheduler(below, spread=2.0)) == 8192
+    assert pending_step_limit(scheduler(below, spread=1.5)) == 12288
+
+
+def test_spread_one_keeps_one_step_per_stage():
+    def one_step_per_stage(pending):
+        share = -(-pending // 8)
+        return min(16384, max(2048, -(-share // 2048) * 2048))
+
+    for pending in [*range(0, 140000, 997), 131071, 131072, 131073]:
+        sched = scheduler([req(pending)] if pending else [])
+        assert pending_step_limit(sched) == one_step_per_stage(pending), pending
+
+
+def test_spread_counts_chunks_in_flight_below_a_full_step_per_stage():
+    in_flight = [batch(16384) for _ in range(4)]
+    sched = scheduler([req(32768)], mbs=in_flight, last_mbs=[None] * 4, spread=2.0)
+    assert pending_step_limit(sched) == 6144
+
+
+def test_spread_keeps_the_largest_step_from_one_full_step_per_stage():
+    """A pipeline with a full step of work per stage must keep its largest
+    step whatever the spread, or saturated throughput drops."""
+    at = [req(16384, rid=str(i)) for i in range(8)]
+    deep = [req(32768, rid=str(i)) for i in range(16)]
+    for spread in (1.0, 2.0, 4.0):
+        assert pending_step_limit(scheduler(at, spread=spread)) == 16384
+        assert pending_step_limit(scheduler(deep, spread=spread)) == 16384
+    in_flight = [batch(16384) for _ in range(4)]
+    sched = scheduler([req(65536)], mbs=in_flight, last_mbs=[None] * 4, spread=2.0)
+    assert pending_step_limit(sched) == 16384
+
+
+def test_full_step_is_the_admission_cap_not_a_padding_bucket():
+    """A compile bucket above --chunked-prefill-size only pads; a full step of
+    real work per stage must still keep the largest step under the spread."""
+    at_cap = [req(12288, rid=str(i)) for i in range(8)]
+    assert pending_step_limit(scheduler(at_cap, spread=2.0, chunk_cap=12288)) == 16384
+    below = at_cap[:7] + [req(12000, rid="7")]
+    assert pending_step_limit(scheduler(below, spread=2.0, chunk_cap=12288)) == 6144
 
 
 def test_cached_prefix_of_a_waiting_request_is_not_pending_work():
@@ -383,7 +444,6 @@ def test_continuation_does_not_count_loaded_host_prefix_twice(monkeypatch):
 
 def test_profile_requires_resolved_compiler_setting(monkeypatch):
     monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "1")
-    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SLACK", "-1")
     with get_context().override_server_args(
         device="tpu",
         pp_size=8,
@@ -391,10 +451,16 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
         chunked_prefill_size=16384,
         enable_torch_compile=True,
     ) as raw:
-        scheduler = NS(tp_worker=NS(model_runner=NS(server_args=raw)))
+        scheduler = NS(
+            tp_worker=NS(model_runner=NS(server_args=raw)),
+            world_group=NS(world_size=2, cpu_group=(0, 1)),
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda out, obj, group: out.__setitem__(slice(None), [obj] * len(out)),
+        )
         assert not raw.enable_torch_compile
-        with pytest.raises(ValueError, match="SLACK must be nonnegative"):
-            profile_and_install_cost_model(scheduler)
         get_context().override("test.no_compile", enable_torch_compile=False)
         with pytest.raises(ValueError, match="require --enable-torch-compile"):
             profile_and_install_cost_model(scheduler)
@@ -405,10 +471,11 @@ def _profile_ms(rank, tokens, prefix):
     return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
 
 
-def _install_profiled_models(monkeypatch, *, ms):
+def _install_profiled_models(monkeypatch, *, ms, spread=1.0):
     """Run profile_and_install_cost_model once per rank of a PP2 x TP2 world
     whose gather returns every rank's precomputed report."""
     points = [(2048, 0), (2048, 2048), (4096, 0), (4096, 4096)]
+    env = {rank: (True, 0.1, spread) for rank in range(4)}
     reports = [
         (rank // 2, [(t, p, ms(rank, t, p)) for t, p in points], None)
         for rank in range(4)
@@ -416,12 +483,15 @@ def _install_profiled_models(monkeypatch, *, ms):
     current = {"rank": 0}
 
     def all_gather_object(out, obj, group):
-        # The rank reports its own stage and the times it measured.
+        # Each rank sends its env first, then its own stage and the times it measured.
+        if isinstance(obj[0], bool):
+            out[:] = [env[rank] for rank in group]
+            return
         assert obj == reports[current["rank"]]
         out[:] = reports
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
-    monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda: True)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
     monkeypatch.setattr(
         pp_chunk_scheduler, "get_exec", lambda: NS(graph=NS(enable_torch_compile=True))
     )
@@ -462,14 +532,85 @@ def _install_profiled_models(monkeypatch, *, ms):
         ):
             profile_and_install_cost_model(scheduler)
         models.append(scheduler._tpu_pp_chunk_cost)
-    return models
+        assert scheduler._tpu_pp_chunk_spread == spread
+    return NS(models=models, scheduler=scheduler, policy=policy, env=env)
 
 
 def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
     """The devices of a multi-device stage must size chunks alike even when
     they time the profile differently; diverging sizes deadlock the stage."""
-    models = _install_profiled_models(monkeypatch, ms=_profile_ms)
+    run = _install_profiled_models(monkeypatch, ms=_profile_ms)
+    models, scheduler, policy, env = run.models, run.scheduler, run.policy, run.env
     assert all(model == models[0] for model in models)
+    # One rank's bad or differing value fails every rank after the gather,
+    # instead of leaving the others waiting in it.
+    calls = []
+    policy._run_one = lambda **kw: calls.append(kw) or 1.0
+    for knobs, match in (
+        ((-1.0, 1.0), "SLACK must be finite and nonnegative"),
+        ((math.nan, 1.0), "SLACK must be finite and nonnegative"),
+        ((math.inf, 1.0), "SLACK must be finite and nonnegative"),
+        ((0.1, 0.5), "SPREAD must be finite and at least 1"),
+        ((0.1, math.inf), "SPREAD must be finite and at least 1"),
+        ((0.1, math.nan), "SPREAD must be finite and at least 1"),
+        ((0.2, 1.0), "must be the same on every rank"),
+        ((0.1, 2.0), "must be the same on every rank"),
+    ):
+        env[3] = (True, *knobs)
+        with pytest.raises(ValueError, match=match):
+            profile_and_install_cost_model(scheduler)
+    assert not calls
+
+
+def test_agreed_spread_is_installed(monkeypatch):
+    """Every rank installs the spread the ranks agreed on, not the default."""
+    _install_profiled_models(monkeypatch, ms=_profile_ms, spread=2.0)
+
+
+@pytest.mark.parametrize("flags", [(True, False), (False, True)])
+def test_dynamic_chunks_mismatch_fails_every_rank_before_profiling(monkeypatch, flags):
+    """A rank with dynamic chunks off must not leave its peers waiting in a
+    collective; every rank fails at startup instead."""
+    sent = []
+
+    def all_gather_object(out, obj, group):
+        sent.append(obj[0])
+        out[:] = [(flag, *obj[1:]) for flag in flags]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
+    for rank, flag in enumerate(flags):
+        monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", str(int(flag)))
+        runner = MagicMock()
+        scheduler = NS(
+            tp_worker=NS(model_runner=runner),
+            world_group=NS(world_size=2, cpu_group=(0, 1)),
+        )
+        with pytest.raises(ValueError, match="DYNAMIC_CHUNKS must be the same"):
+            profile_and_install_cost_model(scheduler)
+        runner.compile_policy._run_one.assert_not_called()
+    assert sent == list(flags)
+
+
+def test_dynamic_chunks_off_on_every_rank_skips_profiling(monkeypatch):
+    monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "0")
+    gathered = []
+
+    def all_gather_object(out, obj, group):
+        gathered.append(obj)
+        out[:] = [obj] * len(out)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(pp_chunk_scheduler, "pipeline_prefill_is_chunked", lambda: True)
+    runner = MagicMock()
+    scheduler = NS(
+        tp_worker=NS(model_runner=runner),
+        world_group=NS(world_size=2, cpu_group=(0, 1)),
+    )
+    profile_and_install_cost_model(scheduler)
+    assert [dynamic for dynamic, _, _ in gathered] == [False]
+    runner.compile_policy._run_one.assert_not_called()
+    assert "_tpu_pp_chunk_cost" not in vars(scheduler)
 
 
 def test_a_delayed_device_does_not_inflate_its_stage(monkeypatch):
@@ -479,8 +620,8 @@ def test_a_delayed_device_does_not_inflate_its_stage(monkeypatch):
     def even(rank, tokens, prefix):
         return _profile_ms(rank - rank % 2, tokens, prefix)
 
-    models = _install_profiled_models(monkeypatch, ms=_profile_ms)
-    assert models[0] == _install_profiled_models(monkeypatch, ms=even)[0]
+    models = _install_profiled_models(monkeypatch, ms=_profile_ms).models
+    assert models[0] == _install_profiled_models(monkeypatch, ms=even).models[0]
 
 
 def test_a_slow_stage_still_sets_the_cost(monkeypatch):
@@ -493,8 +634,8 @@ def test_a_slow_stage_still_sets_the_cost(monkeypatch):
     def stage_one(rank, tokens, prefix):
         return 2 * _profile_ms(0, tokens, prefix)
 
-    models = _install_profiled_models(monkeypatch, ms=slow_stage)
-    assert models[0] == _install_profiled_models(monkeypatch, ms=stage_one)[0]
+    models = _install_profiled_models(monkeypatch, ms=slow_stage).models
+    assert models[0] == _install_profiled_models(monkeypatch, ms=stage_one).models[0]
 
 
 if __name__ == "__main__":
