@@ -5,11 +5,18 @@ import os
 import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 
 register_tpu_ci(
-    est_time=500,
+    est_time=90,
     suite="stage-a-test-tpu-unit",
     chips=1,
+    labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
+)
+register_tpu_ci(
+    est_time=150,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
 )
 
@@ -137,15 +144,22 @@ def _assert_top_scores(selected, scores, allowed, k, ordered):
 # (odd counts stay unpaired), and prefill-sized requests.
 @pytest.mark.parametrize(
     "counts",
-    [
-        [1] * 8,
-        [2] * 4,
-        [3] * 4,
-        [4] * 3,
-        [6] * 2,
-        [1, 3, 2, 6, 5],
-        [257, 128],
-    ],
+    sweep(
+        (
+            (1,) * 8,
+            (2,) * 4,
+            (3,) * 4,
+            (4,) * 3,
+            (6,) * 2,
+            (1, 3, 2, 6, 5),
+            (257, 128),
+        ),
+        (
+            (1,) * 8,
+            (1, 3, 2, 6, 5),
+            (257, 128),
+        ),
+    ),
 )
 @pytest.mark.parametrize("unordered", [False, True])
 def test_candidate_scoring_matches_dense_reference_real_tpu(counts, unordered):
@@ -225,17 +239,22 @@ def test_candidate_gather(banks_count, page_size, fragments):
     out = np.asarray(out).reshape(3, fragments // 16, 33, 128)
     # Only valid fragments of live groups are defined; skipped tiles and
     # ignored fragments are left uninitialized by the gather.
-    for i, physical in enumerate(ids[0]):
-        if physical < 0:
-            continue
-        page, fragment = divmod(int(physical), page_size // 8)
-        base = layout.page_offset + page * layout.page_stride
-        for field in range(33):
-            start = base * 128 + field * page_size + fragment * 8
-            np.testing.assert_array_equal(
-                out[0, i // 16, field, i % 16 * 8 : (i % 16 + 1) * 8],
-                raw.reshape(-1)[start : start + 8],
-            )
+    valid = np.flatnonzero(ids[0] >= 0)
+    page, fragment = np.divmod(ids[0, valid], page_size // 8)
+    base = layout.page_offset + page * layout.page_stride
+    starts = (
+        base[:, None, None] * 128
+        + np.arange(33)[None, :, None] * page_size
+        + fragment[:, None, None] * 8
+        + np.arange(8)[None, None, :]
+    )
+    got = (
+        out[0]
+        .reshape(fragments // 16, 33, 16, 8)
+        .transpose(0, 2, 1, 3)
+        .reshape(fragments, 33, 8)[valid]
+    )
+    np.testing.assert_array_equal(got, raw.reshape(-1)[starts])
 
 
 if __name__ == "__main__":

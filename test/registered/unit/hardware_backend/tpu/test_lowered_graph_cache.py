@@ -21,7 +21,7 @@ from sglang_tpu.compilation.lowered_graph import (
 )
 from sglang_tpu.compilation.spmd_compiler import ExecutableInterface, InputSpec
 
-register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class _Mode(enum.Enum):
