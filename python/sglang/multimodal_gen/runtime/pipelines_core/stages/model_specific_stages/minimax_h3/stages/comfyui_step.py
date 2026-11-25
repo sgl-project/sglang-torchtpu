@@ -18,7 +18,6 @@ _logger = logging.getLogger(__name__)
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
-    MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _FORWARD_SUPPORTED_KWARGS,
@@ -33,6 +32,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    packed_sequence,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
@@ -208,15 +210,12 @@ def _layout_signature_matches(
 def comfyui_layout_to_packed(layout: dict[str, Any]) -> dict[str, Any]:
     """Rebuild the SGLD packed dict from a serialized ComfyUI layout.
 
-    Only pads ``seq_len`` to 64. Row order, RoPE ids, and update masks stay
-    exactly as ComfyUI computed them.
+    Only pads ``seq_len``, as the packed builders do
+    (``packed_sequence.minimax_h3_padded_seq_len``: to 64 by default). Row
+    order, RoPE ids, and update masks stay exactly as ComfyUI computed them.
     """
     used = int(layout["seq_len"])
-    seq_len = (
-        (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
-        // MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-        * MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
-    )
+    seq_len = packed_sequence.minimax_h3_padded_seq_len(used)
     position_ids = layout["position_ids"].to(dtype=torch.float64)
     grid = torch.zeros(seq_len, 3, dtype=torch.float64)
     grid[:used] = position_ids[:used]

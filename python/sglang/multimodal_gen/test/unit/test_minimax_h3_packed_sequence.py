@@ -2,13 +2,23 @@
 """Numerical contracts for MiniMax-H3 packed-sequence layouts."""
 
 import unittest
+from unittest.mock import patch
+
+import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     trailing_padding_used_len,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    packed_sequence,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
+    minimax_h3_padded_seq_len,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+    comfyui_step,
 )
 
 
@@ -225,3 +235,62 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         )
         target_t0 = built["img_position_ids"][built["img_pos"][frozen_rows], 0]
         self.assertEqual(float(target_t0), target_origin)
+
+    def test_padding_rounds_used_up_to_the_alignment(self):
+        alignment = packed_sequence.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
+        self.assertEqual(alignment, 64)
+        for used in (1, 63, 64, 65, 127, 128, 37_749, 37_888):
+            self.assertEqual(
+                minimax_h3_padded_seq_len(used), -(-used // alignment) * alignment
+            )
+        # The module constant is read at call time (platforms patch it).
+        with patch.object(packed_sequence, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT", 512):
+            self.assertEqual(minimax_h3_padded_seq_len(600), 1024)
+
+    def test_every_builder_pads_through_the_one_function(self):
+        # A platform replaces the module attribute; the t2va and ref2va
+        # builders and the ComfyUI layout all pick it up and keep the layout.
+        def to_640(used):  # never a multiple-of-64 rounding of used
+            return (-(-used // 640) + 1) * 640
+
+        empty = torch.zeros(0, dtype=torch.long)
+        comfyui_layout = {
+            "seq_len": 600,
+            "position_ids": torch.ones(600, 3),
+            "segments": [(0, 600, "text")],
+            "signature": (600, 3, 8, 8, 10),
+            "img_pos": empty,
+            "img_update": empty.bool(),
+            "audio_pos": empty,
+            "audio_update": empty.bool(),
+        }
+        with patch.object(packed_sequence, "minimax_h3_padded_seq_len", to_640):
+            built = (
+                minimax_h3_packed_sequence(
+                    text_len=60,
+                    latent_t=3,
+                    latent_h=8,
+                    latent_w=8,
+                    audio_t=10,
+                    include_keyframe_cond=False,
+                ),
+                minimax_h3_packed_sequence_ref2va_blocks(
+                    text_len=600,
+                    latent_t=3,
+                    latent_h=8,
+                    latent_w=8,
+                    audio_t=10,
+                    ref_blocks=[{"kind": "image", "latent_h": 8, "latent_w": 8}],
+                ),
+                comfyui_step.comfyui_layout_to_packed(comfyui_layout),
+            )
+        for packed in built:
+            used = int(packed["cu_seqlens"][1])
+            self.assertEqual(packed["seq_len"], to_640(used))
+            self.assertNotEqual(packed["seq_len"], minimax_h3_padded_seq_len(used))
+            self.assertEqual(
+                packed["cu_seqlens"].tolist(), [0, used, packed["seq_len"]]
+            )
+            self.assertEqual(packed["img_position_ids"].shape[0], packed["seq_len"])
+            self.assertTrue((packed["img_position_ids"][used:] == 0).all())
+            self.assertTrue((packed["token_tags"][used:] == -1).all())

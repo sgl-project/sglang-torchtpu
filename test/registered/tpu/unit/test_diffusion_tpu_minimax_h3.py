@@ -39,8 +39,12 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 from sglang.multimodal_gen.test.unit.test_minimax_h3_encoder_device import (  # noqa: F401
     TestMiniMaxH3EncoderTextPositions,
 )
+from sglang.multimodal_gen.test.unit.test_minimax_h3_packed_sequence import (  # noqa: F401
+    TestMiniMaxH3PackedSequence as TestMiniMaxH3PackedSequenceLayouts,
+)
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.multimodal_gen import minimax_h3, worker
 from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
 from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
@@ -66,7 +70,6 @@ def _installed():
     with contextlib.ExitStack() as stack:
         for target, name in (
             (packed_sequence, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
-            (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
             (dit, "_minimax_h3_attention_core_bcg"),
             (dit.MiniMaxH3DiTModel, "_compile_conditions"),
             (dit.MiniMaxH3DiTModel, "_embed"),
@@ -75,6 +78,19 @@ def _installed():
         minimax_h3.install()
         minimax_h3.install()  # idempotent
         yield
+
+
+class TestShardEmbedding(CustomTestCase):
+    def test_full_row_embedding_unless_each_rank_embeds_its_shard(self):
+        stock = dit.MiniMaxH3DiTModel.__dict__["_embed"]
+        for shard in (False, True):
+            with (
+                tpu_envs.SGLANG_TPU_OPT_H3_SHARD_EMBEDDING.override(shard),
+                _installed(),
+            ):
+                embed = dit.MiniMaxH3DiTModel.__dict__["_embed"]
+                self.assertEqual(embed is stock, shard)
+        self.assertIs(dit.MiniMaxH3DiTModel.__dict__["_embed"], stock)
 
 
 def _packed(text_len):

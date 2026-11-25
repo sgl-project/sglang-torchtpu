@@ -32,9 +32,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     denoise_loop,
     packed_sequence,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
-    comfyui_step,
-)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils import torch_compile
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -162,8 +159,8 @@ def _tpu_compile_path():
     """The TPU worker's H3 patches and compile path, restored afterwards."""
     with contextlib.ExitStack() as stack:
         for target, name in (
+            # The ComfyUI layout pads through packed_sequence's function.
             (packed_sequence, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
-            (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
             (dit, "_minimax_h3_attention_core_bcg"),
             (dit.MiniMaxH3DiTModel, "_compile_conditions"),
             (dit.MiniMaxH3DiTModel, "_embed"),

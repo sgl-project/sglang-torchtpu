@@ -9,9 +9,11 @@ Runtime patch, tracked debt:
   condition and run at the prompt length. Separately, the breakable-CUDA-graph
   break point around H3's attention splits every compiled block into two
   graphs; BCG is CUDA-only.
-- How: :func:`install` (1) sets the alignment the packed-sequence builders
-  and the ComfyUI layout read to 512 rows (padding rows are tagged padding,
-  carry zero RoPE positions and stay in ``cu_seqlens``' trailing segment),
+- How: :func:`install` (1) sets the alignment that
+  ``packed_sequence.minimax_h3_padded_seq_len``, the one padding function of
+  the packed-sequence builders and the ComfyUI layout, rounds to: 512 rows
+  (padding rows are tagged padding, carry zero RoPE positions and stay in
+  ``cu_seqlens``' trailing segment),
   (2) compiles only the 50 DiT blocks: the refiner runs once per request,
   eager, and (3) rebinds ``_minimax_h3_attention_core_bcg`` to the undecorated
   core. The attention backend reads the live length
@@ -23,6 +25,8 @@ Runtime patch, tracked debt:
   ``_embed`` projects every video and audio row into one padded-length buffer
   and returns the rank's slice, so only the text-row copy has a
   prompt-length shape. Each row's projection and placement are unchanged.
+  ``SGLANG_TPU_OPT_H3_SHARD_EMBEDDING`` keeps the stock per-shard ``_embed``
+  for deployments that compile their prompt lengths at startup.
 - Upstream PR or issue: none.
 - Remove when: the H3 packed builder takes a platform-provided alignment, the
   refiner pads to a bucket, the embedding takes shard-independent shapes, and
@@ -34,6 +38,8 @@ from __future__ import annotations
 import functools
 
 import torch
+
+from sglang_tpu.envs import envs as tpu_envs
 
 # Most prompt lengths of one video size share a 512 bucket; the padding costs
 # at most 511 extra rows next to ~32k packed rows at 1344x768x4s.
@@ -95,22 +101,24 @@ def install() -> None:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
         packed_sequence,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
-        comfyui_step,
-    )
 
-    # The builders read the alignment when called. Reading it first raises on
-    # a rename; a multiple of it keeps the DiT's sequence-parallel admission,
+    # Every builder pads through packed_sequence.minimax_h3_padded_seq_len,
+    # which reads the alignment when called. Reading it first raises on a
+    # rename; a multiple of it keeps the DiT's sequence-parallel admission,
     # which checks the core alignment, valid.
-    for module in (packed_sequence, comfyui_step):
-        if TPU_PACKED_SEQUENCE_ALIGNMENT % module.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT:
-            raise ValueError(
-                f"{TPU_PACKED_SEQUENCE_ALIGNMENT} rows is not a multiple of "
-                f"{module.__name__}.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"
-            )
-        module.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = TPU_PACKED_SEQUENCE_ALIGNMENT
+    if (
+        TPU_PACKED_SEQUENCE_ALIGNMENT
+        % packed_sequence.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
+    ):
+        raise ValueError(
+            f"{TPU_PACKED_SEQUENCE_ALIGNMENT} rows is not a multiple of "
+            "packed_sequence.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"
+        )
+    packed_sequence.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = TPU_PACKED_SEQUENCE_ALIGNMENT
     dit.MiniMaxH3DiTModel._compile_conditions = [_is_dit_block]
     dit._minimax_h3_attention_core_bcg = dit._minimax_h3_attention_core_impl
     model = dit.MiniMaxH3DiTModel
-    if not getattr(model._embed, "__wrapped_by_sglang_tpu__", False):
+    if not tpu_envs.SGLANG_TPU_OPT_H3_SHARD_EMBEDDING.get() and not getattr(
+        model._embed, "__wrapped_by_sglang_tpu__", False
+    ):
         model._embed = _embed_full_rows(model._embed)
