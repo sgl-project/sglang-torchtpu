@@ -49,9 +49,7 @@ def self_hostname() -> str:
 class TestMuseSparkPDSinglehostDflashUnified(PDSingleHostTestCase):
     """Require accepted DFlash drafts and a complete prefill host-cache reload."""
 
-    config_module = (
-        "recipe/configs/muse_spark/pd_singlehost_prefix_cache_kv_offload_dflash_unified.py"
-    )
+    config_module = "recipe/configs/muse_spark/pd_singlehost_prefix_cache_kv_offload_dflash_unified.py"
     log_path = "/tmp/pd_muse_spark_unified_prefill.log"
     decode_log_path = "/tmp/pd_muse_spark_unified_decode.log"
     self_hostname = staticmethod(self_hostname)

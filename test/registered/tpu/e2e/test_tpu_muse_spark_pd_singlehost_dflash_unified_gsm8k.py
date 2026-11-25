@@ -43,9 +43,7 @@ def self_hostname() -> str:
 class TestMuseSparkPDSinglehostDflashUnifiedGSM8K(PDSingleHostTestCase):
     """Require the backbone GSM8K score and accepted DFlash drafts through P/D."""
 
-    config_module = (
-        "recipe/configs/muse_spark/pd_singlehost_dflash_unified_gsm8k.py"
-    )
+    config_module = "recipe/configs/muse_spark/pd_singlehost_dflash_unified_gsm8k.py"
     log_path = "/tmp/pd_muse_spark_unified_gsm8k_prefill.log"
     decode_log_path = "/tmp/pd_muse_spark_unified_gsm8k_decode.log"
     self_hostname = staticmethod(self_hostname)

@@ -10,13 +10,13 @@ import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_prefix_cache_kv_offload_dflash import (  # noqa: F401
-    GROUP,
-)
-from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_prefix_cache_kv_offload_dflash import (
     _COMMON_CONFIG,
 )
 from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_prefix_cache_kv_offload_dflash import (
     DECODE_CONFIG as BASE_DECODE_CONFIG,
+)
+from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_prefix_cache_kv_offload_dflash import (  # noqa: F401
+    GROUP,
 )
 
 PREFILL_CONFIG = deepcopy(_COMMON_CONFIG)
