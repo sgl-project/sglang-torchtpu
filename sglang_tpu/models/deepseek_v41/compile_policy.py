@@ -130,9 +130,32 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
                 coordinator, hasher, input_ids, forward_batch
             )
             if not active_uploads:
-                return super()._forward(
+                out = super()._forward(
                     fn, input_ids, positions, forward_batch, *args, **kwargs
                 )
+                if (
+                    isinstance(out, PendingCall)
+                    and forward_batch.tpu_engram_staged is not None
+                ):
+                    # On-device Engram verify stages tensors without host DMA
+                    # uploads; re-pin them when the deferred warmup executes so
+                    # the traced graph never falls back to CPU Engram weights.
+                    staged_ids = forward_batch.tpu_engram_local_ids
+                    staged_rows = forward_batch.tpu_engram_staged
+
+                    def _run_pending_device():
+                        prev_ids = forward_batch.tpu_engram_local_ids
+                        prev_staged = forward_batch.tpu_engram_staged
+                        forward_batch.tpu_engram_local_ids = staged_ids
+                        forward_batch.tpu_engram_staged = staged_rows
+                        try:
+                            return out.wait()
+                        finally:
+                            forward_batch.tpu_engram_local_ids = prev_ids
+                            forward_batch.tpu_engram_staged = prev_staged
+
+                    return PendingCall(_run_pending_device)
+                return out
             raw_consumers: list[torch.Tensor] = []
             recorded_events: list[Any] = []
 
