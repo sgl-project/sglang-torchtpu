@@ -80,6 +80,11 @@ CONFIG["runtime_env"].update(
         # or all-reduce of the padded batch. It needs the shared expert on TP1.
         "SGLANG_TPU_DSV41_FUSED_EP": "1",
         "SGLANG_SHARED_EXPERT_TP1": "1",
+        # K32Z experts keep the checkpoint's FP4 codes and per-32 scales
+        # (lossless). "auto" pushes up to 1024 rows per rank and all-gathers
+        # above; rows without a tuned push recipe run the plain K32Z program.
+        "SGLANG_TPU_DSV41_EXPERT_FORMAT": "k32z",
+        "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH": "auto",
         # Spec-step host pipelining: upload the DSV4.1 metadata fields in one
         # packed transfer, build the slot-only draft/verify attention metadata
         # ahead of the blocking reads, and build the position-dependent rows on
