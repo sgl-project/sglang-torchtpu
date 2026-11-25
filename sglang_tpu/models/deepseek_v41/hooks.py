@@ -366,6 +366,20 @@ prepare_tpu_dsv41_fused_ep
   Upstream PR or issue: not filed.
   Remove when: the loader offers a platform step after quant-method weight
        processing.
+prepare_tpu_dsv41_fused_oproj, MQALayer._project_wo_a / _project_wo_b
+  (registered only with SGLANG_TPU_DSV41_FUSED_OPROJ=1, see fused_oproj_hook_specs)
+  Why: the attention output projection runs wo_a (BF16 einsum) and wo_b (FP8
+       linear) as two programs with the wo_a result round-tripping HBM. The
+       fused kernel does both in one Pallas call and needs
+       wo_a as per-channel FP8, which exists only after the quant methods'
+       weight processing (same timing problem as the fused EP layout).
+  How: AFTER DefaultModelLoader.postprocess_weights requantizes each eligible
+       target layer's wo_a and releases the BF16 copy. AROUND _project_wo_a
+       applies the inverse RoPE and hands the attention output on; AROUND
+       _project_wo_b runs the kernel for every token count. Bodies in
+       sglang_tpu.models.deepseek_v41.output_projection.
+  Upstream PR or issue: not filed.
+  Remove when: core grows an output-projection seam for fused kernels.
 """
 
 from __future__ import annotations
@@ -1133,6 +1147,48 @@ def fused_ep_hook_specs():
     return specs
 
 
+def prepare_tpu_dsv41_fused_oproj(result, model, target_device):
+    """AFTER DefaultModelLoader.postprocess_weights: requantize the eligible V4.1
+    attention layers' wo_a for the fused output-projection kernel."""
+    if target_device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.output_projection import prepare_model
+
+        prepare_model(model)
+    return result
+
+
+def tpu_dsv41_fused_oproj_wo_a(original, attn, o, **kwargs):
+    from sglang_tpu.models.deepseek_v41.output_projection import project_wo_a
+
+    return project_wo_a(original, attn, o, **kwargs)
+
+
+def tpu_dsv41_fused_oproj_wo_b(original, attn, o, defer_all_reduce: bool = False):
+    from sglang_tpu.models.deepseek_v41.output_projection import project_wo_b
+
+    return project_wo_b(original, attn, o, defer_all_reduce)
+
+
+def fused_oproj_hook_specs():
+    """The fused output projection, only when SGLANG_TPU_DSV41_FUSED_OPROJ=1.
+    Otherwise nothing is registered and the default path is untouched."""
+    from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_FUSED_OPROJ.get():
+        return []
+    mqa = "sglang.srt.models.deepseek_v4.MQALayer"
+    return [
+        (
+            "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights",
+            prepare_tpu_dsv41_fused_oproj,
+            HookType.AFTER,
+        ),
+        (f"{mqa}._project_wo_a", tpu_dsv41_fused_oproj_wo_a, HookType.AROUND),
+        (f"{mqa}._project_wo_b", tpu_dsv41_fused_oproj_wo_b, HookType.AROUND),
+    ]
+
+
 def engram_flush_hook_specs():
     """The early Engram commit flush, only with SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ=1."""
     from sglang.srt.plugins.hook_registry import HookType
@@ -1350,4 +1406,5 @@ def hook_specs():
         ),
         *decoder_replay_sync.hook_specs(),
         *engram_flush_hook_specs(),
+        *fused_oproj_hook_specs(),
     ] + fused_ep_hook_specs()

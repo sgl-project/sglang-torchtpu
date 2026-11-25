@@ -720,6 +720,16 @@ class TpuEnvs:
     # calculate_tiling instead of the tuned-table lookup, which has no float4 entry and
     # falls back to tk512/tn1280. Same outputs; one K x N step per expert at V4.1's shapes.
     SGLANG_TPU_FP4_GMM2_CALC_TILING = EnvBool(False)
+    # DeepSeek-V4.1: the target's attention output projection (wo_a, then wo_b)
+    # as one Pallas call (models/deepseek_v41/output_projection.py). wo_a is
+    # requantized to per-channel FP8 at load and its BF16 copy released. Read
+    # when the plugin hooks are built; False registers nothing.
+    SGLANG_TPU_DSV41_FUSED_OPROJ = EnvBool(False)
+    # Layer ids that use it, "3", "0,5" or "0-3,10"; empty means all eligible.
+    SGLANG_TPU_DSV41_FUSED_OPROJ_LAYERS = EnvStr("")
+    # Forwards with fewer rows keep the default wo_a/wo_b (e.g. 416: extend chunks
+    # only); a positive value keeps the BF16 wo_a for them. 0: every forward.
+    SGLANG_TPU_DSV41_FUSED_OPROJ_MIN_TOKENS = EnvInt(0)
     # K512 push dispatch knobs (moe/pallas/fused_moe_v2/push_fused_moe), read once
     # per op build for the shapes that push (SGLANG_TPU_DSV41_FUSED_EP_DISPATCH
     # push, or auto's push shapes); K32Z builds ignore them. Defaults are the
