@@ -262,6 +262,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # SPTP_PA_HEAD=0: that kernel takes a token-major [T, qd] copy of the o gate's output
     # instead of its head layout [Hkv, T, G * d] as is
     pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
+    # SPTP_PA_OGATE_TOK=1: the o gate's math laid out token major (o transposed instead of gate)
+    pa_gtok = pa_a2a and os.environ.get("SPTP_PA_OGATE_TOK", "0") == "1"
+    pa_head = pa_head and not pa_gtok
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head) if pa else None
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
@@ -397,42 +400,25 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     sm_scale=c.attn_scale,
                     sliding_window=None if is_global else c.window,
                 )
-                if ogate_kernel:
+                if pa_gtok:
                     with _scope("sp_o_gate"):
-                        g8, g_s = o_gate(o, gate)
-                else:
-                    with _scope("sp_o_gate"):
-                        # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
+                        # the same per-element math as below, laid out token major (o moved
+                        # instead of gate): the in-kernel a2a reads it without a relayout
                         o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
+                        o4 = o4.transpose(1, 0, 2, 3)
                         o4 = o4 * jax.lax.rsqrt(
                             jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
                         )
-                        if xag_gate4:
-                            g4 = gate[..., :hd]
-                        else:
-                            g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(
-                                1, 0, 2, 3
-                            )
+                        g4 = gate.reshape(T, c.kv_heads, gq, hd)
                         a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
-                        if xag_gate4:
-                            # per kv head first: one reduce over (0, 2, 3) with gate4's operands
-                            # fuses into a 10x slower reduction
-                            amax = jnp.max(jnp.max(jnp.abs(a4), axis=(2, 3)), axis=0)
-                        else:
-                            amax = jnp.max(jnp.abs(a4), axis=(0, 2, 3))
-                        g_s = jnp.maximum(amax, 1e-30).reshape(T, 1) / 448.0
-                        g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
-                if pa_a2a:
+                        g_s = (
+                            jnp.maximum(
+                                jnp.max(jnp.abs(a4), axis=(1, 2, 3)), 1e-30
+                            ).reshape(T, 1)
+                            / 448.0
+                        )
+                        g8 = (a4 / g_s.reshape(T, 1, 1, 1)).astype(jnp.float8_e4m3fn)
                     with _scope("sp_postattn"):
-                        if ogate_kernel:
-                            if pa_head:
-                                raise ValueError(
-                                    "SPTP_OGATE_KERNEL writes token-major rows: SPTP_PA_HEAD=0"
-                                )
-                        elif pa_head:
-                            g8 = g8.reshape(c.kv_heads, T, gq * hd)
-                        else:
-                            g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
                         pa_o = oproj_a2a_call(
                             c,
                             wrouter.shape[-1],
@@ -443,63 +429,96 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             pa_fp,
                             pa_ns,
                             pa_order,
-                            pa_head,
+                            False,
                         )
                         args = (
-                            l,
-                            me,
-                            g8,
-                            g_s.reshape(1, T),
-                            stream,
-                            smalls,
-                            wo,
+                            l, me, g8.reshape(T, qd), g_s.reshape(1, T), stream, smalls, wo,
                             wrouter,
-                        )
+                        )  # fmt: skip
                         if pa_fp:
                             stream, ids, tw, xe8, xs = pa_o(*args, wpool)
                         else:
                             stream, ids, tw, f8, f_s = pa_o(*args)
                             xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
-                elif pa:
-                    with _scope("sp_o_a2a"):
-                        # the token-major [T, qd] gated output (the o gate's layout to come)
-                        g8 = (
-                            g8
-                            if ogate_kernel
-                            else g8.transpose(1, 0, 2, 3).reshape(T, qd)
-                        )
-                        g8 = jax.lax.all_to_all(g8, axis, 0, 0, tiled=True)
-                        g_s = jax.lax.all_to_all(g_s, axis, 0, 0, tiled=True)
-                        g8, g_s = g8.reshape(tp, Ts, qd), g_s.reshape(tp, Ts, 1)
-                    with _scope("sp_postattn"):
-                        pa_o = oproj_call(c, wrouter.shape[-1], pa_tn, pa_rc)
-                        stream, ids, tw, f8, f_s = pa_o(
-                            l, g8, g_s, stream, smalls, wo, wrouter
-                        )
-                        xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
-                elif ogate_kernel:
-                    with _scope("sp_o_a2a"):
-                        g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
-                    with _scope("sp_o_proj"):
-                        g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
-                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
                 else:
-                    with _scope("sp_o_a2a"):
-                        g8 = jax.lax.all_to_all(
-                            g8.reshape(c.kv_heads, tp, Ts, gq, hd),
-                            axis,
-                            1,
-                            1,
-                            tiled=True,
+                    with _scope("sp_o_gate"):
+                        # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized per token
+                        o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
+                        o4 = o4 * jax.lax.rsqrt(
+                            jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
                         )
-                        g_s = to_owner(g_s, tp, axis)
-                    with _scope("sp_o_proj"):
-                        # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
-                        a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
-                            Ts, tp, 1, 1, 1
+                        g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(1, 0, 2, 3)
+                        a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                        g_s = (
+                            jnp.maximum(
+                                jnp.max(jnp.abs(a4), axis=(0, 2, 3)), 1e-30
+                            ).reshape(T, 1)
+                            / 448.0
                         )
-                        g8, g_s = q8(a.reshape(Ts, tp * qd))
-                        o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                        g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(jnp.float8_e4m3fn)
+                    if pa_a2a:
+                        with _scope("sp_postattn"):
+                            if pa_head:
+                                g8 = g8.reshape(c.kv_heads, T, gq * hd)
+                            else:
+                                g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                            pa_o = oproj_a2a_call(
+                                c,
+                                wrouter.shape[-1],
+                                SPTP_PA_COLLECTIVE_ID,
+                                pa_tn,
+                                pa_rc,
+                                pa_la,
+                                pa_fp,
+                                pa_ns,
+                                pa_order,
+                                pa_head,
+                            )
+                            args = (
+                                l,
+                                me,
+                                g8,
+                                g_s.reshape(1, T),
+                                stream,
+                                smalls,
+                                wo,
+                                wrouter,
+                            )
+                            if pa_fp:
+                                stream, ids, tw, xe8, xs = pa_o(*args, wpool)
+                            else:
+                                stream, ids, tw, f8, f_s = pa_o(*args)
+                                xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                    elif pa:
+                        with _scope("sp_o_a2a"):
+                            # the token-major [T, qd] gated output (the o gate's layout to come)
+                            g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                            g8 = jax.lax.all_to_all(g8, axis, 0, 0, tiled=True)
+                            g_s = jax.lax.all_to_all(g_s, axis, 0, 0, tiled=True)
+                            g8, g_s = g8.reshape(tp, Ts, qd), g_s.reshape(tp, Ts, 1)
+                        with _scope("sp_postattn"):
+                            pa_o = oproj_call(c, wrouter.shape[-1], pa_tn, pa_rc)
+                            stream, ids, tw, f8, f_s = pa_o(
+                                l, g8, g_s, stream, smalls, wo, wrouter
+                            )
+                            xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                    else:
+                        with _scope("sp_o_a2a"):
+                            g8 = jax.lax.all_to_all(
+                                g8.reshape(c.kv_heads, tp, Ts, gq, hd),
+                                axis,
+                                1,
+                                1,
+                                tiled=True,
+                            )
+                            g_s = to_owner(g_s, tp, axis)
+                        with _scope("sp_o_proj"):
+                            # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
+                            a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
+                                Ts, tp, 1, 1, 1
+                            )
+                            g8, g_s = q8(a.reshape(Ts, tp * qd))
+                            o_own = dense(g8, g_s, wo[l], sm, "wo", H)
             else:
                 o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
                 with _scope("sp_o_gate"):
