@@ -242,6 +242,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Token demand for eviction before paged extend."""
         return conservative_num_tokens
 
+    def reclaim_for_prealloc(self, tree_cache, demand: KVDemand) -> Optional[str]:
+        """Free room for a decode-node preallocation; None means it is ready,
+        else a description of the shortfall. One pool of its own: a decode
+        radix cache gives back the token rows the admission counted."""
+        full_tokens = demand.checked(self.window_pool_names()).full_tokens
+        self.evict_to_free_tokens(tree_cache, full_tokens)
+        available = self.available_size()
+        if available < full_tokens:
+            return (
+                f"KV eviction insufficient: needed={full_tokens}, available={available}"
+            )
+        return None
+
     def reclaim_for_load_back(self, tree_cache, demand: KVDemand) -> Optional[str]:
         """Make room before a host load takes ``demand``'s rows; None means
         ready. Separate buffers reclaim nothing here."""

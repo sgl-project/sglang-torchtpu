@@ -765,9 +765,17 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
             f"{unit}: each rank's share of a page holds whole RoPE rows and indexer "
             f"pools (got {cfg.page_size})."
         )
+    # A decode over the Raiden pipeline transfer takes its share of each page
+    # (pool_spans.fanout_spans); a split prefill would hand on part pages.
+    pipeline_decode = (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "raiden"
+        and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    )
     refused = {
-        # Both sides would have to split pages the same way; not validated.
-        "--disaggregation-mode": cfg.disaggregation_mode != "null",
+        "--disaggregation-mode (other than a decode with SGLANG_RAIDEN_PIPELINE_TRANSFER)": (
+            cfg.disaggregation_mode != "null" and not pipeline_decode
+        ),
         "--enable-prefill-cp": cfg.enable_prefill_cp,
         # Its context-parallel DSA spans every rank, and it gathers 16-token blocks.
         "SGLANG_TPU_GLM_FLASH_MEGAKERNEL (needs shards == --tp-size, 16-token shares)": (
@@ -795,11 +803,18 @@ def _validate_kpool_raw_ring(cfg) -> None:
 
     if not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
         return
-    if cfg.disaggregation_mode != "null":
+    # The Raiden pool transfer lands a decode request's open pool in its ring
+    # (pool_spans.last_page_spans); other transfers move pages only.
+    if cfg.disaggregation_mode != "null" and not (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "raiden"
+        and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    ):
         raise ValueError(
             "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --disaggregation-mode "
-            f"{cfg.disaggregation_mode!r}: a P/D transfer moves pages, and the "
-            "ring's raw rows are not paged."
+            f"{cfg.disaggregation_mode!r} except a decode with "
+            "SGLANG_RAIDEN_PIPELINE_TRANSFER: a P/D transfer moves pages, and "
+            "the ring's raw rows are not paged."
         )
     if cfg.enable_prefill_cp:
         raise ValueError(

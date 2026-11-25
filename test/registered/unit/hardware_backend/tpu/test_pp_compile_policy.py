@@ -195,6 +195,26 @@ class TestWarmupProxy(CustomTestCase):
         self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
         self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].shape, (64, 3 * _HIDDEN))
 
+    def test_warmup_proxy_uses_the_model_pp_transfer_hidden_size(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+
+        runner = _model_runner(_pp_group(first=False, last=False))
+        # mHC hands on every stream; the aux capture slots stay one hidden wide.
+        runner.model.pp_transfer_hidden_size = 4 * _HIDDEN
+        runner.model.relays_pp_aux_hidden_states = True
+        runner.spec_aux_config = SimpleNamespace(
+            eagle_use_aux_hidden_state=False,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16],
+        )
+        _, kwargs = _policy(runner)._make_warmup_inputs(
+            num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+        )
+        proxy = kwargs["pp_proxy_tensors"]
+        self.assertEqual(tuple(proxy["hidden_states"].shape), (64, 4 * _HIDDEN))
+        self.assertEqual(tuple(proxy["residual"].shape), (64, 4 * _HIDDEN))
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].shape, (64, 2 * _HIDDEN))
+
 
 class TestLogitsProcessorGating(CustomTestCase):
     def test_only_the_last_stage_compiles_the_logits_processor(self):

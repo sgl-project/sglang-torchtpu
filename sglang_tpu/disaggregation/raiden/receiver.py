@@ -257,12 +257,25 @@ class RaidenReceiverMixin:
         *,
         local_state_rows: Sequence[int] = (),
         local_draft_swa_blocks: Sequence[int] = (),
+        raw_ring_page: Optional[int] = None,
+        decode_prefix_len: int = 0,
     ) -> None:
         if self._pipeline is not None:
             self._pipeline.register_decode(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                room,
+                local_blocks,
+                local_state_rows if self._pipeline.moves_state else local_swa_blocks,
+                aux_index,
+                bootstrap_infos,
+                ring_page=raw_ring_page,
+                prefix_len=decode_prefix_len,
             )
             return
+        if decode_prefix_len:
+            raise ValueError(
+                "A decode prefix (decode radix cache) needs the Raiden pool "
+                "transfer (SGLANG_RAIDEN_PIPELINE_TRANSFER)"
+            )
         if len(bootstrap_infos) != 1:
             if self._state_engine is not None:
                 raise NotImplementedError(
@@ -1621,6 +1634,9 @@ class RaidenReceiverMixin:
 class RaidenKVReceiver(CommonKVReceiver):
     # See RaidenKVSender: a group Failed waits for every rank's transfers.
     group_failure_requires_drain = True
+    # The raw ring page the request's last page lands in, set before
+    # send_metadata on a decode with a raw ring (raw_ring_hooks.py).
+    raw_ring_page: Optional[int] = None
 
     def __init__(
         self,
@@ -1672,6 +1688,8 @@ class RaidenKVReceiver(CommonKVReceiver):
             local_draft_swa_blocks=self.kv_mgr._draft_swa_blocks_from_state_indices(
                 state_indices
             ),
+            raw_ring_page=self.raw_ring_page,
+            decode_prefix_len=decode_prefix_len or 0,
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         # The waiting timeout counts from here: the request is now known to

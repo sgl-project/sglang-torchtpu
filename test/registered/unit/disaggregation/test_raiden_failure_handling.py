@@ -709,6 +709,33 @@ class TestSenderBootstrapGate(unittest.TestCase):
         )
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
 
+    def test_pipeline_stage_ends_bootstrapping_without_a_poll(self):
+        """A pipeline stage's bootstrap queue reads the stages' consensus and
+        never polls the sender, so the decode's request, before or after the
+        request reaches the stage, must end Bootstrapping on the stage."""
+        frames = [
+            MessageTag.PIPELINE_REQ,
+            str(ROOM).encode(),
+            b"tcp://10.0.0.2:31000",
+            b'{"attn_tp_size": 8, "attn_tp_rank": 0}',
+        ]
+        for request_first in (False, True):
+            with self.subTest(request_first=request_first):
+                mgr = _gate_manager()
+                mgr.pp_size, mgr.pp_rank = 2, 1
+                mgr._pipeline_enabled = True
+                mgr._pipeline_init_lock = threading.Lock()
+                mgr._pipeline = _producer_pipeline(mgr)
+                if request_first:
+                    mgr._dispatch(frames)
+                    self.assertNotIn(ROOM, mgr.request_status)
+                    _gate_sender(mgr, ROOM)
+                else:
+                    _gate_sender(mgr, ROOM)
+                    self.assertEqual(mgr.request_status[ROOM], KVPoll.Bootstrapping)
+                    mgr._dispatch(frames)
+                self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
+
     def test_tombstoned_room_is_not_admitted_on_a_late_request(self):
         sender, mgr = self._sender()
         with mgr._state_lock:

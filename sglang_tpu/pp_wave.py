@@ -470,6 +470,12 @@ class PPAuxWave(PPWave):
         return super().probe_blocks(got) + [got[AUX_HIDDEN_STATES_PROXY_KEY]]
 
 
+def pp_transfer_hidden_size(model: nn.Module, model_config: Any) -> int:
+    """Width of the activations a pipeline stage hands on: the model's own
+    ``pp_transfer_hidden_size`` when it declares one, else its hidden size."""
+    return int(getattr(model, "pp_transfer_hidden_size", model_config.hidden_size))
+
+
 def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig, model: nn.Module) -> int:
     """Aux capture slots (Eagle3 or DFlash/DSpark) a pipeline stage hand-off carries; 0 when none."""
     if not getattr(model, "relays_pp_aux_hidden_states", False):

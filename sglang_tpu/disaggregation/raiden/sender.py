@@ -1444,6 +1444,12 @@ class RaidenKVSender(CommonKVSender):
                         preserve_reason=True,
                     )
                     self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            # A pipeline stage's bootstrap queue reads the stages' consensus and
+            # never polls this sender, so the stage ends Bootstrapping itself:
+            # here when the decode asked before the request reached this stage,
+            # else when the decode's request arrives (_on_pipeline_message).
+            if self.kv_mgr._pipeline is not None and self.kv_mgr.pp_size > 1:
+                self.kv_mgr.finish_bootstrap_if_decode_requested(self.bootstrap_room)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)

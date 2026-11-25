@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -181,9 +182,20 @@ class MambaComponent(TreeComponent):
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
+    @property
+    def kv_only_checkpoints(self) -> bool:
+        """SGLANG_PD_DECODE_KV_ONLY_CHECKPOINT on a PD decode: the tree keeps
+        and matches KV without a state, which the prefill sends every turn."""
+        return (
+            envs.SGLANG_PD_DECODE_KV_ONLY_CHECKPOINT.get()
+            and get_disagg().disaggregation_mode == "decode"
+        )
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if self.kv_only_checkpoints:
+            return lambda node: True
         ct = self.component_type
         # Host-only checkpoints never occupy a GPU slot. Counting the host
         # value as a device-prefix match keeps Full KV indices reachable.
@@ -872,7 +884,7 @@ class MambaComponent(TreeComponent):
     def checkpoint_takes_state_slot(self, req: Req) -> bool:
         """Whether checkpointing the unfinished ``req`` up to its extend end
         takes a state slot (`prepare_for_caching_req`)."""
-        if self._mamba_host_only_checkpoint():
+        if self._mamba_host_only_checkpoint() or self.kv_only_checkpoints:
             return False
         token_ids_len = min(len(req.full_untruncated_fill_ids), req.extend_end)
         if self.cache.enable_mamba_extra_buffer:
@@ -985,6 +997,10 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if self.kv_only_checkpoints:
+            # No state to donate: the insert keeps the KV alone, uncapped.
+            insert_params.allow_missing_mamba = True
+            return None
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:

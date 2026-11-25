@@ -16,7 +16,12 @@ from sglang_tpu.pp_buffered import (
     build_pp_buffered_handoff,
     hbm_reserve_bytes,
 )
-from sglang_tpu.pp_wave import PPWave, build_pp_wave, num_relayed_aux_slots
+from sglang_tpu.pp_wave import (
+    PPWave,
+    build_pp_wave,
+    num_relayed_aux_slots,
+    pp_transfer_hidden_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -90,13 +95,14 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
         _check_aux_capture_relay(model_runner.model)
     num_aux = num_relayed_aux_slots(aux_config, model_runner.model)
     dtype = getattr(model_runner.model, "pp_transfer_dtype", model_runner.dtype)
+    hidden = pp_transfer_hidden_size(model_runner.model, model_runner.model_config)
     if tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get():
         _check_buffered_supported(scheduler)
         wave = build_pp_buffered_handoff(
             pp_group=scheduler.pp_group,
             world_group=scheduler.world_group,
             max_rows=policy.max_padded_tokens(),
-            hidden=int(model_runner.model_config.hidden_size),
+            hidden=hidden,
             num_aux=num_aux,
             dtype=dtype,
             aux_dtype=model_runner.dtype,
@@ -112,7 +118,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
             stage_group=scheduler.tp_group,
             world_group=scheduler.world_group,
             rows=policy.max_padded_tokens(),
-            hidden=int(model_runner.model_config.hidden_size),
+            hidden=hidden,
             num_aux=num_aux,
             dtype=dtype,
             aux_dtype=model_runner.dtype,
@@ -161,7 +167,7 @@ def buffered_handoff_reserve_bytes(
     )
     return hbm_reserve_bytes(
         max_rows=max(t_bucketer.max_val, b_bucketer.max_val),
-        hidden=int(model_config.hidden_size),
+        hidden=pp_transfer_hidden_size(model, model_config),
         num_aux=num_relayed_aux_slots(spec_aux_config, model),
         dtype=getattr(model, "pp_transfer_dtype", model_dtype),
         aux_dtype=model_dtype,

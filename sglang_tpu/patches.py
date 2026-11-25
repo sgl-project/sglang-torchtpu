@@ -979,6 +979,26 @@ def _patch_prefill_kv_offload_to_decode_dram() -> None:
     dram_offload_hooks.install()
 
 
+def _patch_raiden_raw_ring_page() -> None:
+    """Name a decode request's raw ring page for the Raiden pool transfer.
+
+    Why: the ring keeps raw rows by request slot, and core's decode hands the
+    receiver page ids and state rows only.
+    How: wrap ``DecodePreallocQueue._send_kv_metadata``
+    (disaggregation/raiden/raw_ring_hooks.py).
+    Upstream PR or issue: none.
+    Remove when: the receiver gets the request slot from core.
+    """
+    if not (
+        envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get()
+        and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    ):
+        return
+    from sglang_tpu.disaggregation.raiden import raw_ring_hooks
+
+    raw_ring_hooks.install()
+
+
 def _patch_host_heap_trim() -> None:
     """Return freed host heap pages once the scheduler is warmed up.
 
@@ -1092,6 +1112,7 @@ def apply_tpu_patches() -> None:
     _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
     _patch_prefill_kv_offload_to_decode_dram()
+    _patch_raiden_raw_ring_page()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
     install_benchmark_batch_gate()

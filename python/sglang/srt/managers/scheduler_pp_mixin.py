@@ -2291,9 +2291,15 @@ class SchedulerPPMixin:
                 )
                 if pp_proxy_tensors is not None:
                     # Prevent allocator reuse of received tensors while the forward
-                    # stream is still consuming them.
+                    # stream is still consuming them. TPU tensors have no
+                    # record_stream; torch_tpu runs a rank's ops in order.
                     for tensor in pp_proxy_tensors.tensors.values():
-                        if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
+                        if isinstance(
+                            tensor, torch.Tensor
+                        ) and tensor.device.type not in (
+                            "cpu",
+                            "tpu",
+                        ):
                             tensor.record_stream(self.forward_stream)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(

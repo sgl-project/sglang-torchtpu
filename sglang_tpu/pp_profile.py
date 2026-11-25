@@ -8,7 +8,7 @@ import torch
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.pp_wave import num_relayed_aux_slots, pp_transfer_hidden_size
 
 
 @contextmanager
@@ -102,6 +102,7 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         )
 
         hidden = runner.model_config.hidden_size
+        transfer_size = pp_transfer_hidden_size(runner.model, runner.model_config)
         # The wave's buffer height and hand-off dtype (see _pp_init_wave), not
         # this chunk's token count and the model config dtype: serving always
         # delivers the full buffer and the shim trims it to the padded bucket,
@@ -123,8 +124,8 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
             ).to(device)
 
         proxy = {
-            "hidden_states": randn(hidden, transfer_dtype),
-            "residual": randn(hidden, transfer_dtype),
+            "hidden_states": randn(transfer_size, transfer_dtype),
+            "residual": randn(transfer_size, transfer_dtype),
         }
         # Serving hands the aux capture slots on with the activations, so
         # the profiled chunk must carry them too.

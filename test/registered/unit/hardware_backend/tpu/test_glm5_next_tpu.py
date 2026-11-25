@@ -53,6 +53,34 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
+    def test_pipeline_stage_hands_on_every_mhc_stream(self):
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        width = Glm5NextForConditionalGeneration.pp_transfer_hidden_size.fget
+        config = SimpleNamespace(hidden_size=4096, hc_mult=4, mhc=True)
+        self.assertEqual(width(SimpleNamespace(config=config)), 4 * 4096)
+        config.mhc = False
+        self.assertEqual(width(SimpleNamespace(config=config)), 4096)
+
+    def test_server_pp8_recipe_validates_under_launch_server(self):
+        import sys
+
+        repo_root = str(Path(__file__).resolve().parents[5])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from benchmark.tpu.launch_server import load_recipe, plan_launch
+
+        plan = plan_launch(
+            load_recipe("recipe/configs/glm_5_3_flash/server_pp8.py"), inherited={}
+        )
+        args = plan.config.server_args
+        self.assertEqual((args["tp_size"], args["pp_size"], args["ep_size"]), (1, 8, 1))
+        self.assertFalse(args["enable_attn_tp_input_scattered"])
+        self.assertNotIn("enable_hierarchical_cache", args)
+        partition = [int(n) for n in plan.env["SGLANG_PP_LAYER_PARTITION"].split(",")]
+        self.assertEqual((len(partition), sum(partition)), (8, 45))
+
     def test_mhc_envs_off_select_the_traceable_torch_path(self):
         with ExitStack() as stack:
             for env in _MHC_ENVS:

@@ -1652,24 +1652,63 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             return [None] * len(self.kpool_raw_buffer)
         return self.kpool_raw_buffer
 
-    def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
-        """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
+    def transfer_page_entries(self) -> list[tuple[str, int, torch.Tensor]]:
+        """``(kind, layer_id, buffer)`` for every buffer a P/D transfer moves.
 
-        Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
-        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) has only
-        a placeholder RoPE buffer that no op reads, so it stays behind. A split
-        latent cache moves this rank's share of each page.
+        Grouped by kind: every layer's NoPE (``mla.nope``), then RoPE
+        (``mla.rope``), index keys (``dsa.idx``) and raw key|gate
+        (``dsa.raw``). A model without RoPE dims (``qk_rope_head_dim == 0``) has
+        only a placeholder RoPE buffer that no op reads, so it stays behind. A
+        split latent cache moves this rank's share of each page.
         """
-        kinds = [self.nope_buffer]
+        kinds = [("mla.nope", self.nope_buffer)]
         if self.qk_rope_head_dim > 0:
-            kinds.append(self.rope_buffer)
-        kinds += [self.index_key_buffer, self._paged_raw_buffers()]
+            kinds.append(("mla.rope", self.rope_buffer))
+        kinds += [
+            ("dsa.idx", self.index_key_buffer),
+            ("dsa.raw", self._paged_raw_buffers()),
+        ]
         return [
-            (self.start_layer + i, buf)
-            for kind in kinds
-            for i, buf in enumerate(kind)
+            (kind, self.start_layer + i, buf)
+            for kind, buffers in kinds
+            for i, buf in enumerate(buffers)
             if buf is not None
         ]
+
+    def transfer_ring_entries(self) -> list[tuple[str, int, torch.Tensor]]:
+        """``(kind, layer_id, ring)`` for each indexer layer's raw ring, which
+        transfer_page_entries leaves out: a P/D pool transfer lands a request's
+        last page of raw rows at its raw_ring_page."""
+        if not self.raw_ring_pages_cnt:
+            return []
+        if not self._raw_ring_slots:
+            raise RuntimeError("the raw ring is moved before attach_raw_ring sized it")
+        return [
+            ("dsa.raw", self.start_layer + i, buf)
+            for i, buf in enumerate(self.kpool_raw_buffer)
+            if buf is not None
+        ]
+
+    def raw_ring_page(self, req_slot: int, token: int) -> int:
+        """The ring page that holds ``token``'s raw row for request slot
+        ``req_slot`` (dsa_kpool_topk._raw_page_slot)."""
+        return (
+            req_slot * self.raw_ring_pages_cnt
+            + token // self.page_size % self.raw_ring_pages_cnt
+        )
+
+    def transfer_page_shards(self, kind: str) -> int:
+        """Ranks that split each page of a transfer_page_entries kind: this
+        rank's buffer holds its 1/shards of every page."""
+        if kind in ("mla.nope", "mla.rope"):
+            return self.mla_shards
+        if kind == "dsa.idx":
+            return self.index_shards
+        return 1
+
+    def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
+        """``(layer_id, buffer)`` of transfer_page_entries, in its order."""
+        return [(layer, buf) for _, layer, buf in self.transfer_page_entries()]
 
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]

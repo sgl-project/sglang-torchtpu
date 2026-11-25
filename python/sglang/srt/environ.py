@@ -888,6 +888,10 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # PD decode radix cache on a recurrent-state (Mamba/KDA) model: keep and
+    # match a request's KV without a state checkpoint. The prefill sends the
+    # state at the end of the prompt every turn, so the decode needs none.
+    SGLANG_PD_DECODE_KV_ONLY_CHECKPOINT = EnvBool(False)
     # Bound on the per-iteration transfer-status all_reduce across attention
     # TP/CP ranks; the CPU group's own timeout is hours. Matches the decode
     # waiting timeout so no new deadline is introduced. <= 0 disables.

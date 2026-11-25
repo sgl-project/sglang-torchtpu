@@ -1437,6 +1437,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @property
+    def pp_transfer_hidden_size(self) -> int:
+        """Width of the activations a pipeline stage hands on: every mHC
+        stream, which only the last layer contracts."""
+        hidden_size = self.config.hidden_size
+        return hidden_size * self.config.hc_mult if self.config.mhc else hidden_size
+
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         # Kept in lockstep with the wrapper gate below: a divergence drops the

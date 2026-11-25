@@ -467,6 +467,7 @@ class TestSplitValidator(CustomTestCase):
             page_size=128,
             enable_hierarchical_cache=True,
             disaggregation_mode="null",
+            disaggregation_transfer_backend="raiden",
             enable_prefill_cp=False,
             use_spmd_compile=False,
             hicache_storage_backend=None,
@@ -474,19 +475,31 @@ class TestSplitValidator(CustomTestCase):
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
 
-    def _validate(self, cfg, kpool=4, shards=8, megakernel=False, token_split=False):
+    def _validate(
+        self,
+        cfg,
+        kpool=4,
+        shards=8,
+        megakernel=False,
+        token_split=False,
+        pipeline_transfer=False,
+    ):
         from sglang_tpu.tpu_platform import _validate_mla_kv_shards
 
         env = {
             "SGLANG_TPU_DSA_MLA_KV_SHARDS": str(shards),
             "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "1" if megakernel else "0",
             "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": "1" if token_split else "0",
+            "SGLANG_RAIDEN_PIPELINE_TRANSFER": "1" if pipeline_transfer else "0",
         }
         with patch.dict(os.environ, env):
             _validate_mla_kv_shards(cfg, SimpleNamespace(index_kpool=kpool))
 
     def test_admits_the_host_tier(self):
         self._validate(self._cfg())
+
+    def test_admits_a_decode_over_the_raiden_pipeline_transfer(self):
+        self._validate(self._cfg(disaggregation_mode="decode"), pipeline_transfer=True)
 
     def test_token_split_admits_every_group_size(self):
         for shards in (2, 4, 8):
@@ -510,6 +523,15 @@ class TestSplitValidator(CustomTestCase):
     def test_refuses_pd_and_a_page_that_does_not_split(self):
         with self.assertRaisesRegex(ValueError, "--disaggregation-mode"):
             self._validate(self._cfg(disaggregation_mode="prefill"))
+        for mode in ("prefill", "decode"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "--disaggregation-mode"),
+            ):
+                self._validate(
+                    self._cfg(disaggregation_mode=mode),
+                    pipeline_transfer=mode == "prefill",
+                )
         with self.assertRaisesRegex(ValueError, "--page-size a multiple of 64"):
             self._validate(self._cfg(page_size=96), kpool=8)
         # kpool 6: shares need lcm(4, 6) = 12 tokens, not max(4, 6) = 6.
