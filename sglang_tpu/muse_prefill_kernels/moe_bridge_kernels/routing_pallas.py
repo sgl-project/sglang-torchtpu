@@ -567,7 +567,7 @@ def resolve_qblock_params(
         chunks_8row = total_elems // 1024
         if chunks_8row <= 256:
             return chunks_8row, eff_q
-        for cand in (256, 192, 128, 64):
+        for cand in (256, 192, 128, 96, 64, 32):
             if chunks_8row % cand == 0:
                 return cand, eff_q
     n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
@@ -931,8 +931,10 @@ def pallas_compact_local_packed_keys(
         row_128 = lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
         u_128 = (row_128 < lane_128).astype(jnp.bfloat16)
         l_128 = (row_128 > lane_128).astype(jnp.bfloat16)
-        base_tok = row_128 * jnp.int32(16) + lax.shift_right_logical(
-            lane_128, jnp.int32(3)
+        chunk_base_tok = (
+            lax.shift_right_logical(row_128, jnp.int32(3)) * jnp.int32(n_macro * 128)
+            + (row_128 & jnp.int32(7)) * jnp.int32(16)
+            + lax.shift_right_logical(lane_128, jnp.int32(3))
         )
 
         used_mid_rows = n_macro * r_keep1
@@ -946,11 +948,18 @@ def pallas_compact_local_packed_keys(
             )
 
         def _stage1_body(m, ovf1):
-            r0 = pl.multiple_of(m * LANE, LANE)
-            ids_blk = g_ref[pl.ds(r0, LANE), :]
+            # Sample 16 strided 8-row slices across the global batch so replicated/hot
+            # experts cannot cluster inside a single Stage-1 tile or Stage-2 quarter.
+            ids_blk = jnp.concatenate(
+                [
+                    g_ref[pl.ds(pl.multiple_of((j * n_macro + m) * 8, 8), 8), :]
+                    for j in range(16)
+                ],
+                axis=0,
+            )
             rel = ids_blk - go
             is_loc = (rel >= 0) & (rel < jnp.int32(num_local_experts))
-            tok_id = m * jnp.int32(2048) + base_tok
+            tok_id = m * jnp.int32(128) + chunk_base_tok
             if rotate_rs:
                 chip_r = jnp.mod(
                     lax.div(tok_id, jnp.int32(chunk_size)) + (ep_size - 1) - me,

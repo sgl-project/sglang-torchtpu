@@ -309,10 +309,14 @@ def test_compact_local_sort_all_tiers_and_100pct_skew_parity(
     med = np.where(m_med, go_py + (med % num_local_experts), med).astype(np.int32)
     cases.append(("medium_skew_tier1", med, {1}))
 
-    # Case 3: Localized macro-block 0 burst (> 40*128 = 5,120 local hits inside tokens 0..2047) -> Tier 2
+    # Case 3: Localized macro-block 0 burst (> 40*128 = 5,120 local hits inside tokens 0..2047)
+    # is dispersed by Stage-1 strided 8-row sampling out of Tier 2 into the minimum viable tier
+    # (`Tier 0` when loc_total <= 32,768 at T=16K, `Tier 1` when loc_total ~34.7k > 32,768 at T=24K).
     burst = rng.integers(0, ep_size * num_local_experts, size=(t_global, 8), dtype=np.int32)
     burst[:1500, :] = go_py + (burst[:1500, :] % num_local_experts)
-    cases.append(("localized_burst_tier2", burst, {2}))
+    cases.append(
+        ("localized_burst_dispersed_below_tier2", burst, {0 if t_global == 16384 else 1})
+    )
 
     # Case 4: Heavy > 64k global skew (~80k local hits) -> Tier 2
     heavy = rng.integers(0, ep_size * num_local_experts, size=(t_global, 8), dtype=np.int32)
@@ -472,3 +476,113 @@ def test_real_libtpu_tpu7x_aot_mosaic_compile():
                 .compile()
             )
             assert c_comp is not None
+
+        c_comp_ep16 = (
+            jax.jit(
+                lambda g, go, me: pallas_compact_local_packed_keys(
+                    g,
+                    go,
+                    me,
+                    num_local_experts=18,
+                    ep_size=16,
+                    rotate_rs=True,
+                )
+            )
+            .trace(
+                jax.ShapeDtypeStruct((24576, 8), jnp.int32, sharding=shd),
+                jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+                jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+            )
+            .lower()
+            .compile()
+        )
+        assert c_comp_ep16 is not None
+
+
+def test_strided_compact_qblock_r4_tier0_and_resolve_qblock_non_po2():
+    """Verify q_block R=4 spatial concentration compacts into Tier 0 (0-ULP) and non-Po2 T>32K candidates."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        compute_block_scatter_routing,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_compact_local_packed_keys,
+        resolve_qblock_params,
+    )
+
+    assert resolve_qblock_params(36864 * 8, 8, 256) == (96, 128)
+    assert resolve_qblock_params(36864 * 8, 16, 256) == (96, 128)
+
+    t_global, ep_size, num_local_experts = 24576, 8, 36
+    rng = np.random.default_rng(777)
+    g_np = rng.integers(0, ep_size * num_local_experts, size=(t_global, 8), dtype=np.int32)
+    # Emulate R=4 q_block contiguous slab assignment: concentrate replica slots into tokens 0..6143
+    # (exceeding old Stage-1 r_keep1=40 and Stage-2 quarter=8,192 limits while keeping rank total < 32K).
+    g_np = np.where((g_np < num_local_experts), num_local_experts + (g_np % num_local_experts), g_np)
+    g_np[:6144, :4] = rng.integers(0, num_local_experts, size=(6144, 4), dtype=np.int32)
+    loc_total = int(np.sum(g_np < num_local_experts))
+    assert loc_total <= 32768
+
+    g_ids = jnp.asarray(g_np)
+    go_val = jnp.int32(0)
+    me_val = jnp.int32(0)
+    dummy_gs = jnp.zeros((ep_size * num_local_experts,), dtype=jnp.int32)
+    dummy_hdr = jnp.zeros((2 + ep_size + num_local_experts * ep_size,), dtype=jnp.int32)
+    dummy_tr = jnp.int32(0)
+
+    with (
+        _tpu7x_cpu_context(interpret=True),
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT": "0",
+            },
+        ),
+    ):
+        lhs_ref, *_ = compute_block_scatter_routing(
+            g_ids,
+            go_val,
+            me_val,
+            ep_size=ep_size,
+            num_local_experts=num_local_experts,
+            topk=8,
+            precomputed_counts=(dummy_gs, dummy_hdr, dummy_tr),
+        )
+
+    with (
+        _tpu7x_cpu_context(interpret=True),
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL": "1",
+                "SGLANG_TPU_MUSE_KERNEL_SORTFREE_SCATTER": "1",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT": "1",
+            },
+        ),
+    ):
+        _, _, tier_val = pallas_compact_local_packed_keys(
+            g_ids,
+            go_val,
+            me_val,
+            num_local_experts=num_local_experts,
+            ep_size=ep_size,
+            rotate_rs=True,
+        )
+        lhs_got, *_ = compute_block_scatter_routing(
+            g_ids,
+            go_val,
+            me_val,
+            ep_size=ep_size,
+            num_local_experts=num_local_experts,
+            topk=8,
+            precomputed_counts=(dummy_gs, dummy_hdr, dummy_tr),
+        )
+
+    assert int(tier_val) == 0
+    assert np.array_equal(np.asarray(lhs_ref)[:loc_total], np.asarray(lhs_got)[:loc_total])
