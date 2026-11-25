@@ -64,6 +64,10 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
     SWA_PAGE_TOKENS,
 )
 from sglang_tpu.models.deepseek_v41.metadata_pack import pack_upload
+from sglang_tpu.models.deepseek_v41.ops.qb_rope import (
+    register_qb_rope_op,
+    supports_qb_rope,
+)
 from sglang_tpu.models.deepseek_v41.request_window import (
     WINDOW_TOKENS,
     DSV41TPURequestWindow,
@@ -1400,6 +1404,14 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # sees the buffer it lifted, not a tensor captured at init.
         self.rope_owners: Dict[int, torch.nn.Module] = {}
         self.csa2_ops, self.indexer_ops = self._register_ops()
+        from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
+
+        self.qb_rope_op = (
+            register_qb_rope_op()
+            if torch.device(self.device).type == "tpu"
+            and get_pallas_tpu_device_kind() == "TPU7x"
+            else None
+        )
         # CSA2's fast main-record path reads exactly this many selected ids.
         self.selection_width = self.csa2_ops.MAX_SELECTED
         if self.index_topk > self.selection_width:
@@ -1719,10 +1731,24 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # A module reference, never a tensor: safe to keep across traces.
         self.rope_owners.setdefault(layer.layer_id, layer)
         q_lora = layer.q_norm(q_lora)
-        q, _ = layer.wq_b(q_lora)
-        q = apply_rope(
-            q.view(-1, layer.n_local_heads, layer.head_dim), positions, layer.freqs_cis
-        )
+        table = rope_table(layer.freqs_cis)
+        if (
+            self.qb_rope_op is not None
+            and q_lora.device.type == "tpu"
+            and supports_qb_rope(layer, q_lora, positions, table)
+        ):
+            q = self.qb_rope_op(
+                q_lora,
+                layer.wq_b.weight,
+                layer.wq_b.weight_scale,
+                positions.to(torch.int32),
+                table,
+            )
+        else:
+            q, _ = layer.wq_b(q_lora)
+            q = apply_rope(
+                q.view(-1, layer.n_local_heads, layer.head_dim), positions, table
+            )
         if qkv_a is not None:
             kv = qkv_a[..., layer.q_lora_rank :]
         else:
