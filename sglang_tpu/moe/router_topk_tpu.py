@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Pallas router top-k for small batches on TPU.
+"""Fused Pallas router top-k on TPU.
 
 ``biased_topk_impl`` (sigmoid scores + correction bias, then top-k) lowers on
 TPU to an XLA sort over all experts plus a gather and reductions: 7 us per
-MoE layer for Kimi-K3's top-16 of 896 at batch 1. This kernel does sigmoid,
-the biased choice, k rounds of argmax-and-mask, the weight gather and the
-renormalization in VMEM (sglang_tpu/kernels/router_topk.py); this module
+MoE layer for Kimi-K3's top-16 of 896 at batch 1, 750 us at 4096 tokens.
+This kernel does sigmoid, the biased choice, k rounds of argmax-and-mask, the
+weight gather and the renormalization in VMEM, at every batch size
+(sglang_tpu/kernels/router_topk.py); this module
 registers it as an op and routes eligible ``biased_topk_impl`` calls to it.
 
 Ties pick the lowest expert id, which ``torch.topk`` does not promise; the
@@ -19,8 +20,6 @@ from typing import Callable
 
 import torch
 
-# Batch sizes the kernel serves; larger batches keep the sort.
-MAX_TOKENS = 64
 # Expert counts validated against biased_topk_impl on TPU: Kimi-K3 (top-16 of
 # 896) and GLM-5.3-Flash (top-8 of 288). Other sigmoid routers (e.g. Kimi-K2.x
 # with 384) keep the sort until they are measured.
@@ -74,6 +73,26 @@ def register_router_topk_op() -> None:
         _OP_READY = True
 
 
+def router_topk_enabled() -> bool:
+    """SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL, as registered: gates every fast
+    router path here, so turning it off restores the generic top-k."""
+    return _OP_READY
+
+
+def fits_sigmoid_router_topk(num_tokens: int) -> bool:
+    """True when ``sigmoid_router_topk`` takes a batch of this many tokens."""
+    return router_topk_enabled() and num_tokens > 0
+
+
+def sigmoid_router_topk(
+    logits: torch.Tensor, bias: torch.Tensor, k: int, eps: float, scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """For models that route outside ``biased_topk_impl``: top-k of
+    ``sigmoid(logits) + bias``, weights renormalized over the top-k and scaled.
+    logits [T, E] f32, bias [E] f32; returns f32 weights and i32 ids, [T, k]."""
+    return _OP[0](logits, bias, k, True, eps, scale)
+
+
 def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) -> bool:
     return (
         _OP_READY
@@ -85,7 +104,7 @@ def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) ->
         # the sum to bf16 in torch, so it keeps the sort.
         and correction_bias.dtype == torch.float32
         and gating_output.dim() == 2
-        and 0 < gating_output.shape[0] <= MAX_TOKENS
+        and gating_output.shape[0] > 0
         and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
         and topk <= 128
     )
@@ -118,59 +137,6 @@ def _run(
     )
 
 
-def _large_batch_eligible(
-    gating_output, correction_bias, topk, num_fused_shared_experts
-):
-    """Batches past the kernel's MAX_TOKENS (prefill) with one expert group.
-    Gated like the kernel (SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL via _OP_READY,
-    validated expert counts), though this path does not run the op."""
-    return (
-        _OP_READY
-        and num_fused_shared_experts == 0
-        and correction_bias is not None
-        and correction_bias.dim() == 1
-        and gating_output.dim() == 2
-        and gating_output.shape[0] > MAX_TOKENS
-        and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
-        and topk <= 8
-    )
-
-
-def _large_batch_topk(
-    gating_output,
-    correction_bias,
-    topk,
-    renormalize,
-    routed_scaling_factor,
-    apply_routed_scaling_factor_on_output,
-):
-    """``biased_topk_impl`` for prefill-sized batches without XLA's TopK and
-    the row gather it lowers to a general gather: k argmax-and-mask rounds,
-    each pick's weight by a one-hot reduce
-    (one nonzero term, so exact). Same picks as the sort; exact score ties go
-    to the lowest expert id."""
-    from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
-
-    scores = gating_output.sigmoid()
-    remaining = scores + correction_bias.view(1, -1)
-    experts = torch.arange(scores.shape[1], device=scores.device)
-    picks, weights = [], []
-    for _ in range(topk):
-        pick = remaining.argmax(dim=-1, keepdim=True)
-        hit = experts == pick
-        picks.append(pick)
-        weights.append(torch.where(hit, scores, 0).sum(dim=-1, keepdim=True))
-        remaining = remaining.masked_fill(hit, float("-inf"))
-    topk_ids = torch.cat(picks, dim=-1)
-    topk_weights = torch.cat(weights, dim=-1)
-    if renormalize:
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-
-
 def biased_topk_around(
     original,
     hidden_states,
@@ -186,21 +152,6 @@ def biased_topk_around(
     apply_routed_scaling_factor_on_output=False,
 ):
     """AROUND hook for ``topk.biased_topk_impl``."""
-    if (
-        scoring_func == "sigmoid"
-        and expert_location_dispatch_info is None
-        and _large_batch_eligible(
-            gating_output, correction_bias, topk, num_fused_shared_experts
-        )
-    ):
-        return _large_batch_topk(
-            gating_output,
-            correction_bias,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            apply_routed_scaling_factor_on_output,
-        )
     if not (
         scoring_func == "sigmoid"
         and expert_location_dispatch_info is None
@@ -244,21 +195,6 @@ def biased_grouped_topk_around(
 ):
     """AROUND hook for ``topk.biased_grouped_topk_impl``: with one expert group
     the group mask keeps every expert, so it is the plain biased top-k."""
-    if (
-        num_expert_group in (None, 1)
-        and topk_group in (None, 1)
-        and _large_batch_eligible(
-            gating_output, correction_bias, topk, num_fused_shared_experts
-        )
-    ):
-        return _large_batch_topk(
-            gating_output,
-            correction_bias,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            apply_routed_scaling_factor_on_output,
-        )
     if not (
         num_expert_group in (None, 1)
         and topk_group in (None, 1)

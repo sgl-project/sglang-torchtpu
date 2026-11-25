@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused router top-k for small batches on TPU.
+"""Fused router top-k on TPU.
 
 Why: topk.biased_topk_impl (sigmoid + correction bias + top-k) lowers on TPU
      to an XLA sort over every expert plus a gather and reductions, about
      7 us per MoE layer for Kimi-K3's top-16 of 896 at batch 1.
 How: AROUND topk.biased_topk_impl and topk.biased_grouped_topk_impl (single
-     expert group only, which Kimi-K3 uses): batches of at most 64 tokens
-     with sigmoid scoring, a shared f32 bias vector, no fused shared experts
-     and a validated expert count (896, Kimi-K3) run one Pallas kernel
+     expert group only, which Kimi-K3 uses): calls with sigmoid scoring, a
+     shared f32 bias vector, no fused shared experts and a validated expert
+     count (288, GLM-5.3-Flash; 896, Kimi-K3) run one Pallas kernel
      (sglang_tpu/kernels/router_topk.py); everything else calls the
      original. SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL=0 turns it off.
      AFTER TopK.__init__ registers the kernel's custom op before

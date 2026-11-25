@@ -26,6 +26,7 @@ def _reference(logits, bias, k, renormalize, scale):
     s = 1.0 / (1.0 + np.exp(-np.asarray(logits.astype(jnp.float32), np.float32)))
     s = np.asarray(jnp.asarray(s).astype(logits.dtype).astype(jnp.float32))
     choice = s + bias[None]
+    choice = np.where(np.isnan(choice), np.finfo(np.float32).min, choice)
     ids = np.argsort(-choice, axis=-1, kind="stable")[:, :k]
     w = np.take_along_axis(s, ids, -1)
     if renormalize:
@@ -49,6 +50,14 @@ class TestRouterTopk(CustomTestCase):
             (1, 896, 16, True, 2.5, jnp.float32),
             (2, 896, 16, True, 1.0, jnp.float32),
             (64, 896, 16, True, 2.5, jnp.float32),
+            # Gridded over 512-token tiles: one partial tile, several tiles with a
+            # partial last one, and an exact multiple.
+            (65, 256, 8, True, 1.0, jnp.float32),
+            (1100, 288, 8, True, 2.5, jnp.bfloat16),
+            (1024, 896, 16, False, 1.0, jnp.float32),
+            # Expert counts above 1024 shrink the tile to 256 and 128 tokens.
+            (600, 2048, 8, True, 1.0, jnp.float32),
+            (300, 4096, 8, True, 1.0, jnp.bfloat16),
         ):
             logits = jnp.asarray(rng.standard_normal((tokens, experts)), dtype)
             bias = rng.standard_normal(experts).astype(np.float32) * 0.1
@@ -75,7 +84,7 @@ class TestRouterTopk(CustomTestCase):
         from sglang_tpu.kernels.router_topk import router_topk_jax
 
         rng = np.random.default_rng(1)
-        for tokens in (1, 8):
+        for tokens in (1, 8, 600):
             logits = np.round(rng.standard_normal((tokens, 896)) * 2) / 2
             logits = jnp.asarray(logits, jnp.float32)
             bias = np.zeros(896, np.float32)  # keep the ties in the biased choice
@@ -87,6 +96,32 @@ class TestRouterTopk(CustomTestCase):
             np.testing.assert_allclose(
                 np.sort(np.asarray(w), -1), np.sort(want_w, -1), rtol=1e-6
             )
+
+    def test_nan_logits_keep_ids_in_range(self):
+        """A NaN score ranks below every finite one, so ids stay distinct and in [0, E)."""
+        from sglang_tpu.kernels.router_topk import router_topk_jax
+
+        rng = np.random.default_rng(2)
+        for tokens in (1, 8, 600):
+            logits = rng.standard_normal((tokens, 256)).astype(np.float32)
+            logits[:, rng.choice(256, 32, replace=False)] = np.nan
+            logits[0] = np.nan
+            bias = rng.standard_normal(256).astype(np.float32) * 0.1
+            w, ids = router_topk_jax(
+                jnp.asarray(logits), jnp.asarray(bias), 8, True, EPS, 1.0
+            )
+            ids = np.asarray(ids)
+            np.testing.assert_array_equal(np.sort(ids[0]), np.arange(8))
+            if tokens > 1:
+                want_w, want_ids = _reference(
+                    jnp.asarray(logits[1:]), bias, 8, True, 1.0
+                )
+                np.testing.assert_array_equal(
+                    np.sort(ids[1:], -1), np.sort(want_ids, -1)
+                )
+                np.testing.assert_allclose(
+                    np.sort(np.asarray(w)[1:], -1), np.sort(want_w, -1), rtol=1e-6
+                )
 
 
 if __name__ == "__main__":
