@@ -8,7 +8,7 @@ Covered here:
   ``kv_lens`` holds the per-rank LOCAL lengths the STRIPED pass walks (the
   cached prefix of a multi-token row, the whole sequence of a single-token
   row), ``page_indices`` uses the widened page stride, the
-  ``dcp_kv_lens_global`` / ``dcp_cp_rank`` fields carry the global lengths
+  ``dcp_kv_lens_global`` / ``dcp_rank`` fields carry the global lengths
   and the rank constant, and a mixed batch's ``distribution`` is
   ``[n_chunk, n_chunk, n]`` (chunk rows first, the trailing decode rows last).
 * The per-request page-table capacity check measures the LOCAL length, so a
@@ -109,7 +109,7 @@ class _DcpBackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self._dcp_group = None
         # One page spans page_size * dcp logical tokens over page_size slots.
         self._page_stride = page_size * dcp
-        self._cp_rank_t = torch.tensor([dcp_rank], dtype=torch.int32)
+        self._dcp_rank_tensor = torch.tensor([dcp_rank], dtype=torch.int32)
         self._get_dcp_lens = get_dcp_lens if dcp > 1 else None
 
 
@@ -220,9 +220,9 @@ class TestPallasRpaDcpMetadataDecode(CustomTestCase):
         for rank in range(self.DCP):
             with self.subTest(rank=rank):
                 meta = self._meta(rank)
-                self.assertEqual(tuple(meta.dcp_cp_rank.shape), (1,))
-                self.assertEqual(meta.dcp_cp_rank.dtype, torch.int32)
-                self.assertEqual(int(meta.dcp_cp_rank[0]), rank)
+                self.assertEqual(tuple(meta.dcp_rank.shape), (1,))
+                self.assertEqual(meta.dcp_rank.dtype, torch.int32)
+                self.assertEqual(int(meta.dcp_rank[0]), rank)
 
     def test_page_indices_use_the_widened_stride(self):
         widened = self.PAGE_SIZE * self.DCP
@@ -448,7 +448,7 @@ class TestPallasRpaDcpDisabled(CustomTestCase):
         meta = _build_meta(backend, fb, 1, 0)
 
         self.assertIsNone(meta.dcp_kv_lens_global)
-        self.assertIsNone(meta.dcp_cp_rank)
+        self.assertIsNone(meta.dcp_rank)
         self.assertTrue(torch.equal(meta.kv_lens.to(torch.int32), seq_lens))
         expected_pages = [
             int(req_to_token[pool_idx, j * self.PAGE_SIZE]) // self.PAGE_SIZE

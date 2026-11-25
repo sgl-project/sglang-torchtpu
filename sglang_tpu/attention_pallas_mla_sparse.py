@@ -38,11 +38,7 @@ from sglang_tpu.attention_pallas_mla_sparse_dcp import (
     build_sparse_mla_dcp_op,
     index_page_indices,
 )
-from sglang_tpu.attention_pallas_rpa_dcp import (
-    gather_heads,
-    merge_across_ranks,
-    own_heads,
-)
+from sglang_tpu.attention_pallas_rpa_dcp import cp_lse_ag_out_rs, gather_heads
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
@@ -868,8 +864,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # TODO(weiyulin): Current collectives for RPA DCP is not optimal.
-        # We should replace it with AG + RS or two A2A
         args = list(
             self._mla_kernel_args(
                 q=q,
@@ -883,38 +877,41 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # _mla_kernel_args passes page_indices, the indexer's under DCP.
         md = self.forward_metadata
         args[7] = md.dcp_latent_page_indices
-        cp_rank = getattr(md, "dcp_cp_rank", None)
-        if cp_rank is None:
-            cp_rank = self._cp_rank_t
-        cp_rank_index = cp_rank.to(torch.int64)
-        cp_rank_mask = (
-            torch.arange(self._dcp, device=cp_rank.device, dtype=cp_rank.dtype)
-            == cp_rank
-        )
         ql_nope, q_pe = args[0], args[1]
-        nope = ql_nope.shape[-1]
-        # One gather for both nope and pe.
-        q_all = gather_heads(
-            torch.cat([ql_nope, q_pe], dim=-1).contiguous(),
-            self._dcp_group,
-            self._dcp,
-            cp_rank_mask,
-        )
+        if self._zero_rope:
+            q_nope_all = gather_heads(
+                ql_nope.contiguous(),
+                self._dcp_group,
+                self._dcp,
+                md.dcp_rank,
+            )
+            q_pe_all = q_pe.new_zeros(
+                (q_nope_all.shape[0], q_nope_all.shape[1], q_pe.shape[-1])
+            )
+        else:
+            nope = ql_nope.shape[-1]
+            q_all = gather_heads(
+                torch.cat([ql_nope, q_pe], dim=-1).contiguous(),
+                self._dcp_group,
+                self._dcp,
+                md.dcp_rank,
+            )
+            q_nope_all = q_all[..., :nope].contiguous()
+            q_pe_all = q_all[..., nope:].contiguous()
         out, lse = self._dcp_op(
-            q_all[..., :nope].contiguous(),
-            q_all[..., nope:].contiguous(),
+            q_nope_all,
+            q_pe_all,
             *args[2:],
             topk_indices.contiguous(),
-            cp_rank,
+            md.dcp_rank,
         )
-        out, _ = merge_across_ranks(
+        out, _ = cp_lse_ag_out_rs(
             out.float(),
             lse,
             self._dcp_group,
             self._dcp,
-            cp_rank_mask,
+            md.dcp_rank,
         )
-        out = own_heads(out, self._dcp, cp_rank_index)
         return out.to(ql_nope.dtype).reshape(
             q.shape[0], layer.tp_q_head_num * layer.v_head_dim
         )

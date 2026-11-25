@@ -49,8 +49,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.attention_pallas_rpa_dcp import (
     build_dcp_kernel_op,
+    cp_lse_ag_out_rs,
     gather_heads,
-    merge_across_ranks,
     merge_lse,
     own_heads,
     sink_fold,
@@ -188,7 +188,7 @@ class PallasForwardMetadata:
     # i32[max_num_seqs]  unsharded KV length per sequence
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
-    dcp_cp_rank: torch.Tensor | None = None
+    dcp_rank: torch.Tensor | None = None
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
@@ -661,9 +661,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             parallel, pcp_ring=pcp_ring
         )
         self._page_stride = self.page_size * self._dcp
-        self._cp_rank_t: torch.Tensor | None = None
-        self._cp_rank_index: torch.Tensor | None = None
-        self._cp_rank_mask: torch.Tensor | None = None
+        self._dcp_rank_tensor: torch.Tensor | None = None
         self._dcp_op = None
         self._get_dcp_lens = None
         if self._dcp > 1:
@@ -685,17 +683,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "--attention-backend pallas_tpu_rpa_batched."
                 )
             self._get_dcp_lens = _import_dcp_helpers()
-            self._cp_rank_t = torch.tensor(
+            # The rank enters the compiled forward as data via forward_metadata
+            # so every rank traces one SPMD program.
+            self._dcp_rank_tensor = torch.tensor(
                 [self._dcp_rank], dtype=torch.int32, device=self.device
-            )
-            # The rank enters the compiled forward as data (kernel scalar,
-            # one-hot mask, index) so every rank traces one program.
-            self._cp_rank_index = torch.tensor(
-                [self._dcp_rank], dtype=torch.int64, device=self.device
-            )
-            self._cp_rank_mask = (
-                torch.arange(self._dcp, dtype=torch.int64, device=self.device)
-                == self._dcp_rank
             )
             if not cls.runs_own_dcp_forward:
                 self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
@@ -1235,7 +1226,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 pass
 
         dcp_kv_lens_global: torch.Tensor | None = None
-        dcp_cp_rank: torch.Tensor | None = None
+        dcp_rank: torch.Tensor | None = None
         seq_lens_host: torch.Tensor | None = None
         ext_host: torch.Tensor | None = None
         if self._dcp > 1:
@@ -1294,7 +1285,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
             kv_lens = _padded(self._dcp_lens(target_host))
             dcp_kv_lens_global = _padded(target_global)
-            dcp_cp_rank = self._cp_rank_t
+            dcp_rank = self._dcp_rank_tensor
 
         req_pool_indices = forward_batch.req_pool_indices_cpu
         assert req_pool_indices is not None
@@ -1356,7 +1347,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             swa_page_indices=swa_page_indices,
             swa_group_page_indices=swa_group_page_indices,
             dcp_kv_lens_global=dcp_kv_lens_global,
-            dcp_cp_rank=dcp_cp_rank,
+            dcp_rank=dcp_rank,
             decode_query_size=decode_query_size,
             segments=segments,
         )
@@ -1898,7 +1889,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         Decode is one fused ``STRIPED`` launch: the kernel attends this rank's
         page stripe with the whole group's query heads and, on the rank that
         owns the new token's page, also attends and writes the new token (its
-        slot is exactly the end of that rank's stripe). ``merge_across_ranks``
+        slot is exactly the end of that rank's stripe). ``cp_lse_ag_out_rs``
         then merges the per-rank partial softmaxes and hands each rank back
         its own heads; the sink is folded in once, after the merge.
 
@@ -1928,27 +1919,16 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        cp_rank = md.dcp_cp_rank if md.dcp_cp_rank is not None else self._cp_rank_t
-        cp_rank_index = cp_rank.to(torch.int64)
-        cp_rank_mask = (
-            torch.arange(cp, device=cp_rank.device, dtype=cp_rank.dtype) == cp_rank
-        )
-
         # The kernels run on every query head the group holds; each rank then
         # keeps its own ``layer_q_heads`` of the result.
+        scatter_heads = self._dcp_head_blocks > 1
         group_q_heads = layer_q_heads * self._dcp_head_blocks
         if q.shape[1] == group_q_heads:
             # Every rank holds the same heads, or the layer already projected
             # the whole group's (--dcp-replicate-q-proj).
             q_all = q.contiguous()
         else:
-            q_all = gather_heads(q.contiguous(), group, cp, cp_rank_mask)
-
-        def keep_own_heads(x: torch.Tensor) -> torch.Tensor:
-            if x.shape[1] == layer_q_heads:
-                return x
-            return own_heads(x, cp, cp_rank_index)
-
+            q_all = gather_heads(q.contiguous(), group, cp, md.dcp_rank)
         if forward_batch.forward_mode.is_decode():
             # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
             # new token included iff this rank owns its page); the page table
@@ -1965,7 +1945,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 md.cu_q_lens,
                 md.distribution,
                 md.dcp_kv_lens_global,
-                md.dcp_cp_rank,
+                md.dcp_rank,
                 None,  # attention_sink: folded in after the merge
                 sm_scale,
                 sliding_window,
@@ -1978,8 +1958,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 3,  # attention_scope: STRIPED
                 1,  # rpa_cases: DECODE only
             )
-            out, lse = merge_across_ranks(out_p.float(), lse_p, group, cp, cp_rank_mask)
-            out, lse = keep_own_heads(out), keep_own_heads(lse)
+            out, lse = cp_lse_ag_out_rs(
+                out_p.float(),
+                lse_p,
+                group,
+                cp,
+                md.dcp_rank,
+                scatter_heads=scatter_heads,
+            )
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
             return out.to(q.dtype)
@@ -2001,7 +1987,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             md.cu_q_lens,
             md.distribution,
             md.dcp_kv_lens_global,
-            md.dcp_cp_rank,
+            md.dcp_rank,
             None,  # attention_sink: folded in after the merge
             sm_scale,
             sliding_window,
@@ -2028,7 +2014,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             md.cu_q_lens,
             md.distribution,
             md.dcp_kv_lens_global,
-            md.dcp_cp_rank,
+            md.dcp_rank,
             None,  # attention_sink: folded in after the merge
             sm_scale,
             sliding_window,
@@ -2041,12 +2027,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             3,  # attention_scope: STRIPED
             0 if is_mixed else 2,  # rpa_cases: DECODE + MIXED / MIXED only
         )
-        out_prefix, lse_prefix = merge_across_ranks(
-            out_prefix.float(), lse_prefix, group, cp, cp_rank_mask
+        out_prefix, lse_prefix = cp_lse_ag_out_rs(
+            out_prefix.float(),
+            lse_prefix,
+            group,
+            cp,
+            md.dcp_rank,
+            scatter_heads=scatter_heads,
         )
-        out_prefix, lse_prefix = keep_own_heads(out_prefix), keep_own_heads(lse_prefix)
-        out_chunk = keep_own_heads(out_chunk).float()
-        lse_chunk = keep_own_heads(lse_chunk)
+
+        if scatter_heads:
+            out_chunk = own_heads(out_chunk, cp, md.dcp_rank).float()
+            lse_chunk = own_heads(lse_chunk, cp, md.dcp_rank)
+        else:
+            out_chunk = out_chunk.float()
         # A single-token row attended its token in the prefix pass; the chunk
         # pass leaves such rows (and a mixed batch's decode rows, outside its
         # range) unprocessed, with LSE -inf, so the merge weighs them zero.

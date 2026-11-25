@@ -26,7 +26,7 @@ PAGE = 4  # tokens per page; the stripe unit
 
 
 class _SumGroup:
-    """An all-reduce over ``world`` threads."""
+    """In-process collective group over ``world`` threads."""
 
     def __init__(self, world):
         self.world = world
@@ -39,6 +39,24 @@ class _SumGroup:
         self.sent[me] = x.clone()
         self.barrier.wait()
         out = sum(self.sent[i] for i in range(self.world))
+        self.barrier.wait()
+        return out
+
+    def all_gather(self, x, dim=-1):
+        me = self.local.rank
+        self.sent[me] = x.clone()
+        self.barrier.wait()
+        out = torch.cat([self.sent[i] for i in range(self.world)], dim=dim)
+        self.barrier.wait()
+        return out
+
+    def reduce_scatter_along_dim(self, x, dim=-1):
+        me = self.local.rank
+        self.sent[me] = x.clone()
+        self.barrier.wait()
+        summed = sum(self.sent[i] for i in range(self.world))
+        chunk = summed.shape[dim] // self.world
+        out = summed.narrow(dim, me * chunk, chunk).clone()
         self.barrier.wait()
         return out
 
@@ -120,14 +138,13 @@ class TestForwardSparseMlaDcp(CustomTestCase):
             backend = SimpleNamespace(
                 _mla_kernel_args=lambda **_: args,
                 forward_metadata=SimpleNamespace(
-                    dcp_latent_page_indices="latent stripe"
+                    dcp_latent_page_indices="latent stripe",
+                    dcp_rank=torch.tensor([rank], dtype=torch.int32),
                 ),
                 _dcp_op=kernel,
                 _dcp_group=group,
                 _dcp=world,
-                _cp_rank_t=torch.tensor([rank], dtype=torch.int32),
-                _cp_rank_index=torch.tensor([rank]),
-                _cp_rank_mask=torch.arange(world) == rank,
+                _zero_rope=False,
             )
             layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=dim)
             out = TpuPallasSparseMlaAttnBackend._forward_mla_dcp(
@@ -143,6 +160,71 @@ class TestForwardSparseMlaDcp(CustomTestCase):
                     rtol=1e-5,
                     atol=1e-5,
                 )
+
+    def test_zero_rope_skips_q_pe_gather(self):
+        world, heads, dim, rope_dim, tokens, width = 4, 2, 8, 2, 5, 12
+        length = PAGE * world * 3
+        g = torch.Generator().manual_seed(1)
+        keys = torch.randn(length, dim, generator=g)
+        q_all = torch.randn(tokens, heads * world, dim, generator=g)
+        rows = torch.stack(
+            [torch.randperm(length, generator=g)[:width] for _ in range(tokens)]
+        ).to(torch.int32)
+        scale = 0.3
+        want, _ = _attend(q_all, keys, rows, scale)
+        group = _SumGroup(world)
+        gathered_last_dims = []
+        orig_ag = group.all_gather
+
+        def tracking_ag(x, dim=-1):
+            gathered_last_dims.append(x.shape[-1])
+            return orig_ag(x, dim=dim)
+
+        group.all_gather = tracking_ag
+
+        def kernel(ql_nope, q_pe, *rest):
+            topk, rank_t = rest[-2], rest[-1]
+            self.assertEqual(tuple(q_pe.shape), (tokens, heads * world, rope_dim))
+            self.assertTrue(torch.equal(q_pe, torch.zeros_like(q_pe)))
+            rank = int(rank_t)
+            local = remap_dcp_sparse_indices(topk, world, rank, interleave_size=PAGE)
+            owns = (local >= 0).any(dim=1)
+            local[:, 0] = torch.where(owns, local[:, 0], 0)
+            out, lse = _attend(ql_nope, _stripe(keys, rank, world), local, scale)
+            return out, torch.where(owns[:, None], lse, float("-inf"))
+
+        def rank_main(rank):
+            mine = q_all[:, rank * heads : (rank + 1) * heads]
+            args = (mine, torch.zeros(tokens, heads, rope_dim)) + ("indexer",) * 12
+            backend = SimpleNamespace(
+                _mla_kernel_args=lambda **_: args,
+                forward_metadata=SimpleNamespace(
+                    dcp_latent_page_indices="latent stripe",
+                    dcp_rank=torch.tensor([rank], dtype=torch.int32),
+                ),
+                _dcp_op=kernel,
+                _dcp_group=group,
+                _dcp=world,
+                _zero_rope=True,
+            )
+            layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=dim)
+            out = TpuPallasSparseMlaAttnBackend._forward_mla_dcp(
+                backend, mine, None, layer, None, topk_indices=rows
+            )
+            return out.view(tokens, heads, dim)
+
+        for rank, got in enumerate(group.run(rank_main)):
+            with self.subTest(rank=rank):
+                torch.testing.assert_close(
+                    got.float(),
+                    want[:, rank * heads : (rank + 1) * heads],
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+        # First AG per rank is q_nope (last dim == dim, not dim + rope_dim);
+        # second AG per rank is lse (last dim == heads * world).
+        self.assertIn(dim, gathered_last_dims)
+        self.assertNotIn(dim + rope_dim, gathered_last_dims)
 
 
 class TestIndexPageIndices(CustomTestCase):
