@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import pkgutil
 import subprocess
 import sys
@@ -97,6 +98,40 @@ def _state(rows):
         tpu_verify_cache_candidates=torch.zeros(_pad(bs), 8, dtype=torch.int64),
         tpu_committed_lens=torch.zeros(_pad(bs), dtype=torch.int64),
         tpu_req_pool_indices=torch.zeros(_pad(bs), dtype=torch.int64),
+    )
+
+
+def _markov_heads(*, vocab_size, hidden_size):
+    from sglang.srt.models.dspark import build_markov_head
+
+    torch.manual_seed(0)
+    for head_type in ("vanilla", "gated", "rnn"):
+        config = SimpleNamespace(
+            markov_rank=3,
+            markov_head_type=head_type,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+        )
+        yield head_type, build_markov_head(config)
+
+
+def _upstream_markov_block(head, base_logits, *, anchor_tokens, draft_hidden, greedy):
+    """Upstream DSparkWorkerV2's argmax draft of the same block."""
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        DraftNoise,
+        draft_markov_block,
+    )
+
+    bs = base_logits.shape[0]
+    return draft_markov_block(
+        markov_head=head,
+        base_logits=base_logits,
+        anchor_tokens=anchor_tokens,
+        draft_hidden=draft_hidden,
+        step_temperatures=torch.zeros(bs),
+        noise=DraftNoise(key=0, offset=torch.zeros(1, dtype=torch.int64)),
+        tp_sync=SimpleNamespace(sync=lambda site, values: values),
+        greedy_draft=greedy,
     )
 
 
@@ -523,34 +558,35 @@ class TestExperimentalSpecHooks(CustomTestCase):
             DSparkDraftModel.sample_draft_tokens_tpu,
             DFlashDraftModel.sample_draft_tokens_tpu,
         )
-        for anchor in (True, False):
-            width = 2 if anchor else 3
-            hidden = torch.arange(2 * width * 4, dtype=torch.float32).view(-1, 4)
-            tokens = torch.arange(2 * width).view(-1)
-
-            def sample_block(
-                logits, *, first_prev_tokens, hidden_states, sampler, collect_corrected
-            ):
-                torch.testing.assert_close(first_prev_tokens, torch.tensor([0, width]))
-                expected = hidden.view(2, width, 4)
-                if not anchor:
-                    expected = expected[:, 1:]
-                torch.testing.assert_close(hidden_states, expected)
-                return torch.stack(
-                    [sampler(logits[:, i], i) for i in range(2)], dim=1
-                ), None
-
+        bs, gamma, vocab = 2, 3, 8
+        for (head_type, head), anchor in itertools.product(
+            _markov_heads(vocab_size=vocab, hidden_size=vocab), (True, False)
+        ):
+            width = gamma if anchor else gamma + 1
+            hidden = torch.randn(bs * width, vocab)
+            tokens = torch.randint(vocab, (bs * width,))
             model = SimpleNamespace(
-                gamma=2,
+                gamma=gamma,
                 sample_from_anchor=anchor,
+                # The hidden rows double as the base logits.
                 compute_base_logits=lambda values: (values, None),
-                markov_head=SimpleNamespace(sample_block=sample_block),
+                markov_head=head,
             )
-            result, lattice = DSparkDraftModel.sample_draft_tokens_tpu(
-                model, hidden, tokens
-            )
-            torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
-            self.assertIsNone(lattice)
+            with torch.no_grad():
+                result, lattice = DSparkDraftModel.sample_draft_tokens_tpu(
+                    model, hidden, tokens
+                )
+                draft_hidden = hidden.view(bs, width, vocab)[:, -gamma:]
+                expected, _ = _upstream_markov_block(
+                    head,
+                    draft_hidden,
+                    anchor_tokens=tokens.view(bs, width)[:, 0],
+                    draft_hidden=draft_hidden,
+                    greedy=True,
+                )
+            with self.subTest(head_type=head_type, anchor=anchor):
+                torch.testing.assert_close(result, expected)
+                self.assertIsNone(lattice)
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
             envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
@@ -559,6 +595,47 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel
             )
+
+    def test_sampled_dspark_drafts_match_the_upstream_markov_block(self):
+        """The sampled TPU drafter steps every Markov head from the bonus token as
+        upstream does: same argmax drafts, same per-step logits."""
+        from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
+            TpuDsparkDraftWorker,
+        )
+
+        bs, gamma, vocab = 2, 3, 8
+        for (head_type, head), anchor in itertools.product(
+            _markov_heads(vocab_size=vocab, hidden_size=vocab), (True, False)
+        ):
+            block_hidden = torch.randn(bs, gamma if anchor else gamma + 1, vocab)
+            bonus_tokens = torch.randint(vocab, (bs,))
+            worker = SimpleNamespace(
+                num_drafts=gamma,
+                _dspark_model=SimpleNamespace(
+                    sample_from_anchor=anchor,
+                    compute_base_logits=lambda values: (values, None),
+                    markov_head=head,
+                ),
+            )
+            with torch.no_grad():
+                drafts = TpuDsparkDraftWorker.sample_drafts(
+                    worker,
+                    block_hidden=block_hidden,
+                    bonus_tokens=bonus_tokens,
+                    draft_lattice=None,
+                    sampler=lambda logits, step: torch.argmax(logits, dim=-1),
+                )
+                draft_hidden = block_hidden[:, -gamma:]
+                tokens, logits = _upstream_markov_block(
+                    head,
+                    draft_hidden,
+                    anchor_tokens=bonus_tokens,
+                    draft_hidden=draft_hidden,
+                    greedy=False,
+                )
+            with self.subTest(head_type=head_type, anchor=anchor):
+                torch.testing.assert_close(drafts.draft_tokens, tokens)
+                torch.testing.assert_close(drafts.draft_logits, logits, rtol=0, atol=0)
 
     def test_either_flag_enables_the_experimental_worker(self):
         from sglang_tpu.experimental import (
