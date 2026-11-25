@@ -82,8 +82,13 @@ def refresh_qt(
         scale = cfgs.model.sm_scale * LOG2E
         hd = cfgs.aligned_kv_head_dim
         for kv_head in range(cfgs.model.num_kv_heads):
-            qh = q[0, kv_head].astype(jnp.float32) * scale  # [rows, aligned_q_head_dim]
-            qt = qh.T[:hd]  # [hd, rows]
+            if cfgs.serve.transposed_qt_bf16:
+                qt = q[0, kv_head].T[:hd].astype(jnp.float32) * scale  # [hd, rows]
+            else:
+                qh = (
+                    q[0, kv_head].astype(jnp.float32) * scale
+                )  # [rows, aligned_q_head_dim]
+                qt = qh.T[:hd]  # [hd, rows]
             info = jnp.finfo(qt_ref.dtype)
             qt = jnp.clip(qt, float(info.min), float(info.max))
             qt_ref[kv_head] = qt.astype(qt_ref.dtype)
@@ -446,3 +451,124 @@ def _tile_shifted(
 
         lax.fori_loop(0, live_groups, run_group, 0)
         lax.fori_loop(live_groups, n_groups, reset_group, 0)
+
+
+TRI_CHUNK = 128  # keys per chunk of tile_tri: K and V^T hold keys along lanes
+
+
+def tri_offsets(cfgs: configs.RpaConfigs) -> tuple[int, ...]:
+    """First query minus first key of the masked tiles tile_tri covers: every multiple of
+    gcd(bq, bkv) whose tile is neither full nor empty (contexts aligned to that gcd)."""
+    w = cfgs.model.sliding_window
+    bq, bkv = cfgs.bq_sz, cfgs.bkv_sz
+    g = math.gcd(bq, bkv)
+    out = []
+    for r in range(-(bq // g) * g, bkv + (w or 0) + g, g):
+        empty = r + bq - 1 < 0 or (w is not None and r - (bkv - 1) >= w)
+        full = r >= bkv - 1 and (w is None or r + bq - 1 < w)
+        if not empty and not full:
+            out.append(r)
+    assert len(out) <= 4, (bq, bkv, w, out)
+    return tuple(out)
+
+
+def _tri_range(rel: int, q_lo: int, q_hi: int, cfgs: configs.RpaConfigs):
+    """Static visible key range [a, b) (TRI_CHUNK aligned) of one compute block (queries
+    q_lo..q_hi of the tile) and the starts of its TRI_CHUNK chunks that need the mask."""
+    w = cfgs.model.sliding_window
+    bkv, c = cfgs.bkv_sz, TRI_CHUNK
+    live, masked = [], []
+    for a in range(0, bkv, c):
+        b = min(bkv, a + c)
+        d_min, d_max = (
+            rel + q_lo - (b - 1),
+            rel + q_hi - a,
+        )  # query - key over the chunk
+        if d_max < 0 or (w is not None and d_min >= w):
+            continue
+        live.append(a)
+        if not (d_min >= 0 and (w is None or d_max < w)):
+            masked.append(a)
+    if not live:
+        return None
+    return live[0], min(bkv, live[-1] + c), masked
+
+
+def tile_tri(
+    k: jax.Array,  # [1, KV, aligned_kv_head_dim, bkv] fp8
+    v: jax.Array,  # [1, KV, aligned_kv_head_dim, bkv] fp8
+    acc_ref: jax.Ref,
+    qt_ref: jax.Ref,
+    *,
+    rel: int,
+    cfgs: configs.RpaConfigs,
+):
+    """The unshifted streaming tile of a masked tile with a static first query minus first
+    key (rel): each compute block scores only its visible key range, one QK and one PV
+    matmul, with an additive mask on the boundary chunks (shared static patterns)."""
+    assert cfgs.serve.no_max
+    heads = cfgs.aligned_num_q_heads_per_kv_head
+    hd = cfgs.aligned_kv_head_dim
+    bkv = cfgs.bkv_sz
+    lanes = cfgs.bq_c_sz * heads
+    w = cfgs.model.sliding_window
+    c = TRI_CHUNK
+    s_dtype = jnp.bfloat16 if cfgs.serve.transposed_s_bf16 else jnp.float32
+    biases = {}
+
+    def bias(d0: int) -> jax.Array:
+        """0 / -3e4 for key row r, lane l of a chunk whose query - key is d0 + l // heads - r."""
+        if d0 not in biases:
+            d = (
+                lax.broadcasted_iota(jnp.int32, (c, lanes), 1) // heads
+                - lax.broadcasted_iota(jnp.int32, (c, lanes), 0)
+                + d0
+            )
+            ok = d >= 0
+            if w is not None:
+                ok = jnp.logical_and(ok, d < w)
+            biases[d0] = jnp.where(ok, 0.0, -3e4).astype(jnp.bfloat16)
+        return biases[d0]
+
+    kvs = []
+    for kv_head in range(cfgs.model.num_kv_heads):
+        ones_rows = cfgs.acct_scratch_shape[1] - hd
+        vt = jnp.concatenate(
+            [
+                v[0, kv_head].astype(jnp.bfloat16),
+                jnp.ones((ones_rows, bkv), jnp.bfloat16),
+            ],
+            axis=0,
+        )
+        kvs.append((k[0, kv_head], vt))
+    items = []
+    for kv_head in range(cfgs.model.num_kv_heads):
+        for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+            rng = _tri_range(rel, bq_start, bq_start + cfgs.bq_c_sz - 1, cfgs)
+            if rng is not None:
+                items.append((kv_head, bq_start, rng))
+    for kv_head, bq_start, rng in items:
+        kh, vt = kvs[kv_head]
+        a, b, masked = rng
+        cs = slice(bq_start * heads, bq_start * heads + lanes)
+        s = lax.dot_general(
+            kh[:, a:b],
+            qt_ref[kv_head, :, cs],
+            (((0,), (0,)), ((), ())),
+            preferred_element_type=s_dtype,
+        ).astype(jnp.bfloat16)  # [b - a, lanes]
+        if masked:
+            pieces, r = [], a
+            for m0 in masked:
+                if m0 > r:
+                    pieces.append(s[r - a : m0 - a])
+                pieces.append(s[m0 - a : m0 - a + c] + bias(rel + bq_start - m0))
+                r = m0 + c
+            if r < b:
+                pieces.append(s[r - a :])
+            s = jnp.concatenate(pieces, axis=0) if len(pieces) > 1 else pieces[0]
+        p = jnp.exp2(s)
+        o_t = lax.dot_general(
+            vt[:, a:b], p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        acc_ref[kv_head, :, cs] = acc_ref[kv_head, :, cs] + o_t

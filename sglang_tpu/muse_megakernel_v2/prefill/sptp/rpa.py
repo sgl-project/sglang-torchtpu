@@ -10,6 +10,7 @@ assembly, so a shared seam would replace it if the layout is adopted."""
 import dataclasses
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,29 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.attention.pallas.batched_rpa import configs, kernel, schedule, utils
 from sglang_tpu.attention.pallas.batched_rpa.wrapper import calculate_block_sizes
 from sglang_tpu.envs import envs as tpu_envs
+
+
+@dataclasses.dataclass(frozen=True)
+class RpaOpts:
+    """sptp-local kernel options (build-time env SPTP_RPA_*); the defaults are the shared kernel."""
+
+    # transposed_tri: aligned diagonal / window-edge tiles score only their visible keys
+    tri: bool = False
+    # transposed_qt_bf16: Q^T transposed in bf16
+    qt_bf16: bool = False
+    # "bq:bkv" of global / SWA layers over SGLANG_TPU_RPA_(SWA_)PREFILL_BLOCKS
+    global_blocks: str = ""
+    swa_blocks: str = ""
+
+    @classmethod
+    def from_env(cls) -> "RpaOpts":
+        env = os.environ.get
+        return cls(
+            tri=env("SPTP_RPA_TRI", "0") == "1",
+            qt_bf16=env("SPTP_RPA_QTB", "0") == "1",
+            global_blocks=env("SPTP_RPA_GBLOCKS", ""),
+            swa_blocks=env("SPTP_RPA_SBLOCKS", ""),
+        )
 
 
 def new_kv(k, v, page_size: int):
@@ -37,10 +61,22 @@ def new_kv(k, v, page_size: int):
 
 # jitted like the wrapper: one lowered computation per (heads, window) instead of a Mosaic
 # compile per layer (inlined: ~530 s vs ~140 s for the 62-layer program)
+def rpa_prepared(*args, opts: "RpaOpts | None" = None, **kw):
+    """_rpa_prepared with the build-time env resolved here, so a jit cache entry never
+    outlives an env change (warm benchmark workers)."""
+    env = tuple(
+        sorted((k, v) for k, v in os.environ.items() if k.startswith("SGLANG_TPU_RPA_"))
+    )
+    return _rpa_prepared(
+        *args, opts=RpaOpts.from_env() if opts is None else opts, env=env, **kw
+    )
+
+
 @functools.partial(
-    jax.jit, static_argnames=("num_q_heads", "sm_scale", "sliding_window")
+    jax.jit,
+    static_argnames=("num_q_heads", "sm_scale", "sliding_window", "opts", "env"),
 )
-def rpa_prepared(
+def _rpa_prepared(
     q_hbm,
     k,
     v,
@@ -53,9 +89,12 @@ def rpa_prepared(
     num_q_heads: int,
     sm_scale: float,
     sliding_window: int | None,
+    opts: RpaOpts,
+    env: tuple,
 ):
     """q_hbm [Hkv, T, G / pack, pack, D128] bf16 (pad lanes zero), fp8 k / v [T, Hkv, D] ->
     (o [Hkv, T, G / pack, pack, D128] bf16, kv_cache)."""
+    del env  # cache key only
     t, hkv, d = k.shape
     q_dtype = q_hbm.dtype
     queries = jax.ShapeDtypeStruct((t, num_q_heads, d), q_dtype)
@@ -98,6 +137,8 @@ def rpa_prepared(
         transposed_fp8_p=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_FP8_P.get(),
         transposed_chunk_vt=tpu_envs.SGLANG_TPU_RPA_CHUNK_VT.get(),
         transposed_s_bf16=tpu_envs.SGLANG_TPU_RPA_S_BF16.get(),
+        transposed_tri=opts.tri,
+        transposed_qt_bf16=opts.qt_bf16,
         transposed=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get() and d <= 64,
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
         skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
@@ -109,6 +150,8 @@ def rpa_prepared(
         model_cfgs, serve_cfgs, vmem_limit_bytes
     )
     blocks_env = (
+        opts.global_blocks if sliding_window is None else opts.swa_blocks
+    ) or (
         tpu_envs.SGLANG_TPU_RPA_PREFILL_BLOCKS
         if sliding_window is None
         else tpu_envs.SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS

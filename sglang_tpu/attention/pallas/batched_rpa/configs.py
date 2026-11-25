@@ -120,6 +120,13 @@ class ServingConfigs:
     transposed_chunk_vt: bool = False
     # Unshifted streaming tile: the QK matmul pops bf16 scores (no f32->bf16 pass).
     transposed_s_bf16: bool = False
+    # Unshifted transposed tile (sptp prefill only): a masked tile whose first query minus
+    # first key is a multiple of gcd(bq, bkv) (aligned contexts) scores only each compute
+    # block's visible 128-key chunks and masks only the boundary chunks; exact.
+    transposed_tri: bool = False
+    # Transposed tile (sptp prefill only): Q^T is transposed in bf16 and scaled after
+    # (half the XLU transposes of the f32 path); bit-identical.
+    transposed_qt_bf16: bool = False
 
     @property
     def pages_per_seq(self) -> int:
