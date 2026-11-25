@@ -286,6 +286,18 @@ def build_forward(c: PFConfig, axis: str = "model"):
     )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
+    # the in-kernel a2a's row groups: up to 512 own rows each (its o accumulator lives in VMEM)
+    pa_ng = 1
+    if pa_a2a and Ts > 512:
+        pa_ng = -(-Ts // 512)
+        while Ts % pa_ng or (Ts // pa_ng) % 128:
+            pa_ng += 1
+            if pa_ng > Ts // 128:
+                raise ValueError(
+                    f"SPTP_PA_A2A: {T} rows do not split into 128-row groups"
+                )
+    if pa_a2a and Ts % 128:
+        raise ValueError(f"SPTP_PA_A2A needs rows / tp a multiple of 128, got {T} rows")
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
@@ -575,34 +587,46 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                 g8 = g8.reshape(c.kv_heads, T, gq * hd)
                             else:
                                 g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
-                            pa_o = oproj_a2a_call(
-                                c,
-                                wrouter.shape[-1],
-                                SPTP_PA_COLLECTIVE_ID,
-                                pa_tn,
-                                pa_rc,
-                                pa_la,
-                                pa_fp,
-                                pa_ns,
-                                pa_order,
-                                pa_head,
-                                pa_tmaj,
-                            )
-                            args = (
-                                l,
-                                me,
-                                g8,
-                                g_s.reshape(1, T),
-                                stream,
-                                smalls,
-                                wo,
-                                wrouter,
-                            )
-                            if pa_fp:
-                                stream, ids, tw, xe8, xs = pa_o(*args, wpool)
-                            else:
-                                stream, ids, tw, f8, f_s = pa_o(*args)
-                                xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                            # one call per row group of up to 512 own rows (VMEM)
+                            ids = tw = xe8 = xs = None
+                            for gj in range(pa_ng):
+                                grp = (gj, pa_ng) if pa_ng > 1 else ()
+                                pa_o = oproj_a2a_call(
+                                    c,
+                                    wrouter.shape[-1],
+                                    SPTP_PA_COLLECTIVE_ID,
+                                    pa_tn,
+                                    pa_rc,
+                                    pa_la,
+                                    pa_fp,
+                                    pa_ns,
+                                    pa_order,
+                                    pa_head,
+                                    pa_tmaj,
+                                    grp,
+                                )
+                                args = (
+                                    l,
+                                    me,
+                                    g8,
+                                    g_s.reshape(1, T),
+                                    stream,
+                                    smalls,
+                                    wo,
+                                    wrouter,
+                                )
+                                if pa_fp:
+                                    stream, ids, tw, xe8, xs = pa_o(*args, wpool)
+                                    continue
+                                prev = (ids, tw) if gj else ()
+                                stream, ids, tw, f8, f_s = pa_o(*args, prev=prev)
+                                pool = (
+                                    pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj, grp)
+                                    if grp
+                                    else pa_pool
+                                )
+                                prev = (xe8, xs) if gj else ()
+                                xe8, xs = pool(l, f8, f_s, smalls, wpool, prev=prev)
                     elif pa:
                         with _scope("sp_o_a2a"):
                             # the token-major [T, qd] gated output (the o gate's layout to come)

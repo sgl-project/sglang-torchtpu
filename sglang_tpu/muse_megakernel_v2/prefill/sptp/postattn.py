@@ -24,6 +24,14 @@ _FP8_MAX = 448.0
 _ROUTER_ROWS = 256
 
 
+def _router_rows(Ts: int) -> int:
+    """Router dot rows per pass: _ROUTER_ROWS, or the largest power-of-two divisor of Ts below."""
+    rr = min(_ROUTER_ROWS, Ts)
+    while Ts % rr:
+        rr //= 2
+    return rr
+
+
 def _row(sm_ref, name: str, lo, n: int):
     i = SMALL[name]
     return sm_ref[i : i + 1, pl.ds(lo, n)]
@@ -184,6 +192,7 @@ def oproj_a2a_call(
     order: tuple = (),
     head: bool = False,
     tmaj: bool = False,
+    group: tuple = (),
 ):
     """oproj_call with the gated-output a2a inside: (lyr_me [2] i32 (layer, rank), g8 [T, qd]
     e4m3 (this rank's heads of every row, token major), gs [1, T] f32 (their row scales),
@@ -203,13 +212,26 @@ def oproj_a2a_call(
     head: g8 in the o gate's head layout [kvh, T, w] (w = qd / kvh, wo's row order within a
     rank) instead of token major; each send gathers rank d's rows of every head group.
     tmaj: g8 [qd, T] (rows in lanes: the o gate fusion's own layout, no relayout before the
-    kernel); blocks land as [qd, Ts] and are transposed once per o proj step; the pool input gets its own [tp, Ts, qd] buffer."""
-    Ts, tp, qd = _dims(c)
+    kernel); blocks land as [qd, Ts] and are transposed once per o proj step; the pool input
+    goes to wo's free first buffer as [Ts, H].
+    group (j, n): own rows [j * G, (j + 1) * G) of n groups (G = Ts / n; VMEM holds 512 rows):
+    stream is updated in place (aliased), ids / tw write their column block over the previous
+    group's outputs (call(..., prev=(ids, tw))), f8 / fs are the group's rows."""
+    Tf, tp, qd = _dims(c)
+    gj, ng = group or (0, 1)
+    if Tf % ng or (ng > 1 and (Tf // ng) % 128):
+        raise ValueError(
+            f"{Tf} own rows do not split into {ng} groups of 128-row multiples"
+        )
+    Ts = Tf // ng
+    row0 = gj * Ts
+    if ng > 1 and (pool_tn or not tmaj):
+        raise ValueError("row groups need the tmaj layout and the separate pool kernel")
     H, E = c.hidden, n_router
     if (
         H % tn
         or Ts % rc
-        or Ts % min(_ROUTER_ROWS, Ts)
+        or Ts % _router_rows(Ts)
         or H != tp * qd
         or qd % _KC
         or tp & (tp - 1)
@@ -253,6 +275,9 @@ def oproj_a2a_call(
             ) = refs  # fmt: skip
             f8_hbm = None
         else:
+            if ng > 1 and gj:
+                # the previous group's ids / tw: aliased to this call's outputs, never read
+                refs = refs[:6] + refs[8:]
             (
                 g8_hbm, gs_hbm, st_hbm, sm_ref, wo_hbm, wr_hbm,
                 so_hbm, ids_ref, tw_ref, f8_hbm, fs_ref,
@@ -274,8 +299,12 @@ def oproj_a2a_call(
             # token-major [T, qd] or the head layout [kvh, T, w]: rank d's rows of every group
             return g8_hbm.at[:, rows] if head or tmaj else g8_hbm.at[rows]
 
+        def src_row(d):
+            # rank d's rows of this group in the [.., T] gate output
+            return d * Tf + row0 if row0 else d * Tf
+
         def sends(d):
-            rows = pl.ds(pl.multiple_of(d * Ts, Ts), Ts)
+            rows = pl.ds(pl.multiple_of(src_row(d), 128 if ng > 1 else Ts), Ts)
             return (
                 pltpu.make_async_remote_copy(
                     g8_rows(rows), gq.at[me], sg.at[d], rg.at[me],
@@ -288,7 +317,7 @@ def oproj_a2a_call(
             )  # fmt: skip
 
         def locals_(d):
-            rows = pl.ds(pl.multiple_of(d * Ts, Ts), Ts)
+            rows = pl.ds(pl.multiple_of(src_row(d), 128 if ng > 1 else Ts), Ts)
             return (
                 pltpu.make_async_copy(g8_rows(rows), gq.at[d], rg.at[d]),
                 pltpu.make_async_copy(gs_hbm.at[:, rows], gsr.at[d], rs.at[d]),
@@ -384,7 +413,9 @@ def oproj_a2a_call(
                         ss = ss + jnp.sum(o * o, axis=1, keepdims=True)
                     sso[...] = ss
 
-        ep = _Epilogue(c, Ts, rc, sm_ref, st_hbm, so_hbm, big, sbuf, obuf, sin, sout)
+        ep = _Epilogue(
+            c, Ts, rc, sm_ref, st_hbm, so_hbm, big, sbuf, obuf, sin, sout, row0
+        )
 
         @pl.when(r == tp - 2)
         def _():
@@ -424,11 +455,16 @@ def oproj_a2a_call(
         anyspec,
     ]
     k_top = c.top_k
-    out_specs = [anyspec, whole(k_top, Ts), whole(k_top, Ts)]
+    if ng > 1:
+        # this group's column block of the full [k, Tf] ids / tw
+        col = pl.BlockSpec((k_top, Ts), lambda r, lm: (0, gj))
+        out_specs = [anyspec, col, col]
+    else:
+        out_specs = [anyspec, whole(k_top, Ts), whole(k_top, Ts)]
     out_shape = [
-        jax.ShapeDtypeStruct((Ts, H), _F32),
-        jax.ShapeDtypeStruct((k_top, Ts), jnp.int32),
-        jax.ShapeDtypeStruct((k_top, Ts), _F32),
+        jax.ShapeDtypeStruct((Tf, H), _F32),
+        jax.ShapeDtypeStruct((k_top, Tf), jnp.int32),
+        jax.ShapeDtypeStruct((k_top, Tf), _F32),
     ]
     if fuse:
         in_specs.append(
@@ -480,15 +516,32 @@ def oproj_a2a_call(
         collective_id=collective_id,
     )
 
-    def call(layer: int, me, g8, gs, stream, smalls, wo, wrouter, *wpool):
+    if ng > 1:
+        # stream in place; the previous group's ids / tw under this group's column block
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(tp + nP,),
+            in_specs=in_specs + ([anyspec, anyspec] if gj else []),
+            out_specs=tuple(out_specs),
+            scratch_shapes=scratch,
+        )
+        aliases = {3: 0}
+        if gj:
+            aliases.update({7: 1, 8: 2})
+    else:
+        aliases = {}
+
+    def call(layer: int, me, g8, gs, stream, smalls, wo, wrouter, *wpool, prev=()):
         lm = jnp.stack([jnp.asarray(layer, jnp.int32), me.astype(jnp.int32)])
+        tag = f"_g{gj}of{ng}" if ng > 1 else ""
         return pl.pallas_call(
             kernel,
             grid_spec=grid_spec,
             out_shape=tuple(out_shape),
             compiler_params=params,
-            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}_o{''.join(map(str, order))}{'_h' if head else ''}{'_t' if tmaj else ''}",
-        )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool)
+            input_output_aliases=aliases,
+            name=f"muse_sptp_pa_oproj_a2a_t{c.rows}_n{tn}_r{rc}_la{la}_p{pool_tn}_s{ns}_o{''.join(map(str, order))}{'_h' if head else ''}{'_t' if tmaj else ''}{tag}",
+        )(lm, g8, gs, stream, smalls, wo, wrouter, *wpool, *prev)
 
     return call
 
@@ -528,19 +581,25 @@ class _Epilogue:
     """Kernel A's tail on the o proj rows in big: attention residual (stream in / out by row
     chunk), pool input rms + e4m3 into gq, router input over big, router and top-k."""
 
-    def __init__(self, c, Ts, rc, sm_ref, st_hbm, so_hbm, big, sbuf, obuf, sin, sout):
-        self.c, self.Ts, self.rc, self.n_rc = c, Ts, rc, Ts // rc
+    def __init__(
+        self, c, Ts, rc, sm_ref, st_hbm, so_hbm, big, sbuf, obuf, sin, sout, row0=0
+    ):
+        self.c, self.Ts, self.rc, self.n_rc, self.row0 = c, Ts, rc, Ts // rc, row0
         self.sm, self.st, self.so, self.big = sm_ref, st_hbm, so_hbm, big
         self.sbuf, self.obuf, self.sin, self.sout = sbuf, obuf, sin, sout
 
+    def _rows(self, i):
+        r0 = i * self.rc
+        return pl.ds(r0 + self.row0 if self.row0 else r0, self.rc)
+
     def cp_in(self, i, slot):
-        rows = pl.ds(i * self.rc, self.rc)
+        rows = self._rows(i)
         return pltpu.make_async_copy(
             self.st.at[rows], self.sbuf.at[slot], self.sin.at[slot]
         )
 
     def cp_out(self, i, slot):
-        rows = pl.ds(i * self.rc, self.rc)
+        rows = self._rows(i)
         return pltpu.make_async_copy(
             self.obuf.at[slot], self.so.at[rows], self.sout.at[slot]
         )
@@ -601,7 +660,7 @@ class _Epilogue:
             f8_cp.start()
         wr_cp.wait()
         bias = _row(self.sm, "expert_bias", 0, E)
-        rr = min(_ROUTER_ROWS, Ts)
+        rr = _router_rows(Ts)
         with _scope("pa_router"):
             for r0 in range(0, Ts, rr):
                 x = big[r0 : r0 + rr, :].astype(_BF16)
@@ -642,20 +701,28 @@ def _top_k(sc, bias, k: int, eps: float, scale: float):
 
 
 def pool_call(
-    c: PFConfig, tpn: int = 512, rc: int = 64, head: bool = False, flat: bool = False
+    c: PFConfig,
+    tpn: int = 512,
+    rc: int = 64,
+    head: bool = False,
+    flat: bool = False,
+    group: tuple = (),
 ):
     """(lyr [1] i32, f8 [tp, Ts, qd] e4m3, fs [Ts, 1] f32, smalls [L, 16, H],
-    wpool [L, H, He] e4m3) -> (xe8 [Ts, He] e4m3, xs [1, Ts] f32): pool, pre-expert rms + e4m3."""
-    Ts, tp, qd = _dims(c)
+    wpool [L, H, He] e4m3) -> (xe8 [Ts, He] e4m3, xs [1, Ts] f32): pool, pre-expert rms + e4m3.
+    group (j, n): f8 / fs are row group j of n; xe8 / xs [.., Tf] get its block over the
+    previous group's outputs (call(..., prev=(xe8, xs)))."""
+    Tf, tp, qd = _dims(c)
+    gj, ng = group or (0, 1)
+    Ts = Tf // ng
     H, He = c.hidden, c.expert_hidden
     nP = He // tpn
     if He % tpn or Ts % rc:
         raise ValueError(f"pool tiles {tpn} / {rc} do not fit He {He} Ts {Ts}")
     n_rc = Ts // rc
 
-    def kernel(
-        lyr, f8_ref, fs_ref, sm_ref, wp_ref, xe_ref, xs_ref, pooled, ssq, amx, xsc
-    ):
+    def kernel(lyr, f8_ref, fs_ref, sm_ref, wp_ref, *refs):
+        xe_ref, xs_ref, pooled, ssq, amx, xsc = refs[-6:]
         _pool_step(
             c, pl.program_id(0), nP, tpn, rc, f8_ref, fs_ref, sm_ref, wp_ref, pooled,
             ssq, amx, xsc, xe_ref, xs_ref,
@@ -680,8 +747,16 @@ def pool_call(
             whole(Ts, 1),
             pl.BlockSpec((None, SMALL_ROWS, H), lambda p, lyr: (lyr[0], 0, 0)),
             pl.BlockSpec((None, H, tpn), lambda p, lyr: (lyr[0], 0, p)),
-        ],
-        out_specs=(whole(Ts, He), whole(1, Ts)),
+        ]
+        + [pl.BlockSpec(memory_space=pl.ANY)] * (2 if gj else 0),
+        out_specs=(
+            (
+                pl.BlockSpec((Ts, He), lambda p, lyr: (gj, 0)),
+                pl.BlockSpec((1, Ts), lambda p, lyr: (0, gj)),
+            )
+            if ng > 1
+            else (whole(Ts, He), whole(1, Ts))
+        ),
         scratch_shapes=[
             pltpu.VMEM((Ts, He), _F32),
             pltpu.VMEM((Ts, 1), _F32),
@@ -693,17 +768,19 @@ def pool_call(
         dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
     )
 
-    def call(layer: int, f8, fs, smalls, wpool):
+    def call(layer: int, f8, fs, smalls, wpool, prev=()):
+        tag = f"_g{gj}of{ng}" if ng > 1 else ""
         return pl.pallas_call(
             kernel,
             grid_spec=grid_spec,
             out_shape=(
-                jax.ShapeDtypeStruct((Ts, He), _FP8),
-                jax.ShapeDtypeStruct((1, Ts), _F32),
+                jax.ShapeDtypeStruct((Tf, He), _FP8),
+                jax.ShapeDtypeStruct((1, Tf), _F32),
             ),
             compiler_params=params,
-            name=f"muse_sptp_pa_pool_t{c.rows}_p{tpn}{'_h' if head else ''}{'_f' if flat else ''}",
-        )(jnp.full((1,), layer, jnp.int32), f8, fs, smalls, wpool)
+            input_output_aliases={5: 0, 6: 1} if gj else {},
+            name=f"muse_sptp_pa_pool_t{c.rows}_p{tpn}{'_h' if head else ''}{'_f' if flat else ''}{tag}",
+        )(jnp.full((1,), layer, jnp.int32), f8, fs, smalls, wpool, *prev)
 
     return call
 
