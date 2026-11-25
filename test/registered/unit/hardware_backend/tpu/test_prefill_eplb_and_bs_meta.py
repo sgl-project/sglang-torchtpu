@@ -470,6 +470,47 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
         out_pre = MuseSparkMoE._route_scaled_logits(fake_moe, packed, prerouted=True)
         np.testing.assert_array_equal(out_pre.topk_ids.numpy(), fb_np)
 
+    def test_r0_chip_spread_and_fine_qblock_peak_balance(self):
+        rng = np.random.default_rng(2026)
+        counts = np.full(256, 400, dtype=np.int64)
+        hot_ids = [17, 63, 102, 145, 198, 211, 240, 250]
+        hot_vals = [23800, 22200, 15600, 15200, 8400, 7900, 6700, 6100]
+        for eid, cnt in zip(hot_ids, hot_vals):
+            counts[eid] = cnt
+
+        # Verify R=0 chip_spread spreads top-4/top-8 hottest experts across distinct physical chips (r >> 1).
+        for ep_size, base_loc, n_top_chips in ((8, 32, 4), (16, 16, 8)):
+            _, col_perm = compute_zeroglue_eplb_perm(
+                counts,
+                ep_size=ep_size,
+                num_local_base=base_loc,
+                num_replicas=0,
+                tile_m=128,
+            )
+            self.assertEqual(sorted(col_perm.tolist()), list(range(256)))
+            inv_perm = np.argsort(col_perm)
+            top_chips = [int(inv_perm[e] // base_loc) >> 1 for e in hot_ids[:n_top_chips]]
+            self.assertEqual(len(set(top_chips)), n_top_chips)
+
+        # Verify T=24576 R=4 fine q_block keeps rank token peak within 3% of mean under extreme skew.
+        r2g, col_perm4 = compute_zeroglue_eplb_perm(
+            counts, ep_size=8, num_local_base=32, num_replicas=4, tile_m=128
+        )
+        probs = counts[col_perm4] / counts.sum()
+        raw = rng.choice(256, size=(24576, 8), p=probs).astype(np.int32)
+        v_qb, _ = remap_zeroglue_virtual_ids(
+            jnp.asarray(raw),
+            jnp.int32(0),
+            ep_size=8,
+            num_local_experts=36,
+            mode="q_block",
+            quantum=256,
+        )
+        v_np = np.asarray(v_qb)
+        np.testing.assert_array_equal(r2g[v_np // 36, v_np % 36], col_perm4[raw])
+        per_rank = np.bincount(v_np.reshape(-1) // 36, minlength=8)
+        self.assertLess(per_rank.max() / per_rank.mean(), 1.03)
+
     def test_sp_off_bf16_split_preserves_virtual_ids_above_256(self):
         # Verify the hi/lo bf16 split in fused_moe.py preserves all virtual IDs 0..319 bit-identically
         all_ids = jnp.arange(320, dtype=jnp.int32)

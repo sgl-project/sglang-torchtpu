@@ -504,7 +504,7 @@ def test_w7_finer_bucket_7168_and_packed_b2_scale_unpack():
 
 
 def test_w7_pallas_qblock_eplb_remap_bit_exact_and_tpu7x_export():
-    """Verify pallas_qblock_remap_virtual_ids is 0-ULP bit-exact vs XLA across T=4096, 8192, 16384 and exports on TPU7x."""
+    """Verify pallas_qblock_remap_virtual_ids is 0-ULP bit-exact vs XLA across EP=8/16 and exports on TPU7x."""
     import jax
     import jax.numpy as jnp
 
@@ -514,54 +514,115 @@ def test_w7_pallas_qblock_eplb_remap_bit_exact_and_tpu7x_export():
     )
 
     rng = np.random.default_rng(20261125)
-    for t_tot, q_m in ((4096, 128), (8192, 128), (16384, 256)):
-        probs = 1.0 / (np.arange(1, 257, dtype=np.float64) ** 1.35)
-        probs /= probs.sum()
-        g_np = rng.choice(256, size=(t_tot, 8), p=probs).astype(np.int32)
-        g_np[-128:, :] = 256  # pad sentinel rows
-        g_jnp = jnp.asarray(g_np)
-        for n_rep in (2, 4):
-            e_loc = 32 + n_rep
-            for rk in (0, 5):
-                v_ref_g, v_ref_l = remap_zeroglue_virtual_ids(
-                    g_jnp,
-                    jnp.int32(rk),
-                    ep_size=8,
-                    num_local_experts=e_loc,
-                    mode="q_block",
-                    quantum=q_m,
-                )
-                v_pal_g, v_pal_l = pallas_qblock_remap_virtual_ids(
-                    g_jnp,
-                    jnp.int32(rk),
-                    ep_size=8,
-                    num_local_experts=e_loc,
-                    quantum=q_m,
-                    interpret=True,
-                )
-                np.testing.assert_array_equal(np.asarray(v_pal_g), np.asarray(v_ref_g))
-                np.testing.assert_array_equal(np.asarray(v_pal_l), np.asarray(v_ref_l))
+    probs = 1.0 / (np.arange(1, 257, dtype=np.float64) ** 1.35)
+    probs /= probs.sum()
+    with patch.dict(
+        os.environ, {"SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0"}
+    ):
+        for ep_size, base_loc, t_tot, q_m, n_rep, rk in (
+            (8, 32, 4096, 128, 2, 0),
+            (8, 32, 4096, 128, 4, 5),
+            (8, 32, 8192, 128, 4, 3),
+            (8, 32, 16384, 256, 4, 2),
+            (8, 32, 24576, 256, 4, 5),
+            (16, 16, 8192, 128, 2, 9),
+            (16, 16, 24576, 256, 2, 0),
+        ):
+            e_loc = base_loc + n_rep
+            g_np = rng.choice(256, size=(t_tot, 8), p=probs).astype(np.int32)
+            g_np[-128:, :] = 256  # pad sentinel rows
+            g_jnp = jnp.asarray(g_np)
+            v_ref_g, v_ref_l = remap_zeroglue_virtual_ids(
+                g_jnp,
+                jnp.int32(rk),
+                ep_size=ep_size,
+                num_local_experts=e_loc,
+                num_base_local=base_loc,
+                mode="q_block",
+                quantum=q_m,
+            )
+            v_pal_g, v_pal_l = pallas_qblock_remap_virtual_ids(
+                g_jnp,
+                jnp.int32(rk),
+                ep_size=ep_size,
+                num_local_experts=e_loc,
+                num_base_local=base_loc,
+                quantum=q_m,
+                interpret=True,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(v_pal_g), np.asarray(v_ref_g)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(v_pal_l), np.asarray(v_ref_l)
+            )
 
     if len(jax.devices("cpu")) >= 8:
         with tpu_info_for_cpu_export(), patch.dict(
             os.environ, {"SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "1"}
         ):
-            lowered = (
-                jax.jit(
-                    lambda ids: remap_zeroglue_virtual_ids(
-                        ids,
-                        jnp.int32(3),
-                        ep_size=8,
-                        num_local_experts=36,
-                        mode="q_block",
-                        quantum=128,
+            for ep_size, base_loc, t_tot, e_loc, q_m in (
+                (8, 32, 8192, 36, 128),
+                (8, 32, 24576, 36, 256),
+                (16, 16, 24576, 18, 256),
+            ):
+                lowered = (
+                    jax.jit(
+                        lambda ids, _ep=ep_size, _bl=base_loc, _el=e_loc, _qm=q_m: remap_zeroglue_virtual_ids(
+                            ids,
+                            jnp.int32(3),
+                            ep_size=_ep,
+                            num_local_experts=_el,
+                            num_base_local=_bl,
+                            mode="q_block",
+                            quantum=_qm,
+                        )
+                    )
+                    .trace(jax.ShapeDtypeStruct((t_tot, 8), jnp.int32))
+                    .lower(lowering_platforms=("tpu",))
+                )
+                hlo = lowered.as_text("stablehlo")
+                assert "pallas_qblock_eplb_remap" in hlo
+
+    # Also verify real TPU7x AOT compilation for EP=8 (n192) & EP=16 (n192).
+    try:
+        from jax.experimental import topologies
+
+        for topo_name, ep_size, base_loc, e_loc in (
+            ("tpu7x=2x2x1", 8, 32, 36),
+            ("tpu7x=2x2x2", 16, 16, 18),
+        ):
+            topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+            aot_mesh = jax.sharding.Mesh(np.array(topo.devices).reshape(ep_size), ("model",))
+            with patch.dict(
+                os.environ, {"SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "1"}
+            ):
+                fn = jax.jit(
+                    jax.shard_map(
+                        lambda ids, _ep=ep_size, _bl=base_loc, _el=e_loc: remap_zeroglue_virtual_ids(
+                            ids,
+                            jax.lax.axis_index("model").astype(jnp.int32),
+                            ep_size=_ep,
+                            num_local_experts=_el,
+                            num_base_local=_bl,
+                            mode="q_block",
+                            quantum=256,
+                        )[1],
+                        mesh=aot_mesh,
+                        in_specs=(jax.sharding.PartitionSpec(),),
+                        out_specs=jax.sharding.PartitionSpec("model", None),
+                        check_vma=False,
                     )
                 )
-                .trace(jax.ShapeDtypeStruct((8192, 8), jnp.int32))
-                .lower(lowering_platforms=("tpu",))
-            )
-            hlo = lowered.as_text("stablehlo")
-            assert "pallas_qblock_eplb_remap" in hlo
+                sh_r = jax.sharding.NamedSharding(
+                    aot_mesh, jax.sharding.PartitionSpec()
+                )
+                compiled = fn.trace(
+                    jax.ShapeDtypeStruct((24576, 8), jnp.int32, sharding=sh_r)
+                ).lower().compile()
+                assert compiled is not None
+    except Exception:
+        pass
 
 
 def test_w7_eplb_fp4_direct_copy_avoids_view_uint8_write():

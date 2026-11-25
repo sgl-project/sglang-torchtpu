@@ -255,8 +255,12 @@ def compute_zeroglue_eplb_perm(
                 tiles_e = (int(counts[e]) + tile_m - 1) // tile_m
                 eff_costs[e] = tiles_e * tile_m * 1024 + int(counts[e])
 
+        use_chip_spread = (
+            num_replicas == 0 and ep_size >= 4 and (ep_size % 2 == 0)
+        )
         rank_bins = [list(rep_experts)] + [[] for _ in range(ep_size - 1)]
         rank_loads = np.zeros(ep_size, dtype=np.int64)
+        chip_loads = np.zeros(ep_size // 2, dtype=np.int64)
         non_rep_order = [
             int(e)
             for e in np.argsort(-eff_costs, kind="stable")
@@ -266,11 +270,24 @@ def compute_zeroglue_eplb_perm(
             candidates = [
                 r for r in range(ep_size) if len(rank_bins[r]) < num_local_base
             ]
-            best_r = min(
-                candidates, key=lambda r: (int(rank_loads[r]), len(rank_bins[r]), r)
-            )
+            if use_chip_spread:
+                best_r = min(
+                    candidates,
+                    key=lambda r: (
+                        int(rank_loads[r]),
+                        int(chip_loads[r >> 1]),
+                        len(rank_bins[r]),
+                        r & 1,
+                        r >> 1,
+                    ),
+                )
+            else:
+                best_r = min(
+                    candidates, key=lambda r: (int(rank_loads[r]), len(rank_bins[r]), r)
+                )
             rank_bins[best_r].append(e)
             rank_loads[best_r] += eff_costs[e]
+            chip_loads[best_r >> 1] += eff_costs[e]
 
         # 2-opt pairwise swap refinement between heaviest and lightest rank (preserving rep_experts).
         for _ in range(64):
@@ -280,27 +297,42 @@ def compute_zeroglue_eplb_perm(
                 break
             start_max = num_replicas if max_r == 0 else 0
             start_min = num_replicas if min_r == 0 else 0
-            best_gain = 0
+            best_score = (0, 0)
             best_pair = None
             for i in range(start_max, num_local_base):
                 ei = rank_bins[max_r][i]
                 for j in range(start_min, num_local_base):
                     ej = rank_bins[min_r][j]
+                    delta = int(eff_costs[ei] - eff_costs[ej])
+                    if delta <= 0:
+                        continue
                     new_peak = max(
-                        rank_loads[max_r] - eff_costs[ei] + eff_costs[ej],
-                        rank_loads[min_r] - eff_costs[ej] + eff_costs[ei],
+                        rank_loads[max_r] - delta,
+                        rank_loads[min_r] + delta,
                     )
-                    gain = int(rank_loads[max_r] - new_peak)
-                    if gain > best_gain:
-                        best_gain = gain
+                    gain_r = int(rank_loads[max_r] - new_peak)
+                    if gain_r <= 0:
+                        continue
+                    if use_chip_spread and (max_r >> 1) != (min_r >> 1):
+                        cm0 = int(chip_loads[max_r >> 1])
+                        cn0 = int(chip_loads[min_r >> 1])
+                        gain_c = max(cm0, cn0) - max(cm0 - delta, cn0 + delta)
+                    else:
+                        gain_c = 0
+                    score = (gain_r, gain_c)
+                    if score > best_score:
+                        best_score = score
                         best_pair = (i, j)
             if best_pair is None:
                 break
             i, j = best_pair
             ei, ej = rank_bins[max_r][i], rank_bins[min_r][j]
             rank_bins[max_r][i], rank_bins[min_r][j] = ej, ei
-            rank_loads[max_r] += eff_costs[ej] - eff_costs[ei]
-            rank_loads[min_r] += eff_costs[ei] - eff_costs[ej]
+            delta = int(eff_costs[ei] - eff_costs[ej])
+            rank_loads[max_r] -= delta
+            rank_loads[min_r] += delta
+            chip_loads[max_r >> 1] -= delta
+            chip_loads[min_r >> 1] += delta
 
     col_perm = np.zeros(num_experts, dtype=np.int32)
     rank_to_global = np.zeros((ep_size, e_local), dtype=np.int32)
@@ -471,21 +503,21 @@ def remap_zeroglue_virtual_ids(
 
     total_elems = global_topk_ids.shape[0] * topk
     from sglang_tpu.envs import envs as _tpu_envs
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_qblock_remap_virtual_ids,
+        resolve_qblock_params,
+    )
 
     if (
         int(_tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING.get() or 0) >= 1
-        and ep_size == 8
-        and num_base_local == 32
+        and ep_size in (8, 16)
+        and num_base_local in (16, 32)
         and 1 <= num_replicas <= 8
         and quantum > 0
         and total_elems >= 32768
         and total_elems % (64 * 512) == 0
         and ((t_local * topk) // 128) % 8 == 0
     ):
-        from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
-            pallas_qblock_remap_virtual_ids,
-        )
-
         return pallas_qblock_remap_virtual_ids(
             global_topk_ids,
             my_id,
@@ -496,7 +528,7 @@ def remap_zeroglue_virtual_ids(
             quantum=quantum,
         )
 
-    n_blocks = 64 if (total_elems >= 64 and total_elems % 64 == 0) else ep_size
+    n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     blk_elems = total_elems // n_blocks
     ids_blk = ids_by_chip.reshape(n_blocks, blk_elems)
     base_owner_blk = base_owner.reshape(n_blocks, blk_elems)
@@ -508,20 +540,14 @@ def remap_zeroglue_virtual_ids(
         (non_rep_owner_blk[:, :, None] == ranks_1d[None, None, :]).astype(jnp.int32),
         axis=(0, 1),
     )
-    active_e = jnp.array(
-        [num_base_local - num_replicas] + [num_base_local] * (ep_size - 1),
-        dtype=jnp.int32,
-    )
-    cur_tiles = (
-        base_rows_per_rank + (active_e * quantum) // 2 + quantum - 1
-    ) // quantum
+    cur_tiles = (base_rows_per_rank + q_eff - 1) // q_eff
 
     m_1d = ranks_1d + jnp.int32(1)
     for k in range(num_replicas):
         hit_blk = ids_blk == k
         blk_cnt = jnp.sum(hit_blk.astype(jnp.int32), axis=1)  # int32[n_blocks]
         cnt_k = jnp.sum(blk_cnt)
-        n_blks = jnp.where(cnt_k > 0, (cnt_k + quantum - 1) // quantum, 0)
+        n_blks = jnp.where(cnt_k > 0, (cnt_k + q_eff - 1) // q_eff, 0)
 
         # Closed-form exact integer water-filling across `ep_size` ranks (0 while loops, 0 sort ops).
         ord_ct = jnp.sum(
@@ -554,7 +580,7 @@ def remap_zeroglue_virtual_ids(
 
         cum_blk = jnp.cumsum(blk_cnt) - blk_cnt
         mid_row = cum_blk + jax.lax.shift_right_logical(blk_cnt, 1)
-        blk_tile = mid_row // quantum
+        blk_tile = mid_row // q_eff
         rk_b = jnp.sum(
             (blk_tile[:, None] >= cum_tq[:-1][None, :]).astype(jnp.int32), axis=1
         )

@@ -1598,6 +1598,41 @@ def _make_sparse_weight_dma_ops(
     )
 
 
+def _reshape_x_to_3d(
+    x_in_ref,
+    x_3d_buf,
+    batch_size: int,
+    cfg: SparseDecodeConfig,
+) -> None:
+    """Reshape ``x_in_ref [B, 4096]`` into sublane-tiled ``x_3d_buf [B, 32, 128]``."""
+    if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
+        cfg.fast_gs and batch_size <= 128
+    ):
+        x_chunk = min(batch_size, 32)
+        for r0 in range(0, batch_size, x_chunk):
+            for h_idx in range(2):
+                x_3d_buf[
+                    pl.ds(r0, x_chunk), pl.ds(h_idx * 16, 16), :
+                ] = x_in_ref[
+                    pl.ds(r0, x_chunk), pl.ds(h_idx * 2048, 2048)
+                ].reshape(x_chunk, 16, 128)
+        return
+
+    x_rc = 16
+
+    def _reshape_x_chunk(ci, _):
+        r0 = pl.multiple_of(ci * x_rc, x_rc)
+        for h_idx in range(2):
+            x_3d_buf[
+                pl.ds(r0, x_rc), pl.ds(h_idx * 16, 16), :
+            ] = x_in_ref[
+                pl.ds(r0, x_rc), pl.ds(h_idx * 2048, 2048)
+            ].reshape(x_rc, 16, 128)
+        return _
+
+    lax.fori_loop(0, batch_size // x_rc, _reshape_x_chunk, jnp.int32(0))
+
+
 def zero_and_pack_muse_sparse_from_vmem(
     plan_res: MuseSparsePlanResult,
     *,
@@ -1605,10 +1640,12 @@ def zero_and_pack_muse_sparse_from_vmem(
     accum_3d,
     io_3d_buf,
     accum_2d=None,
+    x_in_ref=None,
+    x_3d_buf=None,
     batch_size: int,
     cfg: SparseDecodeConfig,
 ) -> None:
-    """Zero MoE accumulators/staging buffers and scatter packed tokens into SMEM buckets."""
+    """Zero MoE accumulators/staging buffers, optionally reshape x->3D, and pack SMEM buckets."""
     tile_m = cfg.tile_m
     if plan_res.is_dense:
         for s_col in range(0, _H, 1024):
@@ -1653,6 +1690,11 @@ def zero_and_pack_muse_sparse_from_vmem(
             return _
 
         lax.fori_loop(0, tile_m // 8, _zero_io_chunk, jnp.int32(0))
+
+    # Emit VPU x_in->x_3d_buf relayout before pack_active_tokens_smem's scf.for
+    # so VPU/XLU relayout overlaps concurrently with SALU packing and Expert-0 DMA.
+    if x_in_ref is not None and x_3d_buf is not None:
+        _reshape_x_to_3d(x_in_ref, x_3d_buf, batch_size, cfg)
 
     pack_active_tokens_smem(
         batch_size,
@@ -1705,6 +1747,8 @@ def plan_and_prime_muse_sparse_from_vmem(
     stop_stage: str = "",
     early_exit_fn=None,
     zero_and_pack: bool = True,
+    x_in_ref=None,
+    x_3d_buf=None,
 ) -> MuseSparsePlanResult | None:
     """Phase 1 of VMEM-resident Muse sparse decode: route, plan, prime Expert-0, & optional zero/pack.
 
@@ -1962,6 +2006,8 @@ def plan_and_prime_muse_sparse_from_vmem(
             accum_3d=accum_3d,
             io_3d_buf=io_3d_buf,
             accum_2d=accum_2d,
+            x_in_ref=x_in_ref,
+            x_3d_buf=x_3d_buf,
             batch_size=batch_size,
             cfg=cfg,
         )
@@ -2034,8 +2080,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
       - Pass ``x_is_3d=True`` if ``x_3d_buf`` already holds ``[B, 32, 128] bf16``.
       - Pass ``on_experts_done_fn`` to immediately launch ``chip_b2`` weight DMAs
         into freed ``w1_buf`` / ``w2_buf`` overlapped with ``PAIR_RS``.
-      - Pass ``return_sharded=True, write_output_ref=False`` to leave the
-        sharded BF16 MoE output directly inside ``owner_3d`` VMEM.
+      - Pass ``write_output_ref=False`` to leave the BF16 MoE output in VMEM:
+        inside ``owner_3d`` when ``return_sharded=True`` or inside ``fan_3d_buf``
+        (``[B, 32, 128]``) when ``return_sharded=False``.
     """
     is_dense = plan_res.is_dense
     is_k256 = plan_res.is_k256
@@ -2069,31 +2116,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         if use_lhs_fp8:
             _prequant_lhs_k256(x_in_ref, lhs_fp8_buf, lhs_sc_buf, batch_size)
     elif not x_is_3d:
-        if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
-            cfg.fast_gs and batch_size <= 128
-        ):
-            x_chunk = min(batch_size, 32)
-            for r0 in range(0, batch_size, x_chunk):
-                for h_idx in range(2):
-                    x_3d_buf[
-                        pl.ds(r0, x_chunk), pl.ds(h_idx * 16, 16), :
-                    ] = x_in_ref[
-                        pl.ds(r0, x_chunk), pl.ds(h_idx * 2048, 2048)
-                    ].reshape(x_chunk, 16, 128)
-        else:
-            x_rc = 16
-
-            def _reshape_x_chunk(ci, _):
-                r0 = pl.multiple_of(ci * x_rc, x_rc)
-                for h_idx in range(2):
-                    x_3d_buf[
-                        pl.ds(r0, x_rc), pl.ds(h_idx * 16, 16), :
-                    ] = x_in_ref[
-                        pl.ds(r0, x_rc), pl.ds(h_idx * 2048, 2048)
-                    ].reshape(x_rc, 16, 128)
-                return _
-
-            lax.fori_loop(0, batch_size // x_rc, _reshape_x_chunk, jnp.int32(0))
+        _reshape_x_to_3d(x_in_ref, x_3d_buf, batch_size, cfg)
 
 
     # --- Compute strip helpers ---
@@ -4100,10 +4123,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             fan_s2_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        if write_output_ref and output_ref is not None:
+            for r0 in range(0, batch_size, 16):
+                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
+                    pl.ds(r0, 16), :, :
+                ].reshape(16, _H)
 
         mate_op.wait_send()
         for c, op in s1_ops:
@@ -4144,10 +4168,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             fan_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        if write_output_ref and output_ref is not None:
+            for r0 in range(0, batch_size, 16):
+                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
+                    pl.ds(r0, 16), :, :
+                ].reshape(16, _H)
 
         for dest, fan_op in fan_copies:
 
@@ -4279,6 +4304,8 @@ def _run_muse_sparse_from_vmem_core(
         stop_stage=stop_stage,
         early_exit_fn=early_exit_fn,
         zero_and_pack=True,
+        x_in_ref=None if x_is_3d else x_in_ref,
+        x_3d_buf=None if x_is_3d else x_3d_buf,
     )
     if plan_res is None:
         return
@@ -4330,7 +4357,7 @@ def _run_muse_sparse_from_vmem_core(
         return_sharded=return_sharded,
         ep_axis_name=ep_axis_name,
         cfg=cfg,
-        x_is_3d=x_is_3d,
+        x_is_3d=True if not plan_res.is_dense else x_is_3d,
         wait_entry_barrier=wait_entry_barrier,
         write_output_ref=write_output_ref,
         on_experts_done_fn=on_experts_done_fn,

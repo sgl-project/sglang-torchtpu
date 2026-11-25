@@ -1497,6 +1497,10 @@ class TpuEnvs:
     # Wave-9 opt-in TP_chip=2 W_post [4096, 4096] in chip-sharded Bridge 2b & L61 Final Norm on TP=8,
     # eliminating both tok_s2 and post_ici inter-chip ICI collectives (+0.97 GiB/rank HBM).
     SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST = EnvBool(False)
+    # Wave-9 opt-in Step (b) [chip_b1 + muse_sparse + chip_b2] decode superkernel (L0..L60)
+    # + Step (a) [chip_b1 + muse_sparse] on L61 across TP=8/16 (eliminates inter-op XLA
+    # barriers and keeps residual stream live in VMEM across MoE).
+    SGLANG_TPU_MUSE_DECODE_B1_MOE_B2_SUPERKERNEL = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across

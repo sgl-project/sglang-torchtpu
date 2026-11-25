@@ -3642,6 +3642,319 @@ class MuseSparkDecoderLayer(nn.Module):
                 b2_kind = 2
         return b1_kind, b2_kind
 
+    def _can_run_b1_moe_superkernel(self, n_tok: int, *, tp: int, is_dec_step: bool) -> bool:
+        """True when ``self`` and its NVFP4 sparse MoE match Wave-9 Step (a)/(b) superkernels."""
+        if not bool(self.__dict__.get("_w9_b1_moe_b2_superkernel", False)) or not is_dec_step:
+            return False
+        mlp = self.mlp
+        valid_b = (32, 64, 128) if tp == 8 else (64, 128)
+        if (
+            n_tok not in valid_b
+            or mlp.__dict__.get("_fused_decode_mode", "") != "sparse"
+            or mlp.__dict__.get("_fused_decode_op") is None
+            or n_tok not in mlp.__dict__.get("_fused_decode_batches", ())
+            or "_w8_wpre_pair_w8k" not in mlp._buffers
+            or "_w7_wrouter_km" not in mlp._buffers
+        ):
+            return False
+        allow_eplb = bool(
+            mlp.__dict__.get("_decode_allow_prefill_eplb", False)
+            or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_ALLOW_PREFILL_EPLB", False)
+        )
+        if mlp.__dict__.get("_eplb_num_replicas", 0) and not allow_eplb:
+            return False
+        ex = mlp.experts
+        has_shadow = "_decode_fp4_w1" in mlp._buffers
+        w1_arg = (
+            mlp._buffers["_decode_fp4_w1"]
+            if has_shadow
+            else getattr(ex, "w13_weight", None)
+        )
+        s1_arg = (
+            mlp._buffers["_decode_fp4_s1"]
+            if has_shadow
+            else getattr(ex, "w13_weight_scale", None)
+        )
+        if w1_arg is None or s1_arg is None:
+            return False
+        e_local = 256 // tp
+        max_groups = (e_local + 8) if allow_eplb else e_local
+        return (
+            w1_arg.dtype == torch.float4_e2m1fn_x2
+            and w1_arg.ndim == 3
+            and (e_local <= int(w1_arg.shape[0]) <= max_groups)
+            and tuple(w1_arg.shape[1:]) == (4096, 4096)
+            and s1_arg.dtype == torch.bfloat16
+            and s1_arg.ndim == 3
+            and int(s1_arg.shape[1]) > 0
+            and 4096 % int(s1_arg.shape[1]) == 0
+            and (4096 // int(s1_arg.shape[1])) in (16, 256, 512)
+            and mlp._bias_2d().dtype == torch.float32
+            and mlp._norm_2d().dtype in (torch.bfloat16, torch.float32)
+        )
+
+    def _try_b1_moe_superkernel(
+        self,
+        *,
+        positions: torch.Tensor,
+        stream: torch.Tensor,
+        attn_input: torch.Tensor,
+        forward_batch: ForwardBatch,
+        n_tok: int,
+        tp: int,
+        b2_kind: int,
+        is_dec_step: bool,
+        pa_alpha_arg: torch.Tensor,
+        pa_beta_arg: torch.Tensor,
+        pre_ff_gain: torch.Tensor,
+        pre_exp_gain: torch.Tensor,
+        cos_sin_step: Optional[torch.Tensor],
+        cs_kw: dict,
+        precomputed_qkv_gate: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        precomputed_prepared_qkvg: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        next_input_layernorm: Optional[MuseSparkRMSNorm],
+        next_layer_attn: Optional[MuseSparkAttention],
+        final_layernorm: Optional[MuseSparkRMSNorm],
+    ):
+        """Run fused Step (b) [b1+MoE+b2] (``b2_kind==3``) or Step (a) [b1+MoE] (``L61``)."""
+        if not self._can_run_b1_moe_superkernel(n_tok, tp=tp, is_dec_step=is_dec_step):
+            return None
+        from sglang_tpu.muse_megakernel.decode.b1_moe_ops import (
+            get_b1_moe_b2_chip_sharded_op,
+            get_b1_moe_chip_sharded_op,
+        )
+
+        mlp = self.mlp
+        ex = mlp.experts
+        w_router_km = mlp._buffers["_w7_wrouter_km"]
+        has_shadow = "_decode_fp4_w1" in mlp._buffers
+        w1_arg = mlp._buffers["_decode_fp4_w1"] if has_shadow else ex.w13_weight
+        s1_arg = mlp._buffers["_decode_fp4_s1"] if has_shadow else ex.w13_weight_scale
+        w2_arg = mlp._buffers["_decode_fp4_w2"] if has_shadow else ex.w2_weight
+        s2_arg = mlp._buffers["_decode_fp4_s2"] if has_shadow else ex.w2_weight_scale
+        num_rep = int(mlp.__dict__.get("_fused_decode_num_replicas", 0))
+        has_spec = bool(mlp.__dict__.get("_fused_decode_has_spec_slot", False))
+        cost_mode = str(mlp.__dict__.get("_fused_decode_replica_cost_mode", "tiles"))
+        rep_tail = (
+            (
+                mlp._fused_decode_rep_w1,
+                mlp._fused_decode_rep_s1,
+                mlp._fused_decode_rep_w2,
+                mlp._fused_decode_rep_s2,
+                mlp._fused_decode_replica_meta,
+            )
+            if num_rep > 0
+            else ()
+        )
+        spec_tail = (mlp._fused_decode_spec_slot,) if has_spec else ()
+        bf16_router = w_router_km.dtype == torch.bfloat16
+
+        if (
+            b2_kind == 3
+            and "_w9_wpost_pair_w8k" in mlp._buffers
+            and next_input_layernorm is not None
+            and next_layer_attn is not None
+            and "_w7_wqkv_w8k" in next_layer_attn._buffers
+            and "_w7_wgate_w8k" in next_layer_attn._buffers
+        ):
+            post_ff_gain = self.post_feedforward_layernorm.gain()
+            next_in_gain = next_input_layernorm.gain()
+            assert post_ff_gain is not None and next_in_gain is not None
+            use_qkv_epi = (
+                (
+                    tp == 8
+                    or (
+                        tp == 16
+                        and bool(_env_get("SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI", False))
+                    )
+                )
+                and bool(self.__dict__.get("_w8_bridge_qkv_epi", False))
+                and _can_use_bridge_qkv_epi(
+                    n_tok,
+                    next_layer_attn,
+                    cos_sin_step,
+                    forward_batch,
+                    max_tok=384,
+                )
+            )
+            next_has_rope = next_layer_attn.rotary_emb is not None
+            if use_qkv_epi and next_has_rope and cos_sin_step is None:
+                return None
+            gated = self.self_attn(
+                positions,
+                attn_input,
+                forward_batch,
+                precomputed_qkv_gate=precomputed_qkv_gate,
+                precomputed_prepared_qkvg=precomputed_prepared_qkvg,
+                return_gated_attn=True,
+                **cs_kw,
+            )
+            op_b2 = get_b1_moe_b2_chip_sharded_op(
+                tp,
+                bf16_router=bf16_router,
+                num_replicas=num_rep,
+                has_spec_slot=has_spec,
+                replica_cost_mode=cost_mode,
+                fuse_qkv_epi=use_qkv_epi,
+                has_rope=next_has_rope,
+            )
+            cs_tail = (cos_sin_step,) if (use_qkv_epi and next_has_rope) else ()
+            epi_scalars = (
+                (
+                    float(next_layer_attn.norm_eps),
+                    float(next_layer_attn.query_scale),
+                    float(getattr(next_layer_attn.attn, "k_scale_float", None) or 1.0),
+                    float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
+                )
+                if use_qkv_epi
+                else ()
+            )
+            return op_b2(
+                mlp._fused_decode_rank,
+                stream,
+                gated,
+                self.self_attn._o_proj_w8k,
+                self.self_attn._o_proj_scale,
+                pa_alpha_arg,
+                pa_beta_arg,
+                pre_ff_gain,
+                mlp._buffers["_w8_wpre_pair_w8k"],
+                mlp._buffers["_w8_spre_pair"],
+                w_router_km,
+                pre_exp_gain,
+                mlp._bias_2d(),
+                w1_arg,
+                s1_arg,
+                w2_arg,
+                s2_arg,
+                mlp._norm_2d(),
+                mlp._buffers["_w9_wpost_pair_w8k"],
+                mlp._buffers["_w9_spost_pair"],
+                post_ff_gain,
+                self.post_feedforward_residual_gate.alpha,
+                self.post_feedforward_residual_gate.beta,
+                next_in_gain,
+                next_layer_attn._buffers["_w7_wqkv_w8k"],
+                next_layer_attn._buffers["_w7_sqkv"],
+                next_layer_attn._buffers["_w7_wgate_w8k"],
+                next_layer_attn._buffers["_w7_sgate"],
+                *cs_tail,
+                *rep_tail,
+                *spec_tail,
+                float(self.post_attention_layernorm.eps),
+                float(self.pre_feedforward_layernorm.eps),
+                bool(self.pre_feedforward_layernorm.scale_input),
+                float(mlp.router_multiplier),
+                float(mlp.pre_expert_norm.eps),
+                bool(mlp.pre_expert_norm.scale_input),
+                float(self.post_feedforward_layernorm.eps),
+                bool(self.post_feedforward_layernorm.scale_input),
+                float(next_input_layernorm.eps),
+                bool(next_input_layernorm.scale_input),
+                *epi_scalars,
+            )
+
+        if (
+            b2_kind in (1, 2)
+            and "_w7_wpost_w8k" in mlp._buffers
+            and (n_tok // tp) >= 8
+            and (n_tok // tp) % 8 == 0
+        ):
+            from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                get_moe_post_chip_sharded_final_norm_op,
+            )
+
+            gated = self.self_attn(
+                positions,
+                attn_input,
+                forward_batch,
+                precomputed_qkv_gate=precomputed_qkv_gate,
+                precomputed_prepared_qkvg=precomputed_prepared_qkvg,
+                return_gated_attn=True,
+                **cs_kw,
+            )
+            stream_mid, moe_sh = get_b1_moe_chip_sharded_op(
+                tp,
+                bf16_router=bf16_router,
+                num_replicas=num_rep,
+                has_spec_slot=has_spec,
+                replica_cost_mode=cost_mode,
+                return_sharded=True,
+            )(
+                mlp._fused_decode_rank,
+                stream,
+                gated,
+                self.self_attn._o_proj_w8k,
+                self.self_attn._o_proj_scale,
+                pa_alpha_arg,
+                pa_beta_arg,
+                pre_ff_gain,
+                mlp._buffers["_w8_wpre_pair_w8k"],
+                mlp._buffers["_w8_spre_pair"],
+                w_router_km,
+                pre_exp_gain,
+                mlp._bias_2d(),
+                w1_arg,
+                s1_arg,
+                w2_arg,
+                s2_arg,
+                mlp._norm_2d(),
+                *rep_tail,
+                *spec_tail,
+                float(self.post_attention_layernorm.eps),
+                float(self.pre_feedforward_layernorm.eps),
+                bool(self.pre_feedforward_layernorm.scale_input),
+                float(mlp.router_multiplier),
+                float(mlp.pre_expert_norm.eps),
+                bool(mlp.pre_expert_norm.scale_input),
+            )
+            w_post_p = mlp._buffers.get("_w9_wpost_pair_w8k", mlp._buffers["_w7_wpost_w8k"])
+            s_post_p = mlp._buffers.get("_w9_spost_pair", mlp._buffers["_w7_spost"])
+            post_ff_gain = self.post_feedforward_layernorm.gain()
+            pf_alpha_arg = self.post_feedforward_residual_gate.alpha
+            pf_beta_arg = self.post_feedforward_residual_gate.beta
+            assert post_ff_gain is not None
+            if b2_kind == 1 and final_layernorm is not None:
+                fin_gain = final_layernorm.gain()
+                assert fin_gain is not None
+                hid_f = get_moe_post_chip_sharded_final_norm_op(
+                    tp, sharded_moe_in=True, return_stream_too=False
+                )(
+                    stream_mid,
+                    moe_sh,
+                    w_post_p,
+                    s_post_p,
+                    post_ff_gain,
+                    pf_alpha_arg,
+                    pf_beta_arg,
+                    fin_gain,
+                    float(self.post_feedforward_layernorm.eps),
+                    bool(self.post_feedforward_layernorm.scale_input),
+                    float(final_layernorm.eps),
+                    bool(final_layernorm.scale_input),
+                )
+                return (hid_f,)
+            if b2_kind == 2 and next_input_layernorm is not None:
+                next_in_gain = next_input_layernorm.gain()
+                assert next_in_gain is not None
+                return get_moe_post_chip_sharded_final_norm_op(
+                    tp, sharded_moe_in=True, return_stream_too=True
+                )(
+                    stream_mid,
+                    moe_sh,
+                    w_post_p,
+                    s_post_p,
+                    post_ff_gain,
+                    pf_alpha_arg,
+                    pf_beta_arg,
+                    next_in_gain,
+                    float(self.post_feedforward_layernorm.eps),
+                    bool(self.post_feedforward_layernorm.scale_input),
+                    float(next_input_layernorm.eps),
+                    bool(next_input_layernorm.scale_input),
+                )
+        return None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3728,6 +4041,30 @@ class MuseSparkDecoderLayer(nn.Module):
                 assert pre_ff_gain is not None and pre_exp_gain is not None
                 prerouted_topk = False
                 if b1_kind == 2:
+                    if chip_sharded_stream:
+                        sk_out = self._try_b1_moe_superkernel(
+                            positions=positions,
+                            stream=stream,
+                            attn_input=attn_input,
+                            forward_batch=forward_batch,
+                            n_tok=n_tok,
+                            tp=tp,
+                            b2_kind=b2_kind,
+                            is_dec_step=is_dec_step,
+                            pa_alpha_arg=pa_alpha_arg,
+                            pa_beta_arg=pa_beta_arg,
+                            pre_ff_gain=pre_ff_gain,
+                            pre_exp_gain=pre_exp_gain,
+                            cos_sin_step=cos_sin_step,
+                            cs_kw=cs_kw,
+                            precomputed_qkv_gate=precomputed_qkv_gate,
+                            precomputed_prepared_qkvg=precomputed_prepared_qkvg,
+                            next_input_layernorm=next_input_layernorm,
+                            next_layer_attn=next_layer_attn,
+                            final_layernorm=final_layernorm,
+                        )
+                        if sk_out is not None:
+                            return sk_out
                     gated = self.self_attn(
                         positions,
                         attn_input,
@@ -5922,8 +6259,25 @@ class MuseSparkForConditionalGeneration(nn.Module):
             bool(_env_get("SGLANG_TPU_MUSE_DECODE_TOKEN_SHARDED_BRIDGES", False))
             and not chip_sharded
         )
+        b1_moe_b2_super = bool(
+            _env_get("SGLANG_TPU_MUSE_DECODE_B1_MOE_B2_SUPERKERNEL", False)
+        )
+        fuse_b1_tk = bool(
+            _env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE1_FUSE_TOPK", False)
+        )
+        eff_b1_moe_b2_super = (
+            mode == 3
+            and chip_sharded
+            and b1_moe_b2_super
+            and not m2m_enabled
+            and not fuse_b1_tk
+        )
         chip_b2_tp2_wpost = bool(
-            chip_sharded and tpu_envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.get()
+            chip_sharded
+            and (
+                tpu_envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.get()
+                or eff_b1_moe_b2_super
+            )
         )
         bridge_qkv_epi = bool(_env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI", False))
         tp16_qkv_epi = bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.get())
@@ -6043,16 +6397,16 @@ class MuseSparkForConditionalGeneration(nn.Module):
             or torch.distributed.get_world_size() != warm_tp
         ):
             all_chip_sh_ready = False
-        # Require r_pair >= 16: r_pair == 8 (B=32 on TP=8 -> 50.0 vs 52.7 us/L; B=64 on TP=16 ->
-        # 61.26 vs 63.61 us/L) keeps the faster W7+W8 path without 3D bf16 pack, while r_pair >= 16
-        # wins cleanly (-3.45 us/L at B=64 TP=8; -59.00 us/L at B=256 TP=16 on Ghostfish silicon).
+        # Require r_pair >= 16 on standard chip-sharded bridges (B=64 TP=16 uses W7+W8 unless
+        # Step (b) [b1+MoE+b2] superkernel is enabled, which fuses B=64 TP=16 end-to-end!).
         chip_sh_batches = (
             (64, 128, 256, 384)
-            if warm_tp == 8
+            if (warm_tp == 8 or (warm_tp == 16 and eff_b1_moe_b2_super))
             else ((128, 256, 384) if warm_tp == 16 else ())
         )
         eff_bridge_qkv_epi = bridge_qkv_epi and (warm_tp == 8 or tp16_qkv_epi)
         prewarm_ok = warm_tp in SUPPORTED_WORLD_SIZES and dist_ok
+        b1_moe_b2_layer_flags = [False] * (self.end_layer - self.start_layer)
         if prewarm_ok:
             if (tok_sharded and all_tok_sh_ready) or (
                 chip_sharded and all_chip_sh_ready
@@ -6091,9 +6445,39 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     tok_sharded=tok_sharded and all_tok_sh_ready,
                     **m2m_pw_kw,
                 )
-            fuse_b1_tk = bool(
-                _env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE1_FUSE_TOPK", False)
-            )
+            if eff_b1_moe_b2_super and all_chip_sh_ready:
+                from sglang_tpu.muse_megakernel.decode.b1_moe_ops import (
+                    prewarm_b1_moe_superkernel_ops,
+                )
+
+                super_cfgs = set()
+                rope_vars = set()
+                for idx_off, layer_idx in enumerate(range(self.start_layer, self.end_layer)):
+                    lyr = self.model.layers[layer_idx]
+                    mlp = lyr.mlp
+                    if (
+                        mlp.__dict__.get("_fused_decode_mode", "") == "sparse"
+                        and mlp.__dict__.get("_fused_decode_op") is not None
+                        and "_w8_wpre_pair_w8k" in mlp._buffers
+                        and "_w7_wrouter_km" in mlp._buffers
+                    ):
+                        b1_moe_b2_layer_flags[idx_off] = True
+                        super_cfgs.add(
+                            (
+                                int(mlp.__dict__.get("_fused_decode_num_replicas", 0)),
+                                bool(mlp.__dict__.get("_fused_decode_has_spec_slot", False)),
+                                str(mlp.__dict__.get("_fused_decode_replica_cost_mode", "tiles")),
+                                mlp._buffers["_w7_wrouter_km"].dtype == torch.bfloat16,
+                            )
+                        )
+                        rope_vars.add(lyr.self_attn.rotary_emb is not None)
+                if super_cfgs:
+                    prewarm_b1_moe_superkernel_ops(
+                        warm_tp,
+                        super_cfgs,
+                        bridge_qkv_epi=eff_bridge_qkv_epi,
+                        has_rope_variants=tuple(sorted(rope_vars)) or (True,),
+                    )
             fuse_b2_dqkv = bool(
                 _env_get("SGLANG_TPU_MUSE_DECODE_BRIDGE2_DIRECT_QKV_EPI", False)
             )
@@ -6114,10 +6498,11 @@ class MuseSparkForConditionalGeneration(nn.Module):
         # Gate all Wave-8 / Wave-9 runtime dispatch flags on prewarm_ok so forward() can NEVER
         # trigger lazy cpu_export_jax_op inside torch.compile (#1454).
         qkv_epi_ready = prewarm_ok and eff_bridge_qkv_epi
-        for layer_idx in range(self.start_layer, self.end_layer):
+        for idx_off, layer_idx in enumerate(range(self.start_layer, self.end_layer)):
             lyr = self.model.layers[layer_idx]
             lyr._w8_bridge_qkv_epi = qkv_epi_ready
             lyr.self_attn._w8_bridge_qkv_epi = qkv_epi_ready
+            lyr._w9_b1_moe_b2_superkernel = bool(b1_moe_b2_layer_flags[idx_off])
         self.model._w9_m2m_supports_chip_sh = m2m_supports_chip_sh
         self.model._w8_fuse_final_norm = (
             prewarm_ok and fuse_final_norm and (mode in (2, 3, 4, 5, 6))
