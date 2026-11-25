@@ -134,6 +134,12 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # MiniMax-H3: prompt token counts whose length-shaped programs every rank
+    # compiles at startup (multimodal_gen/minimax_h3_text_warmup.py), e.g.
+    # "24-64" or "36-47,64": one synthetic t2va warmup request a length (a
+    # generated prompt of that many tokens, the synthetic-warmup canvas, the
+    # stages before decoding, one denoise step), results dropped. Unset: off.
+    SGLANG_TPU_OPT_H3_TEXT_WARMUP_LENGTHS = EnvStr(None)
     # Kimi-K3: run attention-residual aggregation for decode-sized batches as
     # one Pallas kernel (pending add + mix + out norm) instead of the torch
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not

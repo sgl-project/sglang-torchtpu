@@ -18,6 +18,11 @@ def install_runtime_patches() -> None:
     rope.install()
     minimax_h3.install()
 
+    from sglang_tpu.multimodal_gen import minimax_h3_text_warmup
+
+    if minimax_h3_text_warmup.requested():
+        minimax_h3_text_warmup.install()
+
 
 def configure_compile_cache() -> None:
     """Scope persisted torch.compile artifacts to what FX graphs cannot see.
