@@ -401,9 +401,9 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         from sglang.srt.mem_cache.unified_cache.components import ComponentType as CT
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.test.tree_slots import tree_slots_of
-        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.hicache_write_back_copy_ahead import attach_copy_ahead
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         # 1. Unified write_back defaults SWA copy-ahead to 131072 without shrinking Full.
         tp, ta = make_target(size=128)
@@ -450,13 +450,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         # 2. alloc_extend updates full_to_swa_index_mapping + draft SWA sidecar from host
         #    buffers without reading back from device ("meta" raises on any D2H copy).
         with (
-            patch.object(swa, "_is_tpu", True),
-            patch.object(
-                swa,
-                "TpuPagedTokenToKVPoolAllocator",
-                TpuPagedTokenToKVPoolAllocator,
-                create=True,
-            ),
+            patch.object(swa, "current_platform", TpuSRTPlatform()),
         ):
             _, ta_meta = make_target(size=64)
             dp_meta = attach_draft(ta_meta, (), (0, 1))

@@ -286,7 +286,6 @@ class TestMXINT8Configurator(CustomTestCase):
     ):
         from sglang.srt.mem_cache.allocator import swa
         from sglang_tpu import unified_kv_pool
-        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang_tpu.tpu_platform import TpuSRTPlatform
@@ -328,13 +327,7 @@ class TestMXINT8Configurator(CustomTestCase):
                 get_parallel().override(
                     attn_tp_size=1, attn_dcp_size=1, dcp_enabled=False
                 ),
-                patch.object(swa, "_is_tpu", True),
-                patch.object(
-                    swa,
-                    "TpuPagedTokenToKVPoolAllocator",
-                    TpuPagedTokenToKVPoolAllocator,
-                    create=True,
-                ),
+                patch.object(swa, "current_platform", tpu_platform),
                 patch.object(self.configurator, "_validate_mxint8", return_value=None),
                 patch.object(
                     self.configurator, "_tpu_mha_pool_class", lambda _: _StubMXINT8Pool

@@ -137,14 +137,7 @@ class TestTpuAllocatorLifecycle(CustomTestCase):
         for name, free in frees.items():
             with (
                 self.subTest(free=name),
-                patch.object(swa, "_is_tpu", True),
                 patch.object(swa, "current_platform", TpuSRTPlatform()),
-                patch.object(
-                    swa,
-                    "TpuPagedTokenToKVPoolAllocator",
-                    TpuPagedTokenToKVPoolAllocator,
-                    create=True,
-                ),
             ):
                 kv_pool = SWAKVPool(
                     size=size,
@@ -335,14 +328,7 @@ class TestHostExtendAllocation(CustomTestCase):
         page_size, size = 4, 32
         with (
             get_context().override_server_args(enable_torch_compile=True),
-            patch.object(swa, "_is_tpu", True),
             patch.object(swa, "current_platform", TpuSRTPlatform()),
-            patch.object(
-                swa,
-                "TpuPagedTokenToKVPoolAllocator",
-                TpuPagedTokenToKVPoolAllocator,
-                create=True,
-            ),
         ):
             kv_pool = SWAKVPool(
                 size=size,

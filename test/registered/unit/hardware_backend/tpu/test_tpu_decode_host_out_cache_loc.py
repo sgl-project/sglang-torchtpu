@@ -20,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
@@ -176,8 +177,7 @@ class TestAllocHostResidentPool(CustomTestCase):
     def setUp(self):
         for target, name, value in (
             (allocation, "_is_tpu", True),
-            (swa, "_is_tpu", True),
-            (swa, "TpuPagedTokenToKVPoolAllocator", TpuPagedTokenToKVPoolAllocator),
+            (swa, "current_platform", TpuSRTPlatform()),
             # write_cache_indices skips Triton for torch_native, as it does for
             # the Pallas backends once sglang_tpu.patches has run.
             (allocation, "attention_backends", lambda: ("torch_native",) * 2),
@@ -382,13 +382,9 @@ class TestAllocHostResidentPool(CustomTestCase):
 
 class TestSwaAllocExtendHostOutput(CustomTestCase):
     def setUp(self):
-        for name, value in (
-            ("_is_tpu", True),
-            ("TpuPagedTokenToKVPoolAllocator", TpuPagedTokenToKVPoolAllocator),
-        ):
-            patcher = patch.object(swa, name, value, create=True)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = patch.object(swa, "current_platform", TpuSRTPlatform())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_ring_mode_fills_host_buffer(self):
         """Ring mode skips the SWA allocator; the caller's host buffer must

@@ -21,7 +21,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm as SA
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu import unified_kv_pool as ukp
-from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.dflash_draft_kv_write import _scatter_layer_kv
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
@@ -30,6 +29,7 @@ from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
 from sglang_tpu.hooks import draft_kv_pool as dkp_hooks
 from sglang_tpu.kv_free_fence import install_kv_free_fence
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -368,17 +368,9 @@ class TestDraftCoPricingAndValidation(unittest.TestCase):
 
 class TestDraftSwaSidecarAndFence(unittest.TestCase):
     def setUp(self):
-        for p in (
-            patch.object(swa, "_is_tpu", True),
-            patch.object(
-                swa,
-                "TpuPagedTokenToKVPoolAllocator",
-                TpuPagedTokenToKVPoolAllocator,
-                create=True,
-            ),
-        ):
-            p.start()
-            self.addCleanup(p.stop)
+        p = patch.object(swa, "current_platform", TpuSRTPlatform())
+        p.start()
+        self.addCleanup(p.stop)
 
     def _build_target(self, num_pages=24, m_swa=3):
         sz = num_pages * 8

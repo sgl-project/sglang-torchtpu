@@ -41,7 +41,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
-from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -103,14 +102,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", page_size=PAGE), role="scheduler")
         with (
-            patch.object(swa, "_is_tpu", True),
             patch.object(swa, "current_platform", TpuSRTPlatform()),
-            patch.object(
-                swa,
-                "TpuPagedTokenToKVPoolAllocator",
-                TpuPagedTokenToKVPoolAllocator,
-                create=True,
-            ),
         ):
             kv_pool = SWAKVPool(
                 size=POOL_TOKENS,
