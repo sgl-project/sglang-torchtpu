@@ -560,6 +560,7 @@ def kernel_main_fused_rs(
     q8_in_gmm1: int = 0,  # leading q8 blocks per forwarded run of tile g - 2 done in GMM1(g)
     q8_tree: bool = False,  # q8 blocks of 8 rows, row maxima by a sublane tree
     pair_mask_offsets: bool = False,  # grouped pair-path DMA sites (see _send_grouped)
+    pair_send_bucket: bool = False,  # sibling send: one bucket-sized DMA from GMM2
     gather_in_gmm1: int = 0,  # first rows of tile g + 1's gather issued inside GMM1(g)
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
@@ -1115,6 +1116,18 @@ def kernel_main_fused_rs(
             _gm_id=0,
             _n_id=n_id,
         )
+        if pair_send_bucket and n_id == 0 and k_id == 0 and not _no_ring:
+            # after the staging stores in program order; the credit was waited before GMM2
+            stg = gm_id % staging_slots
+            ring_slot = gm_id % pair_ring
+            pltpu.make_async_remote_copy(
+                src_ref=scatter_staging_3x_ref.at[stg, pl.ds(0, m_rows)],
+                dst_ref=pair_ring_ref.at[ring_slot, pl.ds(0, m_rows)],
+                send_sem=send_sems_ref.at[stg],
+                recv_sem=pair_recv_sem_ref.at[ring_slot],
+                device_id={ep_axis_name: sibling},
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
 
     # Initialize per-slot DMA counts to 0.
     for _s in range(staging_slots):
@@ -1327,6 +1340,8 @@ def kernel_main_fused_rs(
         n_pieces = _pair_count_pieces(
             metadata_ref.gm_id_to_m_offset[g + 1] - metadata_ref.gm_id_to_m_offset[g]
         )
+        if pair_send_bucket:  # one DMA per tile
+            n_pieces = jnp.minimum(n_pieces, 1)
 
         @pl.when(jnp.logical_and(n_pieces > 0, not _no_ring))
         def _():
@@ -2164,6 +2179,12 @@ def kernel_main_fused_rs(
             if _direct_stage and defer_writes:
                 wait_staging_slot_writes(stg_id)
 
+            if pair_send_bucket and not _no_ring:
+
+                @pl.when(gm_id >= pair_ring)
+                def _():
+                    pl.semaphore_wait(pair_credit_ref.at[0], 1)  # the sibling freed it
+
             # GMM2 loop.
             for step in range(total_w2_steps):
                 _n2 = step // num_k2
@@ -2218,7 +2239,11 @@ def kernel_main_fused_rs(
 
             if pair_exchange:
                 # tile g's rows go to the sibling now; tile g-1 completes while they fly
-                _pair_send(gm_id, stg_id, _ml, num_valid)
+                if pair_send_bucket:
+                    if not _no_ring:
+                        gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + 1
+                else:
+                    _pair_send(gm_id, stg_id, _ml, num_valid)
 
                 if q8_in_gmm1:
 
@@ -2713,6 +2738,7 @@ def _pair_exchange_metadata(
         "q8_in_gmm1",
         "q8_tree",
         "pair_mask_offsets",
+        "pair_send_bucket",
         "gather_in_gmm1",
     ],
 )
@@ -2760,6 +2786,7 @@ def gmm_v2_fused_rs(
     q8_tree: bool = False,
     gather_in_gmm1: int = 0,
     pair_mask_offsets: bool = False,
+    pair_send_bucket: bool = False,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3440,6 +3467,7 @@ def gmm_v2_fused_rs(
         kernel_kwargs["q8_in_gmm1"] = q8_in_gmm1
         kernel_kwargs["q8_tree"] = q8_tree
         kernel_kwargs["pair_mask_offsets"] = pair_mask_offsets
+        kernel_kwargs["pair_send_bucket"] = pair_send_bucket
     if gather_in_gmm1:
         if not expert_tp:
             raise ValueError("gather_in_gmm1 needs expert TP")

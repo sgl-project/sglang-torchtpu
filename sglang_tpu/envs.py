@@ -735,6 +735,10 @@ class TpuEnvs:
     # e4m3 pair path: piece offsets by masking the run length (no running sum), the q8 and
     # scale DMAs of a piece under one predicate, pieces >= 64 rows behind one branch.
     SGLANG_TPU_FUSED_RS_PAIR_MASK_OFFSETS = EnvBool(False)
+    # With Q8_IN_GMM1: a tile's partial rows go to the sibling's ring as one DMA of the tile's
+    # row bucket, issued at the end of the GMM2 bucket branch (the ring slot is private to
+    # the tile; the rows past the tile are never read) instead of power-of-two pieces.
+    SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
