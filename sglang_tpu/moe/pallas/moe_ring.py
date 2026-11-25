@@ -143,18 +143,24 @@ def fit_moe_ring(
 
 
 def _route(
-    topk_ids: jax.Array, topk_weights: jax.Array, num_experts: int
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Groups the (token, expert) pairs by expert, in XLA, before the kernel.
+    topk_ids: jax.Array,
+    topk_weights: jax.Array,
+    num_experts: int,
+    tile_rows: tuple[int, ...] = _TILE_ROWS,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Groups the (token, expert) pairs by expert and lists the hit experts by
+    tile size, in XLA, before the kernel.
 
     Every token has k pairs, one per expert it was routed to. The kernel wants
-    them listed expert by expert, so that one expert's rows are contiguous.
+    them listed expert by expert, so that one expert's rows are contiguous, and
+    it runs the hit experts one tile size at a time (see _TILE_ROWS).
 
     Args:
       topk_ids: int [T, k]. Expert id of each pair. Ids outside [0, E) are
         padding: they are listed after every real pair and never read.
       topk_weights: [T, k]. Routing weight of each pair.
       num_experts: E.
+      tile_rows: row-tile sizes, see _TILE_ROWS.
 
     Returns:
       counts: int32 [E]. Number of pairs of each expert.
@@ -162,6 +168,11 @@ def _route(
       tok: int32 [T * k]. Token of each pair, in list order (by expert, then by
         the pair's original position).
       wt: f32 [T * k]. Routing weight of each pair, in list order.
+      active: int32 [E]. Ids of the hit experts: first those whose pair count
+        takes the smallest tile size, then the next size, and so on; by id
+        within a size. Entries past the last hit expert are never read.
+      ends: int32 [len(tile_rows)]. Where each tile size's experts end in
+        `active`; the last entry is the number of hit experts.
     """
     tokens, k = topk_ids.shape
     p = tokens * k
@@ -186,7 +197,33 @@ def _route(
     tok = jnp.sum(jnp.where(hit, (slot // k)[None, :], 0), axis=1, dtype=jnp.int32)
     weights = topk_weights.reshape(p).astype(jnp.float32)
     wt = jnp.sum(jnp.where(hit, weights[None, :], 0.0), axis=1)
-    return counts.astype(jnp.int32), offsets.astype(jnp.int32), tok, wt
+    # Tile-size class of each expert: 0 = not hit, c = uses tile_rows[c - 1]
+    # (counts above the largest size stay in the last class).
+    lows = jnp.asarray((0,) + tuple(tile_rows[:-1]), jnp.int32)
+    size_class = jnp.sum(counts[:, None] > lows[None, :], axis=1, dtype=jnp.int32)
+    classes = jnp.arange(1, len(tile_rows) + 1, dtype=jnp.int32)
+    ends = jnp.cumsum(
+        jnp.sum(size_class[:, None] == classes[None, :], axis=0, dtype=jnp.int32)
+    )
+    # The hit experts in (class, id) order, by the same compare-and-select as
+    # the pairs above; experts that were not hit sort last.
+    expert = jnp.arange(num_experts, dtype=jnp.int32)
+    order = jnp.where(size_class > 0, size_class, len(tile_rows) + 1) * num_experts
+    order = order + expert
+    place = jnp.sum(order[None, :] < order[:, None], axis=1, dtype=jnp.int32)
+    active = jnp.sum(
+        jnp.where(place[None, :] == expert[:, None], expert[None, :], 0),
+        axis=1,
+        dtype=jnp.int32,
+    )
+    return (
+        counts.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        tok,
+        wt,
+        active,
+        ends.astype(jnp.int32),
+    )
 
 
 def _gate_up(
@@ -276,6 +313,8 @@ def _kernel(
     counts_ref: jax.Array,  # SMEM int32 [E]. Rows routed to each expert.
     offsets_ref: jax.Array,  # SMEM int32 [E]. Each expert's first pair in the list.
     tok_ref: jax.Array,  # SMEM int32 [T * k]. Token of each pair, grouped by expert.
+    active_ref: jax.Array,  # SMEM int32 [E]. Ids of the hit experts, by tile size.
+    ends_ref: jax.Array,  # SMEM int32 [len(tile_rows)]. Where each size ends in it.
     wt_ref: jax.Array,  # SMEM f32 [T * k]. Routing weight of each pair.
     x_ref: jax.Array,  # VMEM bf16 [T, H]. Input rows.
     w1_hbm: jax.Array,  # HBM fp8 [E, H, 2n]. Gate/up weights.
@@ -293,7 +332,6 @@ def _kernel(
     acc_ref: jax.Array,  # VMEM f32 [T, H]. Sum of weight * expert output.
     xg_ref: jax.Array,  # VMEM f32 [R, H]. One row tile gathered from xq_ref.
     xsg_ref: jax.Array,  # VMEM f32 [nq, R, lanes]. That tile's block scales.
-    active_ref: jax.Array,  # SMEM int32 [E + 1]. Ids of the hit experts, by tile size.
     *,
     limit: float | None,  # SiLU clamp limit, or None.
     slots: int,  # Weight ring depth.
@@ -348,38 +386,18 @@ def _kernel(
         )
         return out
 
-    def start_dma(lo: jax.Array | int, hi: jax.Array | int) -> None:
-        """Starts the weight copies of hit experts lo..hi-1 that belong to the
-        first slots - 1 experts (the ones in flight before the loop starts)."""
-        for s in range(slots - 1):
+    # active_ref lists the hit experts one tile size after another; ends[k] is
+    # where size k's experts end, and the last one is the number of hit experts.
+    ends = [ends_ref[k] for k in range(len(tile_rows))]
+    n_u = ends[-1]
 
-            @pl.when((s >= lo) & (s < hi))
-            def _(s=s):
-                for cp in weight_copies(s, s):
-                    cp.start()
+    # The first slots - 1 hit experts' copies start before the loop.
+    for s in range(slots - 1):
 
-    # Hit experts grouped by pair-count class: class k takes counts in
-    # (tile_rows[k-1], tile_rows[k]], the last class everything above. The first
-    # class's DMAs start before the other classes are compacted.
-    ends = []
-    count = jnp.int32(0)
-    for k, hi in enumerate(tile_rows):
-        lo = tile_rows[k - 1] if k else 0
-        last = k == len(tile_rows) - 1
-
-        def compact(e, count, lo=lo, hi=hi, last=last):
-            # Branch-free: a later hit overwrites a miss's entry.
-            c = counts_ref[e]
-            active_ref[count] = e
-            hit = (c > lo) if last else ((c > lo) & (c <= hi))
-            return count + hit.astype(jnp.int32)
-
-        count = jax.lax.fori_loop(0, num_experts, compact, count)
-        ends.append(count)
-        if k == 0:
-            start_dma(0, count)
-    n_u = count
-    start_dma(ends[0], n_u)
+        @pl.when(s < n_u)
+        def _(s=s):
+            for cp in weight_copies(s, s):
+                cp.start()
 
     # x quantized once, as gmm_v2 quantizes each lhs block (bf16 scale and
     # inverse, no clip), while the first experts' weights are in flight.
@@ -503,7 +521,9 @@ def moe_ring(
     assert slots >= 2 and hidden % w1_chunks == 0 and n % w2_chunks == 0
     assert list(tile_rows) == sorted(set(tile_rows)) and min(tile_rows) >= 1
     info = pltpu.get_tpu_info()
-    counts, offsets, tok, wt = _route(topk_ids, topk_weights, num_experts)
+    counts, offsets, tok, wt, active, ends = _route(
+        topk_ids, topk_weights, num_experts, tuple(tile_rows)
+    )
     s1 = w1_scale.astype(jnp.float32)
     s2 = w2_scale.astype(jnp.float32)
     nq = hidden // _Q_BLOCK
@@ -525,7 +545,7 @@ def moe_ring(
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=5,
             in_specs=[smem, vmem, hbm, hbm, hbm, hbm],
             out_specs=vmem,
             scratch_shapes=[
@@ -539,13 +559,11 @@ def moe_ring(
                 pltpu.VMEM((tokens, hidden), jnp.float32),
                 pltpu.VMEM((max(tile_rows), hidden), jnp.float32),
                 pltpu.VMEM((nq, max(tile_rows), lanes), jnp.float32),
-                # One past E: a compaction pass after all E hits stores a miss there.
-                pltpu.SMEM((num_experts + 1,), jnp.int32),
             ],
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=limit),
         name=f"moe_ring_{tokens}x{k}_{num_experts}x{hidden}x{two_n}_s{slots}",
-    )(counts, offsets, tok, wt, x, w1, s1, w2, s2)
+    )(counts, offsets, tok, active, ends, wt, x, w1, s1, w2, s2)
 
 
 # Cost model: TensorCore cycles per call on tpu7x, for this kernel and for the

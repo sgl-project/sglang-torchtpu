@@ -39,8 +39,10 @@ class TestMoeRingRoute(CustomTestCase):
         ids[7] = -1  # padding row
         ids[9, 0] = experts  # out of range
         wts = rng.random((tokens, k)).astype(np.float32)
-        counts, offsets, tok, wt = (
-            np.asarray(v) for v in _route(jnp.asarray(ids), jnp.asarray(wts), experts)
+        tile_rows = (2, 4, 8)
+        counts, offsets, tok, wt, active, ends = (
+            np.asarray(v)
+            for v in _route(jnp.asarray(ids), jnp.asarray(wts), experts, tile_rows)
         )
         for e in range(experts):
             want = sorted(
@@ -50,6 +52,12 @@ class TestMoeRingRoute(CustomTestCase):
             got = slice(offsets[e], offsets[e] + counts[e])
             np.testing.assert_array_equal(tok[got], [t for t, _ in want])
             np.testing.assert_array_equal(wt[got], [wts[t, j] for t, j in want])
+        # Hit experts by tile size (1-2, 3-4, 5+ pairs here), then by id.
+        size = [[e for e in range(experts) if lo < counts[e] <= hi]
+                for lo, hi in ((0, 2), (2, 4), (4, tokens * k))]
+        self.assertTrue(all(size))  # every size is exercised
+        np.testing.assert_array_equal(ends, np.cumsum([len(g) for g in size]))
+        np.testing.assert_array_equal(active[: ends[-1]], sum(size, []))
 
 
 @unittest.skipUnless(_HAS_JAX, "requires JAX and torch_tpu")
