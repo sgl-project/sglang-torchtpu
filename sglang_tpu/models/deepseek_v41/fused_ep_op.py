@@ -615,7 +615,10 @@ def layer_skip_reason(moe: torch.nn.Module) -> Optional[str]:
     """Why a V4.1 MoE layer keeps the gmm_v2 path although the switch is on.
     The decision depends only on the model config, so all ranks agree."""
     if moe.is_nextn:
-        return "NextN/MTP draft layer"
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if not tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_DSPARK.get():
+            return "NextN/MTP draft layer"
     if moe.is_hash:
         return "hash-routed layer (token-id top-k)"
     return None

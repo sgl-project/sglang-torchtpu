@@ -719,6 +719,9 @@ class TpuEnvs:
     # Overlap the replicated TP1 FP8 shared expert inside push_fused_moe's
     # SparseCore pre-push window when SGLANG_TPU_DSV41_FUSED_EP_DISPATCH is push or auto.
     SGLANG_TPU_DSV41_FUSED_EP_SHARED_EXPERT = EnvBool(True)
+    # Also run DeepSeek-V4.1 DSpark draft MoE stages (is_nextn=True) on fused_ep_moe_v2
+    # instead of dp_gather + gmm_v2 + all-reduce.
+    SGLANG_TPU_DSV41_FUSED_EP_DSPARK = EnvBool(True)
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
