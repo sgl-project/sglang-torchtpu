@@ -34,8 +34,9 @@ register_tpu_ci(
 )
 
 TEST_NAME = "muse-spark-pd-singlehost-dflash-unified"
-# Must match HICACHE_RATIO in the launch config; see its sizing note.
-HICACHE_RATIO = 16
+# Probe capacity plan only; the server sizes the host pool from the config's
+# hicache_size, which holds what ratio 3 promises for this probe.
+HICACHE_RATIO = 3
 
 
 def self_hostname() -> str:

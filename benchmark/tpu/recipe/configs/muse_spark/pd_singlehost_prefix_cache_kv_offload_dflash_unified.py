@@ -17,14 +17,14 @@ from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_prefix_cache_kv_offlo
     PREFILL_CONFIG as BASE_PREFILL_CONFIG,
 )
 
-# A unified SWA page costs num_swa_groups (3) host pages and SWA may use 30% of the
-# arena, so ratio 16 matches the separate twin's SWA host capacity (193 pages at 3);
-# at 3 the probe's SWA window is trimmed and the host reload comes back empty.
-HICACHE_RATIO = 16
+# Overrides the inherited hicache_ratio. A 2K prompt sits inside Muse's window, so
+# all of it is SWA; a unified SWA page costs 3 host pages and SWA may use 30% of the
+# arena. 2 GB holds the probe and fillers; 1 GB trims the probe's window.
+HICACHE_SIZE_GB = 2
 
 PREFILL_CONFIG = deepcopy(BASE_PREFILL_CONFIG)
 PREFILL_CONFIG["server_args"].update(
-    enable_unified_memory=True, hicache_ratio=HICACHE_RATIO
+    enable_unified_memory=True, hicache_size=HICACHE_SIZE_GB
 )
 
 DECODE_CONFIG = deepcopy(BASE_DECODE_CONFIG)

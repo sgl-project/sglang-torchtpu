@@ -40,10 +40,12 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
 
 # Permits probe eviction while supporting eight concurrent requests.
 DEVICE_POOL_TOKENS = 16384
-# The unified host arena is sized in full-equivalent tokens, so 5.1 gives the same
-# host bytes (0.79 GB/rank) as the separate twin's 3.0 (0.80 GB/rank); at 3.0 the
-# host reload comes back empty.
-HICACHE_RATIO = 5.1
+# The server sizes the host pool from HICACHE_SIZE_GB alone. A ratio sizes the
+# unified arena in full-equivalent tokens: 3.0 gives 0.47 GB/rank against the
+# twin's 0.80 and an empty host reload. 1 GB (whole GB only) covers the twin's bytes.
+HICACHE_SIZE_GB = 1
+# Probe capacity plan only; the twin's ratio, which 1 GB matches for this probe.
+HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
 
@@ -65,7 +67,7 @@ LAUNCH_ENV = {
     "DISABLE_RADIX_CACHE": "0",
     "KV_OFFLOAD": "1",
     "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
+    "HICACHE_SIZE": str(HICACHE_SIZE_GB),
     # Copy the probe to host before device eviction.
     "HICACHE_WRITE_POLICY": "write_through",
     # Include cache-hit details in OpenAI API responses.
