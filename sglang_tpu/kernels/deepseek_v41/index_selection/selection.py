@@ -716,12 +716,24 @@ def _select_fp8_indexer_jax(
         # Attention re-sorts the records; skip ID tie-breaks and output sorting.
         unordered=unordered,
     )
-    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
+    # TorchTPU traces on CPU with target TPU metadata. A publishing source
+    # can rank keys and candidate blocks in the same SparseCore pass.
+    export_source = (
+        publish_rows
+        and unordered
+        and candidates.shape[1] == 2048
+        and block_size == 8
+        and topk == 512
+        and padded == tokens
+    )
+    chunk_rows = prefill_chunk_rows or indexer_query_rows(
+        tokens, query_tile, cpu_export=export_source
+    )
     # Decode top-k scans only the blocks that can hold a winner. Publishing
     # layers rank the same SparseCore block maxima for their candidates.
     select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
     block_select = (
-        stream_select
+        (stream_select or (export_source and chunk_rows <= rows))
         and prefill_chunk_rows is None
         and chunk_rows is not None
         and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
@@ -748,7 +760,9 @@ def _select_fp8_indexer_jax(
             query_start_loc=(
                 query_offsets if shared else jnp.clip(query_offsets - start, 0, rows)
             ),
-            max_model_len=capacity if stream_select else width,
+            max_model_len=(
+                capacity if stream_select or (block_select and pipelined) else width
+            ),
             q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
             query_size=query_tile,
             cache_layout=layout,
@@ -803,7 +817,12 @@ def _select_fp8_indexer_jax(
         inverse = jnp.argsort(order)
         return output[inverse][:tokens], published[inverse][:tokens]
 
-    if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
+    if (
+        not (stream_select or block_select)
+        or chunk_rows is None
+        or chunk_rows > rows
+        or padded != tokens
+    ):
         return select_serial()
 
     def select(tile, scores, group):

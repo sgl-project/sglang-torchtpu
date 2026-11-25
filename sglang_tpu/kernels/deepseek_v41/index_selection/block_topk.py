@@ -29,6 +29,7 @@ from sglang_tpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     RADIX_BUCKETS,
     _ordered_bits,
 )
+from sglang_tpu.pallas_export import get_tpu_info_or_none
 
 
 def default_blocks(k: int, lanes: int, forced: bool = True) -> int:
@@ -77,9 +78,9 @@ def _plan(rows, width, block_width, k, blocks, block_size):
 
 def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
     """Lane-aligned shapes whose block maxima fit SparseCore VMEM."""
-    if jax.default_backend() != "tpu":
+    info = get_tpu_info_or_none()
+    if info is None:
         return False
-    info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None or rows < 1 or block_size < 1 or sc.num_lanes % block_size:
         return False
