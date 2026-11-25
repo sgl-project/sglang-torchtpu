@@ -91,6 +91,9 @@ _BASE["runtime_env"].update(
         "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
         # Checkpoint a long prefill into the radix tree every 128K tokens, not every chunk.
         "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
+        # The stride needs this to free a deferred chunk's out-of-window SWA rows;
+        # Muse Spark's model defaults (muse_spark_hook.py) turn it off.
+        "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS": "1",
         # Reserve each request's full max_new_tokens at admission: queue, never retract.
         "SGLANG_INIT_NEW_TOKEN_RATIO": "1.0",
         "SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR": "1.0",
