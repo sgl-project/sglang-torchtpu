@@ -502,7 +502,16 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     schedule = "sglang.srt.managers.schedule_batch.ScheduleBatch."
+    from sglang_tpu.experimental.speculative.mixed_step import (
+        carry_mixed_fields,
+        execute_fused_mixed,
+    )
+
+    eager = "sglang.srt.model_executor.runner.eager_runner.EagerRunner."
     hooks = [
+        # Fused mixed prefill + verify forwards (SGLANG_TPU_MIXED_VERIFY_FUSED).
+        (eager + "load_batch", carry_mixed_fields, HookType.AFTER),
+        (eager + "execute", execute_fused_mixed, HookType.AROUND),
         (
             "sglang.srt.arg_groups.kimi_k3_hook.apply_kimi_k3_spec_backend_defaults",
             kimi_spec_defaults,

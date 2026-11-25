@@ -480,6 +480,24 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_spec_mixed_verify_dp(self, algorithm: str) -> bool:
+        """Whether this platform's spec worker runs mixed prefill + verify steps
+        under DP attention (sglang.srt.speculative.mixed_verify) for the algorithm
+        when --enable-mixed-chunk is set."""
+        return False
+
+    def spec_mixed_verify_row_cap(self, server_args, context_len: int):
+        """For fused mixed prefill + verify DP steps: a function from a step's
+        largest per-rank prompt row count to the most rows a rank may hold
+        without a new compiled shape, or None for no cap."""
+        return None
+
+    def spec_mixed_verify_fused(self) -> bool:
+        """Whether a mixed prefill + verify DP step runs as one forward holding the
+        prompt and verify rows (the prompt budget and MLP-sync counts carry the
+        verify rows), rather than a verify forward then an extend forward."""
+        return True
+
     # ------------------------------------------------------------------
     # Distributed
     # ------------------------------------------------------------------

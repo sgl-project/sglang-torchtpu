@@ -828,13 +828,17 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             f"{self.algo_label} DRAFT APPEND KV (VERIFY)", bs_buckets, run
         )
 
+    def _draft_append_token_buckets(self) -> list[int]:
+        """Token buckets the draft KV append runs at for extend/prefill."""
+        return list(self.t_bucketer.buckets)
+
     def _precompile_draft_append_kv_extend(self) -> None:
         """Compile DFLASH draft KV append across token buckets (extend/prefill)."""
         if self.t_bucketer is None:
             raise ValueError(
                 "t_bucketer must be initialized before precompiling draft extend."
             )
-        token_buckets = list(self.t_bucketer.buckets)
+        token_buckets = self._draft_append_token_buckets()
         logger.info(
             "[spec compile policy] %s DRAFT APPEND KV (EXTEND): %d shapes (token_buckets=%s)",
             self.algo_label,

@@ -64,7 +64,13 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     if not verify:
         engram_host.flush_engram_commits(hasher)
     staged_result = None
-    if coordinator.started:
+    mixed_rows = getattr(forward_batch, "mixed_host_rows", None)
+    if mixed_rows is not None:
+        # A fused mixed prefill + verify forward: prompt rows as an extend, verify
+        # rows as a verify. Never host_hash_ids, which would commit the verify
+        # rows' draft tokens to the history as an extend does.
+        staged_result = coordinator.stage_mixed(padded_tokens, mixed_rows)
+    elif coordinator.started:
         staged_result = coordinator.stage_all(
             padded_tokens, forward_batch=forward_batch
         )
@@ -240,6 +246,12 @@ def _local_decoder_rows(forward_batch: ForwardBatch) -> int:
     ).num_rows
 
 
+def _fused_mixed() -> bool:
+    from sglang_tpu.experimental.speculative.mixed_step import fused_mixed_forward
+
+    return fused_mixed_forward()
+
+
 def is_deepseek_v41(model_runner) -> bool:
     config = getattr(model_runner.model_config, "hf_config", None)
     return getattr(config, "model_type", None) == "deepseek_v41"
@@ -342,10 +354,12 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang_tpu.models.deepseek_v41.decoder_replay import (
             decoder_rows_bucket,
+            mixed_decoder_rows_bucket,
         )
 
+        mode = forward_batch.forward_mode
         if (
-            forward_batch.forward_mode != ForwardMode.EXTEND
+            not (mode == ForwardMode.EXTEND or (mode.is_mixed() and _fused_mixed()))
             or getattr(forward_batch, "decoder_rows_bucket", None) is not None
             or not self._decoder_replay_on()
         ):
@@ -359,7 +373,8 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 forward_batch.decoder_rows_bucket = token_bucket
                 return
             rows = [_local_decoder_rows(forward_batch)]
-        forward_batch.decoder_rows_bucket = decoder_rows_bucket(max(rows), token_bucket)
+        pick = mixed_decoder_rows_bucket if mode.is_mixed() else decoder_rows_bucket
+        forward_batch.decoder_rows_bucket = pick(max(rows), token_bucket)
 
     def _extend_serving_variants(self) -> tuple[str, ...]:
         variants = super()._extend_serving_variants()

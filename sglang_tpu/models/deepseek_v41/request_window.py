@@ -51,6 +51,15 @@ class WindowPlan(NamedTuple):
     commit_dst: torch.Tensor
 
 
+def window_chunk_tokens(chunked_prefill_size) -> int:
+    """Rows one forward plans windows for: the prefill chunk, plus the rows a fused
+    mixed prefill + verify step may add on its fine token bucket
+    (SGLANG_TPU_MIXED_VERIFY_FINE_BUCKET; mixed_step.FINE_BUCKET_ROWS)."""
+    from sglang_tpu.experimental.speculative.mixed_step import fine_bucket_extra_rows
+
+    return (chunked_prefill_size or 0) + fine_bucket_extra_rows()
+
+
 def extend_batch_rows() -> int:
     """Requests in a TPU extend graph's fixed batch (torch_compile_max_bs): the
     precompile warms each extend graph with that many one-token requests, one
@@ -218,7 +227,7 @@ class DSV41TPURequestWindow:
             )
         # Rows per slot the core compares against a draft ring's.
         self.capacity = capacity
-        chunk_tokens = get_schedule().chunked_prefill_size or 0
+        chunk_tokens = window_chunk_tokens(get_schedule().chunked_prefill_size)
         batch_rows = extend_batch_rows()
         self.workspace_first_page = RESERVED_PAGES + RING_PAGES * num_slots
         self.workspace_pages = _workspace_pages(

@@ -59,6 +59,41 @@ def _make_running_batch(batch_size: int, *, prefill_only: bool = False):
     )
 
 
+class TestMixedVerifyArming(unittest.TestCase):
+    """Mixed prefill + verify steps: a fused step arms nothing; a Stage A step arms
+    the full interval, or one decode step less under SGLANG_MIXED_VERIFY_PDI_CREDIT
+    (its verify round counts as one)."""
+
+    def _arm_mixed(self, scheduler, *, fused: bool):
+        scheduler._arm_prefill_decode_interval(
+            SimpleNamespace(
+                forward_mode=SimpleNamespace(is_extend=lambda: True),
+                is_extend_in_batch=True,
+                mixed_verify=SimpleNamespace(fused=fused),
+            )
+        )
+
+    def test_arming(self):
+        from sglang.srt.environ import envs
+
+        for credit, fused, want in (
+            (False, False, 4),
+            (True, False, 3),
+            (False, True, 0),
+            (True, True, 0),
+        ):
+            with self.subTest(credit=credit, fused=fused):
+                scheduler = _make_scheduler(interval=4, min_bs=0)
+                with envs.SGLANG_MIXED_VERIFY_PDI_CREDIT.override(credit):
+                    self._arm_mixed(scheduler, fused=fused)
+                self.assertEqual(scheduler._prefill_decode_interval_remaining, want)
+        # A plain extend arms the full interval either way.
+        scheduler = _make_scheduler(interval=4, min_bs=0)
+        with envs.SGLANG_MIXED_VERIFY_PDI_CREDIT.override(True):
+            _arm(scheduler)
+        self.assertEqual(scheduler._prefill_decode_interval_remaining, 4)
+
+
 class TestPrefillDecodeIntervalMinBs(unittest.TestCase):
     def test_small_running_batch_admits_prefill_and_clears_interval(self):
         scheduler = _make_scheduler(interval=4, min_bs=8)

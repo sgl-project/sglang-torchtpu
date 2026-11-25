@@ -608,6 +608,35 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+def extend_mlp_rows(batch, model_runner) -> int:
+    """An extend batch's MLP-sync token count: its new tokens plus the rows the
+    encoder-SWA replay fold prepends."""
+    rows = batch.extend_num_tokens
+    if (
+        batch.encoder_swa_reset is not None
+        and model_runner.attn_backend.folds_encoder_swa_replay
+    ):
+        rows += folded_replay_rows(batch)
+    return rows
+
+
+def _mixed_verify_num_tokens(local_batch, num_tokens: int) -> int:
+    """MLP-sync token count of a mixed prefill + verify step's batch: the forward
+    also holds the verify rows of this rank's decoding requests (a decode batch
+    holds only those). Other batches keep num_tokens."""
+    plan = getattr(local_batch, "mixed_verify", None)
+    if plan is None or local_batch.forward_mode.is_idle():
+        return num_tokens
+    if not plan.fused:
+        # Run as a verify forward then an extend forward: this count sizes the
+        # extend, which a rank without prompt joins idle.
+        return 0 if local_batch.forward_mode.is_decode() else num_tokens
+    verify_rows = plan.n_verify * plan.num_verify_rows
+    if local_batch.forward_mode.is_decode():
+        return verify_rows
+    return num_tokens + verify_rows
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -638,12 +667,7 @@ def prepare_mlp_sync_batch_raw(
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
     else:
-        num_tokens = local_batch.extend_num_tokens
-        if (
-            local_batch.encoder_swa_reset is not None
-            and model_runner.attn_backend.folds_encoder_swa_replay
-        ):
-            num_tokens += folded_replay_rows(local_batch)
+        num_tokens = extend_mlp_rows(local_batch, model_runner)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -656,6 +680,7 @@ def prepare_mlp_sync_batch_raw(
             local_batch.return_logprob
             or num_tokens_for_logprob == local_batch.batch_size()
         )
+    num_tokens = _mixed_verify_num_tokens(local_batch, num_tokens)
 
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph

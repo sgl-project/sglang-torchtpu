@@ -149,12 +149,15 @@ allow_tpu_dsv41_encoder_replay
        on hardware other than CUDA and gfx950 with one inline check, so the TPU
        request window and folded replay rows cannot be enabled. Every other check
        (prefill graphs, CP, ROCm DP, PD, mixed chunk, LoRA, radix sessions) must
-       still apply.
+       still apply, except mixed chunk for mixed prefill + verify DP steps,
+       which fold replay into their prompt part, a plain extend.
   How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
        original with the module's get_platform reporting CUDA and not ROCm, the
        only two platform facts the validator reads. An unset
        --enable-decoder-swa-bounded-replay is first resolved off, since the
        validator defaults it on for CUDA and TPU attention has no decoder replay.
+       With mixed prefill + verify DP steps selected it hides enable_mixed_chunk
+       from the validator's view.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
   Remove when: the validator asks current_platform whether it folds encoder
        SWA replay.
@@ -452,6 +455,18 @@ def allow_tpu_dsv41_encoder_replay(original, server_args):
         if cfg.enable_encoder_swa_bounded_replay:
             cuda = SimpleNamespace(is_cuda=True, is_hip=False)
             stack.enter_context(patch.object(validator, "get_platform", lambda: cuda))
+            if _mixed_verify_config(cfg):
+                # A mixed prefill + verify step folds replay into its prompt
+                # part, a plain extend; the verify rows replay nothing. Core
+                # rejects mixed chunks for the 1-token-decode mixing it does.
+                mixed_view = validator.resolving_view
+                stack.enter_context(
+                    patch.object(
+                        validator,
+                        "resolving_view",
+                        lambda args: _MixedChunkHidden(mixed_view(args)),
+                    )
+                )
         return original(server_args)
 
 
@@ -470,13 +485,31 @@ class _WithoutDecoderReplay:
         setattr(object.__getattribute__(self, "_cfg"), name, value)
 
 
+class _MixedChunkHidden:
+    """A resolving view that reports --enable-mixed-chunk off."""
+
+    def __init__(self, cfg):
+        object.__setattr__(self, "_cfg", cfg)
+
+    def __getattr__(self, name):
+        if name == "enable_mixed_chunk":
+            return False
+        return getattr(object.__getattribute__(self, "_cfg"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_cfg"), name, value)
+
+
 def check_tpu_dsv41_decoder_replay(cfg) -> None:
     """TPU rules of --enable-decoder-swa-bounded-replay beyond core's.
 
-    The backend plans decoder rows for pure extends only, so MIXED batches are
-    out. The radix cache would hand a hit decoder SWA rows that were never
-    computed (only each earlier request's tail ran the decoder), so it needs
-    encoder SWA replay, which keeps no SWA in the cache and rebuilds the window.
+    The backend plans decoder rows for pure extends only, so mixed chunks are out,
+    except mixed prefill + verify steps under DSpark and attention DP (Stage B,
+    sglang.srt.speculative.mixed_verify), whose MIXED forward runs every layer on
+    every row (decoder replay applies to their pure extend steps only). The radix
+    cache would hand a hit decoder SWA rows that were never computed (only each
+    earlier request's tail ran the decoder), so it needs encoder SWA replay, which
+    keeps no SWA in the cache and rebuilds the window.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -485,7 +518,7 @@ def check_tpu_dsv41_decoder_replay(cfg) -> None:
             "--enable-decoder-swa-bounded-replay cannot be combined with the "
             "prefill CUDA graph"
         )
-    if cfg.enable_mixed_chunk:
+    if cfg.enable_mixed_chunk and not _mixed_verify_config(cfg):
         raise ValueError(
             "--enable-decoder-swa-bounded-replay on TPU cannot be combined with "
             "--enable-mixed-chunk"
@@ -495,6 +528,22 @@ def check_tpu_dsv41_decoder_replay(cfg) -> None:
             "--enable-decoder-swa-bounded-replay with the radix cache requires "
             "--enable-encoder-swa-bounded-replay on TPU"
         )
+
+
+def _mixed_verify_config(cfg) -> bool:
+    """Stage B's server configuration (mixed_verify_enabled reads the published
+    runtime context, which the validator runs before)."""
+    from sglang.srt.platforms import current_platform
+    from sglang.srt.runtime_context import attn_dp_enabled_of
+
+    algorithm = cfg.speculative_algorithm
+    return (
+        bool(cfg.enable_mixed_chunk)
+        and algorithm is not None
+        and attn_dp_enabled_of(cfg)
+        # DSpark on the experimental spec worker, as mixed_verify_enabled.
+        and current_platform.supports_spec_mixed_verify_dp(str(algorithm))
+    )
 
 
 class _SlotsOnDevice:

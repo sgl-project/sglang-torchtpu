@@ -58,6 +58,19 @@ def host_copy(forward_batch: Any, name: str) -> Optional[torch.Tensor]:
     return entry[0]
 
 
+def rebind(old: Any, new: Any) -> None:
+    """Move ``old``'s record to ``new``, a copy that shares its tensors (e.g. the
+    dataclasses.replace copy EagerRunner.load_batch hands the model); host_copy
+    still checks each field is the recorded device tensor."""
+    global _record
+    if _record is None or _record[0]() is not old or new is old:
+        return
+    try:
+        _record = (weakref.ref(new), _record[1])
+    except TypeError:
+        _record = None
+
+
 def release(forward_batch: Any) -> None:
     """Drop the record once ``forward_batch``'s metadata has read it."""
     global _record

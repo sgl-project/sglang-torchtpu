@@ -1810,6 +1810,10 @@ class Envs:
     # (non-overlap schedule, no DP attention).
     SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
+    # Mixed prefill + verify DP steps (Stage A, unfused): the step's verify round
+    # counts as one of the prefill_decode_interval decode steps after it, so the
+    # decode cadence per prefill matches a server without mixed steps.
+    SGLANG_MIXED_VERIFY_PDI_CREDIT = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.

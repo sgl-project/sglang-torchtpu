@@ -139,6 +139,10 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
+    # Mixed prefill + verify DP step (sglang.srt.speculative.mixed_verify): this
+    # result covers the prompt batch; the verify part's own result (decode layout)
+    # is here.
+    mixed_verify_result: Optional[GenerationBatchResult] = None
 
     # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
     # bonus) for the NEXT verify round, relayed last stage -> all stages,

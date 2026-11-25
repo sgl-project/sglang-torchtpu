@@ -26,7 +26,10 @@ from sglang_tpu.models.deepseek_v41.decoder_replay import (
     scheduled_decoder_plan,
     scheduled_decoder_rows,
 )
-from sglang_tpu.models.deepseek_v41.hooks import check_tpu_dsv41_decoder_replay
+from sglang_tpu.models.deepseek_v41.hooks import (
+    allow_tpu_dsv41_encoder_replay,
+    check_tpu_dsv41_decoder_replay,
+)
 
 W = 128
 
@@ -993,6 +996,118 @@ class TestWindowRecordsUnique(CustomTestCase):
                 self.assertEqual(n, commits)
 
 
+class TestStageBGates(CustomTestCase):
+    """Mixed prefill + verify steps: decoder replay on the prompt half's extend; a
+    fused forward replays its prompt rows and keeps every verify row."""
+
+    def test_mixed_step_decoder_rows(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        batch = _scheduled([0, 0], [200, 50], [True, True], [200, 50])
+        plain = scheduled_decoder_rows(batch, folds=True)
+        self.assertGreater(plain, 0)
+        batch.mixed_verify = SimpleNamespace(n_verify=3, num_verify_rows=6)
+        batch.mixed_verify_batch = None
+        decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 4,
+            mixed_verify=SimpleNamespace(n_verify=4, num_verify_rows=6),
+        )
+        # Run as halves: the prompt part replays as any extend; a verify-only
+        # rank's extend half is idle.
+        self.assertEqual(scheduled_decoder_rows(batch, folds=True), plain)
+        self.assertEqual(scheduled_decoder_rows(decode, folds=True), 0)
+        # One fused forward: the prompt's replay rows plus every verify row.
+        with tpu_envs.SGLANG_TPU_MIXED_VERIFY_FUSED.override(True):
+            self.assertEqual(scheduled_decoder_rows(batch, folds=True), plain + 18)
+            self.assertEqual(scheduled_decoder_rows(decode, folds=True), 24)
+
+    def test_fused_tail_keeps_whole_verify_requests(self):
+        """Prompt requests plan as an extend; verify requests (from ``whole_from``)
+        keep every valid row, floored at their own floor, never at fill - 128."""
+        # Prompt: 200 rows of a 200-token fill; verify: 2 requests x 6 rows at
+        # positions 500.. and 900..; then a padding request.
+        counts = torch.tensor([200, 6, 6, 0])
+        qsl = torch.nn.functional.pad(torch.cumsum(counts, 0), (1, 0))
+        positions = torch.cat(
+            [torch.arange(0, 200), torch.arange(500, 506), torch.arange(900, 906)]
+        )
+        valid = torch.ones(212, dtype=torch.bool)
+        valid[-1] = False  # a verify row without a slot is not a decoder row
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS.override("prompt"):
+            plan = plan_tail_rows(
+                fill_lens=[200, 506, 906, 0],
+                query_start_loc=qsl,
+                positions=positions,
+                valid=valid,
+                floors=torch.tensor([0, 0, 3, 0]),
+                bucket=256,
+                whole_from=1,
+            )
+        self.assertEqual(plan.counts.tolist(), [128, 6, 5, 0])
+        self.assertEqual(plan.replay_starts.tolist(), [72, 0, 3, 0])
+        self.assertEqual(plan.num_real, 139)
+        self.assertEqual(
+            plan.gather[: plan.num_real].tolist(),
+            list(range(72, 200)) + list(range(200, 206)) + list(range(206, 211)),
+        )
+
+    def test_mixed_decoder_buckets(self):
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            mixed_decoder_buckets,
+            mixed_decoder_rows_bucket,
+        )
+
+        # Two decoder buckets per fused MIXED shape: 256 or the token bucket.
+        self.assertEqual(mixed_decoder_rows_bucket(6, 1024), 256)
+        self.assertEqual(mixed_decoder_rows_bucket(256, 1024), 256)
+        self.assertEqual(mixed_decoder_rows_bucket(257, 1024), 1024)
+        with self.assertRaises(ValueError):
+            mixed_decoder_rows_bucket(1025, 1024)
+        self.assertEqual(mixed_decoder_buckets(6, 1024), [256, 1024])
+        self.assertEqual(mixed_decoder_buckets(300, 1024), [1024])
+        self.assertEqual(mixed_decoder_buckets(6, 128), [128])
+        # Exactly the buckets the rule picks over that row range.
+        for lo, t in ((6, 1024), (198, 1024), (102, 1152), (6, 256)):
+            self.assertEqual(
+                mixed_decoder_buckets(lo, t),
+                sorted({mixed_decoder_rows_bucket(r, t) for r in range(lo, t + 1)}),
+            )
+
+    def test_draft_ring_mask_on_mixed_prompt(self):
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(decoder_replay=True)
+            )
+        )
+        batch = _scheduled([0], [200], [True], [200])
+        pos, rows = torch.arange(200), torch.arange(200) + 1000
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS.override("prompt"):
+            masked = worker._skip_rows_below_decoder_replay(batch, pos, rows)
+        self.assertEqual(int((masked < 0).sum()), 72)  # below the prompt's last 128
+        batch.mixed_verify = object()
+        with tpu_envs.SGLANG_TPU_DSV41_DECODER_REPLAY_ROWS.override("prompt"):
+            halves = worker._skip_rows_below_decoder_replay(batch, pos, rows)
+            self.assertEqual(int((halves < 0).sum()), 72)
+            # The fused forward replays the prompt part as its extend would.
+            with tpu_envs.SGLANG_TPU_MIXED_VERIFY_FUSED.override(True):
+                fused = worker._skip_rows_below_decoder_replay(batch, pos, rows)
+                self.assertEqual(int((fused < 0).sum()), 72)
+        batch.mixed_verify = None
+        batch.forward_mode = ForwardMode.MIXED
+        self.assertIs(worker._skip_rows_below_decoder_replay(batch, pos, rows), rows)
+
+
 class TestTpuStartupRules(CustomTestCase):
     def _cfg(self, prefill_backend=None, **kw):
         from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -1004,6 +1119,7 @@ class TestTpuStartupRules(CustomTestCase):
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=prefill_backend or Backend.DISABLED)
             ),
+            speculative_algorithm=None,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -1057,6 +1173,84 @@ class TestTpuStartupRules(CustomTestCase):
             check_tpu_dsv41_decoder_replay(
                 self._cfg(enable_encoder_swa_bounded_replay=False)
             )
+
+    def test_mixed_chunk_allowed_for_stage_b_only(self):
+        """Mixed prefill + verify under DSpark and attention DP (Stage B)."""
+        from unittest.mock import patch
+
+        from sglang.srt.platforms import current_platform
+
+        stage_b = self._cfg(enable_mixed_chunk=True, speculative_algorithm="DSPARK")
+        for dp, worker, allowed in (
+            (True, True, True),
+            (False, True, False),
+            # DSpark on the non-experimental worker keeps core's mixed chunks.
+            (True, False, False),
+        ):
+            with (
+                self.subTest(dp=dp, worker=worker),
+                patch("sglang.srt.runtime_context.attn_dp_enabled_of", return_value=dp),
+                patch.object(
+                    current_platform,
+                    "supports_spec_mixed_verify_dp",
+                    return_value=worker,
+                ),
+            ):
+                if allowed:
+                    check_tpu_dsv41_decoder_replay(stage_b)
+                else:
+                    with self.assertRaises(ValueError):
+                        check_tpu_dsv41_decoder_replay(stage_b)
+
+    def _encoder_replay_view(self, **kw):
+        """What validate_deepseek_v41_features sees through the TPU hook."""
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups import deepseek_v4_hook as validator
+        from sglang.srt.platforms import current_platform
+
+        cfg = self._cfg(
+            **{
+                "enable_decoder_swa_bounded_replay": False,
+                **kw,
+            }
+        )
+        seen = {}
+
+        def original(args):
+            seen["mixed"] = validator.resolving_view(args).enable_mixed_chunk
+            seen["cuda"] = validator.get_platform().is_cuda
+
+        with (
+            patch.object(validator, "resolving_view", lambda args: cfg),
+            patch.object(
+                validator,
+                "model_config_of",
+                lambda args: SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v41")
+                ),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_platform",
+                return_value=SimpleNamespace(is_tpu=True),
+            ),
+            patch("sglang.srt.runtime_context.attn_dp_enabled_of", return_value=True),
+            patch.object(
+                current_platform, "supports_spec_mixed_verify_dp", return_value=True
+            ),
+        ):
+            allow_tpu_dsv41_encoder_replay(original, object())
+        return seen
+
+    def test_encoder_replay_admits_mixed_verify_steps(self):
+        # Stage B: the validator's view hides the mixed chunk flag.
+        seen = self._encoder_replay_view(
+            enable_mixed_chunk=True, speculative_algorithm="DSPARK"
+        )
+        self.assertEqual(seen, {"mixed": False, "cuda": True})
+        # Other mixed chunks still reach core's rejection.
+        seen = self._encoder_replay_view(enable_mixed_chunk=True)
+        self.assertEqual(seen, {"mixed": True, "cuda": True})
 
     def test_stateful_decoder_layers_are_refused(self):
         cfg = SimpleNamespace(

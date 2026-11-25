@@ -24,6 +24,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
@@ -148,6 +149,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._warmup_folded_drop_draft_kv()
         if not is_pp_non_decode:
             self._warmup_engram_commit_ids()
+        if _fused_mixed() and self._dp_attention:
+            self._warmup_mixed_fused()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -310,10 +313,22 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         if target_hidden is None:
             raise RuntimeError("Block-draft extend requires target hidden capture.")
         assert logits_output.hidden_states_token_indices is None
+        kv_fence_tail = self._write_extend_draft_kv(batch, target_hidden)
+        logits_output.hidden_states = None
+        if not batch.reqs:
+            return self._idle_extend_result(result)
+        return self._extend_result(batch, result, kv_fence_tail)
+
+    def _write_extend_draft_kv(
+        self, batch: ScheduleBatch | None, target_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Inject an extend's [token bucket, F] target hidden into the draft
+        context KV; returns the kv_fence_tail. ``batch`` None or without
+        requests: all rows are padding (a DP rank without prompts)."""
         # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
         # match and upload once. Padded rows write slot 0, like the target forward.
         padded_rows = target_hidden.shape[0]
-        if not batch.reqs:
+        if batch is None or not batch.reqs:
             # A DP-attention rank without prompts (DP padding relabels its batch)
             # still issues the draft KV write; all its rows are padding.
             compile_policy = self.target_worker.model_runner.compile_policy
@@ -351,17 +366,21 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # invalidating out_cache_loc.
         if self.ships_pd_hidden:
             # The decode projects these rows into its draft KV.
-            kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
-        else:
-            with self._block_draft_worker.draft_context():
-                kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                    target_hidden=target_hidden,
-                    positions=positions,
-                    cache_loc=cache_loc,
-                )
-        logits_output.hidden_states = None
-        if not batch.reqs:
-            return self._idle_extend_result(result)
+            return self.write_pd_hidden(batch, target_hidden)
+        with self._block_draft_worker.draft_context():
+            return self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden,
+                positions=positions,
+                cache_loc=cache_loc,
+            )
+
+    def _extend_result(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        kv_fence_tail: torch.Tensor,
+    ) -> GenerationBatchResult:
+        """An extend's result: root := the sampled token, after the draft KV write."""
         next_state = SpecState(
             bonus_tokens=result.next_token_ids,
             seq_lens=batch.seq_lens,
@@ -373,6 +392,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         result.next_draft_input = next_draft_input
         return result
 
+    def inject_mixed_prompt(
+        self, prompt: ScheduleBatch | None, target_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        # The prompt rows of the MIXED forward, folded replay rows dropped, at the
+        # prompt's extend token bucket: as extend's write after drop_folded_rows.
+        if self.ships_pd_hidden:
+            raise NotImplementedError("A PD prefill server does not run mixed steps.")
+        return self._write_extend_draft_kv(prompt, target_hidden)
+
+    def mixed_prompt_result(
+        self,
+        prompt: ScheduleBatch,
+        result: GenerationBatchResult,
+        kv_fence_tail: torch.Tensor,
+    ) -> GenerationBatchResult:
+        return self._extend_result(prompt, result, kv_fence_tail)
+
     def _skip_rows_below_decoder_replay(
         self, batch: ScheduleBatch, positions: torch.Tensor, ring_rows: torch.Tensor
     ) -> torch.Tensor:
@@ -380,7 +416,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         replay start hold no values (the target decoder skipped them); they are
         never in a draft window, and are not written to the ring either."""
         backend = self.target_worker.model_runner.attn_backend
-        if not getattr(backend, "decoder_replay", False):
+        # A fused mixed step's prompt part replays as its extend would.
+        if (
+            not getattr(backend, "decoder_replay", False)
+            or batch.forward_mode != ForwardMode.EXTEND
+        ):
             return ring_rows
         from sglang_tpu.models.deepseek_v41.decoder_replay import (
             scheduled_decoder_plan,
@@ -668,6 +708,79 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         target_hidden=gathered, positions=positions, cache_loc=cache_loc
                     )
 
+    def _warmup_mixed_fused(self) -> None:
+        """The eager ops around a fused mixed step's MIXED forward (the forward
+        itself warms in the target policy's precompile), at every (token
+        bucket, verify bucket) it can run: the logits index upload and the
+        verify-token splice, the prompt / verify logits rows, the verify and
+        prompt hidden gathers and the prompt's draft KV write at its extend
+        bucket (never a fine bucket)."""
+        from sglang.srt.speculative.mixed_verify import mixed_verify_enabled
+        from sglang_tpu.experimental.speculative import mixed_step
+
+        if not mixed_verify_enabled():
+            return
+        runner = self.target_worker.model_runner
+        compile_policy = runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        t_bucketer = compile_policy.t_bucketer
+        assert t_bucketer is not None
+        R = self.num_verify_rows
+        cap = compile_policy._extend_compile_cap()
+        vocab_size = runner.model_config.vocab_size
+        hidden_size = (
+            self._block_draft_worker._compile_policy().dflash_target_hidden_size
+        )
+        loc_dtype = compile_policy.live_cache_loc_dtype()
+        device = self.device
+
+        def upload(t: torch.Tensor) -> torch.Tensor:
+            return t.to(device, non_blocking=True)
+
+        cases = mixed_step.fused_compile_cases(
+            t_bucketer, compile_policy.b_bucketer, get_parallel().attn_tp_size
+        )
+        with torch.no_grad():
+            for num_tokens, ext_cap, pbs in cases:
+                num_logit_rows = ext_cap + R * pbs
+                upload(torch.zeros((num_logit_rows,), dtype=torch.int64)).cpu()
+                ids = upload(torch.zeros((num_tokens,), dtype=torch.int64))
+                verify_tokens = torch.zeros(
+                    (pbs * R,), dtype=torch.int64, device=device
+                )
+                mixed_step.splice_verify_tokens(
+                    ids,
+                    verify_tokens,
+                    upload(mixed_step.splice_index(num_tokens, 0, pbs * R)),
+                ).cpu()
+                logits = upload(
+                    torch.zeros((num_logit_rows, vocab_size), dtype=torch.float32)
+                )
+                logits[:cap].clone().cpu()
+                logits[ext_cap:].clone().cpu()
+                hidden = upload(
+                    torch.zeros((num_tokens, hidden_size), dtype=runner.dtype)
+                )
+                hidden[
+                    upload(mixed_step.verify_hidden_index(0, pbs, R, num_tokens))
+                ].cpu()
+                for rows in {
+                    mixed_step.inject_bucket(t_bucketer, n)
+                    for n in t_bucketer.buckets
+                    if ext_cap <= n <= num_tokens
+                }:
+                    gathered = hidden[
+                        upload(
+                            mixed_step.prompt_hidden_index(None, 0, rows, num_tokens)
+                        )
+                    ]
+                    with self._block_draft_worker.draft_context():
+                        self._block_draft_worker.write_draft_kv(
+                            target_hidden=gathered,
+                            positions=upload(torch.zeros((rows,), dtype=torch.int64)),
+                            cache_loc=upload(torch.zeros((rows,), dtype=loc_dtype)),
+                        )
+
     # FIXME(junyanxu): metrics_reporter calls this on every DSPARK decode log;
     # report the block-accept estimate once the confidence budget is ported.
     def block_accept_estimate_log_suffix(self) -> str | None:
@@ -696,3 +809,9 @@ def _extend_ring_rows(*, ring_pool, batch: ScheduleBatch, positions: torch.Tenso
         torch.tensor(batch.prefix_lens, dtype=torch.int64) + lens, lens
     )
     return ring_pool.swa_ring_rows(slots=slots, positions=positions, ends=ends)
+
+
+def _fused_mixed() -> bool:
+    from sglang_tpu.experimental.speculative.mixed_step import fused_mixed_forward
+
+    return fused_mixed_forward()

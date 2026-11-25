@@ -271,6 +271,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
     DRAIN_STATE_NO_LISTENER,
     MLP_SYNC_CARRIES_DRAIN_STATE,
     SchedulerDPAttnAdapter,
+    extend_mlp_rows,
     should_skip_scheduler_all_gather,
 )
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
@@ -418,6 +419,15 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
     get_draft_recurrent_hidden_state_spec_from_config,
 )
+from sglang.srt.speculative.mixed_verify import (
+    MixedVerifyPlan,
+    StepKind,
+    check_mixed_verify_limits,
+    gather_mixed_counts,
+    global_step_kind,
+    mixed_step_fits,
+    mixed_verify_enabled,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
@@ -545,6 +555,10 @@ class Scheduler(
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
+    # Mixed prefill + verify DP steps (sglang.srt.speculative.mixed_verify);
+    # set in init_chunked_prefill.
+    enable_mixed_verify: bool = False
+    mixed_verify_fused: bool = False
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
@@ -1529,6 +1543,23 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Rows per verify request in a mixed prefill + verify DP step.
+        self.num_verify_rows = get_spec().speculative_num_draft_tokens or 1
+        self.enable_mixed_verify = mixed_verify_enabled()
+        self.mixed_verify_fused = (
+            self.enable_mixed_verify and current_platform.spec_mixed_verify_fused()
+        )
+        self._mixed_verify_row_cap = (
+            current_platform.spec_mixed_verify_row_cap(
+                self.server_args, self.model_config.context_len
+            )
+            if self.mixed_verify_fused
+            else None
+        )
+        if self.enable_mixed_verify:
+            check_mixed_verify_limits(
+                chunk_budget=self.chunked_prefill_size, overlap=self.enable_overlap
+            )
 
         self._tpu_pp_chunk_cost = None
         self._tpu_pp_cached_prefix = {}
@@ -1594,6 +1625,12 @@ class Scheduler(
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
             return
+        plan = getattr(batch, "mixed_verify", None)
+        if plan is not None and plan.fused:
+            # A fused mixed prefill + verify step advances decode itself: forcing
+            # decode-only steps after it would only delay prompts. Every DP rank
+            # of a MIXED step holds the plan, so they agree.
+            return
 
         # DP attention synchronizes this flag across ranks. This keeps every
         # rank on the same prefill/decode cadence even when only one rank has
@@ -1604,7 +1641,11 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            interval = self.prefill_decode_interval
+            if plan is not None and envs.SGLANG_MIXED_VERIFY_PDI_CREDIT.get():
+                # The mixed step already ran a verify round (Stage A).
+                interval -= 1
+            self._prefill_decode_interval_remaining = interval
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -4661,6 +4702,13 @@ class Scheduler(
             # Read before the merge below empties last_batch.
             staged = self.dllm_manager.staged_reqs(last_batch)
 
+        # A mixed prefill + verify step's plan lives for that step only.
+        if self.enable_mixed_verify:
+            for batch in (running_batch, last_batch):
+                if batch is not None and batch.mixed_verify is not None:
+                    batch.mixed_verify = None
+                    batch.mixed_verify_batch = None
+
         # Merge the prefill batch into the running batch
         reqs_to_exclude = set(staged)
         for req in staged:
@@ -4742,6 +4790,10 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+        if need_mlp_sync and self.enable_mixed_verify:
+            # Mixed prefill + verify DP steps: prefill no longer pauses decode.
+            ret, running_batch = self._mixed_verify_next_batch(new_batch, running_batch)
+            return self._finish_next_batch(ret, running_batch)
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -4777,6 +4829,11 @@ class Scheduler(
         # A converted running batch stays the running batch; next step it comes
         # back as last_batch and is filtered in place, not merged with itself.
         ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
+        return self._finish_next_batch(ret, running_batch)
+
+    def _finish_next_batch(
+        self, ret: Optional[ScheduleBatch], running_batch: ScheduleBatch
+    ) -> NextBatchPlan:
         self._arm_prefill_decode_interval(ret)
 
         # Handle ngram embedding
@@ -4788,6 +4845,144 @@ class Scheduler(
             set_schedule_time_batch(ret)
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _mixed_verify_next_batch(
+        self, new_batch: Optional[ScheduleBatch], running_batch: ScheduleBatch
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """The batch of a step that may mix prefill and verify across DP ranks.
+
+        Every rank gathers (prompt tokens, verify requests) and derives the same
+        step kind (mixed_verify.global_step_kind):
+        - DECODE (no rank prefills): this rank's running batch verifies.
+        - EXTEND (no rank verifies): this rank's prompt batch, if any.
+        - MIXED: one forward per rank holding its prompt batch and its running
+          batch's verify rows. The batch is a container of native batches
+          (mixed_verify.mixed_parts): the prompt batch carries the running batch
+          as mixed_verify_batch; a rank without prompt runs its running batch;
+          a rank with neither runs an idle batch. Each carries the plan.
+
+        The running batch is prepared for decode (KV, retraction) before the
+        gather, so the counts are what runs. A rank holding running requests
+        verifies, so its step is DECODE or MIXED and the batch always runs.
+        """
+        # Gather before preparing the running batch for decode: a step that
+        # does not verify must not prepare it (KV, retraction). The running
+        # request count bounds what verifies; retraction can only lower it.
+        can_verify = not running_batch.is_empty() and not running_batch.is_prefill_only
+        n_verify_bound = running_batch.batch_size() if can_verify else 0
+        prompt_rows = (
+            extend_mlp_rows(new_batch, self.dp_attn_adapter.model_runner)
+            if new_batch is not None
+            else 0
+        )
+        global_prompt, global_verify = gather_mixed_counts(prompt_rows, n_verify_bound)
+        kind = global_step_kind(global_prompt, global_verify)
+        if (
+            kind is StepKind.MIXED
+            and self.mixed_verify_fused
+            and not mixed_step_fits(
+                global_prompt,
+                global_verify,
+                self.num_verify_rows,
+                self._mixed_verify_row_cap,
+            )
+        ):
+            # No slack for the verify rows in the prompt step's shape: the prompt
+            # step runs alone and decode waits, as without mixing.
+            kind = StepKind.EXTEND
+
+        verify_batch = None
+        if kind is not StepKind.EXTEND and can_verify:
+            # Prepared in place; None skips this step's decode (KV full while
+            # finishing requests free theirs at its end), as the non-mixed path
+            # does: the running batch keeps its requests and this rank verifies
+            # none (the gathered count is only an upper bound).
+            prepared = self.update_running_batch(running_batch)
+            if prepared is not None and not prepared.is_empty():
+                verify_batch = prepared
+        n_verify = verify_batch.batch_size() if verify_batch is not None else 0
+
+        if kind is StepKind.DECODE:
+            ret, plan = verify_batch, None
+        elif kind is StepKind.EXTEND:
+            ret, plan = new_batch, None
+        else:
+            plan = MixedVerifyPlan(
+                n_prompt_rows=(
+                    new_batch.extend_num_tokens if new_batch is not None else 0
+                ),
+                n_verify=n_verify,
+                num_verify_rows=self.num_verify_rows,
+                global_prompt_rows=tuple(global_prompt),
+                global_verify_bs=tuple(global_verify),
+                fused=self.mixed_verify_fused,
+            )
+            if new_batch is not None:
+                ret = new_batch
+                ret.mixed_verify_batch = verify_batch
+                if verify_batch is not None:
+                    verify_batch.mixed_verify = plan
+                    # The MLP sync below runs on the container; the verify
+                    # part's own counts would be the previous step's.
+                    verify_batch.global_num_tokens = None
+                    verify_batch.global_num_tokens_for_logprob = None
+            else:
+                ret = verify_batch
+            if ret is not None:
+                ret.mixed_verify = plan
+
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret, need_sync=True)
+        if plan is not None and ret is not None and ret.forward_mode.is_idle():
+            # A rank with neither part runs the mixed step's dummy rows.
+            ret.mixed_verify = plan
+        return ret, running_batch
+
+    def _copy_batch_result_to_cpu(self, batch, batch_result) -> None:
+        """Start the result's D2H after the forward (overlap path)."""
+        if _is_hip:
+            # Cross-stream sync costs more than the tiny D2H it overlaps.
+            batch_result.copy_to_cpu(
+                return_logprob=batch.return_logprob,
+                return_hidden_states=batch.return_hidden_states,
+            )
+        elif self.tpu_async_copy_worker is not None:
+            self.tpu_async_copy_worker.submit(
+                batch_result,
+                return_logprob=batch.return_logprob,
+                return_hidden_states=batch.return_hidden_states,
+            )
+        else:
+            self._copy_result_to_cpu(batch_result, batch)
+
+    def _relay_and_copy_mixed_verify(self, verify_part, verify_result) -> None:
+        """A mixed step's verify part: relay, D2H and next spec_info, as for the
+        decode batch it is, keyed by its own rows."""
+        assert verify_result is not None, (
+            "a mixed prefill + verify step returns its verify part's result"
+        )
+        future_indices = verify_part.req_pool_indices
+        verify_result.copy_done = self.device_module.Event()
+        self._relay_forward_payload(verify_part, future_indices, verify_result)
+        self._copy_batch_result_to_cpu(verify_part, verify_result)
+        verify_part.input_ids = None
+        verify_part.spec_info = verify_result.next_draft_input
+        verify_part.spec_info.future_dsa_topk_indices_available = (
+            verify_part.spec_info.dsa_topk_indices is not None
+        )
+        verify_part.spec_info.future_indices = future_indices
+
+    def _mixed_decode_tokens(self, running_bs: int) -> int:
+        """Chunk-budget tokens the running requests take in a mixed step: one
+        per request for a mixed chunk, their verify rows in a mixed prefill +
+        verify DP step (mixed_verify.prompt_token_budget; startup
+        check_mixed_verify_limits keeps the prompt share positive)."""
+        if not self.is_mixed_chunk:
+            return 0
+        if self.enable_mixed_verify:
+            # Verify rows take a separate forward, or only the prompt step's
+            # slack (mixed_step_fits): the prompt keeps the whole chunk.
+            return 0
+        return running_bs
 
     def get_num_allocatable_reqs(
         self,
@@ -5030,7 +5225,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            self._mixed_decode_tokens(running_bs),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -5354,9 +5549,11 @@ class Scheduler(
             ),
         )
 
-        # Mixed-style chunked prefill
+        # Mixed-style chunked prefill (a mixed prefill + verify DP step instead
+        # mixes after the DP decision, in _mixed_verify_next_batch).
         if (
             self.is_mixed_chunk
+            and not self.enable_mixed_verify
             and not running_batch.is_empty()
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
@@ -5791,6 +5988,15 @@ class Scheduler(
                 )
                 if not gpu_only_lens:
                     self.future_map.resolve_seq_lens_cpu(batch)
+                # A mixed prefill + verify step's verify part resolves as the
+                # decode batch it is (its spec_info and relay rows are its own).
+                verify_part = (
+                    batch.mixed_verify_batch
+                    if getattr(batch, "mixed_verify", None) is not None
+                    else None
+                )
+                if verify_part is not None:
+                    self.future_map.resolve_seq_lens_cpu(verify_part)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -5808,6 +6014,8 @@ class Scheduler(
                     input_ids_from_graph = self.resolve_forward_inputs(
                         batch, self.future_map
                     )
+                    if verify_part is not None:
+                        self.resolve_forward_inputs(verify_part, self.future_map)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -5827,6 +6035,11 @@ class Scheduler(
                             if batch.spec_algorithm.supports_grammar_overlap():
                                 fwd_kwargs["grammar_barrier"] = (
                                     self._advance_pending_grammar
+                                )
+                            if verify_part is not None:
+                                fwd_kwargs["on_publish_verify"] = partial(
+                                    self.future_map.publish,
+                                    verify_part.req_pool_indices,
                                 )
 
                         if input_ids_from_graph:
@@ -5861,22 +6074,15 @@ class Scheduler(
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
                             )
-                            if _is_hip:
-                                # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                            self._copy_batch_result_to_cpu(batch, batch_result)
+                            if verify_part is not None:
+                                self._relay_and_copy_mixed_verify(
+                                    verify_part, batch_result.mixed_verify_result
                                 )
-                            elif self.tpu_async_copy_worker is not None:
-                                self.tpu_async_copy_worker.submit(
-                                    batch_result,
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
-                                )
-                            else:
-                                self._copy_result_to_cpu(batch_result, batch)
                         else:
+                            assert verify_part is None, (
+                                "mixed prefill + verify steps sample in the forward"
+                            )
                             batch_result.future_indices = future_indices
 
                 # Next-iter input_ids relayed via future_map.
@@ -6277,6 +6483,15 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+                if (
+                    getattr(batch, "mixed_verify", None) is not None
+                    and batch.mixed_verify_batch is not None
+                ):
+                    # A mixed prefill + verify step: its verify part, as the
+                    # decode batch it is.
+                    self.batch_result_processor.process_batch_result_decode(
+                        batch.mixed_verify_batch, result.mixed_verify_result
+                    )
         elif batch.forward_mode.is_prebuilt():
             # An inner idle batch ran a forward (`_run_batch_prebuilt`), and
             # its launch is this result's: the host sees that forward end

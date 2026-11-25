@@ -1639,6 +1639,40 @@ class TestDpAttnSelectBucketShape(CustomTestCase):
                     (16, 4),
                 )
 
+    def test_mixed_verify_pads_extend_cap_plus_verify_bucket(self):
+        from sglang.srt.speculative.mixed_verify import MixedVerifyPlan
+
+        t_b = _bucketer("Token", [64, 128])
+        b_b = _bucketer("Bs", [4, 8, 16])
+        # Every rank agrees whatever its own part is: prompt + verify,
+        # verify-only (decode mode) or idle.
+        for mode in ("extend", "decode", "idle"):
+            with self.subTest(mode=mode):
+                fb = self._fb(mode)
+                fb.mixed_verify = MixedVerifyPlan(0, 0, 6, (40, 0), (3, 5))
+                with patch(
+                    "sglang.srt.runtime_context.get_parallel",
+                    return_value=SimpleNamespace(attn_tp_size=1),
+                ):
+                    self.assertEqual(
+                        _dp_attn_select_bucket_shape(
+                            fb, t_b, b_b, max_tokens_per_rank=70, real_q=1, real_b=1
+                        ),
+                        # pad_b = extend cap 16 + bucket(max verify 5) 8.
+                        (128, 24),
+                    )
+
+    def test_mixed_verify_grid_must_cover_the_batch_rows(self):
+        from sglang_tpu.compilation.compiled_forward_shim import (
+            check_mixed_verify_grid,
+        )
+
+        check_mixed_verify_grid(_bucketer("Token", [64, 128]), _bucketer("Bs", [8, 16]))
+        with self.assertRaisesRegex(ValueError, "largest token bucket"):
+            check_mixed_verify_grid(
+                _bucketer("Token", [16, 32]), _bucketer("Bs", [8, 16, 32])
+            )
+
 
 class TestDpAttnApplyBucketMetadata(CustomTestCase):
     def _fb(self, dp_size=2, mode="decode"):

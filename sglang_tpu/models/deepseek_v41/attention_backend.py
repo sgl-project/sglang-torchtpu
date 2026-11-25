@@ -1029,6 +1029,7 @@ def _attach_tail_metadata(
         floors=swa_minimum,
         bucket=getattr(forward_batch, "decoder_rows_bucket", None),
         warmup=getattr(forward_batch, "decoder_replay_warmup", False),
+        whole_from=_mixed_verify_first_request(forward_batch),
     )
     req_pool_indices = tables.req_pool_indices
     tail_positions = positions[plan.gather]
@@ -1074,6 +1075,28 @@ def _attach_tail_metadata(
         )
     for name, t in _upload_metadata(put, device=device).items():
         setattr(metadata, name, t)
+
+
+def _fused_mixed() -> bool:
+    from sglang_tpu.experimental.speculative.mixed_step import fused_mixed_forward
+
+    return fused_mixed_forward()
+
+
+def _mixed_verify_first_request(forward_batch: ForwardBatch) -> Optional[int]:
+    """A fused mixed forward's first verify request (its prompt requests come
+    first, mixed_step.build_mixed_layout), else None."""
+    if not forward_batch.forward_mode.is_mixed() or getattr(
+        forward_batch, "decoder_replay_warmup", False
+    ):
+        return None
+    host = getattr(forward_batch, "mixed_host_rows", None)
+    if host is None:
+        raise RuntimeError(
+            "Decoder replay of a MIXED forward needs its mixed host rows "
+            "(carry_mixed_fields)."
+        )
+    return len(host.prompt_reqs)
 
 
 def _token_rows(
@@ -1546,10 +1569,12 @@ class DSV41TPUAttnBackend(AttentionBackend):
         return scheduled_decoder_rows(batch, folds=folds)
 
     def _uses_decoder_replay(self, forward_batch: ForwardBatch) -> bool:
-        # MIXED (prefill + decode rows) is not served (validated at startup).
+        # MIXED only as a fused prefill + verify forward (its verify requests
+        # keep every row); unfused MIXED is not served (validated at startup).
+        mode = forward_batch.forward_mode
         return (
             self.decoder_replay
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and (mode == ForwardMode.EXTEND or (mode.is_mixed() and _fused_mixed()))
             and not getattr(forward_batch, "encoder_swa_replay", False)
         )
 

@@ -49,6 +49,7 @@ from sglang_tpu.models.deepseek_v41.request_window import (
     extend_batch_rows,
     ring_rows,
     window_buffer_pages,
+    window_chunk_tokens,
 )
 
 try:
@@ -844,7 +845,7 @@ def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
         return fixed
     tpu_window = window_bytes(
         num_slots=configurator.requested_max_running_requests_per_worker + 1,
-        chunk_tokens=get_schedule().chunked_prefill_size,
+        chunk_tokens=window_chunk_tokens(get_schedule().chunked_prefill_size),
         num_layers=configurator.num_layers_total,
     )
     slots = configurator.requested_max_running_requests_per_worker + 1

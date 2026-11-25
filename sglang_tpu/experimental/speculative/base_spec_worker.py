@@ -27,6 +27,7 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 from __future__ import annotations
 
 import contextlib
+import copy
 import itertools
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
@@ -147,6 +148,7 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     pad_rows,
     padded_h2d,
 )
+from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.mamba_pool import (
     TpuMambaPool,
     committed_read_offsets,
@@ -237,6 +239,12 @@ class TpuSpecWorker(BaseSpecWorker):
         # Ranks that share one batch: the attention-TP group under DP attention.
         self._tp_group = get_dp_tp_group()
         self._tp_sync = SpecTpSync(self._tp_group)
+        from sglang_tpu.experimental.speculative import mixed_step
+
+        self._mixed_steps = 0
+        # A fused mixed step's prompt part while its verify half runs; the verify
+        # forward then runs as the step's one MIXED forward (_forward_target_verify).
+        self._mixed_prompt: mixed_step.MixedPromptPart | None = None
         self._rank_check_interval = tpu_envs.SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL.get()
         self._block_verification = tpu_envs.SGLANG_TPU_SPEC_BLOCK_VERIFICATION.get()
         self._verify_ct = 0
@@ -1020,9 +1028,18 @@ class TpuSpecWorker(BaseSpecWorker):
         grammar_barrier: Callable[[], None] | None = None,
         *,
         pp_proxy_tensors: PPProxyTensors | None = None,
+        on_publish_verify: Callable[[torch.Tensor], None] | None = None,
     ) -> GenerationBatchResult:
         self._check_supported(batch=batch, pp_proxy_tensors=pp_proxy_tensors)
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        if getattr(batch, "mixed_verify", None) is not None:
+            # A mixed prefill + verify DP step (sglang.srt.speculative.mixed_verify);
+            # checked first: its verify-only and idle ranks see is_extend_in_batch.
+            result = self._forward_mixed(
+                batch,
+                grammar_barrier=grammar_barrier,
+                on_publish_verify=on_publish_verify,
+            )
+        elif batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Mixed prefill samples another token for its running requests.
             if batch.has_grammar and grammar_barrier is not None:
                 grammar_barrier()
@@ -1041,6 +1058,388 @@ class TpuSpecWorker(BaseSpecWorker):
         if on_publish is not None:
             on_publish(result.new_seq_lens)
         return result
+
+    def _forward_mixed(
+        self,
+        batch: ScheduleBatch,
+        *,
+        grammar_barrier: Callable[[], None] | None,
+        on_publish_verify: Callable[[torch.Tensor], None] | None,
+    ) -> GenerationBatchResult:
+        """A mixed prefill + verify DP step, run as its verify half then its prompt
+        half (two forwards). Every rank runs both halves in this order at the
+        plan's shapes; a rank without a part runs that half idle.
+
+        - Verify half: the decode step of the running requests at the plan's
+          verify bucket (``global_num_tokens`` = every rank's verify count).
+        - Prompt half: the extend of the prompt batch at the step's MLP-synced
+          token counts.
+
+        Returns the prompt part's result with the verify part's result as
+        ``mixed_verify_result`` (scheduler: process_batch_result_prefill /
+        _decode), or the verify-only rank's decode result, or an idle result.
+        """
+        from sglang.srt.speculative.mixed_verify import mixed_parts
+        from sglang_tpu.experimental.speculative.mixed_step import (
+            idle_like,
+            verify_sync_fields,
+        )
+
+        plan = batch.mixed_verify
+        prompt, verify = mixed_parts(batch)
+        self._mixed_steps += 1
+        if verify is not None and verify is not batch:
+            self._check_supported(batch=verify, pp_proxy_tensors=None)
+        from sglang_tpu.experimental.speculative.mixed_step import fused_mixed_forward
+
+        if fused_mixed_forward():
+            return self._forward_mixed_fused(
+                batch,
+                prompt=prompt,
+                verify=verify,
+                grammar_barrier=grammar_barrier,
+                on_publish_verify=on_publish_verify,
+            )
+        sync = verify_sync_fields(plan)
+        if verify is not None:
+            with overridden_fields(verify, **sync):
+                verify_result = self._forward_decode(
+                    verify, grammar_barrier=grammar_barrier
+                )
+        else:
+            verify_result = None
+            # MIXED needs a verifying rank, so the verify bucket is never empty.
+            self._forward_idle_decode(idle_like(batch, **sync))
+
+        if prompt is not None:
+            if prompt.has_grammar and grammar_barrier is not None:
+                grammar_barrier()
+            result = self.extend(prompt, pp_proxy_tensors=None)
+        else:
+            self.extend(
+                batch if batch.forward_mode.is_idle() else idle_like(batch),
+                pp_proxy_tensors=None,
+            )
+            result = None
+
+        if verify_result is None:
+            return result if result is not None else self._idle_result()
+        if result is None:
+            # Verify-only rank: the batch is the running decode batch itself.
+            return verify_result
+        if on_publish_verify is not None:
+            on_publish_verify(verify_result.new_seq_lens)
+        result.mixed_verify_result = verify_result
+        return result
+
+    def _forward_mixed_fused(
+        self,
+        batch: ScheduleBatch,
+        *,
+        prompt: ScheduleBatch | None,
+        verify: ScheduleBatch | None,
+        grammar_barrier: Callable[[], None] | None,
+        on_publish_verify: Callable[[torch.Tensor], None] | None,
+    ) -> GenerationBatchResult:
+        """A mixed prefill + verify DP step as one fused MIXED forward.
+
+        The prompt part is stashed on the worker and the verify half runs as
+        today (draft at the plan's verify bucket, accept, commit); its target
+        forward (_forward_target_verify, on real and idle ranks alike) runs the
+        MIXED forward holding the prompt rows too and hands verify() only the
+        verify rows. Then every rank syncs the prompt's sampled tokens and
+        writes the prompt's draft KV (zero rows / padding rows without a
+        prompt), as the extend of a Stage A step would. Every rank issues: the
+        draft's collectives at pad_bv, one MIXED target forward, the accept,
+        the SPEC_TARGET sync, the draft KV writes.
+
+        Returns as _forward_mixed: the prompt part's extend result with the
+        verify part's decode result as ``mixed_verify_result``, the verify-only
+        rank's decode result, or an idle result.
+        """
+        from sglang_tpu.experimental.speculative import mixed_step
+
+        plan = batch.mixed_verify
+        if prompt is not None and prompt.has_grammar and grammar_barrier is not None:
+            grammar_barrier()
+        part = mixed_step.MixedPromptPart(
+            plan=plan, prompt=prompt, sync_fields=mixed_step.mixed_sync_fields(batch)
+        )
+        sync = mixed_step.verify_sync_fields(plan)
+        self._mixed_prompt = part
+        try:
+            if verify is not None:
+                with overridden_fields(verify, **sync):
+                    verify_result = self._forward_decode(
+                        verify, grammar_barrier=grammar_barrier
+                    )
+            else:
+                verify_result = None
+                # MIXED needs a verifying rank, so the verify bucket is never empty.
+                self._forward_idle_decode(mixed_step.idle_like(batch, **sync))
+        finally:
+            self._mixed_prompt = None
+        if not part.ran:
+            raise RuntimeError("A fused mixed step ran no MIXED target forward.")
+        result = self._finish_mixed_prompt(part)
+        if verify_result is None:
+            return result if result is not None else self._idle_result()
+        if result is None:
+            # Verify-only rank: the batch is the running decode batch itself.
+            return verify_result
+        if on_publish_verify is not None:
+            on_publish_verify(verify_result.new_seq_lens)
+        result.mixed_verify_result = verify_result
+        return result
+
+    def _forward_mixed_target(
+        self,
+        part,
+        *,
+        batch: ScheduleBatch,
+        bucket_state: SpecState,
+        verify_tokens: torch.Tensor,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
+        logits_output_mode: LogitsOutputMode,
+        host_rows: HostVerifyRows | None,
+    ) -> LogitsProcessorOutput:
+        """The fused step's one MIXED target forward, in place of its verify forward.
+
+        ``batch`` is the verify part (or the idle stand-in), with the bucket
+        state and rows the verify forward would take. Returns the verify rows'
+        outputs in the TARGET_VERIFY layout verify() expects:
+        next_token_logits [pbs * R, V] (logits rows [ext_cap, L)) and
+        hidden_states [pbs * R, H] (rows after the folded prompt rows); keeps
+        the prompt's logits rows [0, ext_cap) and draft-inject hidden on ``part``.
+        """
+        from sglang.srt.model_executor.encoder_swa_replay import (
+            fold_encoder_swa_replay,
+        )
+        from sglang.srt.runtime_context import get_exec
+        from sglang_tpu.compilation.compiled_forward_shim import mixed_verify_caps
+        from sglang_tpu.experimental.speculative import mixed_step
+
+        if logits_output_mode is not LogitsOutputMode.FULL_VOCAB:
+            # DP attention gathers full logits (_forward_idle_verify).
+            raise NotImplementedError("A fused mixed step verifies on full logits.")
+        if self._target_has_linear_attn:
+            raise NotImplementedError(
+                "A fused mixed step does not track linear-attention checkpoints."
+            )
+        if part.ran:
+            raise RuntimeError("A fused mixed step ran a second target forward.")
+        runner = self.target_worker.model_runner
+        policy = self._compile_policy()
+        plan = part.plan
+        R = self.num_verify_rows
+        ext_cap, pad_bv = mixed_verify_caps(plan, policy.t_bucketer, policy.b_bucketer)
+        pbs = int(bucket_state.seq_lens.shape[0])
+        if pbs != pad_bv:
+            raise RuntimeError(
+                f"Fused mixed step: verify bucket {pbs} differs from the plan's {pad_bv}."
+            )
+        if host_rows is None:
+            # No host-mirror consumer: read the device rows (a sync).
+            host_rows = HostVerifyRows(
+                positions=rows.flat_positions.to("cpu", torch.int64),
+                out_cache_loc=rows.flat_cache_locs.to("cpu", torch.int64),
+                req_pool_indices=verify_input.req_pool_indices_cpu.to(torch.int64),
+            )
+        prompt = part.prompt
+        folded = None
+        if prompt is not None and get_exec().features.enable_encoder_swa_bounded_replay:
+            if not runner.attn_backend.folds_encoder_swa_replay:
+                raise NotImplementedError(
+                    "A fused mixed step needs the folded encoder SWA replay."
+                )
+            # As tp_worker's extend: fold the prompt part once (it resets the
+            # placed requests' windows). The host Engram path hashes the folded
+            # rows itself, so the fold skips the history upload.
+            scheduled = copy.copy(prompt)
+            scheduled.engram_history = None
+            folded = fold_encoder_swa_replay(self.target_worker, scheduled)
+        part.folded = folded
+        n_verify = len(batch.reqs)
+        mixed_spec = mixed_step.make_mixed_verify_input(
+            positions=torch.zeros((0,), dtype=torch.int64), num_verify_rows=R
+        )
+        layout = mixed_step.build_mixed_layout(
+            base=batch,
+            prompt=prompt,
+            folded=folded,
+            host_rows=mixed_step.HostRows(*host_rows),
+            n_verify=n_verify,
+            verify_reqs=batch.reqs,
+            verify_tokens=verify_tokens,
+            num_verify_rows=R,
+            ext_cap=ext_cap,
+            pad_bv=pad_bv,
+            out_cache_loc_dtype=policy.live_cache_loc_dtype(),
+            spec_info=mixed_spec,
+        )
+        mixed_spec.positions = layout.positions
+        mixed_spec.verify_tokens = verify_tokens
+        mixed_spec.verify_row_start = layout.prompt_rows
+        mixed_spec.num_verify_tokens = layout.verify_rows
+        merged = layout.batch
+        # The step's MLP-synced counts (prompt + replay + verify rows per rank):
+        # the shim picks the token bucket from them and the batch rows from the plan.
+        for name, value in part.sync_fields.items():
+            setattr(merged, name, value)
+        forward_batch = ForwardBatch.init_new(
+            merged,
+            runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        # Attributes, not fields: the compiled pytree never carries them.
+        forward_batch.mixed_verify = plan
+        forward_batch.mixed_host_rows = layout.host_rows
+        if layout.row_floor is not None:
+            forward_batch.encoder_swa_row_floor = layout.row_floor
+            forward_batch.encoder_swa_compress_rows = layout.compress_rows
+        index = layout.logits_index.to(self.device, non_blocking=True)
+        # A ForwardBatch field, so the direct tracer lifts it as a graph input.
+        forward_batch.logit_rows = index
+        mixed_spec.logits_select_index = index
+        mixed_spec.keep_outputs_padded = True
+        forward_batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
+        if layout.real_rows != forward_batch.global_num_token_non_padded_cpu:
+            # The idle rank's dummy verify request: its rows are padding.
+            if forward_batch.global_num_token_non_padded is not None:
+                forward_batch.global_num_token_non_padded = torch.tensor(
+                    layout.real_rows, dtype=torch.int32
+                ).to(self.device, non_blocking=True)
+            forward_batch.global_num_token_non_padded_cpu = layout.real_rows
+        mixed_spec.bind(forward_batch, self.device)
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=False,
+        )
+        part.ran = True
+        if not mixed_spec.finished:
+            # The policy never handed the padded batch back (record_padding): the
+            # verify rows would have run on placeholder tokens.
+            raise RuntimeError("Fused mixed step: the verify tokens were not spliced.")
+        logits_output = target_out.logits_output
+        logits = logits_output.next_token_logits
+        hidden = logits_output.hidden_states
+        num_logit_rows = ext_cap + R * pad_bv
+        if logits is None or logits.shape[0] != num_logit_rows:
+            raise RuntimeError(
+                f"Fused mixed step: {None if logits is None else logits.shape[0]} "
+                f"logits rows, expected {num_logit_rows} (keep the L rows unpadded)."
+            )
+        if hidden is None:
+            raise RuntimeError("Fused mixed step requires full target hidden capture.")
+        forward_rows = int(hidden.shape[0])
+        # Fresh tensors in the layout the accept and the sampler were warmed with:
+        # the prompt rows at the extend cap (_warmup_extend_sampling), the verify
+        # rows at the verify bucket.
+        n_prompt = 0 if prompt is None else int(prompt.extend_num_tokens)
+        # Uploads first: they stay out of the fused split program below.
+        verify_index = mixed_step.verify_hidden_index(
+            layout.prompt_rows, pbs, R, forward_rows
+        ).to(self.device, non_blocking=True)
+        prompt_index = mixed_step.prompt_hidden_index(
+            folded,
+            n_prompt,
+            mixed_step.inject_rows(plan, policy.t_bucketer, ext_cap),
+            forward_rows,
+        ).to(self.device, non_blocking=True)
+        # The output split as one program, not one per op (fused_eager.py): its
+        # shapes are bucketed (ext_cap, pad_bv, forward rows, inject rows).
+        with fused_eager_ops(logits.device.type == "tpu") as fused:
+            part.prompt_logits = logits[: policy._extend_compile_cap()].clone()
+            verify_logits = logits[ext_cap:].clone()
+            verify_hidden = hidden[verify_index]
+            part.prompt_hidden = hidden[prompt_index]
+        if fused:
+            submit(
+                (part.prompt_logits, verify_logits, verify_hidden, part.prompt_hidden)
+            )
+        # The verify forward's batch state, as _prepare_verify_forward_batch leaves it.
+        batch.out_cache_loc = rows.flat_cache_locs
+        batch.input_ids = verify_tokens
+        batch.spec_info = spec_info
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        return LogitsProcessorOutput(
+            next_token_logits=verify_logits, hidden_states=verify_hidden
+        )
+
+    def _finish_mixed_prompt(self, part) -> GenerationBatchResult | None:
+        """The prompt half of a fused step after its MIXED forward, on every rank:
+        sample the prompt's last rows and sync them (SPEC_TARGET), write the
+        prompt rows' draft KV, and build the prompt's extend result (None
+        without a prompt)."""
+        prompt = part.prompt
+        if prompt is None:
+            # Enter the peers' sync and draft KV write at the same shapes.
+            self.sync_target_tokens(self._device_zeros(0))
+            self.inject_mixed_prompt(None, part.prompt_hidden)
+            return None
+        bs = len(prompt.reqs)
+        logits_output, next_token_ids = self._sample_mixed_prompt(part)
+        next_token_ids = self.sync_target_tokens(next_token_ids)[:bs]
+        kv_fence_tail = self.inject_mixed_prompt(prompt, part.prompt_hidden)
+        result = GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=False,
+        )
+        return self.mixed_prompt_result(prompt, result, kv_fence_tail)
+
+    def _sample_mixed_prompt(self, part) -> tuple[LogitsProcessorOutput, torch.Tensor]:
+        """The prompt requests' sampled tokens from their logits rows, as extend
+        samples them (ModelRunner.sample at the batch bucket off the cap rows)."""
+        prompt = part.prompt
+        logits = part.prompt_logits
+        rows = self._pad_bs(len(prompt.reqs))
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=logits if rows == logits.shape[0] else logits[:rows]
+        )
+        sample_view = _PromptSampleView(
+            sampling_info=prompt.sampling_info,
+            seq_lens=prompt.seq_lens,
+            req_pool_indices=prompt.req_pool_indices,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        next_token_ids = self.target_worker.model_runner.sample(
+            logits_output, sample_view
+        )
+        return logits_output, next_token_ids
+
+    def inject_mixed_prompt(
+        self, prompt: ScheduleBatch | None, target_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Seed the draft context with a fused step's prompt rows, as extend does
+        (padding rows only without a prompt); returns the kv_fence_tail.
+
+        Why: the fused step's MIXED forward replaces the prompt's extend forward,
+        whose draft seeding the algorithm owns.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run fused mixed prefill + verify steps."
+        )
+
+    def mixed_prompt_result(
+        self,
+        prompt: ScheduleBatch,
+        result: GenerationBatchResult,
+        kv_fence_tail: torch.Tensor,
+    ) -> GenerationBatchResult:
+        """The prompt part's extend result (next_draft_input, new_seq_lens)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run fused mixed prefill + verify steps."
+        )
 
     def _forward_decode(
         self, batch: ScheduleBatch, *, grammar_barrier: Callable[[], None] | None = None
@@ -1826,6 +2225,20 @@ class TpuSpecWorker(BaseSpecWorker):
         logits_output_mode: LogitsOutputMode,
         host_rows: HostVerifyRows | None = None,
     ) -> LogitsProcessorOutput:
+        mixed_prompt = getattr(self, "_mixed_prompt", None)
+        if mixed_prompt is not None:
+            # A fused mixed step: this verify runs as the step's MIXED forward.
+            return self._forward_mixed_target(
+                mixed_prompt,
+                batch=batch,
+                bucket_state=bucket_state,
+                verify_tokens=verify_tokens,
+                rows=rows,
+                verify_input=verify_input,
+                spec_info=spec_info,
+                logits_output_mode=logits_output_mode,
+                host_rows=host_rows,
+            )
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
             bucket_state=bucket_state,
@@ -1993,3 +2406,22 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         and not need_min_p
         and bool((top_ks[sampled] <= TARGET_CANDIDATES).all()),
     }
+
+
+class _PromptSampleView:
+    """The fields ModelRunner.sample reads, for a fused step's prompt sampling
+    (no ForwardBatch of the prompt alone exists)."""
+
+    return_logprob = False
+    top_logprobs_nums = None
+    token_ids_logprobs = None
+    positions = None
+    ngram_embedding_info = None
+    watermark_prompt_tail_ids = None
+    watermark_context_hash_history = None
+
+    def __init__(self, *, sampling_info, seq_lens, req_pool_indices, forward_mode):
+        self.sampling_info = sampling_info
+        self.seq_lens = seq_lens
+        self.req_pool_indices = req_pool_indices
+        self.forward_mode = forward_mode

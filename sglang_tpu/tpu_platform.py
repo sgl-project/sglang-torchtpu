@@ -1645,6 +1645,27 @@ class TpuSRTPlatform(SRTPlatform):
 
         return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
 
+    def spec_mixed_verify_row_cap(self, server_args, context_len: int):
+        from sglang_tpu.experimental.speculative.mixed_step import mixed_row_cap
+
+        return mixed_row_cap(server_args, context_len)
+
+    def spec_mixed_verify_fused(self) -> bool:
+        from sglang_tpu.experimental.speculative.mixed_step import (
+            fused_mixed_forward,
+        )
+
+        return fused_mixed_forward()
+
+    def supports_spec_mixed_verify_dp(self, algorithm: str) -> bool:
+        # Mixed prefill + verify DP steps are served by the experimental block
+        # worker for DSpark only.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.experimental import is_experimental_spec
+
+        algo = SpeculativeAlgorithm.from_string(algorithm)
+        return algo.is_dspark() and is_experimental_spec(algo)
+
     def is_pin_memory_available(self, device=None) -> bool:
         return False
 

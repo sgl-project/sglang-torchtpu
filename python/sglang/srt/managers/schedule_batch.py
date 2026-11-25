@@ -2144,6 +2144,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    # Mixed prefill + verify DP step (sglang.srt.speculative.mixed_verify): this
+    # rank's plan, and, on a prompt batch, the running batch whose requests verify
+    # in the same forward (prepared for decode). None on every other step.
+    mixed_verify: Optional[Any] = None
+    mixed_verify_batch: Optional[ScheduleBatch] = None
     dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
@@ -3781,6 +3786,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
+            mixed_verify=self.mixed_verify,
+            mixed_verify_batch=(
+                None
+                if self.mixed_verify_batch is None
+                else self.mixed_verify_batch.copy()
+            ),
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,

@@ -26,6 +26,7 @@ from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
+    _fused_mixed_steps,
 )
 
 logger = get_logger(__name__)
@@ -39,6 +40,19 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
     [r, m, ..., m] (the drafter's block_width rows) and never runs EXTEND.
     """
+
+    def _draft_append_token_buckets(self) -> list[int]:
+        """Fused mixed steps add fine token buckets (e.g. 1152) the target alone
+        runs at; the draft KV append kernel needs 256-row multiples and the fused
+        prompt inject stays on them (mixed_step.inject_bucket)."""
+        buckets = super()._draft_append_token_buckets()
+        if not _fused_mixed_steps():
+            return buckets
+        from sglang_tpu.experimental.speculative.mixed_step import (
+            DRAFT_KV_ROW_MULTIPLE,
+        )
+
+        return [b for b in buckets if b % DRAFT_KV_ROW_MULTIPLE == 0]
 
     def _dummy_kv_slot(self) -> int:
         # DSpark warmups have no allocator-owned KV. Slot 0 masks cache writes

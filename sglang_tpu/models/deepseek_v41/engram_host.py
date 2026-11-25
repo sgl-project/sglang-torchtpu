@@ -777,7 +777,11 @@ class HostEngramCoordinator:
         return (tuple(requests), next_starts, list(lengths))
 
     def _reserve_upload(
-        self, layer_index: int, padded_tokens: int
+        self,
+        layer_index: int,
+        padded_tokens: int,
+        *,
+        avoid: PreparedEngramUpload | None = None,
     ) -> PreparedEngramUpload:
         by_tokens = self._uploads_by_layer[layer_index]
         slots = by_tokens.get(padded_tokens)
@@ -796,6 +800,10 @@ class HostEngramCoordinator:
                 for _ in range(2)
             ]
             by_tokens[padded_tokens] = slots
+        if avoid is not None:
+            # The other slot of the pair, even the last forward's: start() waits
+            # for that forward before overwriting it.
+            return next(slot for slot in slots if slot is not avoid)
         last = self._last_bucket_upload.get((layer_index, padded_tokens))
         return next(slot for slot in slots if slot is not last)
 
@@ -1215,6 +1223,150 @@ class HostEngramCoordinator:
             image_token_id=self.image_token_id,
         )
         return self._stage_layers(hashes, padded_tokens, use_prestaged=False)
+
+    def stage_mixed(
+        self, padded_tokens: int, rows: Any
+    ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
+        """Hash and stage a fused mixed prefill + verify forward (``rows``:
+        mixed_step.MixedHostRows): its prompt rows as an extend, with their
+        history commit now, then its verify rows as a verify, which commit
+        nothing here (DSpark's commit defers the accepted tokens' commit).
+
+        The next-chunk prefetch survives: a prompt part that is the prefetched
+        chunk takes its hashes and upload slots (the verify rows are packed into
+        them after the prompt rows); otherwise a prefetch on this bucket keeps
+        its slots and this forward stages through the other slot of the pair.
+        """
+        flush_engram_commits(self._hasher)
+        history = self._hasher.history
+        n1 = self.ngram - 1
+        if history is None or history.ndim != 2 or history.shape[1] != n1:
+            raise RuntimeError(
+                "Host Engram stages a fused mixed forward from EngramHasher.history."
+            )
+        self._discard_staged_uploads()
+        shape = self.tables["offsets"].shape
+        # Verify rows first: they read the history the prompt commit writes
+        # (other requests' slots).
+        verify_rows = rows.verify_rows
+        if verify_rows:
+            tokens = rows.verify_tokens.detach().to("cpu")[:verify_rows]
+            verify_hashes = hash_on_host(
+                verify_inputs_from_host(
+                    history,
+                    tokens,
+                    rows.verify_positions,
+                    rows.verify_slots,
+                    block=rows.num_verify_rows,
+                    ngram=self.ngram,
+                ),
+                **self.tables,
+                pad_id=self.pad_id,
+                image_token_id=self.image_token_id,
+            )
+        else:
+            verify_hashes = torch.empty((0, *shape), dtype=torch.int64)
+        requests = list(rows.prompt_reqs)
+        starts = [int(x) for x in rows.prompt_starts]
+        lengths = [int(x) for x in rows.prompt_lengths]
+        if any(
+            s + n > len(req.origin_input_ids) + len(req.output_ids)
+            for req, s, n in zip(requests, starts, lengths, strict=True)
+        ):
+            raise NotImplementedError(
+                "A fused mixed step requires host-resident prompt chunk tokens"
+            )
+        prefetched = self._prefetch
+        hit = (
+            prefetched is not None
+            and bool(requests)
+            and prefetched.matches(requests, starts, lengths, self.ngram)
+        )
+        reuse: dict[int, PreparedEngramUpload] | None = None
+        keep: _EngramPrefetch | None = None
+        if hit:
+            self._prefetch = None
+            prompt_inputs, prompt_hashes = prefetched.inputs, prefetched.hashes
+            if prefetched.padded_tokens == padded_tokens:
+                reuse = dict(prefetched.uploads)
+            else:
+                prefetched.discard()
+        else:
+            prompt_inputs = capture_inputs(
+                requests, starts, lengths, self.ngram
+            ).resolve(None)
+            prompt_hashes = hash_on_host(
+                prompt_inputs,
+                **self.tables,
+                pad_id=self.pad_id,
+                image_token_id=self.image_token_id,
+            )
+            if prefetched is not None and prefetched.padded_tokens == padded_tokens:
+                keep = prefetched
+        prompt_rows = int(prompt_hashes.shape[0])
+        hashes = torch.cat([prompt_hashes, verify_hashes])
+        if hashes.shape[0] > padded_tokens:
+            raise ValueError("Host Engram rows exceed the padded local token count")
+        # The prompt rows' history commit, as an extend's (stage_all).
+        row_end, commit = 0, []
+        for slot, length in zip(rows.prompt_slots, lengths, strict=True):
+            if length <= 0:
+                continue
+            row_end += length
+            commit.append((int(slot), row_end - 1))
+        self._step_inputs = prompt_inputs
+        self._history_commit = commit
+        self._commit_history()
+        self._step_inputs = None
+        # The next prompt chunk of an unfolded prompt part prefetches after the
+        # forward (finish_forward), as after an extend.
+        self._next_prompt_spec = (
+            self._next_prompt_prediction(requests, starts, lengths)
+            if requests and not rows.prompt_folded
+            else None
+        )
+        uploads: list[tuple[int, PreparedEngramUpload]] = []
+        for layer_index, embedding in self.embeddings:
+            if reuse is not None:
+                upload = reuse[layer_index]
+                if verify_rows:
+                    heads = shape[1]
+                    words = packed_row_words(heads, embedding.weight.shape[1], 1)
+                    host = upload.acquire()
+                    pack_rows(
+                        embedding.weight,
+                        embedding.scale,
+                        verify_hashes[:, layer_index],
+                        row_start=0,
+                        padded_tokens=verify_rows,
+                        out=host[
+                            prompt_rows * words : (prompt_rows + verify_rows) * words
+                        ],
+                    )
+                    upload.start()
+            else:
+                upload = self._reserve_upload(
+                    layer_index,
+                    padded_tokens,
+                    avoid=None if keep is None else keep.uploads.get(layer_index),
+                )
+                pack_rows(
+                    embedding.weight,
+                    embedding.scale,
+                    hashes[:, layer_index],
+                    row_start=0,
+                    padded_tokens=padded_tokens,
+                    out=upload.acquire(),
+                )
+                upload.start()
+            uploads.append((layer_index, upload))
+        ordered: list[PreparedEngramUpload] = []
+        for layer_index, upload in uploads:
+            upload.activate()
+            self._active_uploads[layer_index] = upload
+            self._last_bucket_upload[(layer_index, padded_tokens)] = upload
+            ordered.append(upload)
+        return tuple(upload.device for upload in ordered), ordered, int(shape[1])
 
     def stage_from_hashes(
         self, hashes: torch.Tensor, padded_tokens: int

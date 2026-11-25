@@ -281,10 +281,31 @@ def _dp_attn_select_bucket_shape(
         or forward_batch.forward_mode.is_draft_extend_v2()
     )
 
+    mixed_verify = getattr(forward_batch, "mixed_verify", None)
     group_is_decode = is_decode or (
         is_idle and not getattr(forward_batch, "is_extend_in_batch", False)
     )
-    if group_is_decode:
+    if mixed_verify is not None:
+        # A mixed prefill + verify step (sglang.srt.speculative.mixed_verify),
+        # checked first because a verify-only or idle rank joins it too: the
+        # extend cap of prompt requests plus the verify request bucket every
+        # rank derives from the gathered counts. The plan is an attribute the
+        # spec worker sets on the batch, not a dataclass field, so the compiled
+        # pytree never carries it.
+        from sglang_tpu.experimental.speculative.mixed_step import (
+            mixed_min_token_rows,
+        )
+
+        pad_b = _mixed_verify_batch_rows(mixed_verify, t_bucketer, b_bucketer)
+        pad_t = t_bucketer.next_bucket(
+            max(
+                real_q,
+                max_tokens_per_rank,
+                pad_b,
+                min(mixed_min_token_rows(), t_bucketer.max_val),
+            )
+        )
+    elif group_is_decode:
         # Decode runs one query token per sequence, so the token axis equals
         # the batch axis and both pad with the bs bucketer (decode graphs are
         # precompiled at (bs, bs) shapes). pad_b also uses max_tokens_per_rank
@@ -312,6 +333,30 @@ def _dp_attn_select_bucket_shape(
         pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
         pad_t = t_bucketer.next_bucket(max(real_q, max_tokens_per_rank, pad_b))
     return pad_t, pad_b
+
+
+def mixed_verify_caps(
+    plan, t_bucketer: Bucketer, b_bucketer: Bucketer
+) -> tuple[int, int]:
+    """(prompt request cap, verify request bucket) of a mixed prefill + verify
+    forward under attention DP, the same on every rank. The prompt cap is the
+    DP-attention extend cap (no --prefill-max-requests cap, as DP extends pad)."""
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.mixed_verify import verify_bucket
+
+    pad_bv = verify_bucket(
+        plan.global_verify_bs,
+        attn_tp_size=get_parallel().attn_tp_size,
+        b_bucket=b_bucketer.next_bucket,
+    )
+    return _extend_batch_cap(t_bucketer, b_bucketer), pad_bv
+
+
+def _mixed_verify_batch_rows(plan, t_bucketer: Bucketer, b_bucketer: Bucketer) -> int:
+    """Batch rows of a mixed prefill + verify forward: the prompt cap, then the
+    verify request bucket."""
+    ext_cap, pad_bv = mixed_verify_caps(plan, t_bucketer, b_bucketer)
+    return ext_cap + pad_bv
 
 
 def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> None:
@@ -1495,4 +1540,23 @@ def build_bucketers(
             name="BatchSizeBucketer", min_val=1, max_val=max_b, power=2
         )
 
+    from sglang.srt.speculative.mixed_verify import mixed_verify_enabled
+
+    if mixed_verify_enabled():
+        check_mixed_verify_grid(token_bucketer, bs_bucketer)
     return token_bucketer, bs_bucketer
+
+
+def check_mixed_verify_grid(t_bucketer: Bucketer, b_bucketer: Bucketer) -> None:
+    """A mixed prefill + verify forward pads its batch dim to the prompt cap plus
+    up to the largest batch bucket of verify requests, and its token dim to at
+    least that; the token grid must reach it."""
+    ext_cap = _extend_batch_cap(t_bucketer, b_bucketer)
+    rows = ext_cap + b_bucketer.max_val
+    if rows > t_bucketer.max_val:
+        raise ValueError(
+            f"Mixed prefill + verify DP steps pad the batch to {rows} rows "
+            f"(extend cap {ext_cap} + batch bucket {b_bucketer.max_val}), above "
+            f"the largest token bucket {t_bucketer.max_val}; raise the prefill "
+            "token ceiling or lower the batch buckets"
+        )

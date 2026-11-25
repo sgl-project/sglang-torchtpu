@@ -266,6 +266,13 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
+    # Mixed prefill + verify DP steps (--enable-mixed-chunk + DSpark + attention DP):
+    # one fused forward per step instead of a verify forward then an extend forward.
+    SGLANG_TPU_MIXED_VERIFY_FUSED = EnvBool(False)
+    # Fused mixed steps may also use the next token bucket when it is at most
+    # 128 rows above the prompt's (e.g. 1152 over 1024; needs it in
+    # --tpu-compile-tokens); otherwise verify rows mix only into slack.
+    SGLANG_TPU_MIXED_VERIFY_FINE_BUCKET = EnvBool(False)
     # Every N verify steps, TP ranks compare a digest of their committed tokens and
     # raise on mismatch: hash_uniforms replaces the accept broadcast. 0 disables.
     # Steps, not seconds, so every rank joins the same all-gather; ~1 min at bs 1.

@@ -109,11 +109,37 @@ def scheduled_decoder_rows(batch, *, folds: bool) -> int:
     one-row-per-request extend under MAX_LEN padding); else 0."""
     if batch is None:
         return 0
+    if getattr(batch, "mixed_verify", None) is not None:
+        from sglang_tpu.experimental.speculative.mixed_step import (
+            fused_mixed_forward,
+        )
+
+        if fused_mixed_forward():
+            return fused_mixed_decoder_rows(batch, folds=folds)
+        # Run as halves, the prompt part's extend replays as any extend, and a
+        # rank without one runs an idle extend.
+        if not batch.forward_mode.is_extend():
+            return 0
     if batch.forward_mode.is_decode():
         return batch.batch_size()
     if not batch.forward_mode.is_extend_without_speculative():
         return 0
     return scheduled_decoder_plan(batch, folds=folds).num_rows
+
+
+def fused_mixed_decoder_rows(batch, *, folds: bool) -> int:
+    """This rank's decoder rows of a fused mixed prefill + verify step: its
+    prompt part's rows as an extend plans them, plus every verify row (a verify
+    request keeps all its rows, ``plan_tail_rows``'s ``whole_from``)."""
+    from sglang.srt.speculative.mixed_verify import mixed_parts
+
+    plan = batch.mixed_verify
+    prompt, _ = mixed_parts(batch)
+    rows = plan.n_verify * plan.num_verify_rows
+    if prompt is not None and prompt.reqs:
+        folds = folds and getattr(prompt, "encoder_swa_reset", None) is not None
+        rows += scheduled_decoder_plan(prompt, folds=folds).num_rows
+    return rows
 
 
 def scheduled_decoder_plan(batch, *, folds: bool) -> DecoderRowPlan:
@@ -168,6 +194,27 @@ def decoder_rows_bucket(max_rows: int, token_bucket: int) -> int:
     return token_bucket
 
 
+# A fused MIXED forward's decoder row buckets are this or its token bucket: each
+# decoder bucket is one more MIXED program per (verify bucket), and the 26-shape
+# grid of every DECODER_ROW_BUCKETS bucket OOM-killed warmup (j-881467b2).
+MIXED_DECODER_BUCKET = 256
+
+
+def mixed_decoder_rows_bucket(max_rows: int, token_bucket: int) -> int:
+    """The shared decoder row bucket of a fused MIXED forward."""
+    if max_rows > token_bucket:
+        raise ValueError(f"{max_rows} decoder rows exceed the {token_bucket} bucket")
+    return MIXED_DECODER_BUCKET if max_rows <= MIXED_DECODER_BUCKET else token_bucket
+
+
+def mixed_decoder_buckets(min_rows: int, token_bucket: int) -> List[int]:
+    """The decoder row buckets (``mixed_decoder_rows_bucket``) of a fused MIXED
+    forward whose busiest rank keeps between ``min_rows`` and ``token_bucket``
+    decoder rows."""
+    edges = sorted({min(MIXED_DECODER_BUCKET, token_bucket), token_bucket})
+    return [b for b in edges if b >= min_rows]
+
+
 class TailRows(NamedTuple):
     """Host plan of one forward's decoder rows."""
 
@@ -200,12 +247,17 @@ def plan_tail_rows(
     floors: torch.Tensor,
     bucket: Optional[int],
     warmup: bool = False,
+    whole_from: Optional[int] = None,
 ) -> TailRows:
     """``query_start_loc`` [B + 1], ``positions`` [T], ``valid`` [T] and
     ``floors`` [B] (the fold's SWA floor) are host tensors of the full batch.
     Only valid rows are decoder rows, so a DP rank materialized as a dummy
     extend runs the decoder on padding rows only. A ``warmup`` dummy compiles
-    the bucket's shape with padding rows only."""
+    the bucket's shape with padding rows only.
+
+    ``whole_from``: requests from this batch row on (a fused mixed forward's
+    verify requests) keep every row with their own floor as the replay start,
+    so their decoder layers attend as a plain TARGET_VERIFY's."""
     bs = query_start_loc.shape[0] - 1
     num_tokens = positions.shape[0]
     if warmup:
@@ -217,7 +269,8 @@ def plan_tail_rows(
             num_real=0,
         )
     counts = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
-    live = [b for b in range(bs) if counts[b] > 0]
+    whole = bs if whole_from is None else int(whole_from)
+    live = [b for b in range(min(bs, whole)) if counts[b] > 0]
     starts = [int(positions[query_start_loc[b]]) for b in live]
     ext = [counts[b] for b in live]
     fills = fill_lens_or_ends(
@@ -232,7 +285,9 @@ def plan_tail_rows(
     rows: List[torch.Tensor] = []
     tail_counts = torch.zeros(bs, dtype=torch.int64)
     replay_starts = torch.zeros(bs, dtype=torch.int64)
-    for b, kept, replay in zip(live, plan.kept, plan.replay_starts):
+    kept_rows = list(zip(live, plan.kept, plan.replay_starts))
+    kept_rows += [(b, counts[b], int(floors[b])) for b in range(whole, bs) if counts[b]]
+    for b, kept, replay in kept_rows:
         end = int(query_start_loc[b + 1])
         idx = torch.arange(end - kept, end, dtype=torch.int64)
         idx = idx[valid[idx]]

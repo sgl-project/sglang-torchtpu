@@ -387,6 +387,17 @@ def extend_reads_input_logprobs(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def mixed_logits_select_index(forward_batch) -> Optional[torch.Tensor]:
+    """A MIXED forward's fixed-size logits row index (speculative.mixed_verify),
+    or None (one row per request). The platform's copy on the ForwardBatch field
+    ``logit_rows`` wins: a tracer that flattens the batch lifts it as an input,
+    while ``spec_info`` may be opaque to it (absent inside the traced forward)."""
+    index = getattr(forward_batch, "logit_rows", None)
+    if index is None:
+        index = getattr(forward_batch.spec_info, "logits_select_index", None)
+    return index
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -499,6 +510,11 @@ class LogitsMetadata:
 
         if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             draft_extend_select_index = forward_batch.spec_info.select_index
+        elif forward_batch.forward_mode == ForwardMode.MIXED:
+            # A mixed prefill + verify step (speculative.mixed_verify) selects a
+            # fixed-size row set: each prompt request's last row, then every
+            # verify row, padded, so every DP rank computes the same logits rows.
+            draft_extend_select_index = mixed_logits_select_index(forward_batch)
         else:
             draft_extend_select_index = None
 
@@ -1001,6 +1017,9 @@ class LogitsProcessor(nn.Module):
             ForwardMode.IDLE,
             ForwardMode.TARGET_VERIFY,
             ForwardMode.DRAFT_EXTEND_V2,
+        ) or (
+            logits_metadata.forward_mode == ForwardMode.MIXED
+            and logits_metadata.draft_extend_select_index is not None
         ):
             draft_extend_select_index = logits_metadata.draft_extend_select_index
             if draft_extend_select_index is not None:
