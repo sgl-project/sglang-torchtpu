@@ -14,19 +14,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The fork-only counters compare against the upstream commit last merged
+      # into this fork; a sparse checkout of it is cheaper than full fork history.
+      - name: Read the pinned upstream commit
+        id: pin
+        run: echo "sha=$(grep -v '^#' tools/plugin/upstream_pin.txt | head -n 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ steps.pin.outputs.sha }}
+          path: upstream-sglang
+          sparse-checkout: python/sglang
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Publish the scoreboard and the hook and patch inventory
+      - name: Publish the scoreboard, the plugin's reach into core, and ratchet drift
         run: |
           {
             echo "# TPU plugin migration"
             echo
-            python tools/plugin/scoreboard.py
+            python tools/plugin/scoreboard.py --upstream-root upstream-sglang
             echo
             python tools/plugin/inventory.py
+            echo
+            python tools/plugin/fork_only_api.py --upstream-root upstream-sglang
+            echo "## Growth since the ratchet baseline"
+            echo
+            echo '```'
+            python tools/plugin/check_plugin_ratchets.py --warn-only --upstream-root upstream-sglang 2>&1
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          python tools/plugin/scoreboard.py --json > tpu-plugin-scoreboard.json
+          python tools/plugin/scoreboard.py --json --upstream-root upstream-sglang > tpu-plugin-scoreboard.json
       - uses: actions/upload-artifact@v4
         with:
           name: tpu-plugin-scoreboard

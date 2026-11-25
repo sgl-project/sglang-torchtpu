@@ -162,6 +162,15 @@ repos:
         entry: python3 tools/plugin/check_tpu_branches.py --files
         language: system
         files: ^python/sglang/.*\.py$
+      - id: check-plugin-ratchets
+        name: plugin debt ratchet (hooks, runtime patches, fork-only core API; warn-only)
+        # Ceilings in tools/plugin/plugin_debt_baseline.json; --write-baseline to move them.
+        # Warn-only until the counters have settled; verbose so the warnings show.
+        entry: python3 tools/plugin/check_plugin_ratchets.py --warn-only
+        language: system
+        files: ^(sglang_tpu/.*\.py|python/sglang/srt/platforms/(interface|device_mixin)\.py|tools/plugin/.*)$
+        pass_filenames: false
+        verbose: true
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'

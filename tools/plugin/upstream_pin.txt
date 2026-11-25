@@ -1,0 +1,4 @@
+# sgl-project/sglang commit last merged into this fork. tools/plugin/fork_only_api.py
+# calls core API "fork-only" when this commit lacks it. scripts/code_sync/merge_from_upstream.sh
+# rewrites it on every sync; a hand-made sync updates it too.
+f6de13a0c26697382a1bb7969e24ea59f089365e

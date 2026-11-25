@@ -61,6 +61,9 @@ if ! git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}"; then
   git rev-parse --verify MERGE_HEAD >/dev/null || exit 1
 fi
 git restore --source="$BASE_BRANCH" --staged --worktree -- .github/CI_PERMISSIONS.json
+# The plugin ratchet measures fork-only core API against the upstream commit merged last.
+sed -i "s/^[0-9a-f]\{40\}$/$(git rev-parse "upstream/${UPSTREAM_BRANCH}")/" tools/plugin/upstream_pin.txt
+git add tools/plugin/upstream_pin.txt
 CONFLICTS=$(git diff --name-only --diff-filter=U || true)
 if [ -n "$CONFLICTS" ]; then
   echo "Merge has conflicts in:"

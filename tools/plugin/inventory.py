@@ -18,6 +18,7 @@ import sys
 from typing import NamedTuple, Optional
 
 HOOKS_SOURCE = "sglang_tpu/hooks/__init__.py"
+HOOKS_MODULE = "sglang_tpu.hooks"
 PATCHES_SOURCE = "sglang_tpu/patches.py"
 
 #: The function init_backend() calls; every function it calls is one patch.
@@ -32,9 +33,12 @@ class Patch(NamedTuple):
 
 
 class Hook(NamedTuple):
+    #: Dotted path the hook wraps, as registered.
     target: str
     hook: str
     hook_type: str
+    #: Plugin file the entry is written in.
+    source: str = HOOKS_SOURCE
 
 
 def _summary(func: ast.FunctionDef) -> str:
@@ -201,24 +205,157 @@ def collect_patches(repo_root: str) -> list[Patch]:
     return patches
 
 
-def collect_hooks(repo_root: str) -> list[Hook]:
-    for node in _module_tree(repo_root, HOOKS_SOURCE).body:
-        value = None
+def _string_value(node: ast.expr, names: dict[str, str]) -> Optional[str]:
+    """A string built from literals, f-strings, ``+`` and string constants in ``names``."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _string_value(node.left, names)
+        right = _string_value(node.right, names)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                if value.conversion != -1 or value.format_spec is not None:
+                    return None
+                value = value.value
+            part = _string_value(value, names)
+            if part is None:
+                return None
+            parts.append(part)
+        return "".join(parts)
+    return None
+
+
+def _string_names(body: list[ast.stmt], base: dict[str, str]) -> dict[str, str]:
+    """``name = <string>`` bindings among ``body``'s statements, on top of ``base``."""
+    names = dict(base)
+    for stmt in body:
         if (
-            isinstance(node, ast.AnnAssign)
-            and getattr(node.target, "id", "") == "HOOKS"
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
         ):
-            value = node.value
-        elif isinstance(node, ast.Assign) and any(
-            getattr(t, "id", "") == "HOOKS" for t in node.targets
-        ):
-            value = node.value
+            value = _string_value(stmt.value, names)
+            if value is not None:
+                names[stmt.targets[0].id] = value
+    return names
+
+
+def _is_hook_entry(node: ast.AST) -> bool:
+    """A ``(target, hook, HookType.X)`` triple."""
+    return (
+        isinstance(node, ast.Tuple)
+        and len(node.elts) == 3
+        and isinstance(node.elts[2], ast.Attribute)
+        and isinstance(node.elts[2].value, ast.Name)
+        and node.elts[2].value.id == "HookType"
+    )
+
+
+def _hook_entries(scope: ast.AST, names: dict[str, str], source: str) -> list[Hook]:
+    entries = sorted(
+        (node for node in ast.walk(scope) if _is_hook_entry(node)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    hooks = []
+    for entry in entries:
+        target, hook, hook_type = entry.elts
+        resolved = _string_value(target, names)
+        hooks.append(
+            Hook(
+                target=resolved if resolved is not None else ast.unparse(target),
+                hook=ast.unparse(hook),
+                hook_type=ast.unparse(hook_type),
+                source=source,
+            )
+        )
+    return hooks
+
+
+def _plugin_module_path(repo_root: str, module: str) -> str:
+    base = module.replace(".", "/")
+    for relpath in (f"{base}.py", f"{base}/__init__.py"):
+        if os.path.exists(os.path.join(repo_root, relpath)):
+            return relpath
+    raise ValueError(f"no source file for plugin module {module}")
+
+
+def _provider_hooks(repo_root: str, qualname: str) -> list[Hook]:
+    """The entries a provider such as ``sglang_tpu.hooks.dsv4.hook_specs`` returns.
+
+    Entries behind a runtime condition (an env flag) are counted too: the code
+    that would register them is debt whether or not a deployment turns it on.
+    """
+    module, _, func_name = qualname.rpartition(".")
+    relpath = _plugin_module_path(repo_root, module)
+    tree = _module_tree(repo_root, relpath)
+    for func in tree.body:
+        if isinstance(func, ast.FunctionDef) and func.name == func_name:
+            names = _string_names(func.body, _string_names(tree.body, {}))
+            return _hook_entries(func, names, relpath)
+    raise ValueError(f"hook provider {qualname} not found in {relpath}")
+
+
+def _hooks_list_value(node: ast.stmt) -> Optional[ast.expr]:
+    """The value of ``HOOKS = [...]`` / ``HOOKS: list = [...]``."""
+    if isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    elif isinstance(node, ast.Assign):
+        targets = node.targets
+    else:
+        return None
+    if any(isinstance(t, ast.Name) and t.id == "HOOKS" for t in targets):
+        return node.value
+    return None
+
+
+def _hooks_addition(node: ast.stmt) -> Optional[ast.expr]:
+    """The argument of ``HOOKS.extend(x)`` / ``HOOKS.append(x)`` / ``HOOKS += x``."""
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HOOKS"
+    ):
+        return node.value
+    if (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr in ("extend", "append")
+        and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id == "HOOKS"
+        and len(node.value.args) == 1
+    ):
+        return node.value.args[0]
+    return None
+
+
+def collect_hooks(repo_root: str) -> list[Hook]:
+    """``HOOKS``: the literal list plus what each ``HOOKS.extend(provider())`` adds."""
+    module = _module_tree(repo_root, HOOKS_SOURCE)
+    aliases = _import_aliases(module)
+    names = _string_names(module.body, {})
+    hooks: Optional[list[Hook]] = None
+    for node in module.body:
+        value = _hooks_list_value(node)
         if value is not None:
-            return [
-                Hook(*(ast.unparse(part) for part in entry.elts))
-                for entry in value.elts
-            ]
-    raise ValueError(f"no HOOKS list in {HOOKS_SOURCE}")
+            hooks = _hook_entries(value, names, HOOKS_SOURCE)
+            continue
+        added = _hooks_addition(node)
+        if hooks is None or added is None:
+            continue
+        if isinstance(added, ast.Call) and isinstance(added.func, ast.Name):
+            local = f"{HOOKS_MODULE}.{added.func.id}"
+            hooks += _provider_hooks(repo_root, aliases.get(added.func.id, local))
+        else:
+            hooks += _hook_entries(added, names, HOOKS_SOURCE)
+    if hooks is None:
+        raise ValueError(f"no HOOKS list in {HOOKS_SOURCE}")
+    return hooks
 
 
 def render_patches(patches: list[Patch]) -> str:
@@ -244,7 +381,7 @@ def render_hooks(hooks: list[Hook]) -> str:
     ]
     if hooks:
         lines += ["| Target | Hook | Type |", "|---|---|---|"]
-        lines += [f"| {h.target} | `{h.hook}` | {h.hook_type} |" for h in hooks]
+        lines += [f"| `{h.target}` | `{h.hook}` | {h.hook_type} |" for h in hooks]
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
