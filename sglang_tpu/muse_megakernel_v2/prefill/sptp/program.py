@@ -524,14 +524,18 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     xs_all = ag1(xs).reshape(T, 1)
                     ids_all, tw_all = ag1(ids).T, ag1(tw).T
                     ids_own = ids.T
+                    if xe_pallas:
+                        xe = dequant(ag(xe8, axis), xs_all)
+                    else:
+                        xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
                 else:
-                    xs_all = ag(xs, axis)
+                    # the switch-off op order (lowers as the un-integrated sptp program)
+                    if xe_pallas:
+                        xe = dequant(ag(xe8, axis), ag(xs, axis))
+                    else:
+                        xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
                     ids_all, tw_all = ag(ids, axis), ag(tw, axis)
                     ids_own = ids
-                if xe_pallas:
-                    xe = dequant(ag(xe8, axis), xs_all)
-                else:
-                    xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
                 counts = None
                 if local_counts:
                     # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
