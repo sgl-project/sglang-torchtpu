@@ -1531,7 +1531,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def scheduled_decoder_rows(self, batch, *, folds: bool) -> int:
         """This rank's MLP-sync decoder row count (core dp_attn asks a backend
         with ``decoder_replay``)."""
-        from sglang_tpu.models.deepseek_v41.decoder_replay import scheduled_decoder_rows
+        from sglang_tpu.models.deepseek_v41.decoder_replay import (
+            scheduled_decoder_rows,
+        )
 
         return scheduled_decoder_rows(batch, folds=folds)
 
