@@ -565,6 +565,59 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(req.extend_len, expected)
 
+    def test_tpu_exact_chunk_fill_modes(self):
+        # SGLANG_TPU_EXACT_CHUNK_FILL:
+        #   0 (default off): page-ceiled compute charge blocks the 5th request.
+        #   1: exact token compute charge + page-aligned chunk cuts.
+        #   2: exact token compute charge + exact unaligned chunk cuts.
+        #   4096: exact token compute charge + bq-aligned cuts (avoids small LC tail splits).
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 65536
+
+        def _run_pack(mode_val: int, lengths: list[int], rem_chunk: int, page_size: int = 512):
+            with patch.object(
+                tpu_envs.SGLANG_TPU_EXACT_CHUNK_FILL, "get", return_value=mode_val
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=page_size,
+                    rem_chunk_tokens=rem_chunk,
+                )
+                admitted = []
+                for idx, tok_len in enumerate(lengths):
+                    req = self.create_shared_req(f"r{idx}")
+                    req.full_untruncated_fill_ids = list(range(tok_len))
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    if req in adder.can_run_list:
+                        admitted.append((req.extend_len, req.extend_end))
+                return admitted, adder.rem_chunk_tokens
+
+        # 4 reqs * 5900 (ceil=6144 -> 24576) + 5th req 1200 in 24576 budget:
+        lengths = [5900, 5900, 5900, 5900, 1200]
+        adm0, rem0 = _run_pack(0, lengths, rem_chunk=24576)
+        self.assertEqual([ext for ext, _ in adm0], [5900, 5900, 5900, 5900])
+        self.assertEqual(rem0, 0)
+
+        adm1, rem1 = _run_pack(1, lengths, rem_chunk=24576)
+        self.assertEqual([ext for ext, _ in adm1], [5900, 5900, 5900, 5900, 512])
+        self.assertEqual(adm1[-1][1] % 512, 0)
+        self.assertEqual(rem1, 464)
+
+        adm2, rem2 = _run_pack(2, lengths, rem_chunk=24576)
+        self.assertEqual([ext for ext, _ in adm2], [5900, 5900, 5900, 5900, 976])
+        self.assertEqual(rem2, 0)
+
+        # bq=4096 mode avoids tiny split (<4096 remaining) and cuts at 4096 when >=4096 left.
+        lc_skip, _ = _run_pack(4096, [7300, 7300, 7300], rem_chunk=16384)
+        self.assertEqual([ext for ext, _ in lc_skip], [7300, 7300])
+        lc_cut, _ = _run_pack(4096, [6000, 6000, 7300], rem_chunk=16384)
+        self.assertEqual([ext for ext, _ in lc_cut], [6000, 6000, 4096])
+
     def test_encoder_replay_rows_share_the_chunk(self):
         # A hit's replay rows run in the same step as its extend, so both must
         # fit the chunk: the MegaMoE token cap is sized from it.

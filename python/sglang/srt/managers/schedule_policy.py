@@ -90,16 +90,23 @@ CLIP_MAX_NEW_TOKENS = int(
 )
 
 
-@lru_cache(maxsize=1)
-def _use_exact_chunk_fill() -> bool:
-    """Whether to charge the chunked-prefill compute budget in tokens (gfx95 only).
+def _tpu_exact_chunk_fill_mode() -> int:
+    try:
+        from sglang_tpu.envs import envs as tpu_envs
 
-    Gated on gfx95 because that is where the win is: the aiter absorb bmm picks
-    its EVEN_MN specialization from M % BLOCK_SIZE_M, so a short batch costs 2x
-    on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
-    partial tile.
+        return max(0, int(tpu_envs.SGLANG_TPU_EXACT_CHUNK_FILL.get() or 0))
+    except ImportError:
+        return 0
+
+
+def _use_exact_chunk_fill() -> bool:
+    """Whether to charge the chunked-prefill compute budget in tokens (gfx95 or opt-in TPU).
+
+    Gated on gfx95 or opt-in ``SGLANG_TPU_EXACT_CHUNK_FILL > 0``: on TPU with
+    ``page_size=512`` and static chunked buckets, page-ceiled compute billing
+    leaves ~256 tokens/req unused; exact token billing eliminates that slack.
     """
-    return is_gfx95_supported()
+    return is_gfx95_supported() or _tpu_exact_chunk_fill_mode() > 0
 
 
 # Threshold for in-batch prefix cache.
@@ -931,6 +938,7 @@ class PrefillAdder:
         # Mamba checkpoints only land on page-aligned chunk ends.
         # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
         # ends on pages, which some batch-invariant kernels depend on.
+        tpu_exact_mode = _tpu_exact_chunk_fill_mode()
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
             and dllm_config is None
@@ -938,6 +946,18 @@ class PrefillAdder:
                 tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
             )
             and not get_exec().deterministic.enable_deterministic_inference
+        )
+        self._tpu_page_aligned_chunk_cut = bool(
+            self.exact_chunk_fill and tpu_exact_mode == 1
+        )
+        self._tpu_chunk_cut_align = (
+            self.page_size
+            if (self._tpu_page_aligned_chunk_cut and self.page_size > 1)
+            else (
+                tpu_exact_mode
+                if (self.exact_chunk_fill and tpu_exact_mode >= 64)
+                else None
+            )
         )
 
         if self.dllm_config is not None:
@@ -1842,6 +1862,10 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
+            if truncation_align_size is not None and trunc_len < cand_extend_input_len:
+                trunc_len = trunc_len // truncation_align_size * truncation_align_size
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1900,6 +1924,16 @@ class PrefillAdder:
         """whether running work must finish before another admission attempt"""
         return bool(self.can_run_list) or not self.running_batch.is_empty()
 
+    def _effective_truncation_align_size(
+        self, truncation_align_size: Optional[int]
+    ) -> Optional[int]:
+        align = self._tpu_chunk_cut_align
+        if align is None:
+            return truncation_align_size
+        if truncation_align_size is None:
+            return align
+        return math.lcm(truncation_align_size, align)
+
     @capacity_decision
     def add_one_req(
         self,
@@ -1908,6 +1942,9 @@ class PrefillAdder:
         truncation_align_size: Optional[int],
         chunk_tokens_cap: Optional[int] = None,
     ):
+        truncation_align_size = self._effective_truncation_align_size(
+            truncation_align_size
+        )
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
@@ -2206,9 +2243,17 @@ class PrefillAdder:
                 # capped.
                 extend_len = chunk_tokens_limit
                 if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
+                    if self._tpu_page_aligned_chunk_cut:
+                        end = (
+                            (prefix_len + extend_len)
+                            // truncation_align_size
+                            * truncation_align_size
+                        )
+                        extend_len = end - prefix_len
+                    else:
+                        extend_len = (
+                            extend_len // truncation_align_size * truncation_align_size
+                        )
             else:
                 extend_len = chunk_tokens_limit // self.page_size * self.page_size
                 if truncation_align_size is not None:

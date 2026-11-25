@@ -4133,7 +4133,7 @@ def test_w910_ep16_eplb_num_base_local():
     import re
 
     mesh16 = Mesh(np.array(jax.devices()[:16]), ("model",))
-    for cm_rebal, exp_e_tag in (("0", "E_18"), ("1", "E_19")):
+    for eplb_mode, cm_rebal in (("home", "0"), ("home", "1"), ("q_block", "1")):
         with (
             patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
             tpu_info_for_cpu_export(),
@@ -4172,7 +4172,7 @@ def test_w910_ep16_eplb_num_base_local():
                         d_fp8_unpool=True,
                         in_shard_map=True,
                         b2_deq0_new_buffer=True,
-                        eplb_mode="home",
+                        eplb_mode=eplb_mode,
                         next_in_gather_rows=0,
                         next_in_gather_static_fp8=False,
                     ),
@@ -4216,8 +4216,7 @@ def test_w910_ep16_eplb_num_base_local():
                 .as_text("stablehlo")
             )
             gmm_names = re.findall(r'gmm_v2[^"\\]*', hlo)
-            assert any(f"-{exp_e_tag}-" in n and "-eo3" in n for n in gmm_names), gmm_names
-            if cm_rebal == "0":
-                assert all("-cm" not in n for n in gmm_names), gmm_names
+            assert any("-E_18-" in n and "-eo3" in n for n in gmm_names), gmm_names
+            assert all("-cm" not in n for n in gmm_names), gmm_names
             jax.clear_caches()
 

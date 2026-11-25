@@ -2746,19 +2746,27 @@ class MuseSparkMoE(nn.Module):
     ) -> StandardTopKOutput:
         """Compute Top-K routing directly from pre-scaled ``router_logits * router_multiplier``."""
         eplb_replicas = int(self.__dict__.get("_eplb_num_replicas", 0))
+
+        def _map_eplb_fallback(ids_i32: torch.Tensor) -> torch.Tensor:
+            if eplb_replicas <= 0:
+                return ids_i32
+            from sglang_tpu.muse_prefill_kernels.eplb import (
+                map_torch_fallback_topk_ids,
+            )
+
+            ep_size = int(self.__dict__.get("_eplb_ep_size", 8))
+            return map_torch_fallback_topk_ids(
+                ids_i32,
+                num_replicas=eplb_replicas,
+                ep_size=ep_size,
+                num_base_local=self.num_experts // ep_size,
+            )
+
         if prerouted:
             topk_weights = scaled_logits[:, : self.top_k].contiguous()
-            topk_ids_i32 = scaled_logits[:, 8 : 8 + self.top_k].to(torch.int32)
-            if eplb_replicas > 0:
-                from sglang_tpu.muse_prefill_kernels.eplb import (
-                    map_torch_fallback_topk_ids,
-                )
-
-                topk_ids_i32 = map_torch_fallback_topk_ids(
-                    topk_ids_i32,
-                    num_replicas=eplb_replicas,
-                    ep_size=self.__dict__.get("_eplb_ep_size", 8),
-                )
+            topk_ids_i32 = _map_eplb_fallback(
+                scaled_logits[:, 8 : 8 + self.top_k].to(torch.int32)
+            )
             return StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids_i32,
@@ -2806,15 +2814,7 @@ class MuseSparkMoE(nn.Module):
             / (topk_scores.sum(dim=-1, keepdim=True) + self.route_eps)
             * self.route_scale
         )
-        topk_ids_i32 = topk_ids.to(torch.int32)
-        if eplb_replicas > 0:
-            from sglang_tpu.muse_prefill_kernels.eplb import map_torch_fallback_topk_ids
-
-            topk_ids_i32 = map_torch_fallback_topk_ids(
-                topk_ids_i32,
-                num_replicas=eplb_replicas,
-                ep_size=self.__dict__.get("_eplb_ep_size", 8),
-            )
+        topk_ids_i32 = _map_eplb_fallback(topk_ids.to(torch.int32))
         return StandardTopKOutput(
             topk_weights=topk_weights,
             topk_ids=topk_ids_i32,

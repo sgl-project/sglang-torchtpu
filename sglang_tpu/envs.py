@@ -1518,6 +1518,11 @@ class TpuEnvs:
     # Wave-12 prefill enable 1-op Pallas VMEM+SMEM chipmate router during TorchTPU CPU export
     # (via get_tpu_info_or_none() is not None instead of jax.default_backend() == 'tpu').
     SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE = EnvBool(False)
+    # Opt-in chunked-prefill exact token budget filling for TPU (schedule_policy.py).
+    # 0 = off (default, page-ceiled compute budgets); 1 = exact token compute charge +
+    # page-aligned chunk cuts; 2 = exact token compute charge + exact unaligned cuts;
+    # >=64 = exact token compute charge + chunk cuts aligned to the token multiple (e.g. 4096).
+    SGLANG_TPU_EXACT_CHUNK_FILL = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:
