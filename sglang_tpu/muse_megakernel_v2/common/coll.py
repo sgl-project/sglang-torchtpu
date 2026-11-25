@@ -448,6 +448,30 @@ def direct_all_gather_start(buf, me, tp: int, ssem, rsem):
     return wait
 
 
+def direct_all_gather_fold_start(buf, me, tp: int, ssem, psem):
+    """direct_all_gather_start with block k counted on psem[k]; the wait takes consume(k), called
+    on each block once it is in buf[k]: own block first, then the order peers send in (rank k
+    sends to k + 1 first, so blocks arrive from me - 1, me - 2, ...)."""
+    for d in range(1, tp):
+        pltpu.make_async_remote_copy(
+            src_ref=buf.at[me],
+            dst_ref=buf.at[me],
+            send_sem=ssem,
+            recv_sem=psem.at[me],
+            device_id=((me + d) % tp,),
+        ).start()
+
+    def wait(consume):
+        consume(me)
+        for d in range(1, tp):
+            k = (me + tp - d) % tp
+            pltpu.make_async_copy(buf.at[0], buf.at[0], psem.at[k]).wait()
+            consume(k)
+        _count_wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), tp - 1)
+
+    return wait
+
+
 def pair_all_gather_start(buf, me, ssem, psem):
     """pair (tp 8): own block to the partner and to the same core of the 3 other chips; the
     wait relays each other chip's block to the partner on arrival. psem[k] counts block k."""
