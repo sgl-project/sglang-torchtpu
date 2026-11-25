@@ -41,10 +41,10 @@ def _module():
     return SimpleNamespace(wq_b=linear, head_dim=512, n_local_heads=64)
 
 
-def test_fallback_formats_and_linear_behavior(monkeypatch):
+def test_fallback_formats_and_linear_behavior():
     layer = _module()
-    x = torch.empty(6, 1280, device="meta", dtype=torch.bfloat16)
-    pos = torch.empty(6, device="meta", dtype=torch.int64)
+    x = torch.empty(24, 1280, device="meta", dtype=torch.bfloat16)
+    pos = torch.empty(24, device="meta", dtype=torch.int64)
     table = torch.empty(2**19, 128, device="meta")
     assert supports_qb_rope(layer, x, pos, table)
     assert not supports_qb_rope(layer, x[:0], pos[:0], table)
@@ -54,9 +54,10 @@ def test_fallback_formats_and_linear_behavior(monkeypatch):
     assert not supports_qb_rope(layer, x.float(), pos, table)
     assert not supports_qb_rope(layer, x, pos[:1], table)
     assert not supports_qb_rope(layer, x, pos, table[:, :32])
-    with monkeypatch.context() as patch:
-        patch.setenv("SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL", "1")
-        assert not supports_qb_rope(layer, x, pos, table)
+    for tokens in (1, 6, 7, 12, 48, 64, 128, 163, 512):
+        assert not supports_qb_rope(
+            layer, x[:1].expand(tokens, -1), pos[:1].expand(tokens), table
+        )
     linear = layer.wq_b
     for owner, name, value in (
         (linear, "weight", linear.weight.T),
@@ -81,11 +82,14 @@ def test_fallback_formats_and_linear_behavior(monkeypatch):
 @pytest.mark.skipif(
     importlib.util.find_spec("torch_tpu") is None, reason="requires TorchTPU"
 )
-@pytest.mark.parametrize(("tokens", "packed"), [(7, False), (96, True)])
+@pytest.mark.parametrize(("tokens", "packed"), [(24, False), (96, True)])
 def test_qb_rope_matches_channelwise_linear_and_rope(tokens, packed):
     import torch_tpu  # noqa: F401 - registers the TPU device
 
-    from sglang_tpu.dsv4.dsv4_attention_backend import apply_tpu_dsv4_rope
+    from sglang_tpu.dsv4.dsv4_attention_backend import (
+        _register_rope_op,
+        apply_tpu_dsv4_rope,
+    )
     from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
     from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
@@ -108,10 +112,16 @@ def test_qb_rope_matches_channelwise_linear_and_rope(tokens, packed):
     x, weight, scale, positions, table = (
         t.to("tpu") for t in (x, weight, scale, positions, table)
     )
-    expected = apply_tpu_dsv4_rope(
-        apply_tpu_fp8_linear(x, weight, scale).reshape(tokens, 64, 512),
-        positions,
-        table,
+
+    def unfused(x, weight, scale, positions, table):
+        q = apply_tpu_fp8_linear(x, weight, scale).reshape(tokens, 64, 512)
+        return apply_tpu_dsv4_rope(q, positions, table)
+
+    _register_rope_op()
+    fused = register_qb_rope_op()
+    args = (x, weight, scale, positions, table)
+    expected = torch.compile(unfused, backend="tpu", fullgraph=True, dynamic=False)(
+        *args
     )
-    actual = register_qb_rope_op()(x, weight, scale, positions, table)
+    actual = torch.compile(fused, backend="tpu", fullgraph=True, dynamic=False)(*args)
     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)

@@ -5,6 +5,11 @@ import functools
 
 import torch
 
+# T=48/64 use a different FP8 GEMM lowering in the unfused path and produce
+# different query values. Admit only the independently compared verify/prefill
+# buckets; small decode shapes also see little benefit.
+_VALIDATED_TOKENS = frozenset({24, 96, 192, 288, 384, 1024, 2048})
+
 
 @functools.cache
 def register_qb_rope_op():
@@ -17,8 +22,6 @@ def register_qb_rope_op():
 def supports_qb_rope(layer, x, positions, table) -> bool:
     from sglang.srt.layers.linear import ColumnParallelLinear
     from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-    from sglang_tpu.envs import envs
-    from sglang_tpu.kernels.fp8_linear_small_m import supports as small_m_supports
 
     linear = layer.wq_b
     # A wrapper or a different method can implement adapters, communication or
@@ -47,7 +50,7 @@ def supports_qb_rope(layer, x, positions, table) -> bool:
     return (
         weight.device == scale.device == positions.device == table.device == x.device
         and x.ndim == 2
-        and 0 < x.shape[0] <= 2048
+        and x.shape[0] in _VALIDATED_TOKENS
         and x.shape[1] == 1280
         and x.dtype == torch.bfloat16
         and layer.n_local_heads == 64
@@ -63,8 +66,4 @@ def supports_qb_rope(layer, x, positions, table) -> bool:
         and table.shape[0] > 0
         and table.shape[1] in (64, 128)
         and table.dtype == torch.float32
-        and not (
-            envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
-            and small_m_supports(x.shape[0], *weight.shape)
-        )
     )
