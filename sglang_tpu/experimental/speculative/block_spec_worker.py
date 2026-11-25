@@ -13,7 +13,6 @@ extend: target forward on new prompt tokens, inject every row's target feature
 from __future__ import annotations
 
 import functools
-import itertools
 
 import torch
 
@@ -76,6 +75,7 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     padded_h2d,
     prompt_positions,
 )
+from sglang_tpu.experimental.speculative.verify_width import verify_width_table
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
@@ -123,9 +123,45 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._draft_runner = draft_worker.model_runner
         self._mask_token_id = draft_worker.mask_token_id
         self._draft_block_width = draft_worker.block_width
-        self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=self._draft_block_width, device=self.device
+        self._verify_width_table = verify_width_table(
+            self.num_verify_rows, spec_algorithm=self._spec_algorithm
         )
+        if self._verify_width_table is not None and self._target_has_linear_attn:
+            # The linear-attention verify checkpoints assume the full width.
+            raise NotImplementedError(
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS does not support linear-attention targets."
+            )
+        # Per draft block width; a narrower verify drafts natively at its width.
+        narrow_widths = (
+            () if self._verify_width_table is None else self._verify_width_table.widths
+        )
+        self._draft_block_spec_infos = {
+            width: make_draft_block_spec_info(draft_token_num=width, device=self.device)
+            for width in {self._draft_block_width, *narrow_widths}
+        }
+
+    def verify_widths(self) -> tuple[int, ...]:
+        if self._verify_width_table is None:
+            return (self.num_verify_rows,)
+        return self._verify_width_table.reachable_widths(self._bucket_sizes())
+
+    def verify_width_for(self, padded_bs: int) -> int:
+        if self._verify_width_table is None:
+            return self.num_verify_rows
+        return self._verify_width_table.width_for(padded_bs)
+
+    def _verify_shapes(self) -> list[tuple[int, int]]:
+        if self._verify_width_table is None:
+            return super()._verify_shapes()
+        # One width per bucket, as the compile policy warms the model graphs.
+        return list(self._verify_width_table.shapes(self._bucket_sizes()))
+
+    def _draft_block_width_for(self, verify_width: int) -> int:
+        """Rows of the draft block forward that proposes verify_width - 1 drafts."""
+        # At the full width a drafter may forward fewer rows (DSpark's anchor block).
+        if verify_width == self.num_verify_rows:
+            return self._draft_block_width
+        return verify_width
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -163,8 +199,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             rows=rows,
             verify_input=verify_input,
         )
-        # No confidence budget yet: every bucket verifies all gamma drafts.
-        num_verify_drafts = self._all_drafts[bs]
+        # No confidence budget yet: every row verifies all of the step's drafts.
+        num_verify_drafts = self.num_verify_drafts(bs, rows.cache_locs.shape[1])
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
         if temperatures is None or top_ks is None or not self._sampled_drafts:
             # The draft graph already drafted greedily (sample_draft_tokens_tpu).
@@ -199,7 +235,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         *,
         target_candidates: bool,
     ) -> SampledDrafts:
-        """Sampled [pbs, gamma] drafts and their logits from the [pbs, width, H] block."""
+        """Sampled [pbs, width - 1] drafts and their logits from the [pbs, width, H] block."""
         sampling = DraftSampling(
             temperatures=temperatures,
             top_ks=top_ks,
@@ -240,7 +276,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
                 verify_input.committed_lens,
                 state.seq_lens,
-                self.num_verify_rows,
+                rows.cache_locs.shape[1],
             )
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
@@ -410,7 +446,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         return DFlashVerifyInput(
             draft_token=verify_tokens,
             positions=rows.flat_positions,
-            draft_token_num=self.num_verify_rows,
+            draft_token_num=rows.cache_locs.shape[1],
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
@@ -442,9 +478,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None]:
-        """The block's [pbs, width, H] draft hidden, greedy [pbs, gamma] drafts and lattice."""
+        """The block's [pbs, width, H] draft hidden, greedy [pbs, width - 1] drafts and lattice."""
         padded_bs = state.seq_lens.shape[0]
-        width = self._draft_block_width
+        width = self._draft_block_width_for(rows.cache_locs.shape[1])
         inputs = build_draft_block_inputs(
             state.bonus_tokens,
             rows,
@@ -454,7 +490,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             width,
         )
         # Writes the block's draft KV into the same slots target verify uses next.
-        with self._block_draft_worker.draft_context():
+        with (
+            self._block_draft_worker.draft_context(),
+            self._block_draft_worker.narrow_block(width),
+        ):
             logits_output = forward_draft_rows(
                 draft_runner=self._draft_runner,
                 spec_algorithm=self._spec_algorithm,
@@ -463,7 +502,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 verify_input=verify_input,
                 offset=0,
                 width=width,
-                spec_info=self._draft_block_spec_info,
+                spec_info=self._draft_block_spec_infos[width],
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
         hidden = logits_output.hidden_states
@@ -485,9 +524,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def _warmup_draft_block_inputs(self) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
         with torch.no_grad():
-            for width, padded_bs in itertools.product(
-                self.verify_widths(), self._bucket_sizes()
-            ):
+            for padded_bs, width in self._verify_shapes():
                 block_shape = (padded_bs, width)
                 warmup_compiled_op(
                     build_draft_block_inputs,
@@ -513,22 +550,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
                     torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
                     self._mask_token_id,
-                    self._draft_block_width,
+                    self._draft_block_width_for(width),
                 )
 
     def _warmup_draft_sampling(self) -> None:
         """The eager sampled-draft chain, plus step's verify-token cat and logits cast."""
         hidden_size = self._draft_runner.model_config.hidden_size
         with torch.no_grad():
-            for padded_bs in self._bucket_sizes():
+            for padded_bs, width in self._verify_shapes():
+                block_width = self._draft_block_width_for(width)
                 # Materialized like the draft graph's flat hidden output.
                 block_hidden = (
                     torch.zeros(
-                        (padded_bs * self._draft_block_width, hidden_size),
+                        (padded_bs * block_width, hidden_size),
                         dtype=self._draft_runner.dtype,
                     )
                     .to(self.device)
-                    .view(padded_bs, self._draft_block_width, -1)
+                    .view(padded_bs, block_width, -1)
                 )
                 bonus_tokens = torch.zeros(
                     (padded_bs,), dtype=torch.int64, device=self.device

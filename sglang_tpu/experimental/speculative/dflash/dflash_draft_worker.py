@@ -11,7 +11,9 @@ Not supported: LiLiCorr, Domino projector and trained mask embeddings
 
 from __future__ import annotations
 
+import contextlib
 import os
+from collections.abc import Iterator
 from typing import cast
 
 import torch
@@ -114,16 +116,35 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
                     draft_tokens, None, verify_tokens, (candidate_ids, q_logits)
                 )
             return SampledDrafts(draft_tokens, q_logits, verify_tokens)
-        bs = block_hidden.shape[0]
-        draft_hidden = block_hidden[:, 1:].reshape(bs * self.num_drafts, -1)
+        bs, width = block_hidden.shape[:2]
+        num_drafts = width - 1
+        draft_hidden = block_hidden[:, 1:].reshape(bs * num_drafts, -1)
         with torch.no_grad():
             draft_logits = gather_and_crop_vocab(
                 project_through_lm_head(draft_hidden, lm_head), lm_head
-            ).view(bs, self.num_drafts, -1)
+            ).view(bs, num_drafts, -1)
         draft_tokens = torch.stack(
-            [sampler(draft_logits[:, j], j) for j in range(self.num_drafts)], dim=1
+            [sampler(draft_logits[:, j], j) for j in range(num_drafts)], dim=1
         )
         return SampledDrafts(draft_tokens, draft_logits, None)
+
+    @contextlib.contextmanager
+    def narrow_block(self, width: int) -> Iterator[None]:
+        # The grouped convs, the in-graph argmax and the DFlash2 lattice read the
+        # block size, so a narrower block is a native width - 1 draft, not a cut one.
+        if not 2 <= width <= self.block_width:
+            raise ValueError(
+                f"DFlash block width {width} is outside [2, {self.block_width}]."
+            )
+        if width == self.block_width:
+            yield
+            return
+        # set_block_size only rewrites ints the trace reads; served graphs keep theirs.
+        self._dflash_model.set_block_size(width)
+        try:
+            yield
+        finally:
+            self._dflash_model.set_block_size(self.block_width)
 
     def warmup_draft_lattice(
         self, *, block_hidden: torch.Tensor, bonus_tokens: torch.Tensor

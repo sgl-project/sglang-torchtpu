@@ -118,13 +118,27 @@ policy mixin, and routes all three.
 ## Adaptive worker warmup contract
 
 An adaptive plugin overrides `TpuSpecWorker.verify_widths()` with every reachable
-active verify width (draft count plus one). The default is the fixed active width.
+active verify width (draft count plus one), and `verify_width_for(padded_bs)` with
+the width a decode batch bucket runs. The default is the fixed active width.
 `verify_window_rows` is the maximum configured capacity: scheduler reservation,
 idle inputs and selector warmups must retain twice that many candidate columns
 even when the active width shrinks. The worker owns selector warmup because the
 generic spec-op context only knows the active width. Width-dependent worker
 warmups iterate the hook without changing runtime width state; the plugin still
 owns its adaptive policy and model compilation for those widths.
+
+`SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS` (DFlash, `verify_width.py`) is the built-in
+policy: each batch bucket verifies a fixed width, so every (bucket, width) pair
+compiles once at startup, and DP-attention ranks, which agree on the bucket, agree
+on the width. The threshold is the padded bucket, not the live request count, so
+the bucket list decides where the switch lands. A narrower bucket drafts natively
+at its width (the drafter's `narrow_block`, where DFlash sets the draft model's
+block size): verifying the first tokens of a full block would accept less, since
+the draft block's attention and convolutions span the whole block. A wide verify
+pays only while the batch is small: for Muse DFlash2 on the decode megakernel,
+width 8 measured best at 1-2 decoding requests and width 4 from 3-4 on (`1:8,3:4`
+at 16 running, `1:8,4:4` at 6; with `SGLANG_TPU_SIMULATE_ACC_LEN_BY_WIDTH=4:3.06`
+when simulating acceptance). A 3-token rung did not pay in serving.
 
 ## DP attention
 

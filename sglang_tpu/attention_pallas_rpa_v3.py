@@ -14,13 +14,14 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from typing import Optional
+from typing import ClassVar, Optional
 
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 __all__ = [
     "PallasForwardMetadata",
@@ -94,6 +95,29 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
     """RPA v3 attention backend (``--attention-backend pallas_tpu_rpa_v3``)."""
 
     kernel_spec = RPA_V3_SPEC
+    # RPA v3 specializes its decode tiles per forward's static width; a subclass
+    # with its own kernel (MLA) needs exactly the configured width.
+    supports_narrow_verify_decode_tiles: ClassVar[bool] = True
+    # Whether a verify narrower than decode_query_size keeps decode tiles at its
+    # own width; on with an adaptive verify width (SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS).
+    narrow_verify_decode_tiles: bool = False
+
+    def __init__(self, model_runner, speculative_step_id: int = 0) -> None:
+        super().__init__(model_runner, speculative_step_id)
+        self.narrow_verify_decode_tiles = (
+            self.supports_narrow_verify_decode_tiles
+            and tpu_envs.SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS.get() is not None
+        )
+
+    def _forward_decode_query_size(self, forward_batch) -> int:
+        if (
+            self.narrow_verify_decode_tiles
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            width = forward_batch.spec_info.num_tokens_per_req
+            if 1 < width <= self.decode_query_size:
+                return width
+        return super()._forward_decode_query_size(forward_batch)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int] = None
