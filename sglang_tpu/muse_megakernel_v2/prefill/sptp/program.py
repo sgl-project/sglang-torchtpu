@@ -25,6 +25,7 @@ from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
 from sglang_tpu.muse_megakernel_v2.common.consts import (
     LANE,
     SPTP_PA_COLLECTIVE_ID,
+    SPTP_PA_XE_COLLECTIVE_ID,
     small_row,
 )
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rms, heads_rms_xla
@@ -47,7 +48,9 @@ from sglang_tpu.muse_megakernel_v2.prefill.sptp.post_ffn import post_ffn_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
     oproj_a2a_call,
     oproj_call,
+    pool_ag_call,
     pool_call,
+    xe_wait_call,
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     _heads_rms_mxu,
@@ -326,6 +329,16 @@ def build_forward(c: PFConfig, axis: str = "model"):
     )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
+    # SPTP_PA_XE_AG=1: the pool kernel all-gathers the expert input by remote DMA (sends started
+    # in its last step, waited for by a small kernel before the MoE); xe_all / xs_all replace
+    # the XLA AG of xe8 / xs
+    pa_xag = pa_a2a and os.environ.get("SPTP_PA_XE_AG", "0") == "1"
+    if pa_xag and (
+        pa_head or xe_n or xe_pallas or os.environ.get("SPTP_PA_FUSE_POOL", "0") != "0"
+    ):
+        raise ValueError(
+            "SPTP_PA_XE_AG goes with the tmaj / ogate-tok layouts and the XLA dequant"
+        )
     # the in-kernel a2a's row groups: up to 512 own rows each (its o accumulator lives in VMEM)
     pa_ng = 1
     if pa_a2a and Ts > 512:
@@ -587,7 +600,12 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             stream, ids, tw, xe8, xs = pa_o(*args, wpool)
                         else:
                             stream, ids, tw, f8, f_s = pa_o(*args)
-                            xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                            if pa_xag:
+                                xa_out = pool_ag_call(
+                                    c, SPTP_PA_XE_COLLECTIVE_ID, pa_tp, pa_rc
+                                )(l, me, f8, f_s, smalls, wpool)
+                            else:
+                                xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
                 else:
                     if ogate_tm is not None:
                         with _scope("sp_o_gate"):
@@ -677,6 +695,21 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                     if grp
                                     else pa_pool
                                 )
+                                if pa_xag:
+                                    pk = pool_ag_call(
+                                        c,
+                                        SPTP_PA_XE_COLLECTIVE_ID,
+                                        pa_tp,
+                                        pa_rc,
+                                        pa_tmaj,
+                                        grp,
+                                    )
+                                    prev = xa_out[:2] if gj else ()
+                                    out = pk(l, me, f8, f_s, smalls, wpool, prev=prev)
+                                    xa_out = (
+                                        out[:2] + (xa_out[2:] if gj else ()) + out[2:]
+                                    )
+                                    continue
                                 prev = (xe8, xs) if gj else ()
                                 xe8, xs = pool(l, f8, f_s, smalls, wpool, prev=prev)
                     elif pa:
@@ -751,10 +784,22 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     def ag1(x):
                         return jax.lax.all_gather(x, axis, axis=1, tiled=True)
 
-                    xs_all = ag1(xs).reshape(T, 1)
                     ids_all, tw_all = ag1(ids).T, ag1(tw).T
                     ids_own = ids.T
-                    if xe_ag_k is not None:
+                    if pa_xag:
+                        xe_all, xs_row = xe_wait_call(c, 1 if pa_gtok else pa_ng)(
+                            *xa_out
+                        )
+                        xs_all = xs_row.reshape(T, 1)
+                        # the MoE takes the tiled [T, He / 128, 128] lhs as is
+                        xe = (xe_all.astype(_F32) * xs_row.reshape(T, 1, 1)).astype(
+                            _BF16
+                        )
+                    else:
+                        xs_all = ag1(xs).reshape(T, 1)
+                    if pa_xag:
+                        pass
+                    elif xe_ag_k is not None:
                         xe = xe_ag_k(xe8, xs_all)
                     elif xe_pallas:
                         xe = dequant(ag(xe8, axis), xs_all)

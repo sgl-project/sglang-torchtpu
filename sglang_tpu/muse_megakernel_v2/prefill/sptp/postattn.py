@@ -830,7 +830,187 @@ def _pool_step(c, p, nP, tpn, rc, f8_ref, fs_ref, sm_ref, wp_ref, pooled, ssq, a
                 rows = pl.ds(pl.multiple_of(i * rc, rc), rc)
                 f = jax.lax.rsqrt(ssq[rows, :] * (1.0 / He) + c.rms_eps)
                 f = f / xsc[rows, :]
-                xe_ref[rows, :] = (pooled[rows, :He] * f * pe).astype(_FP8)
+                x = pooled[rows, :He] * f * pe
+                if xe_ref.ndim == 3:
+                    # the MoE's tiled lhs layout [Ts, He / 128, 128]: each row one (32, 128)
+                    # e4m3 tile, 32 rows at a time by a major / sublane swap
+                    nb = He // 128
+                    for s0 in range(0, rc, 32):
+                        w = jnp.stack(
+                            [
+                                x[s0 : s0 + 32, j * 128 : (j + 1) * 128]
+                                for j in range(nb)
+                            ]
+                        )
+                        r32 = pl.ds(pl.multiple_of(i * rc + s0, 32), 32)
+                        xe_ref[r32] = pltpu.einshape("jrl->rjl", w).astype(_FP8)
+                else:
+                    xe_ref[rows, :] = x.astype(_FP8)
                 return carry
 
             jax.lax.fori_loop(0, n_rc, body, 0)
+
+
+def pool_ag_call(
+    c: PFConfig,
+    collective_id: int,
+    tpn: int = 512,
+    rc: int = 64,
+    flat: bool = False,
+    group: tuple = (),
+):
+    """pool_call with the expert input's all-gather inside: (lyr_me [2] i32 (layer, rank), f8,
+    fs, smalls, wpool) -> (xe_all [T, He / 128, 128] e4m3 (the fused-RS MoE's tiled lhs layout:
+    a row is one (32, 128) tile, so a row DMA gathers it), xs_all [1, T] f32, recv sem, send
+    sem).
+
+    The last step writes this rank's xe rows / scales into its own slot of xe_all / xs_all
+    (rank-major rows) and starts their remote DMAs into every peer's same slot; it does not wait
+    for them: xe_wait_call does, so XLA can run the MoE routing glue meanwhile (the XLA AG of
+    the [Ts, He] rows sat between the pool and the MoE, ~107 us / layer). group (j, n): row
+    group j's rows; the previous group's xe_all / xs_all alias in (prev=...), each group gets
+    its own semaphores."""
+    Tf, tp, qd = _dims(c)
+    gj, ng = group or (0, 1)
+    Ts = Tf // ng
+    row0 = gj * Ts
+    H, He = c.hidden, c.expert_hidden
+    nP = He // tpn
+    if He % tpn or Ts % rc or Ts % 128 or rc % 32 or He % 128:
+        raise ValueError(f"pool AG tiles {tpn} / {rc} do not fit He {He} Ts {Ts}")
+
+    def kernel(lm, f8_ref, fs_ref, sm_ref, wp_ref, *refs):
+        if gj:
+            refs = refs[2:]  # aliased previous outputs, written by DMA only
+        xa_hbm, sa_hbm, rsem, ssem = refs[:4]
+        xe_v, xs_v, pooled, ssq, amx, xsc, lsem = refs[4:]
+        p = pl.program_id(0)
+        me = lm[1]
+
+        @pl.when(p == 0)
+        def _():
+            # every peer is in this kernel (its xe_all allocated) before anyone writes into it
+            with _scope("pa_xe_barrier"):
+                bar = pltpu.get_barrier_semaphore()
+                for d in range(tp):
+                    pl.semaphore_signal(
+                        bar, device_id=(d,), device_id_type=pl.DeviceIdType.MESH
+                    )
+                pl.semaphore_wait(bar, tp)
+
+        _pool_step(
+            c, p, nP, tpn, rc, f8_ref, fs_ref, sm_ref, wp_ref, pooled, ssq, amx, xsc,
+            xe_v, xs_v,
+        )  # fmt: skip
+
+        @pl.when(p == nP - 1)
+        def _():
+            r0 = pl.multiple_of(me * Tf + row0 if row0 else me * Tf, 128)
+            own_x = xa_hbm.at[pl.ds(r0, Ts)]
+            own_s = sa_hbm.at[:, pl.ds(r0, Ts)]
+            cps = (
+                pltpu.make_async_copy(xe_v, own_x, lsem.at[0]),
+                pltpu.make_async_copy(xs_v, own_s, lsem.at[1]),
+            )
+            for cp in cps:
+                cp.start()
+            for cp in cps:
+                cp.wait()
+            with _scope("pa_xe_send"):
+                for k in range(1, tp):
+                    d = jnp.bitwise_xor(me, k)
+                    for src in (own_x, own_s):
+                        pltpu.make_async_remote_copy(
+                            src, src, ssem, rsem,
+                            device_id=(d,), device_id_type=pl.DeviceIdType.MESH,
+                        ).start()  # fmt: skip
+
+    def whole(*shape):
+        return pl.BlockSpec(shape, lambda p, lm: (0,) * len(shape))
+
+    anyspec = pl.BlockSpec(memory_space=pl.ANY)
+    semspec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        grid=(nP,),
+        in_specs=[
+            whole(*((Ts, H) if flat else (tp, Ts, qd))),
+            whole(Ts, 1),
+            pl.BlockSpec((None, SMALL_ROWS, H), lambda p, lm: (lm[0], 0, 0)),
+            pl.BlockSpec((None, H, tpn), lambda p, lm: (lm[0], 0, p)),
+        ]
+        + ([anyspec, anyspec] if gj else []),
+        out_specs=(anyspec, anyspec, semspec, semspec),
+        scratch_shapes=[
+            pltpu.VMEM((Ts, He // 128, 128), _FP8),
+            pltpu.VMEM((1, Ts), _F32),
+            pltpu.VMEM((Ts, He), _F32),
+            pltpu.VMEM((Ts, 1), _F32),
+            pltpu.VMEM((Ts, 1), _F32),
+            pltpu.VMEM((Ts, 1), _F32),
+            pltpu.SemaphoreType.DMA((2,)),
+        ],
+    )
+    params = pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",),
+        vmem_limit_bytes=60 * 2**20,
+        collective_id=collective_id,
+    )
+
+    def call(layer: int, me, f8, fs, smalls, wpool, prev=()):
+        lm = jnp.stack([jnp.asarray(layer, jnp.int32), me.astype(jnp.int32)])
+        tag = f"_g{gj}of{ng}" if ng > 1 else ""
+        return pl.pallas_call(
+            kernel,
+            grid_spec=grid_spec,
+            out_shape=(
+                jax.ShapeDtypeStruct((c.rows, He // 128, 128), _FP8),
+                jax.ShapeDtypeStruct((1, c.rows), _F32),
+                pltpu.SemaphoreType.DMA(()),
+                pltpu.SemaphoreType.DMA(()),
+            ),
+            compiler_params=params,
+            input_output_aliases={5: 0, 6: 1} if gj else {},
+            name=f"muse_sptp_pa_pool_ag_t{c.rows}_p{tpn}{'_f' if flat else ''}{tag}",
+        )(lm, f8, fs, smalls, wpool, *prev)
+
+    return call
+
+
+def xe_wait_call(c: PFConfig, ng: int = 1):
+    """(xe_all [T, He / 128, 128], xs_all, *(recv sem, send sem) per row group) -> (xe_all, xs_all) once every
+    peer's rows landed and this rank's sends left (DMA semaphores count bytes: one wait per
+    sem for the tp - 1 peers' rows of the group)."""
+    T, tp = c.rows, c.tp
+    G = T // tp // ng
+    He = c.expert_hidden
+
+    def kernel(xa_hbm, sa_hbm, *refs):
+        sems = refs[: 2 * ng]
+        n = (tp - 1) * G
+        for sem in sems:
+            pltpu.make_async_copy(
+                xa_hbm.at[pl.ds(0, n)], xa_hbm.at[pl.ds(0, n)], sem
+            ).wait()
+            pltpu.make_async_copy(
+                sa_hbm.at[:, pl.ds(0, n)], sa_hbm.at[:, pl.ds(0, n)], sem
+            ).wait()
+
+    anyspec = pl.BlockSpec(memory_space=pl.ANY)
+    semspec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+
+    def call(xa, sa, *sems):
+        with _scope("sp_xe_wait"):
+            return pl.pallas_call(
+                kernel,
+                in_specs=[anyspec, anyspec] + [semspec] * (2 * ng),
+                out_specs=(anyspec, anyspec),
+                out_shape=(
+                    jax.ShapeDtypeStruct((T, He // 128, 128), _FP8),
+                    jax.ShapeDtypeStruct((1, T), _F32),
+                ),
+                input_output_aliases={0: 0, 1: 1},
+                name=f"muse_sptp_pa_xe_wait_t{T}",
+            )(xa, sa, *sems)
+
+    return call
