@@ -261,11 +261,13 @@ def generate_block_specs(
 
 # Define kernels.
 def _frs_scope(name: str):
-    """Detail-trace span (MUSE_MK_TRACE >= 1, read at trace time); a no-op otherwise.
+    """Inner detail-trace span (MUSE_MK_TRACE >= 2, read at trace time); a no-op otherwise.
 
-    The spans fence the schedule: dequant and matmul no longer overlap inside a tile.
+    The spans fence the schedule (dequant and matmul stop overlapping) and push the kernel
+    past the instruction-memory cliff (37k -> 68k bundles, 7x slower), so level 1 leaves
+    them out.
     """
-    if int(os.environ.get("MUSE_MK_TRACE", "0")) >= 1:
+    if int(os.environ.get("MUSE_MK_TRACE", "0")) >= 2:
         return jax.named_scope(name)
     return contextlib.nullcontext()
 
