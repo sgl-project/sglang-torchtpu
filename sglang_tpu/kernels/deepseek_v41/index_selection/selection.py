@@ -317,7 +317,13 @@ def _publish_candidate_blocks(
         )
     blocks = block_scores.shape[1]
     cand_k = min(count, blocks)
-    if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
+    if (
+        unordered
+        and blocks >= 2048
+        and blocks % 16 == 0
+        and 0 < cand_k <= 4096
+        and cand_k % 16 == 0
+    ):
         block_lengths = (lengths + block_size - 1) // block_size
         published = _sparsecore_top_k(
             block_scores,
@@ -327,7 +333,7 @@ def _publish_candidate_blocks(
         ).astype(jnp.int32)
     else:
         values, ids = jax.lax.top_k(block_scores, cand_k)
-        published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+        published = _compact_selected(jnp.where(values > -jnp.inf, ids, -1))
     return jnp.pad(published, ((0, 0), (0, count - cand_k)), constant_values=-1)
 
 
@@ -598,22 +604,33 @@ def _select_fp8_indexer_jax(
 
         def sparse():
             if not candidates.shape[1]:
-                return jnp.full(
-                    (q.shape[0], min(topk, width)), -1, jnp.int32
-                ), candidates
+                return (
+                    jnp.full((q.shape[0], min(topk, width)), -1, jnp.int32),
+                    candidates,
+                )
             gathered_candidates = prepare_candidates(
-                banks, page_table, candidates, requests, layout, block_size, width
-            )
-            return _score_and_select_candidates(
-                q,
-                weights,
-                lengths,
-                gathered_candidates,
-                topk,
+                banks,
+                page_table,
+                candidates,
+                requests,
+                layout,
                 block_size,
-                unordered,
                 width,
-            ), candidates
+                ascending=True,
+            )
+            return (
+                _score_and_select_candidates(
+                    q,
+                    weights,
+                    lengths,
+                    gathered_candidates,
+                    topk,
+                    block_size,
+                    unordered,
+                    width,
+                ),
+                candidates,
+            )
 
         return jax.lax.cond(
             jnp.minimum(batch_max.max(), width) <= topk,
@@ -963,6 +980,7 @@ def prepare_fp8_candidates(
             PackedFP8Layout(*layout),
             block,
             width,
+            ascending=True,
         )
     )
 

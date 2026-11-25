@@ -52,6 +52,8 @@ def prepare_candidates(
     layout: PackedFP8Layout,
     block: int,
     width: int,
+    *,
+    ascending: bool = False,
 ) -> PreparedCandidates:
     """Gather packed FP8 K for candidate unions shared by query groups.
 
@@ -70,7 +72,7 @@ def prepare_candidates(
         offsets, validity and the start/split of each query window.
     """
     metadata = prepare_candidate_metadata(
-        pages, candidates, requests_ids, layout, block, width
+        pages, candidates, requests_ids, layout, block, width, ascending=ascending
     )
     keys = gather_candidate_keys(
         banks,
@@ -89,6 +91,8 @@ def prepare_candidate_metadata(
     layout: PackedFP8Layout,
     block: int,
     width: int,
+    *,
+    ascending: bool = False,
 ) -> CandidateMetadata:
     """Pair queries of even-sized requests; odd-sized requests stay unpaired.
 
@@ -131,33 +135,21 @@ def prepare_candidate_metadata(
         (offsets,) = jnp.nonzero(starts, size=tokens + 1, fill_value=tokens)
     sizes = jnp.diff(offsets)
 
-    direct = False
-    if jax.default_backend() == "tpu":
-        info = pltpu.get_tpu_info()
-        if info.sparse_core is not None and count % info.num_lanes == 0:
-            words = _metadata_scratch_words(
-                2,
-                count,
-                pl.cdiv(width, block),
-                pages.shape[1],
-                offsets=offsets.size,
-                requests=requests.size,
-            )
-            direct = (
-                words * jnp.dtype(jnp.int32).itemsize
-                <= info.sparse_core.vmem_capacity_bytes // 2
-            )
-    if direct:
-        candidate_block_ids, physical_block_ids, counts = canonical_candidate_blocks(
+    bitmap = None
+    if jax.default_backend() == "tpu" and pltpu.get_tpu_info().sparse_core is not None:
+        bitmap = _bitmap_candidate_blocks(
             candidates,
             pages,
             offsets,
+            requests,
             block=block,
             width=width,
             cache_pages=layout.pages,
             page_size=layout.page_size,
-            requests=requests,
+            ascending=ascending,
         )
+    if bitmap is not None:
+        candidate_block_ids, physical_block_ids, counts = bitmap
     else:
         # Preserve per-query ownership when forming each pair's union.
         representatives = offsets[:-1]
@@ -223,6 +215,388 @@ def prepare_candidate_metadata(
         valid,
         spans,
     )
+
+
+def _bitmap_candidate_blocks(
+    candidates: jax.Array,
+    table: jax.Array,
+    offsets: jax.Array,
+    requests: jax.Array,
+    *,
+    block: int,
+    width: int,
+    cache_pages: int,
+    page_size: int = PAGE_RECORDS,
+    ascending: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array] | None:
+    """Deduplicate and partition each query pair into A-only/shared/B-only blocks.
+
+    Each query of a pair marks its blocks in its own bitmap of blocks / 32
+    words. A's blocks split by B's bits into A-only and shared, and B's by A's
+    into B-only, so the work scales with the candidate count, not the width.
+
+    Args:
+        candidates: [queries, per_query] logical block IDs. Rows ascend with
+            -1 suffix padding, as candidate publication emits them, so repeats
+            are adjacent.
+        table: [requests, max_pages_per_request] physical page table.
+        offsets: Pair g owns queries [offsets[g], offsets[g + 1]).
+        requests: [queries] request IDs; queries of invalid requests get no
+            blocks.
+        block: Tokens per candidate block; page_size // block is a power of two.
+        width: Logical token range upper bound.
+        cache_pages: Physical cache page count.
+        page_size: Tokens per cache page.
+
+    Returns:
+        Per-query windows [queries, per_query] (A: A-only then shared; B:
+        shared then B-only), per-pair physical union [pairs, 2 * per_query]
+        (A-only, shared, B-only) and per-pair [A-only, shared, B-only] counts.
+        Segments ascend; invalid IDs and padding are -1. Rows of trailing
+        empty pairs remain unset.
+    """
+    sc = plsc.get_sparse_core_info()
+    lanes, units = sc.num_lanes, sc.num_cores * sc.num_subcores
+    alignment = pltpu.get_tpu_info().num_lanes
+    unroll = alignment // lanes
+    # TODO: retry 2 on libtpu > 0.0.50; it gave wrong windows with correct counts.
+    classify_unroll = 4
+    tokens, per_query = candidates.shape
+    pairs = offsets.shape[0] - 1
+    blocks = pl.cdiv(width, block)
+    per_page = page_size // block
+    shift = per_page.bit_length() - 1
+    if per_query % alignment or page_size % block or per_page & (per_page - 1):
+        return None
+    shr = lax.shift_right_logical
+    table = jnp.pad(
+        table, ((0, 0), (0, -table.shape[1] % alignment)), constant_values=-1
+    )
+    table_columns = table.shape[1]
+
+    def aligned(size):
+        return pl.cdiv(size, alignment) * alignment
+
+    offset_words = aligned(offsets.size)
+    # Words per scratch buffer; two-slot buffers hold two pairs in flight.
+    bitmap_words = aligned(pl.cdiv(blocks, 32))
+    words = dict(
+        bits_a=bitmap_words,
+        bits_b=bitmap_words,
+        # Per slot: [pad][A][pad][B]; each pad ends a row's previous-ID compare.
+        ids=2 * (2 * lanes + 2 * per_query),
+        page_ids=2 * table_columns,
+        # Compressed stores address `lanes` words past each live prefix. B's
+        # window holds a pair, so rows that break the ascending contract
+        # cannot write past it.
+        window_a=2 * (per_query + lanes),
+        window_b=2 * (2 * per_query + lanes),
+        union=2 * (2 * per_query + lanes),
+        shared_union=per_query + lanes,
+        counts=2 * alignment,
+        control=alignment + offset_words + aligned(tokens),
+    )
+    # Keep half of subcore VMEM free for compiler temporaries and alignment.
+    if 4 * sum(words.values()) > sc.vmem_capacity_bytes // 2:
+        return None
+    if not ascending:
+        limit = jnp.iinfo(jnp.int32).max
+        candidates = jnp.sort(jnp.where(candidates >= 0, candidates, limit), axis=-1)
+        candidates = jnp.where(candidates == limit, -1, candidates)
+    id_slot, a_slot, b_slot, union_slot = (
+        words[name] // 2 for name in ("ids", "window_a", "window_b", "union")
+    )
+    a_base, b_base = lanes, 2 * lanes + per_query
+
+    # [live pairs][offsets][requests], each lane-aligned.
+    live = jnp.max(jnp.where(offsets[1:] > offsets[:-1], jnp.arange(1, pairs + 1), 0))
+    request_base = alignment + offset_words
+    control = jnp.concatenate(
+        (
+            jnp.full((alignment,), live, jnp.int32),
+            jnp.pad(offsets, (0, offset_words - offsets.size), constant_values=tokens),
+            jnp.pad(requests, (0, -tokens % alignment), constant_values=-1),
+        )
+    )
+    mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+    scratch = {name: pltpu.VMEM((size,), jnp.int32) for name, size in words.items()}
+
+    @pl.kernel(
+        out_type=(
+            jax.ShapeDtypeStruct((tokens, per_query), jnp.int32),
+            jax.ShapeDtypeStruct((pairs, 2 * per_query), jnp.int32),
+            jax.ShapeDtypeStruct((pairs, alignment), jnp.int32),
+        ),
+        mesh=mesh,
+        scratch_types=dict(scratch, sems=pltpu.SemaphoreType.DMA((2, 6))),
+        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
+        name="paged_mqa_candidate_metadata",
+    )
+    def kernel(
+        src,
+        pages,
+        control_hbm,
+        out_ids,
+        out_union,
+        out_counts,
+        *,
+        bits_a,
+        bits_b,
+        ids,
+        page_ids,
+        window_a,
+        window_b,
+        union,
+        shared_union,
+        counts,
+        control,
+        sems,
+    ):
+        pltpu.async_copy(control_hbm, control, sems.at[0, 0]).wait()
+        unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+        lane = jnp.arange(lanes, dtype=jnp.int32)
+        zeros, ones = jnp.zeros(lanes, jnp.int32), jnp.ones(lanes, jnp.int32)
+
+        def scalar(position):
+            return plsc.load_gather(control, [jnp.full(lanes, position, jnp.int32)])[0]
+
+        def count(mask):
+            return plsc.all_reduce_population_count(mask)[0]
+
+        def pair_info(step):
+            pair = unit + step * units
+            start = scalar(alignment + pair)
+            queries = scalar(alignment + pair + 1) - start
+            return pair, start, queries, scalar(request_base + start)
+
+        def page_row(request):
+            return jnp.clip(request, 0, pages.shape[0] - 1)
+
+        def reads(step, wait=False):
+            """Copy a pair's IDs, and its page row unless the slot holds it."""
+            slot = step % 2
+            _, start, _, request = pair_info(step)
+            for query, base in enumerate((a_base, b_base)):
+                copy = pltpu.make_async_copy(
+                    src.at[jnp.minimum(start + query, tokens - 1)],
+                    ids.at[pl.ds(slot * id_slot + base, per_query)],
+                    sems.at[slot, 0],
+                )
+                (copy.wait if wait else copy.start)()
+
+            # The slot still holds the page row of the pair two steps back.
+            before = pair_info(jnp.maximum(step - 2, 0))[3]
+            copy = pltpu.make_async_copy(
+                pages.at[page_row(request)],
+                page_ids.at[pl.ds(slot * table_columns, table_columns)],
+                sems.at[slot, 1],
+            )
+            pl.when((step < 2) | (page_row(request) != page_row(before)))(
+                copy.wait if wait else copy.start
+            )
+
+        def writes(step, wait=False):
+            """Copy a pair's windows, physical union and counts out."""
+            slot = step % 2
+            pair, start, queries, _ = pair_info(step)
+            first = (
+                pltpu.make_async_copy(
+                    window_a.at[pl.ds(slot * a_slot, per_query)],
+                    out_ids.at[start],
+                    sems.at[slot, 2],
+                ),
+                pltpu.make_async_copy(
+                    union.at[pl.ds(slot * union_slot, 2 * per_query)],
+                    out_union.at[pair],
+                    sems.at[slot, 3],
+                ),
+                pltpu.make_async_copy(
+                    counts.at[pl.ds(slot * alignment, alignment)],
+                    out_counts.at[pair],
+                    sems.at[slot, 4],
+                ),
+            )
+            for copy in first:
+                (copy.wait if wait else copy.start)()
+            second = pltpu.make_async_copy(
+                window_b.at[pl.ds(slot * b_slot, per_query)],
+                out_ids.at[jnp.minimum(start + 1, tokens - 1)],
+                sems.at[slot, 5],
+            )
+            pl.when(queries > 1)(second.wait if wait else second.start)
+
+        def pad(ref, base, end, size):
+            """-1 from end to size: the slot holds an earlier pair's IDs."""
+            start = pl.multiple_of(end // lanes * lanes, lanes)
+
+            @plsc.parallel_loop(0, size - start, lanes, unroll=4)
+            def fill(i):
+                at = pl.ds(base + start + i, lanes)
+                ref[at] = jnp.where(start + i + lane >= end, -1, ref[at])
+
+        def emit(targets, offset, mask):
+            """Compress the mask's lanes of each (ref, base, value) to base + offset."""
+            for ref, base, value in targets:
+                plsc.store_compressed(
+                    ref.at[pl.ds(base + offset, lanes)], value, mask=mask
+                )
+            return offset + count(mask)
+
+        def clear_bitmaps():
+            @plsc.parallel_loop(0, bitmap_words, lanes, unroll=unroll)
+            def clear(i):
+                bits_a[pl.ds(i, lanes)] = zeros
+                bits_b[pl.ds(i, lanes)] = zeros
+
+        clear_bitmaps()
+        for slot in range(2):
+            for base in (a_base, b_base):
+                at = pl.ds(slot * id_slot + base - lanes, lanes)
+                ids[at] = jnp.full(lanes, -2, jnp.int32)
+
+        steps = (jnp.maximum(scalar(0) - unit, 0) + units - 1) // units
+
+        @pl.when(steps > 0)
+        def prologue():
+            reads(jnp.int32(0))
+
+        @pl.loop(0, steps)
+        def body(step):
+            slot = step % 2
+            _, _, queries, request = pair_info(step)
+            reads(step, wait=True)
+
+            @pl.when(step + 1 < steps)
+            def prefetch():
+                reads(step + 1)
+
+            bases = (slot * id_slot + a_base, slot * id_slot + b_base)
+            page_base = slot * table_columns
+            valid_request = (request >= 0) & (request < pages.shape[0])
+            bounds = (
+                jnp.where(valid_request, per_query, 0),
+                jnp.where(valid_request & (queries > 1), per_query, 0),
+            )
+
+            def first(query, i, key):
+                """Rows ascend, so a repeat equals the ID before it."""
+                return key != ids[pl.ds(bases[query] + i - 1, lanes)]
+
+            def word(key):
+                return jnp.minimum(shr(key, 5), bitmap_words - 1)
+
+            # Each query marks its in-range first occurrences in its own bitmap.
+            for query, bits in enumerate((bits_a, bits_b)):
+
+                @plsc.parallel_loop(0, bounds[query], lanes, unroll=unroll)
+                def mark(i, query=query, bits=bits):
+                    key = ids[pl.ds(bases[query] + i, lanes)]
+                    marked = (key >= 0) & (key < blocks) & first(query, i, key)
+                    # Distinct IDs set distinct bits, so adding them is an OR.
+                    plsc.addupdate_scatter(
+                        bits, [word(key)], ones << (key & 31), mask=marked
+                    )
+
+            def classify(query, i, other):
+                """Block ID, physical ID, validity and whether `other` lists it."""
+                key = ids[pl.ds(bases[query] + i, lanes)]
+                column = shr(key, shift)
+                page = plsc.load_gather(
+                    page_ids, [page_base + jnp.clip(column, 0, table_columns - 1)]
+                )
+                valid = (key >= 0) & (key < blocks) & (page >= 0) & (page < cache_pages)
+                if blocks > table_columns * per_page:
+                    valid &= column < table_columns
+                valid &= first(query, i, key)
+                listed = plsc.load_gather(other, [word(key)]) >> (key & 31)
+                physical = (page << shift) | (key & (per_page - 1))
+                return key, physical, valid, (listed & 1) != 0
+
+            a_window, b_window = slot * a_slot, slot * b_slot
+            union_base = slot * union_slot
+
+            # The pair two steps back must have drained this slot's outputs.
+            @pl.when(step >= 2)
+            def drain():
+                writes(step - 2, wait=True)
+
+            # A against B's bits: A-only opens A's window, shared opens B's.
+            def classify_a(i, carry):
+                a_only, shared = carry
+                key, physical, valid, in_b = classify(0, i, bits_b)
+                a_targets = ((window_a, a_window, key), (union, union_base, physical))
+                b_targets = ((window_b, b_window, key), (shared_union, 0, physical))
+                only, both = valid & ~in_b, valid & in_b
+                return emit(a_targets, a_only, only), emit(b_targets, shared, both)
+
+            a_only, shared = plsc.parallel_loop(
+                0,
+                bounds[0],
+                lanes,
+                unroll=classify_unroll,
+                carry=(jnp.int32(0), jnp.int32(0)),
+            )(classify_a)
+
+            # Shared closes A's window and follows A-only in the union.
+            @plsc.parallel_loop(0, pl.cdiv(shared, lanes) * lanes, lanes, unroll=unroll)
+            def append_shared(i):
+                live = i + lane < shared
+                plsc.store_compressed(
+                    window_a.at[pl.ds(a_window + a_only + i, lanes)],
+                    window_b[pl.ds(b_window + i, lanes)],
+                    mask=live,
+                )
+                plsc.store_compressed(
+                    union.at[pl.ds(union_base + a_only + i, lanes)],
+                    shared_union[pl.ds(i, lanes)],
+                    mask=live,
+                )
+
+            # B against A's bits: B-only follows shared in B's window and the union.
+            def classify_b(i, b_only):
+                key, physical, valid, in_a = classify(1, i, bits_a)
+                targets = (
+                    (window_b, b_window + shared, key),
+                    (union, union_base + a_only + shared, physical),
+                )
+                return emit(targets, b_only, valid & ~in_a)
+
+            b_only = plsc.parallel_loop(
+                0, bounds[1], lanes, unroll=classify_unroll, carry=jnp.int32(0)
+            )(classify_b)
+
+            pad(window_a, a_window, a_only + shared, per_query)
+            pad(window_b, b_window, shared + b_only, per_query)
+            pad(union, union_base, a_only + shared + b_only, 2 * per_query)
+            counts[pl.ds(slot * alignment, lanes)] = jnp.where(
+                lane == 0,
+                a_only,
+                jnp.where(lane == 1, shared, jnp.where(lane == 2, b_only, 0)),
+            )
+            writes(step)
+
+            # Clear this pair's bits while its outputs drain: whole bitmaps
+            # when they are no longer than a row, else only the marked words.
+            if bitmap_words <= per_query:
+                clear_bitmaps()
+            else:
+                for query, bits in enumerate((bits_a, bits_b)):
+
+                    @plsc.parallel_loop(0, bounds[query], lanes, unroll=unroll)
+                    def unmark(i, query=query, bits=bits):
+                        # Words hold only this pair's bits, so zeroing the
+                        # words of unmarked IDs is harmless.
+                        key = ids[pl.ds(bases[query] + i, lanes)]
+                        plsc.store_scatter(bits, [word(key)], zeros)
+
+        for back in (2, 1):
+
+            @pl.when(steps >= back)
+            def epilogue(back=back):
+                writes(steps - back, wait=True)
+
+    candidate_block_ids, physical_block_ids, owners = kernel(candidates, table, control)
+    return candidate_block_ids, physical_block_ids, owners[:, :3]
 
 
 def _metadata_scratch_words(
@@ -561,6 +935,7 @@ def canonical_candidate_blocks(
                             candidate_block_ids.at[row_start + query],
                             sem.at[2],
                         ).wait()
+
             else:
                 pltpu.async_copy(
                     ids.at[:columns], candidate_block_ids.at[row_id], sem.at[2]
