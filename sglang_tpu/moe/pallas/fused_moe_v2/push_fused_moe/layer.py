@@ -642,8 +642,7 @@ def fused_ep_moe_push(
         # loop step.
         decode_loop = recipe.get("decode_loop")
         if decode_loop is not None and (
-            not decode_loop[0]
-            or _host.k32z_step_applies(decode_loop[0], hidden, inter)
+            not decode_loop[0] or _host.k32z_step_applies(decode_loop[0], hidden, inter)
         ):
             k32z_ffn_roll, k32z_roll_from = decode_loop
     kfn = build_push_moe_kernel(
