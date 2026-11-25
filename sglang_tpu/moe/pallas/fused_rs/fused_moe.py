@@ -470,8 +470,19 @@ def moe_gmm_local_rs_nodedup(
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
     )
     w4a8_rows = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_W4A8_ROWS.get()
-    gmm2_fold = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_FOLD.get()
-    gmm1_fold = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM1_FOLD.get()
+    for old, new in (
+        ("SGLANG_TPU_FUSED_RS_GMM1_FOLD", "SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS"),
+        ("SGLANG_TPU_FUSED_RS_GMM2_FOLD", "SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS"),
+    ):
+        # renamed prototype switches: a stale setting must not run with the feature off
+        if old in os.environ:
+            raise ValueError(f"{old} was renamed to {new}")
+    gmm2_dequant_weights = (
+        fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS.get()
+    )
+    gmm1_dequant_weights = (
+        fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS.get()
+    )
     pair_fp8_rows = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS.get()
     pair_sum_bf16 = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16.get()
     lean_epilogue = pair_fp8_rows and tpu_envs.SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE.get()
@@ -524,8 +535,8 @@ def moe_gmm_local_rs_nodedup(
         pair_exchange=pair_exchange,
         pair_fp8_rows=pair_fp8_rows,
         w4a8_rows=w4a8_rows,
-        gmm2_fold=gmm2_fold,
-        gmm1_fold=gmm1_fold,
+        gmm2_dequant_weights=gmm2_dequant_weights,
+        gmm1_dequant_weights=gmm1_dequant_weights,
         pair_sum_bf16=pair_sum_bf16,
         lean_epilogue=lean_epilogue,
         q8_in_gmm1=q8_in_gmm1,

@@ -704,11 +704,13 @@ class TpuEnvs:
     # Expert-TP W4A16 fused-RS: quantize both GMM inputs to e4m3 with one scale per
     # row, as the EP gmm_v2 path does (W4A8; numerics change).
     SGLANG_TPU_FUSED_RS_W4A8_ROWS = EnvBool(False)
-    # Fused-RS W4A16 GMM2: fold the block scales into the bf16 weights and run K as
-    # one dot (one more bf16 rounding of the scaled weights).
-    SGLANG_TPU_FUSED_RS_GMM2_FOLD = EnvBool(False)
+    # Fused-RS W4A16 GMM2: dequantize the fp4 weights with their block-256 scales to bf16,
+    # then run K as one dot, instead of applying each block's scale after its own dot (one
+    # more bf16 rounding of the scaled weights). Was SGLANG_TPU_FUSED_RS_GMM2_FOLD.
+    SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS = EnvBool(False)
     # The same for GMM1 (K = hidden as one dot instead of one dot per 256-row block).
-    SGLANG_TPU_FUSED_RS_GMM1_FOLD = EnvBool(False)
+    # Was SGLANG_TPU_FUSED_RS_GMM1_FOLD.
+    SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS = EnvBool(False)
     # Fused-RS: extra row buckets (comma list, multiples of the sublane tiling) added
     # to the power-of-two buckets; exact.
     SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr(None)

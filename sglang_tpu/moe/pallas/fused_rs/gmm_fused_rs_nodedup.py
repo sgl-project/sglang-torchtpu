@@ -1280,18 +1280,18 @@ def kernel_main_fused_rs(
         m = jnp.maximum(h[:, :8], h[:, 8:])  # (8, 8, 128): one vreg per row
         sub = lax.broadcasted_iota(jnp.int32, (8, num_lanes), 0)
 
-        def fold(v, k):  # v[s] max v[s + k], sublanes mod 8
+        def sub_max(v, k):  # v[s] max v[s + k], sublanes mod 8
             return jnp.maximum(v, pltpu.roll(v, 8 - k, 0))
 
-        f = [fold(m[i], 4) for i in range(8)]
+        f = [sub_max(m[i], 4) for i in range(8)]
         # row i on sublanes i..i+3, row i + 4 on the other four
         p = [jnp.where((sub - i) % 8 < 4, f[i], f[i + 4]) for i in range(4)]
-        g = [fold(v, 2) for v in p]  # row i valid on sublanes i, i + 1
+        g = [sub_max(v, 2) for v in p]  # row i valid on sublanes i, i + 1
         xa = jnp.where(
             sub % 4 < 2, g[0], g[2]
         )  # rows 0, 2, 4, 6 on pairs from 0, 2, 4, 6
         xb = jnp.where((sub - 1) % 4 < 2, g[1], g[3])  # rows 1, 3, 5, 7 from 1, 3, 5, 7
-        z = jnp.where(sub % 2 == 0, fold(xa, 1), fold(xb, 1))  # sublane i = row i
+        z = jnp.where(sub % 2 == 0, sub_max(xa, 1), sub_max(xb, 1))  # sublane i = row i
         return x, jnp.max(z, axis=1, keepdims=True)
 
     def _q8_rows(stg, ring_slot, r):
@@ -2748,8 +2748,8 @@ def _pair_exchange_metadata(
         "fp4_w4a16",
         "pair_fp8_rows",
         "w4a8_rows",
-        "gmm2_fold",
-        "gmm1_fold",
+        "gmm2_dequant_weights",
+        "gmm1_dequant_weights",
         "pair_sum_bf16",
         "lean_epilogue",
         "q8_in_gmm1",
@@ -2796,8 +2796,8 @@ def gmm_v2_fused_rs(
     fp4_w4a16: bool = False,
     pair_fp8_rows: bool = False,
     w4a8_rows: bool = False,
-    gmm2_fold: bool = False,
-    gmm1_fold: bool = False,
+    gmm2_dequant_weights: bool = False,
+    gmm1_dequant_weights: bool = False,
     pair_sum_bf16: bool = False,
     lean_epilogue: bool = False,
     q8_in_gmm1: int = 0,
@@ -2811,8 +2811,10 @@ def gmm_v2_fused_rs(
 
     pair_fp8_rows (pair exchange): cross-chip pair sums travel as e4m3 with a row
     scale; returns PairFp8Out. w4a8_rows (fp4_w4a16): both GMM inputs become e4m3
-    with one scale per row. gmm2_fold (fp4_w4a16): GMM2 folds its block scales into
-    the weights and runs K as one dot; gmm1_fold does the same for GMM1.
+    with one scale per row. gmm2_dequant_weights (fp4_w4a16): GMM2 dequantizes the fp4
+    weights with their block-256 scales to bf16, then runs K as one dot (instead of
+    applying each block's scale after its own dot); gmm1_dequant_weights does the same
+    for GMM1.
 
     fp4_w4a16: block-256 fp4 experts take bf16 rows, each block's scale applied after its
     dot (requantized NVFP4), instead of fp8-quantized rows.
@@ -3081,7 +3083,7 @@ def gmm_v2_fused_rs(
     lhs1_quant_block_size = min(256 if rhs1_quant_block_size < 512 else 512, size_k1)
     lhs2_quant_block_size = min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
     # W4A16 (fp4 rhs with small scale blocks, bf16 lhs): the lhs block is only
-    # the matmul K granularity (scales are folded into the rhs), so a larger one
+    # the matmul K granularity (the scales are applied to the dequantized rhs), so a larger one
     # cuts the per-block f32 accumulator adds. Tuning override.
     _w4a16_k = int(os.environ.get("MUSE_FUSED_RS_W4A16_KBLOCK", "0"))
     if _w4a16_k and is_quantized and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn:
@@ -3101,11 +3103,11 @@ def gmm_v2_fused_rs(
             f"{rhs2_quant_block_size}, lhs blocks {lhs1_quant_block_size} / "
             f"{lhs2_quant_block_size}"
         )
-    if (w4a8_rows or gmm2_fold or gmm1_fold) and not fp4_w4a16:
-        raise ValueError("w4a8_rows / gmm*_fold modify the fp4_w4a16 path")
-    if gmm2_fold:
+    if (w4a8_rows or gmm2_dequant_weights or gmm1_dequant_weights) and not fp4_w4a16:
+        raise ValueError("w4a8_rows / gmm*_dequant_weights modify the fp4_w4a16 path")
+    if gmm2_dequant_weights:
         lhs2_quant_block_size = size_k2
-    if gmm1_fold:
+    if gmm1_dequant_weights:
         lhs1_quant_block_size = tile_k1
     row_lhs_dtype = jnp.float8_e4m3fn.dtype if w4a8_rows else None
 
