@@ -56,6 +56,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.managers.scheduler_components.prefill_chunk_sharer import (
+    PrefillChunkSharer,
+)
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -255,7 +258,16 @@ class SchedulePolicy:
                 "prefill_chunk_share_min_tokens does not apply to schedule_policy=shortest-prefill-first, "
                 "which reserves room for shorter prefills itself"
             )
-        self.prefill_chunk_share_min_tokens = prefill_chunk_share_min_tokens
+        self._chunk_sharer = (
+            PrefillChunkSharer(
+                min_tokens=prefill_chunk_share_min_tokens,
+                tree_cache=tree_cache,
+                prefill_work=self._shortest_prefill_work,
+                scan_limit=WAITING_QUEUE_PREFIX_MATCH_MAX,
+            )
+            if prefill_chunk_share_min_tokens
+            else None
+        )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
@@ -711,12 +723,13 @@ class SchedulePolicy:
         processed_tokens: int,
     ) -> Optional[int]:
         """Cap the continuing chunk to leave room for waiting requests, or None."""
-        if self.prefill_chunk_share_min_tokens:
-            return self._shared_chunk_limit(
+        if self._chunk_sharer is not None:
+            return self._chunk_sharer.chunk_limit(
                 chunked_req=chunked_req,
                 waiting_queue=waiting_queue,
                 budget=budget,
                 page_size=page_size,
+                prefix_matched=self.waiting_queue_prefix_matched(waiting_queue),
             )
         return self.shortest_prefill_chunk_limit(
             chunked_req,
@@ -726,41 +739,12 @@ class SchedulePolicy:
             processed_tokens=processed_tokens,
         )
 
-    def _shared_chunk_limit(
-        self,
-        *,
-        chunked_req: Req,
-        waiting_queue: List[Req],
-        budget: int,
-        page_size: int,
-    ) -> Optional[int]:
-        candidates = list(waiting_queue)[:WAITING_QUEUE_PREFIX_MATCH_MAX]
-        if not self.waiting_queue_prefix_matched(waiting_queue):
-            # Fit is judged by uncached length. Head last, as in
-            # _touch_waiting_prefixes, so LRU evicts in reverse queue order.
-            for req in reversed(candidates):
-                match_kv_cache(req, self.tree_cache)
-        keep = _ceil_div(self.prefill_chunk_share_min_tokens, page_size) * page_size
-        remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
-        reserved = 0
-        # Queue order, passing over a request that is not shorter than the
-        # chunked prompt's rest or does not fit; it waits for a later pass.
-        for req in candidates:
-            work = self._shortest_prefill_work(req)
-            charge = _ceil_div(work, page_size) * page_size
-            if work < remaining and reserved + charge <= budget - keep:
-                reserved += charge
-        if not reserved:
-            return None
-        return (budget - reserved) // page_size * page_size
-
     def fits_shared_chunk(self, req: Req, rem_chunk_tokens: Optional[int]) -> bool:
-        """Whether req may try to join a pass beside a continuing chunk: always
-        without chunk sharing; with it, only when its uncached prefill fits the
-        tokens the pass has left, so a longer request keeps its queue place."""
-        if not self.prefill_chunk_share_min_tokens or rem_chunk_tokens is None:
-            return True
-        return self._shortest_prefill_work(req) <= rem_chunk_tokens
+        """Whether req may try to join a pass beside a continuing chunk; always
+        true without chunk sharing."""
+        return self._chunk_sharer is None or self._chunk_sharer.can_join(
+            req=req, rem_chunk_tokens=rem_chunk_tokens
+        )
 
     @staticmethod
     def _sort_by_longest_prefix(
