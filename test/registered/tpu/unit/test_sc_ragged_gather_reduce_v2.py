@@ -110,17 +110,10 @@ class ScatterTest(jtu.JaxTestCase):
         desired = reference_ragged_gather_reduce(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
         )
-        try:
-            actual = ragged_gather_reduce_v2(
-                x, indices, topk_weights, valid_rows_mask, reduce_group_size
-            )
-            np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
-        except AssertionError:
-            raise
-        except Exception as e:  # pylint: disable=broad-except
-            print(
-                f"Skipping ragged_gather_reduce_v2 correctness check due to error: {e}"
-            )
+        actual = ragged_gather_reduce_v2(
+            x, indices, topk_weights, valid_rows_mask, reduce_group_size
+        )
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
