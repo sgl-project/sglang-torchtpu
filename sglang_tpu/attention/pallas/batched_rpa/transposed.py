@@ -113,6 +113,7 @@ def store_tile(
     o_vref: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
+    tok_ref: list | tuple = (),
 ):
     """Normalizes and writes the completed q block on its final k step.
 
@@ -125,6 +126,40 @@ def store_tile(
     rows = cfgs.bq_sz * heads
     no_max = cfgs.serve.no_max
     is_last_k = schedule_ref.is_last_k[step, 0] == 1
+
+    def store_tok():
+        """o[0] as the q block's [bq, Hkv * G * hd] rows. Per KV head and TOK_TOKENS-token
+        slice: bf16 O^T is transposed into tok_ref ([(token, head), hd], i.e. u32 rows
+        (token, head pair) holding heads (2m, 2m + 1)); u32 row (t, r) of slot 0 takes heads
+        (4r, 4r + 2) at lanes 0..63 and (4r + 1, 4r + 3) at 64..127 (low, high half)."""
+        (xt_ref,) = tok_ref
+        assert heads == 8 and hd == 64 and cfgs.aligned_q_head_dim == 128
+        assert (
+            cfgs.serve.out_head_norm_eps is None
+            and cfgs.bq_sz % configs.TOK_TOKENS == 0
+        )
+        o_u32 = o_vref.at[0].bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
+        xt_u32 = xt_ref.bitcast(jnp.uint32)  # [(token, head pair), hd]
+        nt = configs.TOK_TOKENS
+        lo16, hi16 = jnp.uint32(0xFFFF), jnp.uint32(0xFFFF0000)
+        for kv_head in range(cfgs.model.num_kv_heads):
+            for t0 in range(0, cfgs.bq_sz, nt):
+                cols = pl.ds(t0 * heads, nt * heads)
+                l = acc_ref[kv_head, hd : hd + 1, cols]
+                if no_max and cfgs.serve.skip_pad_q:
+                    l = jnp.maximum(l, 1e-30)
+                o_t = acc_ref[kv_head, :hd, cols] * pl.reciprocal(l, approx=True)
+                xt_ref[...] = o_t.astype(cfgs.serve.dtype_out).T
+                for j in range(2):
+                    a = xt_u32[pl.ds(2 * j, nt, 4)]  # heads (4j, 4j + 1)
+                    b = xt_u32[pl.ds(2 * j + 1, nt, 4)]  # heads (4j + 2, 4j + 3)
+                    w = jnp.concatenate(
+                        [(a & lo16) | (b << 16), (a >> 16) | (b & hi16)], axis=1
+                    )
+                    r = kv_head * 2 + j
+                    o_u32[pl.ds(t0 * 4 + r, nt, 4)] = w
+        if no_max:
+            acc_ref[...] = jnp.zeros_like(acc_ref)
 
     def store():
         outs = []
@@ -158,7 +193,9 @@ def store_tile(
             # No alpha == 0 restart without a running max: clear for the next block.
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    lax.cond(is_last_k, store, lambda: None)
+    lax.cond(
+        is_last_k, store_tok if cfgs.serve.transposed_out_tok else store, lambda: None
+    )
 
 
 def tile(

@@ -246,7 +246,9 @@ def rpa_body(
     cfgs: configs.RpaConfigs,
 ):
     if cfgs.use_transposed:
-        qt_scratch_ref, qkey_scratch_ref, lse_stage_ref = rest_scratch_refs
+        qt_scratch_ref, qkey_scratch_ref, *tok_scratch, lse_stage_ref = (
+            rest_scratch_refs
+        )
     else:
         (lse_stage_ref,) = rest_scratch_refs
     step = pl.program_id(0)
@@ -505,7 +507,9 @@ def rpa_body(
                     )
                     masked = jnp.logical_and(masked, jnp.logical_not(hit))
             pl.when(masked)(lambda: run_tile(apply_mask=True))
-        transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
+        transposed.store_tile(
+            step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs, tok_ref=tok_scratch
+        )
         return
 
     # Step 3: Perform compute, then step 4: write back outputs.
@@ -663,6 +667,10 @@ def _carry_scratch_shapes(cfgs: configs.RpaConfigs):
         pltpu.VMEM(cfgs.acct_scratch_shape, dtype=jnp.float32),  # O^T and l
         pltpu.VMEM(cfgs.qt_scratch_shape, dtype=cfgs.serve.dtype_kv),  # Q^T
         pltpu.SMEM((2,), dtype=jnp.int32),  # (s_idx, q_idx) of the cached Q^T
+    ) + (
+        (pltpu.VMEM(cfgs.tok_scratch_shape, dtype=cfgs.serve.dtype_out),)
+        if cfgs.serve.transposed_out_tok
+        else ()
     )
 
 
@@ -766,11 +774,17 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
             name += "-tri"
         if cfgs.serve.transposed_qt_bf16:
             name += "-qtb"
+        if cfgs.serve.transposed_out_tok:
+            name += "-otok"
     return name
 
 
 # ServingConfigs fields only sptp/rpa.py sets (prefill SP + TP prototype).
-SPTP_ONLY_OPTIONS = ("serve.transposed_tri", "serve.transposed_qt_bf16")
+SPTP_ONLY_OPTIONS = (
+    "serve.transposed_tri",
+    "serve.transposed_qt_bf16",
+    "serve.transposed_out_tok",
+)
 
 
 def get_kernel_metadata(

@@ -63,6 +63,9 @@ class KVLayout(enum.StrEnum):
     SEQ_ALONG_LANE = enum.auto()
 
 
+TOK_TOKENS = 256  # tokens per slice of the token-major store (transposed_out_tok)
+
+
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
     """Serving config that can change depending on use cases."""
@@ -127,6 +130,10 @@ class ServingConfigs:
     # Transposed tile (sptp prefill only): Q^T is transposed in bf16 and scaled after
     # (half the XLU transposes of the f32 path); bit-identical.
     transposed_qt_bf16: bool = False
+    # Transposed tile (sptp prefill only): the output's KV head 0 slot holds the q block
+    # token major, o[0] = [T, Hkv * G * head_dim] (head h = kv * G + g, no pad lanes)
+    # reshaped to [T, G / pack, pack, lanes]; slot 1 is left unwritten. Same values.
+    transposed_out_tok: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -451,6 +458,14 @@ class RpaConfigs:
             self.model.num_kv_heads,
             self.aligned_kv_head_dim + 2 * num_sublanes,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def tok_scratch_shape(self):
+        # one TOK_TOKENS-token slice of one KV head's transposed output, bf16 rows
+        return (
+            TOK_TOKENS * self.aligned_num_q_heads_per_kv_head,
+            self.aligned_kv_head_dim,
         )
 
     @property

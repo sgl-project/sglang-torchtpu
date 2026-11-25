@@ -38,6 +38,8 @@ class RpaOpts:
     # no decode pass: the caller guarantees distribution[0] == 0 (a prefill-only batch,
     # as the sptp prefill program serves one chunk)
     prefill_only: bool = False
+    # transposed_out_tok: o[0] holds the output token major (tok_rows)
+    out_tok: bool = False
 
     @classmethod
     def from_env(cls) -> "RpaOpts":
@@ -49,7 +51,15 @@ class RpaOpts:
             swa_blocks=env("SPTP_RPA_SBLOCKS", ""),
             kv_stack=int(env("SPTP_RPA_KV_STACK", "0")),
             prefill_only=env("SPTP_RPA_PREFILL_ONLY", "0") == "1",
+            out_tok=env("SPTP_RPA_OUT_TOK", "0") == "1",
         )
+
+
+def tok_rows(o):
+    """[T, Hkv * G * D] bf16 (head h = kv * G + g) of an RpaOpts(out_tok=True) output (an XLA
+    relayout of slot 0; a Pallas consumer reads o[0] = [T, G / pack, pack, 128] itself)."""
+    _, t, gp, pack, lanes = o.shape
+    return o[0].reshape(t, gp * pack * lanes)
 
 
 def new_kv_stacked(k, v, page_size: int):
@@ -173,6 +183,7 @@ def _rpa_prepared(
         transposed_s_bf16=tpu_envs.SGLANG_TPU_RPA_S_BF16.get(),
         transposed_tri=opts.tri,
         transposed_qt_bf16=opts.qt_bf16,
+        transposed_out_tok=opts.out_tok,
         transposed=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get() and d <= 64,
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
         skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
