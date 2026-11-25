@@ -783,7 +783,7 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
     # gather arm with pair collectives (>= 48 rows): the unpool consumes each u all-gather
     # block as it lands instead of after the whole all-gather.
-    SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD = EnvInt(0)
     # EP static expert placement, JSON inline or a path (muse_megakernel_v2/common/
     # ep_placement.py): per layer, slot -> checkpoint expert. Empty: checkpoint order.
     SGLANG_TPU_MUSE_EXPERT_PLACEMENT = EnvStr("")
