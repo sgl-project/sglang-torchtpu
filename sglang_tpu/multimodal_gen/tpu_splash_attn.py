@@ -19,17 +19,24 @@ scale applied to the float32 scores inside an exp2 softmax.
 import functools
 import math
 import threading
+from collections.abc import Callable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+    get_sp_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     SDPABackend,
     SDPAImpl,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = init_logger(__name__)
 
@@ -50,6 +57,10 @@ _FLASH_OP = None
 _FLASH_RING_OP = None
 _FLASH_LIVE_LENGTH_OP = None
 _SPLASH_MHA_OP = None
+# Below 4096 rows per rank, pure-ring per-head ICI hops cost more than intra-chip D2D all_to_all + bulk ppermute.
+_SHORT_SHARD_2D_RING_MAX = 4096
+_RING_OPS: dict[tuple[int, int, int, int, float, bool], Callable | None] = {}
+_SHORT_2D_RING_OPS: dict[tuple[int, int, int, float], Callable | None] = {}
 _OPS_LOCK = threading.Lock()
 _resolved_mode_logged = False
 
@@ -236,6 +247,15 @@ def _splash_mha_block_sizes(
     return 256, 256
 
 
+def _carry_bytes_per_q_row(
+    head_dim: int, *, f32_out: bool = False, resume: bool = False
+) -> int:
+    # A bf16 output + LSE block fits in _VMEM_BUDGET_FRACTION's headroom; ring
+    # steps that write a float32 output carry (f32_out) and/or read a previous
+    # float32 output + LSE carry (resume) allocate double-buffered blocks per row.
+    return (int(f32_out) + int(resume)) * 2 * (head_dim + NUM_SUBLANES) * 4
+
+
 def _flash_call(
     q_seq: int,
     kv_seq: int,
@@ -276,11 +296,9 @@ def _flash_call(
     from jax.experimental.pallas import tpu as pltpu
 
     q_heads_per_kv_head = heads // kv_heads
-    carry_bytes_per_q_row = 0
-    if runtime_kv:
-        # A ring step writes its float32 output and log-sum-exp and, resuming,
-        # reads the previous ones: double-buffered blocks per query row.
-        carry_bytes_per_q_row = (1 + resume) * 2 * (head_dim + NUM_SUBLANES) * 4
+    carry_bytes_per_q_row = _carry_bytes_per_q_row(
+        head_dim, f32_out=(out_dtype == jnp.float32), resume=resume
+    )
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     if rows_in and (return_lse or resume):
@@ -1045,6 +1063,287 @@ def tpu_ring_attention_step(
     return out.to(query.dtype), (out, lse)
 
 
+def _resolve_ring_replica_ranks() -> tuple[
+    list[int], torch.distributed.ProcessGroup | None
+]:
+    world_size = torch.distributed.get_world_size()
+    replica_group = get_replica_group()
+    if replica_group.world_size < world_size:
+        pg = replica_group.device_group
+        ranks = (
+            list(torch.distributed.get_process_group_ranks(pg))
+            if pg is not None
+            else list(replica_group.ranks)
+        )
+        return ranks, pg
+    return list(range(world_size)), None
+
+
+def _resolve_ring_mesh_spec() -> tuple[int, int, int] | None:
+    """Return ``(outer_size, ring_size, inner_size)`` when ring ranks form a regular grid in the replica."""
+    if not torch.distributed.is_initialized() or not model_parallel_is_initialized():
+        return None
+    sp_group = get_sp_group()
+    ring_size = sp_group.ring_world_size
+    if ring_size <= 1:
+        return None
+    replica_ranks, _ = _resolve_ring_replica_ranks()
+    replica_size = len(replica_ranks)
+    ring_ranks = list(torch.distributed.get_process_group_ranks(sp_group.ring_group))
+    if len(ring_ranks) != ring_size or replica_size % ring_size != 0:
+        return None
+    rank_to_local = {rank: idx for idx, rank in enumerate(replica_ranks)}
+    try:
+        local_ring_ranks = [rank_to_local[r] for r in ring_ranks]
+    except KeyError:
+        return None
+    inner_size = local_ring_ranks[1] - local_ring_ranks[0]
+    group_span = ring_size * inner_size
+    if inner_size <= 0 or replica_size % group_span != 0:
+        return None
+    outer_idx, inner_idx = divmod(local_ring_ranks[0], group_span)
+    if inner_idx >= inner_size:
+        return None
+    expected = [
+        outer_idx * group_span + r * inner_size + inner_idx for r in range(ring_size)
+    ]
+    if local_ring_ranks != expected:
+        return None
+    return replica_size // group_span, ring_size, inner_size
+
+
+def _get_ring_op(
+    outer_size: int,
+    ring_size: int,
+    inner_size: int,
+    scale: float,
+    use_fixed_m: bool,
+    *,
+    process_group: torch.distributed.ProcessGroup | None = None,
+    replica_lead: int = 0,
+) -> Callable | None:
+    key = (outer_size, ring_size, inner_size, replica_lead, scale, use_fixed_m)
+    if key in _RING_OPS:
+        return _RING_OPS[key]
+    with _OPS_LOCK:
+        if key in _RING_OPS:
+            return _RING_OPS[key]
+        op: Callable | None = None
+        try:
+            import jax
+            from jax.sharding import PartitionSpec
+            from torch_tpu._internal.pallas import get_pallas_mesh
+
+            from sglang_tpu.multimodal_gen.diffusion_ring_attention import (
+                ring_attention_sharded,
+            )
+            from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+            axis_names = ("batch", "ring", "inner")
+            mesh = get_pallas_mesh(
+                axis_names,
+                (outer_size, ring_size, inner_size),
+                process_group=process_group,
+            )
+            spec = PartitionSpec(*axis_names)
+            sharded = jax.shard_map(
+                functools.partial(
+                    ring_attention_sharded,
+                    ring_axis="ring",
+                    axis_names=axis_names,
+                    scale=scale,
+                    use_fixed_m=use_fixed_m,
+                ),
+                mesh=mesh,
+                in_specs=(spec, spec, spec),
+                out_specs=spec,
+                check_vma=False,
+            )
+
+            def _wrapped(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+                return sharded(q, k, v)
+
+            def _ring_fake(q, k, v):
+                return q.new_empty(q.shape)
+
+            scale_hex = f"{int(np.float64(scale).view(np.uint64)):016x}"
+            fm_tag = "fm1" if use_fixed_m else "fm0"
+            rep_tag = f"r{replica_lead}_" if process_group is not None else ""
+            op_name = (
+                f"sglang_tpu_pallas::diffusion_ring_attn_"
+                f"{rep_tag}{outer_size}_{ring_size}_{inner_size}_{fm_tag}_{scale_hex}"
+            )
+            op = cpu_export_jax_op(
+                op_name,
+                _wrapped,
+                mesh=mesh,
+                input_partition_specs=(spec, spec, spec),
+                output_partition_specs=(spec,),
+            )
+            op.register_fake(_ring_fake)
+        except Exception as exc:
+            logger.warning(
+                "Failed to register TPU Pallas ring attention op at init (%s); "
+                "leaving ring kernel disabled (first-call trace/lowering errors are not caught here).",
+                exc,
+            )
+        _RING_OPS[key] = op
+        return op
+
+
+def _ranks_pair_on_chip() -> bool:
+    from sglang_tpu.attention.pallas.util import get_tpu_version
+
+    # get_pallas_mesh puts ranks r, r ^ 1 on one tpu7x chip (k3_megakernel/config.py);
+    # short-2D runs its Ulysses all_to_all over those pairs.
+    return get_tpu_version() == 7
+
+
+def _short_2d_ring_sharded(q, k, v, *, scale: float):
+    """Run intra-chip Ulysses=2 + bulk-ppermute ring attention on short shards."""
+    import jax
+    import jax.numpy as jnp
+
+    lead_axes = (0, 1, 2)
+    q_s = jnp.squeeze(q, axis=lead_axes)
+    k_s = jnp.squeeze(k, axis=lead_axes)
+    v_s = jnp.squeeze(v, axis=lead_axes)
+
+    q_u = jax.lax.all_to_all(q_s, "uly", split_axis=2, concat_axis=1, tiled=True)
+    k_u = jax.lax.all_to_all(k_s, "uly", split_axis=2, concat_axis=1, tiled=True)
+    v_u = jax.lax.all_to_all(v_s, "uly", split_axis=2, concat_axis=1, tiled=True)
+
+    batch, seq_u, heads_u, head_dim = q_u.shape
+    kv_heads_u = k_u.shape[2]
+    q_flat = jnp.swapaxes(q_u, 1, 2).reshape(batch * heads_u, seq_u, head_dim)
+    k_flat = jnp.swapaxes(k_u, 1, 2).reshape(batch * kv_heads_u, seq_u, head_dim)
+    v_flat = jnp.swapaxes(v_u, 1, 2).reshape(batch * kv_heads_u, seq_u, head_dim)
+
+    ring_2d = jax.lax.axis_size("ring")
+    perm = [(i, (i + 1) % ring_2d) for i in range(ring_2d)]
+    step0 = _flash_call(
+        seq_u,
+        seq_u,
+        head_dim,
+        scale,
+        num_rows=batch * heads_u,
+        heads=heads_u,
+        kv_heads=kv_heads_u,
+        out_dtype=jnp.float32,
+        return_lse=True,
+        resume=False,
+    )
+    step_mid = (
+        _flash_call(
+            seq_u,
+            seq_u,
+            head_dim,
+            scale,
+            num_rows=batch * heads_u,
+            heads=heads_u,
+            kv_heads=kv_heads_u,
+            out_dtype=jnp.float32,
+            return_lse=True,
+            resume=True,
+        )
+        if ring_2d > 2
+        else None
+    )
+    step_last = _flash_call(
+        seq_u,
+        seq_u,
+        head_dim,
+        scale,
+        num_rows=batch * heads_u,
+        heads=heads_u,
+        kv_heads=kv_heads_u,
+        out_dtype=q_u.dtype,
+        return_lse=False,
+        resume=True,
+    )
+
+    k_cur, v_cur = k_flat, v_flat
+    k_nxt = jax.lax.ppermute(k_cur, "ring", perm)
+    v_nxt = jax.lax.ppermute(v_cur, "ring", perm)
+    out_acc, lse_acc = step0(q_flat, k_cur, v_cur)
+    for _ in range(1, ring_2d - 1):
+        k_cur, v_cur = k_nxt, v_nxt
+        k_nxt = jax.lax.ppermute(k_cur, "ring", perm)
+        v_nxt = jax.lax.ppermute(v_cur, "ring", perm)
+        out_acc, lse_acc = step_mid(q_flat, k_cur, v_cur, out_acc, lse_acc)
+    out_flat = step_last(q_flat, k_nxt, v_nxt, out_acc, lse_acc)
+    out_u = jnp.swapaxes(out_flat.reshape(batch, heads_u, seq_u, head_dim), 1, 2)
+    out_s = jax.lax.all_to_all(out_u, "uly", split_axis=1, concat_axis=2, tiled=True)
+    return jnp.expand_dims(out_s, axis=lead_axes)
+
+
+def _get_short_2d_ring_op(
+    outer_size: int,
+    ring_size: int,
+    scale: float,
+    *,
+    process_group: torch.distributed.ProcessGroup | None = None,
+    replica_lead: int = 0,
+) -> Callable | None:
+    key = (outer_size, ring_size, replica_lead, scale)
+    if key in _SHORT_2D_RING_OPS:
+        return _SHORT_2D_RING_OPS[key]
+    with _OPS_LOCK:
+        if key in _SHORT_2D_RING_OPS:
+            return _SHORT_2D_RING_OPS[key]
+        op: Callable | None = None
+        try:
+            import jax
+            from jax.sharding import PartitionSpec
+            from torch_tpu._internal.pallas import get_pallas_mesh
+
+            from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+            axis_names = ("batch", "ring", "uly")
+            mesh = get_pallas_mesh(
+                axis_names,
+                (outer_size, ring_size // 2, 2),
+                process_group=process_group,
+            )
+            spec = PartitionSpec(*axis_names)
+            sharded = jax.shard_map(
+                functools.partial(_short_2d_ring_sharded, scale=scale),
+                mesh=mesh,
+                in_specs=(spec, spec, spec),
+                out_specs=spec,
+                check_vma=False,
+            )
+
+            def _wrapped(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+                return sharded(q, k, v)
+
+            def _short_2d_fake(q, k, v):
+                return q.new_empty(q.shape)
+
+            scale_hex = f"{int(np.float64(scale).view(np.uint64)):016x}"
+            rep_tag = f"r{replica_lead}_" if process_group is not None else ""
+            op_name = (
+                f"sglang_tpu_pallas::diffusion_short_2d_ring_attn_"
+                f"{rep_tag}{outer_size}_{ring_size}_{scale_hex}"
+            )
+            op = cpu_export_jax_op(
+                op_name,
+                _wrapped,
+                mesh=mesh,
+                input_partition_specs=(spec, spec, spec),
+                output_partition_specs=(spec,),
+            )
+            op.register_fake(_short_2d_fake)
+        except Exception as exc:
+            logger.warning(
+                "Failed to register TPU Pallas short-2D ring attention op at init (%s); "
+                "leaving short-2D ring op disabled (first-call trace/lowering errors are not caught here).",
+                exc,
+            )
+        _SHORT_2D_RING_OPS[key] = op
+        return op
+
+
 class TpuSplashAttentionBackend(SDPABackend):
     """TPU Pallas attention, tuned on v7x; uncovered shapes fall back to SDPA."""
 
@@ -1095,6 +1394,41 @@ class TpuSplashAttentionImpl(SDPAImpl):
         if self.use_splash:
             _register_ops()
             self.use_splash = _FLASH_OP is not None
+        self._ring_op: Callable | None = None
+        self._short_2d_ring_op: Callable | None = None
+        if (
+            self.use_splash
+            and not self.causal
+            and self.softmax_scale > 0
+            and tpu_envs.SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL.get()
+        ):
+            mesh_spec = _resolve_ring_mesh_spec()
+            if mesh_spec is not None:
+                outer_size, ring_size, inner_size = mesh_spec
+                replica_ranks, replica_pg = _resolve_ring_replica_ranks()
+                replica_lead = replica_ranks[0] if replica_pg is not None else 0
+                self._ring_op = _get_ring_op(
+                    outer_size,
+                    ring_size,
+                    inner_size,
+                    self.softmax_scale,
+                    tpu_envs.SGLANG_TPU_ENABLE_DIFFUSION_RING_FIXED_M.get(),
+                    process_group=replica_pg,
+                    replica_lead=replica_lead,
+                )
+                if (
+                    inner_size == 1
+                    and ring_size >= 4
+                    and ring_size % 2 == 0
+                    and _ranks_pair_on_chip()
+                ):
+                    self._short_2d_ring_op = _get_short_2d_ring_op(
+                        outer_size,
+                        ring_size,
+                        self.softmax_scale,
+                        process_group=replica_pg,
+                        replica_lead=replica_lead,
+                    )
         _log_resolved_mode_once(self.use_splash, self.dropout)
         # One live segment plus trailing padding (MiniMax H3's packed layout)
         # runs as one kernel call that reads the live length on device, so
@@ -1157,6 +1491,38 @@ class TpuSplashAttentionImpl(SDPAImpl):
             is_causal=self.causal,
         )
         return output.transpose(1, 2)
+
+    def forward_ring(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self._ring_op is None or self.causal or query.device.type != "tpu":
+            return None
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            return None
+        batch, q_seq, num_q_heads, head_dim = query.shape
+        kv_batch, kv_seq, num_kv_heads, k_dim = key.shape
+        if batch != kv_batch or q_seq != kv_seq or q_seq < 256:
+            return None
+        if head_dim != 128 or k_dim != 128 or value.shape != key.shape:
+            return None
+        if num_kv_heads == 0 or num_q_heads % num_kv_heads != 0:
+            return None
+        if not query.dtype == key.dtype == value.dtype == torch.bfloat16:
+            return None
+        q = query.contiguous().reshape(1, 1, 1, *query.shape)
+        k = key.contiguous().reshape(1, 1, 1, *key.shape)
+        v = value.contiguous().reshape(1, 1, 1, *value.shape)
+        if (
+            self._short_2d_ring_op is not None
+            and q_seq <= _SHORT_SHARD_2D_RING_MAX
+            and num_q_heads % 2 == 0
+            and num_kv_heads % 2 == 0
+        ):
+            return self._short_2d_ring_op(q, k, v).reshape(query.shape)
+        return self._ring_op(q, k, v).reshape(query.shape)
 
     def forward_ring_resume(
         self,
