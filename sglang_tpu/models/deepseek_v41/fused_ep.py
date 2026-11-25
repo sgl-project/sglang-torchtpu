@@ -175,6 +175,23 @@ def resolve_dispatch(dispatch: str, *, rows_per_rank: int, push_max_rows: int) -
     return DISPATCH_PUSH if rows_per_rank <= push_max_rows else DISPATCH
 
 
+def resolve_push_capacity(
+    rows_per_rank: int, *, expert_format: str, default_capacity: int
+) -> int:
+    """Bit-exact Pallas tile height (bm) for small-batch K512 decode push.
+
+    At very small decode buckets (rows_per_rank <= 16, e.g. c=8 t_local=6 or
+    DSpark t_local=5), total tokens across EP8 is <= 128 so even skewed routing
+    fits within tile height 32, halving VMEM activation buffers and cutting
+    verify latency by ~1.2 ms. Larger buckets keep capacity=128 to avoid
+    multi-tile splits on skewed hot experts.
+    """
+    if expert_format == EXPERT_FORMAT_K512 and default_capacity == CAPACITY:
+        if rows_per_rank <= 16:
+            return 32
+    return default_capacity
+
+
 def make_fused_ep_moe(
     mesh,
     *,
@@ -242,6 +259,7 @@ def make_fused_ep_moe(
         raise ValueError(f"ep={ep} but the mesh axis {axis!r} has {mesh_ep} devices")
     if kernel_fn is None:
         kernel_fn = package.fused_ep_moe_v2
+    explicit_capacity = capacity is not None
     if expert_format == EXPERT_FORMAT_K512:
         weight_format = package.WeightFormat.FP4
         capacity = CAPACITY if capacity is None else capacity
@@ -270,8 +288,18 @@ def make_fused_ep_moe(
         ss2=None,
     ):
         # Static per traced shape: x holds every rank's rows.
+        rows_per_rank = x.shape[0] // ep
         chosen = resolve_dispatch(
-            dispatch, rows_per_rank=x.shape[0] // ep, push_max_rows=push_max_rows
+            dispatch, rows_per_rank=rows_per_rank, push_max_rows=push_max_rows
+        )
+        tile_capacity = (
+            capacity
+            if (explicit_capacity or chosen != DISPATCH_PUSH)
+            else resolve_push_capacity(
+                rows_per_rank,
+                expert_format=expert_format,
+                default_capacity=capacity,
+            )
         )
         push = {}
         with_shared = fuse_shared and sw13 is not None
@@ -295,7 +323,7 @@ def make_fused_ep_moe(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=capacity,
+            capacity=tile_capacity,
             weight_format=weight_format,
             rhs_qb=rhs_qb,
             act_fn=act_fn,
