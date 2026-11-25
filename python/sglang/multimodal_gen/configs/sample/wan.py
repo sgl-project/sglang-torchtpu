@@ -344,6 +344,12 @@ class Wan2_2_T2V_A14B_SamplingParam(
         ]
     )
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        # The high-to-low-noise expert switch (a fraction of the train timesteps),
+        # else the checkpoint's model_index.json value.
+        return super().video_request_extra_fields() | {"boundary_ratio"}
+
 
 @dataclass
 class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
