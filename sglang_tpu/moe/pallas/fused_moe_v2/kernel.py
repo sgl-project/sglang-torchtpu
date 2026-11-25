@@ -121,6 +121,8 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 # only one the kernel carried before the selector existed; "swigluoai" is
 # the clamped GPT-OSS form and "silu_and_mul_with_clamp" from DeepSeek-V4
 ACT_FNS = ("silu", "swigluoai", "silu_and_mul_with_clamp")
+
+
 def _apply_act(gate, up, act_fn):
     """The FFN activation, on the POST-SCALE gate and up halves.
 
@@ -2343,11 +2345,7 @@ def _build_fused_ep_moe_kernel(
                         # only, so a tail tile never waits; a taller body's
                         # visit waited both slabs at its head.
                         streamed = height <= k32z_streamed
-                        waiter = (
-                            _slab_waiter(e, slot, first_tile)
-                            if streamed
-                            else None
-                        )
+                        waiter = _slab_waiter(e, slot, first_tile) if streamed else None
                         # Every tile rebuilds the column scales: a few dozen
                         # row stores, read by this tile alone.
                         k32z_fill_colscale(
@@ -2713,9 +2711,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(_and_nonempty(is_me, region_blocks))
             def _():
                 pltpu.make_async_copy(
-                    contrib_hbm.at[
-                        pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                    ],
+                    contrib_hbm.at[pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)],
                     recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
                     mehop_sem,
                 ).start()

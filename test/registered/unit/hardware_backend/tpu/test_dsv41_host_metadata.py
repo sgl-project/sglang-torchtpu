@@ -2,6 +2,7 @@
 """CPU tests: the DSV4.1 TPU attention metadata reads the host tensors the compile
 policy uploaded instead of reading the uploads back, and stays bit-identical."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -801,3 +802,7 @@ def test_spec_worker_builds_host_rows_only_for_a_consumer():
             assert worker._new_step_host_rows(**kwargs) is None
             idle = torch.zeros(plan.seq_lens.shape, dtype=torch.int64)
             assert worker._new_step_host_rows(**kwargs, seq_lens_cpu=idle) is not None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

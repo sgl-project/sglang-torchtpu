@@ -1664,14 +1664,14 @@ def early_ship_link_incidence(shard_xy):
                 while cur[axis] != dst[axis]:
                     nxt = list(cur)
                     nxt[axis] += 1 if dst[axis] > cur[axis] else -1
-                    inc[links.index((chip_of[tuple(cur)], chip_of[tuple(nxt)]))][s][d] = 1
+                    inc[links.index((chip_of[tuple(cur)], chip_of[tuple(nxt)]))][s][
+                        d
+                    ] = 1
                     cur = nxt
     return inc
 
 
-def early_ship_tail_us(
-    run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy
-):
+def early_ship_tail_us(run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy):
     """The selector's X in us (f32 scalar) from the replicated plan.
 
     run_rows [E, ep] true rows per (expert, dest shard); expert_rows_aligned
@@ -1700,7 +1700,7 @@ def early_ship_tail_us(
     nxt = jnp.logical_and(pos[:, None, :] == pos[:, :, None] + 1, live[:, None, :])
     # defer_push: g's runs leave after the next visit's first tile; the last
     # visit's at the shard's compute end.
-    rel = (start + dur + jnp.sum(jnp.where(nxt, first[:, None, :], f32(0)), axis=2))
+    rel = start + dur + jnp.sum(jnp.where(nxt, first[:, None, :], f32(0)), axis=2)
     comp_end = jnp.max(jnp.sum(dur, axis=1))
     inc = jnp.asarray(early_ship_link_incidence(shard_xy), jnp.int32)  # [l, s, d]
     rr = run_rows.reshape(ep, g_local, ep).astype(jnp.int32)  # [s, g, d]
@@ -1714,9 +1714,7 @@ def early_ship_tail_us(
     return jnp.max(fin) - comp_end
 
 
-def early_ship_pick(
-    run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy
-):
+def early_ship_pick(run_rows, expert_rows_aligned, *, ep, g_local, tile_m, shard_xy):
     """Mode 2's per-call choice: early shipping iff X > K32Z_ES_THETA_US."""
     return (
         early_ship_tail_us(

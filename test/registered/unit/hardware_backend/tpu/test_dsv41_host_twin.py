@@ -3,6 +3,7 @@
 the device gets its padded req_pool_indices_cpu twin recorded as the host copy, so
 the DSV4.1 attention metadata does not read the slots back from the device."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -83,3 +84,7 @@ def test_spec_batches_are_left_alone():
     fb.spec_info = object()
     _policy()._upload_host_inputs(fb)
     assert host_input_mirror.host_copy(fb, "req_pool_indices") is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

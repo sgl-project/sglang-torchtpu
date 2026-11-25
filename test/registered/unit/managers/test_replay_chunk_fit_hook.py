@@ -116,9 +116,7 @@ class TestReplayChunkFitHook(TestPrefillAdder):
             with self.subTest(new_tokens=new_tokens):
                 core, core_req = self._admit(new_tokens, prefix_len=0, hooked=False)
                 hooked, hooked_req = self._admit(new_tokens, prefix_len=0)
-                self.assertEqual(
-                    hooked_req.extend_len, core_req.extend_len
-                )
+                self.assertEqual(hooked_req.extend_len, core_req.extend_len)
                 self.assertEqual(hooked.rem_chunk_tokens, core.rem_chunk_tokens)
                 self.assertEqual(hooked.rem_input_tokens, core.rem_input_tokens)
 
