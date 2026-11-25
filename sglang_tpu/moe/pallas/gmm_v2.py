@@ -80,15 +80,6 @@ _MXFP4_BLOCK_SIZE = 32
 _PACKED_FP4_BLOCK_SIZES = (16, _MXFP4_BLOCK_SIZE, 64, 128, 256, 512)
 
 
-# fuse_act suffix: the rhs columns hold gate and up interleaved per tile_n block (gate block 2n,
-# up block 2n + 1) instead of as halves [gate | up]; tile_n must be that block width.
-INTERLEAVED = "@il"
-
-
-def _interleaved(fuse_act: str | None) -> bool:
-    return fuse_act is not None and fuse_act.endswith(INTERLEAVED)
-
-
 def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -111,7 +102,6 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
     """
     if fuse_act is None:
         return acc
-    fuse_act = fuse_act.removesuffix(INTERLEAVED)
 
     acc_gate = acc[..., :tile_n]
     acc_up = acc[..., tile_n:]
@@ -358,10 +348,6 @@ class IndexMaps:
 
         return (pl.ds(row_start, row_size), 0, k_id)
 
-    def _rhs_n(self, n_id: jax.Array) -> jax.Array:
-        """rhs column block of output tile n_id (the gate block when interleaved)."""
-        return 2 * n_id if _interleaved(self.cfgs.fuse_act) else n_id
-
     def rhs_weight_index_map(
         self,
         n_id: jax.Array,
@@ -371,7 +357,7 @@ class IndexMaps:
         offset: int = 0,
     ):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
-        return (group_id, k_id, offset + self._rhs_n(n_id))
+        return (group_id, k_id, offset + n_id)
 
     def rhs_bias_index_map(
         self,
@@ -382,7 +368,7 @@ class IndexMaps:
         offset: int = 0,
     ):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
-        return (group_id, 0, offset + self._rhs_n(n_id))
+        return (group_id, 0, offset + n_id)
 
     def rhs_scale_index_map(
         self,
@@ -395,7 +381,7 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         b_id = (k_id * self.cfgs.tiles.tile_k) // self.cfgs.rhs_cfgs.quant_block_size
         b_tile_id = b_id // self.cfgs.num_quant_blocks_per_tile_k
-        return (group_id, b_tile_id, 0, offset + self._rhs_n(n_id))
+        return (group_id, b_tile_id, 0, offset + n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
@@ -1085,20 +1071,18 @@ def kernel_main(
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     if cfgs.fuse_act is not None:
-        # Up half = sub-view of rhs_ref at column size_n (interleaved: at tile_n, so up tile n
-        # reads block 2n + 1 through the same index map as gate's block 2n).
-        up_off = cfgs.tiles.tile_n if _interleaved(cfgs.fuse_act) else cfgs.dims.size_n
+        # Up half = sub-view of rhs_ref at column size_n.
         rhs_up_ref = WeightsRef(
-            weight=rhs_ref.weight.at[..., up_off:],
+            weight=rhs_ref.weight.at[..., cfgs.dims.size_n :],
             # The scale ref must be offset to point to the up half's columns
             # like the weight ref.
             scale=(
-                rhs_ref.scale.at[..., up_off // cfgs.rhs_cfgs.scale_block_n :]
+                rhs_ref.scale.at[..., cfgs.dims.size_n // cfgs.rhs_cfgs.scale_block_n :]
                 if rhs_ref.scale is not None
                 else None
             ),
             bias=(
-                rhs_ref.bias.at[..., up_off:]
+                rhs_ref.bias.at[..., cfgs.dims.size_n :]
                 if rhs_ref.bias is not None
                 else None
             ),
@@ -1374,11 +1358,10 @@ def validate_inputs(
             f"size_n {size_n} should be divisible by 2 when fuse_act is not None"
             " since we need to split n dimension for gate and up projection"
         )
-        act = fuse_act.removesuffix(INTERLEAVED)
         assert (
-            act in ("gelu", "silu", "silu_and_mul_clamp", "swigluoai")
-            or act.startswith("silu_and_mul_clamp:")
-            or act.startswith("situ:")
+            fuse_act in ("gelu", "silu", "silu_and_mul_clamp", "swigluoai")
+            or fuse_act.startswith("silu_and_mul_clamp:")
+            or fuse_act.startswith("situ:")
         ), (
             f"Unsupported fuse_act {fuse_act}. Supported values are 'gelu', 'silu',"
             " 'silu_and_mul_clamp', 'silu_and_mul_clamp:{limit}',"
