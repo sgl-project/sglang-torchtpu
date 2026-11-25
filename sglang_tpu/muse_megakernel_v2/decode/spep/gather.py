@@ -700,11 +700,10 @@ def _unpool_folded(step: EPLayerStep, uag_fold) -> None:
 
     def consume(d):
         x = _unpack_bf16x2(uag[d]).astype(bf16)
-        r0 = pl.multiple_of(jax.lax.rem(d, per_tile) * (W // 4), W // 4)
-        w = pltpu.bitcast(
-            ring.at[jax.lax.div(d, per_tile)][pl.ds(r0, W // 4), pl.ds(0, Hl)],
-            jnp.float8_e4m3fn,
-        )
+        # the tile's fp8 view as stream_matmul reads it (a ref bitcast), at block d's K rows
+        r0 = pl.multiple_of(jax.lax.rem(d, per_tile) * W, W)
+        tile = ring.at[jax.lax.div(d, per_tile)].bitcast(jnp.float8_e4m3fn)
+        w = tile[pl.ds(r0, W), pl.ds(0, Hl)]
         part = jnp.dot(x, w, preferred_element_type=f32)
         acc.append(part if not acc else acc.pop() + part)
 
