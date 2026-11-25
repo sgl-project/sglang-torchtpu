@@ -2804,8 +2804,8 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             self.assertIn("-tp16", hlo)
             self.assertIn("-q8", hlo)
 
-    def test_cand13_u4mix_adapt2k_and_hoistkv_nan_poisoned_and_export(self):
-        """cand_w9_13: mixed u4flat (u4mix), adapt2k Full 1/1K, hoistkv fix, and w7auto c1024 guard."""
+    def test_cand13_hoistkv_u4flat_w7auto_c1024_and_swabatch_nonoz_and_export(self):
+        """cand_w9_14: hoistkv fix in u4flat/_fb_u4, w7auto c1024 guard, swabatch nonoz, and kv_len=1025 boundary."""
         from jax import export as jax_export
         from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
             parse_decode_fast_config,
@@ -2821,19 +2821,25 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         self.assertEqual(cfg_w7.loop_kind, "w7auto")
         self.assertEqual(cfg_w7.chunk_sz, 5120)
 
+        cfg_swa = parse_decode_fast_config(
+            "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol",
+            sliding_window=2049,
+            pages_per_seq=40,
+            page_size=512,
+        )
+        self.assertEqual(cfg_swa.loop_kind, "swabatch")
+        self.assertFalse(cfg_swa.lazy_slot_zero)
+
         rng = np.random.default_rng(1308)
         bs, ps = 8, 512
         cases = [
-            ("tp8_swa_mix_noz", 16, 2049, 6, 8, [100, 513, 640, 1025, 1300, 1450, 1800, 2048], "w8,noz,batchfull,u4flat,g4k,foldcol"),
-            ("tp8_swa_mix_nonoz", 16, 2049, 6, 8, [100, 513, 640, 1025, 1300, 1450, 1800, 2048], "w8,nonoz,batchfull,u4flat,g4k,foldcol"),
-            ("tp16_swa_mix_noz", 8, 2049, 6, 8, [100, 513, 640, 1025, 1300, 1450, 1800, 2048], "tp16,w8,noz,batchfull,u4flat,g4k,foldcol"),
-            ("tp8_swa_unif550", 16, 2049, 6, 8, [550] * 8, "w8,noz,batchfull,u4flat,g4k,foldcol"),
-            ("tp8_full_b1025_hkv", 16, None, 12, 8, [100, 250, 513, 700, 800, 900, 1024, 1025], "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
-            ("tp8_full_mix11k_adapt2k_hkv", 16, None, 12, 8, [100, 220, 400, 550, 620, 800, 1020, 1200], "w8,noz,batchfull,u4flat,adapt2k,hoistkv,g4k,foldcol"),
-            ("tp16_full_mix11k_adapt2k_nonoz", 8, None, 12, 8, [100, 220, 400, 550, 620, 800, 1020, 1200], "tp16,w8,nonoz,batchfull,u4flat,adapt2k,hoistkv,g4k,foldcol"),
-            ("tp8_full_fb_u4_hkv_n3", 16, None, 12, 3, [1, 550, 1200, 1, 1, 1, 1, 1], "w8,noz,batchfull,u4flat,adapt2k,hoistkv,g4k,foldcol"),
-            ("tp8_swa_8k1k_mp5_full", 16, 2049, 10, 8, [2100, 2500, 3000, 3500, 4000, 4500, 4800, 5000], "w8,noz,batchfull,u4flat,g4k,foldcol"),
-            ("tp8_swa_8k1k_mp5_mix", 16, 2049, 10, 8, [100, 600, 1200, 1800, 2200, 3000, 4000, 5000], "w8,noz,batchfull,u4flat,g4k,foldcol"),
+            ("tp8_swa_unif550_u4", 16, 2049, 6, 8, [550] * 8, "w8,noz,batchfull,u4flat,g4k,foldcol"),
+            ("tp8_full_b1025_hkv_u4", 16, None, 12, 8, [100, 250, 513, 700, 800, 900, 1024, 1025], "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+            ("tp8_full_unif900_hkv_u4", 16, None, 12, 8, [900] * 8, "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+            ("tp16_full_b1025_hkv_u4", 8, None, 12, 8, [100, 250, 513, 700, 800, 900, 1024, 1025], "tp16,w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+            ("tp8_full_fb_u4_hkv_n3", 16, None, 12, 3, [1, 550, 1024, 1, 1, 1, 1, 1], "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+            ("tp8_swa_8k1k_mp5_full", 16, 2049, 10, 8, [2100, 2500, 3000, 3500, 4000, 4500, 4800, 5000], "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+            ("tp8_swa_8k1k_mp5_mix", 16, 2049, 10, 8, [100, 600, 1200, 1800, 2200, 3000, 4000, 5000], "w8,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
         ]
         for tag, nq, sw, pps, n_act, lens, mode in cases:
             with self.subTest(case=tag):
@@ -2900,9 +2906,9 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         ):
             bs_e, pps_e = 64, 40
             for tag_e, nq_e, sw_e, mode_e in (
-                ("tp8_swa_u4mix", 16, 2049, "w8,noz,batchfull,u4flat,g4k,foldcol"),
-                ("tp8_full_adapt2k", 16, None, "w8,noz,batchfull,u4flat,adapt2k,g4k,foldcol"),
-                ("tp16_full_adapt2k", 8, None, "tp16,w8,noz,batchfull,u4flat,adapt2k,g4k,foldcol"),
+                ("tp8_swa_nonoz", 16, 2049, "w8,noz,batchfull,u4flat,g4k,foldcol"),
+                ("tp8_full_hkv_c5120", 16, None, "w8,c1024,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
+                ("tp16_full_hkv_c5120", 8, None, "tp16,w8,c1024,noz,batchfull,u4flat,hoistkv,g4k,foldcol"),
             ):
                 with self.subTest(export=tag_e):
                     hlo = jax_export.export(
@@ -2928,9 +2934,10 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
                         jax.ShapeDtypeStruct((3,), jnp.int32),
                     ).mlir_module()
-                    self.assertIn("-u4mix", hlo)
+                    self.assertIn("swabatch-mp2-batchfull", hlo)
+                    self.assertNotIn("swabatch-mp5-noz", hlo)
                     if sw_e is None:
-                        self.assertIn("swabatch-mp4", hlo)
+                        self.assertIn("c5120-w7auto", hlo)
 
 
 if __name__ == "__main__":
