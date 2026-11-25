@@ -203,8 +203,7 @@ def oproj_a2a_call(
     head: g8 in the o gate's head layout [kvh, T, w] (w = qd / kvh, wo's row order within a
     rank) instead of token major; each send gathers rank d's rows of every head group.
     tmaj: g8 [qd, T] (rows in lanes: the o gate fusion's own layout, no relayout before the
-    kernel); blocks land as [qd, Ts] and the o proj contracts their sublanes (transposed-lhs
-    fp8 dot, measured as fast as the plain one); the pool input gets its own [tp, Ts, qd] buffer."""
+    kernel); blocks land as [qd, Ts] and are transposed once per o proj step; the pool input gets its own [tp, Ts, qd] buffer."""
     Ts, tp, qd = _dims(c)
     H, E = c.hidden, n_router
     if (
@@ -344,16 +343,17 @@ def oproj_a2a_call(
                 # src's row scales as a column
                 g_col = jnp.transpose(jnp.broadcast_to(gsr[src], (8, Ts)))[:, 0:1]
 
+                # tmaj: the landed [qd, Ts] block transposed once per step (a transposed-lhs
+                # dot per N tile re-transposed it every time: 47 vs 42 us)
+                x_t = jnp.transpose(gq[src]) if tmaj else None
+
                 def block(n0, first=False):
                     acc = None
                     for k0 in range(0, qd, _KC):
                         w_k = wo_ref[k0 : k0 + _KC, n0 : n0 + tn]
                         if tmaj:
-                            part = jax.lax.dot_general(
-                                gq[src, k0 : k0 + _KC, :],
-                                w_k,
-                                (((0,), (0,)), ((), ())),
-                                preferred_element_type=_F32,
+                            part = jnp.dot(
+                                x_t[:, k0 : k0 + _KC], w_k, preferred_element_type=_F32
                             )
                         else:
                             part = jnp.dot(
