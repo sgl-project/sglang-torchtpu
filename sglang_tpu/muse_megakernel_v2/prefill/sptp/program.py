@@ -242,7 +242,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
         raise ValueError("SPTP_POSTATTN needs the q_rpa path and the fused rms quant")
     pa_tn, pa_tp, pa_rc = (
         int(os.environ.get(k, d))
-        for k, d in (("SPTP_PA_TN", "512"), ("SPTP_PA_TP", "512"), ("SPTP_PA_RC", "64"))
+        for k, d in (
+            ("SPTP_PA_TN", "512"),
+            ("SPTP_PA_TP", "1024"),
+            ("SPTP_PA_RC", "64"),
+        )
     )
     pa_pool = pool_call(c, pa_tp, pa_rc) if pa else None
     # SPTP_PA_A2A=1: the gated-output a2a by remote DMA inside the o proj kernel
