@@ -32,6 +32,12 @@ class RpaOpts:
     # "bq:bkv" of global / SWA layers over SGLANG_TPU_RPA_(SWA_)PREFILL_BLOCKS
     global_blocks: str = ""
     swa_blocks: str = ""
+    # new KV operand: 1 one stack + transpose; 2 a transpose of 32-bit words (4 fp8 head
+    # lanes of one token, the operand's tiled layout) instead of concat / pad / relayout
+    kv_stack: int = 0
+    # no decode pass: the caller guarantees distribution[0] == 0 (a prefill-only batch,
+    # as the sptp prefill program serves one chunk)
+    prefill_only: bool = False
 
     @classmethod
     def from_env(cls) -> "RpaOpts":
@@ -41,7 +47,35 @@ class RpaOpts:
             qt_bf16=env("SPTP_RPA_QTB", "0") == "1",
             global_blocks=env("SPTP_RPA_GBLOCKS", ""),
             swa_blocks=env("SPTP_RPA_SBLOCKS", ""),
+            kv_stack=int(env("SPTP_RPA_KV_STACK", "0")),
+            prefill_only=env("SPTP_RPA_PREFILL_ONLY", "0") == "1",
         )
+
+
+def new_kv_stacked(k, v, page_size: int):
+    """new_kv by stack + transpose: [2 * Hkv (k0, v0, k1, v1), D / pack, pack, T]."""
+    t, hkv, d = k.shape
+    pack = utils.get_dtype_packing(k.dtype)
+    lanes = pltpu.get_tpu_info().num_lanes
+    sub = pltpu.get_tpu_info().num_sublanes
+    assert d % (sub * pack) == 0 and t % max(lanes, page_size) == 0, (
+        k.shape,
+        page_size,
+    )
+    kv = jnp.stack([k, v], axis=2).reshape(t, 2 * hkv, d // pack, pack)
+    return kv.transpose(1, 2, 3, 0)
+
+
+def new_kv_words(k, v, page_size: int):
+    """new_kv_stacked through 32-bit words: [T, 2 Hkv D] fp8 -> u32 [T, 2 Hkv D / 4] ->
+    transposed -> fp8 [2 Hkv, D / 4, 4, T] (4 head lanes of one token per word, as tiled)."""
+    t, hkv, d = k.shape
+    pack = utils.get_dtype_packing(k.dtype)
+    assert d % pack == 0 and t % max(pltpu.get_tpu_info().num_lanes, page_size) == 0
+    kv = jnp.stack([k, v], axis=2).reshape(t, 2 * hkv * d // pack, pack)
+    w = jax.lax.bitcast_convert_type(kv, jnp.uint32).T  # [2 Hkv D / 4, T]
+    kv8 = jax.lax.bitcast_convert_type(w, k.dtype)  # [2 Hkv D / 4, T, 4]
+    return kv8.reshape(2 * hkv, d // pack, t, pack).transpose(0, 1, 3, 2)
 
 
 def new_kv(k, v, page_size: int):
@@ -145,7 +179,9 @@ def _rpa_prepared(
         # the program normalizes each head itself
         out_head_norm_eps=None,
     )
-    new_kv_hbm = new_kv(k, v, page_size)
+    new_kv_hbm = {0: new_kv, 1: new_kv_stacked, 2: new_kv_words}[opts.kv_stack](
+        k, v, page_size
+    )
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs, serve_cfgs, vmem_limit_bytes
     )
@@ -210,6 +246,8 @@ def _rpa_prepared(
             kv_lens_global=None,
         )
 
-    o, kv_cache, _ = run(configs.RpaCase.DECODE, q_hbm, kv_cache)
+    o = q_hbm
+    if not opts.prefill_only:
+        o, kv_cache, _ = run(configs.RpaCase.DECODE, o, kv_cache)
     o, kv_cache, _ = run(configs.RpaCase.MIXED, o, kv_cache)
     return o, kv_cache
