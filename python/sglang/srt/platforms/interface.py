@@ -506,6 +506,11 @@ class SRTPlatform(DeviceMixin):
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
         return False
 
+    def pcp_ring_enabled(self) -> bool:
+        """Whether prefill context parallelism runs in ring mode: the KV cache
+        is striped like DCP over the attention cp group."""
+        return False
+
     def dcp_replicates_q_heads(self) -> bool:
         """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention."""
         return False

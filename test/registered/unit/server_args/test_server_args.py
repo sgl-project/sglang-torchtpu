@@ -898,6 +898,26 @@ class TestPrepareServerArgs(CustomTestCase):
                 model_path="dummy", prefill_decode_interval_min_bs=-1
             ).resolve_once()
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-below-min-bs must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                prefill_decode_interval_min_bs=6,
+                prefill_decode_interval_below_min_bs=-1,
+            ).resolve_once()
+
+        # Without a min batch size the below-min-bs rounds would never apply.
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-below-min-bs needs "
+            "--prefill-decode-interval-min-bs > 0",
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval_below_min_bs=8
+            ).resolve_once()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(
@@ -3149,6 +3169,27 @@ class TestHiCacheArgs(CustomTestCase):
                         handle_hicache(args)
                 else:
                     handle_hicache(args)
+
+    def test_hicache_swa_fraction_needs_a_share_of_hicache_size(self):
+        """The fraction splits --hicache-size, so a ratio-sized host pool rejects
+        it instead of ignoring it."""
+        for fraction, size, error in (
+            (0.3, 56, None),
+            (0.3, 0, "pass --hicache-size"),
+            (0.0, 56, r"in \(0, 1\)"),
+            (1.0, 56, r"in \(0, 1\)"),
+        ):
+            with self.subTest(fraction=fraction, size=size):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_size=size,
+                    hicache_swa_fraction=fraction,
+                )
+                if error is None:
+                    handle_hicache(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
 
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,

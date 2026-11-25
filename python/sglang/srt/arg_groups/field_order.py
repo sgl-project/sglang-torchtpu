@@ -591,6 +591,8 @@ POSITIONAL_FIELD_ORDER = (
     "session_release_evicted_leaf",
     "session_coverage_host_only",
     "session_id_header",
+    "prefill_decode_interval_below_min_bs",
+    "hicache_swa_fraction",
     "prefill_chunk_share_min_tokens",
 )
 # fmt: on

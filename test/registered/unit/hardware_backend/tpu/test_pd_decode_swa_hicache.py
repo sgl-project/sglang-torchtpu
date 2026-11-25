@@ -177,6 +177,7 @@ def memory(**overrides):
         hicache_host_memory_mode="cache",
         hicache_storage_backend=None,
         hicache_size=0,
+        hicache_swa_fraction=None,
         hicache_write_policy="write_through",
         enable_unified_memory=False,
     )
@@ -574,7 +575,7 @@ class TestFullOnlyStrategy(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="scheduler")
 
-    def attach(self, *, offload, hicache_size=0):
+    def attach(self, *, offload, hicache_size=0, hicache_swa_fraction=None):
         cache, params = real_swa_cache()
         params.token_to_kv_pool_allocator.swa_attn_allocator = MagicMock()
         kvcache = MagicMock(spec=SWAKVPool)
@@ -594,7 +595,9 @@ class TestFullOnlyStrategy(CustomTestCase):
             tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(offload),
             patch(
                 TPU + ".get_memory",
-                return_value=memory(hicache_size=hicache_size),
+                return_value=memory(
+                    hicache_size=hicache_size, hicache_swa_fraction=hicache_swa_fraction
+                ),
             ),
             patch(
                 ASSEMBLER + ".build_kv_host_pool",
@@ -714,7 +717,8 @@ class TestFullOnlyStrategy(CustomTestCase):
 
     def test_switch_on_adds_an_swa_pool_sized_like_upstream(self):
         """Both pools take the budget a hybrid host stack gets upstream: the
-        ratio with no fixed size, else --hicache-size split by device bytes."""
+        ratio with no fixed size, else --hicache-size split by device bytes
+        or by --hicache-swa-fraction."""
         cache, host_pool, host_pools = self.attach(offload=True)
         self.assertEqual(
             set(cache.host_pool_group.entry_map), {PoolName.KV, PoolName.SWA}
@@ -733,6 +737,10 @@ class TestFullOnlyStrategy(CustomTestCase):
         self.assertEqual(sizes(host_pool), {"full": None, "swa": None})
         _, host_pool, _ = self.attach(offload=True, hicache_size=16)
         self.assertEqual(sizes(host_pool), {"full": 12.0, "swa": 4.0})
+        _, host_pool, _ = self.attach(
+            offload=True, hicache_size=16, hicache_swa_fraction=0.5
+        )
+        self.assertEqual(sizes(host_pool), {"full": 8.0, "swa": 8.0})
 
 
 class TestAdmissionAndAllocation(CustomTestCase):

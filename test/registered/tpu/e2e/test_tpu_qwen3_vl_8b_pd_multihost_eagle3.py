@@ -105,8 +105,7 @@ EXTRA_SERVER_ARGS: Tuple[str, ...] = (
 )
 # The default PowerBucketer gives 8 token buckets (64..8192), and the VL and
 # spec EXTEND grids each multiply by them, costing ~20 min of startup. Four
-# buckets halve that; 8192 must stay to cover MAX_PREFILL_TOKENS. RESHARD off:
-# symmetric prefill and decode TP needs no strided reshard.
+# buckets halve that; 8192 must stay to cover MAX_PREFILL_TOKENS.
 EXTRA_LAUNCH_ENV: Dict[str, str] = {
     "TPU_COMPILE_TOKENS": "512 1024 2048 8192",
     # common_env.sh defaults this to +recompiles, and dynamo reprints the whole
@@ -115,7 +114,6 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     # and a "-" on an artifact still enables it. Serving-time recompiles stay
     # fatal via the scheduler's fail_on_recompile stance.
     "TORCH_LOGS": "-dynamo",
-    "SGLANG_RAIDEN_RESHARD": "0",
 }
 
 # EAGLE3 speculative decoding, shared by both engines: the P/D handoff carries

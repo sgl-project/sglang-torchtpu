@@ -3,11 +3,15 @@
 import unittest
 from types import SimpleNamespace
 
+import jax.numpy as jnp
+import numpy as np
+
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.muse_megakernel import ops
-from sglang_tpu.muse_megakernel.prefill.tp.program import _layer_experts
+from sglang_tpu.muse_megakernel.common.plan import layer_units
+from sglang_tpu.muse_megakernel.prefill.spep.program import _stacked_group_sizes
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -110,7 +114,7 @@ class TestMusePrefillConfig(CustomTestCase):
         cfg = ops.MuseMegakernel.prefill_config(
             _megakernel(expert_group=15), rows=1024, capture=()
         )
-        units = _layer_experts(cfg)
+        units = layer_units(cfg)
         self.assertEqual(units[0], (0, None))
         # fp4 layers 1..15 share the first stacked group, indexed within it
         self.assertEqual(units[1], (1, 0))
@@ -119,6 +123,22 @@ class TestMusePrefillConfig(CustomTestCase):
         self.assertEqual(units[_LAYERS - 1][1], None)
         # fp8 layer 0, four groups of 15 fp4 layers, fp8 layer 61
         self.assertEqual(len({u for u, _ in units}), 6)
+
+    def test_stacked_ep_layer_runs_on_its_slice_of_the_group(self):
+        # gmm_v2 runs lhs group g on rhs[g - 1] (group 0 pads); a layer at index k of a stacked
+        # group of n layers x E experts must reach rhs k * E + e, rows in their order.
+        n_layers, n_e = 4, 3
+        sizes = jnp.array([1, 2, 0, 1], jnp.int32)  # padding, experts 0..2
+        for k in range(n_layers):
+            out = np.asarray(
+                _stacked_group_sizes(
+                    sizes, in_group=k, n_experts=n_e, n_rhs=n_layers * n_e
+                )
+            )
+            rhs = [g - 1 for g, size in enumerate(out.tolist()) for _ in range(size)]
+            self.assertEqual(rhs, [-1, k * n_e, k * n_e, k * n_e + 2])
+            # gmm_v2 needs a size per rhs expert past the padding group
+            self.assertGreaterEqual(len(out), n_layers * n_e + 1)
 
 
 if __name__ == "__main__":

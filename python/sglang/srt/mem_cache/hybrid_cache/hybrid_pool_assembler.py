@@ -287,6 +287,27 @@ def _split_hicache_size(
     )
 
 
+def _split_hybrid_swa_hicache_size(
+    hicache_size: int,
+    *,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    other_pools: tuple[Any, ...] = (),
+    swa_fraction: Optional[float],
+) -> tuple[float, ...]:
+    """(full, SWA, *others) shares of --hicache-size: by device bytes, or with
+    --hicache-swa-fraction that share to SWA and the rest by device bytes."""
+    if swa_fraction is None:
+        return _split_hicache_size(
+            hicache_size, (full_kv_pool, swa_kv_pool, *other_pools)
+        )
+    swa_host_size = hicache_size * swa_fraction
+    kv_host_size, *other_sizes = _split_hicache_size(
+        hicache_size - swa_host_size, (full_kv_pool, *other_pools)
+    )
+    return (kv_host_size, swa_host_size, *other_sizes)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -576,8 +597,11 @@ def build_hybrid_swa_stack(
     kv_host_size = swa_host_size = None
     memory = get_memory()
     if memory.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
-            memory.hicache_size, (full_kv_pool, swa_kv_pool)
+        kv_host_size, swa_host_size = _split_hybrid_swa_hicache_size(
+            memory.hicache_size,
+            full_kv_pool=full_kv_pool,
+            swa_kv_pool=swa_kv_pool,
+            swa_fraction=memory.hicache_swa_fraction,
         )
 
     host_pool_group = build_hybrid_swa_group(
@@ -1385,9 +1409,14 @@ def build_hybrid_mamba_swa_stack(
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
-    if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+    memory = get_memory()
+    if memory.hicache_size > 0:
+        kv_host_size, swa_host_size, mamba_host_size = _split_hybrid_swa_hicache_size(
+            memory.hicache_size,
+            full_kv_pool=full_kv_pool,
+            swa_kv_pool=swa_kv_pool,
+            other_pools=(mamba_pool,),
+            swa_fraction=memory.hicache_swa_fraction,
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,

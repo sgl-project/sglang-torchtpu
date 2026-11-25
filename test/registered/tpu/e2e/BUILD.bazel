@@ -45,6 +45,35 @@ sglang_tpu_e2e_test(
     ],
 )
 
+# The true on-policy tests import this sibling module by its top-level name.
+py_library(
+    name = "true_on_policy_base",
+    srcs = ["true_on_policy_base.py"],
+    imports = ["."],
+    deps = ["//python:sglang"],
+)
+
+[
+    sglang_tpu_e2e_test(
+        name = "test_tpu_%s_singlehost_true_on_policy" % model,
+        srcs = ["test_tpu_%s_singlehost_true_on_policy.py" % model],
+        data = ["//benchmark/tpu:runtime"],
+        main = "test_tpu_%s_singlehost_true_on_policy.py" % model,
+        tags = ["requires-tpu-v7x"],
+        deps = [
+            ":true_on_policy_base",
+            "//python:sglang",
+            "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+        ],
+    )
+    for model in [
+        "qwen3_0_6b",
+        "qwen3_5_35b_a3b",
+        "qwen3_6_27b",
+        "qwen3_8_27b",
+    ]
+]
+
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_smoke",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_smoke.py"],

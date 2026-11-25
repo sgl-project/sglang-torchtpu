@@ -38,7 +38,6 @@ for _config in (PREFILL_CONFIG, DECODE_CONFIG):
     if DRAFT_MODEL.startswith("gs://"):
         _config["server_args"]["speculative_draft_load_format"] = "runai_streamer"
     _config["runtime_envs"].update(
-        SGLANG_RAIDEN_RESHARD="0",
         HEALTH_TIMEOUT=os.environ.get("WAIT_SECS", "5400"),
     )
 
