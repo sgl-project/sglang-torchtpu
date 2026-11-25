@@ -1,24 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode fused MoE that streams each distinct expert's weights once through a
-multi-slot VMEM ring.
+"""MoE ring kernel: the routed-expert part of an MoE layer for small batches.
 
-At decode row counts with every expert local (EP = 1) the cost is the weight
-bytes of the distinct experts the batch touches. gmm_v2 fetches them one tile
-DMA at a time (about one stream of HBM bandwidth); here the kernel keeps
-``slots - 1`` experts in flight, each split into several DMAs, and computes
-each expert for its routed rows only:
+Where it sits among the MoE paths (`--moe-runner-backend`):
 
-  * XLA builds an expert-major pair list (pairwise compares of the routed
-    slots, no sort) and per-expert counts and offsets;
-  * the kernel compacts the hit experts, starts their weight DMAs, quantizes
-    x once as gmm_v2 quantizes its lhs (per row per 512 columns, bf16 scales);
-  * per expert: gather its rows (an 8-, 16- or 32-row tile by its pair count,
-    one loop per count class), gate/up, clamped SiLU and down exactly as
-    gmm_v2 + fused_moe compute them, then add weight * output into an f32
-    [T, H] accumulator.
+  pallas_tpu_fused_decode:
+    one kernel for the whole MoE block: routing, routed experts, shared expert
+    and the cross-rank all-reduce (fused_moe_decode, moe_tp_decode).
+  pallas_tpu (default), per fused-MoE call:
+    EP = 1 and the cost model below prefers it: this kernel;
+    otherwise: gmm_v2.
 
-Each (token, expert) output matches gmm_v2's bit for bit; the f32 combine
-sums in expert order rather than top-k order.
+At EP = 1 (every expert is on this rank, as a 1/TP slice of its width) a small
+batch touches many experts with only a few rows each, so the time goes to
+reading each touched expert's weights from HBM, not to the matmuls. gmm_v2
+reads them one tile at a time. This kernel:
+
+  * keeps `slots` expert-sized buffers in VMEM and always has the next
+    `slots - 1` experts' weights being copied in while it computes the current
+    one, so the copies overlap each other and the compute;
+  * reads each touched expert once and runs it only on the rows routed to it,
+    in tiles of 8, 16 or 32 rows depending on how many rows the expert has;
+  * adds each expert's weighted output into an f32 [T, H] buffer that stays in
+    VMEM, so nothing goes back to HBM between the two matmuls.
+
+Before the kernel, XLA groups the (token, expert) pairs by expert and counts
+the rows per expert (`_route`).
+
+Each (token, expert) output is bit-identical to gmm_v2's: the same input
+quantization (per row, per 512 columns), bf16 partial sums and clamped SiLU.
+Only the final f32 sum runs in expert order rather than top-k order.
 """
 
 import functools
@@ -31,65 +41,93 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.gmm_v2 import _FP32_MOE_SCALES
 from sglang_tpu.moe.pallas.moe_tp_decode.all_reduce import tiled_bytes
-from sglang_tpu.moe.pallas.moe_tp_decode.kernel import VMEM_FRACTION, VMEM_HEADROOM
+from sglang_tpu.moe.pallas.moe_tp_decode.kernel import (
+    _Q_BLOCK,
+    VMEM_FRACTION,
+    VMEM_HEADROOM,
+)
 
-FP8 = jnp.float8_e4m3fn
-FP8_MAX = float(jnp.finfo(FP8).max)
-# gmm_v2's lhs quantization block.
-_Q_BLOCK = 512
+_FP8_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 # Ring depth: slots - 1 experts in flight while one computes.
 _SLOTS = 4
 # DMAs per expert's w1 / w2 (split along their leading weight dim).
 _W1_CHUNKS = 2
 _W2_CHUNKS = 1
 # Rows per compute tile by expert pair count: up to 8 pairs one 8-row tile, up
-# to 16 one 16-row tile, more in 32-row tiles (measured per-tile cost 0.9 / 1.1 / 1.4 us).
+# to 16 one 16-row tile, more in 32-row tiles.
 _TILE_ROWS = (8, 16, 32)
-# Largest token count the kernel takes: the largest one timed, and a bound on the
-# [tokens * k, tokens * k] compare its routing builds.
-_MAX_TOKENS = 512
 
 
-def _vmem_need(t, h, n, slots, tile_rows, info):
+def _vmem_need(
+    tokens: int,
+    hidden: int,
+    n: int,
+    slots: int,
+    tile_rows: tuple[int, ...],
+    info: pltpu.TpuInfo,
+) -> int:
+    """VMEM bytes of every buffer the kernel holds, padded to Mosaic tiles.
+
+    Args:
+      tokens: T, rows of x.
+      hidden: H, model width.
+      n: expert width on this rank (w1 is [H, 2n], w2 is [n, H]).
+      slots: weight ring depth.
+      tile_rows: the row-tile sizes; the gather buffers hold the largest.
+      info: the TPU's lane and sublane counts.
+    """
     b = functools.partial(tiled_bytes, info=info)
-    nq = h // _Q_BLOCK
+    nq = hidden // _Q_BLOCK
     lanes = info.num_lanes
     ring = slots * (
-        b((h, 2 * n), FP8)
-        + b((n, h), FP8)
-        + b((1, 2 * n), jnp.float32)
-        + b((1, h), jnp.float32)
+        b((hidden, 2 * n), jnp.float8_e4m3fn)  # w1
+        + b((n, hidden), jnp.float8_e4m3fn)  # w2
+        + b((1, 2 * n), jnp.float32)  # w1 scale
+        + b((1, hidden), jnp.float32)  # w2 scale
     )
     rows = (
-        2 * b((t, h), jnp.bfloat16)  # x in, out
-        + 2 * b((t, h), jnp.float32)  # quantized x, accumulator
-        + b((nq, t, lanes), jnp.float32)  # x block scales
-        + b((max(tile_rows), h), jnp.float32)
-        + b((nq, max(tile_rows), lanes), jnp.float32)
+        2 * b((tokens, hidden), jnp.bfloat16)  # x in, out
+        + 2 * b((tokens, hidden), jnp.float32)  # quantized x, accumulator
+        + b((nq, tokens, lanes), jnp.float32)  # x block scales
+        + b((max(tile_rows), hidden), jnp.float32)  # one tile's gathered rows
+        + b((nq, max(tile_rows), lanes), jnp.float32)  # and their block scales
     )
     return ring + rows
 
 
-def _vmem_limit(tokens, hidden, n, slots, tile_rows, info):
-    """The kernel's VMEM limit, by moe_tp_decode's rule: its headroom over the
-    planned bytes, or None when that passes its fraction of the capacity."""
+def _vmem_limit(
+    tokens: int,
+    hidden: int,
+    n: int,
+    slots: int,
+    tile_rows: tuple[int, ...],
+    info: pltpu.TpuInfo,
+) -> int | None:
+    """The kernel's VMEM limit in bytes, by moe_tp_decode's rule: VMEM_HEADROOM
+    times the planned bytes, or None when that passes VMEM_FRACTION of the
+    capacity."""
     limit = int(_vmem_need(tokens, hidden, n, slots, tile_rows, info) * VMEM_HEADROOM)
     if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
         return None
     return min(limit, info.vmem_capacity_bytes)
 
 
-def supports(tokens, hidden, two_n, *, slots=_SLOTS, tile_rows=_TILE_ROWS) -> bool:
+def fit_moe_ring(
+    tokens: int,
+    hidden: int,
+    two_n: int,
+    *,
+    slots: int = _SLOTS,
+    tile_rows: tuple[int, ...] = _TILE_ROWS,
+) -> bool:
+    """Whether the kernel can run these shapes: aligned, bit-compatible with
+    gmm_v2, and within VMEM. There is no token cap of its own; the VMEM limit
+    bounds the tokens (the row buffers grow with tokens * hidden)."""
     info = pltpu.get_tpu_info()
     n = two_n // 2
     # _down quantizes its lhs as one block, which is gmm_v2's rule only for
-    # n <= _Q_BLOCK; wider experts come out 1-3% away from gmm_v2 (measured).
-    if (
-        hidden % _Q_BLOCK
-        or n % info.num_lanes
-        or n > _Q_BLOCK
-        or not 1 <= tokens <= _MAX_TOKENS
-    ):
+    # n <= _Q_BLOCK; wider experts would not match gmm_v2.
+    if hidden % _Q_BLOCK or n % info.num_lanes or n > _Q_BLOCK or tokens < 1:
         return False
     return _vmem_limit(tokens, hidden, n, slots, tile_rows, info) is not None
 
@@ -137,7 +175,7 @@ def _gate_up(xq, xs, w_ref, s_row, *, limit):
     acc = jnp.zeros((m, two_n), jnp.bfloat16)
     for b in range(h // _Q_BLOCK):
         part = jax.lax.dot_general(
-            xq[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK].astype(FP8),
+            xq[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK].astype(jnp.float8_e4m3fn),
             w_ref[pl.ds(b * _Q_BLOCK, _Q_BLOCK), :],
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
@@ -159,10 +197,10 @@ def _down(h, w_ref, s_row):
     """gmm_v2's GMM2 for K <= 512: one quantization block. h [M, n] bf16,
     w_ref [n, H] fp8. Returns [M, H] bf16."""
     sdt = jnp.float32 if _FP32_MOE_SCALES else jnp.bfloat16
-    scale = jnp.max(jnp.abs(h), axis=1, keepdims=True) / FP8_MAX
+    scale = jnp.max(jnp.abs(h), axis=1, keepdims=True) / _FP8_MAX
     inv = jnp.where(scale == 0, 0, 1 / scale)
     part = jax.lax.dot_general(
-        (h * inv).astype(FP8),
+        (h * inv).astype(jnp.float8_e4m3fn),
         w_ref[...],
         (((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
@@ -172,34 +210,65 @@ def _down(h, w_ref, s_row):
 
 
 def _kernel(
-    counts_ref,
-    offsets_ref,
-    tok_ref,
-    wt_ref,
-    x_ref,
-    w1_hbm,
-    s1_hbm,
-    w2_hbm,
-    s2_hbm,
-    o_ref,
-    w1_buf,
-    s1_buf,
-    w2_buf,
-    s2_buf,
-    sems,
-    xq_ref,
-    xs_ref,
-    acc_ref,
-    xg_ref,
-    xsg_ref,
-    active_ref,
+    counts_ref: jax.Array,
+    offsets_ref: jax.Array,
+    tok_ref: jax.Array,
+    wt_ref: jax.Array,
+    x_ref: jax.Array,
+    w1_hbm: jax.Array,
+    s1_hbm: jax.Array,
+    w2_hbm: jax.Array,
+    s2_hbm: jax.Array,
+    o_ref: jax.Array,
+    w1_buf: jax.Array,
+    s1_buf: jax.Array,
+    w2_buf: jax.Array,
+    s2_buf: jax.Array,
+    sems: jax.Array,
+    xq_ref: jax.Array,
+    xs_ref: jax.Array,
+    acc_ref: jax.Array,
+    xg_ref: jax.Array,
+    xsg_ref: jax.Array,
+    active_ref: jax.Array,
     *,
-    limit,
-    slots,
-    w1_chunks,
-    w2_chunks,
-    tile_rows,
+    limit: float | None,
+    slots: int,
+    w1_chunks: int,
+    w2_chunks: int,
+    tile_rows: tuple[int, ...],
 ):
+    """Kernel body. T tokens, k experts per token, E experts, H model width,
+    n expert width, nq = H / 512 quantization blocks, R = max(tile_rows).
+
+    Args:
+      counts_ref: SMEM int32 [E]. Rows routed to each expert.
+      offsets_ref: SMEM int32 [E]. Each expert's first entry in the pair list.
+      tok_ref: SMEM int32 [T * k]. Token of each pair; pairs grouped by expert.
+      wt_ref: SMEM f32 [T * k]. Routing weight of each pair.
+      x_ref: VMEM bf16 [T, H]. Input rows.
+      w1_hbm: HBM fp8 [E, H, 2n]. Gate/up weights.
+      s1_hbm: HBM f32 [E, 1, 1, 2n]. Their per-column scales.
+      w2_hbm: HBM fp8 [E, n, H]. Down weights.
+      s2_hbm: HBM f32 [E, 1, 1, H]. Their per-column scales.
+      o_ref: VMEM [T, H], x's dtype. Output rows.
+      w1_buf: VMEM fp8 [slots, H, 2n]. Weight ring: w1 of the experts in flight.
+      s1_buf: VMEM f32 [slots, 1, 2n].
+      w2_buf: VMEM fp8 [slots, n, H].
+      s2_buf: VMEM f32 [slots, 1, H].
+      sems: DMA semaphores [slots, w1_chunks + w2_chunks + 2], one per copy.
+      xq_ref: VMEM f32 [T, H]. x quantized to fp8 values.
+      xs_ref: VMEM f32 [nq, T, lanes]. x's scale per row per block.
+      acc_ref: VMEM f32 [T, H]. Sum of weight * expert output.
+      xg_ref: VMEM f32 [R, H]. One tile's rows gathered from xq_ref.
+      xsg_ref: VMEM f32 [nq, R, lanes]. Those rows' block scales.
+      active_ref: SMEM int32 [E + 1]. Ids of the hit experts, by tile class.
+      limit: SiLU clamp limit, or None.
+      slots: weight ring depth.
+      w1_chunks: DMAs per expert's w1.
+      w2_chunks: DMAs per expert's w2.
+      tile_rows: row-tile sizes by expert row count.
+    """
     t, h = x_ref.shape
     num_experts, _, two_n = w1_hbm.shape
     n = two_n // 2
@@ -276,10 +345,10 @@ def _kernel(
     # inverse, no clip), while the first experts' weights are in flight.
     for b in range(nq):
         blk = x_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK]
-        scale = jnp.max(jnp.abs(blk), axis=1, keepdims=True) / FP8_MAX
+        scale = jnp.max(jnp.abs(blk), axis=1, keepdims=True) / _FP8_MAX
         inv = jnp.where(scale == 0, 0, 1 / scale)
         xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK] = (
-            (blk * inv).astype(FP8).astype(jnp.float32)
+            (blk * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
         )
         xs_ref[b] = jnp.broadcast_to(scale.astype(jnp.float32), (t, lanes))
     acc_ref[...] = jnp.zeros_like(acc_ref)
@@ -372,7 +441,7 @@ def moe_ring(
     nq = hidden // _Q_BLOCK
     lanes = info.num_lanes
     limit = _vmem_limit(tokens, hidden, n, slots, tile_rows, info)
-    assert limit is not None, "moe_ring does not fit VMEM; check supports() first"
+    assert limit is not None, "moe_ring does not fit VMEM; check fit_moe_ring first"
     nsem = w1_chunks + w2_chunks + 2
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -392,9 +461,9 @@ def moe_ring(
             in_specs=[smem, vmem, hbm, hbm, hbm, hbm],
             out_specs=vmem,
             scratch_shapes=[
-                pltpu.VMEM((slots, hidden, two_n), FP8),
+                pltpu.VMEM((slots, hidden, two_n), jnp.float8_e4m3fn),
                 pltpu.VMEM((slots, 1, two_n), jnp.float32),
-                pltpu.VMEM((slots, n, hidden), FP8),
+                pltpu.VMEM((slots, n, hidden), jnp.float8_e4m3fn),
                 pltpu.VMEM((slots, 1, hidden), jnp.float32),
                 pltpu.SemaphoreType.DMA((slots, nsem)),
                 pltpu.VMEM((tokens, hidden), jnp.float32),
@@ -411,26 +480,32 @@ def moe_ring(
     )(counts, offsets, tok, wt, x, w1, s1, w2, s2)
 
 
-# Cost model: microseconds per call on one tpu7x TensorCore, for this kernel and for
-# the gmm_v2 path it replaces. Fitted to 230 timed calls over 11 weight shapes
-# (hidden 2048-8192, expert width 128-768, 1-512 tokens, spread and concentrated
-# routing); it reproduces them to 8% (ring) and 10% (gmm_v2) rms, 21% / 24% worst.
-_MB = float(1 << 20)
-_RING_FIXED_US = 7.44
-_RING_TOKEN_US = 0.175  # per token, at hidden 4096
-_RING_ROUTE_US = 0.128  # per 1000 token pairs: the routing compares all pairs
-_RING_EXPERT_US = 0.027  # per distinct expert
-_RING_COPY_MB_PER_US = 3.33  # weight bytes into VMEM, three experts in flight
-_RING_TILE_US = 0.52  # one row tile through one expert ...
-_RING_TILE_ROW_MB_US = 0.0066  # ... plus this per row per MB of expert weights
-_GMM_FIXED_US = 15.6
-_GMM_EXPERT_US = 0.94  # per distinct expert
-_GMM_US_PER_MB = 0.252  # per MB of a distinct expert's weights
-_GMM_TOKEN_US = 0.333  # per token, at hidden 4096
-_GMM_TOKEN_WIDTH_US = 0.0047  # per token, at hidden 4096, per 256 of expert width
+# Cost model: TensorCore cycles per call on tpu7x, for this kernel and for the
+# gmm_v2 path it replaces, from static shapes. The constants are fitted to timed
+# calls over 11 weight shapes (hidden 2048-8192, expert width 128-768, 1-512
+# tokens, routing spread over all experts and over 16), converted to cycles at
+# the 1.9 GHz clock XLA's DMA latency model assumes. The fit reproduces the
+# timings to 8% rms (21% worst) for the ring and 10% rms (24% worst) for gmm_v2.
+_RING_FIXED_CYCLES = 14_140
+_RING_CYCLES_PER_ELEMENT = 0.0813  # per token per hidden column: load, quantize, store
+_RING_CYCLES_PER_PAIR_SQ = 0.0038  # routing compares all (token, expert) pairs pairwise
+_RING_EXPERT_CYCLES = 51  # per distinct expert
+_RING_COPY_BYTES_PER_CYCLE = 1_838  # weights into VMEM, slots - 1 experts in flight
+_RING_TILE_CYCLES = 988  # one row tile through one expert ...
+_RING_TILE_CYCLES_PER_ROW_BYTE = 1.196e-5  # ... plus per row per weight byte
+_GMM_FIXED_CYCLES = 29_640
+_GMM_EXPERT_CYCLES = 1_786  # per distinct expert
+_GMM_CYCLES_PER_BYTE = 4.566e-4  # per weight byte of a distinct expert
+_GMM_CYCLES_PER_ELEMENT = 0.1545  # per token per hidden column
+_GMM_CYCLES_PER_ELEMENT_WIDTH = 8.52e-6  # ... plus per column of expert width
 
 
-def _rows_per_expert_pmf(tokens, topk, num_experts):
+def _expert_weight_bytes(hidden: int, n: int) -> int:
+    """FP8 bytes of one expert on this rank: w1 [hidden, 2n] + w2 [n, hidden]."""
+    return 3 * hidden * n
+
+
+def _rows_per_expert_pmf(tokens: int, topk: int, num_experts: int) -> list[float]:
     """P(an expert is routed c of the tokens), c = 0..tokens, when every token
     picks topk distinct experts uniformly: what the trace-time choice assumes,
     since the real routing is only known at run time."""
@@ -441,41 +516,53 @@ def _rows_per_expert_pmf(tokens, topk, num_experts):
     ]
 
 
-def ring_cost_us(tokens, topk, num_experts, hidden, n, tile_rows=_TILE_ROWS) -> float:
-    """Modelled time of one moe_ring call. Each hit expert costs the longer of
+def ring_cost_cycles(
+    tokens: int,
+    topk: int,
+    num_experts: int,
+    hidden: int,
+    n: int,
+    tile_rows: tuple[int, ...] = _TILE_ROWS,
+) -> float:
+    """Modelled cycles of one moe_ring call. Each hit expert costs the longer of
     its weight copy and its row tiles, which overlap."""
-    weight_mb = 3 * hidden * n / _MB  # w1 [hidden, 2n] + w2 [n, hidden], fp8
-    copy = weight_mb / _RING_COPY_MB_PER_US
+    weight_bytes = _expert_weight_bytes(hidden, n)
+    copy = weight_bytes / _RING_COPY_BYTES_PER_CYCLE
     per_expert = 0.0
     for c, prob in enumerate(_rows_per_expert_pmf(tokens, topk, num_experts)):
         if c == 0:
             continue
         rows = next((r for r in tile_rows if c <= r), tile_rows[-1])
         tiles = pl.cdiv(c, rows)
-        tile = _RING_TILE_US + _RING_TILE_ROW_MB_US * rows * weight_mb
-        per_expert += prob * (_RING_EXPERT_US + max(copy, tiles * tile))
+        tile = _RING_TILE_CYCLES + _RING_TILE_CYCLES_PER_ROW_BYTE * rows * weight_bytes
+        per_expert += prob * (_RING_EXPERT_CYCLES + max(copy, tiles * tile))
+    pairs = tokens * topk
     return (
-        _RING_FIXED_US
-        + _RING_TOKEN_US * tokens * hidden / 4096
-        + _RING_ROUTE_US * tokens * tokens / 1000
+        _RING_FIXED_CYCLES
+        + _RING_CYCLES_PER_ELEMENT * tokens * hidden
+        + _RING_CYCLES_PER_PAIR_SQ * pairs * pairs
         + num_experts * per_expert
     )
 
 
-def gmm_cost_us(tokens, topk, num_experts, hidden, n) -> float:
-    """Modelled time of the gmm_v2 path for the same call."""
-    weight_mb = 3 * hidden * n / _MB
+def gmm_cost_cycles(
+    tokens: int, topk: int, num_experts: int, hidden: int, n: int
+) -> float:
+    """Modelled cycles of the gmm_v2 path for the same call."""
     hit = num_experts * (1.0 - _rows_per_expert_pmf(tokens, topk, num_experts)[0])
     return (
-        _GMM_FIXED_US
-        + hit * (_GMM_EXPERT_US + _GMM_US_PER_MB * weight_mb)
-        + tokens * hidden / 4096 * (_GMM_TOKEN_US + _GMM_TOKEN_WIDTH_US * n / 256)
+        _GMM_FIXED_CYCLES
+        + hit
+        * (_GMM_EXPERT_CYCLES + _GMM_CYCLES_PER_BYTE * _expert_weight_bytes(hidden, n))
+        + tokens
+        * hidden
+        * (_GMM_CYCLES_PER_ELEMENT + _GMM_CYCLES_PER_ELEMENT_WIDTH * n)
     )
 
 
-def prefers_ring(tokens, topk, num_experts, hidden, n) -> bool:
-    """Whether the model puts this call's moe_ring time under its gmm_v2 time."""
-    return ring_cost_us(tokens, topk, num_experts, hidden, n) < gmm_cost_us(
+def prefers_ring(tokens: int, topk: int, num_experts: int, hidden: int, n: int) -> bool:
+    """Whether the model puts this call's moe_ring cycles under its gmm_v2 cycles."""
+    return ring_cost_cycles(tokens, topk, num_experts, hidden, n) < gmm_cost_cycles(
         tokens, topk, num_experts, hidden, n
     )
 
@@ -500,7 +587,7 @@ def maybe_moe_ring(
 
     Covers bf16 tokens with every expert local, unbiased FP8 experts with
     per-channel scales and the clamped SiLU, where the kernel fits VMEM
-    (supports) and the cost model puts it under gmm_v2 (prefers_ring)."""
+    (fit_moe_ring) and the cost model puts it under gmm_v2 (prefers_ring)."""
     if not activation_name.startswith("silu_and_mul_clamp:"):
         return None
     clamp_limit = float(activation_name.split(":", 1)[1])
@@ -515,13 +602,13 @@ def maybe_moe_ring(
         or w1_scale is None
         or w2_scale is None
         or hidden_states.dtype != jnp.bfloat16
-        or w1.dtype != FP8
-        or w2.dtype != FP8
+        or w1.dtype != jnp.float8_e4m3fn
+        or w2.dtype != jnp.float8_e4m3fn
         or w1_k != hidden
         or w2.shape != (num_experts, two_n // 2, hidden)
         or w1_scale.shape != (num_experts, 1, 1, two_n)
         or w2_scale.shape != (num_experts, 1, 1, hidden)
-        or not supports(tokens, hidden, two_n)
+        or not fit_moe_ring(tokens, hidden, two_n)
         or not prefers_ring(tokens, topk_ids.shape[1], num_experts, hidden, two_n // 2)
     ):
         return None

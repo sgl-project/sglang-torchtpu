@@ -740,10 +740,9 @@ def _fused_moe_jax(
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
 
-    # Distinct experts streamed once through a VMEM ring, where that kernel covers the
-    # call and its cost model beats gmm_v2; None otherwise. One token stays with the
-    # streaming kernel when that is enabled (the two are within 15% there).
-    if not (m == 1 and tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get()):
+    # Two or more tokens: distinct experts streamed once through a VMEM ring, where
+    # that kernel covers the call and its cost model beats gmm_v2; None otherwise.
+    if m != 1:
         from sglang_tpu.moe.pallas.moe_ring import maybe_moe_ring
 
         out = maybe_moe_ring(

@@ -57,25 +57,30 @@ class TestMoeRingCostModel(CustomTestCase):
     """The trace-time choice between the ring and gmm_v2 (static shapes only)."""
 
     def test_measured_points(self):
-        from sglang_tpu.moe.pallas.moe_ring import gmm_cost_us, ring_cost_us
+        from sglang_tpu.moe.pallas.moe_ring import gmm_cost_cycles, ring_cost_cycles
 
-        # (tokens, experts, hidden, width) -> measured us (ring, gmm_v2), spread routing.
+        # (tokens, experts, hidden, width) -> measured k cycles (ring, gmm_v2),
+        # routing spread over all experts.
         measured = {
-            (2, 288, 4096, 256): (24.6, 47.0),
-            (64, 288, 4096, 256): (235.9, 451.0),
-            (256, 288, 4096, 256): (324.5, 611.1),
-            (64, 288, 4096, 512): (453.6, 554.9),
-            (64, 288, 4096, 128): (186.2, 393.2),
-            (64, 128, 2048, 256): (95.5, 198.1),
-            (64, 96, 8192, 128): (107.3, 262.5),
+            (2, 288, 4096, 256): (46.7, 89.3),
+            (64, 288, 4096, 256): (448.2, 856.9),
+            (256, 288, 4096, 256): (616.6, 1161.1),
+            (64, 288, 4096, 512): (861.8, 1054.3),
+            (64, 288, 4096, 128): (353.8, 747.1),
+            (64, 128, 2048, 256): (181.5, 376.4),
+            (64, 96, 8192, 128): (203.9, 498.8),
         }
         for (tokens, experts, hidden, n), (ring, gmm) in measured.items():
             with self.subTest(tokens=tokens, experts=experts, hidden=hidden, n=n):
                 self.assertAlmostEqual(
-                    ring_cost_us(tokens, TOPK, experts, hidden, n) / ring, 1, delta=0.25
+                    ring_cost_cycles(tokens, TOPK, experts, hidden, n) / 1e3 / ring,
+                    1,
+                    delta=0.25,
                 )
                 self.assertAlmostEqual(
-                    gmm_cost_us(tokens, TOPK, experts, hidden, n) / gmm, 1, delta=0.25
+                    gmm_cost_cycles(tokens, TOPK, experts, hidden, n) / 1e3 / gmm,
+                    1,
+                    delta=0.25,
                 )
 
     def test_prefers_ring_at_decode_sizes(self):
@@ -209,7 +214,6 @@ class TestMoeRing(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out, np.float32), 0)
 
     def test_dispatch(self):
-        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         x, ids, wts = self.batch(32, 31)
@@ -235,7 +239,8 @@ class TestMoeRing(CustomTestCase):
             # Expert parallelism keeps the gmm path.
             _fused_moe_jax(*args, **call, global_num_experts=2 * EXPERTS)
             self.assertFalse(ring.called)
-            # One token: the ring, unless the streaming kernel is enabled.
+            # One token is not the ring's case.
+            ring.reset_mock()
             one = (
                 x[:1],
                 self.w1,
@@ -248,23 +253,20 @@ class TestMoeRing(CustomTestCase):
                 None,
             )
             _fused_moe_jax(*one, **call)
-            self.assertTrue(ring.called)
-            ring.reset_mock()
-            with tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.override(True):
-                _fused_moe_jax(*one, **call)
             self.assertFalse(ring.called)
 
-    def test_supports(self):
-        from sglang_tpu.moe.pallas.moe_ring import _MAX_TOKENS, supports
+    def test_fit_moe_ring(self):
+        from sglang_tpu.moe.pallas.moe_ring import fit_moe_ring
 
-        self.assertTrue(supports(1, HIDDEN, 2 * INTER))
-        self.assertTrue(supports(256, HIDDEN, 2 * INTER))
-        self.assertFalse(supports(_MAX_TOKENS + 1, HIDDEN, 2 * INTER))
+        self.assertTrue(fit_moe_ring(2, HIDDEN, 2 * INTER))
+        self.assertTrue(fit_moe_ring(256, HIDDEN, 2 * INTER))
+        # The row buffers grow with tokens * hidden until they pass the VMEM limit.
+        self.assertFalse(fit_moe_ring(2048, HIDDEN, 2 * INTER))
         # Wider than one quantization block: not gmm_v2's down projection.
-        self.assertTrue(supports(16, HIDDEN, 2 * 512))
-        self.assertFalse(supports(16, HIDDEN, 2 * 640))
+        self.assertTrue(fit_moe_ring(16, HIDDEN, 2 * 512))
+        self.assertFalse(fit_moe_ring(16, HIDDEN, 2 * 640))
         # One EP8 rank's full-width experts are refused.
-        self.assertFalse(supports(16, HIDDEN, 2 * 2048))
+        self.assertFalse(fit_moe_ring(16, HIDDEN, 2 * 2048))
 
 
 if __name__ == "__main__":
