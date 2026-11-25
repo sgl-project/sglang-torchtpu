@@ -126,6 +126,7 @@ class ServingConfigs:
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
+    # A floor: RpaConfigs.max_schedule_size_multiplier grows it to fit every step.
     max_schedule_size_multiplier: int = 16
     decode_query_size: int = 1
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
@@ -510,8 +511,39 @@ class RpaConfigs:
 
     @property
     def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        """HBM schedule length, in SMEM schedules of ``max_steps_ub`` steps."""
+        # The schedule kernel writes a whole SMEM schedule to HBM each time it
+        # fills and once more at the end, with no bounds check.
+        return max(
+            self.serve.max_schedule_size_multiplier,
+            self.max_schedule_steps // self.max_steps_ub + 1,
+        )
+
+    @property
+    def max_schedule_steps(self) -> int:
+        """Most schedule steps an input of these static shapes can produce."""
+        kv_len = self.serve.pages_per_seq * self.serve.page_size
+        if self.serve.attention_scope.skips_cached_keys:
+            # Only the k blocks holding new tokens, a span that may start mid-block.
+            # Under CP its positions are global, past this rank's stripe table.
+            kv_len = self.serve.total_q_tokens + self.bkv_sz - 1
+        elif (
+            self.serve.skip_kv_write
+            and self.serve.attention_scope == AttentionScope.FULL
+        ):
+            # New keys that are not written come from k/v, after the cached ones.
+            kv_len += self.serve.total_q_tokens
+        # Each q block visits a k block at most once.
+        num_k = pl.cdiv(kv_len, self.bkv_sz)
+        if self.mode == RpaCase.DECODE:
+            # A decode sequence carries at most decode_query_size queries.
+            num_q = self.serve.num_seqs * pl.cdiv(
+                self.serve.decode_query_size, self.bq_sz
+            )
+        else:
+            # Every sequence ends in at most one partial q block.
+            num_q = pl.cdiv(self.serve.total_q_tokens, self.bq_sz) + self.serve.num_seqs
+        return pl.cdiv(num_q * num_k, self.batch_size)
 
     def validate_inputs(
         self,
