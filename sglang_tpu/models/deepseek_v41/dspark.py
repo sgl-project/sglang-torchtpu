@@ -110,11 +110,27 @@ def greedy_markov_drafts(
     head = model.markov_head
     vocab = head.vocab_size
     base_logits, _ = model.compute_base_logits(draft_hidden.reshape(bs * gamma, -1))
-    base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
     w1 = head.markov_w1.weight[:vocab]
     w2 = head.markov_w2.weight[:vocab]
-    ids = torch.arange(vocab, device=hidden.device, dtype=torch.int32)
     prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
+    if (
+        hidden.device.type == "tpu"
+        and vocab >= 8
+        and vocab % 8 == 0
+        and w1.shape[1] % 128 == 0
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.dspark_markov import (
+            greedy_markov_pallas,
+        )
+
+        return greedy_markov_pallas(
+            base_logits[..., :vocab].view(bs, gamma, vocab),
+            w1,
+            w2,
+            prev,
+        )
+    base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
+    ids = torch.arange(vocab, device=hidden.device, dtype=torch.int32)
     drafts = []
     for step in range(gamma):
         one_hot = (prev.unsqueeze(-1) == ids).to(w1.dtype)
