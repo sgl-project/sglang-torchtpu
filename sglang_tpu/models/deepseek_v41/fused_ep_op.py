@@ -86,7 +86,7 @@ with ``weight_format=K32Z`` at 256-row tiles and 4-bit gate/up shift fields
 
 ``SGLANG_TPU_DSV41_FUSED_EP_DISPATCH`` sets how the op exchanges tokens:
 ``all_gather`` (the default), ``push`` (fused_moe_v2's push dispatch with
-``fused_ep.tuned_push_options``) or ``auto``, decided statically per compiled
+``fused_ep.push_options``) or ``auto``, decided statically per compiled
 shape: push while the token bucket has at most ``fused_ep.PUSH_MAX_ROWS`` rows
 per EP rank, all-gather above.
 Either expert format takes either dispatch. Push and auto are in the op's key
@@ -122,6 +122,8 @@ W1, W2, W1_SCALE, W2_SCALE, RANK = (
     "_fused_ep_w2_scale",
     "_fused_ep_rank",
 )
+# int32 [E, 1] logical -> physical slot table of a placed layer (expert_layout).
+EXPERT_SLOT = "_fused_ep_expert_slot"
 
 _DEFAULT_MESH_AXIS = "ep"
 _EXPERTS_PER_CHUNK = 8
@@ -223,6 +225,8 @@ def _op_name(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    placed: bool = False,
+    with_load: bool = False,
 ) -> str:
     """One torch custom-op name per closure configuration (the kernel's other
     settings are module constants of fused_ep and part of the name too)."""
@@ -234,7 +238,11 @@ def _op_name(
         head = f"{head}_k32z_g{gate_up_bits}_c{fe.K32Z_CAPACITY}"
     else:
         head = f"{head}_c{fe.CAPACITY}_q{fe.RHS_QB}"
-    return f"{head}{_dispatch_tag(dispatch, push_max_rows)}_{axis_name}"
+    return (
+        f"{head}{_dispatch_tag(dispatch, push_max_rows)}_{axis_name}"
+        + ("_placed" if placed else "")
+        + ("_load" if with_load else "")
+    )
 
 
 def _op_key(
@@ -248,6 +256,8 @@ def _op_key(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    placed: bool = False,
+    with_load: bool = False,
 ) -> tuple:
     """``_build_op``'s arguments, normalized: one key per op (and op name)."""
     if dispatch not in fe.DISPATCHES:
@@ -262,15 +272,25 @@ def _op_key(
     )
     # A K512 all-gather key is these six fields and a K32Z one adds its format
     # and width; a push or auto key adds both (width 0 for K512) and its
-    # dispatch with auto's bound (0 for push, which has none).
-    if expert_format == fe.EXPERT_FORMAT_K512 and dispatch == fe.DISPATCH:
-        return key
+    # dispatch with auto's bound (0 for push, which has none). A placed key
+    # (expert_layout) spells all ten out and adds (True, with_load).
     if expert_format == fe.EXPERT_FORMAT_K512:
         gate_up_bits = 0
+    bound = int(push_max_rows) if dispatch == fe.DISPATCH_AUTO else 0
+    if placed:
+        return key + (
+            str(expert_format),
+            int(gate_up_bits),
+            str(dispatch),
+            bound,
+            True,
+            bool(with_load),
+        )
+    if expert_format == fe.EXPERT_FORMAT_K512 and dispatch == fe.DISPATCH:
+        return key
     key += (str(expert_format), int(gate_up_bits))
     if dispatch == fe.DISPATCH:
         return key
-    bound = int(push_max_rows) if dispatch == fe.DISPATCH_AUTO else 0
     return key + (str(dispatch), bound)
 
 
@@ -285,13 +305,18 @@ def _make_jax_fn(
     expert_format: str = fe.EXPERT_FORMAT_K512,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    placed: bool = False,
+    with_load: bool = False,
 ):
     """The exported JAX body, its input and its output partition specs.
 
     Arguments arrive as global arrays: rows of x/gating, experts of the
     weights and scales, and the rank vector are sharded on the EP axis (each
     rank's torch tensor is its shard); the correction bias is replicated, as
-    it is indexed by global expert id.
+    it is indexed by global expert id. A placed op (expert_layout) also takes
+    the replicated int32 [E, 1] logical -> physical slot table; with_load adds
+    the replicated int32 [E] per-slot routed-row accumulator as an input and
+    returns its update as a second output.
     """
     import jax
     from jax.sharding import PartitionSpec as P
@@ -322,9 +347,53 @@ def _make_jax_fn(
     ) -> jax.Array:
         return moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank)
 
+    # cpu_export_jax_op exports the parameters annotated jax.Array, so each
+    # variant spells its operands out.
+    def dsv41_fused_ep_placed(
+        x: jax.Array,
+        gating: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        score_bias: jax.Array,
+        rank: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank, expert_slot)
+
+    def dsv41_fused_ep_placed_load(
+        x: jax.Array,
+        gating: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        score_bias: jax.Array,
+        rank: jax.Array,
+        expert_slot: jax.Array,
+        expert_load: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return moe(
+            x,
+            gating,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            score_bias,
+            rank,
+            expert_slot,
+            expert_load,
+        )
+
     rows = P(axis_name)
     in_specs = (rows,) * 6 + (P(), rows)
-    return dsv41_fused_ep, in_specs, (rows,)
+    if not placed:
+        return dsv41_fused_ep, in_specs, (rows,)
+    if not with_load:
+        return dsv41_fused_ep_placed, in_specs + (P(),), (rows,)
+    return dsv41_fused_ep_placed_load, in_specs + (P(), P()), (rows, P())
 
 
 def _fake_like_x(x, *_args):
@@ -332,6 +401,10 @@ def _fake_like_x(x, *_args):
     # dtype. Registered over cpu_export_jax_op's export-based fake so that a
     # Dynamo trace does not lower the Pallas kernel once per MoE layer.
     return torch.empty_like(x)
+
+
+def _fake_like_x_and_load(x, *args):
+    return torch.empty_like(x), torch.empty_like(args[-1])
 
 
 def _build_op(
@@ -345,6 +418,8 @@ def _build_op(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    placed: bool = False,
+    with_load: bool = False,
 ) -> Callable:
     mesh = _get_mesh(ep, axis_name)
     fn, in_specs, out_specs = _make_jax_fn(
@@ -358,6 +433,8 @@ def _build_op(
         expert_format,
         dispatch,
         push_max_rows,
+        placed,
+        with_load,
     )
     op = _export_op(
         _op_name(
@@ -371,6 +448,8 @@ def _build_op(
             gate_up_bits,
             dispatch,
             push_max_rows,
+            placed,
+            with_load,
         ),
         fn,
         mesh=mesh,
@@ -378,7 +457,7 @@ def _build_op(
         output_partition_specs=out_specs,
     )
     if hasattr(op, "register_fake"):
-        op.register_fake(_fake_like_x)
+        op.register_fake(_fake_like_x_and_load if with_load else _fake_like_x)
     return op
 
 
@@ -393,6 +472,8 @@ def _get_op(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    placed: bool = False,
+    with_load: bool = False,
 ) -> Callable:
     key = _op_key(
         ep,
@@ -405,6 +486,8 @@ def _get_op(
         gate_up_bits,
         dispatch,
         push_max_rows,
+        placed,
+        with_load,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -768,6 +851,31 @@ def prepare_moe_layer_for_fused_ep(
             + "; ".join(unmet)
         )
     config = moe.config
+    from sglang_tpu.models.deepseek_v41 import expert_layout
+
+    # A layer the loader stored in layout order (expert_layout) runs placed.
+    placed_rank = getattr(moe.experts, expert_layout.LAYOUT_RANK_ATTR, None)
+    placed = placed_rank is not None
+    if placed:
+        filled = getattr(moe.experts, expert_layout.FILLED_ATTR, set())
+        n_local = int(moe.experts.num_local_experts)
+        if int(placed_rank) != int(ep_rank) or len(filled) != n_local:
+            raise ValueError(
+                f"expert layout: MoE layer {getattr(moe, 'layer_id', '?')} loaded "
+                f"{len(filled)} of {n_local} layout slots (loader rank "
+                f"{placed_rank}, ep rank {ep_rank})"
+            )
+    if placed and expert_layout.routing_mode() == "gate":
+        # Router columns in slot order: the kernel routes physical ids itself.
+        expert_layout.permute_router_to_slots(
+            moe.gate,
+            expert_layout.physical_order(
+                expert_layout.active_layout(),
+                getattr(moe.experts, "layer_id", getattr(moe, "layer_id", None)),
+            ),
+        )
+        placed = False
+    with_load = False  # the kernel's expert_load output is diagnostic-only
     experts = moe.experts
     # SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z left the checkpoint experts for this
     # step: the layer takes the K32Z operands and the K32Z op.
@@ -785,6 +893,8 @@ def prepare_moe_layer_for_fused_ep(
         gate_up_bits,
         dispatch,
         push_max_rows,
+        placed,
+        with_load,
     )
     # Build the op first (outside Dynamo): a failure leaves the weights as loaded.
     _get_op(*key)
@@ -803,6 +913,13 @@ def prepare_moe_layer_for_fused_ep(
     for name, tensor in ((W1, w1), (W2, w2), (W1_SCALE, s1), (W2_SCALE, s2)):
         experts.register_buffer(name, tensor, persistent=False)
     experts.register_buffer(RANK, rank, persistent=False)
+    if placed:
+        table = expert_layout.expert_slot_table(
+            expert_layout.active_layout(),
+            getattr(experts, "layer_id", getattr(moe, "layer_id", None)),
+            int(config.n_routed_experts),
+        )
+        experts.register_buffer(EXPERT_SLOT, table.to(device), persistent=False)
 
     setattr(moe, _KEY_ATTR, key)
     setattr(moe, _RANK_ATTR, int(ep_rank))
@@ -970,7 +1087,7 @@ def apply_fused_ep(
     key = getattr(moe, _KEY_ATTR)
     experts = moe.experts
     op = _get_op(*key)
-    return op(
+    args = [
         hidden_states,
         gating,
         getattr(experts, W1),
@@ -979,7 +1096,46 @@ def apply_fused_ep(
         getattr(experts, W2_SCALE),
         moe.gate.e_score_correction_bias,
         _rank_operand(experts, getattr(moe, _RANK_ATTR), key[0]),
-    )
+    ]
+    # Only a placed key (_op_key) has 12 fields: (..., True, with_load).
+    placed, with_load = key[10:12] if len(key) == 12 else (False, False)
+    if placed:
+        args.append(getattr(experts, EXPERT_SLOT))
+    if with_load:
+        raise NotImplementedError("expert_load needs the routed-count diagnostic")
+    return op(*args)
+
+
+def push_pad_rows(t_local: int, key: tuple) -> int:
+    """The row count a K512 push op runs ``t_local`` local rows at: the
+    smallest SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS bucket >= t_local. Else
+    t_local: all-gather (or auto above its bound), K32Z, the knob unset, or
+    t_local in the set or above it."""
+    if len(key) < 10 or key[6] != fe.EXPERT_FORMAT_K512:
+        return t_local
+    dispatch, bound = key[8], key[9]
+    if dispatch == fe.DISPATCH:
+        return t_local
+    from sglang_tpu.envs import envs as tpu_envs
+
+    spec = tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS.get() or ""
+    buckets = sorted(int(b) for b in spec.replace(" ", "").split(",") if b)
+    bigger = [b for b in buckets if b >= t_local]
+    rows = bigger[0] if bigger else t_local
+    if dispatch == fe.DISPATCH_AUTO and rows > bound:
+        return t_local  # auto all-gathers this shape
+    if rows != t_local:
+        _log_pad_once(t_local, rows)
+    return rows
+
+
+_PAD_LOGGED: set = set()
+
+
+def _log_pad_once(t_local: int, rows: int) -> None:
+    if t_local not in _PAD_LOGGED:
+        _PAD_LOGGED.add(t_local)
+        logger.info("push MoE pad rows: t_local=%d -> %d", t_local, rows)
 
 
 def forward_fused_ep_moe(
@@ -1002,7 +1158,18 @@ def forward_fused_ep_moe(
         # Every rank has 0 rows (counts are equal), so no rank enters the op.
         return hidden_states.new_zeros(hidden_states.shape)
     gating = local_gating_logits(moe, hidden_states, real_row_count(forward_batch))
-    out = apply_fused_ep(moe, hidden_states, gating)
+    rows = push_pad_rows(t_local, key)
+    if rows > t_local:
+        # Padding rows: -inf logits route nowhere, so the kernel returns zeros
+        # for them; the real rows are unchanged.
+        pad = rows - t_local
+        out = apply_fused_ep(
+            moe,
+            torch.nn.functional.pad(hidden_states, (0, 0, 0, pad)),
+            torch.nn.functional.pad(gating, (0, 0, 0, pad), value=float("-inf")),
+        )[:t_local]
+    else:
+        out = apply_fused_ep(moe, hidden_states, gating)
     shared = moe._forward_shared_experts(hidden_states)
     if shared is not None:
         out = out + shared

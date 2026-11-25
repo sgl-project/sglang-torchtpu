@@ -23,7 +23,31 @@ Callers go through `fused_ep_moe_v2`; `fused_ep_moe_push` is exported for the
 package's own tests.
 """
 
-from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer import fused_ep_moe_push
+from sglang_tpu.moe.pallas.fused_moe_v2.host import WeightFormat
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import layer as _layer
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import layer_k512 as _layer_k512
+
+# Push options only the K512 build (layer_k512) takes.
+K512_ONLY_OPTIONS = (
+    "split_exchange",
+    "onehot_scale_slab",
+    "pair_kernel",
+    "wide_pair_kernel",
+    "decode_combine",
+)
+
+
+def fused_ep_moe_push(*args, weight_format=WeightFormat.FP8, **kwargs):
+    """Push dispatch. K32Z builds run layer.py (its K32Z schedule, program
+    unchanged); every other format runs layer_k512.py (decode combine, pair
+    kernels, one-hot scale slab)."""
+    if weight_format == WeightFormat.K32Z:
+        given = sorted(k for k in K512_ONLY_OPTIONS if k in kwargs)
+        if given:
+            raise ValueError(f"push options {given} are not available for K32Z")
+        return _layer.fused_ep_moe_push(*args, weight_format=weight_format, **kwargs)
+    return _layer_k512.fused_ep_moe_push(*args, weight_format=weight_format, **kwargs)
+
 
 # The keyword arguments `fused_ep_moe_push` takes beyond v2's operands, which
 # `fused_ep_moe_v2(dispatch="push", push_options=...)` forwards. Everything
@@ -47,9 +71,14 @@ PUSH_OPTIONS = (
     "light_prepush",
     "single_barrier",
     "early_scale_scatter",
+    "split_exchange",
+    "onehot_scale_slab",
+    "pair_kernel",
+    "wide_pair_kernel",
+    "decode_combine",
     "fuse_metadata",
 )
 # K32Z builds on the exchange-table path also take the per-bucket schedule in
 # layer.K32Z_PUSH_RECIPES; it is chosen by the layer, not passed in.
 
-__all__ = ["PUSH_OPTIONS", "fused_ep_moe_push"]
+__all__ = ["K512_ONLY_OPTIONS", "PUSH_OPTIONS", "fused_ep_moe_push"]

@@ -482,3 +482,36 @@ def test_make_fused_ep_moe_passes_production_settings():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_make_fused_ep_moe_reads_push_envs_once(monkeypatch):
+    """K512 push knobs are read when the op is built, so every shape it traces
+    uses the same options even if the env changes afterwards."""
+    _isolated_kernel_package()
+    seen = []
+
+    def fake_kernel(x, w1, w2, w1_scale, w2_scale, gating, **kwargs):
+        seen.append((x.shape[0], kwargs["push_options"]["dispatch_ahead"]))
+        return jnp.zeros_like(x)
+
+    mesh = _cpu_mesh(8)
+    ep = mesh.shape["ep"]
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_DISPATCH_AHEAD", "25")
+    moe = fe.make_fused_ep_moe(mesh, kernel_fn=fake_kernel, dispatch="push")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_DISPATCH_AHEAD", "48")
+
+    def call(rows):
+        tokens = rows * ep
+        moe(
+            jnp.zeros((tokens, 512), jnp.bfloat16),
+            jnp.zeros((tokens, 8), jnp.bfloat16),
+            jnp.zeros((8, 512, 1024), jnp.float4_e2m1fn),
+            jnp.zeros((8, 512, 512), jnp.float4_e2m1fn),
+            jnp.zeros((8 * 8, 1024), jnp.float32),
+            jnp.zeros((8 * 8, 512), jnp.float32),
+            jnp.zeros((8,), jnp.bfloat16),
+        )
+
+    call(6)
+    call(7)
+    assert [a for _, a in seen] == [25, 25]

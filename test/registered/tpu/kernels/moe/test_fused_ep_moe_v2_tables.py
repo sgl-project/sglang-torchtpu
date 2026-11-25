@@ -581,13 +581,17 @@ def test_push_option_inventory_matches_the_public_wrapper():
     from inspect import signature
 
     from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import (
+        K512_ONLY_OPTIONS,
         PUSH_OPTIONS,
-        fused_ep_moe_push,
     )
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import layer as k32z
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import layer_k512 as k512
 
-    options = signature(fused_ep_moe_push).parameters.keys()
     forwarded = signature(layer.fused_ep_moe_v2).parameters.keys()
-    assert set(PUSH_OPTIONS) == options - forwarded
+    k512_options = signature(k512.fused_ep_moe_push).parameters.keys() - forwarded
+    k32z_options = signature(k32z.fused_ep_moe_push).parameters.keys() - forwarded
+    assert set(PUSH_OPTIONS) == k512_options
+    assert set(PUSH_OPTIONS) - set(K512_ONLY_OPTIONS) == k32z_options
 
 
 @pytest.mark.parametrize(
@@ -704,7 +708,367 @@ def test_ep16_fused_metadata_matches_native_tables(monkeypatch, interpret, scena
             )
 
 
+# --------------------------------------------------------------------------- #
+# Push plan kernels (interpret mode) and the TensorCore scale slab of the K512
+# build.
+# --------------------------------------------------------------------------- #
+def _push_routing(ep, t_local, g_local, topk, *, skew, seed):
+    """Global top-k ids [T, topk] (some rows routed nowhere) and plan kwargs;
+    a token selects an expert at most once, as top-k does."""
+    e_total = g_local * ep
+    T = t_local * ep
+    rng = np.random.default_rng(seed)
+    if skew:
+        hot = rng.choice(e_total, size=max(topk, e_total // 12), replace=False)
+        idx = np.stack([rng.choice(hot, size=topk, replace=False) for _ in range(T)])
+    else:
+        idx = np.stack([rng.permutation(e_total)[:topk] for _ in range(T)])
+    idx[rng.random(T) < 0.05] = e_total  # rows that route nowhere
+    capacity = 128
+    kwargs = dict(
+        e_total=e_total,
+        ep=ep,
+        t_local=t_local,
+        block=host.routing_block(t_local, topk),
+        tile_m=capacity,
+        shard_stride=host.ragged_stride_bound(T, topk, e_total, capacity),
+    )
+    return idx.astype(np.int32), kwargs
+
+
+def _push_counts(idx, ep, t_local, e_total):
+    """rows_by_dest [ep, e_total]: each source shard's pairs per expert."""
+    return np.stack(
+        [
+            np.bincount(
+                idx[s * t_local : (s + 1) * t_local].reshape(-1),
+                minlength=e_total + 1,
+            )[:e_total]
+            for s in range(ep)
+        ]
+    ).astype(np.int32)
+
+
+def _push_gathered(idx, me, kw):
+    ep, t_local, block, e_total = kw["ep"], kw["t_local"], kw["block"], kw["e_total"]
+    topk = idx.shape[1]
+    blocks = jnp.asarray(idx.reshape(-1, block))
+    per_dest = t_local * topk // block
+    local = blocks[me * per_dest : (me + 1) * per_dest]
+    return host.GatheredPairs(
+        expert_blocks=blocks,
+        local_blocks=local,
+        block_hist=host.pair_block_hist(local, e_total),
+        rows_by_dest=jnp.asarray(_push_counts(idx, ep, t_local, e_total)),
+        n_tokens=ep * t_local,
+        topk=topk,
+    )
+
+
+@pytest.mark.parametrize("n,scale_rows", [(768, 11), (3072, 11), (4096, 21)])
+def test_push_scale_slab_onehot_equals_the_scatter(n, scale_rows):
+    """The one-hot scale slab is the drop-mode scatter-add bit for bit when
+    every routed pair has a slab row of its own: any bit pattern, rows left
+    unwritten, and off-slab sentinels dropped."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer_k512 import (
+        _scale_slab_onehot,
+    )
+
+    rng = np.random.default_rng(n)
+    cells = scale_rows * 128
+    rows = rng.permutation(cells)[: min(n, cells - 7)]
+    slab_row = np.full(n, cells + 5, np.int32)  # off-slab: dropped
+    slab_row[rng.permutation(n)[: rows.size]] = rows
+    bits = rng.integers(-(2**31), 2**31, n, dtype=np.int64).astype(np.int32)
+    bits[:4] = np.array([np.nan, np.inf, -np.inf, -0.0], np.float32).view(np.int32)
+    want = (
+        jnp.zeros((cells,), jnp.int32)
+        .at[jnp.asarray(slab_row)]
+        .add(jnp.asarray(bits), mode="drop")
+    )
+    got = _scale_slab_onehot(jnp.asarray(slab_row), jnp.asarray(bits), scale_rows)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.int32).reshape(-1), np.asarray(want)
+    )
+
+
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("t_local,topk", [(16, 6), (16, 8), (8, 6)])
+def test_push_pair_tables_kernel_matches_the_xla_plan(t_local, topk, skew):
+    """plan_kernel.build_pair_tables (interpret mode), fed the exchanged
+    payload and the table kernel's plan tables, gives routing_pairs_from_tables'
+    pos and mirror_pos and the drop-mode scale-slab scatter exactly, at the
+    served decode geometry (ep 8, 48 slots), rows routed nowhere included."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer_k512 import (
+        _exchange_layout,
+        _pack_routing_exchange,
+    )
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel_k512 import (
+        build_pair_tables,
+        build_push_tables,
+        pair_tables_apply,
+    )
+
+    ep, g_local = 8, 48
+    idx, kw = _push_routing(ep, t_local, g_local, topk, skew=skew, seed=17 + topk)
+    e_total = kw["e_total"]
+    layout = _exchange_layout(t_local, topk, e_total, True)
+    scale_rows = host.act_scale_slab_rows(kw["shard_stride"])
+    assert pair_tables_apply(t_local, topk, layout[0], scale_rows)
+    rng = np.random.default_rng(t_local + topk)
+    bits = rng.integers(-(2**31), 2**31, (ep, t_local), dtype=np.int64)
+    bits = jnp.asarray(bits.astype(np.int32))
+    blocks = idx.reshape(ep, t_local * topk // kw["block"], kw["block"])
+    counts = _push_counts(idx, ep, t_local, e_total)
+    payload = jnp.stack(
+        [
+            _pack_routing_exchange(
+                jnp.asarray(blocks[s].reshape(-1)), bits[s], counts[s], layout
+            )
+            for s in range(ep)
+        ]
+    )
+    rows = -(-layout[2] // 128)
+    out = jnp.pad(payload, ((0, 0), (0, rows * 128 - layout[2]))).reshape(ep, rows, 128)
+    for me in (0, 5, ep - 1):
+        gathered = _push_gathered(idx, me, kw)
+        seg_start = jnp.asarray(np.cumsum(counts[me]) - counts[me])
+        tables = build_push_tables(
+            gathered.rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=2,
+            tile_m=kw["tile_m"], interpret=True,
+        )[8]  # fmt: skip
+        want_pos, want_mir, slab_row = push_host.routing_pairs_from_tables(
+            jnp.int32(me),
+            gathered,
+            *tables,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=kw["block"],
+            shard_stride=kw["shard_stride"],
+        )
+        want_slab = (
+            jnp.zeros((scale_rows * 128,), jnp.int32)
+            .at[slab_row]
+            .add(jnp.repeat(bits.reshape(-1), topk), mode="drop")
+        )
+        pos, mir, slab = build_pair_tables(
+            out, *tables, jnp.int32(me), ep=ep, t_local=t_local, topk=topk,
+            block=kw["block"], e_total=e_total, scale_rows=scale_rows,
+            interpret=True,
+        )  # fmt: skip
+        np.testing.assert_array_equal(np.asarray(pos), np.asarray(want_pos))
+        np.testing.assert_array_equal(np.asarray(mir), np.asarray(want_mir))
+        np.testing.assert_array_equal(
+            np.asarray(slab).view(np.int32).reshape(-1), np.asarray(want_slab)
+        )
+
+
+# Prefill-sized steps: the served mixed step (t_local 1024), a step whose
+# routing block is one 128-pair chunk, and an unaligned expert count.
+PUSH_WIDE_GEOMETRIES = [
+    pytest.param(8, 1024, 48, 6, 256, id="ep8_t1024_g48"),
+    pytest.param(8, 512, 48, 4, 128, id="ep8_t512_g48_topk4_block128"),
+    pytest.param(4, 128, 50, 8, 256, id="ep4_t128_g50_topk8"),
+]
+PUSH_WIDE_MODES = ["uniform", "skewed", "one_expert", "mostly_nowhere"]
+
+
+def _push_wide_routing(ep, t_local, g_local, topk, block, mode, seed):
+    """_push_routing's ids and kwargs (with routing block `block`), plus
+    degenerate routings: every pair on one expert, or most rows routed
+    nowhere."""
+    idx, kw = _push_routing(
+        ep, t_local, g_local, topk, skew=mode == "skewed", seed=seed
+    )
+    kw["block"] = block
+    rng = np.random.default_rng(seed + 1)
+    if mode == "one_expert":
+        idx[:] = rng.integers(0, kw["e_total"])
+        idx[rng.random(idx.shape[0]) < 0.05] = kw["e_total"]
+    elif mode == "mostly_nowhere":
+        idx[rng.random(idx.shape[0]) < 0.8] = kw["e_total"]
+    return idx, kw
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk,block", PUSH_WIDE_GEOMETRIES)
+@pytest.mark.parametrize("mode", PUSH_WIDE_MODES)
+def test_push_local_ranks_kernel_matches_the_local_sort(
+    ep, t_local, g_local, topk, block, mode
+):
+    """plan_kernel.build_local_ranks (interpret mode): its counts are
+    pair_block_hist's, its segment starts and row map give exactly
+    local_sort_tokens' (tok, seg_start), rows routed nowhere included, and
+    the argsort path's tokens when every pair is on one expert."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel_k512 import (
+        build_local_ranks,
+        wide_pair_tables_apply,
+    )
+
+    idx, kw = _push_wide_routing(
+        ep, t_local, g_local, topk, block, mode, seed=t_local + topk
+    )
+    e_total = kw["e_total"]
+    assert wide_pair_tables_apply(t_local, topk, block)
+    n = t_local * topk
+    for me in (0, ep - 1):
+        local = jnp.asarray(idx[me * t_local : (me + 1) * t_local].reshape(-1))
+        want_counts = host.pair_block_hist(local.reshape(-1, block), e_total).sum(0)
+        want_tok, want_seg = push_host.local_sort_tokens(
+            local, want_counts, e_total=e_total, topk=topk
+        )
+        if mode == "one_expert":
+            # A token selecting one expert topk times breaks the count path's
+            # premise (top-k ids are distinct); the argsort path takes it.
+            want_tok = push_host._sorted_tokens_by_argsort(
+                local, jnp.cumsum(want_counts), t_local=t_local, topk=topk
+            )
+        counts, seg, row_map, words = build_local_ranks(
+            local, e_total=e_total, topk=topk, block=block, interpret=True
+        )
+        np.testing.assert_array_equal(np.asarray(counts), np.asarray(want_counts))
+        np.testing.assert_array_equal(np.asarray(seg), np.asarray(want_seg))
+        np.testing.assert_array_equal(np.asarray(words) & 0xFFFF, np.asarray(local))
+        row_map = np.asarray(row_map)
+        dest, src = row_map & 0xFFFF, row_map >> 16
+        np.testing.assert_array_equal(np.sort(dest), np.arange(n))
+        tok = np.empty(n, np.int32)
+        tok[dest] = src
+        np.testing.assert_array_equal(tok, np.asarray(want_tok))
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk,block", PUSH_WIDE_GEOMETRIES)
+@pytest.mark.parametrize("mode", PUSH_WIDE_MODES)
+def test_push_pair_rows_kernel_matches_the_xla_plan(
+    ep, t_local, g_local, topk, block, mode
+):
+    """plan_kernel.build_pair_rows (interpret mode), fed a payload carrying
+    every source's build_local_ranks words and the table kernel's plan
+    tables, gives routing_pairs_from_tables' pos, mirror_pos and slab_row
+    exactly, rows routed nowhere included."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer_k512 import (
+        _exchange_layout,
+        _pack_routing_exchange,
+    )
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel_k512 import (
+        build_local_ranks,
+        build_pair_rows,
+        build_push_tables,
+    )
+
+    idx, kw = _push_wide_routing(
+        ep, t_local, g_local, topk, block, mode, seed=3 * t_local
+    )
+    e_total = kw["e_total"]
+    layout = _exchange_layout(t_local, topk, e_total, True)
+    blocks = idx.reshape(ep, -1)
+    bits = jnp.zeros((t_local,), jnp.int32)
+    payload = []
+    for s in range(ep):
+        counts, _, _, words = build_local_ranks(
+            jnp.asarray(blocks[s]), e_total=e_total, topk=topk, block=block,
+            interpret=True,
+        )  # fmt: skip
+        payload.append(_pack_routing_exchange(words, bits, counts, layout))
+    rows = -(-layout[2] // 1024) * 8
+    out = jnp.pad(jnp.stack(payload), ((0, 0), (0, rows * 128 - layout[2])))
+    out = out.reshape(ep, rows, 128)
+    counts = _push_counts(idx, ep, t_local, e_total)
+    for me in (0, ep - 1):
+        gathered = _push_gathered(idx, me, kw)
+        seg_start = jnp.asarray(np.cumsum(counts[me]) - counts[me])
+        tables = build_push_tables(
+            gathered.rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=2,
+            tile_m=kw["tile_m"], interpret=True,
+        )[8]  # fmt: skip
+        want = push_host.routing_pairs_from_tables(
+            jnp.int32(me),
+            gathered,
+            *tables,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            shard_stride=kw["shard_stride"],
+        )
+        got = build_pair_rows(
+            out, *tables, jnp.int32(me), ep=ep, t_local=t_local, topk=topk,
+            e_total=e_total, shard_stride=kw["shard_stride"], interpret=True,
+        )  # fmt: skip
+        for g_arr, w_arr in zip(got, want):
+            np.testing.assert_array_equal(np.asarray(g_arr), np.asarray(w_arr))
+
+
+def test_push_pair_kernels_admit_only_their_sizes():
+    """The decode pair kernel takes a step whose routed pairs fit one payload
+    row (DSV4.1 top-6: t_local <= 21, so the c4 verify buckets 6 and 12 but not
+    24 or 48); the wide kernels take prefill-sized steps whose sorted rows,
+    ranks and source tokens fit their 16-bit word fields."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer_k512 import (
+        _exchange_layout,
+    )
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel_k512 import (
+        WIDE_PAIRS_MAX,
+        pair_tables_apply,
+        wide_pair_tables_apply,
+    )
+
+    def decode(t_local):
+        return pair_tables_apply(
+            t_local, 6, _exchange_layout(t_local, 6, 384, True)[0], 11
+        )
+
+    assert [decode(t) for t in (6, 12, 21, 24, 48)] == [1, 1, 1, 0, 0]
+    assert wide_pair_tables_apply(1024, 6, 256)
+    assert not wide_pair_tables_apply(16, 6, 32)  # decode: build_pair_tables
+    assert not wide_pair_tables_apply(288, 6, 64)  # not whole [8, 128] tiles
+    assert not wide_pair_tables_apply(16384, 6, 256)  # rows overflow 16 bits
+    assert WIDE_PAIRS_MAX < 1 << 15
+
+
+def test_push_combine_paths_by_token_count():
+    """Which push combine a DSV4.1 step takes: the one-pass decode kernel at
+    whole bf16 tiles up to COMBINE_TOKENS tokens a shard (48, 64), the
+    pipelined fs kernel from COMBINE_MIN_TOKENS up, v2's XLA epilogue between
+    and below (the c4 verify buckets 6, 12 and 24)."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.kernel import combine_step_tokens
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.kernel import (
+        decode_combine_applies,
+        fs_combine_chunk,
+    )
+
+    decode = [t for t in (6, 12, 16, 24, 48, 64, 96, 128) if decode_combine_applies(t)]
+    assert decode == [16, 48, 64]
+    assert fs_combine_chunk(256, 6) == 32 and fs_combine_chunk(1024, 6) == 32
+    # Below COMBINE_MIN_TOKENS v2's step rule refuses, whatever the fs chunk.
+    assert not combine_step_tokens(128) and not combine_step_tokens(96)
+
+
 if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_push_routes_k32z_to_upstream_layer_and_the_rest_to_k512(monkeypatch):
+    """K32Z keeps layer.py (its program unchanged); every other format runs the
+    K512 build in layer_k512.py, whose extra options K32Z refuses."""
+    from sglang_tpu.moe.pallas.fused_moe_v2 import push_fused_moe as push
+    from sglang_tpu.moe.pallas.fused_moe_v2.host import WeightFormat
+
+    calls = []
+    monkeypatch.setattr(
+        push._layer, "fused_ep_moe_push", lambda *a, **k: calls.append(("k32z", k))
+    )
+    monkeypatch.setattr(
+        push._layer_k512, "fused_ep_moe_push", lambda *a, **k: calls.append(("k512", k))
+    )
+    push.fused_ep_moe_push(1, weight_format=WeightFormat.K32Z, sc_prepush=2)
+    push.fused_ep_moe_push(1, weight_format="k32z")
+    for fmt in (WeightFormat.FP4, WeightFormat.FP8):
+        push.fused_ep_moe_push(1, weight_format=fmt, decode_combine=True)
+    push.fused_ep_moe_push(1)
+    assert [c[0] for c in calls] == ["k32z", "k32z", "k512", "k512", "k512"]
+    for name in push.K512_ONLY_OPTIONS:
+        with pytest.raises(ValueError, match="not available for K32Z"):
+            push.fused_ep_moe_push(1, weight_format=WeightFormat.K32Z, **{name: True})

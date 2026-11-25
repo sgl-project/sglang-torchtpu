@@ -101,6 +101,21 @@ def _fp8_weights(mesh, seed, *, hidden, inter, e_total):
     return out[0], out[1], scales[0], scales[1]
 
 
+def _fp4_weights(mesh, seed, *, hidden, inter, e_total, rhs_qb):
+    """(w1, w2, w1_scale, w2_scale), fp4 e2m1 with per-`rhs_qb` block scales."""
+    rng = np.random.default_rng(seed)
+    shard = NamedSharding(mesh, P(AXIS))
+    weights, scales = [], []
+    for shape in ((e_total, hidden, 2 * inter), (e_total, inter, hidden)):
+        raw = rng.normal(0, 0.1, shape).astype(np.float32)
+        grouped = raw.reshape(shape[0], shape[1] // rhs_qb, rhs_qb, shape[2])
+        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
+        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
+        weights.append(jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn))
+        scales.append(jax.device_put(scale, shard))
+    return weights[0], weights[1], scales[0], scales[1]
+
+
 def _inputs(mesh, seed, *, hidden, e_logical, tokens=TOKENS):
     rng = np.random.default_rng(seed)
     shard = NamedSharding(mesh, P(AXIS))
@@ -126,16 +141,29 @@ def _roll(weights):
 
 
 SMALL = dict(hidden=512, inter=256, e_total=32)
+FP4_SHAPE = dict(hidden=1024, inter=512, e_total=32)
+G_LOCAL = SMALL["e_total"] // EP  # 4, the same for FP4_SHAPE
+# A ragged stride past ep * g_local * capacity makes the build ship tiles
+# through the contribution slab instead of straight from VMEM.
+CONTRIB_SLAB_STRIDE = EP * G_LOCAL * CAPACITY + CAPACITY
 
 
-def _check_parity(weights, common, *, sc_prepush, tc_exchange, ragged_stride):
+def _check_parity(
+    weights, common, *, sc_prepush, tc_exchange, ragged_stride, **push_kw
+):
     mesh = common["mesh"]
     hidden = weights[0].shape[1]
     x, gating = _inputs(mesh, 7, hidden=hidden, e_logical=weights[0].shape[0])
     kw = dict(common, ragged_stride=ragged_stride)
     want = fused_ep_moe_v2(x, *weights, gating, **kw)
     got = fused_ep_moe_push(
-        x, *weights, gating, sc_prepush=sc_prepush, tc_exchange=tc_exchange, **kw
+        x,
+        *weights,
+        gating,
+        sc_prepush=sc_prepush,
+        tc_exchange=tc_exchange,
+        **push_kw,
+        **kw,
     )
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     wrong = fused_ep_moe_v2(x, *_roll(weights), gating, **kw)
@@ -554,6 +582,308 @@ def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows
         )
         assert np.isfinite(np.asarray(got_shared, np.float32)).all()
         assert _rel(got_shared, want_shared) < 0.01
+
+
+# --------------------------------------------------------------------------- #
+# K512 build: decode scale paths, pair kernels, split exchange,
+# decode and fs combines.
+# --------------------------------------------------------------------------- #
+def _fp4_common(mesh, bias):
+    return dict(
+        topk=TOPK,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=bias,
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+    )
+
+
+@pytest.mark.parametrize(
+    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
+)
+@pytest.mark.parametrize(
+    "decode_kw",
+    [
+        dict(onehot_scale_slab=True),
+        dict(
+            onehot_scale_slab=True,
+            exchange_row_gather=True,
+            table_kernel=True,
+            exchange_tables=True,
+            kernel_plan_tables=True,
+            pair_kernel=True,
+        ),
+    ],
+    ids=["onehot_slab", "pair_kernel"],
+)
+def test_decode_scale_paths_match_v2(decode_kw, ragged_stride):
+    """A decode-sized step (32 tokens a shard here) with the TensorCore scale
+    slab, and with the per-pair tables kernel behind the exchange-tables
+    kernel, gives v2's output bit for bit, on the served FP4 form with the
+    TensorCore exchange."""
+    mesh = _mesh()
+    weights = _fp4_weights(mesh, 23, rhs_qb=512, **FP4_SHAPE)
+    bias = jax.device_put(
+        np.random.default_rng(6)
+        .normal(0, 0.1, FP4_SHAPE["e_total"])
+        .astype(np.float32),
+        NamedSharding(mesh, P()),
+    )
+    _check_parity(
+        weights,
+        _fp4_common(mesh, bias),
+        sc_prepush=2,
+        tc_exchange=True,
+        ragged_stride=ragged_stride,
+        **decode_kw,
+    )
+
+
+@pytest.mark.parametrize(
+    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
+)
+def test_split_exchange_with_the_pair_kernel_is_bit_exact(ragged_stride):
+    """With the split exchange around an in-op shared expert and the per-pair
+    tables kernel behind it, routed and shared outputs equal the unsplit
+    layer's that builds those tables in XLA, bit for bit, at a decode size
+    (32 tokens a shard)."""
+    from sglang_tpu.fp8_swiglu_mlp import _FP8_MAX
+
+    mesh = _mesh()
+    weights = _fp4_weights(mesh, 29, rhs_qb=512, **FP4_SHAPE)
+    hidden, n = FP4_SHAPE["hidden"], 256
+    rng = np.random.default_rng(31)
+    repl = NamedSharding(mesh, P())
+
+    def w(shape):
+        raw = np.clip(rng.normal(0, 64, shape), -_FP8_MAX, _FP8_MAX)
+        return jax.device_put(jnp.asarray(raw, jnp.float32).astype(FP8), repl)
+
+    def scl(size):
+        return jax.device_put(
+            rng.uniform(0.5, 1.5, size).astype(np.float32) * 1e-3, repl
+        )
+
+    shared = (w((hidden, 2 * n)), scl(2 * n), w((n, hidden)), scl(hidden))
+    bias = jax.device_put(
+        rng.normal(0, 0.1, FP4_SHAPE["e_total"]).astype(np.float32), repl
+    )
+    x, gating = _inputs(mesh, 33, hidden=hidden, e_logical=FP4_SHAPE["e_total"])
+    common = dict(
+        _fp4_common(mesh, bias),
+        sc_prepush=2,
+        tc_exchange=True,
+        exchange_row_gather=True,
+        table_kernel=True,
+        exchange_tables=True,
+        kernel_plan_tables=True,
+        onehot_scale_slab=True,
+        ragged_stride=ragged_stride,
+        shared_expert=shared,
+        shared_limit=10.0,
+    )
+
+    def layer(x, gating, split):
+        return fused_ep_moe_push(
+            x, *weights, gating, split_exchange=split, pair_kernel=split, **common
+        )
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=2, compiler_options=_AS_SERVED)(
+                x, gating, split
+            )
+        ]
+        for split in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
+
+
+def _combine_case(t_local, topk, recv_rows, lane_blocks, sublanes, tile_m, seed):
+    rng = np.random.default_rng(seed)
+    arrivals = jnp.asarray(
+        rng.normal(0, 4, (recv_rows, lane_blocks, 128)), jnp.float32
+    ).astype(FP8)
+    scales = rng.uniform(0.01, 2, (sublanes, tile_m)).astype(np.float32)
+    scales[rng.random(scales.shape) < 0.3] = np.nan
+    pos = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    mirror_pos = rng.integers(0, sublanes * tile_m, (t_local, topk), dtype=np.int32)
+    finite = np.isfinite(scales.reshape(-1)[mirror_pos])
+    mirror_pos = np.where(finite, mirror_pos, mirror_pos[finite][0])
+    weights = jnp.asarray(rng.uniform(0, 1, (t_local, topk)), jnp.float32)
+    args = (arrivals, jnp.asarray(scales), jnp.asarray(pos), jnp.asarray(mirror_pos))
+    return args, weights
+
+
+def _assert_combine_matches_xla(args, weights):
+    from sglang_tpu.moe.pallas.fused_moe_v2.layer import _combine_arrivals
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer_k512 import (
+        _combine_arrivals_fs,
+    )
+
+    got = jax.jit(_combine_arrivals_fs, static_argnums=5)(*args, weights, jnp.bfloat16)
+    want = jax.jit(_combine_arrivals, static_argnums=5)(*args, weights, jnp.bfloat16)
+    assert np.isfinite(np.asarray(got, np.float32)).all()
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+
+@pytest.mark.parametrize("t_local,topk", [(16, 6), (48, 6), (64, 6), (16, 3)])
+def test_decode_combine_matches_xla_epilogue(t_local, topk):
+    """At decode sizes the combine is the one-pass kernel; it gives v2's XLA
+    epilogue bit for bit, unwritten (NaN) mirror entries and repeated arrival
+    rows included. 48 is the DSV4.1 c16/c32 verify bucket."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.kernel import (
+        decode_combine_applies,
+    )
+
+    assert decode_combine_applies(t_local)
+    args, weights = _combine_case(t_local, topk, 480, 40, 773, 128, t_local * 10 + topk)
+    _assert_combine_matches_xla(args, weights)
+
+
+@pytest.mark.parametrize(
+    "t_local,lane_blocks", [(256, 40), (320, 40), (384, 40), (256, 20), (256, 4)]
+)
+def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks):
+    """At mixed-step sizes the combine is the pipelined fs kernel (an even
+    and an odd block count, both chunk widths, hidden sizes that are not
+    whole registers of lane blocks); it gives v2's XLA epilogue bit for bit,
+    unwritten (NaN) mirror entries and repeated arrival rows included."""
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.kernel import (
+        decode_combine_applies,
+        fs_combine_chunk,
+    )
+
+    topk = 6
+    assert fs_combine_chunk(t_local, topk) and not decode_combine_applies(t_local)
+    args, weights = _combine_case(
+        t_local, topk, t_local * topk + 512, lane_blocks, 97, 128, t_local + lane_blocks
+    )
+    _assert_combine_matches_xla(args, weights)
+
+
+# (g_local, rows per shard, top-k): the drafter's 240 rows and a decode step
+# of the 48-slot target layer, both on the shared expert's unfused path.
+SPLIT_SHAPES = {"g9": (9, 240, 3), "g48_decode": (48, 16, 6)}
+
+
+def _served_push_common(mesh, topk, **extra):
+    return dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+        exchange_row_gather=True,
+        table_kernel=True,
+        exchange_tables=True,
+        kernel_plan_tables=True,
+        light_prepush=2,
+        single_barrier=True,
+        shared_limit=10.0,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(SPLIT_SHAPES))
+def test_served_dims_split_exchange_is_bit_exact(shape):
+    """Splitting the exchange-tables kernel around the shared expert's gate_up
+    projection changes no arithmetic: routed and shared outputs match the
+    unsplit layer bit for bit."""
+    g_local, rows, topk = SPLIT_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 91, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 92, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    common = _served_push_common(
+        mesh,
+        topk,
+        routed_scaling_factor=2.5,
+        shared_expert=_shared_expert_weights(mesh, 93),
+    )
+
+    def layer(x, gating, split):
+        return fused_ep_moe_push(x, *weights, gating, split_exchange=split, **common)
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=2, compiler_options=_AS_SERVED)(
+                x, gating, split
+            )
+        ]
+        for split in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
+
+
+def test_served_dims_wide_pair_kernel_is_bit_exact():
+    """The mixed step's per-pair tables and local sort from the two wide pair
+    kernels change no arithmetic: at the served 48-slot layer with 1024 rows a
+    shard, a few hot experts and padded rows routed nowhere, routed and
+    shared outputs match the XLA tables' bit for bit."""
+    g_local, rows, topk = 48, 1024, 6
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 101, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 102, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    rng = np.random.default_rng(103)
+    pad = np.zeros((EP * rows, 1), bool)
+    pad[rng.random(EP * rows) < 0.05] = True
+    gating = jnp.where(jnp.asarray(pad), -jnp.inf, gating)
+    bias = np.zeros(e_total, np.float32)
+    bias[rng.choice(e_total, EP, replace=False)] = 3.0
+    common = _served_push_common(
+        mesh,
+        topk,
+        score_bias=jax.device_put(bias, NamedSharding(mesh, P())),
+        routed_scaling_factor=1.5,
+        split_exchange=True,
+        early_scale_scatter=2,
+        pair_kernel=True,
+        shared_expert=_shared_expert_weights(mesh, 104),
+    )
+
+    # The weights are operands, not constants captured by the trace.
+    def layer(x, gating, weights, wide):
+        return fused_ep_moe_push(x, *weights, gating, wide_pair_kernel=wide, **common)
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=3, compiler_options=_AS_SERVED)(
+                x, gating, weights, wide
+            )
+        ]
+        for wide in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
 
 
 if __name__ == "__main__":

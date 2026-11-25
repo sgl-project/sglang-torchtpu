@@ -108,11 +108,7 @@ class EPLocalRunaiModelStreamerLoader(RunaiModelStreamerLoader):
 
         with SafetensorsStreamer() as streamer:
             shard_of = self._shard_of_names(streamer, files)
-            plan = (
-                None
-                if shard_of is None
-                else plan_expert_fetch(shard_of, self._expert_range)
-            )
+            plan = None if shard_of is None else self._plan_expert_fetch(shard_of)
             streamed, extra = (
                 (None, iter(()))
                 if plan is None
@@ -148,6 +144,10 @@ class EPLocalRunaiModelStreamerLoader(RunaiModelStreamerLoader):
                 "streams whole shards."
             )
         yield from extra
+
+    def _plan_expert_fetch(self, shard_of: Mapping[str, str]) -> ExpertFetchPlan:
+        """The routed-expert tensors this rank reads; a model loader may override."""
+        return plan_expert_fetch(shard_of, self._expert_range)
 
     def _split_kept(
         self, *, kept: frozenset[str], shard_of: Mapping[str, str]

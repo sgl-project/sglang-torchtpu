@@ -15,6 +15,7 @@ torch_tpu would, and the kernel by dsv41_fused_ep_reference.reference_moe
 """
 
 import ast
+import copy
 import inspect
 import os
 import re
@@ -325,8 +326,12 @@ class _Exported:
         self.calls.append(args)
         if self.mesh.shape["ep"] != 1:
             # Several emulated ranks: collect, run the body once afterwards.
+            if len(self.out_specs) == 2:
+                return torch.zeros_like(args[0]), torch.zeros_like(args[-1])
             return torch.zeros_like(args[0])
-        (out,) = [self.fn(*_global_args([args], self.in_specs, self.mesh))]
+        out = self.fn(*_global_args([args], self.in_specs, self.mesh))
+        if isinstance(out, tuple):
+            return tuple(_to_torch(o) for o in out)
         return _to_torch(out)
 
 
@@ -380,6 +385,40 @@ class ReferenceKernel:
             logical_intermediate_size=kw["logical_intermediate_size"],
         )
         return out.astype(x.dtype)
+
+
+class PlacedReferenceKernel(ReferenceKernel):
+    """The static-placement contract: weights in physical-slot order,
+    ``expert_slot[e, 0]`` the slot of logical expert e; ``expert_load`` returns
+    ``(out, load + routed rows per slot)``. Computed by undoing the placement
+    and running the logical-order reference."""
+
+    def __call__(self, x, w1, w2, w1_scale, w2_scale, gating, **kw):
+        slot = kw.pop("expert_slot", None)
+        load = kw.pop("expert_load", None)
+        assert slot is not None and slot.shape == (gating.shape[1], 1)
+        phys_of = slot[:, 0]  # logical expert -> physical slot
+        self.calls.append(dict(kw, w1=w1, w2=w2, expert_slot=slot))
+        # Dequantize in slot order, then gather (no gather on float4 arrays).
+        out = ref.reference_moe(
+            x,
+            gating,
+            ref.dequantize_kernel_layout(w1, w1_scale)[phys_of],
+            ref.dequantize_kernel_layout(w2, w2_scale)[phys_of],
+            kw["score_bias"],
+            topk=kw["topk"],
+            renormalize=kw["renormalize"],
+            routed_scaling_factor=kw["routed_scaling_factor"],
+            logical_intermediate_size=kw["logical_intermediate_size"],
+        ).astype(x.dtype)
+        if load is None:
+            return out
+        scores = jnp.sqrt(jax.nn.softplus(gating)) + kw["score_bias"]
+        ids = jax.lax.top_k(scores, kw["topk"])[1]
+        real = jnp.isfinite(gating).any(axis=-1)
+        phys = phys_of[ids]
+        hits = (phys[..., None] == jnp.arange(gating.shape[1])) & real[:, None, None]
+        return out, load + hits.sum(axis=(0, 1)).astype(load.dtype)
 
 
 class MaxLen:
@@ -1066,6 +1105,127 @@ def test_two_ranks_against_gathered_current_path(cpu_op):
         )
 
 
+# --------------------------------------------------------------------------- #
+# Static expert placement (expert_layout): a permuted layer gives the same
+# output as the contiguous one.
+# --------------------------------------------------------------------------- #
+class PlacedExperts(FakeExperts):
+    """A rank's experts in layout slot order, as the placed loader stores them."""
+
+    def __init__(self, gmm, experts, rank):
+        torch.nn.Module.__init__(self)
+        from sglang_tpu.models.deepseek_v41 import expert_layout
+
+        for name, value in gmm.items():
+            local = torch.from_numpy(np.ascontiguousarray(value[list(experts)]))
+            self.register_parameter(
+                name, torch.nn.Parameter(local.clone(), requires_grad=False)
+            )
+        self.num_local_experts = len(experts)
+        self.quant_method = SimpleNamespace(is_fp4_expert=True)
+        self.layer_id = 3
+        setattr(self, expert_layout.LAYOUT_RANK_ATTR, rank)
+        setattr(self, expert_layout.FILLED_ATTR, set(range(len(experts))))
+
+
+_LAYOUT = {3: [[3, 0], [1, 2]]}  # rank 0 holds experts 3, 0; rank 1 holds 1, 2
+
+
+def _two_rank_routed(cpu_op, kernel, make_experts, *, real=(5, 3)):
+    dtype = torch.bfloat16
+    gmm = _gmm_prepared(E, H, I)
+    gate, shared = _parts(dtype, seed=4)
+    g = torch.Generator().manual_seed(11)
+    t_local = 8
+    xs = [torch.randn(t_local, H, generator=g).to(dtype) for _ in range(2)]
+    with op_mod.kernel_override(kernel):
+        for rank in range(2):
+            # Each rank owns its router (gate routing permutes it in place).
+            moe = FakeMoE(
+                _config(), copy.deepcopy(gate), make_experts(gmm, rank), shared
+            )
+            assert op_mod.prepare_moe_layer_for_fused_ep(
+                moe, ep=2, ep_rank=rank, multimodal_enabled=False
+            )
+            fb = SimpleNamespace(
+                num_token_non_padded=torch.tensor(real[rank], dtype=torch.int32),
+                global_num_tokens_cpu=[t_local, t_local],
+                dp_padding_mode=MaxLen(),
+            )
+            moe.dp_local_forward(xs[rank], fb, input_ids=None)
+        exported = cpu_op[-1]
+        routed = exported.fn(
+            *_global_args(exported.calls, exported.in_specs, exported.mesh)
+        )
+    return exported, routed
+
+
+def test_placed_layer_matches_contiguous(cpu_op, monkeypatch):
+    from sglang_tpu.models.deepseek_v41 import expert_layout
+
+    monkeypatch.setattr(expert_layout, "active_layout", lambda: _LAYOUT)
+    _, want = _two_rank_routed(
+        cpu_op,
+        ReferenceKernel(),
+        lambda gmm, rank: FakeExperts(gmm, 2 * rank, 2),
+    )
+    kernel = PlacedReferenceKernel()
+    exported, got = _two_rank_routed(
+        cpu_op,
+        kernel,
+        lambda gmm, rank: PlacedExperts(gmm, _LAYOUT[3][rank], rank),
+    )
+    assert exported.name.endswith("_placed")
+    assert inspect.signature(exported.fn).return_annotation is jax.Array
+    assert exported.in_specs == (P("ep"),) * 6 + (P(), P("ep"), P())
+    # Both ranks pass the same replicated table: logical e -> physical slot.
+    for args in exported.calls:
+        assert args[8].tolist() == [[1], [2], [3], [0]]
+    np.testing.assert_array_equal(
+        np.asarray(kernel.calls[0]["expert_slot"]), [[1], [2], [3], [0]]
+    )
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
+def test_placed_layer_refuses_incomplete_load(cpu_op, monkeypatch):
+    from sglang_tpu.models.deepseek_v41 import expert_layout
+
+    monkeypatch.setattr(expert_layout, "active_layout", lambda: _LAYOUT)
+    gmm = _gmm_prepared(E, H, I)
+    gate, shared = _parts(torch.bfloat16, seed=4)
+    experts = PlacedExperts(gmm, _LAYOUT[3][0], 0)
+    getattr(experts, expert_layout.FILLED_ATTR).discard(1)
+    moe = FakeMoE(_config(), gate, experts, shared)
+    with op_mod.kernel_override(PlacedReferenceKernel()):
+        with pytest.raises(ValueError, match="1 of 2 layout slots"):
+            op_mod.prepare_moe_layer_for_fused_ep(
+                moe, ep=2, ep_rank=0, multimodal_enabled=False
+            )
+
+
+def test_gate_routing_layout_matches_contiguous(cpu_op, monkeypatch):
+    """ "gate" routing: the router rows and score bias move to slot order and
+    the default (unplaced) op runs; outputs equal the contiguous layer's."""
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.models.deepseek_v41 import expert_layout
+
+    monkeypatch.setattr(expert_layout, "active_layout", lambda: _LAYOUT)
+    _, want = _two_rank_routed(
+        cpu_op, ReferenceKernel(), lambda gmm, rank: FakeExperts(gmm, 2 * rank, 2)
+    )
+    with tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_LAYOUT_ROUTING.override("gate"):
+        exported, got = _two_rank_routed(
+            cpu_op,
+            ReferenceKernel(),
+            lambda gmm, rank: PlacedExperts(gmm, _LAYOUT[3][rank], rank),
+        )
+    assert not exported.name.endswith("_placed")
+    assert exported.in_specs == (P("ep"),) * 6 + (P(), P("ep"))
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
@@ -1128,3 +1288,86 @@ def test_set_live_verify_rows(monkeypatch):
     none = SimpleNamespace(num_token_non_padded=None)
     op_mod.set_live_verify_rows(none, 6)
     assert none.num_token_non_padded is None
+
+
+def test_push_options_k512_from_envs_k32z_unchanged(monkeypatch):
+    for name in fe.PUSH_ENV_OPTIONS:
+        monkeypatch.delenv(
+            f"SGLANG_TPU_DSV41_FUSED_EP_PUSH_{name.upper()}", raising=False
+        )
+    tuned = fe.tuned_push_options(48)
+    # K32Z: upstream's options, byte for byte (its program is upstream's).
+    assert fe.push_options(fe.EXPERT_FORMAT_K32Z, 48) == tuned
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_DECODE_COMBINE", "0")
+    assert fe.push_options(fe.EXPERT_FORMAT_K32Z, 48) == tuned
+    monkeypatch.delenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_DECODE_COMBINE")
+    # K512: the same keys plus the fast paths; dispatch_ahead 25.
+    k512 = fe.push_options(fe.EXPERT_FORMAT_K512, 48)
+    assert set(k512) == set(tuned) | set(fe.PUSH_ENV_OPTIONS)
+    assert {k: v for k, v in k512.items() if k != "dispatch_ahead"} == {
+        **{k: v for k, v in tuned.items() if k != "dispatch_ahead"},
+        "onehot_scale_slab": True,
+        "pair_kernel": True,
+        "wide_pair_kernel": True,
+        "decode_combine": True,
+    }
+    assert k512["dispatch_ahead"] == 25
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_DISPATCH_AHEAD", "48")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAIR_KERNEL", "0")
+    k512 = fe.push_options(fe.EXPERT_FORMAT_K512, 48)
+    assert k512["dispatch_ahead"] == 48 and k512["pair_kernel"] is False
+
+
+def _pad_key(fmt, dispatch, bound=0):
+    return op_mod._op_key(
+        2, TOPK, True, SCALE, I, "ep", fmt, 4, dispatch, bound or fe.PUSH_MAX_ROWS
+    )
+
+
+def test_push_pad_rows_buckets(monkeypatch):
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS", "16,32,48")
+    k512, k32z = fe.EXPERT_FORMAT_K512, fe.EXPERT_FORMAT_K32Z
+    push = _pad_key(k512, fe.DISPATCH_PUSH)
+    assert [op_mod.push_pad_rows(t, push) for t in (6, 12, 16, 24, 48, 96, 512)] == [
+        16,
+        16,
+        16,
+        32,
+        48,
+        96,
+        512,
+    ]
+    assert op_mod.push_pad_rows(6, _pad_key(k512, fe.DISPATCH)) == 6
+    assert op_mod.push_pad_rows(6, (2, TOPK, True, SCALE, I, "ep")) == 6
+    assert op_mod.push_pad_rows(6, _pad_key(k32z, fe.DISPATCH_PUSH)) == 6
+    assert op_mod.push_pad_rows(6, _pad_key(k512, fe.DISPATCH_AUTO, 1024)) == 16
+    assert op_mod.push_pad_rows(6, _pad_key(k512, fe.DISPATCH_AUTO, 8)) == 6
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS", "")
+    assert op_mod.push_pad_rows(6, push) == 6
+
+
+def test_push_pad_rows_pads_the_op_and_slices(monkeypatch):
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS", "16")
+    t, e = 6, 8
+    moe = SimpleNamespace(
+        **{op_mod._KEY_ATTR: _pad_key(fe.EXPERT_FORMAT_K512, fe.DISPATCH_PUSH)},
+        _forward_shared_experts=lambda h: torch.ones_like(h),
+    )
+    fb = SimpleNamespace(dp_padding_mode=MaxLen(), global_num_tokens_cpu=[t, t])
+    gating = torch.randn(t, e)
+    gating[5] = float("-inf")  # a padding row of the batch itself
+    monkeypatch.setattr(op_mod, "local_gating_logits", lambda m, h, n: gating)
+    monkeypatch.setattr(op_mod, "real_row_count", lambda fb: None)
+    seen = {}
+
+    def fake_apply(m, h, g):
+        seen["shape"] = (tuple(h.shape), tuple(g.shape))
+        seen["pad_inf"] = bool(torch.isneginf(g[t:]).all())
+        return h * 2 * torch.isfinite(g[:, :1])
+
+    monkeypatch.setattr(op_mod, "apply_fused_ep", fake_apply)
+    h = torch.randn(t, H)
+    out = op_mod.forward_fused_ep_moe(moe, h, fb)
+    assert seen["shape"] == ((16, H), (16, e)) and seen["pad_inf"]
+    ref = h * 2 * torch.isfinite(gating[:, :1]) + 1
+    assert out.shape == (t, H) and torch.equal(out, ref)

@@ -167,6 +167,58 @@ def tuned_push_options(g_local: int) -> dict:
     )
 
 
+# The push knobs K512 push builds read from sglang_tpu.envs
+# (SGLANG_TPU_DSV41_FUSED_EP_PUSH_<NAME>): tuned_push_options' keys with the
+# measured V4.1 serving defaults (dispatch_ahead 25), plus the K512 build's fast
+# paths (push_fused_moe.layer_k512).
+PUSH_ENV_OPTIONS = (
+    "sc_prepush",
+    "tc_exchange",
+    "tail_barrier",
+    "onehot_slots",
+    "hbm_staging",
+    "dispatch_ahead",
+    "matmul_scale_repeat",
+    "exchange_row_gather",
+    "bf16_sort_counts",
+    "slim_prepush_barrier",
+    "fused_dispatch_meta",
+    "table_kernel",
+    "exchange_tables",
+    "kernel_plan_tables",
+    "light_prepush",
+    "single_barrier",
+    "early_scale_scatter",
+    "onehot_scale_slab",
+    "pair_kernel",
+    "wide_pair_kernel",
+    "decode_combine",
+)
+
+
+def push_env_options() -> dict:
+    """The K512 push options SGLANG_TPU_DSV41_FUSED_EP_PUSH_<NAME> sets."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return {
+        name: getattr(tpu_envs, f"SGLANG_TPU_DSV41_FUSED_EP_PUSH_{name.upper()}").get()
+        for name in PUSH_ENV_OPTIONS
+    }
+
+
+def push_options(
+    expert_format: str, g_local: int, env_options: dict | None = None
+) -> dict:
+    """The push options of one build. K32Z: :func:`tuned_push_options`
+    unchanged (its program is upstream's). K512: the same keys plus the fast
+    paths, from ``env_options`` (default: :func:`push_env_options` now)."""
+    options = tuned_push_options(g_local)
+    if expert_format == EXPERT_FORMAT_K32Z:
+        return options
+    options.update(push_env_options() if env_options is None else env_options)
+    return options
+
+
 def resolve_dispatch(dispatch: str, *, rows_per_rank: int, push_max_rows: int) -> str:
     """The dispatch one compiled shape runs: "auto" pushes while the bucket has
     at most ``push_max_rows`` rows per EP rank and all-gathers above."""
@@ -220,7 +272,7 @@ def make_fused_ep_moe(
     ``dispatch`` exchanges the tokens with :data:`DISPATCH` (all-gather, the
     default), "push" or "auto" (:func:`resolve_dispatch` on each traced
     shape's rows per EP rank against ``push_max_rows``). A push call uses
-    :func:`tuned_push_options` for the operands' local experts. It runs the
+    :func:`push_options` for the operands' local experts. It runs the
     kernel's fused stage without the push layer's optional fused shared
     expert, so the output stays the routed experts alone, as on all-gather.
     """
@@ -253,15 +305,42 @@ def make_fused_ep_moe(
             f"{EXPERT_FORMAT_K32Z!r}, got {expert_format!r}"
         )
     mesh_ep_ranks = tuple(range(ep))
+    # The K512 push knobs are read once, here, so every shape this builder
+    # traces uses the same options (they are not in the op's key).
+    env_options = (
+        push_env_options()
+        if expert_format == EXPERT_FORMAT_K512 and dispatch != DISPATCH
+        else None
+    )
 
-    def moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank=None):
+    def moe(
+        x,
+        gating,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        score_bias,
+        rank=None,
+        expert_slot=None,
+        expert_load=None,
+    ):
+        # Static placement (expert_slot) and load accounting (expert_load) only
+        # when given, so the default call is unchanged.
+        placement = {}
+        if expert_slot is not None:
+            placement["expert_slot"] = expert_slot
+        if expert_load is not None:
+            placement["expert_load"] = expert_load
         # Static per traced shape: x holds every rank's rows.
         chosen = resolve_dispatch(
             dispatch, rows_per_rank=x.shape[0] // ep, push_max_rows=push_max_rows
         )
         push = {}
         if chosen == DISPATCH_PUSH:
-            push["push_options"] = tuned_push_options(w1.shape[0] // ep)
+            push["push_options"] = push_options(
+                expert_format, w1.shape[0] // ep, env_options
+            )
         return kernel_fn(
             x,
             w1,
@@ -285,6 +364,7 @@ def make_fused_ep_moe(
             logical_intermediate_size=logical_intermediate_size,
             preprocess_topology=None,
             dispatch=chosen,
+            **placement,
             **push,
         )
 

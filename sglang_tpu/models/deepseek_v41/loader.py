@@ -46,12 +46,55 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
     _plans_without_expert_range = True
     # The model being loaded; its Engram layout sets each table's row ranges.
     _hf_config = None
+    # This EP rank while the target loads under SGLANG_TPU_DSV41_FUSED_EP_LAYOUT.
+    _layout_rank = None
     # The model being loaded; its shared Engram host tables take rows in place.
     _model = None
 
     def _get_all_weights(self, model_config, model):
+        from sglang_tpu.models.deepseek_v41 import expert_layout
+
+        layout = expert_layout.active_layout()
+        target = (
+            self.load_config.draft_model_idx is None and not model_config.is_draft_model
+        )
         self._model = model
+        if layout is not None and target:
+            from sglang.srt.runtime_context import get_parallel
+
+            tagged = expert_layout.tag_target_layers(model, layout)
+            self._layout_rank = int(get_parallel().moe_ep_rank)
+            logger.info(
+                "V4.1 expert layout %s: %d MoE layers placed (ep rank %d)",
+                expert_layout.layout_path(),
+                tagged,
+                self._layout_rank,
+            )
         yield from super()._get_all_weights(model_config, model)
+
+    def _plan_expert_fetch(self, shard_of):
+        if self._layout_rank is None:
+            return super()._plan_expert_fetch(shard_of)
+        from sglang_tpu.ep_weight_shard import ExpertFetchPlan
+        from sglang_tpu.models.deepseek_v41 import expert_layout
+
+        layout = expert_layout.active_layout()
+        kept, skipped, local = set(), set(), set()
+        for name in shard_of:
+            keep = expert_layout.keep_expert(
+                name, layout, self._layout_rank, self._expert_range
+            )
+            if keep is False:
+                skipped.add(name)
+                continue
+            kept.add(name)
+            if keep:
+                local.add(name)
+        return ExpertFetchPlan(
+            kept=frozenset(kept),
+            skipped=frozenset(skipped),
+            local_experts=frozenset(local),
+        )
 
     def _get_weights_iterator(self, source):
         self._hf_config = source.model_config.hf_config

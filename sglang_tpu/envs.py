@@ -720,6 +720,71 @@ class TpuEnvs:
     # calculate_tiling instead of the tuned-table lookup, which has no float4 entry and
     # falls back to tk512/tn1280. Same outputs; one K x N step per expert at V4.1's shapes.
     SGLANG_TPU_FP4_GMM2_CALC_TILING = EnvBool(False)
+    # K512 push dispatch knobs (moe/pallas/fused_moe_v2/push_fused_moe), read once
+    # per op build for the shapes that push (SGLANG_TPU_DSV41_FUSED_EP_DISPATCH
+    # push, or auto's push shapes); K32Z builds ignore them. Defaults are the
+    # measured DSV4.1 serving configuration (TC exchange on). The in-op shared expert
+    # and the split exchange around it are not offered: the shared expert runs
+    # outside the op.
+    # Destination visit positions the SparseCore pushes before the expert kernel.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_SC_PREPUSH = EnvInt(2)
+    # Routing exchange as a TensorCore remote-DMA kernel, not XLA's all-gather.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_TC_EXCHANGE = EnvBool(True)
+    # Keep the expert kernel's closing all-pairs barrier.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_TAIL_BARRIER = EnvBool(False)
+    # Map selected experts to replica slots with a one-hot matmul (placed layers).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_ONEHOT_SLOTS = EnvBool(True)
+    # Ship result tiles through the HBM contribution slab instead of from VMEM.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_HBM_STAGING = EnvBool(True)
+    # Visit positions the kernel's own dispatch pushes run ahead of its compute.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_DISPATCH_AHEAD = EnvInt(25)
+    # Per-pair scale-slab row scales by one-hot matmul instead of jnp.repeat.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT = EnvBool(True)
+    # With TC_EXCHANGE: the exchange kernel also copies the expert-sorted rows.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER = EnvBool(True)
+    # Expert-sorted token order from two single-pass bf16 matmuls.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_BF16_SORT_COUNTS = EnvBool(True)
+    # Keep the run tables out of the barrier ordering the SparseCore pre-push.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER = EnvBool(True)
+    # Pre-push counts and remote-row count built with the dispatch segments.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_FUSED_DISPATCH_META = EnvBool(True)
+    # Dispatch and shard tables in one TensorCore kernel (push plan_kernel.py).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_TABLE_KERNEL = EnvBool(True)
+    # With TABLE_KERNEL and EXCHANGE_ROW_GATHER: build them inside the exchange.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_EXCHANGE_TABLES = EnvBool(True)
+    # With TABLE_KERNEL: the routing plan's small tables come from that kernel.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_KERNEL_PLAN_TABLES = EnvBool(True)
+    # 0, 1 or 2: the SparseCore pre-push takes the lightest experts (>= 16 slots).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_LIGHT_PREPUSH = EnvInt(2)
+    # One all-pairs barrier phase opening the expert kernel and exchange, not two.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_SINGLE_BARRIER = EnvBool(True)
+    # 0, 1 or 2: how early the scale-slab scatter may run (2: not behind the
+    # SparseCore pre-push either).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_EARLY_SCALE_SCATTER = EnvInt(2)
+    # Decode-sized steps (<= 4096 routed pairs) build the scale slab on the
+    # TensorCore with a one-hot matmul instead of a SparseCore scatter.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB = EnvBool(True)
+    # With EXCHANGE_TABLES and KERNEL_PLAN_TABLES: one kernel builds the per-pair
+    # tables and scale slab of a step with t_local * topk <= 128 (top-6: <= 21).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAIR_KERNEL = EnvBool(True)
+    # With EXCHANGE_TABLES and KERNEL_PLAN_TABLES: two kernels build a prefill
+    # step's per-pair tables and local sort (t_local * topk a multiple of 1024).
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_WIDE_PAIR_KERNEL = EnvBool(True)
+    # One-pass decode combine for t_local <= 64 and a multiple of 16.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_DECODE_COMBINE = EnvBool(True)
+    # K512 push only: comma-separated local row buckets (e.g. "16,32,48"). A layer
+    # whose t_local is below the largest bucket and not in the set runs the push op
+    # on the smallest bucket >= t_local; the extra rows get -inf logits (routed
+    # nowhere, zero output) and are sliced off. Empty keeps today's shapes.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_PAD_ROWS = EnvStr("")
+    # Static expert placement for fused EP: path of a per-layer permutation JSON
+    # (models/deepseek_v41/expert_layout.py). Unset keeps the contiguous order.
+    SGLANG_TPU_DSV41_FUSED_EP_LAYOUT = EnvStr(None)
+    # How a placed layer reaches its physical slots: "slot" passes the kernel
+    # its expert_slot table (logical routing, unfused finalize); "gate" permutes
+    # the router weight rows and score bias to slot order at load (the kernel
+    # sees physical ids, default route; same experts except on exact score ties).
+    SGLANG_TPU_DSV41_FUSED_EP_LAYOUT_ROUTING = EnvStr("slot")
     # DeepSeek-V4.1 fused EP expert format: "k512" (default) requantizes the
     # checkpoint's block-32 MXFP4 experts to block 512 (dsv4_mxfp4_moe.py);
     # "k32z" converts them losslessly to K32Z operands (dsv4_mxfp4_k32z.py) in

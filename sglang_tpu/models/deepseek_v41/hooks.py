@@ -1112,13 +1112,25 @@ def fused_ep_hook_specs():
         return []
     # Never raise here: load_plugins logs a plugin import error and drops all TPU
     # hooks. check_dsv41_fused_ep_env rejects a missing SGLANG_SHARED_EXPERT_TP1.
-    return [
+    specs = [
         (
             "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights",
             prepare_tpu_dsv41_fused_ep,
             HookType.AFTER,
         ),
     ]
+    if tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_LAYOUT.get():
+        from sglang_tpu.models.deepseek_v41.expert_layout import place_expert_ids
+
+        specs.append(
+            (
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE."
+                "_weight_loader_expert_ids",
+                place_expert_ids,
+                HookType.AROUND,
+            )
+        )
+    return specs
 
 
 def engram_flush_hook_specs():
