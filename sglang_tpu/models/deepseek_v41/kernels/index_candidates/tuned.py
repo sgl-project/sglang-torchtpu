@@ -1,6 +1,7 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TPU v7 tuning for V4.1 candidate selection."""
+"""TPU v7 tiles and pipeline depths for DeepSeek-V4.1 candidate selection."""
 
 from sglang_tpu.kernels.index_selection.fp8.tuned import PagedMQAConfig
 
@@ -13,14 +14,11 @@ PACKED_FP8_PREPARED_PAIRS = 2
 PACKED_FP8_PREPARED_PREFIX_TOKENS = 4096
 
 
-# Rolling SparseCore gather: three buffers overlap reads and writes for 8-token blocks.
-# 64 pages per tile divides tokens * 2 * 2048 candidate blocks over 32 subcores, so the
-# gather output needs no trailing slice; 96 left a sliced 8.25 GiB copy at 2048 tokens.
-PAGED_MQA_GATHER_CONFIG = {(8, 1): (64, 3), (8, 2): (64, 3)}
-
-# (candidate block, physical page, banks): pages per tile and pipeline buffers.
-PAGED_MQA_FRAGMENT_GATHER_CONFIG = {(8, 128, 2): (64, 4)}
-
+# SparseCore gather, block size: (fragments per step, buffers). TC tiling needs
+# whole 128-lane metadata rows; three 8-token buffers fill SparseCore VMEM.
+# 128 divides tokens * 2 * 2048 blocks over 32 subcores: no 8.25 GiB output slice.
+# On v7, 128 vs. 64 tied in prefill and at 128 decode groups, but was 4% slower at 32.
+PAGED_MQA_GATHER_CONFIG = {8: (128, 3)}
 
 # (generation, queries, token-score width, block size): (rows, output blocks).
 PUBLISH_BLOCK_MAX_CONFIG = {(7, 96, 98816, 8): (96, 1024)}
