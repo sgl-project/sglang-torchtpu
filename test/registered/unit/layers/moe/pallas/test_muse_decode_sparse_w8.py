@@ -2964,8 +2964,13 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             )
 
         # 2. Offline TPU7x Mosaic compilation for full split flow + on_experts_done_fn
-        #    aliasing into w2_buf + write_output_ref=False -> owner_3d (EP=8 & EP=16).
-        for topo_str, cur_ep in (("tpu7x:2x2x1", 8), ("tpu7x:2x2x2", 16)):
+        #    aliasing into w2_buf + write_output_ref=False:
+        #      - EP=8 return_sharded=True + spec_prime_parts=1 -> owner_3d
+        #      - EP=16 return_sharded=False (B=64 rpr=4) + output_ref=None -> fan_3d_buf
+        for topo_str, cur_ep, cur_ret_sh, cur_sp_parts in (
+            ("tpu7x:2x2x1", 8, True, 1),
+            ("tpu7x:2x2x2", 16, False, 0),
+        ):
             tpu_devs = get_topology_desc(topo_str, platform="tpu").devices
             if len(tpu_devs) < cur_ep:
                 continue
@@ -2976,7 +2981,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 ("model",),
             )
             cur_eloc = 256 // cur_ep
-            cur_rpr = batch_size // cur_ep
+            cur_out_rows = (batch_size // cur_ep) if cur_ret_sh else batch_size
             cur_cfg = dataclasses.replace(
                 v1_mod.default_sparse_decode_config(batch_size, cur_ep, scale_block),
                 m_buckets=(16, 32),
@@ -2989,6 +2994,8 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 pair_rs=True,
                 bridge_ag=True,
                 fast_b64_epi_pro=False,
+                spec_prime_parts=cur_sp_parts,
+                spec_home_slots=(0,) * cur_ep if cur_sp_parts > 0 else (),
             )
             cur_scratch = v1_mod.build_muse_sparse_scratch_shapes(
                 ep=cur_ep,
@@ -2997,7 +3004,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 s1_dtype=jnp.bfloat16,
                 s2_dtype=jnp.bfloat16,
                 num_replicas=8,
-                return_sharded=True,
+                return_sharded=cur_ret_sh,
                 config=cur_cfg,
             )
             cur_shapes = (
@@ -3031,7 +3038,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     )
                     rw1_r, rs1_r, rw2_r, rs2_r = next(it), next(it), next(it), next(it)
                     out_r = next(it)
-                    sc = _unpack_vmem_scratch(it, 8, return_sharded=True)
+                    sc = _unpack_vmem_scratch(it, 8, return_sharded=cur_ret_sh)
                     bsem = pltpu.get_barrier_semaphore()
                     for d in range(cur_ep):
                         pl.semaphore_signal(
@@ -3129,7 +3136,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         gain_f32_buf=sc["gain_f32_buf"],
                         accum_3d=sc["accum_3d"],
                         accum_2d=None,
-                        fan_3d_buf=None,
+                        fan_3d_buf=sc["x_3d_buf"] if not cur_ret_sh else None,
                         rs_send_bf16=sc["rs_send_bf16"],
                         rs_pair_recv=sc["rs_pair_recv"],
                         rs_chip_send=sc["rs_chip_send"],
@@ -3142,16 +3149,16 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         rs_send_sem=None,
                         rs_recv_sem=None,
                         owner_3d=sc["owner_3d"],
-                        fan_send_sem=None,
-                        fan_recv_sem=None,
-                        fan_s2_send_sem=None,
-                        fan_s2_recv_sem=None,
+                        fan_send_sem=sc["fan_send_sem"],
+                        fan_recv_sem=sc["fan_recv_sem"],
+                        fan_s2_send_sem=sc["fan_s2_send_sem"],
+                        fan_s2_recv_sem=sc["fan_s2_recv_sem"],
                         barrier_sem=bsem,
-                        output_ref=out_r,
+                        output_ref=out_r if cur_ret_sh else None,
                         ep=cur_ep,
                         batch_size=batch_size,
                         scale_block=scale_block,
-                        return_sharded=True,
+                        return_sharded=cur_ret_sh,
                         ep_axis_name="model",
                         cfg=cur_cfg,
                         x_is_3d=True,
@@ -3159,11 +3166,17 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                         write_output_ref=False,
                         on_experts_done_fn=_on_experts_done,
                     )
-                    out_r[...] = sc["owner_3d"][...].reshape(cur_rpr, h)
+                    if cur_ret_sh:
+                        out_r[...] = sc["owner_3d"][...].reshape(cur_out_rows, h)
+                    else:
+                        for r0 in range(0, batch_size, 16):
+                            out_r[pl.ds(r0, 16), :] = sc["x_3d_buf"][
+                                pl.ds(r0, 16), :, :
+                            ].reshape(16, h)
 
                 return pl.pallas_call(
                     _k,
-                    out_shape=jax.ShapeDtypeStruct((cur_rpr, h), jnp.bfloat16),
+                    out_shape=jax.ShapeDtypeStruct((cur_out_rows, h), jnp.bfloat16),
                     grid_spec=pltpu.PrefetchScalarGridSpec(
                         num_scalar_prefetch=2,
                         grid=(1,),

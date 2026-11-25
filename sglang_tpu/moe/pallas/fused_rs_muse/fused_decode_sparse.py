@@ -2034,8 +2034,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
       - Pass ``x_is_3d=True`` if ``x_3d_buf`` already holds ``[B, 32, 128] bf16``.
       - Pass ``on_experts_done_fn`` to immediately launch ``chip_b2`` weight DMAs
         into freed ``w1_buf`` / ``w2_buf`` overlapped with ``PAIR_RS``.
-      - Pass ``return_sharded=True, write_output_ref=False`` to leave the
-        sharded BF16 MoE output directly inside ``owner_3d`` VMEM.
+      - Pass ``write_output_ref=False`` to leave the BF16 MoE output in VMEM:
+        inside ``owner_3d`` when ``return_sharded=True`` or inside ``fan_3d_buf``
+        (``[B, 32, 128]``) when ``return_sharded=False``.
     """
     is_dense = plan_res.is_dense
     is_k256 = plan_res.is_k256
@@ -4100,10 +4101,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             fan_s2_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        if write_output_ref and output_ref is not None:
+            for r0 in range(0, batch_size, 16):
+                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
+                    pl.ds(r0, 16), :, :
+                ].reshape(16, _H)
 
         mate_op.wait_send()
         for c, op in s1_ops:
@@ -4144,10 +4146,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             fan_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        if write_output_ref and output_ref is not None:
+            for r0 in range(0, batch_size, 16):
+                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
+                    pl.ds(r0, 16), :, :
+                ].reshape(16, _H)
 
         for dest, fan_op in fan_copies:
 
