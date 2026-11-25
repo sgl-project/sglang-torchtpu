@@ -480,7 +480,9 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
                 f"the Muse prefill program runs at TP {PREFILL_TP}, got {self.tp}"
             )
         if self.sptp and (self.sp or self.fp8_gather):
-            raise ValueError("prefill/sptp takes prefill/tp's config without sp / fp8_gather")
+            raise ValueError(
+                "prefill/sptp takes prefill/tp's config without sp / fp8_gather"
+            )
         align = SPTP_ROW_ALIGN if self.sptp else SP_ROW_ALIGN if self.sp else ROW_ALIGN
         if self.rows % align:
             raise ValueError(
