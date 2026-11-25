@@ -586,6 +586,10 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN = EnvInt(0)
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
+    # Opt-in B=16 (LC 8K/1K) sparse execution (m_buckets=(8, 16) vs dense) unlocking FREE/MIN_P.
+    SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE = EnvBool(False)
+    # Opt-in non-uniform per-layer FREE/MIN_P preset or spec ("" = uniform off).
+    SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE = EnvStr("")
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT = EnvInt(-1)
