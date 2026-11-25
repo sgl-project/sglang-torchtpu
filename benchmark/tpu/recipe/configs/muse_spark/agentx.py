@@ -54,7 +54,8 @@ PROFILES = {
     # c8-c10 verify 4 tokens (golden AL 3.06); c8 keeps j-03bad578's 2 running requests.
     8: (2, 4, 128, None),
     9: (4, 4, 128, None),
-    10: (6, 4, 64, None),
+    # c10 at 8 running: +2.3% tok/s/chip over 6 (j-83d7512f vs j-fe083895); decode rarely exceeds 6.
+    10: (8, 4, 64, None),
     16: (16, 4, 64, None),
     22: (16, 4, 64, None),
     # Not swept; kept for reruns.

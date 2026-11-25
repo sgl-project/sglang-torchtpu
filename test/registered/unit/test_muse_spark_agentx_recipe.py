@@ -301,9 +301,9 @@ PER_CONC = {
     10: (
         {
             "--speculative-num-draft-tokens": ["4"],
-            "--max-running-requests": ["6"],
-            "--torch-compile-max-bs": ["6"],
-            "--tpu-compile-bs": ["1", "2", "3", "4", "5", "6"],
+            "--max-running-requests": ["8"],
+            "--torch-compile-max-bs": ["8"],
+            "--tpu-compile-bs": ["1", "2", "3", "4", "5", "6", "7", "8"],
             "--tpu-compile-tokens": ["1024", "2048", "4096"],
             "--prefill-decode-interval": ["64"],
             "--hicache-ratio": ["2.0"],
