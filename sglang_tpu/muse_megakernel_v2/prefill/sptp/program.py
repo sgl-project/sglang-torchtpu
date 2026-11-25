@@ -57,7 +57,11 @@ from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
     dequant_rows_call,
     qkvg_call,
 )
-from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import (
+    RpaOpts,
+    rpa_prepared,
+    tok_rows,
+)
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.xag_qkvg import xag_qkvg_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.xe_ag import xe_ag_dequant_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
@@ -231,6 +235,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
     # unfused-norm kernel on XLA's rows
     xag_mix = int(os.environ.get("SPTP_XAG_NORM_DBG", "0")) if xag_norm else 0
+    # SPTP_XAG_KV_RPA=1: the fused qkvg kernel writes k / v as batched RPA's e4m3 new-KV
+    # operand itself (no XLA cast / relayout copies before the RPA)
+    xag_kv_rpa = xag_fused and q_rpa and os.environ.get("SPTP_XAG_KV_RPA", "0") == "1"
+    if xag_kv_rpa and (xag_mix or os.environ.get("SPTP_XAG_OWNFIRST", "0") == "1"):
+        raise ValueError("SPTP_XAG_KV_RPA: no SPTP_XAG_NORM_DBG / SPTP_XAG_OWNFIRST")
     xag_k = {
         r: xag_qkvg_call(
             c,
@@ -256,6 +265,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
             route=int(os.environ.get("SPTP_XAG_ROUTE", "0")),
             own_first=os.environ.get("SPTP_XAG_OWNFIRST", "0") == "1",
             q_strided=xag_q_strided,
+            kv_rpa=xag_kv_rpa,
         )
         for r in (True, False)
     }
@@ -321,6 +331,14 @@ def build_forward(c: PFConfig, axis: str = "model"):
         if pa_gtok and os.environ.get("SPTP_OGATE_PK", "0") != "0"
         else None
     )
+    # SPTP_RPA_OUT_TOK=1: the RPA leaves o token major in slot 0; only the XLA token-major o
+    # gate reads that layout so far (the padded-layout readers would take garbage)
+    rpa_out_tok = RpaOpts.from_env().out_tok
+    if rpa_out_tok and not (q_rpa and pa_gtok and ogate_pk is None):
+        raise ValueError(
+            "SPTP_RPA_OUT_TOK needs SPTP_PA_OGATE_TOK=1 without SPTP_OGATE_PK (the only o"
+            " consumer of the token-major layout)"
+        )
     # SPTP_OGATE_PK=13 (with SPTP_PA_TMAJ): the same Pallas o gate writing the [qd, T] layout
     ogate_tm = (
         o_gate_pk_call(c, int(os.environ.get("SPTP_OGATE_PK_TM", "512")), 13)
@@ -397,6 +415,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 n_pre=n_pre,
                 wk=int(os.environ.get("SPTP_XAG_WK", "1")),
                 defer_res=defer_res,
+                kv_rpa=xag_kv_rpa,
             )
             for r in (True, False)
         }
@@ -549,10 +568,23 @@ def build_forward(c: PFConfig, axis: str = "model"):
             if q_rpa:
                 kvd = c.kv_dim
                 is_global = l in c.global_layers
+                if kvs.ndim == 4:  # SPTP_XAG_KV_RPA: already the RPA's new-KV operand
+                    k_in, v_in = kvs, None
+                else:
+                    k_in = (
+                        kvs[:, :kvd]
+                        .astype(jnp.float8_e4m3fn)
+                        .reshape(T, c.kv_heads, hd)
+                    )
+                    v_in = (
+                        kvs[:, kvd:]
+                        .astype(jnp.float8_e4m3fn)
+                        .reshape(T, c.kv_heads, hd)
+                    )
                 o, kv[l] = rpa_prepared(
                     q.reshape(c.kv_heads, T, gq // 2, 2, 128),
-                    kvs[:, :kvd].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
-                    kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
+                    k_in,
+                    v_in,
                     kv[l],
                     kv_lens,
                     pf if is_global else psw,
@@ -570,10 +602,14 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         with _scope("sp_o_gate"):
                             # the same per-element math as below, laid out token major (o moved
                             # instead of gate): the in-kernel a2a reads it without a relayout
-                            o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
-                                _F32
-                            )
-                            o4 = o4.transpose(1, 0, 2, 3)
+                            if rpa_out_tok:  # already [T, (kv, g, d)]
+                                o4 = tok_rows(o).reshape(T, c.kv_heads, gq, hd)
+                                o4 = o4.astype(_F32)
+                            else:
+                                o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
+                                    _F32
+                                )
+                                o4 = o4.transpose(1, 0, 2, 3)
                             o4 = o4 * jax.lax.rsqrt(
                                 jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
                             )

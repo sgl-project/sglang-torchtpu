@@ -137,8 +137,14 @@ def _rpa_prepared(
     env: tuple,
 ):
     """q_hbm [Hkv, T, G / pack, pack, D128] bf16 (pad lanes zero), fp8 k / v [T, Hkv, D] ->
-    (o [Hkv, T, G / pack, pack, D128] bf16, kv_cache)."""
+    (o [Hkv, T, G / pack, pack, D128] bf16, kv_cache). v None: k is the new-KV operand
+    (new_kv's layout, e.g. xag_qkvg kv_rpa)."""
     del env  # cache key only
+    new_kv_hbm = None
+    if v is None:  # k: the new-KV operand already built ([2 Hkv, D / pack, pack, T])
+        new_kv_hbm = k
+        h2, dp, pk, tk = k.shape
+        k = v = jax.ShapeDtypeStruct((tk, h2 // 2, dp * pk), k.dtype)
     t, hkv, d = k.shape
     q_dtype = q_hbm.dtype
     queries = jax.ShapeDtypeStruct((t, num_q_heads, d), q_dtype)
@@ -190,9 +196,10 @@ def _rpa_prepared(
         # the program normalizes each head itself
         out_head_norm_eps=None,
     )
-    new_kv_hbm = {0: new_kv, 1: new_kv_stacked, 2: new_kv_words}[opts.kv_stack](
-        k, v, page_size
-    )
+    if new_kv_hbm is None:
+        new_kv_hbm = {0: new_kv, 1: new_kv_stacked, 2: new_kv_words}[opts.kv_stack](
+            k, v, page_size
+        )
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs, serve_cfgs, vmem_limit_bytes
     )

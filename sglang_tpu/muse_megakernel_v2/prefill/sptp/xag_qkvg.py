@@ -322,6 +322,7 @@ def xag_qkvg_call(
     n_pre: int = 0,
     wk: int = 1,
     defer_res: bool = False,
+    kv_rpa: bool = False,
 ):
     """(layer [1] i32, x8 [Ts, H] e4m3 own rows, xs [T, 1] f32 every row's scale, rope [T, 2 hd]
     f32, stacked wqkvg [L, H, nq] e4m3 and smalls [L, 16, H] f32) -> (q, kv [T, 2 kvd], gate
@@ -363,6 +364,11 @@ def xag_qkvg_call(
         raise ValueError(f"wk {wk}: needs n_pre and H % (wk * kc) == 0")
     if n_pre and (not fuse_norm or own_first or dbg_xs or not dma_first or n_pre >= nt):
         raise ValueError("n_pre needs fuse_norm, dma_first and not own_first / dbg_xs")
+    # kv_rpa: kv as batched RPA's new-KV operand, e4m3 [2 Hkv (k0, v0, k1, v1), D / 4, 4, T]
+    # (sptp/rpa.py new_kv of the same values): per tile the rows are transposed, cast and
+    # placed in a VMEM image of the whole operand, written once at the end
+    if kv_rpa and (own_first or seg % 32 or Ts % 128 or 128 % seg or hd % 4):
+        raise ValueError("kv_rpa needs no own_first, seg | 128 and Ts % 128 == 0")
     if q_strided and (not q_rpa or own_first or hd != 64):
         raise ValueError("q_strided needs q_rpa, head_dim 64 and not own_first")
     if own_first and (not fuse_norm or dbg_xs or nt < 3 or half % 128 or seg != 32):
@@ -455,6 +461,8 @@ def xag_qkvg_call(
             *coll_sems, pre_v, presc_v, pre_sem = coll_sems
         if q_strided:
             *coll_sems, qs_v = coll_sems
+        if kv_rpa:
+            *coll_sems, kvn_v, kvn_sem = coll_sems
         me = jax.lax.axis_index(axis).astype(jnp.int32)
 
         def slot_of(j):
@@ -662,7 +670,8 @@ def xag_qkvg_call(
                         cps.append((q_v.at[b, :, tile_rows(p)], q_hbm.at[:, dst]))
                 else:
                     cps.append((q_v.at[b, tile_rows(p)], q_hbm.at[dst]))
-                cps.append((kv_v.at[b, tile_rows(p)], kv_hbm.at[dst]))
+                if not kv_rpa:
+                    cps.append((kv_v.at[b, tile_rows(p)], kv_hbm.at[dst]))
                 if gate4:
                     cps.append((g_v.at[b, :, tile_rows(p)], g_hbm.at[:, dst]))
                 else:
@@ -956,10 +965,40 @@ def xag_qkvg_call(
                     q_v[b, k] = qs_v[k].astype(jnp.bfloat16)
             else:
                 q_v[b] = _q_rpa(q, kvh, gq, hd) if q_rpa else q
-            kv_v[b] = kv
+            if kv_rpa:
+                kv_place(j, kv)
+            else:
+                kv_v[b] = kv
             g_v[b] = _q_rpa(g, kvh, gq, hd) if gate4 else g
             for cp in out_writes(j):
                 cp.start()
+
+        def kv_place(j, kv):
+            """Tile j's kv rows [tm, 2 kvd] into kvn_v: u32 words of 4 e4m3 head lanes,
+            lanes = tokens; position p's seg tokens go to lanes p * Ts + j * seg."""
+            # e4m3 first: the transpose moves 8-bit tiles (XLU) instead of bf16 ones
+            kvt = kv.astype(jnp.float8_e4m3fn).T  # [2 kvd, tm]
+            rows = []
+            for h in range(kvh):
+                rows += [
+                    kvt[h * hd : (h + 1) * hd],
+                    kvt[kvd + h * hd : kvd + (h + 1) * hd],
+                ]
+            w = pltpu.bitcast(
+                jnp.concatenate(rows, axis=0), jnp.uint32
+            )  # [2 kvd / 4, tm]
+            nw = w.shape[0]
+            kvn_u32 = kvn_v.bitcast(jnp.uint32).reshape(nw, T)
+            per = 128 // seg
+            sub = jax.lax.rem(j, per) * seg
+            lane = jax.lax.broadcasted_iota(jnp.int32, (nw, 128), 1)
+            m = jnp.logical_and(lane >= sub, lane < sub + seg)
+            for p in range(tp):
+                off = (p * seg) % 128
+                src = w[:, p * seg - off : p * seg - off + 128]
+                rolled = pltpu.roll(src, jax.lax.rem(sub - off + 128, 128), 1)
+                col = pl.ds(pl.multiple_of(p * Ts + (j // per) * 128, 128), 128)
+                kvn_u32[:, col] = jnp.where(m, rolled, kvn_u32[:, col])
 
         def pre(i):
             """Tile i < n_pre, gathered by the previous layer's post_ffn kernel."""
@@ -1005,6 +1044,10 @@ def xag_qkvg_call(
         for j in range(max(0, nt - 2), nt) if not dbg_ag_only else ():
             for cp in out_writes(j):
                 cp.wait()
+        if kv_rpa:
+            cp = pltpu.make_async_copy(kvn_v, kv_hbm, kvn_sem.at[0])
+            cp.start()
+            cp.wait()
         if defer_res:
             for j in range(max(n_pre, nt - 2), nt):
                 st_write(j).wait()
@@ -1051,6 +1094,9 @@ def xag_qkvg_call(
             sem((3, 2)),
         ]
     scratch += [sem((n_slots,)) for _ in range(2 * len(kinds))]
+    kvn_shape = (2 * kvh, hd // 4, 4, T)
+    if kv_rpa:
+        scratch += [vmem(kvn_shape, jnp.float8_e4m3fn), sem((1,))]
     if q_strided:
         scratch += [vmem((kvh, tm * gq, 128), jnp.float32)]
     if n_pre:
@@ -1076,7 +1122,7 @@ def xag_qkvg_call(
     q_shape = (kvh, T, gq, 128) if q_rpa else (T, qd)
     q_shape = (kvh, T * gq, 128) if q_strided else q_shape
     name = (
-        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}{f'_ds{dma_split}' if dma_split > 1 else ''}{'_nt' if n_tail else ''}{'_dbgag' if dbg_ag_only else ''}{f'_rt{route}' if route else ''}{'_of' if own_first else ''}{'_qs' if q_strided else ''}{f'_pre{n_pre}' if n_pre else ''}{f'_wk{wk}' if wk > 1 else ''}{'_dr' if defer_res else ''}"
+        f"muse_sptp_xag_qkvg_t{T}_s{seg}_k{kc}_g{gap}_r{int(rope)}{'_df' if dma_first else ''}{'_se' if split_epi else ''}{'_g4' if gate4 else ''}_w{w_start}{f'_ms{m_split}' if m_split > 1 else ''}{f'_ds{dma_split}' if dma_split > 1 else ''}{'_nt' if n_tail else ''}{'_dbgag' if dbg_ag_only else ''}{f'_rt{route}' if route else ''}{'_of' if own_first else ''}{'_qs' if q_strided else ''}{f'_pre{n_pre}' if n_pre else ''}{f'_wk{wk}' if wk > 1 else ''}{'_dr' if defer_res else ''}{'_kvr' if kv_rpa else ''}"
         f"{'_mxun' if mxu_norm else ''}{'_qrpa' if q_rpa else ''}{'_norm' if fuse_norm else ''}"
     )
 
@@ -1094,7 +1140,9 @@ def xag_qkvg_call(
             raise ValueError(f"xs {args[0].shape}: expected ({T}, 1)")
         outs = [
             jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
-            jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
+            jax.ShapeDtypeStruct(kvn_shape, jnp.float8_e4m3fn)
+            if kv_rpa
+            else jax.ShapeDtypeStruct((T, 2 * kvd), jnp.bfloat16),
             jax.ShapeDtypeStruct((kvh, T, gq, 128) if gate4 else (T, qd), jnp.bfloat16),
         ]
         if defer_res:
