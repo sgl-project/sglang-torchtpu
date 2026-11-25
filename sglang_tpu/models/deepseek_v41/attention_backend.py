@@ -1436,12 +1436,18 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _register_ops():
         # Registration must precede torch.compile tracing.
         from sglang_tpu.dsv4.dsv4_attention_backend import _register_rope_op
-        from sglang_tpu.models.deepseek_v41.ops import csa2, dspark_markov, indexer
+        from sglang_tpu.models.deepseek_v41.ops import (
+            csa2,
+            dspark_markov,
+            indexer,
+            wo_a_fp8,
+        )
 
         _register_rope_op()  # apply_rope's Pallas RoPE op
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
         dspark_markov.register_dspark_markov_op()
+        wo_a_fp8.register_wo_a_fp8_op()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:

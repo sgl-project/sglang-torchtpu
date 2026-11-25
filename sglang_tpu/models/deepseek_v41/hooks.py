@@ -307,6 +307,28 @@ tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: the Engram history lives on the device and commits in-graph.
 
+prepare_tpu_dsv41_wo_a_fp8, tpu_dsv41_project_wo_a
+  Why: disable_tpu_dsv4_wo_a_fp8_gemm keeps wo_a in BF16 (~2.88 GB/rank across
+       43 layers), making torch.einsum("tgd,grd->tgr") ~20.7% of decode_c8
+       active time.
+  How: AFTER DefaultModelLoader.postprocess_weights quantizes eligible V4.1
+       wo_a weights to per-channel float8_e4m3fn ([G, R, D] + [G, R] f32
+       scale) when SGLANG_TPU_DSV41_WO_A_FP8=1; AROUND MQALayer._project_wo_a
+       dispatches to the exported XLA FP8 einsum op (ops/wo_a_fp8.py).
+  Upstream PR or issue: not filed (V4.1 TPU kernel optimization).
+  Remove when: MQALayer._project_wo_a dispatches through a backend FP8 grouped
+       matmul seam.
+
+prepare_tpu_dsv41_dummy_model
+  Why: DummyModelLoader.load_model bypasses load_weights / postprocess_weights,
+       so dummy-weight TPU benchmarks skip vocab-parallel LM head sharding,
+       FP8 wo_a quantization, and fused EP MoE preparation.
+  How: AFTER DummyModelLoader.load_model runs the same V4.1 post-load
+       transforms on TPU.
+  Upstream PR or issue: not filed (V4.1 TPU kernel optimization).
+  Remove when: DummyModelLoader invokes the same post-load hook as
+       DefaultModelLoader.
+
 prepare_tpu_dsv41_fused_ep
   (registered only with SGLANG_TPU_DSV41_FUSED_EP=1, see fused_ep_hook_specs)
   Why: the fused EP kernel (fused_ep_moe_v2) needs its own expert layout,
@@ -979,6 +1001,67 @@ def prepare_tpu_dsv41_fused_ep(result, model, target_device):
     return result
 
 
+def prepare_tpu_dsv41_wo_a_fp8(result, model, target_device):
+    """AFTER DefaultModelLoader.postprocess_weights: quantize V4.1 wo_a to per-channel FP8."""
+    if (
+        target_device.type == "tpu"
+        and getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v41"
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.wo_a_fp8 import (
+            prepare_model_for_dsv41_wo_a_fp8,
+        )
+
+        prepare_model_for_dsv41_wo_a_fp8(model)
+    return result
+
+
+def tpu_dsv41_project_wo_a(original, layer, o, *args, **kwargs):
+    """AROUND MQALayer._project_wo_a: run per-channel FP8 grouped einsum on TPU."""
+    wo_a = getattr(layer, "wo_a", None)
+    scale = getattr(wo_a, "_tpu_wo_a_fp8_scale", None) if wo_a is not None else None
+    if scale is None:
+        return original(layer, o, *args, **kwargs)
+    from sglang_tpu.models.deepseek_v41.ops.wo_a_fp8 import wo_a_fp8_matmul
+
+    # On TPU CSA2, inverse RoPE is already applied by CSA2 (apply_mqa_inv_rope is identity).
+    o_grouped = o.view(o.shape[0], layer.n_local_groups, -1)
+    return wo_a_fp8_matmul(o_grouped, wo_a.weight, scale)
+
+
+def prepare_tpu_dsv41_dummy_model(result, loader, *, model_config, device_config):
+    """AFTER DummyModelLoader.load_model: apply V4.1 post-load transforms
+    (vocab-parallel LM head sharding, FP8 wo_a, and fused EP MoE preparation)
+    that DefaultModelLoader runs through load_weights / postprocess_weights."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if (
+        torch.cuda.is_available()
+        or getattr(getattr(result, "config", None), "model_type", None) != "deepseek_v41"
+    ):
+        return result
+    is_draft = result.__class__.__name__.endswith("DSpark") or result.__class__.__name__.endswith("NextN")
+    if (
+        not is_draft
+        and tpu_envs.SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD.get()
+        and hasattr(result, "lm_head")
+    ):
+        from sglang_tpu.models.deepseek_v41.vocab_parallel_head import shard_lm_head
+
+        shard_lm_head(result)
+    from sglang_tpu.models.deepseek_v41.ops.wo_a_fp8 import (
+        prepare_model_for_dsv41_wo_a_fp8,
+    )
+
+    prepare_model_for_dsv41_wo_a_fp8(result)
+    if tpu_envs.SGLANG_TPU_DSV41_FUSED_EP.get():
+        from sglang_tpu.models.deepseek_v41.fused_ep_op import (
+            prepare_model_for_dsv41_fused_ep,
+        )
+
+        prepare_model_for_dsv41_fused_ep(result)
+    return result
+
+
 def fused_ep_hook_specs():
     """The fused EP hook, only when SGLANG_TPU_DSV41_FUSED_EP=1. Otherwise nothing
     is registered and the default path is untouched."""
@@ -1172,6 +1255,21 @@ def hook_specs():
             f"{ngram}._prepare_engram_history",
             tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.MQALayer._project_wo_a",
+            tpu_dsv41_project_wo_a,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_loader.loader.DefaultModelLoader.postprocess_weights",
+            prepare_tpu_dsv41_wo_a_fp8,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_loader.loader.DummyModelLoader.load_model",
+            prepare_tpu_dsv41_dummy_model,
+            HookType.AFTER,
         ),
         *decoder_replay_sync.hook_specs(),
         *engram_flush_hook_specs(),

@@ -713,6 +713,9 @@ class TpuEnvs:
     # rows per EP rank and all-gathers a larger one. Needs
     # SGLANG_TPU_DSV41_FUSED_EP=1 (checked at startup).
     SGLANG_TPU_DSV41_FUSED_EP_DISPATCH = EnvStr("all_gather")
+    # DeepSeek-V4.1 per-channel FP8 grouped wo_a contraction (models/deepseek_v41/ops/wo_a_fp8.py).
+    # Halves wo_a weight HBM (~1.44 GB/rank saved) and runs XLA FP8 einsum (2.5-3.4x faster at decode).
+    SGLANG_TPU_DSV41_WO_A_FP8 = EnvBool(True)
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
