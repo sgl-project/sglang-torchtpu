@@ -51,6 +51,21 @@ def largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
+SUBLANE = 8
+
+
+def token_tile(num_tokens: int, cap: int) -> int:
+    """Tokens per grid step: a divisor of `num_tokens`, at most `cap`. The tile is the
+    sublane axis of the ``(tile_n, rotary_dim)`` cos/sin block (and of the 2-D x block),
+    so below the full extent it must be a multiple of SUBLANE; e.g. 120 tokens (24
+    requests x 5) would otherwise tile as 60 and fail to compile."""
+    if num_tokens <= cap:
+        return num_tokens
+    if num_tokens % SUBLANE == 0:
+        return SUBLANE * largest_divisor(num_tokens // SUBLANE, cap // SUBLANE)
+    return largest_divisor(num_tokens, cap)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CosSinRef(pltpu.BufferedRef):
@@ -477,7 +492,7 @@ def _rope_call(
         # is exactly LANE).
         raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
 
-    tile_n = largest_divisor(num_tokens, cap=128)
+    tile_n = token_tile(num_tokens, cap=128)
     assert num_tokens % tile_n == 0
 
     x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
@@ -585,7 +600,7 @@ def qnorm_rope(
     rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-    tile_n = largest_divisor(num_tokens, cap=64)
+    tile_n = token_tile(num_tokens, cap=64)
 
     x_block_shape = (tile_n, rows_per_token, head_dim)
     kernel = functools.partial(

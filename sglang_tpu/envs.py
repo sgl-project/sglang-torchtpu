@@ -718,6 +718,9 @@ class TpuEnvs:
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its
     # backlog exceeds the least backlogged rank's by more than m x the prompt.
     SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN = EnvFloat(0.0)
+    # Skip TokenizerManager's per-id vocabulary walk for prompt ids the chat server
+    # rendered itself (hooks/server_prompt_ids.py); client-supplied ids are still checked.
+    SGLANG_TPU_SKIP_SERVER_PROMPT_VOCAB_CHECK = EnvBool(False)
     # Treat routed_dp_rank (X-Data-Parallel-Rank) as an affinity hint: prompts no
     # rank holds may go to a less backlogged rank, continuations follow the rank
     # holding them. False keeps it a hard route.

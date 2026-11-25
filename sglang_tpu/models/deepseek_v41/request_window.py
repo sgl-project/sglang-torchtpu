@@ -51,18 +51,36 @@ class WindowPlan(NamedTuple):
     commit_dst: torch.Tensor
 
 
-def _workspace_pages(*, num_slots: int, chunk_tokens: int) -> int:
-    return ceil_div(chunk_tokens, SWA_PAGE_TOKENS) + (
-        EXTRA_WORKSPACE_PAGES_PER_REQUEST * num_slots
+def extend_batch_rows() -> int:
+    """Requests in a TPU extend graph's fixed batch (torch_compile_max_bs): the
+    precompile warms each extend graph with that many one-token requests, one
+    fresh workspace page each, whatever the scheduler's request slots."""
+    from sglang.srt.runtime_context import get_exec
+
+    return get_exec().graph.torch_compile_max_bs or 0
+
+
+def _workspace_pages(*, num_slots: int, chunk_tokens: int, batch_rows: int = 0) -> int:
+    # A real extend: one chunk plus each request's history span. The fixed-batch
+    # warmup: one page per batch row. With few slots (a small
+    # --max-running-requests) the second is the larger.
+    return max(
+        ceil_div(chunk_tokens, SWA_PAGE_TOKENS)
+        + EXTRA_WORKSPACE_PAGES_PER_REQUEST * num_slots,
+        batch_rows,
     )
 
 
-def window_buffer_pages(*, num_slots: int, chunk_tokens: int) -> int:
+def window_buffer_pages(
+    *, num_slots: int, chunk_tokens: int, batch_rows: int = 0
+) -> int:
     """64-token pages of one layer's buffer: reserved, rings, workspace."""
     return (
         RESERVED_PAGES
         + RING_PAGES * num_slots
-        + _workspace_pages(num_slots=num_slots, chunk_tokens=chunk_tokens)
+        + _workspace_pages(
+            num_slots=num_slots, chunk_tokens=chunk_tokens, batch_rows=batch_rows
+        )
     )
 
 
@@ -201,11 +219,14 @@ class DSV41TPURequestWindow:
         # Rows per slot the core compares against a draft ring's.
         self.capacity = capacity
         chunk_tokens = get_schedule().chunked_prefill_size or 0
+        batch_rows = extend_batch_rows()
         self.workspace_first_page = RESERVED_PAGES + RING_PAGES * num_slots
         self.workspace_pages = _workspace_pages(
-            num_slots=num_slots, chunk_tokens=chunk_tokens
+            num_slots=num_slots, chunk_tokens=chunk_tokens, batch_rows=batch_rows
         )
-        pages = window_buffer_pages(num_slots=num_slots, chunk_tokens=chunk_tokens)
+        pages = window_buffer_pages(
+            num_slots=num_slots, chunk_tokens=chunk_tokens, batch_rows=batch_rows
+        )
         # The SWA pool adds one reserved 256-token logical page to the size.
         self.state = pool_factory((pages - RESERVED_PAGES) * SWA_PAGE_TOKENS, layers)
         assert self.state.num_pages == pages, (self.state.num_pages, pages)

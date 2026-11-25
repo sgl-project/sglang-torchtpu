@@ -46,6 +46,7 @@ from sglang_tpu.models.deepseek_v41.request_window import (
     RING_PAGES,
     RING_TOKENS,
     DSV41TPURequestWindow,
+    extend_batch_rows,
     ring_rows,
     window_buffer_pages,
 )
@@ -810,7 +811,9 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
 
 def window_bytes(*, num_slots: int, chunk_tokens: int, num_layers: int) -> int:
     """SWA bytes of the TPU request window (reserved pages, rings, workspace)."""
-    pages = window_buffer_pages(num_slots=num_slots, chunk_tokens=chunk_tokens)
+    pages = window_buffer_pages(
+        num_slots=num_slots, chunk_tokens=chunk_tokens, batch_rows=extend_batch_rows()
+    )
     return pages * SWA_PAGE_TOKENS * SWA_BYTES_PER_TOKEN * num_layers
 
 
