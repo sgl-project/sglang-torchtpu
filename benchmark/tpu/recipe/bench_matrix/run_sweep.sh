@@ -34,6 +34,15 @@ if [[ "$PD_DISAGG" == "1" ]]; then
         PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT"
     fi
     PROBE_URL=${PROBE_URL:-http://127.0.0.1:$PD_PREFILL_PORT}
+    # The mini-LB pairs each request with a random prefill engine, so a leg's
+    # cache counters are the sum over all of them; probing only the first lets
+    # a low-concurrency leg read 0% while its session hits on another engine.
+    if [[ -z "${PROBE_URLS:-}" ]]; then
+        PROBE_URLS=$PROBE_URL
+        for (( i = 1; i < PD_PREFILL_ENGINES && i < ${#_slice_hosts[@]}; i++ )); do
+            PROBE_URLS+=" http://${_slice_hosts[$i]}:$PD_PREFILL_PORT"
+        done
+    fi
     if [[ -z "${PROBE_URL_2:-}" && ${#_slice_hosts[@]} -ge 3 ]]; then
         PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT"
     fi
@@ -47,7 +56,7 @@ mkdir -p "$OUT_DIR"
 log_config | tee "$RUN_ROOT/config.log"
 {
     echo "run_root  = $RUN_ROOT"
-    echo "base_url  = $BASE_URL   probe_url = $PROBE_URL"
+    echo "base_url  = $BASE_URL   probe_url = ${PROBE_URLS:-$PROBE_URL}"
     echo "host      = $(hostname)"
     echo "started   = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "git       = $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -76,7 +85,8 @@ for bs in $SWEEP_BS; do
         echo
         echo "[sweep] ===== leg c${bs}-long${long} ====="
         BS="$bs" NUM_LONG="$long" BASE_URL="$BASE_URL" \
-        PROBE_URL="$PROBE_URL" PROBE_URL_2="${PROBE_URL_2:-}" \
+        PROBE_URL="$PROBE_URL" PROBE_URLS="${PROBE_URLS:-$PROBE_URL}" \
+        PROBE_URL_2="${PROBE_URL_2:-}" \
         OUTPUT_DIR="$OUT_DIR" TRACE_DIR="$TRACE_CACHE_DIR" \
             bash "$HERE/bench_leg.sh" || true
     done
