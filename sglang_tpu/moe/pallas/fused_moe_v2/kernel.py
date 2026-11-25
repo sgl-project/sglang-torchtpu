@@ -2320,6 +2320,39 @@ def combine_step_tokens(t_local):
     return 0
 
 
+def combine_prefetch_bytes(t_local, topk, *, scale_words=None):
+    """SMEM bytes the combine kernel's scalar-prefetched tables take.
+
+    The plain build prefetches pos (int32) and coef (f32), each
+    t_local * topk long. The fused-scales build (``scale_words`` set)
+    prefetches pos, the mirror indices (int32) and the router weights (f32),
+    each t_local * topk long, plus the ``scale_words`` f32 of the
+    arrival-scale mirror.
+    """
+    word = 4  # int32 and f32 alike
+    if scale_words is None:
+        return 2 * t_local * topk * word
+    return (3 * t_local * topk + scale_words) * word
+
+
+def combine_smem_budget(info=None):
+    """SMEM the combine kernel's tables may take: the chip's SMEM less
+    host.SMEM_HEADROOM_BYTES."""
+    if info is None:
+        info = pltpu.get_tpu_info()
+    return info.smem_capacity_bytes - host.SMEM_HEADROOM_BYTES
+
+
+def combine_tables_fit(t_local, topk, *, scale_words=None, info=None):
+    """Whether the combine kernel's prefetched tables fit SMEM.
+
+    Where they do not, the layer keeps the fused XLA gather epilogue instead
+    of failing Mosaic's SMEM allocation.
+    """
+    need = combine_prefetch_bytes(t_local, topk, scale_words=scale_words)
+    return need <= combine_smem_budget(info)
+
+
 def _build_combine_kernel(
     *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, fuse_scales=False
 ):
@@ -2345,6 +2378,11 @@ def _build_combine_kernel(
     are shared by the two builds; the choice is static at trace time.
     """
     tb = combine_step_tokens(t_local)
+    if not tb:
+        raise ValueError(
+            f"the combine kernel needs t_local >= {COMBINE_MIN_TOKENS} with an "
+            f"aligned step count, got t_local={t_local}"
+        )
     steps = t_local // tb
     gt = COMBINE_GROUP
     groups = tb // gt
