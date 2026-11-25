@@ -193,6 +193,7 @@ def make_fused_ep_moe(
     expert_format: str = EXPERT_FORMAT_K512,
     dispatch: str = DISPATCH,
     push_max_rows: int = PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ):
     """Return ``(x, gating, w1, w2, w1_scale, w2_scale, score_bias[, rank]) -> out``.
 
@@ -254,15 +255,37 @@ def make_fused_ep_moe(
         )
     mesh_ep_ranks = tuple(range(ep))
 
-    def moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank=None):
+    def moe(
+        x,
+        gating,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        score_bias,
+        rank=None,
+        sw13=None,
+        ss13=None,
+        sw2=None,
+        ss2=None,
+    ):
         # Static per traced shape: x holds every rank's rows.
         chosen = resolve_dispatch(
             dispatch, rows_per_rank=x.shape[0] // ep, push_max_rows=push_max_rows
         )
         push = {}
+        with_shared = fuse_shared and sw13 is not None
         if chosen == DISPATCH_PUSH:
             push["push_options"] = tuned_push_options(w1.shape[0] // ep)
-        return kernel_fn(
+            if with_shared:
+                push["shared_expert"] = (
+                    sw13,
+                    ss13.reshape(-1),
+                    sw2,
+                    ss2.reshape(-1),
+                )
+                push["shared_limit"] = SWIGLU_LIMIT
+        out = kernel_fn(
             x,
             w1,
             w2,
@@ -287,5 +310,23 @@ def make_fused_ep_moe(
             dispatch=chosen,
             **push,
         )
+        if with_shared:
+            if chosen == DISPATCH_PUSH:
+                routed, shared = out
+                return routed + shared
+            from jax.sharding import PartitionSpec as P
+            from sglang_tpu.fp8_swiglu_mlp import fp8_swiglu_mlp
+
+            shared = jax.shard_map(
+                lambda xl, w13_s, s13_s, w2_s, s2_s: fp8_swiglu_mlp(
+                    xl, w13_s, s13_s.reshape(-1), w2_s, s2_s.reshape(-1), limit=SWIGLU_LIMIT
+                ),
+                mesh=mesh,
+                in_specs=(P(axis), P(), P(), P(), P()),
+                out_specs=P(axis),
+                check_vma=False,
+            )(x, sw13, ss13, sw2, ss2)
+            return out + shared
+        return out
 
     return jax.jit(moe) if jit else moe
