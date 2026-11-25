@@ -353,6 +353,13 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 )
     if pa_a2a and Ts % 128:
         raise ValueError(f"SPTP_PA_A2A needs rows / tp a multiple of 128, got {T} rows")
+    if pa_gtok and pa_ng > 1:
+        # the in-kernel a2a's row groups read only the [qd, T] layout: the token-major one keeps
+        # every own row's o accumulator in VMEM (R=8192: 82 MB of 64)
+        raise ValueError(
+            f"SPTP_PA_OGATE_TOK takes rows / tp <= 512, got {T} rows: use SPTP_PA_TMAJ "
+            "(SPTP_OGATE_PK=13 for the Pallas o gate)"
+        )
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
     pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
     # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel

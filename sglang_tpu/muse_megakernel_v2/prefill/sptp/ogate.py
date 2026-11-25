@@ -80,6 +80,9 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
     T, qd, hd = c.rows, c.q_dim, c.head_dim
     hkv, gq = c.kv_heads, c.q_heads // c.kv_heads
     npair = gq // 2
+    # rows that do not tile by tm (any multiple of 128 rows): the largest 128-multiple divisor
+    while T % tm and tm > 128:
+        tm //= 2
     if T % tm or hd != 64 or gq % 2:
         raise ValueError(f"o gate pk: {T} rows / tile {tm}, head_dim {hd}, group {gq}")
 
